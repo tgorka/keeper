@@ -18,7 +18,8 @@
 //! The operator's token is used only for the person's first pairing code, as
 //! an operator pairs a person's first device. Each device runs behind a local
 //! TCP relay, so the test can cut one device off the server and see every
-//! byte the other sends.
+//! byte the other sends. Every log line keeper writes during the run is
+//! captured and searched for the token.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keeper_core::error::CoreError;
-use keeper_core::hq::port::{Replica, RowOp};
+use keeper_core::hq::port::{Replica, RowOp, Subscription};
+use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::vm::{HqDatabaseState, HqPhase, HqStatusVm};
 use keeper_core::hq::Hq;
@@ -186,6 +188,7 @@ fn hq(device: &Arc<Device>, name: &str) -> Arc<Hq> {
     Hq::new(
         Arc::clone(device) as Arc<dyn Platform>,
         Arc::new(SyncularOpener),
+        Arc::new(HttpRoutes::new()),
         name.to_owned(),
     )
 }
@@ -276,9 +279,13 @@ async fn mutate(replica: &Arc<dyn Replica>, ops: Vec<RowOp>) -> String {
 }
 
 async fn subscribe(replica: &Arc<dyn Replica>, id: &str, table: &str, variable: &str, value: &str) {
-    let (replica, id, table) = (Arc::clone(replica), id.to_owned(), table.to_owned());
-    let scope = vec![(variable.to_owned(), vec![value.to_owned()])];
-    tokio::task::spawn_blocking(move || replica.subscribe(&id, &table, scope).expect("subscribes"))
+    let replica = Arc::clone(replica);
+    let subscription = Subscription {
+        id: id.to_owned(),
+        table: table.to_owned(),
+        scopes: vec![(variable.to_owned(), vec![value.to_owned()])],
+    };
+    tokio::task::spawn_blocking(move || replica.subscribe(subscription).expect("subscribes"))
         .await
         .expect("joins");
 }
@@ -295,40 +302,46 @@ fn page_key(session: &str, at_ms: i64) -> String {
     format!("{session}/{month}")
 }
 
-/// A session of `author`'s with one message, in one commit.
+fn by(author: &Author, mut values: Value) -> Value {
+    values["author_actor"] = json!(author.actor);
+    values["author_client"] = json!(author.client);
+    values
+}
+
+/// Session `<client>.<number>` of `author`'s with one message, in one commit.
 fn session_with_message(
     author: &Author,
     number: u32,
     agent: &str,
+    message_id: &str,
     body: &str,
 ) -> (String, String, Vec<RowOp>) {
     let now = chrono::Utc::now().timestamp_millis();
     let id = format!("{}.{number}", author.client);
     let page = page_key(&id, now);
-    let by = json!({ "author_actor": author.actor, "author_client": author.client });
-    let with = |mut values: Value| {
-        for (k, v) in by.as_object().expect("object") {
-            values[k] = v.clone();
-        }
-        values
-    };
     let ops = vec![
         upsert(
             "sessions",
-            with(json!({
-                "id": id, "title": "hq_live", "status": "open", "agent_actor": agent,
-                "created_by_actor": author.actor, "created_by_client": author.client,
-                "invite": "[]", "archived": false, "created_at_ms": now, "last_activity_ms": now,
-            })),
+            by(
+                author,
+                json!({
+                    "id": id, "title": "hq_live", "status": "open", "agent_actor": agent,
+                    "created_by_actor": author.actor, "created_by_client": author.client,
+                    "invite": "[]", "archived": false, "created_at_ms": now, "last_activity_ms": now,
+                }),
+            ),
         ),
         upsert(
             "session_members",
-            with(json!({
-                "id": format!("{id}/{}", author.actor), "session_id": id, "actor_id": author.actor,
-                "role": "owner", "reads_trace": true, "added_by_actor": author.actor, "added_at_ms": now,
-            })),
+            by(
+                author,
+                json!({
+                    "id": format!("{id}/{}", author.actor), "session_id": id, "actor_id": author.actor,
+                    "role": "owner", "reads_trace": true, "added_by_actor": author.actor, "added_at_ms": now,
+                }),
+            ),
         ),
-        message(author, &id, &page, &format!("m-{number}-0"), body, now),
+        message(author, &id, &page, message_id, body, now),
     ];
     (id, page, ops)
 }
@@ -336,16 +349,49 @@ fn session_with_message(
 fn message(author: &Author, session: &str, page: &str, id: &str, body: &str, at_ms: i64) -> RowOp {
     upsert(
         "messages",
-        json!({
-            "id": id, "session_id": session, "page_key": page, "role": "person", "body": body,
-            "created_at_ms": at_ms, "author_actor": author.actor, "author_client": author.client,
-        }),
+        by(
+            author,
+            json!({
+                "id": id, "session_id": session, "page_key": page, "role": "person", "body": body,
+                "created_at_ms": at_ms,
+            }),
+        ),
     )
+}
+
+/// Every log line of the run, at every level.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a running agents server; see the module docs"]
 async fn pair_discover_replicate_go_offline_and_revoke() {
+    let log = Captured::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.clone())
+            .finish(),
+    )
+    .expect("the only subscriber");
     let server = env("KEEPER_HQ_LIVE_URL");
     let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
     let actor = env("KEEPER_HQ_LIVE_ACTOR");
@@ -353,6 +399,10 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         .split(',')
         .map(str::to_owned)
         .collect();
+    assert!(
+        expected.len() >= 2,
+        "two databases, to prove they stay apart"
+    );
     let upstream = server
         .trim_start_matches("http://")
         .trim_end_matches('/')
@@ -366,11 +416,6 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
     let a = hq(&platform_a, "hq_live device a");
     a.start().await.expect("starts");
     assert_eq!(a.status().borrow().phase, HqPhase::NoServer);
-    assert_eq!(
-        relay_a.connections.load(Ordering::SeqCst),
-        0,
-        "no server, no request"
-    );
     a.set_server(&relay_a.url())
         .await
         .expect("stores the address");
@@ -404,31 +449,7 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
     let a_client = status.device.as_ref().expect("a device").client_id.clone();
     println!("PASS a paired as {a_client}, databases {names:?}");
 
-    // The token is in the keychain and nowhere on disk.
-    let stored = platform_a
-        .keychain
-        .lock()
-        .expect("keychain")
-        .values()
-        .next()
-        .cloned()
-        .expect("an item");
-    let token: String = serde_json::from_str::<Value>(&stored).expect("json")["token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
-    let needle = &token[..8];
-    for entry in walk(&platform_a.data_dir) {
-        let bytes = std::fs::read(&entry).expect("reads");
-        assert!(
-            !bytes.windows(8).any(|w| w == needle.as_bytes()),
-            "the token's first eight characters are in {}",
-            entry.display()
-        );
-    }
-    println!("PASS the token is in the keychain only");
-
-    // Device B: types the code A shows, straight at its own relay.
+    // Device B: types the code A shows, at its own relay.
     let relay_b = Relay::start(upstream.clone()).await;
     let platform_b = device(&scratch.path().join("b"));
     let b = hq(&platform_b, "hq_live device b");
@@ -456,15 +477,20 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         .clone();
     println!("PASS b paired by a's code as {b_client}");
 
-    // A commit on A in each database reaches B with the server-stamped author.
+    // The same session number in every database, each with its own words:
+    // each database's rows reach B's replica of that database and no other.
     let author = Author {
         actor: actor.clone(),
         client: a_client.clone(),
     };
+    let forger = Author {
+        actor: actor.clone(),
+        client: b_client.clone(),
+    };
     let mut pages = Vec::new();
-    for (n, db) in expected.iter().enumerate() {
-        let ra = a.replica(db).await.expect("a holds it");
-        let rb = b.replica(db).await.expect("b holds it");
+    for db in &expected {
+        let ra = a.replica(db).expect("a holds it");
+        let rb = b.replica(db).expect("b holds it");
         let agents = wait_rows(
             &ra,
             "SELECT id FROM actors WHERE kind = 'agent' ORDER BY id LIMIT 1",
@@ -475,41 +501,80 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         .await;
         let agent = agents[0]["id"].as_str().expect("an agent").to_owned();
         let (session, page, ops) =
-            session_with_message(&author, (n + 1) as u32, &agent, &format!("hello {db}"));
+            session_with_message(&author, 1, &agent, "m-1", &format!("words of {db}"));
         mutate(&ra, ops).await;
+        // A commit naming B as its author, sent by A: the server refuses it.
+        let forged_page = page.clone();
+        mutate(
+            &ra,
+            vec![message(
+                &forger,
+                &session,
+                &forged_page,
+                "m-forged",
+                "forged",
+                chrono::Utc::now().timestamp_millis(),
+            )],
+        )
+        .await;
         subscribe(&rb, &format!("page-{db}"), "messages", "page", &page).await;
         rb.sync_now();
         let rows = wait_rows(
             &rb,
-            "SELECT id, body, author_actor, author_client FROM messages WHERE session_id = ?1",
-            vec![json!(session)],
+            "SELECT id, body, author_client FROM messages WHERE id = 'm-1'",
+            vec![],
             1,
             within,
         )
         .await;
-        assert_eq!(rows[0]["body"], format!("hello {db}"));
-        assert_eq!(rows[0]["author_actor"], actor.as_str());
+        assert_eq!(rows[0]["body"], format!("words of {db}"));
         assert_eq!(rows[0]["author_client"], a_client.as_str());
         pages.push((db.clone(), session, page, ra, rb));
-        println!("PASS {db}: a's message is in b's replica, authored {actor}/{a_client}");
+    }
+    // Long enough for the forged commit to have been answered.
+    wait_status(
+        &a,
+        "a's outbox is empty",
+        |s| s.databases.iter().all(|db| db.waiting == 0),
+        within,
+    )
+    .await;
+    for (db, _, _, ra, rb) in &pages {
+        let bodies: Vec<String> = query(rb, "SELECT body FROM messages", vec![])
+            .await
+            .iter()
+            .map(|r| r["body"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            bodies,
+            [format!("words of {db}")],
+            "{db}: b holds only its own database's row"
+        );
+        assert!(
+            query(ra, "SELECT id FROM messages WHERE id = 'm-forged'", vec![])
+                .await
+                .is_empty(),
+            "{db}: the forged row was not rolled back"
+        );
+        println!("PASS {db}: a's row reached b with a's client; the forged one was refused; nothing crossed databases");
     }
 
-    // Both devices are listed under Devices on both.
+    // Both devices are listed on both, from the replicated directory.
     for (label, device) in [("a", &a), ("b", &b)] {
-        let deadline = Instant::now() + within;
-        loop {
-            let listed = device.devices().await.expect("lists");
-            let ids: Vec<&str> = listed.iter().map(|d| d.client_id.as_str()).collect();
-            if ids.contains(&a_client.as_str()) && ids.contains(&b_client.as_str()) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "{label} lists {ids:?}");
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        wait_status(
+            device,
+            &format!("{label} lists both"),
+            |s| {
+                let ids: Vec<&str> = s.devices.iter().map(|d| d.client_id.as_str()).collect();
+                ids.contains(&a_client.as_str()) && ids.contains(&b_client.as_str())
+            },
+            within,
+        )
+        .await;
     }
     println!("PASS both devices are listed on both");
 
-    // A goes offline: writes wait in its outbox, reads answer, B sees nothing.
+    // A goes offline: writes wait in its outbox, reads answer, then drain.
     relay_a.cut();
     let now = chrono::Utc::now().timestamp_millis();
     for (db, session, page, ra, _) in &pages {
@@ -579,9 +644,24 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
     }
     println!("PASS reconnected: the outbox drained and b has the offline writes");
 
-    // A restart keeps the replicas and the pairing; no new code.
+    // A restart: the old service stops and is gone; a new one on the same
+    // disk and keychain reconnects with no new code.
     drop(pages);
+    a.shutdown().await;
+    let gone = Arc::downgrade(&a);
     drop(a);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        gone.upgrade().is_none(),
+        "the old service outlived its restart"
+    );
+    let before = relay_a.connections.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        relay_a.connections.load(Ordering::SeqCst),
+        before,
+        "a stopped service still connected"
+    );
     let a = hq(&platform_a, "hq_live device a");
     a.start().await.expect("restarts");
     wait_status(
@@ -596,9 +676,9 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         within,
     )
     .await;
-    println!("PASS restart: paired and connected with no new code");
+    println!("PASS restart: the old service is gone; the new one is paired and connected with no new code");
 
-    // A removes B: B is refused on every database, says so and stops sending.
+    // A removes B: B is refused, says so, stops sending, stays readable.
     a.revoke(&b_client).await.expect("revokes");
     let removed = wait_status(
         &b,
@@ -612,7 +692,7 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         .iter()
         .all(|db| db.state == HqDatabaseState::Removed));
     for db in &expected {
-        let rb = b.replica(db).await.expect("still held");
+        let rb = b.replica(db).expect("still held");
         assert!(
             !query(&rb, "SELECT id FROM messages", vec![])
                 .await
@@ -620,6 +700,17 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
             "{db} readable"
         );
     }
+    wait_status(
+        &a,
+        "a lists b as removed",
+        |s| {
+            s.devices
+                .iter()
+                .any(|d| d.client_id == b_client && d.revoked)
+        },
+        within,
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let (connections, bytes) = (
         relay_b.connections.load(Ordering::SeqCst),
@@ -636,9 +727,9 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         bytes,
         "a removed device sent bytes"
     );
-    println!("PASS b removed: refused, readable, and silent for 15 s");
+    println!("PASS b removed: refused, readable, listed as removed on a, and silent for 15 s");
 
-    // A person in one database never asks for the other.
+    // A person in one database never asks for another.
     if let Ok(one) = std::env::var("KEEPER_HQ_LIVE_ONE_DB_ACTOR") {
         let (one_actor, one_db) = one.split_once(':').expect("<actor>:<database>");
         let relay_m = Relay::start(upstream).await;
@@ -664,8 +755,45 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
                 "m requested /{other}"
             );
         }
-        println!("PASS {one_actor} holds {one_db} alone and never requested another");
+        println!("PASS the one-database person holds {one_db} alone and never requested another");
     }
+
+    // No token, A's or B's, in any file either device wrote or any log line.
+    let log = String::from_utf8_lossy(&log.0.lock().expect("log")).into_owned();
+    assert!(
+        log.contains("keeper_core::hq"),
+        "the capture saw keeper's lines"
+    );
+    for platform in [&platform_a, &platform_b] {
+        let stored = platform
+            .keychain
+            .lock()
+            .expect("keychain")
+            .values()
+            .next()
+            .cloned()
+            .expect("an item");
+        let token: String = serde_json::from_str::<Value>(&stored).expect("json")["token"]
+            .as_str()
+            .expect("token")
+            .to_owned();
+        let needle = &token[..8];
+        assert!(
+            !log.contains(needle),
+            "the token's first eight characters are in the log"
+        );
+        for directory in [&platform_a.data_dir, &platform_b.data_dir] {
+            for entry in walk(directory) {
+                let bytes = std::fs::read(&entry).expect("reads");
+                assert!(
+                    !bytes.windows(8).any(|w| w == needle.as_bytes()),
+                    "the token is in {}",
+                    entry.display()
+                );
+            }
+        }
+    }
+    println!("PASS no token in any file or log line");
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

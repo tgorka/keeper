@@ -5,6 +5,8 @@
 //! ever logged, because a redeem's body is the token.
 
 use serde::Deserialize;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::hq::pairing::PairingCode;
@@ -141,13 +143,79 @@ fn discovery_of(
     })
 }
 
-/// The client every root request goes through.
-pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+/// A root route's answer, as a future the caller can drop to cancel it.
+pub type Answer<'a, T> = Pin<Box<dyn Future<Output = Result<T, RouteError>> + Send + 'a>>;
+
+/// The server's root routes. [`HttpRoutes`] is the one implementation keeper
+/// runs; tests answer with their own.
+pub trait Routes: Send + Sync {
+    /// `GET /databases`: whom the token was issued to and what it opens.
+    fn discover<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Discovery>;
+    /// `POST /pair/redeem`: the code is the credential; `name` is how the
+    /// person's other devices list this one.
+    fn redeem<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        code: &'a PairingCode,
+        name: &'a str,
+    ) -> Answer<'a, Redeemed>;
+    /// `POST /pair/start`: a code another device of this person can redeem.
+    fn start<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Issued>;
+    /// `POST /clients/{id}/revoke`: ends `client_id`'s access everywhere.
+    fn revoke<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        client_id: &'a str,
+    ) -> Answer<'a, ()>;
+}
+
+/// The root routes over HTTP, with no redirect followed.
+pub struct HttpRoutes {
+    http: reqwest::Client,
+}
+
+impl HttpRoutes {
+    pub fn new() -> HttpRoutes {
+        HttpRoutes {
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
+    }
+}
+
+impl Default for HttpRoutes {
+    fn default() -> Self {
+        HttpRoutes::new()
+    }
+}
+
+impl Routes for HttpRoutes {
+    fn discover<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Discovery> {
+        Box::pin(discover(&self.http, server, token))
+    }
+    fn redeem<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        code: &'a PairingCode,
+        name: &'a str,
+    ) -> Answer<'a, Redeemed> {
+        Box::pin(redeem(&self.http, server, code, name))
+    }
+    fn start<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Issued> {
+        Box::pin(start(&self.http, server, token))
+    }
+    fn revoke<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        client_id: &'a str,
+    ) -> Answer<'a, ()> {
+        Box::pin(revoke(&self.http, server, token, client_id))
+    }
 }
 
 async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, RouteError> {
@@ -183,7 +251,7 @@ async fn body<T: serde::de::DeserializeOwned>(
 }
 
 /// `GET /databases`: whom the token was issued to and the databases it opens.
-pub async fn discover(
+async fn discover(
     http: &reqwest::Client,
     server: &ServerUrl,
     token: &str,
@@ -195,7 +263,7 @@ pub async fn discover(
 
 /// `POST /pair/redeem`: the code is the credential; `name` is how the
 /// person's other devices list this one.
-pub async fn redeem(
+async fn redeem(
     http: &reqwest::Client,
     server: &ServerUrl,
     code: &PairingCode,
@@ -218,7 +286,7 @@ pub async fn redeem(
 }
 
 /// `POST /pair/start`: a code another device of this person can redeem.
-pub async fn start(
+async fn start(
     http: &reqwest::Client,
     server: &ServerUrl,
     token: &str,
@@ -240,7 +308,7 @@ pub async fn start(
 }
 
 /// `POST /clients/{id}/revoke`: ends `client_id`'s access on every database.
-pub async fn revoke(
+async fn revoke(
     http: &reqwest::Client,
     server: &ServerUrl,
     token: &str,
@@ -263,7 +331,7 @@ mod tests {
 
     #[test]
     fn a_database_name_is_safe_in_a_path_and_a_url() {
-        for ok in ["tgdrive", "neuradrive", "a", "db-2", "x_y"] {
+        for ok in ["alpha", "beta", "a", "db-2", "x_y"] {
             assert!(is_database_name(ok), "{ok}");
         }
         for bad in ["", "..", "a/b", "A", "-a", "a b", "a?b", &"a".repeat(64)] {
@@ -277,12 +345,12 @@ mod tests {
             name: name.to_owned(),
         };
         let found = discovery_of(
-            "tgorka".to_owned(),
-            "tgorka.0a1b2c3d".to_owned(),
-            vec![row("tgdrive"), row("neuradrive"), row("tgdrive")],
+            "ana".to_owned(),
+            "ana.0a1b2c3d".to_owned(),
+            vec![row("alpha"), row("beta"), row("alpha")],
         )
         .expect("reads");
-        assert_eq!(found.databases, ["tgdrive", "neuradrive"]);
+        assert_eq!(found.databases, ["alpha", "beta"]);
         assert!(discovery_of("t".to_owned(), "t.1".to_owned(), vec![row("../x")]).is_err());
         assert!(discovery_of("../t".to_owned(), "t.1".to_owned(), vec![]).is_err());
         assert!(discovery_of("t".to_owned(), ".t".to_owned(), vec![]).is_err());

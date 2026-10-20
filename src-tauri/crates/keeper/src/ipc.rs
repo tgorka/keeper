@@ -13353,14 +13353,16 @@ pub async fn egress_list(
     let provider_base_urls =
         keeper_core::bots::store::provider_base_urls(&data_dir).map_err(to_ipc_error)?;
     // The agents server (R-HQ-9): the setting as stored, read on every call,
-    // so clearing it removes the row at the next open.
-    let agents_server =
-        keeper_core::registry::get_agents_server_url(&data_dir).map_err(to_ipc_error)?;
+    // and every server a request may still reach — an old one stays listed
+    // until its last request has ended.
+    let mut agents_servers = crate::hq_ipc::contacting();
+    agents_servers
+        .extend(keeper_core::registry::get_agents_server_url(&data_dir).map_err(to_ipc_error)?);
     let mut destinations = compute_egress(
         &accounts,
         &sync_remotes,
         &provider_base_urls,
-        agents_server.as_deref(),
+        &agents_servers,
         if cfg!(desktop) {
             EGRESS_UPDATE_ENDPOINT
         } else {

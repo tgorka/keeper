@@ -174,9 +174,10 @@ fn remote_host(remote_url: &str) -> Option<String> {
 /// Beeper, then each distinct sync remote *host* (first-seen, deduplicated — two
 /// profiles on one host are one entry, because they are one destination), then
 /// each distinct AI provider *host* on the same rule, then the agents server
-/// (`agents_server`, `agents.server_url` as stored) once by host and port —
-/// one row however many of its databases this device holds, since they share
-/// it, and none when the setting is blank or an address
+/// (`agents_servers`: `agents.server_url` as stored, and every server a request
+/// may still reach) once per host and port — one row however many of its
+/// databases this device holds, since they share it, and none for a blank
+/// value or an address
 /// [`ServerUrl::parse`](crate::hq::server::ServerUrl::parse) refuses, which
 /// keeper never contacts — then the update endpoint
 /// last. Never panics and never uses `.unwrap()` — a malformed
@@ -189,7 +190,7 @@ pub fn compute_egress(
     accounts: &[(String, Provider)],
     sync_remotes: &[String],
     provider_base_urls: &[String],
-    agents_server: Option<&str>,
+    agents_servers: &[String],
     update_endpoint: &str,
 ) -> Vec<EgressEndpointVm> {
     let mut endpoints: Vec<EgressEndpointVm> = Vec::new();
@@ -276,9 +277,17 @@ pub fn compute_egress(
         });
     }
 
-    // The agents server (R-HQ-9): host and port, never its path, and nothing
-    // when keeper would not contact what is stored.
-    if let Some(Ok(Some(server))) = agents_server.map(crate::hq::server::ServerUrl::parse) {
+    // The agents server (R-HQ-9): host and port, never its path, once per
+    // host, and nothing for what keeper would not contact.
+    let mut seen_agents_hosts: Vec<String> = Vec::new();
+    for stored in agents_servers {
+        let Ok(Some(server)) = crate::hq::server::ServerUrl::parse(stored) else {
+            continue;
+        };
+        if seen_agents_hosts.iter().any(|host| host == server.host()) {
+            continue;
+        }
+        seen_agents_hosts.push(server.host().to_owned());
         endpoints.push(EgressEndpointVm {
             url: server.host().to_owned(),
             kind: EgressKind::AgentsServer,
@@ -576,7 +585,7 @@ mod tests {
     /// Matrix row 1 — No accounts: exactly one entry, the update endpoint.
     #[test]
     fn no_accounts_yields_only_the_update_endpoint() {
-        let out = compute_egress(&[], NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&[], NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(shape(&out), vec![(EgressKind::Update, UPDATE)]);
     }
 
@@ -585,13 +594,13 @@ mod tests {
     #[test]
     fn the_agents_server_is_one_row_by_host_and_port_and_nothing_when_unset() {
         for stored in [
-            None,
-            Some(""),
-            Some("  "),
-            Some("agents.example.org"),
-            Some("https://me:pw@a.example.org"),
+            vec![],
+            vec![String::new()],
+            vec!["  ".to_owned()],
+            vec!["agents.example.org".to_owned()],
+            vec!["https://me:pw@a.example.org".to_owned()],
         ] {
-            let out = compute_egress(&[], NO_REMOTES, NO_PROVIDERS, stored, UPDATE);
+            let out = compute_egress(&[], NO_REMOTES, NO_PROVIDERS, &stored, UPDATE);
             assert_eq!(
                 shape(&out),
                 vec![(EgressKind::Update, UPDATE)],
@@ -602,7 +611,11 @@ mod tests {
             &[],
             NO_REMOTES,
             NO_PROVIDERS,
-            Some("http://100.64.0.7:8790/hq/"),
+            &[
+                "http://100.64.0.7:8790/hq/".to_owned(),
+                // An old address still being contacted on the same host: one row.
+                "http://100.64.0.7:8790/old".to_owned(),
+            ],
             UPDATE,
         );
         assert_eq!(
@@ -619,7 +632,7 @@ mod tests {
     #[test]
     fn one_non_beeper_account_has_homeserver_and_update_only() {
         let accounts = vec![("https://matrix.example.org".to_owned(), Provider::Password)];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -637,7 +650,7 @@ mod tests {
     #[test]
     fn one_beeper_account_by_provider_adds_beeper_api() {
         let accounts = vec![("https://matrix.beeper.com".to_owned(), Provider::Beeper)];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -657,7 +670,7 @@ mod tests {
             // Deliberately not the Beeper provider tag — host detection must win.
             Provider::Password,
         )];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -675,7 +688,7 @@ mod tests {
             ("https://matrix.example.org".to_owned(), Provider::Password),
             ("https://matrix.example.org".to_owned(), Provider::Oidc),
         ];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -699,7 +712,7 @@ mod tests {
             ("https://matrix.beeper.com".to_owned(), Provider::Beeper),
             ("https://matrix.beeper.com".to_owned(), Provider::Beeper),
         ];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             out.iter().filter(|e| e.kind == EgressKind::Beeper).count(),
             1,
@@ -721,7 +734,7 @@ mod tests {
     #[test]
     fn malformed_homeserver_url_is_shown_verbatim_and_not_beeper() {
         let accounts = vec![("not a url".to_owned(), Provider::Password)];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -741,7 +754,7 @@ mod tests {
     #[test]
     fn malformed_url_with_beeper_provider_still_adds_beeper_api() {
         let accounts = vec![("::::garbage".to_owned(), Provider::Beeper)];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -761,7 +774,7 @@ mod tests {
             ("https://matrix.example.org".to_owned(), Provider::Password),
             ("https://matrix.beeper.com".to_owned(), Provider::Beeper),
         ];
-        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -784,9 +797,9 @@ mod tests {
     #[test]
     fn adding_a_sync_profile_discloses_exactly_one_entry_for_its_remote_host() {
         let accounts = one_account();
-        let before = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let before = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
-        let after = compute_egress(&accounts, &remotes, NO_PROVIDERS, None, UPDATE);
+        let after = compute_egress(&accounts, &remotes, NO_PROVIDERS, &[], UPDATE);
 
         assert_eq!(
             shape(&after),
@@ -810,8 +823,8 @@ mod tests {
     fn removing_the_sync_profile_removes_its_entry_again() {
         let accounts = one_account();
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
-        let with_profile = compute_egress(&accounts, &remotes, NO_PROVIDERS, None, UPDATE);
-        let without_profile = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
+        let with_profile = compute_egress(&accounts, &remotes, NO_PROVIDERS, &[], UPDATE);
+        let without_profile = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
 
         assert!(
             with_profile
@@ -840,7 +853,7 @@ mod tests {
             // same host to DNS and must be the same host here.
             "https://GitHub.com/tgorka/archive.git".to_owned(),
         ];
-        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, &[], UPDATE);
 
         assert_eq!(
             out.iter()
@@ -876,7 +889,7 @@ mod tests {
             "/srv/repos/a:b".to_owned(),
             "".to_owned(),
         ];
-        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, &[], UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -902,7 +915,7 @@ mod tests {
             // ssh with an explicit user and port.
             "ssh://deploy@ssh.example.com:2222/srv/git/vault.git".to_owned(),
         ];
-        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, &[], UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -949,7 +962,7 @@ mod tests {
             "/Volumes/pendrive/vault.git".to_owned(),
             "git@gitlab.example.org:team/archive.git".to_owned(),
         ];
-        let out = compute_egress(&accounts, &remotes, NO_PROVIDERS, None, UPDATE);
+        let out = compute_egress(&accounts, &remotes, NO_PROVIDERS, &[], UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -975,7 +988,7 @@ mod tests {
     #[test]
     fn a_provider_is_disclosed_as_a_host_and_never_as_a_url() {
         let providers = vec!["https://oauth2:ghp_live@gw.example.org/v1".to_owned()];
-        let out = compute_egress(&one_account(), NO_REMOTES, &providers, None, UPDATE);
+        let out = compute_egress(&one_account(), NO_REMOTES, &providers, &[], UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -1016,7 +1029,7 @@ mod tests {
             "/srv/models".to_owned(),
             "   ".to_owned(),
         ];
-        let out = compute_egress(&one_account(), NO_REMOTES, &providers, None, UPDATE);
+        let out = compute_egress(&one_account(), NO_REMOTES, &providers, &[], UPDATE);
 
         assert_eq!(
             out.iter()
@@ -1037,7 +1050,7 @@ mod tests {
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
         let providers = vec!["http://127.0.0.1:8642".to_owned()];
 
-        let with_provider = compute_egress(&accounts, &remotes, &providers, None, UPDATE);
+        let with_provider = compute_egress(&accounts, &remotes, &providers, &[], UPDATE);
         assert_eq!(
             shape(&with_provider),
             vec![
@@ -1049,7 +1062,7 @@ mod tests {
             "providers disclose after the sync remotes, and the update endpoint stays last"
         );
 
-        let without_provider = compute_egress(&accounts, &remotes, NO_PROVIDERS, None, UPDATE);
+        let without_provider = compute_egress(&accounts, &remotes, NO_PROVIDERS, &[], UPDATE);
         assert!(
             !without_provider
                 .iter()
@@ -1083,8 +1096,8 @@ mod tests {
             created_ms: 1,
         };
         let accounts = one_account();
-        let without = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, None, UPDATE);
-        let with = compute_egress(&accounts, NO_REMOTES, &[provider.base_url], None, UPDATE);
+        let without = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, &[], UPDATE);
+        let with = compute_egress(&accounts, NO_REMOTES, &[provider.base_url], &[], UPDATE);
 
         let providers: Vec<(&str, &str)> = with
             .iter()
@@ -1158,7 +1171,7 @@ mod tests {
             &accounts,
             &remotes,
             &providers,
-            Some("https://agents.example.org"),
+            &["https://agents.example.org".to_owned()],
             UPDATE,
         );
         let telemetry = crate::telemetry::Telemetry::open(
@@ -1544,7 +1557,7 @@ mod tests {
     /// #2, R464).
     #[test]
     fn the_update_row_names_what_this_build_contacts() {
-        let phone = compute_egress(&[], &[], &[], None, EGRESS_RELEASE_CHECK_ENDPOINT);
+        let phone = compute_egress(&[], &[], &[], &[], EGRESS_RELEASE_CHECK_ENDPOINT);
         let row = phone.last().expect("the update row");
         assert_eq!(row.kind, EgressKind::Update);
         assert_eq!(
@@ -1555,7 +1568,7 @@ mod tests {
             row.label,
             "Release check (reads the latest version, downloads nothing)"
         );
-        let desktop = compute_egress(&[], &[], &[], None, EGRESS_UPDATE_ENDPOINT);
+        let desktop = compute_egress(&[], &[], &[], &[], EGRESS_UPDATE_ENDPOINT);
         assert_eq!(
             desktop.last().map(|row| row.label.as_str()),
             Some("Signed app updates")

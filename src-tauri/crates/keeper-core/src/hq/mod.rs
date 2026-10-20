@@ -3,20 +3,27 @@
 //!
 //! keeper ships no server address (D-4). The person sets `agents.server_url`
 //! to the server's base URL; a device pairs by redeeming a code another of
-//! their devices shows ([`pairing`]); the token it receives lives in the
-//! platform keychain and nowhere else — never in `keeper.db`, a settings
-//! file, a view model or a log line. `GET /databases` says which databases the
-//! token opens, and the device holds one replica of each ([`databases`]),
-//! each with its own socket at `<base>/<database>/…` and its own owner thread
-//! ([`syncular`]). With no address, or no pairing, everything written waits in
-//! a local replica's outbox and keeper makes no request to any agents server.
+//! their devices shows, typed or opened from its QR ([`pairing`]); the token
+//! it receives lives in the platform keychain and nowhere else — never in
+//! `keeper.db`, a settings file, a view model or a log line. `GET /databases`
+//! says which databases the token opens, and the device holds one replica of
+//! each ([`databases`]), each with its own socket at `<base>/<database>/…` and
+//! its own owner thread ([`syncular`]). With no address, or no pairing,
+//! everything written waits in a local replica's outbox and keeper makes no
+//! request to any agents server.
 //!
-//! A revoked device's next round is refused; its replicas stop syncing, say
-//! so, send nothing more, and stay readable until the person removes them.
+//! One lifecycle owns every request: [`Hq`] follows the effective
+//! `agents.server_url` ([`Hq::reconcile`], called whenever a setting or a
+//! settings layer changes), and a change closes every replica's network
+//! before it is published. [`Hq::contacting`] names each server a request may
+//! still reach, so the egress list never drops a host keeper is talking to.
+//! A replica links only once this run's discovery says its database is open;
+//! a refused replica is retried on a growing backoff that outlives the
+//! replica; a device the server removed stays removed across restarts until
+//! it is paired again, and stays readable until the person removes it.
 //!
-//! [`Hq`] owns all of it; the shell's `hq_ipc` is a call site and decides
-//! nothing. Its tracing targets are `keeper_core::hq::*` and carry no row
-//! content.
+//! The shell's `hq_ipc` is a call site and decides nothing. Tracing targets
+//! are `keeper_core::hq::*` and carry no row content.
 
 pub mod databases;
 pub mod pairing;
@@ -26,17 +33,23 @@ pub mod server;
 pub mod syncular;
 pub mod vm;
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::error::CoreError;
-use crate::hq::port::{Link, LinkState, Opener, Replica, ReplicaSpec};
-use crate::hq::routes::RouteError;
+use crate::hq::databases::Authorization;
+use crate::hq::pairing::PairingCode;
+use crate::hq::port::{Link, LinkState, Opener, Replica, ReplicaSpec, Subscription};
+use crate::hq::routes::{RouteError, Routes};
 use crate::hq::server::ServerUrl;
 use crate::hq::vm::{
     database_vm, phase_sentence, HqDeviceVm, HqPairCodeVm, HqPhase, HqStatusVm, HqThisDeviceVm,
@@ -46,16 +59,21 @@ use crate::platform::{exclude_from_backup_best_effort, Platform};
 /// The keychain item of a server's pairing: this prefix and the base URL.
 const KEYCHAIN_PREFIX: &str = "agents-server/";
 
-/// The directory subscriptions every replica holds: the database's actors
-/// and clients (the person's devices among them), by `dir` (`syncular.json`).
+/// The directory subscriptions every linked replica holds: the database's
+/// actors and clients (the person's devices among them), by `dir`.
 const DIRECTORY: [(&str, &str); 2] = [
     ("directoryActors", "actors"),
     ("directoryClients", "clients"),
 ];
 
-/// The longest wait between two discoveries of a server that cannot be
-/// reached.
-const MAX_DISCOVERY_BACKOFF: Duration = Duration::from_secs(60);
+/// The longest wait before a refused database is tried again.
+const MAX_REFUSAL_BACKOFF: Duration = Duration::from_secs(600);
+
+/// The wait before a database refused `streak` times in a row is linked again.
+fn refusal_backoff(streak: u32) -> Duration {
+    let exponent = streak.saturating_sub(1).min(10);
+    Duration::from_secs(1u64 << exponent).min(MAX_REFUSAL_BACKOFF)
+}
 
 /// Why an hq call failed. `Sentence` is shown to the person as it is.
 #[derive(Debug, thiserror::Error)]
@@ -88,13 +106,56 @@ impl std::fmt::Debug for Pairing {
     }
 }
 
+/// The servers a request may still reach, each held by whatever is
+/// reaching it.
+#[derive(Default)]
+struct Contacts {
+    next: AtomicU64,
+    live: Mutex<Vec<(u64, String)>>,
+}
+
+/// One holder of a server in [`Contacts`]; released when dropped.
+struct Contact {
+    contacts: Arc<Contacts>,
+    id: u64,
+}
+
+impl Contacts {
+    fn hold(self: &Arc<Self>, server: &ServerUrl) -> Contact {
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        lock(&self.live).push((id, server.as_str().to_owned()));
+        Contact {
+            contacts: Arc::clone(self),
+            id,
+        }
+    }
+}
+
+impl Drop for Contact {
+    fn drop(&mut self) {
+        lock(&self.contacts.live).retain(|(id, _)| *id != self.id);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct Db {
     name: String,
     replica: Arc<dyn Replica>,
-    /// The server's last `GET /databases` listed it (or has not answered).
-    open: bool,
-    /// Whether `replica` syncs (it is reopened local-only when not).
+    /// Whether `replica` was opened with a link.
     linked: bool,
+    /// This replica's refusal has been counted.
+    refusal_counted: bool,
+}
+
+/// A database's refusals in a row, kept across the replicas that replace
+/// each other, and when it may be linked again.
+#[derive(Debug, Clone, Copy, Default)]
+struct Refusal {
+    streak: u32,
+    until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -103,33 +164,40 @@ struct Inner {
     /// `agents.server_url` holds text the grammar refuses.
     address_refused: bool,
     pairing: Option<Pairing>,
-    removed: bool,
+    authorization: Authorization,
     local: Option<Arc<dyn Replica>>,
-    databases: Vec<Db>,
-    /// Bumped on every (re)start, so a discovery of an older start lands
-    /// nowhere.
+    dbs: Vec<Db>,
+    /// Bumped on every reconfiguration, so work of an older one lands nowhere.
     generation: u64,
+    tasks: Vec<JoinHandle<()>>,
+    /// A discovery is pending or running.
     discovering: bool,
+    refusals: HashMap<String, Refusal>,
+    /// A pairing link opened here, waiting for the person to confirm it.
+    offer: Option<(ServerUrl, PairingCode)>,
+    /// Held while any replica of `server` is linked.
+    linked_contact: Option<Contact>,
 }
 
-impl Inner {
-    fn close_all(&mut self) {
-        for db in self.databases.drain(..) {
-            db.replica.close();
-        }
-        if let Some(local) = self.local.take() {
-            local.close();
-        }
-    }
+/// What a reconfiguration takes out of service.
+struct Retired {
+    replicas: Vec<Arc<dyn Replica>>,
+    contact: Option<Contact>,
 }
 
 /// The agents server, this device's pairing with it, and every replica.
 pub struct Hq {
+    me: Weak<Hq>,
     platform: Arc<dyn Platform>,
     opener: Arc<dyn Opener>,
-    http: reqwest::Client,
+    routes: Arc<dyn Routes>,
     device_name: String,
+    /// Serialises every change of configuration. Never held across a request
+    /// to the server; reads never take it.
+    lifecycle: tokio::sync::Mutex<()>,
+    /// Short sections only, never across an await.
     inner: Mutex<Inner>,
+    contacts: Arc<Contacts>,
     status: watch::Sender<HqStatusVm>,
 }
 
@@ -141,6 +209,8 @@ fn no_server() -> HqStatusVm {
         device: None,
         databases: Vec::new(),
         waiting_here: 0,
+        devices: Vec::new(),
+        offer: None,
     }
 }
 
@@ -162,21 +232,48 @@ fn route_sentence(server: &ServerUrl, error: &RouteError) -> String {
     }
 }
 
+fn sentence(error: impl std::fmt::Display) -> HqError {
+    HqError::Sentence(error.to_string())
+}
+
+/// Close every replica's network at once, then wait for every owner to stop.
+async fn retire(retired: Retired) {
+    for replica in &retired.replicas {
+        replica.close();
+    }
+    let replicas = retired.replicas;
+    let joined = tokio::task::spawn_blocking(move || {
+        for replica in &replicas {
+            replica.join();
+        }
+    })
+    .await;
+    if let Err(error) = joined {
+        tracing::warn!(%error, "an agents replica did not stop cleanly");
+    }
+    // Only now is the server no longer contacted.
+    drop(retired.contact);
+}
+
 impl Hq {
     /// A service with nothing open yet; [`Hq::start`] reads the setting.
     /// `device_name` is how the person's other devices will list this one.
     pub fn new(
         platform: Arc<dyn Platform>,
         opener: Arc<dyn Opener>,
+        routes: Arc<dyn Routes>,
         device_name: String,
     ) -> Arc<Hq> {
         let (status, _) = watch::channel(no_server());
-        Arc::new(Hq {
+        Arc::new_cyclic(|me| Hq {
+            me: me.clone(),
             platform,
             opener,
-            http: routes::client(),
+            routes,
             device_name,
+            lifecycle: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner::default()),
+            contacts: Arc::default(),
             status,
         })
     }
@@ -186,19 +283,31 @@ impl Hq {
         self.status.subscribe()
     }
 
+    /// Every agents server a request may still reach: the configured one
+    /// while it is linked or asked, and an old one until its last request
+    /// has ended. The egress list adds these to the setting.
+    pub fn contacting(&self) -> Vec<String> {
+        let mut servers: Vec<String> = Vec::new();
+        for (_, server) in lock(&self.contacts.live).iter() {
+            if !servers.contains(server) {
+                servers.push(server.clone());
+            }
+        }
+        servers
+    }
+
     /// The replica of `database`, when this device holds one.
-    pub async fn replica(&self, database: &str) -> Option<Arc<dyn Replica>> {
-        let inner = self.inner.lock().await;
-        inner
-            .databases
+    pub fn replica(&self, database: &str) -> Option<Arc<dyn Replica>> {
+        lock(&self.inner)
+            .dbs
             .iter()
             .find(|db| db.name == database)
             .map(|db| Arc::clone(&db.replica))
     }
 
     /// The replica of what is written while no server is paired.
-    pub async fn local(&self) -> Option<Arc<dyn Replica>> {
-        self.inner.lock().await.local.clone()
+    pub fn local(&self) -> Option<Arc<dyn Replica>> {
+        lock(&self.inner).local.clone()
     }
 
     fn data_dir(&self) -> Result<PathBuf, HqError> {
@@ -218,21 +327,35 @@ impl Hq {
         }
     }
 
-    async fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, HqError> {
-        if let Some(parent) = spec.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Open replicas off the async workers; never touches the network.
+    async fn open_all(&self, specs: Vec<ReplicaSpec>) -> Result<Vec<Arc<dyn Replica>>, HqError> {
+        for spec in &specs {
+            if let Some(parent) = spec.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let opener = Arc::clone(&self.opener);
-        let database = spec.database.clone();
-        tokio::task::spawn_blocking(move || opener.open(spec))
-            .await
-            .map_err(|error| HqError::Sentence(format!("opening {database}: {error}")))?
-            .map_err(|error| HqError::Sentence(format!("opening {database}: {error}")))
+        tokio::task::spawn_blocking(move || {
+            let mut opened: Vec<Arc<dyn Replica>> = Vec::new();
+            for spec in specs {
+                match opener.open(spec) {
+                    Ok(replica) => opened.push(replica),
+                    Err(error) => {
+                        for replica in &opened {
+                            replica.close();
+                        }
+                        return Err(sentence(error));
+                    }
+                }
+            }
+            Ok(opened)
+        })
+        .await
+        .map_err(sentence)?
     }
 
     fn spec(
-        &self,
-        data_dir: &Path,
+        data_dir: &std::path::Path,
         server: &ServerUrl,
         pairing: &Pairing,
         database: &str,
@@ -246,271 +369,480 @@ impl Hq {
                 base_url: server.mount(database),
                 token: pairing.token.clone(),
             }),
+            subscriptions: if linked {
+                DIRECTORY
+                    .iter()
+                    .map(|(id, table)| Subscription {
+                        id: (*id).to_owned(),
+                        table: (*table).to_owned(),
+                        scopes: vec![("dir".to_owned(), vec![database.to_owned()])],
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
-    /// Read `agents.server_url` and the pairing, and open every replica the
-    /// device holds: the ones on disk first, so reads answer before the
-    /// server does, then whatever `GET /databases` adds.
-    pub async fn start(self: &Arc<Self>) -> Result<(), HqError> {
+    /// Read `agents.server_url` and the pairing and open every replica the
+    /// device holds — local-only, so every read answers before the server
+    /// does — then ask the server which of them sync.
+    pub async fn start(&self) -> Result<(), HqError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.restart().await
+    }
+
+    /// Follow the effective setting: a no-op when it still names what this
+    /// service runs, a restart otherwise.
+    pub async fn reconcile(&self) -> Result<(), HqError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let stored = crate::registry::get_agents_server_url(&self.data_dir()?)?;
+        let wanted = stored.as_deref().map(ServerUrl::parse);
+        let unchanged = {
+            let inner = lock(&self.inner);
+            match &wanted {
+                None | Some(Ok(None)) => inner.server.is_none() && !inner.address_refused,
+                Some(Ok(Some(server))) => inner.server.as_ref() == Some(server),
+                Some(Err(_)) => inner.address_refused,
+            }
+        };
+        if unchanged {
+            return Ok(());
+        }
+        tracing::info!("the agents server setting changed; following it");
+        self.restart().await
+    }
+
+    /// Stop everything: no request after this returns. For a process
+    /// ending, or a test's restart.
+    pub async fn shutdown(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        let retired = {
+            let mut inner = lock(&self.inner);
+            inner.generation += 1;
+            Self::retire_all(&mut inner)
+        };
+        retire(retired).await;
+    }
+
+    fn retire_all(inner: &mut Inner) -> Retired {
+        for task in inner.tasks.drain(..) {
+            task.abort();
+        }
+        inner.discovering = false;
+        let mut replicas: Vec<Arc<dyn Replica>> =
+            inner.dbs.drain(..).map(|db| db.replica).collect();
+        replicas.extend(inner.local.take());
+        Retired {
+            replicas,
+            contact: inner.linked_contact.take(),
+        }
+    }
+
+    /// The lifecycle lock is held.
+    async fn restart(&self) -> Result<(), HqError> {
         let data_dir = self.data_dir()?;
         let stored = crate::registry::get_agents_server_url(&data_dir)?;
-        let mut inner = self.inner.lock().await;
-        inner.close_all();
-        inner.generation += 1;
-        inner.removed = false;
-        inner.discovering = false;
-        (inner.server, inner.address_refused) = match stored.as_deref().map(ServerUrl::parse) {
+        let (server, address_refused) = match stored.as_deref().map(ServerUrl::parse) {
             None | Some(Ok(None)) => (None, false),
             Some(Ok(Some(server))) => (Some(server), false),
             Some(Err(_)) => (None, true),
         };
-        inner.pairing = match &inner.server {
+        let pairing = match &server {
             Some(server) => self.read_pairing(server)?,
             None => None,
         };
+        let authorization = match (&server, &pairing) {
+            (Some(server), Some(_)) => Authorization::load(&data_dir, server),
+            _ => Authorization::default(),
+        };
+        let (retired, generation) = {
+            let mut inner = lock(&self.inner);
+            inner.generation += 1;
+            let retired = Self::retire_all(&mut inner);
+            if inner.server != server {
+                inner.refusals.clear();
+            }
+            inner.server = server.clone();
+            inner.address_refused = address_refused;
+            inner.pairing = pairing.clone();
+            inner.authorization = authorization.clone();
+            (retired, inner.generation)
+        };
+        // Every old request ends before the new configuration is published.
+        retire(retired).await;
+
         let root = databases::root(&data_dir);
         std::fs::create_dir_all(&root)?;
         exclude_from_backup_best_effort(self.platform.as_ref(), &root);
-
         let local = databases::local_replica(&data_dir);
-        if inner.pairing.is_none() || local.is_file() {
-            inner.local = Some(
-                self.open(ReplicaSpec {
-                    database: "local".to_owned(),
-                    path: local,
-                    client_id: None,
-                    link: None,
-                })
-                .await?,
-            );
+        let mut specs = Vec::new();
+        let open_local = pairing.is_none() || local.is_file();
+        if open_local {
+            specs.push(ReplicaSpec {
+                database: "local".to_owned(),
+                path: local,
+                client_id: None,
+                link: None,
+                subscriptions: Vec::new(),
+            });
         }
-        if let (Some(server), Some(pairing)) = (inner.server.clone(), inner.pairing.clone()) {
-            for name in databases::held(&data_dir, &server, &pairing.actor_id) {
-                let replica = self
-                    .open(self.spec(&data_dir, &server, &pairing, &name, true))
-                    .await?;
-                self.watch_replica(&replica, inner.generation);
-                inner.databases.push(Db {
+        let held = match (&server, &pairing) {
+            (Some(server), Some(pairing)) => databases::held(&data_dir, server, &pairing.actor_id),
+            _ => Vec::new(),
+        };
+        if let (Some(server), Some(pairing)) = (&server, &pairing) {
+            for name in &held {
+                specs.push(Self::spec(&data_dir, server, pairing, name, false));
+            }
+        }
+        let mut opened = self.open_all(specs).await?.into_iter();
+        {
+            let mut inner = lock(&self.inner);
+            if open_local {
+                inner.local = opened.next();
+            }
+            for (name, replica) in held.into_iter().zip(opened) {
+                inner.dbs.push(Db {
                     name,
                     replica,
-                    open: true,
-                    linked: true,
+                    linked: false,
+                    refusal_counted: false,
                 });
             }
-            inner.discovering = true;
-            let hq = Arc::clone(self);
-            let generation = inner.generation;
-            tokio::spawn(async move { hq.discover(generation).await });
+            let watched: Vec<(Option<String>, Arc<dyn Replica>)> = inner
+                .local
+                .iter()
+                .map(|local| (None, Arc::clone(local)))
+                .chain(
+                    inner
+                        .dbs
+                        .iter()
+                        .map(|db| (Some(db.name.clone()), Arc::clone(&db.replica))),
+                )
+                .collect();
+            for (name, replica) in watched {
+                let task = self.watch_replica(name, &replica, generation);
+                inner.tasks.push(task);
+            }
+            // A removed device asks nothing until it is paired again.
+            if pairing.is_some() && !authorization.removed {
+                self.schedule_discovery(&mut inner, Duration::ZERO);
+            }
         }
-        if let Some(local) = &inner.local {
-            self.watch_replica(local, inner.generation);
-        }
-        self.publish(&inner);
+        self.publish();
         Ok(())
     }
 
-    /// Recompute the status whenever `replica` publishes, and ask the server
-    /// about a refusal once.
-    fn watch_replica(self: &Arc<Self>, replica: &Arc<dyn Replica>, generation: u64) {
+    /// Recompute the status whenever `replica` publishes; count a refusal of
+    /// `database` once per replica.
+    fn watch_replica(
+        &self,
+        database: Option<String>,
+        replica: &Arc<dyn Replica>,
+        generation: u64,
+    ) -> JoinHandle<()> {
         let mut states = replica.watch();
-        let hq = Arc::clone(self);
+        let me = self.me.clone();
+        let watched = Arc::downgrade(replica);
         tokio::spawn(async move {
             while states.changed().await.is_ok() {
-                let refused = states.borrow_and_update().link == LinkState::Refused;
-                let mut inner = hq.inner.lock().await;
-                if inner.generation != generation {
-                    return;
+                let link = states.borrow_and_update().link;
+                let Some(hq) = me.upgrade() else { return };
+                if let Some(database) = &database {
+                    hq.on_link(database, &watched, link, generation);
                 }
-                hq.publish(&inner);
-                if refused && !inner.discovering && !inner.removed {
-                    inner.discovering = true;
-                    let again = Arc::clone(&hq);
-                    tokio::spawn(async move { again.discover(generation).await });
-                }
+                hq.publish();
             }
-        });
-    }
-
-    /// `GET /databases` until it answers or a newer start replaces this one,
-    /// then open what it lists and stop syncing what it no longer does.
-    async fn discover(self: Arc<Self>, generation: u64) {
-        let mut failures: u32 = 0;
-        loop {
-            let (server, pairing) = {
-                let inner = self.inner.lock().await;
-                if inner.generation != generation {
-                    return;
-                }
-                match (inner.server.clone(), inner.pairing.clone()) {
-                    (Some(server), Some(pairing)) => (server, pairing),
-                    _ => return,
-                }
-            };
-            let answer = routes::discover(&self.http, &server, &pairing.token).await;
-            match answer {
-                Err(RouteError::Unreachable(why)) | Err(RouteError::Unexpected(why)) => {
-                    failures = failures.saturating_add(1);
-                    let wait = syncular::backoff(failures).min(MAX_DISCOVERY_BACKOFF);
-                    tracing::info!(%why, retry_in_ms = wait.as_millis() as u64, "agents server discovery failed");
-                    tokio::time::sleep(wait).await;
-                }
-                other => {
-                    if let Err(error) = self.apply_discovery(generation, other).await {
-                        tracing::warn!(%error, "agents server discovery could not be applied");
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    async fn apply_discovery(
-        self: &Arc<Self>,
-        generation: u64,
-        answer: Result<routes::Discovery, RouteError>,
-    ) -> Result<(), HqError> {
-        let data_dir = self.data_dir()?;
-        let mut inner = self.inner.lock().await;
-        if inner.generation != generation {
-            return Ok(());
-        }
-        inner.discovering = false;
-        let (Some(server), Some(pairing)) = (inner.server.clone(), inner.pairing.clone()) else {
-            return Ok(());
-        };
-        let open: Vec<String> = match answer {
-            Ok(found) => {
-                tracing::info!(
-                    databases = found.databases.len(),
-                    "agents server discovered"
-                );
-                inner.removed = false;
-                found.databases
-            }
-            Err(RouteError::Unauthorized) => {
-                tracing::warn!(
-                    "the agents server no longer knows this device; every replica stops syncing"
-                );
-                inner.removed = true;
-                Vec::new()
-            }
-            Err(error) => {
-                tracing::warn!(%error, "agents server discovery refused");
-                return Ok(());
-            }
-        };
-        let held: Vec<String> = inner.databases.iter().map(|db| db.name.clone()).collect();
-        let mut next: Vec<Db> = Vec::new();
-        for (name, is_open) in databases::plan(&held, &open) {
-            let existing = inner
-                .databases
-                .iter()
-                .position(|db| db.name == name)
-                .map(|at| inner.databases.remove(at));
-            let db = match existing {
-                Some(db) if db.linked == is_open => Db {
-                    open: is_open,
-                    ..db
-                },
-                Some(db) => {
-                    db.replica.close();
-                    self.reopen(&data_dir, &server, &pairing, name, is_open, generation)
-                        .await?
-                }
-                None => {
-                    self.reopen(&data_dir, &server, &pairing, name, is_open, generation)
-                        .await?
-                }
-            };
-            if db.linked && db.replica.state().link == LinkState::Refused {
-                // Listed again after a refusal: try once more from a fresh owner.
-                db.replica.close();
-                next.push(
-                    self.reopen(&data_dir, &server, &pairing, db.name, true, generation)
-                        .await?,
-                );
-            } else {
-                next.push(db);
-            }
-        }
-        inner.databases = next;
-        self.publish(&inner);
-        Ok(())
-    }
-
-    async fn reopen(
-        self: &Arc<Self>,
-        data_dir: &Path,
-        server: &ServerUrl,
-        pairing: &Pairing,
-        name: String,
-        linked: bool,
-        generation: u64,
-    ) -> Result<Db, HqError> {
-        let replica = self
-            .open(self.spec(data_dir, server, pairing, &name, linked))
-            .await?;
-        if linked {
-            let subscriber = Arc::clone(&replica);
-            let database = name.clone();
-            tokio::task::spawn_blocking(move || {
-                for (id, table) in DIRECTORY {
-                    subscriber.subscribe(
-                        id,
-                        table,
-                        vec![("dir".to_owned(), vec![database.clone()])],
-                    )?;
-                }
-                Ok::<(), port::ReplicaError>(())
-            })
-            .await
-            .map_err(|error| HqError::Sentence(error.to_string()))?
-            .map_err(|error| HqError::Sentence(error.to_string()))?;
-        }
-        self.watch_replica(&replica, generation);
-        Ok(Db {
-            name,
-            replica,
-            open: linked,
-            linked,
         })
     }
 
-    fn publish(&self, inner: &Inner) {
-        let waiting_here = inner.local.as_ref().map_or(0, |local| {
-            u32::try_from(local.state().outbox).unwrap_or(u32::MAX)
-        });
-        let host = inner.server.as_ref().map(ServerUrl::host);
-        let phase = if inner.address_refused {
-            HqPhase::Refused
-        } else if inner.server.is_none() {
-            HqPhase::NoServer
-        } else if inner.pairing.is_none() {
-            HqPhase::NotPaired
-        } else if inner.removed {
-            HqPhase::Removed
-        } else {
-            HqPhase::Paired
+    fn on_link(
+        &self,
+        database: &str,
+        replica: &Weak<dyn Replica>,
+        link: LinkState,
+        generation: u64,
+    ) {
+        let mut inner = lock(&self.inner);
+        if inner.generation != generation {
+            return;
+        }
+        let Some(db) = inner.dbs.iter_mut().find(|db| {
+            db.name == database
+                && replica
+                    .upgrade()
+                    .is_some_and(|replica| Arc::ptr_eq(&replica, &db.replica))
+        }) else {
+            return;
         };
-        let status = HqStatusVm {
-            server: inner.server.as_ref().map(|s| s.as_str().to_owned()),
-            phase,
-            sentence: phase_sentence(phase, host, waiting_here),
-            device: inner.pairing.as_ref().map(|pairing| HqThisDeviceVm {
-                client_id: pairing.client_id.clone(),
-                name: pairing.name.clone(),
-            }),
-            databases: inner
-                .databases
-                .iter()
-                .map(|db| {
-                    let state = db.replica.state();
-                    database_vm(&db.name, state.link, state.outbox, db.open, inner.removed)
-                })
-                .collect(),
-            waiting_here,
+        match link {
+            LinkState::Connected => {
+                inner.refusals.remove(database);
+            }
+            LinkState::Refused if !db.refusal_counted => {
+                db.refusal_counted = true;
+                let refusal = inner.refusals.entry(database.to_owned()).or_default();
+                refusal.streak = refusal.streak.saturating_add(1);
+                let wait = refusal_backoff(refusal.streak);
+                refusal.until = Some(Instant::now() + wait);
+                tracing::info!(
+                    streak = refusal.streak,
+                    retry_in_ms = wait.as_millis() as u64,
+                    "an agents database refused this device; asking the server again later"
+                );
+                // A refused mount is often a removed device: ask at once whether
+                // it still is one; the database itself waits for its backoff.
+                if !inner.authorization.removed {
+                    self.schedule_discovery(&mut inner, Duration::ZERO);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `GET /databases` after `delay`, unless one is already pending.
+    fn schedule_discovery(&self, inner: &mut Inner, delay: Duration) {
+        if inner.discovering {
+            return;
+        }
+        let (Some(server), Some(pairing)) = (inner.server.clone(), inner.pairing.clone()) else {
+            return;
         };
+        inner.discovering = true;
+        let generation = inner.generation;
+        let me = self.me.clone();
+        let routes = Arc::clone(&self.routes);
+        let contacts = Arc::clone(&self.contacts);
+        inner.tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let mut failures: u32 = 0;
+            loop {
+                let answer = {
+                    let _contact = contacts.hold(&server);
+                    routes.discover(&server, &pairing.token).await
+                };
+                match answer {
+                    Err(RouteError::Unreachable(why)) | Err(RouteError::Unexpected(why)) => {
+                        failures = failures.saturating_add(1);
+                        let wait = syncular::backoff(failures);
+                        tracing::info!(%why, retry_in_ms = wait.as_millis() as u64, "agents server discovery failed");
+                        tokio::time::sleep(wait).await;
+                    }
+                    other => {
+                        let Some(hq) = me.upgrade() else { return };
+                        if let Err(error) = hq.apply_discovery(generation, other).await {
+                            tracing::warn!(%error, "agents server discovery could not be applied");
+                        }
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    /// Link what the answer opens (and whose refusal backoff is over), stop
+    /// linking what it does not, remember what it said. A replica being
+    /// replaced stays readable until its successor is in place.
+    async fn apply_discovery(
+        &self,
+        generation: u64,
+        answer: Result<routes::Discovery, RouteError>,
+    ) -> Result<(), HqError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let data_dir = self.data_dir()?;
+        let (server, pairing, authorization) = {
+            let mut inner = lock(&self.inner);
+            if inner.generation != generation {
+                return Ok(());
+            }
+            inner.discovering = false;
+            let (Some(server), Some(pairing)) = (inner.server.clone(), inner.pairing.clone())
+            else {
+                return Ok(());
+            };
+            let authorization = match answer {
+                Ok(found) => Authorization {
+                    removed: false,
+                    open: found.databases,
+                },
+                Err(RouteError::Unauthorized) => {
+                    tracing::warn!("the agents server no longer knows this device; every replica stops syncing");
+                    Authorization {
+                        removed: true,
+                        open: inner.authorization.open.clone(),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "agents server discovery refused");
+                    return Ok(());
+                }
+            };
+            inner.authorization = authorization.clone();
+            (server, pairing, authorization)
+        };
+        if let Err(error) = authorization.save(&data_dir, &server) {
+            tracing::warn!(%error, "what the agents server said about this device could not be kept");
+        }
+
+        let now = Instant::now();
+        // What changes, decided under the lock; done outside it.
+        let (reopen, retired, next_retry) = {
+            let inner = lock(&self.inner);
+            let held: Vec<String> = inner.dbs.iter().map(|db| db.name.clone()).collect();
+            let mut reopen: Vec<(String, bool)> = Vec::new();
+            let mut retired: Vec<Arc<dyn Replica>> = Vec::new();
+            let mut next_retry: Option<Duration> = None;
+            for (name, open) in databases::plan(&held, &authorization.open) {
+                let ready = inner
+                    .refusals
+                    .get(&name)
+                    .and_then(|refusal| refusal.until)
+                    .is_none_or(|until| now >= until);
+                if !ready && open && !authorization.removed {
+                    let wait = inner
+                        .refusals
+                        .get(&name)
+                        .and_then(|refusal| refusal.until)
+                        .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+                    next_retry = Some(next_retry.map_or(wait, |w: Duration| w.min(wait)));
+                }
+                let link = open && !authorization.removed && ready;
+                let current = inner.dbs.iter().position(|db| db.name == name);
+                let keep = current.is_some_and(|at| {
+                    let db = &inner.dbs[at];
+                    db.linked == link && !(link && db.replica.state().link == LinkState::Refused)
+                }) || current.is_some_and(|at| {
+                    // A refused replica waits for its backoff rather than reopening.
+                    let db = &inner.dbs[at];
+                    db.linked && !ready && open && !authorization.removed
+                });
+                if keep {
+                    continue;
+                }
+                // The old replica stays listed, and readable, until its
+                // successor is installed.
+                if let Some(at) = current {
+                    retired.push(Arc::clone(&inner.dbs[at].replica));
+                }
+                reopen.push((name, link));
+            }
+            (reopen, retired, next_retry)
+        };
+        retire(Retired {
+            replicas: retired,
+            contact: None,
+        })
+        .await;
+        let specs = reopen
+            .iter()
+            .map(|(name, link)| Self::spec(&data_dir, &server, &pairing, name, *link))
+            .collect();
+        let opened = self.open_all(specs).await?;
+        let stale_contact = {
+            let mut inner = lock(&self.inner);
+            if inner.generation != generation {
+                for replica in &opened {
+                    replica.close();
+                }
+                return Ok(());
+            }
+            for ((name, linked), replica) in reopen.into_iter().zip(opened) {
+                inner.dbs.retain(|db| db.name != name);
+                let task = self.watch_replica(Some(name.clone()), &replica, generation);
+                inner.tasks.push(task);
+                inner.dbs.push(Db {
+                    name,
+                    replica,
+                    linked,
+                    refusal_counted: false,
+                });
+            }
+            let order = databases::plan(
+                &inner
+                    .dbs
+                    .iter()
+                    .map(|db| db.name.clone())
+                    .collect::<Vec<_>>(),
+                &authorization.open,
+            );
+            inner
+                .dbs
+                .sort_by_key(|db| order.iter().position(|(name, _)| *name == db.name));
+            let any_linked = inner.dbs.iter().any(|db| db.linked);
+            let stale = if any_linked {
+                if inner.linked_contact.is_none() {
+                    inner.linked_contact = Some(self.contacts.hold(&server));
+                }
+                None
+            } else {
+                inner.linked_contact.take()
+            };
+            if let Some(wait) = next_retry {
+                self.schedule_discovery(&mut inner, wait);
+            }
+            stale
+        };
+        drop(stale_contact);
+        self.publish();
+        Ok(())
+    }
+
+    /// Recompute the status from the replicas' states and their directory.
+    /// Reads replica files only.
+    fn publish(&self) {
+        let (snapshot, replicas, actor, me) = {
+            let inner = lock(&self.inner);
+            let waiting_here = inner.local.as_ref().map_or(0, |local| {
+                u32::try_from(local.state().outbox).unwrap_or(u32::MAX)
+            });
+            let host = inner.server.as_ref().map(ServerUrl::host);
+            let removed = inner.authorization.removed;
+            let phase = if inner.address_refused {
+                HqPhase::Refused
+            } else if inner.server.is_none() {
+                HqPhase::NoServer
+            } else if inner.pairing.is_none() {
+                HqPhase::NotPaired
+            } else if removed {
+                HqPhase::Removed
+            } else {
+                HqPhase::Paired
+            };
+            let status = HqStatusVm {
+                server: inner.server.as_ref().map(|s| s.as_str().to_owned()),
+                phase,
+                sentence: phase_sentence(phase, host, waiting_here),
+                device: inner.pairing.as_ref().map(|pairing| HqThisDeviceVm {
+                    client_id: pairing.client_id.clone(),
+                    name: pairing.name.clone(),
+                }),
+                databases: inner
+                    .dbs
+                    .iter()
+                    .map(|db| {
+                        let state = db.replica.state();
+                        let open = inner.authorization.open.contains(&db.name);
+                        database_vm(&db.name, state.link, state.outbox, open, removed)
+                    })
+                    .collect(),
+                waiting_here,
+                devices: Vec::new(),
+                offer: inner
+                    .offer
+                    .as_ref()
+                    .map(|(server, _)| server.host().to_owned()),
+            };
+            let replicas: Vec<Arc<dyn Replica>> =
+                inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
+            let actor = inner.pairing.as_ref().map(|p| p.actor_id.clone());
+            let me = inner.pairing.as_ref().map(|p| p.client_id.clone());
+            (status, replicas, actor, me)
+        };
+        let mut status = snapshot;
+        if let (Some(actor), Some(me)) = (actor, me) {
+            status.devices = devices(&replicas, &actor, &me);
+        }
         self.status.send_if_modified(|current| {
             let changed = *current != status;
             *current = status;
@@ -518,22 +850,22 @@ impl Hq {
         });
     }
 
-    /// Set `agents.server_url` and start over on it. A refused address is
-    /// returned as its sentence and nothing is stored; blank clears it.
-    pub async fn set_server(self: &Arc<Self>, raw: &str) -> Result<HqStatusVm, HqError> {
-        let server = ServerUrl::parse(raw).map_err(|why| HqError::Sentence(why.to_string()))?;
+    /// Set `agents.server_url` and follow it. A refused address is returned
+    /// as its sentence and nothing is stored; blank clears it.
+    pub async fn set_server(&self, raw: &str) -> Result<HqStatusVm, HqError> {
+        let server = ServerUrl::parse(raw).map_err(sentence)?;
+        let _lifecycle = self.lifecycle.lock().await;
         crate::registry::set_agents_server_url(&self.data_dir()?, server.as_ref())?;
-        self.start().await?;
+        self.restart().await?;
         Ok(self.status.borrow().clone())
     }
 
     /// Redeem a code (or the link a QR carries) typed on this device. The
     /// token goes into the keychain and nowhere else.
-    pub async fn pair_redeem(self: &Arc<Self>, raw: &str) -> Result<HqStatusVm, HqError> {
-        let read = pairing::parse(raw).map_err(|why| HqError::Sentence(why.to_string()))?;
-        let data_dir = self.data_dir()?;
-        let server = match (&read.server, self.inner.lock().await.server.clone()) {
-            (Some(linked), _) => linked.clone(),
+    pub async fn pair_redeem(&self, raw: &str) -> Result<HqStatusVm, HqError> {
+        let read = pairing::parse(raw).map_err(sentence)?;
+        let server = match (read.server, lock(&self.inner).server.clone()) {
+            (Some(linked), _) => linked,
             (None, Some(stored)) => stored,
             (None, None) => {
                 return Err(HqError::Sentence(
@@ -542,41 +874,104 @@ impl Hq {
                 ))
             }
         };
-        let redeemed = routes::redeem(&self.http, &server, &read.code, &self.device_name)
-            .await
-            .map_err(|error| match error {
-                RouteError::Unauthorized => HqError::Sentence(
-                    "That code is not valid any more: it was used, or ten minutes passed. Ask \
-                     for a new one."
-                        .to_owned(),
-                ),
-                other => HqError::Sentence(route_sentence(&server, &other)),
-            })?;
+        self.redeem(server, read.code).await
+    }
+
+    async fn redeem(&self, server: ServerUrl, code: PairingCode) -> Result<HqStatusVm, HqError> {
+        let generation = lock(&self.inner).generation;
+        let redeemed = {
+            let _contact = self.contacts.hold(&server);
+            self.routes
+                .redeem(&server, &code, &self.device_name)
+                .await
+                .map_err(|error| match error {
+                    RouteError::Unauthorized => HqError::Sentence(
+                        "That code is not valid any more: it was used, or ten minutes passed. \
+                         Ask for a new one."
+                            .to_owned(),
+                    ),
+                    other => HqError::Sentence(route_sentence(&server, &other)),
+                })?
+        };
+        let _lifecycle = self.lifecycle.lock().await;
+        if lock(&self.inner).generation != generation {
+            return Err(HqError::Sentence(
+                "The agents server changed while this device was pairing, so nothing was \
+                 saved. Pair again."
+                    .to_owned(),
+            ));
+        }
+        let data_dir = self.data_dir()?;
         let record = Pairing {
             token: redeemed.token,
             actor_id: redeemed.discovery.actor_id,
             client_id: redeemed.discovery.client_id,
             name: self.device_name.clone(),
         };
-        let stored =
-            serde_json::to_string(&record).map_err(|error| HqError::Sentence(error.to_string()))?;
+        let stored = serde_json::to_string(&record).map_err(sentence)?;
         self.platform
             .keychain_set(&keychain_key(&server), &stored)?;
+        Authorization {
+            removed: false,
+            open: redeemed.discovery.databases.clone(),
+        }
+        .save(&data_dir, &server)?;
         crate::registry::set_agents_server_url(&data_dir, Some(&server))?;
+        {
+            let mut inner = lock(&self.inner);
+            inner.refusals.clear();
+            inner.offer = None;
+        }
         tracing::info!(
             databases = redeemed.discovery.databases.len(),
             "this device is paired with its agents server"
         );
-        self.start().await?;
+        self.restart().await?;
         Ok(self.status.borrow().clone())
+    }
+
+    /// A pairing link opened on this device (a scanned QR): checked here,
+    /// kept, and shown for the person to confirm. Nothing is sent yet.
+    pub fn offer_link(&self, raw: &str) -> Result<(), HqError> {
+        let read = pairing::parse(raw).map_err(sentence)?;
+        let Some(server) = read.server else {
+            return Err(HqError::Sentence(
+                pairing::CodeRefusal::NotACode.to_string(),
+            ));
+        };
+        lock(&self.inner).offer = Some((server, read.code));
+        self.publish();
+        Ok(())
+    }
+
+    /// Pair with the offered link's server.
+    pub async fn accept_offer(&self) -> Result<HqStatusVm, HqError> {
+        let offer = lock(&self.inner).offer.take();
+        self.publish();
+        let Some((server, code)) = offer else {
+            return Err(HqError::Sentence(
+                "There is no pairing to confirm.".to_owned(),
+            ));
+        };
+        self.redeem(server, code).await
+    }
+
+    /// Forget the offered link.
+    pub fn dismiss_offer(&self) {
+        lock(&self.inner).offer = None;
+        self.publish();
     }
 
     /// A code another device of this person can redeem, with its QR.
     pub async fn pair_start(&self) -> Result<HqPairCodeVm, HqError> {
-        let (server, pairing) = self.paired().await?;
-        let issued = routes::start(&self.http, &server, &pairing.token)
-            .await
-            .map_err(|error| HqError::Sentence(route_sentence(&server, &error)))?;
+        let (server, pairing) = self.paired()?;
+        let issued = {
+            let _contact = self.contacts.hold(&server);
+            self.routes
+                .start(&server, &pairing.token)
+                .await
+                .map_err(|error| HqError::Sentence(route_sentence(&server, &error)))?
+        };
         let link = pairing::pairing_link(&server, &issued.code);
         Ok(HqPairCodeVm {
             code: issued.code.grouped(),
@@ -585,9 +980,9 @@ impl Hq {
         })
     }
 
-    async fn paired(&self) -> Result<(ServerUrl, Pairing), HqError> {
-        let inner = self.inner.lock().await;
-        match (&inner.server, &inner.pairing, inner.removed) {
+    fn paired(&self) -> Result<(ServerUrl, Pairing), HqError> {
+        let inner = lock(&self.inner);
+        match (&inner.server, &inner.pairing, inner.authorization.removed) {
             (Some(server), Some(pairing), false) => Ok((server.clone(), pairing.clone())),
             (Some(server), Some(_), true) => Err(HqError::Sentence(phase_sentence(
                 HqPhase::Removed,
@@ -600,340 +995,108 @@ impl Hq {
         }
     }
 
-    /// The person's devices, from every database's `clients` rows.
-    pub async fn devices(&self) -> Result<Vec<HqDeviceVm>, HqError> {
-        let (replicas, pairing) = {
-            let inner = self.inner.lock().await;
-            let Some(pairing) = inner.pairing.clone() else {
-                return Ok(Vec::new());
-            };
-            let replicas: Vec<Arc<dyn Replica>> = inner
-                .databases
-                .iter()
-                .map(|db| Arc::clone(&db.replica))
-                .collect();
-            (replicas, pairing)
-        };
-        tokio::task::spawn_blocking(move || {
-            let mut devices: Vec<HqDeviceVm> = Vec::new();
-            for replica in replicas {
-                let rows = replica
-                    .query(
-                        "SELECT id, name, created_at_ms, revoked_at_ms FROM clients \
-                         WHERE actor_id = ?1 AND kind = 'device' ORDER BY created_at_ms, id",
-                        &[Value::from(pairing.actor_id.clone())],
-                    )
-                    .map_err(|error| HqError::Sentence(error.to_string()))?;
-                for row in rows {
-                    let Some(id) = row.get("id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let revoked = row.get("revoked_at_ms").is_some_and(|v| !v.is_null());
-                    if let Some(known) = devices.iter_mut().find(|d| d.client_id == id) {
-                        known.revoked |= revoked;
-                        continue;
-                    }
-                    devices.push(HqDeviceVm {
-                        client_id: id.to_owned(),
-                        name: row
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or(id)
-                            .to_owned(),
-                        added_at_ms: row.get("created_at_ms").and_then(Value::as_i64),
-                        this_device: id == pairing.client_id,
-                        revoked,
-                    });
-                }
-            }
-            Ok(devices)
-        })
-        .await
-        .map_err(|error| HqError::Sentence(error.to_string()))?
-    }
-
-    /// Remove one of the person's devices from the server, on every database.
-    pub async fn revoke(&self, client_id: &str) -> Result<Vec<HqDeviceVm>, HqError> {
-        let (server, pairing) = self.paired().await?;
-        routes::revoke(&self.http, &server, &pairing.token, client_id)
-            .await
-            .map_err(|error| HqError::Sentence(route_sentence(&server, &error)))?;
+    /// Remove one of the person's devices from the server, on every
+    /// database. The Devices list follows when the directory replicates.
+    pub async fn revoke(&self, client_id: &str) -> Result<HqStatusVm, HqError> {
+        let (server, pairing) = self.paired()?;
+        {
+            let _contact = self.contacts.hold(&server);
+            self.routes
+                .revoke(&server, &pairing.token, client_id)
+                .await
+                .map_err(|error| HqError::Sentence(route_sentence(&server, &error)))?;
+        }
         tracing::info!(
             this_device = client_id == pairing.client_id,
             "a device was removed from the agents server"
         );
-        {
-            let inner = self.inner.lock().await;
-            for db in &inner.databases {
-                db.replica.sync_now();
-            }
+        let replicas: Vec<Arc<dyn Replica>> = lock(&self.inner)
+            .dbs
+            .iter()
+            .map(|db| Arc::clone(&db.replica))
+            .collect();
+        for replica in replicas {
+            replica.sync_now();
         }
-        self.devices().await
+        Ok(self.status.borrow().clone())
     }
 
-    /// Forget this server: its pairing leaves the keychain and its replicas
-    /// leave the disk. What waits in the local replica stays.
-    pub async fn forget(self: &Arc<Self>) -> Result<HqStatusVm, HqError> {
+    /// Forget this server: its replicas leave the disk, then its pairing
+    /// leaves the keychain. What waits in the local replica stays. A copy
+    /// that cannot be deleted is said, and the pairing is kept with it.
+    pub async fn forget(&self) -> Result<HqStatusVm, HqError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let data_dir = self.data_dir()?;
-        let server = {
-            let mut inner = self.inner.lock().await;
-            inner.close_all();
-            inner.server.clone()
+        let (server, retired) = {
+            let mut inner = lock(&self.inner);
+            inner.generation += 1;
+            (inner.server.clone(), Self::retire_all(&mut inner))
         };
-        if let Some(server) = server {
-            self.platform.keychain_delete(&keychain_key(&server))?;
-            let dir = databases::server_dir(&data_dir, &server);
-            // The owner threads close their files as they stop.
-            for _ in 0..50 {
-                match std::fs::remove_dir_all(&dir) {
-                    Ok(()) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-                }
-            }
+        retire(retired).await;
+        let Some(server) = server else {
+            self.restart().await?;
+            return Ok(self.status.borrow().clone());
+        };
+        let dir = databases::server_dir(&data_dir, &server);
+        let removed = match std::fs::remove_dir_all(&dir) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+        if let Err(error) = removed {
+            tracing::warn!(%error, "the agents server's copies could not be deleted");
+            self.restart().await?;
+            return Err(HqError::Sentence(format!(
+                "keeper could not delete this server's copies in {}: {error}. They are still \
+                 on this device, and so is the pairing.",
+                dir.display()
+            )));
         }
-        self.start().await?;
+        self.platform.keychain_delete(&keychain_key(&server))?;
+        lock(&self.inner).refusals.clear();
+        self.restart().await?;
         Ok(self.status.borrow().clone())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::forges::testing::FakePlatform;
-    use crate::hq::port::fake::FakeOpener;
-    use crate::hq::port::RowOp;
-
-    fn hq(platform: &Arc<FakePlatform>, opener: &Arc<FakeOpener>) -> Arc<Hq> {
-        Hq::new(
-            Arc::clone(platform) as Arc<dyn Platform>,
-            Arc::clone(opener) as Arc<dyn Opener>,
-            "keeper on test".to_owned(),
-        )
-    }
-
-    #[tokio::test]
-    async fn with_no_address_writes_wait_in_a_local_replica_and_nothing_is_linked() {
-        let platform = Arc::new(FakePlatform::default());
-        let opener = Arc::new(FakeOpener::default());
-        let hq = hq(&platform, &opener);
-        hq.start().await.expect("starts");
-        let status = hq.status().borrow().clone();
-        assert_eq!(status.phase, HqPhase::NoServer);
-        assert!(status.databases.is_empty());
-        let opened = opener.opened.lock().expect("opened").clone();
-        assert_eq!(opened.len(), 1);
-        assert!(opened[0].spec.link.is_none(), "no replica is linked");
-
-        let local = hq.local().await.expect("a local replica");
-        local
-            .mutate(vec![RowOp::Upsert {
-                table: "messages".to_owned(),
-                values: serde_json::Map::new(),
-                base_version: None,
-            }])
-            .expect("commits");
-        let mut status = hq.status();
-        let waited = tokio::time::timeout(
-            Duration::from_secs(2),
-            status.wait_for(|status| status.waiting_here == 1),
-        )
-        .await;
-        assert!(waited.is_ok(), "the outbox count reaches the status");
-        assert!(hq
-            .status()
-            .borrow()
-            .sentence
-            .ends_with("1 change waits on this device."));
-    }
-
-    #[tokio::test]
-    async fn a_refused_address_is_not_stored_and_a_good_one_without_a_pairing_contacts_nothing() {
-        let platform = Arc::new(FakePlatform::default());
-        let opener = Arc::new(FakeOpener::default());
-        let hq = hq(&platform, &opener);
-        hq.start().await.expect("starts");
-        let refused = hq.set_server("agents.example.org").await;
-        assert!(matches!(refused, Err(HqError::Sentence(_))));
-        let data_dir = platform.data_dir().expect("data dir");
-        assert_eq!(
-            crate::registry::get_agents_server_url(&data_dir).expect("reads"),
-            None
-        );
-
-        let status = hq
-            .set_server("https://agents.example.org/")
-            .await
-            .expect("stores");
-        assert_eq!(status.phase, HqPhase::NotPaired);
-        assert_eq!(status.server.as_deref(), Some("https://agents.example.org"));
-        assert_eq!(
-            crate::registry::get_agents_server_url(&data_dir)
-                .expect("reads")
-                .as_deref(),
-            Some("https://agents.example.org")
-        );
-        assert!(opener
-            .opened
-            .lock()
-            .expect("opened")
-            .iter()
-            .all(|replica| replica.spec.link.is_none()));
-
-        let cleared = hq.set_server(" ").await.expect("clears");
-        assert_eq!(cleared.phase, HqPhase::NoServer);
-    }
-
-    #[tokio::test]
-    async fn a_paired_device_opens_the_replicas_it_holds_before_the_server_answers() {
-        let platform = Arc::new(FakePlatform::default());
-        let opener = Arc::new(FakeOpener::default());
-        let data_dir = platform.data_dir().expect("data dir");
-        // A port nothing listens on: discovery cannot answer.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let server = ServerUrl::parse(&format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().expect("addr").port()
-        ))
-        .expect("parses")
-        .expect("an address");
-        drop(listener);
-        crate::registry::set_agents_server_url(&data_dir, Some(&server)).expect("stores");
-        let pairing = Pairing {
-            token: "0123456789abcdef".to_owned(),
-            actor_id: "tgorka".to_owned(),
-            client_id: "tgorka.0a1b".to_owned(),
-            name: "keeper on test".to_owned(),
+/// The person's devices from every replica's `clients` rows.
+fn devices(replicas: &[Arc<dyn Replica>], actor: &str, me: &str) -> Vec<HqDeviceVm> {
+    let mut devices: Vec<HqDeviceVm> = Vec::new();
+    for replica in replicas {
+        let rows = match replica.query(
+            "SELECT id, name, created_at_ms, revoked_at_ms FROM clients \
+             WHERE actor_id = ?1 AND kind = 'device' ORDER BY created_at_ms, id",
+            &[Value::from(actor)],
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(%error, "an agents replica's directory could not be read");
+                continue;
+            }
         };
-        platform
-            .keychain_set(
-                &keychain_key(&server),
-                &serde_json::to_string(&pairing).expect("json"),
-            )
-            .expect("keychain");
-        for db in ["tgdrive", "neuradrive"] {
-            let path = databases::replica(&data_dir, &server, db, "tgorka");
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&path, b"").expect("write");
+        for row in rows {
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let revoked = row.get("revoked_at_ms").is_some_and(|v| !v.is_null());
+            if let Some(known) = devices.iter_mut().find(|d| d.client_id == id) {
+                known.revoked |= revoked;
+                continue;
+            }
+            devices.push(HqDeviceVm {
+                client_id: id.to_owned(),
+                name: row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                added_at_ms: row.get("created_at_ms").and_then(Value::as_i64),
+                this_device: id == me,
+                revoked,
+            });
         }
-        let hq = hq(&platform, &opener);
-        hq.start().await.expect("starts");
-        let status = hq.status().borrow().clone();
-        assert_eq!(status.phase, HqPhase::Paired);
-        assert_eq!(
-            status
-                .databases
-                .iter()
-                .map(|db| db.name.as_str())
-                .collect::<Vec<_>>(),
-            ["neuradrive", "tgdrive"]
-        );
-        assert_eq!(
-            status.device.as_ref().map(|d| d.client_id.as_str()),
-            Some("tgorka.0a1b")
-        );
-        let opened = opener.opened.lock().expect("opened").clone();
-        let linked: Vec<_> = opened.iter().filter_map(|r| r.spec.link.clone()).collect();
-        assert_eq!(linked.len(), 2);
-        assert_eq!(linked[0].base_url, server.mount("neuradrive"));
-        // The token reached the replica's link and no view model.
-        assert!(!serde_json::to_string(&status)
-            .expect("json")
-            .contains("01234567"));
-        // Not even a refusal stops the replicas answering reads.
-        opened[0].set(LinkState::Offline);
-        let mut watch = hq.status();
-        let offline = tokio::time::timeout(
-            Duration::from_secs(2),
-            watch.wait_for(|s| {
-                s.databases
-                    .iter()
-                    .any(|db| db.state == vm::HqDatabaseState::Offline)
-            }),
-        )
-        .await;
-        assert!(offline.is_ok());
-        assert!(hq.replica("neuradrive").await.is_some());
     }
-
-    #[tokio::test]
-    async fn a_revoked_device_stops_syncing_and_keeps_its_replicas_readable() {
-        let platform = Arc::new(FakePlatform::default());
-        let opener = Arc::new(FakeOpener::default());
-        let data_dir = platform.data_dir().expect("data dir");
-        let server = ServerUrl::parse("http://127.0.0.1:9")
-            .expect("parses")
-            .expect("an address");
-        let pairing = Pairing {
-            token: "t".to_owned(),
-            actor_id: "tgorka".to_owned(),
-            client_id: "tgorka.1".to_owned(),
-            name: "n".to_owned(),
-        };
-        crate::registry::set_agents_server_url(&data_dir, Some(&server)).expect("stores");
-        platform
-            .keychain_set(
-                &keychain_key(&server),
-                &serde_json::to_string(&pairing).expect("json"),
-            )
-            .expect("keychain");
-        let hq = hq(&platform, &opener);
-        {
-            let mut inner = hq.inner.lock().await;
-            inner.server = Some(server.clone());
-            inner.pairing = Some(pairing.clone());
-            inner.generation = 7;
-        }
-        hq.apply_discovery(
-            7,
-            Ok(routes::Discovery {
-                actor_id: "tgorka".to_owned(),
-                client_id: "tgorka.1".to_owned(),
-                databases: vec!["tgdrive".to_owned(), "neuradrive".to_owned()],
-            }),
-        )
-        .await
-        .expect("applies");
-        assert_eq!(hq.status().borrow().databases.len(), 2);
-
-        // The server drops neuradrive: it stops syncing, and is still shown.
-        hq.apply_discovery(
-            7,
-            Ok(routes::Discovery {
-                actor_id: "tgorka".to_owned(),
-                client_id: "tgorka.1".to_owned(),
-                databases: vec!["tgdrive".to_owned()],
-            }),
-        )
-        .await
-        .expect("applies");
-        let status = hq.status().borrow().clone();
-        assert_eq!(status.databases[1].name, "neuradrive");
-        assert_eq!(status.databases[1].state, vm::HqDatabaseState::NotOpen);
-        let neuradrive = hq.replica("neuradrive").await.expect("held");
-        assert_eq!(
-            neuradrive.state().link,
-            LinkState::Local,
-            "reopened without a link"
-        );
-
-        // Then the device is removed.
-        hq.apply_discovery(7, Err(RouteError::Unauthorized))
-            .await
-            .expect("applies");
-        let status = hq.status().borrow().clone();
-        assert_eq!(status.phase, HqPhase::Removed);
-        assert!(status
-            .databases
-            .iter()
-            .all(|db| db.state == vm::HqDatabaseState::Removed));
-        let opened = opener.opened.lock().expect("opened").clone();
-        let live: Vec<_> = opened
-            .iter()
-            .filter(|r| !*r.closed.lock().expect("closed"))
-            .collect();
-        assert_eq!(live.len(), 2);
-        assert!(live.iter().all(|r| r.spec.link.is_none()), "nothing syncs");
-        assert!(matches!(hq.pair_start().await, Err(HqError::Sentence(_))));
-    }
+    devices
 }
+
+#[cfg(test)]
+mod tests;

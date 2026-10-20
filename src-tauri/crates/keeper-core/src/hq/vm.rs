@@ -76,6 +76,11 @@ pub struct HqStatusVm {
     pub databases: Vec<HqDatabaseVm>,
     /// Commits written while no server was paired, waiting on this device.
     pub waiting_here: u32,
+    /// The person's devices, from the replicated directory; follows it.
+    pub devices: Vec<HqDeviceVm>,
+    /// A pairing link opened on this device and not yet confirmed: the
+    /// server's host it would pair with.
+    pub offer: Option<String>,
 }
 
 /// One of the person's devices, read from a database's `clients` rows.
@@ -143,7 +148,7 @@ pub fn database_vm(
             ),
             // A refusal the discovery has not judged yet, or a replica
             // still opening.
-            LinkState::Connecting | LinkState::Refused | LinkState::Local => {
+            LinkState::Connecting | LinkState::Refused | LinkState::Local | LinkState::Closed => {
                 (HqDatabaseState::Connecting, "Connecting…".to_owned())
             }
         }
@@ -184,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_database_line_follows_its_link_and_what_the_server_said() {
-        let vm = |link, outbox, open, removed| database_vm("tgdrive", link, outbox, open, removed);
+        let vm = |link, outbox, open, removed| database_vm("alpha", link, outbox, open, removed);
         assert_eq!(
             vm(LinkState::Connected, 0, true, false).state,
             HqDatabaseState::Connected
@@ -229,5 +234,9 @@ mod tests {
         );
         assert!(phase_sentence(HqPhase::Removed, Some("hq.example.org"), 0)
             .starts_with("This device was removed from hq.example.org."));
+        assert!(
+            phase_sentence(HqPhase::Paired, Some("hq.example.org"), 0)
+                == "Paired with hq.example.org."
+        );
     }
 }

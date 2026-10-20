@@ -9,13 +9,13 @@ import { SessionsSettingsSection } from "@/components/sessions/sessions-settings
 import { AboutSection } from "@/components/settings/about-section";
 import { AccountSection } from "@/components/settings/account-section";
 import { AgentsSection } from "@/components/settings/agents-section";
+import { AgentsServerSection } from "@/components/settings/agents-server-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
-import { AgentsServerSection } from "@/components/settings/agents-server-section";
 import { BotGrantsSection } from "@/components/settings/bot-grants-section";
 import { BotsSection } from "@/components/settings/bots-section";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";

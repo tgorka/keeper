@@ -870,6 +870,8 @@ pub fn watch_layers(app: &tauri::App) {
     keeper_core::config::set_account_layers_observer(keeper_core::agents::launch::layers_observer(
         move || {
             crate::telemetry_ipc::consent_changed(&consent, "an account settings file changed");
+            // An account layer may name, change or clear the agents server.
+            crate::hq_ipc::reconcile();
         },
         || {
             let app = RUNTIME.app.get()?;
@@ -1109,6 +1111,9 @@ pub fn watch_settings() {
     registry::set_setting_observer(Box::new(|key: &str| {
         if key == "bots.wake_enabled" {
             wake_chosen();
+        }
+        if key == "agents.server_url" {
+            crate::hq_ipc::reconcile();
         }
         if settings_sync::synced_file(key).is_some() {
             note_local_change();
@@ -2429,6 +2434,9 @@ async fn sync_settings(
             crate::telemetry_ipc::account_settled(app, known);
         }
     }
+    // A pulled settings file is written with the observer suppressed; the
+    // agents server follows whatever it changed.
+    crate::hq_ipc::reconcile();
 
     // A manifest whose state is in the repository now takes this device's
     // list as its base; otherwise the old base stands, and this device's

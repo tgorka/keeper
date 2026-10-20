@@ -1034,7 +1034,8 @@ pub fn run() {
                 hq_ipc::hq_server_forget,
                 hq_ipc::hq_pair_start,
                 hq_ipc::hq_pair_redeem,
-                hq_ipc::hq_devices_list,
+                hq_ipc::hq_pair_offer_accept,
+                hq_ipc::hq_pair_offer_dismiss,
                 hq_ipc::hq_device_revoke,
                 // The Bots surface's sync-free half (Epic 61, Story 61.4;
                 // split in Story 62.1), in the shared body for

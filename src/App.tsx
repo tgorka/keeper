@@ -14,6 +14,7 @@ import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useDefaultAgentFollowsSync } from "@/hooks/use-default-agent-follows-sync";
+import { useHqPairOffer } from "@/hooks/use-hq-pair-offer";
 import { useLaunchIntoAgents } from "@/hooks/use-launch-into-agents";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
@@ -125,6 +126,8 @@ function App() {
   // `keeper://setup` link, and ask for an unforced sync whenever keeper comes
   // back into focus — Rust runs no timer, so focus is the cadence.
   useAccountMirror();
+  // A scanned agents-server pairing QR: open Settings on its confirmation.
+  useHqPairOffer();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);

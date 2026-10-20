@@ -1,11 +1,13 @@
 /**
  * Settings › Agents › Server (UX-DR-E106-1): the agents server's address, each database's
  * status line, this device and its pairing, *Add a device* (a code and its QR) and the
- * person's *Devices*, each with *Remove*.
+ * person's *Devices*, each with *Remove*, and the confirmation of a pairing link a scanned QR
+ * opened.
  *
  * Every sentence but the copy is Rust's (`HqStatusVm`, the commands' refusals): whether an
  * address is one keeper contacts, which databases this device holds and how each stands,
- * whether the device was removed. The token never reaches the webview. On every tier: a phone
+ * whether the device was removed, and the devices — which follow the server's replicated
+ * directory while this is open. The token never reaches the webview. On every tier: a phone
  * pairs and syncs the same way.
  */
 import { useCallback, useEffect, useId, useState } from "react";
@@ -15,11 +17,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { logFailure } from "@/lib/failure";
 import {
-  type HqDeviceVm,
   type HqPairCodeVm,
   type HqStatusVm,
   hqDeviceRevoke,
-  hqDevicesList,
+  hqPairOfferAccept,
+  hqPairOfferDismiss,
   hqPairRedeem,
   hqPairStart,
   hqServerForget,
@@ -46,6 +48,8 @@ export const THIS_DEVICE = "This device";
 export const REMOVE_DEVICE = "Remove";
 export const REMOVED_DEVICE = "Removed";
 export const FORGET_SERVER = "Remove this server's copies";
+export const OFFER_PAIR = "Pair this device";
+export const OFFER_DISMISS = "Not now";
 const PLACEHOLDER = "https://agents.example.org";
 const READ_FAILED = "Could not read the agents server's status.";
 const QR_ALT = "QR code of the pairing code";
@@ -64,7 +68,6 @@ export function AgentsServerSection({ open }: { open: boolean }) {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [alert, setAlert] = useState<string | null>(null);
-  const [devices, setDevices] = useState<HqDeviceVm[]>([]);
   const [pairCode, setPairCode] = useState<HqPairCodeVm | null>(null);
 
   useEffect(() => {
@@ -96,36 +99,15 @@ export function AgentsServerSection({ open }: { open: boolean }) {
   }, [open]);
 
   const paired = status?.phase === "paired";
-  const databases = status?.databases.map((db) => `${db.name}:${db.state}`).join(",") ?? "";
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the list is read again when a database's state changes, which is what `databases` is for.
-  useEffect(() => {
-    if (!open || !paired) {
-      setDevices([]);
-      return;
-    }
-    let cancelled = false;
-    void hqDevicesList()
-      .then((list) => {
-        if (!cancelled) setDevices(list);
-      })
-      .catch(logFailure("hq.devicesList"));
-    return () => {
-      cancelled = true;
-    };
-  }, [open, paired, databases]);
-
-  const run = useCallback(
-    <T,>(scope: string, call: () => Promise<T>, then: (value: T) => void) => {
-      setBusy(true);
-      setAlert(null);
-      void call()
-        .then(then)
-        .catch((raw: unknown) => setAlert(failed(scope, "That did not work.")(raw)))
-        .finally(() => setBusy(false));
-    },
-    [],
-  );
+  const run = useCallback(<T,>(scope: string, call: () => Promise<T>, then: (value: T) => void) => {
+    setBusy(true);
+    setAlert(null);
+    void call()
+      .then(then)
+      .catch((raw: unknown) => setAlert(failed(scope, "That did not work.")(raw)))
+      .finally(() => setBusy(false));
+  }, []);
 
   if (status === undefined) {
     return alert === null ? null : (
@@ -154,10 +136,14 @@ export function AgentsServerSection({ open }: { open: boolean }) {
           className="flex min-w-0 items-center gap-2"
           onSubmit={(event) => {
             event.preventDefault();
-            run("hq.serverSet", () => hqServerSet(draft), (next) => {
-              setStatus(next);
-              setDraft(next.server ?? "");
-            });
+            run(
+              "hq.serverSet",
+              () => hqServerSet(draft),
+              (next) => {
+                setStatus(next);
+                setDraft(next.server ?? "");
+              },
+            );
           }}
         >
           <Input
@@ -199,15 +185,47 @@ export function AgentsServerSection({ open }: { open: boolean }) {
         </ul>
       )}
 
-      {status.phase === "notPaired" && (
+      {status.offer !== null && (
+        <fieldset aria-label={OFFER_PAIR} className="flex min-w-0 flex-col gap-2">
+          <p className="[overflow-wrap:anywhere]">
+            Pair this device with {status.offer}? It will sync your agents&apos; conversations with
+            that server.
+          </p>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              size="sm"
+              disabled={busy}
+              onClick={() => run("hq.pairOfferAccept", hqPairOfferAccept, setStatus)}
+            >
+              {OFFER_PAIR}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => run("hq.pairOfferDismiss", hqPairOfferDismiss, () => {})}
+            >
+              {OFFER_DISMISS}
+            </Button>
+          </div>
+        </fieldset>
+      )}
+
+      {(status.phase === "notPaired" || status.phase === "noServer") && (
         <form
           className="flex min-w-0 flex-col gap-2"
           onSubmit={(event) => {
             event.preventDefault();
-            run("hq.pairRedeem", () => hqPairRedeem(code), (next) => {
-              setStatus(next);
-              setCode("");
-            });
+            run(
+              "hq.pairRedeem",
+              () => hqPairRedeem(code),
+              (next) => {
+                setStatus(next);
+                setCode("");
+              },
+            );
           }}
         >
           <Label htmlFor={`${id}-code`}>{PAIR_CODE_LABEL}</Label>
@@ -251,11 +269,11 @@ export function AgentsServerSection({ open }: { open: boolean }) {
         </div>
       )}
 
-      {devices.length > 0 && (
+      {status.devices.length > 0 && (
         <div className="flex min-w-0 flex-col gap-2">
           <h4 className="font-medium">{DEVICES_TITLE}</h4>
           <ul aria-label={DEVICES_TITLE} className="flex min-w-0 flex-col gap-1">
-            {devices.map((device) => (
+            {status.devices.map((device) => (
               <li
                 key={device.clientId}
                 aria-label={device.name}
@@ -283,7 +301,7 @@ export function AgentsServerSection({ open }: { open: boolean }) {
                     disabled={busy}
                     aria-label={`${REMOVE_DEVICE} ${device.name}`}
                     onClick={() =>
-                      run("hq.deviceRevoke", () => hqDeviceRevoke(device.clientId), setDevices)
+                      run("hq.deviceRevoke", () => hqDeviceRevoke(device.clientId), setStatus)
                     }
                   >
                     {REMOVE_DEVICE}

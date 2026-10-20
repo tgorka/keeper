@@ -920,7 +920,6 @@ import type { ForgeReposVm } from "./gen/ForgeReposVm";
 import type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 import type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 import type { HotkeyVm } from "./gen/HotkeyVm";
-import type { HqDeviceVm } from "./gen/HqDeviceVm";
 import type { HqPairCodeVm } from "./gen/HqPairCodeVm";
 import type { HqStatusVm } from "./gen/HqStatusVm";
 import type { InboxBatch } from "./gen/InboxBatch";
@@ -4106,14 +4105,32 @@ export async function hqPairRedeem(code: string): Promise<HqStatusVm> {
   return await invoke<HqStatusVm>("hq_pair_redeem", { code });
 }
 
-/** The person's devices, as the server's directory lists them. */
-export async function hqDevicesList(): Promise<HqDeviceVm[]> {
-  return await invoke<HqDeviceVm[]>("hq_devices_list");
+/**
+ * Remove one of the person's devices from the server; resolves with the status after. The
+ * Devices list in the status follows when the server's directory replicates.
+ */
+export async function hqDeviceRevoke(clientId: string): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_device_revoke", { clientId });
 }
 
-/** Remove one of the person's devices from the server; resolves with the devices after. */
-export async function hqDeviceRevoke(clientId: string): Promise<HqDeviceVm[]> {
-  return await invoke<HqDeviceVm[]>("hq_device_revoke", { clientId });
+/** Pair with the server of the link a scanned QR opened (`HqStatusVm.offer`). */
+export async function hqPairOfferAccept(): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_pair_offer_accept");
+}
+
+/** Forget the link a scanned QR opened. */
+export async function hqPairOfferDismiss(): Promise<void> {
+  await invoke<void>("hq_pair_offer_dismiss");
+}
+
+/** Raised when a `keeper://agents/pair` link opened keeper; Rust holds the link. */
+export const HQ_PAIR_OFFER_EVENT = "hq-pair-offer";
+
+/** Subscribe to {@link HQ_PAIR_OFFER_EVENT}; resolves with an unlisten function. */
+export async function listenHqPairOffer(onOffer: () => void): Promise<() => void> {
+  return await listen(HQ_PAIR_OFFER_EVENT, () => {
+    onOffer();
+  });
 }
 
 /** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */

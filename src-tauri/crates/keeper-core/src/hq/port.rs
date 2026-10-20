@@ -3,11 +3,10 @@
 //! replacement client would be a second adapter, and nothing above this file
 //! names `syncular_client`.
 //!
-//! Every method is synchronous. Reads answer from the replica file on the
-//! caller's thread and never wait on the network; everything else is handed to
-//! the replica's owner thread and waits for it, which can be behind a round
-//! bounded by the transport's request timeout. An async caller runs them on
-//! `spawn_blocking`, never on a tokio worker serving IPC.
+//! Reads answer from the replica file on the caller's thread and never wait
+//! on the network. Everything else is handed to the replica's owner thread
+//! and waits for it, which can be behind a round bounded by the transport's
+//! request timeout; an async caller runs those on `spawn_blocking`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +37,32 @@ pub enum RowOp {
     },
 }
 
+/// A named subscription: `table`'s rows under `scopes` (each a variable and
+/// the values requested).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscription {
+    pub id: String,
+    pub table: String,
+    pub scopes: Vec<(String, Vec<String>)>,
+}
+
+/// A windowed subscription's base (SPEC §4.8): `table` subscribed along
+/// `variable`, one unit per value, with `fixed_scopes` shared by every unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowBase {
+    pub table: String,
+    pub variable: String,
+    pub fixed_scopes: Vec<(String, Vec<String>)>,
+}
+
+/// The units a window holds, and those whose first pull has not completed —
+/// whose rows may be missing and must not be drawn as complete.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WindowState {
+    pub units: Vec<String>,
+    pub pending: Vec<String>,
+}
+
 /// A peer present on a scope key.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Peer {
@@ -50,7 +75,8 @@ pub struct Peer {
 /// writes wait in its outbox and it makes no request.
 #[derive(Clone)]
 pub struct Link {
-    /// The database's mount: `<server>/<database>`.
+    /// The database's mount: `<server>/<database>`. Every request the replica
+    /// makes, blob capabilities included, goes to this origin or nowhere.
     pub base_url: String,
     /// The device's bearer token. Never logged, never in a view model.
     pub token: String,
@@ -76,12 +102,15 @@ pub struct ReplicaSpec {
     /// device alone, which keeps the id it minted the first time.
     pub client_id: Option<String>,
     pub link: Option<Link>,
+    /// Subscriptions the replica holds from its first round, registered
+    /// before the owner touches the network.
+    pub subscriptions: Vec<Subscription>,
 }
 
 /// How a replica's connection stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
-    /// No server: everything stays on this device.
+    /// No link: everything stays on this device.
     Local,
     /// The first round or the socket is under way.
     Connecting,
@@ -89,9 +118,11 @@ pub enum LinkState {
     Connected,
     /// The last round could not reach the server; it is retried with backoff.
     Offline,
-    /// The server refused this device's credential. Nothing more is sent
-    /// until the replica is opened again.
+    /// The server refused this device's credential. The replica's network is
+    /// closed for good; only a new replica opens it again.
     Refused,
+    /// Closed: the owner has stopped or is stopping.
+    Closed,
 }
 
 /// A replica's state, as its owner last published it.
@@ -100,6 +131,8 @@ pub struct ReplicaState {
     pub link: LinkState,
     /// Commits written here that the server has not acknowledged.
     pub outbox: usize,
+    /// Bumped whenever the replica's `clients` rows change.
+    pub directory: u64,
 }
 
 /// Why a replica call failed.
@@ -108,6 +141,10 @@ pub enum ReplicaError {
     /// The client refused the call; its code and message.
     #[error("{0}")]
     Client(String),
+    /// A network call on a replica that does not sync (local, refused or
+    /// closed).
+    #[error("this database is not syncing on this device")]
+    NotSyncing,
     /// The owner thread is gone (the replica was closed).
     #[error("this database's replica is closed")]
     Closed,
@@ -119,14 +156,13 @@ pub trait Replica: Send + Sync {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError>;
     /// Read the replica. Answers from the file, never from the network.
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError>;
-    /// Ask the server for `table`'s rows under `scopes` (a variable and the
-    /// values requested), persisted under `id`.
-    fn subscribe(
-        &self,
-        id: &str,
-        table: &str,
-        scopes: Vec<(String, Vec<String>)>,
-    ) -> Result<(), ReplicaError>;
+    /// Hold `subscription`, persisted under its id.
+    fn subscribe(&self, subscription: Subscription) -> Result<(), ReplicaError>;
+    /// Set a window's units: units added are subscribed, units removed are
+    /// evicted (rows the outbox still holds stay). Persisted with the replica.
+    fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError>;
+    /// A window's units and the ones not complete yet.
+    fn window_state(&self, base: &WindowBase) -> Result<WindowState, ReplicaError>;
     /// Publish (or clear, `None`) this client's presence on `scope_key`.
     fn set_presence(&self, scope_key: &str, doc: Option<Value>) -> Result<(), ReplicaError>;
     /// The peers present on `scope_key`.
@@ -137,7 +173,7 @@ pub trait Replica: Send + Sync {
         bytes: Vec<u8>,
         media_type: Option<String>,
     ) -> Result<Value, ReplicaError>;
-    /// A blob's bytes, from the cache or the server.
+    /// A blob's bytes, from the cache or, while the replica syncs, its server.
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
@@ -145,12 +181,16 @@ pub trait Replica: Send + Sync {
     fn state(&self) -> ReplicaState;
     /// Every state its owner publishes from now on.
     fn watch(&self) -> watch::Receiver<ReplicaState>;
-    /// Stop the owner: the socket closes and no request is sent again. The
-    /// file stays.
+    /// Close the replica's network at once — no request starts after this
+    /// returns — and ask its owner to stop. The file stays.
     fn close(&self);
+    /// Wait until the owner has stopped and released the file. A request
+    /// already on the wire when [`Replica::close`] ran ends within the
+    /// transport's request timeout.
+    fn join(&self);
 }
 
-/// Opens a replica.
+/// Opens a replica. Never touches the network.
 pub trait Opener: Send + Sync {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError>;
 }
@@ -159,19 +199,31 @@ pub trait Opener: Send + Sync {
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     pub(crate) struct FakeReplica {
         pub(crate) spec: ReplicaSpec,
         pub(crate) rows: Mutex<Vec<Map<String, Value>>>,
-        pub(crate) commits: Mutex<usize>,
-        pub(crate) closed: Mutex<bool>,
+        pub(crate) closed: AtomicBool,
+        pub(crate) joined: AtomicBool,
         state: watch::Sender<ReplicaState>,
     }
 
     impl FakeReplica {
         pub(crate) fn set(&self, link: LinkState) {
             self.state.send_modify(|state| state.link = link);
+        }
+        /// Replace the rows every query answers, as a round would, and say
+        /// the directory changed.
+        pub(crate) fn replicate(&self, rows: Vec<Map<String, Value>>) {
+            if let Ok(mut held) = self.rows.lock() {
+                *held = rows;
+            }
+            self.state.send_modify(|state| state.directory += 1);
+        }
+        pub(crate) fn closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
         }
     }
 
@@ -180,29 +232,20 @@ pub(crate) mod fake {
             if ops.is_empty() {
                 return Err(ReplicaError::Client("no operations".to_owned()));
             }
-            for op in ops {
-                if let RowOp::Upsert { values, .. } = op {
-                    self.rows
-                        .lock()
-                        .map_err(|_| ReplicaError::Closed)?
-                        .push(values);
-                }
-            }
-            let mut commits = self.commits.lock().map_err(|_| ReplicaError::Closed)?;
-            *commits += 1;
             self.state.send_modify(|state| state.outbox += 1);
-            Ok(format!("commit-{commits}"))
+            Ok(format!("commit-{}", self.state.borrow().outbox))
         }
         fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Ok(self.rows.lock().map_err(|_| ReplicaError::Closed)?.clone())
         }
-        fn subscribe(
-            &self,
-            _: &str,
-            _: &str,
-            _: Vec<(String, Vec<String>)>,
-        ) -> Result<(), ReplicaError> {
+        fn subscribe(&self, _: Subscription) -> Result<(), ReplicaError> {
             Ok(())
+        }
+        fn set_window(&self, _: &WindowBase, _: &[String]) -> Result<(), ReplicaError> {
+            Ok(())
+        }
+        fn window_state(&self, _: &WindowBase) -> Result<WindowState, ReplicaError> {
+            Ok(WindowState::default())
         }
         fn set_presence(&self, _: &str, _: Option<Value>) -> Result<(), ReplicaError> {
             Ok(())
@@ -224,9 +267,10 @@ pub(crate) mod fake {
             self.state.subscribe()
         }
         fn close(&self) {
-            if let Ok(mut closed) = self.closed.lock() {
-                *closed = true;
-            }
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        fn join(&self) {
+            self.joined.store(true, Ordering::SeqCst);
         }
     }
 
@@ -234,21 +278,45 @@ pub(crate) mod fake {
     #[derive(Default)]
     pub(crate) struct FakeOpener {
         pub(crate) opened: Mutex<Vec<Arc<FakeReplica>>>,
+        /// A database whose next open waits until the sender is dropped or sends.
+        pub(crate) hold: Mutex<std::collections::HashMap<String, std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl FakeOpener {
+        pub(crate) fn all(&self) -> Vec<Arc<FakeReplica>> {
+            self.opened.lock().map(|o| o.clone()).unwrap_or_default()
+        }
+        /// The replicas not closed, by database.
+        pub(crate) fn live(&self) -> Vec<Arc<FakeReplica>> {
+            self.all().into_iter().filter(|r| !r.closed()).collect()
+        }
     }
 
     impl Opener for FakeOpener {
         fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError> {
+            let held = self
+                .hold
+                .lock()
+                .ok()
+                .and_then(|mut hold| hold.remove(&spec.database));
+            if let Some(release) = held {
+                let _ = release.recv();
+            }
             let link = if spec.link.is_some() {
                 LinkState::Connecting
             } else {
                 LinkState::Local
             };
-            let (state, _) = watch::channel(ReplicaState { link, outbox: 0 });
+            let (state, _) = watch::channel(ReplicaState {
+                link,
+                outbox: 0,
+                directory: 0,
+            });
             let replica = Arc::new(FakeReplica {
                 spec,
                 rows: Mutex::new(Vec::new()),
-                commits: Mutex::new(0),
-                closed: Mutex::new(false),
+                closed: AtomicBool::new(false),
+                joined: AtomicBool::new(false),
                 state,
             });
             self.opened

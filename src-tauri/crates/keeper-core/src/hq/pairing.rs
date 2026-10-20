@@ -99,6 +99,11 @@ pub fn parse(raw: &str) -> Result<Redeemable, CodeRefusal> {
     })
 }
 
+/// Whether `raw` is the link a pairing QR carries (it may still be refused).
+pub fn is_link(raw: &str) -> bool {
+    raw.trim().starts_with(LINK_PREFIX)
+}
+
 /// The link a QR carries: the server's address and the code.
 pub fn pairing_link(server: &ServerUrl, code: &PairingCode) -> String {
     let query: String = url::form_urlencoded::Serializer::new(String::new())

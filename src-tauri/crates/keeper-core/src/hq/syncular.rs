@@ -2,32 +2,39 @@
 //! a replica file, driven as a blocking host (SPEC §8.4) on its own owner
 //! thread, with realtime over the `native-transport` WebSocket.
 //!
-//! The owner thread is the only thread that touches the client. Between
-//! commands it feeds socket frames to the client, runs the rounds the client
-//! asks for, reconnects a socket that is not up, and runs a heartbeat round
-//! every [`HEARTBEAT`], because the client cannot see an idle socket die. A
-//! round that cannot reach the server backs off (1 s doubling to a minute); a
-//! round the server refuses for this device's credential stops the link for
-//! good — the replica keeps answering reads and keeps writes in its outbox,
-//! and no further request is sent, so a revoked device has no request loop.
+//! Every request the client makes passes through a [`GatedTransport`]: a gate
+//! any thread can close, after which no request starts, and an origin check
+//! that refuses a server-issued blob URL on any host but the replica's own
+//! server — the only host the egress list names for it. Closing a replica
+//! closes its gate before anything else; a refused credential closes it for
+//! good and turns the client's own transport switch off.
 //!
-//! Reads go to a second, read-only connection on the same file
-//! (`FileQuerySnapshotReader`, WAL), so a read never queues behind a round.
+//! The owner thread is the only thread that touches the client. Its timing is
+//! [`Schedule`]'s: a round at least every [`HEARTBEAT`], because the client
+//! cannot see an idle socket die; a round that cannot reach the server backs
+//! off (1 s doubling to a minute); a socket that will not open backs off on
+//! its own streak, which a successful HTTP round does not reset; a refused
+//! round stops the link. Reads go to a second, read-only connection on the
+//! same file (`FileQuerySnapshotReader`, WAL), so a read never queues behind a
+//! round.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use syncular_client::native_transport::{HostTransport, Inbound};
 use syncular_client::{
-    ClientLimits, FileQuerySnapshotReader, Mutation, RealtimeState, SyncClient, SyncIntent,
-    SyncOutcome,
+    BlobDownload, BlobUploadGrant, ClientLimits, FileQuerySnapshotReader, Mutation, RealtimeState,
+    SegmentRequest, SyncClient, SyncIntent, SyncOutcome, Transport, TransportError,
 };
 use tokio::sync::watch;
 
 use crate::hq::port::{
-    LinkState, Opener, Peer, Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp,
+    LinkState, Opener, Peer, Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, Subscription,
+    WindowBase, WindowState,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -35,7 +42,7 @@ pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// One HTTP request's deadline; a firewalled server costs a round at most this.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// One round's deadline across every request it makes.
-const ROUND_DEADLINE: Duration = Duration::from_secs(60);
+const ROUND_DEADLINE: Duration = Duration::from_secs(30);
 /// The longest wait between two attempts on a server that cannot be reached.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -51,6 +58,144 @@ pub fn schema() -> Result<&'static Value, ReplicaError> {
     SCHEMA
         .as_ref()
         .map_err(|error| ReplicaError::Client(format!("the contract's schema: {error}")))
+}
+
+/// The code a request refused by a closed gate fails with.
+const CLOSED: &str = "transport.closed";
+/// The code a server-issued URL off the server's origin fails with.
+const FOREIGN: &str = "transport.foreign_origin";
+
+/// The client's transport behind a gate and an origin check.
+pub(crate) struct GatedTransport {
+    inner: HostTransport,
+    open: Arc<AtomicBool>,
+    /// The replica's server; `None` for a replica that never links.
+    origin: Option<url::Origin>,
+}
+
+impl GatedTransport {
+    fn check(&self) -> Result<(), TransportError> {
+        if self.open.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(TransportError::new(
+                CLOSED,
+                "this replica's network is closed",
+            ))
+        }
+    }
+
+    /// A URL the server handed out (a signed segment, a blob download or
+    /// upload grant) is fetched only on the server's own origin.
+    fn check_url(&self, url: &str) -> Result<(), TransportError> {
+        self.check()?;
+        let same = url::Url::parse(url)
+            .ok()
+            .is_some_and(|url| Some(url.origin()) == self.origin);
+        if same {
+            Ok(())
+        } else {
+            Err(TransportError::new(
+                FOREIGN,
+                "the server named a host other than its own; keeper contacts only the agents server",
+            ))
+        }
+    }
+}
+
+impl Transport for GatedTransport {
+    fn sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        self.check()?;
+        self.inner.sync(request)
+    }
+    fn remote_operation(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        self.check()?;
+        self.inner.remote_operation(request)
+    }
+    fn realtime_sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        self.check()?;
+        self.inner.realtime_sync(request)
+    }
+    fn download_segment(
+        &mut self,
+        request: &SegmentRequest,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, TransportError> {
+        self.check()?;
+        self.inner.download_segment(request, on_progress)
+    }
+    fn supports_url_fetch(&self) -> bool {
+        self.inner.supports_url_fetch()
+    }
+    fn fetch_url(
+        &mut self,
+        url: &str,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> Result<Vec<u8>, TransportError> {
+        self.check_url(url)?;
+        self.inner.fetch_url(url, on_progress)
+    }
+    fn segment_fetch_started_at(&self, url: &str) -> Option<i64> {
+        self.inner.segment_fetch_started_at(url)
+    }
+    fn blob_upload(
+        &mut self,
+        blob_id: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<(), TransportError> {
+        self.check()?;
+        self.inner.blob_upload(blob_id, bytes, media_type)
+    }
+    fn blob_download(&mut self, blob_id: &str) -> Result<BlobDownload, TransportError> {
+        self.check()?;
+        self.inner.blob_download(blob_id)
+    }
+    fn fetch_blob_url(&mut self, url: &str) -> Result<Vec<u8>, TransportError> {
+        self.check_url(url)?;
+        self.inner.fetch_blob_url(url)
+    }
+    fn blob_upload_grant(
+        &mut self,
+        blob_id: &str,
+        byte_length: u64,
+        media_type: Option<&str>,
+    ) -> Result<BlobUploadGrant, TransportError> {
+        self.check()?;
+        self.inner
+            .blob_upload_grant(blob_id, byte_length, media_type)
+    }
+    fn blob_put_url(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<(), TransportError> {
+        self.check_url(url)?;
+        self.inner.blob_put_url(url, bytes, media_type)
+    }
+    fn realtime_connect(&mut self) -> Result<(), TransportError> {
+        self.check()?;
+        self.inner.realtime_connect()
+    }
+    fn realtime_connect_for_client(&mut self, client_id: &str) -> Result<(), TransportError> {
+        self.check()?;
+        self.inner.realtime_connect_for_client(client_id)
+    }
+    fn round_deadline(&self) -> Option<Duration> {
+        self.inner.round_deadline()
+    }
+    fn set_round_deadline(&mut self, deadline: Option<Instant>) {
+        self.inner.set_round_deadline(deadline);
+    }
+    fn realtime_send(&mut self, text: &str) -> Result<(), TransportError> {
+        self.check()?;
+        self.inner.realtime_send(text)
+    }
+    fn realtime_close(&mut self) -> Result<(), TransportError> {
+        // Closing sends at most a close frame on a socket already open.
+        self.inner.realtime_close()
+    }
 }
 
 /// What one round's outcome means for the link.
@@ -103,16 +248,118 @@ pub(crate) fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1u64 << exponent).min(MAX_BACKOFF)
 }
 
+/// One capability's failure streak and when it may be tried again.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Backoff {
+    failures: u32,
+    until: Option<Instant>,
+}
+
+impl Backoff {
+    fn fail(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.until = Some(now + backoff(self.failures));
+    }
+    fn reset(&mut self) {
+        *self = Backoff::default();
+    }
+    fn ready(&self, now: Instant) -> bool {
+        self.until.is_none_or(|until| now >= until)
+    }
+    fn wait(&self, now: Instant) -> Duration {
+        self.until
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+    }
+}
+
+/// When a linked owner runs a round and opens its socket. HTTP rounds and the
+/// socket keep separate streaks: a server whose HTTP answers while its
+/// upgrades fail backs the socket off toward a minute and keeps the rounds on
+/// the heartbeat.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Schedule {
+    http: Backoff,
+    socket: Backoff,
+    last_round: Option<Instant>,
+    refused: bool,
+}
+
+impl Schedule {
+    fn heartbeat_due(&self, now: Instant) -> bool {
+        self.last_round
+            .is_none_or(|last| now.saturating_duration_since(last) >= HEARTBEAT)
+    }
+
+    pub(crate) fn round_due(&self, now: Instant, wanted: bool) -> bool {
+        !self.refused && self.http.ready(now) && (wanted || self.heartbeat_due(now))
+    }
+
+    pub(crate) fn round_done(&mut self, verdict: &RoundVerdict, now: Instant) {
+        self.last_round = Some(now);
+        match verdict {
+            RoundVerdict::Answered => self.http.reset(),
+            RoundVerdict::Refused => self.refused = true,
+            RoundVerdict::Unreachable(_) => self.http.fail(now),
+        }
+    }
+
+    /// A socket is tried only while HTTP answers, so an unreachable server
+    /// costs one backoff, not two.
+    pub(crate) fn socket_due(&self, now: Instant) -> bool {
+        !self.refused && self.http.failures == 0 && self.socket.ready(now)
+    }
+
+    pub(crate) fn socket_done(&mut self, opened: bool, now: Instant) {
+        if opened {
+            self.socket.reset();
+        } else {
+            self.socket.fail(now);
+        }
+    }
+
+    /// How long the owner may sleep; `None` until a command arrives.
+    pub(crate) fn next_wake(
+        &self,
+        now: Instant,
+        wanted: bool,
+        connected: bool,
+    ) -> Option<Duration> {
+        if self.refused {
+            return None;
+        }
+        let round = if !self.http.ready(now) {
+            self.http.wait(now)
+        } else if wanted {
+            Duration::ZERO
+        } else {
+            self.last_round.map_or(Duration::ZERO, |last| {
+                (last + HEARTBEAT).saturating_duration_since(now)
+            })
+        };
+        let socket = (!connected && self.http.failures == 0).then(|| self.socket.wait(now));
+        Some(socket.map_or(round, |socket| socket.min(round)))
+    }
+
+    pub(crate) fn link(&self, connected: bool) -> LinkState {
+        if self.refused {
+            LinkState::Refused
+        } else if self.http.failures > 0 {
+            LinkState::Offline
+        } else if self.last_round.is_some() && connected {
+            LinkState::Connected
+        } else {
+            LinkState::Connecting
+        }
+    }
+}
+
 type Reply<T> = SyncSender<Result<T, ReplicaError>>;
 
 enum Command {
     Mutate(Vec<Mutation>, Reply<String>),
-    Subscribe {
-        id: String,
-        table: String,
-        scopes: Vec<(String, Vec<String>)>,
-        reply: Reply<()>,
-    },
+    Subscribe(Subscription, Reply<()>),
+    SetWindow(WindowBase, Vec<String>, Reply<()>),
+    WindowState(WindowBase, Reply<WindowState>),
     SetPresence {
         scope_key: String,
         doc: Option<Value>,
@@ -159,118 +406,165 @@ fn mutation(op: RowOp) -> Mutation {
     }
 }
 
+fn window_base(base: &WindowBase) -> syncular_client::WindowBase {
+    syncular_client::WindowBase {
+        table: base.table.clone(),
+        variable: base.variable.clone(),
+        fixed_scopes: base.fixed_scopes.clone(),
+        params: None,
+    }
+}
+
 struct Owner {
     database: String,
     client: SyncClient,
-    transport: HostTransport,
+    transport: GatedTransport,
     linked: bool,
-    refused: bool,
-    /// Rounds failed in a row; zero when the last one was answered.
-    failures: u32,
-    retry_at: Option<Instant>,
-    last_round: Option<Instant>,
+    schedule: Schedule,
     /// A local write or an asked-for round waits to be pushed.
     dirty: bool,
+    directory: u64,
     state: watch::Sender<ReplicaState>,
 }
 
 impl Owner {
-    fn open(spec: &ReplicaSpec, wake: Sender<Command>) -> Result<Owner, ReplicaError> {
+    fn open(
+        spec: &ReplicaSpec,
+        gate: Arc<AtomicBool>,
+        wake: Sender<Command>,
+    ) -> Result<Owner, ReplicaError> {
         let path = spec
             .path
             .to_str()
             .ok_or_else(|| ReplicaError::Client("the replica's path is not UTF-8".to_owned()))?;
-        let client = SyncClient::open_path_with_identity(
+        let mut client = SyncClient::open_path_with_identity(
             spec.client_id.clone(),
             schema()?,
             ClientLimits::default(),
             path,
         )
         .map_err(ReplicaError::Client)?;
-        let config = match &spec.link {
-            Some(link) => json!({
-                "baseUrl": link.base_url,
-                "headers": { "authorization": format!("Bearer {}", link.token) },
-                "requestTimeoutMs": REQUEST_TIMEOUT.as_millis() as u64,
-                "roundDeadlineMs": ROUND_DEADLINE.as_millis() as u64,
-            }),
+        let (config, origin) = match &spec.link {
+            Some(link) => {
+                let origin = url::Url::parse(&link.base_url)
+                    .map_err(|error| {
+                        ReplicaError::Client(format!("the server's address: {error}"))
+                    })?
+                    .origin();
+                (
+                    json!({
+                        "baseUrl": link.base_url,
+                        "headers": { "authorization": format!("Bearer {}", link.token) },
+                        "requestTimeoutMs": REQUEST_TIMEOUT.as_millis() as u64,
+                        "roundDeadlineMs": ROUND_DEADLINE.as_millis() as u64,
+                    }),
+                    Some(origin),
+                )
+            }
             // No `baseUrl`: the transport that refuses every network call.
-            None => json!({}),
+            None => (json!({}), None),
         };
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let _ = wake.send(Command::Wake);
         });
-        let transport = HostTransport::from_config_with_notify(&config, Some(notify))
+        let inner = HostTransport::from_config_with_notify(&config, Some(notify))
             .map_err(ReplicaError::Client)?;
+        let linked = spec.link.is_some();
+        if !linked {
+            gate.store(false, Ordering::SeqCst);
+        }
+        let mut transport = GatedTransport {
+            inner,
+            open: gate,
+            origin,
+        };
+        if !linked {
+            client.set_transport_enabled(&mut transport, false);
+        }
+        for subscription in &spec.subscriptions {
+            client
+                .subscribe(
+                    subscription.id.clone(),
+                    subscription.table.clone(),
+                    subscription.scopes.clone(),
+                    None,
+                )
+                .map_err(ReplicaError::Client)?;
+        }
         let outbox = client.status_snapshot().outbox;
-        let link = if spec.link.is_some() {
+        let link = if linked {
             LinkState::Connecting
         } else {
             LinkState::Local
         };
-        let (state, _) = watch::channel(ReplicaState { link, outbox });
+        let (state, _) = watch::channel(ReplicaState {
+            link,
+            outbox,
+            directory: 0,
+        });
         Ok(Owner {
             database: spec.database.clone(),
             client,
             transport,
-            linked: spec.link.is_some(),
-            refused: false,
-            failures: 0,
-            retry_at: None,
-            last_round: None,
+            linked,
+            schedule: Schedule::default(),
             dirty: true,
+            directory: 0,
             state,
         })
     }
 
+    /// Whether this owner may touch the network now.
     fn online(&self) -> bool {
-        self.linked && !self.refused
+        self.linked && !self.schedule.refused && self.transport.open.load(Ordering::SeqCst)
+    }
+
+    fn connected(&self) -> bool {
+        self.client.realtime_state() == RealtimeState::Connected
     }
 
     fn run(mut self, commands: Receiver<Command>) {
         loop {
-            let command = if self.online() {
-                match commands.recv_timeout(self.next_due()) {
+            let wake = if self.online() {
+                self.schedule.next_wake(
+                    Instant::now(),
+                    self.dirty || self.client.sync_needed(),
+                    self.connected(),
+                )
+            } else {
+                None
+            };
+            let command = match wake {
+                Some(wait) => match commands.recv_timeout(wait) {
                     Ok(command) => Some(command),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => break,
-                }
-            } else {
-                match commands.recv() {
+                },
+                None => match commands.recv() {
                     Ok(command) => Some(command),
                     Err(_) => break,
-                }
+                },
             };
             if let Some(command) = command {
                 if !self.handle(command) {
                     break;
                 }
                 // Everything already queued before the network is touched.
+                let mut stop = false;
                 while let Ok(command) = commands.try_recv() {
                     if !self.handle(command) {
-                        self.stop();
-                        return;
+                        stop = true;
+                        break;
                     }
+                }
+                if stop {
+                    break;
                 }
             }
             self.drive();
             self.publish();
         }
         self.stop();
-    }
-
-    fn next_due(&self) -> Duration {
-        let now = Instant::now();
-        if let Some(retry_at) = self.retry_at {
-            return retry_at.saturating_duration_since(now);
-        }
-        if self.dirty {
-            return Duration::ZERO;
-        }
-        match self.last_round {
-            Some(last) => (last + HEARTBEAT).saturating_duration_since(now),
-            None => Duration::ZERO,
-        }
     }
 
     /// One command; `false` to stop.
@@ -283,29 +577,48 @@ impl Owner {
                 self.dirty |= outcome.is_ok();
                 let _ = reply.send(outcome);
             }
-            Command::Subscribe {
-                id,
-                table,
-                scopes,
-                reply,
-            } => {
+            Command::Subscribe(subscription, reply) => {
                 let outcome = self
                     .client
-                    .subscribe(id, table, scopes, None)
+                    .subscribe(
+                        subscription.id,
+                        subscription.table,
+                        subscription.scopes,
+                        None,
+                    )
                     .map_err(ReplicaError::Client);
                 self.dirty |= outcome.is_ok();
                 let _ = reply.send(outcome);
+            }
+            Command::SetWindow(base, units, reply) => {
+                let outcome = self
+                    .client
+                    .set_window(&window_base(&base), &units)
+                    .map(|_| ())
+                    .map_err(ReplicaError::Client);
+                self.dirty |= outcome.is_ok();
+                let _ = reply.send(outcome);
+            }
+            Command::WindowState(base, reply) => {
+                let state = self.client.window_state(&window_base(&base));
+                let _ = reply.send(Ok(WindowState {
+                    units: state.units,
+                    pending: state.pending,
+                }));
             }
             Command::SetPresence {
                 scope_key,
                 doc,
                 reply,
             } => {
-                let _ = reply.send(
+                let outcome = if self.online() {
                     self.client
                         .set_presence(&mut self.transport, &scope_key, doc.as_ref())
-                        .map_err(ReplicaError::Client),
-                );
+                        .map_err(ReplicaError::Client)
+                } else {
+                    Err(ReplicaError::NotSyncing)
+                };
+                let _ = reply.send(outcome);
             }
             Command::Presence(scope_key, reply) => {
                 let peers = self
@@ -329,6 +642,8 @@ impl Owner {
                 let _ = reply.send(outcome);
             }
             Command::Fetch(blob, reply) => {
+                // With the network closed the client serves its cache and
+                // refuses a miss itself; the gate refuses it again.
                 let _ = reply.send(
                     self.client
                         .fetch_blob_bytes(&mut self.transport, &blob)
@@ -338,27 +653,19 @@ impl Owner {
                         }),
                 );
             }
-            Command::SyncNow => {
-                self.dirty = true;
-                // An explicit ask retries a backed-off server at once.
-                self.retry_at = None;
-            }
+            Command::SyncNow => self.dirty = true,
             Command::Wake => {}
             Command::Stop => return false,
         }
         true
     }
 
-    /// Frames, the rounds they and the heartbeat ask for, and the socket.
+    /// Frames, the rounds they and the schedule ask for, and the socket.
     fn drive(&mut self) {
         if !self.online() {
             return;
         }
-        if self.retry_at.is_some_and(|at| Instant::now() < at) {
-            return;
-        }
-        self.retry_at = None;
-        for frame in self.transport.take_inbound() {
+        for frame in self.transport.inner.take_inbound() {
             match frame {
                 Inbound::Text(text) => self.client.on_realtime_text(&text),
                 Inbound::Binary(bytes) => {
@@ -371,91 +678,84 @@ impl Owner {
             .drain_sync_intents()
             .iter()
             .any(|intent| !matches!(intent, SyncIntent::None));
-        // Change batches are read back through queries; the queue is only
-        // drained so it does not grow.
-        self.client.drain_change_batches();
-        let due = self
-            .last_round
-            .is_none_or(|last| last.elapsed() >= HEARTBEAT);
-        if (asked || due || self.dirty || self.client.sync_needed()) && !self.round() {
+        self.absorb_changes();
+        let wanted = asked || self.dirty || self.client.sync_needed();
+        if self.schedule.round_due(Instant::now(), wanted) {
+            self.round();
+        }
+        if !self.online() || self.connected() || !self.schedule.socket_due(Instant::now()) {
             return;
         }
-        if self.client.realtime_state() != RealtimeState::Connected {
-            match self.client.connect_realtime(&mut self.transport) {
-                Ok(()) => {
-                    self.round();
-                }
-                Err(error) => {
-                    tracing::debug!(database = %self.database, %error, "agents server socket refused");
-                    // The round says whether that was the credential or the network.
-                    if self.round() {
-                        self.fail(format!("socket: {error}"));
-                    }
-                }
+        match self.client.connect_realtime(&mut self.transport) {
+            Ok(()) => {
+                self.schedule.socket_done(true, Instant::now());
+                self.round();
+            }
+            Err(error) => {
+                self.schedule.socket_done(false, Instant::now());
+                tracing::debug!(database = %self.database, %error, "agents server socket refused");
             }
         }
     }
 
-    /// One round until idle; whether the server answered.
-    fn round(&mut self) -> bool {
-        self.last_round = Some(Instant::now());
+    /// Change batches only say what changed; the directory's revision is all
+    /// keeper reads from them.
+    fn absorb_changes(&mut self) {
+        let directory = self
+            .client
+            .drain_change_batches()
+            .iter()
+            .any(|batch| batch.tables.iter().any(|change| change.table == "clients"));
+        if directory {
+            self.directory += 1;
+        }
+    }
+
+    fn round(&mut self) {
         self.dirty = false;
         let outcome = self.client.sync_until_idle(&mut self.transport, None);
-        match verdict(&outcome) {
-            RoundVerdict::Answered => {
-                self.failures = 0;
-                true
-            }
+        let verdict = verdict(&outcome);
+        self.schedule.round_done(&verdict, Instant::now());
+        match verdict {
+            RoundVerdict::Answered => {}
             RoundVerdict::Refused => {
                 tracing::warn!(
                     database = %self.database,
                     "the agents server refused this device's credential; this replica stops syncing"
                 );
-                self.refused = true;
+                self.transport.open.store(false, Ordering::SeqCst);
+                self.client
+                    .set_transport_enabled(&mut self.transport, false);
                 self.client.disconnect_realtime(&mut self.transport);
-                self.transport.shutdown();
-                false
+                self.transport.inner.shutdown();
             }
             RoundVerdict::Unreachable(why) => {
-                self.fail(why);
-                false
+                tracing::info!(
+                    database = %self.database,
+                    retry_in_ms = self.schedule.http.wait(Instant::now()).as_millis() as u64,
+                    %why,
+                    "agents server not reached"
+                );
+                if self.connected() {
+                    self.client.disconnect_realtime(&mut self.transport);
+                }
             }
         }
-    }
-
-    fn fail(&mut self, why: String) {
-        self.failures = self.failures.saturating_add(1);
-        let wait = backoff(self.failures);
-        tracing::info!(
-            database = %self.database,
-            failures = self.failures,
-            retry_in_ms = wait.as_millis() as u64,
-            %why,
-            "agents server not reached"
-        );
-        self.retry_at = Some(Instant::now() + wait);
-        if self.client.realtime_state() == RealtimeState::Connected {
-            self.client.disconnect_realtime(&mut self.transport);
-        }
+        self.absorb_changes();
     }
 
     fn publish(&self) {
         let link = if !self.linked {
             LinkState::Local
-        } else if self.refused {
-            LinkState::Refused
-        } else if self.failures > 0 {
-            LinkState::Offline
-        } else if self.last_round.is_some()
-            && self.client.realtime_state() == RealtimeState::Connected
-        {
-            LinkState::Connected
+        } else if !self.transport.open.load(Ordering::SeqCst) && !self.schedule.refused {
+            LinkState::Closed
         } else {
-            LinkState::Connecting
+            self.schedule.link(self.connected())
         };
         let next = ReplicaState {
             link,
             outbox: self.client.status_snapshot().outbox,
+            directory: self.directory,
         };
         self.state.send_if_modified(|state| {
             let changed = *state != next;
@@ -465,25 +765,33 @@ impl Owner {
     }
 
     fn stop(&mut self) {
-        if self.linked && !self.refused {
-            self.client.disconnect_realtime(&mut self.transport);
-        }
-        self.transport.shutdown();
-        self.linked = false;
-        self.publish();
+        self.transport.open.store(false, Ordering::SeqCst);
+        self.client
+            .set_transport_enabled(&mut self.transport, false);
+        self.client.disconnect_realtime(&mut self.transport);
+        self.transport.inner.shutdown();
+        let next = ReplicaState {
+            link: LinkState::Closed,
+            outbox: self.client.status_snapshot().outbox,
+            directory: self.directory,
+        };
+        self.state.send_replace(next);
     }
 }
 
 /// A replica whose owner thread runs [`Owner`].
 pub struct SyncularReplica {
     commands: Sender<Command>,
+    gate: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<FileQuerySnapshotReader>,
     state: watch::Receiver<ReplicaState>,
 }
 
 impl SyncularReplica {
-    /// Open (creating when absent) the replica at `spec.path` and start its
-    /// owner thread. Returns once the file is open, or with why it is not.
+    /// Open (creating when absent) the replica at `spec.path`, register its
+    /// subscriptions and start its owner thread. Returns once the file is
+    /// open, before any request.
     pub fn open(spec: ReplicaSpec) -> Result<SyncularReplica, ReplicaError> {
         let path = spec
             .path
@@ -493,9 +801,11 @@ impl SyncularReplica {
         let (commands, inbox) = mpsc::channel::<Command>();
         let (ready, opened) = mpsc::sync_channel(1);
         let wake = commands.clone();
-        std::thread::Builder::new()
+        let gate = Arc::new(AtomicBool::new(true));
+        let owner_gate = Arc::clone(&gate);
+        let thread = std::thread::Builder::new()
             .name(format!("hq-{}", spec.database))
-            .spawn(move || match Owner::open(&spec, wake) {
+            .spawn(move || match Owner::open(&spec, owner_gate, wake) {
                 Ok(owner) => {
                     let _ = ready.send(Ok(owner.state.subscribe()));
                     owner.run(inbox);
@@ -508,6 +818,8 @@ impl SyncularReplica {
         let state = opened.recv().map_err(|_| ReplicaError::Closed)??;
         Ok(SyncularReplica {
             commands,
+            gate,
+            thread: Mutex::new(Some(thread)),
             reader: Mutex::new(FileQuerySnapshotReader::new(path)),
             state,
         })
@@ -536,18 +848,18 @@ impl Replica for SyncularReplica {
             .map_err(|failure| ReplicaError::Client(failure.to_string()))
     }
 
-    fn subscribe(
-        &self,
-        id: &str,
-        table: &str,
-        scopes: Vec<(String, Vec<String>)>,
-    ) -> Result<(), ReplicaError> {
-        self.ask(|reply| Command::Subscribe {
-            id: id.to_owned(),
-            table: table.to_owned(),
-            scopes,
-            reply,
-        })
+    fn subscribe(&self, subscription: Subscription) -> Result<(), ReplicaError> {
+        self.ask(|reply| Command::Subscribe(subscription, reply))
+    }
+
+    fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError> {
+        let (base, units) = (base.clone(), units.to_vec());
+        self.ask(|reply| Command::SetWindow(base, units, reply))
+    }
+
+    fn window_state(&self, base: &WindowBase) -> Result<WindowState, ReplicaError> {
+        let base = base.clone();
+        self.ask(|reply| Command::WindowState(base, reply))
     }
 
     fn set_presence(&self, scope_key: &str, doc: Option<Value>) -> Result<(), ReplicaError> {
@@ -587,13 +899,23 @@ impl Replica for SyncularReplica {
     }
 
     fn close(&self) {
+        self.gate.store(false, Ordering::SeqCst);
         let _ = self.commands.send(Command::Stop);
+    }
+
+    fn join(&self) {
+        let thread = self.thread.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(thread) = thread {
+            if thread.join().is_err() {
+                tracing::warn!("an agents replica's owner thread panicked");
+            }
+        }
     }
 }
 
 impl Drop for SyncularReplica {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
+        self.close();
     }
 }
 
@@ -609,6 +931,8 @@ impl Opener for SyncularOpener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicUsize;
     use syncular_client::SyncReport;
 
     fn failed(code: &str, status: Option<u64>) -> SyncOutcome {
@@ -642,18 +966,135 @@ mod tests {
             RoundVerdict::Unreachable(_)
         ));
         assert!(matches!(
-            verdict(&failed("transport.timeout", None)),
+            verdict(&failed(CLOSED, None)),
             RoundVerdict::Unreachable(_)
         ));
     }
 
     #[test]
-    fn an_unreachable_server_is_retried_less_and_less_often() {
-        assert_eq!(backoff(1), Duration::from_secs(1));
-        assert_eq!(backoff(2), Duration::from_secs(2));
-        assert_eq!(backoff(6), Duration::from_secs(32));
-        assert_eq!(backoff(7), MAX_BACKOFF);
-        assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
+    fn a_socket_that_will_not_open_backs_off_while_http_rounds_answer() {
+        let mut schedule = Schedule::default();
+        let mut now = Instant::now();
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            assert!(schedule.round_due(now, true));
+            schedule.round_done(&RoundVerdict::Answered, now);
+            assert!(
+                schedule.socket_due(now),
+                "the socket is tried once its wait is over"
+            );
+            schedule.socket_done(false, now);
+            waits.push(schedule.socket.wait(now).as_secs());
+            assert!(!schedule.socket_due(now));
+            assert_eq!(schedule.link(false), LinkState::Connecting);
+            // The owner sleeps no longer than a heartbeat while rounds answer.
+            assert_eq!(
+                schedule.next_wake(now, false, false),
+                Some(HEARTBEAT.min(schedule.socket.wait(now)))
+            );
+            now += schedule.socket.wait(now);
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60]);
+        schedule.socket_done(true, now);
+        schedule.round_done(&RoundVerdict::Answered, now);
+        assert_eq!(schedule.link(true), LinkState::Connected);
+        assert_eq!(schedule.socket.failures, 0);
+    }
+
+    #[test]
+    fn an_unreachable_server_backs_off_and_a_refusal_ends_the_schedule() {
+        let mut schedule = Schedule::default();
+        let now = Instant::now();
+        schedule.round_done(&RoundVerdict::Unreachable("x".to_owned()), now);
+        schedule.round_done(&RoundVerdict::Unreachable("x".to_owned()), now);
+        assert_eq!(schedule.link(false), LinkState::Offline);
+        assert!(
+            !schedule.round_due(now, true),
+            "a wanted round waits for the backoff"
+        );
+        assert!(!schedule.socket_due(now), "no socket while HTTP fails");
+        assert_eq!(
+            schedule.next_wake(now, true, false),
+            Some(Duration::from_secs(2))
+        );
+        schedule.round_done(&RoundVerdict::Refused, now + Duration::from_secs(2));
+        assert_eq!(schedule.link(false), LinkState::Refused);
+        assert!(!schedule.round_due(now + MAX_BACKOFF, true));
+        assert_eq!(schedule.next_wake(now, true, false), None);
+    }
+
+    fn gated(open: bool) -> GatedTransport {
+        GatedTransport {
+            inner: HostTransport::from_config(&json!({})).expect("null transport"),
+            open: Arc::new(AtomicBool::new(open)),
+            origin: Some(
+                url::Url::parse("https://hq.example.org:8443/alpha")
+                    .expect("url")
+                    .origin(),
+            ),
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_every_request_and_a_url_off_the_servers_origin() {
+        let code =
+            |result: Result<Vec<u8>, TransportError>| result.map(|_| ()).err().map(|e| e.code);
+        let mut open = gated(true);
+        // Through the gate: the null transport answers for itself.
+        assert_eq!(
+            code(open.sync(b"x")).as_deref(),
+            Some("transport.unavailable")
+        );
+        assert_eq!(
+            code(open.fetch_blob_url("https://hq.example.org:8443/alpha/blobs/x")).as_deref(),
+            Some("transport.unavailable")
+        );
+        for foreign in [
+            "https://cdn.example.net/x",
+            "https://hq.example.org/alpha/blobs/x",
+            "http://hq.example.org:8443/x",
+            "not a url",
+        ] {
+            assert_eq!(
+                code(open.fetch_blob_url(foreign)).as_deref(),
+                Some(FOREIGN),
+                "{foreign}"
+            );
+            assert_eq!(
+                code(open.fetch_url(foreign, &mut |_| {})).as_deref(),
+                Some(FOREIGN)
+            );
+            assert_eq!(
+                open.blob_put_url(foreign, b"x", None)
+                    .err()
+                    .map(|e| e.code)
+                    .as_deref(),
+                Some(FOREIGN)
+            );
+        }
+        let mut closed = gated(false);
+        assert_eq!(code(closed.sync(b"x")).as_deref(), Some(CLOSED));
+        assert_eq!(code(closed.realtime_sync(b"x")).as_deref(), Some(CLOSED));
+        assert_eq!(
+            code(closed.fetch_blob_url("https://hq.example.org:8443/x")).as_deref(),
+            Some(CLOSED)
+        );
+        assert_eq!(
+            closed
+                .blob_download("sha256:00")
+                .err()
+                .map(|e| e.code)
+                .as_deref(),
+            Some(CLOSED)
+        );
+        assert_eq!(
+            closed
+                .realtime_connect_for_client("c")
+                .err()
+                .map(|e| e.code)
+                .as_deref(),
+            Some(CLOSED)
+        );
     }
 
     fn message(id: &str) -> RowOp {
@@ -676,79 +1117,190 @@ mod tests {
         }
     }
 
-    fn wait_for(replica: &SyncularReplica, outbox: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while replica.state().outbox != outbox && Instant::now() < deadline {
+    fn wait_until(replica: &SyncularReplica, what: &str, ok: impl Fn(&ReplicaState) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ok(&replica.state()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(replica.state().outbox, outbox);
+        assert!(ok(&replica.state()), "{what}: {:?}", replica.state());
+    }
+
+    fn local(path: std::path::PathBuf) -> ReplicaSpec {
+        ReplicaSpec {
+            database: "local".to_owned(),
+            path,
+            client_id: None,
+            link: None,
+            subscriptions: Vec::new(),
+        }
     }
 
     #[test]
     fn a_write_with_no_server_waits_in_the_replicas_outbox_across_a_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let spec = ReplicaSpec {
-            database: "local".to_owned(),
-            path: dir.path().join("local.sqlite"),
-            client_id: None,
-            link: None,
-        };
+        let spec = local(dir.path().join("local.sqlite"));
         let replica = SyncularReplica::open(spec.clone()).expect("opens");
-        assert_eq!(
-            replica.state(),
-            ReplicaState {
-                link: LinkState::Local,
-                outbox: 0
-            }
-        );
+        assert_eq!(replica.state().link, LinkState::Local);
         replica.mutate(vec![message("m-1")]).expect("commits");
         replica.mutate(vec![message("m-2")]).expect("commits");
-        wait_for(&replica, 2);
+        wait_until(&replica, "two commits wait", |s| s.outbox == 2);
         let rows = replica
             .query("SELECT id, body FROM messages ORDER BY id", &[])
             .expect("reads");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["body"], "hello");
         replica.close();
+        replica.join();
         drop(replica);
 
         let again = SyncularReplica::open(spec).expect("reopens");
-        wait_for(&again, 2);
+        wait_until(&again, "the outbox survived", |s| s.outbox == 2);
         assert_eq!(again.state().link, LinkState::Local);
-        assert_eq!(
-            again
-                .query("SELECT count(*) AS n FROM messages", &[])
-                .expect("reads")[0]["n"],
-            2
+        assert!(matches!(
+            again.set_presence("page:x", None),
+            Err(ReplicaError::NotSyncing)
+        ));
+    }
+
+    #[test]
+    fn a_window_and_its_units_persist_with_the_replica() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("w.sqlite"));
+        let base = WindowBase {
+            table: "messages".to_owned(),
+            variable: "page".to_owned(),
+            fixed_scopes: Vec::new(),
+        };
+        let units = vec!["s.1/2026-09".to_owned(), "s.1/2026-10".to_owned()];
+        let replica = SyncularReplica::open(spec.clone()).expect("opens");
+        replica.set_window(&base, &units).expect("sets");
+        assert_eq!(replica.window_state(&base).expect("reads").units, units);
+        replica.set_window(&base, &units[1..]).expect("narrows");
+        replica.close();
+        replica.join();
+        drop(replica);
+        let again = SyncularReplica::open(spec).expect("reopens");
+        let state = again.window_state(&base).expect("reads");
+        assert_eq!(state.units, units[1..]);
+        assert_eq!(state.pending, units[1..], "never pulled, so not complete");
+        let wrong = WindowBase {
+            variable: "trace".to_owned(),
+            ..base
+        };
+        assert!(
+            again.set_window(&wrong, &units).is_err(),
+            "messages has no trace scope"
         );
+    }
+
+    /// A server on a local port that answers every request with `status`,
+    /// counting the connections it accepts.
+    fn server(status: &'static str) -> (u16, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"error":"sync.auth_required"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (port, count)
+    }
+
+    fn linked(dir: &std::path::Path, port: u16) -> ReplicaSpec {
+        ReplicaSpec {
+            database: "alpha".to_owned(),
+            path: dir.join("alpha.sqlite"),
+            client_id: Some("ana.1".to_owned()),
+            link: Some(crate::hq::port::Link {
+                base_url: format!("http://127.0.0.1:{port}/alpha"),
+                token: "0123456789abcdef".to_owned(),
+            }),
+            subscriptions: vec![Subscription {
+                id: "directoryClients".to_owned(),
+                table: "clients".to_owned(),
+                scopes: vec![("dir".to_owned(), vec!["alpha".to_owned()])],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_refused_replica_sends_nothing_more_and_still_answers_reads() {
+        let (port, connections) = server("401 Unauthorized");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replica = SyncularReplica::open(linked(dir.path(), port)).expect("opens");
+        wait_until(&replica, "refused", |s| s.link == LinkState::Refused);
+        let after_refusal = connections.load(Ordering::SeqCst);
+        replica
+            .mutate(vec![message("m-1")])
+            .expect("commits locally");
+        replica.sync_now();
+        assert!(replica
+            .fetch_blob("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+            .is_err());
+        assert!(matches!(
+            replica.set_presence("page:x", None),
+            Err(ReplicaError::NotSyncing)
+        ));
+        std::thread::sleep(HEARTBEAT + Duration::from_secs(1));
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            after_refusal,
+            "a refused replica connected"
+        );
+        assert_eq!(
+            replica
+                .query("SELECT id FROM messages", &[])
+                .expect("reads")
+                .len(),
+            1
+        );
+        assert_eq!(replica.state().outbox, 1);
+    }
+
+    #[test]
+    fn a_closed_replica_joins_and_connects_no_more() {
+        let (port, connections) = server("503 Service Unavailable");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replica = SyncularReplica::open(linked(dir.path(), port)).expect("opens");
+        wait_until(&replica, "offline", |s| s.link == LinkState::Offline);
+        replica.close();
+        let at_close = connections.load(Ordering::SeqCst);
+        replica.sync_now();
+        replica.join();
+        assert_eq!(replica.state().link, LinkState::Closed);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            at_close,
+            "a closed replica connected"
+        );
+        // Reads still answer from the file.
+        assert!(replica.query("SELECT id FROM messages", &[]).is_ok());
     }
 
     #[test]
     fn a_server_that_cannot_be_reached_leaves_reads_and_the_outbox_alone() {
-        // A port nothing listens on: every round fails at connect.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
         let dir = tempfile::tempdir().expect("tempdir");
-        let replica = SyncularReplica::open(ReplicaSpec {
-            database: "db".to_owned(),
-            path: dir.path().join("db.sqlite"),
-            client_id: Some("t.1".to_owned()),
-            link: Some(crate::hq::port::Link {
-                base_url: format!("http://127.0.0.1:{port}/db"),
-                token: "0123456789abcdef".to_owned(),
-            }),
-        })
-        .expect("opens");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while replica.state().link != LinkState::Offline && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(replica.state().link, LinkState::Offline);
+        let replica = SyncularReplica::open(linked(dir.path(), port)).expect("opens");
+        wait_until(&replica, "offline", |s| s.link == LinkState::Offline);
         replica
             .mutate(vec![message("m-1")])
             .expect("commits while offline");
-        wait_for(&replica, 1);
+        wait_until(&replica, "one waits", |s| s.outbox == 1);
         let started = Instant::now();
         assert_eq!(
             replica

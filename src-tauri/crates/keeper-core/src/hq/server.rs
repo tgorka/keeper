@@ -69,24 +69,25 @@ impl ServerUrl {
         format!("{}/{database}", self.base)
     }
 
-    /// The directory this server's replicas live in under `hq/`: the host
-    /// with its port, and its path when it has one, made filename-safe, so
-    /// two servers never share a replica.
+    /// The directory name of this server's replicas: its host, for a person
+    /// looking at the disk, then 16 bytes of the SHA-256 of the whole
+    /// normalised base URL, so two servers that differ anywhere — scheme,
+    /// port, a path's case or its separators — never share a directory.
     pub fn dir_name(&self) -> String {
-        let without_scheme = self
-            .base
-            .split_once("://")
-            .map_or(self.base.as_str(), |(_, rest)| rest);
-        without_scheme
+        use sha2::Digest;
+        let host: String = self
+            .host
             .chars()
             .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                    c.to_ascii_lowercase()
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                    c
                 } else {
                     '_'
                 }
             })
-            .collect()
+            .collect();
+        let digest = sha2::Sha256::digest(self.base.as_bytes());
+        format!("{host}-{}", hex::encode(&digest[..16]))
     }
 }
 
@@ -139,10 +140,7 @@ mod tests {
             server.route("/databases"),
             "https://agents.example.org/databases"
         );
-        assert_eq!(
-            server.mount("tgdrive"),
-            "https://agents.example.org/tgdrive"
-        );
+        assert_eq!(server.mount("alpha"), "https://agents.example.org/alpha");
 
         let proxied = ServerUrl::parse("http://100.64.0.7:8790/hq/")
             .expect("parses")
@@ -150,7 +148,7 @@ mod tests {
         assert_eq!(proxied.as_str(), "http://100.64.0.7:8790/hq");
         assert_eq!(proxied.host(), "100.64.0.7:8790");
         assert_eq!(proxied.mount("n"), "http://100.64.0.7:8790/hq/n");
-        assert_eq!(proxied.dir_name(), "100.64.0.7_8790_hq");
+        assert!(proxied.dir_name().starts_with("100.64.0.7_8790-"));
     }
 
     #[test]
@@ -197,21 +195,31 @@ mod tests {
     }
 
     #[test]
-    fn two_ports_or_two_paths_are_two_servers() {
+    fn servers_that_differ_anywhere_never_share_a_directory() {
         let dir = |raw: &str| {
             ServerUrl::parse(raw)
                 .expect("parses")
                 .expect("an address")
                 .dir_name()
         };
-        assert_ne!(
-            dir("https://a.example.org"),
-            dir("https://a.example.org:8443")
-        );
-        assert_ne!(
-            dir("https://a.example.org/x"),
-            dir("https://a.example.org/y")
-        );
-        assert!(!dir("https://a.example.org/../x").contains('/'));
+        let all = [
+            "https://a.example.org",
+            "http://a.example.org",
+            "https://a.example.org:8443",
+            "https://a.example.org/x",
+            "https://a.example.org/y",
+            "https://a.example.org/a/b",
+            "https://a.example.org/a_b",
+            "https://a.example.org/A",
+            "https://a.example.org/a",
+            "http://local",
+        ];
+        let names: std::collections::BTreeSet<String> = all.iter().map(|raw| dir(raw)).collect();
+        assert_eq!(names.len(), all.len(), "{names:?}");
+        for name in &names {
+            assert!(!name.contains('/') && !name.starts_with('.'), "{name}");
+        }
+        // The same server, however it was typed, is one directory.
+        assert_eq!(dir("https://A.example.org/"), dir("https://a.example.org"));
     }
 }
