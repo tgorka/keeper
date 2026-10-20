@@ -52,6 +52,13 @@ pub enum AuthError {
     #[error("could not reach homeserver: {0}")]
     ServerUnreachable(String),
 
+    /// The homeserver (or its sign-in server) did not answer within
+    /// `oauth::REACH_TIMEOUT` before any browser opened. The string is the
+    /// whole sentence a person reads, naming the `host[:port]`
+    /// (`oauth::no_answer`).
+    #[error("{0}")]
+    NoAnswer(String),
+
     /// The homeserver rejected the supplied username/password.
     #[error("invalid username or password")]
     InvalidCredentials,

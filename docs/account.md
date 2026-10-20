@@ -435,6 +435,18 @@ starts by itself has the same link on its own line under Settings › Account, w
 Matrix sign-in* — which works from the moment the line appears, even before the link does: a
 cancelled sign-in never opens a browser afterwards. A sign-out page is never shown this way: its address carries your ID token.
 
+**When the server does not answer.** Discovery — everything a sign-in asks the identity
+provider (or, for Matrix, the homeserver and its sign-in server) before the browser opens —
+has ten seconds. A server behind a network that drops keeper's packets (a tailnet rule without
+a grant for that port, a VPN that is off) refuses nothing, so without this the sign-in sat
+silent until the five-minute browser timeout. Now it stops with the server's address and
+port: "Can't reach id.acme.dev:8451: it did not answer within 10 seconds. Check that this
+device is on a network (or VPN) that can reach it." This happens before the sign-in has a
+page, so there is no link to copy: the login screen, the setup sheet, Settings › Account and a
+restored device's Matrix sign-in line say the sentence and offer a fresh sign-in. A
+background sync that cannot reach the account still says the quiet "Offline", and a
+background token refresh keeps its HTTP client's own timeouts.
+
 *Cancel*, in keeper or in the sign-in window, ends the attempt as cancelled, not failed: the
 setup sheet says the sign-in was closed and nothing was set up (or, for an account already
 signed in on this device, that it stays as it was — never "Up to date"). Connecting an `oauth`

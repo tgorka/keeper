@@ -346,6 +346,12 @@ pub enum IpcErrorCode {
     /// failure). Retriable — the sign-in may be started again. Serializes as
     /// `"oauthFailed"`.
     OauthFailed,
+    /// A sign-in's server did not answer before any browser opened, within
+    /// `oauth::REACH_TIMEOUT` (discovery, the homeserver probe). The message
+    /// is a sentence naming the server's `host[:port]`, rendered as written.
+    /// Retriable — the network between may come back. Serializes as
+    /// `"noAnswer"`.
+    NoAnswer,
     /// The Beeper unofficial email-code login flow is unavailable (Story 2.3):
     /// a non-2xx / timeout / transport failure from `api.beeper.com`, a
     /// missing/renamed field (the private API changed shape), an abandoned flow,

@@ -301,6 +301,9 @@ pub enum AccountPhase {
 pub enum AccountProblem {
     /// The repository (or issuer) could not be reached.
     Offline,
+    /// A sign-in's server did not answer before the browser opened; the
+    /// sentence names it ([`AccountError::NoAnswer`]). Otherwise offline.
+    NoAnswer(String),
     /// The sign-in needs repeating; the message is the reason, for logs.
     NeedsSignIn(String),
     /// A policy refusal, already a sentence ([`super::AccountError::Refused`]).
@@ -329,6 +332,7 @@ impl AccountProblem {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Offline => "offline",
+            Self::NoAnswer(_) => "no_answer",
             Self::NeedsSignIn(_) => "needs_sign_in",
             Self::Refused(_) => "refused",
             Self::Blocked { .. } => "blocked",
@@ -347,6 +351,7 @@ pub fn problem_of(error: AccountError) -> Option<AccountProblem> {
     match error {
         AccountError::Cancelled => None,
         AccountError::Unreachable(_) => Some(AccountProblem::Offline),
+        AccountError::NoAnswer(sentence) => Some(AccountProblem::NoAnswer(sentence)),
         AccountError::NeedsSignIn(sentence) => Some(AccountProblem::NeedsSignIn(sentence)),
         AccountError::Refused(sentence) => Some(AccountProblem::Refused(sentence)),
         AccountError::Internal(sentence) => Some(AccountProblem::Failed(sentence)),
@@ -520,6 +525,9 @@ pub enum RestoreSignInEnd {
     Cancelled,
     /// Its deadline passed: its link no longer works (R481).
     TimedOut,
+    /// Its server did not answer before any browser opened; the sentence
+    /// names it ([`crate::oauth::no_answer`]). There never was a link.
+    NoAnswer(String),
     /// Anything else, with keeper's sentence for it.
     Failed(String),
 }
@@ -694,6 +702,9 @@ impl RestoreSignInAttempt {
                 tracing::warn!(reason = %error, "account: the restored Matrix sign-in did not finish");
                 match error {
                     CoreError::Auth(AuthError::OAuthTimedOut) => RestoreSignInEnd::TimedOut,
+                    CoreError::Auth(AuthError::NoAnswer(sentence)) => {
+                        RestoreSignInEnd::NoAnswer(sentence)
+                    }
                     error => RestoreSignInEnd::Failed(error.to_string()),
                 }
             }
@@ -744,6 +755,7 @@ impl RestoreSignIn {
                 ),
                 true,
             ),
+            Some(RestoreSignInEnd::NoAnswer(sentence)) => (format!("{sentence} {again}"), true),
             Some(RestoreSignInEnd::Failed(reason)) => (
                 format!(
                     "Signing in to your Matrix account on {host} did not finish ({reason}). {again}"
@@ -827,6 +839,12 @@ fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
                 format!("keeper could not reach {name} to sign you in. Check the connection, then sign in again."),
                 true,
             ),
+            // Which server, on which port: what a network rule blocks.
+            Some(AccountProblem::NoAnswer(sentence)) => (
+                S::Offline,
+                format!("{sentence} Then sign in again."),
+                true,
+            ),
             Some(AccountProblem::Failed(reason)) => (
                 S::NeedsSignIn,
                 format!(
@@ -857,6 +875,11 @@ fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
                 format!("keeper could not reach {name}'s repository to connect it. Check the connection, then sign in again."),
                 true,
             ),
+            Some(AccountProblem::NoAnswer(sentence)) => (
+                S::Offline,
+                format!("{sentence} Then sign in again."),
+                true,
+            ),
             Some(AccountProblem::Failed(reason)) => (
                 S::NeedsSignIn,
                 format!(
@@ -877,7 +900,7 @@ fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
         .map(|at| format!("from {}", clock(at, facts.now_ms)))
         .unwrap_or_else(|| "kept on this device".to_owned());
     match &facts.problem {
-        Some(AccountProblem::Offline) => (
+        Some(AccountProblem::Offline | AccountProblem::NoAnswer(_)) => (
             S::Offline,
             format!("Offline — using settings {since}."),
             false,
@@ -1072,6 +1095,12 @@ mod tests {
                 "keeper could not reach Acme to sign you in. Check the connection, then sign in again.",
             ),
             (
+                AccountError::NoAnswer(crate::oauth::no_answer("id.acme.dev:8451")),
+                AccountStateVm::Offline,
+                "Can't reach id.acme.dev:8451: it did not answer within 10 seconds. Check that \
+                 this device is on a network (or VPN) that can reach it. Then sign in again.",
+            ),
+            (
                 AccountError::Internal("keeper could not open the sign-in page: denied.".to_owned()),
                 AccountStateVm::NeedsSignIn,
                 "Signing in to Acme failed (keeper could not open the sign-in page: denied). Sign in again.",
@@ -1195,6 +1224,45 @@ mod tests {
         assert!(ended
             .sentence
             .ends_with("Sign in to it again from Add an account."));
+    }
+
+    /// A restore's single sign-on whose homeserver did not answer ends with
+    /// the sentence naming it, as a problem, with no link — the sign-in never
+    /// reached a page to finish by hand.
+    #[tokio::test]
+    async fn a_restore_sign_in_whose_server_did_not_answer_names_it() {
+        use crate::error::{AuthError, CoreError};
+        use std::sync::{Arc, Mutex};
+
+        let flows = crate::oauth::OAuthFlowRegistry::new();
+        let shared = Arc::new(Mutex::new(RestoreFacts::default()));
+        let access: RestoreFactsAccess = {
+            let shared = Arc::clone(&shared);
+            Arc::new(move |change: &mut dyn FnMut(&mut RestoreFacts)| {
+                change(&mut shared.lock().expect("facts"));
+            })
+        };
+        let attempt = shared
+            .lock()
+            .expect("facts")
+            .begin_matrix_sign_in("https://matrix.acme.dev:8448", &flows);
+        let sentence = crate::oauth::no_answer("matrix.acme.dev:8448");
+        let answer = sentence.clone();
+        attempt
+            .run(access, |_| async move {
+                Err(CoreError::Auth(AuthError::NoAnswer(answer)))
+            })
+            .await;
+
+        let row = restore_vm(&shared.lock().expect("facts"))
+            .matrix_sign_in
+            .expect("its outcome");
+        assert!(!row.waiting && row.problem);
+        assert_eq!(row.link, None);
+        assert_eq!(
+            row.sentence,
+            format!("{sentence} Sign in to it again from Add an account.")
+        );
     }
 
     /// R500 (R102D2-01): a restore sign-in that is still running when the

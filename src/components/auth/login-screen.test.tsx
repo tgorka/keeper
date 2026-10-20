@@ -404,6 +404,16 @@ describe("LoginScreen", () => {
     expect(await screen.findByText(TIMED_OUT)).toBeInTheDocument();
   });
 
+  it("names the homeserver that did not answer (noAnswer)", async () => {
+    const sentence =
+      "Can't reach matrix.acme.dev:8448: it did not answer within 10 seconds. Check that this device is on a network (or VPN) that can reach it.";
+    loginOidc.mockRejectedValue({ ...ipcError("noAnswer"), message: sentence });
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(await screen.findByText(sentence)).toBeInTheDocument();
+  });
+
   it("shows the failed message for oauthFailed", async () => {
     loginOidc.mockRejectedValue(ipcError("oauthFailed"));
     render(<LoginScreen />);

@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use matrix_sdk::authentication::oauth::registration::{
     ApplicationType, ClientMetadata, Localized, OAuthGrantType,
@@ -38,6 +39,38 @@ const CLIENT_URI: &str = "https://keeper.tgorka.dev/";
 
 /// Human-readable client name presented to the user on the consent screen.
 const CLIENT_NAME: &str = "keeper";
+
+/// How long a sign-in waits for its server to answer before any browser
+/// opens: discovery, and for Matrix the homeserver probe. A server behind a
+/// network that drops keeper's packets (a tailnet ACL without a grant, a VPN
+/// that is off) never refuses the connection, and without this budget the
+/// sign-in waited out the five-minute browser timeout saying nothing.
+pub const REACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `host[:port]` a sign-in reaches for `raw` — the port only when the
+/// address names one — or `raw` itself when it is not a URL (a bare Matrix
+/// server name).
+pub fn address_of(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_owned(),
+            _ => raw.to_owned(),
+        },
+        Err(_) => raw.trim().to_owned(),
+    }
+}
+
+/// What a person reads when `address` did not answer within
+/// [`REACH_TIMEOUT`]: which server, and that the network between is the
+/// likely cause.
+pub fn no_answer(address: &str) -> String {
+    format!(
+        "Can't reach {address}: it did not answer within {} seconds. \
+         Check that this device is on a network (or VPN) that can reach it.",
+        REACH_TIMEOUT.as_secs()
+    )
+}
 
 /// The outcome of an in-flight OIDC flow, delivered over its one-shot channel.
 ///
@@ -599,6 +632,27 @@ mod tests {
         assert_eq!(
             json.get("client_name").and_then(|v| v.as_str()),
             Some(CLIENT_NAME)
+        );
+    }
+
+    #[test]
+    fn the_address_names_the_host_and_the_port_it_names() {
+        assert_eq!(
+            address_of("https://electra.siren-alsephina.ts.net:8451"),
+            "electra.siren-alsephina.ts.net:8451"
+        );
+        assert_eq!(address_of("https://id.acme.dev/realms/x"), "id.acme.dev");
+        assert_eq!(address_of("http://127.0.0.1:8008/"), "127.0.0.1:8008");
+        // A bare Matrix server name is not a URL: named as typed.
+        assert_eq!(address_of(" matrix.acme.dev "), "matrix.acme.dev");
+    }
+
+    #[test]
+    fn a_server_that_does_not_answer_is_named_with_its_port() {
+        assert_eq!(
+            no_answer("electra.siren-alsephina.ts.net:8451"),
+            "Can't reach electra.siren-alsephina.ts.net:8451: it did not answer within 10 \
+             seconds. Check that this device is on a network (or VPN) that can reach it."
         );
     }
 }

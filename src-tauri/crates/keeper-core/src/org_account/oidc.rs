@@ -56,7 +56,7 @@ use super::session::{
     StoredSession,
 };
 use super::{claims, AccountError};
-use crate::oauth::{OAuthCallback, OAuthFlowRegistry};
+use crate::oauth::{address_of, no_answer, OAuthCallback, OAuthFlowRegistry, REACH_TIMEOUT};
 use crate::platform::Platform;
 
 /// How long a sign-in waits for the browser to come back.
@@ -186,11 +186,15 @@ fn bad_url(what: &str, host: &str) -> AccountError {
     AccountError::Refused(format!("{host} published an unusable {what} address."))
 }
 
-fn discovery_error<E: std::error::Error>(host: &str, error: DiscoveryError<E>) -> AccountError {
+/// `address` is the `host[:port]` the request went to, which a person needs
+/// when the port is what a network rule blocks; `host` names the provider.
+fn discovery_error<E: std::error::Error>(
+    host: &str,
+    address: &str,
+    error: DiscoveryError<E>,
+) -> AccountError {
     match error {
-        DiscoveryError::Request(_) => {
-            AccountError::Unreachable(format!("keeper could not reach {host}."))
-        }
+        DiscoveryError::Request(_) => AccountError::Unreachable(format!("Can't reach {address}.")),
         // A server having a bad minute is not a policy answer: "Blocked"
         // would tell the person to call an administrator about a 503.
         DiscoveryError::Response(status, ..) if status.is_server_error() => {
@@ -264,7 +268,7 @@ async fn fetch_jwks(
 ) -> Result<CoreJsonWebKeySet, AccountError> {
     let jwks = CoreJsonWebKeySet::fetch_async(url, http)
         .await
-        .map_err(|e| discovery_error(host, e))?;
+        .map_err(|e| discovery_error(host, &address_of(url.as_str()), e))?;
     require_asymmetric(host, jwks)
 }
 
@@ -281,7 +285,7 @@ async fn discover(
     let issuer_url = IssuerUrl::new(issuer.to_owned()).map_err(|_| bad_url("issuer", &host))?;
     let metadata = Metadata::discover_async(issuer_url.clone(), http)
         .await
-        .map_err(|e| discovery_error(&host, e))?;
+        .map_err(|e| discovery_error(&host, &address_of(issuer), e))?;
 
     let algs: Vec<CoreJwsSigningAlgorithm> = metadata
         .id_token_signing_alg_values_supported()
@@ -366,6 +370,25 @@ async fn discover(
             end_session_url,
         }),
     })
+}
+
+/// `work` — discovery, everything a sign-in asks before the browser opens —
+/// within [`REACH_TIMEOUT`], or the sentence naming `address`. A provider
+/// behind a network that drops the packets never refuses the connection, and
+/// the sign-in would otherwise sit silent until the browser's own timeout.
+/// It ends before the flow is registered, so no link is ever shown for it.
+/// Only the interactive legs are bounded: a background refresh keeps the
+/// HTTP client's own timeouts and its quiet offline status.
+async fn within_reach<T>(
+    address: &str,
+    work: impl Future<Output = Result<T, AccountError>>,
+) -> Result<T, AccountError> {
+    tokio::time::timeout(REACH_TIMEOUT, work)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(%address, "the sign-in server did not answer in time");
+            Err(AccountError::NoAnswer(no_answer(address)))
+        })
 }
 
 async fn account_provider(
@@ -942,7 +965,11 @@ async fn sign_in_within(
     wait: Duration,
 ) -> Result<Identity, AccountError> {
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = account_provider(&oauth_http, d).await?;
+    let mut provider = within_reach(
+        &address_of(&d.auth.issuer),
+        account_provider(&oauth_http, d),
+    )
+    .await?;
     let scopes: Vec<String> = d
         .auth
         .scopes
@@ -1100,7 +1127,14 @@ async fn forge_connect_within(
         AccountError::Internal("the repository has no forge redirect address".to_owned())
     })?;
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = forge_provider(&oauth_http, forge).await?;
+    let forge_address = address_of(
+        forge
+            .issuer
+            .as_deref()
+            .or(forge.authorize_url.as_deref())
+            .unwrap_or_default(),
+    );
+    let mut provider = within_reach(&forge_address, forge_provider(&oauth_http, forge)).await?;
     let leg = ForgeLeg {
         platform,
         flows,
@@ -1942,6 +1976,10 @@ mod tests {
     }
 
     fn start_fake(behaviour: Behaviour) -> Fake {
+        // The key is generated here, not inside the first discovery: an
+        // unoptimised RSA generation on a loaded machine can outlast the
+        // sign-in's reach budget (`REACH_TIMEOUT`).
+        std::sync::LazyLock::force(&TEST_KEY);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
         let issuer = format!("http://{}", listener.local_addr().expect("addr"));
         let seen = Arc::new(Mutex::new(Seen::default()));
@@ -3589,6 +3627,86 @@ mod tests {
             access_token(&p, &http(), &d).await.expect("refreshed"),
             "access-2"
         );
+    }
+
+    /// A provider behind a network that drops the packets (a tailnet ACL
+    /// without a grant) accepts nothing and refuses nothing. The sign-in
+    /// stops at `REACH_TIMEOUT` with a sentence naming the host and port,
+    /// not at the browser's five-minute timeout with none — before the flow
+    /// exists, so no browser opens and no link is shown. Paused time: the
+    /// provider never answers, so the budget is all that ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_that_never_answers_is_named_with_its_port_before_any_browser() {
+        // Accepts the connection (the kernel does) and never answers.
+        let silent = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = silent.local_addr().expect("addr");
+        let fake = Fake {
+            issuer: format!("http://{address}"),
+            seen: Arc::default(),
+        };
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = account(&fake, "acme", None);
+
+        // Bounded well past the budget: without it the sign-in would wait out
+        // the browser's timeout.
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            sign_in_within(&p, &p.flows, &http(), &d, FLOW_TIMEOUT),
+        )
+        .await
+        .expect("the sign-in ended on its own budget")
+        .expect_err("nobody answered");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Can't reach {address}: it did not answer within 10 seconds. \
+                 Check that this device is on a network (or VPN) that can reach it."
+            )
+        );
+        assert!(matches!(error, AccountError::NoAnswer(_)), "{error:?}");
+        assert!(
+            p.shown.lock().expect("shown").is_empty(),
+            "no browser opened"
+        );
+        assert!(p.links.lock().expect("links").is_empty(), "no link shown");
+        drop(silent);
+    }
+
+    /// The repository's forge leg has the same budget when its forge names
+    /// an issuer to discover: the sentence names the forge's host and port.
+    #[tokio::test(start_paused = true)]
+    async fn a_forge_that_never_answers_is_named_with_its_port_before_any_browser() {
+        let silent = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = silent.local_addr().expect("addr");
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let i = &fake.issuer;
+        let d = descriptor::parse_json(&format!(
+            r#"{{"version":1,"id":"forge","name":"Acme",
+                "auth":{{"issuer":"{i}","client_id":"{CLIENT_ID}"}},
+                "config":{{"url":"{i}/c.git","api_base":"{i}/api/v1",
+                  "auth":{{"mode":"oauth","client_id":"forge-client","scope":"{FORGE_SCOPE}",
+                           "issuer":"http://{address}"}}}}}}"#
+        ))
+        .expect("a valid oauth-mode descriptor");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT),
+        )
+        .await
+        .expect("the connection ended on its own budget")
+        .expect_err("nobody answered");
+
+        assert!(matches!(error, AccountError::NoAnswer(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            crate::oauth::no_answer(&address.to_string())
+        );
+        assert!(p.shown.lock().expect("shown").is_empty());
+        assert!(p.links.lock().expect("links").is_empty());
+        drop(silent);
     }
 
     #[tokio::test]

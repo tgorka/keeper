@@ -824,6 +824,7 @@ pub(crate) fn account_ipc_error(error: AccountError) -> IpcError {
     let (code, retriable) = match &error {
         AccountError::NeedsSignIn(_) => (IpcErrorCode::OauthFailed, true),
         AccountError::Unreachable(_) => (IpcErrorCode::ServerUnreachable, true),
+        AccountError::NoAnswer(_) => (IpcErrorCode::NoAnswer, true),
         AccountError::Refused(_) | AccountError::Denied { .. } => (IpcErrorCode::Internal, false),
         AccountError::Cancelled => (IpcErrorCode::OauthCancelled, true),
         AccountError::TimedOut => (IpcErrorCode::OauthTimedOut, true),

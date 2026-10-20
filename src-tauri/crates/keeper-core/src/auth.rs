@@ -33,7 +33,10 @@ use matrix_sdk::Client;
 use ulid::Ulid;
 
 use crate::error::{AuthError, CoreError};
-use crate::oauth::{registration_data, CancelLatch, OAuthCallback, OAuthFlowRegistry};
+use crate::oauth::{
+    address_of, no_answer, registration_data, CancelLatch, OAuthCallback, OAuthFlowRegistry,
+    REACH_TIMEOUT,
+};
 use crate::platform::Platform;
 use crate::registry;
 use crate::vm::{AccountVm, Provider};
@@ -172,29 +175,50 @@ impl AuthProvider for OidcAuthProvider {
 
         // Discovery and dynamic registration are network work before the flow
         // has a registry entry; a Cancel meanwhile ends them here (R500).
+        // matrix-sdk retries a request that got no answer indefinitely, so
+        // each is bounded by `REACH_TIMEOUT` and the sentence names the server
+        // that did not answer. Both end before the flow is registered, so a
+        // server that does not answer never leaves a link behind.
         let prepared = async {
             // Discover the authorization server; a not-supported response means
             // this homeserver does not offer OIDC (before any browser work).
-            oauth.server_metadata().await.map_err(|e| {
-                if e.is_not_supported() {
-                    CoreError::Auth(AuthError::OAuthUnsupported)
-                } else {
-                    CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
-                }
-            })?;
+            let address = address_of(client.homeserver().as_str());
+            let metadata = tokio::time::timeout(REACH_TIMEOUT, oauth.server_metadata())
+                .await
+                .map_err(|_| CoreError::Auth(AuthError::NoAnswer(no_answer(&address))))?
+                .map_err(|e| {
+                    if e.is_not_supported() {
+                        CoreError::Auth(AuthError::OAuthUnsupported)
+                    } else {
+                        CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
+                    }
+                })?;
 
             // Build the authorization URL (registers the client dynamically and
-            // stashes PKCE/state in the in-memory oauth handle).
-            oauth
-                .login(
-                    crate::oauth::redirect_uri()?,
-                    None,
-                    Some(registration_data()?),
-                    None,
-                )
-                .build()
-                .await
-                .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))
+            // stashes PKCE/state in the in-memory oauth handle). Registration
+            // goes to the authorization server, often another host and port
+            // than the homeserver's (MAS), so its budget names that server.
+            let registrar = address_of(
+                metadata
+                    .registration_endpoint
+                    .as_ref()
+                    .unwrap_or(&metadata.issuer)
+                    .as_str(),
+            );
+            tokio::time::timeout(
+                REACH_TIMEOUT,
+                oauth
+                    .login(
+                        crate::oauth::redirect_uri()?,
+                        None,
+                        Some(registration_data()?),
+                        None,
+                    )
+                    .build(),
+            )
+            .await
+            .map_err(|_| CoreError::Auth(AuthError::NoAnswer(no_answer(&registrar))))?
+            .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))
         };
         let data = tokio::select! {
             biased;
@@ -602,19 +626,13 @@ pub async fn login_oidc(
     add_account(platform, homeserver, &provider).await
 }
 
-/// Shared add-account orchestration used by every [`AuthProvider`] mechanism
-/// (AD-17). The strict ordering: store-less SSS capability gate (Phase A) →
-/// persistent store dir → `provider.authenticate` → Keychain session → registry
-/// row with a freshly assigned hue index (Phase B), rolling back the store dir
-/// and Keychain entry on any Phase-B failure so a rejected/unreachable server
-/// leaves zero residue. Never enforces an account-count limit, so the Nth add
-/// is identical to the 2nd.
-pub async fn add_account<P: AuthProvider>(
-    platform: &dyn Platform,
+/// The store-less probe of [`add_account`]'s Phase A: resolve `homeserver`
+/// (`.well-known`) and read its `/versions`, persisting nothing. Returns the
+/// resolved homeserver URL, reused so discovery runs exactly once, and what
+/// it supports.
+async fn probe_homeserver(
     homeserver: &str,
-    provider: &P,
-) -> Result<AccountVm, CoreError> {
-    // --- Phase A: store-less SSS probe (NOTHING persisted) --------------------
+) -> Result<(url::Url, matrix_sdk::ruma::api::SupportedVersions), AuthError> {
     // Default in-memory store (no `.sqlite_store`), so a non-SSS or unreachable
     // server leaves zero state on disk.
     let probe = Client::builder()
@@ -634,6 +652,29 @@ pub async fn add_account<P: AuthProvider>(
         .supported_versions()
         .await
         .map_err(|e| AuthError::ServerUnreachable(e.to_string()))?;
+    Ok((probe.homeserver(), supported))
+}
+
+/// Shared add-account orchestration used by every [`AuthProvider`] mechanism
+/// (AD-17). The strict ordering: store-less SSS capability gate (Phase A) →
+/// persistent store dir → `provider.authenticate` → Keychain session → registry
+/// row with a freshly assigned hue index (Phase B), rolling back the store dir
+/// and Keychain entry on any Phase-B failure so a rejected/unreachable server
+/// leaves zero residue. Never enforces an account-count limit, so the Nth add
+/// is identical to the 2nd.
+pub async fn add_account<P: AuthProvider>(
+    platform: &dyn Platform,
+    homeserver: &str,
+    provider: &P,
+) -> Result<AccountVm, CoreError> {
+    // --- Phase A: store-less SSS probe (NOTHING persisted) --------------------
+    // matrix-sdk retries a request that got no answer indefinitely, so a
+    // homeserver behind a network that drops the packets would hang the add
+    // with no word: the probe gets `REACH_TIMEOUT`, and the sentence names
+    // the server.
+    let (resolved, supported) = tokio::time::timeout(REACH_TIMEOUT, probe_homeserver(homeserver))
+        .await
+        .map_err(|_| AuthError::NoAnswer(no_answer(&address_of(homeserver))))??;
     if !supported.features.contains(&FeatureFlag::Msc4186) {
         tracing::info!(sss_supported = false, "SSS probe: homeserver lacks MSC4186");
         return Err(AuthError::SlidingSyncUnsupported.into());
@@ -642,10 +683,6 @@ pub async fn add_account<P: AuthProvider>(
         sss_supported = true,
         "SSS probe: homeserver supports MSC4186"
     );
-
-    // Reuse the discovered homeserver URL so discovery runs exactly once.
-    let resolved = probe.homeserver();
-    drop(probe);
 
     // --- Phase B: persistent account (rollback on any failure below) ---------
     let account_id = Ulid::new().to_string();
@@ -1910,6 +1947,87 @@ mod tests {
             "the cancelled account's store is rolled back"
         );
         assert!(platform.keychain.lock().expect("keychain").is_empty());
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    /// A homeserver behind a network that drops the packets accepts nothing
+    /// and refuses nothing; matrix-sdk would retry it forever. The add stops
+    /// at `REACH_TIMEOUT` with the host and port named. Paused time: nothing
+    /// answers, so the budget is all that ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_homeserver_that_never_answers_is_named_with_its_port() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = silent.local_addr().expect("addr");
+        let platform = FakePlatform::new(temp_dir("no-answer"));
+
+        // Bounded well past the budget: without it the add would never end.
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            login_password(&platform, &format!("http://{address}"), "alice", "pw"),
+        )
+        .await
+        .expect("the add ended on its own budget")
+        .expect_err("nobody answered");
+
+        match error {
+            CoreError::Auth(AuthError::NoAnswer(sentence)) => assert_eq!(
+                sentence,
+                format!(
+                    "Can't reach {address}: it did not answer within 10 seconds. \
+                     Check that this device is on a network (or VPN) that can reach it."
+                )
+            ),
+            other => panic!("expected NoAnswer, got {other:?}"),
+        }
+        drop(silent);
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    /// The homeserver answers its probe, but its authorization-server
+    /// discovery never does. The single sign-on stops at `REACH_TIMEOUT`
+    /// naming the homeserver's port — before the flow is registered, so no
+    /// browser opens and no link is ever shown (a sign-in that cannot start
+    /// has no page to finish by hand), and the account rolls back. Time is
+    /// paused once the discovery is held: the budget is all that ends it.
+    #[tokio::test]
+    async fn a_sign_in_whose_discovery_never_answers_is_named_and_shows_no_link() {
+        use crate::sign_in_link::{ShowsSignInLink, SignInLinkVm};
+
+        let HeldDiscovery {
+            url,
+            asked,
+            release,
+        } = held_discovery();
+        let platform = FakePlatform::new(temp_dir("discovery-no-answer"));
+        let flows = Arc::new(OAuthFlowRegistry::new());
+        let shown = Mutex::new(Vec::<(u64, Option<SignInLinkVm>)>::new());
+        let shows = ShowsSignInLink::new(&platform, |flow: u64, link: Option<&SignInLinkVm>| {
+            shown.lock().expect("shown").push((flow, link.cloned()));
+        });
+
+        let sign_in = tokio::time::timeout(
+            Duration::from_secs(60),
+            login_oidc(&shows, &url, Arc::clone(&flows), flows.cancel_latch()),
+        );
+        let hold = async {
+            asked.await.expect("discovery was asked");
+            tokio::time::pause();
+        };
+        let (result, ()) = tokio::join!(sign_in, hold);
+        let result = result.expect("the sign-in ended on its own budget");
+
+        let address = address_of(&url);
+        match result {
+            Err(CoreError::Auth(AuthError::NoAnswer(sentence))) => {
+                assert_eq!(sentence, no_answer(&address));
+                assert!(sentence.contains(&address), "{sentence}");
+            }
+            other => panic!("expected NoAnswer, got {other:?}"),
+        }
+        assert!(platform.opened.lock().expect("opened").is_empty());
+        assert!(shown.lock().expect("shown").is_empty(), "no link exists");
+        assert!(platform.keychain.lock().expect("keychain").is_empty());
+        drop(release);
         let _ = std::fs::remove_dir_all(&platform.data_dir);
     }
 }

@@ -46,8 +46,12 @@ const BEEPER_FAILURE = "Beeper login unavailable — this is an unofficial API a
  * would otherwise reach the backend as an opaque error). */
 type FormErrorCode = IpcErrorCode | "missingFields";
 
-/** Friendly, sentence-case copy per error code (no error codes shown). */
-function errorCopy(code: FormErrorCode): string {
+/**
+ * Friendly, sentence-case copy per error code (no error codes shown). `detail`
+ * is the backend's message, used only where it is a sentence written for the
+ * person (`noAnswer` names the server that did not answer).
+ */
+function errorCopy(code: FormErrorCode, detail: string | null): string {
   switch (code) {
     case "missingFields":
       return "Enter your homeserver, username, and password.";
@@ -57,6 +61,8 @@ function errorCopy(code: FormErrorCode): string {
       return "Wrong username or password.";
     case "serverUnreachable":
       return "Couldn't reach that homeserver. Check the address and your connection.";
+    case "noAnswer":
+      return detail ?? "That homeserver didn't answer. Check the address and your connection.";
     case "unsupportedLoginType":
       return "This homeserver doesn't support password login.";
     case "oauthUnsupported":
@@ -261,6 +267,8 @@ function PasswordTab({
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [errorCode, setErrorCode] = useState<FormErrorCode | null>(null);
+  // The backend's message beside `errorCode`, for the codes whose message is a sentence.
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   // `true` while an OIDC flow is pending (the browser round-trip). The form is
   // replaced with a "complete sign-in in your browser" state + Cancel.
@@ -344,6 +352,7 @@ function PasswordTab({
     } catch (err) {
       logFailure("login.password")(err);
       setErrorCode(isIpcError(err) ? err.code : "internal");
+      setErrorDetail(isIpcError(err) ? err.message : null);
     } finally {
       setSubmitting(false);
     }
@@ -380,6 +389,7 @@ function PasswordTab({
       } else {
         logFailure("login.oidc")(err);
         setErrorCode(isIpcError(err) ? err.code : "internal");
+        setErrorDetail(isIpcError(err) ? err.message : null);
       }
     } finally {
       // Settled: the link is spent, and anything still in flight for this
@@ -461,7 +471,7 @@ function PasswordTab({
         <Alert variant="destructive" className="bg-destructive/10">
           <AlertTitle>Couldn't sign in</AlertTitle>
           <AlertDescription>
-            {errorCopy(errorCode)}
+            {errorCopy(errorCode, errorDetail)}
             {errorCode === "slidingSyncUnsupported" && (
               <>
                 {" "}
