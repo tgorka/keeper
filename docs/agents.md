@@ -172,12 +172,18 @@ Only the session's owner changes who is in it:
   their membership is deleted, and their devices drop the session and its rows, keeping only their
   own writes still waiting to be sent.
 
-A server change whose answer never arrives (the connection dropped after the server acted) is
-not lost: the sheet says keeper did not hear back, the database syncs at once, and asking again
-about the same member asks under the same request id, which the server answers from its record
-(`cached`) instead of acting twice — so a removal repeated after the person was invited again
-does not remove their new membership. Once the device has seen them invited again, Remove is a
-new removal. Refusals are matched by the server's stable codes (`hq.remove_member.*`,
+A server change whose answer never arrives (the connection dropped after the server acted) — or
+arrives and cannot be read — is not lost: keeper keeps the request until the server's own answer
+(applied, replayed or refused) settles it. The sheet says keeper did not hear back (or could not
+read the answer, which also says something must change before asking again — keeper never asks
+again by itself), the database syncs at once, and asking again about the same membership asks
+under the same request id, which the server answers from its record (`cached`) instead of acting
+twice — so a removal repeated after the person was invited again on the server does not remove
+their new membership. The membership is told by the fields fixed when it was made
+(`added_at_ms`, `added_by_actor`, `role`, which no write changes): a read point or a reader flag
+landing meanwhile is the same membership and keeps the request. Once the device has seen them
+invited again (a new membership, stamped anew), Remove is a new removal. Refusals are matched by
+the server's stable codes (`hq.remove_member.*`,
 `hq.v3.owner_only`, `hq.v11.invite_outside_directory`, `hq.v3.owner_cannot_leave`,
 `hq.v8.not_reader`); any other is shown as the server said it.
 

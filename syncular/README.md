@@ -273,7 +273,11 @@ A refusal answers `kind: "error"` with `code: "operation.forbidden"`. Params tha
 
 A command sent again under a `requestId` the server already applied is answered from its record:
 `status: "cached"` with the first answer's `results` and `commitSeq`, never a second commit. A
-client whose answer was lost asks again under the same `requestId` and treats `cached` as success.
+client whose answer was lost — or arrived unreadable, which says nothing about whether the
+command ran — asks again under the same `requestId` and treats `cached` as success; only an
+answer it can read (applied, cached, rejected, or an `error`) settles the request. keeper asks
+again under the same id only about the same membership: one whose `added_at_ms`,
+`added_by_actor` and `role` (immutable, V4) are unchanged.
 
 ## The live check
 
