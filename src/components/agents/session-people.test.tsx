@@ -191,6 +191,24 @@ describe("the People sheet", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
+  it("offers the owner no Leave at all, and shows the server's refusal of one", async () => {
+    // R-HQ-40: an owner cannot leave. A leave this device wrote as a member and the
+    // server refused anyway comes back in Rust's notice.
+    const dialog = await openWith(ownerSheet());
+    expect(within(dialog).queryByRole("button", { name: "Leave session" })).toBeNull();
+    act(() =>
+      mock.push?.(
+        ownerSheet({
+          notice: "The server refused your leaving: the session's owner cannot leave it.",
+        }),
+      ),
+    );
+    expect(within(dialog).getByRole("status")).toHaveTextContent(
+      "The server refused your leaving: the session's owner cannot leave it.",
+    );
+    expect(within(dialog).queryByRole("button", { name: "Leave session" })).toBeNull();
+  });
+
   it("returns focus to the People button when closed, and ends its stream", async () => {
     const dialog = await openWith(ownerSheet());
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
@@ -230,5 +248,18 @@ describe("a session that leaves the list", () => {
       selected: { database: "alpha", sessionId: "new.1" },
       gone: null,
     });
+  });
+
+  it("drops the note when a refused leave brings the session back", () => {
+    const store = agentSessionsStore.getState();
+    store.apply({ ops: [{ op: "reset", rows: [row("s.1"), row("s.2")] }], total: 2 });
+    store.select({ database: "alpha", sessionId: "s.1" });
+    store.apply({ ops: [{ op: "remove", index: 0 }], total: 1 });
+    expect(agentSessionsStore.getState().gone).toMatchObject({ sessionId: "s.1" });
+    // Another session changing keeps the note.
+    store.apply({ ops: [{ op: "set", index: 0, row: row("s.2") }], total: 1 });
+    expect(agentSessionsStore.getState().gone).toMatchObject({ sessionId: "s.1" });
+    store.apply({ ops: [{ op: "insert", index: 0, row: row("s.1") }], total: 2 });
+    expect(agentSessionsStore.getState().gone).toBeNull();
   });
 });

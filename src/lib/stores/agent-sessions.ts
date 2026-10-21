@@ -69,6 +69,14 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
           gone: { database: dropped.database, sessionId: dropped.sessionId, title: dropped.title },
         };
       }
+      // A refused leave (R-HQ-40) brings the session back: the note would no longer be true.
+      const { gone } = state;
+      if (
+        gone &&
+        rows.some((row) => row.database === gone.database && row.sessionId === gone.sessionId)
+      ) {
+        return { rows, loaded: true, error: null, gone: null };
+      }
       return { rows, loaded: true, error: null };
     }),
   select: (selected) => set({ selected, gone: null, newSession: null }),
