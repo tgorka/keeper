@@ -215,7 +215,8 @@ commit.
    names. Someone who left or was removed comes back only when the owner invites them again;
    staying in an `invite` they were already in does not bring them back. Another member's row is
    deleted only by the owner, through `remove_member`. A member leaves by deleting its own row, and
-   the server then takes it out of `invite`. `reads_trace` is turned on for a person only by the
+   the server then takes it out of `invite`; the owner's own row is not deleted
+   (`hq.v3.owner_cannot_leave`). `reads_trace` is turned on for a person only by the
    session's owner. A member may change only its own `read_until`.
 5. **V5 — page keys.** As *Page keys* above.
 6. **V6 — one writer per answer.** `turn_chunks`, `reasoning`, `tool_calls`, agent `messages`, new

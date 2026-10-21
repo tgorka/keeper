@@ -169,8 +169,12 @@ Only the session's owner changes who is in it:
 
 A member who is not the owner sees the same list without those controls and may **Leave
 session**, which deletes their own membership; the server then takes them out of the invite. The
-owner cannot leave, since nobody else could change who is in the session. If the session open on a
-device leaves its list — the person left or was removed — the window closes it and says so.
+owner has no Leave, since nobody else could change who is in the session and 106.4 has no
+transfer of ownership; the server refuses an owner's leave as well (`hq.v3.owner_cannot_leave`,
+R-HQ-40). If a device that held its person as a member leaves anyway and the server refuses, the
+session comes back and its sheet says the server refused the leave. If the session open on a
+device leaves its list — the person left or was removed — the window closes it and says so, and
+drops that note if the session comes back.
 
 Development fixtures: `?sessions=launch&people=member|refused|offline|long`, with
 `&platform=phone` for the phone shell.
