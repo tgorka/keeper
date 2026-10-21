@@ -35,7 +35,7 @@ default session.
 
 **Earlier conversations** preserves earlier Matrix agent history as read-only. The former dock's
 Matrix note-focus and drive-scope controls are not sent to database agents: those carriers were
-not migrated by this story. Instance selection belongs to the subsequent story; message and
+not migrated by this story. Instance selection is **Answers from** (below); message and
 attention state remain Rust-owned throughout.
 
 Browser checks use the development mock shell (`?sessions=launch`, optionally
@@ -259,6 +259,46 @@ had grown to 954 px (the sheet's scroll area 550–555 px wider than the sheet) 
 1280 px a 383 px confirmation in the 416 px side sheet, at 420 px 388 px in the bottom sheet,
 neither scrolling sideways, its destructive control reading *Remove* with the person's whole name
 as its accessible name, both controls 44 px tall and at least 64 px wide.
+
+## Which instance answers
+
+An agent is one actor and can run as several instances — `nixie@electra` on the server and
+`nixie@hesperia` on a laptop are two clients of Nixie, sharing her sessions and memory through the
+server. **Settings › Agents & bots › Answers from** lists, per agent, its instances from the
+directory of each database you share with it (their `clients` rows, and the name, description and
+definition hash of their `agent_profiles` rows), each marked **Online**, **Offline** or
+**Not known here**. Online is the instance's presence on `dir:<database>`, which this device
+receives over its own socket; while that database does not sync on this device nobody here can
+tell, so it says **Not known here** rather than offline.
+
+Choose the instance that answers your new sessions; the others answer, in the order shown, while
+it is offline (**Ask … earlier** / **later** reorders them). The choice is an `instance_prefs` row
+(default instance and ordered fallback) in your own `actor` scope — never a setting of this device
+— so every device of yours follows it after one sync. A row cannot cross databases (AD-433), so
+keeper writes the same row into each database this device holds that you share with the agent. A
+choice made on a device that holds only one of them reaches only that one (DW-E106-7); the section
+then shows the newest row and says how the databases differ, and choosing again on a device that
+holds both writes the same choice into each. `agents.default` keeps its meaning: which agent keeper
+opens at launch, not which of its instances answers.
+
+The instances route by the row themselves (keeper-hq's `routing`): for a session nobody holds, the
+first instance of the order whose presence is online claims it, and with no row any online instance
+may. keeper records no instance on the session (`preferred_client` stays empty) and never pings an
+instance. An open session stays with the instance holding its claim; another takes it over only
+after the holder's lease lapses.
+
+An instance whose definition hash differs from its siblings' is marked **Different definition**,
+with the start of its hash: with a majority hash, the instances that differ from it; with no
+majority, every instance, since each differs from the others.
+
+The open session's header names the instance answering — the claim holder — and each instance's
+state, from the session's own database alone: **nixie@electra is answering.**; a holder whose
+presence is gone is still named, offline, until another takes the session over once the lease runs
+out; a session nobody holds names the instance that takes it next by your order, or says it waits
+when none of them is online.
+
+Development fixtures: `?sessions=launch&instances=two|offline|disagree|stale|refused|long`, with
+`&platform=phone` for the phone shell.
 
 ## Earlier Matrix agent hosting
 
