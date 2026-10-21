@@ -39,8 +39,7 @@ pub mod voice_target;
 
 pub use keeper_llm::{chat, error, http, quirks, sse, url};
 pub use keeper_llm::{
-    parse_base_url, parse_bot_target, BaseUrl, BaseUrlError, BotTargetError, Endpoint, Provider,
-    ProviderKind,
+    parse_base_url, parse_bot_target, BaseUrl, BaseUrlError, BotTargetError, Endpoint, ProviderKind,
 };
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +47,47 @@ use ts_rs::TS;
 
 use crate::error::CoreError;
 use crate::platform::Platform;
+
+/// A configured provider: one endpoint, one credential, side by side with
+/// others of the same kind (Story 61.1, FR-369).
+///
+/// The multi-tenant shape is `SyncProfile`'s, which is the tree's only
+/// precedent for "several endpoints of the same kind, each with its own
+/// credential" (research §8.1) — so two Ollama servers, or a work Hermes and a
+/// home Hermes, are two rows and never a mode switch.
+///
+/// **No credential and no health here.** The token lives behind the secret port
+/// ([`provider_token_key`]); the health snapshot is a mutable observation about
+/// this row rather than part of its identity, so it is read alongside it as
+/// [`store::ProviderRow`]. What remains is exactly what the user typed and
+/// cannot be re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provider {
+    /// Opaque ULID, minted once. The credential's keychain key and every bot's
+    /// `provider_id` are built from it, so it must survive a rename of anything
+    /// user-visible.
+    pub id: String,
+    /// Which back end this is.
+    pub kind: ProviderKind,
+    /// The user's display name. Free text — it names the tenant ("work
+    /// Hermes"), not the endpoint.
+    pub name: String,
+    /// The normalized base URL ([`BaseUrl::normalized`]), never the raw typed
+    /// string: the store holds only URLs that passed the grammar.
+    pub base_url: String,
+    /// When the row was written, `i64` ms since the Unix epoch (UTC).
+    pub created_ms: i64,
+}
+
+impl Provider {
+    /// The endpoint this provider is reached at, optionally addressing `bot`,
+    /// with the `token` the caller read from the secret port. The model client
+    /// reads only the kind and the base URL; the registry's identity, name and
+    /// age stay here.
+    pub fn endpoint(&self, bot: Option<&str>, token: Option<String>) -> Endpoint {
+        Endpoint::new(self.kind, &self.base_url, bot, token)
+    }
+}
 
 /// What keeper last learned about a provider by talking to it (Story 61.1).
 ///

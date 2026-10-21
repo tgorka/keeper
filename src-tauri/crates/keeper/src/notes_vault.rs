@@ -1238,7 +1238,7 @@ pub(crate) async fn embedding_endpoint(
     platform: &dyn Platform,
     provider: &str,
 ) -> Result<keeper_core::bots::Endpoint, String> {
-    use keeper_core::bots::{store, Endpoint};
+    use keeper_core::bots::store;
     let dir = platform
         .data_dir()
         .map_err(|_| "Could not read embedding settings.")?;
@@ -1248,7 +1248,7 @@ pub(crate) async fn embedding_endpoint(
     let token = crate::account_ipc::bot_credential(platform, provider, None)
         .await
         .map_err(|_| "Could not read the embedding provider credential.")?;
-    Ok(Endpoint::new(&row.provider, None, token))
+    Ok(row.provider.endpoint(None, token))
 }
 
 pub(crate) fn embedding_client() -> Result<&'static reqwest::Client, &'static str> {

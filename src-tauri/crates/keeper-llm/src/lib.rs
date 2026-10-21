@@ -82,38 +82,7 @@ impl ProviderKind {
     }
 }
 
-/// A configured provider: one endpoint, one credential, side by side with
-/// others of the same kind (Story 61.1, FR-369).
-///
-/// The multi-tenant shape is `SyncProfile`'s, which is the tree's only
-/// precedent for "several endpoints of the same kind, each with its own
-/// credential" (research §8.1) — so two Ollama servers, or a work Hermes and a
-/// home Hermes, are two rows and never a mode switch.
-///
-/// **No credential and no health here.** The token lives behind the secret port
-/// (`keeper_core::bots::provider_token_key`); the health snapshot is a mutable
-/// observation about this row rather than part of its identity, so it is read
-/// alongside it as `keeper_core::bots::store::ProviderRow`. What remains is
-/// exactly what the user typed and cannot be re-derived.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Provider {
-    /// Opaque ULID, minted once. The credential's keychain key and every bot's
-    /// `provider_id` are built from it, so it must survive a rename of anything
-    /// user-visible.
-    pub id: String,
-    /// Which back end this is.
-    pub kind: ProviderKind,
-    /// The user's display name. Free text — it names the tenant ("work
-    /// Hermes"), not the endpoint.
-    pub name: String,
-    /// The normalized base URL ([`BaseUrl::normalized`]), never the raw typed
-    /// string: the store holds only URLs that passed the grammar.
-    pub base_url: String,
-    /// When the row was written, `i64` ms since the Unix epoch (UTC).
-    pub created_ms: i64,
-}
-
-/// Everything one request needs, assembled from a [`Provider`], a chosen bot
+/// Everything one request needs: a provider's kind and base URL, a chosen bot
 /// and the provider's secret (Story 61.1).
 ///
 /// **Why this type exists at all.** The alternative is passing a base URL, a
@@ -144,18 +113,24 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Assemble an endpoint for `provider`, optionally addressing `bot`, with
-    /// the `token` the caller read from the secret port.
+    /// Assemble an endpoint of `kind` at `base_url` (normalized by the
+    /// grammar), optionally addressing `bot`, with the `token` the caller read
+    /// from the secret port.
     ///
     /// The token is a parameter rather than something read here because
     /// keeper reaches the OS only through its platform port (AD-24) and an
     /// `Endpoint` is built on the request path, where a keychain round trip
     /// per call would be a dialog per call on some platforms. The shell reads
     /// it once — see `keeper_core::bots::resolve_token` — and hands it in.
-    pub fn new(provider: &Provider, bot: Option<&str>, token: Option<String>) -> Self {
+    pub fn new(
+        kind: ProviderKind,
+        base_url: &str,
+        bot: Option<&str>,
+        token: Option<String>,
+    ) -> Self {
         Endpoint {
-            kind: provider.kind,
-            base_url: provider.base_url.clone(),
+            kind,
+            base_url: base_url.to_owned(),
             bot: bot.map(str::to_owned),
             token,
         }
@@ -203,23 +178,13 @@ impl Endpoint {
 mod tests {
     use super::*;
 
-    /// A provider fixture. `base_url` is what the grammar would have stored.
-    fn provider(kind: ProviderKind, base_url: &str) -> Provider {
-        Provider {
-            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-            kind,
-            name: "work".to_owned(),
-            base_url: base_url.to_owned(),
-            created_ms: 1_700_000_000_000,
-        }
-    }
-
     /// The `/p/{bot}` prefix is the whole of bot mode on the wire, so it is
     /// asserted on the exact route Story 61.3 probes a profile with.
     #[test]
     fn a_hermes_bot_is_addressed_by_the_profile_prefix() {
         let endpoint = Endpoint::new(
-            &provider(ProviderKind::Hermes, "http://127.0.0.1:8642"),
+            ProviderKind::Hermes,
+            "http://127.0.0.1:8642",
             Some("grokbot"),
             None,
         );
@@ -237,11 +202,7 @@ mod tests {
     /// profile — the prefix appears only when a bot does.
     #[test]
     fn a_hermes_endpoint_without_a_bot_has_no_prefix() {
-        let endpoint = Endpoint::new(
-            &provider(ProviderKind::Hermes, "http://127.0.0.1:8642"),
-            None,
-            None,
-        );
+        let endpoint = Endpoint::new(ProviderKind::Hermes, "http://127.0.0.1:8642", None, None);
         assert_eq!(
             endpoint.url("/v1/models"),
             "http://127.0.0.1:8642/v1/models"
@@ -253,7 +214,8 @@ mod tests {
     #[test]
     fn an_ollama_endpoint_ignores_the_bot_for_routing() {
         let endpoint = Endpoint::new(
-            &provider(ProviderKind::Ollama, "http://localhost:11434"),
+            ProviderKind::Ollama,
+            "http://localhost:11434",
             Some("llama3.1:8b"),
             None,
         );
@@ -275,18 +237,15 @@ mod tests {
     /// row restored from anywhere else.
     #[test]
     fn joining_never_doubles_or_drops_a_separator() {
-        let trailing = Endpoint::new(
-            &provider(ProviderKind::Ollama, "http://localhost:11434/"),
-            None,
-            None,
-        );
+        let trailing = Endpoint::new(ProviderKind::Ollama, "http://localhost:11434/", None, None);
         assert_eq!(
             trailing.url("/v1/models"),
             "http://localhost:11434/v1/models"
         );
 
         let prefixed = Endpoint::new(
-            &provider(ProviderKind::Ollama, "https://gw.example.org/ollama"),
+            ProviderKind::Ollama,
+            "https://gw.example.org/ollama",
             None,
             None,
         );
@@ -296,7 +255,8 @@ mod tests {
         );
 
         let prefixed_hermes = Endpoint::new(
-            &provider(ProviderKind::Hermes, "https://gw.example.org/hermes/"),
+            ProviderKind::Hermes,
+            "https://gw.example.org/hermes/",
             Some("grokbot"),
             None,
         );
