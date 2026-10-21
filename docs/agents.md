@@ -355,6 +355,16 @@ The instances' labels are their client ids here because the rig's registry names
 its id; the deployed registry names them `nixie@electra` and `nixie@hesperia`. The same with
 *nixie@hesperia*'s container on the Mac (105.3) and the installed apps is owed on the devices.
 
+After the 106.5 review the same case ran again on delectra against a clean `git archive` of
+keeper-hq `hq/106-3-tools` 6406b32, on the tree rebased onto 106.4's second review round. Both
+instances showed **Online** only once each device's presence ask had come back (4–37 ms after
+pairing). The choice showed on the phone 128 ms after the Mac wrote it, and the new sessions were
+taken in 0.5 s. With `nixie.hesperia` SIGKILLed it was **Offline** 108 ms later. The device named it
+as having held its sessions (**nixie.hesperia held this conversation; its lease ran out, so
+nixie.electra takes it over next.**) 29.4 s after the kill, before `nixie.electra` took them over at
+29.9–30.5 s. Nothing ever said a holder whose lease had run out was answering. The rest of the case
+held as before.
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history
