@@ -4647,33 +4647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keeper-agentd"
-version = "0.10.6"
-dependencies = [
- "axum",
- "chrono",
- "clap",
- "fs4",
- "image",
- "keeper-agent",
- "keeper-core",
- "keeper-ported",
- "keeper-sync",
- "matrix-sdk",
- "reqwest",
- "rmcp",
- "rustix",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml_edit 0.25.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "ulid 1.2.1",
-]
-
-[[package]]
 name = "keeper-core"
 version = "0.10.6"
 dependencies = [
