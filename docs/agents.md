@@ -275,7 +275,12 @@ replica asks — a leave on `dir:<database>` (taken silently while the key is re
 while not) and one on a key it never holds (always refused, after the first) — and only once that
 second refusal comes alone does it treat the presence it holds as complete
 (`ReplicaState::presence_known`, keeper-hq's `PresenceGate`). Until then, and again after every
-reconnect, the instances are **Not known here**.
+reconnect, the instances are **Not known here**. Nothing of an old socket reaches a new one: the
+socket's reader shares one queue with the next socket's, so whenever keeper lets a socket go —
+lost, unreachable, refused or closed — it joins that reader and then drops every frame it left
+queued, before a new socket starts. A join of an instance that stopped while that socket died is
+therefore never shown on the next socket, whose snapshot does not mention it (row changes dropped
+with it come back in the next round, from the cursor they never moved).
 
 Choose the instance that answers your new sessions; the others answer, in the order shown, while
 it is offline (**Ask … earlier** / **later** reorders them). One instance alone is a whole choice.
