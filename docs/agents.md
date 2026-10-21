@@ -269,17 +269,35 @@ directory of each database you share with it (their `clients` rows, and the name
 definition hash of their `agent_profiles` rows), each marked **Online**, **Offline** or
 **Not known here**. Online is the instance's presence on `dir:<database>`, which this device
 receives over its own socket; while that database does not sync on this device nobody here can
-tell, so it says **Not known here** rather than offline.
+tell, so it says **Not known here** rather than offline. A socket that has just connected is no
+answer either: the server sends the peers already on the key in the step that registers it, so the
+replica asks — a leave on `dir:<database>` (taken silently while the key is registered, refused
+while not) and one on a key it never holds (always refused, after the first) — and only once that
+second refusal comes alone does it treat the presence it holds as complete
+(`ReplicaState::presence_known`, keeper-hq's `PresenceGate`). Until then, and again after every
+reconnect, the instances are **Not known here**.
 
 Choose the instance that answers your new sessions; the others answer, in the order shown, while
-it is offline (**Ask … earlier** / **later** reorders them). The choice is an `instance_prefs` row
-(default instance and ordered fallback) in your own `actor` scope — never a setting of this device
-— so every device of yours follows it after one sync. A row cannot cross databases (AD-433), so
-keeper writes the same row into each database this device holds that you share with the agent. A
-choice made on a device that holds only one of them reaches only that one (DW-E106-7); the section
-then shows the newest row and says how the databases differ, and choosing again on a device that
-holds both writes the same choice into each. `agents.default` keeps its meaning: which agent keeper
-opens at launch, not which of its instances answers.
+it is offline (**Ask … earlier** / **later** reorders them). One instance alone is a whole choice.
+The choice is an `instance_prefs` row (default instance and ordered fallback) in your own `actor`
+scope — never a setting of this device — so every device of yours follows it after one sync. A row
+cannot cross databases (AD-433), so keeper writes a row into each database this device holds that
+you share with the agent: your order less the instances that database's directory does not list
+(R-HQ-43). No database ever receives a client id it does not list; one that lists none of the
+instances you chose gets no row change, and the section says so in that database's terms. The
+section shows one order — the rows written together last, merged back into one — and, whenever the
+databases' own orders differ, a write still waits or one was refused, each database's line: the
+order its row asks, **saved on this device, waiting to sync**, or the server's refusal. Above them
+it says where the choice is saved and where it waits (**Saved in tgdrive; waiting to sync to
+neuradrive.**), so a row that is the same here but not yet at its server is never shown as
+agreement. What waits is read from the replica's outbox and a refusal from its outcome journal —
+the replica file, scoped by server, person, database and row (`<person>/<agent>`) — so neither is
+lost when keeper quits, and another person's or server's never shows. A choice made on a device
+that holds only one of the databases reaches only that one (DW-E106-7); when a database's row is
+not the order shown, or a database refused it, **Apply this order to all databases** writes the
+order shown into each again without changing it, and a new write sets the earlier refusal aside.
+`agents.default` keeps its meaning: which agent keeper opens at launch, not which of its instances
+answers.
 
 The instances route by the row themselves (keeper-hq's `routing`): for a session nobody holds, the
 first instance of the order whose presence is online claims it, and with no row any online instance
@@ -295,10 +313,16 @@ The open session's header names the instance answering — the claim holder — 
 state, from the session's own database alone: **nixie@electra is answering.**; a holder whose
 presence is gone is still named, offline, until another takes the session over once the lease runs
 out; a session nobody holds names the instance that takes it next by your order, or says it waits
-when none of them is online.
+when none of them is online. A holder whose claim stopped renewing — its row unchanged a whole
+lease as this device watched it, or renewed more than two minutes ago by its own clock — is named
+as the one that **held this conversation; its lease ran out**, never as answering, with the
+instance that takes it over next (never the lapsed one) or that it waits. The header is drawn again
+when the lease would lapse, with no new row to wake it.
 
-Development fixtures: `?sessions=launch&instances=two|offline|disagree|stale|refused|long`, with
-`&platform=phone` for the phone shell.
+Development fixtures: `?sessions=launch&instances=two|offline|lapsed|disagree|stale|refused|long`,
+with `&platform=phone` for the phone shell. They keep the choice per agent and per database as Rust
+does: a write waits about 0.7 s for its server, `refused` has beta refuse it and keep its old row,
+`stale` adds an instance only alpha lists, and Researcher's single instance can be chosen.
 
 ### Measured: two instances against the real server
 
