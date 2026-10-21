@@ -196,10 +196,11 @@ Development fixtures: `?sessions=launch&people=member|refused|offline|long`, wit
 ### Measured: many people against the real server
 
 2026-10-21, `hq_live.rs`'s `many_people_in_one_session_by_the_owner_and_the_server` on delectra:
-the keeper-hq server from a `git archive` of `hq/106-4-members` 654ec57, and again of 7490af5 on
-this branch rebased onto 106.3's fix wave 9f7a93ba (Bun 1.2, over a throwaway
-Postgres 18), serving this branch's contract (schema 3) in place of the archive's own schema 2 —
-keeper-hq still pins schema 2, and a schema-3 client receives no rows from a schema-2 server. One
+the keeper-hq server from a `git archive` of `hq/106-4-members` 654ec57, again of 7490af5 on
+this branch rebased onto 106.3's fix wave 9f7a93ba, and of 941ccdc after the review (Bun 1.2,
+over a throwaway Postgres 18), serving this branch's contract (schema 3) in place of the archive's
+own schema 2 — keeper-hq still pins schema 2, and a schema-3 client receives no rows from a
+schema-2 server. One
 real `keeper-agentd` served Nixie on `tgdrive` and another Dixi on `neuradrive`, from the e2e model
 stub; tgorka owns the session, kuba belongs to `tgdrive` alone and marta to `neuradrive` alone.
 
@@ -212,11 +213,17 @@ stub; tgorka owns the session, kuba belongs to `tgdrive` alone and marta to `neu
   (`hq.v1.author_actor`); an invite kuba wrote naming one more person was refused
   (`hq.v3.owner_only`).
 - **Reader flag:** without it kuba held no `reasoning` or `tool_calls` row after a thinking
-  answer; granted, the reasoning reached him 170–230 ms later; withdrawn, his replica evicted
+  answer; granted, the reasoning reached him 170–240 ms later; withdrawn, his replica evicted
   every reasoning, tool call and approval row of the session and kept the answers.
+- **Approvals follow the flag** (106.4 review, against keeper-hq 941ccdc with Nixie offered
+  `run`): granted, kuba was shown the agent's T2 approval and held its tool call; the moment his
+  device knew the flag was withdrawn his view showed no approval and nothing of the session waited
+  for him in the decisions panel (the window had already evicted the rows in that run, so the
+  rows-still-here boundary is covered by keeper-core's unit test, not by this run).
 - **Remove and leave:** removed by the owner, the session left kuba's list and every row of it
-  left his replica within about 110 ms, and he left the owner's sheet (and could be added again);
-  added again and leaving himself, he was gone from his list, the owner's sheet and the invite.
+  left his replica within about 110–120 ms, and he left the owner's sheet (and could be added
+  again); added again and leaving himself, he was gone from his list, the owner's sheet and the
+  invite.
 
 The *People* sheet was walked in the agent desktop's Chrome over CDP on the mock shell at 1280
 and 420 px (the phone shell): open and close (Close and Escape, focus back on **People**), add
@@ -225,6 +232,12 @@ Cancel, back on **Remove** after Cancel, on Close after removing), a member's vi
 owner's controls and **Leave session** (the window closes the session and says so), the refused
 and offline sentences, and twelve-word names with no document or sheet overflow. Every button
 measured at least 44 × 44 px; the runs recorded no console error or failed request.
+
+After the 106.4 review the long-name fixture's removal confirmation was measured with it open: it
+had grown to 954 px (the sheet's scroll area 550–555 px wider than the sheet) and now fits — at
+1280 px a 383 px confirmation in the 416 px side sheet, at 420 px 388 px in the bottom sheet,
+neither scrolling sideways, its destructive control reading *Remove* with the person's whole name
+as its accessible name, both controls 44 px tall and at least 64 px wide.
 
 ## Earlier Matrix agent hosting
 
