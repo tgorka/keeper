@@ -2064,7 +2064,10 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
         )
         .await;
         let calls = count(&rk, "tool_calls", &key.session_id).await;
-        assert!(calls > 0, "the approval's tool call is on the guest's device");
+        assert!(
+            calls > 0,
+            "the approval's tool call is on the guest's device"
+        );
         println!(
             "PASS granted: the guest is shown {shown} approval(s) of the session and holds {calls} tool call(s)"
         );
