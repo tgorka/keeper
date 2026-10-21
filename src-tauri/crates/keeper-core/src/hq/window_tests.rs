@@ -538,17 +538,20 @@ fn a_decision_is_bound_to_the_digest_shown_and_to_the_approvers() {
 /// A replica that answers as the real one does, except that its writes can
 /// be held (as behind a stalled round), its commits can be refused (as the
 /// server would), and the version it reports for every row can be set.
-struct Staged {
+/// The People sheet's tests refuse a leave through it too.
+pub(super) struct Staged {
     inner: Arc<dyn crate::hq::port::Replica>,
     held: std::sync::Mutex<bool>,
     released: std::sync::Condvar,
-    refused: std::sync::Mutex<HashMap<String, String>>,
+    pub(super) refused: std::sync::Mutex<HashMap<String, String>>,
     version: Option<i64>,
     written: std::sync::Mutex<Vec<Vec<RowOp>>>,
+    /// Every commit written through it, in order.
+    pub(super) commits: std::sync::Mutex<Vec<String>>,
 }
 
 impl Staged {
-    fn over(source: &Source, version: Option<i64>) -> (Arc<Staged>, Source) {
+    pub(super) fn over(source: &Source, version: Option<i64>) -> (Arc<Staged>, Source) {
         let staged = Arc::new(Staged {
             inner: Arc::clone(&source.replica),
             held: std::sync::Mutex::new(false),
@@ -556,6 +559,7 @@ impl Staged {
             refused: std::sync::Mutex::new(HashMap::new()),
             version,
             written: std::sync::Mutex::new(Vec::new()),
+            commits: std::sync::Mutex::new(Vec::new()),
         });
         let wrapped = Source {
             replica: Arc::clone(&staged) as Arc<dyn crate::hq::port::Replica>,
@@ -577,7 +581,9 @@ impl crate::hq::port::Replica for Staged {
         }
         drop(held);
         self.written.lock().expect("written").push(ops.clone());
-        self.inner.mutate(ops)
+        let commit = self.inner.mutate(ops)?;
+        self.commits.lock().expect("commits").push(commit.clone());
+        Ok(commit)
     }
     fn query(
         &self,

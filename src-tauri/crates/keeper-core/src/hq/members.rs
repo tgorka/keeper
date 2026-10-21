@@ -89,7 +89,8 @@ pub struct AgentSessionMembersVm {
     /// This person may leave: a member who is not the owner (an owner who
     /// left would leave nobody able to change who is in it).
     pub can_leave: bool,
-    /// The server's refusal of an addition written here, as a sentence.
+    /// The server's refusal of an addition or a leave written here, as a
+    /// sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub notice: Option<String>,
@@ -101,7 +102,13 @@ type Addition = (String, String, String);
 /// Additions written here whose outcome is still owed: the commit to look up.
 static ADDING: LazyLock<Mutex<HashMap<Addition, String>>> = LazyLock::new(Mutex::default);
 
-/// Refusals of additions, kept until the person reads them once.
+/// Leaves written here whose outcome is still owed: (database, session) to
+/// the commit to look up. The owner's Leave is absent, so the server refusing
+/// one (`hq.v3.owner_cannot_leave`, R-HQ-40) means this replica thought the
+/// person was not the owner; the refused delete comes back with the session.
+static LEAVING: LazyLock<Mutex<HashMap<(String, String), String>>> = LazyLock::new(Mutex::default);
+
+/// Refusals of additions and leaves, kept until the next addition.
 static REFUSED: LazyLock<Mutex<HashMap<(String, String), String>>> = LazyLock::new(Mutex::default);
 
 struct Row {
@@ -258,11 +265,12 @@ pub fn view(source: &Source, session_id: &str) -> Result<AgentSessionMembersVm, 
     })
 }
 
-/// Look up the additions written here for `session_id`: a refused one
-/// becomes the sheet's notice, a settled one is forgotten.
+/// Look up the additions and the leave written here for `session_id`: a
+/// refused one becomes the sheet's notice, a settled one is forgotten.
 fn settle(source: &Source, session_id: &str) -> Option<String> {
     let mut adding = lock(&ADDING);
     let mut refused = lock(&REFUSED);
+    let key = (source.database.clone(), session_id.to_owned());
     adding.retain(|(database, session, actor), commit| {
         if database != &source.database || session != session_id {
             return true;
@@ -270,18 +278,34 @@ fn settle(source: &Source, session_id: &str) -> Option<String> {
         match source.replica.delivery(commit) {
             Ok(Delivery::Pending) => true,
             Ok(Delivery::Refused(reason)) => {
-                refused.insert(
-                    (database.clone(), session.clone()),
-                    refusal(actor, &source.database, &reason),
-                );
+                refused.insert(key.clone(), refusal(actor, &source.database, &reason));
                 false
             }
             Ok(Delivery::Applied | Delivery::Unknown) | Err(_) => false,
         }
     });
-    refused
-        .get(&(source.database.clone(), session_id.to_owned()))
-        .cloned()
+    let mut leaving = lock(&LEAVING);
+    if let Some(commit) = leaving.get(&key) {
+        match source.replica.delivery(commit) {
+            Ok(Delivery::Pending) => {}
+            Ok(Delivery::Refused(reason)) => {
+                refused.insert(key.clone(), leave_refusal(&reason));
+                leaving.remove(&key);
+            }
+            Ok(Delivery::Applied | Delivery::Unknown) | Err(_) => {
+                leaving.remove(&key);
+            }
+        }
+    }
+    refused.get(&key).cloned()
+}
+
+fn leave_refusal(reason: &str) -> String {
+    if reason.contains("owner_cannot_leave") {
+        "The server refused your leaving: the session's owner cannot leave it.".to_owned()
+    } else {
+        format!("The server refused your leaving: {reason}")
+    }
 }
 
 fn refusal(actor: &str, database: &str, reason: &str) -> String {
@@ -422,7 +446,7 @@ pub fn leave(source: &Source, session_id: &str) -> Result<(), String> {
             "The owner cannot leave: nobody else could change who is in this session.".to_owned(),
         );
     }
-    source
+    let commit = source
         .replica
         .mutate(vec![RowOp::Delete {
             table: "session_members".to_owned(),
@@ -430,6 +454,7 @@ pub fn leave(source: &Source, session_id: &str) -> Result<(), String> {
             base_version: None,
         }])
         .map_err(|error| error.to_string())?;
+    lock(&LEAVING).insert((source.database.clone(), session_id.to_owned()), commit);
     source.replica.sync_now();
     Ok(())
 }

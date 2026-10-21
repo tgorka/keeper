@@ -25,6 +25,7 @@ addable: Array<AgentDirectoryPersonVm>,
  */
 canLeave: boolean, 
 /**
- * The server's refusal of an addition written here, as a sentence.
+ * The server's refusal of an addition or a leave written here, as a
+ * sentence.
  */
 notice?: string, };

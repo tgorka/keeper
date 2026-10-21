@@ -13,6 +13,7 @@ use crate::hq::port::{ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, names, object, Source};
 use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, Opened};
+use crate::hq::window_tests::Staged;
 
 const ANA: &str = "ana";
 const BEN: &str = "ben";
@@ -218,6 +219,40 @@ fn the_owner_does_not_leave_and_server_changes_wait_for_the_server() {
         "the agent's flag is not the owner's"
     );
     assert!(remove(&ana, "s.1", CAL).is_err(), "not a member");
+}
+
+#[test]
+fn a_leave_the_server_refuses_comes_back_with_its_reason() {
+    // Ben's replica holds him as a person, so Leave is his; the server holds
+    // him as the owner and refuses the delete (R-HQ-40). Its own database
+    // name keeps the process-wide outcome maps apart from the other tests.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plain = open(dir.path(), "alpha-leave", BEN);
+    seed(&plain);
+    let (staged, ben) = Staged::over(&plain, None);
+    assert!(view(&ben, "s.1").expect("view").can_leave);
+    leave(&ben, "s.1").expect("written");
+    let commit = staged
+        .commits
+        .lock()
+        .expect("commits")
+        .last()
+        .cloned()
+        .expect("the leave's commit");
+    staged
+        .refused
+        .lock()
+        .expect("refused")
+        .insert(commit, "hq.v3.owner_cannot_leave".to_owned());
+    // The refused delete comes back, as the server's rejection restores it.
+    plain
+        .replica
+        .mutate(vec![member("s.1", BEN, "person", false)])
+        .expect("restored");
+    assert_eq!(
+        view(&ben, "s.1").expect("view").notice.as_deref(),
+        Some("The server refused your leaving: the session's owner cannot leave it.")
+    );
 }
 
 #[test]
