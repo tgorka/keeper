@@ -162,3 +162,7 @@ image = { workspace = true }
 # The container move's tests (Epic 98) move real directories; already in the
 # graph through keeper-sync.
 tempfile = { workspace = true }
+# The agents adapter's socket-generation test (106.5, R1065-06) plays the
+# server's end of a realtime socket; already in the graph through
+# syncular-client's native transport.
+tungstenite = "0.30"

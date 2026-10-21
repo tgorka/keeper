@@ -817,6 +817,36 @@ impl Owner {
         if !self.online() {
             return;
         }
+        self.take_frames();
+        let asked = self
+            .client
+            .drain_sync_intents()
+            .iter()
+            .any(|intent| !matches!(intent, SyncIntent::None));
+        self.absorb_changes();
+        let wanted = asked || self.dirty || self.client.sync_needed();
+        if self.schedule.round_due(Instant::now(), wanted) {
+            self.round();
+        }
+        self.ask_presence();
+        if !self.online() || self.connected() || !self.schedule.socket_due(Instant::now()) {
+            return;
+        }
+        match self.new_socket() {
+            Ok(()) => {
+                self.schedule.socket_done(true, Instant::now());
+                self.round();
+                self.ask_presence();
+            }
+            Err(error) => {
+                self.schedule.socket_done(false, Instant::now());
+                tracing::debug!(database = %self.database, %error, "agents server socket refused");
+            }
+        }
+    }
+
+    /// The frames the socket's reader queued since the last call.
+    fn take_frames(&mut self) {
         for frame in self.transport.inner.take_inbound() {
             match frame {
                 // Hello, presence and wake frames come as text; only a
@@ -834,37 +864,34 @@ impl Owner {
                 }
             }
         }
-        let asked = self
-            .client
-            .drain_sync_intents()
-            .iter()
-            .any(|intent| !matches!(intent, SyncIntent::None));
-        self.absorb_changes();
-        let wanted = asked || self.dirty || self.client.sync_needed();
-        if self.schedule.round_due(Instant::now(), wanted) {
-            self.round();
-        }
-        self.ask_presence();
-        if !self.online() || self.connected() || !self.schedule.socket_due(Instant::now()) {
-            return;
-        }
-        // A socket that was lost keeps the peers it last saw until it is
-        // released: a new socket starts from its own snapshot.
-        if self.client.realtime_state() == RealtimeState::Lost {
-            self.client.disconnect_realtime(&mut self.transport);
-        }
+    }
+
+    /// A socket of its own: whatever the last one saw is gone first, and
+    /// nothing of it is known of this one yet.
+    fn new_socket(&mut self) -> Result<(), String> {
+        self.release_socket();
         self.gate.reset();
-        match self.client.connect_realtime(&mut self.transport) {
-            Ok(()) => {
-                self.schedule.socket_done(true, Instant::now());
-                self.rounds_on_socket = 0;
-                self.round();
-                self.ask_presence();
-            }
-            Err(error) => {
-                self.schedule.socket_done(false, Instant::now());
-                tracing::debug!(database = %self.database, %error, "agents server socket refused");
-            }
+        self.rounds_on_socket = 0;
+        self.client.connect_realtime(&mut self.transport)
+    }
+
+    /// Let the socket go: its peers and every frame it left behind.
+    ///
+    /// Its reader shares one queue with the next socket's, and a frame it
+    /// queued while a round ran — after the last drain — would otherwise
+    /// reach the next socket's peers: a join of an instance that has since
+    /// stopped, which that socket's snapshot never mentions and so nothing
+    /// would ever remove. So the reader is joined first, after which nothing
+    /// joins the queue until a new socket starts, and the queue is then
+    /// emptied. A dropped row delta costs nothing: the next round pulls from
+    /// the cursor it never moved.
+    fn release_socket(&mut self) {
+        // A lost socket is released too; one already let go is left alone.
+        self.client.disconnect_realtime(&mut self.transport);
+        self.transport.inner.shutdown();
+        let stale = self.transport.inner.take_inbound().len();
+        if stale > 0 {
+            tracing::debug!(database = %self.database, stale, "frames of a released socket dropped");
         }
     }
 
@@ -924,8 +951,7 @@ impl Owner {
                 self.transport.open.store(false, Ordering::SeqCst);
                 self.client
                     .set_transport_enabled(&mut self.transport, false);
-                self.client.disconnect_realtime(&mut self.transport);
-                self.transport.inner.shutdown();
+                self.release_socket();
             }
             RoundVerdict::Unreachable(why) => {
                 tracing::info!(
@@ -934,8 +960,11 @@ impl Owner {
                     %why,
                     "agents server not reached"
                 );
-                if self.connected() {
-                    self.client.disconnect_realtime(&mut self.transport);
+                if matches!(
+                    self.client.realtime_state(),
+                    RealtimeState::Connected | RealtimeState::Lost
+                ) {
+                    self.release_socket();
                 }
             }
         }
@@ -969,8 +998,7 @@ impl Owner {
         self.transport.open.store(false, Ordering::SeqCst);
         self.client
             .set_transport_enabled(&mut self.transport, false);
-        self.client.disconnect_realtime(&mut self.transport);
-        self.transport.inner.shutdown();
+        self.release_socket();
         let next = ReplicaState {
             link: LinkState::Closed,
             outbox: self.client.status_snapshot().outbox,
@@ -1651,6 +1679,86 @@ mod tests {
             "a join whose document says error is no refusal"
         );
         assert_eq!(refused_presence(r#"{"event":"hello","data":{}}"#), None);
+    }
+
+    /// The server's end of the realtime sockets a replica opens, in order.
+    /// The first answers a round only with a join of `nixie.electra` on
+    /// `dir:alpha` and then dies; every later one has no peer on the key and
+    /// answers the presence asks as keeper-hq does: a leave on the registered
+    /// key silently, one on a never-held key with a refusal.
+    fn realtime_server() -> u16 {
+        use tungstenite::Message;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut sockets = 0;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let Ok(mut socket) = tungstenite::accept(stream) else {
+                    continue;
+                };
+                sockets += 1;
+                while let Ok(message) = socket.read() {
+                    match message {
+                        Message::Binary(_) if sockets == 1 => {
+                            let join = r#"{"event":"presence","data":{"scopeKey":"dir:alpha","kind":"join","actorId":"nixie","clientId":"nixie.electra","doc":{"name":"electra"}}}"#;
+                            let _ = socket.send(Message::Text(join.into()));
+                            let _ = socket.close(None);
+                            while socket.read().is_ok() {}
+                            break;
+                        }
+                        Message::Text(text) if sockets > 1 => {
+                            let ask: Value = serde_json::from_str(&text).expect("a presence ask");
+                            let key = ask["data"]["scopeKey"].as_str().expect("a key");
+                            if key.starts_with("probe:") {
+                                let refusal = json!({ "event": "presence", "data": {
+                                    "scopeKey": key, "error": "presence.forbidden", "timestamp": 1,
+                                }});
+                                let _ = socket.send(Message::Text(refusal.to_string().into()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_join_the_last_socket_left_queued_never_reaches_the_next_sockets_peers() {
+        let port = realtime_server();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (wake, woken) = mpsc::channel();
+        let mut owner = Owner::open(
+            &linked(dir.path(), port),
+            Arc::new(AtomicBool::new(true)),
+            wake,
+        )
+        .expect("opens");
+        owner.new_socket().expect("the first socket");
+        // A round on it: the server's answer is a join, and then the socket
+        // dies. The join was queued after the drive's last drain.
+        owner.round();
+        assert_ne!(owner.client.realtime_state(), RealtimeState::Connected);
+        assert!(
+            woken.try_iter().count() > 0,
+            "the dying socket queued a frame"
+        );
+        // nixie.electra stops, and the next socket's snapshot has no peer.
+        owner.new_socket().expect("the next socket");
+        owner.ask_presence();
+        woken
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the ask is answered");
+        owner.take_frames();
+        assert!(owner.gate.ready(), "the new socket's ask completed");
+        assert_eq!(
+            owner.client.presence("dir:alpha").len(),
+            0,
+            "a peer of the last socket is shown on this one"
+        );
+        owner.stop();
     }
 
     fn prefs_row(id: &str) -> RowOp {
