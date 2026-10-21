@@ -2,7 +2,7 @@
  * What a rendered answer is, and what it refuses to become (Epic 61, Story
  * 61.5).
  *
- * `bots-markdown.test.ts` owns the parse. This file owns the four things only a
+ * `agents/markdown.test.ts` owns the parse. This file owns the four things only a
  * DOM can show:
  *
  * - a `<script>` the model wrote is text on the page and not a node in it,
@@ -16,8 +16,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { BotAnswer } from "@/components/bots/bot-answer";
-import { BOT_CODE_COPIED_LABEL, BOT_CODE_COPY_LABEL } from "@/lib/bots-markdown";
+import { AgentAnswer } from "@/components/agents/agent-answer";
+import { BOT_CODE_COPIED_LABEL, BOT_CODE_COPY_LABEL } from "@/lib/agents/markdown";
 import type * as IpcClient from "@/lib/ipc/client";
 
 const frontendErrorReport = vi.fn<(...args: unknown[]) => Promise<void>>(() => Promise.resolve());
@@ -34,7 +34,7 @@ beforeEach(() => {
 describe("a rendered answer", () => {
   it("renders the supported constructs as elements, not as punctuation", () => {
     const { container } = render(
-      <BotAnswer
+      <AgentAnswer
         body={[
           "# Title",
           "",
@@ -70,7 +70,7 @@ describe("a rendered answer", () => {
 
   it("shows a link's label and its URL, and creates no destination", () => {
     const url = "htt" + "ps://example.invalid/doc";
-    const { container } = render(<BotAnswer body={`read [the docs](${url}) first`} />);
+    const { container } = render(<AgentAnswer body={`read [the docs](${url}) first`} />);
     expect(container.textContent).toContain("the docs");
     expect(container.textContent).toContain(url);
     // No anchor, no image, nothing that could fetch: an answer is a string an
@@ -81,14 +81,14 @@ describe("a rendered answer", () => {
 
   it("renders a script tag the model wrote as text, never as a node", () => {
     const { container } = render(
-      <BotAnswer body={"before\n\n<script>alert(1)</script>\n\nafter"} />,
+      <AgentAnswer body={"before\n\n<script>alert(1)</script>\n\nafter"} />,
     );
     expect(container.querySelector("script")).toBeNull();
     expect(container.textContent).toContain("<script>alert(1)</script>");
   });
 
   it("renders an inline HTML tag as its characters", () => {
-    const { container } = render(<BotAnswer body="a<b>c</b>d" />);
+    const { container } = render(<AgentAnswer body="a<b>c</b>d" />);
     expect(container.querySelector("b")).toBeNull();
     expect(container.textContent).toBe("a<b>c</b>d");
   });
@@ -96,7 +96,7 @@ describe("a rendered answer", () => {
 
 describe("a code block", () => {
   it("labels its language and puts its text on the clipboard, confirming it", async () => {
-    render(<BotAnswer body={"```python\nprint(1)\n```"} />);
+    render(<AgentAnswer body={"```python\nprint(1)\n```"} />);
     const block = screen.getByTestId("bot-code-block");
     expect(block.dataset.language).toBe("python");
     expect(block.dataset.closed).toBe("true");
@@ -112,7 +112,7 @@ describe("a code block", () => {
     Object.assign(navigator, {
       clipboard: { writeText: vi.fn(() => Promise.reject(new Error("denied"))) },
     });
-    render(<BotAnswer body={"```\nx\n```"} />);
+    render(<AgentAnswer body={"```\nx\n```"} />);
 
     fireEvent.click(screen.getByRole("button", { name: BOT_CODE_COPY_LABEL }));
 
@@ -122,7 +122,7 @@ describe("a code block", () => {
   });
 
   it("closes an unterminated fence itself rather than swallowing what arrived", () => {
-    render(<BotAnswer body={"```js\nconst a = 1;"} />);
+    render(<AgentAnswer body={"```js\nconst a = 1;"} />);
     const block = screen.getByTestId("bot-code-block");
     expect(block.dataset.closed).toBe("false");
     expect(block.textContent).toContain("const a = 1;");
@@ -146,22 +146,22 @@ describe("streaming", () => {
   ].join("\n");
 
   it("lands on the same DOM whether it arrived at once or token by token", () => {
-    const streamed = render(<BotAnswer body="" />);
+    const streamed = render(<AgentAnswer body="" />);
     for (let length = 1; length <= ANSWER.length; length += 1) {
-      streamed.rerender(<BotAnswer body={ANSWER.slice(0, length)} />);
+      streamed.rerender(<AgentAnswer body={ANSWER.slice(0, length)} />);
     }
-    const oneShot = render(<BotAnswer body={ANSWER} />);
+    const oneShot = render(<AgentAnswer body={ANSWER} />);
     expect(streamed.container.innerHTML).toBe(oneShot.container.innerHTML);
   });
 
   it("keeps the DOM node of a settled block across the deltas that follow it", () => {
-    const view = render(<BotAnswer body="First paragraph." />);
+    const view = render(<AgentAnswer body="First paragraph." />);
     const first = view.container.querySelector("p");
     expect(first?.textContent).toBe("First paragraph.");
 
     // Everything the rest of an answer can do to the block above it.
     for (const suffix of ["\n", "\n\n", "\n\nSecond", "\n\nSecond paragraph.", "\n\n```js\nx"]) {
-      view.rerender(<BotAnswer body={`First paragraph.${suffix}`} />);
+      view.rerender(<AgentAnswer body={`First paragraph.${suffix}`} />);
       expect(
         view.container.querySelector("p"),
         `the settled first block was remounted by "${suffix.replace(/\n/g, "\\n")}"`,
@@ -170,10 +170,10 @@ describe("streaming", () => {
   });
 
   it("does not bold an answer retroactively from a marker still being typed", () => {
-    const view = render(<BotAnswer body="**bold" />);
+    const view = render(<AgentAnswer body="**bold" />);
     expect(view.container.querySelector("strong")).toBeNull();
     expect(view.container.textContent).toBe("**bold");
-    view.rerender(<BotAnswer body="**bold**" />);
+    view.rerender(<AgentAnswer body="**bold**" />);
     expect(view.container.querySelector("strong")?.textContent).toBe("bold");
   });
 
@@ -185,7 +185,7 @@ describe("streaming", () => {
       body += chunk;
     }
     const started = performance.now();
-    const { container } = render(<BotAnswer body={body} />);
+    const { container } = render(<AgentAnswer body={body} />);
     const elapsed = performance.now() - started;
     expect(container.querySelectorAll("[data-testid='bot-code-block']").length).toBeGreaterThan(
       100,

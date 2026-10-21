@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentApprovalVm, AgentSessionsBatch, AgentSessionViewVm } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
+import { agentViewPrefsStore } from "@/lib/stores/agent-view-prefs";
 
 const mock = vi.hoisted(() => ({
   list: null as ((batch: AgentSessionsBatch) => void) | null,
@@ -18,6 +19,9 @@ const mock = vi.hoisted(() => ({
   create: vi.fn().mockResolvedValue({ database: "beta", sessionId: "new.1" }),
   decide: vi.fn().mockResolvedValue({ state: "sent", sentence: "Sent" }),
   loadDraft: vi.fn(),
+  prefsGet: vi.fn(),
+  prefsSet: vi.fn(),
+  toolSet: vi.fn().mockResolvedValue(undefined),
   phone: false,
 }));
 vi.mock("@/hooks/use-shell-layout", () => ({ useShellLayout: () => ({ phone: mock.phone }) }));
@@ -37,6 +41,9 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentSessionArchive: mock.archive,
   agentSessionUnarchive: mock.unarchive,
   agentSessionPageBack: mock.page,
+  agentViewPrefsGet: mock.prefsGet,
+  agentViewPrefsSet: mock.prefsSet,
+  agentSessionToolSet: mock.toolSet,
   agentSessionNew: mock.create,
   agentSessionApprovalDecide: mock.decide,
   agentApprovalsSubscribe: vi.fn(async (callback) => {
@@ -82,6 +89,10 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
     hasEarlier: false,
     loadingEarlier: false,
     complete: true,
+    readsTrace: true,
+    untrusted: false,
+    live: [],
+    tools: [],
     messages: [
       {
         id: "m1",
@@ -131,6 +142,17 @@ beforeEach(() => {
   mock.list = null;
   mock.views.clear();
   mock.phone = false;
+  mock.prefsGet.mockResolvedValue({ showReasoning: false, showDetails: false });
+  mock.prefsSet.mockImplementation(async (patch) => ({
+    ...agentViewPrefsStore.getState().value,
+    ...patch,
+  }));
+  agentViewPrefsStore.setState({
+    value: { showReasoning: false, showDetails: false },
+    loaded: false,
+    busy: false,
+    error: null,
+  });
   agentSessionsStore.setState({
     rows: [],
     loaded: false,
@@ -443,4 +465,256 @@ it("keeps phone Back focused when loading the last earlier page removes its cont
   expect(screen.getByRole("button", { name: "Back to sessions" })).toHaveFocus();
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
   expect(screen.getByRole("button", { name: /^beta session/ })).toHaveFocus();
+});
+
+describe("live answer controls", () => {
+  it("grows the answer without replacing the draft and ends on the final row", async () => {
+    draw();
+    await list();
+    const turn = { turnId: "t1", text: "First paragraph.", steps: [], stopped: false };
+    await open("alpha", { live: [turn] });
+    const composer = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(composer, { target: { value: "My next question" } });
+    composer.focus();
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", { live: [{ ...turn, text: "First paragraph.\n\nSecond paragraph." }] }),
+      ),
+    );
+    expect(screen.getByText("Second paragraph.")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message" })).toBe(composer);
+    expect(composer).toHaveValue("My next question");
+    expect(composer).toHaveFocus();
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          messages: [
+            {
+              id: "final",
+              role: "agent",
+              authorActor: "assistant",
+              authorName: "Assistant",
+              body: "First paragraph.\n\nSecond paragraph.",
+              createdAtMs: 1780000000000,
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getAllByText("First paragraph.")).toHaveLength(1);
+    expect(screen.queryByText("Answering…")).not.toBeInTheDocument();
+    expect(composer).toHaveValue("My next question");
+  });
+
+  it("shows reasoning only after the reader chooses it, and keeps it readable after completion", async () => {
+    draw();
+    await list();
+    const turn = {
+      turnId: "t1",
+      text: "An answer",
+      reasoning: "Private thought",
+      steps: [],
+      stopped: false,
+    };
+    await open("alpha", { live: [turn] });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Show thinking" })).toBeEnabled(),
+    );
+    expect(screen.queryByText("Private thought")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show thinking" }));
+    expect(await screen.findByText("Private thought")).toBeInTheDocument();
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          messages: [
+            {
+              id: "final",
+              role: "agent",
+              authorActor: "assistant",
+              authorName: "Assistant",
+              body: "An answer",
+              reasoning: "Private thought",
+              createdAtMs: 1780000000000,
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getByRole("region", { name: "Thinking" })).toHaveTextContent("Private thought");
+    fireEvent.click(screen.getByRole("button", { name: "Show thinking" }));
+    await waitFor(() => expect(screen.queryByText("Private thought")).not.toBeInTheDocument());
+  });
+
+  it("never renders trace content for a nonreader, including a previously enabled preference", async () => {
+    mock.prefsGet.mockResolvedValue({ showReasoning: true, showDetails: false });
+    draw();
+    await list();
+    await open("alpha", {
+      readsTrace: false,
+      live: [
+        {
+          turnId: "t1",
+          text: "Visible answer",
+          tool: "web_search",
+          reasoning: "Private thought",
+          steps: [{ id: "c1", name: "web_search", status: "done", result: "Private result" }],
+          stopped: false,
+        },
+      ],
+    });
+    await waitFor(() => expect(agentViewPrefsStore.getState().loaded).toBe(true));
+    expect(screen.queryByRole("button", { name: "Show thinking" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Private thought")).not.toBeInTheDocument();
+    expect(screen.queryByText("Private result")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Tool calls" })).not.toBeInTheDocument();
+    expect(screen.getByText("Calling: web_search")).toBeInTheDocument();
+  });
+
+  it("reveals reported details, including a measured zero and an error, without inventing usage", async () => {
+    draw();
+    await list();
+    await open("alpha", {
+      messages: [
+        {
+          id: "final",
+          role: "agent",
+          authorActor: "assistant",
+          authorName: "Assistant",
+          body: "Partial answer",
+          createdAtMs: 1780000000000,
+          details: {
+            model: "example-model",
+            ttftMs: 0,
+            durationMs: 1240,
+            finish: "error",
+            error: "Provider disconnected",
+          },
+        },
+      ],
+    });
+    expect(screen.queryByText("example-model")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Show details" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(await screen.findByText("example-model")).toBeInTheDocument();
+    expect(screen.getByText("0 ms")).toBeInTheDocument();
+    expect(screen.getByText("Provider disconnected")).toBeInTheDocument();
+    expect(screen.queryByText("Total tokens")).not.toBeInTheDocument();
+    expect(screen.queryByText("Prompt tokens")).not.toBeInTheDocument();
+  });
+
+  it("renders only offered switches, waits for their confirmed state, and exposes refusal", async () => {
+    draw();
+    await list();
+    await open("alpha", { tools: [{ name: "read_file", on: true }] });
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    const tool = screen.getByRole("switch", { name: "read_file" });
+    fireEvent.click(tool);
+    await waitFor(() =>
+      expect(mock.toolSet).toHaveBeenCalledWith(
+        expect.objectContaining({ database: "alpha", sessionId: "same.1" }),
+        "read_file",
+        false,
+      ),
+    );
+    expect(tool).toHaveAttribute("aria-checked", "true");
+    act(() =>
+      mock.views.get("alpha")?.(view("alpha", { tools: [{ name: "read_file", on: false }] })),
+    );
+    expect(tool).toHaveAttribute("aria-checked", "false");
+    await waitFor(() => expect(tool).toBeEnabled());
+    fireEvent.click(tool);
+    await waitFor(() =>
+      expect(mock.toolSet).toHaveBeenLastCalledWith(
+        { database: "alpha", sessionId: "same.1" },
+        "read_file",
+        true,
+      ),
+    );
+    act(() =>
+      mock.views.get("alpha")?.(view("alpha", { tools: [{ name: "read_file", on: true }] })),
+    );
+    await waitFor(() => expect(tool).toBeEnabled());
+    expect(tool).toHaveAttribute("aria-checked", "true");
+    mock.toolSet.mockRejectedValueOnce({ message: "The definition no longer offers this tool." });
+    fireEvent.click(tool);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The definition no longer offers this tool.",
+    );
+    expect(tool).toHaveAttribute("aria-checked", "true");
+    act(() => mock.views.get("alpha")?.(view("alpha", { tools: [] })));
+    expect(screen.queryByRole("button", { name: "Tools" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+  });
+
+  it("keeps a refused preference off and applies the effective returned value", async () => {
+    draw();
+    await list();
+    await open("alpha");
+    const toggle = screen.getByRole("button", { name: "Show details" });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    mock.prefsSet.mockRejectedValueOnce({ message: "The preference could not be saved." });
+    fireEvent.click(toggle);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The preference could not be saved.",
+    );
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    mock.prefsSet.mockResolvedValueOnce({ showReasoning: false, showDetails: false });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("keeps controls safe after a failed preference read and retries without losing the session", async () => {
+    mock.prefsGet.mockRejectedValueOnce({ message: "The preference store is unavailable." });
+    draw();
+    await list();
+    await open("alpha");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The preference store is unavailable.",
+    );
+    const toggle = screen.getByRole("button", { name: "Show thinking" });
+    expect(toggle).toBeDisabled();
+    expect(screen.getByText("Message in alpha")).toBeInTheDocument();
+    mock.prefsGet.mockResolvedValueOnce({ showReasoning: true, showDetails: false });
+    fireEvent.click(screen.getByRole("button", { name: "Try preferences again" }));
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(mock.prefsSet).not.toHaveBeenCalled();
+  });
+
+  it("shows tool completion and a stopped answer without an endless answering state", async () => {
+    draw();
+    await list();
+    const turn = {
+      turnId: "t1",
+      text: "Kept text",
+      tool: "read_file",
+      steps: [{ id: "c1", name: "read_file", status: "started" as const }],
+      stopped: false,
+    };
+    await open("alpha", { untrusted: true, live: [turn] });
+    expect(screen.getByText("Untrusted")).toBeInTheDocument();
+    expect(screen.getByText("read_file · Started")).toBeInTheDocument();
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          live: [
+            {
+              ...turn,
+              stopped: true,
+              steps: [
+                { id: "c1", name: "read_file", status: "refused", result: "Not allowed here" },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getByText("Kept text")).toBeInTheDocument();
+    expect(screen.getByText("The answer stopped.")).toBeInTheDocument();
+    expect(screen.queryByText("Answering…")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("read_file · Refused"));
+    expect(screen.getByText("Not allowed here")).toBeVisible();
+  });
 });

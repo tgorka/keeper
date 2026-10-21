@@ -9314,6 +9314,14 @@ function hqRefuse(message: string): never {
   throw { code: "internal", message, accountId: null, retriable: false };
 }
 const sessionScenario = new URLSearchParams(location.search).get("sessions");
+// ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused
+const liveScenario = new URLSearchParams(location.search).get("live");
+// Node's own `localStorage` global is undefined without a storage file, so the
+// test runs that import this module read nothing here.
+let agentViewPrefs = {
+  showReasoning: globalThis.localStorage?.getItem("keeper.mock.agents.show_reasoning") === "1",
+  showDetails: globalThis.localStorage?.getItem("keeper.mock.agents.show_details") === "1",
+};
 const sessionChoices: AgentChoiceVm[] = [
   {
     agentActor: "assistant",
@@ -9412,6 +9420,16 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
       hasEarlier: row.archived,
       loadingEarlier: false,
       complete: true,
+      readsTrace: liveScenario !== "nonreader",
+      untrusted: liveScenario === "untrusted" || liveScenario === "stream",
+      live: [],
+      tools:
+        liveScenario === "no-tools"
+          ? []
+          : [
+              { name: "web_search", on: true },
+              { name: "read_file", on: false },
+            ],
       approvals: row.database === "alpha" && row.sessionId === "device.1" ? sessionApprovals : [],
       messages: [
         {
@@ -9454,6 +9472,102 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
     },
   ]),
 );
+
+/** The mock's source retains rows; only the reader's selected projection crosses IPC. */
+function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
+  return {
+    ...vm,
+    approvals: vm.readsTrace ? vm.approvals : [],
+    tools: vm.tools.map((tool) => ({ ...tool })),
+    messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
+      ...message,
+      ...(agentViewPrefs.showDetails && details ? { details } : {}),
+      ...(vm.readsTrace && agentViewPrefs.showReasoning && reasoning ? { reasoning } : {}),
+      ...(vm.readsTrace && steps ? { steps } : {}),
+    })),
+    live: vm.live.map(({ reasoning, steps, ...turn }) => ({
+      ...turn,
+      ...(vm.readsTrace && agentViewPrefs.showReasoning && reasoning ? { reasoning } : {}),
+      steps: vm.readsTrace ? steps.map((step) => ({ ...step })) : [],
+    })),
+  };
+}
+
+const startedLiveFixtures = new Set<string>();
+function startLiveFixture(vm: AgentSessionViewVm) {
+  const key = JSON.stringify([vm.database, vm.sessionId]);
+  if (!liveScenario || vm.archived || startedLiveFixtures.has(key)) return;
+  startedLiveFixtures.add(key);
+  vm.approvals = [];
+  const turn: AgentSessionViewVm["live"][number] = {
+    turnId: `live-${vm.database}`,
+    text: "",
+    steps: [],
+    stopped: false,
+  };
+  vm.live = [turn];
+  const text =
+    "## Release checks\n\nStart with the acceptance checks, then review the changes with Ana and Ben.\n\n" +
+    Array.from(
+      { length: 16 },
+      (_, index) =>
+        `${index + 1}. Verify the visible behavior and record the result before publishing.\n`,
+    ).join("") +
+    "\n```text\nRun the acceptance checks before publishing.\n```\n" +
+    (liveScenario === "long" ? `\n${"long-result-".repeat(80)}` : "");
+  let tick = 0;
+  const timer = setInterval(() => {
+    tick += 1;
+    turn.text = text.slice(0, Math.ceil((text.length * Math.min(tick, 90)) / 90));
+    turn.reasoning = "I will separate the acceptance checks from the release notes.".slice(
+      0,
+      tick * 3,
+    );
+    if (tick === 4) {
+      turn.tool = "web_search";
+      turn.steps = [
+        { id: "tool-live", name: "web_search", status: "started", startedAtMs: Date.now() },
+      ];
+    }
+    if (tick === 24) {
+      delete turn.tool;
+      turn.steps[0] = {
+        ...turn.steps[0],
+        status: "done",
+        result: "Found the release checklist. No files changed.",
+        endedAtMs: Date.now(),
+      };
+    }
+    if (tick === 90) {
+      clearInterval(timer);
+      if (liveScenario === "stopped") turn.stopped = true;
+      else {
+        vm.messages.push({
+          id: `final-${vm.database}`,
+          role: "agent",
+          authorActor: "assistant",
+          authorName: "Assistant",
+          body: turn.text,
+          createdAtMs: Date.now(),
+          reasoning: turn.reasoning,
+          steps: turn.steps,
+          details: {
+            model: "example-model",
+            promptTokens: 120,
+            completionTokens: 310,
+            totalTokens: 430,
+            ttftMs: 84,
+            durationMs: 18000,
+            finish: liveScenario === "error" ? "error" : "stop",
+            ...(liveScenario === "error" ? { error: "The provider stopped responding." } : {}),
+          },
+        });
+        vm.live = [];
+      }
+    }
+    publishSessions();
+  }, 200);
+}
 const sessionListWatchers = new Map<string, MockChannel<AgentSessionsBatch>>();
 const sessionViewWatchers = new Map<
   string,
@@ -9466,7 +9580,7 @@ function publishSessions() {
     channel.onmessage?.({ ops: [{ op: "reset", rows: sessionRows }], total: sessionRows.length });
   for (const { key, channel } of sessionViewWatchers.values()) {
     const vm = sessionViews.get(key);
-    if (vm) channel.onmessage?.({ ...vm, messages: [...vm.messages] });
+    if (vm) channel.onmessage?.(sessionViewerVm(vm));
   }
 }
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
@@ -9475,6 +9589,34 @@ function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   return vm;
 }
 const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  agent_view_prefs_get: () => ({ ...agentViewPrefs }),
+  agent_view_prefs_set: (payload) => {
+    if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
+    const patch = payload.patch as { showReasoning: boolean | null; showDetails: boolean | null };
+    agentViewPrefs = {
+      showReasoning: patch.showReasoning ?? agentViewPrefs.showReasoning,
+      showDetails: patch.showDetails ?? agentViewPrefs.showDetails,
+    };
+    globalThis.localStorage?.setItem(
+      "keeper.mock.agents.show_reasoning",
+      agentViewPrefs.showReasoning ? "1" : "0",
+    );
+    globalThis.localStorage?.setItem(
+      "keeper.mock.agents.show_details",
+      agentViewPrefs.showDetails ? "1" : "0",
+    );
+    publishSessions();
+    return { ...agentViewPrefs };
+  },
+  agent_session_tool_set: (payload) => {
+    const vm = mockSession(payload);
+    const tool = vm.tools.find((tool) => tool.name === payload.name);
+    if (!tool || vm.readOnly) hqRefuse("This agent does not offer that tool here.");
+    if (liveScenario === "refused") hqRefuse("This device cannot change the session's tools.");
+    tool.on = payload.on === true;
+    publishSessions();
+    return null;
+  },
   agent_approvals_subscribe: (payload) => {
     const id = `session-approvals-${++sessionSerial}`;
     const channel = payload.channel as MockChannel<AgentApprovalVm[]>;
@@ -9535,7 +9677,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       key: JSON.stringify([payload.database, payload.sessionId]),
       channel,
     });
-    channel.onmessage?.({ ...vm, messages: [...vm.messages] });
+    startLiveFixture(vm);
+    channel.onmessage?.(sessionViewerVm(vm));
     return id;
   },
   agent_session_close: (payload) => {
@@ -9642,6 +9785,10 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       complete: true,
       hasEarlier: false,
       loadingEarlier: false,
+      readsTrace: true,
+      untrusted: false,
+      live: [],
+      tools: [],
       approvals: [],
       messages: [
         {

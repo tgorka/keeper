@@ -24,6 +24,7 @@ vi.mock("@/lib/ipc/client", () => ({
     return "view";
   }),
   agentSessionClose: vi.fn().mockResolvedValue(undefined),
+  agentViewPrefsGet: vi.fn().mockResolvedValue({ showReasoning: false, showDetails: false }),
 }));
 beforeEach(() => {
   vi.clearAllMocks();
@@ -54,6 +55,10 @@ it("shares a list channel across docks but keeps the window's selection and each
     complete: true,
     hasEarlier: false,
     loadingEarlier: false,
+    readsTrace: false,
+    untrusted: false,
+    live: [],
+    tools: [],
     approvals: [],
     messages: [
       {

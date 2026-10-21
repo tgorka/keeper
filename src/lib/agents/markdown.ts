@@ -11,7 +11,7 @@
  * the parser that is already here rather than with a new dependency.
  *
  * **This module produces data, never DOM and never HTML.** It hands back a
- * tree of plain objects; `bot-answer.tsx` turns those into React elements. That
+ * tree of plain objects; `agent-answer.tsx` turns those into React elements. That
  * split is what makes the streaming property testable without a renderer, and
  * it is what keeps the house rule mechanical rather than aspirational: there is
  * no HTML string anywhere in the pipeline, so there is nothing for
@@ -32,7 +32,7 @@
  *   {@link MdBlock.source}. The key is what stops React remounting settled
  *   blocks when a later one grows; the source is what lets the renderer's memo
  *   skip them entirely. Neither is derived from the block's content hash, and
- *   `bot-answer.test.tsx` asserts DOM node identity across deltas so that a
+ *   `agent-answer.test.tsx` asserts DOM node identity across deltas so that a
  *   later "tidy-up" cannot quietly reintroduce a remount per token.
  *
  * **Anything outside the subset renders as its own source text.** Never

@@ -22,15 +22,15 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
+  AgentToolCall,
   BOT_TOOL_ARGUMENTS_LABEL,
   BOT_TOOL_DOM_CHARS,
   BOT_TOOL_GRANT_DENIED_LABEL,
   BOT_TOOL_REFUSED_LABEL,
   BOT_TOOL_RESULT_LABEL,
-  BotToolCall,
   botToolCallCaption,
   botToolClipNotice,
-} from "@/components/bots/bot-tool-call";
+} from "@/components/agents/agent-tool-call";
 import type { BotToolCallVm } from "@/lib/ipc/client";
 
 /** A read that returned a whole small file. */
@@ -61,9 +61,9 @@ function row(): HTMLElement {
   return screen.getAllByRole("button")[0] as HTMLElement;
 }
 
-describe("BotToolCall", () => {
+describe("AgentToolCall", () => {
   it("renders one collapsed disclosure naming the verb, the path and the outcome", () => {
-    render(<BotToolCall count={1} calls={[call()]} />);
+    render(<AgentToolCall count={1} calls={[call()]} />);
 
     const disclosure = row();
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
@@ -76,7 +76,7 @@ describe("BotToolCall", () => {
   });
 
   it("expands onto what it asked for and what the model was told", () => {
-    render(<BotToolCall count={1} calls={[call()]} />);
+    render(<AgentToolCall count={1} calls={[call()]} />);
 
     fireEvent.click(row());
 
@@ -98,7 +98,7 @@ describe("BotToolCall", () => {
 
   it("discloses a bounded result on the collapsed row, in bytes", () => {
     render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[call({ bytes: 65_536, truncatedAtBytes: 65_536, ofBytes: 1_258_291 })]}
       />,
@@ -110,7 +110,7 @@ describe("BotToolCall", () => {
 
   it("discloses a bounded listing in entries", () => {
     render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[
           call({
@@ -132,7 +132,7 @@ describe("BotToolCall", () => {
   });
 
   it("says nothing about truncation when the result was whole", () => {
-    const { container } = render(<BotToolCall count={1} calls={[call()]} />);
+    const { container } = render(<AgentToolCall count={1} calls={[call()]} />);
 
     fireEvent.click(row());
     expect(container.textContent).not.toMatch(/truncated/);
@@ -141,7 +141,7 @@ describe("BotToolCall", () => {
   it("marks a refusal by shape and words, never by colour alone", () => {
     const reason = "keeper's grant for this bot permits reading, not writing.";
     const { container } = render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[
           call({
@@ -167,7 +167,7 @@ describe("BotToolCall", () => {
   });
 
   it("keeps a successful row free of every refusal channel", () => {
-    const { container } = render(<BotToolCall count={1} calls={[call()]} />);
+    const { container } = render(<AgentToolCall count={1} calls={[call()]} />);
 
     const item = container.querySelector('[data-slot="bot-tool-call"]');
     expect(item).toHaveAttribute("data-refused", "false");
@@ -178,7 +178,7 @@ describe("BotToolCall", () => {
 
   it("names a grant's refusal as the grant's, because that one is the person's to widen", () => {
     render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[
           call({
@@ -197,7 +197,7 @@ describe("BotToolCall", () => {
 
   it("renders a note's OKF type and says when no person reviewed it", () => {
     const { container } = render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[
           call({
@@ -227,7 +227,7 @@ describe("BotToolCall", () => {
 
   it("names the person who reviewed a note, when one did", () => {
     const { container } = render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[
           call({
@@ -251,7 +251,7 @@ describe("BotToolCall", () => {
 
   it("says a note nobody reviewed is a note nobody reviewed", () => {
     const { container } = render(
-      <BotToolCall
+      <AgentToolCall
         count={1}
         calls={[
           call({
@@ -275,7 +275,7 @@ describe("BotToolCall", () => {
   });
 
   it("invents no provenance for a read that carried none", () => {
-    const { container } = render(<BotToolCall count={1} calls={[call({ okf: null })]} />);
+    const { container } = render(<AgentToolCall count={1} calls={[call({ okf: null })]} />);
 
     expect(container.querySelector('[data-slot="bot-tool-provenance"]')).toBeNull();
     expect(container.textContent).not.toMatch(/OKF/);
@@ -285,7 +285,7 @@ describe("BotToolCall", () => {
   it("does not put a 64 kB result in the DOM", () => {
     const body = "x".repeat(65_536);
     const { container } = render(
-      <BotToolCall count={1} calls={[call({ result: body, bytes: 65_536 })]} />,
+      <AgentToolCall count={1} calls={[call({ result: body, bytes: 65_536 })]} />,
     );
 
     fireEvent.click(row());
@@ -298,7 +298,7 @@ describe("BotToolCall", () => {
 
   it("keeps arriving rows out of every live region", () => {
     const { container } = render(
-      <BotToolCall
+      <AgentToolCall
         count={3}
         calls={[
           call({ id: "a" }),
@@ -316,14 +316,14 @@ describe("BotToolCall", () => {
   });
 
   it("falls back to the stored count for a conversation replayed without detail", () => {
-    render(<BotToolCall count={2} calls={[]} />);
+    render(<AgentToolCall count={2} calls={[]} />);
 
     expect(screen.getByText(botToolCallCaption(2))).toBeInTheDocument();
     expect(screen.queryAllByRole("button")).toHaveLength(0);
   });
 
   it("renders nothing for a turn that called no tools", () => {
-    const { container } = render(<BotToolCall count={0} />);
+    const { container } = render(<AgentToolCall count={0} />);
 
     expect(container).toBeEmptyDOMElement();
   });

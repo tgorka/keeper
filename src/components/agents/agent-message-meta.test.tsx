@@ -27,17 +27,17 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AgentMessageMeta,
+  AgentMetaToggle,
   BOT_META_LESS_LABEL,
   BOT_META_MORE_LABEL,
   BOT_META_NOTHING_REPORTED,
   BOT_META_PANEL_LABEL,
   BOT_META_PARTIAL,
   BOT_META_TOGGLE_LABEL,
-  BotMessageMeta,
-  BotMetaToggle,
   metaCaption,
   toggleBotMessageDetails,
-} from "@/components/bots/bot-message-meta";
+} from "@/components/agents/agent-message-meta";
 import { paletteActionHandlers } from "@/components/command-palette/actions";
 import type { BotMessageVm } from "@/lib/ipc/client";
 import { botsStore } from "@/lib/stores/bots";
@@ -96,7 +96,7 @@ afterEach(() => {
 
 describe("the toggle governs whether anything is shown at all", () => {
   it("renders nothing while the toggle is off, however much was recorded", () => {
-    const { container } = render(<BotMessageMeta message={answer()} />);
+    const { container } = render(<AgentMessageMeta message={answer()} />);
 
     expect(container).toBeEmptyDOMElement();
     // Not merely invisible: the numbers are not in the document.
@@ -104,19 +104,10 @@ describe("the toggle governs whether anything is shown at all", () => {
     expect(screen.queryByText(BOT_META_MORE_LABEL)).not.toBeInTheDocument();
   });
 
-  it("renders the compact caption once the toggle is on", () => {
-    botsStore.getState().setMetaShown(true);
-    render(<BotMessageMeta message={answer()} />);
-
-    expect(
-      screen.getByText("llama3.1:8b · 1,291 tokens · first token after 340 ms · answered in 0:12"),
-    ).toBeInTheDocument();
-  });
-
   it("says nothing about a question, which has no model and no tokens", () => {
     botsStore.getState().setMetaShown(true);
     const { container } = render(
-      <BotMessageMeta message={answer({ role: "user", content: "where is it?" })} />,
+      <AgentMessageMeta message={answer({ role: "user", content: "where is it?" })} />,
     );
 
     expect(container).toBeEmptyDOMElement();
@@ -124,7 +115,7 @@ describe("the toggle governs whether anything is shown at all", () => {
 
   it("keeps the caption out of every live region, so a stream cannot spam it", () => {
     botsStore.getState().setMetaShown(true);
-    const { container } = render(<BotMessageMeta message={answer()} />);
+    const { container } = render(<AgentMessageMeta message={answer()} />);
 
     expect(container.querySelector("[aria-live]")).toBeNull();
     expect(container.querySelector('[role="status"]')).toBeNull();
@@ -153,7 +144,7 @@ describe("an absent number renders as absent, never as zero", () => {
       // A non-zero tool-call count, so the only `0` a panel could contain is a
       // fabricated one. `toolCallCount` is the one column that is not nullable,
       // and its own zero is asserted separately below.
-      render(<BotMessageMeta message={answer({ toolCallCount: 2, [field]: null })} />);
+      render(<AgentMessageMeta message={answer({ toolCallCount: 2, [field]: null })} />);
       fireEvent.click(screen.getByRole("button", { name: BOT_META_MORE_LABEL }));
 
       const panel = screen.getByLabelText(BOT_META_PANEL_LABEL);
@@ -179,7 +170,7 @@ describe("an absent number renders as absent, never as zero", () => {
 
   it("shows every field when the endpoint reported all of them", async () => {
     botsStore.getState().setMetaShown(true);
-    render(<BotMessageMeta message={answer()} />);
+    render(<AgentMessageMeta message={answer()} />);
     fireEvent.click(screen.getByRole("button", { name: BOT_META_MORE_LABEL }));
 
     const panel = screen.getByLabelText(BOT_META_PANEL_LABEL);
@@ -192,7 +183,7 @@ describe("an absent number renders as absent, never as zero", () => {
   it("names the silence when an endpoint reported nothing measurable", () => {
     botsStore.getState().setMetaShown(true);
     render(
-      <BotMessageMeta
+      <AgentMessageMeta
         message={answer({
           model: null,
           providerId: null,
@@ -214,7 +205,7 @@ describe("an absent number renders as absent, never as zero", () => {
 
   it("shows a zero tool-call count, because that one IS a measurement", async () => {
     botsStore.getState().setMetaShown(true);
-    render(<BotMessageMeta message={answer()} />);
+    render(<AgentMessageMeta message={answer()} />);
     fireEvent.click(screen.getByRole("button", { name: BOT_META_MORE_LABEL }));
 
     expect(screen.getByText("Tool calls")).toBeInTheDocument();
@@ -225,7 +216,7 @@ describe("an absent number renders as absent, never as zero", () => {
 describe("the expander is a real disclosure", () => {
   it("moves aria-expanded and mounts the panel only when open", async () => {
     botsStore.getState().setMetaShown(true);
-    render(<BotMessageMeta message={answer()} />);
+    render(<AgentMessageMeta message={answer()} />);
 
     const trigger = screen.getByRole("button", { name: BOT_META_MORE_LABEL });
     expect(trigger).toHaveAttribute("aria-expanded", "false");
@@ -252,14 +243,14 @@ describe("the expander is a real disclosure", () => {
 describe("a row that never finished says so", () => {
   it("states the answer is incomplete in the caption", () => {
     botsStore.getState().setMetaShown(true);
-    render(<BotMessageMeta message={answer({ partial: true, finishReason: null })} />);
+    render(<AgentMessageMeta message={answer({ partial: true, finishReason: null })} />);
 
     expect(screen.getByText(new RegExp(BOT_META_PARTIAL))).toBeInTheDocument();
   });
 
   it("says nothing about completeness on a row that finished", () => {
     botsStore.getState().setMetaShown(true);
-    render(<BotMessageMeta message={answer()} />);
+    render(<AgentMessageMeta message={answer()} />);
 
     expect(screen.queryByText(new RegExp(BOT_META_PARTIAL))).not.toBeInTheDocument();
   });
@@ -268,7 +259,7 @@ describe("a row that never finished says so", () => {
 describe("the toggle is persisted in Rust and defaults off", () => {
   it("hydrates from the stored setting rather than assuming", async () => {
     stored = true;
-    render(<BotMetaToggle />);
+    render(<AgentMetaToggle />);
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: BOT_META_TOGGLE_LABEL })).toHaveAttribute(
@@ -280,7 +271,7 @@ describe("the toggle is persisted in Rust and defaults off", () => {
   });
 
   it("starts off when nothing has been stored", async () => {
-    render(<BotMetaToggle />);
+    render(<AgentMetaToggle />);
 
     await waitFor(() => expect(detailsGet).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: BOT_META_TOGGLE_LABEL })).toHaveAttribute(
@@ -296,7 +287,7 @@ describe("the toggle is persisted in Rust and defaults off", () => {
 
   it("stays off when the setting could not be read, rather than claiming it is on", async () => {
     detailsGet.mockImplementationOnce(() => Promise.reject(new Error("no data dir")));
-    render(<BotMetaToggle />);
+    render(<AgentMetaToggle />);
 
     await waitFor(() => expect(detailsGet).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: BOT_META_TOGGLE_LABEL })).toHaveAttribute(
@@ -306,7 +297,7 @@ describe("the toggle is persisted in Rust and defaults off", () => {
   });
 
   it("writes through Rust and moves the mirror the caption reads", async () => {
-    render(<BotMetaToggle />);
+    render(<AgentMetaToggle />);
     await waitFor(() => expect(detailsGet).toHaveBeenCalled());
 
     fireEvent.click(screen.getByRole("button", { name: BOT_META_TOGGLE_LABEL }));

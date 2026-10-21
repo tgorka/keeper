@@ -27,8 +27,9 @@
  * it (a centered dialog vs the full-screen `PhoneSearchSurface`) driven by two
  * stores; it reads the tier at dispatch and opens the right one.
  */
+
+import { toggleBotMessageDetails } from "@/components/agents/agent-message-meta";
 import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
-import { toggleBotMessageDetails } from "@/components/bots/bot-message-meta";
 import { transcribeAFile } from "@/components/transcription/transcribe-a-file";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";

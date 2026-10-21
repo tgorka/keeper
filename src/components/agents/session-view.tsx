@@ -1,7 +1,14 @@
 import { Archive, ArchiveRestore, ArrowLeft } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
+import { SessionControls } from "@/components/agents/session-controls";
+import {
+  SessionAnswerDetails,
+  SessionLiveTurn,
+  SessionTrace,
+} from "@/components/agents/session-turn";
 import { Composer } from "@/components/chat/composer";
 import { Button } from "@/components/ui/button";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -17,6 +24,7 @@ import {
   agentSessionPageBack,
   agentSessionUnarchive,
 } from "@/lib/ipc/client";
+import { useAgentViewPrefs } from "@/lib/stores/agent-view-prefs";
 import {
   ConversationStoresProvider,
   createConversationStores,
@@ -36,6 +44,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const { database, sessionId } = target;
   const pinned = useRef(true);
   const previousHeight = useRef<number | null>(null);
+  const { value: prefs } = useAgentViewPrefs();
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: explicit retry restarts the failed subscription
   useEffect(() => {
@@ -131,6 +140,14 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             <span className="break-all">{database}</span>
             {vm && <span className="break-all">{vm.agentName}</span>}
             {vm?.archived && <span>Archived</span>}
+            {vm?.untrusted && (
+              <span
+                className="font-medium text-foreground"
+                title="This session has read outside content. Consequential actions need a person."
+              >
+                Untrusted
+              </span>
+            )}
           </p>
         </div>
         {vm && (
@@ -146,6 +163,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           </Button>
         )}
       </header>
+      {vm && <SessionControls vm={vm} />}
       {error && (
         <div
           role="alert"
@@ -192,7 +210,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             Loading messages…
           </p>
         )}
-        {vm?.complete && vm.messages.length === 0 && (
+        {vm?.complete && vm.messages.length === 0 && vm.live.length === 0 && (
           <p className="text-muted-foreground text-sm">No messages in this session yet.</p>
         )}
         <ol aria-label="Messages" className="mx-auto flex w-full max-w-3xl flex-col gap-5">
@@ -205,9 +223,22 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 </span>
                 {message.state && <span className="text-muted-foreground">{message.state}</span>}
               </div>
-              <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
-                {message.body}
-              </p>
+              {message.role === "agent" ? (
+                <AgentAnswer body={message.body} />
+              ) : (
+                <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
+                  {message.body}
+                </p>
+              )}
+              {vm.readsTrace && (
+                <SessionTrace
+                  reasoning={prefs.showReasoning ? message.reasoning : undefined}
+                  steps={message.steps}
+                />
+              )}
+              {prefs.showDetails && message.details && (
+                <SessionAnswerDetails details={message.details} />
+              )}
               {message.ask && (
                 <fieldset
                   className="mt-2 flex min-w-0 flex-wrap gap-2"
@@ -248,6 +279,15 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
               )}
             </li>
           ))}
+          {vm?.live.map((turn) => (
+            <SessionLiveTurn
+              key={turn.turnId}
+              turn={turn}
+              agentName={vm.agentName}
+              readsTrace={vm.readsTrace}
+              showReasoning={prefs.showReasoning}
+            />
+          ))}
         </ol>
         {!!vm?.approvals.length && (
           <section
@@ -269,7 +309,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           This archived session is read-only. Unarchive it to continue.
         </p>
       ) : (
-        <div className="shrink-0 border-border border-t p-3">
+        <div data-slot="agent-session-composer" className="shrink-0 border-border border-t p-3">
           <ConversationStoresProvider value={stores}>
             <Composer
               transport="session"

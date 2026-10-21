@@ -30,6 +30,7 @@
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BOT_META_TOGGLE_LABEL } from "@/components/agents/agent-message-meta";
 import { APPROVAL_DENY_LABEL, APPROVAL_ONCE_LABEL } from "@/components/bots/bot-approval-dialog";
 import {
   BOT_COMPOSER_LABEL,
@@ -41,7 +42,6 @@ import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
 import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-bar";
 import { LISTENING_TOGGLE_LABEL } from "@/components/bots/bot-listening-toggle";
 import { BOT_PARTIAL_CAPTION, BOT_RETRY_LABEL } from "@/components/bots/bot-message";
-import { BOT_META_TOGGLE_LABEL } from "@/components/bots/bot-message-meta";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
 import { voiceFoldedLine, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {

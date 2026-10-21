@@ -15,8 +15,8 @@
  *
  * # Reuse, and the one thing forked
  *
- * `BotSessionList`, `BotConversation` (hence `BotMessage` / `BotAnswer`),
- * `BotEmptyState`, `BotPicker`, `BotMetaToggle`, `BotComposer` and the voice
+ * `BotSessionList`, `BotConversation` (hence `BotMessage` / `AgentAnswer`),
+ * `BotEmptyState`, `BotPicker`, `AgentMetaToggle`, `BotComposer` and the voice
  * pieces are the desktop components unchanged, and every stream event lands
  * through the desktop pane's own `onStreamEvent`. What IS repeated here is the
  * desktop pane's glue — the three-read `refresh`, `send`, `retry`, `stop` —
@@ -66,11 +66,11 @@
  * slash-command that would point at the bar answers with a sentence instead.
  */
 import { type Ref, useEffect, useState } from "react";
+import { AgentMetaToggle } from "@/components/agents/agent-message-meta";
 import { BotComposer } from "@/components/bots/bot-composer";
 import { BotConversation } from "@/components/bots/bot-conversation";
 import { BOTS_NO_DRIVE_HERE_SENTENCE, BotEmptyState } from "@/components/bots/bot-empty-state";
 import { BotListeningToggle } from "@/components/bots/bot-listening-toggle";
-import { BotMetaToggle } from "@/components/bots/bot-message-meta";
 import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
 import { BotSessionList } from "@/components/bots/bot-session-list";
@@ -659,7 +659,7 @@ export function BotsPhoneConversation({
           )}
           <div className="flex items-center justify-between gap-2 px-4 py-2">
             <span className="text-muted-foreground text-xs">Answer details under each reply</span>
-            <BotMetaToggle />
+            <AgentMetaToggle />
           </div>
           <BotVoiceWake />
         </SheetContent>

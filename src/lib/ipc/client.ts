@@ -355,6 +355,7 @@ export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
+export type { AgentLiveTurnVm } from "./gen/AgentLiveTurnVm";
 export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
 export type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
 export type { AgentMcpListVm } from "./gen/AgentMcpListVm";
@@ -364,6 +365,7 @@ export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
 export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
 export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
 export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
+export type { AgentMessageDetailsVm } from "./gen/AgentMessageDetailsVm";
 export type { AgentMessageVm } from "./gen/AgentMessageVm";
 export type { AgentModelBotVm } from "./gen/AgentModelBotVm";
 export type { AgentModelLineVm } from "./gen/AgentModelLineVm";
@@ -390,9 +392,12 @@ export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentSessionRef } from "./gen/AgentSessionRef";
 export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
 export type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
+export type { AgentSessionToolVm } from "./gen/AgentSessionToolVm";
 export type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
 export type { AgentStatusVm } from "./gen/AgentStatusVm";
 export type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
+export type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
 export type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 export type { AgentWebSearchVm } from "./gen/AgentWebSearchVm";
@@ -875,6 +880,7 @@ import type { AgentSessionRef } from "./gen/AgentSessionRef";
 import type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
 import type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
 import type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+import type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 import type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
 import type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
@@ -4132,6 +4138,29 @@ export async function agentSessionClose(subscriptionId: string): Promise<void> {
 
 export async function agentSessionPageBack(target: AgentSessionRef): Promise<void> {
   await invoke<void>("agent_session_page_back", { ...target });
+}
+
+export async function agentViewPrefsGet(): Promise<AgentViewPrefsVm> {
+  return await invoke("agent_view_prefs_get");
+}
+
+export async function agentViewPrefsSet(
+  patch: Partial<AgentViewPrefsVm>,
+): Promise<AgentViewPrefsVm> {
+  return await invoke("agent_view_prefs_set", {
+    patch: {
+      showReasoning: patch.showReasoning ?? null,
+      showDetails: patch.showDetails ?? null,
+    },
+  });
+}
+
+export async function agentSessionToolSet(
+  target: AgentSessionRef,
+  name: string,
+  on: boolean,
+): Promise<void> {
+  await invoke("agent_session_tool_set", { ...target, name, on });
 }
 
 export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {
