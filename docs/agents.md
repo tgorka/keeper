@@ -35,13 +35,104 @@ default session.
 
 **Earlier conversations** preserves earlier Matrix agent history as read-only. The former dock's
 Matrix note-focus and drive-scope controls are not sent to database agents: those carriers were
-not migrated by this story. Live tail rendering, thinking/details and instance selection belong
-to the subsequent stories; message and attention state remain Rust-owned throughout.
+not migrated by this story. Instance selection belongs to the subsequent story; message and
+attention state remain Rust-owned throughout.
 
 Browser checks use the development mock shell (`?sessions=launch`, optionally
 `&platform=phone`), not a server or a performance measurement. The installed macOS shell and the
 archived-session ≤1 s tailnet target still require the native/device gates; mock page timing is
 not evidence for that target.
+
+## Live answers, thinking and details
+
+An open answer grows as its text arrives. Its current tool is named below the text. Tool-call
+disclosures show a reader when a call starts, when it finishes or is refused, and its result.
+The transcript scrolls inside its own viewport: a growing answer does not move the composer or
+replace an unsent draft. Scrolling back stops following the newest text until you return to the
+bottom. If the claim ends without a final message, the retained text says **The answer stopped.**
+
+**Show thinking** and **Show details** start off and are remembered on this device
+(`agents.show_reasoning`, `agents.show_details`). Changing one writes only that preference.
+Thinking is offered only to a person who can read the session's trace, and reasoning enters the
+view only while that preference is on. It remains readable after the answer finishes. A person
+without trace access receives no reasoning or tool-result rows; the current tool's name is public
+to the session, not its arguments or result. These are server/Rust boundaries, not CSS hiding.
+
+**Show details** reveals the final answer's model, reported input/output/total tokens, time to
+first token, duration, finish reason and error. Missing measurements have no label and are never
+filled with zero. A reported zero remains a real measurement. Answer markdown renders inert text:
+model-written HTML does not become HTML, and model-written links do not navigate.
+
+**Tools** contains only tools the answering instance offers, from its definition and container.
+Switching off narrows that set; switching on restores an offered tool and never adds one. An
+unknown or absent offered-tools list renders no Tools control. Changes wait for Rust's view; a
+refusal is visible beside the controls. **Untrusted** marks a session that has read outside content;
+consequential actions still need a person.
+
+The viewer rule is Rust's: “A viewer renders a turn that is still being written as the turn's
+`turn_chunks` contiguous from seq 0, followed by the latest `text` it has seen on
+`session:{session_id}` whose `from_seq` is the seq after the last of them; it keeps the latest tail
+for each `from_seq` — through a presence leave — until that seq's chunk arrives, and replaces both
+with the agent's `messages` row for the turn (`turn_id`) once it holds it.” The frontend renders
+that projection, never folds chunks or presence itself.
+
+Development fixtures: `?sessions=launch&live=stream`, with `&platform=phone` for the phone shell.
+`live=error`, `stopped`, `nonreader`, `no-tools`, `untrusted`, `long` and `refused` cover provider
+error, ended claim, trace exclusion, absent offers, outside-content marker, long strings and
+refused preference/tool writes. Timed mock deltas are UI evidence only, not a server or latency proof.
+
+### Measured: live-answer presentation
+
+2026-10-20, real app in the agent-desktop Chrome with the development mock shell, at 1280 × 900
+and 420 × 900. During an 18-second timed answer, 171 desktop and 175 phone geometry samples
+kept the composer's top at exactly 850.5 px and 844 px respectively (0 px movement); its draft
+and textarea node were retained. The long-string phone case also held 844 px across 175 samples.
+There was no document-width overflow. Phone controls — thinking/details, Tools, offered switches,
+tool disclosure, code-copy, Back, Archive and Send — measured at least 44 × 44 px. Both preferences
+were exercised on/off and survived mock-shell reloads; offered tools were switched off and back on.
+
+ARIA snapshots and screenshots covered live text, tool start/completion, thinking on/off, final
+details, provider error, stopped answer, nonreader, absent tools, refused writes and long output.
+The stopped notice sits after the retained answer so it remains visible at the reading edge,
+rather than disappearing above a long reply. These successful runs recorded no browser console
+errors or failed network requests. The mock's persisted preferences are not proof of native
+settings storage; Rust and the native shell gates own that boundary. Layout geometry is browser
+evidence, not a claim that jsdom measures layout.
+
+The native tailnet p95 publish-to-receive target (NFR-124) requires the real agent and viewer
+timestamps. Browser mock timing does not measure it; no native latency result is claimed here.
+
+### Measured: a live answer against the real server
+
+2026-10-21, `hq_live.rs`'s three live-answer tests on one Linux host: the keeper-hq server
+(`hq/104-5-claims` 2dc38f4, Bun 1.4.2, serving this branch's contract, schema 3) over a throwaway
+Postgres 18 on delectra, one real `keeper-agentd run` serving Nixie on `tgdrive` from the e2e model
+stub (40 reasoning tokens, then 240 answer tokens, 25 ms apart), and keeper-core viewers. A second
+Nixie client stood in for R-HQ-30's runtime half and wrote only an `agent_profiles` row whose
+`tools` named `journal_append` and `journal_read`.
+
+- **Growing answer** (four runs): the owner's view grew in 151–223 steps over about 6 s, median
+  step 25 ms, each step a prefix of the final 1,090 bytes, the last equal to the final row. A
+  second device that paired and opened mid-answer showed at once at least what the first had
+  shown by then (98/98, 118/118, 146/146, 274/274 bytes), then the same final row byte for byte.
+  With *Show details* on, the final row showed model, 50/240/290 tokens, time to first token
+  27–33 ms and duration about 7.1 s. With *Show thinking* on, the thinking streamed and stayed.
+- **Model to viewer** (three runs, 544 steps): from the stub emitting a token to keeper-core's
+  session view first showing that length, p50 3.6 ms, p95 21.5 ms, p99 256 ms, max 556 ms. The
+  outliers fall while the second device pairs in the same process. This is one host over
+  loopback and includes the instance's work, so it is **not** NFR-124's figure: the tailnet
+  publish-to-receive p95 (electra → hesperia) is still owed.
+- **Non-reader:** a person invited when the session opened saw the answer grow and the same
+  final row, was shown no thinking or tool step with *Show thinking* on, and held no
+  `reasoning` or `tool_calls` row for the session.
+- **Tool switches:** both offered tools were listed on. `journal_append` switched off on the
+  owner's device showed off on the guest's, and the next turn offered the model only
+  `journal_read`; switched back on, the next turn offered both. A name not offered was refused.
+- **Killed instance:** SIGKILLed with 202 bytes shown, the view kept those 202 bytes and said the
+  answer stopped 28.7 s later, once the claim's lease had lapsed.
+
+The Agents-window archive test assumes no agent answers its messages, and the pairing test needs
+two databases; neither fits this rig, which runs an agent on one database.
 
 ## Earlier Matrix agent hosting
 
