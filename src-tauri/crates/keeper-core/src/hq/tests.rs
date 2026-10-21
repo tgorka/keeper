@@ -628,6 +628,14 @@ impl Replica for Staged {
     ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
         self.inner.remote_query(id, params)
     }
+    fn remote_command(
+        &self,
+        id: &str,
+        request: &str,
+        params: Value,
+    ) -> Result<(), crate::hq::port::ReplicaError> {
+        self.inner.remote_command(id, request, params)
+    }
     fn sync_now(&self) {
         self.inner.sync_now();
     }
