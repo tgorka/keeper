@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { type AgentSessionViewVm, agentSessionToolSet } from "@/lib/ipc/client";
 import {
@@ -13,12 +13,19 @@ export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
   const prefs = useAgentViewPrefs();
   const [toolsOpen, setToolsOpen] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
+  const writing = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const toolsId = useId();
   useEffect(() => {
     void loadAgentViewPrefs();
   }, []);
 
+  // A session that cannot be changed here draws no switches at all: a tool
+  // not changeable is absent, not disabled.
+  const tools = vm.readOnly ? [] : vm.tools;
+  // Never the `disabled` attribute while a write is in flight: it would drop
+  // keyboard focus to the page. A click then is ignored instead (the store
+  // ignores a preference click too).
   return (
     <div className="shrink-0 border-border border-b px-3 py-1">
       <fieldset className="flex flex-wrap items-center gap-1" aria-label="Answer preferences">
@@ -27,7 +34,8 @@ export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
             variant={prefs.value.showReasoning ? "secondary" : "ghost"}
             className="min-h-11"
             aria-pressed={prefs.value.showReasoning}
-            disabled={!prefs.loaded || prefs.busy}
+            aria-disabled={!prefs.loaded}
+            aria-busy={prefs.busy}
             onClick={() => void setAgentViewPrefs({ showReasoning: !prefs.value.showReasoning })}
           >
             Show thinking
@@ -37,12 +45,13 @@ export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
           variant={prefs.value.showDetails ? "secondary" : "ghost"}
           className="min-h-11"
           aria-pressed={prefs.value.showDetails}
-          disabled={!prefs.loaded || prefs.busy}
+          aria-disabled={!prefs.loaded}
+          aria-busy={prefs.busy}
           onClick={() => void setAgentViewPrefs({ showDetails: !prefs.value.showDetails })}
         >
           Show details
         </Button>
-        {vm.tools.length > 0 && (
+        {tools.length > 0 && (
           <Button
             variant="ghost"
             className="min-h-11"
@@ -55,22 +64,24 @@ export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
           </Button>
         )}
       </fieldset>
-      {toolsOpen && vm.tools.length > 0 && (
+      {toolsOpen && tools.length > 0 && (
         <fieldset id={toolsId} className="max-h-48 overflow-y-auto pb-2">
           <legend className="text-muted-foreground text-xs">Tools allowed in this session</legend>
           <p className="py-1 text-muted-foreground text-xs">
             Turning a tool on only restores what this agent offers.
           </p>
           <div className="flex flex-wrap gap-1">
-            {vm.tools.map((tool) => (
+            {tools.map((tool) => (
               <Button
                 key={tool.name}
                 role="switch"
                 aria-checked={tool.on}
                 variant={tool.on ? "secondary" : "outline"}
                 className="h-auto min-h-11 max-w-full whitespace-normal break-all"
-                disabled={pending !== null || vm.readOnly}
+                aria-busy={pending === tool.name}
                 onClick={async () => {
+                  if (writing.current) return;
+                  writing.current = true;
                   setPending(tool.name);
                   setError(null);
                   try {
@@ -82,6 +93,7 @@ export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
                   } catch (raw) {
                     setError(syncErrorMessage(raw, "keeper could not change this tool."));
                   } finally {
+                    writing.current = false;
                     setPending(null);
                   }
                 }}

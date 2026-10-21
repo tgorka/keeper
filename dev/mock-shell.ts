@@ -9316,12 +9316,25 @@ function hqRefuse(message: string): never {
 const sessionScenario = new URLSearchParams(location.search).get("sessions");
 // ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused
 const liveScenario = new URLSearchParams(location.search).get("live");
-// Node's own `localStorage` global is undefined without a storage file, so the
-// test runs that import this module read nothing here.
-let agentViewPrefs = {
-  showReasoning: globalThis.localStorage?.getItem("keeper.mock.agents.show_reasoning") === "1",
-  showDetails: globalThis.localStorage?.getItem("keeper.mock.agents.show_details") === "1",
-};
+/**
+ * The answer preferences survive a reload in `sessionStorage`, as the capture
+ * sources do, read on first use rather than at import.
+ */
+const AGENT_VIEW_PREFS_KEY = "keeper.mock-shell.agentViewPrefs";
+let agentViewPrefs: { showReasoning: boolean; showDetails: boolean } | null = null;
+function viewPrefs(): { showReasoning: boolean; showDetails: boolean } {
+  if (agentViewPrefs) return agentViewPrefs;
+  const shipped = { showReasoning: false, showDetails: false };
+  let read = shipped;
+  try {
+    const stored = sessionStorage.getItem(AGENT_VIEW_PREFS_KEY);
+    if (stored !== null) read = { ...shipped, ...JSON.parse(stored) };
+  } catch {
+    // Unreadable: the shipped defaults, as a fresh profile would have.
+  }
+  agentViewPrefs = read;
+  return read;
+}
 const sessionChoices: AgentChoiceVm[] = [
   {
     agentActor: "assistant",
@@ -9481,13 +9494,13 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     tools: vm.tools.map((tool) => ({ ...tool })),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
       ...message,
-      ...(agentViewPrefs.showDetails && details ? { details } : {}),
-      ...(vm.readsTrace && agentViewPrefs.showReasoning && reasoning ? { reasoning } : {}),
+      ...(viewPrefs().showDetails && details ? { details } : {}),
+      ...(vm.readsTrace && viewPrefs().showReasoning && reasoning ? { reasoning } : {}),
       ...(vm.readsTrace && steps ? { steps } : {}),
     })),
     live: vm.live.map(({ reasoning, steps, ...turn }) => ({
       ...turn,
-      ...(vm.readsTrace && agentViewPrefs.showReasoning && reasoning ? { reasoning } : {}),
+      ...(vm.readsTrace && viewPrefs().showReasoning && reasoning ? { reasoning } : {}),
       steps: vm.readsTrace ? steps.map((step) => ({ ...step })) : [],
     })),
   };
@@ -9589,22 +9602,20 @@ function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   return vm;
 }
 const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
-  agent_view_prefs_get: () => ({ ...agentViewPrefs }),
+  agent_view_prefs_get: () => ({ ...viewPrefs() }),
   agent_view_prefs_set: (payload) => {
     if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
     const patch = payload.patch as { showReasoning: boolean | null; showDetails: boolean | null };
+    const held = viewPrefs();
     agentViewPrefs = {
-      showReasoning: patch.showReasoning ?? agentViewPrefs.showReasoning,
-      showDetails: patch.showDetails ?? agentViewPrefs.showDetails,
+      showReasoning: patch.showReasoning ?? held.showReasoning,
+      showDetails: patch.showDetails ?? held.showDetails,
     };
-    globalThis.localStorage?.setItem(
-      "keeper.mock.agents.show_reasoning",
-      agentViewPrefs.showReasoning ? "1" : "0",
-    );
-    globalThis.localStorage?.setItem(
-      "keeper.mock.agents.show_details",
-      agentViewPrefs.showDetails ? "1" : "0",
-    );
+    try {
+      sessionStorage.setItem(AGENT_VIEW_PREFS_KEY, JSON.stringify(agentViewPrefs));
+    } catch {
+      // A harness that cannot write still answers honestly for this page.
+    }
     publishSessions();
     return { ...agentViewPrefs };
   },

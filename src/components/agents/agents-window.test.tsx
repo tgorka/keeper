@@ -506,23 +506,35 @@ describe("live answer controls", () => {
     expect(composer).toHaveValue("My next question");
   });
 
-  it("shows reasoning only after the reader chooses it, and keeps it readable after completion", async () => {
+  it("draws thinking as Rust re-projects it after the toggle, and keeps focus on the toggle", async () => {
     draw();
     await list();
-    const turn = {
-      turnId: "t1",
-      text: "An answer",
-      reasoning: "Private thought",
-      steps: [],
-      stopped: false,
-    };
+    const turn = { turnId: "t1", text: "An answer", steps: [], stopped: false };
     await open("alpha", { live: [turn] });
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Show thinking" })).toBeEnabled(),
+    const toggle = screen.getByRole("button", { name: "Show thinking" });
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
+    // The executor form, not `Promise.withResolvers`: the project compiles
+    // against `lib: ES2020`, where that constructor method does not exist.
+    let saved: (value: Ipc.AgentViewPrefsVm) => void = () => {};
+    mock.prefsSet.mockReturnValueOnce(new Promise((resolve) => (saved = resolve)));
+    toggle.focus();
+    fireEvent.click(toggle);
+    // A browser drops focus from a control that turns disabled; jsdom does
+    // not, so the write in flight must leave the toggle enabled.
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-busy", "true"));
+    expect(toggle).toBeEnabled();
+    expect(toggle).toHaveFocus();
+    fireEvent.click(toggle);
+    await act(async () => saved({ showReasoning: true, showDetails: false }));
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(mock.prefsSet).toHaveBeenCalledTimes(1);
+    expect(toggle).toHaveFocus();
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", { live: [{ ...turn, reasoning: "Private thought" }] }),
+      ),
     );
-    expect(screen.queryByText("Private thought")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Show thinking" }));
-    expect(await screen.findByText("Private thought")).toBeInTheDocument();
+    expect(screen.getByText("Private thought")).toBeInTheDocument();
     act(() =>
       mock.views.get("alpha")?.(
         view("alpha", {
@@ -541,65 +553,116 @@ describe("live answer controls", () => {
       ),
     );
     expect(screen.getByRole("region", { name: "Thinking" })).toHaveTextContent("Private thought");
-    fireEvent.click(screen.getByRole("button", { name: "Show thinking" }));
-    await waitFor(() => expect(screen.queryByText("Private thought")).not.toBeInTheDocument());
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "false"));
+    expect(toggle).toHaveFocus();
+    act(() => mock.views.get("alpha")?.(view("alpha")));
+    expect(screen.queryByText("Private thought")).not.toBeInTheDocument();
   });
 
-  it("never renders trace content for a nonreader, including a previously enabled preference", async () => {
+  it("offers no thinking toggle to a nonreader but still says which tool is running", async () => {
     mock.prefsGet.mockResolvedValue({ showReasoning: true, showDetails: false });
     draw();
     await list();
     await open("alpha", {
       readsTrace: false,
       live: [
-        {
-          turnId: "t1",
-          text: "Visible answer",
-          tool: "web_search",
-          reasoning: "Private thought",
-          steps: [{ id: "c1", name: "web_search", status: "done", result: "Private result" }],
-          stopped: false,
-        },
+        { turnId: "t1", text: "Visible answer", tool: "web_search", steps: [], stopped: false },
       ],
     });
     await waitFor(() => expect(agentViewPrefsStore.getState().loaded).toBe(true));
     expect(screen.queryByRole("button", { name: "Show thinking" })).not.toBeInTheDocument();
-    expect(screen.queryByText("Private thought")).not.toBeInTheDocument();
-    expect(screen.queryByText("Private result")).not.toBeInTheDocument();
-    expect(screen.queryByRole("list", { name: "Tool calls" })).not.toBeInTheDocument();
     expect(screen.getByText("Calling: web_search")).toBeInTheDocument();
   });
 
-  it("reveals reported details, including a measured zero and an error, without inventing usage", async () => {
+  it("draws the thinking and details Rust sends even where this window last read them off", async () => {
+    // Switched on another device or in a settings file: Rust re-projects the
+    // open session while this window's mirror of the preference still says off.
     draw();
     await list();
-    await open("alpha", {
-      messages: [
-        {
-          id: "final",
-          role: "agent",
-          authorActor: "assistant",
-          authorName: "Assistant",
-          body: "Partial answer",
-          createdAtMs: 1780000000000,
-          details: {
-            model: "example-model",
-            ttftMs: 0,
-            durationMs: 1240,
-            finish: "error",
-            error: "Provider disconnected",
-          },
-        },
-      ],
-    });
-    expect(screen.queryByText("example-model")).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Show details" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
-    expect(await screen.findByText("example-model")).toBeInTheDocument();
+    await open("alpha");
+    await waitFor(() => expect(agentViewPrefsStore.getState().loaded).toBe(true));
+    expect(agentViewPrefsStore.getState().value.showReasoning).toBe(false);
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          live: [
+            {
+              turnId: "t1",
+              text: "An answer",
+              reasoning: "Synced thought",
+              steps: [],
+              stopped: false,
+            },
+          ],
+          messages: [
+            {
+              id: "final",
+              role: "agent",
+              authorActor: "assistant",
+              authorName: "Assistant",
+              body: "Earlier answer",
+              createdAtMs: 1780000000000,
+              details: { model: "synced-model" },
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getByRole("region", { name: "Thinking" })).toHaveTextContent("Synced thought");
+    expect(screen.getByText("synced-model")).toBeInTheDocument();
+  });
+
+  it("draws the details Rust sends once they are chosen, a measured zero and an error included", async () => {
+    draw();
+    await list();
+    await open("alpha");
+    const toggle = screen.getByRole("button", { name: "Show details" });
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
+    toggle.focus();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+    expect(toggle).toHaveFocus();
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          messages: [
+            {
+              id: "final",
+              role: "agent",
+              authorActor: "assistant",
+              authorName: "Assistant",
+              body: "Partial answer",
+              createdAtMs: 1780000000000,
+              details: {
+                model: "example-model",
+                ttftMs: 0,
+                durationMs: 1240,
+                finish: "error",
+                error: "Provider disconnected",
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getByText("example-model")).toBeInTheDocument();
     expect(screen.getByText("0 ms")).toBeInTheDocument();
     expect(screen.getByText("Provider disconnected")).toBeInTheDocument();
     expect(screen.queryByText("Total tokens")).not.toBeInTheDocument();
     expect(screen.queryByText("Prompt tokens")).not.toBeInTheDocument();
+  });
+
+  it("draws no tool switches in a session that cannot be changed here", async () => {
+    draw();
+    await list();
+    await open("alpha", {
+      archived: true,
+      readOnly: true,
+      tools: [{ name: "read_file", on: true }],
+    });
+    expect(screen.queryByRole("button", { name: "Tools" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
   });
 
   it("renders only offered switches, waits for their confirmed state, and exposes refusal", async () => {
@@ -608,6 +671,10 @@ describe("live answer controls", () => {
     await open("alpha", { tools: [{ name: "read_file", on: true }] });
     fireEvent.click(screen.getByRole("button", { name: "Tools" }));
     const tool = screen.getByRole("switch", { name: "read_file" });
+    // Held open (executor form: `lib: ES2020`) to look at the switch mid-write.
+    let written: () => void = () => {};
+    mock.toolSet.mockReturnValueOnce(new Promise<void>((resolve) => (written = resolve)));
+    tool.focus();
     fireEvent.click(tool);
     await waitFor(() =>
       expect(mock.toolSet).toHaveBeenCalledWith(
@@ -616,12 +683,19 @@ describe("live answer controls", () => {
         false,
       ),
     );
+    expect(tool).toHaveAttribute("aria-busy", "true");
+    expect(tool).toBeEnabled();
+    expect(tool).toHaveFocus();
+    fireEvent.click(tool);
+    expect(mock.toolSet).toHaveBeenCalledTimes(1);
+    await act(async () => written());
     expect(tool).toHaveAttribute("aria-checked", "true");
     act(() =>
       mock.views.get("alpha")?.(view("alpha", { tools: [{ name: "read_file", on: false }] })),
     );
     expect(tool).toHaveAttribute("aria-checked", "false");
-    await waitFor(() => expect(tool).toBeEnabled());
+    await waitFor(() => expect(tool).toHaveAttribute("aria-busy", "false"));
+    expect(tool).toHaveFocus();
     fireEvent.click(tool);
     await waitFor(() =>
       expect(mock.toolSet).toHaveBeenLastCalledWith(
@@ -633,7 +707,7 @@ describe("live answer controls", () => {
     act(() =>
       mock.views.get("alpha")?.(view("alpha", { tools: [{ name: "read_file", on: true }] })),
     );
-    await waitFor(() => expect(tool).toBeEnabled());
+    await waitFor(() => expect(tool).toHaveAttribute("aria-busy", "false"));
     expect(tool).toHaveAttribute("aria-checked", "true");
     mock.toolSet.mockRejectedValueOnce({ message: "The definition no longer offers this tool." });
     fireEvent.click(tool);
@@ -641,6 +715,7 @@ describe("live answer controls", () => {
       "The definition no longer offers this tool.",
     );
     expect(tool).toHaveAttribute("aria-checked", "true");
+    expect(tool).toHaveFocus();
     act(() => mock.views.get("alpha")?.(view("alpha", { tools: [] })));
     expect(screen.queryByRole("button", { name: "Tools" })).not.toBeInTheDocument();
     expect(screen.queryByRole("switch")).not.toBeInTheDocument();
@@ -651,13 +726,15 @@ describe("live answer controls", () => {
     await list();
     await open("alpha");
     const toggle = screen.getByRole("button", { name: "Show details" });
-    await waitFor(() => expect(toggle).toBeEnabled());
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
+    toggle.focus();
     mock.prefsSet.mockRejectedValueOnce({ message: "The preference could not be saved." });
     fireEvent.click(toggle);
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The preference could not be saved.",
     );
     expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(toggle).toHaveFocus();
     mock.prefsSet.mockResolvedValueOnce({ showReasoning: false, showDetails: false });
     fireEvent.click(toggle);
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
@@ -673,11 +750,12 @@ describe("live answer controls", () => {
       "The preference store is unavailable.",
     );
     const toggle = screen.getByRole("button", { name: "Show thinking" });
-    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(toggle);
     expect(screen.getByText("Message in alpha")).toBeInTheDocument();
     mock.prefsGet.mockResolvedValueOnce({ showReasoning: true, showDetails: false });
     fireEvent.click(screen.getByRole("button", { name: "Try preferences again" }));
-    await waitFor(() => expect(toggle).toBeEnabled());
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(mock.prefsSet).not.toHaveBeenCalled();
@@ -695,13 +773,16 @@ describe("live answer controls", () => {
     };
     await open("alpha", { untrusted: true, live: [turn] });
     expect(screen.getByText("Untrusted")).toBeInTheDocument();
+    // Said in words, not in a `title` touch and most screen readers never reach.
+    expect(screen.getByText(/consequential actions need a person/)).toBeVisible();
     expect(screen.getByText("read_file · Started")).toBeInTheDocument();
     act(() =>
       mock.views.get("alpha")?.(
         view("alpha", {
           live: [
             {
-              ...turn,
+              text: turn.text,
+              turnId: turn.turnId,
               stopped: true,
               steps: [
                 { id: "c1", name: "read_file", status: "refused", result: "Not allowed here" },

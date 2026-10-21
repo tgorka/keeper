@@ -2,18 +2,9 @@ import { AgentAnswer } from "@/components/agents/agent-answer";
 import { countLabel, TOKENS } from "@/lib/count-label";
 import type { AgentLiveTurnVm, AgentMessageDetailsVm, AgentToolStepVm } from "@/lib/ipc/client";
 
-/** No live region around token text: announce the state, not the whole answer per delta. */
-export function SessionLiveTurn({
-  turn,
-  agentName,
-  readsTrace,
-  showReasoning,
-}: {
-  turn: AgentLiveTurnVm;
-  agentName: string;
-  readsTrace: boolean;
-  showReasoning: boolean;
-}) {
+/** No live region around token text: announce the state, not the whole answer per delta.
+ * Rust sends a turn's thinking and steps only to a reader who may see them. */
+export function SessionLiveTurn({ turn, agentName }: { turn: AgentLiveTurnVm; agentName: string }) {
   return (
     <li className="min-w-0" aria-label={`Answer from ${agentName}`}>
       <div className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs">
@@ -27,12 +18,10 @@ export function SessionLiveTurn({
       <AgentAnswer body={turn.text} />
       {turn.tool && (
         <p role="status" className="mt-2 break-all text-muted-foreground text-xs">
-          {turn.stopped ? "Last tool" : "Calling"}: {turn.tool}
+          Calling: {turn.tool}
         </p>
       )}
-      {readsTrace && (
-        <SessionTrace reasoning={showReasoning ? turn.reasoning : undefined} steps={turn.steps} />
-      )}
+      <SessionTrace reasoning={turn.reasoning} steps={turn.steps} />
       {turn.stopped && (
         <p
           role="status"

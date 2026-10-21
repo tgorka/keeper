@@ -24,7 +24,6 @@ import {
   agentSessionPageBack,
   agentSessionUnarchive,
 } from "@/lib/ipc/client";
-import { useAgentViewPrefs } from "@/lib/stores/agent-view-prefs";
 import {
   ConversationStoresProvider,
   createConversationStores,
@@ -44,7 +43,6 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const { database, sessionId } = target;
   const pinned = useRef(true);
   const previousHeight = useRef<number | null>(null);
-  const { value: prefs } = useAgentViewPrefs();
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: explicit retry restarts the failed subscription
   useEffect(() => {
@@ -141,11 +139,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             {vm && <span className="break-all">{vm.agentName}</span>}
             {vm?.archived && <span>Archived</span>}
             {vm?.untrusted && (
-              <span
-                className="font-medium text-foreground"
-                title="This session has read outside content. Consequential actions need a person."
-              >
-                Untrusted
+              <span className="min-w-0">
+                <span className="font-medium text-foreground">Untrusted</span>: this session has
+                read outside content, so consequential actions need a person.
               </span>
             )}
           </p>
@@ -230,15 +226,8 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                   {message.body}
                 </p>
               )}
-              {vm.readsTrace && (
-                <SessionTrace
-                  reasoning={prefs.showReasoning ? message.reasoning : undefined}
-                  steps={message.steps}
-                />
-              )}
-              {prefs.showDetails && message.details && (
-                <SessionAnswerDetails details={message.details} />
-              )}
+              <SessionTrace reasoning={message.reasoning} steps={message.steps} />
+              {message.details && <SessionAnswerDetails details={message.details} />}
               {message.ask && (
                 <fieldset
                   className="mt-2 flex min-w-0 flex-wrap gap-2"
@@ -280,13 +269,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             </li>
           ))}
           {vm?.live.map((turn) => (
-            <SessionLiveTurn
-              key={turn.turnId}
-              turn={turn}
-              agentName={vm.agentName}
-              readsTrace={vm.readsTrace}
-              showReasoning={prefs.showReasoning}
-            />
+            <SessionLiveTurn key={turn.turnId} turn={turn} agentName={vm.agentName} />
           ))}
         </ol>
         {!!vm?.approvals.length && (

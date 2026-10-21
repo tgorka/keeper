@@ -161,7 +161,7 @@ function CodeBlock({
           type="button"
           variant="ghost"
           size="sm"
-          className="min-h-11 shrink-0 px-2 text-xs"
+          className="h-6 shrink-0 px-2 text-xs max-md:h-auto max-md:min-h-11"
           onClick={() => {
             // The code is on screen either way, but a copy that did not happen
             // is said, so nobody pastes something else believing it went.
