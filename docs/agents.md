@@ -370,6 +370,71 @@ nixie.electra takes it over next.**) 29.4 s after the kill, before `nixie.electr
 29.9–30.5 s. Nothing ever said a holder whose lease had run out was answering. The rest of the case
 held as before.
 
+## A push from the agents server
+
+Story 106.6 (FR-855, FR-856; AD-432, D-35, R-HQ-44). With keeper closed, the phone learns of
+two things and nothing else: an approval waiting for you, and your own proxy's answer
+(Nixie's for tgorka, Dixi's for Marta) in a session you are in. Asks are not pushed.
+
+**What the phone registers.** The iPhone's APNs token (as Sygnal reads a pushkey, base64)
+and its app (`dev.tgorka.keeper.ios` or `.ios.dev`, by the build's `aps-environment`), or
+Android's UnifiedPush endpoint and its app (`dev.tgorka.keeper.android`), go to the agents
+server with your existing push gateway (`push.gateway_url` on the iPhone, read through the
+same grammar; the gateway discovered on the endpoint's server on Android) as this device's
+push target: `PUT /clients/self/push-target`, once per change and again after every start
+(`keeper_core::hq::push::PushTarget`, `Hq::set_push_target`). Clearing the gateway, or
+Android losing its endpoint, sends `DELETE`. A device not paired, or removed, sends nothing.
+
+**What the server sends.** Ids only, in the Matrix Push Gateway's `notify` shape: `event_id`
+is the item, `room_id` the session, `default_payload.keeper_hq` names
+`{database, session_id, kind, item_id}`; the iPhone's adds `mutable-content` and an alert
+that is only a key (`KEEPER_HQ_ITEM`, localised on the phone as *Open keeper to see what
+arrived.*). No title, text or summary reaches the gateway.
+
+**What the phone shows** is decided on the phone (`keeper_core::hq::push::classify`), from
+one authenticated read of the item: `GET /<database>/push/item/{kind}/{id}` with this
+device's token, the pairing of the server whose replica of that database this device holds.
+
+| item | shows |
+|---|---|
+| a pending approval you may decide, below T4, whose summary fits (one line, at most 120 characters, no control or direction character) | *nixie asks for a decision*, the tier's words, the summary; **Approve once** and **Deny** |
+| the same at T4, longer, or of a tier keeper cannot read | the tier and *open keeper to read the whole request*; **Deny** only |
+| an approval not yours, already decided or expired | keeper's words, no action |
+| your proxy's answer | the agent and its words |
+| an ask, a person's message, your own | nothing |
+
+The item the server pushes is the approval row alone, without its tool call, so "the whole
+request" the lock screen can show is the row's `summary` — keeper's own sentence for the
+call, which the runtime writes. Anything that cannot be read — no pairing, the server or the
+tailnet unreachable (DW-E106-5), a refusal (`401`, `403`, `404`), an answer about another
+item — is the generic notification with no actions. The same item may arrive twice; it shows
+once: the iPhone's extension removes an earlier notification of that item, Android tags the
+notification with it.
+
+**An action** writes the decision row through the session's own replica, exactly as the card
+does (`Hq::decide_pushed`, `hq::approvals::decide_pushed`): the request and digest the
+notification showed, only an action its category offered, never *Approve once* on a request
+the replica holds at T4 (the server's whole-commit validator refuses a T4 decision from the
+claim holder's host in any case, AD-428). On the iPhone an action that launches keeper in the
+background starts the agents client alone and waits up to twenty seconds for the request to
+reach its replica and for the server to take the decision; otherwise the notification is
+replaced by *Open keeper to finish deciding.* with the reason. **A tap** opens the item's
+session in the Agents window (`use-push-open.ts`, `PushOpenVm::Session`).
+
+**Proved on Linux:** the table, the fit, the ids grammar, folding a second delivery, the
+actions and the tap (`keeper-core/src/hq/push.rs` tests); the push target sent once per wish,
+cleared with the gateway, retried at the next discovery and never from a removed device
+(`hq/tests.rs`); the decision row written after the request arrives, T4 refused, a missing
+request refused at the deadline (`hq/window_tests.rs`); the extension's read over a real HTTP
+listener answering recorded item JSON — one `GET` with the bearer token, the generic
+notification for every refusal and an unreachable server (`keeper-nse` tests); Android's one
+notification per item (`keeper-core/tests/unifiedpush_android.rs`); the webview's landing
+(`src/hooks/use-push-open.test.ts`). **Inspection only:** `push_ios.rs`, `push_android.rs`,
+`hq_ipc.rs`, `NotificationService.swift` (CI's macOS and iOS jobs compile the Rust; the Swift
+is compiled only by the device build). **Owed on devices:** kalypso (the token reaching the
+server, the notification through Sygnal, the actions with Face ID, the tap, the generic
+notification with the tailnet off) and the Android tablet through ntfy.
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history
