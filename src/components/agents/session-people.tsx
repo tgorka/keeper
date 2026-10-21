@@ -143,11 +143,28 @@ function PeopleBody({ target, onClose }: { target: AgentSessionRef; onClose: () 
   };
 
   const busy = pending !== null;
-  const confirmRow = (subject: string, consequence: string, onConfirm: () => void) => (
-    <fieldset className="mt-2 flex flex-wrap items-center gap-2" aria-label={subject}>
-      <p className="w-full text-sm">{consequence}</p>
-      <Button variant="destructive" className="min-h-11" disabled={busy} onClick={onConfirm}>
-        {subject}
+  // A fieldset's minimum width is its content's by default: `min-w-0` lets it follow the sheet,
+  // the consequence wraps anywhere (a name may be one unbroken word), and the destructive control
+  // shows a short label while its accessible name carries the whole subject.
+  const confirmRow = (
+    subject: string,
+    label: string,
+    consequence: string,
+    onConfirm: () => void,
+  ) => (
+    <fieldset
+      className="mt-2 flex min-w-0 max-w-full flex-wrap items-center gap-2"
+      aria-label={subject}
+    >
+      <p className="w-full min-w-0 text-sm [overflow-wrap:anywhere]">{consequence}</p>
+      <Button
+        variant="destructive"
+        className="min-h-11"
+        aria-label={subject}
+        disabled={busy}
+        onClick={onConfirm}
+      >
+        {label}
       </Button>
       <Button ref={keep} variant="outline" className="min-h-11" disabled={busy} onClick={cancel}>
         Cancel
@@ -251,6 +268,7 @@ function PeopleBody({ target, onClose }: { target: AgentSessionRef; onClose: () 
                   {confirming === member.actorId &&
                     confirmRow(
                       `Remove ${member.name}`,
+                      "Remove",
                       `${member.name} leaves this session; it disappears from their devices.`,
                       () =>
                         void run(
@@ -310,6 +328,7 @@ function PeopleBody({ target, onClose }: { target: AgentSessionRef; onClose: () 
               <div className="mt-6 border-border border-t pt-4">
                 {confirming === "leave" ? (
                   confirmRow(
+                    "Leave session",
                     "Leave session",
                     "This session and its messages leave your devices.",
                     () =>
