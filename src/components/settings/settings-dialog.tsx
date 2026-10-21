@@ -8,6 +8,7 @@ import { RecordingDestinationControls } from "@/components/recording/recording-d
 import { SessionsSettingsSection } from "@/components/sessions/sessions-settings";
 import { AboutSection } from "@/components/settings/about-section";
 import { AccountSection } from "@/components/settings/account-section";
+import { AgentInstancesSection } from "@/components/settings/agent-instances-section";
 import { AgentsSection } from "@/components/settings/agents-section";
 import { AgentsServerSection } from "@/components/settings/agents-server-section";
 import {
@@ -282,6 +283,11 @@ export function SettingsBody({
     // The agents server (AD-418, AD-422): on every tier and behind no
     // capability — a phone pairs and syncs its agents' databases the same way.
     "agents-server": { node: <AgentsServerSection open={open} /> },
+    // Story 106.5 (AD-425): which instance of each agent answers. On every
+    // tier and behind no capability — the choice is a row in the person's
+    // databases, so a phone chooses the same way — and absent while no held
+    // database lists an instance (AD-27).
+    "agent-instances": { node: <AgentInstancesSection open={open} /> },
     // Story 90.6: this Mac as a host for your agents. On `botTools` for the
     // grants' reason — a host reads drives, and a phone is never one — and
     // absent besides where no flagged folder holds an agent (AD-27).

@@ -356,6 +356,10 @@ export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 export type { AgentDirectoryPersonVm } from "./gen/AgentDirectoryPersonVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
+export type { AgentInstancePresenceVm } from "./gen/AgentInstancePresenceVm";
+export type { AgentInstanceStateVm } from "./gen/AgentInstanceStateVm";
+export type { AgentInstancesVm } from "./gen/AgentInstancesVm";
+export type { AgentInstanceVm } from "./gen/AgentInstanceVm";
 export type { AgentLiveTurnVm } from "./gen/AgentLiveTurnVm";
 export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
 export type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
@@ -392,6 +396,7 @@ export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+export type { AgentSessionAnsweringVm } from "./gen/AgentSessionAnsweringVm";
 export type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 export type { AgentSessionRef } from "./gen/AgentSessionRef";
 export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
@@ -869,6 +874,7 @@ import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 import type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 import type { AgentFocusReq } from "./gen/AgentFocusReq";
+import type { AgentInstancesVm } from "./gen/AgentInstancesVm";
 import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
 import type { AgentMcpListVm } from "./gen/AgentMcpListVm";
 import type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
@@ -4204,6 +4210,25 @@ export async function agentSessionMemberRemove(
 
 export async function agentSessionLeave(target: AgentSessionRef): Promise<void> {
   await invoke<void>("agent_session_leave", { ...target });
+}
+
+/**
+ * Every agent's instances — who is online, the definition each runs — and the person's choice of
+ * which answers (AD-425), at once and at every change.
+ */
+export async function agentInstancesSubscribe(
+  onAgents: (agents: AgentInstancesVm[]) => void,
+): Promise<string> {
+  return await subscribeWithStringId<AgentInstancesVm[]>("agent_instances_subscribe", onAgents);
+}
+
+export async function agentInstancesUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("agent_instances_unsubscribe", { subscriptionId });
+}
+
+/** `order[0]` answers new sessions; the rest, in order, while it is offline. */
+export async function agentInstancesSet(agentActor: string, order: string[]): Promise<void> {
+  await invoke<void>("agent_instances_set", { agentActor, order });
 }
 
 export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {

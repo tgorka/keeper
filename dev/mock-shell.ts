@@ -64,6 +64,7 @@ import type {
   AgentConsoleVm,
   AgentCopyVm,
   AgentFocusReq,
+  AgentInstancesVm,
   AgentMcpDraftVm,
   AgentMcpListVm,
   AgentMcpServerReq,
@@ -82,6 +83,7 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentSessionAnsweringVm,
   AgentSessionMembersVm,
   AgentSessionRowVm,
   AgentSessionsBatch,
@@ -10007,6 +10009,157 @@ const peopleHandlers: Record<string, (payload: Record<string, unknown>) => unkno
   },
 };
 
+// ?sessions=launch&instances=two|offline|disagree|stale|refused|long — which instance of an
+// agent answers (Settings › Agents › Answers from) and the session header's instance line.
+// The words mirror Rust's `keeper_core::hq::instances`; the fixture is a viewing aid only.
+const instancesScenario = new URLSearchParams(location.search).get("instances");
+const instanceLabel = (label: string) =>
+  instancesScenario === "long" ? `${label}-${"very-long-host-name-".repeat(6)}` : label;
+type MockInstance = AgentInstancesVm["instances"][number];
+const mockInstances: MockInstance[] = [
+  {
+    clientId: "assistant.electra",
+    label: instanceLabel("assistant@electra"),
+    host: "electra",
+    description: "Ana's assistant",
+    databases: ["alpha", "beta"],
+    presence: instancesScenario === "offline" ? "offline" : "online",
+    definition: "3f9c2a71b0de",
+  },
+  {
+    clientId: "assistant.hesperia",
+    label: instanceLabel("assistant@hesperia"),
+    host: "hesperia",
+    description: "Ana's assistant",
+    databases: ["alpha", "beta"],
+    presence: "online",
+    definition: "3f9c2a71b0de",
+  },
+  ...(instancesScenario === "stale"
+    ? [
+        {
+          clientId: "assistant.laptop",
+          label: "assistant@laptop",
+          host: "laptop",
+          description: "Ana's assistant",
+          databases: ["alpha"],
+          presence: "offline" as const,
+          definition: "a01b44c9e2f7",
+        },
+      ]
+    : []),
+];
+for (const instance of mockInstances) {
+  if (instancesScenario === "stale" && instance.definition !== "3f9c2a71b0de")
+    instance.definitionDiffers =
+      "Runs a different definition from assistant@electra and assistant@hesperia: one of them runs an older or a newer image.";
+}
+let mockOrder: string[] = mockInstances.map((i) => i.clientId);
+let mockInstancesNotice: string | undefined;
+function orderSentence(order: string[]): string {
+  const name = (id: string) => mockInstances.find((i) => i.clientId === id)?.label ?? id;
+  const [first, ...rest] = order;
+  if (first === undefined)
+    return "No choice yet: a new session goes to whichever instance is online.";
+  if (rest.length === 0)
+    return `New sessions go to ${name(first)}; while it is offline they wait for it.`;
+  return `New sessions go to ${name(first)}; while it is offline, to ${rest.map(name).join(", then ")}.`;
+}
+function mockAgentInstances(): AgentInstancesVm[] {
+  const ranked = mockOrder
+    .map((id) => mockInstances.find((i) => i.clientId === id))
+    .filter((i): i is MockInstance => i !== undefined);
+  return [
+    {
+      agentActor: "assistant",
+      agentName: "Assistant",
+      agentMark: "A",
+      databases: ["alpha", "beta"],
+      instances: ranked.map((instance, rank) => ({ ...instance, rank })),
+      defaultClient: mockOrder[0],
+      fallback: mockOrder.slice(1),
+      sentence: orderSentence(mockOrder),
+      ...(instancesScenario === "disagree"
+        ? {
+            disagreement:
+              "Your databases differ: alpha asks assistant@electra, then assistant@hesperia; beta asks assistant@hesperia, then assistant@electra. Choosing here writes the same choice into each.",
+          }
+        : {}),
+      ...(mockInstancesNotice ? { notice: mockInstancesNotice } : {}),
+    },
+    {
+      agentActor: "researcher",
+      agentName: "Researcher",
+      agentMark: "R",
+      databases: ["beta"],
+      instances: [
+        {
+          clientId: "researcher.electra",
+          label: "researcher@electra",
+          host: "electra",
+          databases: ["beta"],
+          presence: "unknown",
+          definition: "77aa01c3d9e0",
+        },
+      ],
+      fallback: [],
+      sentence: "No choice yet: a new session goes to whichever instance is online.",
+    },
+  ];
+}
+function mockAnswering(): AgentSessionAnsweringVm {
+  const holder = instancesScenario === "offline" ? mockInstances[1] : mockInstances[0];
+  return {
+    holder: holder.clientId,
+    sentence: `${holder.label} is answering.`,
+    instances: [
+      holder,
+      ...mockInstances.filter((i) => i !== holder && i.databases.includes("alpha")),
+    ].map((i) => ({
+      clientId: i.clientId,
+      label: i.label,
+      presence: i.presence,
+      holds: i === holder,
+    })),
+  };
+}
+if (instancesScenario) {
+  for (const vm of sessionViews.values())
+    if (vm.agentActor === "assistant") vm.answering = mockAnswering();
+}
+const instanceWatchers = new Map<string, MockChannel<AgentInstancesVm[]>>();
+function publishInstances() {
+  for (const channel of instanceWatchers.values()) channel.onmessage?.(mockAgentInstances());
+}
+const instanceHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  agent_instances_subscribe: (payload) => {
+    const id = `agent-instances-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentInstancesVm[]>;
+    instanceWatchers.set(id, channel);
+    channel.onmessage?.(instancesScenario ? mockAgentInstances() : []);
+    return id;
+  },
+  agent_instances_unsubscribe: (payload) => {
+    instanceWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_instances_set: (payload) => {
+    const order = (payload.order as string[]) ?? [];
+    if (order.length === 0) return hqRefuse("Choose the instance that answers first.");
+    if (payload.agentActor !== "assistant")
+      return hqRefuse(`${String(payload.agentActor)} has one instance here.`);
+    mockOrder = order;
+    mockInstancesNotice = undefined;
+    publishInstances();
+    if (instancesScenario === "refused")
+      setTimeout(() => {
+        mockInstancesNotice = "The server refused your choice in beta: hq.v9.person_actor";
+        publishInstances();
+      }, 400);
+    return null;
+  },
+};
+
 const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   hq_status_subscribe: (payload) => {
     const id = `hq-subscription-${hqWatchers.size + 1}`;
@@ -10083,6 +10236,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   ...hqHandlers,
   ...sessionHandlers,
   ...peopleHandlers,
+  ...instanceHandlers,
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
   failure_subscribe: (payload) => {
