@@ -141,6 +141,72 @@ Nixie client stood in for R-HQ-30's runtime half and wrote only an `agent_profil
 The Agents-window archive test assumes no agent answers its messages, and the pairing test needs
 two databases; neither fits this rig, which runs an agent on one database.
 
+## People in a session
+
+A session can hold several people. **People** in the session header opens a sheet (a side sheet
+on the desktop, a bottom sheet on a phone) listing the session's members — the owner, the other
+people and the agent — read by Rust from the session's `session_members` rows and the directory of
+the session's own database. Every message names its author from the `author_actor` the server
+stamped on the row; a client cannot choose it, and the server refuses a row that claims another
+author.
+
+Only the session's owner changes who is in it:
+
+- **Add** offers only the people of the session's database who are not in it yet — in a
+  `tgdrive` session never someone who belongs to `neuradrive` alone. Adding writes the session's
+  `invite`, so it can wait offline in the outbox; the person shows as *Joining…* until the server
+  has written their membership, and their devices then list the session and its newest page. The
+  server refuses an invite naming anyone outside the database, and an invite changed by anyone but
+  the owner; a refusal shows in the sheet. There is no invitation by address.
+- **Can read thinking and tool results** is a person's reader flag, off when they are added.
+  Turning it on lets the server send them the session's reasoning, tool calls and approvals after
+  their scope is refreshed; turning it off makes their devices evict those rows. Both are the
+  server's `grant_trace` / `revoke_trace` commands, so they need the database to be syncing; an
+  offline device says so and changes nothing.
+- **Remove** (with a confirmation) is the server's `remove_member`: the person leaves the invite,
+  their membership is deleted, and their devices drop the session and its rows, keeping only their
+  own writes still waiting to be sent.
+
+A member who is not the owner sees the same list without those controls and may **Leave
+session**, which deletes their own membership; the server then takes them out of the invite. The
+owner cannot leave, since nobody else could change who is in the session. If the session open on a
+device leaves its list — the person left or was removed — the window closes it and says so.
+
+Development fixtures: `?sessions=launch&people=member|refused|offline|long`, with
+`&platform=phone` for the phone shell.
+
+### Measured: many people against the real server
+
+2026-10-21, `hq_live.rs`'s `many_people_in_one_session_by_the_owner_and_the_server` on delectra:
+the keeper-hq server from a `git archive` of `hq/106-4-members` 654ec57 (Bun 1.2, over a throwaway
+Postgres 18), serving this branch's contract (schema 3) in place of the archive's own schema 2 —
+keeper-hq still pins schema 2, and a schema-3 client receives no rows from a schema-2 server. One
+real `keeper-agentd` served Nixie on `tgdrive` and another Dixi on `neuradrive`, from the e2e model
+stub; tgorka owns the session, kuba belongs to `tgdrive` alone and marta to `neuradrive` alone.
+
+- **Directory:** a `tgdrive` session offered only kuba and a `neuradrive` one only marta; keeper
+  refused adding marta to the `tgdrive` session, and an invite naming her written anyway was
+  refused by the server (`hq.v11.invite_outside_directory`).
+- **Add:** kuba's device listed the session 190–310 ms after the owner added him and showed its
+  newest page; his message showed on the owner's device as `kuba`.
+- **Authorship and ownership:** a message from kuba's device claiming tgorka was refused
+  (`hq.v1.author_actor`); an invite kuba wrote naming one more person was refused
+  (`hq.v3.owner_only`).
+- **Reader flag:** without it kuba held no `reasoning` or `tool_calls` row after a thinking
+  answer; granted, the reasoning reached him about 230 ms later; withdrawn, his replica evicted
+  every reasoning, tool call and approval row of the session and kept the answers.
+- **Remove and leave:** removed by the owner, the session left kuba's list and every row of it
+  left his replica within about 110 ms, and he left the owner's sheet (and could be added again);
+  added again and leaving himself, he was gone from his list, the owner's sheet and the invite.
+
+The *People* sheet was walked in the agent desktop's Chrome over CDP on the mock shell at 1280
+and 420 px (the phone shell): open and close (Close and Escape, focus back on **People**), add
+(*Joining…*, then a member), the reader switch on and off, remove with its confirmation (focus on
+Cancel, back on **Remove** after Cancel, on Close after removing), a member's view without the
+owner's controls and **Leave session** (the window closes the session and says so), the refused
+and offline sentences, and twelve-word names with no document or sheet overflow. Every button
+measured at least 44 × 44 px; the runs recorded no console error or failed request.
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history
