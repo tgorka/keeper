@@ -300,6 +300,37 @@ when none of them is online.
 Development fixtures: `?sessions=launch&instances=two|offline|disagree|stale|refused|long`, with
 `&platform=phone` for the phone shell.
 
+### Measured: two instances against the real server
+
+2026-10-21, `hq_live.rs`'s `two_instances_answer_by_the_persons_choice_and_who_is_online` on
+delectra, twice: the keeper-hq server from a clean `git archive` of `hq/106-3-tools` 3e8db43
+(schema 3, Bun 1.2.23 baseline) over a throwaway Postgres 18, the e2e model stub, and two real
+`keeper-agentd run` processes built from the same archive — `nixie.electra` and `nixie.hesperia`,
+each with its own token, home and state, both serving Nixie on `tgdrive` and `neuradrive`; tgorka
+in both, on two keeper-core devices ("mac" and "phone").
+
+- **The choice is a row:** `nixie.hesperia` chosen on the mac showed as the phone's choice 139 ms
+  and 55 ms after it was written, with no disagreement; each database held one `instance_prefs`
+  row `tgorka/nixie` naming it, authored by tgorka.
+- **New sessions follow it in both databases:** a new session in `tgdrive` and one in `neuradrive`
+  were taken by `nixie.hesperia` 0.6–1.2 s after they were written, the header saying
+  **nixie.hesperia is answering.**
+- **Offline, and the other answers:** with `nixie.hesperia` SIGKILLed, the mac's view showed
+  it offline 2–4 ms later (its socket closed, so the server sent its presence leave at once; a
+  partition that keeps the socket half-open waits for the server's presence expiry instead, which
+  this run did not exercise). A new session was taken by `nixie.electra` 0.5–1.2 s after it was
+  written, the header naming it. The two sessions the killed instance held said
+  **nixie.hesperia holds this conversation and is offline; …** until its lease lapsed, and were
+  taken over by `nixie.electra` 30.0–31.6 s after the kill.
+- **A held session stays with its holder:** with `nixie.hesperia` — the default — back online for
+  15 s, all three sessions stayed with `nixie.electra`.
+- **The new holder is named:** with `nixie.electra` SIGKILLed in turn, the header of the session it
+  held named `nixie.hesperia` 25.3 s and 26.8 s later, once the lease lapsed and it took over.
+
+The instances' labels are their client ids here because the rig's registry names each client by
+its id; the deployed registry names them `nixie@electra` and `nixie@hesperia`. The same with
+*nixie@hesperia*'s container on the Mac (105.3) and the installed apps is owed on the devices.
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history
