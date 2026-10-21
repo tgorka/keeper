@@ -31,6 +31,11 @@
 //! directory alone ([`members`]); which instance of an agent answers and
 //! who is online, and the person's choice of it ([`instances`]).
 //!
+//! A phone registers where the server's push reaction posts for it, and
+//! reads, shows and decides the one item a push names ([`push`], AD-432,
+//! D-35): the notification extension with the same item read and the same
+//! table, the app with the same decision row.
+//!
 //! The shell's `hq_ipc` is a call site and decides nothing. Tracing targets
 //! are `keeper_core::hq::*` and carry no row content.
 
@@ -42,6 +47,7 @@ pub mod live;
 pub mod members;
 pub mod pairing;
 pub mod port;
+pub mod push;
 pub mod routes;
 pub mod send;
 pub mod server;
@@ -199,6 +205,12 @@ struct Inner {
     offer: Option<(ServerUrl, PairingCode)>,
     /// Held while any replica of `server` is linked.
     linked_contact: Option<Contact>,
+    /// The push target this device wants the server to post to (106.6):
+    /// `None` until the shell has said, `Some(None)` for none.
+    push_target: Option<Option<push::PushTarget>>,
+    /// What the server last took: its base URL, this device's client id and
+    /// the target.
+    push_told: Option<(String, String, Option<push::PushTarget>)>,
 }
 
 /// What a reconfiguration takes out of service.
@@ -235,6 +247,9 @@ pub struct Hq {
     /// Ticks when only a presence document moved: the open sessions read
     /// again on it, nothing else does.
     live: watch::Sender<u64>,
+    /// One push target request at a time, so the last wish is the one the
+    /// server keeps.
+    push_turn: tokio::sync::Mutex<()>,
 }
 
 fn no_server() -> HqStatusVm {
@@ -319,6 +334,7 @@ impl Hq {
             window_task: Mutex::default(),
             decisions: std::sync::OnceLock::new(),
             prefs: Mutex::default(),
+            push_turn: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -861,6 +877,9 @@ impl Hq {
         };
         drop(stale_contact);
         self.publish();
+        if !authorization.removed {
+            self.tell_push_target();
+        }
         Ok(())
     }
 

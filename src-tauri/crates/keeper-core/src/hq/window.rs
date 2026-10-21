@@ -538,7 +538,7 @@ impl Hq {
     /// The decisions written here whose outcome is still owed, kept with
     /// the replicas so a refusal that arrives after a relaunch is still
     /// shown.
-    fn decisions(&self) -> Result<&Decisions, HqError> {
+    pub(crate) fn decisions(&self) -> Result<&Decisions, HqError> {
         if let Some(decisions) = self.decisions.get() {
             return Ok(decisions);
         }

@@ -414,7 +414,7 @@ fn a_notification_offers_actions_only_where_android_can_require_unlock() {
     }
     assert_eq!(
         tap_target(&old.user_info),
-        Some(PushOpenVm {
+        Some(PushOpenVm::Room {
             account_id: ACCOUNT.to_owned(),
             room_id: ROOM.to_owned()
         })
@@ -467,7 +467,7 @@ fn an_unsent_decision_asks_the_person_to_finish_in_keeper() {
     assert_eq!(finish.body, format!("{FINISH_IN_KEEPER} The card is gone."));
     assert_eq!(
         tap_target(&finish.user_info),
-        Some(PushOpenVm {
+        Some(PushOpenVm::Room {
             account_id: ACCOUNT.to_owned(),
             room_id: ROOM.to_owned()
         })
@@ -475,4 +475,50 @@ fn an_unsent_decision_asks_the_person_to_finish_in_keeper() {
     let unknown = finish_in_keeper("t", &json!({"room_id": ROOM}), "");
     assert_eq!(unknown.body, FINISH_IN_KEEPER);
     assert_eq!(tap_target(&unknown.user_info), None);
+}
+
+/// 106.6 #6, #7: an agents server item posts one notification per item on
+/// the tablet — a second delivery has the same tag and replaces it — with
+/// actions only where Android requires unlock, and an unsent decision's
+/// replacement still opens the item's session.
+#[test]
+fn an_agents_item_is_one_notification_and_its_replacement_opens_the_session() {
+    use keeper_core::hq::push::{classify, HqClassified, ItemKind, PushedItem};
+
+    let pushed = PushedItem {
+        database: "neuradrive".to_owned(),
+        session_id: "marta.1.2".to_owned(),
+        kind: ItemKind::Approval,
+        item_id: "01JAPPROVAL".to_owned(),
+    };
+    let row = json!({"id": "01JAPPROVAL", "session_id": "marta.1.2", "tool_call_id": "c1",
+        "tier": "T1", "binding_digest": "d", "summary": "list files",
+        "approvers": "[\"marta\"]", "state": "pending", "expires_at_ms": 2_000,
+        "author_actor": "dixi"});
+    let HqClassified::Show(shown) =
+        classify(&pushed, row.as_object().expect("object"), "marta", 1_000)
+    else {
+        panic!("shown")
+    };
+    let first = item_notification(&shown, 34);
+    let again = item_notification(&shown, 34);
+    assert_eq!(first.tag, "neuradrive/approval/01JAPPROVAL");
+    assert_eq!(again.tag, first.tag, "a second delivery replaces the first");
+    assert_eq!(first.group, "neuradrive/marta.1.2");
+    assert_eq!(first.category.as_deref(), Some("KEEPER_APPROVAL"));
+    assert_eq!(first.actions.len(), 2);
+    let old = item_notification(&shown, 30);
+    assert!(old.actions.is_empty() && old.category.is_none());
+    assert_eq!(old.user_info["keeper_hq_approval"]["category"], json!(null));
+
+    let finish = finish_in_keeper(&first.tag, &first.user_info, "");
+    assert_eq!(finish.group, "neuradrive/marta.1.2");
+    assert_eq!(
+        keeper_core::agents::push::open_target(&finish.user_info),
+        Some(PushOpenVm::Session {
+            database: "neuradrive".to_owned(),
+            session_id: "marta.1.2".to_owned(),
+        })
+    );
+    assert_eq!(finish.user_info.get("keeper_hq_approval"), None);
 }

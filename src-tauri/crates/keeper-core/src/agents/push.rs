@@ -536,7 +536,7 @@ pub fn classify_notification(event: &Value, ctx: &PushContext<'_>) -> Classified
 }
 
 /// The body of an approval the notification cannot show whole.
-fn open_body(tier: u8) -> String {
+pub(crate) fn open_body(tier: u8) -> String {
     format!(
         "{} — open keeper to read the whole request",
         crate::agents::approval_card::tier_word(tier)
@@ -545,7 +545,7 @@ fn open_body(tier: u8) -> String {
 
 /// Whether `c` could make shown text read as other than it is: a line
 /// break or any other control character, or a bidirectional override.
-fn misreads(c: char) -> bool {
+pub(crate) fn misreads(c: char) -> bool {
     c.is_control()
         || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
@@ -1156,29 +1156,75 @@ fn composed_account(user_info: &Value) -> Option<&str> {
         .filter(|account| ulid::Ulid::from_string(account).is_ok())
 }
 
-/// Where tapping a keeper notification opens (UX-DR144): its account and
-/// session room.
+/// Where tapping a keeper notification opens (UX-DR144): a session in the
+/// Agents window, named by its database (106.6, AD-433) — or, for a
+/// notification of a Matrix agent room, that room in its account, until
+/// 108.2 removes those.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[ts(export)]
-pub struct PushOpenVm {
-    pub account_id: String,
-    pub room_id: String,
+pub enum PushOpenVm {
+    /// A session of the agents server.
+    Session {
+        database: String,
+        session_id: String,
+    },
+    /// A Matrix agent room.
+    Room { account_id: String, room_id: String },
 }
 
-/// Where tapping the notification whose `userInfo` this is opens: the
-/// approval's room, else the room the push named, in the account it names;
-/// `None` for a notification keeper did not compose ([`SHOWN_INFO`]).
+/// Where tapping the Matrix notification whose `userInfo` this is opens:
+/// the approval's room, else the room the push named, in the account it
+/// names; `None` for a notification keeper did not compose ([`SHOWN_INFO`]).
 pub fn tap_target(user_info: &Value) -> Option<PushOpenVm> {
     let account = composed_account(user_info)?;
     let room = user_info[APPROVAL_INFO]["room"]
         .as_str()
         .or_else(|| user_info["room_id"].as_str())?;
     matrix_sdk::ruma::RoomId::parse(room).ok()?;
-    Some(PushOpenVm {
+    Some(PushOpenVm::Room {
         account_id: account.to_owned(),
         room_id: room.to_owned(),
     })
+}
+
+/// Where tapping any notification keeper composed opens: the session of an
+/// agents server item ([`crate::hq::push::tap_target`]), else a Matrix
+/// agent room ([`tap_target`]).
+pub fn open_target(user_info: &Value) -> Option<PushOpenVm> {
+    crate::hq::push::tap_target(user_info).or_else(|| tap_target(user_info))
+}
+
+/// What a notification keeper re-posts after an action carries of the one
+/// acted on, so a tap on it still opens where that one did; `None` when
+/// keeper did not compose that one.
+pub fn reposted_info(user_info: &Value) -> Option<Value> {
+    crate::hq::push::reposted_info(user_info).or_else(|| match tap_target(user_info)? {
+        PushOpenVm::Room {
+            account_id,
+            room_id,
+        } => Some(serde_json::json!({
+            PAYLOAD_ACCOUNT: account_id,
+            SHOWN_INFO: true,
+            "room_id": room_id,
+        })),
+        PushOpenVm::Session { .. } => None,
+    })
+}
+
+/// The group a re-posted notification joins: the session's or the room's.
+pub fn reposted_group(user_info: &Value) -> Option<String> {
+    match open_target(user_info)? {
+        PushOpenVm::Session {
+            database,
+            session_id,
+        } => Some(format!("{database}/{session_id}")),
+        PushOpenVm::Room { room_id, .. } => Some(room_id),
+    }
 }
 
 /// The categories the app registers with iOS, as its delegate's Swift reads
@@ -2205,7 +2251,7 @@ mod tests {
     #[test]
     fn a_tap_opens_the_session_room_the_notification_names() {
         let open = |account_id: &str, room_id: &str| {
-            Some(PushOpenVm {
+            Some(PushOpenVm::Room {
                 account_id: account_id.to_owned(),
                 room_id: room_id.to_owned(),
             })

@@ -15,6 +15,11 @@ struct FakeRoutes {
     redeemed: Mutex<Vec<String>>,
     /// The next redeem waits until this is notified.
     redeem_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Every push target request: the server, the token and the body (`None`
+    /// for a `DELETE`).
+    push_targets: Mutex<Vec<(String, String, Option<Value>)>>,
+    /// Refuse every push target request.
+    push_target_refused: std::sync::atomic::AtomicBool,
 }
 
 fn found(databases: &[&str]) -> Discovery {
@@ -56,6 +61,34 @@ impl Routes for FakeRoutes {
     }
     fn revoke<'a>(&'a self, _: &'a ServerUrl, _: &'a str, _: &'a str) -> Answer<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+    fn set_push_target<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        target: Option<&'a push::PushTarget>,
+    ) -> Answer<'a, ()> {
+        lock(&self.push_targets).push((
+            server.as_str().to_owned(),
+            token.to_owned(),
+            target.map(push::PushTarget::body),
+        ));
+        let refused = self.push_target_refused.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if refused {
+                Err(RouteError::Unreachable("down".to_owned()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn push_item<'a>(
+        &'a self,
+        _: &'a ServerUrl,
+        _: &'a str,
+        _: &'a push::PushedItem,
+    ) -> Answer<'a, Vec<u8>> {
+        Box::pin(async { Err(RouteError::Unreachable("unused".to_owned())) })
     }
 }
 
@@ -987,4 +1020,111 @@ async fn a_people_change_while_the_sheet_is_first_read_is_not_missed() {
         .members
         .iter()
         .any(|m| m.actor_id == "ben"));
+}
+
+/// What the server was asked about this device's push target, in order.
+async fn push_targets_until(world: &World, count: usize) -> Vec<(String, String, Option<Value>)> {
+    for _ in 0..100 {
+        if lock(&world.routes.push_targets).len() >= count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Anything more would have been sent by now.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    lock(&world.routes.push_targets).clone()
+}
+
+fn apns(gateway: &str) -> Option<push::PushTarget> {
+    push::PushTarget::apns(
+        Some(gateway),
+        crate::agents::push::ApnsEnvironment::Production,
+        &[0xAB, 0xCD],
+    )
+}
+
+/// 106.6: the phone's push target goes to the server it is paired with,
+/// once per wish, with its own token; clearing the gateway removes it; a
+/// wish made before the device is paired, or while the server is down, is
+/// sent at the next discovery; an unpaired or removed device sends nothing.
+#[tokio::test]
+async fn the_push_target_is_registered_once_per_wish_and_cleared_with_the_gateway() {
+    let world = World::new();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    // Not paired: nothing to tell, and nothing told.
+    hq.set_push_target(apns("https://push.example.org"));
+    assert!(push_targets_until(&world, 1).await.is_empty());
+
+    // Paired: the wish made earlier goes at the first discovery.
+    let server = world.paired("https://hq.example.org", &["alpha"]);
+    *lock(&world.routes.discovery) = Some(Ok(found(&["alpha"])));
+    hq.reconcile().await.expect("follows the setting");
+    let sent = push_targets_until(&world, 1).await;
+    let body = apns("https://push.example.org").map(|t| t.body());
+    assert_eq!(
+        sent,
+        [(
+            server.as_str().to_owned(),
+            "0123456789abcdef".to_owned(),
+            body.clone()
+        )]
+    );
+    assert_eq!(
+        body.as_ref().map(|b| b["gateway_url"].clone()),
+        Some(serde_json::json!(
+            "https://push.example.org/_matrix/push/v1/notify"
+        ))
+    );
+
+    // The same wish again sends nothing; a new gateway sends it; clearing
+    // the gateway removes the target.
+    hq.set_push_target(apns("https://push.example.org"));
+    assert_eq!(push_targets_until(&world, 2).await.len(), 1);
+    hq.set_push_target(apns("https://other.example.org"));
+    hq.set_push_target(None);
+    let sent = push_targets_until(&world, 3).await;
+    // Two quick wishes may fold into one request; the last is always sent.
+    assert!(matches!(sent.len(), 2 | 3), "{sent:?}");
+    assert_eq!(
+        sent.last().map(|s| s.2.clone()),
+        Some(None),
+        "the last wish is the one the server keeps"
+    );
+
+    // A refused request is sent again at the next discovery.
+    let before = sent.len();
+    world
+        .routes
+        .push_target_refused
+        .store(true, Ordering::SeqCst);
+    hq.set_push_target(apns("https://push.example.org"));
+    assert_eq!(
+        push_targets_until(&world, before + 1).await.len(),
+        before + 1
+    );
+    world
+        .routes
+        .push_target_refused
+        .store(false, Ordering::SeqCst);
+    hq.shutdown().await;
+    let again = world.hq();
+    again.set_push_target(apns("https://push.example.org"));
+    again.start().await.expect("restarts");
+    let sent = push_targets_until(&world, before + 2).await;
+    assert_eq!(sent.len(), before + 2, "{sent:?}");
+    assert_eq!(sent.last().map(|s| s.2.clone()), Some(body));
+}
+
+#[tokio::test]
+async fn a_removed_device_registers_no_push_target() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["alpha"]);
+    *lock(&world.routes.discovery) = Some(Err(RouteError::Unauthorized));
+    let hq = world.hq();
+    hq.set_push_target(apns("https://push.example.org"));
+    hq.start().await.expect("starts");
+    status_until(&hq, "removed", |s| s.phase == HqPhase::Removed).await;
+    hq.set_push_target(None);
+    assert!(push_targets_until(&world, 1).await.is_empty());
 }

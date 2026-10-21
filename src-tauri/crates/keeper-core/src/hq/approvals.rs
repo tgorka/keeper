@@ -551,3 +551,86 @@ pub fn decide(
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+/// keeper's refusal of *Approve once* from a notification on a request the
+/// replica holds at T4 (or at a tier it cannot read): approving it is done
+/// on the card in keeper, from another of the person's devices (AD-428).
+pub const NOT_FROM_A_NOTIFICATION: &str =
+    "This request cannot be approved from a notification; decide on the card in keeper.";
+
+/// Whether `source` holds what deciding `approval_id` needs: the person
+/// reads the session's trace, the request is here and — to approve — so is
+/// the exact call it runs.
+fn here(source: &Source, session_id: &str, approval_id: &str, approve: bool) -> bool {
+    reads_trace(source, session_id)
+        && read(
+            source,
+            &format!("{SELECT} WHERE a.id = ?1 AND a.session_id = ?2"),
+            &[Value::from(approval_id), Value::from(session_id)],
+        )
+        .first()
+        .is_some_and(|row| !approve || action(row).is_some())
+}
+
+/// The decision an action on a notification sends (106.6), written as
+/// [`decide`] writes the card's: once the session's replica — `source_of`,
+/// asked again while it starts — holds the request, or at `deadline`
+/// whatever it holds, so the refusal says why. *Approve once* on a request
+/// the replica holds at T4 is refused whatever the notification carried. A
+/// decision the server has not taken by then is reported as not sent — the
+/// lock screen's action ends with it — though it stays written here and
+/// goes when the device next reaches the database. Blocking.
+pub fn decide_pushed(
+    source_of: impl Fn() -> Option<Source>,
+    decisions: &Decisions,
+    decision: &crate::hq::push::HqActionDecision,
+    deadline: std::time::Instant,
+) -> Result<AgentDecisionOutcomeVm, Refusal> {
+    let session_id = decision.session.session_id.as_str();
+    let approval_id = decision.approval_id.as_str();
+    let source = loop {
+        let source = source_of();
+        let ready = source
+            .as_ref()
+            .is_some_and(|source| here(source, session_id, approval_id, decision.approve));
+        if ready || std::time::Instant::now() >= deadline {
+            break source.ok_or_else(|| {
+                Refusal(format!(
+                    "This device does not hold {} yet.",
+                    decision.session.database
+                ))
+            })?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if decision.approve {
+        let tier = read(
+            &source,
+            "SELECT tier FROM approvals WHERE id = ?1",
+            &[Value::from(approval_id)],
+        )
+        .first()
+        .map(|row| text(row, "tier").to_owned());
+        let below_t4 = tier.as_deref().is_some_and(|tier| {
+            tier.strip_prefix('T')
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| n < 4)
+        });
+        if tier.is_some() && !below_t4 {
+            return Err(Refusal(NOT_FROM_A_NOTIFICATION.to_owned()));
+        }
+    }
+    let outcome = decide(
+        &source,
+        decisions,
+        session_id,
+        approval_id,
+        &decision.binding_digest,
+        decision.approve,
+        crate::hq::sessions::now_ms(),
+    )?;
+    match outcome.state {
+        AgentDecisionStateVm::Sent => Ok(outcome),
+        AgentDecisionStateVm::Waiting => Err(Refusal(outcome.sentence)),
+    }
+}
