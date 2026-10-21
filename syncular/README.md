@@ -226,7 +226,9 @@ commit.
    exactly one, and an update carries the version it read, so a second taker conflicts instead of
    overwriting.
 8. **V8 — approvals.** `pending` becomes `approved` or `denied` only by an actor named in
-   `approvers`, never by an agent, with `decided_by_actor` and `decided_by_client` the commit's;
+   `approvers`, never by an agent, with `decided_by_actor` and `decided_by_client` the commit's,
+   and only by a person or owner member of the session whose `reads_trace` holds in the commit's
+   candidate state — a removed or withdrawn reader is refused `hq.v8.not_reader`;
    `approved` becomes `consumed` only by the claim holder, with `consumed_by_client` the commit's;
    a decision on a tier-4 approval comes only from a client whose host is not the claim holder's
    host. A consumption carries the version it read, so a second consumer conflicts.
@@ -268,6 +270,10 @@ A refusal answers `kind: "error"` with `code: "operation.forbidden"`. Params tha
   `hq.remove_member.self` (the owner themself), `hq.remove_member.not_member` (the actor is not a
   member) or `hq.remove_member.agent` (an agent member, including the session's own agent).
   `grant_trace` and `revoke_trace` refuse without a reason.
+
+A command sent again under a `requestId` the server already applied is answered from its record:
+`status: "cached"` with the first answer's `results` and `commitSeq`, never a second commit. A
+client whose answer was lost asks again under the same `requestId` and treats `cached` as success.
 
 ## The live check
 

@@ -162,10 +162,24 @@ Only the session's owner changes who is in it:
   Turning it on lets the server send them the session's reasoning, tool calls and approvals after
   their scope is refreshed; turning it off makes their devices evict those rows. Both are the
   server's `grant_trace` / `revoke_trace` commands, so they need the database to be syncing; an
-  offline device says so and changes nothing.
+  offline device says so and changes nothing. A device draws the thinking, tool steps and
+  approvals — in the session and in the decisions panel — only while its person's membership reads
+  the trace: from the moment it knows the flag is withdrawn or the person removed, none of them is
+  shown and keeper refuses a decision, even while rows not yet evicted (or a decision still in the
+  outbox) are on the device. The server refuses such a decision too (`hq.v8.not_reader`), and the
+  request says so in keeper's words.
 - **Remove** (with a confirmation) is the server's `remove_member`: the person leaves the invite,
   their membership is deleted, and their devices drop the session and its rows, keeping only their
   own writes still waiting to be sent.
+
+A server change whose answer never arrives (the connection dropped after the server acted) is
+not lost: the sheet says keeper did not hear back, the database syncs at once, and asking again
+about the same member asks under the same request id, which the server answers from its record
+(`cached`) instead of acting twice — so a removal repeated after the person was invited again
+does not remove their new membership. Once the device has seen them invited again, Remove is a
+new removal. Refusals are matched by the server's stable codes (`hq.remove_member.*`,
+`hq.v3.owner_only`, `hq.v11.invite_outside_directory`, `hq.v3.owner_cannot_leave`,
+`hq.v8.not_reader`); any other is shown as the server said it.
 
 A member who is not the owner sees the same list without those controls and may **Leave
 session**, which deletes their own membership; the server then takes them out of the invite. The
