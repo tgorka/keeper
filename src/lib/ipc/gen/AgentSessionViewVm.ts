@@ -2,6 +2,7 @@
 import type { AgentApprovalVm } from "./AgentApprovalVm";
 import type { AgentLiveTurnVm } from "./AgentLiveTurnVm";
 import type { AgentMessageVm } from "./AgentMessageVm";
+import type { AgentSessionAnsweringVm } from "./AgentSessionAnsweringVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
 import type { AgentViewPrefsVm } from "./AgentViewPrefsVm";
 
@@ -59,4 +60,10 @@ tools: Array<AgentSessionToolVm>,
  * now (a settings file wins): the state its switches show, whichever
  * device or file last changed it.
  */
-prefs: AgentViewPrefsVm, };
+prefs: AgentViewPrefsVm, 
+/**
+ * Which instance is answering and each instance's online state, from
+ * this session's database; absent while it lists no instance of the
+ * agent and no claim.
+ */
+answering?: AgentSessionAnsweringVm, };

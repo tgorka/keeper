@@ -1064,6 +1064,10 @@ pub fn run() {
                 hq_ipc::agent_session_member_reader_set,
                 hq_ipc::agent_session_member_remove,
                 hq_ipc::agent_session_leave,
+                // Which instance of an agent answers, and who is online.
+                hq_ipc::agent_instances_subscribe,
+                hq_ipc::agent_instances_unsubscribe,
+                hq_ipc::agent_instances_set,
                 // The Bots surface's sync-free half (Epic 61, Story 61.4;
                 // split in Story 62.1), in the shared body for
                 // `config_layers`' reason: `keeper_core::bots` has no desktop

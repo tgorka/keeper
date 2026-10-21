@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
 use crate::hq::approvals::{self, AgentApprovalVm};
+use crate::hq::instances::{self, AgentSessionAnsweringVm};
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentMessageDetailsVm, AgentSessionToolVm, AgentToolStepVm,
     AgentViewPrefsVm, Extras, Live,
@@ -149,6 +150,12 @@ pub struct AgentSessionViewVm {
     /// now (a settings file wins): the state its switches show, whichever
     /// device or file last changed it.
     pub prefs: AgentViewPrefsVm,
+    /// Which instance is answering and each instance's online state, from
+    /// this session's database; absent while it lists no instance of the
+    /// agent and no claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub answering: Option<AgentSessionAnsweringVm>,
 }
 
 /// The pages of an archived session read so far through the server.
@@ -335,6 +342,7 @@ pub fn view(
         .collect();
     let messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
     let newest_ms = messages.last().map(|m| m.created_at_ms);
+    let answering = instances::answering(source, session_id, &session.agent_actor, &agent_name);
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -355,6 +363,7 @@ pub fn view(
             live: live::turns(source, session_id, &opened.live, &ended, &extras),
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
+            answering,
             agent_actor: session.agent_actor,
         },
         newest_ms,
