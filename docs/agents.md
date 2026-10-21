@@ -182,7 +182,8 @@ Development fixtures: `?sessions=launch&people=member|refused|offline|long`, wit
 ### Measured: many people against the real server
 
 2026-10-21, `hq_live.rs`'s `many_people_in_one_session_by_the_owner_and_the_server` on delectra:
-the keeper-hq server from a `git archive` of `hq/106-4-members` 654ec57 (Bun 1.2, over a throwaway
+the keeper-hq server from a `git archive` of `hq/106-4-members` 654ec57, and again of 7490af5 on
+this branch rebased onto 106.3's fix wave 9f7a93ba (Bun 1.2, over a throwaway
 Postgres 18), serving this branch's contract (schema 3) in place of the archive's own schema 2 —
 keeper-hq still pins schema 2, and a schema-3 client receives no rows from a schema-2 server. One
 real `keeper-agentd` served Nixie on `tgdrive` and another Dixi on `neuradrive`, from the e2e model
@@ -191,13 +192,13 @@ stub; tgorka owns the session, kuba belongs to `tgdrive` alone and marta to `neu
 - **Directory:** a `tgdrive` session offered only kuba and a `neuradrive` one only marta; keeper
   refused adding marta to the `tgdrive` session, and an invite naming her written anyway was
   refused by the server (`hq.v11.invite_outside_directory`).
-- **Add:** kuba's device listed the session 190–310 ms after the owner added him and showed its
+- **Add:** kuba's device listed the session 150–310 ms after the owner added him and showed its
   newest page; his message showed on the owner's device as `kuba`.
 - **Authorship and ownership:** a message from kuba's device claiming tgorka was refused
   (`hq.v1.author_actor`); an invite kuba wrote naming one more person was refused
   (`hq.v3.owner_only`).
 - **Reader flag:** without it kuba held no `reasoning` or `tool_calls` row after a thinking
-  answer; granted, the reasoning reached him about 230 ms later; withdrawn, his replica evicted
+  answer; granted, the reasoning reached him 170–230 ms later; withdrawn, his replica evicted
   every reasoning, tool call and approval row of the session and kept the answers.
 - **Remove and leave:** removed by the owner, the session left kuba's list and every row of it
   left his replica within about 110 ms, and he left the owner's sheet (and could be added again);
