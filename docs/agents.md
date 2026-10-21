@@ -181,11 +181,17 @@ under the same request id, which the server answers from its record (`cached`) i
 twice — so a removal repeated after the person was invited again on the server does not remove
 their new membership. The membership is told by the fields fixed when it was made
 (`added_at_ms`, `added_by_actor`, `role`, which no write changes): a read point or a reader flag
-landing meanwhile is the same membership and keeps the request. Once the device has seen them
-invited again (a new membership, stamped anew), Remove is a new removal. Refusals are matched by
-the server's stable codes (`hq.remove_member.*`,
-`hq.v3.owner_only`, `hq.v11.invite_outside_directory`, `hq.v3.owner_cannot_leave`,
-`hq.v8.not_reader`); any other is shown as the server said it.
+landing meanwhile is the same membership and keeps the request. The server stamps every new
+membership of a person in a session a later `added_at_ms` than any before it, even when they are
+invited again within the same millisecond, so two memberships never look alike. Once the device
+has seen them invited again (a new membership, stamped anew), Remove is a new removal. A reader
+switch asked again is a new decision as well as a retry: when the earlier request comes back
+replayed (`cached`), it already took effect — and the flag now reading the other way means it was
+undone since, or this device has not seen it yet — so keeper asks for this switch under a new
+request id, and the server ends with the latest decision. Setting a flag twice is the same change
+twice, never a different one. Refusals are matched by the server's stable codes
+(`hq.remove_member.*`, `hq.v3.owner_only`, `hq.v11.invite_outside_directory`,
+`hq.v3.owner_cannot_leave`, `hq.v8.not_reader`); any other is shown as the server said it.
 
 A member who is not the owner sees the same list without those controls and may **Leave
 session**, which deletes their own membership; the server then takes them out of the invite. The
