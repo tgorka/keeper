@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
 use keeper_core::hq::instances::AgentInstancesVm;
-use keeper_core::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
+use keeper_core::hq::live::{AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::members::AgentSessionMembersVm;
 use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::sessions::{
@@ -321,23 +321,27 @@ pub fn agent_session_open(
                         tracing::debug!(%error, "an open agents session could not be read");
                     }
                 }
-                // An answer still arriving is read again on its own, so one
-                // whose instance stopped says so with nothing else moving.
-                let arriving = shown
-                    .as_ref()
-                    .is_some_and(|view| view.live.iter().any(|turn| !turn.stopped));
+                // Read again on its own when keeper-core says so: an answer
+                // still arriving (one whose instance stopped says so), or a
+                // claim whose lease lapses with nothing else moving.
+                let recheck = hq.session_recheck(&held, shown.as_ref());
                 let woke = async {
                     tokio::select! {
                         changed = changes.changed() => changed.is_ok(),
                         changed = tails.changed() => changed.is_ok(),
                     }
                 };
-                if arriving {
-                    if let Ok(false) = tokio::time::timeout(live::RECHECK, woke).await {
-                        return;
+                match recheck {
+                    Some(wait) => {
+                        if let Ok(false) = tokio::time::timeout(wait, woke).await {
+                            return;
+                        }
                     }
-                } else if !woke.await {
-                    return;
+                    None => {
+                        if !woke.await {
+                            return;
+                        }
+                    }
                 }
             }
         })

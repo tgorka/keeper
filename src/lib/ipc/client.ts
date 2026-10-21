@@ -358,6 +358,7 @@ export type { AgentDirectoryPersonVm } from "./gen/AgentDirectoryPersonVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
 export type { AgentInstancePresenceVm } from "./gen/AgentInstancePresenceVm";
 export type { AgentInstanceStateVm } from "./gen/AgentInstanceStateVm";
+export type { AgentInstancesDatabaseVm } from "./gen/AgentInstancesDatabaseVm";
 export type { AgentInstancesVm } from "./gen/AgentInstancesVm";
 export type { AgentInstanceVm } from "./gen/AgentInstanceVm";
 export type { AgentLiveTurnVm } from "./gen/AgentLiveTurnVm";

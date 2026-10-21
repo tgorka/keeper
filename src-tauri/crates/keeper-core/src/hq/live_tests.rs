@@ -377,6 +377,7 @@ fn world(reads_trace: bool) -> World {
         client_id: Some("dev1".to_owned()),
         link: None,
         subscriptions: Vec::new(),
+        watch_presence: None,
     })
     .expect("opens");
     let source = Source {

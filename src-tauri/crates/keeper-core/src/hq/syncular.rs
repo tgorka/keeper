@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use syncular_client::api::{
-    CommitDelivery, CommitOperationOutcome, CommitOutcomeStatus, WindowCoverage,
+    CommitDelivery, CommitOperationOutcome, CommitOutcomeResolution, CommitOutcomeStatus,
+    ResolveCommitOutcomeInput, WindowCoverage,
 };
 use syncular_client::native_transport::{HostTransport, Inbound};
 use syncular_client::{
@@ -37,8 +38,8 @@ use syncular_client::{
 use tokio::sync::watch;
 
 use crate::hq::port::{
-    Covered, Delivery, LinkState, Opener, Peer, Rejection, Replica, ReplicaError, ReplicaSpec,
-    ReplicaState, RowOp, Subscription, WindowBase, WindowState, CONFLICT,
+    Covered, Delivery, LinkState, Opener, Peer, Refusal, Rejection, Replica, ReplicaError,
+    ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription, WindowBase, WindowState, CONFLICT,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -363,6 +364,126 @@ impl Schedule {
     }
 }
 
+/// A presence publish the server refused (`presence.forbidden`,
+/// `presence.too_large`) comes back as a frame to the publisher alone: its
+/// key.
+fn refused_presence(text: &str) -> Option<String> {
+    if !text.contains("\"error\"") {
+        return None;
+    }
+    let frame = serde_json::from_str::<Value>(text).ok()?;
+    if frame["event"] != "presence" || frame["data"]["error"].as_str().is_none() {
+        return None;
+    }
+    Some(frame["data"]["scopeKey"].as_str()?.to_owned())
+}
+
+/// Whether the peers already present on one key have reached this replica
+/// over the current socket — keeper-hq's `hq-runtime` `PresenceGate`, asked
+/// with leaves rather than a document of its own, since a person's device
+/// is not one of the directory's instances.
+///
+/// The server hands a socket the peers already on a key once the key is
+/// among the socket's registrations — at connect, or when the registration
+/// refresh after a round adds it — in the same step that registers it,
+/// before it judges anything that socket sends later. A connected socket
+/// proves none of that. So the replica asks: it sends a leave on the key,
+/// which a registered key takes silently (nothing of this device is there
+/// to leave) and an unregistered one refuses, then a leave on a key it
+/// never holds, which the server always refuses — after any refusal of the
+/// first, on the same socket. When the second refusal comes alone, the key
+/// was registered when the first was judged, so every peer already on it
+/// arrived before that answer.
+#[derive(Debug, Default)]
+pub(crate) struct PresenceGate {
+    key: Option<String>,
+    /// The ask in flight: its never-held key, and whether the server
+    /// refused `key` before answering it.
+    probe: Option<(String, bool)>,
+    /// The rounds on this socket when an ask found `key` unregistered: the
+    /// next ask waits for another round, where registrations change.
+    retry_after: Option<u32>,
+    asked: u64,
+    ready: bool,
+}
+
+impl PresenceGate {
+    pub(crate) fn watching(key: Option<String>) -> PresenceGate {
+        PresenceGate {
+            key,
+            ..PresenceGate::default()
+        }
+    }
+
+    /// A new socket: nothing of it is known yet.
+    pub(crate) fn reset(&mut self) {
+        self.probe = None;
+        self.retry_after = None;
+        self.ready = false;
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.ready
+    }
+
+    /// The watched key and the never-held key to ask on now, if an ask is
+    /// due.
+    pub(crate) fn due(&mut self, rounds: u32, client: &str) -> Option<(String, String)> {
+        if self.ready || self.probe.is_some() {
+            return None;
+        }
+        let key = self.key.clone()?;
+        if self.retry_after.is_some_and(|at| rounds <= at) {
+            return None;
+        }
+        self.asked += 1;
+        let probe = format!("probe:{client}:{}", self.asked);
+        self.probe = Some((probe.clone(), false));
+        Some((key, probe))
+    }
+
+    /// The ask could not be sent: the next one is due at once.
+    pub(crate) fn unasked(&mut self) {
+        self.probe = None;
+    }
+
+    /// The server refused a publish on `scope` (`rounds` run on the socket).
+    pub(crate) fn refused(&mut self, scope: &str, rounds: u32) {
+        let watched = self.key.as_deref() == Some(scope);
+        let Some((probe, key_refused)) = &mut self.probe else {
+            return;
+        };
+        if watched {
+            *key_refused = true;
+            return;
+        }
+        if probe != scope {
+            return;
+        }
+        if *key_refused {
+            self.retry_after = Some(rounds);
+        } else {
+            self.ready = true;
+        }
+        self.probe = None;
+    }
+}
+
+/// The standing refusals of commits written here that wrote one row, newest
+/// first: the replica's outcome journal keeps a refused commit's operations
+/// until it is resolved.
+const ROW_REFUSED: &str =
+    "SELECT o.client_commit_id AS commit_id FROM _syncular_commit_outcomes o, \
+     json_each(o.operations_json) op \
+     WHERE o.resolution = 'active' AND o.status IN ('conflict', 'rejected') \
+     AND json_extract(op.value, '$.table') = ?1 AND json_extract(op.value, '$.rowId') = ?2 \
+     GROUP BY o.seq ORDER BY o.seq DESC";
+
+/// Whether a commit in the outbox writes one row.
+const ROW_PENDING: &str = "SELECT 1 AS pending FROM _syncular_outbox o, json_each(o.ops_json) op \
+     WHERE json_extract(op.value, '$.table') = ?1 AND json_extract(op.value, '$.rowId') = ?2 \
+     LIMIT 1";
+
 type Reply<T> = SyncSender<Result<T, ReplicaError>>;
 
 enum Command {
@@ -376,6 +497,7 @@ enum Command {
         reply: Reply<()>,
     },
     Presence(String, Reply<Vec<Peer>>),
+    Supersede(Vec<String>, String, Reply<()>),
     Upload(Vec<u8>, Option<String>, Reply<Value>),
     Fetch(String, Reply<Vec<u8>>),
     SyncNow,
@@ -436,6 +558,11 @@ struct Owner {
     directory: u64,
     rows: u64,
     presence: u64,
+    /// Whether the peers already on the watched key have arrived over this
+    /// socket.
+    gate: PresenceGate,
+    /// Rounds run over the current socket.
+    rounds_on_socket: u32,
     state: watch::Sender<ReplicaState>,
 }
 
@@ -504,6 +631,7 @@ impl Owner {
             directory: 0,
             rows: 0,
             presence: 0,
+            presence_known: false,
         });
         Ok(Owner {
             database: spec.database.clone(),
@@ -515,6 +643,8 @@ impl Owner {
             directory: 0,
             rows: 0,
             presence: 0,
+            gate: PresenceGate::watching(spec.watch_presence.clone()),
+            rounds_on_socket: 0,
             state,
         })
     }
@@ -639,6 +769,22 @@ impl Owner {
                     .collect();
                 let _ = reply.send(Ok(peers));
             }
+            Command::Supersede(commits, replacement, reply) => {
+                let mut outcome = Ok(());
+                for commit in commits {
+                    let resolved = self
+                        .client
+                        .resolve_commit_outcome(ResolveCommitOutcomeInput {
+                            client_commit_id: commit,
+                            resolution: CommitOutcomeResolution::Superseded,
+                            replacement_client_commit_id: Some(replacement.clone()),
+                        });
+                    if let Err(error) = resolved {
+                        outcome = Err(ReplicaError::Client(error));
+                    }
+                }
+                let _ = reply.send(outcome);
+            }
             Command::Upload(bytes, media_type, reply) => {
                 let outcome = self
                     .client
@@ -678,6 +824,9 @@ impl Owner {
                 // here would parse each frame twice.
                 Inbound::Text(text) => {
                     self.client.on_realtime_text(&text);
+                    if let Some(scope) = refused_presence(&text) {
+                        self.gate.refused(&scope, self.rounds_on_socket);
+                    }
                     self.presence += 1;
                 }
                 Inbound::Binary(bytes) => {
@@ -695,13 +844,22 @@ impl Owner {
         if self.schedule.round_due(Instant::now(), wanted) {
             self.round();
         }
+        self.ask_presence();
         if !self.online() || self.connected() || !self.schedule.socket_due(Instant::now()) {
             return;
         }
+        // A socket that was lost keeps the peers it last saw until it is
+        // released: a new socket starts from its own snapshot.
+        if self.client.realtime_state() == RealtimeState::Lost {
+            self.client.disconnect_realtime(&mut self.transport);
+        }
+        self.gate.reset();
         match self.client.connect_realtime(&mut self.transport) {
             Ok(()) => {
                 self.schedule.socket_done(true, Instant::now());
+                self.rounds_on_socket = 0;
                 self.round();
+                self.ask_presence();
             }
             Err(error) => {
                 self.schedule.socket_done(false, Instant::now());
@@ -726,9 +884,34 @@ impl Owner {
         }
     }
 
+    /// Ask whether the watched key's peers have arrived, when an ask is due
+    /// ([`PresenceGate`]).
+    fn ask_presence(&mut self) {
+        if !self.online() || !self.connected() {
+            return;
+        }
+        let Some((key, probe)) = self
+            .gate
+            .due(self.rounds_on_socket, self.client.client_id())
+        else {
+            return;
+        };
+        let asked = self
+            .client
+            .set_presence(&mut self.transport, &key, None)
+            .and_then(|()| self.client.set_presence(&mut self.transport, &probe, None));
+        if let Err(error) = asked {
+            tracing::debug!(database = %self.database, %error, "the directory's presence was not asked after");
+            self.gate.unasked();
+        }
+    }
+
     fn round(&mut self) {
         self.dirty = false;
         let outcome = self.client.sync_until_idle(&mut self.transport, None);
+        if self.connected() {
+            self.rounds_on_socket = self.rounds_on_socket.saturating_add(1);
+        }
         let verdict = verdict(&outcome);
         self.schedule.round_done(&verdict, Instant::now());
         match verdict {
@@ -773,6 +956,7 @@ impl Owner {
             directory: self.directory,
             rows: self.rows,
             presence: self.presence,
+            presence_known: link == LinkState::Connected && self.gate.ready(),
         };
         self.state.send_if_modified(|state| {
             let changed = *state != next;
@@ -793,6 +977,7 @@ impl Owner {
             directory: self.directory,
             rows: self.rows,
             presence: self.presence,
+            presence_known: false,
         };
         self.state.send_replace(next);
     }
@@ -1028,6 +1213,32 @@ impl Replica for SyncularReplica {
                 ),
             },
         })
+    }
+
+    fn row_writes(&self, table: &str, row_id: &str) -> Result<RowWrites, ReplicaError> {
+        let params = [Value::from(table), Value::from(row_id)];
+        let pending = !self.query(ROW_PENDING, &params)?.is_empty();
+        let mut refused = Vec::new();
+        for row in self.query(ROW_REFUSED, &params)? {
+            let Some(commit_id) = row.get("commit_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Delivery::Refused(rejection) = self.delivery(commit_id)? {
+                refused.push(Refusal {
+                    commit_id: commit_id.to_owned(),
+                    rejection,
+                });
+            }
+        }
+        Ok(RowWrites { pending, refused })
+    }
+
+    fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError> {
+        if commit_ids.is_empty() {
+            return Ok(());
+        }
+        let replacement = replacement.to_owned();
+        self.ask(|reply| Command::Supersede(commit_ids, replacement, reply))
     }
 
     fn remote_query(
@@ -1352,6 +1563,7 @@ mod tests {
             client_id: None,
             link: None,
             subscriptions: Vec::new(),
+            watch_presence: None,
         }
     }
 
@@ -1380,6 +1592,193 @@ mod tests {
             again.set_presence("page:x", None),
             Err(ReplicaError::NotSyncing)
         ));
+    }
+
+    #[test]
+    fn the_directorys_presence_is_known_only_once_an_ask_finds_the_key_registered() {
+        let mut gate = PresenceGate::watching(Some("dir:alpha".to_owned()));
+        // The socket is connected and nothing is asked yet: not known.
+        assert!(!gate.ready());
+        // Round 1 ran; the key is not registered yet: the server refuses the
+        // leave on it before it answers the never-held key.
+        let (key, probe) = gate.due(1, "ana.dev").expect("an ask");
+        assert_eq!(key, "dir:alpha");
+        gate.refused("dir:alpha", 1);
+        gate.refused(&probe, 1);
+        assert!(
+            !gate.ready(),
+            "refused: the peers on the key may not be here"
+        );
+        assert_eq!(
+            gate.due(1, "ana.dev"),
+            None,
+            "asked again only after a round"
+        );
+        // After round 2 the key is registered: the answer comes alone.
+        let (_, probe) = gate.due(2, "ana.dev").expect("a second ask");
+        gate.refused("page:other", 2);
+        assert!(!gate.ready(), "another key's refusal says nothing");
+        gate.refused(&probe, 2);
+        assert!(gate.ready());
+        assert_eq!(gate.due(3, "ana.dev"), None, "known: nothing more to ask");
+        // A new socket knows nothing yet, and asks at once.
+        gate.reset();
+        assert!(!gate.ready());
+        assert!(gate.due(0, "ana.dev").is_some());
+        // An ask that could not be sent is due again at once.
+        gate.unasked();
+        assert!(gate.due(0, "ana.dev").is_some());
+        // A replica that watches no key never asks, and never knows.
+        let mut none = PresenceGate::watching(None);
+        assert_eq!(none.due(5, "ana.dev"), None);
+        assert!(!none.ready());
+    }
+
+    #[test]
+    fn a_presence_refusal_frame_names_its_key() {
+        assert_eq!(
+            refused_presence(
+                r#"{"event":"presence","data":{"scopeKey":"probe:a:1","error":"presence.forbidden","timestamp":1}}"#
+            )
+            .as_deref(),
+            Some("probe:a:1")
+        );
+        assert_eq!(
+            refused_presence(
+                r#"{"event":"presence","data":{"scopeKey":"dir:alpha","kind":"join","actorId":"nixie","clientId":"n.e","doc":{"error":1}}}"#
+            ),
+            None,
+            "a join whose document says error is no refusal"
+        );
+        assert_eq!(refused_presence(r#"{"event":"hello","data":{}}"#), None);
+    }
+
+    fn prefs_row(id: &str) -> RowOp {
+        let Value::Object(values) = json!({
+            "id": id, "person_actor": "ana", "agent_actor": "nixie",
+            "default_client": "nixie.electra", "fallback": "[]", "updated_at_ms": 1,
+            "author_actor": "ana", "author_client": "ana.dev",
+        }) else {
+            unreachable!("a literal object");
+        };
+        RowOp::Upsert {
+            table: "instance_prefs".to_owned(),
+            values,
+            base_version: None,
+        }
+    }
+
+    /// Record, as a round would, the server refusing commit `commit` that
+    /// wrote `instance_prefs` row `row_id`.
+    fn journal_refusal(path: &std::path::Path, commit: &str, row_id: &str, code: &str) {
+        use syncular_client::api::{CommitOperation, RejectionRecord};
+        let operations = vec![CommitOperation {
+            table: "instance_prefs".to_owned(),
+            row_id: row_id.to_owned(),
+            op: "upsert".to_owned(),
+            base_version: None,
+            values: json!({ "id": row_id, "default_client": "nixie.electra" })
+                .as_object()
+                .cloned(),
+        }];
+        let results = vec![CommitOperationOutcome::Error {
+            rejection: RejectionRecord {
+                client_commit_id: commit.to_owned(),
+                op_index: 0,
+                code: code.to_owned(),
+                message: "not yours".to_owned(),
+                retryable: false,
+                details: None,
+                operation: None,
+            },
+        }];
+        let conn = rusqlite::Connection::open(path).expect("opens");
+        conn.busy_timeout(Duration::from_secs(5)).expect("timeout");
+        conn.execute(
+            "INSERT INTO _syncular_commit_outcomes(client_commit_id, status, recorded_at_ms, \
+             results_json, operations_json) VALUES (?1, 'rejected', 1, ?2, ?3)",
+            rusqlite::params![
+                commit,
+                serde_json::to_string(&results).expect("results"),
+                serde_json::to_string(&operations).expect("operations")
+            ],
+        )
+        .expect("records");
+    }
+
+    #[test]
+    fn what_a_row_still_owes_and_was_refused_is_read_from_the_file_across_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("local.sqlite"));
+        let replica = SyncularReplica::open(spec.clone()).expect("opens");
+        assert_eq!(
+            replica
+                .row_writes("instance_prefs", "ana/nixie")
+                .expect("reads"),
+            RowWrites::default(),
+            "never written"
+        );
+        let written = replica
+            .mutate(vec![prefs_row("ana/nixie")])
+            .expect("commits");
+        let owed = replica
+            .row_writes("instance_prefs", "ana/nixie")
+            .expect("reads");
+        assert!(owed.pending && owed.refused.is_empty());
+        assert_eq!(
+            replica
+                .row_writes("instance_prefs", "kuba/nixie")
+                .expect("reads"),
+            RowWrites::default(),
+            "another person's row"
+        );
+        replica.close();
+        replica.join();
+        drop(replica);
+
+        // A new process: nothing of the last one but the file.
+        let again = SyncularReplica::open(spec.clone()).expect("reopens");
+        assert!(
+            again
+                .row_writes("instance_prefs", "ana/nixie")
+                .expect("reads")
+                .pending,
+            "the outbox survived"
+        );
+        journal_refusal(&spec.path, "c-old", "ana/nixie", "hq.v9.person_actor");
+        journal_refusal(&spec.path, "c-other", "kuba/nixie", "hq.v9.person_actor");
+        let writes = again
+            .row_writes("instance_prefs", "ana/nixie")
+            .expect("reads");
+        assert_eq!(writes.refused.len(), 1);
+        assert_eq!(writes.refused[0].commit_id, "c-old");
+        assert_eq!(writes.refused[0].rejection.code, "hq.v9.person_actor");
+        // Written again: the refusal is set aside, durably.
+        again
+            .supersede(vec!["c-old".to_owned()], &written)
+            .expect("supersedes");
+        assert!(again
+            .row_writes("instance_prefs", "ana/nixie")
+            .expect("reads")
+            .refused
+            .is_empty());
+        again.close();
+        again.join();
+        drop(again);
+        let third = SyncularReplica::open(spec).expect("reopens");
+        let writes = third
+            .row_writes("instance_prefs", "ana/nixie")
+            .expect("reads");
+        assert!(writes.refused.is_empty(), "set aside across a restart");
+        assert_eq!(
+            third
+                .row_writes("instance_prefs", "kuba/nixie")
+                .expect("reads")
+                .refused
+                .len(),
+            1,
+            "another row's refusal stands"
+        );
     }
 
     #[test]
@@ -1451,6 +1850,7 @@ mod tests {
                 table: "clients".to_owned(),
                 scopes: vec![("dir".to_owned(), vec!["alpha".to_owned()])],
             }],
+            watch_presence: Some("dir:alpha".to_owned()),
         }
     }
 

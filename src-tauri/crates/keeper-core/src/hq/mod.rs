@@ -435,6 +435,7 @@ impl Hq {
             } else {
                 Vec::new()
             },
+            watch_presence: linked.then(|| instances::dir_key(database)),
         }
     }
 
@@ -543,6 +544,7 @@ impl Hq {
                 client_id: None,
                 link: None,
                 subscriptions: Vec::new(),
+                watch_presence: None,
             });
         }
         let held = match (&server, &pairing) {

@@ -6,6 +6,11 @@ import type { AgentInstancePresenceVm } from "./AgentInstancePresenceVm";
  */
 export type AgentInstanceStateVm = { clientId: string, label: string, presence: AgentInstancePresenceVm, 
 /**
- * It holds the session's claim.
+ * It holds the session's claim, its lease running.
  */
-holds: boolean, };
+holds: boolean, 
+/**
+ * It held the session last and its lease ran out, no other instance
+ * holding it yet: it is not answering.
+ */
+lapsed: boolean, };

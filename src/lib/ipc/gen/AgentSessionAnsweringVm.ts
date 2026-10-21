@@ -7,10 +7,11 @@ import type { AgentInstanceStateVm } from "./AgentInstanceStateVm";
  */
 export type AgentSessionAnsweringVm = { 
 /**
- * The claim holder's client id, while one holds the session.
+ * The claim holder's client id, while one holds the session with its
+ * lease running.
  */
 holder?: string, sentence: string, 
 /**
- * The holder first, then by label.
+ * The holder (or the one whose lease ran out) first, then by label.
  */
 instances: Array<AgentInstanceStateVm>, };

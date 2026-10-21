@@ -31,6 +31,7 @@ fn open(dir: &std::path::Path, database: &str, actor: &str) -> Source {
         client_id: Some(format!("{actor}.dev")),
         link: None,
         subscriptions: Vec::new(),
+        watch_presence: None,
     })
     .expect("opens");
     Source {
@@ -945,6 +946,7 @@ fn an_unreadable_answer_keeps_its_request_and_a_retry_replays_it() {
             token: "0123456789abcdef".to_owned(),
         }),
         subscriptions: Vec::new(),
+        watch_presence: None,
     })
     .expect("opens");
     let ana = Source {

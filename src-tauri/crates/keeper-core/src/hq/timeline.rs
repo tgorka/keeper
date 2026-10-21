@@ -342,7 +342,14 @@ pub fn view(
         .collect();
     let messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
     let newest_ms = messages.last().map(|m| m.created_at_ms);
-    let answering = instances::answering(source, session_id, &session.agent_actor, &agent_name);
+    let answering = instances::answering(
+        source,
+        session_id,
+        &session.agent_actor,
+        &agent_name,
+        &opened.live,
+        now_ms,
+    );
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),

@@ -33,6 +33,7 @@ fn open(dir: &std::path::Path, database: &str) -> Source {
         client_id: Some("dev1".to_owned()),
         link: None,
         subscriptions: Vec::new(),
+        watch_presence: None,
     })
     .expect("opens");
     Source {
@@ -673,6 +674,20 @@ impl crate::hq::port::Replica for Staged {
             return Ok(crate::hq::port::Delivery::Refused(rejection.clone()));
         }
         self.inner.delivery(commit)
+    }
+    fn row_writes(
+        &self,
+        table: &str,
+        row_id: &str,
+    ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
+        self.inner.row_writes(table, row_id)
+    }
+    fn supersede(
+        &self,
+        commits: Vec<String>,
+        replacement: &str,
+    ) -> Result<(), crate::hq::port::ReplicaError> {
+        self.inner.supersede(commits, replacement)
     }
     fn remote_query(
         &self,

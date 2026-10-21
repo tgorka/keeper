@@ -13,10 +13,15 @@
 //! The person's choice — the default instance and an ordered fallback — is
 //! an `instance_prefs` row in the person's own `actor` scope, one per
 //! database the person and the agent share, since a row cannot cross
-//! (AD-433, DW-E106-7). keeper writes the same row into every such database
-//! the device holds, shows one choice (the newest row) and says when the
-//! rows differ. The instances route by it themselves: the first of the
-//! order whose presence is online claims a new session (keeper-hq's
+//! (AD-433, DW-E106-7). The person picks one order; keeper writes into each
+//! such database the device holds that order less the instances that
+//! database's directory does not list, never a foreign client id, and no
+//! row at all where none of them is (R-HQ-43). It shows one choice — the
+//! rows written last, merged back into one order — and, per database, the
+//! order its row asks, whether a write there still waits for its server,
+//! and the server's refusal, all read from the replica file so a restart
+//! loses none of it. The instances route by the row themselves: the first
+//! of the order whose presence is online claims a new session (keeper-hq's
 //! `hq-runtime` `routing`), so keeper never picks an instance for a session
 //! and never pings one. `agents.default` keeps its meaning — which agent
 //! keeper opens at launch.
@@ -26,16 +31,18 @@
 //! every instance, since each differs from the others.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::hq::live::{self, Claim};
-use crate::hq::port::{Delivery, LinkState, RowOp};
+use crate::hq::live::{self, Claim, Live};
+use crate::hq::port::{LinkState, RowOp, RowWrites};
 use crate::hq::sessions::{authored, int, names, object, opt_text, read, text, Source};
-use crate::hq::{lock, Hq, HqError};
+use crate::hq::{Hq, HqError};
+
+/// The table the person's choice is a row of.
+const PREFS: &str = "instance_prefs";
 
 /// Whether an instance is online, as far as this device can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -105,14 +112,45 @@ pub struct AgentInstancesVm {
     pub fallback: Vec<String>,
     /// What the choice does, as the person reads it.
     pub sentence: String,
-    /// The shared databases' rows differ: the sentence saying how.
+    /// A database's row is not the order shown, as far as that database's
+    /// instances go: the sentence saying how each differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub disagreement: Option<String>,
-    /// The server's refusal of a choice written here.
+    /// A choice written here still waits for some database's server:
+    /// where it is saved and where it waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery: Option<String>,
+    /// The servers' refusals of the latest choice written here, by database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub notice: Option<String>,
+    /// The rows disagree or a database refused: writing the order shown
+    /// into every database again is offered.
+    pub reapply: bool,
+    /// Each shared database's own order and state, while their orders
+    /// differ, a write waits or one was refused; empty otherwise.
+    pub by_database: Vec<AgentInstancesDatabaseVm>,
+}
+
+/// One shared database's part of the person's choice (R-HQ-43).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentInstancesDatabaseVm {
+    pub database: String,
+    /// The order this database's row asks, as its instances route by it;
+    /// empty with no row.
+    pub order: Vec<String>,
+    /// How it stands, in this database's own terms.
+    pub sentence: String,
+    /// A choice written here waits to reach this database's server.
+    pub pending: bool,
+    /// The server refused the latest choice written here: why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub refused: Option<String>,
 }
 
 /// One instance of the session's agent in the session's header.
@@ -123,8 +161,11 @@ pub struct AgentInstanceStateVm {
     pub client_id: String,
     pub label: String,
     pub presence: AgentInstancePresenceVm,
-    /// It holds the session's claim.
+    /// It holds the session's claim, its lease running.
     pub holds: bool,
+    /// It held the session last and its lease ran out, no other instance
+    /// holding it yet: it is not answering.
+    pub lapsed: bool,
 }
 
 /// Which instance is answering an open session, and each instance's
@@ -133,12 +174,13 @@ pub struct AgentInstanceStateVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AgentSessionAnsweringVm {
-    /// The claim holder's client id, while one holds the session.
+    /// The claim holder's client id, while one holds the session with its
+    /// lease running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub holder: Option<String>,
     pub sentence: String,
-    /// The holder first, then by label.
+    /// The holder (or the one whose lease ran out) first, then by label.
     pub instances: Vec<AgentInstanceStateVm>,
 }
 
@@ -148,12 +190,16 @@ pub fn dir_key(database: &str) -> String {
 }
 
 /// The client ids present on a database's directory key, or `None` while
-/// this device's socket to it is not up — when an empty list says nothing.
+/// this device cannot tell — when an empty list says nothing.
 pub type Online = Option<HashSet<String>>;
 
-/// Who is present on `source`'s directory key now.
+/// Who is present on `source`'s directory key now: `None` while its socket
+/// is not up, and while the peers already present there have not reached
+/// this socket yet (a reconnect starts over) — a connected socket alone is
+/// no complete view (R1065-01).
 pub fn online(source: &Source) -> Online {
-    if source.replica.state().link != LinkState::Connected {
+    let state = source.replica.state();
+    if state.link != LinkState::Connected || !state.presence_known {
         return None;
     }
     match source.replica.presence(&dir_key(&source.database)) {
@@ -275,17 +321,91 @@ pub struct Shared {
     pub instances: Vec<Instance>,
     pub prefs: Option<Prefs>,
     pub online: Online,
+    /// What the replica still owes its server of the person's row, or was
+    /// refused — from its file, scoped by its server, person, database and
+    /// agent as the replica and the row id are.
+    pub writes: RowWrites,
 }
 
 impl Shared {
     pub fn read(source: &Source, agent: &str, online: Online) -> Shared {
+        let writes = source
+            .replica
+            .row_writes(PREFS, &prefs_id(&source.actor, agent))
+            .unwrap_or_else(|error| {
+                tracing::debug!(database = %source.database, %error, "the choice's delivery could not be read");
+                RowWrites::default()
+            });
         Shared {
             database: source.database.clone(),
             instances: instances_of(source, agent),
             prefs: prefs_of(source, agent),
             online,
+            writes,
         }
     }
+
+    fn ids(&self) -> HashSet<&str> {
+        self.instances
+            .iter()
+            .map(|instance| instance.client_id.as_str())
+            .collect()
+    }
+
+    fn order(&self) -> Vec<String> {
+        self.prefs.as_ref().map(Prefs::order).unwrap_or_default()
+    }
+}
+
+/// `order` less the instances `ids` does not name: one database's part of
+/// it.
+pub fn project(order: &[String], ids: &HashSet<&str>) -> Vec<String> {
+    order
+        .iter()
+        .filter(|client| ids.contains(client.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// One order each of `rows` is a part of, each keeping its own order;
+/// `None` when they contradict one another.
+fn merge(rows: &[Vec<String>]) -> Option<Vec<String>> {
+    let mut rest: Vec<&[String]> = rows.iter().map(Vec::as_slice).collect();
+    let mut out: Vec<String> = Vec::new();
+    loop {
+        rest.retain(|row| !row.is_empty());
+        if rest.is_empty() {
+            return Some(out);
+        }
+        let next = rest
+            .iter()
+            .map(|row| &row[0])
+            .find(|head| rest.iter().all(|row| !row[1..].contains(head)))?
+            .clone();
+        for row in &mut rest {
+            if row[0] == next {
+                *row = &row[1..];
+            }
+        }
+        out.push(next);
+    }
+}
+
+/// The person's order: the rows written last — keeper writes one choice
+/// into every database at one time, each row that order less what its
+/// database lacks — merged back into one. Rows written apart that cannot
+/// be merged give the first database's.
+fn chosen(shared: &[Shared]) -> Vec<String> {
+    let rows: Vec<&Prefs> = shared.iter().filter_map(|db| db.prefs.as_ref()).collect();
+    let Some(newest) = rows.iter().map(|prefs| prefs.updated_ms).max() else {
+        return Vec::new();
+    };
+    let last: Vec<Vec<String>> = rows
+        .iter()
+        .filter(|prefs| prefs.updated_ms == newest)
+        .map(|prefs| prefs.order())
+        .collect();
+    merge(&last).unwrap_or_else(|| last.first().cloned().unwrap_or_default())
 }
 
 /// How `client` stands in the databases that list it.
@@ -384,12 +504,7 @@ fn order_sentence(order: &[String], labels: &HashMap<String, String>) -> String 
 }
 
 /// One agent's view over the databases it shares with the person.
-pub fn agent_view(
-    agent_actor: &str,
-    agent_name: &str,
-    shared: &[Shared],
-    notice: Option<String>,
-) -> AgentInstancesVm {
+pub fn agent_view(agent_actor: &str, agent_name: &str, shared: &[Shared]) -> AgentInstancesVm {
     // Every instance once, with the databases that list it.
     let mut merged: BTreeMap<String, (Instance, Vec<usize>)> = BTreeMap::new();
     for (at, db) in shared.iter().enumerate() {
@@ -421,34 +536,8 @@ pub fn agent_view(
         .iter()
         .map(|(id, (instance, _))| (id.clone(), instance.label.clone()))
         .collect();
-    // The newest row is the choice shown; the first database wins a tie.
-    let mut chosen: Option<&Prefs> = None;
-    for prefs in shared.iter().filter_map(|db| db.prefs.as_ref()) {
-        if chosen.is_none_or(|held| prefs.updated_ms > held.updated_ms) {
-            chosen = Some(prefs);
-        }
-    }
-    let order: Vec<String> = chosen.map(Prefs::order).unwrap_or_default();
-    let orders: Vec<(&str, Option<Vec<String>>)> = shared
-        .iter()
-        .map(|db| (db.database.as_str(), db.prefs.as_ref().map(Prefs::order)))
-        .collect();
-    let disagreement = orders.windows(2).any(|w| w[0].1 != w[1].1).then(|| {
-        let parts: Vec<String> = orders
-            .iter()
-            .map(|(database, order)| match order {
-                Some(order) => {
-                    let named: Vec<String> = order.iter().map(|c| label_of(&labels, c)).collect();
-                    format!("{database} asks {}", named.join(", then "))
-                }
-                None => format!("{database} has no choice, so any online instance answers"),
-            })
-            .collect();
-        format!(
-            "Your databases differ: {}. Choosing here writes the same choice into each.",
-            parts.join("; ")
-        )
-    });
+    let order = chosen(shared);
+    let per = per_database(shared, &order, &labels);
     let hashes: Vec<(String, String, Option<String>)> = merged
         .values()
         .map(|(i, _)| (i.client_id.clone(), i.label.clone(), i.hash.clone()))
@@ -500,8 +589,131 @@ pub fn agent_view(
         default_client: order.first().cloned(),
         fallback: order.iter().skip(1).cloned().collect(),
         instances,
+        disagreement: per.disagreement,
+        delivery: per.delivery,
+        notice: per.notice,
+        reapply: per.reapply,
+        by_database: per.by_database,
+    }
+}
+
+/// How each shared database stands against the order shown.
+struct PerDatabase {
+    disagreement: Option<String>,
+    delivery: Option<String>,
+    notice: Option<String>,
+    reapply: bool,
+    by_database: Vec<AgentInstancesDatabaseVm>,
+}
+
+fn per_database(
+    shared: &[Shared],
+    order: &[String],
+    labels: &HashMap<String, String>,
+) -> PerDatabase {
+    let named = |order: &[String]| {
+        order
+            .iter()
+            .map(|client| label_of(labels, client))
+            .collect::<Vec<_>>()
+            .join(", then ")
+    };
+    let asks = |row: &[String]| {
+        if row.is_empty() {
+            "has no choice, so any online instance answers".to_owned()
+        } else {
+            format!("asks {}", named(row))
+        }
+    };
+    let mut differs = false;
+    let mut outside = false;
+    let mut saved: Vec<&str> = Vec::new();
+    let mut waiting: Vec<&str> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
+    let mut by_database = Vec::new();
+    for db in shared {
+        let row = db.order();
+        let expected = project(order, &db.ids());
+        let refused = db
+            .writes
+            .refused
+            .first()
+            .map(|refusal| refusal.rejection.to_string());
+        let pending = db.writes.pending;
+        if !expected.is_empty() && row != expected {
+            differs = true;
+        }
+        let sentence = if let Some(reason) = &refused {
+            refusals.push(format!(
+                "The server refused your choice in {}: {reason}.",
+                db.database
+            ));
+            format!("{} refused your choice: {reason}.", db.database)
+        } else if !order.is_empty() && expected.is_empty() {
+            outside = true;
+            format!(
+                "None of the instances you chose is in {}, so its row is unchanged: it {}.",
+                db.database,
+                asks(&row)
+            )
+        } else if pending {
+            waiting.push(&db.database);
+            format!(
+                "{} {}; saved on this device, waiting to sync.",
+                db.database,
+                asks(&row)
+            )
+        } else {
+            if !expected.is_empty() && row == expected {
+                saved.push(&db.database);
+            }
+            format!("{} {}.", db.database, asks(&row))
+        };
+        by_database.push(AgentInstancesDatabaseVm {
+            database: db.database.clone(),
+            order: row,
+            sentence,
+            pending,
+            refused,
+        });
+    }
+    let disagreement = differs.then(|| {
+        let parts: Vec<String> = shared
+            .iter()
+            .map(|db| format!("{} {}", db.database, asks(&db.order())))
+            .collect();
+        format!(
+            "Your databases differ: {}. Applying the order shown writes it into each.",
+            parts.join("; ")
+        )
+    });
+    let delivery = (!waiting.is_empty()).then(|| {
+        if saved.is_empty() {
+            format!(
+                "Saved on this device; waiting to sync to {}.",
+                and_list(&waiting)
+            )
+        } else {
+            format!(
+                "Saved in {}; waiting to sync to {}.",
+                and_list(&saved),
+                and_list(&waiting)
+            )
+        }
+    });
+    let orders_differ = by_database.windows(2).any(|w| w[0].order != w[1].order);
+    let worth_saying = shared.len() > 1
+        && (orders_differ || outside || !waiting.is_empty() || !refusals.is_empty());
+    PerDatabase {
         disagreement,
-        notice,
+        delivery,
+        reapply: differs || !refusals.is_empty(),
+        notice: (!refusals.is_empty()).then(|| refusals.join(" ")),
+        by_database: if worth_saying {
+            by_database
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -550,8 +762,7 @@ pub fn list(sources: &[Source], online: &dyn Fn(&Source) -> Online) -> Vec<Agent
             if shared.iter().all(|db| db.instances.is_empty()) {
                 return None;
             }
-            let notice = settle(sources, &agent);
-            Some(agent_view(&agent, &name, &shared, notice))
+            Some(agent_view(&agent, &name, &shared))
         })
         .collect();
     out.sort_by(|a, b| {
@@ -561,43 +772,12 @@ pub fn list(sources: &[Source], online: &dyn Fn(&Source) -> Online) -> Vec<Agent
     out
 }
 
-/// Choices written here whose outcome the server still owes: (database,
-/// agent) to the commit.
-static WRITING: LazyLock<Mutex<HashMap<(String, String), String>>> = LazyLock::new(Mutex::default);
-
-/// The server's refusals of a choice, by agent, kept until the next choice.
-static REFUSED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
-
-/// Look up the choices written here for `agent`: a refused one becomes the
-/// notice, a settled one is forgotten.
-fn settle(sources: &[Source], agent: &str) -> Option<String> {
-    let mut writing = lock(&WRITING);
-    let mut refused = lock(&REFUSED);
-    writing.retain(|(database, of), commit| {
-        if of != agent {
-            return true;
-        }
-        let Some(source) = sources.iter().find(|s| s.database == *database) else {
-            return false;
-        };
-        match source.replica.delivery(commit) {
-            Ok(Delivery::Pending) => true,
-            Ok(Delivery::Refused(reason)) => {
-                refused.insert(
-                    agent.to_owned(),
-                    format!("The server refused your choice in {database}: {reason}"),
-                );
-                false
-            }
-            Ok(Delivery::Applied | Delivery::Unknown) | Err(_) => false,
-        }
-    });
-    refused.get(agent).cloned()
-}
-
 /// Write `order` — the instance that answers first, then the fallback — as
 /// the person's `instance_prefs` row for `agent` in every held database
-/// they share with it, offline if need be.
+/// they share with it, offline if need be: in each, the order less the
+/// instances that database's directory does not list, and nothing where it
+/// lists none of them (R-HQ-43). A refusal standing against the row there
+/// is set aside by the new write.
 pub fn set_order(
     sources: &[Source],
     agent: &str,
@@ -608,39 +788,60 @@ pub fn set_order(
     if shared.is_empty() {
         return Err(format!("{agent} is in no database this device holds."));
     }
-    let Some(default) = order.first() else {
+    if order.is_empty() {
         return Err("Choose the instance that answers first.".to_owned());
-    };
+    }
     let mut seen: HashSet<&str> = HashSet::new();
     if let Some(twice) = order.iter().find(|c| !seen.insert(c.as_str())) {
         return Err(format!(
             "{twice} is named twice; each instance takes one place."
         ));
     }
-    let known: HashSet<String> = shared
+    let held: Vec<HashSet<String>> = shared
         .iter()
-        .flat_map(|source| instances_of(source, agent))
-        .map(|instance| instance.client_id)
+        .map(|source| {
+            instances_of(source, agent)
+                .into_iter()
+                .map(|instance| instance.client_id)
+                .collect()
+        })
         .collect();
-    if let Some(stranger) = order.iter().find(|c| !known.contains(*c)) {
+    if let Some(stranger) = order
+        .iter()
+        .find(|c| !held.iter().any(|ids| ids.contains(*c)))
+    {
         return Err(format!(
             "{stranger} is not an instance of {agent} in your databases."
         ));
     }
-    let fallback = Value::from(order[1..].to_vec()).to_string();
     let mut failed: Vec<String> = Vec::new();
-    lock(&REFUSED).remove(agent);
-    for source in shared {
+    for (source, ids) in shared.into_iter().zip(&held) {
+        let part = project(order, &ids.iter().map(String::as_str).collect());
+        let Some((default, fallback)) = part.split_first() else {
+            continue;
+        };
+        let row_id = prefs_id(&source.actor, agent);
+        let standing: Vec<String> = source
+            .replica
+            .row_writes(PREFS, &row_id)
+            .map(|writes| {
+                writes
+                    .refused
+                    .into_iter()
+                    .map(|refusal| refusal.commit_id)
+                    .collect()
+            })
+            .unwrap_or_default();
         let row = RowOp::Upsert {
-            table: "instance_prefs".to_owned(),
+            table: PREFS.to_owned(),
             values: authored(
                 source,
                 object(serde_json::json!({
-                    "id": prefs_id(&source.actor, agent),
+                    "id": row_id,
                     "person_actor": source.actor,
                     "agent_actor": agent,
                     "default_client": default,
-                    "fallback": fallback,
+                    "fallback": Value::from(fallback.to_vec()).to_string(),
                     "updated_at_ms": now_ms,
                 })),
             ),
@@ -648,7 +849,9 @@ pub fn set_order(
         };
         match source.replica.mutate(vec![row]) {
             Ok(commit) => {
-                lock(&WRITING).insert((source.database.clone(), agent.to_owned()), commit);
+                if let Err(error) = source.replica.supersede(standing, &commit) {
+                    tracing::debug!(database = %source.database, %error, "an earlier refusal of the choice was not set aside");
+                }
                 source.replica.sync_now();
             }
             Err(error) => failed.push(format!("{}: {error}", source.database)),
@@ -690,18 +893,62 @@ fn session_order(source: &Source, session_id: &str, agent: &str) -> Option<Vec<S
     Some(order)
 }
 
+/// Who takes a session nobody holds next, as the instances route it.
+enum Next<'a> {
+    /// This device cannot see presence.
+    Unknown,
+    /// The first of the order that is online.
+    Takes(&'a str),
+    /// None of the order is online.
+    WaitsForChosen,
+    /// No order here, and no instance is online.
+    WaitsForAny,
+    /// No order here: any instance that is online.
+    AnyOnline,
+}
+
+fn next<'a>(
+    states: &'a [AgentInstanceStateVm],
+    order: Option<&'a [String]>,
+    online: &Online,
+    excluded: Option<&str>,
+) -> Next<'a> {
+    let Some(present) = online else {
+        return Next::Unknown;
+    };
+    let up = |client: &str| present.contains(client) && excluded != Some(client);
+    match order {
+        Some(order) if !order.is_empty() => order
+            .iter()
+            .find(|client| up(client))
+            .map(|client| {
+                states
+                    .iter()
+                    .find(|s| s.client_id == *client)
+                    .map_or(client.as_str(), |s| s.label.as_str())
+            })
+            .map_or(Next::WaitsForChosen, Next::Takes),
+        _ if states.iter().any(|s| up(&s.client_id)) => Next::AnyOnline,
+        _ => Next::WaitsForAny,
+    }
+}
+
 /// The header of a session as its database's rows and presence say it.
+/// `lapsed`: the claim's lease ran out as this device has watched it — its
+/// holder is named as the one that held it, never as answering (R1065-05).
 pub fn answering_vm(
     agent_name: &str,
     instances: &[Instance],
     claim: Option<&Claim>,
+    lapsed: bool,
     order: Option<&[String]>,
     online: &Online,
 ) -> Option<AgentSessionAnsweringVm> {
-    let holder = claim
+    let last = claim
         .filter(|claim| !claim.released && !claim.holder_client.is_empty())
         .map(|claim| claim.holder_client.clone());
-    if instances.is_empty() && holder.is_none() {
+    let holder = last.clone().filter(|_| !lapsed);
+    if instances.is_empty() && last.is_none() {
         return None;
     }
     let mut states: Vec<AgentInstanceStateVm> = instances
@@ -709,68 +956,71 @@ pub fn answering_vm(
         .map(|instance| AgentInstanceStateVm {
             presence: presence_in(&instance.client_id, std::iter::once(online)),
             holds: holder.as_deref() == Some(instance.client_id.as_str()),
+            lapsed: lapsed && last.as_deref() == Some(instance.client_id.as_str()),
             client_id: instance.client_id.clone(),
             label: instance.label.clone(),
         })
         .collect();
-    if let Some(holder) = &holder {
-        if !states.iter().any(|s| s.client_id == *holder) {
+    if let Some(last) = &last {
+        if !states.iter().any(|s| s.client_id == *last) {
             states.push(AgentInstanceStateVm {
-                presence: presence_in(holder, std::iter::once(online)),
-                holds: true,
-                client_id: holder.clone(),
-                label: holder.clone(),
+                presence: presence_in(last, std::iter::once(online)),
+                holds: !lapsed,
+                lapsed,
+                client_id: last.clone(),
+                label: last.clone(),
             });
         }
     }
     states.sort_by(|a, b| {
-        (!a.holds, a.label.to_lowercase(), &a.client_id).cmp(&(
-            !b.holds,
+        (!(a.holds || a.lapsed), a.label.to_lowercase(), &a.client_id).cmp(&(
+            !(b.holds || b.lapsed),
             b.label.to_lowercase(),
             &b.client_id,
         ))
     });
-    let sentence = match states.iter().find(|s| s.holds) {
-        Some(held) => match held.presence {
+    let sentence = if let Some(held) = states.iter().find(|s| s.holds) {
+        match held.presence {
             AgentInstancePresenceVm::Online => format!("{} is answering.", held.label),
             AgentInstancePresenceVm::Offline => format!(
                 "{} holds this conversation and is offline; another instance takes it over once its lease runs out.",
                 held.label
             ),
             AgentInstancePresenceVm::Unknown => format!("{} holds this conversation.", held.label),
-        },
-        None => match online {
-            None => "No instance holds this conversation yet.".to_owned(),
-            Some(present) => {
-                let up: Vec<&AgentInstanceStateVm> = states
-                    .iter()
-                    .filter(|s| present.contains(&s.client_id))
-                    .collect();
-                let next = match order {
-                    Some(order) if !order.is_empty() => order
-                        .iter()
-                        .find(|c| up.iter().any(|s| s.client_id == **c))
-                        .and_then(|c| states.iter().find(|s| s.client_id == *c)),
-                    _ => None,
-                };
-                match (next, up.is_empty(), order.is_some_and(|o| !o.is_empty())) {
-                    (Some(next), _, _) => format!(
-                        "No instance holds this conversation yet; {} takes it next.",
-                        next.label
-                    ),
-                    (None, _, true) => "None of the instances you chose is online; this \
-                         conversation waits for one."
-                        .to_owned(),
-                    (None, true, false) => format!(
-                        "No instance of {agent_name} is online; this conversation waits for one."
-                    ),
-                    (None, false, false) => {
-                        "No instance holds this conversation yet; one that is online takes it next."
-                            .to_owned()
-                    }
-                }
+        }
+    } else if let Some(gone) = states.iter().find(|s| s.lapsed) {
+        let held = format!("{} held this conversation; its lease ran out", gone.label);
+        match next(&states, order, online, Some(&gone.client_id)) {
+            Next::Unknown => format!("{held}."),
+            Next::Takes(label) => format!("{held}, so {label} takes it over next."),
+            Next::WaitsForChosen => {
+                format!(
+                    "{held}; none of the other instances you chose is online, so it waits for one."
+                )
             }
-        },
+            Next::WaitsForAny => {
+                format!("{held}; no other instance of {agent_name} is online, so it waits for one.")
+            }
+            Next::AnyOnline => format!("{held}, so one that is online takes it over next."),
+        }
+    } else {
+        match next(&states, order, online, None) {
+            Next::Unknown => "No instance holds this conversation yet.".to_owned(),
+            Next::Takes(label) => {
+                format!("No instance holds this conversation yet; {label} takes it next.")
+            }
+            Next::WaitsForChosen => {
+                "None of the instances you chose is online; this conversation waits for one."
+                    .to_owned()
+            }
+            Next::WaitsForAny => {
+                format!("No instance of {agent_name} is online; this conversation waits for one.")
+            }
+            Next::AnyOnline => {
+                "No instance holds this conversation yet; one that is online takes it next."
+                    .to_owned()
+            }
+        }
     };
     Some(AgentSessionAnsweringVm {
         holder,
@@ -779,20 +1029,27 @@ pub fn answering_vm(
     })
 }
 
-/// The header of `session_id` with `agent`, from its database alone.
+/// The header of `session_id` with `agent`, from its database alone; `live`
+/// is how this device has watched the session's claim.
 pub fn answering(
     source: &Source,
     session_id: &str,
     agent: &str,
     agent_name: &str,
+    live: &Live,
+    now_ms: i64,
 ) -> Option<AgentSessionAnsweringVm> {
     let instances = instances_of(source, agent);
     let claim = live::claim(source, session_id);
+    let lapsed = claim
+        .as_ref()
+        .is_some_and(|claim| live.claim_lapsed(claim, now_ms));
     let order = session_order(source, session_id, agent);
     answering_vm(
         agent_name,
         &instances,
         claim.as_ref(),
+        lapsed,
         order.as_deref(),
         &online(source),
     )
