@@ -2525,6 +2525,34 @@ async fn two_instances_answer_by_the_persons_choice_and_who_is_online() {
         "PASS {} s after the kill the header said: {sentence}",
         killed.elapsed().as_secs()
     );
+    // Its lease runs out on this device's watch about when the server lets
+    // the other take it over: whichever comes first is said, and a holder
+    // whose lease ran out is never said to be answering (R1065-05).
+    let (sentence, _) = {
+        let (key, first, gone) = (held[0].clone(), first.clone(), second.clone());
+        poll(
+            &mac,
+            "the lapsed holder is named as such, or the session taken over",
+            Duration::from_secs(120),
+            move |hq| {
+                let view = hq.session_view(&key).ok()?.answering?;
+                let lapsed = view
+                    .instances
+                    .iter()
+                    .any(|s| s.client_id == gone && s.lapsed);
+                if lapsed {
+                    assert_eq!(view.holder, None, "{}", view.sentence);
+                    assert!(!view.sentence.contains("is answering"), "{}", view.sentence);
+                }
+                (lapsed || view.holder.as_deref() == Some(first.as_str())).then_some(view.sentence)
+            },
+        )
+        .await
+    };
+    println!(
+        "PASS {} ms after the kill, first seen: {sentence}",
+        killed.elapsed().as_millis()
+    );
     for key in held.clone() {
         let (first, database) = (first.clone(), key.database.clone());
         let ((holder, sentence), _) = poll(
