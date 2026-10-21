@@ -184,14 +184,23 @@ their new membership. The membership is told by the fields fixed when it was mad
 landing meanwhile is the same membership and keeps the request. The server stamps every new
 membership of a person in a session a later `added_at_ms` than any before it, even when they are
 invited again within the same millisecond, so two memberships never look alike. Once the device
-has seen them invited again (a new membership, stamped anew), Remove is a new removal. A reader
-switch asked again is a new decision as well as a retry: when the earlier request comes back
-replayed (`cached`), it already took effect — and the flag now reading the other way means it was
-undone since, or this device has not seen it yet — so keeper asks for this switch under a new
-request id, and the server ends with the latest decision. Setting a flag twice is the same change
-twice, never a different one. Refusals are matched by the server's stable codes
-(`hq.remove_member.*`, `hq.v3.owner_only`, `hq.v11.invite_outside_directory`,
-`hq.v3.owner_cannot_leave`, `hq.v8.not_reader`); any other is shown as the server said it.
+has seen them invited again (a new membership, stamped anew), Remove is a new removal.
+
+Every Remove and reader switch also names the membership it is about — the `added_at_ms` the
+sheet shows — and the server refuses it (`hq.member.changed`) when that person's membership is
+another one by now, or — for a reader switch — gone (a Remove of someone gone is refused as not a
+member): a decision about someone never lands on their next membership, which nobody decided
+about. The sheet then says so, and shows them as they are.
+
+A replayed answer is the end of that request: it ran before, and keeper asks nothing more of its
+own — it syncs and the sheet shows where things stand, which may be a change made since on another
+device. A new decision is the person's next switch or Remove, sent under a new request id about
+the membership shown then. A reader switch whose result the sheet has shown is settled even if its
+answer never came, so switching it again later — after it was undone on another device, say — is
+that new decision at once. Refusals are matched by the server's stable codes
+(`hq.remove_member.*`, `hq.member.changed`, `hq.v3.owner_only`,
+`hq.v11.invite_outside_directory`, `hq.v3.owner_cannot_leave`, `hq.v8.not_reader`); any other is
+shown as the server said it.
 
 A member who is not the owner sees the same list without those controls and may **Leave
 session**, which deletes their own membership; the server then takes them out of the invite. The

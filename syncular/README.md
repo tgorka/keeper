@@ -257,27 +257,41 @@ Registered commands go to `POST /<database>/operations` with `kind: "command"` (
 `params` is a JSON object with camelCase keys. Each command belongs only to the session's owner, on
 the database the session lives in, and lands as one ordinary commit authored by the calling client.
 A refusal answers `kind: "error"` with `code: "operation.forbidden"`. Params that are not
-`{ sessionId, actorId }` strings answer `operation.invalid_request` for `remove_member`, and
-`operation.forbidden` for `grant_trace` and `revoke_trace`.
+`{ sessionId, actorId }` strings and an `expectedAddedAtMs` integer answer
+`operation.invalid_request` for `remove_member`, and `operation.forbidden` for `grant_trace` and
+`revoke_trace`.
 
-- `grant_trace` `{ sessionId, actorId }` — turns `reads_trace` on for a person member (D-34). The
-  trace reaches their replicas after the scope refresh.
-- `revoke_trace` `{ sessionId, actorId }` — turns it off. Their replicas evict the trace.
-- `remove_member` `{ sessionId, actorId }` — takes a person member out of `invite` and deletes
-  their `session_members` row in one commit. Their replicas drop the session and its rows, except
-  their own writes still in the outbox. A refusal names why in `message`:
+Each command names the membership it acts on: `expectedAddedAtMs` is the member's `added_at_ms`
+as the caller shows it, which the server stamps later for every new membership of a person in a
+session than for any before it, so no two memberships share one. Inside the command's
+transaction, a member whose membership now has another `added_at_ms` (removed and invited again
+since) is refused with `message: "hq.member.changed"`, and so is a member with none for
+`grant_trace` and `revoke_trace`; nothing is written. A command never lands on a membership
+nobody decided about.
+
+- `grant_trace` `{ sessionId, actorId, expectedAddedAtMs }` — turns `reads_trace` on for a person
+  member (D-34). The trace reaches their replicas after the scope refresh.
+- `revoke_trace` `{ sessionId, actorId, expectedAddedAtMs }` — turns it off. Their replicas evict
+  the trace.
+- `remove_member` `{ sessionId, actorId, expectedAddedAtMs }` — takes a person member out of
+  `invite` and deletes their `session_members` row in one commit. Their replicas drop the session
+  and its rows, except their own writes still in the outbox. A refusal names why in `message`:
   `hq.remove_member.not_owner` (the caller is not the session's owner person on this database),
   `hq.remove_member.self` (the owner themself), `hq.remove_member.not_member` (the actor is not a
-  member) or `hq.remove_member.agent` (an agent member, including the session's own agent).
-  `grant_trace` and `revoke_trace` refuse without a reason.
+  member), `hq.remove_member.agent` (an agent member, including the session's own agent) or
+  `hq.member.changed`. `grant_trace` and `revoke_trace` refuse without a reason, except
+  `hq.member.changed`.
 
-A command sent again under a `requestId` the server already applied is answered from its record:
-`status: "cached"` with the first answer's `results` and `commitSeq`, never a second commit. A
-client whose answer was lost — or arrived unreadable, which says nothing about whether the
-command ran — asks again under the same `requestId` and treats `cached` as success; only an
-answer it can read (applied, cached, rejected, or an `error`) settles the request. keeper asks
-again under the same id only about the same membership: one whose `added_at_ms`,
-`added_by_actor` and `role` (immutable, V4) are unchanged.
+A command sent again under a `requestId` the server already applied is answered from its record,
+before the member or the membership is looked at: `status: "cached"` with the first answer's
+`results` and `commitSeq`, never a second commit. A client whose answer was lost — or arrived
+unreadable, which says nothing about whether the command ran — asks again under the same
+`requestId` and the same params, and treats `cached` as the end of that request: it ran before, and
+the replica's next sync shows where things stand. It never follows a replayed answer with a
+request of its own; a new decision is a person's new action, under a new `requestId`, about the
+membership shown then. Only an answer it can read (applied, cached, rejected, or an `error`)
+settles the request. keeper asks again under the same id only about the same membership: one whose
+`added_at_ms`, `added_by_actor` and `role` (immutable, V4) are unchanged.
 
 ## The live check
 
