@@ -4041,13 +4041,14 @@ export async function listenNotifyNavigate(
 
 /**
  * The event a phone's shell emits when a keeper push was tapped (98.1, UX-DR144; 98.4).
- * Must match `PUSH_OPEN_EVENT` in `keeper/src/push_ios.rs` and `push_android.rs`. It carries nothing: the room to
+ * Must match `PUSH_OPEN_EVENT` in `keeper/src/push_ios.rs` and `push_android.rs`. It carries nothing: where to
  * open is taken with {@link pushOpenTake}.
  */
 export const PUSH_OPEN_EVENT = "push://open";
 
 /**
- * The session room a tapped keeper notification opens, once; `null` when none waits
+ * Where a tapped keeper notification opens, once — an agents session by its database (106.6), or a
+ * Matrix agent room; `null` when none waits
  * (always, off the iPhone and Android).
  */
 export async function pushOpenTake(): Promise<PushOpenVm | null> {
