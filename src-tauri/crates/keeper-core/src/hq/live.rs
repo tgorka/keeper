@@ -212,6 +212,8 @@ struct Turn {
     client: Option<String>,
     /// A document of the turn is on its scope now.
     present: bool,
+    /// When this viewer last saw a document of the turn.
+    seen: Option<Instant>,
 }
 
 /// A session's `claims` row, as far as telling a holder that stopped.
@@ -246,6 +248,10 @@ pub struct Live {
     claim: Option<(Claim, Instant)>,
     /// The claim's holder is gone ([`LEASE`], [`STALE_MS`]) or let it go.
     lapsed: bool,
+    /// The first and the latest observation: how long a turn with no
+    /// claim to judge it by has gone without a document.
+    first: Option<Instant>,
+    at: Option<Instant>,
 }
 
 fn doc_turn(doc: &Value) -> Option<(&str, i64)> {
@@ -264,8 +270,13 @@ impl Live {
         now: Instant,
         now_ms: i64,
     ) {
+        self.first.get_or_insert(now);
+        self.at = Some(now);
+        // A document that left takes its tool with it: a present one names
+        // it again in this same pass.
         for turn in self.turns.values_mut() {
             turn.present = false;
+            turn.tool = None;
         }
         for peer in session {
             let Some((id, from_seq)) = doc_turn(&peer.doc) else {
@@ -283,6 +294,7 @@ impl Live {
                 .map(str::to_owned);
             turn.client = Some(peer.client_id.clone());
             turn.present = true;
+            turn.seen = Some(now);
         }
         for peer in trace {
             let Some((id, from_seq)) = doc_turn(&peer.doc) else {
@@ -295,6 +307,7 @@ impl Live {
             turn.reasoning.see(from_seq, tail);
             turn.client.get_or_insert_with(|| peer.client_id.clone());
             turn.present = true;
+            turn.seen = Some(now);
         }
         self.claim = match (self.claim.take(), claim) {
             (Some((held, since)), Some(now_claim)) if held == now_claim => Some((held, since)),
@@ -315,13 +328,20 @@ impl Live {
     }
 
     /// Whether the instance writing a turn has stopped: its document has
-    /// left and its claim lapsed, or went to another instance.
+    /// left and its claim lapsed, or went to another instance. With no
+    /// claim row to judge by (not yet replicated, or gone), a turn whose
+    /// document has been away a whole lease is taken for stopped too, so
+    /// no answer waits without an end.
     fn stopped(&self, turn: Option<&Turn>, author: Option<&str>) -> bool {
         if turn.is_some_and(|turn| turn.present) {
             return false;
         }
         let Some((claim, _)) = &self.claim else {
-            return false;
+            let quiet_since = turn.and_then(|turn| turn.seen).or(self.first);
+            return match (quiet_since, self.at) {
+                (Some(since), Some(at)) => at.saturating_duration_since(since) >= LEASE,
+                _ => false,
+            };
         };
         let writer = turn.and_then(|turn| turn.client.as_deref()).or(author);
         self.lapsed || writer.is_some_and(|writer| writer != claim.holder_client)
@@ -530,9 +550,10 @@ pub fn details(metadata: &Value) -> Option<AgentMessageDetailsVm> {
 // ---------------------------------------------------------------------------
 
 /// The tools the session's agent offers: what the claim holder's profile
-/// says (`agent_profiles.tools`), or, before any instance holds it, what
-/// every instance of the agent that says anything offers. Empty while no
-/// instance has said.
+/// says (`agent_profiles.tools`); before any instance holds it, or while
+/// the holder's row says nothing (an instance older than the column), what
+/// every instance of the agent that says anything offers in common. Empty
+/// while no instance has said.
 pub fn offered(source: &Source, agent_actor: &str, holder: Option<&str>) -> Vec<String> {
     let profiles: Vec<(String, Option<Vec<String>>)> = read(
         source,

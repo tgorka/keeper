@@ -1652,7 +1652,7 @@ async fn an_answer_whose_instance_was_killed_says_it_stopped() {
             .cloned()
             .expect("the cut answer stays shown");
         assert!(
-            turn.text.starts_with(&last) || last.starts_with(&turn.text),
+            turn.text.starts_with(&last),
             "{last:?} then {:?}",
             turn.text
         );

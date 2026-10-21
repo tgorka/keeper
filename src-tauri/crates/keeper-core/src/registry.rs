@@ -1249,12 +1249,12 @@ pub fn set_agents_server_url(
     )
 }
 
-/// Whether an agent's thinking is shown on this device; `"1"`/`"0"`, absent
-/// = off. Session state: it never leaves this device.
+/// Whether an agent's thinking is shown; `"1"`/`"0"`, absent = off. A
+/// person's preference, the same on every device; who may read the thinking
+/// at all is the session's reader flag, not this key.
 const AGENTS_SHOW_REASONING_KEY: &str = "agents.show_reasoning";
 
-/// Whether an agent answer's details are shown on this device; `"1"`/`"0"`,
-/// absent = off. Session state: it never leaves this device.
+/// Whether an agent answer's details are shown; `"1"`/`"0"`, absent = off.
 const AGENTS_SHOW_DETAILS_KEY: &str = "agents.show_details";
 
 pub fn get_agents_show_reasoning(data_dir: &Path) -> Result<bool, CoreError> {

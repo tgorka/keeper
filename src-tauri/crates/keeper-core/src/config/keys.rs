@@ -481,28 +481,22 @@ pub const KEYS: &[KeySpec] = &[
     KeySpec {
         key: "agents.show_reasoning",
         family: false,
-        scope: Scope::SessionState,
-        settable: Settable::Never(
-            "it is what the person reading on this device chose to see of an agent's turn, and a \
-             file switching it would draw thinking on a screen whose reader turned it off",
-        ),
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
         shape: Shape::Flag01,
         default: "0",
-        summary: "Whether an agent's thinking streams beside its answer on this device, for a session whose thinking you may read. Off until chosen; it never leaves this device.",
-        example: "",
+        summary: "Whether an agent's thinking streams beside its answer, in a session whose thinking you may read. Off until chosen. Who may read it is the session's, not this switch's: without the reader flag nothing of it reaches this device.",
+        example: "true",
     },
     KeySpec {
         key: "agents.show_details",
         family: false,
-        scope: Scope::SessionState,
-        settable: Settable::Never(
-            "it is what the person reading on this device chose to see of an agent's answer, \
-             and a file switching it would change a screen its reader set",
-        ),
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
         shape: Shape::Flag01,
         default: "0",
-        summary: "Whether an agent's answer shows its details on this device — model, tokens, time to first token, duration, finish. Off until chosen; it never leaves this device.",
-        example: "",
+        summary: "Whether an agent's answer shows its details — model, tokens, time to first token, duration, finish. Off until chosen.",
+        example: "true",
     },
     // ---- bots ------------------------------------------------------------
     KeySpec {

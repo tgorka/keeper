@@ -438,10 +438,12 @@ impl Hq {
         Ok(())
     }
 
-    /// Follow the effective setting: a no-op when it still names what this
-    /// service runs, a restart otherwise.
+    /// Follow the effective settings: the view preferences (a settings file
+    /// or another device may have switched them) and the server — a no-op
+    /// when it still names what this service runs, a restart otherwise.
     pub async fn reconcile(&self) -> Result<(), HqError> {
         let _lifecycle = self.lifecycle.lock().await;
+        self.reread_view_prefs();
         let stored = crate::registry::get_agents_server_url(&self.data_dir()?)?;
         let wanted = stored.as_deref().map(ServerUrl::parse);
         let unchanged = {

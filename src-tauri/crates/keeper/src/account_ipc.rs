@@ -1112,7 +1112,10 @@ pub fn watch_settings() {
         if key == "bots.wake_enabled" {
             wake_chosen();
         }
-        if key == "agents.server_url" {
+        if matches!(
+            key,
+            "agents.server_url" | "agents.show_reasoning" | "agents.show_details"
+        ) {
             crate::hq_ipc::reconcile();
         }
         if settings_sync::synced_file(key).is_some() {

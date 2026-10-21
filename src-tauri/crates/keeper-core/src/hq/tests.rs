@@ -368,6 +368,23 @@ async fn a_changed_setting_is_followed_and_an_unchanged_one_restarts_nothing() {
     );
 }
 
+/// The view preferences are a person's settings: switched in a settings
+/// file or synced from another device, they reach the open views on the
+/// next reconcile.
+#[tokio::test]
+async fn a_view_preference_switched_elsewhere_is_followed() {
+    let world = World::new();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    assert!(!hq.view_prefs().show_reasoning);
+    let mut changes = hq.changes();
+    changes.borrow_and_update();
+    crate::registry::set_agents_show_reasoning(&world.data_dir(), true).expect("stores");
+    hq.reconcile().await.expect("reconciles");
+    assert!(hq.view_prefs().show_reasoning);
+    assert!(changes.has_changed().expect("open"), "the views read again");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_redemption_overtaken_by_a_new_address_saves_nothing() {
     let world = World::new();
@@ -484,4 +501,255 @@ async fn copies_that_cannot_be_deleted_are_reported_and_the_pairing_kept() {
         .keychain_get(&keychain_key(&server))
         .expect("reads")
         .is_none());
+}
+
+/// A real local replica whose `session:` presence answers by the reading
+/// thread, so a test can stage two streams of one session reading it at once.
+struct Staged {
+    inner: Arc<dyn Replica>,
+    /// The stream on thread `late` says it is reading the presence...
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// ...and reads on once the stream on thread `early` is done, or after a
+    /// while if that stream cannot get in.
+    early_done: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+fn tail(from_seq: i64, text: &str) -> Vec<crate::hq::port::Peer> {
+    vec![crate::hq::port::Peer {
+        actor_id: "nixie".to_owned(),
+        client_id: "nixie.box".to_owned(),
+        doc: serde_json::json!({"turn": "t1", "from_seq": from_seq, "text": text}),
+    }]
+}
+
+impl Replica for Staged {
+    fn mutate(&self, ops: Vec<RowOp>) -> Result<String, crate::hq::port::ReplicaError> {
+        self.inner.mutate(ops)
+    }
+    fn query(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
+        self.inner.query(sql, params)
+    }
+    fn query_covered(
+        &self,
+        sql: &str,
+        params: &[Value],
+        base: &crate::hq::port::WindowBase,
+        units: &[String],
+    ) -> Result<crate::hq::port::Covered, crate::hq::port::ReplicaError> {
+        self.inner.query_covered(sql, params, base, units)
+    }
+    fn subscribe(&self, s: Subscription) -> Result<(), crate::hq::port::ReplicaError> {
+        self.inner.subscribe(s)
+    }
+    fn set_window(
+        &self,
+        base: &crate::hq::port::WindowBase,
+        units: &[String],
+    ) -> Result<(), crate::hq::port::ReplicaError> {
+        self.inner.set_window(base, units)
+    }
+    fn window_state(
+        &self,
+        base: &crate::hq::port::WindowBase,
+    ) -> Result<crate::hq::port::WindowState, crate::hq::port::ReplicaError> {
+        self.inner.window_state(base)
+    }
+    fn set_presence(
+        &self,
+        key: &str,
+        doc: Option<Value>,
+    ) -> Result<(), crate::hq::port::ReplicaError> {
+        self.inner.set_presence(key, doc)
+    }
+    fn presence(
+        &self,
+        key: &str,
+    ) -> Result<Vec<crate::hq::port::Peer>, crate::hq::port::ReplicaError> {
+        if !key.starts_with("session:") {
+            return Ok(Vec::new());
+        }
+        // The writer flushed between the two reads: `early` saw the tail at
+        // 5, everyone after sees chunk 5's successor, still empty.
+        match std::thread::current().name() {
+            Some("early") => Ok(tail(5, "abc")),
+            Some("late") => {
+                if let Some(entered) = lock(&self.entered).take() {
+                    let _ = entered.send(());
+                }
+                if let Some(done) = lock(&self.early_done).take() {
+                    let _ = done.recv_timeout(Duration::from_millis(300));
+                }
+                Ok(tail(6, ""))
+            }
+            _ => Ok(tail(6, "")),
+        }
+    }
+    fn upload_blob(
+        &self,
+        b: Vec<u8>,
+        m: Option<String>,
+    ) -> Result<Value, crate::hq::port::ReplicaError> {
+        self.inner.upload_blob(b, m)
+    }
+    fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
+        self.inner.fetch_blob(b)
+    }
+    fn delivery(
+        &self,
+        commit: &str,
+    ) -> Result<crate::hq::port::Delivery, crate::hq::port::ReplicaError> {
+        self.inner.delivery(commit)
+    }
+    fn remote_query(
+        &self,
+        id: &str,
+        params: Value,
+    ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
+        self.inner.remote_query(id, params)
+    }
+    fn sync_now(&self) {
+        self.inner.sync_now();
+    }
+    fn state(&self) -> ReplicaState {
+        self.inner.state()
+    }
+    fn watch(&self) -> watch::Receiver<ReplicaState> {
+        self.inner.watch()
+    }
+    fn close(&self) {
+        self.inner.close();
+    }
+    fn join(&self) {
+        self.inner.join();
+    }
+}
+
+/// Opens the one staged replica, on this device alone.
+struct StagedOpener(Mutex<Option<Arc<Staged>>>);
+
+impl Opener for StagedOpener {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+        let inner = crate::hq::syncular::SyncularReplica::open(ReplicaSpec { link: None, ..spec })?;
+        let (entered, _) = std::sync::mpsc::channel();
+        let (_, early_done) = std::sync::mpsc::channel();
+        let staged = Arc::new(Staged {
+            inner: Arc::new(inner),
+            entered: Mutex::new(Some(entered)),
+            early_done: Mutex::new(Some(early_done)),
+        });
+        *lock(&self.0) = Some(Arc::clone(&staged));
+        Ok(staged)
+    }
+}
+
+/// R1063-01: two streams of one open session (a remount opens the next
+/// before the last has closed) read its tails at once. Whichever finishes
+/// last, the tail the other one kept is not lost: the answer only grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_streams_of_one_session_never_drop_each_others_tail() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["alpha"]);
+    let opener = Arc::new(StagedOpener(Mutex::new(None)));
+    let hq = Hq::new(
+        Arc::clone(&world.platform) as Arc<dyn Platform>,
+        Arc::clone(&opener) as Arc<dyn Opener>,
+        Arc::clone(&world.routes) as Arc<dyn Routes>,
+        "keeper on test".to_owned(),
+    );
+    hq.start().await.expect("starts");
+    let staged = lock(&opener.0).clone().expect("alpha opened");
+    let at = sessions::now_ms() - 60_000;
+    let upsert = |table: &str, values: Value| RowOp::Upsert {
+        table: table.to_owned(),
+        values: sessions::object(values),
+        base_version: None,
+    };
+    let mut seed = vec![
+        upsert(
+            "actors",
+            serde_json::json!({"id": "nixie", "kind": "agent", "display_name": "Nixie",
+                "family": null, "dir": "alpha", "created_at_ms": 1, "author_actor": "server",
+                "author_client": "server"}),
+        ),
+        upsert(
+            "sessions",
+            serde_json::json!({"id": "ana.1.1", "title": "t", "status": "open",
+                "agent_actor": "nixie", "created_by_actor": "ana", "created_by_client": "ana.1",
+                "preferred_client": null, "parent_session": null, "invite": "[]",
+                "archived": false, "heard_until": null, "created_at_ms": at,
+                "last_activity_ms": at, "trust": null, "author_actor": "ana",
+                "author_client": "ana.1"}),
+        ),
+        upsert(
+            "session_members",
+            serde_json::json!({"id": "ana.1.1/ana", "session_id": "ana.1.1", "actor_id": "ana",
+                "role": "person", "reads_trace": false, "added_by_actor": "ana",
+                "added_at_ms": at, "read_until": null, "author_actor": "ana",
+                "author_client": "ana.1"}),
+        ),
+    ];
+    for (seq, text) in ["", "1", "2", "3", "4"].iter().enumerate() {
+        seed.push(upsert(
+            "turn_chunks",
+            serde_json::json!({"id": format!("k{seq}"), "session_id": "ana.1.1",
+                "turn_id": "t1", "seq": seq, "text": text, "created_at_ms": at,
+                "author_actor": "nixie", "author_client": "nixie.box"}),
+        ));
+    }
+    staged.mutate(seed).expect("seeded");
+    let key = sessions::AgentSessionRef {
+        database: "alpha".to_owned(),
+        session_id: "ana.1.1".to_owned(),
+    };
+    hq.open_session(&key).expect("first stream");
+    hq.open_session(&key).expect("second stream");
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (done, early_done) = std::sync::mpsc::channel();
+    *lock(&staged.entered) = Some(entered_tx);
+    *lock(&staged.early_done) = Some(early_done);
+    let text =
+        |view: &timeline::AgentSessionViewVm| view.live.first().map(|turn| turn.text.clone());
+    // `late` reads first and holds inside its presence read until `early`
+    // is done (or cannot be, because the read excludes it).
+    let late = {
+        let hq = Arc::clone(&hq);
+        let key = key.clone();
+        std::thread::Builder::new()
+            .name("late".to_owned())
+            .spawn(move || hq.session_view(&key).expect("late view"))
+            .expect("spawns")
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("late reads the presence");
+    let early = {
+        let hq = Arc::clone(&hq);
+        let key = key.clone();
+        std::thread::Builder::new()
+            .name("early".to_owned())
+            .spawn(move || {
+                let view = hq.session_view(&key).expect("early view");
+                let _ = done.send(());
+                view
+            })
+            .expect("spawns")
+    };
+    let early = early.join().expect("early joins");
+    let _late = late.join().expect("late joins");
+    assert_eq!(
+        text(&early).as_deref(),
+        Some("1234abc"),
+        "early saw the tail"
+    );
+    // Chunk 5 has not landed: the kept tail is all that shows its text.
+    let next = hq.session_view(&key).expect("the next read");
+    assert_eq!(
+        text(&next).as_deref(),
+        Some("1234abc"),
+        "the answer shrank: a stream wrote back a set without the other's tail"
+    );
 }

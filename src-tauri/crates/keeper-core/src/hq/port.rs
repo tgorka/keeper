@@ -139,8 +139,8 @@ pub struct ReplicaState {
     /// Bumped whenever any row or window of the replica changes, locally or
     /// from the server: what a view over its rows reads again on.
     pub rows: u64,
-    /// Bumped whenever a presence document may have moved (a socket frame,
-    /// or the socket closing, which clears every peer).
+    /// Bumped on every socket text frame, a presence fanout among them. A
+    /// closing socket changes `link` instead, which is published anyway.
     pub presence: u64,
 }
 

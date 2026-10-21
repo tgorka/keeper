@@ -317,11 +317,50 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         late.stopped(None, Some(INSTANCE)),
         "opened long after its holder stopped"
     );
+    // No claim row to judge by: a document away a whole lease is a stop too.
     let mut unclaimed = Live::default();
-    unclaimed.observe(&[], &[], None, start, now_ms);
+    unclaimed.observe(&doc, &[], None, start, now_ms);
+    unclaimed.observe(&[], &[], None, start + Duration::from_secs(29), now_ms);
     assert!(
-        !unclaimed.stopped(None, Some(INSTANCE)),
-        "no claim says nothing"
+        !unclaimed.stopped(unclaimed.turns.get(TURN), Some(INSTANCE)),
+        "left, not yet a lease ago"
+    );
+    unclaimed.observe(&[], &[], None, start + LEASE, now_ms);
+    assert!(
+        unclaimed.stopped(unclaimed.turns.get(TURN), Some(INSTANCE)),
+        "away a whole lease with no claim"
+    );
+    let mut chunks_only = Live::default();
+    chunks_only.observe(&[], &[], None, start, now_ms);
+    assert!(!chunks_only.stopped(None, Some(INSTANCE)), "just opened");
+    chunks_only.observe(&[], &[], None, start + LEASE, now_ms);
+    assert!(
+        chunks_only.stopped(None, Some(INSTANCE)),
+        "chunks, no claim and no document for a lease"
+    );
+}
+
+#[test]
+fn a_document_that_leaves_takes_its_tool_with_it() {
+    let calling = Peer {
+        doc: json!({"turn": TURN, "from_seq": 1, "text": "half", "tool": "web_search"}),
+        ..session_doc(1, "half")
+    };
+    let mut live = Live::default();
+    let now = Instant::now();
+    live.observe(&[calling], &[], None, now, 0);
+    assert_eq!(
+        live.turns.get(TURN).and_then(|t| t.tool.as_deref()),
+        Some("web_search")
+    );
+    live.observe(&[], &[], None, now, 0);
+    let turn = live.turns.get(TURN).expect("kept through the leave");
+    assert_eq!(
+        (
+            turn.tool.as_deref(),
+            turn.text.0.get(&1).map(String::as_str)
+        ),
+        (None, Some("half"))
     );
 }
 
