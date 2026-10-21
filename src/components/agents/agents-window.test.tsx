@@ -809,12 +809,19 @@ describe("the session header's instance line (106.5)", () => {
         holder: "nixie.electra",
         sentence: "nixie@electra is answering.",
         instances: [
-          { clientId: "nixie.electra", label: "nixie@electra", presence: "online", holds: true },
+          {
+            clientId: "nixie.electra",
+            label: "nixie@electra",
+            presence: "online",
+            holds: true,
+            lapsed: false,
+          },
           {
             clientId: "nixie.hesperia",
             label: "nixie@hesperia",
             presence: "offline",
             holds: false,
+            lapsed: false,
           },
         ],
       },
@@ -826,6 +833,39 @@ describe("the session header's instance line (106.5)", () => {
       "nixie@electraOnline· holds it",
       "nixie@hesperiaOffline",
     ]);
+    // electra stopped renewing and its lease ran out; nobody holds the session yet.
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          answering: {
+            sentence:
+              "nixie@electra held this conversation; its lease ran out, so nixie@hesperia takes it over next.",
+            instances: [
+              {
+                clientId: "nixie.electra",
+                label: "nixie@electra",
+                presence: "online",
+                holds: false,
+                lapsed: true,
+              },
+              {
+                clientId: "nixie.hesperia",
+                label: "nixie@hesperia",
+                presence: "online",
+                holds: false,
+                lapsed: false,
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    expect(screen.queryByText(/is answering/)).toBeNull();
+    expect(
+      within(screen.getByRole("list", { name: "Instances of Assistant" }))
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["nixie@electraOnline· its lease ran out", "nixie@hesperiaOnline"]);
     // The holder stopped, its lease lapsed and hesperia took the session over.
     act(() =>
       mock.views.get("alpha")?.(
@@ -839,12 +879,14 @@ describe("the session header's instance line (106.5)", () => {
                 label: "nixie@hesperia",
                 presence: "online",
                 holds: true,
+                lapsed: false,
               },
               {
                 clientId: "nixie.electra",
                 label: "nixie@electra",
                 presence: "offline",
                 holds: false,
+                lapsed: false,
               },
             ],
           },

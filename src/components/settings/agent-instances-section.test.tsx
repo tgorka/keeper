@@ -41,8 +41,22 @@ function nixie(patch: Partial<AgentInstancesVm> = {}): AgentInstancesVm {
     defaultClient: "nixie.electra",
     fallback: ["nixie.hesperia", "nixie.laptop"],
     sentence: "New sessions go to nixie@electra; while it is offline, to nixie@hesperia.",
+    reapply: false,
+    byDatabase: [],
     ...patch,
   };
+}
+
+/** Two instances: no fallback to move, so only an explicit action can write the order again. */
+function twoInstances(patch: Partial<AgentInstancesVm> = {}): AgentInstancesVm {
+  return nixie({
+    instances: [
+      instance({ clientId: "nixie.electra", rank: 0 }),
+      instance({ clientId: "nixie.hesperia", rank: 1 }),
+    ],
+    fallback: ["nixie.hesperia"],
+    ...patch,
+  });
 }
 
 async function drawWith(agents: AgentInstancesVm[]) {
@@ -165,5 +179,73 @@ describe("Settings › Answers from", () => {
     expect(
       screen.getByText("The server refused your choice in neuradrive: hq.v9.id"),
     ).toBeInTheDocument();
+  });
+
+  it("writes the order shown into every database again when Rust offers it, keeping focus", async () => {
+    await drawWith([
+      twoInstances({
+        reapply: true,
+        disagreement:
+          "Your databases differ: tgdrive asks nixie@electra, then nixie@hesperia; neuradrive asks nixie@hesperia, then nixie@electra.",
+      }),
+    ]);
+    expect(screen.queryByRole("button", { name: /earlier|later/ })).toBeNull();
+    const apply = screen.getByRole("button", { name: "Apply this order to all databases" });
+    apply.focus();
+    fireEvent.click(apply);
+    await waitFor(() =>
+      expect(mock.set).toHaveBeenCalledWith("nixie", ["nixie.electra", "nixie.hesperia"]),
+    );
+    // The selected order did not change to get there.
+    expect(screen.getByRole("radio", { name: /nixie@electra/ })).toBeChecked();
+    // Still offered (a database refused again): focus stays on the action.
+    act(() => mock.push?.([twoInstances({ reapply: true, notice: "The server refused it." })]));
+    expect(screen.getByRole("button", { name: "Apply this order to all databases" })).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Apply this order to all databases" }));
+    await waitFor(() => expect(mock.set).toHaveBeenCalledTimes(2));
+    // Rust's next list agrees: the action is gone and focus lands on the choice, not the dialog.
+    act(() => mock.push?.([twoInstances()]));
+    expect(screen.queryByRole("button", { name: "Apply this order to all databases" })).toBeNull();
+    expect(screen.getByRole("radio", { name: /nixie@electra/ })).toHaveFocus();
+  });
+
+  it("offers no such action while the rows agree and nothing was refused", async () => {
+    await drawWith([twoInstances()]);
+    expect(screen.queryByRole("button", { name: "Apply this order to all databases" })).toBeNull();
+  });
+
+  it("says, per database, its own order, what waits for its server and what it refused", async () => {
+    await drawWith([
+      twoInstances({
+        delivery: "Saved in tgdrive; waiting to sync to neuradrive.",
+        byDatabase: [
+          {
+            database: "tgdrive",
+            order: ["nixie.electra", "nixie.hesperia"],
+            sentence: "tgdrive asks nixie@electra, then nixie@hesperia.",
+            pending: false,
+          },
+          {
+            database: "neuradrive",
+            order: ["nixie.electra", "nixie.hesperia"],
+            sentence:
+              "neuradrive asks nixie@electra, then nixie@hesperia; saved on this device, waiting to sync.",
+            pending: true,
+          },
+        ],
+      }),
+    ]);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Saved in tgdrive; waiting to sync to neuradrive.",
+    );
+    const each = screen.getByRole("list", { name: "Each database's order: Nixie" });
+    expect(
+      within(each)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "tgdrive asks nixie@electra, then nixie@hesperia.",
+      "neuradrive asks nixie@electra, then nixie@hesperia; saved on this device, waiting to sync.",
+    ]);
   });
 });

@@ -3,7 +3,7 @@
  * answering — the claim holder — and each instance's online state, from the session's own database.
  *
  * Every word but the copy is Rust's (`AgentSessionAnsweringVm`): who holds the session, what it
- * means that the holder is offline, which instance takes a session nobody holds, and whether this
+ * means that the holder is offline, a holder whose lease ran out (named, never as answering), which instance takes a session nobody holds, and whether this
  * device can see presence at all ("Not known here" while the database does not sync, never
  * "Offline"). The frontend draws it and decides nothing.
  */
@@ -38,6 +38,7 @@ export function SessionInstances({
             <span className={instance.holds ? "font-medium" : ""}>{instance.label}</span>
             <PresenceMark presence={instance.presence} />
             {instance.holds && <span className="text-muted-foreground">· holds it</span>}
+            {instance.lapsed && <span className="text-muted-foreground">· its lease ran out</span>}
           </li>
         ))}
       </ul>

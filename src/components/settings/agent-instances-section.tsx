@@ -4,10 +4,13 @@
  * instance that answers new sessions, with the order the others answer in while it is offline.
  *
  * Every word but the copy is Rust's (`AgentInstancesVm`): who is online (unknown while a database
- * does not sync here, never "offline"), the definition marks, what the choice does, and when the
- * rows of the person's databases differ. The choice is an `instance_prefs` row in each database the
- * person and the agent share — never a setting of this device — so every device follows it after
- * one sync. This only says which order to write; Rust checks it and writes the rows.
+ * does not sync here, never "offline"), the definition marks, what the choice does, when the rows
+ * of the person's databases differ, each database's own order, what still waits for a server and
+ * what a server refused. The choice is an `instance_prefs` row in each database the person and the
+ * agent share — never a setting of this device — so every device follows it after one sync; each
+ * database's row is the order less the instances it does not list (R-HQ-43). This only says which
+ * order to write; Rust checks it and writes the rows. When the rows disagree or a database refused,
+ * Rust offers to write the order shown into every database again (`reapply`).
  *
  * On every tier, behind no capability: a phone chooses the same way. Absent, not empty, while no
  * held database lists an instance of any agent.
@@ -27,12 +30,14 @@ import {
   agentInstancesUnsubscribe,
 } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
+import { cn } from "@/lib/utils";
 
 export const AGENT_INSTANCES_TITLE = "Answers from";
 export const AGENT_INSTANCES_NOTE =
   "An agent can run as several instances, on a server and on your laptop. Choose the one that " +
   "answers your new sessions; while it is offline the others answer in the order below. The " +
   "choice is kept in your agents' databases, so each of your devices follows it.";
+export const REAPPLY = "Apply this order to all databases";
 const READ_FAILED = "Could not read your agents' instances.";
 const SAVE_FAILED = "Your choice was not saved.";
 
@@ -65,7 +70,10 @@ function AgentInstances({
   const box = useRef<HTMLFieldSetElement>(null);
   // The control the person used, found again once Rust's next list has moved its row: a write
   // never disables what holds focus, and a moved row must not drop it on the dialog.
-  const refocus = useRef<{ client: string; move: "earlier" | "later" | null } | null>(null);
+  const refocus = useRef<{
+    client: string;
+    move: "earlier" | "later" | "apply" | null;
+  } | null>(null);
   const chosen = agent.defaultClient !== undefined;
   // Reordering needs at least two fallbacks.
   const reorder = chosen && agent.instances.length > 2;
@@ -76,11 +84,19 @@ function AgentInstances({
     if (wanted === null || root === null) return;
     refocus.current = null;
     const row = root.querySelector<HTMLElement>(`[data-instance="${CSS.escape(wanted.client)}"]`);
+    // Applied again: the action while it is still offered, else the radio of the instance that
+    // answers first — never the dialog.
+    const applied =
+      wanted.move === "apply"
+        ? (root.querySelector<HTMLElement>("[data-reapply]") ??
+          root.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]'))
+        : null;
     const control =
-      wanted.move === null
+      applied ??
+      (wanted.move === null || wanted.move === "apply"
         ? row?.querySelector<HTMLElement>('[role="radio"]')
         : (row?.querySelector<HTMLButtonElement>(`[data-move="${wanted.move}"]:not(:disabled)`) ??
-          row?.querySelector<HTMLButtonElement>("[data-move]:not(:disabled)"));
+          row?.querySelector<HTMLButtonElement>("[data-move]:not(:disabled)")));
     control?.focus();
   }, [agent]);
   return (
@@ -188,10 +204,50 @@ function AgentInstances({
           );
         })}
       </RadioGroup>
+      {agent.byDatabase.length > 0 && (
+        <ul
+          aria-label={`Each database's order: ${agent.agentName}`}
+          className="flex min-w-0 flex-col gap-1 text-xs"
+        >
+          {agent.byDatabase.map((db) => (
+            <li
+              key={db.database}
+              data-database={db.database}
+              data-pending={db.pending || undefined}
+              className={cn(
+                "[overflow-wrap:anywhere]",
+                db.refused === undefined ? "text-muted-foreground" : "text-destructive",
+              )}
+            >
+              {db.sentence}
+            </li>
+          ))}
+        </ul>
+      )}
+      {agent.delivery !== undefined && (
+        <p role="status" className="text-xs [overflow-wrap:anywhere]">
+          {agent.delivery}
+        </p>
+      )}
       {agent.notice !== undefined && (
         <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
           {agent.notice}
         </p>
+      )}
+      {agent.reapply && agent.defaultClient !== undefined && (
+        <Button
+          type="button"
+          variant="outline"
+          className="min-h-11 self-start whitespace-normal text-left"
+          data-reapply=""
+          onClick={() => {
+            if (busy || agent.defaultClient === undefined) return;
+            refocus.current = { client: agent.defaultClient, move: "apply" };
+            write([agent.defaultClient, ...agent.fallback]);
+          }}
+        >
+          {REAPPLY}
+        </Button>
       )}
     </fieldset>
   );
