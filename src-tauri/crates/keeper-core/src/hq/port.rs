@@ -197,12 +197,24 @@ pub enum ReplicaError {
     /// The client refused the call; its code and message.
     #[error("{0}")]
     Client(String),
-    /// A server operation failed: refused by the server, or its answer never
-    /// heard. `retryable` is the server's (or, for a request whose answer
-    /// was lost, the client's) word that the outcome is still open: asking
-    /// again under the same request id answers it.
+    /// The server answered a command and made no change: its code, its
+    /// message, and its word (`retryable`) whether the same command may
+    /// succeed later. A definite outcome.
     #[error("{code}: {message}")]
     Remote {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    /// A command was sent and no answer keeper can trust came back — the
+    /// connection failed, or the answer could not be read — so whether the
+    /// server made it is not known. Asking again under the same request id
+    /// answers it (the server replays a request it applied). `retryable` is
+    /// only the client's word on asking again now: `false` (an answer keeper
+    /// could not read) means something must change first, never that the
+    /// command was refused.
+    #[error("{code}: {message}")]
+    Unheard {
         code: String,
         message: String,
         retryable: bool,

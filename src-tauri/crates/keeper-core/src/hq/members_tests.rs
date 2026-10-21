@@ -1,7 +1,9 @@
 //! The People sheet over real on-disk replicas seeded through `mutate`,
 //! with no server: who is in a session, who may be added (only people of the
 //! session's own database), the owner's writes, a member leaving, and the
-//! changes that need the server refused while it is not there.
+//! changes that need the server refused while it is not there. The server's
+//! commands are answered by a stand-in — in place of the replica's network,
+//! or over HTTP to the replica's own adapter.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -418,7 +420,8 @@ fn a_decision_refused_for_not_reading_says_so() {
 
 /// A stand-in for the server's `remove_member`: who is a member there, the
 /// request ids it applied (a repeat is answered from its record, `cached`),
-/// and whether the next answer is lost on its way back.
+/// and whether the next answer is lost on its way back (or, over HTTP,
+/// arrives unreadable).
 #[derive(Default)]
 struct Server {
     members: std::collections::HashSet<String>,
@@ -427,45 +430,71 @@ struct Server {
     requests: Vec<String>,
 }
 
+/// What the server does with one `remove_member` request.
+enum Outcome {
+    Applied,
+    Cached,
+    NotMember,
+}
+
+impl Server {
+    fn run(&mut self, request: &str, actor: &str) -> Outcome {
+        self.requests.push(request.to_owned());
+        if self.applied.contains(request) {
+            return Outcome::Cached;
+        }
+        if !self.members.remove(actor) {
+            return Outcome::NotMember;
+        }
+        self.applied.insert(request.to_owned());
+        Outcome::Applied
+    }
+
+    /// Invite `actor` again: a new membership, on the server only.
+    fn reinvite(server: &std::sync::Mutex<Server>, actor: &str) {
+        server
+            .lock()
+            .expect("server")
+            .members
+            .insert(actor.to_owned());
+    }
+}
+
 fn answer(
     server: &Arc<std::sync::Mutex<Server>>,
     request: &str,
     params: &Value,
 ) -> Result<(), ReplicaError> {
     let mut server = server.lock().expect("server");
-    server.requests.push(request.to_owned());
-    if server.applied.contains(request) {
-        return Ok(());
-    }
     let actor = params["actorId"].as_str().unwrap_or_default().to_owned();
-    if !server.members.remove(&actor) {
-        return Err(ReplicaError::Remote {
+    match server.run(request, &actor) {
+        Outcome::Cached => Ok(()),
+        Outcome::NotMember => Err(ReplicaError::Remote {
             code: "operation.forbidden".to_owned(),
             message: "hq.remove_member.not_member".to_owned(),
             retryable: false,
-        });
+        }),
+        Outcome::Applied if std::mem::take(&mut server.lose_next_answer) => {
+            Err(ReplicaError::Unheard {
+                code: "transport.timeout".to_owned(),
+                message: "the request timed out".to_owned(),
+                retryable: true,
+            })
+        }
+        Outcome::Applied => Ok(()),
     }
-    server.applied.insert(request.to_owned());
-    if std::mem::take(&mut server.lose_next_answer) {
-        return Err(ReplicaError::Remote {
-            code: "transport.timeout".to_owned(),
-            message: "the request timed out".to_owned(),
-            retryable: true,
-        });
-    }
-    Ok(())
 }
 
-/// R1064K-02: a removal the server made whose answer was lost is asked
-/// again under the same request id, so the server replays it rather than
-/// removing Ben's newer membership (he was invited again meanwhile); once
-/// this device has seen him re-invited, Remove is a new removal.
-#[test]
-fn a_removal_whose_answer_was_lost_is_asked_again_under_the_same_request() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let plain = open(dir.path(), "alpha-unheard", ANA);
+/// Ana's replica of `alpha` (as [`world`]) behind [`Staged`], reporting
+/// version 1 for every row, whose `remove_member` the stand-in server
+/// answers, losing its first answer.
+fn unheard_world(
+    dir: &std::path::Path,
+    database: &str,
+) -> (Source, Arc<Staged>, Source, Arc<std::sync::Mutex<Server>>) {
+    let plain = open(dir, database, ANA);
     seed(&plain);
-    let (staged, ana) = Staged::over(&plain, None);
+    let (staged, ana) = Staged::over(&plain, Some(1));
     let server = Arc::new(std::sync::Mutex::new(Server {
         members: [ANA, BEN].map(str::to_owned).into(),
         lose_next_answer: true,
@@ -478,22 +507,49 @@ fn a_removal_whose_answer_was_lost_is_asked_again_under_the_same_request() {
             answer(&answering, request, params)
         },
     ));
+    (plain, staged, ana, server)
+}
+
+/// R1064K-02, R1064K-04: a removal the server made whose answer was lost is
+/// asked again under the same request id — even after an update to Ben's
+/// same membership (his read point, a newer row version) reached this device
+/// meanwhile — so the server replays it rather than removing the newer
+/// membership it gave him when he was invited again.
+#[test]
+fn an_unheard_removal_is_asked_again_under_its_request_across_updates_to_the_membership() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (plain, staged, ana, server) = unheard_world(dir.path(), "alpha-unheard");
     let lost = remove(&ana, "s.1", BEN).expect_err("the answer was lost");
     assert!(lost.contains("did not hear"), "{lost}");
-    // Removed on the server; then invited again there, before this device
-    // has synced either change.
-    server
-        .lock()
-        .expect("server")
-        .members
-        .insert(BEN.to_owned());
+    // Removed on the server, then invited again there; this device has
+    // seen neither, only a delayed update to his old membership.
+    Server::reinvite(&server, BEN);
+    plain
+        .replica
+        .mutate(vec![RowOp::Patch {
+            table: "session_members".to_owned(),
+            values: object(json!({"id": format!("s.1/{BEN}"), "read_until": 5,
+                                  "author_actor": BEN, "author_client": "ben.dev"})),
+            base_version: None,
+        }])
+        .expect("his read point");
+    staged.set_version(Some(2));
     remove(&ana, "s.1", BEN).expect("the server's record answers");
-    {
-        let server = server.lock().expect("server");
-        assert_eq!(server.requests[0], server.requests[1], "the same request");
-        assert!(server.members.contains(BEN), "his newer membership stays");
-    }
-    // This device sees him re-invited: a membership written again.
+    let server = server.lock().expect("server");
+    assert_eq!(server.requests.len(), 2);
+    assert_eq!(server.requests[0], server.requests[1], "the same request");
+    assert!(server.members.contains(BEN), "his newer membership stays");
+}
+
+/// R1064K-04: while a removal's answer is still unheard, this device sees
+/// Ben invited again (a new membership, stamped anew): Remove is then a new
+/// removal of that membership, not a replay of the first.
+#[test]
+fn an_unheard_removal_is_a_new_request_once_the_membership_is_new() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (plain, _staged, ana, server) = unheard_world(dir.path(), "alpha-reinvited");
+    remove(&ana, "s.1", BEN).expect_err("the answer was lost");
+    Server::reinvite(&server, BEN);
     plain
         .replica
         .mutate(vec![upsert(
@@ -506,8 +562,180 @@ fn a_removal_whose_answer_was_lost_is_asked_again_under_the_same_request() {
         .expect("re-invited");
     remove(&ana, "s.1", BEN).expect("a new removal");
     let server = server.lock().expect("server");
-    assert_ne!(server.requests[2], server.requests[0], "a new request");
-    assert!(!server.members.contains(BEN), "removed again");
+    assert_eq!(server.requests.len(), 2);
+    assert_ne!(server.requests[1], server.requests[0], "a new request");
+    assert!(!server.members.contains(BEN), "his new membership removed");
+}
+
+/// The protocol's tagged value encoding (`{"t": …, "v": …}`), both ways.
+fn tagged(value: &Value) -> Value {
+    match value {
+        Value::Null => json!({"t": "null"}),
+        Value::Bool(b) => json!({"t": "boolean", "v": b}),
+        Value::Number(n) if n.is_i64() => json!({"t": "integer", "v": n.to_string()}),
+        Value::Number(n) => json!({"t": "number", "v": n}),
+        Value::String(s) => json!({"t": "string", "v": s}),
+        Value::Array(items) => {
+            json!({"t": "array", "v": items.iter().map(tagged).collect::<Vec<_>>()})
+        }
+        Value::Object(map) => json!({"t": "object",
+            "v": map.iter().map(|(k, v)| json!([k, tagged(v)])).collect::<Vec<_>>()}),
+    }
+}
+
+fn untagged(value: &Value) -> Value {
+    match value["t"].as_str() {
+        Some("integer") => json!(value["v"].as_str().and_then(|v| v.parse::<i64>().ok())),
+        Some("array") => Value::Array(
+            value["v"]
+                .as_array()
+                .map(|items| items.iter().map(untagged).collect())
+                .unwrap_or_default(),
+        ),
+        Some("object") => Value::Object(
+            value["v"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|e| {
+                            (
+                                e[0].as_str().unwrap_or_default().to_owned(),
+                                untagged(&e[1]),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        Some("null") | None => Value::Null,
+        Some(_) => value["v"].clone(),
+    }
+}
+
+/// A server on a local port whose `/operations` is [`Server`]'s
+/// `remove_member` in the protocol's own encoding — its first applied
+/// answer sent back truncated, unreadable — and which answers every sync
+/// round 503. The port.
+fn operations_server(server: Arc<std::sync::Mutex<Server>>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let body_at = loop {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    break None;
+                };
+                if n == 0 {
+                    break None;
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(body_at) = body_at else { continue };
+            let head = String::from_utf8_lossy(&bytes[..body_at]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|n| n.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while bytes.len() < body_at + length {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let (status, body) = if head.starts_with("post /alpha/operations ") {
+                let request: Value = serde_json::from_slice(&bytes[body_at..])
+                    .map(|v| untagged(&v))
+                    .unwrap_or_default();
+                let id = request["requestId"].as_str().unwrap_or_default().to_owned();
+                let actor = request["params"]["actorId"].as_str().unwrap_or_default();
+                let mut server = server.lock().expect("server");
+                let reply = |status: &str| {
+                    json!({"revision": 1, "kind": "command", "operationId": "remove_member",
+                           "requestId": id, "status": status, "results": []})
+                };
+                let answer = match server.run(&id, actor) {
+                    Outcome::Applied => reply("applied"),
+                    Outcome::Cached => reply("cached"),
+                    Outcome::NotMember => json!({"revision": 1, "kind": "error",
+                        "code": "operation.forbidden", "message": "hq.remove_member.not_member",
+                        "retryable": false}),
+                };
+                let mut body = tagged(&answer).to_string().into_bytes();
+                if std::mem::take(&mut server.lose_next_answer) {
+                    body.truncate(body.len() / 2);
+                }
+                ("200 OK", body)
+            } else {
+                ("503 Service Unavailable", Vec::new())
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/vnd.syncular.operations.v1+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    port
+}
+
+/// R1064K-05, at the replica adapter over HTTP: the server applies Ben's
+/// removal and its answer arrives unreadable (the client's
+/// `client.invalid_host_response`, which the client marks not retryable).
+/// keeper does not take that for a refusal: it keeps the request, does not
+/// send it again by itself, and when Ana asks again — Ben meanwhile invited
+/// again on the server — the same request is answered from the server's
+/// record (`cached`) and his newer membership stays.
+#[test]
+fn an_unreadable_answer_keeps_its_request_and_a_retry_replays_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = Arc::new(std::sync::Mutex::new(Server {
+        members: [ANA, BEN].map(str::to_owned).into(),
+        lose_next_answer: true,
+        ..Server::default()
+    }));
+    let port = operations_server(Arc::clone(&server));
+    let replica = SyncularReplica::open(ReplicaSpec {
+        database: "alpha".to_owned(),
+        path: dir.path().join("alpha-linked.sqlite"),
+        client_id: Some("ana.dev".to_owned()),
+        link: Some(crate::hq::port::Link {
+            base_url: format!("http://127.0.0.1:{port}/alpha"),
+            token: "0123456789abcdef".to_owned(),
+        }),
+        subscriptions: Vec::new(),
+    })
+    .expect("opens");
+    let ana = Source {
+        database: "alpha".to_owned(),
+        replica: Arc::new(replica),
+        actor: ANA.to_owned(),
+        client: "ana.dev".to_owned(),
+    };
+    seed(&ana);
+    let unread = remove(&ana, "s.1", BEN).expect_err("the answer could not be read");
+    assert!(unread.contains("could not read"), "{unread}");
+    assert!(unread.contains("client.invalid_host_response"), "{unread}");
+    {
+        let server = server.lock().expect("server");
+        assert_eq!(server.requests.len(), 1, "not sent again by itself");
+        assert!(!server.members.contains(BEN), "the server removed him");
+    }
+    Server::reinvite(&server, BEN);
+    remove(&ana, "s.1", BEN).expect("the server's record answers");
+    let server = server.lock().expect("server");
+    assert_eq!(server.requests.len(), 2);
+    assert_eq!(server.requests[0], server.requests[1], "the same request");
+    assert!(server.members.contains(BEN), "his newer membership stays");
 }
 
 /// `remove_member`'s refusals are matched by their exact reason.

@@ -545,7 +545,7 @@ pub(super) struct Staged {
     held: std::sync::Mutex<bool>,
     released: std::sync::Condvar,
     pub(super) refused: std::sync::Mutex<HashMap<String, crate::hq::port::Rejection>>,
-    version: Option<i64>,
+    version: std::sync::Mutex<Option<i64>>,
     written: std::sync::Mutex<Vec<Vec<RowOp>>>,
     /// Every commit written through it, in order.
     pub(super) commits: std::sync::Mutex<Vec<String>>,
@@ -565,7 +565,7 @@ impl Staged {
             held: std::sync::Mutex::new(false),
             released: std::sync::Condvar::new(),
             refused: std::sync::Mutex::new(HashMap::new()),
-            version,
+            version: std::sync::Mutex::new(version),
             written: std::sync::Mutex::new(Vec::new()),
             commits: std::sync::Mutex::new(Vec::new()),
             server: std::sync::Mutex::new(None),
@@ -575,6 +575,11 @@ impl Staged {
             ..source.clone()
         };
         (staged, wrapped)
+    }
+    /// Report `version` for every row from now on, as a pull that wrote
+    /// the rows again would.
+    pub(super) fn set_version(&self, version: Option<i64>) {
+        *self.version.lock().expect("version") = version;
     }
     fn hold(&self, held: bool) {
         *self.held.lock().expect("held") = held;
@@ -600,7 +605,7 @@ impl crate::hq::port::Replica for Staged {
         params: &[Value],
     ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
         let mut rows = self.inner.query(sql, params)?;
-        if let Some(version) = self.version {
+        if let Some(version) = *self.version.lock().expect("version") {
             for row in &mut rows {
                 if row.contains_key("version") {
                     row.insert("version".to_owned(), json!(version));

@@ -31,8 +31,8 @@ use syncular_client::api::{
 use syncular_client::native_transport::{HostTransport, Inbound};
 use syncular_client::{
     BlobDownload, BlobUploadGrant, ClientLimits, FileQuerySnapshotReader, Mutation, RealtimeState,
-    SegmentRequest, SyncClient, SyncIntent, SyncOutcome, SyncRemoteClient, Transport,
-    TransportError,
+    RemoteClientError, SegmentRequest, SyncClient, SyncIntent, SyncOutcome, SyncRemoteClient,
+    Transport, TransportError,
 };
 use tokio::sync::watch;
 
@@ -75,6 +75,10 @@ pub(crate) struct GatedTransport {
     open: Arc<AtomicBool>,
     /// The replica's server; `None` for a replica that never links.
     origin: Option<url::Origin>,
+    /// What became of the last remote operation: `None` while none passed
+    /// the gate (nothing was sent), `Some(false)` when it went out and its
+    /// transport failed, `Some(true)` when an answer's bytes came back.
+    reached: Option<bool>,
 }
 
 impl GatedTransport {
@@ -114,7 +118,9 @@ impl Transport for GatedTransport {
     }
     fn remote_operation(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.check()?;
-        self.inner.remote_operation(request)
+        let answer = self.inner.remote_operation(request);
+        self.reached = Some(answer.is_ok());
+        answer
     }
     fn realtime_sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.check()?;
@@ -471,6 +477,7 @@ impl Owner {
             inner,
             open: gate,
             origin,
+            reached: None,
         };
         if !linked {
             client.set_transport_enabled(&mut transport, false);
@@ -883,6 +890,36 @@ impl SyncularReplica {
     }
 }
 
+/// The code the client gives an answer it could not decode or validate.
+const UNREADABLE: &str = "client.invalid_host_response";
+
+/// What a failed command means, by how far it got (`reached`, from the
+/// gate): never sent is the client's own refusal (or a closed network); sent
+/// with no answer back, or with an answer keeper could not read, is
+/// [`ReplicaError::Unheard`] — the server may have made it, whatever the
+/// client's `retryable` says; an answer the server gave is its refusal.
+fn command_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaError {
+    match reached {
+        None if error.code == CLOSED => ReplicaError::Closed,
+        None => ReplicaError::Client(error.to_string()),
+        Some(false) => ReplicaError::Unheard {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+        Some(true) if error.code == UNREADABLE => ReplicaError::Unheard {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+        Some(true) => ReplicaError::Remote {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+    }
+}
+
 impl Replica for SyncularReplica {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
         let ops = ops.into_iter().map(mutation).collect();
@@ -1008,6 +1045,7 @@ impl Replica for SyncularReplica {
             inner: HostTransport::from_config(&remote.config).map_err(ReplicaError::Client)?,
             open: Arc::clone(&self.gate),
             origin: Some(remote.origin.clone()),
+            reached: None,
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
@@ -1034,16 +1072,13 @@ impl Replica for SyncularReplica {
             inner: HostTransport::from_config(&remote.config).map_err(ReplicaError::Client)?,
             open: Arc::clone(&self.gate),
             origin: Some(remote.origin.clone()),
+            reached: None,
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
         let answer = client.command(&mut transport, operation_id, request_id, &params);
         transport.inner.shutdown();
-        let answer = answer.map_err(|error| ReplicaError::Remote {
-            code: error.code,
-            message: error.message,
-            retryable: error.retryable,
-        })?;
+        let answer = answer.map_err(|error| command_error(error, transport.reached))?;
         // `cached`: this request id was applied before and its first answer
         // is replayed (a retry whose earlier answer was lost) — a success.
         if answer.status == "rejected" {
@@ -1216,6 +1251,7 @@ mod tests {
                     .expect("url")
                     .origin(),
             ),
+            reached: None,
         }
     }
 

@@ -100,18 +100,18 @@ pub struct AgentSessionMembersVm {
 type Addition = (String, String, String);
 
 /// A server command about a member whose answer was never heard (the
-/// response lost, the connection dropped): the request id it went under and
-/// the member row it was asked about. Asking the same of that same row
-/// again reuses the id, so the server answers from its record (`cached`)
-/// if the first one was applied, rather than applying a second change —
-/// which, the person re-invited meanwhile, would remove their new
-/// membership. Asked of a newer row (the replica has seen them re-invited),
-/// or a different command, it is a new request.
+/// response lost or unreadable, the connection dropped): the request id it
+/// went under and the membership it was asked about. Asking the same of
+/// that same membership again reuses the id, so the server answers from its
+/// record (`cached`) if the first one was applied, rather than applying a
+/// second change — which, the person re-invited meanwhile, would remove
+/// their new membership. Asked of a newer membership (the replica has seen
+/// them re-invited), or a different command, it is a new request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unheard {
     operation: String,
     request_id: String,
-    row: String,
+    membership: String,
 }
 
 /// Commands whose answer was not heard, by database, session and member.
@@ -398,40 +398,41 @@ fn changeable(source: &Source, session_id: &str, actor: &str) -> Result<AgentMem
         .ok_or_else(|| "They are not a member of this session.".to_owned())
 }
 
-/// The member row `actor` holds in the session as this replica has it: when
-/// it was added, and its version. A row written again (the person removed
-/// and re-invited) reads differently.
-fn member_row(source: &Source, session_id: &str, actor: &str) -> String {
+/// Which membership `actor` holds in the session as this replica has it:
+/// the fields fixed when it was made (`added_at_ms`, `added_by_actor`,
+/// `role`), which no write may change (the server's V4) and which a
+/// re-invitation writes anew, as a new row stamped when it ran. A read
+/// point or a reader flag changes the row, not the membership.
+fn membership(source: &Source, session_id: &str, actor: &str) -> String {
     read(
         source,
-        "SELECT added_at_ms, _sync_version AS version FROM session_members \
+        "SELECT added_at_ms, added_by_actor, role FROM session_members \
          WHERE session_id = ?1 AND actor_id = ?2",
         &[Value::from(session_id), Value::from(actor)],
     )
     .first()
     .map(|row| {
-        format!(
-            "{}/{}",
-            row.get("added_at_ms").cloned().unwrap_or_default(),
-            row.get("version").cloned().unwrap_or_default()
-        )
+        ["added_at_ms", "added_by_actor", "role"]
+            .map(|field| row.get(field).cloned().unwrap_or_default().to_string())
+            .join("/")
     })
     .unwrap_or_default()
 }
 
-/// Run the server's `operation` on `actor`'s membership. A command whose
-/// answer was not heard keeps its request id ([`Unheard`]), and whatever the
-/// answer the replica syncs at once: a change the server made reaches the
-/// sheet even when its answer did not.
+/// Run the server's `operation` on `actor`'s membership. A command sent
+/// without an answer keeper can trust keeps its request id ([`Unheard`]):
+/// only the server's answer — applied, replayed (`cached`) or refused —
+/// settles it. Whatever the answer the replica syncs at once: a change the
+/// server made reaches the sheet even when its answer did not.
 fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> Result<(), String> {
     let key = (
         source.database.clone(),
         session_id.to_owned(),
         actor.to_owned(),
     );
-    let row = member_row(source, session_id, actor);
+    let membership = membership(source, session_id, actor);
     let request_id = match lock(&UNHEARD).get(&key) {
-        Some(unheard) if unheard.operation == operation && unheard.row == row => {
+        Some(unheard) if unheard.operation == operation && unheard.membership == membership => {
             unheard.request_id.clone()
         }
         _ => ulid::Ulid::new().to_string(),
@@ -443,24 +444,23 @@ fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> R
     );
     source.replica.sync_now();
     match &answer {
-        // Nothing was sent: an earlier unheard request stays as it was.
-        Err(ReplicaError::NotSyncing | ReplicaError::Closed) => {}
-        Err(ReplicaError::Remote {
-            retryable: true, ..
-        }) => {
+        // Sent, and no answer to trust: the server may have made it.
+        Err(ReplicaError::Unheard { .. }) => {
             lock(&UNHEARD).insert(
                 key,
                 Unheard {
                     operation: operation.to_owned(),
                     request_id,
-                    row,
+                    membership,
                 },
             );
         }
-        // Answered: applied, replayed (`cached`) or refused for good.
-        Ok(()) | Err(_) => {
+        // The server's answer: applied, replayed or refused.
+        Ok(()) | Err(ReplicaError::Remote { .. }) => {
             lock(&UNHEARD).remove(&key);
         }
+        // Nothing was sent: an earlier unheard request stays as it was.
+        Err(ReplicaError::NotSyncing | ReplicaError::Closed | ReplicaError::Client(_)) => {}
     }
     answer.map_err(|error| command_sentence(&source.database, &error))
 }
@@ -473,10 +473,13 @@ fn command_sentence(database: &str, error: &ReplicaError) -> String {
         ReplicaError::NotSyncing | ReplicaError::Closed => format!(
             "This needs the server, and {database} is not syncing on this device now. Try again when it is."
         ),
-        ReplicaError::Remote {
+        ReplicaError::Unheard {
             retryable: true, ..
         } => format!(
             "keeper did not hear whether {database} made this change. Asking again asks about this same change, which the server never makes twice."
+        ),
+        ReplicaError::Unheard { code, message, .. } => format!(
+            "keeper could not read {database}'s answer ({code}: {message}), so it does not know whether the change was made, and it will not ask again by itself. Once keeper and the server understand each other again (an update of either), asking again asks about this same change, which the server never makes twice."
         ),
         ReplicaError::Remote { code, message, .. } if code == "operation.forbidden" => {
             match message.as_str() {
