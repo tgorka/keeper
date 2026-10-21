@@ -191,16 +191,6 @@ pub enum Delivery {
     Unknown,
 }
 
-/// How the server answered a command it accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Answered {
-    /// It ran now, under this request id.
-    Applied,
-    /// This request id ran before: its first answer replayed, nothing
-    /// changed now.
-    Cached,
-}
-
 /// Why a replica call failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicaError {
@@ -286,15 +276,15 @@ pub trait Replica: Send + Sync {
     ) -> Result<Vec<Map<String, Value>>, ReplicaError>;
     /// Run the server's registered command `operation_id` with `params`
     /// under `request_id` (a retry with the same id is answered from the
-    /// server's cache, [`Answered::Cached`]): its writes reach the replica by
-    /// sync, never here. Like [`Replica::remote_query`], off the owner thread
-    /// and refused while the replica does not sync.
+    /// server's cache): its writes reach the replica by sync, never here.
+    /// Like [`Replica::remote_query`], off the owner thread and refused
+    /// while the replica does not sync.
     fn remote_command(
         &self,
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<Answered, ReplicaError>;
+    ) -> Result<(), ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
     /// The state its owner last published.
@@ -394,7 +384,7 @@ pub(crate) mod fake {
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
-        fn remote_command(&self, _: &str, _: &str, _: Value) -> Result<Answered, ReplicaError> {
+        fn remote_command(&self, _: &str, _: &str, _: Value) -> Result<(), ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
         fn sync_now(&self) {}

@@ -645,7 +645,7 @@ impl Replica for Staged {
         id: &str,
         request: &str,
         params: Value,
-    ) -> Result<crate::hq::port::Answered, crate::hq::port::ReplicaError> {
+    ) -> Result<(), crate::hq::port::ReplicaError> {
         self.inner.remote_command(id, request, params)
     }
     fn sync_now(&self) {

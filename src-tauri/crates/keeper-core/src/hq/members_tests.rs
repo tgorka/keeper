@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use super::{add, leave, remove, set_reader, view, AgentMemberRoleVm};
 use crate::hq::approvals::{self, Decisions};
-use crate::hq::port::{Answered, Rejection, ReplicaError, ReplicaSpec, RowOp};
+use crate::hq::port::{Rejection, ReplicaError, ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, names, object, Source};
 use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, Opened};
@@ -421,14 +421,19 @@ fn a_decision_refused_for_not_reading_says_so() {
 /// A stand-in for the server's member commands: who is a member there and
 /// the `added_at_ms` it last stamped for each (R-HQ-48), who reads the
 /// trace, the request ids it applied (a repeat is answered from its record,
-/// `cached`), and whether the next answer is lost on its way back (or, over
-/// HTTP, arrives unreadable).
+/// `cached`, before anything else is looked at), and whether the next
+/// request is lost on its way there, or its answer on its way back (or,
+/// over HTTP, arrives unreadable). A command names the membership it acts
+/// on (`expectedAddedAtMs`, R-HQ-49); one the member does not hold now is
+/// refused (`hq.member.changed`). A request that names none — keeper's
+/// before R-HQ-49 — is checked against nothing, as the server then did.
 #[derive(Default)]
 struct Server {
     members: std::collections::HashSet<String>,
     stamped: HashMap<String, i64>,
     readers: std::collections::HashSet<String>,
     applied: std::collections::HashSet<String>,
+    lose_next_request: bool,
     lose_next_answer: bool,
     requests: Vec<String>,
 }
@@ -438,6 +443,7 @@ enum Outcome {
     Applied,
     Cached,
     NotMember,
+    Changed,
 }
 
 impl Server {
@@ -452,12 +458,25 @@ impl Server {
         }
     }
 
-    fn run(&mut self, operation: &str, request: &str, actor: &str) -> Outcome {
+    fn run(
+        &mut self,
+        operation: &str,
+        request: &str,
+        actor: &str,
+        expected: Option<i64>,
+    ) -> Outcome {
         self.requests.push(request.to_owned());
         if self.applied.contains(request) {
             return Outcome::Cached;
         }
-        if !self.members.contains(actor) {
+        let member = self.members.contains(actor);
+        if operation == "remove_member" && !member {
+            return Outcome::NotMember;
+        }
+        if expected.is_some() && (!member || self.stamped.get(actor).copied() != expected) {
+            return Outcome::Changed;
+        }
+        if !member {
             return Outcome::NotMember;
         }
         match operation {
@@ -475,6 +494,17 @@ impl Server {
         }
         self.applied.insert(request.to_owned());
         Outcome::Applied
+    }
+
+    /// Another device of Ana's runs `operation` on Ben's membership as the
+    /// server has it now, under `request`.
+    fn elsewhere(server: &std::sync::Mutex<Server>, operation: &str, request: &str) {
+        let mut server = server.lock().expect("server");
+        let at = server.stamped.get(BEN).copied();
+        assert!(matches!(
+            server.run(operation, request, BEN, at),
+            Outcome::Applied
+        ));
     }
 
     /// Invite `actor` again at the server's clock `now`: a new membership,
@@ -497,24 +527,29 @@ fn answer(
     operation: &str,
     request: &str,
     params: &Value,
-) -> Result<Answered, ReplicaError> {
+) -> Result<(), ReplicaError> {
     let mut server = server.lock().expect("server");
+    let unheard = || ReplicaError::Unheard {
+        code: "transport.timeout".to_owned(),
+        message: "the request timed out".to_owned(),
+        retryable: true,
+    };
+    if std::mem::take(&mut server.lose_next_request) {
+        return Err(unheard());
+    }
     let actor = params["actorId"].as_str().unwrap_or_default().to_owned();
-    match server.run(operation, request, &actor) {
-        Outcome::Cached => Ok(Answered::Cached),
-        Outcome::NotMember => Err(ReplicaError::Remote {
-            code: "operation.forbidden".to_owned(),
-            message: "hq.remove_member.not_member".to_owned(),
-            retryable: false,
-        }),
-        Outcome::Applied if std::mem::take(&mut server.lose_next_answer) => {
-            Err(ReplicaError::Unheard {
-                code: "transport.timeout".to_owned(),
-                message: "the request timed out".to_owned(),
-                retryable: true,
-            })
-        }
-        Outcome::Applied => Ok(Answered::Applied),
+    let expected = params["expectedAddedAtMs"].as_i64();
+    let refused = |reason: &str| ReplicaError::Remote {
+        code: "operation.forbidden".to_owned(),
+        message: reason.to_owned(),
+        retryable: false,
+    };
+    match server.run(operation, request, &actor, expected) {
+        Outcome::Cached => Ok(()),
+        Outcome::NotMember => Err(refused("hq.remove_member.not_member")),
+        Outcome::Changed => Err(refused("hq.member.changed")),
+        Outcome::Applied if std::mem::take(&mut server.lose_next_answer) => Err(unheard()),
+        Outcome::Applied => Ok(()),
     }
 }
 
@@ -612,18 +647,23 @@ fn an_unheard_removal_is_a_new_request_once_the_membership_is_new() {
 }
 
 /// R1064K-06: Ana switches Ben's reading to `reads` and the answer is lost.
-/// Her device then sees the switch made, and then undone from another
-/// device of hers. Switching it again is a new decision: the unheard request
-/// is replayed (`cached`) and this decision asked as its own, so the server
-/// ends with her latest.
+/// Her sheet then shows the switch made, and then undone from another
+/// device of hers. That settled the unheard request: switching it again is
+/// a new decision, asked under its own request id, so the server ends with
+/// her latest — and the unheard request is not asked again.
 fn a_switch_after_its_unheard_one_was_undone(reads: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let (plain, _staged, ana, server) = unheard_world(dir.path(), &format!("alpha-reader-{reads}"));
+    // A pull bringing Ben's flag, and the sheet read again for it, as the
+    // watched sheet is on every change.
     let seen = |reading: bool| {
         ben_row(
             &plain,
             json!({"reads_trace": reading, "author_actor": ANA, "author_client": "ana.dev"}),
         );
+        let sheet = view(&ana, "s.1").expect("the sheet");
+        let ben = sheet.members.iter().find(|m| m.actor_id == BEN);
+        assert_eq!(ben.map(|m| m.reads_trace), Some(reading));
     };
     // Ben starts the other way round, on the server and here.
     if !reads {
@@ -639,10 +679,7 @@ fn a_switch_after_its_unheard_one_was_undone(reads: bool) {
     assert_eq!(server.lock().expect("server").readers.contains(BEN), reads);
     seen(reads);
     let undo = if reads { "revoke_trace" } else { "grant_trace" };
-    server
-        .lock()
-        .expect("server")
-        .run(undo, "from-another-device", BEN);
+    Server::elsewhere(&server, undo, "from-another-device");
     seen(!reads);
     set_reader(&ana, "s.1", BEN, reads).expect("her new decision");
     let server = server.lock().expect("server");
@@ -651,10 +688,8 @@ fn a_switch_after_its_unheard_one_was_undone(reads: bool) {
         reads,
         "her latest decision holds"
     );
-    assert_eq!(
-        server.requests[2], server.requests[0],
-        "the unheard one first"
-    );
+    assert_eq!(server.requests.len(), 3, "one request for her decision");
+    assert_ne!(server.requests[2], server.requests[0], "a new request");
 }
 
 #[test]
@@ -667,21 +702,91 @@ fn a_grant_after_its_unheard_one_was_undone_is_its_own_decision() {
     a_switch_after_its_unheard_one_was_undone(true);
 }
 
-/// R1064K-02 for a reader switch: asked again before this device has seen
-/// anything, the unheard request is what is asked first — replayed, not run
-/// twice — and the flag ends as asked.
+/// R1064K-02, R1064K-08 for a reader switch: asked again before this
+/// device has seen anything, the unheard request is asked again — replayed
+/// (`cached`) — and that is all: one write on the server, two requests.
 #[test]
-fn a_reader_switch_asked_again_unseen_ends_as_asked() {
+fn a_reader_switch_asked_again_unseen_is_replayed_and_nothing_more() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (_plain, _staged, ana, server) = unheard_world(dir.path(), "alpha-reader-again");
     set_reader(&ana, "s.1", BEN, true).expect_err("the answer was lost");
     set_reader(&ana, "s.1", BEN, true).expect("asked again");
     let server = server.lock().expect("server");
     assert!(server.readers.contains(BEN));
+    assert_eq!(server.requests.len(), 2, "nothing more asked");
     assert_eq!(
         server.requests[1], server.requests[0],
-        "the unheard one first"
+        "the unheard one again"
     );
+    assert_eq!(server.applied.len(), 1, "written once");
+}
+
+/// R1064K-08: Ana grants Ben reading and the answer is lost; from another
+/// device she then withdraws it, and this device has seen neither. Granting
+/// again here asks the unheard request again — replayed, `cached` — and
+/// stops there: her withdrawal stands, and keeper asked nothing more.
+#[test]
+fn an_unseen_switch_asked_again_leaves_a_later_withdrawal_standing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_plain, _staged, ana, server) = unheard_world(dir.path(), "alpha-reader-withdrawn");
+    set_reader(&ana, "s.1", BEN, true).expect_err("the answer was lost");
+    Server::elsewhere(&server, "revoke_trace", "from-another-device");
+    set_reader(&ana, "s.1", BEN, true).expect("the server's record answers");
+    let server = server.lock().expect("server");
+    assert!(!server.readers.contains(BEN), "her withdrawal stands");
+    assert_eq!(server.requests.len(), 3, "nothing more asked");
+    assert_eq!(
+        server.requests[2], server.requests[0],
+        "the unheard one again"
+    );
+}
+
+/// R1064K-08: Ana grants Ben reading on his membership M1 and hears nothing
+/// back — the grant applied (`arrived`), or it never reached the server.
+/// From another device she removes him and invites him again: M2, stamped
+/// later, not reading. This device has seen none of it, so granting again
+/// here is about M1: replayed (`cached`) if it ran, refused
+/// `hq.member.changed` if not. Either way M2 stays a non-reader, and nothing
+/// is written after the re-invitation.
+fn an_unheard_grant_never_lands_on_a_new_membership(arrived: bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_plain, _staged, ana, server) =
+        unheard_world(dir.path(), &format!("alpha-reader-m2-{arrived}"));
+    if !arrived {
+        let mut server = server.lock().expect("server");
+        server.lose_next_request = true;
+        server.lose_next_answer = false;
+    }
+    set_reader(&ana, "s.1", BEN, true).expect_err("nothing heard");
+    Server::elsewhere(&server, "remove_member", "removed-elsewhere");
+    assert_eq!(Server::reinvite(&server, BEN, 1), 2, "M2, stamped later");
+    let writes = server.lock().expect("server").applied.len();
+    let again = set_reader(&ana, "s.1", BEN, true);
+    let server = server.lock().expect("server");
+    if arrived {
+        again.expect("the server's record answers");
+    } else {
+        let refused = again.expect_err("asked about M1");
+        assert!(refused.contains("invited again"), "{refused}");
+    }
+    assert!(server.members.contains(BEN), "M2 is a member");
+    assert!(!server.readers.contains(BEN), "M2 is not a reader");
+    assert_eq!(server.applied.len(), writes, "nothing written since");
+    assert_eq!(
+        server.requests.len(),
+        if arrived { 3 } else { 2 },
+        "one request each time"
+    );
+}
+
+#[test]
+fn an_unheard_grant_that_ran_is_replayed_not_made_on_the_new_membership() {
+    an_unheard_grant_never_lands_on_a_new_membership(true);
+}
+
+#[test]
+fn an_unheard_grant_that_never_arrived_is_refused_for_the_new_membership() {
+    an_unheard_grant_never_lands_on_a_new_membership(false);
 }
 
 /// The protocol's tagged value encoding (`{"t": …, "v": …}`), both ways.
@@ -774,17 +879,28 @@ fn operations_server(server: Arc<std::sync::Mutex<Server>>) -> u16 {
                     .unwrap_or_default();
                 let id = request["requestId"].as_str().unwrap_or_default().to_owned();
                 let actor = request["params"]["actorId"].as_str().unwrap_or_default();
+                let expected = request["params"]["expectedAddedAtMs"].as_i64();
                 let mut server = server.lock().expect("server");
                 let reply = |status: &str| {
                     json!({"revision": 1, "kind": "command", "operationId": "remove_member",
                            "requestId": id, "status": status, "results": []})
                 };
-                let answer = match server.run("remove_member", &id, actor) {
-                    Outcome::Applied => reply("applied"),
-                    Outcome::Cached => reply("cached"),
-                    Outcome::NotMember => json!({"revision": 1, "kind": "error",
-                        "code": "operation.forbidden", "message": "hq.remove_member.not_member",
-                        "retryable": false}),
+                let refused = |code: &str, message: &str| {
+                    json!({"revision": 1, "kind": "error", "code": code, "message": message,
+                           "retryable": false})
+                };
+                // The server refuses params without the membership, as an
+                // integer, outright (R-HQ-49).
+                let answer = match expected {
+                    None => refused("operation.invalid_request", "operation.invalid_request"),
+                    Some(_) => match server.run("remove_member", &id, actor, expected) {
+                        Outcome::Applied => reply("applied"),
+                        Outcome::Cached => reply("cached"),
+                        Outcome::NotMember => {
+                            refused("operation.forbidden", "hq.remove_member.not_member")
+                        }
+                        Outcome::Changed => refused("operation.forbidden", "hq.member.changed"),
+                    },
                 };
                 let mut body = tagged(&answer).to_string().into_bytes();
                 if std::mem::take(&mut server.lose_next_answer) {

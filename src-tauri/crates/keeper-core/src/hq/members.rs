@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::hq::port::{Answered, Delivery, Rejection, ReplicaError, RowOp};
+use crate::hq::port::{Delivery, Rejection, ReplicaError, RowOp};
 use crate::hq::sessions::{
     authored, mark, names, object, opt_text, read, text, truthy, AgentSessionRef, Source,
 };
@@ -107,8 +107,8 @@ type Addition = (String, String, String);
 /// second change — which, the person re-invited meanwhile, would remove
 /// their new membership. Asked of a newer membership (the replica has seen
 /// them re-invited), or a different command, it is a new request. A reader
-/// switch whose replay comes back `cached` is then asked again as its own
-/// request ([`set_reader`]).
+/// switch whose effect the sheet has shown is settled ([`seen_switches`]):
+/// what the person does next is a new decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unheard {
     operation: String,
@@ -196,6 +196,7 @@ fn not_here() -> String {
 pub fn view(source: &Source, session_id: &str) -> Result<AgentSessionMembersVm, String> {
     let invite = invite_of(source, session_id).ok_or_else(not_here)?;
     let rows = members_of(source, session_id);
+    seen_switches(source, session_id, &rows);
     let mine = rows.iter().find(|row| row.actor_id == source.actor);
     let Some(mine) = mine else {
         return Err(not_here());
@@ -283,6 +284,31 @@ pub fn view(source: &Source, session_id: &str) -> Result<AgentSessionMembersVm, 
         can_leave: !owner,
         notice,
     })
+}
+
+/// R1064K-06, R1064K-08: an unheard reader switch whose effect this sheet
+/// shows — the flag as it asked, on the membership it asked about — is
+/// settled, whoever made it. The person has seen it done, so their next
+/// switch is a new decision under a new request id, never a replay of this
+/// one. Until then a switch asks the unheard request again, and its answer
+/// (`cached` or not) is the end of it: keeper never follows a replay with a
+/// request of its own.
+fn seen_switches(source: &Source, session_id: &str, rows: &[Row]) {
+    let mut unheard = lock(&UNHEARD);
+    unheard.retain(|(database, session, actor), asked| {
+        if database != &source.database || session != session_id {
+            return true;
+        }
+        let reads = match asked.operation.as_str() {
+            "grant_trace" => true,
+            "revoke_trace" => false,
+            _ => return true,
+        };
+        let shown = rows
+            .iter()
+            .any(|row| &row.actor_id == actor && row.reads_trace == reads);
+        !(shown && membership(source, session_id, actor).1 == asked.membership)
+    });
 }
 
 /// Look up the additions and the leave written here for `session_id`: a
@@ -401,46 +427,45 @@ fn changeable(source: &Source, session_id: &str, actor: &str) -> Result<AgentMem
 }
 
 /// Which membership `actor` holds in the session as this replica has it:
-/// the fields fixed when it was made (`added_at_ms`, `added_by_actor`,
-/// `role`), which no write may change (the server's V4) and which a
-/// re-invitation writes anew, as a new row stamped when it ran. The server
-/// stamps each membership of a person in a session a later `added_at_ms`
-/// than any before it, however close together (R-HQ-48), so no two share
-/// these fields. A read point or a reader flag changes the row, not the
-/// membership.
-fn membership(source: &Source, session_id: &str, actor: &str) -> String {
-    read(
+/// its `added_at_ms`, which the server's member commands carry as
+/// `expectedAddedAtMs` and refuse (`hq.member.changed`) when the member's
+/// membership there is another or none (R-HQ-49), and the fields fixed when
+/// it was made (`added_at_ms`, `added_by_actor`, `role`), joined, which no
+/// write may change (the server's V4) and which a re-invitation writes anew,
+/// as a new row stamped when it ran. The server stamps each membership of a
+/// person in a session a later `added_at_ms` than any before it, however
+/// close together (R-HQ-48), so no two share these fields. A read point or a
+/// reader flag changes the row, not the membership.
+fn membership(source: &Source, session_id: &str, actor: &str) -> (Value, String) {
+    let rows = read(
         source,
         "SELECT added_at_ms, added_by_actor, role FROM session_members \
          WHERE session_id = ?1 AND actor_id = ?2",
         &[Value::from(session_id), Value::from(actor)],
-    )
-    .first()
-    .map(|row| {
-        ["added_at_ms", "added_by_actor", "role"]
-            .map(|field| row.get(field).cloned().unwrap_or_default().to_string())
-            .join("/")
-    })
-    .unwrap_or_default()
+    );
+    let Some(row) = rows.first() else {
+        return (Value::Null, String::new());
+    };
+    let field = |name: &str| row.get(name).cloned().unwrap_or_default();
+    let fixed = ["added_at_ms", "added_by_actor", "role"]
+        .map(|name| field(name).to_string())
+        .join("/");
+    (field("added_at_ms"), fixed)
 }
 
-/// Run the server's `operation` on `actor`'s membership. A command sent
-/// without an answer keeper can trust keeps its request id ([`Unheard`]):
-/// only the server's answer — applied, replayed (`cached`) or refused —
-/// settles it. Whatever the answer the replica syncs at once: a change the
-/// server made reaches the sheet even when its answer did not.
-fn command(
-    source: &Source,
-    operation: &str,
-    session_id: &str,
-    actor: &str,
-) -> Result<Answered, String> {
+/// Run the server's `operation` on `actor`'s membership, the one this
+/// replica shows (`expectedAddedAtMs`). A command sent without an answer
+/// keeper can trust keeps its request id ([`Unheard`]): only the server's
+/// answer — applied, replayed (`cached`) or refused — settles it. Whatever
+/// the answer the replica syncs at once: a change the server made reaches
+/// the sheet even when its answer did not.
+fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> Result<(), String> {
     let key = (
         source.database.clone(),
         session_id.to_owned(),
         actor.to_owned(),
     );
-    let membership = membership(source, session_id, actor);
+    let (added_at, membership) = membership(source, session_id, actor);
     let request_id = match lock(&UNHEARD).get(&key) {
         Some(unheard) if unheard.operation == operation && unheard.membership == membership => {
             unheard.request_id.clone()
@@ -450,7 +475,11 @@ fn command(
     let answer = source.replica.remote_command(
         operation,
         &request_id,
-        serde_json::json!({ "sessionId": session_id, "actorId": actor }),
+        serde_json::json!({
+            "sessionId": session_id,
+            "actorId": actor,
+            "expectedAddedAtMs": added_at,
+        }),
     );
     source.replica.sync_now();
     match &answer {
@@ -476,8 +505,9 @@ fn command(
 }
 
 /// Why a command failed, by the server's stable code (and, for
-/// `operation.forbidden`, the reason `remove_member` gives as its message),
-/// matched exactly; anything else as the server said it.
+/// `operation.forbidden`, the reason it gives as its message: `remove_member`'s
+/// own, or `hq.member.changed` from any member command), matched exactly;
+/// anything else as the server said it.
 fn command_sentence(database: &str, error: &ReplicaError) -> String {
     match error {
         ReplicaError::NotSyncing | ReplicaError::Closed => format!(
@@ -505,6 +535,10 @@ fn command_sentence(database: &str, error: &ReplicaError) -> String {
                 "hq.remove_member.agent" => {
                     "The server refused: an agent is not removed from its session.".to_owned()
                 }
+                "hq.member.changed" => "The server refused: they were removed or invited again \
+                     since this device last saw them. The sheet now shows them as they are; \
+                     decide again there."
+                    .to_owned(),
                 _ => "The server refused this change to the session's people.".to_owned(),
             }
         }
@@ -528,17 +562,11 @@ pub fn set_reader(
         return Ok(());
     }
     let operation = if reads { "grant_trace" } else { "revoke_trace" };
-    // R1064K-06: the earlier, unheard request replayed (`cached`) ran
-    // before, and this switch was asked because the flag now reads the other
-    // way: undone since (on another device, by the owner), or not yet seen
-    // here. Either way the replay is that earlier decision, not this one —
-    // this one is asked as its own request. The earlier one is settled by
-    // the replay, so it gets a new id; setting the flag twice is the same
-    // change made twice, never a different one.
-    if command(source, operation, session_id, actor)? == Answered::Cached {
-        command(source, operation, session_id, actor)?;
-    }
-    Ok(())
+    // R1064K-08: one request, whatever its answer. An unheard switch asked
+    // again is replayed under its id; `cached` means it ran before, and
+    // keeper stops there — the sync shows where the flag stands. A new
+    // decision is the person's next switch, on what the sheet then shows.
+    command(source, operation, session_id, actor)
 }
 
 /// Remove a person member: the server's `remove_member`, which drops them
@@ -549,7 +577,7 @@ pub fn remove(source: &Source, session_id: &str, actor: &str) -> Result<(), Stri
     if !member.can_remove {
         return Err("Only another person can be removed.".to_owned());
     }
-    command(source, "remove_member", session_id, actor).map(|_| ())
+    command(source, "remove_member", session_id, actor)
 }
 
 /// Leave a session: delete this person's own membership. The windows
