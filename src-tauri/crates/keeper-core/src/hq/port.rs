@@ -218,6 +218,17 @@ pub trait Replica: Send + Sync {
         operation_id: &str,
         params: Value,
     ) -> Result<Vec<Map<String, Value>>, ReplicaError>;
+    /// Run the server's registered command `operation_id` with `params`
+    /// under `request_id` (a retry with the same id is answered from the
+    /// server's cache): its writes reach the replica by sync, never here.
+    /// Like [`Replica::remote_query`], off the owner thread and refused
+    /// while the replica does not sync.
+    fn remote_command(
+        &self,
+        operation_id: &str,
+        request_id: &str,
+        params: Value,
+    ) -> Result<(), ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
     /// The state its owner last published.
@@ -315,6 +326,9 @@ pub(crate) mod fake {
             Ok(Delivery::Unknown)
         }
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            Err(ReplicaError::NotSyncing)
+        }
+        fn remote_command(&self, _: &str, _: &str, _: Value) -> Result<(), ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
         fn sync_now(&self) {}

@@ -1015,6 +1015,39 @@ impl Replica for SyncularReplica {
         Ok(answer?.rows)
     }
 
+    fn remote_command(
+        &self,
+        operation_id: &str,
+        request_id: &str,
+        params: Value,
+    ) -> Result<(), ReplicaError> {
+        let Some(remote) = &self.remote else {
+            return Err(ReplicaError::NotSyncing);
+        };
+        if !self.gate.load(Ordering::SeqCst) {
+            return Err(ReplicaError::NotSyncing);
+        }
+        let mut transport = GatedTransport {
+            inner: HostTransport::from_config(&remote.config).map_err(ReplicaError::Client)?,
+            open: Arc::clone(&self.gate),
+            origin: Some(remote.origin.clone()),
+        };
+        let client = SyncRemoteClient::for_operations(remote.client_id.clone())
+            .map_err(|error| ReplicaError::Client(error.to_string()))?;
+        let answer = client
+            .command(&mut transport, operation_id, request_id, &params)
+            .map_err(|error| ReplicaError::Client(error.to_string()));
+        transport.inner.shutdown();
+        let answer = answer?;
+        if answer.status == "rejected" {
+            return Err(ReplicaError::Client(format!(
+                "operation.rejected: {}",
+                Value::from(answer.results)
+            )));
+        }
+        Ok(())
+    }
+
     fn sync_now(&self) {
         let _ = self.commands.send(Command::SyncNow);
     }

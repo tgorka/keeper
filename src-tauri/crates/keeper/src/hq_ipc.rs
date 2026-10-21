@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
 use keeper_core::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
+use keeper_core::hq::members::AgentSessionMembersVm;
 use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::sessions::{
     diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
@@ -479,4 +480,94 @@ pub async fn agent_session_approval_decide(
         )
     })
     .await
+}
+
+/// Stream a session's People sheet — its members and who the owner may
+/// add — at once, then on every change. The stream does not hold the
+/// session open; the session view does.
+#[tauri::command]
+pub fn agent_session_members_subscribe(
+    database: String,
+    session_id: String,
+    channel: Channel<AgentSessionMembersVm>,
+) -> Result<String, IpcError> {
+    let hq = Arc::clone(hq()?);
+    let key = session(database, session_id);
+    let first = hq.session_members(&key).map_err(error)?;
+    let mut changes = hq.changes();
+    let start = move |id: String| {
+        tauri::async_runtime::spawn(async move {
+            let mut shown = first;
+            if channel.send(shown.clone()).is_err() {
+                end(&id);
+                return;
+            }
+            while changes.changed().await.is_ok() {
+                let (read, at) = (Arc::clone(&hq), key.clone());
+                let Ok(sheet) =
+                    tauri::async_runtime::spawn_blocking(move || read.session_members(&at)).await
+                else {
+                    return;
+                };
+                match sheet {
+                    Ok(sheet) if sheet != shown => {
+                        if channel.send(sheet.clone()).is_err() {
+                            end(&id);
+                            return;
+                        }
+                        shown = sheet;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "an agents session's people could not be read");
+                    }
+                }
+            }
+        })
+    };
+    Ok(keep(None, start))
+}
+
+/// End an [`agent_session_members_subscribe`] stream.
+#[tauri::command]
+pub fn agent_session_members_unsubscribe(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// Add a person of the session's database; they join once the server has
+/// written their membership.
+#[tauri::command]
+pub async fn agent_session_member_add(
+    database: String,
+    session_id: String,
+    actor_id: String,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.add_member(&session(database, session_id), &actor_id)).await
+}
+
+/// Grant or withdraw a member's reading of thinking and tool results.
+#[tauri::command]
+pub async fn agent_session_member_reader_set(
+    database: String,
+    session_id: String,
+    actor_id: String,
+    reads: bool,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.set_member_reader(&session(database, session_id), &actor_id, reads)).await
+}
+
+/// Remove a member from a session.
+#[tauri::command]
+pub async fn agent_session_member_remove(
+    database: String,
+    session_id: String,
+    actor_id: String,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.remove_member(&session(database, session_id), &actor_id)).await
+}
+
+/// Leave a session this person does not own.
+#[tauri::command]
+pub async fn agent_session_leave(database: String, session_id: String) -> Result<(), IpcError> {
+    blocking(move |hq| hq.leave_session(&session(database, session_id))).await
 }

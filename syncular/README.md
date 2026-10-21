@@ -204,11 +204,19 @@ commit.
    `agent_actor`, `created_by_actor`, `created_by_client` and `parent_session` never change. A
    session is inserted only by a person, or by an instance of an agent the registry lets start work;
    an instance of any other agent inserts only a child session whose `parent_session` is a session
-   of this database the agent is a member of.
+   of this database the agent is a member of. `invite` is changed only by the session's owner (the
+   person whose `session_members` row has role `owner`), compared as a set of actor ids. An invited
+   member or an agent instance that changes it is refused (`hq.v3.owner_only`). An instance that
+   inserts a delegated child may invite only people who are members of its parent session, and a
+   session an instance opens at the top level invites no one.
 4. **V4 — membership.** A client inserts only its own actor's `session_members` row, and only in
-   the commit that inserts the session; every other membership row is written by the service
-   client (an agent the session names, and each invited person). `reads_trace` is turned on for a
-   person only by the session's owner. A member may change only its own `read_until`.
+   the commit that inserts the session. Every other membership row is written by the service
+   client: the agent the session names, and each actor that an owner's change of `invite` newly
+   names. Someone who left or was removed comes back only when the owner invites them again;
+   staying in an `invite` they were already in does not bring them back. Another member's row is
+   deleted only by the owner, through `remove_member`. A member leaves by deleting its own row, and
+   the server then takes it out of `invite`. `reads_trace` is turned on for a person only by the
+   session's owner. A member may change only its own `read_until`.
 5. **V5 — page keys.** As *Page keys* above.
 6. **V6 — one writer per answer.** `turn_chunks`, `reasoning`, `tool_calls`, agent `messages`, new
    `approvals` and `sessions.heard_until` are written only by the client holding the session's
@@ -239,6 +247,25 @@ commit.
     person who is a member of the session.
 
 An attachment's `size` is at most 26,214,400 bytes and its message is in the same session.
+
+## Commands
+
+Registered commands go to `POST /<database>/operations` with `kind: "command"` (REMOTE §3).
+`params` is a JSON object with camelCase keys. Each command belongs only to the session's owner, on
+the database the session lives in, and lands as one ordinary commit authored by the calling client.
+A refusal answers `kind: "error"` with `code: "operation.forbidden"`. Params that are not
+`{ sessionId, actorId }` strings answer `operation.invalid_request`.
+
+- `grant_trace` `{ sessionId, actorId }` — turns `reads_trace` on for a person member (D-34). The
+  trace reaches their replicas after the scope refresh.
+- `revoke_trace` `{ sessionId, actorId }` — turns it off. Their replicas evict the trace.
+- `remove_member` `{ sessionId, actorId }` — takes a person member out of `invite` and deletes
+  their `session_members` row in one commit. Their replicas drop the session and its rows, except
+  their own writes still in the outbox. A refusal names why in `message`:
+  `hq.remove_member.not_owner` (the caller is not the session's owner person on this database),
+  `hq.remove_member.self` (the owner themself), `hq.remove_member.not_member` (the actor is not a
+  member) or `hq.remove_member.agent` (an agent member, including the session's own agent).
+  `grant_trace` and `revoke_trace` refuse without a reason.
 
 ## The live check
 

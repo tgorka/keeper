@@ -1056,6 +1056,14 @@ pub fn run() {
                 // What a viewer chose to see, and a session's tool switches.
                 hq_ipc::agent_view_prefs_set,
                 hq_ipc::agent_session_tool_set,
+                // A session's people: who is in it, adding, the reader
+                // flag, removing, leaving.
+                hq_ipc::agent_session_members_subscribe,
+                hq_ipc::agent_session_members_unsubscribe,
+                hq_ipc::agent_session_member_add,
+                hq_ipc::agent_session_member_reader_set,
+                hq_ipc::agent_session_member_remove,
+                hq_ipc::agent_session_leave,
                 // The Bots surface's sync-free half (Epic 61, Story 61.4;
                 // split in Story 62.1), in the shared body for
                 // `config_layers`' reason: `keeper_core::bots` has no desktop

@@ -13,6 +13,8 @@
 //! KEEPER_HQ_LIVE_DATABASES=<the person's databases, comma-separated> \
 //! KEEPER_HQ_LIVE_ONE_DB_ACTOR=<optional: a person in one database>:<that database> \
 //! KEEPER_HQ_LIVE_AGENT=<an agent in the first database's directory, for the Agents window> \
+//! KEEPER_HQ_LIVE_AGENT_2=<for many people: an agent in the second database's directory> \
+//! KEEPER_HQ_LIVE_OTHER_DB_ACTOR=<for many people: a person of the second database alone>:<that database> \
 //! KEEPER_HQ_LIVE_MODEL_RECORD=<for the tool switches: a URL answering the model's requests as JSON> \
 //! KEEPER_HQ_LIVE_KILL=<for the killed instance, run last: a URL that SIGKILLs the agent's instance> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
@@ -1674,6 +1676,508 @@ async fn an_answer_whose_instance_was_killed_says_it_stopped() {
         stopped.text.len()
     );
     a.shutdown().await;
+}
+
+/// Wait until `ready` answers, reading again whenever `hq` changes.
+async fn until<T>(
+    hq: &Arc<Hq>,
+    what: &str,
+    within: Duration,
+    mut ready: impl FnMut() -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + within;
+    let mut changes = hq.changes();
+    loop {
+        if let Some(found) = ready() {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::select! {
+            _ = changes.changed() => {}
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+}
+
+/// What became of `commit` once the server answered it.
+async fn delivered(replica: &Arc<dyn Replica>, commit: &str) -> keeper_core::hq::port::Delivery {
+    use keeper_core::hq::port::Delivery;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let delivery = replica.delivery(commit).expect("reads");
+        if !matches!(delivery, Delivery::Pending) {
+            return delivery;
+        }
+        assert!(Instant::now() < deadline, "{commit} was never answered");
+        replica.sync_now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn count(replica: &Arc<dyn Replica>, table: &str, session: &str) -> u64 {
+    let rows = query(
+        replica,
+        &format!("SELECT count(*) AS n FROM {table} WHERE session_id = ?1"),
+        vec![json!(session)],
+    )
+    .await;
+    rows[0]["n"].as_u64().unwrap_or(0)
+}
+
+/// Many people in one session against the real server and an agent
+/// instance in each database: the owner adds a person of the session's own
+/// database and their device lists it after one sync with its newest page;
+/// their message carries their name on the owner's; an author a client
+/// claims for another is refused; the owner grants and withdraws the reader
+/// flag and the thinking comes to and leaves that person's replica; the
+/// owner removes them and the session leaves their device; a member leaving
+/// is dropped from the invite; the directory of each database offers only
+/// its own people, and the server refuses an invite across. Needs
+/// `KEEPER_HQ_LIVE_DATABASES` naming two databases, `KEEPER_HQ_LIVE_AGENT`
+/// serving the first and `KEEPER_HQ_LIVE_AGENT_2` the second,
+/// `KEEPER_HQ_LIVE_ONE_DB_ACTOR` (a person of the first database alone) and
+/// `KEEPER_HQ_LIVE_OTHER_DB_ACTOR` (a person of the second alone), and a
+/// model that thinks before it answers a message starting `long`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server and an agent instance in each database; see the module docs"]
+async fn many_people_in_one_session_by_the_owner_and_the_server() {
+    use keeper_core::hq::live::AgentViewPrefsPatch;
+    use keeper_core::hq::port::Delivery;
+
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let databases = env("KEEPER_HQ_LIVE_DATABASES");
+    let dbs: Vec<String> = databases.split(',').map(str::to_owned).collect();
+    assert_eq!(dbs.len(), 2, "two databases, to prove they stay apart");
+    let (first, second) = (dbs[0].clone(), dbs[1].clone());
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let agent_2 = env("KEEPER_HQ_LIVE_AGENT_2");
+    let guest_of = env("KEEPER_HQ_LIVE_ONE_DB_ACTOR");
+    let (guest, guest_db) = guest_of.split_once(':').expect("<actor>:<database>");
+    assert_eq!(guest_db, first);
+    let outsider_of = env("KEEPER_HQ_LIVE_OTHER_DB_ACTOR");
+    let (outsider, outsider_db) = outsider_of.split_once(':').expect("<actor>:<database>");
+    assert_eq!(outsider_db, second);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let a = paired(
+        &device(&scratch.path().join("a")),
+        &server,
+        &operator,
+        &actor,
+        2,
+    )
+    .await;
+    let k = paired(
+        &device(&scratch.path().join("k")),
+        &server,
+        &operator,
+        guest,
+        1,
+    )
+    .await;
+    k.set_view_prefs(AgentViewPrefsPatch {
+        show_reasoning: Some(true),
+        show_details: None,
+    })
+    .expect("prefs");
+    let owner_client = a
+        .status()
+        .borrow()
+        .device
+        .as_ref()
+        .expect("device")
+        .client_id
+        .clone();
+    let guest_client = k
+        .status()
+        .borrow()
+        .device
+        .as_ref()
+        .expect("device")
+        .client_id
+        .clone();
+    let new_session = |db: String, agent: String, body: &'static str| {
+        let a = Arc::clone(&a);
+        async move {
+            tokio::task::spawn_blocking(move || a.new_session(&db, &agent, body))
+                .await
+                .expect("joins")
+                .expect("a new session")
+        }
+    };
+    // Connected is not yet synced: wait until each directory names its agent.
+    until(
+        &a,
+        "both directories name their agent",
+        Duration::from_secs(30),
+        || {
+            let choices = a.choices().ok()?;
+            let names = |agent: &str, db: &str| {
+                choices
+                    .iter()
+                    .any(|c| c.agent_actor == agent && c.databases.iter().any(|d| d == db))
+            };
+            (names(&agent, &first) && names(&agent_2, &second)).then_some(())
+        },
+    )
+    .await;
+    let key = new_session(first.clone(), agent.clone(), "hello from the owner").await;
+    let other = new_session(second.clone(), agent_2.clone(), "hello in the other").await;
+    let ra = a.replica(&first).expect("a holds the first");
+    let rk = k.replica(&first).expect("k holds the first");
+
+    // 5: each directory offers only its own people; the server refuses an
+    // invite across, and keeper never writes one.
+    let sheet = until(&a, "a's sheet", Duration::from_secs(30), || {
+        a.session_members(&key).ok()
+    })
+    .await;
+    let offered: Vec<&str> = sheet.addable.iter().map(|p| p.actor_id.as_str()).collect();
+    assert!(
+        sheet.owner && offered.contains(&guest) && !offered.contains(&outsider),
+        "{offered:?}"
+    );
+    let across = until(&a, "the other's sheet", Duration::from_secs(30), || {
+        a.session_members(&other).ok()
+    })
+    .await;
+    let offered_there: Vec<&str> = across.addable.iter().map(|p| p.actor_id.as_str()).collect();
+    assert!(
+        offered_there.contains(&outsider) && !offered_there.contains(&guest),
+        "{offered_there:?}"
+    );
+    let refused = a
+        .add_member(&key, outsider)
+        .expect_err("not this database's");
+    println!("PASS {first} offers {offered:?}, {second} offers {offered_there:?}; keeper refuses {outsider} in {first}: {refused}");
+    let forged_invite = mutate(
+        &ra,
+        vec![RowOp::Patch {
+            table: "sessions".to_owned(),
+            values: object(json!({
+                "id": key.session_id, "invite": json!([outsider]).to_string(),
+                "author_actor": actor, "author_client": owner_client,
+            })),
+            base_version: None,
+        }],
+    )
+    .await;
+    match delivered(&ra, &forged_invite).await {
+        Delivery::Refused(reason) => {
+            assert!(reason.contains("v11"), "{reason}");
+            println!("PASS the server refuses an invite naming {outsider} in {first}: {reason}");
+        }
+        other => panic!("an invite across databases was {other:?}"),
+    }
+
+    // 1: added, the guest's device lists the session after one sync and
+    // shows its newest page; their message carries their name.
+    let added = Instant::now();
+    a.add_member(&key, guest).expect("adds");
+    let listed = until(
+        &k,
+        "the guest lists the session",
+        Duration::from_secs(30),
+        || {
+            k.sessions()
+                .into_iter()
+                .find(|row| row.database == key.database && row.session_id == key.session_id)
+        },
+    )
+    .await;
+    let listed_ms = added.elapsed().as_millis();
+    k.open_session(&key).expect("k opens");
+    let page = until(
+        &k,
+        "the guest's newest page",
+        Duration::from_secs(30),
+        || {
+            k.session_view(&key).ok().filter(|v| {
+                v.complete && v.messages.iter().any(|m| m.body == "hello from the owner")
+            })
+        },
+    )
+    .await;
+    println!(
+        "PASS the guest listed {:?} {listed_ms} ms after the add and showed its newest page ({} messages, the owner's by {:?})",
+        listed.title,
+        page.messages.len(),
+        page.messages[0].author_name
+    );
+    let joined = until(
+        &a,
+        "the guest joins on a's sheet",
+        Duration::from_secs(30),
+        || {
+            a.session_members(&key).ok().and_then(|s| {
+                s.members
+                    .into_iter()
+                    .find(|m| m.actor_id == guest && !m.joining)
+            })
+        },
+    )
+    .await;
+    assert!(
+        !joined.reads_trace,
+        "an added person does not read the trace"
+    );
+    k.send(&key, "hello from the guest").expect("k sends");
+    let shown = until(
+        &a,
+        "the guest's message on a",
+        Duration::from_secs(30),
+        || {
+            a.session_view(&key)
+                .ok()?
+                .messages
+                .into_iter()
+                .find(|m| m.body == "hello from the guest")
+        },
+    )
+    .await;
+    assert_eq!(shown.author_actor, guest);
+    assert_eq!(shown.author_name, joined.name);
+    println!(
+        "PASS the guest's message shows on the owner's as {:?} ({})",
+        shown.author_name, shown.author_actor
+    );
+
+    // 2: a row claiming another author is refused; nobody shows it.
+    let now = chrono::Utc::now().timestamp_millis();
+    let forged = mutate(
+        &rk,
+        vec![message(
+            &Author {
+                actor: actor.clone(),
+                client: guest_client.clone(),
+            },
+            &key.session_id,
+            &page_key(&key.session_id, now),
+            &ulid::Ulid::new().to_string(),
+            "forged as the owner",
+            now,
+        )],
+    )
+    .await;
+    match delivered(&rk, &forged).await {
+        Delivery::Refused(reason) => {
+            assert!(reason.contains("author"), "{reason}");
+            println!("PASS a message claiming {actor} from {guest}'s device is refused: {reason}");
+        }
+        other => panic!("a forged author was {other:?}"),
+    }
+    // And a member who is not the owner changes nobody: refused here, and
+    // an invite written anyway — naming one more person — is refused by the
+    // server (rewriting the same invite changes nobody, so it is not).
+    assert!(k.add_member(&key, &actor).is_err());
+    let invite_by_guest = mutate(
+        &rk,
+        vec![RowOp::Patch {
+            table: "sessions".to_owned(),
+            values: object(json!({
+                "id": key.session_id, "invite": json!([guest, actor]).to_string(),
+                "author_actor": guest, "author_client": guest_client,
+            })),
+            base_version: None,
+        }],
+    )
+    .await;
+    match delivered(&rk, &invite_by_guest).await {
+        Delivery::Refused(reason) => {
+            assert!(reason.contains("owner_only"), "{reason}");
+            println!(
+                "PASS an invite written by a member who is not the owner is refused: {reason}"
+            );
+        }
+        other => panic!("a member's invite change was {other:?}"),
+    }
+
+    // 3: the reader flag. Not a reader: no thinking reaches the guest.
+    a.send(&key, "long: think about the plan").expect("a asks");
+    // The owner reads the trace (and shows no thinking, so its window holds
+    // none): the final answer ends the turn; the guest is never sent it.
+    let answers = |hq: &Arc<Hq>| {
+        hq.session_view(&key).map_or(0, |v| {
+            v.messages
+                .iter()
+                .filter(|m| m.role == keeper_core::hq::timeline::AgentMessageRoleVm::Agent)
+                .count()
+        })
+    };
+    let before = answers(&a);
+    until(
+        &a,
+        "the thinking answer ends",
+        Duration::from_secs(120),
+        || {
+            let view = a.session_view(&key).ok()?;
+            (view.live.is_empty() && answers(&a) > before).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(count(&rk, "reasoning", &key.session_id).await, 0);
+    assert_eq!(count(&rk, "tool_calls", &key.session_id).await, 0);
+    let granting = {
+        let (a, key, guest) = (Arc::clone(&a), key.clone(), guest.to_owned());
+        tokio::task::spawn_blocking(move || a.set_member_reader(&key, &guest, true))
+    };
+    let granted_at = Instant::now();
+    granting.await.expect("joins").expect("grants");
+    until(
+        &k,
+        "the guest reads the trace",
+        Duration::from_secs(30),
+        || k.session_view(&key).ok().filter(|v| v.reads_trace),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut held = 0;
+    while held == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the thinking never reached the guest"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        held = count(&rk, "reasoning", &key.session_id).await;
+    }
+    println!(
+        "PASS granted: the guest reads the trace and holds {held} reasoning rows {} ms after the grant",
+        granted_at.elapsed().as_millis()
+    );
+    let withdrawing = {
+        let (a, key, guest) = (Arc::clone(&a), key.clone(), guest.to_owned());
+        tokio::task::spawn_blocking(move || a.set_member_reader(&key, &guest, false))
+    };
+    withdrawing.await.expect("joins").expect("withdraws");
+    until(
+        &k,
+        "the guest no longer reads the trace",
+        Duration::from_secs(30),
+        || k.session_view(&key).ok().filter(|v| !v.reads_trace),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while count(&rk, "reasoning", &key.session_id).await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the thinking stayed on the guest's device"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(count(&rk, "tool_calls", &key.session_id).await, 0);
+    assert_eq!(count(&rk, "approvals", &key.session_id).await, 0);
+    let view = k.session_view(&key).expect("k's view");
+    assert!(view.messages.iter().all(|m| m.reasoning.is_none()));
+    println!("PASS withdrawn: the guest's replica holds no reasoning, tool call or approval of the session, and still the answers ({} messages)", view.messages.len());
+
+    // 4: the owner removes the guest: the session leaves their device.
+    let removing = {
+        let (a, key, guest) = (Arc::clone(&a), key.clone(), guest.to_owned());
+        tokio::task::spawn_blocking(move || a.remove_member(&key, &guest))
+    };
+    let removed_at = Instant::now();
+    removing.await.expect("joins").expect("removes");
+    until(
+        &k,
+        "the session leaves the guest's list",
+        Duration::from_secs(30),
+        || {
+            (!k.sessions()
+                .iter()
+                .any(|r| r.database == key.database && r.session_id == key.session_id))
+            .then_some(())
+        },
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = [
+            count(&rk, "messages", &key.session_id).await,
+            count(&rk, "session_members", &key.session_id).await,
+            count(&rk, "turn_chunks", &key.session_id).await,
+        ];
+        let row = query(
+            &rk,
+            "SELECT count(*) AS n FROM sessions WHERE id = ?1",
+            vec![json!(key.session_id)],
+        )
+        .await[0]["n"]
+            .as_u64()
+            .unwrap_or(0);
+        if left == [0, 0, 0] && row == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest still holds {left:?} and the session row {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let after = until(
+        &a,
+        "the guest leaves a's sheet",
+        Duration::from_secs(30),
+        || {
+            a.session_members(&key)
+                .ok()
+                .filter(|s| !s.members.iter().any(|m| m.actor_id == guest))
+        },
+    )
+    .await;
+    assert!(
+        after.addable.iter().any(|p| p.actor_id == guest),
+        "removed, they can be added again"
+    );
+    println!("PASS removed by the owner: the session left the guest's list and replica ({} ms) and the owner's sheet", removed_at.elapsed().as_millis());
+    k.close_session(&key);
+
+    // A member leaving: added again, they leave; the server drops them from
+    // the invite, so the next change does not bring them back.
+    a.add_member(&key, guest).expect("adds again");
+    until(
+        &k,
+        "the guest lists it again",
+        Duration::from_secs(30),
+        || k.session_members(&key).ok().filter(|s| s.can_leave),
+    )
+    .await;
+    k.leave_session(&key).expect("leaves");
+    until(
+        &a,
+        "the invite drops the guest",
+        Duration::from_secs(30),
+        || {
+            let rows = ra
+                .query(
+                    "SELECT invite FROM sessions WHERE id = ?1",
+                    &[json!(key.session_id)],
+                )
+                .ok()?;
+            let held = rows.first()?.get("invite")?;
+            let invite = held
+                .as_str()
+                .map_or_else(|| held.to_string(), str::to_owned);
+            (!invite.contains(guest)
+                && !a
+                    .session_members(&key)
+                    .ok()?
+                    .members
+                    .iter()
+                    .any(|m| m.actor_id == guest))
+            .then_some(())
+        },
+    )
+    .await;
+    assert!(!k
+        .sessions()
+        .iter()
+        .any(|r| r.session_id == key.session_id && r.database == key.database));
+    println!(
+        "PASS the guest left: gone from their list, from the owner's sheet and from the invite"
+    );
+    a.shutdown().await;
+    k.shutdown().await;
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

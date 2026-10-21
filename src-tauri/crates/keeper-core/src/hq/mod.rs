@@ -27,7 +27,8 @@
 //! database ([`sessions`]); an opened session from its windowed months, or,
 //! archived, through the server's registered `sessionPage` ([`timeline`]);
 //! messages and decisions written as rows into the session's own database
-//! ([`send`], [`approvals`]).
+//! ([`send`], [`approvals`]); who is in a session, from that database's
+//! directory alone ([`members`]).
 //!
 //! The shell's `hq_ipc` is a call site and decides nothing. Tracing targets
 //! are `keeper_core::hq::*` and carry no row content.
@@ -36,6 +37,7 @@ pub mod approvals;
 pub mod databases;
 pub mod identity;
 pub mod live;
+pub mod members;
 pub mod pairing;
 pub mod port;
 pub mod routes;

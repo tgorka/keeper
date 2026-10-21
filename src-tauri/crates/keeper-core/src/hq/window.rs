@@ -78,7 +78,7 @@ impl Hq {
             .collect()
     }
 
-    fn source(&self, database: &str) -> Result<Source, HqError> {
+    pub(crate) fn source(&self, database: &str) -> Result<Source, HqError> {
         self.sources()
             .into_iter()
             .find(|source| source.database == database)
