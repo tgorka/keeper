@@ -53,8 +53,11 @@ bottom. If the claim ends without a final message, the retained text says **The 
 
 **Show thinking** and **Show details** start off and are your preferences on every device
 (`agents.show_reasoning`, `agents.show_details`, user-global, settable in a settings file).
-Changing one writes only that preference; a change synced from another device or a settings
-file reaches open sessions too.
+Changing one writes only that preference. The switches show the preferences as they hold now,
+carried with the open session's view: a change synced from another device or a settings file
+reaches open sessions and their switches too. A settings file that sets one keeps it — the
+switch stays as the file says and **Saved, but a settings file keeps this preference as it is.**
+appears beside it.
 Thinking is offered only to a person who can read the session's trace, and reasoning enters the
 view only while that preference is on. It remains readable after the answer finishes. A person
 without trace access receives no reasoning or tool-result rows; the current tool's name is public
@@ -80,9 +83,10 @@ with the agent's `messages` row for the turn (`turn_id`) once it holds it.” Th
 that projection, never folds chunks or presence itself.
 
 Development fixtures: `?sessions=launch&live=stream`, with `&platform=phone` for the phone shell.
-`live=error`, `stopped`, `nonreader`, `no-tools`, `untrusted`, `long` and `refused` cover provider
-error, ended claim, trace exclusion, absent offers, outside-content marker, long strings and
-refused preference/tool writes. Timed mock deltas are UI evidence only, not a server or latency proof.
+`live=error`, `stopped`, `nonreader`, `no-tools`, `untrusted`, `long`, `refused` and `pinned` cover
+provider error, ended claim, trace exclusion, absent offers, outside-content marker, long strings,
+refused preference/tool writes and a settings file keeping Show details off. Timed mock deltas
+are UI evidence only, not a server or latency proof.
 
 ### Measured: live-answer presentation
 
