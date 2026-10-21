@@ -4,6 +4,7 @@ import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
 import { SessionControls } from "@/components/agents/session-controls";
+import { SessionPeople } from "@/components/agents/session-people";
 import {
   SessionAnswerDetails,
   SessionLiveTurn,
@@ -146,6 +147,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             )}
           </p>
         </div>
+        {vm && <SessionPeople target={target} />}
         {vm && (
           <Button
             variant="ghost"
