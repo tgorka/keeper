@@ -13,6 +13,7 @@ use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
 use keeper_core::hq::instances::AgentInstancesVm;
 use keeper_core::hq::live::{AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::members::AgentSessionMembersVm;
+use keeper_core::hq::push::PushTarget;
 use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::sessions::{
     diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
@@ -67,10 +68,23 @@ fn end(subscription_id: &str) {
     }
 }
 
+/// The push target the shell asked for before the service existed.
+static PUSH_TARGET: Mutex<Option<Option<PushTarget>>> = Mutex::new(None);
+
 /// Build the service and open what this device holds. Called from setup
 /// after the settings layers are installed, so `agents.server_url` is read
 /// through them.
 pub fn init(app: &tauri::App) {
+    ensure(app.handle());
+}
+
+/// The service, built and started now if it is not yet: setup's, or — on
+/// the iPhone, when an action on a notification launched keeper in the
+/// background and no setup runs — the only thing that launch opens.
+pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
+    if let Some(hq) = HQ.get() {
+        return Arc::clone(hq);
+    }
     let platform = Arc::clone(&app.state::<crate::ipc::AppState>().platform);
     let hq = Hq::new(
         platform,
@@ -79,13 +93,65 @@ pub fn init(app: &tauri::App) {
         format!("keeper on {}", keeper_core::config::read_host_label()),
     );
     if HQ.set(Arc::clone(&hq)).is_err() {
-        return;
+        return HQ.get().map_or(hq, Arc::clone);
     }
+    let started = Arc::clone(&hq);
+    let pending = PUSH_TARGET
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = hq.start().await {
+        if let Some(target) = pending {
+            started.set_push_target(target);
+        }
+        if let Err(error) = started.start().await {
             tracing::warn!(%error, "the agents server could not be started");
         }
     });
+    hq
+}
+
+/// Where the agents server's push reaction posts for this device (106.6):
+/// the phone's push shell calls this with its gateway, token and app, or
+/// `None` when the gateway is cleared. Kept until the service starts.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn set_push_target(target: Option<PushTarget>) {
+    match HQ.get() {
+        Some(hq) => {
+            let hq = Arc::clone(hq);
+            tauri::async_runtime::spawn(async move { hq.set_push_target(target) });
+        }
+        None => {
+            *PUSH_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = Some(target);
+        }
+    }
+}
+
+/// Read and classify the agents item a push names (Android, where the push
+/// reaches keeper itself).
+#[cfg(target_os = "android")]
+pub async fn read_pushed(
+    pushed: &keeper_core::hq::push::PushedItem,
+) -> Result<keeper_core::hq::push::HqClassified, String> {
+    let hq = HQ
+        .get()
+        .cloned()
+        .ok_or_else(|| "the agents server is not started yet".to_owned())?;
+    hq.read_pushed(pushed).await
+}
+
+/// Write the decision an action on an agents item's notification sends,
+/// within `budget`; the service is started first when this launch has none.
+/// Blocking: never on the async workers.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn decide_pushed(
+    app: &tauri::AppHandle,
+    decision: &keeper_core::hq::push::HqActionDecision,
+    budget: std::time::Duration,
+) -> Result<AgentDecisionOutcomeVm, String> {
+    ensure(app)
+        .decide_pushed(decision, budget)
+        .map_err(|error| error.to_string())
 }
 
 /// The effective settings may have changed (a setting written, a settings
