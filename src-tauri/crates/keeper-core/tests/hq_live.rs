@@ -18,6 +18,8 @@
 //! KEEPER_HQ_LIVE_APPROVAL=<optional, many people: a message the first database's agent answers by asking for an approval> \
 //! KEEPER_HQ_LIVE_MODEL_RECORD=<for the tool switches: a URL answering the model's requests as JSON> \
 //! KEEPER_HQ_LIVE_KILL=<for the killed instance, run last: a URL that SIGKILLs the agent's instance> \
+//! KEEPER_HQ_LIVE_INSTANCES=<for the default instance: two instance client ids of KEEPER_HQ_LIVE_AGENT, in both databases> \
+//! KEEPER_HQ_LIVE_INSTANCE_CTL=<for the default instance: a URL whose /kill/<client> SIGKILLs and /start/<client> starts one> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
 //! ```
 //!
@@ -2247,4 +2249,353 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Wait until `ready` answers from what `hq` reads now, reading again every
+/// 100 ms: presence moves without a row changing, so nothing else wakes it.
+async fn poll<T: Send + 'static>(
+    hq: &Arc<Hq>,
+    what: &str,
+    within: Duration,
+    ready: impl Fn(&Arc<Hq>) -> Option<T> + Send + Sync + 'static,
+) -> (T, Duration) {
+    let ready = Arc::new(ready);
+    let started = Instant::now();
+    loop {
+        let (hq, check) = (Arc::clone(hq), Arc::clone(&ready));
+        let found = tokio::task::spawn_blocking(move || check(&hq))
+            .await
+            .expect("joins");
+        if let Some(found) = found {
+            return (found, started.elapsed());
+        }
+        assert!(started.elapsed() < within, "{what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn instance_ctl(ctl: &str, verb: &str, client: &str) {
+    reqwest::get(format!("{ctl}/{verb}/{client}"))
+        .await
+        .unwrap_or_else(|error| panic!("{verb} {client}: {error}"))
+        .error_for_status()
+        .unwrap_or_else(|error| panic!("{verb} {client}: {error}"));
+}
+
+/// The presence of `client` of `agent` on this device, across its databases.
+fn presence_of(
+    hq: &Arc<Hq>,
+    agent: &str,
+    client: &str,
+) -> Option<keeper_core::hq::instances::AgentInstancePresenceVm> {
+    hq.agent_instances()
+        .into_iter()
+        .find(|a| a.agent_actor == agent)?
+        .instances
+        .into_iter()
+        .find(|i| i.client_id == client)
+        .map(|i| i.presence)
+}
+
+/// Who the header of `key` names as answering, and its sentence.
+fn header(
+    hq: &Arc<Hq>,
+    key: &keeper_core::hq::sessions::AgentSessionRef,
+) -> Option<(String, String)> {
+    let answering = hq.session_view(key).ok()?.answering?;
+    Some((answering.holder?, answering.sentence))
+}
+
+/// The default instance against a real server and two real instances of
+/// one agent, each with its own token, both in both databases (106.5):
+/// the person's choice made on one device shows on another after one sync
+/// and is one `instance_prefs` row in each database; a new session in each
+/// database is taken by the chosen instance and the header names it; with
+/// that instance killed it shows offline and a new session is answered by
+/// the other; a session one instance holds stays with it when the other
+/// comes back; after its holder stops and the lease lapses, the header
+/// names the new holder. Needs `KEEPER_HQ_LIVE_DATABASES` naming two
+/// databases, `KEEPER_HQ_LIVE_INSTANCES` and `KEEPER_HQ_LIVE_INSTANCE_CTL`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server and two instances of one agent it controls; see the module docs"]
+async fn two_instances_answer_by_the_persons_choice_and_who_is_online() {
+    use keeper_core::hq::instances::AgentInstancePresenceVm as Presence;
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let ctl = env("KEEPER_HQ_LIVE_INSTANCE_CTL");
+    let databases: Vec<String> = env("KEEPER_HQ_LIVE_DATABASES")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(databases.len(), 2, "two databases");
+    let instances: Vec<String> = env("KEEPER_HQ_LIVE_INSTANCES")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    let [first, second] = [instances[0].clone(), instances[1].clone()];
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let mac = paired(
+        &device(&scratch.path().join("mac")),
+        &server,
+        &operator,
+        &actor,
+        2,
+    )
+    .await;
+    let phone = paired(
+        &device(&scratch.path().join("phone")),
+        &server,
+        &operator,
+        &actor,
+        2,
+    )
+    .await;
+
+    // Both instances online on both devices.
+    for (name, hq) in [("mac", &mac), ("phone", &phone)] {
+        let (agent, first, second) = (agent.clone(), first.clone(), second.clone());
+        let (_, took) = poll(
+            hq,
+            "both instances online",
+            Duration::from_secs(30),
+            move |hq| {
+                (presence_of(hq, &agent, &first) == Some(Presence::Online)
+                    && presence_of(hq, &agent, &second) == Some(Presence::Online))
+                .then_some(())
+            },
+        )
+        .await;
+        println!(
+            "PASS {name}: both instances online after {} ms",
+            took.as_millis()
+        );
+    }
+
+    // 1. The second instance chosen on the Mac: the phone shows the same
+    //    choice after one sync — a row in each database, not a setting.
+    {
+        let (mac, agent, order) = (
+            Arc::clone(&mac),
+            agent.clone(),
+            vec![second.clone(), first.clone()],
+        );
+        tokio::task::spawn_blocking(move || mac.set_agent_instances(&agent, &order))
+            .await
+            .expect("joins")
+            .expect("the choice is written");
+    }
+    let chosen = Instant::now();
+    let (vm, _) = {
+        let (agent, second) = (agent.clone(), second.clone());
+        poll(
+            &phone,
+            "the phone shows the Mac's choice",
+            Duration::from_secs(30),
+            move |hq| {
+                hq.agent_instances()
+                    .into_iter()
+                    .find(|a| {
+                        a.agent_actor == agent && a.default_client.as_deref() == Some(&second)
+                    })
+                    .filter(|a| a.disagreement.is_none())
+            },
+        )
+        .await
+    };
+    println!(
+        "PASS phone shows the Mac's choice {} ms after it was written: {:?} — {}",
+        chosen.elapsed().as_millis(),
+        vm.default_client,
+        vm.sentence
+    );
+    assert_eq!(vm.fallback, std::slice::from_ref(&first));
+    assert_eq!(vm.databases, databases);
+    for database in &databases {
+        let rows = query(
+            &phone.replica(database).expect("a replica"),
+            "SELECT id, default_client, fallback, author_actor FROM instance_prefs",
+            vec![],
+        )
+        .await;
+        assert_eq!(rows.len(), 1, "one row in {database}");
+        assert_eq!(rows[0]["id"], json!(format!("{actor}/{agent}")));
+        assert_eq!(rows[0]["default_client"], json!(second));
+        assert_eq!(rows[0]["author_actor"], json!(actor));
+    }
+    println!("PASS one instance_prefs row in each of {databases:?}, the same on the phone");
+
+    // New sessions in both databases follow it.
+    let mut held = Vec::new();
+    for database in &databases {
+        let key = {
+            let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
+            tokio::task::spawn_blocking(move || {
+                mac.new_session(&database, &agent, "who answers this one?")
+            })
+            .await
+            .expect("joins")
+            .expect("a new session")
+        };
+        mac.open_session(&key).expect("opens");
+        let opened = Instant::now();
+        let ((holder, sentence), _) = {
+            let (key, second) = (key.clone(), second.clone());
+            poll(
+                &mac,
+                "the chosen instance takes it",
+                Duration::from_secs(30),
+                move |hq| header(hq, &key).filter(|(holder, _)| *holder == second),
+            )
+            .await
+        };
+        println!(
+            "PASS {database}: {holder} took the new session {} ms after it was written; header: {sentence}",
+            opened.elapsed().as_millis()
+        );
+        assert!(sentence.contains("is answering"), "{sentence}");
+        held.push(key);
+    }
+
+    // 2. The chosen instance killed: offline within the presence expiry, and
+    //    a new session is answered by the other, the header naming it.
+    instance_ctl(&ctl, "kill", &second).await;
+    let killed = Instant::now();
+    {
+        let (agent, gone) = (agent.clone(), second.clone());
+        let (_, took) = poll(
+            &mac,
+            "the killed instance shows offline",
+            Duration::from_secs(90),
+            move |hq| (presence_of(hq, &agent, &gone) == Some(Presence::Offline)).then_some(()),
+        )
+        .await;
+        println!(
+            "PASS {second} offline {} ms after SIGKILL",
+            took.as_millis()
+        );
+    }
+    let database = databases[0].clone();
+    let other = {
+        let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
+        tokio::task::spawn_blocking(move || mac.new_session(&database, &agent, "and this one?"))
+            .await
+            .expect("joins")
+            .expect("a new session")
+    };
+    mac.open_session(&other).expect("opens");
+    let ((holder, sentence), took) = {
+        let (key, first) = (other.clone(), first.clone());
+        poll(
+            &mac,
+            "the other instance answers",
+            Duration::from_secs(60),
+            move |hq| header(hq, &key).filter(|(holder, _)| *holder == first),
+        )
+        .await
+    };
+    assert_eq!(
+        sentence,
+        format!("{} is answering.", label(&mac, &agent, &first))
+    );
+    println!(
+        "PASS with {second} killed, {holder} took a new session in {} ms; header: {sentence}",
+        took.as_millis()
+    );
+    // The sessions the killed instance held: named, offline, until the lease
+    // lapses and the other takes them.
+    let (sentence, _) = {
+        let key = held[0].clone();
+        poll(
+            &mac,
+            "the killed holder is named offline",
+            Duration::from_secs(10),
+            move |hq| {
+                // Taken over already is the next step's to see; until then
+                // the killed holder is named, offline.
+                let view = hq.session_view(&key).ok()?.answering?;
+                (view.sentence.contains("is offline") || view.sentence.contains("is answering"))
+                    .then_some(view.sentence)
+            },
+        )
+        .await
+    };
+    println!(
+        "PASS {} s after the kill the header said: {sentence}",
+        killed.elapsed().as_secs()
+    );
+    for key in held.clone() {
+        let (first, database) = (first.clone(), key.database.clone());
+        let ((holder, sentence), _) = poll(
+            &mac,
+            "the lapsed session is taken over",
+            Duration::from_secs(120),
+            move |hq| header(hq, &key).filter(|(holder, _)| *holder == first),
+        )
+        .await;
+        println!(
+            "PASS {}: {holder} took over {} ms after the kill; header: {sentence}",
+            database,
+            killed.elapsed().as_millis()
+        );
+    }
+
+    // 3. The default comes back: what the other holds stays with it.
+    instance_ctl(&ctl, "start", &second).await;
+    {
+        let (agent, second) = (agent.clone(), second.clone());
+        poll(
+            &mac,
+            "the default is back online",
+            Duration::from_secs(60),
+            move |hq| (presence_of(hq, &agent, &second) == Some(Presence::Online)).then_some(()),
+        )
+        .await;
+    }
+    let back = Instant::now();
+    while back.elapsed() < Duration::from_secs(15) {
+        for key in std::iter::once(&other).chain(&held) {
+            let (holder, _) = {
+                let (mac, key) = (Arc::clone(&mac), key.clone());
+                tokio::task::spawn_blocking(move || header(&mac, &key))
+                    .await
+                    .expect("joins")
+                    .expect("a header")
+            };
+            assert_eq!(holder, first, "{key:?} stays with its holder");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("PASS {second} back online for 15 s: all three sessions stayed with {first}");
+
+    // ... and after the holder stops and its lease lapses, the header names
+    // the new holder.
+    instance_ctl(&ctl, "kill", &first).await;
+    let killed = Instant::now();
+    let ((holder, sentence), _) = {
+        let (key, second) = (other.clone(), second.clone());
+        poll(
+            &mac,
+            "the new holder is named",
+            Duration::from_secs(120),
+            move |hq| header(hq, &key).filter(|(holder, _)| *holder == second),
+        )
+        .await
+    };
+    println!(
+        "PASS {first} killed: the header names {holder} {} ms later: {sentence}",
+        killed.elapsed().as_millis()
+    );
+    instance_ctl(&ctl, "start", &first).await;
+    mac.shutdown().await;
+    phone.shutdown().await;
+}
+
+fn label(hq: &Arc<Hq>, agent: &str, client: &str) -> String {
+    hq.agent_instances()
+        .into_iter()
+        .find(|a| a.agent_actor == agent)
+        .and_then(|a| a.instances.into_iter().find(|i| i.client_id == client))
+        .map_or_else(|| client.to_owned(), |i| i.label)
 }
