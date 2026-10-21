@@ -254,7 +254,8 @@ Registered commands go to `POST /<database>/operations` with `kind: "command"` (
 `params` is a JSON object with camelCase keys. Each command belongs only to the session's owner, on
 the database the session lives in, and lands as one ordinary commit authored by the calling client.
 A refusal answers `kind: "error"` with `code: "operation.forbidden"`. Params that are not
-`{ sessionId, actorId }` strings answer `operation.invalid_request`.
+`{ sessionId, actorId }` strings answer `operation.invalid_request` for `remove_member`, and
+`operation.forbidden` for `grant_trace` and `revoke_trace`.
 
 - `grant_trace` `{ sessionId, actorId }` — turns `reads_trace` on for a person member (D-34). The
   trace reaches their replicas after the scope refresh.
