@@ -37,8 +37,8 @@ use syncular_client::{
 use tokio::sync::watch;
 
 use crate::hq::port::{
-    Covered, Delivery, LinkState, Opener, Peer, Rejection, Replica, ReplicaError, ReplicaSpec,
-    ReplicaState, RowOp, Subscription, WindowBase, WindowState, CONFLICT,
+    Answered, Covered, Delivery, LinkState, Opener, Peer, Rejection, Replica, ReplicaError,
+    ReplicaSpec, ReplicaState, RowOp, Subscription, WindowBase, WindowState, CONFLICT,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -1061,7 +1061,7 @@ impl Replica for SyncularReplica {
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<(), ReplicaError> {
+    ) -> Result<Answered, ReplicaError> {
         let Some(remote) = &self.remote else {
             return Err(ReplicaError::NotSyncing);
         };
@@ -1080,7 +1080,8 @@ impl Replica for SyncularReplica {
         transport.inner.shutdown();
         let answer = answer.map_err(|error| command_error(error, transport.reached))?;
         // `cached`: this request id was applied before and its first answer
-        // is replayed (a retry whose earlier answer was lost) — a success.
+        // is replayed (a retry whose earlier answer was lost) — a success,
+        // which says nothing about the room now.
         if answer.status == "rejected" {
             let refusal = answer.results.iter().find_map(|result| {
                 let code = result.get("code").and_then(Value::as_str)?;
@@ -1102,7 +1103,11 @@ impl Replica for SyncularReplica {
                 retryable: false,
             });
         }
-        Ok(())
+        Ok(if answer.status == "cached" {
+            Answered::Cached
+        } else {
+            Answered::Applied
+        })
     }
 
     fn sync_now(&self) {

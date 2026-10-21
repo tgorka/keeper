@@ -555,8 +555,14 @@ pub(super) struct Staged {
 }
 
 /// A stand-in server's answer to one command.
-pub(super) type ServerCommand =
-    Box<dyn FnMut(&str, &str, &Value) -> Result<(), crate::hq::port::ReplicaError> + Send>;
+pub(super) type ServerCommand = Box<
+    dyn FnMut(
+            &str,
+            &str,
+            &Value,
+        ) -> Result<crate::hq::port::Answered, crate::hq::port::ReplicaError>
+        + Send,
+>;
 
 impl Staged {
     pub(super) fn over(source: &Source, version: Option<i64>) -> (Arc<Staged>, Source) {
@@ -686,7 +692,7 @@ impl crate::hq::port::Replica for Staged {
         id: &str,
         request: &str,
         params: Value,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    ) -> Result<crate::hq::port::Answered, crate::hq::port::ReplicaError> {
         if let Some(server) = self.server.lock().expect("server").as_mut() {
             return server(id, request, &params);
         }
