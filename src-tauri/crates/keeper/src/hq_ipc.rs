@@ -483,8 +483,9 @@ pub async fn agent_session_approval_decide(
 }
 
 /// Stream a session's People sheet — its members and who the owner may
-/// add — at once, then on every change. The stream does not hold the
-/// session open; the session view does.
+/// add — at once, then on every change. The change feed is registered
+/// before the first sheet is read, so a change landing in between is never
+/// missed. The stream does not hold the session open; the session view does.
 #[tauri::command]
 pub fn agent_session_members_subscribe(
     database: String,
@@ -493,8 +494,7 @@ pub fn agent_session_members_subscribe(
 ) -> Result<String, IpcError> {
     let hq = Arc::clone(hq()?);
     let key = session(database, session_id);
-    let first = hq.session_members(&key).map_err(error)?;
-    let mut changes = hq.changes();
+    let (first, mut changes) = hq.session_members_watched(&key).map_err(error)?;
     let start = move |id: String| {
         tauri::async_runtime::spawn(async move {
             let mut shown = first;

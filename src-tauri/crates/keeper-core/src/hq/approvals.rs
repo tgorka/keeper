@@ -4,6 +4,12 @@
 //! may approve and refuses a tier-4 decision from the claim holder's host; a
 //! refusal reaches the person as the server's sentence.
 //!
+//! An approval exists here only for a member whose membership reads the
+//! trace now. The server stops sending them when the flag is withdrawn or
+//! the member removed, but rows already here stay until the window evicts
+//! them, and a decision still in the outbox pins its row; so every view,
+//! and a decision, ask the membership first (D-34, epic invariant 5).
+//!
 //! An approval is decided only on the exact action it would run: a request
 //! whose tool call is not on this device cannot be approved here, and a
 //! decision names the binding digest it was shown, so a request that changed
@@ -16,8 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use crate::hq::port::{Delivery, LinkState, RowOp};
-use crate::hq::sessions::{authored, int, names, object, opt_text, read, text, Source};
+use crate::hq::port::{Delivery, LinkState, Rejection, RowOp};
+use crate::hq::sessions::{
+    authored, int, names, object, opt_text, read, reads_trace, text, Source,
+};
 
 /// How long a decision waits for the server before it is reported as
 /// waiting on this device.
@@ -219,7 +227,7 @@ fn vm(
 }
 
 /// A session's approvals, oldest first. Empty for a member who does not
-/// read the trace: the server never sends them.
+/// read the trace now, whatever rows this device still holds.
 pub fn of_session(
     source: &Source,
     session_id: &str,
@@ -227,6 +235,9 @@ pub fn of_session(
     refusals: &Refusals,
     now_ms: i64,
 ) -> Vec<AgentApprovalVm> {
+    if !reads_trace(source, session_id) {
+        return Vec::new();
+    }
     read(
         source,
         &format!("{SELECT} WHERE a.session_id = ?1 ORDER BY a.created_at_ms, a.id"),
@@ -238,11 +249,17 @@ pub fn of_session(
 }
 
 /// Every approval this person may decide now, in every held database,
-/// oldest first: the decisions panel.
+/// oldest first: the decisions panel. Only of sessions whose trace they
+/// read now.
 pub fn waiting(sources: &[Source], refusals: &Refusals, now_ms: i64) -> Vec<AgentApprovalVm> {
     let mut all: Vec<AgentApprovalVm> = Vec::new();
     for source in sources {
         let directory = crate::hq::sessions::directory(source);
+        let reading: std::collections::HashSet<String> = crate::hq::sessions::held(source)
+            .into_iter()
+            .filter(|membership| membership.reads_trace)
+            .map(|membership| membership.id)
+            .collect();
         all.extend(
             read(
                 source,
@@ -250,6 +267,7 @@ pub fn waiting(sources: &[Source], refusals: &Refusals, now_ms: i64) -> Vec<Agen
                 &[],
             )
             .iter()
+            .filter(|row| reading.contains(text(row, "session_id")))
             .filter_map(|row| vm(source, row, &directory, refusals, now_ms))
             .filter(|approval| approval.can_decide),
         );
@@ -353,7 +371,7 @@ impl Decisions {
             match source.replica.delivery(commit) {
                 Ok(Delivery::Pending) | Err(_) => true,
                 Ok(Delivery::Applied | Delivery::Unknown) => false,
-                Ok(Delivery::Refused(sentence)) => {
+                Ok(Delivery::Refused(rejection)) => {
                     let still_pending = !read(
                         source,
                         "SELECT 1 FROM approvals WHERE id = ?1 \
@@ -365,7 +383,10 @@ impl Decisions {
                     )
                     .is_empty();
                     if still_pending {
-                        refusals.insert((o.database.clone(), o.approval_id.clone()), sentence);
+                        refusals.insert(
+                            (o.database.clone(), o.approval_id.clone()),
+                            refused_because(&rejection),
+                        );
                     }
                     still_pending
                 }
@@ -408,6 +429,26 @@ pub fn decision_op(
 #[error("{0}")]
 pub struct Refusal(pub String);
 
+/// Why the server refused a decision, in keeper's words where its code is
+/// one keeper knows (matched exactly); any other as the server said it. It
+/// follows "The server refused your decision: ".
+pub fn refused_because(rejection: &Rejection) -> String {
+    match rejection.code.as_str() {
+        "hq.v8.not_reader" => {
+            "you no longer read this session's thinking and tool calls, so its requests \
+             are not yours to decide."
+                .to_owned()
+        }
+        _ if rejection.message.is_empty() => rejection.code.clone(),
+        _ => rejection.message.clone(),
+    }
+}
+
+/// keeper's own refusal of a decision by a person who does not read the
+/// session's trace now, before anything is written.
+pub const NOT_A_READER: &str = "You no longer read this session's thinking and tool calls, \
+     so its requests are not yours to decide.";
+
 /// Write this person's decision on `approval_id`, bound to the digest they
 /// were shown, then wait up to [`DECISION_WAIT`] for the server: taken, or
 /// waiting on this device, or refused with the server's sentence. The
@@ -422,6 +463,12 @@ pub fn decide(
     approve: bool,
     now_ms: i64,
 ) -> Result<AgentDecisionOutcomeVm, Refusal> {
+    // A member who does not read the trace holds no request to decide, even
+    // where its row is still here (withdrawn, removed, or pinned by the
+    // outbox).
+    if !reads_trace(source, session_id) {
+        return Err(Refusal(NOT_A_READER.to_owned()));
+    }
     let rows = read(
         source,
         &format!("{SELECT} WHERE a.id = ?1 AND a.session_id = ?2"),
@@ -484,7 +531,12 @@ pub fn decide(
                     sentence: if approve { "Approved." } else { "Denied." }.to_owned(),
                 })
             }
-            Ok(Delivery::Refused(sentence)) => return Err(Refusal(sentence)),
+            Ok(Delivery::Refused(rejection)) => {
+                return Err(Refusal(format!(
+                    "The server refused your decision: {}",
+                    refused_because(&rejection)
+                )))
+            }
             Ok(Delivery::Pending | Delivery::Unknown) | Err(_) => {}
         }
         if std::time::Instant::now() >= deadline {

@@ -537,18 +537,26 @@ fn a_decision_is_bound_to_the_digest_shown_and_to_the_approvers() {
 
 /// A replica that answers as the real one does, except that its writes can
 /// be held (as behind a stalled round), its commits can be refused (as the
-/// server would), and the version it reports for every row can be set.
-/// The People sheet's tests refuse a leave through it too.
+/// server would), the version it reports for every row can be set, and its
+/// server commands can be answered by a stand-in server. The People sheet's
+/// tests refuse a leave and lose a command's answer through it too.
 pub(super) struct Staged {
     inner: Arc<dyn crate::hq::port::Replica>,
     held: std::sync::Mutex<bool>,
     released: std::sync::Condvar,
-    pub(super) refused: std::sync::Mutex<HashMap<String, String>>,
+    pub(super) refused: std::sync::Mutex<HashMap<String, crate::hq::port::Rejection>>,
     version: Option<i64>,
     written: std::sync::Mutex<Vec<Vec<RowOp>>>,
     /// Every commit written through it, in order.
     pub(super) commits: std::sync::Mutex<Vec<String>>,
+    /// Answers `remote_command` (operation, request id, params) in place
+    /// of a server.
+    pub(super) server: std::sync::Mutex<Option<ServerCommand>>,
 }
+
+/// A stand-in server's answer to one command.
+pub(super) type ServerCommand =
+    Box<dyn FnMut(&str, &str, &Value) -> Result<(), crate::hq::port::ReplicaError> + Send>;
 
 impl Staged {
     pub(super) fn over(source: &Source, version: Option<i64>) -> (Arc<Staged>, Source) {
@@ -560,6 +568,7 @@ impl Staged {
             version,
             written: std::sync::Mutex::new(Vec::new()),
             commits: std::sync::Mutex::new(Vec::new()),
+            server: std::sync::Mutex::new(None),
         });
         let wrapped = Source {
             replica: Arc::clone(&staged) as Arc<dyn crate::hq::port::Replica>,
@@ -655,8 +664,8 @@ impl crate::hq::port::Replica for Staged {
         &self,
         commit: &str,
     ) -> Result<crate::hq::port::Delivery, crate::hq::port::ReplicaError> {
-        if let Some(sentence) = self.refused.lock().expect("refused").get(commit) {
-            return Ok(crate::hq::port::Delivery::Refused(sentence.clone()));
+        if let Some(rejection) = self.refused.lock().expect("refused").get(commit) {
+            return Ok(crate::hq::port::Delivery::Refused(rejection.clone()));
         }
         self.inner.delivery(commit)
     }
@@ -673,6 +682,9 @@ impl crate::hq::port::Replica for Staged {
         request: &str,
         params: Value,
     ) -> Result<(), crate::hq::port::ReplicaError> {
+        if let Some(server) = self.server.lock().expect("server").as_mut() {
+            return server(id, request, &params);
+        }
         self.inner.remote_command(id, request, params)
     }
     fn sync_now(&self) {
@@ -825,7 +837,10 @@ fn a_refusal_after_the_wait_reaches_the_request_and_survives_a_relaunch() {
     };
     staged.refused.lock().expect("refused").insert(
         pending_commit,
-        "a tier-4 decision must come from another host".to_owned(),
+        crate::hq::port::Rejection::new(
+            "hq.v8.tier4_host",
+            "a tier-4 decision must come from another host",
+        ),
     );
     let relaunched = approvals::Decisions::load(path);
     let refusals = relaunched.refusals(std::slice::from_ref(&source));

@@ -515,6 +515,9 @@ struct Staged {
     /// The stream on thread `older` says it is drawing its view (reading the
     /// messages, its tails already kept) and draws on once released.
     projecting: Mutex<Option<Gate>>,
+    /// The People sheet read on thread `people` says it has read the
+    /// members, and returns them once released.
+    people: Mutex<Option<Gate>>,
     /// What every thread the staging does not name reads.
     others: Mutex<Vec<crate::hq::port::Peer>>,
 }
@@ -539,7 +542,16 @@ impl Replica for Staged {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
-        self.inner.query(sql, params)
+        let rows = self.inner.query(sql, params)?;
+        if std::thread::current().name() == Some("people")
+            && sql.contains("reads_trace FROM session_members WHERE session_id")
+        {
+            if let Some((entered, release)) = lock(&self.people).take() {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            }
+        }
+        Ok(rows)
     }
     fn query_covered(
         &self,
@@ -666,6 +678,7 @@ impl Opener for StagedOpener {
             entered: Mutex::new(Some(entered)),
             early_done: Mutex::new(Some(early_done)),
             projecting: Mutex::new(None),
+            people: Mutex::new(None),
             others: Mutex::new(tail(6, "")),
         });
         *lock(&self.0) = Some(Arc::clone(&staged));
@@ -908,4 +921,56 @@ async fn a_view_preference_a_settings_file_sets_stays_as_the_file_says() {
             show_details: false,
         }
     );
+}
+
+/// R1064K-03: a change to a session's people that lands while its sheet is
+/// first read — after the members were read, before the stream follows the
+/// feed — is still reported by the feed the stream follows, so the stream
+/// reads again instead of keeping the stale sheet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_people_change_while_the_sheet_is_first_read_is_not_missed() {
+    let world = World::new();
+    let (hq, staged, key) = staged_session(&world, true, &[]).await;
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    *lock(&staged.people) = Some((entered_tx, released));
+    let watching = {
+        let hq = Arc::clone(&hq);
+        let key = key.clone();
+        std::thread::Builder::new()
+            .name("people".to_owned())
+            .spawn(move || hq.session_members_watched(&key).expect("the sheet"))
+            .expect("spawns")
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the members are read");
+    // Ben's membership lands now, and the service says so.
+    staged
+        .mutate(vec![RowOp::Upsert {
+            table: "session_members".to_owned(),
+            values: sessions::object(serde_json::json!({"id": "ana.1.1/ben",
+                "session_id": "ana.1.1", "actor_id": "ben", "role": "person",
+                "reads_trace": false, "added_by_actor": "ana", "added_at_ms": 1,
+                "read_until": null, "author_actor": "server", "author_client": "server"})),
+            base_version: None,
+        }])
+        .expect("ben arrives");
+    hq.touch();
+    release.send(()).expect("releases");
+    let (sheet, changes) = watching.join().expect("joins");
+    assert!(
+        sheet.members.iter().all(|m| m.actor_id != "ben"),
+        "the first sheet was read before Ben arrived"
+    );
+    assert!(
+        changes.has_changed().expect("the service is alive"),
+        "the feed reports the change, so the stream reads the sheet again"
+    );
+    assert!(hq
+        .session_members(&key)
+        .expect("again")
+        .members
+        .iter()
+        .any(|m| m.actor_id == "ben"));
 }

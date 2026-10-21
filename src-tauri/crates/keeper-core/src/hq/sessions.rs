@@ -377,6 +377,19 @@ pub fn held(source: &Source) -> Vec<Held> {
     .collect()
 }
 
+/// Whether this person's membership of `session_id` reads its trace now: no
+/// membership (removed, or left) reads nothing. What a view shows of the
+/// trace asks this, never only whether the rows are still on the device.
+pub fn reads_trace(source: &Source, session_id: &str) -> bool {
+    read(
+        source,
+        "SELECT reads_trace FROM session_members WHERE session_id = ?1 AND actor_id = ?2",
+        &[Value::from(session_id), Value::from(source.actor.as_str())],
+    )
+    .first()
+    .is_some_and(|row| truthy(row, "reads_trace"))
+}
+
 /// Each window's units for one database: every session row and its members;
 /// for each active session its streamed chunks, its claim and its tool switches, and
 /// its newest months (widened by `widen` for an opened one); its trace

@@ -15,6 +15,7 @@
 //! KEEPER_HQ_LIVE_AGENT=<an agent in the first database's directory, for the Agents window> \
 //! KEEPER_HQ_LIVE_AGENT_2=<for many people: an agent in the second database's directory> \
 //! KEEPER_HQ_LIVE_OTHER_DB_ACTOR=<for many people: a person of the second database alone>:<that database> \
+//! KEEPER_HQ_LIVE_APPROVAL=<optional, many people: a message the first database's agent answers by asking for an approval> \
 //! KEEPER_HQ_LIVE_MODEL_RECORD=<for the tool switches: a URL answering the model's requests as JSON> \
 //! KEEPER_HQ_LIVE_KILL=<for the killed instance, run last: a URL that SIGKILLs the agent's instance> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
@@ -1865,7 +1866,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     .await;
     match delivered(&ra, &forged_invite).await {
         Delivery::Refused(reason) => {
-            assert!(reason.contains("v11"), "{reason}");
+            assert_eq!(reason.code, "hq.v11.invite_outside_directory", "{reason}");
             println!("PASS the server refuses an invite naming {outsider} in {first}: {reason}");
         }
         other => panic!("an invite across databases was {other:?}"),
@@ -1962,7 +1963,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     .await;
     match delivered(&rk, &forged).await {
         Delivery::Refused(reason) => {
-            assert!(reason.contains("author"), "{reason}");
+            assert_eq!(reason.code, "hq.v1.author_actor", "{reason}");
             println!("PASS a message claiming {actor} from {guest}'s device is refused: {reason}");
         }
         other => panic!("a forged author was {other:?}"),
@@ -1985,7 +1986,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     .await;
     match delivered(&rk, &invite_by_guest).await {
         Delivery::Refused(reason) => {
-            assert!(reason.contains("owner_only"), "{reason}");
+            assert_eq!(reason.code, "hq.v3.owner_only", "{reason}");
             println!(
                 "PASS an invite written by a member who is not the owner is refused: {reason}"
             );
@@ -2045,18 +2046,70 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
         "PASS granted: the guest reads the trace and holds {held} reasoning rows {} ms after the grant",
         granted_at.elapsed().as_millis()
     );
+    // R1064K-01: with `KEEPER_HQ_LIVE_APPROVAL` naming a message the first
+    // database's agent answers by asking for an approval, the guest — a
+    // reader now — is shown that approval and holds its tool call before
+    // the flag is withdrawn, so the withdrawal has one to take away.
+    let approval = std::env::var("KEEPER_HQ_LIVE_APPROVAL").ok();
+    if let Some(asking) = &approval {
+        a.send(&key, asking).expect("a asks for a run");
+        let shown = until(
+            &k,
+            "the guest is shown the agent's approval",
+            Duration::from_secs(60),
+            || {
+                let view = k.session_view(&key).ok()?;
+                (!view.approvals.is_empty()).then_some(view.approvals.len())
+            },
+        )
+        .await;
+        let calls = count(&rk, "tool_calls", &key.session_id).await;
+        assert!(calls > 0, "the approval's tool call is on the guest's device");
+        println!(
+            "PASS granted: the guest is shown {shown} approval(s) of the session and holds {calls} tool call(s)"
+        );
+    }
     let withdrawing = {
         let (a, key, guest) = (Arc::clone(&a), key.clone(), guest.to_owned());
         tokio::task::spawn_blocking(move || a.set_member_reader(&key, &guest, false))
     };
     withdrawing.await.expect("joins").expect("withdraws");
-    until(
+    // The moment the guest's device knows the flag is withdrawn, its view
+    // shows no approval — whether or not the window has evicted the rows yet.
+    let (approvals_held, approvals_shown) = until(
         &k,
         "the guest no longer reads the trace",
         Duration::from_secs(30),
-        || k.session_view(&key).ok().filter(|v| !v.reads_trace),
+        || {
+            k.session_view(&key)
+                .ok()
+                .filter(|v| !v.reads_trace)
+                .map(|v| {
+                    let held = rk
+                        .query(
+                            "SELECT count(*) AS n FROM approvals WHERE session_id = ?1",
+                            &[json!(key.session_id)],
+                        )
+                        .ok()
+                        .and_then(|rows| rows.first().and_then(|r| r["n"].as_u64()))
+                        .unwrap_or(0);
+                    (held, v.approvals.len())
+                })
+        },
     )
     .await;
+    assert_eq!(approvals_shown, 0, "a non-reader is shown no approval");
+    assert!(
+        k.approvals_waiting()
+            .iter()
+            .all(|waiting| waiting.session_id != key.session_id),
+        "nothing of the session waits for the guest"
+    );
+    if approval.is_some() {
+        println!(
+            "PASS withdrawn: the guest's view showed no approval the moment it knew, with {approvals_held} approval row(s) still on the device"
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     while count(&rk, "reasoning", &key.session_id).await != 0 {
         assert!(

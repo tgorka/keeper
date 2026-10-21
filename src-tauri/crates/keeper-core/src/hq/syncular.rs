@@ -37,8 +37,8 @@ use syncular_client::{
 use tokio::sync::watch;
 
 use crate::hq::port::{
-    Covered, Delivery, LinkState, Opener, Peer, Replica, ReplicaError, ReplicaSpec, ReplicaState,
-    RowOp, Subscription, WindowBase, WindowState,
+    Covered, Delivery, LinkState, Opener, Peer, Rejection, Replica, ReplicaError, ReplicaSpec,
+    ReplicaState, RowOp, Subscription, WindowBase, WindowState, CONFLICT,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -970,21 +970,24 @@ impl Replica for SyncularReplica {
             CommitDelivery::Unknown { .. } => Delivery::Unknown,
             CommitDelivery::Known { outcome, .. } => match outcome.status {
                 CommitOutcomeStatus::Applied | CommitOutcomeStatus::Cached => Delivery::Applied,
-                CommitOutcomeStatus::Conflict => Delivery::Refused(
-                    "Someone changed this first; keeper shows what the server holds now."
-                        .to_owned(),
-                ),
+                CommitOutcomeStatus::Conflict => Delivery::Refused(Rejection::new(
+                    CONFLICT,
+                    "Someone changed this first; keeper shows what the server holds now.",
+                )),
                 CommitOutcomeStatus::Rejected => Delivery::Refused(
                     outcome
                         .results
                         .iter()
                         .find_map(|result| match result {
-                            CommitOperationOutcome::Error { rejection } => {
-                                Some(rejection.message.clone())
-                            }
+                            CommitOperationOutcome::Error { rejection } => Some(Rejection::new(
+                                rejection.code.clone(),
+                                rejection.message.clone(),
+                            )),
                             _ => None,
                         })
-                        .unwrap_or_else(|| "The server refused this.".to_owned()),
+                        .unwrap_or_else(|| {
+                            Rejection::new("sync.rejected", "The server refused this.")
+                        }),
                 ),
             },
         })
@@ -1034,16 +1037,35 @@ impl Replica for SyncularReplica {
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
-        let answer = client
-            .command(&mut transport, operation_id, request_id, &params)
-            .map_err(|error| ReplicaError::Client(error.to_string()));
+        let answer = client.command(&mut transport, operation_id, request_id, &params);
         transport.inner.shutdown();
-        let answer = answer?;
+        let answer = answer.map_err(|error| ReplicaError::Remote {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        })?;
+        // `cached`: this request id was applied before and its first answer
+        // is replayed (a retry whose earlier answer was lost) — a success.
         if answer.status == "rejected" {
-            return Err(ReplicaError::Client(format!(
-                "operation.rejected: {}",
-                Value::from(answer.results)
-            )));
+            let refusal = answer.results.iter().find_map(|result| {
+                let code = result.get("code").and_then(Value::as_str)?;
+                let message = result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or(code);
+                Some((code.to_owned(), message.to_owned()))
+            });
+            let (code, message) = refusal.unwrap_or_else(|| {
+                (
+                    "operation.rejected".to_owned(),
+                    Value::from(answer.results).to_string(),
+                )
+            });
+            return Err(ReplicaError::Remote {
+                code,
+                message,
+                retryable: false,
+            });
         }
         Ok(())
     }

@@ -26,7 +26,7 @@ use crate::hq::live::{
 use crate::hq::port::ReplicaError;
 use crate::hq::sessions::{
     earlier_months, int, is_ask, json, mark, month, newest_months, opt_text, page_key,
-    previous_month, read, text, truthy, window, Source,
+    previous_month, read, reads_trace, text, truthy, window, Source,
 };
 
 /// The registered `sessionPage` query's operation id, as `syncular/`'s
@@ -359,17 +359,6 @@ pub fn view(
         },
         newest_ms,
     ))
-}
-
-/// Whether this person's membership of the session reads its trace.
-fn reads_trace(source: &Source, session_id: &str) -> bool {
-    read(
-        source,
-        "SELECT reads_trace FROM session_members WHERE session_id = ?1 AND actor_id = ?2",
-        &[Value::from(session_id), Value::from(source.actor.as_str())],
-    )
-    .first()
-    .is_some_and(|row| truthy(row, "reads_trace"))
 }
 
 /// The person's messages a turn names: by an agent message or a streamed

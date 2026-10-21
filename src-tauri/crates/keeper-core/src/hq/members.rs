@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::hq::port::{Delivery, ReplicaError, RowOp};
+use crate::hq::port::{Delivery, Rejection, ReplicaError, RowOp};
 use crate::hq::sessions::{
     authored, mark, names, object, opt_text, read, text, truthy, AgentSessionRef, Source,
 };
@@ -96,8 +96,26 @@ pub struct AgentSessionMembersVm {
     pub notice: Option<String>,
 }
 
-/// A person added to a session: its database, the session and the person.
+/// A person of a session: its database, the session and the person.
 type Addition = (String, String, String);
+
+/// A server command about a member whose answer was never heard (the
+/// response lost, the connection dropped): the request id it went under and
+/// the member row it was asked about. Asking the same of that same row
+/// again reuses the id, so the server answers from its record (`cached`)
+/// if the first one was applied, rather than applying a second change —
+/// which, the person re-invited meanwhile, would remove their new
+/// membership. Asked of a newer row (the replica has seen them re-invited),
+/// or a different command, it is a new request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Unheard {
+    operation: String,
+    request_id: String,
+    row: String,
+}
+
+/// Commands whose answer was not heard, by database, session and member.
+static UNHEARD: LazyLock<Mutex<HashMap<Addition, Unheard>>> = LazyLock::new(Mutex::default);
 
 /// Additions written here whose outcome is still owed: the commit to look up.
 static ADDING: LazyLock<Mutex<HashMap<Addition, String>>> = LazyLock::new(Mutex::default);
@@ -277,8 +295,8 @@ fn settle(source: &Source, session_id: &str) -> Option<String> {
         }
         match source.replica.delivery(commit) {
             Ok(Delivery::Pending) => true,
-            Ok(Delivery::Refused(reason)) => {
-                refused.insert(key.clone(), refusal(actor, &source.database, &reason));
+            Ok(Delivery::Refused(rejection)) => {
+                refused.insert(key.clone(), refusal(actor, &source.database, &rejection));
                 false
             }
             Ok(Delivery::Applied | Delivery::Unknown) | Err(_) => false,
@@ -288,8 +306,8 @@ fn settle(source: &Source, session_id: &str) -> Option<String> {
     if let Some(commit) = leaving.get(&key) {
         match source.replica.delivery(commit) {
             Ok(Delivery::Pending) => {}
-            Ok(Delivery::Refused(reason)) => {
-                refused.insert(key.clone(), leave_refusal(&reason));
+            Ok(Delivery::Refused(rejection)) => {
+                refused.insert(key.clone(), leave_refusal(&rejection));
                 leaving.remove(&key);
             }
             Ok(Delivery::Applied | Delivery::Unknown) | Err(_) => {
@@ -300,21 +318,26 @@ fn settle(source: &Source, session_id: &str) -> Option<String> {
     refused.get(&key).cloned()
 }
 
-fn leave_refusal(reason: &str) -> String {
-    if reason.contains("owner_cannot_leave") {
-        "The server refused your leaving: the session's owner cannot leave it.".to_owned()
-    } else {
-        format!("The server refused your leaving: {reason}")
+/// A refused leave, by the server's code, matched exactly.
+fn leave_refusal(rejection: &Rejection) -> String {
+    match rejection.code.as_str() {
+        "hq.v3.owner_cannot_leave" => {
+            "The server refused your leaving: the session's owner cannot leave it.".to_owned()
+        }
+        _ => format!("The server refused your leaving: {rejection}"),
     }
 }
 
-fn refusal(actor: &str, database: &str, reason: &str) -> String {
-    if reason.contains("v11") {
-        format!("The server refused adding {actor}: they are not in {database}'s directory.")
-    } else if reason.contains("owner_only") {
-        format!("The server refused adding {actor}: only the session's owner adds people.")
-    } else {
-        format!("The server refused adding {actor}: {reason}")
+/// A refused addition, by the server's code, matched exactly.
+fn refusal(actor: &str, database: &str, rejection: &Rejection) -> String {
+    match rejection.code.as_str() {
+        "hq.v11.invite_outside_directory" | "hq.v11.invite" => {
+            format!("The server refused adding {actor}: they are not in {database}'s directory.")
+        }
+        "hq.v3.owner_only" => {
+            format!("The server refused adding {actor}: only the session's owner adds people.")
+        }
+        _ => format!("The server refused adding {actor}: {rejection}"),
     }
 }
 
@@ -375,34 +398,104 @@ fn changeable(source: &Source, session_id: &str, actor: &str) -> Result<AgentMem
         .ok_or_else(|| "They are not a member of this session.".to_owned())
 }
 
-fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> Result<(), String> {
-    source
-        .replica
-        .remote_command(
-            operation,
-            &ulid::Ulid::new().to_string(),
-            serde_json::json!({ "sessionId": session_id, "actorId": actor }),
+/// The member row `actor` holds in the session as this replica has it: when
+/// it was added, and its version. A row written again (the person removed
+/// and re-invited) reads differently.
+fn member_row(source: &Source, session_id: &str, actor: &str) -> String {
+    read(
+        source,
+        "SELECT added_at_ms, _sync_version AS version FROM session_members \
+         WHERE session_id = ?1 AND actor_id = ?2",
+        &[Value::from(session_id), Value::from(actor)],
+    )
+    .first()
+    .map(|row| {
+        format!(
+            "{}/{}",
+            row.get("added_at_ms").cloned().unwrap_or_default(),
+            row.get("version").cloned().unwrap_or_default()
         )
-        .map_err(|error| command_sentence(&source.database, &error))?;
-    source.replica.sync_now();
-    Ok(())
+    })
+    .unwrap_or_default()
 }
 
+/// Run the server's `operation` on `actor`'s membership. A command whose
+/// answer was not heard keeps its request id ([`Unheard`]), and whatever the
+/// answer the replica syncs at once: a change the server made reaches the
+/// sheet even when its answer did not.
+fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> Result<(), String> {
+    let key = (
+        source.database.clone(),
+        session_id.to_owned(),
+        actor.to_owned(),
+    );
+    let row = member_row(source, session_id, actor);
+    let request_id = match lock(&UNHEARD).get(&key) {
+        Some(unheard) if unheard.operation == operation && unheard.row == row => {
+            unheard.request_id.clone()
+        }
+        _ => ulid::Ulid::new().to_string(),
+    };
+    let answer = source.replica.remote_command(
+        operation,
+        &request_id,
+        serde_json::json!({ "sessionId": session_id, "actorId": actor }),
+    );
+    source.replica.sync_now();
+    match &answer {
+        // Nothing was sent: an earlier unheard request stays as it was.
+        Err(ReplicaError::NotSyncing | ReplicaError::Closed) => {}
+        Err(ReplicaError::Remote {
+            retryable: true, ..
+        }) => {
+            lock(&UNHEARD).insert(
+                key,
+                Unheard {
+                    operation: operation.to_owned(),
+                    request_id,
+                    row,
+                },
+            );
+        }
+        // Answered: applied, replayed (`cached`) or refused for good.
+        Ok(()) | Err(_) => {
+            lock(&UNHEARD).remove(&key);
+        }
+    }
+    answer.map_err(|error| command_sentence(&source.database, &error))
+}
+
+/// Why a command failed, by the server's stable code (and, for
+/// `operation.forbidden`, the reason `remove_member` gives as its message),
+/// matched exactly; anything else as the server said it.
 fn command_sentence(database: &str, error: &ReplicaError) -> String {
     match error {
         ReplicaError::NotSyncing | ReplicaError::Closed => format!(
             "This needs the server, and {database} is not syncing on this device now. Try again when it is."
         ),
-        ReplicaError::Client(message) if message.contains("not_owner") => {
-            "The server refused: only the session's owner changes who is in it.".to_owned()
+        ReplicaError::Remote {
+            retryable: true, ..
+        } => format!(
+            "keeper did not hear whether {database} made this change. Asking again asks about this same change, which the server never makes twice."
+        ),
+        ReplicaError::Remote { code, message, .. } if code == "operation.forbidden" => {
+            match message.as_str() {
+                "hq.remove_member.not_owner" => {
+                    "The server refused: only the session's owner changes who is in it.".to_owned()
+                }
+                "hq.remove_member.not_member" => {
+                    "The server refused: they are not a member of this session.".to_owned()
+                }
+                "hq.remove_member.self" => {
+                    "The server refused: the session's owner cannot remove themselves.".to_owned()
+                }
+                "hq.remove_member.agent" => {
+                    "The server refused: an agent is not removed from its session.".to_owned()
+                }
+                _ => "The server refused this change to the session's people.".to_owned(),
+            }
         }
-        ReplicaError::Client(message) if message.contains("not_member") => {
-            "The server refused: they are not a member of this session.".to_owned()
-        }
-        ReplicaError::Client(message) if message.contains("operation.forbidden") => {
-            "The server refused this change to the session's people.".to_owned()
-        }
-        ReplicaError::Client(message) => format!("The server could not make this change: {message}"),
+        other => format!("The server could not make this change: {other}"),
     }
 }
 
@@ -464,6 +557,19 @@ impl Hq {
     pub fn session_members(&self, key: &AgentSessionRef) -> Result<AgentSessionMembersVm, HqError> {
         let source = self.source(&key.database)?;
         view(&source, &key.session_id).map_err(HqError::Sentence)
+    }
+
+    /// The People sheet as it stands, and the change feed to follow it by:
+    /// registered before the sheet is read, so a change that lands while it
+    /// is read (a grant, a removal) is still a change the feed reports, and
+    /// the stream reads the sheet again rather than keeping a stale one.
+    pub fn session_members_watched(
+        &self,
+        key: &AgentSessionRef,
+    ) -> Result<(AgentSessionMembersVm, tokio::sync::watch::Receiver<u64>), HqError> {
+        let changes = self.changes();
+        let sheet = self.session_members(key)?;
+        Ok((sheet, changes))
     }
 
     /// Add a person of the session's database. The owner's.
