@@ -11,7 +11,8 @@
   },
   "schemaVersions": [
     { "version": 1, "through": "0001_initial" },
-    { "version": 2, "through": "0002_session_trust" }
+    { "version": 2, "through": "0002_session_trust" },
+    { "version": 3, "through": "0003_agent_profile_tools" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },

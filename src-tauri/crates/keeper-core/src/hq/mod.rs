@@ -35,6 +35,7 @@
 pub mod approvals;
 pub mod databases;
 pub mod identity;
+pub mod live;
 pub mod pairing;
 pub mod port;
 pub mod routes;
@@ -61,7 +62,7 @@ use tokio::time::Instant;
 use crate::error::CoreError;
 use crate::hq::databases::Authorization;
 use crate::hq::pairing::PairingCode;
-use crate::hq::port::{Link, LinkState, Opener, Replica, ReplicaSpec, Subscription};
+use crate::hq::port::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Subscription};
 use crate::hq::routes::{RouteError, Routes};
 use crate::hq::server::ServerUrl;
 use crate::hq::vm::{
@@ -76,9 +77,10 @@ const KEYCHAIN_PREFIX: &str = "agents-server/";
 /// actors and clients (the person's devices among them), by `dir`. Beside
 /// them each holds the person's memberships (`memberships`), from which the
 /// Agents window's windows follow ([`window`]).
-const DIRECTORY: [(&str, &str); 2] = [
+const DIRECTORY: [(&str, &str); 3] = [
     ("directoryActors", "actors"),
     ("directoryClients", "clients"),
+    ("directoryAgentProfiles", "agent_profiles"),
 ];
 
 /// The longest wait before a refused database is tried again.
@@ -223,6 +225,11 @@ pub struct Hq {
     window_task: Mutex<Option<JoinHandle<()>>>,
     /// Decisions whose outcome the server still owes ([`approvals::Decisions`]).
     decisions: std::sync::OnceLock<approvals::Decisions>,
+    /// What this viewer chose to see ([`live::AgentViewPrefsVm`]), once read.
+    prefs: Mutex<Option<live::AgentViewPrefsVm>>,
+    /// Ticks when only a presence document moved: the open sessions read
+    /// again on it, nothing else does.
+    live: watch::Sender<u64>,
 }
 
 fn no_server() -> HqStatusVm {
@@ -301,10 +308,12 @@ impl Hq {
             contacts: Arc::default(),
             status,
             changes,
+            live: watch::channel(0).0,
             views: Mutex::default(),
             windows: Mutex::default(),
             window_task: Mutex::default(),
             decisions: std::sync::OnceLock::new(),
+            prefs: Mutex::default(),
         })
     }
 
@@ -583,11 +592,27 @@ impl Hq {
         let me = self.me.clone();
         let watched = Arc::downgrade(replica);
         tokio::spawn(async move {
+            // Nothing is taken as seen before the first change: one landing
+            // before this task first runs is still published.
+            let mut last: Option<ReplicaState> = None;
             while states.changed().await.is_ok() {
-                let link = states.borrow_and_update().link;
+                let state = *states.borrow_and_update();
                 let Some(hq) = me.upgrade() else { return };
+                // A tail moving is the open sessions' alone: nothing the
+                // status or the list reads changed.
+                let presence_only = last.is_some_and(|last| {
+                    ReplicaState {
+                        presence: last.presence,
+                        ..state
+                    } == last
+                });
+                last = Some(state);
+                if presence_only {
+                    hq.live.send_modify(|tick| *tick = tick.wrapping_add(1));
+                    continue;
+                }
                 if let Some(database) = &database {
-                    hq.on_link(database, &watched, link, generation);
+                    hq.on_link(database, &watched, state.link, generation);
                 }
                 hq.publish();
             }

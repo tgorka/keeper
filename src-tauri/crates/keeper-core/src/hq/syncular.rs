@@ -429,6 +429,7 @@ struct Owner {
     dirty: bool,
     directory: u64,
     rows: u64,
+    presence: u64,
     state: watch::Sender<ReplicaState>,
 }
 
@@ -495,6 +496,7 @@ impl Owner {
             outbox,
             directory: 0,
             rows: 0,
+            presence: 0,
         });
         Ok(Owner {
             database: spec.database.clone(),
@@ -505,6 +507,7 @@ impl Owner {
             dirty: true,
             directory: 0,
             rows: 0,
+            presence: 0,
             state,
         })
     }
@@ -663,7 +666,13 @@ impl Owner {
         }
         for frame in self.transport.inner.take_inbound() {
             match frame {
-                Inbound::Text(text) => self.client.on_realtime_text(&text),
+                // Hello, presence and wake frames come as text; only a
+                // presence fanout changes a peer, and telling them apart
+                // here would parse each frame twice.
+                Inbound::Text(text) => {
+                    self.client.on_realtime_text(&text);
+                    self.presence += 1;
+                }
                 Inbound::Binary(bytes) => {
                     self.client.on_realtime_binary(&mut self.transport, &bytes)
                 }
@@ -756,6 +765,7 @@ impl Owner {
             outbox: self.client.status_snapshot().outbox,
             directory: self.directory,
             rows: self.rows,
+            presence: self.presence,
         };
         self.state.send_if_modified(|state| {
             let changed = *state != next;
@@ -775,6 +785,7 @@ impl Owner {
             outbox: self.client.status_snapshot().outbox,
             directory: self.directory,
             rows: self.rows,
+            presence: self.presence,
         };
         self.state.send_replace(next);
     }

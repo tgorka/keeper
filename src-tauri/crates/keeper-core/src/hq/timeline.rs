@@ -2,7 +2,10 @@
 //! holds them, newest months first and widened month by month as the person
 //! scrolls back, each message with its turn state (R465: *waiting* until the
 //! server has it, *sent*, *taken* once the agent's turn names it — never a
-//! read receipt) and an agent's ask (R-HQ-28); and its approvals.
+//! read receipt) and an agent's ask (R-HQ-28); its approvals; the answer
+//! still being written, an ended answer's details, thinking and tool steps
+//! as far as this viewer chose and may see them ([`live`]); the session's
+//! tools and whether it read outside content.
 //!
 //! An archived session holds no rows here. Opening it reads its newest page
 //! through the server's registered `sessionPage` query, read-only, page by
@@ -16,6 +19,10 @@ use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
 use crate::hq::approvals::{self, AgentApprovalVm};
+use crate::hq::live::{
+    self, AgentLiveTurnVm, AgentMessageDetailsVm, AgentSessionToolVm, AgentToolStepVm,
+    AgentViewPrefsVm, Extras, Live,
+};
 use crate::hq::port::ReplicaError;
 use crate::hq::sessions::{
     earlier_months, int, is_ask, json, mark, month, newest_months, opt_text, page_key,
@@ -87,6 +94,18 @@ pub struct AgentMessageVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub ask: Option<AgentSessionAskVm>,
+    /// An agent answer's details, when this viewer shows them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub details: Option<AgentMessageDetailsVm>,
+    /// An agent answer's thinking, for a reader who shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reasoning: Option<String>,
+    /// An agent answer's tool calls, for a reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub steps: Option<Vec<AgentToolStepVm>>,
 }
 
 /// What an opened session shows, whole, every time it changes.
@@ -117,6 +136,15 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub note: Option<String>,
+    /// This person may read the session's thinking and tool results.
+    pub reads_trace: bool,
+    /// The session has read outside content (`sessions.trust`, D-34).
+    pub untrusted: bool,
+    /// The answers still being written, oldest first.
+    pub live: Vec<AgentLiveTurnVm>,
+    /// The tools the agent offers here and whether each is on; empty while
+    /// no instance has said what it offers.
+    pub tools: Vec<AgentSessionToolVm>,
 }
 
 /// The pages of an archived session read so far through the server.
@@ -186,6 +214,10 @@ pub struct Opened {
     /// Months widened back beyond the newest page.
     pub widen: u32,
     pub remote: RemotePages,
+    /// The tails seen of its answers still being written.
+    pub live: Live,
+    /// What this viewer chose to see.
+    pub prefs: AgentViewPrefsVm,
 }
 
 /// A session's own row, as the view reads it.
@@ -196,12 +228,14 @@ pub struct SessionRow {
     pub archived: bool,
     pub created_ms: i64,
     pub last_activity_ms: i64,
+    /// `sessions.trust` is `untrusted`.
+    pub untrusted: bool,
 }
 
 pub fn session_row(source: &Source, session_id: &str) -> Option<SessionRow> {
     let rows = read(
         source,
-        "SELECT title, agent_actor, archived, created_at_ms, last_activity_ms \
+        "SELECT title, agent_actor, archived, created_at_ms, last_activity_ms, trust \
          FROM sessions WHERE id = ?1",
         &[Value::from(session_id)],
     );
@@ -212,6 +246,7 @@ pub fn session_row(source: &Source, session_id: &str) -> Option<SessionRow> {
         archived: truthy(row, "archived"),
         created_ms: int(row, "created_at_ms").unwrap_or(0),
         last_activity_ms: int(row, "last_activity_ms").unwrap_or(0),
+        untrusted: text(row, "trust") == "untrusted",
     })
 }
 
@@ -287,7 +322,14 @@ pub fn view(
         (rows, oldest_shown > first, loading, complete, None)
     };
     let taken = taken(source, session_id, &rows);
-    let messages = messages(source, &mut rows, &directory, &taken);
+    let reads_trace = reads_trace(source, session_id);
+    let extras = live::extras(source, session_id, reads_trace, opened.prefs.show_reasoning);
+    let ended: HashSet<String> = rows
+        .iter()
+        .filter(|row| text(row, "role") == "agent")
+        .filter_map(|row| opt_text(row, "turn_id"))
+        .collect();
+    let messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
     let newest_ms = messages.last().map(|m| m.created_at_ms);
     Ok((
         AgentSessionViewVm {
@@ -296,7 +338,6 @@ pub fn view(
             title: session.title,
             agent_mark: mark(&agent_name),
             agent_name,
-            agent_actor: session.agent_actor,
             archived: session.archived,
             read_only: session.archived,
             messages,
@@ -305,9 +346,25 @@ pub fn view(
             loading_earlier,
             complete,
             note,
+            reads_trace,
+            untrusted: session.untrusted,
+            live: live::turns(source, session_id, &opened.live, &ended, &extras),
+            tools: live::tools(source, session_id, &session.agent_actor),
+            agent_actor: session.agent_actor,
         },
         newest_ms,
     ))
+}
+
+/// Whether this person's membership of the session reads its trace.
+fn reads_trace(source: &Source, session_id: &str) -> bool {
+    read(
+        source,
+        "SELECT reads_trace FROM session_members WHERE session_id = ?1 AND actor_id = ?2",
+        &[Value::from(session_id), Value::from(source.actor.as_str())],
+    )
+    .first()
+    .is_some_and(|row| truthy(row, "reads_trace"))
 }
 
 /// The person's messages a turn names: by an agent message or a streamed
@@ -335,6 +392,8 @@ fn messages(
     rows: &mut [Map<String, Value>],
     directory: &HashMap<String, String>,
     taken: &HashSet<String>,
+    extras: &Extras,
+    prefs: AgentViewPrefsVm,
 ) -> Vec<AgentMessageVm> {
     let last_person = rows.iter().rposition(|row| text(row, "role") == "person");
     rows.iter()
@@ -359,6 +418,9 @@ fn messages(
                     }
                 });
             let metadata = json(row, "metadata");
+            let answer = role == AgentMessageRoleVm::Agent;
+            let turn = opt_text(row, "turn_id").filter(|_| answer);
+            let turn = turn.as_deref();
             let ask = (role == AgentMessageRoleVm::Agent && is_ask(&metadata)).then(|| {
                 AgentSessionAskVm {
                     options: metadata
@@ -386,6 +448,13 @@ fn messages(
                 created_at_ms: int(row, "created_at_ms").unwrap_or(0),
                 state,
                 ask,
+                details: (answer && prefs.show_details)
+                    .then(|| live::details(&metadata))
+                    .flatten(),
+                reasoning: turn
+                    .filter(|_| extras.thinking)
+                    .and_then(|turn| live::ended_thinking(extras, turn)),
+                steps: turn.and_then(|turn| extras.steps.get(turn).cloned()),
             })
         })
         .collect()

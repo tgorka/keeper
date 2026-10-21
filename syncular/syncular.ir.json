@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "schemaVersions": [
     {
       "version": 1,
@@ -12,6 +12,12 @@
       "version": 2,
       "migrations": [
         "0002_session_trust"
+      ]
+    },
+    {
+      "version": 3,
+      "migrations": [
+        "0003_agent_profile_tools"
       ]
     }
   ],
@@ -215,6 +221,11 @@
           "name": "author_client",
           "type": "string",
           "nullable": false
+        },
+        {
+          "name": "tools",
+          "type": "json",
+          "nullable": true
         }
       ],
       "scopes": [

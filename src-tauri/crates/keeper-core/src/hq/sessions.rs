@@ -307,11 +307,14 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 // ---------------------------------------------------------------------------
 
 /// The windows a replica holds, each along one scope variable.
-pub const WINDOWS: [(&str, &str); 5] = [
+pub const WINDOWS: [(&str, &str); 8] = [
     ("sessions", "session"),
     ("turn_chunks", "session"),
+    ("claims", "session"),
+    ("session_tool_switches", "session"),
     ("messages", "page"),
     ("approvals", "trace"),
+    ("reasoning", "trace"),
     ("tool_calls", "trace"),
 ];
 
@@ -372,12 +375,14 @@ pub fn held(source: &Source) -> Vec<Held> {
 }
 
 /// Each window's units for one database: every session row; for each
-/// active session its streamed chunks and its newest months (widened by
-/// `widen` for an opened one), its trace months only where the person
-/// reads the trace; nothing of an archived one.
+/// active session its streamed chunks, its claim and its tool switches, and
+/// its newest months (widened by `widen` for an opened one); its trace
+/// months only where the person reads the trace, and their thinking only
+/// while `reasoning` is shown; nothing of an archived one.
 pub fn plan(
     held: &[Held],
     widen: &HashMap<String, u32>,
+    reasoning: bool,
     now_ms: i64,
 ) -> Vec<(&'static str, Vec<String>)> {
     let mut sessions = BTreeSet::new();
@@ -403,11 +408,18 @@ pub fn plan(
         }
     }
     let trace: Vec<String> = trace.into_iter().collect();
+    let turns: Vec<String> = turns.into_iter().collect();
     vec![
         ("sessions", sessions.into_iter().collect()),
-        ("turn_chunks", turns.into_iter().collect()),
+        ("turn_chunks", turns.clone()),
+        ("claims", turns.clone()),
+        ("session_tool_switches", turns),
         ("messages", pages.into_iter().collect()),
         ("approvals", trace.clone()),
+        (
+            "reasoning",
+            if reasoning { trace.clone() } else { Vec::new() },
+        ),
         ("tool_calls", trace),
     ]
 }
@@ -963,13 +975,24 @@ mod tests {
             },
         ];
         let october = 1_790_928_000_000;
-        let plan: HashMap<_, _> = plan(&held, &HashMap::new(), october).into_iter().collect();
-        assert_eq!(plan["sessions"], vec!["c.1", "c.2", "c.3", "c.4"]);
-        assert_eq!(plan["turn_chunks"], vec!["c.1", "c.3"]);
-        assert_eq!(plan["messages"], vec!["c.1/2026-10", "c.3/2026-10"]);
+        let shown: HashMap<_, _> = plan(&held, &HashMap::new(), true, october)
+            .into_iter()
+            .collect();
+        assert_eq!(shown["sessions"], vec!["c.1", "c.2", "c.3", "c.4"]);
+        assert_eq!(shown["turn_chunks"], vec!["c.1", "c.3"]);
+        assert_eq!(shown["claims"], vec!["c.1", "c.3"]);
+        assert_eq!(shown["session_tool_switches"], vec!["c.1", "c.3"]);
+        assert_eq!(shown["messages"], vec!["c.1/2026-10", "c.3/2026-10"]);
         // Only a reader's trace is asked for: the server grants no other.
-        assert_eq!(plan["approvals"], vec!["c.1/2026-10"]);
-        assert_eq!(plan["tool_calls"], vec!["c.1/2026-10"]);
+        assert_eq!(shown["approvals"], vec!["c.1/2026-10"]);
+        assert_eq!(shown["tool_calls"], vec!["c.1/2026-10"]);
+        assert_eq!(shown["reasoning"], vec!["c.1/2026-10"]);
+        // Thinking nobody shows is not fetched; the rest of the trace is.
+        let hidden: HashMap<_, _> = plan(&held, &HashMap::new(), false, october)
+            .into_iter()
+            .collect();
+        assert!(hidden["reasoning"].is_empty());
+        assert_eq!(hidden["tool_calls"], vec!["c.1/2026-10"]);
     }
 
     #[test]
@@ -986,7 +1009,7 @@ mod tests {
             }),
         }];
         let widen = HashMap::from([("c.1".to_owned(), 9)]);
-        let plan: HashMap<_, _> = plan(&held, &widen, last).into_iter().collect();
+        let plan: HashMap<_, _> = plan(&held, &widen, false, last).into_iter().collect();
         assert_eq!(
             plan["messages"],
             vec!["c.1/2026-08", "c.1/2026-09", "c.1/2026-10"]

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
+use keeper_core::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::sessions::{
     diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
@@ -291,6 +292,7 @@ pub fn agent_session_open(
     let key = session(database, session_id);
     hq.open_session(&key).map_err(error)?;
     let mut changes = hq.changes();
+    let mut tails = hq.live_changes();
     let held = key.clone();
     let start = move |id: String| {
         tauri::async_runtime::spawn(async move {
@@ -315,7 +317,22 @@ pub fn agent_session_open(
                         tracing::debug!(%error, "an open agents session could not be read");
                     }
                 }
-                if changes.changed().await.is_err() {
+                // An answer still arriving is read again on its own, so one
+                // whose instance stopped says so with nothing else moving.
+                let arriving = shown
+                    .as_ref()
+                    .is_some_and(|view| view.live.iter().any(|turn| !turn.stopped));
+                let woke = async {
+                    tokio::select! {
+                        changed = changes.changed() => changed.is_ok(),
+                        changed = tails.changed() => changed.is_ok(),
+                    }
+                };
+                if arriving {
+                    if let Ok(false) = tokio::time::timeout(live::RECHECK, woke).await {
+                        return;
+                    }
+                } else if !woke.await {
                     return;
                 }
             }
@@ -328,6 +345,32 @@ pub fn agent_session_open(
 #[tauri::command]
 pub fn agent_session_close(subscription_id: String) {
     end(&subscription_id);
+}
+
+/// What this viewer chose to see of agents' turns, on this device.
+#[tauri::command]
+pub fn agent_view_prefs_get() -> Result<AgentViewPrefsVm, IpcError> {
+    Ok(hq()?.view_prefs())
+}
+
+/// Change what this viewer sees: only the fields present are written; the
+/// answer is what holds after, and every open session is drawn again.
+#[tauri::command]
+pub async fn agent_view_prefs_set(
+    patch: AgentViewPrefsPatch,
+) -> Result<AgentViewPrefsVm, IpcError> {
+    blocking(move |hq| hq.set_view_prefs(patch)).await
+}
+
+/// Switch a tool the agent offers off or back on for one session.
+#[tauri::command]
+pub async fn agent_session_tool_set(
+    database: String,
+    session_id: String,
+    name: String,
+    on: bool,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.set_session_tool(&session(database, session_id), &name, on)).await
 }
 
 /// The person scrolled to the top of an open session: earlier messages.

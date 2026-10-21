@@ -13,6 +13,8 @@
 //! KEEPER_HQ_LIVE_DATABASES=<the person's databases, comma-separated> \
 //! KEEPER_HQ_LIVE_ONE_DB_ACTOR=<optional: a person in one database>:<that database> \
 //! KEEPER_HQ_LIVE_AGENT=<an agent in the first database's directory, for the Agents window> \
+//! KEEPER_HQ_LIVE_MODEL_RECORD=<for the tool switches: a URL answering the model's requests as JSON> \
+//! KEEPER_HQ_LIVE_KILL=<for the killed instance, run last: a URL that SIGKILLs the agent's instance> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
 //! ```
 //!
@@ -1082,6 +1084,596 @@ async fn agents_window_archive_and_an_archived_session_opens_within_a_second() {
     println!("PASS unarchived on b: its {MESSAGES} messages are back");
     a.shutdown().await;
     b.shutdown().await;
+}
+
+/// A live answer against a real agent instance: a person writes to the
+/// agent in a new session; the answer grows in keeper-core's session view
+/// as the instance streams it — chunks and the presence tail folded, only
+/// ever growing, always a prefix of the answer — and a second device that
+/// pairs and opens the session mid-answer sees at least everything the
+/// first showed when it opened, then the same final row. Needs an instance
+/// of `KEEPER_HQ_LIVE_AGENT` serving the first database and a model that
+/// streams for several seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server and an agent instance; see the module docs"]
+async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
+    use keeper_core::hq::live::AgentViewPrefsPatch;
+    use keeper_core::hq::sessions::AgentSessionRef;
+    use keeper_core::hq::timeline::{AgentMessageRoleVm, AgentSessionViewVm};
+
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let databases: Vec<String> = env("KEEPER_HQ_LIVE_DATABASES")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    let database = databases[0].clone();
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let a = paired(
+        &device(&scratch.path().join("a")),
+        &server,
+        &operator,
+        &actor,
+        databases.len(),
+    )
+    .await;
+    a.set_view_prefs(AgentViewPrefsPatch {
+        show_reasoning: Some(true),
+        show_details: Some(true),
+    })
+    .expect("prefs");
+    let key: AgentSessionRef = {
+        let a = Arc::clone(&a);
+        let (database, agent) = (database.clone(), agent.clone());
+        tokio::task::spawn_blocking(move || a.new_session(&database, &agent, "long: tell me"))
+            .await
+            .expect("joins")
+            .expect("a new session")
+    };
+    a.open_session(&key).expect("opens");
+    let view_of = |hq: &Arc<Hq>, key: &AgentSessionRef| {
+        let (hq, key) = (Arc::clone(hq), key.clone());
+        async move {
+            tokio::task::spawn_blocking(move || hq.session_view(&key))
+                .await
+                .expect("joins")
+                .expect("a view")
+        }
+    };
+    let answer_of = |view: &AgentSessionViewVm| {
+        view.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == AgentMessageRoleVm::Agent)
+            .cloned()
+    };
+
+    // The second device opens the session once the first shows some text.
+    // It reports the moment it opened: what a had shown by then is what b
+    // must show at least.
+    let (opening_tx, mut opening_rx) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut late = Some({
+        let (server, operator, actor, key) =
+            (server.clone(), operator.clone(), actor.clone(), key.clone());
+        let dir = scratch.path().join("b");
+        let dbs = databases.len();
+        move || async move {
+            let b = paired(&device(&dir), &server, &operator, &actor, dbs).await;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while b.session_view(&key).is_err() {
+                assert!(Instant::now() < deadline, "b never held the session");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            opening_tx.send(Instant::now()).expect("main listens");
+            b.open_session(&key).expect("b opens");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let view = b.session_view(&key).expect("b's view");
+                if let Some(turn) = view.live.first() {
+                    if !turn.text.is_empty() {
+                        first_tx.send(turn.text.clone()).expect("main listens");
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "b never showed the answer");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            b
+        }
+    });
+
+    let started = Instant::now();
+    let mut changes = a.changes();
+    let mut tails = a.live_changes();
+    let mut shown: Vec<(u128, String)> = Vec::new();
+    // When each length was first shown, by this host's clock: against the
+    // model's emission times, the tail's delay from model to viewer.
+    let mut received: Vec<(i64, usize)> = Vec::new();
+    let mut reasoning_seen = false;
+    let mut late_task = None;
+    let mut a_at_open: Option<String> = None;
+    let mut b_first: Option<(String, String)> = None;
+    let final_view = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "no answer in 3 minutes"
+        );
+        let view = view_of(&a, &key).await;
+        if let Some(turn) = view.live.first() {
+            let last = shown.last().map_or("", |(_, text)| text.as_str());
+            assert!(
+                turn.text.starts_with(last),
+                "a showed {last:?}, then {:?}",
+                turn.text
+            );
+            if turn.text != last {
+                shown.push((started.elapsed().as_millis(), turn.text.clone()));
+                received.push((chrono::Utc::now().timestamp_millis(), turn.text.len()));
+            }
+            reasoning_seen |= turn.reasoning.as_ref().is_some_and(|r| !r.is_empty());
+        }
+        if shown.len() >= 5 {
+            if let Some(start) = late.take() {
+                late_task = Some(tokio::spawn(start()));
+            }
+        }
+        if let Ok(at) = opening_rx.try_recv() {
+            let by = at.saturating_duration_since(started).as_millis();
+            a_at_open = shown
+                .iter()
+                .take_while(|(when, _)| *when <= by)
+                .last()
+                .map(|(_, text)| text.clone());
+        }
+        if let Ok(text) = first_rx.try_recv() {
+            let a_now = shown.last().map(|(_, t)| t.clone()).unwrap_or_default();
+            b_first = Some((text, a_now));
+        }
+        if view.live.is_empty() && answer_of(&view).is_some() && !shown.is_empty() {
+            break view;
+        }
+        tokio::select! {
+            _ = changes.changed() => {}
+            _ = tails.changed() => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    };
+    let answer = answer_of(&final_view).expect("the agent's answer");
+    for (_, text) in &shown {
+        assert!(
+            answer.body.starts_with(text.as_str()),
+            "{text:?} is not a prefix of the answer"
+        );
+    }
+    let gaps: Vec<u128> = shown.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    println!(
+        "PASS a showed the answer growing in {} steps over {} ms (median step {} ms), each a prefix of the final {} bytes; the last shown {} the final row",
+        shown.len(),
+        shown.last().map_or(0, |(at, _)| *at) - shown[0].0,
+        {
+            let mut sorted = gaps.clone();
+            sorted.sort_unstable();
+            sorted.get(sorted.len() / 2).copied().unwrap_or(0)
+        },
+        answer.body.len(),
+        if shown.last().map(|(_, t)| t.as_str()) == Some(answer.body.as_str()) {
+            "equals"
+        } else {
+            "is a prefix of"
+        },
+    );
+    assert!(
+        shown.len() >= 20,
+        "token by token: only {} steps",
+        shown.len()
+    );
+    println!("RECEIVED {}", json!(received));
+    let details = answer.details.clone().expect("details, shown");
+    assert!(details.model.is_some(), "{details:?}");
+    println!("PASS the final row's details: {details:?}");
+    assert!(
+        reasoning_seen,
+        "a reader showing the thinking saw it stream"
+    );
+    assert!(answer.reasoning.is_some(), "and kept it after the end");
+    println!("PASS the thinking streamed beside the answer and stayed after it");
+
+    let b = late_task.expect("b started").await.expect("b joins");
+    let (b_text, a_then) = b_first.expect("b showed the answer while it was written");
+    let a_open = a_at_open.unwrap_or_default();
+    assert!(answer.body.starts_with(&b_text), "b's {b_text:?}");
+    assert!(
+        b_text.len() >= a_open.len(),
+        "b opened when a showed {} bytes, and showed only {}",
+        a_open.len(),
+        b_text.len()
+    );
+    println!(
+        "PASS b opened mid-answer when a showed {} bytes and at once showed {} (a then {}), of {}",
+        a_open.len(),
+        b_text.len(),
+        a_then.len(),
+        answer.body.len()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let b_answer = loop {
+        let view = view_of(&b, &key).await;
+        if let (true, Some(m)) = (view.live.is_empty(), answer_of(&view)) {
+            break m;
+        }
+        assert!(Instant::now() < deadline, "b never held the final row");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(b_answer.body, answer.body, "the same final row on both");
+    println!("PASS b ends on the same final row, byte for byte");
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// A member who does not read the trace, and a session's tool switches,
+/// against a real agent instance. The invited person sees the answer grow
+/// but is shown no thinking and no tool step, and holds no reasoning or
+/// tool-call row, even with *Show thinking* on; the owner, a reader, sees
+/// the thinking. The tools the agent says it offers are listed on; one
+/// switched off reaches the other member and is not offered to the model
+/// on the next turn, and switched back on it is again. Needs
+/// `KEEPER_HQ_LIVE_ONE_DB_ACTOR` (the invited person, in the first
+/// database), an instance of the agent whose `agent_profiles.tools` names
+/// at least one tool, and `KEEPER_HQ_LIVE_MODEL_RECORD`: a URL answering
+/// the requests the model was sent as JSON `[{ "lastUser", "tools" }]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server and an agent instance; see the module docs"]
+async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered() {
+    use keeper_core::hq::live::AgentViewPrefsPatch;
+    use keeper_core::hq::sessions::AgentSessionRef;
+    use keeper_core::hq::timeline::{AgentMessageRoleVm, AgentMessageVm, AgentSessionViewVm};
+
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let record = env("KEEPER_HQ_LIVE_MODEL_RECORD");
+    let databases = env("KEEPER_HQ_LIVE_DATABASES");
+    let database = databases.split(',').next().expect("a database").to_owned();
+    let guest_of = env("KEEPER_HQ_LIVE_ONE_DB_ACTOR");
+    let (guest, guest_db) = guest_of.split_once(':').expect("<actor>:<database>");
+    assert_eq!(guest_db, database, "the guest is in the first database");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let a = paired(
+        &device(&scratch.path().join("a")),
+        &server,
+        &operator,
+        &actor,
+        databases.split(',').count(),
+    )
+    .await;
+    let k = paired(
+        &device(&scratch.path().join("k")),
+        &server,
+        &operator,
+        guest,
+        1,
+    )
+    .await;
+    for hq in [&a, &k] {
+        hq.set_view_prefs(AgentViewPrefsPatch {
+            show_reasoning: Some(true),
+            show_details: Some(true),
+        })
+        .expect("prefs");
+    }
+    let client = a
+        .status()
+        .borrow()
+        .device
+        .as_ref()
+        .expect("a device")
+        .client_id
+        .clone();
+    let author = Author {
+        actor: actor.clone(),
+        client,
+    };
+    let first = ulid::Ulid::new().to_string();
+    let (id, _, mut ops) =
+        session_with_message(&author, 1, &agent, &first, "long: think it through");
+    if let RowOp::Upsert { values, .. } = &mut ops[0] {
+        values.insert("invite".to_owned(), json!(json!([guest]).to_string()));
+    }
+    mutate(&a.replica(&database).expect("a holds it"), ops).await;
+    let key = AgentSessionRef {
+        database: database.clone(),
+        session_id: id,
+    };
+    let view_of = |hq: &Arc<Hq>| {
+        let (hq, key) = (Arc::clone(hq), key.clone());
+        async move {
+            tokio::task::spawn_blocking(move || hq.session_view(&key))
+                .await
+                .expect("joins")
+        }
+    };
+    let answer_of = |view: &AgentSessionViewVm| -> Option<AgentMessageVm> {
+        view.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == AgentMessageRoleVm::Agent)
+            .cloned()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while view_of(&k).await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the guest never held the session"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    a.open_session(&key).expect("a opens");
+    k.open_session(&key).expect("k opens");
+
+    let (mut a_thinking, mut k_text) = (false, false);
+    let mut changes = a.changes();
+    let mut tails = a.live_changes();
+    let started = Instant::now();
+    let a_answer = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "no answer in 3 minutes"
+        );
+        let (va, vk) = (
+            view_of(&a).await.expect("a's view"),
+            view_of(&k).await.expect("k's view"),
+        );
+        assert!(
+            va.reads_trace && !vk.reads_trace,
+            "the owner reads the trace, the guest does not"
+        );
+        a_thinking |= va.live.iter().any(|t| t.reasoning.is_some());
+        k_text |= vk.live.iter().any(|t| !t.text.is_empty());
+        assert!(
+            vk.live
+                .iter()
+                .all(|t| t.reasoning.is_none() && t.steps.is_empty()),
+            "the guest was shown {:?}",
+            vk.live
+        );
+        if let (true, Some(answer)) = (va.live.is_empty() && a_thinking, answer_of(&va)) {
+            break answer;
+        }
+        tokio::select! {
+            _ = changes.changed() => {}
+            _ = tails.changed() => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    };
+    assert!(
+        a_answer.reasoning.is_some(),
+        "the owner keeps the thinking after the end"
+    );
+    assert!(k_text, "the guest saw the answer while it was written");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let k_answer = loop {
+        let view = view_of(&k).await.expect("k's view");
+        if let (true, Some(m)) = (view.live.is_empty(), answer_of(&view)) {
+            break m;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest never held the final row"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(k_answer.body, a_answer.body, "the same final row on both");
+    assert!(
+        k_answer.reasoning.is_none() && k_answer.steps.is_none(),
+        "{k_answer:?}"
+    );
+    let rk = k.replica(&database).expect("k holds it");
+    for table in ["reasoning", "tool_calls"] {
+        let rows = query(
+            &rk,
+            &format!("SELECT COUNT(*) AS n FROM {table} WHERE session_id = ?1"),
+            vec![json!(key.session_id)],
+        )
+        .await;
+        assert_eq!(rows[0]["n"], json!(0), "the guest holds {table} rows");
+    }
+    println!(
+        "PASS the owner saw the thinking stream and keeps it; the guest saw the answer grow, was shown no thinking or tool step and holds no reasoning or tool_calls row"
+    );
+
+    let offered: Vec<(String, bool)> = view_of(&a)
+        .await
+        .expect("a's view")
+        .tools
+        .into_iter()
+        .map(|tool| (tool.name, tool.on))
+        .collect();
+    assert!(
+        offered.len() >= 2 && offered.iter().all(|(_, on)| *on),
+        "{offered:?}"
+    );
+    let off = offered[0].0.clone();
+    let kept = offered[1].0.clone();
+    let tool_on_k = |want: bool| {
+        let k = Arc::clone(&k);
+        let off = off.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let tools = view_of(&k).await.expect("k's view").tools;
+                if tools.iter().any(|t| t.name == off && t.on == want) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the guest never showed {off} on = {want}: {tools:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let offered_for = |body: &'static str| {
+        let record = record.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let served: Value = reqwest::get(&record)
+                    .await
+                    .expect("the model's record")
+                    .json()
+                    .await
+                    .expect("json");
+                let asked = served.as_array().and_then(|all| {
+                    all.iter()
+                        .rev()
+                        .find(|s| s["lastUser"] == json!(body))
+                        .cloned()
+                });
+                if let Some(asked) = asked {
+                    return asked["tools"]
+                        .as_array()
+                        .map(|tools| {
+                            tools
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the model was never asked {body:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    a.set_session_tool(&key, &off, false).expect("switches off");
+    tool_on_k(false).await;
+    a.send(&key, "tools: one off").expect("sends");
+    let asked = offered_for("tools: one off").await;
+    assert!(
+        !asked.contains(&off) && asked.contains(&kept),
+        "offered {asked:?} with {off} off"
+    );
+    println!("PASS {off} switched off on a reached the guest, and the next turn offered the model {asked:?}");
+
+    a.set_session_tool(&key, &off, true).expect("switches on");
+    tool_on_k(true).await;
+    a.send(&key, "tools: all on").expect("sends");
+    let asked = offered_for("tools: all on").await;
+    assert!(
+        asked.contains(&off) && asked.contains(&kept),
+        "offered {asked:?} with {off} on"
+    );
+    println!("PASS {off} switched back on reached the guest, and the next turn offered it again: {asked:?}");
+    let refused = a.set_session_tool(&key, "not_offered", false);
+    assert!(
+        refused.is_err(),
+        "a tool the agent does not offer has no switch"
+    );
+    a.shutdown().await;
+    k.shutdown().await;
+}
+
+/// An instance killed mid-answer: the viewer keeps what was committed and,
+/// once the claim's lease lapses, says the answer stopped — no spinner
+/// without an end. Needs `KEEPER_HQ_LIVE_KILL`: a URL that SIGKILLs the
+/// agent's instance (and does not start it again). Run it last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server and an agent instance it may kill; see the module docs"]
+async fn an_answer_whose_instance_was_killed_says_it_stopped() {
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let kill = env("KEEPER_HQ_LIVE_KILL");
+    let databases = env("KEEPER_HQ_LIVE_DATABASES");
+    let database = databases.split(',').next().expect("a database").to_owned();
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let a = paired(
+        &device(&scratch.path().join("a")),
+        &server,
+        &operator,
+        &actor,
+        databases.split(',').count(),
+    )
+    .await;
+    let key = {
+        let a = Arc::clone(&a);
+        tokio::task::spawn_blocking(move || a.new_session(&database, &agent, "cut: a long one"))
+            .await
+            .expect("joins")
+            .expect("a new session")
+    };
+    a.open_session(&key).expect("opens");
+    let view_of = |hq: &Arc<Hq>| {
+        let (hq, key) = (Arc::clone(hq), key.clone());
+        async move {
+            tokio::task::spawn_blocking(move || hq.session_view(&key))
+                .await
+                .expect("joins")
+                .expect("a view")
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let view = view_of(&a).await;
+        if view.live.first().is_some_and(|turn| turn.text.len() >= 200) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no answer to cut");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    reqwest::get(&kill)
+        .await
+        .expect("kills")
+        .error_for_status()
+        .expect("killed");
+    let killed = Instant::now();
+    let at_kill = view_of(&a)
+        .await
+        .live
+        .first()
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    let mut last = at_kill.clone();
+    let stopped = loop {
+        let view = view_of(&a).await;
+        let turn = view
+            .live
+            .first()
+            .cloned()
+            .expect("the cut answer stays shown");
+        assert!(
+            turn.text.starts_with(&last) || last.starts_with(&turn.text),
+            "{last:?} then {:?}",
+            turn.text
+        );
+        assert!(!turn.text.is_empty(), "the committed part stays");
+        last = turn.text.clone();
+        if turn.stopped {
+            break turn;
+        }
+        assert!(
+            killed.elapsed() < keeper_core::hq::live::LEASE + Duration::from_secs(15),
+            "the answer never said it stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    println!(
+        "PASS killed at {} bytes shown; {} ms later the answer said it stopped, keeping {} bytes",
+        at_kill.len(),
+        killed.elapsed().as_millis(),
+        stopped.text.len()
+    );
+    a.shutdown().await;
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

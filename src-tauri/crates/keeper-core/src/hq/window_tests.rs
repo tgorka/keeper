@@ -335,7 +335,8 @@ fn archiving_shrinks_the_windows_and_an_outbox_pinned_row_survives() {
     ops.push(message("m1", "dev1.1", "person", t, None, Value::Null));
     w.alpha.replica.mutate(ops).expect("seed");
     let apply = |source: &Source| {
-        for (table, units) in sessions::plan(&sessions::held(source), &HashMap::new(), now()) {
+        for (table, units) in sessions::plan(&sessions::held(source), &HashMap::new(), false, now())
+        {
             source
                 .replica
                 .set_window(&sessions::window(table), &units)

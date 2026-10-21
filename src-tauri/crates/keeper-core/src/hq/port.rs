@@ -139,6 +139,9 @@ pub struct ReplicaState {
     /// Bumped whenever any row or window of the replica changes, locally or
     /// from the server: what a view over its rows reads again on.
     pub rows: u64,
+    /// Bumped whenever a presence document may have moved (a socket frame,
+    /// or the socket closing, which clears every peer).
+    pub presence: u64,
 }
 
 /// What became of a commit written here.
@@ -367,6 +370,7 @@ pub(crate) mod fake {
                 outbox: 0,
                 directory: 0,
                 rows: 0,
+                presence: 0,
             });
             let replica = Arc::new(FakeReplica {
                 spec,

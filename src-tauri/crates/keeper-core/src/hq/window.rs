@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions};
+use crate::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
 use crate::hq::send;
 use crate::hq::sessions::{
     self, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionRowVm, Source,
@@ -90,6 +91,13 @@ impl Hq {
         self.changes.subscribe()
     }
 
+    /// Ticks whenever only a presence document moved — a tail of an answer
+    /// being written: what an open session reads again on beside
+    /// [`Hq::changes`].
+    pub fn live_changes(&self) -> watch::Receiver<u64> {
+        self.live.subscribe()
+    }
+
     pub(crate) fn touch(&self) {
         self.changes
             .send_modify(|tick| *tick = tick.wrapping_add(1));
@@ -110,7 +118,12 @@ impl Hq {
                 .filter(|(key, _)| key.database == source.database)
                 .map(|(key, opened)| (key.session_id.clone(), opened.widen))
                 .collect();
-            let plan = sessions::plan(&sessions::held(&source), &widen, now);
+            let plan = sessions::plan(
+                &sessions::held(&source),
+                &widen,
+                self.view_prefs().show_reasoning,
+                now,
+            );
             for (table, units) in plan {
                 let key = (source.database.clone(), table);
                 if lock(&self.windows).get(&key) == Some(&units) {
@@ -174,19 +187,109 @@ impl Hq {
     }
 
     /// An opened session as it stands. Its read point is written after,
-    /// never before: the view is the replica's and waits on nothing.
+    /// never before: the view is the replica's and waits on nothing. The
+    /// tails present now are kept first, so one that leaves later is still
+    /// shown until its chunk arrives.
     pub fn session_view(&self, key: &AgentSessionRef) -> Result<AgentSessionViewVm, HqError> {
         let source = self.source(&key.database)?;
-        let opened = lock(&self.views).get(key).cloned().unwrap_or_default();
+        let mut opened = lock(&self.views).get(key).cloned().unwrap_or_default();
+        opened.prefs = self.view_prefs();
+        let now_ms = sessions::now_ms();
+        if let Some(session) = timeline::session_row(&source, &key.session_id) {
+            let presence = |scope: &str| {
+                source.replica.presence(scope).unwrap_or_else(|error| {
+                    tracing::debug!(database = %source.database, %error, "an agents presence could not be read");
+                    Vec::new()
+                })
+            };
+            let on_session = presence(&format!("session:{}", key.session_id));
+            let on_trace: Vec<_> =
+                sessions::newest_months(session.created_ms, session.last_activity_ms, now_ms)
+                    .iter()
+                    .flat_map(|m| {
+                        presence(&format!("trace:{}", sessions::page_key(&key.session_id, m)))
+                    })
+                    .collect();
+            opened.live.observe(
+                &on_session,
+                &on_trace,
+                live::claim(&source, &key.session_id),
+                std::time::Instant::now(),
+                now_ms,
+            );
+        }
         let refusals = self.refusals();
-        view_now(
+        let view = view_now(&source, &key.session_id, &opened, &refusals, now_ms)
+            .map_err(HqError::Sentence)?;
+        opened.live.settle(&view.live);
+        if let Some(held) = lock(&self.views).get_mut(key) {
+            held.live = opened.live;
+        }
+        Ok(view)
+    }
+
+    /// What this viewer chose to see, read once from this device's
+    /// settings and kept.
+    pub fn view_prefs(&self) -> AgentViewPrefsVm {
+        if let Some(prefs) = *lock(&self.prefs) {
+            return prefs;
+        }
+        let read = || -> Result<AgentViewPrefsVm, HqError> {
+            let data_dir = self.data_dir()?;
+            Ok(AgentViewPrefsVm {
+                show_reasoning: crate::registry::get_agents_show_reasoning(&data_dir)?,
+                show_details: crate::registry::get_agents_show_details(&data_dir)?,
+            })
+        };
+        match read() {
+            Ok(prefs) => *lock(&self.prefs).get_or_insert(prefs),
+            Err(error) => {
+                tracing::debug!(%error, "the agents view preferences could not be read");
+                AgentViewPrefsVm::default()
+            }
+        }
+    }
+
+    /// Write what is present in `patch` and answer what holds after. The
+    /// windows follow: the thinking is subscribed only while it is shown.
+    pub fn set_view_prefs(&self, patch: AgentViewPrefsPatch) -> Result<AgentViewPrefsVm, HqError> {
+        let data_dir = self.data_dir()?;
+        let mut prefs = self.view_prefs();
+        if let Some(shown) = patch.show_reasoning {
+            crate::registry::set_agents_show_reasoning(&data_dir, shown)?;
+            prefs.show_reasoning = shown;
+        }
+        if let Some(shown) = patch.show_details {
+            crate::registry::set_agents_show_details(&data_dir, shown)?;
+            prefs.show_details = shown;
+        }
+        *lock(&self.prefs) = Some(prefs);
+        self.touch();
+        Ok(prefs)
+    }
+
+    /// Switch an offered tool off or back on for one session.
+    pub fn set_session_tool(
+        &self,
+        key: &AgentSessionRef,
+        name: &str,
+        on: bool,
+    ) -> Result<(), HqError> {
+        let source = self.source(&key.database)?;
+        let session = timeline::session_row(&source, &key.session_id).ok_or_else(|| {
+            HqError::Sentence("This conversation is not on this device.".to_owned())
+        })?;
+        live::set_tool(
             &source,
             &key.session_id,
-            &opened,
-            &refusals,
+            &session.agent_actor,
+            name,
+            on,
             sessions::now_ms(),
         )
-        .map_err(HqError::Sentence)
+        .map_err(sentence)?;
+        self.touch();
+        Ok(())
     }
 
     /// A stream begins showing `key`: its window holds it (an archived one

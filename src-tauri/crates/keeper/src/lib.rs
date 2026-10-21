@@ -1053,6 +1053,10 @@ pub fn run() {
                 hq_ipc::agent_approvals_subscribe,
                 hq_ipc::agent_approvals_unsubscribe,
                 hq_ipc::agent_session_approval_decide,
+                // What a viewer chose to see, and a session's tool switches.
+                hq_ipc::agent_view_prefs_get,
+                hq_ipc::agent_view_prefs_set,
+                hq_ipc::agent_session_tool_set,
                 // The Bots surface's sync-free half (Epic 61, Story 61.4;
                 // split in Story 62.1), in the shared body for
                 // `config_layers`' reason: `keeper_core::bots` has no desktop

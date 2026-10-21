@@ -1249,6 +1249,38 @@ pub fn set_agents_server_url(
     )
 }
 
+/// Whether an agent's thinking is shown on this device; `"1"`/`"0"`, absent
+/// = off. Session state: it never leaves this device.
+const AGENTS_SHOW_REASONING_KEY: &str = "agents.show_reasoning";
+
+/// Whether an agent answer's details are shown on this device; `"1"`/`"0"`,
+/// absent = off. Session state: it never leaves this device.
+const AGENTS_SHOW_DETAILS_KEY: &str = "agents.show_details";
+
+pub fn get_agents_show_reasoning(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_SHOW_REASONING_KEY)?.as_deref() == Some("1"))
+}
+
+pub fn set_agents_show_reasoning(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_SHOW_REASONING_KEY,
+        if shown { "1" } else { "0" },
+    )
+}
+
+pub fn get_agents_show_details(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_SHOW_DETAILS_KEY)?.as_deref() == Some("1"))
+}
+
+pub fn set_agents_show_details(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_SHOW_DETAILS_KEY,
+        if shown { "1" } else { "0" },
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";

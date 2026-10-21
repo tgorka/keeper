@@ -478,6 +478,32 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The base URL of the agents server you run (`https://…` or `http://…`, no user name or password, no query). keeper reads which of its databases this device's pairing opens from `GET <url>/databases` and keeps one local replica of each; the device's token lives in the keychain, never here. Absent means no server: keeper contacts none, and what you write to an agent waits on this device.",
         example: "\"https://agents.example.org\"",
     },
+    KeySpec {
+        key: "agents.show_reasoning",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is what the person reading on this device chose to see of an agent's turn, and a \
+             file switching it would draw thinking on a screen whose reader turned it off",
+        ),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether an agent's thinking streams beside its answer on this device, for a session whose thinking you may read. Off until chosen; it never leaves this device.",
+        example: "",
+    },
+    KeySpec {
+        key: "agents.show_details",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is what the person reading on this device chose to see of an agent's answer, \
+             and a file switching it would change a screen its reader set",
+        ),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether an agent's answer shows its details on this device — model, tokens, time to first token, duration, finish. Off until chosen; it never leaves this device.",
+        example: "",
+    },
     // ---- bots ------------------------------------------------------------
     KeySpec {
         key: "bots.provider_credential_source.",
