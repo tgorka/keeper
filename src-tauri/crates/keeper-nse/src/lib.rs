@@ -31,7 +31,21 @@
 //!   one client lives at a time under the 24 MB ceiling (R339).
 //! - **No unwinding across the C ABI.** A panic below [`keeper_nse_handle`]
 //!   is the generic notification, not an aborted extension.
+//!
+//! **An agents server item (106.6; AD-432, D-35).** A push from the agents
+//! server names an item by ids alone (`userInfo["keeper_hq"]`). The Swift
+//! then hands over the keychain's `agents-server/…` pairings and the
+//! notifications already delivered ([`HqRequest`]) through the same entry,
+//! and [`answer_item`] makes one authenticated read of that item
+//! (`GET /<database>/push/item/{kind}/{id}`) with the pairing of the server
+//! whose replica of that database this device holds, and asks
+//! [`keeper_core::hq::push::classify`] what shows: an [`NseAnswer::Item`],
+//! which names the earlier notifications of the same item it replaces. No
+//! store is opened and nothing is written; an item that cannot be read —
+//! no pairing, the server or the tailnet unreachable, a refusal — is the
+//! generic notification.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
@@ -41,6 +55,10 @@ use std::time::{Duration, Instant};
 use keeper_core::agents::push::{shown_of, Classified, Shown};
 use keeper_core::auth::StoredSession;
 use keeper_core::container::{group_data_dir, MOVE_DONE};
+use keeper_core::hq::push::{
+    credential_for, read_item, replaces, Delivered, HqClassified, HqShown, PushedItem,
+};
+use keeper_core::hq::routes::HttpRoutes;
 use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
 use matrix_sdk::store::RoomLoadSettings;
@@ -75,12 +93,37 @@ pub struct NseRequest {
     pub passphrase: Option<String>,
 }
 
+/// What the extension's Swift hands over for a push from the agents server,
+/// as JSON: the App Group container's root, the push's `keeper_hq`, the
+/// keychain's `agents-server/<base URL>` items by key, and the keeper
+/// notifications already on the lock screen.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HqRequest {
+    pub group: PathBuf,
+    pub hq: serde_json::Value,
+    #[serde(default)]
+    pub pairings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub delivered: Vec<Delivered>,
+}
+
+/// An agents server item to show, and the notifications of the same item it
+/// replaces (a second delivery shows once).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ItemShown {
+    #[serde(flatten)]
+    pub shown: HqShown,
+    pub replaces: Vec<String>,
+}
+
 /// What the extension does with the notification, as JSON (`kind` tags it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum NseAnswer {
     /// Show this.
     Show(Shown),
+    /// Show this agents server item in place of `replaces`.
+    Item(ItemShown),
     /// Show nothing of it (whether iOS lets an extension show nothing
     /// without the filtering entitlement is DW-408's question).
     Drop,
@@ -231,6 +274,54 @@ async fn decide(
     }
 }
 
+/// What the lock screen shows for an agents server item (106.6): one read
+/// of the item with this device's pairing, classified on the phone.
+pub async fn answer_item(request: HqRequest) -> NseAnswer {
+    let data_dir = group_data_dir(&request.group);
+    if !data_dir.join(MOVE_DONE).is_file() {
+        return generic(NoStore::NotMoved);
+    }
+    let Some(pushed) = PushedItem::of_payload(&request.hq) else {
+        return generic("the push names no agents item");
+    };
+    let (server, token, actor) = match credential_for(&data_dir, &pushed, &request.pairings) {
+        Ok(credential) => credential,
+        Err(why) => return generic(why),
+    };
+    let read = read_item(
+        &HttpRoutes::new(),
+        &server,
+        &token,
+        &actor,
+        &pushed,
+        keeper_core::hq::sessions::now_ms(),
+    )
+    .await;
+    match read {
+        Ok(HqClassified::Show(shown)) => NseAnswer::Item(ItemShown {
+            replaces: replaces(&request.delivered, &pushed),
+            shown: *shown,
+        }),
+        Ok(HqClassified::Drop) => NseAnswer::Drop,
+        Err(why) => generic(format!("the agents item could not be read: {why}")),
+    }
+}
+
+/// The request's answer, within [`DEADLINE`].
+fn within_deadline(work: impl std::future::Future<Output = NseAnswer>, slow: &str) -> NseAnswer {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async {
+            tokio::time::timeout(DEADLINE, work)
+                .await
+                .unwrap_or_else(|_| generic(slow))
+        }),
+        Err(e) => generic(format!("no runtime: {e}")),
+    }
+}
+
 /// The lock that keeps one notification's client alive at a time in this
 /// process (R339): two concurrent clients would each open the store, the
 /// crypto store and a sliding sync with the same lock holder and connection
@@ -255,21 +346,25 @@ fn unwinding_stops_here(work: impl FnOnce() -> String + UnwindSafe) -> String {
 /// notification at a time ([`one_at_a_time`]). Why an answer is generic is
 /// warned through `tracing`.
 pub fn handle_json(request: &str) -> String {
-    let answer = match serde_json::from_str::<NseRequest>(request) {
-        Err(_) => generic("the extension's request does not read"),
-        Ok(request) => one_at_a_time(|| {
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(async {
-                    tokio::time::timeout(DEADLINE, answer(request))
-                        .await
-                        .unwrap_or_else(|_| generic("the event took too long to read"))
-                }),
-                Err(e) => generic(format!("no runtime: {e}")),
-            }
-        }),
+    let is_item = serde_json::from_str::<serde_json::Value>(request)
+        .is_ok_and(|value| value.get("hq").is_some());
+    let answer = if is_item {
+        match serde_json::from_str::<HqRequest>(request) {
+            Err(_) => generic("the extension's request does not read"),
+            Ok(request) => one_at_a_time(|| {
+                within_deadline(
+                    answer_item(request),
+                    "the agents item took too long to read",
+                )
+            }),
+        }
+    } else {
+        match serde_json::from_str::<NseRequest>(request) {
+            Err(_) => generic("the extension's request does not read"),
+            Ok(request) => one_at_a_time(|| {
+                within_deadline(answer(request), "the event took too long to read")
+            }),
+        }
     };
     if let NseAnswer::Generic { why } = &answer {
         tracing::warn!(%why, "keeper-nse: the notification stays as the gateway sent it");
@@ -278,7 +373,7 @@ pub fn handle_json(request: &str) -> String {
 }
 
 /// The one C-ABI entry the extension's Swift calls: `request` is the JSON of
-/// an [`NseRequest`]; the answer is the JSON of an [`NseAnswer`] — the
+/// an [`NseRequest`] or an [`HqRequest`]; the answer is the JSON of an [`NseAnswer`] — the
 /// generic one when anything below panics — owned by the caller until it
 /// hands it to [`keeper_nse_free`]. Null only when the answer held a NUL
 /// byte, which JSON escapes never do.
@@ -558,6 +653,265 @@ mod one_at_a_time_tests {
         assert_eq!(
             keys(&serde_json::to_value(generic("why")).expect("json")),
             BTreeSet::from(["kind", "why"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod item_tests {
+    //! The agents server branch over a real HTTP listener standing in for
+    //! keeper-hq's item route, answering recorded item JSON.
+    use super::*;
+    use keeper_core::hq::server::ServerUrl;
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    const TOKEN: &str = "tok-0123456789abcdef";
+    const ITEM: &str = "01JAPPROVAL0000000000000001";
+
+    /// A listener that answers every request with `status` and `body`, and
+    /// keeps each request's line and bearer header.
+    struct Server {
+        url: String,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    fn serve(status: u16, body: String) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let mut bearer = String::new();
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header
+                        .split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    {
+                        bearer = value.1.trim().to_owned();
+                    }
+                }
+                kept.lock()
+                    .expect("seen")
+                    .push((line.trim().to_owned(), bearer));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        Server { url, seen }
+    }
+
+    /// A moved group container holding ana's replica of `tgdrive` on `url`.
+    fn group(url: &str) -> tempfile::TempDir {
+        let group = tempfile::tempdir().expect("group");
+        let data = group_data_dir(group.path());
+        std::fs::create_dir_all(&data).expect("data");
+        std::fs::write(data.join(MOVE_DONE), "/old").expect("marker");
+        let server = ServerUrl::parse(url).expect("parses").expect("an address");
+        let replica = keeper_core::hq::databases::replica(&data, &server, "tgdrive", "ana");
+        std::fs::create_dir_all(replica.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&replica, b"").expect("replica");
+        group
+    }
+
+    fn request(group: &std::path::Path, url: &str, delivered: Value) -> String {
+        json!({
+            "group": group,
+            "hq": {"database": "tgdrive", "session_id": "ana.1.3", "kind": "approval",
+                   "item_id": ITEM},
+            "pairings": {
+                format!("agents-server/{url}"): json!({"token": TOKEN, "actorId": "ana",
+                    "clientId": "ana.1", "name": "keeper on kalypso"}).to_string(),
+                "session/01J9ZK3Y6V5T4R3Q2P1N0M9K8J": "{}",
+            },
+            "delivered": delivered,
+        })
+        .to_string()
+    }
+
+    /// The approval as the server's item route answers it (recorded shape).
+    fn approval(tier: &str, summary: &str) -> String {
+        json!({"database": "tgdrive", "kind": "approval", "session_id": "ana.1.3",
+            "item_id": ITEM, "row": {
+                "id": ITEM, "session_id": "ana.1.3", "page_key": "ana.1.3/2026-10",
+                "tool_call_id": "call-1", "tier": tier, "binding_digest": "d1",
+                "summary": summary, "approvers": "[\"ana\"]", "state": "pending",
+                "decided_by_actor": null, "decided_by_client": null,
+                "consumed_by_client": null, "expires_at_ms": 4_102_444_800_000_i64,
+                "created_at_ms": 1_000, "author_actor": "nixie",
+                "author_client": "nixie.electra"}})
+        .to_string()
+    }
+
+    fn answer(raw: &str) -> Value {
+        serde_json::from_str(raw).expect("json")
+    }
+
+    #[test]
+    fn an_approval_is_read_once_with_the_device_token_and_shown_in_keepers_words() {
+        let server = serve(200, approval("T2", "Run `git status` in keeper"));
+        let group = group(&server.url);
+        let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
+        assert_eq!(shown["kind"], "item", "{shown}");
+        assert_eq!(shown["title"], "nixie asks for a decision");
+        assert_eq!(shown["body"], "Run `git status` in keeper");
+        assert_eq!(shown["category"], "KEEPER_APPROVAL");
+        assert_eq!(shown["thread_id"], "tgdrive/ana.1.3");
+        assert_eq!(shown["item"]["item_id"], ITEM);
+        assert_eq!(shown["approval"]["binding_digest"], "d1");
+        assert_eq!(shown["replaces"], json!([]));
+        assert_eq!(
+            *server.seen.lock().expect("seen"),
+            [(
+                format!("GET /tgdrive/push/item/approval/{ITEM} HTTP/1.1"),
+                format!("Bearer {TOKEN}")
+            )],
+            "one authenticated read"
+        );
+    }
+
+    #[test]
+    fn a_t4_or_long_request_offers_deny_alone() {
+        for (tier, summary) in [
+            ("T4", "Delete the backups".to_owned()),
+            ("T1", "x".repeat(121)),
+        ] {
+            let server = serve(200, approval(tier, &summary));
+            let group = group(&server.url);
+            let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
+            assert_eq!(shown["category"], "KEEPER_APPROVAL_OPEN", "{tier}");
+            assert_ne!(shown["body"], summary.as_str());
+        }
+    }
+
+    #[test]
+    fn a_second_delivery_of_the_item_replaces_the_first() {
+        let server = serve(200, approval("T2", "list files"));
+        let group = group(&server.url);
+        let item = json!({"database": "tgdrive", "session_id": "ana.1.3", "kind": "approval",
+                          "item_id": ITEM});
+        let delivered = json!([
+            {"id": "first-delivery", "item": item},
+            {"id": "another-item", "item": {"database": "tgdrive", "session_id": "ana.1.3",
+                                             "kind": "approval", "item_id": "01JOTHER"}},
+            {"id": "a-matrix-one"},
+        ]);
+        let shown = answer(&handle_json(&request(group.path(), &server.url, delivered)));
+        assert_eq!(shown["replaces"], json!(["first-delivery"]));
+    }
+
+    #[test]
+    fn the_proxys_answer_shows_its_words_and_an_ask_shows_nothing() {
+        let message = |metadata: Value| {
+            json!({"database": "tgdrive", "kind": "message", "session_id": "ana.1.3",
+                "item_id": ITEM, "row": {"id": ITEM, "session_id": "ana.1.3",
+                "role": "agent", "body": "The build is green.", "body_blob": null,
+                "metadata": metadata, "created_at_ms": 1_000, "author_actor": "nixie",
+                "author_client": "nixie.electra"}})
+            .to_string()
+        };
+        let ask = |raw: String| raw.replace("\"approval\"", "\"message\"");
+        for (metadata, kind) in [(Value::Null, "item"), (json!("{\"kind\":\"ask\"}"), "drop")] {
+            let server = serve(200, message(metadata));
+            let group = group(&server.url);
+            let shown = answer(&handle_json(&ask(request(
+                group.path(),
+                &server.url,
+                json!([]),
+            ))));
+            assert_eq!(shown["kind"], kind, "{shown}");
+            if kind == "item" {
+                assert_eq!(shown["body"], "The build is green.");
+                assert_eq!(shown["category"], Value::Null);
+            }
+        }
+    }
+
+    #[test]
+    fn anything_unreadable_is_the_generic_notification() {
+        let refusals = [
+            (401, json!({"error": "sync.auth_required"}).to_string()),
+            (404, json!({"error": "hq.push_item.not_found"}).to_string()),
+            (403, json!({"error": "hq.push_item.not_reader"}).to_string()),
+            (200, "not json".to_owned()),
+            (200, approval("T2", "list").replace("ana.1.3", "ana.1.9")),
+        ];
+        for (status, body) in refusals {
+            let server = serve(status, body.clone());
+            let group = group(&server.url);
+            let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
+            assert_eq!(shown["kind"], "generic", "{status} {body}: {shown}");
+        }
+
+        // The server or the tailnet unreachable: a port nothing listens on.
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!("http://{}", listener.local_addr().expect("addr"))
+        };
+        let group_dir = group(&closed);
+        let shown = answer(&handle_json(&request(group_dir.path(), &closed, json!([]))));
+        assert_eq!(shown["kind"], "generic");
+
+        // No pairing for the server holding the database, or the move not
+        // done: generic, and no request made.
+        let server = serve(200, approval("T2", "list"));
+        let elsewhere = group("https://hq.example.org");
+        let shown = answer(&handle_json(&request(
+            elsewhere.path(),
+            &server.url,
+            json!([]),
+        )));
+        assert_eq!(shown["kind"], "generic");
+        let unmoved = tempfile::tempdir().expect("group");
+        let shown = answer(&handle_json(&request(
+            unmoved.path(),
+            &server.url,
+            json!([]),
+        )));
+        assert_eq!(shown["kind"], "generic");
+        assert!(server.seen.lock().expect("seen").is_empty());
+        assert!(!group_data_dir(unmoved.path()).exists(), "nothing created");
+    }
+
+    /// The keys the Swift reads from an item answer.
+    #[test]
+    fn the_item_answer_has_the_keys_the_swift_reads() {
+        let server = serve(200, approval("T2", "list files"));
+        let group = group(&server.url);
+        let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
+        let keys: std::collections::BTreeSet<&str> = shown
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "kind",
+                "title",
+                "subtitle",
+                "body",
+                "category",
+                "thread_id",
+                "item",
+                "approval",
+                "replaces",
+            ])
         );
     }
 }
