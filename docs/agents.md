@@ -51,8 +51,10 @@ The transcript scrolls inside its own viewport: a growing answer does not move t
 replace an unsent draft. Scrolling back stops following the newest text until you return to the
 bottom. If the claim ends without a final message, the retained text says **The answer stopped.**
 
-**Show thinking** and **Show details** start off and are remembered on this device
-(`agents.show_reasoning`, `agents.show_details`). Changing one writes only that preference.
+**Show thinking** and **Show details** start off and are your preferences on every device
+(`agents.show_reasoning`, `agents.show_details`, user-global, settable in a settings file).
+Changing one writes only that preference; a change synced from another device or a settings
+file reaches open sessions too.
 Thinking is offered only to a person who can read the session's trace, and reasoning enters the
 view only while that preference is on. It remains readable after the answer finishes. A person
 without trace access receives no reasoning or tool-result rows; the current tool's name is public
@@ -65,7 +67,8 @@ model-written HTML does not become HTML, and model-written links do not navigate
 
 **Tools** contains only tools the answering instance offers, from its definition and container.
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
-unknown or absent offered-tools list renders no Tools control. Changes wait for Rust's view; a
+unknown or absent offered-tools list renders no Tools control, and neither does a session that
+cannot be changed here (archived). Changes wait for Rust's view; a
 refusal is visible beside the controls. **Untrusted** marks a session that has read outside content;
 consequential actions still need a person.
 
