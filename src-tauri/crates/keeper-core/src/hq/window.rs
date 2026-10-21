@@ -194,7 +194,9 @@ impl Hq {
     /// shown until its chunk arrives. They are read and kept under the
     /// views' lock: two streams of one session (a remount opens the next
     /// before the last has closed) each add to the one kept set, so neither
-    /// writes back a set missing the other's tail.
+    /// writes back a set missing the other's tail. What a view settles
+    /// after is only what its own snapshot held: an older view never
+    /// forgets a turn a newer stream observed meanwhile.
     pub fn session_view(&self, key: &AgentSessionRef) -> Result<AgentSessionViewVm, HqError> {
         let source = self.source(&key.database)?;
         let prefs = self.view_prefs();
@@ -246,19 +248,21 @@ impl Hq {
         let view = view_now(&source, &key.session_id, &opened, &refusals, now_ms)
             .map_err(HqError::Sentence)?;
         if let Some(held) = lock(&self.views).get_mut(key) {
-            held.live.settle(&view.live);
+            held.live.settle(&opened.live, &view.live);
         }
         Ok(view)
     }
 
-    /// What this viewer chose to see, read from the settings once and kept
-    /// until they are written here or [`Hq::reconcile`] finds them moved.
+    /// What this viewer sees, as the settings resolve it (a settings file
+    /// wins), read once and kept until it is written here or
+    /// [`Hq::reconcile`] finds it moved.
     pub fn view_prefs(&self) -> AgentViewPrefsVm {
-        if let Some(prefs) = *lock(&self.prefs) {
+        let mut held = lock(&self.prefs);
+        if let Some(prefs) = *held {
             return prefs;
         }
         match self.read_view_prefs() {
-            Ok(prefs) => *lock(&self.prefs).get_or_insert(prefs),
+            Ok(prefs) => *held.insert(prefs),
             Err(error) => {
                 tracing::debug!(%error, "the agents view preferences could not be read");
                 AgentViewPrefsVm::default()
@@ -277,31 +281,41 @@ impl Hq {
     /// The settings may have moved under this process (a settings file, or
     /// a change synced from another device): read them again, and when
     /// they differ from what is kept, the windows and open views follow.
+    /// Read and kept under the one lock a write holds, so a read from
+    /// before a write is never kept after it.
     pub(crate) fn reread_view_prefs(&self) {
+        let mut held = lock(&self.prefs);
         let Ok(read) = self.read_view_prefs() else {
             return;
         };
-        let moved = lock(&self.prefs).replace(read) != Some(read);
+        let moved = held.replace(read) != Some(read);
+        drop(held);
         if moved {
             self.touch();
         }
     }
 
-    /// Write what is present in `patch` and answer what holds after. The
-    /// windows follow: the thinking is subscribed only while it is shown.
+    /// Write what is present in `patch` and answer what holds after — the
+    /// settings read again, so a settings file that sets a preference keeps
+    /// it, and the answer says so. Written, read and kept under one lock,
+    /// so a re-read racing it never keeps an older value. The windows and
+    /// open views follow when it moved: the thinking is subscribed only
+    /// while it is shown.
     pub fn set_view_prefs(&self, patch: AgentViewPrefsPatch) -> Result<AgentViewPrefsVm, HqError> {
         let data_dir = self.data_dir()?;
-        let mut prefs = self.view_prefs();
+        let mut held = lock(&self.prefs);
         if let Some(shown) = patch.show_reasoning {
             crate::registry::set_agents_show_reasoning(&data_dir, shown)?;
-            prefs.show_reasoning = shown;
         }
         if let Some(shown) = patch.show_details {
             crate::registry::set_agents_show_details(&data_dir, shown)?;
-            prefs.show_details = shown;
         }
-        *lock(&self.prefs) = Some(prefs);
-        self.touch();
+        let prefs = self.read_view_prefs()?;
+        let moved = held.replace(prefs) != Some(prefs);
+        drop(held);
+        if moved {
+            self.touch();
+        }
         Ok(prefs)
     }
 

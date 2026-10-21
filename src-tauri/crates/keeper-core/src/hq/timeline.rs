@@ -145,6 +145,10 @@ pub struct AgentSessionViewVm {
     /// The tools the agent offers here and whether each is on; empty while
     /// no instance has said what it offers.
     pub tools: Vec<AgentSessionToolVm>,
+    /// What this viewer sees of agents' turns, as the settings resolve it
+    /// now (a settings file wins): the state its switches show, whichever
+    /// device or file last changed it.
+    pub prefs: AgentViewPrefsVm,
 }
 
 /// The pages of an archived session read so far through the server.
@@ -350,6 +354,7 @@ pub fn view(
             untrusted: session.untrusted,
             live: live::turns(source, session_id, &opened.live, &ended, &extras),
             tools: live::tools(source, session_id, &session.agent_actor),
+            prefs: opened.prefs,
             agent_actor: session.agent_actor,
         },
         newest_ms,

@@ -512,7 +512,15 @@ struct Staged {
     /// ...and reads on once the stream on thread `early` is done, or after a
     /// while if that stream cannot get in.
     early_done: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// The stream on thread `older` says it is drawing its view (reading the
+    /// messages, its tails already kept) and draws on once released.
+    projecting: Mutex<Option<Gate>>,
+    /// What every thread the staging does not name reads.
+    others: Mutex<Vec<crate::hq::port::Peer>>,
 }
+
+/// One side says it got there; the other lets it go on.
+type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 fn tail(from_seq: i64, text: &str) -> Vec<crate::hq::port::Peer> {
     vec![crate::hq::port::Peer {
@@ -540,6 +548,12 @@ impl Replica for Staged {
         base: &crate::hq::port::WindowBase,
         units: &[String],
     ) -> Result<crate::hq::port::Covered, crate::hq::port::ReplicaError> {
+        if std::thread::current().name() == Some("older") {
+            if let Some((entered, release)) = lock(&self.projecting).take() {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            }
+        }
         self.inner.query_covered(sql, params, base, units)
     }
     fn subscribe(&self, s: Subscription) -> Result<(), crate::hq::port::ReplicaError> {
@@ -585,7 +599,10 @@ impl Replica for Staged {
                 }
                 Ok(tail(6, ""))
             }
-            _ => Ok(tail(6, "")),
+            // Before the answer began; then its first tail, from seq 0.
+            Some("older") => Ok(Vec::new()),
+            Some("newer") => Ok(tail(0, "hel")),
+            _ => Ok(lock(&self.others).clone()),
         }
     }
     fn upload_blob(
@@ -640,18 +657,22 @@ impl Opener for StagedOpener {
             inner: Arc::new(inner),
             entered: Mutex::new(Some(entered)),
             early_done: Mutex::new(Some(early_done)),
+            projecting: Mutex::new(None),
+            others: Mutex::new(tail(6, "")),
         });
         *lock(&self.0) = Some(Arc::clone(&staged));
         Ok(staged)
     }
 }
 
-/// R1063-01: two streams of one open session (a remount opens the next
-/// before the last has closed) read its tails at once. Whichever finishes
-/// last, the tail the other one kept is not lost: the answer only grows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_streams_of_one_session_never_drop_each_others_tail() {
-    let world = World::new();
+/// A started service on one staged replica holding `ana`'s session
+/// `ana.1.1` with agent `nixie`, the trace read or not, and `t1`'s chunks
+/// `chunks` from seq 0, opened by two streams.
+async fn staged_session(
+    world: &World,
+    reads_trace: bool,
+    chunks: &[&str],
+) -> (Arc<Hq>, Arc<Staged>, sessions::AgentSessionRef) {
     world.paired("https://hq.example.org", &["alpha"]);
     let opener = Arc::new(StagedOpener(Mutex::new(None)));
     let hq = Hq::new(
@@ -687,17 +708,26 @@ async fn two_streams_of_one_session_never_drop_each_others_tail() {
         upsert(
             "session_members",
             serde_json::json!({"id": "ana.1.1/ana", "session_id": "ana.1.1", "actor_id": "ana",
-                "role": "person", "reads_trace": false, "added_by_actor": "ana",
+                "role": "person", "reads_trace": reads_trace, "added_by_actor": "ana",
                 "added_at_ms": at, "read_until": null, "author_actor": "ana",
                 "author_client": "ana.1"}),
         ),
     ];
-    for (seq, text) in ["", "1", "2", "3", "4"].iter().enumerate() {
+    for (seq, text) in chunks.iter().enumerate() {
         seed.push(upsert(
             "turn_chunks",
             serde_json::json!({"id": format!("k{seq}"), "session_id": "ana.1.1",
                 "turn_id": "t1", "seq": seq, "text": text, "created_at_ms": at,
                 "author_actor": "nixie", "author_client": "nixie.box"}),
+        ));
+    }
+    if reads_trace {
+        seed.push(upsert(
+            "reasoning",
+            serde_json::json!({"id": "r1", "session_id": "ana.1.1",
+                "page_key": sessions::page_key("ana.1.1", &sessions::month(at)),
+                "turn_id": "t1", "seq": 1, "compacted": false, "text": "thinking",
+                "created_at_ms": at, "author_actor": "nixie", "author_client": "nixie.box"}),
         ));
     }
     staged.mutate(seed).expect("seeded");
@@ -707,12 +737,24 @@ async fn two_streams_of_one_session_never_drop_each_others_tail() {
     };
     hq.open_session(&key).expect("first stream");
     hq.open_session(&key).expect("second stream");
+    (hq, staged, key)
+}
+
+fn live_text(view: &timeline::AgentSessionViewVm) -> Option<String> {
+    view.live.first().map(|turn| turn.text.clone())
+}
+
+/// R1063-01: two streams of one open session (a remount opens the next
+/// before the last has closed) read its tails at once. Whichever finishes
+/// last, the tail the other one kept is not lost: the answer only grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_streams_of_one_session_never_drop_each_others_tail() {
+    let world = World::new();
+    let (hq, staged, key) = staged_session(&world, false, &["", "1", "2", "3", "4"]).await;
     let (entered_tx, entered) = std::sync::mpsc::channel();
     let (done, early_done) = std::sync::mpsc::channel();
     *lock(&staged.entered) = Some(entered_tx);
     *lock(&staged.early_done) = Some(early_done);
-    let text =
-        |view: &timeline::AgentSessionViewVm| view.live.first().map(|turn| turn.text.clone());
     // `late` reads first and holds inside its presence read until `early`
     // is done (or cannot be, because the read excludes it).
     let late = {
@@ -741,15 +783,121 @@ async fn two_streams_of_one_session_never_drop_each_others_tail() {
     let early = early.join().expect("early joins");
     let _late = late.join().expect("late joins");
     assert_eq!(
-        text(&early).as_deref(),
+        live_text(&early).as_deref(),
         Some("1234abc"),
         "early saw the tail"
     );
     // Chunk 5 has not landed: the kept tail is all that shows its text.
     let next = hq.session_view(&key).expect("the next read");
     assert_eq!(
-        text(&next).as_deref(),
+        live_text(&next).as_deref(),
         Some("1234abc"),
         "the answer shrank: a stream wrote back a set without the other's tail"
+    );
+}
+
+/// R1063-08: a view drawn from a snapshot taken before an answer began
+/// settles after a newer stream of the session showed that answer's first
+/// tail. The older view must not forget a turn it never saw: once the
+/// writer moves on to its next, still empty tail before the chunk lands
+/// here, the answer still shows what it showed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_view_never_forgets_a_turn_a_newer_stream_saw() {
+    let world = World::new();
+    let (hq, staged, key) = staged_session(&world, false, &[]).await;
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    *lock(&staged.projecting) = Some((entered_tx, released));
+    // After both views: chunk 0 is written but not here yet, and the
+    // writer's next tail is still empty.
+    *lock(&staged.others) = tail(1, "");
+    let older = {
+        let hq = Arc::clone(&hq);
+        let key = key.clone();
+        std::thread::Builder::new()
+            .name("older".to_owned())
+            .spawn(move || hq.session_view(&key).expect("older view"))
+            .expect("spawns")
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the older view is drawing from its snapshot");
+    let newer = {
+        let hq = Arc::clone(&hq);
+        let key = key.clone();
+        std::thread::Builder::new()
+            .name("newer".to_owned())
+            .spawn(move || hq.session_view(&key).expect("newer view"))
+            .expect("spawns")
+    }
+    .join()
+    .expect("newer joins");
+    assert_eq!(
+        live_text(&newer).as_deref(),
+        Some("hel"),
+        "the newer stream saw the tail"
+    );
+    release.send(()).expect("the older view waits");
+    let older = older.join().expect("older joins");
+    assert!(older.live.is_empty(), "drawn before the answer began");
+    let next = hq.session_view(&key).expect("the next read");
+    assert_eq!(
+        live_text(&next).as_deref(),
+        Some("hel"),
+        "the answer shrank: an older view forgot a turn it never saw"
+    );
+}
+
+/// R1063-09: a settings file that sets a view preference keeps it. Asking
+/// for the other value — thinking on where the file says off, details off
+/// where it says on — answers what holds, keeps it and draws by it.
+#[tokio::test]
+async fn a_view_preference_a_settings_file_sets_stays_as_the_file_says() {
+    let layers = crate::config::install_for_test(crate::config::layers_from(&[
+        (
+            "agents.show_reasoning",
+            "0",
+            crate::config::LayerTier::UserGlobal,
+        ),
+        (
+            "agents.show_details",
+            "1",
+            crate::config::LayerTier::UserGlobal,
+        ),
+    ]));
+    let world = World::new();
+    let (hq, staged, key) = staged_session(&world, true, &[""]).await;
+    *lock(&staged.others) = Vec::new();
+    let held = live::AgentViewPrefsVm {
+        show_reasoning: false,
+        show_details: true,
+    };
+    let answered = hq
+        .set_view_prefs(live::AgentViewPrefsPatch {
+            show_reasoning: Some(true),
+            show_details: Some(false),
+        })
+        .expect("writes");
+    assert_eq!(
+        answered, held,
+        "the caller learns what holds, not what it asked"
+    );
+    assert_eq!(hq.view_prefs(), held, "and that is what is kept");
+    let view = hq.session_view(&key).expect("view");
+    assert_eq!(view.prefs, held, "the switches show what holds");
+    assert!(view.reads_trace);
+    assert_eq!(
+        view.live[0].reasoning, None,
+        "no thinking the file keeps off"
+    );
+    // Without the file the written choice holds.
+    drop(layers);
+    hq.reconcile().await.expect("reconciles");
+    assert_eq!(
+        hq.view_prefs(),
+        live::AgentViewPrefsVm {
+            show_reasoning: true,
+            show_details: false,
+        }
     );
 }

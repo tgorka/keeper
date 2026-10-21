@@ -3,6 +3,7 @@ import type { AgentApprovalVm } from "./AgentApprovalVm";
 import type { AgentLiveTurnVm } from "./AgentLiveTurnVm";
 import type { AgentMessageVm } from "./AgentMessageVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
+import type { AgentViewPrefsVm } from "./AgentViewPrefsVm";
 
 /**
  * What an opened session shows, whole, every time it changes.
@@ -52,4 +53,10 @@ live: Array<AgentLiveTurnVm>,
  * The tools the agent offers here and whether each is on; empty while
  * no instance has said what it offers.
  */
-tools: Array<AgentSessionToolVm>, };
+tools: Array<AgentSessionToolVm>, 
+/**
+ * What this viewer sees of agents' turns, as the settings resolve it
+ * now (a settings file wins): the state its switches show, whichever
+ * device or file last changed it.
+ */
+prefs: AgentViewPrefsVm, };

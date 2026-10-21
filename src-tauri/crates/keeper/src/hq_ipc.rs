@@ -349,14 +349,9 @@ pub fn agent_session_close(subscription_id: String) {
     end(&subscription_id);
 }
 
-/// What this viewer chose to see of agents' turns, on this device.
-#[tauri::command]
-pub fn agent_view_prefs_get() -> Result<AgentViewPrefsVm, IpcError> {
-    Ok(hq()?.view_prefs())
-}
-
 /// Change what this viewer sees: only the fields present are written; the
-/// answer is what holds after, and every open session is drawn again.
+/// answer is what holds after (a settings file keeps a preference it sets),
+/// and every open session is drawn again with it (`AgentSessionViewVm.prefs`).
 #[tauri::command]
 pub async fn agent_view_prefs_set(
     patch: AgentViewPrefsPatch,

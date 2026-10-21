@@ -41,7 +41,8 @@ const STALE_MS: i64 = 120_000;
 /// so an answer whose instance stopped says so with nothing else changing.
 pub const RECHECK: Duration = Duration::from_secs(2);
 
-/// What this viewer chose to see, on this device (never synced).
+/// What this viewer chose to see — a person's settings, the same on every
+/// device (R-HQ-31), a settings file winning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -245,12 +246,14 @@ pub fn claim(source: &Source, session_id: &str) -> Option<Claim> {
 #[derive(Debug, Clone, Default)]
 pub struct Live {
     turns: HashMap<String, Turn>,
+    /// When this device first saw each turn being written — by a document
+    /// or by its chunks alone: how long a turn with no claim to judge it by
+    /// has gone without a document, when it never had one.
+    first: HashMap<String, Instant>,
     claim: Option<(Claim, Instant)>,
     /// The claim's holder is gone ([`LEASE`], [`STALE_MS`]) or let it go.
     lapsed: bool,
-    /// The first and the latest observation: how long a turn with no
-    /// claim to judge it by has gone without a document.
-    first: Option<Instant>,
+    /// The latest observation.
     at: Option<Instant>,
 }
 
@@ -270,7 +273,6 @@ impl Live {
         now: Instant,
         now_ms: i64,
     ) {
-        self.first.get_or_insert(now);
         self.at = Some(now);
         // A document that left takes its tool with it: a present one names
         // it again in this same pass.
@@ -285,6 +287,7 @@ impl Live {
             let Some(tail) = peer.doc.get("text").and_then(Value::as_str) else {
                 continue;
             };
+            self.first.entry(id.to_owned()).or_insert(now);
             let turn = self.turns.entry(id.to_owned()).or_default();
             turn.text.see(from_seq, tail);
             turn.tool = peer
@@ -303,6 +306,7 @@ impl Live {
             let Some(tail) = peer.doc.get("reasoning").and_then(Value::as_str) else {
                 continue;
             };
+            self.first.entry(id.to_owned()).or_insert(now);
             let turn = self.turns.entry(id.to_owned()).or_default();
             turn.reasoning.see(from_seq, tail);
             turn.client.get_or_insert_with(|| peer.client_id.clone());
@@ -321,23 +325,42 @@ impl Live {
         });
     }
 
-    /// Forget every turn that is no longer being written.
-    pub fn settle(&mut self, live: &[AgentLiveTurnVm]) {
+    /// Settle what `seen` — the snapshot a view was drawn from — tells of
+    /// the turns being written. A turn it held that the view no longer
+    /// shows has ended (a view shows every held turn but those with their
+    /// message), so it is forgotten. A turn it never held was observed
+    /// later, by another stream of the session: not this view's to forget.
+    /// A turn the view shows that this device had not seen yet — its
+    /// chunks arrived before any document — is first seen as of `seen`.
+    pub fn settle(&mut self, seen: &Live, live: &[AgentLiveTurnVm]) {
+        let shown = |id: &String| live.iter().any(|turn| turn.turn_id == *id);
         self.turns
-            .retain(|id, _| live.iter().any(|turn| turn.turn_id == *id));
+            .retain(|id, _| !seen.turns.contains_key(id) || shown(id));
+        self.first
+            .retain(|id, _| !seen.first.contains_key(id) || shown(id));
+        if let Some(at) = seen.at {
+            for turn in live {
+                self.first.entry(turn.turn_id.clone()).or_insert(at);
+            }
+        }
     }
 
-    /// Whether the instance writing a turn has stopped: its document has
+    /// Whether the instance writing turn `id` has stopped: its document has
     /// left and its claim lapsed, or went to another instance. With no
     /// claim row to judge by (not yet replicated, or gone), a turn whose
-    /// document has been away a whole lease is taken for stopped too, so
-    /// no answer waits without an end.
-    fn stopped(&self, turn: Option<&Turn>, author: Option<&str>) -> bool {
+    /// document has been away a whole lease — or that has shown none for a
+    /// lease since this device first saw it — is taken for stopped too, so
+    /// no answer waits without an end. A turn seen for the first time now
+    /// has had no time to show anything.
+    fn stopped(&self, id: &str, author: Option<&str>) -> bool {
+        let turn = self.turns.get(id);
         if turn.is_some_and(|turn| turn.present) {
             return false;
         }
         let Some((claim, _)) = &self.claim else {
-            let quiet_since = turn.and_then(|turn| turn.seen).or(self.first);
+            let quiet_since = turn
+                .and_then(|turn| turn.seen)
+                .or_else(|| self.first.get(id).copied());
             return match (quiet_since, self.at) {
                 (Some(since), Some(at)) => at.saturating_duration_since(since) >= LEASE,
                 _ => false,
@@ -515,7 +538,7 @@ pub fn turns(
                 tool: turn.and_then(|turn| turn.tool.clone()),
                 reasoning,
                 steps: extras.steps.get(id).cloned().unwrap_or_default(),
-                stopped: live.stopped(turn, held.and_then(|c| c.author.as_deref())),
+                stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
             }
         })
         .collect()

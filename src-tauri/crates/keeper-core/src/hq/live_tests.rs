@@ -254,7 +254,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         start,
         now_ms,
     );
-    assert!(!live.stopped(live.turns.get(TURN), None), "present");
+    assert!(!live.stopped(TURN, None), "present");
     live.observe(
         &[],
         &[],
@@ -263,7 +263,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         now_ms,
     );
     assert!(
-        !live.stopped(live.turns.get(TURN), None),
+        !live.stopped(TURN, None),
         "left, the claim still in its lease"
     );
     live.observe(
@@ -273,10 +273,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         start + LEASE,
         now_ms,
     );
-    assert!(
-        live.stopped(live.turns.get(TURN), None),
-        "the lease passed unrenewed"
-    );
+    assert!(live.stopped(TURN, None), "the lease passed unrenewed");
     // A renewal is a new row: the lease starts again from it.
     live.observe(
         &[],
@@ -285,7 +282,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         start + LEASE,
         now_ms,
     );
-    assert!(!live.stopped(live.turns.get(TURN), None));
+    assert!(!live.stopped(TURN, None));
     live.observe(
         &[],
         &[],
@@ -293,7 +290,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         start + LEASE,
         now_ms,
     );
-    assert!(live.stopped(live.turns.get(TURN), None), "released");
+    assert!(live.stopped(TURN, None), "released");
     live.observe(
         &[],
         &[],
@@ -301,10 +298,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         start,
         now_ms,
     );
-    assert!(
-        live.stopped(live.turns.get(TURN), None),
-        "another instance took it"
-    );
+    assert!(live.stopped(TURN, None), "another instance took it");
     let mut late = Live::default();
     late.observe(
         &[],
@@ -314,7 +308,7 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
         now_ms,
     );
     assert!(
-        late.stopped(None, Some(INSTANCE)),
+        late.stopped(TURN, Some(INSTANCE)),
         "opened long after its holder stopped"
     );
     // No claim row to judge by: a document away a whole lease is a stop too.
@@ -322,21 +316,13 @@ fn a_holder_that_stops_is_said_once_its_claim_stands_still_for_the_lease() {
     unclaimed.observe(&doc, &[], None, start, now_ms);
     unclaimed.observe(&[], &[], None, start + Duration::from_secs(29), now_ms);
     assert!(
-        !unclaimed.stopped(unclaimed.turns.get(TURN), Some(INSTANCE)),
+        !unclaimed.stopped(TURN, Some(INSTANCE)),
         "left, not yet a lease ago"
     );
     unclaimed.observe(&[], &[], None, start + LEASE, now_ms);
     assert!(
-        unclaimed.stopped(unclaimed.turns.get(TURN), Some(INSTANCE)),
+        unclaimed.stopped(TURN, Some(INSTANCE)),
         "away a whole lease with no claim"
-    );
-    let mut chunks_only = Live::default();
-    chunks_only.observe(&[], &[], None, start, now_ms);
-    assert!(!chunks_only.stopped(None, Some(INSTANCE)), "just opened");
-    chunks_only.observe(&[], &[], None, start + LEASE, now_ms);
-    assert!(
-        chunks_only.stopped(None, Some(INSTANCE)),
-        "chunks, no claim and no document for a lease"
     );
 }
 
@@ -705,6 +691,39 @@ fn a_turn_whose_instance_stopped_keeps_its_text_and_says_it_stopped() {
         .observe(&[], &[], claim, start + LEASE, sessions::now_ms());
     let turn = &w.view(&opened).live[0];
     assert_eq!((turn.text.as_str(), turn.stopped), ("half an ans", true));
+}
+
+/// R1063-10: a session open longer than a lease, then a new answer whose
+/// chunks arrive before its claim or any document. Its lease runs from
+/// when this device first saw it, not from when the session was opened;
+/// with neither a claim nor a document for a whole lease it stopped.
+#[test]
+fn a_new_unclaimed_turn_gets_its_own_lease_however_long_the_session_was_open() {
+    let w = world(true);
+    let mut held = Opened::default();
+    // What a stream does: observe, draw, settle what that drawing held.
+    let draw = |held: &mut Opened, at: Instant| {
+        held.live.observe(&[], &[], None, at, sessions::now_ms());
+        let view = w.view(held);
+        let seen = held.live.clone();
+        held.live.settle(&seen, &view.live);
+        view.live.first().map(|turn| turn.stopped)
+    };
+    let start = Instant::now();
+    assert_eq!(draw(&mut held, start), None, "nothing being written");
+    let begun = start + LEASE * 3;
+    w.put(vec![w.chunk(0, ""), w.chunk(1, "a new ans")]);
+    assert_eq!(draw(&mut held, begun), Some(false), "just begun");
+    assert_eq!(
+        draw(&mut held, begun + Duration::from_secs(29)),
+        Some(false),
+        "within its own lease"
+    );
+    assert_eq!(
+        draw(&mut held, begun + LEASE),
+        Some(true),
+        "a lease with neither a claim nor a document"
+    );
 }
 
 fn live_claim(w: &World) -> Option<Claim> {
