@@ -4140,10 +4140,6 @@ export async function agentSessionPageBack(target: AgentSessionRef): Promise<voi
   await invoke<void>("agent_session_page_back", { ...target });
 }
 
-export async function agentViewPrefsGet(): Promise<AgentViewPrefsVm> {
-  return await invoke("agent_view_prefs_get");
-}
-
 export async function agentViewPrefsSet(
   patch: Partial<AgentViewPrefsVm>,
 ): Promise<AgentViewPrefsVm> {

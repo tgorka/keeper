@@ -1,53 +1,47 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useEffect, useId, useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { type AgentSessionViewVm, agentSessionToolSet } from "@/lib/ipc/client";
-import {
-  loadAgentViewPrefs,
-  setAgentViewPrefs,
-  useAgentViewPrefs,
-} from "@/lib/stores/agent-view-prefs";
+import { setAgentViewPrefs, useAgentViewPrefsWrite } from "@/lib/stores/agent-view-prefs";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
-  const prefs = useAgentViewPrefs();
+  // The switches show the preferences as Rust resolves them now, carried with
+  // the view: switched on another device or in a settings file, they follow.
+  const { prefs } = vm;
+  const write = useAgentViewPrefsWrite();
   const [toolsOpen, setToolsOpen] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const writing = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const toolsId = useId();
-  useEffect(() => {
-    void loadAgentViewPrefs();
-  }, []);
 
   // A session that cannot be changed here draws no switches at all: a tool
   // not changeable is absent, not disabled.
   const tools = vm.readOnly ? [] : vm.tools;
   // Never the `disabled` attribute while a write is in flight: it would drop
-  // keyboard focus to the page. A click then is ignored instead (the store
-  // ignores a preference click too).
+  // keyboard focus to the page. A click then is ignored instead (the write
+  // store ignores a preference click too).
   return (
     <div className="shrink-0 border-border border-b px-3 py-1">
       <fieldset className="flex flex-wrap items-center gap-1" aria-label="Answer preferences">
         {vm.readsTrace && (
           <Button
-            variant={prefs.value.showReasoning ? "secondary" : "ghost"}
+            variant={prefs.showReasoning ? "secondary" : "ghost"}
             className="min-h-11"
-            aria-pressed={prefs.value.showReasoning}
-            aria-disabled={!prefs.loaded}
-            aria-busy={prefs.busy}
-            onClick={() => void setAgentViewPrefs({ showReasoning: !prefs.value.showReasoning })}
+            aria-pressed={prefs.showReasoning}
+            aria-busy={write.busy}
+            onClick={() => void setAgentViewPrefs({ showReasoning: !prefs.showReasoning })}
           >
             Show thinking
           </Button>
         )}
         <Button
-          variant={prefs.value.showDetails ? "secondary" : "ghost"}
+          variant={prefs.showDetails ? "secondary" : "ghost"}
           className="min-h-11"
-          aria-pressed={prefs.value.showDetails}
-          aria-disabled={!prefs.loaded}
-          aria-busy={prefs.busy}
-          onClick={() => void setAgentViewPrefs({ showDetails: !prefs.value.showDetails })}
+          aria-pressed={prefs.showDetails}
+          aria-busy={write.busy}
+          onClick={() => void setAgentViewPrefs({ showDetails: !prefs.showDetails })}
         >
           Show details
         </Button>
@@ -107,18 +101,15 @@ export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
           </div>
         </fieldset>
       )}
-      {(prefs.error || error) && (
-        <div
-          role="alert"
-          className="flex flex-wrap items-center gap-2 py-1 text-destructive text-sm [overflow-wrap:anywhere]"
-        >
-          <span>{error ?? prefs.error}</span>
-          {!prefs.loaded && (
-            <Button variant="ghost" className="min-h-11" onClick={() => void loadAgentViewPrefs()}>
-              Try preferences again
-            </Button>
-          )}
-        </div>
+      {(write.error || error) && (
+        <p role="alert" className="py-1 text-destructive text-sm [overflow-wrap:anywhere]">
+          {error ?? write.error}
+        </p>
+      )}
+      {write.shadowed && (
+        <p role="alert" className="py-1 text-held text-xs [overflow-wrap:anywhere]">
+          Saved, but a settings file keeps this preference as it is.
+        </p>
       )}
     </div>
   );

@@ -6,7 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentApprovalVm, AgentSessionsBatch, AgentSessionViewVm } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
-import { agentViewPrefsStore } from "@/lib/stores/agent-view-prefs";
+import { agentViewPrefsWriteStore } from "@/lib/stores/agent-view-prefs";
 
 const mock = vi.hoisted(() => ({
   list: null as ((batch: AgentSessionsBatch) => void) | null,
@@ -19,7 +19,6 @@ const mock = vi.hoisted(() => ({
   create: vi.fn().mockResolvedValue({ database: "beta", sessionId: "new.1" }),
   decide: vi.fn().mockResolvedValue({ state: "sent", sentence: "Sent" }),
   loadDraft: vi.fn(),
-  prefsGet: vi.fn(),
   prefsSet: vi.fn(),
   toolSet: vi.fn().mockResolvedValue(undefined),
   phone: false,
@@ -41,7 +40,6 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentSessionArchive: mock.archive,
   agentSessionUnarchive: mock.unarchive,
   agentSessionPageBack: mock.page,
-  agentViewPrefsGet: mock.prefsGet,
   agentViewPrefsSet: mock.prefsSet,
   agentSessionToolSet: mock.toolSet,
   agentSessionNew: mock.create,
@@ -93,6 +91,7 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
     untrusted: false,
     live: [],
     tools: [],
+    prefs: { showReasoning: false, showDetails: false },
     messages: [
       {
         id: "m1",
@@ -142,17 +141,12 @@ beforeEach(() => {
   mock.list = null;
   mock.views.clear();
   mock.phone = false;
-  mock.prefsGet.mockResolvedValue({ showReasoning: false, showDetails: false });
   mock.prefsSet.mockImplementation(async (patch) => ({
-    ...agentViewPrefsStore.getState().value,
+    showReasoning: false,
+    showDetails: false,
     ...patch,
   }));
-  agentViewPrefsStore.setState({
-    value: { showReasoning: false, showDetails: false },
-    loaded: false,
-    busy: false,
-    error: null,
-  });
+  agentViewPrefsWriteStore.setState({ busy: false, error: null, shadowed: false });
   agentSessionsStore.setState({
     rows: [],
     loaded: false,
@@ -512,7 +506,6 @@ describe("live answer controls", () => {
     const turn = { turnId: "t1", text: "An answer", steps: [], stopped: false };
     await open("alpha", { live: [turn] });
     const toggle = screen.getByRole("button", { name: "Show thinking" });
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
     // The executor form, not `Promise.withResolvers`: the project compiles
     // against `lib: ES2020`, where that constructor method does not exist.
     let saved: (value: Ipc.AgentViewPrefsVm) => void = () => {};
@@ -526,18 +519,20 @@ describe("live answer controls", () => {
     expect(toggle).toHaveFocus();
     fireEvent.click(toggle);
     await act(async () => saved({ showReasoning: true, showDetails: false }));
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(mock.prefsSet).toHaveBeenCalledTimes(1);
     expect(toggle).toHaveFocus();
+    const on = { showReasoning: true, showDetails: false };
     act(() =>
       mock.views.get("alpha")?.(
-        view("alpha", { live: [{ ...turn, reasoning: "Private thought" }] }),
+        view("alpha", { prefs: on, live: [{ ...turn, reasoning: "Private thought" }] }),
       ),
     );
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText("Private thought")).toBeInTheDocument();
     act(() =>
       mock.views.get("alpha")?.(
         view("alpha", {
+          prefs: on,
           messages: [
             {
               id: "final",
@@ -554,38 +549,41 @@ describe("live answer controls", () => {
     );
     expect(screen.getByRole("region", { name: "Thinking" })).toHaveTextContent("Private thought");
     fireEvent.click(toggle);
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "false"));
+    await waitFor(() => expect(mock.prefsSet).toHaveBeenLastCalledWith({ showReasoning: false }));
     expect(toggle).toHaveFocus();
     act(() => mock.views.get("alpha")?.(view("alpha")));
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByText("Private thought")).not.toBeInTheDocument();
   });
 
   it("offers no thinking toggle to a nonreader but still says which tool is running", async () => {
-    mock.prefsGet.mockResolvedValue({ showReasoning: true, showDetails: false });
     draw();
     await list();
     await open("alpha", {
       readsTrace: false,
+      prefs: { showReasoning: true, showDetails: false },
       live: [
         { turnId: "t1", text: "Visible answer", tool: "web_search", steps: [], stopped: false },
       ],
     });
-    await waitFor(() => expect(agentViewPrefsStore.getState().loaded).toBe(true));
     expect(screen.queryByRole("button", { name: "Show thinking" })).not.toBeInTheDocument();
     expect(screen.getByText("Calling: web_search")).toBeInTheDocument();
   });
 
-  it("draws the thinking and details Rust sends even where this window last read them off", async () => {
+  it("follows preferences switched elsewhere, both ways, and the next click writes the opposite", async () => {
     // Switched on another device or in a settings file: Rust re-projects the
-    // open session while this window's mirror of the preference still says off.
+    // open session with the preferences as they hold now.
     draw();
     await list();
     await open("alpha");
-    await waitFor(() => expect(agentViewPrefsStore.getState().loaded).toBe(true));
-    expect(agentViewPrefsStore.getState().value.showReasoning).toBe(false);
+    const thinking = screen.getByRole("button", { name: "Show thinking" });
+    const details = screen.getByRole("button", { name: "Show details" });
+    expect(thinking).toHaveAttribute("aria-pressed", "false");
+    expect(details).toHaveAttribute("aria-pressed", "false");
     act(() =>
       mock.views.get("alpha")?.(
         view("alpha", {
+          prefs: { showReasoning: true, showDetails: true },
           live: [
             {
               turnId: "t1",
@@ -611,6 +609,22 @@ describe("live answer controls", () => {
     );
     expect(screen.getByRole("region", { name: "Thinking" })).toHaveTextContent("Synced thought");
     expect(screen.getByText("synced-model")).toBeInTheDocument();
+    expect(thinking).toHaveAttribute("aria-pressed", "true");
+    expect(details).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(thinking);
+    await waitFor(() => expect(mock.prefsSet).toHaveBeenLastCalledWith({ showReasoning: false }));
+    await waitFor(() => expect(thinking).toHaveAttribute("aria-busy", "false"));
+    fireEvent.click(details);
+    await waitFor(() => expect(mock.prefsSet).toHaveBeenLastCalledWith({ showDetails: false }));
+    await waitFor(() => expect(details).toHaveAttribute("aria-busy", "false"));
+    // And back off elsewhere: the switches follow again, and the next click
+    // turns them on.
+    act(() => mock.views.get("alpha")?.(view("alpha")));
+    expect(thinking).toHaveAttribute("aria-pressed", "false");
+    expect(details).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByText("Synced thought")).not.toBeInTheDocument();
+    fireEvent.click(details);
+    await waitFor(() => expect(mock.prefsSet).toHaveBeenLastCalledWith({ showDetails: true }));
   });
 
   it("draws the details Rust sends once they are chosen, a measured zero and an error included", async () => {
@@ -618,14 +632,14 @@ describe("live answer controls", () => {
     await list();
     await open("alpha");
     const toggle = screen.getByRole("button", { name: "Show details" });
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
     toggle.focus();
     fireEvent.click(toggle);
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+    await waitFor(() => expect(mock.prefsSet).toHaveBeenCalledWith({ showDetails: true }));
     expect(toggle).toHaveFocus();
     act(() =>
       mock.views.get("alpha")?.(
         view("alpha", {
+          prefs: { showReasoning: false, showDetails: true },
           messages: [
             {
               id: "final",
@@ -721,12 +735,11 @@ describe("live answer controls", () => {
     expect(screen.queryByRole("switch")).not.toBeInTheDocument();
   });
 
-  it("keeps a refused preference off and applies the effective returned value", async () => {
+  it("keeps a refused preference off and says when a settings file keeps it", async () => {
     draw();
     await list();
     await open("alpha");
     const toggle = screen.getByRole("button", { name: "Show details" });
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
     toggle.focus();
     mock.prefsSet.mockRejectedValueOnce({ message: "The preference could not be saved." });
     fireEvent.click(toggle);
@@ -735,30 +748,17 @@ describe("live answer controls", () => {
     );
     expect(toggle).toHaveAttribute("aria-pressed", "false");
     expect(toggle).toHaveFocus();
+    // Saved, but what holds after is still off: a settings file sets it.
     mock.prefsSet.mockResolvedValueOnce({ showReasoning: false, showDetails: false });
     fireEvent.click(toggle);
-    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-  });
-
-  it("keeps controls safe after a failed preference read and retries without losing the session", async () => {
-    mock.prefsGet.mockRejectedValueOnce({ message: "The preference store is unavailable." });
-    draw();
-    await list();
-    await open("alpha");
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "The preference store is unavailable.",
+      "Saved, but a settings file keeps this preference as it is.",
     );
-    const toggle = screen.getByRole("button", { name: "Show thinking" });
-    expect(toggle).toHaveAttribute("aria-disabled", "true");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(toggle).toHaveFocus();
     fireEvent.click(toggle);
-    expect(screen.getByText("Message in alpha")).toBeInTheDocument();
-    mock.prefsGet.mockResolvedValueOnce({ showReasoning: true, showDetails: false });
-    fireEvent.click(screen.getByRole("button", { name: "Try preferences again" }));
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "false"));
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(mock.prefsSet).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(mock.prefsSet).toHaveBeenLastCalledWith({ showDetails: true });
   });
 
   it("shows tool completion and a stopped answer without an endless answering state", async () => {

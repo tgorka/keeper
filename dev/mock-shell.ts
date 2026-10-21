@@ -9314,7 +9314,7 @@ function hqRefuse(message: string): never {
   throw { code: "internal", message, accountId: null, retriable: false };
 }
 const sessionScenario = new URLSearchParams(location.search).get("sessions");
-// ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused
+// ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused|pinned
 const liveScenario = new URLSearchParams(location.search).get("live");
 /**
  * The answer preferences survive a reload in `sessionStorage`, as the capture
@@ -9334,6 +9334,13 @@ function viewPrefs(): { showReasoning: boolean; showDetails: boolean } {
   }
   agentViewPrefs = read;
   return read;
+}
+/**
+ * The preferences as they hold: what was chosen, with `live=pinned` standing in
+ * for a settings file that keeps Show details off whatever is chosen.
+ */
+function heldViewPrefs(): { showReasoning: boolean; showDetails: boolean } {
+  return liveScenario === "pinned" ? { ...viewPrefs(), showDetails: false } : { ...viewPrefs() };
 }
 const sessionChoices: AgentChoiceVm[] = [
   {
@@ -9436,6 +9443,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
       readsTrace: liveScenario !== "nonreader",
       untrusted: liveScenario === "untrusted" || liveScenario === "stream",
       live: [],
+      prefs: { showReasoning: false, showDetails: false },
       tools:
         liveScenario === "no-tools"
           ? []
@@ -9488,19 +9496,21 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
 
 /** The mock's source retains rows; only the reader's selected projection crosses IPC. */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
+  const prefs = heldViewPrefs();
   return {
     ...vm,
+    prefs,
     approvals: vm.readsTrace ? vm.approvals : [],
     tools: vm.tools.map((tool) => ({ ...tool })),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
       ...message,
-      ...(viewPrefs().showDetails && details ? { details } : {}),
-      ...(vm.readsTrace && viewPrefs().showReasoning && reasoning ? { reasoning } : {}),
+      ...(prefs.showDetails && details ? { details } : {}),
+      ...(vm.readsTrace && prefs.showReasoning && reasoning ? { reasoning } : {}),
       ...(vm.readsTrace && steps ? { steps } : {}),
     })),
     live: vm.live.map(({ reasoning, steps, ...turn }) => ({
       ...turn,
-      ...(vm.readsTrace && viewPrefs().showReasoning && reasoning ? { reasoning } : {}),
+      ...(vm.readsTrace && prefs.showReasoning && reasoning ? { reasoning } : {}),
       steps: vm.readsTrace ? steps.map((step) => ({ ...step })) : [],
     })),
   };
@@ -9602,7 +9612,6 @@ function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   return vm;
 }
 const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
-  agent_view_prefs_get: () => ({ ...viewPrefs() }),
   agent_view_prefs_set: (payload) => {
     if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
     const patch = payload.patch as { showReasoning: boolean | null; showDetails: boolean | null };
@@ -9617,7 +9626,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       // A harness that cannot write still answers honestly for this page.
     }
     publishSessions();
-    return { ...agentViewPrefs };
+    return heldViewPrefs();
   },
   agent_session_tool_set: (payload) => {
     const vm = mockSession(payload);
@@ -9800,6 +9809,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       untrusted: false,
       live: [],
       tools: [],
+      prefs: { showReasoning: false, showDetails: false },
       approvals: [],
       messages: [
         {
