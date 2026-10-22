@@ -638,7 +638,7 @@ cat <<EOF
 What is still yours to do, on the phone, in this order — none of it can be
 done from here:
 
-  1. Open Bots and tap Talk once. iOS asks for the microphone and for speech
+  1. Open Settings > Voice and tap Talk once. iOS asks for the microphone and for speech
      recognition; grant both. Until then the port refuses with the permission
      sentence, not silence.
   2. Have the dictation language downloaded on the phone: Settings > General >
@@ -648,13 +648,13 @@ done from here:
   3. Arm the wake phrase. It is OFF on a fresh install, on purpose (a fresh
      install that listened would be the silent always-on listener the design
      refuses, keeper-core/src/registry.rs). The switch is "Listen for a
-     phrase", in Settings > Bots and inside the "Bot and model" sheet on the
-     Bots surface; the phrase beside it is "nixie" until you change it. The
+     phrase", in Settings > Voice; the phrase beside it is "nixie" until you
+     change it. The
      orange microphone indicator stays lit while it is armed.
   4. Look at the island. With the phrase armed, the Dynamic Island shows
      keeper's ear and "nixie" (or your phrase), and the lock screen a card
      saying "Listening for “nixie”"; while you talk it says Listening, Heard
-     you, Thinking, Answering, Speaking. If nothing appears, Settings > Bots
+     you, Thinking, Answering, Speaking. If nothing appears, Settings > Voice
      on the phone lists what happened: an `island:refused` row names the
      reason — Live Activities off for keeper in Settings, or the free
      team's profile refusing (`unentitled`), which is the measurement

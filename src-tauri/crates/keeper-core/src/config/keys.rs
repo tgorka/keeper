@@ -509,73 +509,11 @@ pub const KEYS: &[KeySpec] = &[
         ),
         shape: Shape::Text,
         default: "",
-        summary: "Per bot provider: `account:<account id>` sends that organisation account's \
-                  sign-in token while it is the configured account; absent uses the provider's \
-                  own saved token.",
+        summary: "Per model provider (Settings › Model providers): `account:<account id>` sends \
+                  that organisation account's sign-in token while it is the configured account; \
+                  absent uses the provider's own saved token. The name predates the providers' \
+                  own section and is kept so older devices read the same row.",
         example: "",
-    },
-    KeySpec {
-        key: "bots.message_details",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
-        shape: Shape::Flag01,
-        default: "0",
-        summary: "Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id.",
-        example: "true",
-    },
-    KeySpec {
-        key: "bots.wake_enabled",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::Never(
-            "an open microphone is a person's tap on the device that listens, so no file — \
-             this machine's, the account's or a folder's — may switch it on",
-        ),
-        shape: Shape::Flag01,
-        default: "0",
-        summary: "Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act.",
-        example: "",
-    },
-    KeySpec {
-        key: "bots.wake_phrase",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
-        shape: Shape::Text,
-        default: "nixie",
-        summary: "The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words.",
-        example: "\"hej keeper\"",
-    },
-    KeySpec {
-        key: "bots.voice_locale",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
-        shape: Shape::Text,
-        default: "",
-        summary: "The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced.",
-        example: "\"en-US\"",
-    },
-    KeySpec {
-        key: "bots.voice_target",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
-        shape: Shape::Text,
-        default: "",
-        summary: "Where a spoken turn goes: the id of a pinned bot, or `agent:<room id>` for one of your assistant's conversations (AD-384), sent there as your own message and never held for Undo-Send. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so. An `agent:` room that is no longer one of your assistant's is refused, never sent to a bot instead.",
-        example: "\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"",
-    },
-    KeySpec {
-        key: "bots.stop_phrase",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
-        shape: Shape::Text,
-        default: "stop",
-        summary: "The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud.",
-        example: "\"stop\"",
     },
     // ---- debug -----------------------------------------------------------
     KeySpec {
@@ -1208,6 +1146,60 @@ pub const KEYS: &[KeySpec] = &[
         default: "1",
         summary: "Whether keeper checks for its own update on a cadence, installs it in the background, and then restarts itself into it once nobody is using keeper — overnight, or after hours away, and never while a recording is live. Off means the update endpoint is contacted only when somebody clicks Check for updates, and only a person restarts.",
         example: "false",
+    },
+    // ---- voice -----------------------------------------------------------
+    KeySpec {
+        key: "voice.wake_enabled",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::Never(
+            "an open microphone is a person's tap on the device that listens, so no file — \
+             this machine's, the account's or a folder's — may switch it on",
+        ),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act.",
+        example: "",
+    },
+    KeySpec {
+        key: "voice.wake_phrase",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "nixie",
+        summary: "The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words.",
+        example: "\"hej keeper\"",
+    },
+    KeySpec {
+        key: "voice.locale",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced.",
+        example: "\"en-US\"",
+    },
+    KeySpec {
+        key: "voice.target",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "Where a spoken turn goes (Settings › Voice, *Speak to*): `agent:<room id>` for one of your assistant's conversations (AD-384), sent there as your own message and never held for Undo-Send. Blank means nothing is chosen, and a spoken turn is refused and says so. A room that is no longer one of your assistant's is refused, never sent elsewhere.",
+        example: "\"agent:!dm:example.org\"",
+    },
+    KeySpec {
+        key: "voice.stop_phrase",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "stop",
+        summary: "The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud.",
+        example: "\"stop\"",
     },
 ];
 

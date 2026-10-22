@@ -5,7 +5,6 @@ import { LoginScreen } from "@/components/auth/login-screen";
 import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
 import { NoBackgroundSyncDisclosure } from "@/components/settings/no-background-sync-disclosure";
-import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
 import { useAccountMirror } from "@/hooks/use-account-mirror";
@@ -29,20 +28,8 @@ import { logFailure } from "@/lib/failure";
 import { encryptionPosture, firstRunSetupSkippedGet, telemetryStudyStop } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useFailureNotices } from "@/lib/stores/failure-notices";
-import { primaryViewStore } from "@/lib/stores/primary-view";
 import { useWizardStore, wizardStore } from "@/lib/stores/wizard";
-
-/**
- * The way past the login screen with no account (Story 63.1, AD-180). A
- * conversation with a model needs no Matrix account, so the sign-in screen
- * stops being a wall: one control, under the form, that says what it opens
- * and what it does not close.
- */
-export const NO_ACCOUNT_BOTS_LABEL = "Continue without an account";
-export const NO_ACCOUNT_BOTS_NOTE =
-  "Bots needs no Matrix account. You can sign in later from the menu.";
 
 /**
  * How long the boot waits for the stored "don't open setup when keeper starts"
@@ -138,15 +125,6 @@ function App() {
   // screen). Both are session-scoped and never persisted.
   const wizardActive = useWizardStore((s) => s.active);
   const wizardDismissed = useWizardStore((s) => s.dismissed);
-  // Whether this build can talk to a model at all (AD-161): the no-account way
-  // into Bots exists only where Bots does — absent, not disabled, otherwise.
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
-  // Whether sign-in was declined this session in favour of Bots (Story 63.1,
-  // AD-180). Session-scoped like the wizard's `dismissed`, and its own flag
-  // rather than that one: the wizard's means "the wizard was skipped", this
-  // means "the login screen was", and each is set by the surface it names.
-  const [signInSkipped, setSignInSkipped] = useState(false);
-
   // The persisted answer to "don't open setup when keeper starts" (spec *Skipping
   // setup can stick*). Tri-state: `undefined` = still reading (hold the splash),
   // `true`/`false` = answered. Before this read the wizard's dismissal lived only
@@ -365,35 +343,9 @@ function App() {
       // the frame in between would be the login screen the stored answer exists
       // to avoid. A sign-out-of-last-account on a device with no stored answer
       // still shows the login screen (nothing set `dismissed`). All other
-      // zero-account states render the login screen — with, where this build has
-      // Bots, the one explicit way past it (Story 63.1, AD-180): a conversation
-      // with a model needs no account, and the phone that opens keeper for one
-      // must not meet a wall. Signing in stays the form above it; the way past is
-      // a control that says what it opens and that sign-in is still there.
-      if (!wizardDismissed && !signInSkipped && setupSkipped !== true) {
-        return (
-          <>
-            <LoginScreen />
-            {bots && (
-              <div className="fixed inset-x-0 bottom-0 flex flex-col items-center gap-1 px-6 pt-3 pb-[calc(var(--safe-bottom)+0.75rem)] text-center">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  onClick={() => {
-                    // Land on Bots itself rather than the empty Inbox: the
-                    // control names Bots, and an Inbox with nothing in it is
-                    // not what was asked for.
-                    primaryViewStore.getState().setView("bots");
-                    setSignInSkipped(true);
-                  }}
-                >
-                  {NO_ACCOUNT_BOTS_LABEL}
-                </Button>
-                <p className="text-muted-foreground text-xs">{NO_ACCOUNT_BOTS_NOTE}</p>
-              </div>
-            )}
-          </>
-        );
+      // zero-account states render the login screen.
+      if (!wizardDismissed && setupSkipped !== true) {
+        return <LoginScreen />;
       }
       // Fall through to the shell path below (empty inbox + reachable add-account
       // overlay).

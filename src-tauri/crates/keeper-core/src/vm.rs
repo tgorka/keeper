@@ -14,7 +14,7 @@ use crate::agents::gate_room::GateLineVm;
 use crate::agents::heard::HeardMarkVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
 use crate::agents::turn_marks::TurnMarkVm;
-use crate::bots::{BotHealthState, ProviderKind};
+use crate::providers::{ProviderHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
 
@@ -220,41 +220,6 @@ pub struct CapabilitiesVm {
     /// every sessions affordance is **absent** from the DOM rather than
     /// disabled, which is the whole of FR-223.
     pub sessions: bool,
-    /// The Bots surface (Epic 61, FR-378; Epic 62, FR-396) can run here:
-    /// **true wherever the pane exists** — desktop and phone alike — computed
-    /// in the shell like every other flag in this struct.
-    ///
-    /// **This is not a synonym for `sessions`, and the difference is the whole
-    /// reason it is a separate flag.** `notes` and `sessions` are both
-    /// `sync && desktop` because a vault and a sessions root are *folders
-    /// keeper syncs*, so neither can exist without a usable `git`. Talking to a
-    /// model needs neither `git` nor `sync.db`: a provider is a URL and a
-    /// credential, a conversation is two tables in `keeper.db`, and a machine
-    /// with no `git` at all — or a phone with no folder sync at all — can hold
-    /// both. So a build gated on `sessions` here would hide a working surface
-    /// on every desktop whose `git` is too old and on every phone, which is a
-    /// lie in the opposite direction from the one AD-27 usually guards.
-    ///
-    /// The half that genuinely needs the drive is [`Self::bot_tools`]. Two
-    /// facts, two flags, and the split stated where both are declared. When
-    /// this is `false` every bots affordance is **absent** from the DOM rather
-    /// than disabled.
-    pub bots: bool,
-    /// This build can reach the drive on a bot's behalf (Epic 62, FR-396,
-    /// AD-162): **desktop and `sync`**, computed in the shell like every other
-    /// flag in this struct.
-    ///
-    /// Strictly narrower than `bots`, for a reason that is a fact about
-    /// linking rather than a design choice: a tool call resolves a path inside
-    /// a synced profile through `keeper-sync`, and `keeper-sync` is not a
-    /// dependency of the shell on iOS or Android. A grant is therefore a
-    /// promise about files keeper cannot reach from a phone, so on a phone
-    /// there is no grant, no audit, no tool row and no deliverable path —
-    /// **absent** rather than disabled (AD-27), with one sentence saying the
-    /// drive tools live on the Mac. On a desktop it is `sync` for
-    /// `notes`' reason: the drive IS the synced folders, so a machine whose
-    /// `git` the engine refuses has no drive to grant.
-    pub bot_tools: bool,
     /// The window's title bar is a transparent overlay over the webview, so the
     /// native window controls float over page content (Story 34.2, AD-34-2):
     /// `true` only on desktop macOS, the only platform where `tauri.conf.json`'s
@@ -1695,9 +1660,9 @@ impl Provider {
 /// classification. `Homeserver` is an account's Matrix homeserver; `Beeper` is the
 /// `api.beeper.com` login/service endpoint present exactly when a Beeper account
 /// exists; `GitRemote` is the host of one folder-sync profile's remote repository;
-/// `BotProvider` is the host of one configured AI provider; `Update` is the
-/// signed-update endpoint the app checks. Serializes to
-/// `"homeserver" | "beeper" | "gitRemote" | "botProvider" | "update"`.
+/// `ModelProvider` is the host of one model provider notes search calls; `Update` is
+/// the signed-update endpoint the app checks. Serializes to
+/// `"homeserver" | "beeper" | "gitRemote" | "modelProvider" | "update"`.
 ///
 /// The container rename is `camelCase` rather than `lowercase` (Story 23.7) so a
 /// multi-word variant reads as `gitRemote` on the wire, matching every other
@@ -1720,15 +1685,16 @@ pub enum EgressKind {
     /// do bytes go", and the host is the whole of that answer; the rest is only
     /// material to leak onto a screen the user may be sharing.
     GitRemote,
-    /// The *host* of one configured AI provider — a Hermes gateway or an Ollama
-    /// server (Story 61.1, FR-371).
+    /// The *host* of one model provider notes search calls for embeddings — a
+    /// Hermes gateway, an Ollama server or an OpenAI-compatible endpoint (Story
+    /// 61.1, FR-371; Story 108.3a).
     ///
     /// The host alone, for [`EgressKind::GitRemote`]'s reason and derived by the
     /// same function. Usually a private one: both supported back ends bind
     /// loopback by default, so this row most often discloses that the bytes did
     /// not leave the machine — which is a claim worth making explicitly rather
     /// than by omission.
-    BotProvider,
+    ModelProvider,
     /// The signed auto-update endpoint (`plugins.updater.endpoints`).
     Update,
     /// Opt-in diagnostics, statistics, remote config or an active synthetic study.
@@ -5869,7 +5835,7 @@ pub struct BotModelVm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub enum BotReach {
+pub enum ProviderReach {
     /// The endpoint answered — with any HTTP status, including 401 and 404.
     /// An answer keeper did not like is still an answer.
     Online,
@@ -5877,35 +5843,17 @@ pub enum BotReach {
     Offline,
 }
 
-/// Whether a named bot exists at an endpoint — the honest third arm included.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub enum BotPresence {
-    /// The endpoint served this bot's own model list, so the bot is there.
-    Exists,
-    /// The endpoint answered, and said it has no such bot.
-    Absent,
-    /// keeper could not tell: a rejected credential, an unexpected status, or
-    /// nothing on the wire. Never collapsed into `Absent` — "I could not ask"
-    /// and "it is not there" are different sentences to a user who is about to
-    /// retype a name that was right all along.
-    Unknown,
-}
-
-/// What keeper learned by asking an endpoint one question (Story 61.3, FR-375,
-/// FR-376).
+/// What keeper learned by asking a provider whether it is there (Story 61.3,
+/// FR-375).
 ///
-/// Serves both probes: a provider probe (`bot` is `None`) and a bot probe
-/// (`bot` names the profile or model tag that was asked about). Never an error
-/// type — an endpoint that refused, or never answered, is a *fact about the
-/// endpoint* that the surface must be able to print.
+/// Never an error type — an endpoint that refused, or never answered, is a
+/// *fact about the endpoint* that the surface must be able to print.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub struct BotProbeVm {
+pub struct ProviderProbeVm {
     /// Whether anything answered at all.
-    pub reach: BotReach,
+    pub reach: ProviderReach,
     /// The HTTP status of the answer, where one arrived.
     pub status: Option<u16>,
     /// The server's own version string where the endpoint reports one —
@@ -5916,10 +5864,6 @@ pub struct BotProbeVm {
     /// arrived. Measured, not estimated.
     #[ts(type = "number | null")]
     pub round_trip_ms: Option<i64>,
-    /// The bot that was asked about, echoed back; `None` for a provider probe.
-    pub bot: Option<String>,
-    /// The verdict on that bot; `None` for a provider probe.
-    pub presence: Option<BotPresence>,
     /// keeper's own sentence for whatever went wrong, ready to print. Carries
     /// no credential and no full URL — a token never reaches a screen or a log.
     pub reason: Option<String>,
@@ -5930,16 +5874,16 @@ pub struct BotProbeVm {
 ///
 /// **What is deliberately absent is the point.** There is no token field and no
 /// field a token could hide in: the credential lives behind the secret port
-/// (`bots::provider_token_key`) and the base-URL grammar refuses userinfo, so
+/// (`providers::provider_token_key`) and the base-URL grammar refuses userinfo, so
 /// the strongest statement this VM can make about it is [`has_token`] — a
 /// boolean the surface needs in order to say "no credential stored" *before*
 /// the user sends a message, rather than at send time (FR-370).
 ///
-/// [`has_token`]: BotProviderVm::has_token
+/// [`has_token`]: ModelProviderVm::has_token
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub struct BotProviderVm {
+pub struct ModelProviderVm {
     /// The provider's opaque id — every command's handle on it.
     pub id: String,
     /// Which back end this is.
@@ -5966,7 +5910,7 @@ pub struct BotProviderVm {
     pub created_ms: i64,
     /// The last verdict keeper reached by talking to it — `unknown` until
     /// something has.
-    pub health: BotHealthState,
+    pub health: ProviderHealthState,
     /// When that verdict was reached, or `null` when no probe has ever run.
     /// Absent rather than zero: this app does not print a number it did not
     /// measure.
@@ -5983,22 +5927,22 @@ pub struct BotProviderVm {
     /// The *presence* of a secret, never the secret. An Ollama on loopback
     /// legitimately has none (research §3.5), so `false` is not a fault by
     /// itself — it is a fault only when the endpoint answered `401`, which is
-    /// what [`BotProviderVm::health`] says.
+    /// what [`ModelProviderVm::health`] says.
     pub has_token: bool,
 }
 
-impl BotProviderVm {
+impl ModelProviderVm {
     /// Project a stored provider row for the UI (Story 61.1).
     ///
     /// `has_token` is a parameter because it is a keychain fact, and this crate
     /// reaches the OS only through `Platform` (AD-24) — the shell reads it once
     /// per list rather than making this projection do I/O. The host and the
     /// private-network flag are re-derived from the stored URL by the same
-    /// grammar that accepted it (`bots::parse_base_url`), so the disclosure on
+    /// grammar that accepted it (`providers::parse_base_url`), so the disclosure on
     /// the card and the refusal in the form can never disagree.
-    pub fn compose(row: &crate::bots::store::ProviderRow, has_token: bool) -> Self {
-        let parsed = crate::bots::parse_base_url(&row.provider.base_url).ok();
-        BotProviderVm {
+    pub fn compose(row: &crate::providers::store::ProviderRow, has_token: bool) -> Self {
+        let parsed = crate::providers::parse_base_url(&row.provider.base_url).ok();
+        ModelProviderVm {
             id: row.provider.id.clone(),
             kind: row.provider.kind,
             name: row.provider.name.clone(),
@@ -6013,61 +5957,6 @@ impl BotProviderVm {
             health_detail: row.health.detail.clone(),
             read_timeout_ms: row.read_timeout_ms,
             has_token,
-        }
-    }
-}
-
-/// One pinned bot, as the pinned strip and the conversation header render it
-/// (Story 61.1, FR-383).
-///
-/// A bot is (provider, target, identity), and all three are here: `providerId`
-/// says which endpoint, `target` says what it is on the far side, and the three
-/// identity fields say how it looks. The identity fields are `null` until Story
-/// 61.7 gives them a picker and a bounded, contrast-checked palette — an
-/// assigned colour would have to be un-assigned later, and `DESIGN.md:172`
-/// requires a colour to be paired with a shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotVm {
-    /// The bot's opaque id — every command's handle on it.
-    pub id: String,
-    /// The owning provider's id.
-    pub provider_id: String,
-    /// The Hermes profile name or the Ollama model tag this bot **is**.
-    pub target: String,
-    /// The user's display name.
-    pub name: String,
-    /// Position in the hand-set order, ascending.
-    #[ts(type = "number")]
-    pub pin_order: i64,
-    /// The chosen shape, from Story 61.7's closed set; `null` until chosen.
-    pub shape: Option<String>,
-    /// The chosen colour **token**, from Story 61.7's bounded palette — never a
-    /// hex value, so `scripts/check-design.mjs` stays the single authority on
-    /// what passes AA in both themes. `null` until chosen.
-    pub colour: Option<String>,
-    /// The chosen mark: a short grapheme or an existing icon name. `null` until
-    /// chosen.
-    pub mark: Option<String>,
-    /// When the bot was pinned, ms since the Unix epoch (UTC).
-    #[ts(type = "number")]
-    pub created_ms: i64,
-}
-
-impl BotVm {
-    /// Project a stored bot row for the UI (Story 61.1).
-    pub fn compose(bot: &crate::bots::Bot) -> Self {
-        BotVm {
-            id: bot.id.clone(),
-            provider_id: bot.provider_id.clone(),
-            target: bot.target.clone(),
-            name: bot.name.clone(),
-            pin_order: bot.pin_order,
-            shape: bot.identity.shape.clone(),
-            colour: bot.identity.colour.clone(),
-            mark: bot.identity.mark.clone(),
-            created_ms: bot.created_ms,
         }
     }
 }
@@ -6229,30 +6118,6 @@ impl BotMessageVm {
     }
 }
 
-/// A conversation and its messages in one read (Story 61.4, FR-382).
-///
-/// One command rather than two, because a session header rendered beside a
-/// message list read a moment later is a surface that can show one
-/// conversation's title over another's rows for a frame.
-///
-/// `transcript` says where the messages came from (AD-181): `remote` when they
-/// were read from the gateway's own history for `session.remoteSessionId` —
-/// which is the transcript both devices share — and `local` when they were
-/// replayed from `keeper.db`, either because the endpoint keeps no sessions or
-/// because it could not be reached just now and the local copy is what there
-/// is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotConversationVm {
-    /// The conversation.
-    pub session: BotSessionVm,
-    /// Its messages, in order.
-    pub messages: Vec<BotMessageVm>,
-    /// Where `messages` were read from.
-    pub transcript: BotTranscriptSource,
-}
-
 /// Where a conversation's transcript was read from (Epic 63, AD-181).
 ///
 /// Two values and not a boolean, because the surface prints the word: a row
@@ -6267,57 +6132,6 @@ pub enum BotTranscriptSource {
     Local,
     /// Read from the gateway's session history.
     Remote,
-}
-
-/// One read of a conversation another device is writing (Epic 63, Story 63.7,
-/// FR-425, FR-426, AD-177).
-///
-/// The answer to `bots_session_follow`: the transcript as it stands now, folded
-/// under [`crate::bots::follow::merge`]'s rule so this device's own rows are
-/// never doubled or overwritten, and what to do next. `nextPollMs` is the
-/// decision of [`crate::bots::follow::decide`] — how long to wait before
-/// asking again — and `null` when the following stops: this device holds the
-/// turn, or the session has gone cold. `live` is whether the newest step is
-/// one a turn is still working on, which is when the surface says that steps
-/// land as they complete rather than as they are typed.
-///
-/// `messages` is `null` where the gateway's transcript could not be read —
-/// the endpoint keeps no sessions, or did not answer — and then what is on
-/// screen stays; a gateway that is down does not blank a conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotFollowVm {
-    /// The merged transcript, or `null` when it was not read this time.
-    pub messages: Option<Vec<BotMessageVm>>,
-    /// Whether a turn is open on the other device.
-    pub live: bool,
-    /// Ms to wait before the next read; `null` to stop following.
-    #[ts(type = "number | null")]
-    pub next_poll_ms: Option<i64>,
-}
-
-impl BotFollowVm {
-    /// The answer where nothing was read: what is on screen stands, and the
-    /// following stops.
-    pub const UNREAD: Self = Self {
-        messages: None,
-        live: false,
-        next_poll_ms: None,
-    };
-
-    /// Project one read and its decision for the UI.
-    pub fn compose(
-        messages: &[crate::bots::session::BotMessage],
-        live: bool,
-        next: crate::bots::follow::Follow,
-    ) -> Self {
-        BotFollowVm {
-            messages: Some(messages.iter().map(BotMessageVm::compose).collect()),
-            live,
-            next_poll_ms: next.after_ms(),
-        }
-    }
 }
 
 /// What the webview is told while an answer is arriving (Story 61.4, FR-372,
@@ -6478,21 +6292,21 @@ pub struct BotRetryReq {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
-pub struct BotProviderSaveReq {
+pub struct ModelProviderSaveReq {
     /// The row to rewrite, or `null` to add one.
     pub id: Option<String>,
     /// Which back end this is.
     pub kind: ProviderKind,
     /// The display name for this tenant.
     pub name: String,
-    /// The base URL, as typed. Validated by `keeper_core::bots::parse_base_url`
+    /// The base URL, as typed. Validated by `keeper_core::providers::parse_base_url`
     /// and never by the frontend, so there is one grammar.
     pub base_url: String,
     /// The credential to store behind the secret port, or `null` to leave
     /// whatever is there alone.
     ///
     /// `null` is "unchanged" and not "clear": an edit form cannot render the
-    /// stored token — there is no field on [`BotProviderVm`] that could carry
+    /// stored token — there is no field on [`ModelProviderVm`] that could carry
     /// it — so a save that treated an empty field as a deletion would silently
     /// unauthenticate a working provider every time somebody renamed it. Use
     /// [`Self::clear_token`] to mean deletion.
@@ -6500,261 +6314,6 @@ pub struct BotProviderSaveReq {
     /// Whether to delete the stored credential. Explicit, for the reason
     /// [`Self::token`] gives.
     pub clear_token: bool,
-}
-
-/// What Settings sends to add or edit a bot (Story 61.4, FR-376).
-///
-/// AD-C7 again: `id` absent adds, `id` present edits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotSaveReq {
-    /// The row to rewrite, or `null` to add one.
-    pub id: Option<String>,
-    /// The owning provider.
-    pub provider_id: String,
-    /// The Hermes profile name or Ollama model tag this bot **is**. Validated
-    /// by `keeper_core::bots::parse_bot_target`.
-    pub target: String,
-    /// The display name.
-    pub name: String,
-    /// This bot's own credential, where the far side needs one — a Hermes
-    /// profile served under its own `API_SERVER_KEY` does. `null` leaves
-    /// whatever is stored alone, for [`BotProviderSaveReq::token`]'s reason.
-    pub token: Option<String>,
-    /// Whether to delete this bot's own credential, so the provider's default
-    /// key is used again.
-    pub clear_token: bool,
-}
-
-/// One grant, as Settings and the conversation header render it (Story 61.10,
-/// FR-386).
-///
-/// **The whole permission model is visible in one list, and this is that
-/// list's row.** It carries the scope as structure *and* as a label, because
-/// the surface renders the label verbatim and the audit log stores the same
-/// words — `layout/panel-strip.tsx:20-25`'s rule, that two surfaces wording one
-/// fact differently is how a person concludes they are two problems.
-///
-/// A revoked grant is still a row here. "What can it change?" is answered by a
-/// list of grants and their state, never by a history of clicks, so a
-/// revocation is a state on the thing it revoked and not its disappearance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotGrantVm {
-    /// The grant's opaque id — the handle revoke and save use.
-    pub id: String,
-    /// Which provider it is about.
-    pub provider_id: String,
-    /// Which bot, or `null` for every bot of that provider.
-    pub bot_id: Option<String>,
-    /// Which bytes, as structure — the shape a picker round-trips.
-    pub scope: crate::bots::grant::GrantScope,
-    /// Which bytes, as one short label: `the whole drive`, a profile name, or
-    /// `profile/subpath`. Composed in Rust so the pane, Settings and the audit
-    /// log name a scope identically.
-    pub scope_label: String,
-    /// What is permitted.
-    pub mode: crate::bots::grant::GrantMode,
-    /// When it was created, ms since the Unix epoch (UTC).
-    #[ts(type = "number")]
-    pub created_ms: i64,
-    /// When it was revoked, or `null` while it is in force. A revoked grant
-    /// permits nothing — `revokedMs` is the only field the UI needs to consult
-    /// to know that.
-    #[ts(type = "number | null")]
-    pub revoked_ms: Option<i64>,
-}
-
-impl BotGrantVm {
-    /// Project a stored grant row for the UI (Story 61.10).
-    pub fn compose(row: &crate::bots::store::GrantRow) -> Self {
-        BotGrantVm {
-            id: row.grant.id.clone(),
-            provider_id: row.grant.provider_id.clone(),
-            bot_id: row.grant.bot_id.clone(),
-            scope: row.grant.scope.clone(),
-            scope_label: row.grant.scope.label(),
-            mode: row.grant.mode,
-            created_ms: row.grant.created_ms,
-            revoked_ms: row.revoked_ms,
-        }
-    }
-}
-
-/// A grant row this build cannot act on, as Settings renders it (Story 61.10).
-///
-/// Shown rather than skipped, for [`UnknownTaskVm`]'s reason with a sharper
-/// edge: a permission row the user can see and keeper silently ignores is a
-/// permission they believe they have. The surface's one action is to revoke it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct UnknownBotGrantVm {
-    /// The row's id, so it can be revoked.
-    pub id: String,
-    /// The provider it names.
-    pub provider_id: String,
-    /// The stored scope kind, verbatim — a string this build has no meaning
-    /// for.
-    pub scope_kind: String,
-    /// The stored mode, verbatim.
-    pub mode: String,
-}
-
-impl UnknownBotGrantVm {
-    /// Project an unreadable grant row for the UI (Story 61.10).
-    pub fn compose(row: &crate::bots::store::UnknownGrantRow) -> Self {
-        UnknownBotGrantVm {
-            id: row.id.clone(),
-            provider_id: row.provider_id.clone(),
-            scope_kind: row.scope_kind.clone(),
-            mode: row.mode.clone(),
-        }
-    }
-}
-
-/// Every grant, partitioned by whether this build can act on it (Story 61.10,
-/// FR-386).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotGrantListVm {
-    /// The grants, oldest first — `created_ms, id`, the order the store reads
-    /// in, so a list that is re-read does not shuffle.
-    pub grants: Vec<BotGrantVm>,
-    /// The rows keeper cannot act on.
-    pub unknown: Vec<UnknownBotGrantVm>,
-}
-
-impl BotGrantListVm {
-    /// Project the whole grant table for the UI (Story 61.10).
-    pub fn compose(listing: &crate::bots::store::GrantListing) -> Self {
-        BotGrantListVm {
-            grants: listing.rows.iter().map(BotGrantVm::compose).collect(),
-            unknown: listing
-                .unknown
-                .iter()
-                .map(UnknownBotGrantVm::compose)
-                .collect(),
-        }
-    }
-}
-
-/// One line of the tool-call audit log (Story 61.10, FR-388, NFR-47).
-///
-/// **Its reader is a human**, so `path` is the path — `profile/sub/path`, ready
-/// to print — and the profile and subpath are here as well for a filter, not
-/// for the reader to join. Claude Code's default telemetry redacts the file
-/// path entirely (R6 §8.1); a log that cannot say which file was touched is not
-/// an audit trail.
-///
-/// A row whose `outcome` is `pending` and whose `finishedMs` is `null` is a
-/// call that was recorded and never closed — which, after a restart, is a call
-/// that was in flight when the process stopped. That pair is the crash evidence
-/// NFR-47 asks for, and the surface says so rather than rendering it as
-/// success.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotAuditRowVm {
-    /// The row's id.
-    #[ts(type = "number")]
-    pub id: i64,
-    /// When the call was about to start, ms since the Unix epoch (UTC).
-    #[ts(type = "number")]
-    pub started_ms: i64,
-    /// When it finished, or `null` while it is pending.
-    #[ts(type = "number | null")]
-    pub finished_ms: Option<i64>,
-    /// Which provider.
-    pub provider_id: String,
-    /// Which bot, where one was named.
-    pub bot_id: Option<String>,
-    /// Which conversation.
-    pub session_id: String,
-    /// Which assistant message asked for it, where one was known.
-    pub message_id: Option<String>,
-    /// The tool's name, as the model called it.
-    pub tool: String,
-    /// The path a person reads — `profile/sub/path`.
-    pub path: String,
-    /// The profile, for a filter.
-    pub profile_id: String,
-    /// The profile-relative path, for a filter.
-    pub subpath: String,
-    /// Read or write. `null` for a stored value this build cannot read — never
-    /// defaulted to `read`, which would understate what happened.
-    pub effect: Option<crate::bots::grant::Effect>,
-    /// What the grant check concluded. `null` for a stored value this build
-    /// cannot read.
-    pub verdict: Option<crate::bots::audit::AuditVerdict>,
-    /// The sentence the user was shown, quoted verbatim from
-    /// `bots::grant`'s consts, so the log and the pane say the same words.
-    pub reason: Option<String>,
-    /// The grant it ran under, where one permitted it.
-    pub grant_id: Option<String>,
-    /// What became of it.
-    pub outcome: crate::bots::audit::AuditOutcome,
-    /// Bytes read or written, or `null` where nothing was counted. Absent
-    /// rather than zero: this app does not print a number it did not measure.
-    #[ts(type = "number | null")]
-    pub bytes: Option<i64>,
-    /// Whether the result was cut short at a cap.
-    pub truncated: bool,
-}
-
-impl BotAuditRowVm {
-    /// Project one audit row for the UI (Story 61.10).
-    pub fn compose(row: &crate::bots::audit::AuditRow) -> Self {
-        BotAuditRowVm {
-            id: row.id,
-            started_ms: row.started_ms,
-            finished_ms: row.finished_ms,
-            provider_id: row.provider_id.clone(),
-            bot_id: row.bot_id.clone(),
-            session_id: row.session_id.clone(),
-            message_id: row.message_id.clone(),
-            tool: row.tool.clone(),
-            path: row.display_path.clone(),
-            profile_id: row.profile_id.clone(),
-            subpath: row.subpath.clone(),
-            effect: row.effect,
-            verdict: row.verdict,
-            reason: row.reason.clone(),
-            grant_id: row.grant_id.clone(),
-            outcome: row.outcome,
-            bytes: row.bytes,
-            truncated: row.truncated,
-        }
-    }
-}
-
-/// What the grant editor sends to create or change one grant (Story 61.10,
-/// FR-386, AD-C7 on the wire).
-///
-/// `id` absent creates, present rewrites — the same one-request shape
-/// [`BotProviderSaveReq`] uses, because add and edit are one component in two
-/// modes and two commands would let them diverge.
-///
-/// **Nothing but this request can create a grant** (NFR-48): no tool result, no
-/// file content and no model message reaches the writer, so a file that
-/// instructs a model to widen its own access has no route to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotGrantSaveReq {
-    /// The grant to rewrite, or `null` to create one.
-    pub id: Option<String>,
-    /// Which provider this grant is about.
-    pub provider_id: String,
-    /// Which bot, or `null` for every bot of that provider.
-    pub bot_id: Option<String>,
-    /// Which bytes.
-    pub scope: crate::bots::grant::GrantScope,
-    /// What is permitted.
-    pub mode: crate::bots::grant::GrantMode,
 }
 
 /// One filesystem tool call, as the conversation renders it (Story 61.11,
@@ -7153,333 +6712,9 @@ impl BotApprovalRequestVm {
 }
 
 // ---------------------------------------------------------------------------
-// Story 61.6 — the conversation list, the archive, and continue
-// ---------------------------------------------------------------------------
-
-/// Which conversations a list is asking for (Story 61.6, FR-381).
-///
-/// Three positions and not a boolean, matching the sessions board's own
-/// `All | Active | Archived` chips: a person who archives conversations wants
-/// to read the archive alone sometimes, and a widening flag cannot say that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub enum BotSessionScope {
-    /// Everything not archived — what the pane opens onto.
-    #[default]
-    Live,
-    /// Live and archived together.
-    All,
-    /// The archive alone.
-    Archived,
-}
-
-impl BotSessionScope {
-    /// The store's own scope for this one.
-    pub fn to_scope(self) -> crate::bots::session::SessionScope {
-        use crate::bots::session::SessionScope;
-        match self {
-            BotSessionScope::Live => SessionScope::Live,
-            BotSessionScope::All => SessionScope::All,
-            BotSessionScope::Archived => SessionScope::Archived,
-        }
-    }
-}
-
-/// What the conversation list asks for (Story 61.6, FR-381).
-///
-/// One request struct rather than three positionals, for `BotChatSendReq`'s
-/// reason: a text, a scope and a limit in a row is a call site that reorders
-/// silently.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotSessionQueryReq {
-    /// Free text, matched case-insensitively against the title **and** every
-    /// message body. Empty is no text predicate at all.
-    pub text: String,
-    /// Which conversations to consider.
-    pub scope: BotSessionScope,
-    /// How many rows to return; `0` takes the store's default and anything
-    /// above its ceiling is clamped to it.
-    pub limit: u32,
-}
-
-impl BotSessionQueryReq {
-    /// The store query this request means.
-    pub fn to_query(&self) -> crate::bots::session::SessionQuery {
-        crate::bots::session::SessionQuery {
-            text: self.text.clone(),
-            scope: self.scope.to_scope(),
-            limit: usize::try_from(self.limit).unwrap_or(0),
-        }
-    }
-}
-
-/// One row of the conversation list (Story 61.6, FR-381; Epic 63, AD-181).
-///
-/// The session plus the facts a row renders that are not columns of it.
-/// `latestActivityMs` is composed in Rust rather than derived on the frontend
-/// because it is a `MAX` over another table, and a row that guessed it from
-/// `updatedMs` alone would sort a conversation nobody has renamed below one
-/// somebody just renamed. `transcript` says whether opening this row reads the
-/// gateway's history or keeper's own copy, so the list can say which is which
-/// before a click.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotSessionRowVm {
-    /// The conversation.
-    pub session: BotSessionVm,
-    /// When anything last happened to it — the newest message or the session's
-    /// own last change, whichever is later. Never null and never zero: a
-    /// conversation with no messages was still created.
-    #[ts(type = "number")]
-    pub latest_activity_ms: i64,
-    /// How many messages **keeper's own copy** holds. On a `remote` row the
-    /// gateway's transcript may hold more — this device may never have written
-    /// a turn of it — so the number is labelled as local, never as the whole.
-    #[ts(type = "number")]
-    pub message_count: i64,
-    /// Where opening this row reads its transcript from.
-    pub transcript: BotTranscriptSource,
-}
-
-/// One page of the conversation list, and the size of the set it came from
-/// (Story 61.6, FR-381).
-///
-/// `total` is separate from `rows.length` on purpose: the page is bounded, and
-/// a count that means "how many are mounted" while looking like a total is the
-/// defect `count-label.ts:4-18` exists to make unreachable.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotSessionListVm {
-    /// The rows, newest activity first.
-    pub rows: Vec<BotSessionRowVm>,
-    /// How many conversations matched, whether or not they fitted on the page.
-    #[ts(type = "number")]
-    pub total: i64,
-}
-
-impl BotSessionListVm {
-    /// Project one page for the UI (Story 61.6, Epic 63).
-    ///
-    /// `caps_of` answers, per provider id, what that endpoint said about
-    /// sessions — the shell's cache, read here so the label on every row is
-    /// `bots::remote::transcript_source`'s decision and not the frontend's
-    /// guess from a non-null id.
-    pub fn compose(
-        page: &crate::bots::session::SessionPage,
-        caps_of: impl Fn(&str) -> crate::bots::remote::SessionCapabilities,
-    ) -> Self {
-        BotSessionListVm {
-            rows: page
-                .rows
-                .iter()
-                .map(|row| BotSessionRowVm {
-                    session: BotSessionVm::compose(&row.session),
-                    latest_activity_ms: row.latest_activity_ms,
-                    message_count: row.message_count,
-                    transcript: crate::bots::remote::transcript_source(
-                        caps_of(&row.session.provider_id),
-                        &row.session,
-                    ),
-                })
-                .collect(),
-            total: page.total,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Story 61.9 — the slash-command surface's view models
-//
-// One round trip answers the composer's whole question: what is this draft,
-// and what should the menu show? The frontend filters nothing and ranks
-// nothing, which is the palette's own contract (AD-20) applied to a second
-// picker — because a TypeScript matcher beside the Rust registry would be two
-// opinions about what `/mod` means.
-// ---------------------------------------------------------------------------
-
-/// What the composer knows when it asks (Story 61.9, FR-385).
-///
-/// Four facts the pane already holds. `modelTools` is a tri-state and stays
-/// one: `null` is *the endpoint did not say*, never *no* (AD-27).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotCommandContextReq {
-    /// The chosen bot's provider kind, or `null` when no bot is chosen.
-    pub provider_kind: Option<crate::bots::ProviderKind>,
-    /// Whether any provider is configured.
-    pub has_provider: bool,
-    /// Whether a bot is chosen.
-    pub has_bot: bool,
-    /// Whether the open conversation has started.
-    pub has_session: bool,
-    /// Whether the chosen model takes tools, as the endpoint stated it.
-    pub model_tools: Option<bool>,
-}
-
-impl BotCommandContextReq {
-    /// The `keeper_core::bots::commands` context this request describes.
-    pub fn context(&self) -> crate::bots::commands::Context {
-        crate::bots::commands::Context {
-            kind: self.provider_kind,
-            has_provider: self.has_provider,
-            has_bot: self.has_bot,
-            has_session: self.has_session,
-            model_tools: self.model_tools,
-        }
-    }
-}
-
-/// One row of the slash-command menu (Story 61.9, FR-385).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotCommandRowVm {
-    /// The registry name, without the slash.
-    pub name: String,
-    /// Every other spelling that reaches it, for the row's own disclosure —
-    /// `/h` is discoverable only if `/help` says so.
-    pub aliases: Vec<String>,
-    /// The one sentence the registry holds.
-    pub description: String,
-    /// What may follow the name.
-    pub args: crate::bots::commands::ArgMode,
-    /// What the argument is, in the hint's own words. `null` exactly when
-    /// nothing may follow.
-    pub arg_hint: Option<String>,
-    /// Whether Enter may run it right now.
-    pub available: bool,
-    /// Why not, where it may not. `null` exactly when `available`.
-    pub reason: Option<String>,
-    /// The caveat a runnable command still owes the person — today, that keeper
-    /// could not read whether the chosen model takes tools. `null` when there
-    /// is nothing to say, and never a reason not to run: a row can be both
-    /// `available` and warned, which is the whole point of the field.
-    pub warning: Option<String>,
-}
-
-impl BotCommandRowVm {
-    /// Project one registry entry against a context (Story 61.9).
-    pub fn compose(
-        spec: &crate::bots::commands::CommandSpec,
-        ctx: &crate::bots::commands::Context,
-    ) -> Self {
-        let availability = crate::bots::commands::availability(spec, ctx);
-        BotCommandRowVm {
-            name: spec.name.to_string(),
-            aliases: spec
-                .aliases
-                .iter()
-                .map(|alias| (*alias).to_string())
-                .collect(),
-            description: spec.description.to_string(),
-            args: spec.args,
-            arg_hint: spec.arg_hint.map(|hint| hint.to_string()),
-            available: availability.is_available(),
-            reason: availability.reason().map(|reason| reason.to_string()),
-            warning: availability.warning().map(|warning| warning.to_string()),
-        }
-    }
-}
-
-/// What one draft is (Story 61.9, FR-385).
-///
-/// Three arms and no fourth: text for the model, a command for keeper, or a
-/// refusal that sends nothing. The composer's whole job is to obey whichever
-/// one arrives, which is why an unknown command cannot leak out as prose — the
-/// arm that would carry it does not exist.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-#[ts(export)]
-pub enum BotCommandVerdictVm {
-    /// Send this to the model, verbatim. The escaped leading slash arrives
-    /// here with one slash already removed.
-    Prose {
-        /// What to send.
-        text: String,
-    },
-    /// Run this command.
-    Command {
-        /// The registry name, never the alias that was typed.
-        name: String,
-        /// What followed it, trimmed. `null` when nothing did.
-        args: Option<String>,
-    },
-    /// Send nothing, and say this.
-    Refusal {
-        /// keeper's whole sentence, quoted verbatim by the composer.
-        message: String,
-    },
-}
-
-/// Everything the composer needs about one draft (Story 61.9, FR-385).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotCommandPreviewVm {
-    /// The draft this answers, echoed verbatim.
-    ///
-    /// **The caller must check it.** Replies can land out of order, so a slow
-    /// answer for a half-typed draft can arrive after a fast answer for the
-    /// finished one, and rendering it would show a refusal for text the field
-    /// no longer holds — `TaskSchedulePreviewVm`'s rule, restated because the
-    /// call site is the same shape.
-    pub draft: String,
-    /// What the draft is.
-    pub verdict: BotCommandVerdictVm,
-    /// The menu rows for the token as typed, in registry order. Empty when the
-    /// draft is not a command line, so an empty list means "draw no menu".
-    pub rows: Vec<BotCommandRowVm>,
-    /// The one sentence this context owes about commands keeper does not
-    /// serve — Hermes' own, which are enumerable only over a channel keeper
-    /// does not speak. `null` where there is nothing to disclose.
-    pub note: Option<String>,
-    /// How to send a message that really does start with a slash.
-    ///
-    /// Carried on every preview rather than fetched separately: the empty
-    /// state, the menu footer and the unknown-command refusal all teach the
-    /// same escape, and one source is what stops them wording it three ways.
-    pub escape_hint: String,
-}
-
-impl BotCommandPreviewVm {
-    /// Resolve one draft and project the menu beside it (Story 61.9).
-    pub fn compose(draft: &str, ctx: &crate::bots::commands::Context) -> Self {
-        use crate::bots::commands::{self, Resolution};
-        let verdict = match commands::resolve(draft, ctx) {
-            Resolution::Prose(text) => BotCommandVerdictVm::Prose { text },
-            Resolution::Command { name, args } => BotCommandVerdictVm::Command {
-                name: name.to_string(),
-                args,
-            },
-            Resolution::Refusal(message) => BotCommandVerdictVm::Refusal { message },
-        };
-        BotCommandPreviewVm {
-            draft: draft.to_string(),
-            verdict,
-            rows: commands::menu(draft, ctx)
-                .into_iter()
-                .map(|spec| BotCommandRowVm::compose(spec, ctx))
-                .collect(),
-            note: commands::note(ctx).map(|note| note.to_string()),
-            escape_hint: commands::ESCAPE_HINT.to_string(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Story 100.5 — the messenger composer's slash menu (R385)
 //
-// The bot composer's contract, restated for chats and agent rooms: one round
+// The composer's contract for chats and agent rooms: one round
 // trip answers what the draft is and what the menu shows, and the webview
 // filters and ranks nothing (AD-20). The context is not on the wire: Rust reads
 // the room (its kind, the person's power levels) itself.
@@ -7497,7 +6732,7 @@ pub struct ChatCommandRowVm {
     /// The one sentence the registry holds.
     pub description: String,
     /// What may follow the name.
-    pub args: crate::bots::commands::ArgMode,
+    pub args: crate::chat::commands::ArgMode,
     /// What the argument is, in the hint's own words; `null` exactly when
     /// nothing may follow.
     pub arg_hint: Option<String>,
@@ -7603,7 +6838,7 @@ impl ChatCommandPreviewVm {
                 .into_iter()
                 .map(|spec| ChatCommandRowVm::compose(spec, ctx))
                 .collect(),
-            escape_hint: crate::bots::commands::ESCAPE_HINT.to_string(),
+            escape_hint: crate::chat::commands::ESCAPE_HINT.to_string(),
         }
     }
 }
@@ -7707,88 +6942,6 @@ impl ChatInlinePreviewVm {
 // ---------------------------------------------------------------------------
 // Story 61.12 — an image you can paste, a path you can open (FR-392, FR-393)
 // ---------------------------------------------------------------------------
-
-/// One pasted image, staged on disk and waiting to be sent (Story 61.12,
-/// FR-392, AD-58).
-///
-/// **There is no `bytes` field and there must never be one.** The image
-/// arrived over a raw binary IPC body and lives in the staging folder; the
-/// webview holds a `blob:` object URL it made from the same clipboard `File`
-/// it already had, so the thumbnail costs no second copy and no base64. The
-/// only `data:` URI in this feature is minted inside the outbound HTTP body,
-/// by [`crate::bots::deliverable::image_data_uri`], and is never seen here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotAttachmentVm {
-    /// The staging id — the handle send and discard use.
-    pub id: String,
-    /// What the attachment is called, for the tray and the alt text.
-    pub filename: String,
-    /// The MIME the clipboard reported, already checked against
-    /// [`crate::bots::deliverable::IMAGE_MIMES`].
-    pub mime: String,
-    /// How many bytes landed on disk.
-    #[ts(type = "number")]
-    pub byte_len: i64,
-}
-
-/// One path an assistant reply named, and what keeper offers on it (Story
-/// 61.12, FR-393, AD-160).
-///
-/// `start`/`end` are byte offsets into the reply **as it was received**. keeper
-/// never strips a path out of a reply the way the Hermes gateway does — here
-/// the reply is the record — so these are the coordinates of a decoration and
-/// never of an edit.
-///
-/// `reason` is `None` exactly when the control is offered. A path with a
-/// reason renders as the text it is, with that one sentence beside it, which
-/// is AD-27's shape: the affordance that could not work is absent and the
-/// reason is on screen.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct BotDeliverableVm {
-    /// Exactly the characters the reply used, punctuation already trimmed.
-    pub raw: String,
-    /// The same path with `~` expanded, for display.
-    pub absolute: String,
-    /// Byte offset of `raw` in the reply.
-    #[ts(type = "number")]
-    pub start: i64,
-    /// Byte offset one past the end of `raw` in the reply.
-    #[ts(type = "number")]
-    pub end: i64,
-    /// The sync profile the file is in, where a control is offered.
-    pub profile_id: Option<String>,
-    /// Where in that profile, profile-relative, where a control is offered.
-    pub subpath: Option<String>,
-    /// Why there is no control, or `None` when there is one.
-    pub reason: Option<String>,
-}
-
-impl BotDeliverableVm {
-    /// Project one resolved mention for the UI (Story 61.12).
-    pub fn compose(item: &crate::bots::deliverable::Deliverable) -> Self {
-        use crate::bots::deliverable::DeliverableControl;
-        let (profile_id, subpath, reason) = match &item.control {
-            DeliverableControl::Reveal {
-                profile_id,
-                subpath,
-            } => (Some(profile_id.clone()), Some(subpath.clone()), None),
-            DeliverableControl::None { reason } => (None, None, Some(reason.clone())),
-        };
-        BotDeliverableVm {
-            raw: item.mention.raw.clone(),
-            absolute: item.absolute.clone(),
-            start: item.mention.start as i64,
-            end: item.mention.end as i64,
-            profile_id,
-            subpath,
-            reason,
-        }
-    }
-}
 
 /// Where a voice turn is (Epic 62, Story 62.4, FR-401), streamed over the
 /// `voice_start` channel as a snapshot after every transition.
@@ -7966,7 +7119,7 @@ pub enum VoiceUnavailableVm {
 
 /// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406),
 /// the recogniser's language (Epic 63), the stop phrase (Epic 67, AD-208)
-/// and the bot a spoken turn goes to (Epic 67, AD-206), from `voice_wake_get`
+/// and where a spoken turn goes (Epic 67, AD-206), from `voice_wake_get`
 /// and back from `voice_wake_set`, `voice_locale_set` and `voice_target_set`.
 ///
 /// `limits` is the port's own `VoicePlatform::limits` carried to the surface
@@ -7988,18 +7141,18 @@ pub struct VoiceWakeVm {
     /// The locale the recogniser runs in, or — when the choice is refused —
     /// the one that was asked for, canonical (`en-US`).
     pub locale: String,
-    /// `bots.voice_locale` as stored; `None` means "choose for me".
+    /// `voice.locale` as stored; `None` means "choose for me".
     pub locale_chosen: Option<String>,
     /// Every locale this device can recognise on its own, sorted by
     /// identifier; empty when none can.
     pub on_device_locales: Vec<String>,
-    /// The word that ends a spoken answer, as typed (`bots.stop_phrase`);
+    /// The word that ends a spoken answer, as typed (`voice.stop_phrase`);
     /// never blank.
     pub stop_phrase: String,
-    /// `bots.voice_target` as stored — the id of the pinned bot a spoken
-    /// turn goes to, or `agent:<room id>` for one of the person's proxy
-    /// conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
-    /// pinned bot most recently talked to".
+    /// `voice.target` as stored — `agent:<room id>` for one of the person's
+    /// proxy conversations ([`VoiceAgentTargetVm::target`]); `None` means
+    /// nothing is chosen, and a spoken turn is refused until something is
+    /// (`keeper_core::voice::target::resolve`).
     pub voice_target: Option<String>,
     /// The turn models' line under the voice switch (UX-DR142, D-36):
     /// `keeper_core::voice::turn_models::turn_models_state` as transcription's
@@ -8010,28 +7163,9 @@ pub struct VoiceWakeVm {
     pub turn_models: Option<crate::transcription::vm::ModelsStateVm>,
 }
 
-/// How fast a pinned bot starts answering (Epic 68, Story 68.4, AD-216),
-/// one per pinned bot, from `voice_target_speeds`. Read beside the voice
-/// target picker, so choosing a bot to talk to is a choice made with
-/// numbers: `bot_messages` already holds `ttft_ms` per answer, and this is
-/// `keeper_core::bots::voice_target::median_first_token` over the bot's
-/// last ten. Nothing is measured that is not already stored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct VoiceTargetSpeedVm {
-    /// The pinned bot's id.
-    pub bot_id: String,
-    /// The median milliseconds to the first token over the bot's last ten
-    /// answers, or `None` with fewer than three measured answers — the picker
-    /// shows nothing rather than a number one slow answer made.
-    #[ts(type = "number | null")]
-    pub first_token_median_ms: Option<u64>,
-}
-
 /// One of the person's proxy conversations a spoken turn may go to
 /// (AD-384), from `voice_agent_targets`, listed by the voice target picker
-/// ("Speak to") after the pinned bots: the `main` DM first, then the
+/// ("Speak to"): the `main` DM first, then the
 /// conversations, per signed-in account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

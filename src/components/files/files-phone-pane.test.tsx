@@ -106,7 +106,7 @@ import { PhoneShell } from "@/components/layout/phone-shell";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 
 /** The tier a phone hydrates to once its folder links (Epic 66): only what the OS refuses is off. */
-const PHONE = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, shareOut: true };
+const PHONE = { ...DEFAULT_CAPABILITIES, sync: true, shareOut: true };
 /** A Mac whose window is narrower than the phone breakpoint: the stack, with Finder. */
 const NARROW_DESKTOP = {
   ...DEFAULT_CAPABILITIES,
@@ -120,8 +120,6 @@ const NARROW_DESKTOP = {
   sync: true,
   notes: true,
   sessions: true,
-  bots: true,
-  botTools: true,
 };
 
 const account: AccountVm = {
@@ -354,7 +352,7 @@ describe("Files on the phone — the stack (Story 66.3, AD-200)", () => {
   });
 
   it("has no Files row where the folder cannot sync", async () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
     render(<PhoneShell />);
     fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
     const nav = await screen.findByRole("navigation", { name: "Views" });

@@ -82,7 +82,7 @@ export const SETUP_DEVICE_NOTE =
  * reinstall keeps its name (AD-329), and the first sync brings the rest back.
  */
 export const SETUP_DEVICE_REGISTERED_NOTE =
-  "This device is already in your settings repository; keeper will restore its drives, bots and settings.";
+  "This device is already in your settings repository; keeper will restore its drives, model providers and settings.";
 export const SETUP_CLASS_LABEL = "Kind of device";
 export const SETUP_CONTINUE_LABEL = "Continue";
 export const SETUP_CANCEL_LABEL = "Cancel";

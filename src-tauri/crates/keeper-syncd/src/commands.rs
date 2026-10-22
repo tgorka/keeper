@@ -717,19 +717,6 @@ pub struct TaskSetArgs {
     /// `manual` when you did not. On update it keeps its stored value.
     #[arg(long, value_enum)]
     pub mode: Option<TaskModeArg>,
-    /// Which bot a `bot` task asks (its id, as `bots list` prints it).
-    ///
-    /// Kept when the flag is absent, like `--schedule` and `--description`:
-    /// editing a bot task's window must not forget which bot it asks.
-    #[arg(long, value_name = "ID")]
-    pub bot: Option<String>,
-    /// Any markdown prompt under the folder's root, relative to that root.
-    /// Frontmatter and one leading heading are omitted from the prompt.
-    #[arg(long, value_name = "SUBPATH")]
-    pub prompt: Option<String>,
-    /// The model to ask as. A bot runner refuses a task without a model.
-    #[arg(long, value_name = "MODEL")]
-    pub model: Option<String>,
     /// Absolute source path for a verified copy job.
     #[arg(long)]
     pub copy_source: Option<String>,
@@ -946,10 +933,6 @@ pub enum TaskKindArg {
     /// Re-check stored content against its recorded digests. Reads only, asks
     /// no network, and takes no per-folder reservation.
     Verify,
-    /// Ask a bot the prompt in one markdown file under a folder,
-    /// and record what it answered. Needs `--bot` and `--prompt`; runs only on
-    /// a host with a bot runner, which today is the keeper app.
-    Bot,
     /// One verified local copy job, optionally bounded by source modification time.
     Copy,
     /// Repack the folder's git objects (`git gc --quiet`) in a quiet window:
@@ -1031,7 +1014,6 @@ impl From<TaskKindArg> for TaskKind {
             TaskKindArg::Sync => Self::Sync,
             TaskKindArg::Release => Self::Release,
             TaskKindArg::Verify => Self::Verify,
-            TaskKindArg::Bot => Self::Bot,
             TaskKindArg::Copy => Self::Copy,
             TaskKindArg::Gc => Self::Gc,
         }
@@ -4116,7 +4098,7 @@ fn cmd_task_set(
         (None, None) => {
             return Err(SyncError::Config(format!(
                 "task `{}` does not exist yet, so a new one must name its kind: \
-                 pass --kind sync, --kind release, --kind verify or --kind bot",
+                 pass --kind sync, --kind release, --kind verify, --kind copy or --kind gc",
                 args.task
             ))
             .into());
@@ -4208,23 +4190,6 @@ fn cmd_task_set(
         on_missed,
         description,
         missed_delay_ms,
-        // Story 69.4's three, with `description`'s keep-when-absent shape and
-        // no way to clear them: a bot task without a bot or a prompt is a row
-        // that can only fail, so the flags that name them are additive only.
-        // Changing one is `--bot`/`--prompt` again; a task that should ask
-        // something else entirely is a different task.
-        bot_id: args
-            .bot
-            .clone()
-            .or_else(|| existing.and_then(|row| row.bot_id.clone())),
-        prompt_subpath: args
-            .prompt
-            .clone()
-            .or_else(|| existing.and_then(|row| row.prompt_subpath.clone())),
-        model: args
-            .model
-            .clone()
-            .or_else(|| existing.and_then(|row| row.model.clone())),
         copy_source: args
             .copy_source
             .clone()
@@ -6330,9 +6295,6 @@ mod tests {
             on_missed: TaskMissedPolicy::RunNow,
             description: None,
             missed_delay_ms: None,
-            bot_id: None,
-            prompt_subpath: None,
-            model: None,
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
@@ -6375,9 +6337,6 @@ mod tests {
             on_missed: None,
             missed_delay: None,
             no_missed_delay: false,
-            bot: None,
-            prompt: None,
-            model: None,
             copy_source: None,
             copy_destination: None,
             replace_existing: None,
@@ -6482,6 +6441,7 @@ mod tests {
                 id: "teleport-1".to_owned(),
                 reason: "kind 'teleport' is not one this keeper can run".to_owned(),
             }],
+            retired: Vec::new(),
         };
 
         // The one that resolves.

@@ -95,7 +95,6 @@ export function providerOffer(over: Partial<ProviderOfferVm> = {}): ProviderOffe
     name: "Acme Hermes",
     baseUrl: "https://hermes.acme.dev",
     credential: "account",
-    bots: ["Research", "Scheduler"],
     devices: ["iphone-3f2a"],
     ...over,
   };

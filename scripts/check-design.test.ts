@@ -2,13 +2,13 @@
  * The design gate's arithmetic, tested — because a gate that only ever passes
  * is indistinguishable from a gate that checks nothing.
  *
- * `check-design.mjs` grew a rule for Story 61.7's bot identity palette, and
- * that rule is the story: `DESIGN.md` records that no colour of any hue passes
+ * `check-design.mjs` grew a rule for Story 61.7's identity palette (an agent's
+ * since Story 106.2), and that rule is the story: `DESIGN.md` records that no colour of any hue passes
  * AA in both themes, so a bounded palette is only defensible if every member is
  * MEASURED. Two halves are asserted here:
  *
  * 1. **The shipped palette passes**, read out of the real `src/index.css` and
- *    the real `bot-identity.tsx`. This is the half that catches a hex somebody
+ *    the real `components/agents/identity.tsx`. This is the half that catches a hex somebody
  *    nudged.
  * 2. **A palette that does not pass is reported** — per theme and per surface,
  *    with the ratio. This is the half that catches the rule being softened:
@@ -47,7 +47,7 @@ function themeWith(inks: Record<string, string>) {
   };
 }
 
-describe("the shipped bot palette", () => {
+describe("the shipped identity palette", () => {
   it("is declared in both themes and in both languages", () => {
     expect(NAMES.length).toBeGreaterThanOrEqual(IDENTITY_PALETTE_BOUNDS[0]);
     expect(NAMES.length).toBeLessThanOrEqual(IDENTITY_PALETTE_BOUNDS[1]);

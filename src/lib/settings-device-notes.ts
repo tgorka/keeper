@@ -83,11 +83,11 @@ export const STORE_PASSPHRASE_NOTE: DeviceNote = {
 
 export const VOICE_NOTE: DeviceNote = {
   text: "Listening for the wake phrase, and the voice language: an open microphone is a person's tap on the device that listens, and each device runs its own speech models. Setting this device up again brings the language back and leaves listening off.",
-  keys: ["bots.wake_enabled", "bots.voice_locale"],
+  keys: ["voice.wake_enabled", "voice.locale"],
 };
 
 export const ENDPOINT_KEY_NOTE: DeviceNote = {
-  text: "An endpoint's key: it is in this device's keychain. The endpoint itself is offered to your other devices.",
+  text: "A model provider's key: it is in this device's keychain. The provider itself is offered to your other devices.",
   kept: "device",
 };
 

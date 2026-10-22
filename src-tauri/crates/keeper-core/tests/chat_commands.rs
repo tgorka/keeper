@@ -6,7 +6,7 @@
 //! those are facts about a textarea, proven in `composer.test.tsx` against these
 //! verdicts.
 
-use keeper_core::bots::commands::MAX_COMMAND_CHARS;
+use keeper_core::chat::commands::MAX_COMMAND_CHARS;
 use keeper_core::chat::commands::{
     availability, menu, resolve, Availability, Context, Need, RefusalReason, Resolution, RoomKind,
     COMMANDS, SHRUG,

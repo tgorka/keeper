@@ -185,7 +185,7 @@ struct State {
     /// keeper's activity is in front: set when the port is made, cleared by
     /// the plugin's `background`, set again by its `front`.
     in_front: bool,
-    /// `bots.voice_locale`, as [`VoicePort::set_locale`] last said.
+    /// `voice.locale`, as [`VoicePort::set_locale`] last said.
     requested: Option<String>,
     /// Which recogniser session is heard, and whether a capture is up.
     sessions: Sessions,

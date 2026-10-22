@@ -7,7 +7,7 @@
 //! though English could have run there, and the sentence it showed told the
 //! person that no download would help. Both were wrong, and both are fixed
 //! by one pure function: [`choose`] takes what the person asked for
-//! (`bots.voice_locale`, unset meaning "choose for me"), what the system is
+//! (`voice.locale`, unset meaning "choose for me"), what the system is
 //! set to, and which locales this device can run on its own, and answers the
 //! locale to build the recogniser for or the refusal to show.
 //!
@@ -96,7 +96,7 @@ fn fold(c: char) -> char {
 
 /// The locale to run in, or the refusal.
 ///
-/// `requested` is `bots.voice_locale`; `None` or blank means "choose for
+/// `requested` is `voice.locale`; `None` or blank means "choose for
 /// me". `system` is the system locale in whichever spelling the OS gave it.
 /// `on_device` is every locale whose recogniser reports
 /// `supportsOnDeviceRecognition`, in the port's sorted order. The `Ok`

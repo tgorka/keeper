@@ -12,16 +12,17 @@
 //! The files hold preferences, not pins: a value is applied into the table, so
 //! the settings pane can still change it, and `keeper.toml` keeps winning on
 //! read wherever it sets the same key. Local identifiers — a sync profile id, a
-//! bot id, a provider id — travel as references that name the same drive or
-//! endpoint on every device ([`to_portable`], [`from_portable`]).
+//! provider id — travel as references that name the same drive or endpoint on
+//! every device ([`to_portable`], [`from_portable`]).
 //!
-//! Everything here is pure except [`Catalog::with_bots`] and [`local_values`],
+//! Everything here is pure except [`Catalog::with_providers`] and [`local_values`],
 //! which read `keeper.db`; the shell moves the bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::bots::{self, store, voice_target};
+use crate::providers::{self, store};
+use crate::voice::target as voice_target;
 use crate::config::keys::{self, Scope, Shape};
 use crate::error::CoreError;
 use crate::registry::{self, EmbeddingModel};
@@ -45,15 +46,15 @@ pub enum SyncedFile {
 const DEVICE_KEYS: &[&str] = &[
     "sdk_encryption",
     "sync.git_path",
-    "bots.wake_enabled",
-    "bots.voice_locale",
+    "voice.wake_enabled",
+    "voice.locale",
     "notes.hide_service_files",
     "notes.include_private",
 ];
 
 /// The wake phrase's switch: an open microphone is a person's tap, never a
 /// sync's.
-const WAKE_ENABLED_KEY: &str = "bots.wake_enabled";
+const WAKE_ENABLED_KEY: &str = "voice.wake_enabled";
 
 const SYNC_CREDENTIAL_PREFIX: &str = "sync.credential_source.";
 const BOTS_CREDENTIAL_PREFIX: &str = "bots.provider_credential_source.";
@@ -145,6 +146,7 @@ impl Values {
             Some(toml::Value::Table(table)) => {
                 let mut flat = Vec::with_capacity(table.len());
                 flatten("", table, &mut flat);
+                let flat = retire_bot_keys(flat, |value| value.as_str());
                 for (key, value) in flat {
                     let stored = keys::spec(&key)
                         .filter(|_| synced_file(&key) == Some(file))
@@ -197,10 +199,48 @@ impl Values {
         serde_json::from_str::<BTreeMap<String, String>>(raw)
             .ok()
             .map(|values| Values {
-                values,
+                values: retire_bot_keys(values.into_iter().collect(), |value| Some(value))
+                    .into_iter()
+                    .collect(),
                 ..Values::default()
             })
     }
+}
+
+/// A file or a base an older device wrote, read under the keys voice has now
+/// (Story 108.3a): each `bots.*` voice key becomes its `voice.*` key unless the
+/// same file already holds that one, `bots.voice_target` only when it names an
+/// agent room, and `bots.message_details` is dropped — the same moves
+/// `registry` makes in `keeper.db` once. The next render writes the new keys.
+fn retire_bot_keys<V>(
+    entries: Vec<(String, V)>,
+    text: impl Fn(&V) -> Option<&str>,
+) -> Vec<(String, V)> {
+    let present: BTreeSet<String> = entries.iter().map(|(key, _)| key.clone()).collect();
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if key == registry::RETIRED_BOT_SETTING {
+                return None;
+            }
+            let Some(new) = registry::RETIRED_VOICE_KEYS
+                .iter()
+                .find(|(old, _)| *old == key)
+                .map(|(_, new)| *new)
+            else {
+                return Some((key, value));
+            };
+            if present.contains(new) {
+                return None;
+            }
+            if new == VOICE_TARGET_KEY
+                && !text(&value).is_some_and(|value| voice_target::agent_room_of(value).is_some())
+            {
+                return None;
+            }
+            Some((new.to_owned(), value))
+        })
+        .collect()
 }
 
 /// `[settings.recording] fps = 30` and `"recording.fps" = 30` are one key. No
@@ -482,10 +522,10 @@ pub fn remote_has_secret(url: &str) -> bool {
     }
 }
 
-/// A provider's base URL in the one spelling the bots store keeps
-/// ([`bots::parse_base_url`]); a string that does not parse is only trimmed.
+/// A provider's base URL in the one spelling the provider store keeps
+/// ([`providers::parse_base_url`]); a string that does not parse is only trimmed.
 pub fn normalize_base_url(url: &str) -> String {
-    bots::parse_base_url(url).map_or_else(
+    providers::parse_base_url(url).map_or_else(
         |_| url.trim().trim_end_matches('/').to_owned(),
         |parsed| parsed.normalized,
     )
@@ -559,7 +599,7 @@ pub fn url_origin(url: &str) -> Option<String> {
     Some(parsed.origin().ascii_serialization()).filter(|origin| origin != "null")
 }
 
-/// A bot provider as every device names it: its kind and base URL.
+/// A model provider as every device names it: its kind and base URL.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProviderRef {
     kind: String,
@@ -583,11 +623,6 @@ impl ProviderRef {
     pub fn origin(&self) -> Option<String> {
         url_origin(&self.base_url)
     }
-
-    /// `bot:<kind>:<normalized base URL>#<target>`.
-    pub fn bot_reference(&self, target: &str) -> String {
-        format!("bot:{}:{}#{}", self.kind, self.base_url, target)
-    }
 }
 
 /// One of this device's drives, as the shell reads it from `sync.db`.
@@ -607,7 +642,7 @@ impl LocalDrive {
     }
 }
 
-/// This device's drives, providers and bots, by local id.
+/// This device's drives and providers, by local id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
     pub drives: Vec<LocalDrive>,
@@ -617,8 +652,6 @@ pub struct Catalog {
     pub drives_known: bool,
     /// `(provider id, provider)`.
     pub providers: Vec<(String, ProviderRef)>,
-    /// `(bot id, provider id, target)`.
-    pub bots: Vec<(String, String, String)>,
     /// The configured account. A credential-source row travels only when it
     /// is bound to this account, and comes back bound to it.
     pub account_id: Option<String>,
@@ -636,12 +669,11 @@ pub struct Catalog {
 
 impl Catalog {
     /// `drives` from the shell (keeper-core cannot see `sync.db`), `None`
-    /// when the drive list could not be read; providers and bots from
-    /// `keeper.db`. A provider of a kind this build does not speak has no base
+    /// when the drive list could not be read; providers from `keeper.db`. A provider of a kind this build does not speak has no base
     /// URL to name it by, and is left out. The shell sets
     /// [`account_id`](Catalog::account_id) and
     /// [`trusted_origins`](Catalog::trusted_origins).
-    pub fn with_bots(
+    pub fn with_providers(
         data_dir: &Path,
         drives: Option<Vec<LocalDrive>>,
     ) -> Result<Catalog, CoreError> {
@@ -654,15 +686,10 @@ impl Catalog {
                 (provider.id, named)
             })
             .collect();
-        let bots = store::list_bots(data_dir)?
-            .into_iter()
-            .map(|bot| (bot.id, bot.provider_id, bot.target))
-            .collect();
         Ok(Catalog {
             drives_known: drives.is_some(),
             drives: drives.unwrap_or_default(),
             providers,
-            bots,
             account_id: None,
             trusted_origins: Vec::new(),
             forge_origins: Vec::new(),
@@ -721,7 +748,7 @@ const DRIVE_KEYS: &[&str] = &[
     "tasks.ledger_vault",
     "recording.destination_profile_id",
 ];
-const VOICE_TARGET_KEY: &str = "bots.voice_target";
+const VOICE_TARGET_KEY: &str = "voice.target";
 const EMBEDDING_MODEL_KEY: &str = "notes.embedding_model";
 
 /// A credential-source key split into its family prefix and the rest: a
@@ -802,8 +829,8 @@ pub fn stored_key(key: &str, catalog: &Catalog) -> Option<String> {
     Some(format!("{prefix}{id}"))
 }
 
-/// A stored value in the form it travels in. `None` when it names a drive,
-/// bot or provider this device does not know ([`local_values`] then takes the
+/// A stored value in the form it travels in. `None` when it names a drive or
+/// provider this device does not know, or a voice target that is no agent room ([`local_values`] then takes the
 /// base's value). A blank value (a cleared choice) and every key without a
 /// local id pass through unchanged. Credential-source rows change their key
 /// as well and are translated by [`local_values`].
@@ -816,12 +843,8 @@ pub fn to_portable(key: &str, stored: &str, catalog: &Catalog) -> Option<String>
         return catalog.drive_reference(id);
     }
     match key {
-        // A room id is the same on every device; a bot id is not.
-        VOICE_TARGET_KEY if voice_target::agent_room_of(id).is_some() => Some(id.to_owned()),
-        VOICE_TARGET_KEY => {
-            let (_, provider_id, target) = catalog.bots.iter().find(|(bot_id, ..)| bot_id == id)?;
-            Some(catalog.provider(provider_id)?.bot_reference(target))
-        }
+        // A room id is the same on every device; nothing else names a target.
+        VOICE_TARGET_KEY => voice_target::agent_room_of(id).map(|_| id.to_owned()),
         EMBEDDING_MODEL_KEY => {
             let model: EmbeddingModel = serde_json::from_str(stored).ok()?;
             let provider = catalog.provider(&model.provider)?;
@@ -887,18 +910,7 @@ pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<Str
     match key {
         // Only a person's tap opens the microphone; "off" travels freely.
         WAKE_ENABLED_KEY if portable == "1" => None,
-        VOICE_TARGET_KEY if voice_target::agent_room_of(portable).is_some() => {
-            Some(portable.to_owned())
-        }
-        VOICE_TARGET_KEY => catalog
-            .bots
-            .iter()
-            .find(|(_, provider_id, target)| {
-                catalog
-                    .provider(provider_id)
-                    .is_some_and(|provider| provider.bot_reference(target) == portable)
-            })
-            .map(|(bot_id, ..)| bot_id.clone()),
+        VOICE_TARGET_KEY => voice_target::agent_room_of(portable).map(|_| portable.to_owned()),
         EMBEDDING_MODEL_KEY => {
             let model: EmbeddingModel = serde_json::from_str(portable).ok()?;
             let (provider_id, _) = catalog
@@ -954,7 +966,7 @@ fn git_executable(portable: &str, catalog: &Catalog) -> bool {
 }
 
 /// Whether this device's file asks for the wake phrase while this device has
-/// it off (`stored_wake` is its `bots.wake_enabled` row): the account view
+/// it off (`stored_wake` is its `voice.wake_enabled` row): the account view
 /// then offers to turn listening on, and nothing turns it on by itself.
 pub fn listening_off(device_file: &Values, stored_wake: Option<&str>) -> bool {
     device_file.values.get(WAKE_ENABLED_KEY).map(String::as_str) == Some("1")
@@ -995,7 +1007,7 @@ pub fn local_values(
 }
 
 /// A row naming something this device cannot describe right now — a removed
-/// bot or provider, or any drive while the drive list is unreadable — is not
+/// provider, or any drive while the drive list is unreadable — is not
 /// the person deleting the key: it reads as the base's value, so it is neither
 /// pushed as a deletion nor as a change. A credential-source row travels under
 /// its drive's or provider's reference, and only when bound to this account.
@@ -1072,7 +1084,7 @@ mod tests {
             "recording.codec",
             "notify.previews_enabled",
             "notes.embedding_model",
-            "bots.voice_target",
+            "voice.target",
         ] {
             assert_eq!(synced_file(key), Some(SyncedFile::Shared), "{key}");
         }
@@ -1084,8 +1096,8 @@ mod tests {
             "recording.destination_profile_id",
             "sdk_encryption",
             "sync.git_path",
-            "bots.wake_enabled",
-            "bots.voice_locale",
+            "voice.wake_enabled",
+            "voice.locale",
             "notes.hide_service_files",
             "notes.include_private",
             "sync.credential_source.01P",
@@ -1585,17 +1597,17 @@ mod tests {
         assert!(retry.apply.is_empty());
     }
 
-    const BOT: &str = "bot:ollama:http://localhost:11434#llama3";
+    const ROOM: &str = "agent:!dm:example.org";
 
-    /// Device B has no such bot.
+    /// Device B cannot apply that value.
     fn b_resolves(key: &str, value: &str) -> Option<String> {
-        (key != VOICE_TARGET_KEY || value != BOT).then(|| value.to_owned())
+        (key != VOICE_TARGET_KEY || value != ROOM).then(|| value.to_owned())
     }
 
     #[test]
     fn a_value_this_device_cannot_apply_stays_in_the_file_and_is_never_pushed_over() {
-        // Device A pushed its voice target; B lacks that bot.
-        let remote = values(&[(VOICE_TARGET_KEY, BOT), ("recording.codec", "hevc")]);
+        // Device A pushed its voice target; B cannot apply it.
+        let remote = values(&[(VOICE_TARGET_KEY, ROOM), ("recording.codec", "hevc")]);
         let first = merge(Some(&remote), None, &Values::default(), None, &b_resolves);
         assert_eq!(first.file, remote, "kept in the file");
         assert_eq!(
@@ -1624,7 +1636,7 @@ mod tests {
         assert!(second.apply.is_empty());
         assert_eq!(second.base_if_pushed, base_is_local);
 
-        // B adds the bot: the reference resolves, and the value is applied.
+        // B can apply it now, and the value is applied.
         let third = merge(
             Some(&second.file),
             None,
@@ -1632,14 +1644,14 @@ mod tests {
             Some(&second.base_if_pushed),
             &verbatim,
         );
-        assert_eq!(third.apply, applied(&[(VOICE_TARGET_KEY, Some(BOT))]));
+        assert_eq!(third.apply, applied(&[(VOICE_TARGET_KEY, Some(ROOM))]));
         assert!(!third.changed);
     }
 
     #[test]
     fn two_devices_that_cannot_resolve_each_others_value_settle() {
-        const X: &str = "bot:ollama:http://a.local:11434#x"; // only on A
-        const Y: &str = "bot:ollama:http://b.local:11434#y"; // only on B
+        const X: &str = "agent:!a:example.org"; // only on A
+        const Y: &str = "agent:!b:example.org"; // only on B
         fn a_resolves(key: &str, value: &str) -> Option<String> {
             (value != Y).then(|| format!("{key}:{value}"))
         }
@@ -1693,7 +1705,7 @@ mod tests {
     fn device_a_keeps_its_value_while_b_syncs() {
         // A resolves everything; after B's no-op sync the file is untouched, so
         // A's next merge neither pulls nor pushes.
-        let file = values(&[(VOICE_TARGET_KEY, BOT)]);
+        let file = values(&[(VOICE_TARGET_KEY, ROOM)]);
         let a = merge(Some(&file), None, &file, Some(&file), &verbatim);
         assert!(!a.changed);
         assert!(a.apply.is_empty());
@@ -1723,7 +1735,6 @@ mod tests {
                 "01PROV".to_owned(),
                 ProviderRef::new("ollama", "HTTP://LocalHost:11434/"),
             )],
-            bots: vec![("01BOT".to_owned(), "01PROV".to_owned(), "llama3".to_owned())],
             account_id: None,
             trusted_origins: Vec::new(),
             forge_origins: Vec::new(),
@@ -1822,12 +1833,6 @@ mod tests {
             );
         }
 
-        let bot = to_portable(VOICE_TARGET_KEY, "01BOT", &catalog).expect("known bot");
-        assert_eq!(bot, BOT);
-        assert_eq!(
-            from_portable(VOICE_TARGET_KEY, &bot, &catalog).as_deref(),
-            Some("01BOT")
-        );
         assert_eq!(to_portable(VOICE_TARGET_KEY, "01GONE", &catalog), None);
 
         let stored = r#"{"provider":"01PROV","model":"nomic-embed-text"}"#;
@@ -1860,8 +1865,8 @@ mod tests {
     }
 
     /// A voice target naming an agent room travels as it is stored: a room
-    /// id is the same on every device. A bot target still travels as its
-    /// reference, and an unknown bot still stays home.
+    /// id is the same on every device. Anything else names no target and
+    /// stays home.
     #[test]
     fn an_agent_voice_target_is_portable_verbatim() {
         let catalog = catalog();
@@ -1872,17 +1877,17 @@ mod tests {
             from_portable(VOICE_TARGET_KEY, agent, &catalog).as_deref(),
             Some(agent)
         );
-        // A device that knows no bot and no room still takes it.
+        // A device that knows no room still takes it.
         assert_eq!(
             from_portable(VOICE_TARGET_KEY, agent, &Catalog::default()).as_deref(),
             Some(agent)
         );
+        assert_eq!(to_portable(VOICE_TARGET_KEY, "01ARZ3NDEKTSV4RRFFQ69G5FAV", &catalog), None);
         assert_eq!(
-            to_portable(VOICE_TARGET_KEY, "01BOT", &catalog).as_deref(),
-            Some(BOT)
+            from_portable(VOICE_TARGET_KEY, "bot:ollama:http://localhost:11434#llama3", &catalog),
+            None
         );
-        // `agent:` with no room names nothing: it is neither passed through
-        // nor read as a bot.
+        // `agent:` with no room names nothing.
         assert_eq!(to_portable(VOICE_TARGET_KEY, "agent:", &catalog), None);
         assert_eq!(from_portable(VOICE_TARGET_KEY, "agent:", &catalog), None);
     }
@@ -1962,7 +1967,7 @@ mod tests {
     #[test]
     fn a_stale_or_unknown_local_reference_reads_as_the_base() {
         let base = values(&[
-            (VOICE_TARGET_KEY, BOT),
+            (VOICE_TARGET_KEY, ROOM),
             (
                 "notes.active_vault",
                 "drive:https://github.com/acme/notes#main",
@@ -1975,7 +1980,7 @@ mod tests {
                 .collect()
         };
 
-        // The bot is gone here, but its row still names it.
+        // The row names no target here; the base's value stands.
         let local = local_from_rows(
             rows(&[(VOICE_TARGET_KEY, "01GONE")]),
             &catalog(),
@@ -1983,7 +1988,7 @@ mod tests {
         );
         assert_eq!(
             local.values.get(VOICE_TARGET_KEY).map(String::as_str),
-            Some(BOT)
+            Some(ROOM)
         );
         let local = local_from_rows(rows(&[(VOICE_TARGET_KEY, "01GONE")]), &catalog(), None);
         assert_eq!(local.values.get(VOICE_TARGET_KEY), None);
@@ -2171,5 +2176,57 @@ mod tests {
         let seed = seed_shared(&tree).expect("template");
         assert_eq!(seed.1, FirstSync::LocalWins);
         assert_eq!(seed.0.values["recording.codec"], "hevc");
+    }
+
+    /// Story 108.3a: a file an older device wrote reads under the voice keys.
+    /// Each `bots.*` voice key becomes its `voice.*` key, a value the same file
+    /// already holds under the new key wins, `bots.voice_target` moves only
+    /// when it names an agent room, and `bots.message_details` is gone — so
+    /// the next render writes the new keys and none of the old ones. A stored
+    /// base reads the same way, or the first merge after the upgrade would
+    /// see every voice key as deleted on one side.
+    #[test]
+    fn an_older_devices_bot_keys_read_as_the_voice_keys() {
+        let text = "[settings]\n\
+                    \"bots.wake_phrase\" = \"nixie\"\n\
+                    \"voice.wake_phrase\" = \"computer\"\n\
+                    \"bots.stop_phrase\" = \"enough\"\n\
+                    \"bots.voice_target\" = \"agent:!dm:example.org\"\n\
+                    \"bots.message_details\" = true\n";
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Shared).expect("parses");
+        assert_eq!(
+            parsed.values,
+            values(&[
+                ("voice.stop_phrase", "enough"),
+                ("voice.target", "agent:!dm:example.org"),
+                ("voice.wake_phrase", "computer"),
+            ])
+            .values
+        );
+        assert!(parsed.preserved.is_empty(), "{:?}", parsed.preserved);
+        let rendered = parsed.render().expect("renders");
+        assert!(!rendered.contains("bots."), "{rendered}");
+
+        // The device file's two: the language and the switch.
+        let text = "[settings]\n\
+                    \"bots.voice_locale\" = \"pl-PL\"\n\
+                    \"bots.wake_enabled\" = false\n";
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Device).expect("parses");
+        assert_eq!(
+            parsed.values,
+            values(&[("voice.locale", "pl-PL"), ("voice.wake_enabled", "0")]).values
+        );
+        assert!(parsed.preserved.is_empty(), "{:?}", parsed.preserved);
+
+        // A pinned bot's id names nothing once the bots are gone.
+        let text = "[settings]\n\"bots.voice_target\" = \"01BOTID\"\n";
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Shared).expect("parses");
+        assert!(parsed.values.is_empty() && parsed.preserved.is_empty());
+
+        let base = Values::from_base_json(
+            r#"{"bots.wake_phrase":"nixie","bots.voice_target":"01BOTID","bots.message_details":"1"}"#,
+        )
+        .expect("base");
+        assert_eq!(base.values, values(&[("voice.wake_phrase", "nixie")]).values);
     }
 }

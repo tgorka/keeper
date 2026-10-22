@@ -393,7 +393,7 @@ pub fn listing(
                 Some(difference.sentence())
             } else if bot_for(home, rows).is_none() {
                 Some(format!(
-                    "No bot provider on this Mac serves {}'s model {} at {}. Add one under Bots.",
+                    "No model provider on this Mac serves {}'s model {} at {}. Add one under Settings › Model providers.",
                     home.config.name, home.config.bot.target, home.config.bot.base
                 ))
             } else if homeserver_for(user, &facts.homeservers).is_none() {

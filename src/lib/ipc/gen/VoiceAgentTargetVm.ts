@@ -4,7 +4,7 @@ import type { SessionKind } from "./SessionKind";
 /**
  * One of the person's proxy conversations a spoken turn may go to
  * (AD-384), from `voice_agent_targets`, listed by the voice target picker
- * ("Speak to") after the pinned bots: the `main` DM first, then the
+ * ("Speak to"): the `main` DM first, then the
  * conversations, per signed-in account.
  */
 export type VoiceAgentTargetVm = { 

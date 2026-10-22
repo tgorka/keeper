@@ -33,7 +33,7 @@ enabled: boolean,
 /**
  * The profile this task is scoped to, `null` for host-wide work.
  */
-profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, copySourceFacts: TaskPathFactsVm | null, copyDestinationFacts: TaskPathFactsVm | null, replaceExisting: boolean, pruneDestination: boolean, refreshMissing: boolean, copyLookbackMs: number, 
+profileId: string | null, copySource: string | null, copyDestination: string | null, copySourceFacts: TaskPathFactsVm | null, copyDestinationFacts: TaskPathFactsVm | null, replaceExisting: boolean, pruneDestination: boolean, refreshMissing: boolean, copyLookbackMs: number, 
 /**
  * The engine's resolved ledger directory for this task.
  */

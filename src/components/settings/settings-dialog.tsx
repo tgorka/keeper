@@ -17,10 +17,9 @@ import {
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
-import { BotGrantsSection } from "@/components/settings/bot-grants-section";
-import { BotsSection } from "@/components/settings/bots-section";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
 import { DefaultAgentSection } from "@/components/settings/default-agent-section";
+import { ModelProvidersSection } from "@/components/settings/model-providers-section";
 import { BADGE_NOT_LIVE_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
 import { PhonePush } from "@/components/settings/phone-push";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
@@ -37,6 +36,7 @@ import { TasksSection } from "@/components/settings/tasks-section";
 import { TelemetrySection } from "@/components/settings/telemetry-section";
 import { TranscriptionSection } from "@/components/settings/transcription-section";
 import { UnsetShortcutRow } from "@/components/settings/unset-shortcut-row";
+import { VoiceSection } from "@/components/settings/voice-section";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -196,15 +196,6 @@ export function SettingsBody({
   // Folder sync needs a usable `git` binary (Epic 29, AD-41); render the Sync
   // section only where the capability reports one — never a dead affordance.
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
-  // The Bots section (Epic 61, FR-379), on its own flag rather than `sync`: an
-  // endpoint is a URL and a credential behind the keychain, so it can exist on
-  // a machine with no folder sync at all — and on a phone (Epic 62).
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
-  // The drive half of the same surface (Epic 62, FR-396): `desktop && sync`
-  // in Rust, because a grant names a folder inside a synced profile and a
-  // phone has no `keeper-sync` to resolve one. Where it is false the Grants
-  // section is absent, not disabled (AD-27).
-  const botTools = useCapabilitiesStore((s) => s.capabilities.botTools);
   // Whether this is the capability-reduced (phone) tier — drives the Archive
   // backup-exclusion line below, the "On this iPhone" list in About, and hides the
   // desktop "Background & dock" section (Story 14.2).
@@ -288,23 +279,14 @@ export function SettingsBody({
     // databases, so a phone chooses the same way — and absent while no held
     // database lists an instance (AD-27).
     "agent-instances": { node: <AgentInstancesSection open={open} /> },
-    // Story 90.6: this Mac as a host for your agents. On `botTools` for the
-    // grants' reason — a host reads drives, and a phone is never one — and
-    // absent besides where no flagged folder holds an agent (AD-27).
-    agents: botTools ? { node: <AgentsSection open={open} /> } : null,
-    // Endpoints and bots (Epic 61, FR-379). Gated on `bots`, which is NOT
-    // the sync gate the drive sections ride: an endpoint is a URL and a
-    // credential, so it needs no `git`.
-    bots: bots
-      ? { node: <BotsSection open={open} />, staysHere: [VOICE_NOTE, ENDPOINT_KEY_NOTE] }
-      : null,
-    // Story 61.10's grants: the list that answers "what can a bot change?".
-    // Gated on `botTools` rather than `sync`, because a grant names a
-    // folder inside a synced profile and a build that cannot reach the
-    // drive — a desktop with no usable git, or a phone — has nothing it
-    // could name. `botTools` is strictly narrower than `bots` in Rust, so
-    // it is the one gate this section needs.
-    "bot-grants": botTools ? { node: <BotGrantsSection open={open} /> } : null,
+    // Story 90.6: this Mac as a host for your agents. A host reads drives,
+    // so a desktop with folder sync — a phone is never one — and absent
+    // besides where no flagged folder holds an agent (AD-27).
+    agents: sync && !reducedPlatform ? { node: <AgentsSection open={open} /> } : null,
+    // Voice (AD-179): on every tier and behind no capability flag; the
+    // section renders itself away where `voice_availability` says
+    // `unsupported` (Story 108.3a, UX-DR-E108-4).
+    voice: { node: <VoiceSection open={open} />, staysHere: [VOICE_NOTE] },
     // Ungated by any capability: a sessions zone IS a synced folder somebody
     // flagged, but what a space does when it arrives is a reading preference
     // and not a sync setting. The section removes itself when no folder is
@@ -317,6 +299,13 @@ export function SettingsBody({
     // when there is no vault to configure (Story 45.16, FR-193).
     capture: { node: <CaptureSettingsSection open={open} />, staysHere: [CAPTURE_NOTE] },
     "notes-search": { node: <SearchSettingsSection open={open} /> },
+    // The endpoints notes search asks (Story 108.3a, R-HQ-12): a URL and a
+    // credential behind the keychain, so on every tier and behind no
+    // capability — a phone searches its notes the same way.
+    "model-providers": {
+      node: <ModelProvidersSection open={open} />,
+      staysHere: [ENDPOINT_KEY_NOTE],
+    },
     // Folder sync needs a usable `git` (Epic 29): absent on every machine
     // that has none, never a section whose every button would reject.
     sync: sync ? { node: <SyncSection open={open} />, staysHere: [DRIVE_FOLDER_NOTE] } : null,
@@ -1312,14 +1301,14 @@ const VOICE_HOTKEY_PERMISSION_SENTENCE =
   "The voice hotkey isn't registered with macOS right now. Another app may already own this shortcut, or keeper may need permission — check System Settings → Privacy & Security (Accessibility) and Keyboard shortcuts, then reassign it below.";
 
 /** The voice row's label. */
-export const VOICE_SHORTCUT_LABEL = "Talk to a bot";
+export const VOICE_SHORTCUT_LABEL = "Start a voice turn";
 
 /** What the voice row says a press does, and where else the same reach lives. */
 export const VOICE_SHORTCUT_NOTE =
   "Starts a voice turn from any app, with keeper hidden or not. The menu bar item and the keeper://voice/talk link — for a Shortcut, which the Touch Bar's Quick Actions can hold — do the same.";
 
 /**
- * The "Talk to a bot" row inside Settings → Shortcuts (Epic 63, Story 63.5,
+ * The "Start a voice turn" row inside Settings → Shortcuts (Epic 63, Story 63.5,
  * FR-420, AD-174, AD-179): a fourth, independent OS-global binding whose
  * press starts a voice turn from Rust, with keeper in front or not.
  *

@@ -15,14 +15,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use keeper_core::bots::{self, store, Bot, BotIdentity, Provider, ProviderKind};
 use keeper_core::error::CoreError;
 use keeper_core::org_account::device_state::{
-    drive_key, DeviceStateFile, DriveKey, GrantState, PendingGrant, ProviderState, RestorePending,
-    RestorePlan,
+    drive_key, DeviceStateFile, DriveKey, ProviderState, RestorePending, RestorePlan,
 };
-use keeper_core::org_account::manifest::BotRecord;
 use keeper_core::org_account::settings_sync::{Catalog, DriveRef};
+use keeper_core::providers::{self, store, Provider, ProviderKind};
 use keeper_core::platform::Platform;
 use keeper_core::registry;
 use keeper_sync::db::TaskRow;
@@ -41,8 +39,8 @@ const SCHEDULES: &str = "schedules";
 const LOCAL_ONLY: [&str; 3] = ["id", "volumeId", "authorOverride"];
 
 /// The task kinds a drive's schedules carry: the ones whose whole meaning is
-/// the folder and the schedule. A bot task names a bot id and a copy task
-/// absolute paths on this disk, neither of which means anything elsewhere.
+/// the folder and the schedule. A copy task names absolute paths on this
+/// disk, which mean nothing elsewhere.
 fn travels(kind: TaskKind) -> bool {
     matches!(
         kind,
@@ -230,9 +228,6 @@ pub(crate) fn tasks_of(
                     .and_then(toml::Value::as_str)
                     .map(str::to_owned),
                 missed_delay_ms: row.get("missed_delay_ms").and_then(toml::Value::as_integer),
-                bot_id: None,
-                prompt_subpath: None,
-                model: None,
                 copy_source: None,
                 copy_destination: None,
                 replace_existing: false,
@@ -245,8 +240,8 @@ pub(crate) fn tasks_of(
 }
 
 /// This device's file as the next sync writes it: its current state, plus
-/// everything still waiting to be restored — a drive table not yet here,
-/// and a grant under its provider — so nothing waiting is ever dropped from
+/// everything still waiting to be restored — a drive table, a provider or a
+/// Matrix account not yet here — so nothing waiting is ever dropped from
 /// the file; with the fields the tip carries that this build does not know
 /// kept at the file, provider and account level.
 pub(crate) fn rendered(
@@ -259,17 +254,6 @@ pub(crate) fn rendered(
         let key = drive_key(table);
         if key.is_some() && !file.drives.iter().any(|t| drive_key(t) == key) {
             file.drives.push(table.clone());
-        }
-    }
-    for waiting in &pending.grants {
-        if let Some(provider) = file
-            .providers
-            .iter_mut()
-            .find(|p| p.key().reference() == waiting.provider)
-        {
-            if !provider.grants.contains(&waiting.grant) {
-                provider.grants.push(waiting.grant.clone());
-            }
         }
     }
     for provider in &pending.providers {
@@ -309,19 +293,6 @@ pub(crate) fn rendered(
                 continue;
             };
             provider.extra = old.extra.clone();
-            for bot in &mut provider.bots {
-                if let Some(was) = old.bots.iter().find(|b| b.target == bot.target) {
-                    bot.extra = was.extra.clone();
-                }
-            }
-            for grant in &mut provider.grants {
-                let same = |g: &&GrantState| {
-                    (&g.bot, &g.drive, &g.subtree) == (&grant.bot, &grant.drive, &grant.subtree)
-                };
-                if let Some(was) = old.grants.iter().find(same) {
-                    grant.extra = was.extra.clone();
-                }
-            }
         }
         for account in &mut file.matrix {
             if let Some(old) = tip
@@ -376,8 +347,7 @@ enum DriveRestore {
 }
 
 /// Restore what `plan` names that this device lacks (the first restore;
-/// `None` on every later sync) and the grants `present_grants` of providers
-/// this device already has, then retry what `pending` holds — each
+/// `None` on every later sync), then retry what `pending` holds — each
 /// idempotent against identity, so nothing already here is made twice.
 /// Everything that could not be made yet, bar a table that can never be,
 /// comes back in `pending`.
@@ -387,7 +357,6 @@ pub(crate) fn run(
     data_dir: &Path,
     account_id: &str,
     plan: Option<RestorePlan>,
-    present_grants: Vec<PendingGrant>,
     pending: &mut RestorePending,
 ) -> Result<Outcome, CoreError> {
     let engine = crate::sync::engine(Arc::clone(platform))
@@ -443,9 +412,8 @@ pub(crate) fn run(
         drives_added(app);
     }
 
-    // Providers with their bots; one that could not be added waits.
-    let mut catalog = catalog_of(platform.as_ref(), data_dir, account_id, &profiles)?;
-    let mut grants = present_grants;
+    // Providers; one that could not be added waits.
+    let catalog = catalog_of(platform.as_ref(), data_dir, account_id, &profiles)?;
     let queued = std::mem::take(&mut pending.providers);
     for state in queued.into_iter().chain(plan_providers) {
         let key = state.key();
@@ -455,66 +423,13 @@ pub(crate) fn run(
             continue;
         }
         match add_provider_state(data_dir, account_id, &state) {
-            Ok(_) => {
-                outcome.providers += 1;
-                let reference = key.reference();
-                grants.extend(state.grants.iter().map(|grant| PendingGrant {
-                    provider: reference.clone(),
-                    grant: grant.clone(),
-                }));
-            }
+            Ok(_) => outcome.providers += 1,
             Err(why) => {
-                tracing::warn!(%why, "account: a bot provider was not restored; it waits");
+                tracing::warn!(%why, "account: a model provider was not restored; it waits");
                 pending.providers.push(state);
             }
         }
     }
-    if outcome.providers > 0 {
-        catalog = catalog_of(platform.as_ref(), data_dir, account_id, &profiles)?;
-    }
-
-    // Grants, for providers matched by identity; the same grant already
-    // here is not made twice, and one that cannot be made yet waits.
-    let bots = store::list_bots(data_dir)?;
-    let live: Vec<_> = store::list_grants(data_dir)?
-        .rows
-        .into_iter()
-        .filter(|row| row.revoked_ms.is_none())
-        .map(|row| row.grant)
-        .collect();
-    let queued = std::mem::take(&mut pending.grants);
-    for waiting in grants.into_iter().chain(queued) {
-        let provider_id = catalog
-            .providers
-            .iter()
-            .find(|(_, provider)| provider.reference() == waiting.provider)
-            .map(|(id, _)| id.clone());
-        // The person removed the provider since: nothing to grant to.
-        let Some(provider_id) = provider_id else {
-            continue;
-        };
-        match account_settings::grant_of(&waiting.grant, &provider_id, &bots, &catalog) {
-            Ok(Some(grant)) => {
-                let exists = live.iter().any(|g| {
-                    (&g.provider_id, &g.bot_id, &g.scope, g.mode)
-                        == (&grant.provider_id, &grant.bot_id, &grant.scope, grant.mode)
-                });
-                if exists {
-                    continue;
-                }
-                if let Err(error) = store::save_grant(data_dir, &grant) {
-                    tracing::warn!(%error, "account: a bot's folder grant waits");
-                    pending.grants.push(waiting);
-                }
-            }
-            Ok(None) => pending.grants.push(waiting),
-            Err(why) => {
-                tracing::warn!(%why, "account: a bot's folder grant waits");
-                pending.grants.push(waiting);
-            }
-        }
-    }
-
     // Matrix accounts wait for their sign-in; their preferences go on when
     // each is added (`account_ipc::matrix_account_added`).
     for account in plan_matrix {
@@ -709,8 +624,8 @@ fn drives_added(app: Option<&AppHandle>) {
     );
 }
 
-/// Add a provider from this device's file, with its read timeout, its bots
-/// and — when it used the account — its account credential; `own` is left
+/// Add a provider from this device's file, with its read timeout and — when
+/// it used the account — its account credential; `own` is left
 /// for the person, whom the provider's health then asks for its key.
 fn add_provider_state(
     data_dir: &Path,
@@ -719,7 +634,7 @@ fn add_provider_state(
 ) -> Result<String, String> {
     let kind = ProviderKind::from_registry_str(&state.kind)
         .ok_or_else(|| format!("this keeper cannot talk to a {} provider", state.kind))?;
-    let base_url = bots::parse_base_url(&state.base_url)
+    let base_url = providers::parse_base_url(&state.base_url)
         .map_err(|error| format!("{}: {error}", state.base_url))?
         .normalized;
     let provider = Provider {
@@ -730,29 +645,20 @@ fn add_provider_state(
         created_ms: chrono::Utc::now().timestamp_millis(),
     };
     let account = (state.credential == "account").then_some(account_id);
-    add_provider(
-        data_dir,
-        &provider,
-        account,
-        state.read_timeout_ms,
-        state.bots.clone(),
-    )
-    .map_err(|error| error.to_string())?;
+    add_provider(data_dir, &provider, account, state.read_timeout_ms)
+        .map_err(|error| error.to_string())?;
     Ok(provider.id)
 }
 
-/// Write a provider the account describes: the row, its read timeout, its
-/// account credential when `account` is set, and its bots after the ones
-/// already pinned, in their own order. All or nothing: a failed write — a
-/// bot target the store refuses among them — removes what was written.
+/// Write a provider the account describes: the row, its read timeout and
+/// its account credential when `account` is set. All or nothing: a failed
+/// write removes what was written.
 pub(crate) fn add_provider(
     data_dir: &Path,
     provider: &Provider,
     account: Option<&str>,
     read_timeout_ms: Option<u64>,
-    mut offered: Vec<BotRecord>,
 ) -> Result<(), CoreError> {
-    offered.sort_by_key(|bot| bot.pin_order);
     let written = (|| -> Result<(), CoreError> {
         store::insert_provider(data_dir, provider)?;
         if let Some(ms) = read_timeout_ms {
@@ -768,30 +674,6 @@ pub(crate) fn add_provider(
                 &provider.id,
                 Some("account"),
                 Some(account_id),
-            )?;
-        }
-        let pinned = store::list_bots(data_dir)?.len();
-        for (offset, bot) in offered.into_iter().enumerate() {
-            let target = bot.target.trim().to_owned();
-            let name = match bot.name.trim() {
-                "" => target.clone(),
-                name => name.to_owned(),
-            };
-            store::insert_bot(
-                data_dir,
-                &Bot {
-                    id: keeper_agent::turn::new_id(),
-                    provider_id: provider.id.clone(),
-                    target,
-                    name,
-                    pin_order: i64::try_from(pinned + offset).unwrap_or(i64::MAX),
-                    identity: BotIdentity {
-                        shape: bot.shape,
-                        colour: bot.colour,
-                        mark: bot.mark,
-                    },
-                    created_ms: provider.created_ms,
-                },
             )?;
         }
         Ok(())
@@ -903,7 +785,7 @@ mod tests {
 
     /// An `openai` provider travels in the device file as the word it is
     /// stored as — the file holds the kind as an opaque string — and comes
-    /// back as an `openai` provider with its bots; a word this build does not
+    /// back as an `openai` provider; a word this build does not
     /// speak is still refused rather than read as another kind.
     #[test]
     fn an_openai_device_record_is_restored_as_an_openai_provider() {
@@ -913,11 +795,6 @@ mod tests {
                 name: "CLIProxyAPI".to_owned(),
                 base_url: "https://cliproxy.acme.dev:8452/".to_owned(),
                 credential: "own".to_owned(),
-                bots: vec![BotRecord {
-                    target: "gpt-6-astra".to_owned(),
-                    name: "Astra".to_owned(),
-                    ..BotRecord::default()
-                }],
                 ..ProviderState::default()
             }],
             ..DeviceStateFile::default()
@@ -934,13 +811,6 @@ mod tests {
             .expect("present");
         assert_eq!(row.provider.kind, ProviderKind::OpenAi);
         assert_eq!(row.provider.base_url, "https://cliproxy.acme.dev:8452");
-        let bots = store::list_bots(dir.path()).expect("bots");
-        assert_eq!(
-            bots.iter()
-                .map(|bot| (bot.provider_id.as_str(), bot.target.as_str()))
-                .collect::<Vec<_>>(),
-            [(id.as_str(), "gpt-6-astra")]
-        );
 
         let omp = ProviderState {
             kind: "omp".to_owned(),
@@ -1007,7 +877,7 @@ mod tests {
         let tasks = [
             task("t-sync", Some("01LOCAL"), TaskKind::Sync),
             task("t-gc", Some("01LOCAL"), TaskKind::Gc),
-            task("t-bot", Some("01LOCAL"), TaskKind::Bot),
+            task("t-copy", Some("01LOCAL"), TaskKind::Copy),
             task("t-other", Some("01OTHER"), TaskKind::Verify),
             task("t-host", None, TaskKind::Release),
         ];

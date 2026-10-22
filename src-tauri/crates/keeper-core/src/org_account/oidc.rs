@@ -3397,30 +3397,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bot_provider_opted_into_the_account_sends_the_account_token() {
+    async fn a_provider_opted_into_the_account_sends_the_account_token() {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
-        let d = account(&fake, "bots", None);
+        let d = account(&fake, "providers", None);
         sign_in_at_fake(&p, &d).await.expect("sign in");
-        crate::bots::save_provider_token(&p, "prov", "keychain-token").expect("save");
+        crate::providers::save_provider_token(&p, "prov", "keychain-token").expect("save");
 
-        let before = crate::bots::resolve_credential(&p, &http(), Some(&d), "prov", None).await;
+        let before = crate::providers::resolve_credential(&p, &http(), Some(&d), "prov").await;
         assert_eq!(before.expect("keychain"), Some("keychain-token".to_owned()));
 
         crate::registry::set_bots_provider_credential_source(
             &p.data_dir,
             "prov",
             Some("account"),
-            Some("bots"),
+            Some("providers"),
         )
         .expect("opt in");
-        let after = crate::bots::resolve_credential(&p, &http(), Some(&d), "prov", None).await;
+        let after = crate::providers::resolve_credential(&p, &http(), Some(&d), "prov").await;
         assert_eq!(after.expect("account"), Some("access-1".to_owned()));
 
         // Another account now configured: the row is not its to answer.
         let other = account(&fake, "globex", None);
         let foreign =
-            crate::bots::resolve_credential(&p, &http(), Some(&other), "prov", None).await;
+            crate::providers::resolve_credential(&p, &http(), Some(&other), "prov").await;
         assert_eq!(
             foreign.expect("keychain"),
             Some("keychain-token".to_owned())
@@ -3431,13 +3431,13 @@ mod tests {
     async fn no_account_resolves_a_bot_credential_without_touching_the_database() {
         let fake = start_fake(Behaviour::default());
         let mut p = FakePlatform::new(&fake, Browser::Honest);
-        crate::bots::save_provider_token(&p, "prov", "keychain-token").expect("save");
+        crate::providers::save_provider_token(&p, "prov", "keychain-token").expect("save");
         // A data dir no database can open: any registry read would fail.
         let file = p.data_dir.join("not-a-dir");
         std::fs::write(&file, "x").expect("file");
         let real = std::mem::replace(&mut p.data_dir, file);
 
-        let token = crate::bots::resolve_credential(&p, &http(), None, "prov", None).await;
+        let token = crate::providers::resolve_credential(&p, &http(), None, "prov").await;
 
         p.data_dir = real;
         assert_eq!(token.expect("keychain"), Some("keychain-token".to_owned()));

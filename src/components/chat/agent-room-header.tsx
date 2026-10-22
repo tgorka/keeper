@@ -67,7 +67,7 @@ import type {
 } from "@/lib/ipc/client";
 import { agentsConsoleSet, agentsCopies, agentsWebSearchSet } from "@/lib/ipc/client";
 import { useAgentRoomsStore } from "@/lib/stores/agent-rooms";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { defaultAgentStore, useDefaultAgentStore } from "@/lib/stores/default-agent";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { WEB_SEARCH_LEVELS } from "@/lib/web-search-levels";
@@ -195,7 +195,10 @@ function AgentMenu({ agent }: { agent: string }) {
   const vm = useDefaultAgentStore((s) => s.vm);
   const readError = useDefaultAgentStore((s) => s.readError);
   const saving = useDefaultAgentStore((s) => s.saving);
-  const writes = useCapabilitiesStore((s) => s.capabilities.botTools);
+  // Writes need this desktop to reach the drive: folder sync, and not the phone.
+  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  const reduced = useIsReducedCapabilityPlatform();
+  const writes = sync && !reduced;
   const tools = useAgentRow(agent, writes);
   const [busy, setBusy] = useState(false);
   // *Full access* picked from a narrower mode, its warning not yet accepted.

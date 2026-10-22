@@ -1742,47 +1742,6 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
             cfg!(desktop),
             crate::sessions_root::any(),
         ),
-        // Bots (Epic 61, FR-378; Epic 62, FR-396): `cfg!(desktop) ||
-        // cfg!(mobile)`, i.e. true on every target that has a pane to put it
-        // in, and **deliberately not** `notes_available`. Every other surface
-        // in this struct that rides the sync gate does so because its record
-        // IS a synced folder; a conversation is not. A provider is a URL and a
-        // credential behind the secret port, and a conversation is two tables
-        // in `keeper.db` — the same database the account registry lives in —
-        // so nothing here needs `git` and nothing here reads `sync.db`.
-        // Gating on `sessions` would hide a working surface on every desktop
-        // whose `git` is older than the engine's floor and on every phone,
-        // which is a dishonest absence rather than an honest one.
-        //
-        // **`|| cfg!(mobile)` is not a slip for `true`.** Tauri injects
-        // `desktop` and `mobile` as a partition of the targets it builds for,
-        // so today the two are exhaustive — but writing `true` would make the
-        // flag stop being a claim about this build, and `AppState::new`
-        // already `compile_error!`s on a mobile target that is neither iOS
-        // nor Android. A
-        // later target earns the pane by joining the partition, not by
-        // inheriting a literal.
-        //
-        // A bare `cfg!` rather than a probe because there is nothing to probe:
-        // the surface needs no binary, no OS version and no database that
-        // might not open. The half that DOES need the drive is `bot_tools`,
-        // next — two facts, two flags.
-        bots: cfg!(desktop) || cfg!(mobile),
-        // Bot tools (Epic 62, FR-396, AD-162): desktop AND `sync`, and the
-        // `desktop` half is a linking fact rather than a design choice. A
-        // tool call resolves a path inside a synced profile through
-        // `keeper-sync`, and `keeper-sync` is not a dependency of this crate
-        // on iOS or Android (see Cargo.toml's target table) — so
-        // `bots_drive_ipc`, which holds every grant, audit, approval and
-        // deliverable command, is `#[cfg(desktop)]` and a phone has nothing to
-        // call. The `sync` half is `notes`' reason: the drive IS the synced
-        // folders, so a desktop whose `git` the engine refuses has no folder to
-        // grant into. Where this is `false` the grant bar, the audit list,
-        // the tool rows and the reveal control are absent, not disabled
-        // (AD-27). `desktop && sync`, stated with the `cfg!` spelled out since
-        // Epic 66 flipped `notes_available` on for the phone (AD-201, AD-162):
-        // the tools spawn and read a drive the phone does not have.
-        bot_tools: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
         // On-device transcription (AD-349): the engine's own availability
         // probe — Apple silicon and macOS ≥ 15 on the Mac, `Unsupported`
         // everywhere else. The models are a separate state.
@@ -1866,9 +1825,9 @@ pub fn platform_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 /// the phone now, and notes are the desktop's readers in the phone's stack. The
 /// `cfg!(desktop)` that used to sit in front is gone; the git-ok gate stays,
 /// which on a phone is the engine's own answer (`engine: gix`, AD-198). What
-/// stays desktop-only is decided by name below — sessions and the drive half
-/// of Bots (AD-201) — and by the window-bound notes commands staying in the
-/// desktop's extra handler list.
+/// stays desktop-only is decided by name below — sessions (AD-201) — and by
+/// the window-bound notes commands staying in the desktop's extra handler
+/// list.
 pub(crate) fn notes_available(state: &AppState) -> bool {
     notes_capability_of(&git_report(state))
 }
@@ -1876,13 +1835,6 @@ pub(crate) fn notes_available(state: &AppState) -> bool {
 /// The notes gate over a git report, pure: `sync`, on every tier.
 fn notes_capability_of(report: &SyncGitVm) -> bool {
     report.state == SyncGitState::Ok
-}
-
-/// The gate for what rides the folder but stays on the Mac (AD-201): the
-/// drive half of Bots. `desktop && sync`, with the tier a parameter so the
-/// phone's shape can be asserted from any host.
-fn mac_folder_capability_of(report: &SyncGitVm, desktop: bool) -> bool {
-    desktop && notes_capability_of(report)
 }
 
 /// The sessions board's gate (98.2 #6, AD-27): `sync`, and on the phone a
@@ -5167,34 +5119,19 @@ pub async fn palette_query(
 ) -> Result<PaletteResultsVm, IpcError> {
     // The recording capability gates the `open-recording` action out of the palette
     // (and thus the cheat sheet + native menu) when unavailable (Story 16.3); the
-    // notes capability does the same for the whole Notes section (FR-122, AD-27),
-    // and `bots` for the Bots section (Epic 61, FR-384). The bots flag is spelled
-    // here exactly as `capabilities` spells it — desktop or mobile, the phone
-    // has a Bots pane too (Epic 68, AD-218: the section was `cfg!(desktop)`
-    // while the pane was not) — rather than borrowed from `notes`, because a
-    // desktop build with folder sync off still has a Bots pane. The voice gate
-    // is `voice_availability`'s one answer, read as the tray reads it
+    // notes capability does the same for the whole Notes section (FR-122, AD-27).
+    // The voice gate is `voice_availability`'s one answer, read as the tray reads it
     // (AD-179), so a listening toggle is never offered where nothing listens.
     // The transcription gate is the probe `capabilities` fills
     // `transcription` from, so "Transcribe a File…" exists only where the
     // speech engine runs.
     let recording = crate::macos_version::recording_supported();
     let notes = notes_available(&state);
-    let bots = cfg!(desktop) || cfg!(mobile);
     let voice = crate::voice_ipc::port_present();
     let transcription = crate::transcribe_ipc::transcription_supported();
     Ok(state
         .accounts
-        .palette_query(
-            &query,
-            mode,
-            open_chat,
-            recording,
-            notes,
-            bots,
-            voice,
-            transcription,
-        )
+        .palette_query(&query, mode, open_chat, recording, notes, voice, transcription)
         .await)
 }
 
@@ -5212,13 +5149,11 @@ pub fn cheat_sheet_sections(state: State<'_, AppState>) -> Result<Vec<MenuSectio
     // (Story 16.3), keeping it in lockstep with the palette and native menu. The
     // notes gate rides the same mechanism (Story 36.2): six actions declared once
     // reach the palette, the ⌘? sheet, the native menu bar and the tray, so the
-    // four cannot drift (UX-DR42). The bots gate is its own (Epic 61, FR-384) and
-    // is spelled the way `capabilities` spells it; the voice gate is the tray's
-    // (Epic 68, AD-218); the transcription gate is `capabilities`' own probe.
+    // four cannot drift (UX-DR42). The voice gate is the tray's (Epic 68,
+    // AD-218); the transcription gate is `capabilities`' own probe.
     Ok(keeper_core::palette::registry_sections(
         crate::macos_version::recording_supported(),
         notes_available(&state),
-        cfg!(desktop) || cfg!(mobile),
         crate::voice_ipc::port_present(),
         crate::transcribe_ipc::transcription_supported(),
     ))
@@ -13312,7 +13247,7 @@ fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
 /// [`session_restore`] uses — `registry::list_accounts` — projects each row to its
 /// `(homeserver_url, Provider)`, reads every folder-sync profile's remote via
 /// [`sync_remote_urls`], reads every configured AI provider's base URL via
-/// `bots::store::provider_base_urls`, and feeds all three plus the shared
+/// `providers::store::provider_base_urls`, and feeds all three plus the shared
 /// [`EGRESS_UPDATE_ENDPOINT`] — on a build without an in-app updater the
 /// [`EGRESS_RELEASE_CHECK_ENDPOINT`] its *Check for updates* reads instead
 /// (102.9, R464), since it never contacts the updater's —
@@ -13349,12 +13284,12 @@ pub async fn egress_list(
         })
         .collect();
     let sync_remotes = sync_remote_urls(&state)?;
-    // Read from the same table the Providers surface writes, so a provider added
-    // there is disclosed here on the next open with no cache in between. A row
+    // Read from the same table Settings > Model providers writes, so a provider
+    // added there is disclosed here on the next open with no cache in between. A row
     // whose `kind` this build cannot read contributes nothing: `provider_base_urls`
     // drops it, because keeper cannot say what it would contact.
     let provider_base_urls =
-        keeper_core::bots::store::provider_base_urls(&data_dir).map_err(to_ipc_error)?;
+        keeper_core::providers::store::provider_base_urls(&data_dir).map_err(to_ipc_error)?;
     // The agents server (R-HQ-9): the setting as stored, read on every call,
     // and every server a request may still reach — an old one stays listed
     // until its last request has ended.
@@ -13576,11 +13511,11 @@ mod tests {
     }
 
     /// Epic 66, Story 66.4 (AD-200, AD-201): the phone's git report — `Ok`
-    /// with `engine: gix` — turns notes on, and leaves the drive half of Bots
-    /// on the Mac; a desktop whose git the engine refuses has neither. 98.2
-    /// #6: the phone's board is there exactly when a sessions zone is.
+    /// with `engine: gix` — turns notes on; a desktop whose git the engine
+    /// refuses has none. 98.2 #6: the phone's board is there exactly when a
+    /// sessions zone is.
     #[test]
-    fn the_phone_shaped_report_opens_notes_and_keeps_bot_tools_on_the_mac() {
+    fn the_phone_shaped_report_opens_notes() {
         let phone = SyncGitVm {
             state: SyncGitState::Ok,
             engine: SyncGitEngine::Gix,
@@ -13589,11 +13524,6 @@ mod tests {
             configured_path: None,
         };
         assert!(notes_capability_of(&phone));
-        assert!(
-            !mac_folder_capability_of(&phone, false),
-            "bot tools stay on the Mac"
-        );
-        assert!(mac_folder_capability_of(&phone, true));
         assert!(
             sessions_capability_of(&phone, false, true),
             "a phone with a sessions zone has the board"
@@ -13615,7 +13545,6 @@ mod tests {
             configured_path: None,
         };
         assert!(!notes_capability_of(&refused));
-        assert!(!mac_folder_capability_of(&refused, true));
         assert!(!sessions_capability_of(&refused, false, true));
     }
 

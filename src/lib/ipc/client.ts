@@ -437,43 +437,19 @@ export type { BbctlNetworkVm } from "./gen/BbctlNetworkVm";
 export type { BbctlPhase } from "./gen/BbctlPhase";
 export type { BbctlProgressVm } from "./gen/BbctlProgressVm";
 export type { BotApprovalRequestVm } from "./gen/BotApprovalRequestVm";
-export type { BotAttachmentVm } from "./gen/BotAttachmentVm";
-export type { BotAuditRowVm } from "./gen/BotAuditRowVm";
 export type { BotChatSendReq } from "./gen/BotChatSendReq";
-export type { BotCommandContextReq } from "./gen/BotCommandContextReq";
-export type { BotCommandPreviewVm } from "./gen/BotCommandPreviewVm";
-export type { BotCommandRowVm } from "./gen/BotCommandRowVm";
-export type { BotCommandVerdictVm } from "./gen/BotCommandVerdictVm";
 export type { BotContextBundleVm } from "./gen/BotContextBundleVm";
 export type { BotContextFileVm } from "./gen/BotContextFileVm";
 export type { BotContextSkipVm } from "./gen/BotContextSkipVm";
-export type { BotConversationVm } from "./gen/BotConversationVm";
-export type { BotDeliverableVm } from "./gen/BotDeliverableVm";
-export type { BotFollowVm } from "./gen/BotFollowVm";
-export type { BotGrantListVm } from "./gen/BotGrantListVm";
-export type { BotGrantSaveReq } from "./gen/BotGrantSaveReq";
-export type { BotGrantVm } from "./gen/BotGrantVm";
-export type { BotHealthState } from "./gen/BotHealthState";
 export type { BotMessageVm } from "./gen/BotMessageVm";
 export type { BotModelVm } from "./gen/BotModelVm";
 export type { BotOkfFactsVm } from "./gen/BotOkfFactsVm";
-export type { BotPresence } from "./gen/BotPresence";
-export type { BotProbeVm } from "./gen/BotProbeVm";
-export type { BotProviderSaveReq } from "./gen/BotProviderSaveReq";
-export type { BotProviderVm } from "./gen/BotProviderVm";
-export type { BotReach } from "./gen/BotReach";
 export type { BotRetryReq } from "./gen/BotRetryReq";
-export type { BotSaveReq } from "./gen/BotSaveReq";
-export type { BotSessionListVm } from "./gen/BotSessionListVm";
-export type { BotSessionQueryReq } from "./gen/BotSessionQueryReq";
-export type { BotSessionRowVm } from "./gen/BotSessionRowVm";
-export type { BotSessionScope } from "./gen/BotSessionScope";
 export type { BotSessionVm } from "./gen/BotSessionVm";
 export type { BotStreamEvent } from "./gen/BotStreamEvent";
 export type { BotToolCallVm } from "./gen/BotToolCallVm";
 export type { BotToolOutcomeKind } from "./gen/BotToolOutcomeKind";
 export type { BotTranscriptSource } from "./gen/BotTranscriptSource";
-export type { BotVm } from "./gen/BotVm";
 export type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 export type { BridgeHealth } from "./gen/BridgeHealth";
 export type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
@@ -610,6 +586,8 @@ export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
 export type { MenuItemVm } from "./gen/MenuItemVm";
 export type { MenuSectionVm } from "./gen/MenuSectionVm";
+export type { ModelProviderSaveReq } from "./gen/ModelProviderSaveReq";
+export type { ModelProviderVm } from "./gen/ModelProviderVm";
 export type { MuteState } from "./gen/MuteState";
 export type { NavState } from "./gen/NavState";
 export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
@@ -702,8 +680,11 @@ export type { PlatformVm } from "./gen/PlatformVm";
 export type { PromoteRowVm } from "./gen/PromoteRowVm";
 export type { PromoteState } from "./gen/PromoteState";
 export type { Provider } from "./gen/Provider";
+export type { ProviderHealthState } from "./gen/ProviderHealthState";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
+export type { ProviderProbeVm } from "./gen/ProviderProbeVm";
+export type { ProviderReach } from "./gen/ProviderReach";
 export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 export type { PushGatewayVm } from "./gen/PushGatewayVm";
 export type { PushOpenVm } from "./gen/PushOpenVm";
@@ -845,7 +826,6 @@ export type { TurnMarkVm } from "./gen/TurnMarkVm";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { UnifiedPushVm } from "./gen/UnifiedPushVm";
-export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { UnlistedVm } from "./gen/UnlistedVm";
 export type { UrlForm } from "./gen/UrlForm";
@@ -855,7 +835,6 @@ export type { VerificationPhase } from "./gen/VerificationPhase";
 export type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
 export type { VoiceEventVm } from "./gen/VoiceEventVm";
 export type { VoiceStateVm } from "./gen/VoiceStateVm";
-export type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
 export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
 export type { WebSearchLevel } from "./gen/WebSearchLevel";
@@ -903,28 +882,7 @@ import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
 import type { BbctlProgressVm } from "./gen/BbctlProgressVm";
-import type { BotAttachmentVm } from "./gen/BotAttachmentVm";
-import type { BotAuditRowVm } from "./gen/BotAuditRowVm";
-import type { BotChatSendReq } from "./gen/BotChatSendReq";
-import type { BotCommandContextReq } from "./gen/BotCommandContextReq";
-import type { BotCommandPreviewVm } from "./gen/BotCommandPreviewVm";
-import type { BotConversationVm } from "./gen/BotConversationVm";
-import type { BotDeliverableVm } from "./gen/BotDeliverableVm";
-import type { BotFollowVm } from "./gen/BotFollowVm";
-import type { BotGrantListVm } from "./gen/BotGrantListVm";
-import type { BotGrantSaveReq } from "./gen/BotGrantSaveReq";
-import type { BotGrantVm } from "./gen/BotGrantVm";
 import type { BotModelVm } from "./gen/BotModelVm";
-import type { BotProbeVm } from "./gen/BotProbeVm";
-import type { BotProviderSaveReq } from "./gen/BotProviderSaveReq";
-import type { BotProviderVm } from "./gen/BotProviderVm";
-import type { BotRetryReq } from "./gen/BotRetryReq";
-import type { BotSaveReq } from "./gen/BotSaveReq";
-import type { BotSessionListVm } from "./gen/BotSessionListVm";
-import type { BotSessionQueryReq } from "./gen/BotSessionQueryReq";
-import type { BotSessionVm } from "./gen/BotSessionVm";
-import type { BotStreamEvent } from "./gen/BotStreamEvent";
-import type { BotVm } from "./gen/BotVm";
 import type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 import type { BridgeHealthSnapshot } from "./gen/BridgeHealthSnapshot";
 import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
@@ -961,6 +919,8 @@ import type { HqStatusVm } from "./gen/HqStatusVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { MenuSectionVm } from "./gen/MenuSectionVm";
+import type { ModelProviderSaveReq } from "./gen/ModelProviderSaveReq";
+import type { ModelProviderVm } from "./gen/ModelProviderVm";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { NoteAttachmentVm } from "./gen/NoteAttachmentVm";
@@ -1012,6 +972,7 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { PanelIntentVm } from "./gen/PanelIntentVm";
+import type { ProviderProbeVm } from "./gen/ProviderProbeVm";
 import type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
@@ -1090,7 +1051,6 @@ import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 import type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
 import type { VoiceEventVm } from "./gen/VoiceEventVm";
 import type { VoiceStateVm } from "./gen/VoiceStateVm";
-import type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
 import type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 import type { VoiceWakeVm } from "./gen/VoiceWakeVm";
 import type { WidgetKind } from "./gen/WidgetKind";
@@ -7975,6 +7935,16 @@ export async function syncTasks(): Promise<TaskListingVm> {
 }
 
 /**
+ * Put away the Tasks list's notice about the stored tasks keeper removed when
+ * it stopped running prompts on a schedule (Story 108.3a, UX-DR-E108-3).
+ *
+ * Rejects with: `internal`.
+ */
+export async function syncTasksRetiredDismiss(): Promise<void> {
+  await invoke<void>("sync_tasks_retired_dismiss");
+}
+
+/**
  * One task's run history, newest first. `limit` is clamped in Rust; omitting it
  * asks for the default page.
  *
@@ -8159,8 +8129,8 @@ export async function syncTaskSchedulePreview(expression: string): Promise<TaskS
 // Agents on this Mac (Story 90.6)
 //
 // Registered in the DESKTOP splice of the `invoke_handler` literal: a phone is
-// never an agents host. Settings renders the section only where
-// `CapabilitiesVm.botTools` is true, so nothing on a phone calls these.
+// never an agents host. Settings renders the section only on a desktop with
+// folder sync, so nothing on a phone calls these.
 // ---------------------------------------------------------------------------
 
 /**
@@ -8576,581 +8546,66 @@ export async function agentPresenceView(view: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Bots (Epic 61, Story 61.4)
-//
-// Every command in this block is registered in the SHARED half of the
-// `invoke_handler` literal, not the desktop splice: `keeper_core::bots` has no
-// desktop gate, because a provider is a URL plus a credential and a
-// conversation is two tables in `keeper.db`. What keeps the surface off a
-// phone is `CapabilitiesVm.bots`, so none of these rejects with `unsupported`.
+// Model providers (Story 61.1; Story 108.3a) — the endpoints notes search asks
+// for embeddings. Registered in the SHARED half of the `invoke_handler`
+// literal: a provider is a URL plus a credential behind the keychain, so none
+// of these rejects with `unsupported`.
 // ---------------------------------------------------------------------------
 
 /**
- * Every configured AI provider, in the order they were added (FR-369).
+ * Every configured model provider, in the order they were added (FR-369).
  *
- * There is no token on {@link BotProviderVm} and no field one could hide in;
- * `hasToken` is the strongest statement the wire makes about a credential, so
- * the card can say "no credential stored" before a send rather than at one.
- *
- * Rejects with: `internal`.
- */
-export async function botsProvidersList(): Promise<BotProviderVm[]> {
-  return await invoke<BotProviderVm[]>("bots_providers_list");
-}
-
-/**
- * Add or edit one provider (FR-379). `req.id` absent adds; present rewrites.
- *
- * The base URL is validated and **normalized** in Rust — the frontend never
- * re-implements the grammar, so `http://LOCALHOST:11434/` and
- * `http://localhost:11434` are one provider and one egress row. A loopback or
- * private host is accepted and the answer discloses it (`host`, `isPrivate`).
- *
- * `req.token` absent means *unchanged*, never "clear": the edit form cannot
- * render a stored token, so an empty field must not unauthenticate a working
- * provider. Pass `clearToken: true` to delete it.
- *
- * An edit deliberately drops the previous health verdict — it was about an
- * endpoint that may no longer be this one — so the caller re-probes.
- *
- * Rejects with: `internal` (a refused base URL, an empty name, an unknown id).
- */
-export async function botsProviderSave(req: BotProviderSaveReq): Promise<BotProviderVm> {
-  return await invoke<BotProviderVm>("bots_provider_save", { req });
-}
-
-/**
- * Remove one provider, every bot on it, and their credentials (FR-379).
+ * There is no token on {@link ModelProviderVm} and no field one could hide in;
+ * `hasToken` is the strongest statement the wire makes about a credential.
  *
  * Rejects with: `internal`.
  */
-export async function botsProviderRemove(providerId: string): Promise<void> {
-  await invoke<void>("bots_provider_remove", { providerId });
+export async function providersList(): Promise<ModelProviderVm[]> {
+  return await invoke<ModelProviderVm[]>("providers_list");
+}
+
+/**
+ * Add (`req.id` null) or edit one provider. The base URL is validated and
+ * normalized by `keeper_core::providers::parse_base_url` — the frontend never
+ * re-implements the grammar — and Rust's sentence comes back verbatim on a
+ * refusal. `token: null` leaves the stored key alone; `clearToken` deletes it.
+ *
+ * Rejects with: `internal`.
+ */
+export async function providerSave(req: ModelProviderSaveReq): Promise<ModelProviderVm> {
+  return await invoke<ModelProviderVm>("provider_save", { req });
+}
+
+/**
+ * Remove one provider and the key stored for it. Idempotent.
+ *
+ * Rejects with: `internal`.
+ */
+export async function providerRemove(providerId: string): Promise<void> {
+  await invoke<void>("provider_remove", { providerId });
 }
 
 /**
  * Ask a provider whether it is there and what it is, and store the verdict
- * (FR-375) — the Test control.
- *
- * A refusal is **not** a rejection: an endpoint that answered 401, or never
- * answered, is a fact about the endpoint, so it arrives as a
- * {@link BotProbeVm} with `reach`, `status` and keeper's own credential-free
- * `reason`. Only keeper's own failures reject.
+ * (FR-375). A refusal or silence comes back as a {@link ProviderProbeVm},
+ * never a rejection: it is a fact about the endpoint.
  *
  * Rejects with: `internal`.
  */
-export async function botsProviderProbe(providerId: string): Promise<BotProbeVm> {
-  return await invoke<BotProbeVm>("bots_provider_probe", { providerId });
+export async function providerProbe(providerId: string): Promise<ProviderProbeVm> {
+  return await invoke<ProviderProbeVm>("provider_probe", { providerId });
 }
 
 /**
- * Every model this provider will accept as a chat request's `model` (FR-377).
- *
- * The three capability flags are a tri-state: `true` the endpoint said yes,
- * `false` it said no, `null` it did not say. `null` is *unknown* and must never
- * be treated as `false` — an unknown capability is offered with a warning, and
- * only a refused one is hidden (AD-27).
- *
- * `bot` addresses a Hermes profile prefix, so the answer is what that bot
- * accepts rather than the gateway's defaults.
+ * Every model this provider lists (FR-377) — what the embedding picker
+ * chooses from. The capability flags are a tri-state: `null` is *unknown*
+ * and never `false`.
  *
  * Rejects with: `internal`, `invalidCredentials`, `serverUnreachable`,
  * `unsupported`.
  */
-export async function botsModelsList(
-  providerId: string,
-  bot?: string | null,
-): Promise<BotModelVm[]> {
-  return await invoke<BotModelVm[]>("bots_models_list", { providerId, bot: bot ?? null });
-}
-
-/**
- * Verify that a named bot is really there (FR-376).
- *
- * Verification, not enumeration: the bearer API keeper is allowed through has
- * no profile roster at all, so a bot is named by the person who has one. The
- * answer's `presence` is `exists` | `absent` | `unknown`, and `unknown` is a
- * real answer — "keeper could not ask" is a different sentence from "it is not
- * there" for somebody about to retype a name that was right all along.
- *
- * Rejects with: `internal`.
- */
-export async function botsBotProbe(providerId: string, target: string): Promise<BotProbeVm> {
-  return await invoke<BotProbeVm>("bots_bot_probe", { providerId, target });
-}
-
-/**
- * Every pinned bot, in the user's hand-set order (FR-383).
- *
- * Rejects with: `internal`.
- */
-export async function botsBotsList(): Promise<BotVm[]> {
-  return await invoke<BotVm[]>("bots_bots_list");
-}
-
-/**
- * Add or edit one bot (FR-376). `req.id` absent adds; present rewrites.
- *
- * The target — a Hermes profile name or an Ollama model tag — is validated in
- * Rust, so the person typing gets the sentence naming what was wrong rather
- * than a 404 from a URL keeper composed out of it. `token` follows
- * {@link botsProviderSave}'s unchanged-vs-cleared rule.
- *
- * Rejects with: `internal` (a refused target, a duplicate provider+target, an
- * unknown id).
- */
-export async function botsBotSave(req: BotSaveReq): Promise<BotVm> {
-  return await invoke<BotVm>("bots_bot_save", { req });
-}
-
-/**
- * Remove one bot and its own credential (FR-383).
- *
- * Its conversations stay: unpinning a bot is not a statement about the past.
- *
- * Rejects with: `internal`.
- */
-export async function botsBotRemove(botId: string): Promise<void> {
-  await invoke<void>("bots_bot_remove", { botId });
-}
-
-/**
- * Every conversation, newest activity first (FR-381).
- *
- * `includeArchived` widens rather than switches, so an archive view shows both
- * — a list that hid the live ones the moment you asked for the archived ones
- * would be two lists pretending to be one filter.
- *
- * Rejects with: `internal`.
- */
-export async function botsSessionsList(includeArchived: boolean): Promise<BotSessionVm[]> {
-  return await invoke<BotSessionVm[]>("bots_sessions_list", { includeArchived });
-}
-
-/**
- * One conversation and its messages, replayed from keeper's own store (FR-382).
- *
- * One call rather than two, so a header can never render one conversation's
- * title over another's rows. Nothing is fetched from the remote: keeper's store
- * is the truth and a Hermes `sessionId` is only a reference.
- *
- * Rejects with: `internal` (unknown id).
- */
-export async function botsSessionOpen(sessionId: string): Promise<BotConversationVm> {
-  return await invoke<BotConversationVm>("bots_session_open", { sessionId });
-}
-
-/**
- * Read the conversation another device may be writing, and learn when to
- * read it again (Epic 63, Story 63.7, FR-425, FR-426, AD-177).
- *
- * One history read of the route `botsSessionOpen` uses — never the run's
- * event stream, which a second reader destroys — merged so this device's own
- * rows are neither doubled nor overwritten. `nextPollMs` is Rust's decision;
- * the caller owns the timer and stops the moment it is `null`, or the moment
- * the conversation leaves the screen. `messages` is `null` where nothing was
- * read, and then what is on screen stands.
- *
- * Rejects with: `internal` (unknown id).
- */
-export async function botsSessionFollow(sessionId: string): Promise<BotFollowVm> {
-  return await invoke<BotFollowVm>("bots_session_follow", { sessionId });
-}
-
-/**
- * Ask a bot, streaming the answer, and resolve with the subscription id
- * (FR-372).
- *
- * By the time this resolves the conversation exists, the question is stored and
- * the answer row is stored **empty and partial** — all three arrive on the
- * first `opened` event, before the request goes out, so the pane renders the
- * pending answer rather than an optimistic placeholder it must reconcile.
- *
- * The row on disk is rewritten as deltas land, so a stream that dies leaves a
- * partial row and never leaves nothing. The terminal event is always `closed`,
- * whether the answer finished, broke or was stopped.
- *
- * Rejects with: `internal`, `unsupported`, `invalidCredentials`,
- * `serverUnreachable`.
- */
-export async function botsChatSend(
-  req: BotChatSendReq,
-  onEvent: (event: BotStreamEvent) => void,
-): Promise<string> {
-  return await subscribeWithStringId<BotStreamEvent>("bots_chat_send", onEvent, { req });
-}
-
-/**
- * Re-ask the question one answer failed to answer (FR-372), resolving with the
- * subscription id.
- *
- * The named answer is **replaced**, along with anything after it: a re-sent
- * request samples afresh, so splicing two halves would produce text the model
- * never wrote, and replaying a later turn over a re-sampled earlier one would
- * build a conversation that never happened.
- *
- * Rejects with: `internal`, `unsupported`, `invalidCredentials`,
- * `serverUnreachable`.
- */
-export async function botsMessageRetry(
-  req: BotRetryReq,
-  onEvent: (event: BotStreamEvent) => void,
-): Promise<string> {
-  return await subscribeWithStringId<BotStreamEvent>("bots_message_retry", onEvent, { req });
-}
-
-/**
- * Stop a streaming answer (FR-372).
- *
- * Idempotent: an answer that already finished, or whose window closed, is not
- * an error to stop — a racing unmount has no way to know which happened. It
- * fires the driver's cancel handle rather than aborting it, so what had arrived
- * is written as a partial row instead of being dropped mid-write.
- *
- * Rejects with: nothing.
- */
-export async function botsChatStop(subscriptionId: string): Promise<void> {
-  await invoke<void>("bots_chat_stop", { subscriptionId });
-}
-
-/**
- * Answer a tool call waiting on a person (Story 61.10, FR-387).
- *
- * The other half of the `approvalAsked` stream event: the turn is blocked on
- * this `requestId` until it is answered, stopped, or the pane goes away.
- * `approved` is `true` for "just this once" and for "always for this folder"
- * alike — the dialog saves the grant before it answers, so the next call is
- * allowed by the grant and not by this answer. Idempotent like
- * {@link botsChatStop}: an id nobody is waiting on is a no-op.
- *
- * Rejects with: nothing.
- */
-export async function botsApprovalAnswer(requestId: string, approved: boolean): Promise<void> {
-  await invoke<void>("bots_approval_answer", { requestId, approved });
-}
-
-/**
- * What one composer draft is: prose for the model, a command for keeper, or a
- * refusal (Story 61.9, FR-385).
- *
- * **There is no second matcher in the browser, and there must never be one.**
- * The registry, the resolution order — exact name, then alias, then the first
- * prefix — the refusal sentences and the availability reasons are all
- * `keeper_core::bots::commands`. A TypeScript matcher beside it would be a
- * second opinion about what `/mod` means, and the one that disagrees is always
- * the one the person is looking at. This is `syncTaskSchedulePreview`'s own
- * precedent on its own stated rule.
- *
- * **A refusal arrives as data and never as a rejection**, because this is
- * called as somebody types and a half-written command is the ordinary case
- * rather than a fault.
- *
- * **`draft` is echoed back, and the caller must check it.** Replies can land
- * out of order, so a slow answer for a half-typed draft can arrive after a
- * fast answer for the finished one; rendering it would show a refusal for text
- * the field no longer holds.
- *
- * `rows` is the menu, in registry order, already filtered for the token as
- * typed — the frontend renders and dispatches by name, and never filters or
- * re-orders (AD-20). Empty means draw no menu.
- *
- * Rejects with: nothing a verdict covers.
- */
-export async function botsCommandPreview(
-  draft: string,
-  context: BotCommandContextReq,
-): Promise<BotCommandPreviewVm> {
-  return await invoke<BotCommandPreviewVm>("bots_command_preview", { draft, context });
-}
-
-/**
- * One page of the conversation list, searched, scoped and bounded
- * (Story 61.6, FR-381).
- *
- * `req.text` matches the title **and** every message body, case-insensitively
- * and literally — a search for `100%` finds the text, not every row. Empty
- * text is no text predicate at all.
- *
- * The answer carries `total` beside `rows` because the page is bounded: the
- * count a reader needs is how many conversations matched, and `rows.length` is
- * how many arrived. Never count the array.
- *
- * Rejects with: `internal`.
- */
-export async function botsSessionsSearch(req: BotSessionQueryReq): Promise<BotSessionListVm> {
-  return await invoke<BotSessionListVm>("bots_sessions_search", { req });
-}
-
-/**
- * Rename one conversation, answering with the row as stored (Story 61.6,
- * FR-381).
- *
- * The name goes through the same local minter a first message goes through, so
- * what comes back may be shorter — or the placeholder — and that answer is what
- * to render. Nothing is sent to the model: a title is keeper's own.
- *
- * Rejects with: `internal` (unknown id).
- */
-export async function botsSessionRename(sessionId: string, title: string): Promise<BotSessionVm> {
-  return await invoke<BotSessionVm>("bots_session_rename", { sessionId, title });
-}
-
-/**
- * Archive or unarchive one conversation (Story 61.6, FR-381).
- *
- * Reversible by construction: one column with two values, so the same command
- * files a conversation and takes it back out. Nothing is deleted and no
- * message moves.
- *
- * Rejects with: `internal` (unknown id).
- */
-export async function botsSessionArchive(
-  sessionId: string,
-  archived: boolean,
-): Promise<BotSessionVm> {
-  return await invoke<BotSessionVm>("bots_session_archive", { sessionId, archived });
-}
-
-/**
- * Delete one conversation and every message in it (Story 61.6, FR-381).
- *
- * Local and permanent, in one transaction, and **no remote request is made**:
- * keeper's store is the record (AD-154), and a Hermes `sessionId` beside the
- * row names something on a server keeper does not own. Offer this only behind a
- * confirmation that says which conversation and what goes with it.
- *
- * Rejects with: `internal` (unknown id).
- */
-export async function botsSessionDelete(sessionId: string): Promise<void> {
-  await invoke<void>("bots_session_delete", { sessionId });
-}
-
-/**
- * Every grant, live and revoked, with the rows this build cannot act on
- * (Story 61.10, FR-386).
- *
- * One list, because "what can this bot change?" is answered by grants and
- * their state and never by a history of clicks: a revoked grant comes back as
- * a row with `revokedMs` set rather than as a row that vanished.
- *
- * Rejects with: `internal`.
- */
-export async function botsGrantsList(): Promise<BotGrantListVm> {
-  return await invoke<BotGrantListVm>("bots_grants_list");
-}
-
-/**
- * Create or rewrite one grant (Story 61.10, FR-386, AD-C7 on the wire).
- *
- * `req.id` absent creates, present rewrites, and a rewrite un-revokes — the
- * same one-request shape {@link botsProviderSave} uses. A subtree goes through
- * Rust's own path grammar, so a refusal arrives as the sentence naming what
- * was wrong rather than as a scope that silently matches nothing.
- *
- * **This is the only writer of a grant** (NFR-48): no tool result, no file
- * content and no model message reaches it, which is what stops a file from
- * widening the access of the model reading it.
- *
- * Rejects with: `internal`.
- */
-export async function botsGrantSave(req: BotGrantSaveReq): Promise<BotGrantVm> {
-  return await invoke<BotGrantVm>("bots_grant_save", { req });
-}
-
-/**
- * Revoke one grant in one act (Story 61.10, FR-386).
- *
- * Idempotent: revoking a grant that is already revoked, or one that never
- * existed, is not an error — a racing double-click has no way to know which
- * happened. It takes effect from the next tool call onward, because Rust
- * re-reads the grant table on every call.
- *
- * Rejects with: `internal`.
- */
-export async function botsGrantRevoke(grantId: string): Promise<void> {
-  await invoke<void>("bots_grant_revoke", { grantId });
-}
-
-/**
- * The tool-call audit log, newest first, optionally for one conversation
- * (Story 61.10, FR-388).
- *
- * Every row names the path a person reads, because the reader of this log is a
- * person. A row whose `outcome` is `pending` with no `finishedMs` is a call
- * that was recorded and never closed — after a restart, one that was in flight
- * when the process stopped (NFR-47) — and the surface says so rather than
- * rendering it as a success.
- *
- * Rejects with: `internal`.
- */
-export async function botsAuditList(
-  sessionId?: string | null,
-  limit?: number | null,
-): Promise<BotAuditRowVm[]> {
-  return await invoke<BotAuditRowVm[]>("bots_audit_list", {
-    sessionId: sessionId ?? null,
-    limit: limit ?? null,
-  });
-}
-
-/**
- * Whether an answer shows its metadata caption (Story 61.8, FR-384).
- *
- * A persisted `settings` key (`bots.message_details`), not component state and
- * not a cookie: it is a preference about the person, so `keeper.toml` may set
- * it and it is the same answer on the next launch. Defaults off.
- *
- * Rejects with: `internal`.
- */
-export async function botsMessageDetailsGet(): Promise<boolean> {
-  return await invoke<boolean>("bots_message_details_get");
-}
-
-/**
- * Switch the metadata caption on or off (Story 61.8, FR-384).
- *
- * The pane's toggle and the palette entry both land here, so the two cannot
- * become two preferences that look like one. Nothing about what is *recorded*
- * changes: the numbers are written by the stream driver either way, so
- * switching this on later still explains answers that arrived before anybody
- * asked.
- *
- * Rejects with: `internal`.
- */
-export async function botsMessageDetailsSet(shown: boolean): Promise<void> {
-  await invoke<void>("bots_message_details_set", { shown });
-}
-
-/**
- * Write one bot's chosen identity — shape, colour token, mark (Story 61.7,
- * FR-383).
- *
- * All three every time, `null` included: a picker that cannot clear a colour is
- * a picker that lied about the colour being optional.
- *
- * The colour is a **token name** from `BOT_IDENTITY_COLOURS`, never a hex. Rust
- * refuses a name outside the closed set, and `scripts/check-design.mjs` is what
- * makes the set trustworthy — every member is recomputed against every surface
- * of both themes. A colour with no shape beside it is refused too
- * (`DESIGN.md:172`), with the sentence the dialog renders.
- *
- * Answers with the row as stored, so the caller renders what was written
- * rather than what it sent.
- *
- * Rejects with: `internal` (an unknown shape or colour, a colour with no
- * shape, a mark that will not draw, an unknown bot).
- */
-export async function botsBotIdentitySave(
-  botId: string,
-  shape: string | null,
-  colour: string | null,
-  mark: string | null,
-): Promise<BotVm> {
-  return await invoke<BotVm>("bots_bot_identity_save", { botId, shape, colour, mark });
-}
-
-/**
- * Rewrite the whole hand order of the pinned bots (Story 61.7, FR-383).
- *
- * `order` is **every** bot id, in the order the strip should draw them. Rust
- * refuses anything that is not a permutation of the bots that exist, because
- * the write rewrites the whole sequence: a partial order would renumber some
- * rows and strand the rest at their old positions — duplicated and gapped
- * orders describing nothing anybody asked for, which is the defect
- * `registry::reorder_pins` was given a transaction for.
- *
- * Answers with the bots in their new order.
- *
- * Rejects with: `internal` (an unknown id, a duplicate, a partial order).
- */
-export async function botsBotsReorder(order: string[]): Promise<BotVm[]> {
-  return await invoke<BotVm[]>("bots_bots_reorder", { order });
-}
-
-/**
- * Stage a pasted clipboard image for the next message (Story 61.12, FR-392,
- * AD-58).
- *
- * The image **bytes** ride as a **raw binary IPC body** — never base64 inside
- * JSON, which is the sanctioned shape for a paste with no OS path and the same
- * route `sendAttachmentBytes` takes for a Matrix room. `mime` and the
- * percent-encoded `filename` ride in request headers, because an ASCII-only
- * header is the one place a non-ASCII file name has to be escaped. Rust writes
- * the bytes into its staging folder and answers with a
- * {@link BotAttachmentVm} — an id, a name, a type and a length, and no bytes
- * coming back.
- *
- * The capability, format, size and count gate runs on the Rust side of this
- * call (`deliverable::accept_image`) as well as in the composer, so an image
- * that reached here without passing the composer's check is still refused.
- *
- * Rejects with: `unsupported` (the refusal sentence, verbatim), `internal`.
- */
-export async function botsImagePaste(
-  bytes: ArrayBuffer,
-  filename: string,
-  mime: string,
-  botId: string,
-  model: string,
-  attached: number,
-): Promise<BotAttachmentVm> {
-  const headers: Record<string, string> = {
-    // Percent-encoded so a non-ASCII file name survives an ASCII-only header;
-    // the Rust side percent-decodes. The rest are ASCII by construction.
-    "x-filename": encodeURIComponent(filename),
-    "x-mime": mime,
-    "x-bot-id": botId,
-    "x-model": encodeURIComponent(model),
-    "x-attached": String(attached),
-  };
-  try {
-    // Raw-body invoke: the `ArrayBuffer` becomes the `InvokeBody::Raw` payload.
-    // `invoke` in `@tauri-apps/api/core` maps a rejection to a value, so the
-    // shared client's IpcError normalization is mirrored here.
-    return await tauriInvoke<BotAttachmentVm>("bots_image_paste", bytes, { headers });
-  } catch (raw) {
-    if (isIpcError(raw)) {
-      throw raw;
-    }
-    throw {
-      code: "internal",
-      message: typeof raw === "string" ? raw : "unexpected IPC failure",
-      accountId: null,
-      retriable: false,
-    } satisfies IpcError;
-  }
-}
-
-/**
- * Drop a staged image that was never sent (Story 61.12, FR-392).
- *
- * Best-effort and idempotent: a staging folder that only grows is a folder
- * that eventually holds every screenshot the person ever pasted.
- *
- * Rejects with: `internal`.
- */
-export async function botsImageDiscard(attachmentId: string): Promise<void> {
-  await invoke<void>("bots_image_discard", { attachmentId });
-}
-
-/**
- * Resolve the paths an assistant reply named against the drive and the live
- * grants (Story 61.12, FR-393, AD-160).
- *
- * keeper does not strip a path out of a reply the way the Hermes gateway does
- * — here the reply is the record — so this answers with byte offsets into the
- * text the caller passed, plus, per path, either a place to reveal or one
- * sentence saying why there is no control. The grant is re-read on every call,
- * so a revocation is visible on the next render rather than on the next
- * launch.
- *
- * Rejects with: `internal`.
- */
-export async function botsDeliverablePaths(
-  sessionId: string,
-  body: string,
-): Promise<BotDeliverableVm[]> {
-  return await invoke<BotDeliverableVm[]>("bots_deliverable_paths", { sessionId, body });
+export async function providerModels(providerId: string): Promise<BotModelVm[]> {
+  return await invoke<BotModelVm[]>("provider_models", { providerId });
 }
 
 // ---------------------------------------------------------------------------
@@ -9366,19 +8821,6 @@ export async function voiceWakeToggle(): Promise<VoiceWakeVm> {
 }
 
 /**
- * How fast each pinned bot starts answering (Epic 68, Story 68.4, AD-216),
- * one row per pinned bot in the pinned order: the median milliseconds to
- * the first token over the bot's last ten answers, or `null` with fewer
- * than three measured. Read from `bot_messages.ttft_ms`, already stored per
- * answer — nothing is measured for this and nothing leaves the device.
- *
- * Rejects with: `internal`.
- */
-export async function voiceTargetSpeeds(): Promise<VoiceTargetSpeedVm[]> {
-  return await invoke<VoiceTargetSpeedVm[]>("voice_target_speeds");
-}
-
-/**
  * Choose the language the recogniser listens in (Epic 63): one of
  * `VoiceWakeVm.onDeviceLocales`, or `null` to persist "choose for me" —
  * the system language when it can run on this device, otherwise a refusal
@@ -9438,25 +8880,6 @@ export async function voiceStart(): Promise<void> {
  */
 export async function voiceStop(): Promise<void> {
   await invoke<void>("voice_stop");
-}
-
-/**
- * The Tauri event the shell forwards a spoken turn's stream on (Epic 67,
- * AD-205): the turn heard a question and Rust opened the stream itself, with
- * no pane channel to hand it, so every {@link BotStreamEvent} of that answer
- * arrives here instead — `opened`, the deltas, `closed` — for a pane that is
- * mounted to apply exactly as it applies its own channel's. The answer is
- * read aloud by Rust whether or not anything listens.
- */
-export const BOTS_SPOKEN_STREAM_EVENT = "keeper://bots-spoken-stream";
-
-/** Subscribe to the spoken turn's stream events. Resolves with an unlisten function. */
-export async function listenSpokenStream(
-  onEvent: (event: BotStreamEvent) => void,
-): Promise<() => void> {
-  return await listen<BotStreamEvent>(BOTS_SPOKEN_STREAM_EVENT, (event) => {
-    onEvent(event.payload);
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -9598,19 +9021,17 @@ export async function syncCredentialSourceSet(
   await invoke<void>("sync_credential_source_set", { profileId, source });
 }
 
-/** Where a bot endpoint's key comes from (AD-315). */
-export async function botsProviderCredentialSourceGet(
-  providerId: string,
-): Promise<CredentialSource> {
-  return await invoke<CredentialSource>("bots_provider_credential_source_get", { providerId });
+/** Where a model provider's key comes from (AD-315). */
+export async function providerCredentialSourceGet(providerId: string): Promise<CredentialSource> {
+  return await invoke<CredentialSource>("provider_credential_source_get", { providerId });
 }
 
-/** Choose where a bot endpoint's key comes from. */
-export async function botsProviderCredentialSourceSet(
+/** Choose where a model provider's key comes from. */
+export async function providerCredentialSourceSet(
   providerId: string,
   source: CredentialSource,
 ): Promise<void> {
-  await invoke<void>("bots_provider_credential_source_set", { providerId, source });
+  await invoke<void>("provider_credential_source_set", { providerId, source });
 }
 
 // ---------------------------------------------------------------------------

@@ -20,8 +20,6 @@ const desktopCapabilities: CapabilitiesVm = {
   sync: true,
   notes: true,
   sessions: true,
-  bots: true,
-  botTools: true,
   overlayTitleBar: true,
   transcription: true,
 };
@@ -48,8 +46,6 @@ describe("capabilitiesStore", () => {
       sync: false,
       notes: false,
       sessions: false,
-      bots: false,
-      botTools: false,
       overlayTitleBar: false,
       transcription: false,
     });
@@ -96,7 +92,6 @@ describe("isReducedCapabilityPlatform", () => {
     // is true on the phone alone (Story 66.3) — so they are the flags that
     // must NOT flip the verdict; the cases below own them.
     const neutral: Partial<Record<keyof CapabilitiesVm, true>> = {
-      bots: true,
       sync: true,
       notes: true,
       sessions: true,
@@ -116,7 +111,7 @@ describe("isReducedCapabilityPlatform", () => {
     // predicate folded it in, hydrating on iOS would read as desktop and the
     // "On this iPhone" disclosure, the backup-exclusion line and the offline
     // pill would all vanish the moment the pane existed.
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
   });
 
@@ -127,7 +122,7 @@ describe("isReducedCapabilityPlatform", () => {
     // first phone that could sync must not read as a desktop.
     capabilitiesStore
       .getState()
-      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true });
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, notes: true });
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
   });
 
@@ -137,7 +132,6 @@ describe("isReducedCapabilityPlatform", () => {
     // would read as a desktop and drop to the desktop frame.
     capabilitiesStore.getState().applySnapshot({
       ...DEFAULT_CAPABILITIES,
-      bots: true,
       sync: true,
       notes: true,
       sessions: true,
@@ -151,12 +145,7 @@ describe("isReducedCapabilityPlatform", () => {
     // phone to the desktop tier the moment it could share.
     capabilitiesStore
       .getState()
-      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, shareOut: true });
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, shareOut: true });
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
-  });
-
-  it("the drive half (`botTools`) is tier-telling: alone true is NOT reduced", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, botTools: true });
-    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
   });
 });

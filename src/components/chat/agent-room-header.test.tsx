@@ -523,7 +523,7 @@ describe("AgentRoomHeader's agent menu: web search and console", () => {
 
   beforeEach(() => {
     capabilitiesStore.setState({
-      capabilities: { ...DEFAULT_CAPABILITIES, botTools: true },
+      capabilities: { ...DEFAULT_CAPABILITIES, sync: true, trayIcon: true },
       hydrated: true,
     });
     vi.mocked(agentsDefaultGet).mockReset();

@@ -12170,7 +12170,7 @@ pub(crate) fn current_model(deps: &AgentDeps) -> Result<Option<Box<AgentDeps>>, 
     }
     let (row, bot) = bot_for(&fresh, &deps.rows).ok_or_else(|| {
         format!(
-            "No bot provider on this host serves {}'s model {} at {}. Add one under Bots.",
+            "No model provider on this host serves {}'s model {} at {}. Add one under Settings › Model providers.",
             fresh.config.name, fresh.config.bot.target, fresh.config.bot.base
         )
     })?;

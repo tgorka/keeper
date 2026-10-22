@@ -18,9 +18,9 @@ mockIPC((command, payload) => {
       return { provider: "local", model: "unknown" };
     case "notes_embedding_model_set":
       return null;
-    case "bots_providers_list":
+    case "providers_list":
       return [{ id: "local", name: "Local provider" }];
-    case "bots_models_list":
+    case "provider_models":
       return [
         { id: "unknown", embedding: null },
         { id: "embedding", embedding: true },

@@ -36,7 +36,7 @@
 //! measured for a Personal Team's automatic profile — `unentitled` /
 //! `unsupportedTarget`. The bridge returns every refusal as a sentence and
 //! it goes into the event ring (`voice_log`, AD-192) as `island:refused`,
-//! so the phone's Settings → Bots shows it and the story is closed on a
+//! so the phone's Settings → Voice shows it and the story is closed on a
 //! measurement rather than a hope.
 //!
 //! # The one rule about threads

@@ -42,8 +42,6 @@ const SWEPT_FILES = [
   "recording/recording-meta-fields.tsx",
   "sync/add-folder-form.tsx",
   "viewers/text-file-frame.tsx",
-  "bots/bot-attachment.tsx",
-  "bots/bot-session-list.tsx",
 ];
 
 function unhintedControls(text: string): number[] {

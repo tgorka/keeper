@@ -5,7 +5,7 @@ import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabiliti
 
 // The shell without a Tauri backend: what `capabilities` answers now, and the
 // `keeper://capabilities-changed` handler the hook registers.
-const PHONE: CapabilitiesVm = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true };
+const PHONE: CapabilitiesVm = { ...DEFAULT_CAPABILITIES, sync: true, notes: true };
 let served: CapabilitiesVm = PHONE;
 let fireChanged: (() => void) | undefined;
 // When set, the subscription is not in place until the test releases it.

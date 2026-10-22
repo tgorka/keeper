@@ -51,6 +51,7 @@ pub mod platform;
 pub mod request;
 pub mod segments;
 pub mod speech;
+pub mod target;
 pub mod timings;
 pub mod turn;
 pub mod turn_models;
@@ -300,7 +301,7 @@ pub trait VoicePort: Send + Sync {
     /// once, not per probe.
     fn locales(&self) -> locale::DeviceLocales;
 
-    /// Record the person's choice of locale (`bots.voice_locale`; `None` is
+    /// Record the person's choice of locale (`voice.locale`; `None` is
     /// "choose for me"). The port hands it to [`locale::choose`] with its
     /// own enumeration before every availability probe and every request,
     /// and builds the recogniser for the answer; it decides nothing itself.
@@ -1026,7 +1027,7 @@ fn voice_for(
 /// Whether keeper arms the phrase again without being asked (Epic 65,
 /// Story 65.2, AD-190).
 ///
-/// `bots.wake_enabled` is the person's `intent`, persisted as chosen even
+/// `voice.wake_enabled` is the person's `intent`, persisted as chosen even
 /// when the port refused at arming time. A refusal is shown, not saved as
 /// "no" — so when it clears (a grant, a language change, keeper back in
 /// front, the port's own resume) the shell asks this and re-runs the arm.

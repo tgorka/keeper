@@ -20,7 +20,6 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { useVoiceStream } from "@/hooks/use-voice-stream";
-import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
 const WAKE: VoiceWakeVm = {
@@ -44,18 +43,15 @@ beforeEach(() => {
   voiceAvailability.mockResolvedValue(null);
   voiceWakeGet.mockResolvedValue(WAKE);
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
-  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
 });
 
 afterEach(() => {
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
-  capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
 });
 
 describe("useVoiceStream", () => {
-  it("opens nothing where the surface does not exist", () => {
-    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
-    renderHook(() => useVoiceStream());
+  it("opens nothing while its surface is not showing", () => {
+    renderHook(() => useVoiceStream(false));
     expect(voiceWatch).not.toHaveBeenCalled();
     expect(voiceAvailability).not.toHaveBeenCalled();
     expect(voiceWakeGet).not.toHaveBeenCalled();
@@ -67,7 +63,7 @@ describe("useVoiceStream", () => {
       sink = onState;
       return Promise.resolve(7);
     });
-    renderHook(() => useVoiceStream());
+    renderHook(() => useVoiceStream(true));
     await waitFor(() => expect(voiceWatch).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE));
     expect(voiceStore.getState().unavailable).toBeNull();
@@ -84,7 +80,7 @@ describe("useVoiceStream", () => {
       sink = onState;
       return Promise.resolve(7);
     });
-    const { unmount } = renderHook(() => useVoiceStream());
+    const { unmount } = renderHook(() => useVoiceStream(true));
     await waitFor(() => expect(voiceWatch).toHaveBeenCalledTimes(1));
     if (sink === null) {
       throw new Error("the watch never handed over its sink");
@@ -109,7 +105,7 @@ describe("useVoiceStream", () => {
           resolve = r;
         }),
     );
-    const { unmount } = renderHook(() => useVoiceStream());
+    const { unmount } = renderHook(() => useVoiceStream(true));
     await waitFor(() => expect(voiceWatch).toHaveBeenCalledTimes(1));
     unmount();
     expect(voiceUnwatch).not.toHaveBeenCalled();
@@ -123,7 +119,7 @@ describe("useVoiceStream", () => {
   it("leaves availability unasked when the question fails, so absence is never decided from it", async () => {
     voiceAvailability.mockRejectedValue({ code: "internal", message: "no shell" });
     voiceWatch.mockResolvedValue(1);
-    renderHook(() => useVoiceStream());
+    renderHook(() => useVoiceStream(true));
     await waitFor(() => expect(voiceWakeGet).toHaveBeenCalled());
     await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE));
     expect(voiceStore.getState().unavailable).toBeUndefined();
@@ -131,7 +127,7 @@ describe("useVoiceStream", () => {
 
   it("asks the two facts again when the document comes back into view, and not after unmount (Epic 65, AD-190)", async () => {
     voiceWatch.mockResolvedValue(1);
-    const { unmount } = renderHook(() => useVoiceStream());
+    const { unmount } = renderHook(() => useVoiceStream(true));
     await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE));
     expect(voiceAvailability).toHaveBeenCalledTimes(1);
     // Rust re-armed while the app was behind; the stale refusal must go.

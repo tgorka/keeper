@@ -61,7 +61,7 @@ pub struct AccountVm {
     pub forge_connected: bool,
     /// `account.toml` faults, one line each.
     pub faults: Vec<String>,
-    /// Drives, bot providers and Matrix accounts the person uses on their
+    /// Drives, model providers and Matrix accounts the person uses on their
     /// other devices and not here. Empty without an account.
     pub offers: AccountOffersVm,
     /// What restoring this device from the account did, and what waits.
@@ -98,7 +98,7 @@ pub struct AccountOffersVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AccountRestoreVm {
-    /// "Restored 2 drives, 1 bot provider and your settings from your
+    /// "Restored 2 drives, 1 model provider and your settings from your
     /// account." once a restore ran.
     pub sentence: Option<String>,
     /// One "Waiting for {path} to restore {name}." per drive whose folder
@@ -175,8 +175,6 @@ pub struct ProviderOfferVm {
     pub base_url: String,
     /// `account` or `own`.
     pub credential: String,
-    /// Bot names, in pin order.
-    pub bots: Vec<String>,
     pub devices: Vec<String>,
 }
 
@@ -464,7 +462,7 @@ pub struct AccountFacts {
 /// The restore's outcome as the shell knows it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreFacts {
-    /// `(drives, bot providers)` restored, once a restore ran.
+    /// `(drives, model providers)` restored, once a restore ran.
     pub restored: Option<(usize, usize)>,
     /// `(path, name)` of each drive waiting for its folder's parent.
     pub waiting: Vec<(String, String)>,
@@ -614,7 +612,7 @@ fn restore_vm(facts: &RestoreFacts) -> AccountRestoreVm {
     let sentence = facts.restored.map(|(drives, providers)| {
         let mut parts: Vec<String> = [
             counted(drives, "drive", "drives"),
-            counted(providers, "bot provider", "bot providers"),
+            counted(providers, "model provider", "model providers"),
         ]
         .into_iter()
         .flatten()
@@ -1460,7 +1458,7 @@ mod tests {
         };
         assert_eq!(
             restored(2, 1).as_deref(),
-            Some("Restored 2 drives, 1 bot provider and your settings from your account.")
+            Some("Restored 2 drives, 1 model provider and your settings from your account.")
         );
         assert_eq!(
             restored(1, 0).as_deref(),
@@ -1468,7 +1466,7 @@ mod tests {
         );
         assert_eq!(
             restored(0, 3).as_deref(),
-            Some("Restored 3 bot providers and your settings from your account.")
+            Some("Restored 3 model providers and your settings from your account.")
         );
         assert_eq!(
             restored(0, 0).as_deref(),

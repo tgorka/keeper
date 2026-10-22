@@ -183,7 +183,7 @@ import { NOTE_AUTOSAVE_IDLE_MS } from "@/hooks/use-notes-body";
 import { phoneRoutesView } from "@/lib/phone-surfaces";
 
 /** The phone once its folder links (Epic 66): notes ride the folder. */
-const PHONE = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true };
+const PHONE = { ...DEFAULT_CAPABILITIES, sync: true, notes: true };
 
 const originalMatchMedia = window.matchMedia;
 function mockPhoneViewport() {

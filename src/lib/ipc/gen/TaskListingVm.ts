@@ -14,4 +14,10 @@ tasks: Array<TaskVm>,
 /**
  * Every unreadable task row (NFR-43).
  */
-unknown: Array<UnknownTaskVm>, };
+unknown: Array<UnknownTaskVm>, 
+/**
+ * The names of stored tasks this build removed because keeper no longer
+ * runs a prompt on a schedule (Story 108.3a, UX-DR-E108-3) — the Tasks
+ * list's one notice, until it is put away. Empty almost always.
+ */
+retired: Array<string>, };

@@ -52,20 +52,10 @@ const SESSIONS_CATEGORY: &str = "Sessions";
 /// nothing to show rather than something to grey out.
 const TASKS_CATEGORY: &str = "Tasks";
 
-/// The bots verbs' category (Epic 61, FR-378/FR-384), gated whole like Notes,
-/// Sessions and Tasks — but **not on their flag**.
-///
-/// Sessions and Tasks deliberately ride the `notes` gate because
-/// `CapabilitiesVm.sessions`, `.notes` and AD-137's task condition are three
-/// names for one fact (`sync && desktop`), and a second boolean would have said
-/// nothing new. This is the case that doc anticipated: `CapabilitiesVm.bots` is
-/// `cfg!(desktop)` (`keeper/src/ipc.rs`), with no `sync.db` in it at all. A
-/// desktop build with folder sync switched off has no vault, no session board
-/// and no task host, and still has a working Bots pane — so borrowing the notes
-/// flag here would hide a surface that works, which is the mirror image of the
-/// dead affordance AD-27 forbids. Hence the third parameter on
-/// [`registry_sections`] and [`PaletteIndex::query`].
-const BOTS_CATEGORY: &str = "Bots";
+/// The voice verbs' category (Epic 68, AD-218; Story 108.3a). Its one verb is
+/// in [`VOICE_ACTION_IDS`], so the section exists exactly where a voice port
+/// answers and nowhere else — the gate is the id's, not the category's.
+const VOICE_CATEGORY: &str = "Voice";
 
 /// The registry ids of the three Recording verbs (Story 20.4, FR-48), named
 /// because a fourth surface now dispatches on them.
@@ -94,15 +84,15 @@ pub const NOTES_CAPTURE_ID: &str = "notes-capture";
 pub const NOTES_JOURNAL_ID: &str = "notes-journal-today";
 
 /// The registry ids that exist only where a voice port answers (Epic 68,
-/// AD-218; AD-179's rule for every voice surface). Not a category — the Bots
-/// section stays on `bots` — and not a `PaletteActionVm` field, because the
+/// AD-218; AD-179's rule for every voice surface). Not a category gate and
+/// not a `PaletteActionVm` field, because the
 /// webview never decides this: the fourth gate on [`registry_sections`] and
 /// [`PaletteIndex::query`] is `voice_availability`'s one answer, read where
 /// the shell reads it for the tray (`voice_reach::present`), so a build whose
 /// port is [`crate::voice::VoiceUnavailable::Unsupported`] never shows a
 /// listening toggle nothing can flip (AD-27).
-const BOTS_TOGGLE_LISTENING_ID: &str = "bots-toggle-listening";
-const VOICE_ACTION_IDS: &[&str] = &[BOTS_TOGGLE_LISTENING_ID];
+const VOICE_TOGGLE_LISTENING_ID: &str = "voice-toggle-listening";
+const VOICE_ACTION_IDS: &[&str] = &[VOICE_TOGGLE_LISTENING_ID];
 
 /// The registry ids that exist only where the on-device speech engine runs
 /// (Epic 87), for [`VOICE_ACTION_IDS`]' reason: the shell's probe decides
@@ -235,16 +225,14 @@ impl PaletteIndex {
     /// when the capability is off (Story 16.3), so it never appears on a platform
     /// that cannot record. `notes` does the same for the whole [`NOTES_CATEGORY`]
     /// section (Phase 5, FR-122) — a build without folder sync has nowhere to put
-    /// a vault, so its notes verbs are absent rather than dead (AD-27). `bots`
-    /// does the same for [`BOTS_CATEGORY`] (Epic 61, FR-384), on its own flag
-    /// rather than the notes one — that const says why. `voice` drops the
+    /// a vault, so its notes verbs are absent rather than dead (AD-27). `voice` drops the
     /// [`VOICE_ACTION_IDS`] where no voice port answers (Epic 68, AD-218), and
     /// `transcription` the [`TRANSCRIPTION_ACTION_IDS`] where no speech engine
     /// runs.
     ///
     /// Each group is capped to [`MAX_RESULTS_PER_GROUP`]. Pure over the index — no
     /// I/O, no locks — so it is cheap and unit-testable.
-    // A query, its mode and six gates: each gate is a capability the palette
+    // A query, its mode and five gates: each gate is a capability the palette
     // folds by (AD-137), and a struct would only move the same names one line down.
     #[allow(clippy::too_many_arguments)]
     pub fn query(
@@ -254,7 +242,6 @@ impl PaletteIndex {
         open_chat: bool,
         recording: bool,
         notes: bool,
-        bots: bool,
         voice: bool,
         transcription: bool,
     ) -> PaletteResultsVm {
@@ -269,7 +256,6 @@ impl PaletteIndex {
                     open_chat,
                     recording,
                     notes,
-                    bots,
                     voice,
                     transcription,
                 ),
@@ -280,7 +266,6 @@ impl PaletteIndex {
                     open_chat,
                     recording,
                     notes,
-                    bots,
                     voice,
                     transcription,
                 );
@@ -409,16 +394,13 @@ fn subsequence_score(needle: &str, haystack: &str) -> Option<i32> {
 ///
 /// A `requires_recording` action is dropped entirely when `recording` is off (Story
 /// 16.3), mirroring the `requires_open_chat` / `open_chat` gate, and every action in
-/// [`NOTES_CATEGORY`] is dropped when `notes` is off (Phase 5, FR-122). `bots` does
-/// the same for [`BOTS_CATEGORY`] (Epic 61, FR-384) — its own flag, for the reason
-/// that const records. `voice` drops the [`VOICE_ACTION_IDS`] (Epic 68, AD-218),
+/// [`NOTES_CATEGORY`] is dropped when `notes` is off (Phase 5, FR-122). `voice` drops the [`VOICE_ACTION_IDS`] (Epic 68, AD-218),
 /// `transcription` the [`TRANSCRIPTION_ACTION_IDS`].
 fn query_actions(
     needle: &str,
     open_chat: bool,
     recording: bool,
     notes: bool,
-    bots: bool,
     voice: bool,
     transcription: bool,
 ) -> Vec<PaletteActionVm> {
@@ -434,10 +416,6 @@ fn query_actions(
         }
         // The notes section is gated whole, by category (see `NOTES_CATEGORY`).
         if !notes && action.category == NOTES_CATEGORY {
-            continue;
-        }
-        // The bots section likewise (see `BOTS_CATEGORY`), on its own flag.
-        if !bots && action.category == BOTS_CATEGORY {
             continue;
         }
         // A voice verb is only offered where a voice port answers (AD-27).
@@ -821,49 +799,17 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             Some("⌘8"),
             false,
         ),
-        // --- Bots (Epic 61, FR-384): its own category on its own gate, for the
-        // reason `BOTS_CATEGORY` records.
-        //
-        // One entry, and it is a preference rather than a navigation: the pane
-        // has ⌘9 and a sidebar row already, and what had no second surface was
-        // the metadata toggle. A toggle reachable only from the pane it changes
-        // is a toggle you have to be looking at the answer to switch on, which
-        // is precisely when you have already stopped reading. Palette-only
-        // (`shortcut: None`): no chord is claimed for it — ⌘1–⌘9 are spoken for
-        // and a preference does not earn a modifier cluster of its own.
-        //
-        // Titled with the direction it moves rather than the state it is in,
-        // because the registry renders one row whichever way the setting sits
-        // and "Show" would be a lie half the time.
+        // --- Voice (Epic 68, AD-218): listening for the wake phrase, one
+        // action this registry feeds to the palette, the ⌘? sheet and the
+        // native menu bar; Settings › Voice and the tray call the same
+        // command. Titled with the direction it moves: the surfaces that can
+        // show the state ("Listening on · nixie") read it from `VoiceWakeVm`,
+        // and a registry row is built once. Offered only where a voice port
+        // answers — `VOICE_ACTION_IDS`.
         action(
-            "bots-toggle-metadata",
-            "Toggle Answer Details",
-            BOTS_CATEGORY,
-            &[
-                "bot",
-                "model",
-                "tokens",
-                "metadata",
-                "details",
-                "finish reason",
-                "request id",
-            ],
-            None,
-            false,
-        ),
-        // Listening for the wake phrase (Epic 68, AD-218): one action in every
-        // menu that has a Bots section — this registry feeds the palette, the
-        // ⌘? sheet and the native menu bar; the pane headers and the tray
-        // call the same command. The switch itself lived in a folded band on
-        // the desktop and a sheet on the phone, and nowhere a menu reached.
-        // Titled with the direction it moves, like the metadata toggle: the
-        // surfaces that can show the state ("Listening on · nixie") read it
-        // from `VoiceWakeVm`; a registry row is built once. Offered only
-        // where a voice port answers — `VOICE_ACTION_IDS`, not the category.
-        action(
-            BOTS_TOGGLE_LISTENING_ID,
+            VOICE_TOGGLE_LISTENING_ID,
             "Toggle Listening",
-            BOTS_CATEGORY,
+            VOICE_CATEGORY,
             &[
                 "listen",
                 "listening",
@@ -1068,9 +1014,9 @@ const CATEGORY_ORDER: &[&str] = &[
     // Sessions: the third surface over that same sync substrate, and the third
     // category this one flag opens or closes whole.
     TASKS_CATEGORY,
-    // The capability-gated bots verb (Epic 61, FR-384), after Tasks and before
-    // Chat. Its flag is its own, not the one the three above share.
-    BOTS_CATEGORY,
+    // The voice verb (Epic 68, AD-218), after Tasks and before Chat; present
+    // only where a voice port answers (`VOICE_ACTION_IDS`).
+    VOICE_CATEGORY,
     "Chat",
 ];
 
@@ -1098,23 +1044,16 @@ const CATEGORY_ORDER: &[&str] = &[
 /// gate parameter serves all three categories: a second boolean here would be
 /// two names for one fact, and it would change this signature and both call
 /// sites (`menu.rs`'s builder and the `cheat_sheet_sections` command) to say
-/// nothing new. **`bots` is the day that came.** Epic 61's pane is gated on
-/// `CapabilitiesVm.bots`, which is `cfg!(desktop)` and has no `sync.db` in it:
-/// a desktop build with folder sync switched off has no vault, no session board
-/// and no task host, and still has a working Bots pane. Riding the `notes` flag
-/// would therefore hide a section whose surface works — the mirror image of the
-/// dead affordance AD-27 forbids — so this signature grew a third parameter
-/// rather than a fourth name for one fact. `voice` (Epic 68, AD-218) is the
-/// fourth, and it gates ids rather than a category: [`VOICE_ACTION_IDS`] are
-/// absent where no voice port answers, and the Bots section keeps its other
-/// verbs. `transcription` is the fifth and gates ids the same way:
+/// nothing new. `voice` (Epic 68, AD-218) is the third, and it gates ids
+/// rather than a category: [`VOICE_ACTION_IDS`] are absent where no voice port
+/// answers, which leaves the Voice section empty and so absent. `transcription`
+/// is the fourth and gates ids the same way:
 /// [`TRANSCRIPTION_ACTION_IDS`] exist only where the on-device speech engine
 /// runs (`CapabilitiesVm.transcription`), and the Recording section keeps
 /// its recording verbs.
 pub fn registry_sections(
     recording: bool,
     notes: bool,
-    bots: bool,
     voice: bool,
     transcription: bool,
 ) -> Vec<MenuSectionVm> {
@@ -1127,7 +1066,6 @@ pub fn registry_sections(
                     && action.category != SESSIONS_CATEGORY
                     && action.category != TASKS_CATEGORY)
         })
-        .filter(|action| bots || action.category != BOTS_CATEGORY)
         .filter(|action| voice || !VOICE_ACTION_IDS.contains(&action.id.as_str()))
         .filter(|action| transcription || !TRANSCRIPTION_ACTION_IDS.contains(&action.id.as_str()))
         .collect();
@@ -1261,7 +1199,7 @@ pub fn tray_recording_verbs(menu: TrayMenu, recording: bool) -> Vec<MenuItemVm> 
     // menu. A verb that failed to resolve for this or any other reason is
     // caught by the test that counts what each rendering asks for against what
     // it gets.
-    registry_sections(recording, false, false, false, false)
+    registry_sections(recording, false, false, false)
         .into_iter()
         .flat_map(|section| section.items)
         .filter(|item| wanted.contains(&item.id.as_str()))
@@ -1323,7 +1261,7 @@ pub struct TrayNotesLabels {
 /// its own ids. The second is not a state; it is a bug, and the test below is
 /// what makes it one. Pure — no I/O, no state.
 pub fn tray_notes_labels(notes: bool) -> Option<TrayNotesLabels> {
-    let items = registry_sections(false, notes, false, false, false)
+    let items = registry_sections(false, notes, false, false)
         .into_iter()
         .find(|section| section.category == NOTES_CATEGORY)?
         .items;
@@ -1490,7 +1428,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         // "al" matches Alice (contact), Alpha (chat), Algorithms (chat).
         assert!(results
@@ -1528,7 +1465,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert!(results.contacts.is_empty());
         assert!(results.chats.is_empty());
@@ -1537,7 +1473,6 @@ mod tests {
         let empty = index.query(
             "",
             PaletteMode::Default,
-            false,
             false,
             false,
             false,
@@ -1555,7 +1490,6 @@ mod tests {
         let results = index.query(
             "zzqq",
             PaletteMode::Default,
-            false,
             false,
             false,
             false,
@@ -1582,7 +1516,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert!(!results.actions.is_empty());
     }
@@ -1593,7 +1526,6 @@ mod tests {
         let results = index.query(
             "arch",
             PaletteMode::Action,
-            false,
             false,
             false,
             false,
@@ -1617,7 +1549,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert!(!results.actions.is_empty());
         // The first several actions must all be requires_open_chat.
@@ -1636,7 +1567,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert!(closed.actions.iter().all(|a| !a.requires_open_chat));
     }
@@ -1648,7 +1578,6 @@ mod tests {
         let results = index.query(
             "al",
             PaletteMode::Default,
-            false,
             false,
             false,
             false,
@@ -1695,12 +1624,10 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         let off = index.query(
             "",
             PaletteMode::Action,
-            false,
             false,
             false,
             false,
@@ -1728,12 +1655,10 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         let queried_off = index.query(
             "record",
             PaletteMode::Action,
-            false,
             false,
             false,
             false,
@@ -1754,7 +1679,7 @@ mod tests {
         // The registry projection (both discovery surfaces) gates them too:
         // `open-recording` lives in Navigation, the verbs in their own
         // Recording section — present with the flag on…
-        let sections_on = registry_sections(true, false, false, false, false);
+        let sections_on = registry_sections(true, false, false, false);
         let all_on: Vec<&str> = sections_on
             .iter()
             .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
@@ -1775,7 +1700,7 @@ mod tests {
             "the three recording verbs share the Recording section"
         );
         // …and the whole category (plus the Navigation entry) vanishes off.
-        let sections_off = registry_sections(false, false, false, false, false);
+        let sections_off = registry_sections(false, false, false, false);
         assert!(
             !sections_off.iter().any(|s| s.category == "Recording"),
             "no Recording section when recording is off"
@@ -1815,7 +1740,6 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
             );
             let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
             assert!(
@@ -1830,7 +1754,6 @@ mod tests {
             PaletteMode::Action,
             false,
             true,
-            false,
             false,
             false,
             false,
@@ -1854,7 +1777,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert!(
             by_old_word
@@ -1866,7 +1788,7 @@ mod tests {
         // A rename must not become a re-home: `palette.rs`'s section-count
         // assertion above is what moving this item to Navigation would break,
         // and this says out loud that the category is load-bearing.
-        let recording = registry_sections(true, false, false, false, false)
+        let recording = registry_sections(true, false, false, false)
             .into_iter()
             .find(|s| s.category == "Recording")
             .expect("Recording section present");
@@ -1920,7 +1842,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
         assert!(ids.contains(&"open-recordings"), "searchable: {ids:?}");
@@ -1963,13 +1884,13 @@ mod tests {
             "sync-now",
         ];
         expected.sort_unstable();
-        let actions = query_actions("", false, false, true, false, false, false);
+        let actions = query_actions("", false, false, true, false, false);
         let mut actual: Vec<&str> = actions.iter().map(|action| action.id.as_str()).collect();
         actual.sort_unstable();
         assert_eq!(actual, expected, "navigation must not evict a default verb");
         for (needle, id) in [("back", "notes-back"), ("forward", "notes-forward")] {
             assert!(
-                query_actions(needle, false, false, true, false, false, false)
+                query_actions(needle, false, false, true, false, false)
                     .iter()
                     .any(|action| action.id == id),
                 "{id} remains searchable"
@@ -1992,7 +1913,6 @@ mod tests {
             true,
             false,
             false,
-            false,
         );
         for id in &NOTES_ACTION_IDS[..6] {
             assert!(
@@ -2003,7 +1923,6 @@ mod tests {
         let off = index.query(
             "",
             PaletteMode::Action,
-            false,
             false,
             false,
             false,
@@ -2027,12 +1946,10 @@ mod tests {
             true,
             false,
             false,
-            false,
         );
         let queried_off = index.query(
             "note",
             PaletteMode::Action,
-            false,
             false,
             false,
             false,
@@ -2052,7 +1969,7 @@ mod tests {
 
         // The registry projection gates the whole category, and the two
         // capability flags are independent of each other.
-        let sections_on = registry_sections(false, true, false, false, false);
+        let sections_on = registry_sections(false, true, false, false);
         let notes_section = sections_on
             .iter()
             .find(|s| s.category == NOTES_CATEGORY)
@@ -2072,7 +1989,7 @@ mod tests {
             !sections_on.iter().any(|s| s.category == "Recording"),
             "notes on does not drag the recording section in with it"
         );
-        let sections_off = registry_sections(true, false, false, false, false);
+        let sections_off = registry_sections(true, false, false, false);
         assert!(
             !sections_off.iter().any(|s| s.category == NOTES_CATEGORY),
             "no Notes section when notes is off"
@@ -2121,7 +2038,7 @@ mod tests {
         // are, so on a build without them the whole section is *absent* from the
         // ⌘? cheat sheet and the native menu bar rather than greyed out in them
         // — both are built from this one projection.
-        let off = registry_sections(false, false, false, false, false);
+        let off = registry_sections(false, false, false, false);
         assert!(
             !off.iter().any(|s| s.category == TASKS_CATEGORY),
             "no Tasks section when the gate is off"
@@ -2133,7 +2050,7 @@ mod tests {
             "and tasks-view reached no other section either"
         );
 
-        let on = registry_sections(false, true, false, false, false);
+        let on = registry_sections(false, true, false, false);
         let tasks = on
             .iter()
             .find(|s| s.category == TASKS_CATEGORY)
@@ -2181,7 +2098,7 @@ mod tests {
 
         // And it survives into the projection the menu builder consumes, chip
         // and all — the registry entry alone would prove nothing about menu.rs.
-        let item = registry_sections(false, true, false, false, false)
+        let item = registry_sections(false, true, false, false)
             .into_iter()
             .find(|s| s.category == TASKS_CATEGORY)
             .and_then(|s| s.items.into_iter().find(|i| i.id == "tasks-view"))
@@ -2191,126 +2108,28 @@ mod tests {
     }
 
     #[test]
-    fn the_bots_section_rides_its_own_flag_and_not_the_notes_one() {
-        // FR-384. The point of the third parameter: `CapabilitiesVm.bots` is
-        // `cfg!(desktop)`, so a desktop build with folder sync off has no notes,
-        // no sessions and no tasks — and a working Bots pane. If the section
-        // rode the notes flag, that build would lose a verb whose surface works.
-        let neither = registry_sections(false, false, false, false, false);
-        assert!(
-            !neither.iter().any(|s| s.category == BOTS_CATEGORY),
-            "no Bots section when the bots gate is off"
-        );
-
-        let notes_only = registry_sections(false, true, false, false, false);
-        assert!(
-            !notes_only.iter().any(|s| s.category == BOTS_CATEGORY),
-            "the notes gate does not open the Bots section"
-        );
-
-        let bots_only = registry_sections(false, false, true, true, false);
-        let section = bots_only
+    fn the_listening_toggle_is_the_voice_section_and_exists_only_where_voice_answers() {
+        // Epic 68, AD-218: one action every menu shows, and AD-27's absence
+        // where no voice port answers — the Voice section has no other verb,
+        // so without voice there is no section at all.
+        let with_voice = registry_sections(false, false, true, false);
+        let voice = with_voice
             .iter()
-            .find(|s| s.category == BOTS_CATEGORY)
-            .expect("Bots section present on its own flag, with notes off");
-        let ids: Vec<&str> = section.items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec!["bots-toggle-metadata", BOTS_TOGGLE_LISTENING_ID]);
-        assert!(
-            !bots_only.iter().any(|s| s.category == NOTES_CATEGORY),
-            "and it does not drag the Notes section in with it"
-        );
-    }
-
-    #[test]
-    fn the_metadata_toggle_is_findable_by_the_words_a_person_would_type() {
-        // The pane's own control is on the pane; this entry exists so somebody
-        // reading an answer that will not explain itself can reach the toggle
-        // without knowing where it lives. That only works if the search finds
-        // it, so the keywords are asserted rather than assumed.
-        let index = sample_index();
-        for needle in ["tokens", "details", "answer details", "request id"] {
-            let hits = index.query(
-                needle,
-                PaletteMode::Action,
-                false,
-                false,
-                false,
-                true,
-                false,
-                false,
-            );
-            let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
-            assert!(
-                ids.contains(&"bots-toggle-metadata"),
-                "{needle:?} should find the toggle, got {ids:?}"
-            );
-        }
-        // And with the gate off it is absent from the query too, not merely from
-        // the menu projection.
-        let off = index.query(
-            "",
-            PaletteMode::Action,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert!(
-            !off.actions.iter().any(|a| a.id == "bots-toggle-metadata"),
-            "the ⌘K list drops it with the capability off"
-        );
-
-        let action = palette_actions()
-            .into_iter()
-            .find(|a| a.id == "bots-toggle-metadata")
-            .expect("bots-toggle-metadata is registered");
-        assert_eq!(action.title, "Toggle Answer Details");
-        assert_eq!(
-            action.shortcut, None,
-            "no chord is claimed for a preference"
-        );
-        assert!(!action.requires_open_chat);
-        assert!(!action.requires_recording);
-        assert_eq!(action.toggle_group, None, "one row, not a pair");
-    }
-
-    #[test]
-    fn the_listening_toggle_is_in_the_bots_section_only_where_voice_answers() {
-        // Epic 68, AD-218: one action in every menu that has a Bots section,
-        // and AD-27's absence where no voice port answers — the Bots section
-        // keeps its other verb, so the gate is on the id and not the category.
-        let with_voice = registry_sections(false, false, true, true, false);
-        let bots = with_voice
-            .iter()
-            .find(|s| s.category == BOTS_CATEGORY)
-            .expect("Bots section");
-        let item = bots
-            .items
-            .iter()
-            .find(|i| i.id == BOTS_TOGGLE_LISTENING_ID)
-            .expect("the listening toggle is a Bots item where voice answers");
+            .find(|s| s.category == VOICE_CATEGORY)
+            .expect("Voice section");
+        let ids: Vec<&str> = voice.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec![VOICE_TOGGLE_LISTENING_ID]);
+        let item = &voice.items[0];
         assert_eq!(item.title, "Toggle Listening");
         assert_eq!(item.shortcut, None, "no chord is claimed for a preference");
         assert_eq!(item.toggle_group, None, "one row, not a pair");
         assert!(!item.requires_open_chat);
 
-        let without_voice = registry_sections(false, false, true, false, false);
-        let bots = without_voice
-            .iter()
-            .find(|s| s.category == BOTS_CATEGORY)
-            .expect("the Bots section stays without voice");
-        let ids: Vec<&str> = bots.items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["bots-toggle-metadata"],
-            "no listening toggle where no voice port answers"
+        let without_voice = registry_sections(true, true, false, true);
+        assert!(
+            !without_voice.iter().any(|s| s.category == VOICE_CATEGORY),
+            "no Voice section where no voice port answers"
         );
-
-        // The voice gate never opens the Bots section on its own.
-        let voice_only = registry_sections(false, false, false, true, false);
-        assert!(!voice_only.iter().any(|s| s.category == BOTS_CATEGORY));
 
         // The ⌘K query applies the same gate, and finds it by the words a
         // person would type.
@@ -2323,12 +2142,11 @@ mod tests {
                 false,
                 false,
                 true,
-                true,
                 false,
             );
             let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
             assert!(
-                ids.contains(&BOTS_TOGGLE_LISTENING_ID),
+                ids.contains(&VOICE_TOGGLE_LISTENING_ID),
                 "{needle:?} should find the toggle, got {ids:?}"
             );
         }
@@ -2338,19 +2156,18 @@ mod tests {
             false,
             false,
             false,
-            true,
             false,
             false,
         );
         assert!(
-            !off.actions.iter().any(|a| a.id == BOTS_TOGGLE_LISTENING_ID),
+            !off.actions.iter().any(|a| a.id == VOICE_TOGGLE_LISTENING_ID),
             "the ⌘K list drops it where voice is unsupported"
         );
     }
 
     #[test]
     fn transcribe_a_file_is_a_recording_verb_only_where_the_speech_engine_runs() {
-        let with = registry_sections(true, false, false, false, true);
+        let with = registry_sections(true, false, false, true);
         let recording = with
             .iter()
             .find(|s| s.category == "Recording")
@@ -2363,7 +2180,7 @@ mod tests {
         assert_eq!(item.title, "Transcribe a File…");
         assert_eq!(item.shortcut, None);
 
-        let without = registry_sections(true, false, false, false, false);
+        let without = registry_sections(true, false, false, false);
         assert!(
             !without
                 .iter()
@@ -2388,7 +2205,6 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
                 true,
             );
             assert!(
@@ -2403,7 +2219,6 @@ mod tests {
             PaletteMode::Action,
             false,
             true,
-            false,
             false,
             false,
             false,
@@ -2431,7 +2246,6 @@ mod tests {
             false,
             false,
             false,
-            false,
         );
         assert_eq!(results.chats.len(), 1);
     }
@@ -2444,7 +2258,6 @@ mod tests {
         let results = index.query(
             "zeta",
             PaletteMode::Default,
-            false,
             false,
             false,
             false,
@@ -2499,7 +2312,7 @@ mod tests {
 
     #[test]
     fn registry_sections_collapse_toggle_pairs_to_one_row() {
-        let sections = registry_sections(false, false, false, false, false);
+        let sections = registry_sections(false, false, false, false);
         let chat = sections
             .iter()
             .find(|s| s.category == "Chat")
@@ -2566,7 +2379,7 @@ mod tests {
     #[test]
     fn registry_sections_no_toggle_group_left_uncollapsed() {
         // Across ALL sections, every toggle group appears exactly once.
-        let sections = registry_sections(false, false, false, false, false);
+        let sections = registry_sections(false, false, false, false);
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for section in &sections {
             for item in &section.items {
@@ -2583,7 +2396,7 @@ mod tests {
 
     #[test]
     fn registry_sections_ordered_by_category() {
-        let sections = registry_sections(false, false, false, false, false);
+        let sections = registry_sections(false, false, false, false);
         let categories: Vec<&str> = sections.iter().map(|s| s.category.as_str()).collect();
         assert_eq!(
             categories,
@@ -2607,9 +2420,9 @@ mod tests {
         // non-toggle action maps to its own item; a toggle action maps to its
         // group's collapsed item (by canonical id or by group membership). This
         // proves the projection drops nothing. Every capability flag is on so
-        // the gated Recording, Notes and Bots actions are in the sections and in
+        // the gated Recording, Notes and Voice actions are in the sections and in
         // the `palette_actions()` set alike.
-        let sections = registry_sections(true, true, true, true, true);
+        let sections = registry_sections(true, true, true, true);
         let section_ids: Vec<String> = sections
             .iter()
             .flat_map(|s| s.items.iter().map(|i| i.id.clone()))
@@ -2758,7 +2571,6 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
             );
             let elapsed = start.elapsed();
             assert!(
@@ -2776,7 +2588,6 @@ mod tests {
         let results = index.query(
             "  ",
             PaletteMode::Default,
-            false,
             false,
             false,
             false,
@@ -3055,7 +2866,7 @@ mod tests {
         // deliberately absent from the menu bar. A projection that widened to
         // "the Notes category" would grow the tray by three rows nobody asked
         // for, silently, on the next registry addition.
-        let section: Vec<String> = registry_sections(false, true, false, false, false)
+        let section: Vec<String> = registry_sections(false, true, false, false)
             .into_iter()
             .find(|section| section.category == NOTES_CATEGORY)
             .expect("the Notes section projects")

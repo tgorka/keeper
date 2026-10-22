@@ -50,7 +50,7 @@ pub fn reach_present(availability: Option<&VoiceUnavailableVm>) -> bool {
 }
 
 /// Which of the three faces a reach surface wears for a snapshot — the same
-/// three the mic control wears (`micState` in `bot-voice-mic.tsx`): `heard`,
+/// three the mic control wears (`micState` in `voice-mic.tsx`): `heard`,
 /// `sending` and `failed` are turns with the microphone already released, so
 /// they show the idle face and offer a start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +156,7 @@ pub fn tray_voice_labels(state: &VoiceStateVm) -> TrayVoiceLabels {
 }
 
 /// The tray's words for the listening switch (Epic 68, AD-218): the label of
-/// the item that flips `bots.wake_enabled`, naming the state it is in —
+/// the item that flips `voice.wake_enabled`, naming the state it is in —
 /// "Listening on · hey nixie" / "Listening off" — the same words the pane
 /// headers show, so five surfaces say one thing. The state is the choice
 /// (`VoiceWakeVm.enabled`, the phrase as typed), never the turn's arm: a

@@ -23,7 +23,7 @@ use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
 use keeper_core::agents::surface::{
     SurfaceAnswerReq, SurfaceRequestArrived, SurfaceRequestVm, CANNOT_SHOW,
 };
-use keeper_core::bots::voice_target;
+use keeper_core::voice::target as voice_target;
 use keeper_core::error::CoreError;
 use keeper_core::notes::outline::{heading_at, heading_in};
 use keeper_core::panels::PanelTargetVm;
@@ -581,8 +581,8 @@ pub fn drop_spoken_answer() {
 
 /// Send what the voice turn heard as `question` into `room_id`, the
 /// person's proxy conversation on `account_id` (AD-384, R31), and speak the
-/// answer as it grows. Called by `bots_ipc::send_spoken` for an agent room
-/// target. Only the text leaves the device, as the person's own message;
+/// answer as it grows. Called by `voice_ipc::send_spoken` once *Speak to*
+/// resolves to an agent room. Only the text leaves the device, as the person's own message;
 /// which room is allowed and what of the answer is heard when are
 /// `keeper_core::account::spoken_send`'s and `keeper_core::agents::spoken`'s.
 /// The voice turn hears the send leave (`note_sent`, with the agent's name),

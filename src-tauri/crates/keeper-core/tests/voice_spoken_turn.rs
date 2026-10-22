@@ -1,21 +1,20 @@
 //! Epic 67, Story 67.1 (AD-205, AD-206): the hands-free turn finishes
 //! without the screen.
 //!
-//! The shell (`voice_ipc::transition` → `bots_ipc::send_spoken` →
-//! `bots_ipc::close` → `voice_ipc::answer_complete`) is a call site over two
-//! core decisions pinned here against fakes: the turn's table hands out
-//! exactly one `SendText` and, once the answer is back, exactly one `Speak`;
-//! and `bots::voice_target` says which bot the text goes to — or refuses
-//! with the sentence. The fake bot host below plays the shell's part: it
-//! takes the `SendText`, answers, and feeds the answer back the way `close`
-//! does. No webview, no channel, no event listener is anywhere in the loop.
+//! The shell (`voice_ipc::transition` → the agent send →
+//! `voice_ipc::answer_complete`) is a call site over two core decisions pinned
+//! here against fakes: the turn's table hands out exactly one `SendText` and,
+//! once the answer is back, exactly one `Speak`; and `voice::target` says
+//! which of the person's agent conversations the text goes to — or refuses
+//! with the sentence. The fake agent host below plays the shell's part: it
+//! takes the `SendText`, answers, and feeds the answer back the way the
+//! stream's close does. No webview, no channel, no event listener is anywhere
+//! in the loop.
 
 use std::sync::Mutex;
 
-use keeper_core::bots::session::BotSession;
-use keeper_core::bots::voice_target::{self, SpokenRefusal, VoiceTarget, NO_TARGET_SENTENCE};
-use keeper_core::bots::{Bot, BotIdentity};
 use keeper_core::vm::VoiceStateVm;
+use keeper_core::voice::target::{self, SpokenRefusal, NO_TARGET_SENTENCE};
 use keeper_core::voice::{
     Effect, Turn, TurnEvent, TurnState, VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase,
 };
@@ -87,54 +86,26 @@ impl VoicePort for FakePort {
     fn finish_recognition(&self, _finish: u64) {}
 }
 
-/// The shell's part, played by a fake: the bot host that receives what the
-/// turn heard, opens one stream on the resolved target, and hands the answer
-/// back. `streams` is every stream it opened — the test asserts on its
+/// The shell's part, played by a fake: the host that receives what the turn
+/// heard, opens one stream on the resolved agent conversation, and hands the
+/// answer back. `streams` is every stream it opened — the test asserts on its
 /// length, because "one turn, not two" is the claim.
-struct FakeBotHost {
+struct FakeAgentHost {
     chosen: Option<String>,
-    bots: Vec<Bot>,
-    sessions: Vec<BotSession>,
+    rooms: Vec<String>,
     answer: &'static str,
-    streams: Vec<(VoiceTarget, String)>,
+    streams: Vec<(String, String)>,
 }
 
-impl FakeBotHost {
-    /// `bots_ipc::send_spoken`, minus the network: resolve the target with
-    /// core, open a stream (record it), and return what `close` would feed
+impl FakeAgentHost {
+    /// The shell's spoken send, minus the network: resolve the target with
+    /// core, open a stream (record it), and return what the close would feed
     /// the turn — the answer, or the refusal's sentence.
     fn send_spoken(&mut self, text: &str) -> Result<String, String> {
-        let target = voice_target::resolve(self.chosen.as_deref(), &self.bots, &self.sessions, &[])
-            .map_err(|refusal| refusal.message())?;
-        self.streams.push((target, text.to_owned()));
+        let room = target::resolve(self.chosen.as_deref(), &self.rooms)
+            .map_err(|refusal| refusal.message().to_owned())?;
+        self.streams.push((room, text.to_owned()));
         Ok(self.answer.to_owned())
-    }
-}
-
-fn bot(id: &str) -> Bot {
-    Bot {
-        id: id.to_owned(),
-        provider_id: "p1".to_owned(),
-        target: id.to_owned(),
-        name: id.to_owned(),
-        pin_order: 0,
-        identity: BotIdentity::default(),
-        created_ms: 0,
-    }
-}
-
-fn session(id: &str, bot_id: &str, updated_ms: i64) -> BotSession {
-    BotSession {
-        id: id.to_owned(),
-        bot_id: bot_id.to_owned(),
-        provider_id: "p1".to_owned(),
-        title: id.to_owned(),
-        created_ms: updated_ms,
-        updated_ms,
-        archived: false,
-        remote_session_id: None,
-        remote_last_active_ms: None,
-        remote_source: None,
     }
 }
 
@@ -157,11 +128,9 @@ fn a_heard_question_becomes_one_stream_on_the_target_and_its_answer_is_spoken() 
     let mut turn = Turn::new(port.platform());
     let armed = turn.set_wake(Some(WakePhrase::parse("nixie").expect("phrase")));
     assert_eq!(armed, vec![Effect::OpenMicrophone]);
-    let mut host = FakeBotHost {
-        chosen: None,
-        bots: vec![bot("a"), bot("b")],
-        // b was talked to most recently; unset means b (AD-206).
-        sessions: vec![session("s2", "b", 20), session("s1", "a", 10)],
+    let mut host = FakeAgentHost {
+        chosen: Some(target::agent_target("!dm:example.org")),
+        rooms: vec!["!dm:example.org".to_owned(), "!talk:example.org".to_owned()],
         answer: "Three notes and a receipt.",
         streams: Vec::new(),
     };
@@ -189,16 +158,10 @@ fn a_heard_question_becomes_one_stream_on_the_target_and_its_answer_is_spoken() 
         "the snapshot the webview would see carries the words, for showing — not for sending"
     );
 
-    // `send_spoken`: one stream, on the most recently talked-to bot.
+    // `send_spoken`: one stream, on the chosen agent conversation.
     let answer = host.send_spoken(&text).expect("a target exists");
     assert_eq!(host.streams.len(), 1, "one turn, not two");
-    assert_eq!(
-        host.streams[0].0,
-        VoiceTarget::Bot {
-            bot_id: "b".to_owned(),
-            session_id: Some("s2".to_owned()),
-        }
-    );
+    assert_eq!(host.streams[0].0, "!dm:example.org");
 
     // The stream's progress, as `drive` reports it (AD-186)...
     turn.drive(TurnEvent::Sent, &port);
@@ -228,10 +191,9 @@ fn a_heard_question_becomes_one_stream_on_the_target_and_its_answer_is_spoken() 
 fn a_button_turn_takes_the_same_path() {
     let port = FakePort::default();
     let mut turn = Turn::new(port.platform());
-    let mut host = FakeBotHost {
-        chosen: Some("a".to_owned()),
-        bots: vec![bot("a")],
-        sessions: Vec::new(),
+    let mut host = FakeAgentHost {
+        chosen: Some(target::agent_target("!talk:example.org")),
+        rooms: vec!["!talk:example.org".to_owned()],
         answer: "Nothing yet.",
         streams: Vec::new(),
     };
@@ -239,16 +201,9 @@ fn a_button_turn_takes_the_same_path() {
     let effects = turn.drive(TurnEvent::FinalHeard("anything new".to_owned()), &port);
     let text = sent(&effects).expect("sent");
     let answer = host.send_spoken(&text).expect("a target exists");
-    // A chosen bot never talked to opens a new conversation on it.
     assert_eq!(
         host.streams,
-        vec![(
-            VoiceTarget::Bot {
-                bot_id: "a".to_owned(),
-                session_id: None,
-            },
-            "anything new".to_owned()
-        )]
+        vec![("!talk:example.org".to_owned(), "anything new".to_owned())]
     );
     let effects = turn.drive(TurnEvent::AnswerDone(answer.clone()), &port);
     assert_eq!(effects, vec![Effect::Speak(answer)]);
@@ -262,10 +217,9 @@ fn no_target_refuses_with_the_sentence_and_sends_nothing() {
     let port = FakePort::default();
     let mut turn = Turn::new(port.platform());
     turn.set_wake(Some(WakePhrase::parse("nixie").expect("phrase")));
-    let mut host = FakeBotHost {
+    let mut host = FakeAgentHost {
         chosen: None,
-        bots: vec![bot("a")],
-        sessions: Vec::new(),
+        rooms: vec!["!dm:example.org".to_owned()],
         answer: "never",
         streams: Vec::new(),
     };
@@ -275,11 +229,8 @@ fn no_target_refuses_with_the_sentence_and_sends_nothing() {
 
     let refusal = host.send_spoken(&text).expect_err("nothing to talk to");
     assert_eq!(refusal, NO_TARGET_SENTENCE);
-    assert!(refusal.contains("choose a bot to talk to under Bots"));
-    assert!(
-        host.streams.is_empty(),
-        "nothing is sent to a bot nobody chose"
-    );
+    assert!(refusal.contains("under Speak to"));
+    assert!(host.streams.is_empty(), "nothing is sent to anyone nobody chose");
 
     // `answer_failed(sentence)`: the turn ends on the sentence.
     let effects = turn.drive(TurnEvent::Failed(refusal.clone()), &port);

@@ -219,7 +219,7 @@ pub enum TurnEvent {
     /// The person said the stop phrase while `Speaking` or `Paused`
     /// (AD-208). Never
     /// emitted by a port: [`super::Turn`] makes it out of a `SpeechDetected`
-    /// whose words match `bots.stop_phrase`.
+    /// whose words match `voice.stop_phrase`.
     StopHeard,
     /// The person stopped the turn by hand — the mic button, the tray item,
     /// the hotkey or the deep link (AD-212). While `Speaking` this is what

@@ -21,11 +21,11 @@ vi.mock("@/lib/ipc/client", () => ({
   notesEmbeddingModelSet: async (model: unknown) => {
     mocks.setModel(model);
   },
-  botsProvidersList: async () => [
+  providersList: async () => [
     { id: "p", name: "Local" },
     { id: "offline", name: "Offline" },
   ],
-  botsModelsList: async (provider: string) => {
+  providerModels: async (provider: string) => {
     if (mocks.failProvider && provider === "p") throw new Error("offline");
     if (provider === "offline") throw new Error("offline");
     return [
@@ -92,7 +92,7 @@ it("names the configured model even when its provider is unreachable", async () 
   ).toBeInTheDocument();
 });
 it("does not offer the embedding picker on the phone capability tier", async () => {
-  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true, bots: true });
+  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true });
   render(<SearchSettingsSection open />);
   expect(await screen.findByLabelText("Service files")).toBeInTheDocument();
   expect(screen.queryByRole("combobox", { name: "Embedding model" })).not.toBeInTheDocument();

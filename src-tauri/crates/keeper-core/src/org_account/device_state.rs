@@ -2,8 +2,7 @@
 //! reinstall restores it (AD-328, AD-329).
 //!
 //! ```text
-//! <login>/device.<device>.toml   [[drive]], [[provider]] with [[provider.bot]]
-//!                                and [[provider.grant]], [[matrix]]
+//! <login>/device.<device>.toml   [[drive]], [[provider]], [[matrix]]
 //! ```
 //!
 //! Each drive is the shell's rendering of its whole sync profile, minus its
@@ -15,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::{self, BotRecord, Extra};
+use super::manifest::{self, Extra};
 use super::settings_sync::{remote_has_secret, DriveRef, ProviderRef};
 
 /// `<login>/device.<device>.toml`.
@@ -23,7 +22,7 @@ pub fn path(login: &str, device: &str) -> String {
     format!("{login}/device.{device}.toml")
 }
 
-const HEADER: &str = "# This device's drives, bots and accounts, so keeper can restore it. keeper rewrites it from this device; edit settings.<device>.toml instead.\n";
+const HEADER: &str = "# This device's drives, model providers and accounts, so keeper can restore it. keeper rewrites it from this device; edit settings.<device>.toml instead.\n";
 
 fn default_credential_own() -> String {
     "own".to_owned()
@@ -36,7 +35,7 @@ fn default_matrix_kind() -> String {
 /// A drive as a restore matches it: remote, branch and name (AD-327).
 pub type DriveKey = DriveRef;
 
-/// A bot provider as a restore matches it: kind and base URL.
+/// A model provider as a restore matches it: kind and base URL.
 pub type ProviderKey = ProviderRef;
 
 /// `device.<device>.toml`. An `Err` from [`parse`](DeviceStateFile::parse)
@@ -59,7 +58,7 @@ pub struct DeviceStateFile {
     pub extra: Extra,
 }
 
-/// One bot provider with its bots and their folder grants.
+/// One model provider (Settings › Model providers).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderState {
@@ -72,27 +71,6 @@ pub struct ProviderState {
     /// `account` or `own`.
     #[serde(default = "default_credential_own")]
     pub credential: String,
-    #[serde(rename = "bot", default, skip_serializing_if = "Vec::is_empty")]
-    pub bots: Vec<BotRecord>,
-    #[serde(rename = "grant", default, skip_serializing_if = "Vec::is_empty")]
-    pub grants: Vec<GrantState>,
-    #[serde(flatten)]
-    pub extra: Extra,
-}
-
-/// One folder a provider's bots (or one bot) may reach.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct GrantState {
-    /// The bot's target; `None` is every bot of the provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bot: Option<String>,
-    /// The drive, as its reference ([`Catalog::drive_reference`](super::settings_sync::Catalog::drive_reference)),
-    /// or `*` for every drive.
-    pub drive: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtree: Option<String>,
-    pub mode: String,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -209,15 +187,6 @@ impl DeviceStateFile {
             .collect();
         drives.sort_by_cached_key(drive_key);
         let mut providers = self.providers.clone();
-        for provider in &mut providers {
-            provider
-                .bots
-                .sort_by(|a, b| (a.pin_order, &a.target).cmp(&(b.pin_order, &b.target)));
-            provider.grants.sort_by(|a, b| {
-                (&a.bot, &a.drive, &a.subtree, &a.mode)
-                    .cmp(&(&b.bot, &b.drive, &b.subtree, &b.mode))
-            });
-        }
         providers.sort_by_cached_key(ProviderState::key);
         let mut matrix = self.matrix.clone();
         for account in &mut matrix {
@@ -287,9 +256,6 @@ pub struct RestorePending {
     /// Drive tables whose folder cannot be made or used yet.
     #[serde(default)]
     pub drives: Vec<toml::Table>,
-    /// Grants whose drive is not on this device yet.
-    #[serde(default)]
-    pub grants: Vec<PendingGrant>,
     /// Providers that could not be added yet.
     #[serde(default)]
     pub providers: Vec<ProviderState>,
@@ -301,18 +267,9 @@ pub struct RestorePending {
 impl RestorePending {
     pub fn is_empty(&self) -> bool {
         self.drives.is_empty()
-            && self.grants.is_empty()
             && self.providers.is_empty()
             && self.matrix.is_empty()
     }
-}
-
-/// A grant waiting for its drive, with the provider it belongs to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingGrant {
-    /// The provider's reference ([`ProviderRef::reference`]).
-    pub provider: String,
-    pub grant: GrantState,
 }
 
 #[cfg(test)]
@@ -344,15 +301,6 @@ mod tests {
         read_timeout_ms = 90000\n\
         credential = \"account\"\n\
         rate = 3\n\
-        [[provider.bot]]\n\
-        target = \"llama3\"\n\
-        name = \"Llama\"\n\
-        pin_order = 1\n\
-        [[provider.grant]]\n\
-        drive = \"drive:https://git.acme.dev/tg/tgdrive#main^tgdrive\"\n\
-        subtree = \"notes\"\n\
-        mode = \"read\"\n\
-        until = 5\n\
         [[matrix]]\n\
         user_id = \"@tg:acme.dev\"\n\
         homeserver_url = \"https://matrix.acme.dev\"\n\
@@ -369,10 +317,6 @@ mod tests {
         assert_eq!(
             parsed.providers[0].extra.get("rate"),
             Some(&toml::Value::Integer(3))
-        );
-        assert_eq!(
-            parsed.providers[0].grants[0].extra.get("until"),
-            Some(&toml::Value::Integer(5))
         );
         assert!(parsed.matrix[0].extra.contains_key("pins"));
 

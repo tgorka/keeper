@@ -2205,9 +2205,6 @@ fn task_vm(
         description: row.description.clone(),
         on_missed: row.on_missed.as_str().to_owned(),
         missed_delay_ms: row.missed_delay_ms,
-        bot_id: row.bot_id.clone(),
-        prompt_subpath: row.prompt_subpath.clone(),
-        model: row.model.clone(),
         copy_source: row.copy_source.clone(),
         copy_destination: row.copy_destination.clone(),
         copy_source_facts: paths.source,
@@ -2567,7 +2564,22 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
                 reason: row.reason.clone(),
             })
             .collect(),
+        retired: listing.retired,
     })
+}
+
+/// Put the Tasks list's notice about removed scheduled-prompt tasks away
+/// (Story 108.3a, UX-DR-E108-3).
+///
+/// Rejects with: `internal`.
+#[tauri::command]
+pub async fn sync_tasks_retired_dismiss(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    engine
+        .dismiss_retired_tasks()
+        .map_err(|err| sync_ipc_error(&err))
 }
 
 /// Everything else this host paces, projected at read time from the folder list
@@ -2998,9 +3010,6 @@ pub async fn sync_task_save(
         // CLI's door unguarded.
         missed_delay_ms: req.missed_delay_ms,
         // Per-kind validation belongs to the shared write door, not this IPC.
-        bot_id: req.bot_id.clone(),
-        prompt_subpath: req.prompt_subpath.clone(),
-        model: req.model.clone(),
         copy_source: req.copy_source.clone(),
         copy_destination: req.copy_destination.clone(),
         replace_existing: req.replace_existing,

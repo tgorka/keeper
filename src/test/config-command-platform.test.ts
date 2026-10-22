@@ -51,9 +51,9 @@ describe("the shared command literal", () => {
     expect(sharedLiteral).toContain("ipc::app_ping");
     // ...and one that is unambiguously a desktop extra, to prove the slice
     // STOPPED before the call sites. Not a sync command: since epic 66 the
-    // folder is on the phone too, and `sync_ipc::*` is shared. The drive half
-    // of Bots (`bots_drive_ipc`) still needs the Mac.
-    expect(sharedLiteral).not.toContain("bots_drive_ipc::bots_grants_list");
+    // folder is on the phone too, and `sync_ipc::*` is shared. The quick
+    // capture panel needs a window, which only the Mac's extras have.
+    expect(sharedLiteral).not.toContain("notes_ipc::notes_capture_show");
   });
 
   it("registers config_layers, so a phone gets an empty stack rather than a rejection", () => {

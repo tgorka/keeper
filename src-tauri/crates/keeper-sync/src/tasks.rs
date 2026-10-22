@@ -223,36 +223,6 @@ pub enum TaskKind {
     /// went fine: *"1000 paths checked, 0 bad, 1000 virtual in 1 folders"* is
     /// the answer to a question `sync` and `release` cannot be asked.
     Verify,
-    /// One turn of a bot over a prompt file under the profile — any markdown
-    /// file qualifies (AD-244), not just one in a session's `prompts/` folder
-    /// (Epic 69, Story 69.4, AD-224, FR-506…FR-509).
-    ///
-    /// The row carries `bot_id`, `prompt_subpath` (any markdown file relative
-    /// to the profile root) and `model`, saved through the same doors, listed
-    /// and run by the same tick, leased and capped like the other kinds.
-    /// A bot task is always folder-scoped, because
-    /// the prompt is a file in that folder; a host-wide row of this kind is a
-    /// misconfiguration the arm reports.
-    ///
-    /// **Why this is not the `exec` the `## Deferred` entry refuses**, item by
-    /// item against the bill above. It spawns nothing: the verb is a chat turn
-    /// keeper already runs from the Bots pane. Its only egress is a provider a
-    /// person configured and Settings → About already discloses, so the
-    /// release workflow's egress diff shows exactly what it always showed. It
-    /// is bounded without a new clock (AD-62): the provider silence budget, the
-    /// tool loop's round ceiling and the one-hour lease already exist. And
-    /// capturing what was said is the feature rather than the gap — the runner
-    /// hands back a [`crate::platform::BotRunRecord`], and Story 69.5 writes it
-    /// into the session. `update` still has no variant.
-    ///
-    /// **This crate cannot run it alone** (AD-40): `keeper-sync` is
-    /// `keeper-core`-free, so the engine reaches the bot through
-    /// [`crate::platform::SyncPlatform::bot_task_runner`], a port that defaults
-    /// to `None`. A host with no runner — `keeper-syncd`, the phone — lists the
-    /// row and records a deferred run with the
-    /// host sentence (NFR-43's shape, one rung up: the kind is *known* here,
-    /// and still not this host's to run).
-    Bot,
     /// One verified local copy job, never a sync relationship (AD-C1).
     Copy,
     /// One `git gc --quiet` over the named folder's repository, or over every
@@ -287,7 +257,6 @@ impl TaskKind {
             Self::Sync => "sync",
             Self::Release => "release",
             Self::Verify => "verify",
-            Self::Bot => "bot",
             Self::Copy => "copy",
             Self::Gc => "gc",
         }
@@ -300,7 +269,6 @@ impl TaskKind {
             "sync" => Some(Self::Sync),
             "release" => Some(Self::Release),
             "verify" => Some(Self::Verify),
-            "bot" => Some(Self::Bot),
             "copy" => Some(Self::Copy),
             "gc" => Some(Self::Gc),
             _ => None,
@@ -1832,9 +1800,9 @@ mod tests {
             // hand-written row would most plausibly try is a verb-looking
             // string this build does not own.
             "exec", "run",
-            // Story 69.4's near-misses: the fourth kind is `bot`, and neither
-            // its plural nor the word for what it runs is a kind.
-            "Bot", "bots", "prompt", "chat",
+            // The scheduled-prompt kind left with the ⌘9 surface (Story
+            // 108.3a): its stored spelling reads as unknown like any other.
+            "bot", "prompt", "chat",
         ] {
             assert_eq!(
                 TaskKind::from_stored(value),
@@ -1853,10 +1821,6 @@ mod tests {
         // exactly one word, and that `update` is still nothing this build can
         // name after it.
         assert_eq!(TaskKind::from_stored("verify"), Some(TaskKind::Verify));
-        // Story 69.4's kind, on the same argument: a *fourth* variant widened
-        // the vocabulary by exactly one word — `bot`, keeper's own verb — and
-        // `exec` is still nothing this build can name after it.
-        assert_eq!(TaskKind::from_stored("bot"), Some(TaskKind::Bot));
         // Epic 70's kind: a *fifth* variant, `gc`, the verb AD-41 admitted the
         // shim for and nothing then called. `update` is still not a kind.
         assert_eq!(TaskKind::from_stored("gc"), Some(TaskKind::Gc));
@@ -1870,7 +1834,6 @@ mod tests {
             TaskKind::Sync,
             TaskKind::Release,
             TaskKind::Verify,
-            TaskKind::Bot,
             TaskKind::Copy,
             TaskKind::Gc,
         ] {
