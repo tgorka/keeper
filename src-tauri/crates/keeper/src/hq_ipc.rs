@@ -207,6 +207,12 @@ fn hq() -> Result<&'static Arc<Hq>, IpcError> {
     })
 }
 
+/// The service, once started: what the `keeper-hq-blob://` handler serves
+/// through.
+pub(crate) fn service() -> Option<Arc<Hq>> {
+    HQ.get().cloned()
+}
+
 fn error(error: HqError) -> IpcError {
     IpcError {
         code: IpcErrorCode::Internal,
@@ -463,6 +469,62 @@ pub async fn agent_send(
     body: String,
 ) -> Result<(), IpcError> {
     blocking(move |hq| hq.send(&session(database, session_id), &body)).await
+}
+
+/// Attach the files at `paths` (the paperclip, drag-and-drop) to a new
+/// message in a session, `caption` its text: Rust reads each file, so no
+/// bytes cross IPC. A file over the contract's bound refuses the message,
+/// with its sentence, before anything is uploaded.
+#[tauri::command]
+pub async fn agent_attach_path(
+    database: String,
+    session_id: String,
+    paths: Vec<String>,
+    caption: Option<String>,
+) -> Result<(), IpcError> {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+    blocking(move |hq| {
+        hq.attach_paths(
+            &session(database, session_id),
+            &paths,
+            caption.as_deref().unwrap_or(""),
+        )
+    })
+    .await
+}
+
+/// Attach a pasted file to a new message in a session. Its bytes ride as a
+/// raw IPC body (`InvokeBody::Raw`, never base64 or JSON), as
+/// `send_attachment_bytes`'s do; `x-database`, `x-session-id`, `x-mime`,
+/// and the percent-encoded `x-filename` and `x-caption` ride in headers.
+#[tauri::command]
+pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<(), IpcError> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: "a pasted attachment must be sent as a raw binary body".to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    };
+    let bytes = bytes.clone();
+    let headers = request.headers();
+    let database = crate::ipc::required_header(headers, "x-database")?;
+    let session_id = crate::ipc::required_header(headers, "x-session-id")?;
+    let mime = crate::ipc::required_header(headers, "x-mime").unwrap_or_default();
+    let name =
+        crate::ipc::decode_header(headers, "x-filename").unwrap_or_else(|| "pasted".to_owned());
+    let caption = crate::ipc::decode_header(headers, "x-caption").unwrap_or_default();
+    blocking(move |hq| {
+        hq.attach_bytes(
+            &session(database, session_id),
+            &name,
+            &mime,
+            bytes,
+            &caption,
+        )
+    })
+    .await
 }
 
 /// Open a session with an agent in one database, with its first message.

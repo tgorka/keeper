@@ -1630,7 +1630,10 @@ where
 /// Read a required raw-string request header (ASCII value), mapping a missing /
 /// non-ASCII value to a retriable `SendFailed` IPC error. Used by the raw-body
 /// pasted-attachment command for `accountId`/`roomId`/`mime` (all ASCII).
-fn required_header(headers: &tauri::http::HeaderMap, name: &str) -> Result<String, IpcError> {
+pub(crate) fn required_header(
+    headers: &tauri::http::HeaderMap,
+    name: &str,
+) -> Result<String, IpcError> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -1645,7 +1648,7 @@ fn required_header(headers: &tauri::http::HeaderMap, name: &str) -> Result<Strin
 /// Read an optional percent-encoded request header and decode it back to a UTF-8
 /// string (`None` when absent or malformed). Used for `filename`/`caption`, which
 /// may contain non-ASCII that an ASCII-only header value cannot carry verbatim.
-fn decode_header(headers: &tauri::http::HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn decode_header(headers: &tauri::http::HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(name)?.to_str().ok()?;
     percent_encoding::percent_decode_str(raw)
         .decode_utf8()

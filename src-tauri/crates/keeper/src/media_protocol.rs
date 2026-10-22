@@ -157,7 +157,7 @@ async fn avatar_response<R: Runtime>(
 
 /// A 200 OK full-body response with `Content-Type` and `Accept-Ranges: bytes` so
 /// the webview knows it may issue subsequent `Range` requests (video/audio seek).
-fn full_response(bytes: Vec<u8>, mimetype: &str) -> Response<Vec<u8>> {
+pub(crate) fn full_response(bytes: Vec<u8>, mimetype: &str) -> Response<Vec<u8>> {
     let len = bytes.len();
     build(StatusCode::OK, mimetype, len)
         .header(header::CONTENT_LENGTH, len)
@@ -187,7 +187,7 @@ fn capped_range_end(start: u64, end: u64, cap: u64) -> u64 {
 
 /// Build a 206 Partial Content response for a satisfiable `Range`, a 200 for a
 /// malformed range (serve the full body), or a 416 for an unsatisfiable range.
-fn partial_or_full(bytes: Vec<u8>, mimetype: &str, range: &str) -> Response<Vec<u8>> {
+pub(crate) fn partial_or_full(bytes: Vec<u8>, mimetype: &str, range: &str) -> Response<Vec<u8>> {
     let total = bytes.len() as u64;
     match parse_range(range, total) {
         // A satisfiable byte range → 206 with the slice + Content-Range.
@@ -236,7 +236,7 @@ fn build(status: StatusCode, mimetype: &str, _len: usize) -> tauri::http::respon
 
 /// A 404 Not Found with an empty body — the honest "handle unresolvable" response
 /// the frontend turns into a retry affordance.
-fn not_found() -> Response<Vec<u8>> {
+pub(crate) fn not_found() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Vec::new())

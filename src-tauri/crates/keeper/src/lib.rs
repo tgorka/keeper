@@ -61,6 +61,7 @@ mod forge_ipc;
 #[cfg(desktop)]
 mod hotkey;
 // The agents server (Epic 106): every target, so the phone pairs too.
+mod hq_blob_protocol;
 mod hq_ipc;
 mod ipc;
 mod lifecycle;
@@ -446,6 +447,16 @@ pub fn run() {
         file_protocol::SCHEME,
         |ctx, request, responder| {
             file_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        },
+    );
+    // An agents session's attachments (story 107.1) reach the webview only
+    // over this scheme, from the session's database replica cache and
+    // downloaded on the first open — a fifth handler, since neither the
+    // Matrix media cache nor a folder on disk is where these bytes live.
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        keeper_core::hq::attachments::SCHEME,
+        |ctx, request, responder| {
+            hq_blob_protocol::handle(ctx.app_handle().clone(), &request, responder);
         },
     );
     let builder = builder
@@ -1055,6 +1066,8 @@ pub fn run() {
                 hq_ipc::agent_session_close,
                 hq_ipc::agent_session_page_back,
                 hq_ipc::agent_send,
+                hq_ipc::agent_attach_path,
+                hq_ipc::agent_attach_bytes,
                 hq_ipc::agent_session_new,
                 hq_ipc::agent_session_archive,
                 hq_ipc::agent_session_unarchive,

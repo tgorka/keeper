@@ -347,6 +347,8 @@ export type { AccountVm } from "./gen/AccountVm";
 export type { AgentApprovalVm } from "./gen/AgentApprovalVm";
 export type { AgentAsksVm } from "./gen/AgentAsksVm";
 export type { AgentAskVm } from "./gen/AgentAskVm";
+export type { AgentAttachmentStateVm } from "./gen/AgentAttachmentStateVm";
+export type { AgentAttachmentVm } from "./gen/AgentAttachmentVm";
 export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
 export type { AgentChoiceVm } from "./gen/AgentChoiceVm";
 export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
@@ -4235,6 +4237,58 @@ export async function agentInstancesSet(agentActor: string, order: string[]): Pr
 
 export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {
   await invoke<void>("agent_send", { ...target, body });
+}
+
+/**
+ * Attach the files at `paths` (the paperclip, drag-and-drop) to a new message in an agents
+ * session, `caption` its text (story 107.1). Rust reads each file, so no bytes cross IPC; a file
+ * over the contract's 25 MB bound refuses the message with its sentence before anything is
+ * uploaded. The message and its chips arrive over the open session's view stream.
+ */
+export async function agentAttachPath(
+  target: AgentSessionRef,
+  paths: string[],
+  caption?: string,
+): Promise<void> {
+  await invoke<void>("agent_attach_path", { ...target, paths, caption: caption ?? null });
+}
+
+/**
+ * Attach a pasted file to a new message in an agents session (story 107.1). The **bytes** ride as
+ * a raw binary IPC body — never base64 inside JSON, as `sendAttachmentBytes` does for a Matrix
+ * room — with the session, type and the percent-encoded name and caption in request headers.
+ * Rejects with the refusal sentence (a file over the bound among them).
+ */
+export async function agentAttachBytes(
+  target: AgentSessionRef,
+  bytes: ArrayBuffer,
+  filename: string,
+  mime: string,
+  caption?: string,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "x-database": target.database,
+    "x-session-id": target.sessionId,
+    "x-filename": encodeURIComponent(filename),
+    "x-mime": mime,
+  };
+  if (caption != null && caption !== "") {
+    headers["x-caption"] = encodeURIComponent(caption);
+  }
+  try {
+    // Raw-body invoke: the `ArrayBuffer` becomes the `InvokeBody::Raw` payload.
+    await tauriInvoke<void>("agent_attach_bytes", bytes, { headers });
+  } catch (raw) {
+    if (isIpcError(raw)) {
+      throw raw;
+    }
+    throw {
+      code: "internal",
+      message: typeof raw === "string" ? raw : "unexpected IPC failure",
+      accountId: null,
+      retriable: false,
+    } satisfies IpcError;
+  }
 }
 
 export async function agentSessionNew(
