@@ -10,8 +10,10 @@
 //!
 //! - **Where the question goes.** The agent's main conversation: its newest
 //!   session that is not archived in any held database — the one launch and
-//!   the docks open (106.5) — or, with none, a new session in the database
-//!   the person last chose for it (else the first that names it)
+//!   the docks open (106.5) — or, with none, a new session in the only
+//!   database that names it or the one the person chose for it. With several
+//!   and no choice nothing is written: the person is told to start the
+//!   conversation in Agents, where the database is chosen (FR-871)
 //!   ([`main_session`]). The words the voice turn heard are a person
 //!   `messages` row there, written into the replica's outbox like any typed
 //!   message ([`Hq::spoken_send`]); recognition never left the device, and
@@ -130,12 +132,19 @@ pub fn targets(choices: &[sessions::AgentChoiceVm]) -> Vec<VoiceAgentTargetVm> {
 pub enum MainSession {
     /// The agent's newest session that is not archived.
     Existing(AgentSessionRef),
-    /// None yet: a new session in this database.
+    /// None yet: a new session in this database — the only one the agent
+    /// shares with this device, or the one the person chose for it.
     New { database: String },
+    /// None yet, and the agent shares several databases with this device
+    /// with none chosen for it: a spoken question goes nowhere until the
+    /// person picks one in Agents (FR-871, R1082-02).
+    Unchosen { databases: Vec<String> },
 }
 
 /// The agent's main conversation over `sources`, or where a new one goes;
-/// `None` when no held database names the agent.
+/// `None` when no held database names the agent. A new conversation goes
+/// only to a database [`sessions::choices`] resolved — never the first of
+/// several by name.
 pub fn main_session(
     sources: &[Source],
     agent: &str,
@@ -154,10 +163,26 @@ pub fn main_session(
             session_id: row.session_id,
         }));
     }
-    let database = choice
-        .database
-        .or_else(|| choice.databases.first().cloned())?;
-    Some(MainSession::New { database })
+    Some(match choice.database {
+        Some(database) => MainSession::New { database },
+        None => MainSession::Unchosen {
+            databases: choice.databases,
+        },
+    })
+}
+
+/// The sentence a spoken question is refused with when its agent has no
+/// conversation yet and works in several databases, none chosen.
+pub fn unchosen_sentence(agent_name: &str, databases: &[String]) -> String {
+    format!(
+        "{agent_name} works in {} of your agents' databases ({}). Start a conversation with {agent_name} in Agents, in the database you mean, then speak again. Nothing was sent.",
+        match databases.len() {
+            2 => "two".to_owned(),
+            3 => "three".to_owned(),
+            n => n.to_string(),
+        },
+        databases.join(", ")
+    )
 }
 
 /// A spoken question written: where, its message id, and the agent's name.
@@ -486,6 +511,10 @@ fn answer_row(source: &Source, session_id: &str, question: &str) -> Option<Answe
 }
 
 /// A person message row `id` in `session_id`, written `at`, with `metadata`.
+///
+/// `messages.metadata` is a `json` column, which syncular carries as raw JSON
+/// text (R1082-01): an object is written as its JSON text and no metadata as
+/// SQL null.
 fn person_row(
     source: &Source,
     session_id: &str,
@@ -506,7 +535,11 @@ fn person_row(
                 "role": "person",
                 "body": body,
                 "body_blob": null,
-                "metadata": metadata,
+                "metadata": if metadata.is_null() {
+                    Value::Null
+                } else {
+                    Value::from(metadata.to_string())
+                },
                 "created_at_ms": at,
             })),
         ),
@@ -524,7 +557,9 @@ impl Hq {
     /// Write what the voice turn heard into `agent`'s main conversation
     /// ([`main_session`]) as the person's own message, and answer where it
     /// went. Refused, with [`AGENT_GONE_SENTENCE`], when no held database
-    /// names the agent; an empty question is never written.
+    /// names the agent, and with [`unchosen_sentence`] — writing nothing —
+    /// when the agent has no conversation yet and several databases, none
+    /// chosen; an empty question is never written.
     pub fn spoken_send(&self, agent: &str, body: &str) -> Result<SpokenAsk, HqError> {
         if body.trim().is_empty() {
             return Err(HqError::Sentence("Nothing was heard to send.".to_owned()));
@@ -552,6 +587,12 @@ impl Hq {
                     .map_err(|error| HqError::Sentence(error.to_string()))?;
                 source.replica.sync_now();
                 key
+            }
+            MainSession::Unchosen { databases } => {
+                return Err(HqError::Sentence(unchosen_sentence(
+                    &agent_name,
+                    &databases,
+                )));
             }
             MainSession::New { database } => {
                 let source = self.source(&database)?;

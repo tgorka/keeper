@@ -1411,3 +1411,164 @@ async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens(
         Err(HqError::Sentence(s)) if s == "This conversation is not on this device."
     ));
 }
+
+/// Opens every replica as a real local syncular replica (no server), so a
+/// write goes through syncular's own column codec.
+#[derive(Default)]
+struct LocalOpener(Mutex<HashMap<String, Arc<dyn Replica>>>);
+
+impl Opener for LocalOpener {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+        let database = spec.database.clone();
+        let replica: Arc<dyn Replica> =
+            Arc::new(crate::hq::syncular::SyncularReplica::open(ReplicaSpec {
+                link: None,
+                ..spec
+            })?);
+        lock(&self.0).insert(database, Arc::clone(&replica));
+        Ok(replica)
+    }
+}
+
+impl LocalOpener {
+    fn replica(&self, database: &str) -> Arc<dyn Replica> {
+        lock(&self.0).get(database).cloned().expect("opened")
+    }
+}
+
+/// A started service over real local replicas of `databases`, each of
+/// whose directories names the agent `nixie`.
+async fn spoken_world(world: &World, databases: &[&str]) -> (Arc<Hq>, Arc<LocalOpener>) {
+    world.paired("https://hq.example.org", databases);
+    let opener = Arc::new(LocalOpener::default());
+    let hq = Hq::new(
+        Arc::clone(&world.platform) as Arc<dyn Platform>,
+        Arc::clone(&opener) as Arc<dyn Opener>,
+        Arc::clone(&world.routes) as Arc<dyn Routes>,
+        "keeper on test".to_owned(),
+    );
+    hq.start().await.expect("starts");
+    for database in databases {
+        opener
+            .replica(database)
+            .mutate(vec![RowOp::Upsert {
+                table: "actors".to_owned(),
+                values: sessions::object(serde_json::json!({
+                    "id": "nixie", "kind": "agent", "display_name": "Nixie", "family": null,
+                    "dir": database, "created_at_ms": 1, "author_actor": "server",
+                    "author_client": "server"})),
+                base_version: None,
+            }])
+            .expect("directory");
+    }
+    (hq, opener)
+}
+
+fn rows(replica: &Arc<dyn Replica>, sql: &str) -> Vec<serde_json::Map<String, Value>> {
+    replica.query(sql, &[]).expect("reads")
+}
+
+/// R1082-01: the heard mark goes through syncular's own mutation into the
+/// `messages.metadata` json column, and reads back as the mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heard_mark_is_stored_as_the_mark_the_runtime_reads() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["alpha"]).await;
+    let ask = hq
+        .spoken_send("nixie", "What is the weather?")
+        .expect("asked");
+    let mut mark = spoken::HeardMark::new(ask.key.clone(), ask.question.clone());
+    mark.anchored();
+    mark.handed(13);
+    mark.handed(33);
+    mark.spoken();
+    let metadata = mark
+        .metadata(crate::agents::log::HeardReason::Stop)
+        .expect("a mark");
+    hq.spoken_heard(&ask.key, metadata).expect("written");
+
+    let alpha = opener.replica("alpha");
+    let stored = rows(
+        &alpha,
+        "SELECT body, metadata FROM messages WHERE role = 'person' AND metadata IS NOT NULL",
+    );
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let text = stored[0]["metadata"].as_str().expect("JSON text");
+    let read: Value = serde_json::from_str(text).expect("parses");
+    assert_eq!(
+        read,
+        serde_json::json!({"kind": "heard", "message": ask.question, "heard_until": 13,
+                           "sentence": 1, "reason": "stop"})
+    );
+    assert_eq!(stored[0]["body"], Value::from(""));
+    // The question itself carries no metadata: SQL null, not the text "null".
+    let question = rows(
+        &alpha,
+        &format!(
+            "SELECT metadata FROM messages WHERE id = '{}'",
+            ask.question
+        ),
+    );
+    assert_eq!(question[0]["metadata"], Value::Null);
+}
+
+/// R1082-02: an agent shared by two databases, with no conversation and no
+/// database chosen for it, is not given one by name: nothing is written and
+/// the person is told where to choose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spoken_question_to_an_agent_of_two_databases_waits_for_a_choice() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["neuradrive", "tgdrive"]).await;
+    let refused = hq
+        .spoken_send("nixie", "Remind me about the dentist")
+        .expect_err("no database chosen");
+    assert_eq!(
+        refused.to_string(),
+        spoken::unchosen_sentence("Nixie", &["neuradrive".to_owned(), "tgdrive".to_owned()])
+    );
+    for database in ["neuradrive", "tgdrive"] {
+        let replica = opener.replica(database);
+        assert!(
+            rows(&replica, "SELECT id FROM sessions").is_empty(),
+            "{database}"
+        );
+        assert!(
+            rows(&replica, "SELECT id FROM messages").is_empty(),
+            "{database}"
+        );
+    }
+
+    // Chosen in Agents (the database the person last opened a session with
+    // it in): the question goes there.
+    sessions::remember_choice(&world.data_dir(), "nixie", "tgdrive");
+    let ask = hq
+        .spoken_send("nixie", "Remind me about the dentist")
+        .expect("asked");
+    assert_eq!(ask.key.database, "tgdrive");
+    assert_eq!(
+        rows(&opener.replica("tgdrive"), "SELECT body FROM messages"),
+        vec![sessions::object(
+            serde_json::json!({"body": "Remind me about the dentist"})
+        )]
+    );
+    assert!(rows(&opener.replica("neuradrive"), "SELECT id FROM messages").is_empty());
+}
+
+/// The only database that names the agent needs no choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spoken_question_to_an_agent_of_one_database_opens_its_conversation_there() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    let ask = hq.spoken_send("nixie", "Hello").expect("asked");
+    assert_eq!(
+        (ask.key.database.as_str(), ask.agent_name.as_str()),
+        ("tgdrive", "Nixie")
+    );
+    let sessions = rows(
+        &opener.replica("tgdrive"),
+        "SELECT id, agent_actor FROM sessions",
+    );
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["agent_actor"], Value::from("nixie"));
+    assert_eq!(sessions[0]["id"], Value::from(ask.key.session_id.clone()));
+}
