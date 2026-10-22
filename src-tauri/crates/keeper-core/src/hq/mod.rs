@@ -40,6 +40,8 @@
 //! are `keeper_core::hq::*` and carry no row content.
 
 pub mod approvals;
+pub mod attachments;
+pub mod blob_cache;
 pub mod databases;
 pub mod identity;
 pub mod instances;

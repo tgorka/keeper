@@ -220,6 +220,17 @@ pub struct RowWrites {
     pub refused: Vec<Refusal>,
 }
 
+/// A commit written here that the server refused, its refusal still
+/// standing, with every row it wrote (`table`, the values written) as the
+/// replica's outcome journal keeps them — the rows themselves are gone from
+/// the replica once the refusal arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefusedCommit {
+    pub commit_id: String,
+    pub rejection: Rejection,
+    pub rows: Vec<(String, Map<String, Value>)>,
+}
+
 /// Why a replica call failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicaError {
@@ -297,6 +308,16 @@ pub trait Replica: Send + Sync {
     /// What is owed, or was refused, of the writes made here to `table`'s
     /// row `row_id`. Answers from the file.
     fn row_writes(&self, table: &str, row_id: &str) -> Result<RowWrites, ReplicaError>;
+    /// The standing refusals of commits written here that wrote a row of
+    /// `table`, newest first, with what each wrote. Answers from the file.
+    fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError>;
+    /// The server's refusal of the last blob upload this replica tried
+    /// (`blob.too_large`, `blob.hash_mismatch`): nothing more is pushed
+    /// while it stands, and a round the server answers in full clears it.
+    fn upload_refusal(&self) -> Option<Rejection>;
+    /// The bytes of blob bodies the replica caches, as its client reports
+    /// them (`blob_cache_bytes_approx`).
+    fn blob_cache_bytes(&self) -> Result<u64, ReplicaError>;
     /// Set the standing refusals `commit_ids` aside: `replacement`, written
     /// since, writes their row again. Durable, like the refusals.
     fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError>;
@@ -352,6 +373,8 @@ pub(crate) mod fake {
         pub(crate) rows: Mutex<Vec<Map<String, Value>>>,
         pub(crate) closed: AtomicBool,
         pub(crate) joined: AtomicBool,
+        /// What [`Replica::upload_refusal`] answers.
+        pub(crate) upload_refusal: Mutex<Option<Rejection>>,
         state: watch::Sender<ReplicaState>,
     }
 
@@ -421,6 +444,18 @@ pub(crate) mod fake {
         }
         fn row_writes(&self, _: &str, _: &str) -> Result<RowWrites, ReplicaError> {
             Ok(RowWrites::default())
+        }
+        fn refused_commits(&self, _: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
+            Ok(Vec::new())
+        }
+        fn upload_refusal(&self) -> Option<Rejection> {
+            self.upload_refusal
+                .lock()
+                .ok()
+                .and_then(|held| held.clone())
+        }
+        fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
+            Ok(0)
         }
         fn supersede(&self, _: Vec<String>, _: &str) -> Result<(), ReplicaError> {
             Ok(())
@@ -492,6 +527,7 @@ pub(crate) mod fake {
                 rows: Mutex::new(Vec::new()),
                 closed: AtomicBool::new(false),
                 joined: AtomicBool::new(false),
+                upload_refusal: Mutex::new(None),
                 state,
             });
             self.opened

@@ -3,4 +3,4 @@
 /**
  * A person's message, by its turn (R465).
  */
-export type AgentMessageStateVm = "waiting" | "sent" | "taken";
+export type AgentMessageStateVm = "waiting" | "sent" | "taken" | "refused";

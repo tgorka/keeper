@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
 use crate::hq::approvals::{self, AgentApprovalVm};
+use crate::hq::attachments::{self, AgentAttachmentVm};
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentMessageDetailsVm, AgentSessionToolVm, AgentToolStepVm,
@@ -64,6 +65,10 @@ pub enum AgentMessageStateVm {
     Sent,
     /// The agent's turn names it.
     Taken,
+    /// The server refused the commit that carried it (an attachment's
+    /// refusal, [`AgentAttachmentVm::sentence`]); nothing of it reached the
+    /// session.
+    Refused,
 }
 
 /// An agent's question to the person (R-HQ-28).
@@ -107,6 +112,10 @@ pub struct AgentMessageVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub steps: Option<Vec<AgentToolStepVm>>,
+    /// The files attached to it, in the order they were attached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<AgentAttachmentVm>>", optional)]
+    pub attachments: Vec<AgentAttachmentVm>,
 }
 
 /// What an opened session shows, whole, every time it changes.
@@ -340,7 +349,14 @@ pub fn view(
         .filter(|row| text(row, "role") == "agent")
         .filter_map(|row| opt_text(row, "turn_id"))
         .collect();
-    let messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
+    let mut messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
+    let mut chips = attachments::chips(source, session_id);
+    for message in &mut messages {
+        message.attachments = chips.remove(&message.id).unwrap_or_default();
+    }
+    if !session.archived {
+        refused(source, session_id, &directory, &mut messages);
+    }
     let newest_ms = messages.last().map(|m| m.created_at_ms);
     let answering = instances::answering(
         source,
@@ -465,9 +481,49 @@ fn messages(
                     .filter(|_| extras.thinking)
                     .and_then(|turn| live::ended_thinking(extras, turn)),
                 steps: turn.and_then(|turn| extras.steps.get(turn).cloned()),
+                attachments: Vec::new(),
             })
         })
         .collect()
+}
+
+/// This device's messages whose files the server refused, among the others
+/// by time: the replica no longer holds them, their outcome journal does.
+fn refused(
+    source: &Source,
+    session_id: &str,
+    directory: &HashMap<String, String>,
+    messages: &mut Vec<AgentMessageVm>,
+) {
+    for refused in attachments::refused_messages(source, session_id) {
+        let Some(id) = opt_text(&refused.values, "id") else {
+            continue;
+        };
+        if messages.iter().any(|message| message.id == id) {
+            continue;
+        }
+        let message = AgentMessageVm {
+            id,
+            role: AgentMessageRoleVm::Person,
+            author_name: directory
+                .get(&source.actor)
+                .cloned()
+                .unwrap_or_else(|| source.actor.clone()),
+            author_actor: source.actor.clone(),
+            body: text(&refused.values, "body").to_owned(),
+            created_at_ms: int(&refused.values, "created_at_ms").unwrap_or(0),
+            state: Some(AgentMessageStateVm::Refused),
+            ask: None,
+            details: None,
+            reasoning: None,
+            steps: None,
+            attachments: refused.attachments,
+        };
+        let at = messages.partition_point(|shown| {
+            (shown.created_at_ms, shown.id.as_str()) <= (message.created_at_ms, message.id.as_str())
+        });
+        messages.insert(at, message);
+    }
 }
 
 /// What a remote fetch read: rows newest first and where the next page

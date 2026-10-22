@@ -17,17 +17,24 @@
 //! round stops the link. Reads go to a second, read-only connection on the
 //! same file (`FileQuerySnapshotReader`, WAL), so a read never queues behind a
 //! round.
+//!
+//! The blob cache (`hq::blob_cache`): the client's own cap is set from
+//! [`BLOB_CACHE_MAX_BYTES`], and the owner keeps the cached bodies under it
+//! by keeper's rule — least recently used first, never a body the outbox
+//! pins — through a third connection on the same file, used only on the
+//! owner thread, after an upload, an open and a round.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use syncular_client::api::{
-    CommitDelivery, CommitOperationOutcome, CommitOutcomeResolution, CommitOutcomeStatus,
-    ResolveCommitOutcomeInput, WindowCoverage,
+    ClientDiagnosticsRequest, CommitDelivery, CommitOperationOutcome, CommitOutcomeResolution,
+    CommitOutcomeStatus, ResolveCommitOutcomeInput, WindowCoverage,
 };
 use syncular_client::native_transport::{HostTransport, Inbound};
 use syncular_client::{
@@ -37,9 +44,11 @@ use syncular_client::{
 };
 use tokio::sync::watch;
 
+use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, BLOB_CACHE_MAX_BYTES};
 use crate::hq::port::{
-    Covered, Delivery, LinkState, Opener, Peer, Refusal, Rejection, Replica, ReplicaError,
-    ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription, WindowBase, WindowState, CONFLICT,
+    Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection, Replica,
+    ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription, WindowBase,
+    WindowState, CONFLICT,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -250,6 +259,34 @@ pub(crate) fn verdict(outcome: &SyncOutcome) -> RoundVerdict {
         SyncOutcome::RealtimeUnavailable { state, .. } => {
             RoundVerdict::Unreachable(format!("realtime {state:?}"))
         }
+    }
+}
+
+/// The server's refusal of a blob upload, read from a round that failed on
+/// one. The client's transport answers a refused upload with
+/// `transport.failed` and the HTTP status, not the server's code: a `413` on
+/// the upload grant or the `PUT` is the server's `blob.too_large`, a `400` on
+/// the `PUT` its `blob.hash_mismatch`. Any other failure is not an upload's.
+pub(crate) fn upload_refusal(outcome: &SyncOutcome) -> Option<Rejection> {
+    let SyncOutcome::Failed {
+        message, details, ..
+    } = outcome
+    else {
+        return None;
+    };
+    if !message.starts_with("blob upload") {
+        return None;
+    }
+    match http_status(details.as_ref()) {
+        Some(413) => Some(Rejection::new(
+            "blob.too_large",
+            "the server refused a file larger than it takes",
+        )),
+        Some(400) => Some(Rejection::new(
+            "blob.hash_mismatch",
+            "the server found the uploaded bytes differ from their address",
+        )),
+        _ => None,
     }
 }
 
@@ -484,6 +521,97 @@ const ROW_PENDING: &str = "SELECT 1 AS pending FROM _syncular_outbox o, json_eac
      WHERE json_extract(op.value, '$.table') = ?1 AND json_extract(op.value, '$.rowId') = ?2 \
      LIMIT 1";
 
+/// The standing refusals of commits written here that wrote a row of one
+/// table, newest first, with every operation each wrote.
+const TABLE_REFUSED: &str =
+    "SELECT o.client_commit_id AS commit_id, o.operations_json AS operations \
+     FROM _syncular_commit_outcomes o \
+     WHERE o.resolution = 'active' AND o.status IN ('conflict', 'rejected') \
+     AND EXISTS (SELECT 1 FROM json_each(o.operations_json) op \
+     WHERE json_extract(op.value, '$.table') = ?1) \
+     ORDER BY o.seq DESC";
+
+/// The bodies the client caches, with whether the outbox pins each: staged
+/// for upload, or referenced by a commit the server has not taken.
+const CACHED_BODIES: &str = "SELECT b.blob_id, b.byte_length, b.created_at_ms, \
+     (EXISTS (SELECT 1 FROM _syncular_blob_uploads u WHERE u.blob_id = b.blob_id) \
+     OR EXISTS (SELECT 1 FROM _syncular_blob_commit_refs r WHERE r.blob_id = b.blob_id)) \
+     FROM _syncular_blobs b";
+
+/// One body dropped, unless the outbox pinned it since it was weighed.
+const DROP_BODY: &str = "DELETE FROM _syncular_blobs WHERE blob_id = ?1 \
+     AND NOT EXISTS (SELECT 1 FROM _syncular_blob_uploads u WHERE u.blob_id = ?1) \
+     AND NOT EXISTS (SELECT 1 FROM _syncular_blob_commit_refs r WHERE r.blob_id = ?1)";
+
+/// The replica file's blob bodies, as the owner keeps them under the cap,
+/// and when each was last used.
+struct BlobCache {
+    bodies: rusqlite::Connection,
+    log: AccessLog,
+}
+
+impl BlobCache {
+    fn open(replica: &Path) -> Result<BlobCache, ReplicaError> {
+        let failed = |error: rusqlite::Error| {
+            ReplicaError::Client(format!("the replica's blob cache: {error}"))
+        };
+        let bodies = rusqlite::Connection::open(replica).map_err(failed)?;
+        bodies
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(failed)?;
+        let log = AccessLog::open(&AccessLog::beside(replica)).map_err(failed)?;
+        Ok(BlobCache { bodies, log })
+    }
+
+    /// `blob_id` was opened or written now.
+    fn touch(&self, database: &str, blob_id: &str) {
+        if let Err(error) = self.log.touch(blob_id, crate::hq::sessions::now_ms()) {
+            tracing::debug!(%database, %error, "a blob's last use was not recorded");
+        }
+    }
+
+    /// Drop what [`evictions`] names once the bodies pass `max`; the ids
+    /// dropped.
+    fn enforce(&self, max: u64) -> Result<Vec<String>, rusqlite::Error> {
+        let total: i64 = self.bodies.query_row(
+            "SELECT COALESCE(SUM(byte_length), 0) FROM _syncular_blobs",
+            [],
+            |row| row.get(0),
+        )?;
+        if u64::try_from(total).unwrap_or(0) <= max {
+            return Ok(Vec::new());
+        }
+        let used = self.log.used()?;
+        let mut statement = self.bodies.prepare(CACHED_BODIES)?;
+        let cached = statement
+            .query_map([], |row| {
+                let blob_id: String = row.get(0)?;
+                let bytes: i64 = row.get(1)?;
+                let cached_at: i64 = row.get(2)?;
+                let pinned: bool = row.get(3)?;
+                Ok(CachedBlob {
+                    used_at_ms: used.get(&blob_id).copied().unwrap_or(cached_at),
+                    blob_id,
+                    bytes: u64::try_from(bytes).unwrap_or(0),
+                    pinned,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let doomed = evictions(&cached, max);
+        if doomed.is_empty() {
+            return Ok(doomed);
+        }
+        let mut dropped = Vec::with_capacity(doomed.len());
+        for blob_id in doomed {
+            if self.bodies.execute(DROP_BODY, [&blob_id])? > 0 {
+                dropped.push(blob_id);
+            }
+        }
+        self.log.forget(&dropped)?;
+        Ok(dropped)
+    }
+}
+
 type Reply<T> = SyncSender<Result<T, ReplicaError>>;
 
 enum Command {
@@ -500,6 +628,7 @@ enum Command {
     Supersede(Vec<String>, String, Reply<()>),
     Upload(Vec<u8>, Option<String>, Reply<Value>),
     Fetch(String, Reply<Vec<u8>>),
+    CacheBytes(Reply<u64>),
     SyncNow,
     /// A socket frame arrived.
     Wake,
@@ -564,6 +693,12 @@ struct Owner {
     /// Rounds run over the current socket.
     rounds_on_socket: u32,
     state: watch::Sender<ReplicaState>,
+    /// The most bytes of blob bodies kept beyond what the outbox pins.
+    cache_max: u64,
+    cache: BlobCache,
+    /// The server's refusal of the last upload a round tried, shared with
+    /// the replica's readers.
+    upload_refusal: Arc<Mutex<Option<Rejection>>>,
 }
 
 impl Owner {
@@ -576,13 +711,14 @@ impl Owner {
             .path
             .to_str()
             .ok_or_else(|| ReplicaError::Client("the replica's path is not UTF-8".to_owned()))?;
-        let mut client = SyncClient::open_path_with_identity(
-            spec.client_id.clone(),
-            schema()?,
-            ClientLimits::default(),
-            path,
-        )
-        .map_err(ReplicaError::Client)?;
+        let limits = ClientLimits {
+            blob_cache_max_bytes: Some(i64::try_from(BLOB_CACHE_MAX_BYTES).unwrap_or(i64::MAX)),
+            ..ClientLimits::default()
+        };
+        let mut client =
+            SyncClient::open_path_with_identity(spec.client_id.clone(), schema()?, limits, path)
+                .map_err(ReplicaError::Client)?;
+        let cache = BlobCache::open(&spec.path)?;
         let (config, origin) = match &spec.link {
             Some(link) => {
                 let (config, origin) = link_config(link)?;
@@ -646,6 +782,9 @@ impl Owner {
             gate: PresenceGate::watching(spec.watch_presence.clone()),
             rounds_on_socket: 0,
             state,
+            cache_max: BLOB_CACHE_MAX_BYTES,
+            cache,
+            upload_refusal: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -790,20 +929,48 @@ impl Owner {
                     .client
                     .upload_blob(&bytes, media_type, None)
                     .map_err(ReplicaError::Client);
+                if let Some(blob) = outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(|reference| reference["blobId"].as_str())
+                {
+                    self.cache.touch(&self.database, blob);
+                }
                 self.dirty |= outcome.is_ok();
                 let _ = reply.send(outcome);
+                self.enforce_cache();
             }
             Command::Fetch(blob, reply) => {
                 // With the network closed the client serves its cache and
                 // refuses a miss itself; the gate refuses it again.
-                let _ = reply.send(
-                    self.client
-                        .fetch_blob_bytes(&mut self.transport, &blob)
-                        .map(|blob| blob.bytes)
-                        .map_err(|(code, message)| {
-                            ReplicaError::Client(format!("{code}: {message}"))
-                        }),
-                );
+                let fetched = self
+                    .client
+                    .fetch_blob_bytes(&mut self.transport, &blob)
+                    .map(|fetched| {
+                        self.cache.touch(&self.database, &fetched.blob_id);
+                        fetched.bytes
+                    })
+                    .map_err(|(code, message)| ReplicaError::Client(format!("{code}: {message}")));
+                let _ = reply.send(fetched);
+                self.enforce_cache();
+            }
+            Command::CacheBytes(reply) => {
+                let bytes = self
+                    .client
+                    .diagnostics_snapshot(&ClientDiagnosticsRequest::default())
+                    .map_err(ReplicaError::Client)
+                    .and_then(|snapshot| {
+                        snapshot
+                            .storage
+                            .blob_cache_bytes_approx
+                            .and_then(|bytes| u64::try_from(bytes).ok())
+                            .ok_or_else(|| {
+                                ReplicaError::Client(
+                                    "the replica's blob cache could not be measured".to_owned(),
+                                )
+                            })
+                    });
+                let _ = reply.send(bytes);
             }
             Command::SyncNow => self.dirty = true,
             Command::Wake => {}
@@ -941,6 +1108,22 @@ impl Owner {
         }
         let verdict = verdict(&outcome);
         self.schedule.round_done(&verdict, Instant::now());
+        match upload_refusal(&outcome) {
+            Some(refusal) => {
+                tracing::warn!(database = %self.database, code = %refusal.code, "the agents server refused an upload; nothing more is pushed until it is resolved");
+                *self
+                    .upload_refusal
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+            }
+            None if verdict == RoundVerdict::Answered => {
+                *self
+                    .upload_refusal
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+            }
+            None => {}
+        }
         match verdict {
             RoundVerdict::Answered => {}
             RoundVerdict::Refused => {
@@ -969,6 +1152,21 @@ impl Owner {
             }
         }
         self.absorb_changes();
+        // A commit the server took no longer pins its blobs.
+        self.enforce_cache();
+    }
+
+    /// Keep the cached blob bodies under the cap ([`BlobCache::enforce`]).
+    fn enforce_cache(&self) {
+        match self.cache.enforce(self.cache_max) {
+            Ok(dropped) if !dropped.is_empty() => {
+                tracing::debug!(database = %self.database, dropped = dropped.len(), "least recently used blobs evicted from this device's cache");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(database = %self.database, %error, "this device's blob cache could not be kept under its cap");
+            }
+        }
     }
 
     fn publish(&self) {
@@ -1043,6 +1241,7 @@ pub struct SyncularReplica {
     reader: Mutex<FileQuerySnapshotReader>,
     state: watch::Receiver<ReplicaState>,
     remote: Option<Remote>,
+    upload_refusal: Arc<Mutex<Option<Rejection>>>,
 }
 
 impl SyncularReplica {
@@ -1060,6 +1259,8 @@ impl SyncularReplica {
         let wake = commands.clone();
         let gate = Arc::new(AtomicBool::new(true));
         let owner_gate = Arc::clone(&gate);
+        let upload_refusal = Arc::new(Mutex::new(None));
+        let owner_refusal = Arc::clone(&upload_refusal);
         let remote = match (&spec.link, &spec.client_id) {
             (Some(link), Some(client_id)) => {
                 let (config, origin) = link_config(link)?;
@@ -1074,7 +1275,8 @@ impl SyncularReplica {
         let thread = std::thread::Builder::new()
             .name(format!("hq-{}", spec.database))
             .spawn(move || match Owner::open(&spec, owner_gate, wake) {
-                Ok(owner) => {
+                Ok(mut owner) => {
+                    owner.upload_refusal = owner_refusal;
                     let _ = ready.send(Ok(owner.state.subscribe()));
                     owner.run(inbox);
                 }
@@ -1091,6 +1293,7 @@ impl SyncularReplica {
             reader: Mutex::new(FileQuerySnapshotReader::new(path)),
             state,
             remote,
+            upload_refusal,
         })
     }
 
@@ -1259,6 +1462,53 @@ impl Replica for SyncularReplica {
             }
         }
         Ok(RowWrites { pending, refused })
+    }
+
+    fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
+        let mut refused = Vec::new();
+        for row in self.query(TABLE_REFUSED, &[Value::from(table)])? {
+            let Some(commit_id) = row.get("commit_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Delivery::Refused(rejection) = self.delivery(commit_id)? else {
+                continue;
+            };
+            let operations = match row.get("operations") {
+                Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or(Value::Null),
+                Some(other) => other.clone(),
+                None => Value::Null,
+            };
+            let rows = operations
+                .as_array()
+                .map(|operations| {
+                    operations
+                        .iter()
+                        .filter_map(|operation| {
+                            let table = operation.get("table")?.as_str()?.to_owned();
+                            let values = operation.get("values")?.as_object()?.clone();
+                            Some((table, values))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            refused.push(RefusedCommit {
+                commit_id: commit_id.to_owned(),
+                rejection,
+                rows,
+            });
+        }
+        Ok(refused)
+    }
+
+    fn upload_refusal(&self) -> Option<Rejection> {
+        self.upload_refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
+        self.ask(Command::CacheBytes)
     }
 
     fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError> {
@@ -2038,5 +2288,116 @@ mod tests {
             1
         );
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_refused_upload_is_read_from_its_status_and_nothing_else_is_one() {
+        let failed = |message: &str, status: Option<u64>| SyncOutcome::Failed {
+            error_code: "transport.failed".to_owned(),
+            message: message.to_owned(),
+            details: status.map(|status| json!({ "causeKind": "status", "httpStatus": status })),
+        };
+        let code = |outcome: SyncOutcome| upload_refusal(&outcome).map(|r| r.code);
+        assert_eq!(
+            code(failed("blob upload grant request failed", Some(413))).as_deref(),
+            Some("blob.too_large")
+        );
+        assert_eq!(
+            code(failed("blob upload failed", Some(413))).as_deref(),
+            Some("blob.too_large")
+        );
+        assert_eq!(
+            code(failed("blob upload failed", Some(400))).as_deref(),
+            Some("blob.hash_mismatch")
+        );
+        // A failed upload that is the network, and a sync request's 413.
+        assert_eq!(code(failed("blob upload failed", Some(502))), None);
+        assert_eq!(code(failed("blob upload failed", None)), None);
+        assert_eq!(code(failed("sync request failed", Some(413))), None);
+        assert_eq!(code(SyncOutcome::Ok(SyncReport::default())), None);
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    /// Put `bytes` in the client's cache as a download would, cached at `at`.
+    fn downloaded(path: &std::path::Path, bytes: &[u8], at: i64) -> String {
+        let id = sha(bytes);
+        let conn = rusqlite::Connection::open(path).expect("opens");
+        conn.busy_timeout(Duration::from_secs(5)).expect("timeout");
+        conn.execute(
+            "INSERT INTO _syncular_blobs(blob_id, bytes, byte_length, media_type, created_at_ms) \
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            rusqlite::params![id, bytes, bytes.len() as i64, at],
+        )
+        .expect("caches");
+        id
+    }
+
+    fn cached(path: &std::path::Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("opens");
+        let mut ids: Vec<String> = conn
+            .prepare("SELECT blob_id FROM _syncular_blobs")
+            .expect("prepares")
+            .query_map([], |row| row.get(0))
+            .expect("reads")
+            .collect::<Result<_, _>>()
+            .expect("reads");
+        ids.sort();
+        ids
+    }
+
+    fn ask<T>(owner: &mut Owner, command: impl FnOnce(Reply<T>) -> Command) -> T {
+        let (reply, answer) = mpsc::sync_channel(1);
+        assert!(owner.handle(command(reply)));
+        answer.recv().expect("answered").expect("succeeds")
+    }
+
+    #[test]
+    fn past_the_cap_the_least_recently_opened_bodies_go_and_never_one_the_outbox_pins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("alpha.sqlite"));
+        let (wake, _woken) = mpsc::channel();
+        let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(false)), wake).expect("opens");
+        assert_eq!(owner.cache_max, BLOB_CACHE_MAX_BYTES, "the named constant");
+        owner.cache_max = 250;
+        // Staged here, 100 bytes: pinned until the server takes it.
+        let pinned = vec![7u8; 100];
+        let reference: Value = ask(&mut owner, |reply| {
+            Command::Upload(pinned.clone(), Some("application/pdf".to_owned()), reply)
+        });
+        assert_eq!(reference["blobId"], json!(sha(&pinned)));
+        // Three downloads of 80 bytes, cached in this order, long ago.
+        let a = downloaded(&spec.path, &[1u8; 80], 1);
+        let b = downloaded(&spec.path, &[2u8; 80], 2);
+        let c = downloaded(&spec.path, &[3u8; 80], 3);
+        // Opening the oldest makes it the most recently used; past the cap
+        // (340 > 250) the least recently used unpinned bodies go — b, then
+        // c — and the pinned one stays though it is the largest.
+        let bytes: Vec<u8> = ask(&mut owner, |reply| Command::Fetch(a.clone(), reply));
+        assert_eq!(bytes, vec![1u8; 80], "served from the cache, no server");
+        let mut want = vec![sha(&pinned), a.clone()];
+        want.sort();
+        assert_eq!(cached(&spec.path), want, "{b} and {c} evicted");
+        let reported: u64 = ask(&mut owner, Command::CacheBytes);
+        assert_eq!(reported, 180, "the client's blob_cache_bytes_approx");
+
+        // Pinned bodies alone past the cap: every unpinned one goes, never
+        // the pinned one, and the order survives a relaunch.
+        owner.stop();
+        drop(owner);
+        let (wake, _woken) = mpsc::channel();
+        let mut owner =
+            Owner::open(&spec, Arc::new(AtomicBool::new(false)), wake).expect("reopens");
+        owner.cache_max = 50;
+        let d = downloaded(&spec.path, &[4u8; 10], 9_999_999_999_999);
+        owner.enforce_cache();
+        assert_eq!(
+            cached(&spec.path),
+            vec![sha(&pinned)],
+            "{a} and {d} evicted"
+        );
     }
 }

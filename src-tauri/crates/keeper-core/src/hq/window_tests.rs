@@ -682,6 +682,18 @@ impl crate::hq::port::Replica for Staged {
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
         self.inner.row_writes(table, row_id)
     }
+    fn refused_commits(
+        &self,
+        table: &str,
+    ) -> Result<Vec<crate::hq::port::RefusedCommit>, crate::hq::port::ReplicaError> {
+        self.inner.refused_commits(table)
+    }
+    fn upload_refusal(&self) -> Option<crate::hq::port::Rejection> {
+        self.inner.upload_refusal()
+    }
+    fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
+        self.inner.blob_cache_bytes()
+    }
     fn supersede(
         &self,
         commits: Vec<String>,

@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions};
+use crate::hq::attachments::{self, OpenedBlob};
 use crate::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
 use crate::hq::send;
 use crate::hq::sessions::{
@@ -462,6 +463,57 @@ impl Hq {
     pub fn send(&self, key: &AgentSessionRef, body: &str) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
         send::send(&source, &key.session_id, body).map_err(sentence)
+    }
+
+    /// Attach the files at `paths` to a new message in a session, `caption`
+    /// its text: every file read and checked first, so one over the bound
+    /// refuses the message before anything is uploaded or written.
+    pub fn attach_paths(
+        &self,
+        key: &AgentSessionRef,
+        paths: &[std::path::PathBuf],
+        caption: &str,
+    ) -> Result<(), HqError> {
+        let source = self.source(&key.database)?;
+        let files = paths
+            .iter()
+            .map(|path| attachments::stage_path(path))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sentence)?;
+        attachments::attach(&source, &key.session_id, caption, files).map_err(sentence)?;
+        self.touch();
+        Ok(())
+    }
+
+    /// Attach pasted `bytes` named `name` to a new message in a session.
+    pub fn attach_bytes(
+        &self,
+        key: &AgentSessionRef,
+        name: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+        caption: &str,
+    ) -> Result<(), HqError> {
+        let source = self.source(&key.database)?;
+        let file = attachments::stage_bytes(name, mime, bytes).map_err(sentence)?;
+        attachments::attach(&source, &key.session_id, caption, vec![file]).map_err(sentence)?;
+        self.touch();
+        Ok(())
+    }
+
+    /// A chip opened: `blob_id` of `database`, from this device's cache or
+    /// downloaded now. Blocking: a download waits for the replica's owner.
+    pub fn open_blob(&self, database: &str, blob_id: &str) -> Result<OpenedBlob, HqError> {
+        let source = self.source(database)?;
+        attachments::open_blob(&source, blob_id).map_err(sentence)
+    }
+
+    /// The bytes of blobs `database`'s replica caches on this device.
+    pub fn blob_cache_bytes(&self, database: &str) -> Result<u64, HqError> {
+        self.source(database)?
+            .replica
+            .blob_cache_bytes()
+            .map_err(sentence)
     }
 
     /// Open a session with `agent` in `database` and write its first

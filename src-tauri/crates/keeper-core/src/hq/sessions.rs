@@ -309,12 +309,13 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 /// The windows a replica holds, each along one scope variable. Every held
 /// session's members are held beside its row, so the People sheet reads
 /// who else is in it.
-pub const WINDOWS: [(&str, &str); 9] = [
+pub const WINDOWS: [(&str, &str); 10] = [
     ("sessions", "session"),
     ("session_members", "session"),
     ("turn_chunks", "session"),
     ("claims", "session"),
     ("session_tool_switches", "session"),
+    ("attachments", "session"),
     ("messages", "page"),
     ("approvals", "trace"),
     ("reasoning", "trace"),
@@ -391,7 +392,8 @@ pub fn reads_trace(source: &Source, session_id: &str) -> bool {
 }
 
 /// Each window's units for one database: every session row and its members;
-/// for each active session its streamed chunks, its claim and its tool switches, and
+/// for each active session its streamed chunks, its claim, its tool switches
+/// and its attachments' rows (never their bytes), and
 /// its newest months (widened by `widen` for an opened one); its trace
 /// months only where the person reads the trace, and their thinking only
 /// while `reasoning` is shown; nothing of an archived one.
@@ -431,7 +433,8 @@ pub fn plan(
         ("session_members", sessions),
         ("turn_chunks", turns.clone()),
         ("claims", turns.clone()),
-        ("session_tool_switches", turns),
+        ("session_tool_switches", turns.clone()),
+        ("attachments", turns),
         ("messages", pages.into_iter().collect()),
         ("approvals", trace.clone()),
         (
@@ -817,14 +820,20 @@ pub(crate) fn authored(source: &Source, mut values: Map<String, Value>) -> Map<S
     values
 }
 
-/// A person message row written now.
-pub(crate) fn person_message(source: &Source, session_id: &str, body: &str, at: i64) -> RowOp {
+/// A person message row `id`, written now.
+pub(crate) fn person_message(
+    source: &Source,
+    session_id: &str,
+    id: &str,
+    body: &str,
+    at: i64,
+) -> RowOp {
     RowOp::Upsert {
         table: "messages".to_owned(),
         values: authored(
             source,
             object(serde_json::json!({
-                "id": ulid::Ulid::new().to_string(),
+                "id": id,
                 "session_id": session_id,
                 "page_key": page_key(session_id, &month(at)),
                 "turn_id": null,
@@ -890,7 +899,7 @@ pub fn create(source: &Source, agent: &str, body: &str) -> Result<String, Replic
         ),
         base_version: None,
     };
-    let first = person_message(source, &id, body, at);
+    let first = person_message(source, &id, &ulid::Ulid::new().to_string(), body, at);
     source.replica.mutate(vec![session, member, first])?;
     source.replica.sync_now();
     Ok(id)
@@ -1002,6 +1011,9 @@ mod tests {
         assert_eq!(shown["turn_chunks"], vec!["c.1", "c.3"]);
         assert_eq!(shown["claims"], vec!["c.1", "c.3"]);
         assert_eq!(shown["session_tool_switches"], vec!["c.1", "c.3"]);
+        // An active session's attachments' rows (never their bytes), not an
+        // archived one's.
+        assert_eq!(shown["attachments"], vec!["c.1", "c.3"]);
         assert_eq!(shown["messages"], vec!["c.1/2026-10", "c.3/2026-10"]);
         // Only a reader's trace is asked for: the server grants no other.
         assert_eq!(shown["approvals"], vec!["c.1/2026-10"]);

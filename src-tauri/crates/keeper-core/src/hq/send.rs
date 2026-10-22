@@ -32,17 +32,23 @@ pub fn send(source: &Source, session_id: &str, body: &str) -> Result<(), SendErr
         return Err(SendError::Archived);
     }
     let at = now_ms();
-    let activity = RowOp::Patch {
+    let message = person_message(source, session_id, &ulid::Ulid::new().to_string(), body, at);
+    source
+        .replica
+        .mutate(vec![message, activity(source, session_id, at)])?;
+    source.replica.sync_now();
+    Ok(())
+}
+
+/// The session's last activity moved to `at`, in the commit that writes a
+/// person's message.
+pub(crate) fn activity(source: &Source, session_id: &str, at: i64) -> RowOp {
+    RowOp::Patch {
         table: "sessions".to_owned(),
         values: authored(
             source,
             object(serde_json::json!({ "id": session_id, "last_activity_ms": Value::from(at) })),
         ),
         base_version: None,
-    };
-    source
-        .replica
-        .mutate(vec![person_message(source, session_id, body, at), activity])?;
-    source.replica.sync_now();
-    Ok(())
+    }
 }
