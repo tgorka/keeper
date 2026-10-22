@@ -592,6 +592,43 @@ server's `sessionPage` and its attachments' rows are held while it is open (`ses
 its chips show and its files open through the same row check, downloaded only when opened; the
 rows go again when it closes.
 
+**Composer and chip layout (UX-DR-E107-1).** The session composer reuses the paperclip,
+native file drop, file paste, and the platform's Take photo / Choose photo controls.
+The existing photo-to-JPEG conversion remains in place; a Mac picker still passes the
+original file path. Selected files sit in a wrapping tray above a full-width text field,
+with removal buttons and the size for pasted/photos' bytes. A native path has no size
+metadata until Rust reads it: its tray says **Size on send**, never an invented number.
+After Send, Rust's message owns the chip and its size/state; the tray is not another
+outbox. Send stages the whole selection under Rust handles (paths in one call per run of
+them, each pasted/photo body as its raw IPC request), then one `agent_attach_commit` sends
+them all with the caption as one message (R1071C-02). A staging refusal commits nothing:
+what was staged is released, and the whole selection and the caption stay for a retry.
+Files added during a send stay selected for the next one. A paste that carries a file and
+plain text (a screenshot with its words) stages the file and puts the text into the draft at
+the caret; plain-text-only paste is the browser's own, and text or HTML never becomes an
+attachment (R1071C-01). A pasted or picked file is selected from the moment it is pasted or
+picked, not when its bytes have been read: until every file of that paste or pick is read,
+Send is disabled, Enter does nothing and the composer says *Reading the file to send…*; the
+batch then joins the tray whole, so a caption never leaves before its file and no message
+carries part of a multi-file paste. A failed read adds none of that batch and says so
+(R1071C-04). Each batch still being read shows as a *reading…* chip beside the tray, with a
+remove control; removing it, or pressing Escape in the composer, drops that batch (Escape
+drops all of them) and releases its hold on Send while the caption stays. A read still
+pending after `FILE_READ_TIMEOUT_MS` (60 s) fails like a failed read, with the same
+sentence. A dropped or failed batch's read that finishes later adds nothing: only a batch
+still pending when its read lands joins the tray, and every other batch keeps holding Send
+(R1071C-05).
+
+A message chip is a keyboard-reachable Open button: file icon, wrapping filename,
+Rust's size label and state beneath it. Its refusal sentence sits immediately below,
+inside the same bordered card. A *blocked* file — not refused itself; another file of its
+message was — reads **not sent** in its label, description and announcement, with Rust's
+sentence in neutral text; only the refused file is styled as an error (R1071C-03). State changes and refusals are announced politely.
+Cards use one column on a phone and two where space permits. The text field sits on its
+own row above the attachment toolbar and Send, leaving room to type at 320 px. An
+enqueue-time refusal appears under the composer, with the draft and unsent selections kept.
+No progress percentage, resend promise, or successful upload is invented in TypeScript.
+
 **Opening.** A chip's URL is `keeper-hq-blob://blob/<database>/<blobId>` (on Android and Windows,
 `http://keeper-hq-blob.localhost/…`). The handler serves only a blob an `attachments` row of that
 replica names, from the replica's cache, and downloads it on the first open — a second device
@@ -600,6 +637,15 @@ as `keeper-media://` does (200, 206 for a `Range`, 416, 404 for anything it will
 `nosniff`, and serves pictures, sound, video and PDF as themselves, text as `text/plain`, and
 everything else — HTML and SVG among them — as `application/octet-stream`, so no attachment runs
 as a page.
+
+Open mounts a modal preview only on activation, with the VM's URL unchanged on the first
+request. Raster images use an image element; other types use a sandboxed frame without
+script permission. The modal also offers Download file and Retry opening (a cache-busting
+query on the same scheme); no `fetch`, blob decoding, or base64 path is involved.
+Image load errors are announced. Frame HTTP failures are not reliably observable by the
+webview, so Retry remains available even when the embedded viewer cannot report its error.
+Closing returns focus to the chip. Installed WebKit/custom-scheme preview and download
+behavior still needs the hesperia/kalypso device check; Chrome's mock blob URL is not that proof.
 
 **The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
 outbox pins (`keeper_core::hq::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's

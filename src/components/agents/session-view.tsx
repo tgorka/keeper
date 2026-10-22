@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
+import { SessionAttachments } from "@/components/agents/session-attachments";
 import { SessionControls } from "@/components/agents/session-controls";
 import { SessionInstances } from "@/components/agents/session-instances";
 import { SessionPeople } from "@/components/agents/session-people";
@@ -19,6 +20,10 @@ import { formatMessageTime } from "@/lib/format-time";
 import {
   type AgentSessionRef,
   type AgentSessionViewVm,
+  agentAttachBytes,
+  agentAttachCommit,
+  agentAttachPath,
+  agentAttachRelease,
   agentSend,
   agentSessionArchive,
   agentSessionClose,
@@ -26,6 +31,7 @@ import {
   agentSessionPageBack,
   agentSessionUnarchive,
 } from "@/lib/ipc/client";
+import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import {
   ConversationStoresProvider,
   createConversationStores,
@@ -82,6 +88,69 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
       stores.composer.getState().requestFocus();
     }
   }, [vm?.complete, phone, stores]);
+
+  useEffect(() => {
+    if (!vm?.complete || vm.readOnly) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/webview")
+      .then(({ getCurrentWebview }) =>
+        getCurrentWebview().onDragDropEvent((event) => {
+          if (!active || event.payload.type !== "drop") return;
+          stores.attachments.getState().addMany(
+            event.payload.paths.map((path) => ({
+              id: attachmentId(),
+              kind: "path",
+              path,
+              filename: path.split(/[/\\]/).pop() || path,
+            })),
+          );
+        }),
+      )
+      .then((release) => {
+        if (active) unlisten = release;
+        else release();
+      })
+      .catch(logFailure("agents.session.drop"));
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [vm?.complete, vm?.readOnly, stores]);
+
+  async function attach(pending: PendingAttachment[], caption?: string) {
+    // Rust stages every selection under a handle (paths in one call per run of
+    // them, each paste or photo as its raw body), then one commit writes them
+    // all with the caption as ONE message. A staging refusal commits nothing:
+    // what was staged is released and the whole selection stays in the tray.
+    const handles: string[] = [];
+    try {
+      for (let index = 0; index < pending.length; ) {
+        const attachment = pending[index];
+        if (attachment.kind === "path") {
+          const paths: string[] = [];
+          while (index < pending.length) {
+            const next = pending[index];
+            if (next.kind !== "path") break;
+            paths.push(next.path);
+            index += 1;
+          }
+          handles.push(...(await agentAttachPath(target, paths)));
+        } else {
+          index += 1;
+          handles.push(
+            await agentAttachBytes(target, attachment.bytes, attachment.filename, attachment.mime),
+          );
+        }
+      }
+    } catch (raw) {
+      if (handles.length > 0) {
+        void agentAttachRelease(target, handles).catch(logFailure("agents.attach.release"));
+      }
+      throw raw;
+    }
+    await agentAttachCommit(target, handles, caption);
+  }
 
   const pageBack = async () => {
     if (!vm?.hasEarlier || vm.loadingEarlier || busy) return;
@@ -230,6 +299,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                   {message.body}
                 </p>
               )}
+              {!!message.attachments?.length && (
+                <SessionAttachments attachments={message.attachments} />
+              )}
               <SessionTrace reasoning={message.reasoning} steps={message.steps} />
               {message.details && <SessionAnswerDetails details={message.details} />}
               {message.ask && (
@@ -303,6 +375,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
               accountId={database}
               roomId={sessionId}
               disabled={!vm?.complete}
+              onSendAttachments={attach}
               onSend={async (body) => {
                 await agentSend(target, body);
               }}

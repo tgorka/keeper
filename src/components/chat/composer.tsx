@@ -134,12 +134,10 @@ interface ComposerProps {
    */
   onSend: (body: string, context: SendContext, line?: string) => Promise<void>;
   /**
-   * Dispatch the pending attachments (Story 3.7). `caption` is the trimmed
-   * composer text, passed only when exactly one attachment is pending (otherwise
-   * `undefined` — a caption maps to a single media event). The parent routes each
-   * attachment to `sendAttachmentPath` / `sendAttachmentBytes`. Resolves when all
-   * are enqueued (the tray + draft then clear); rejects to keep the tray so the
-   * user can retry. Absent → the attach/paste affordances are inert.
+   * Dispatch the pending attachments. Session batches carry one caption; Matrix
+   * media carry a caption only for a single attachment. Resolves when enqueued;
+   * rejects to keep unaccepted selections and the draft available for retry.
+   * Absent → the attach/paste affordances are inert.
    */
   onSendAttachments?: (attachments: PendingAttachment[], caption?: string) => Promise<void>;
   /** When `true`, the composer is inert (no room loaded). */
@@ -233,6 +231,26 @@ const DRAFT_MIRROR_DEBOUNCE_MS = 1000;
 export const DRAFT_NOT_SAVED =
   "keeper couldn't save this draft, so it is kept only while this chat stays open.";
 
+/**
+ * How long a pasted or picked batch may take to be read before it fails with its read-error
+ * sentence and stops holding Send (R1071C-05). Generous: a large file or a photo the webview
+ * re-encodes takes seconds, and the person can cancel the batch sooner from its chip or Escape.
+ */
+export const FILE_READ_TIMEOUT_MS = 60_000;
+
+/** A pasted or picked batch still being read: its tray chip and the way to drop it. */
+interface ReadingBatch {
+  id: number;
+  label: string;
+  /** Settles the batch's read as cancelled: whatever its files resolve to later is ignored. */
+  cancel: () => void;
+}
+
+/** What a batch's chip says it is reading: its one file's name, or how many files. */
+function batchLabel(files: readonly File[], fallback: string): string {
+  return files.length === 1 ? files[0].name || fallback : `${files.length} files`;
+}
+
 export function Composer({
   transport = "matrix",
   accountId,
@@ -274,6 +292,14 @@ export function Composer({
   const { phone } = useShellLayout();
   const [cameraOpen, setCameraOpen] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  // Batches of files still being read (a paste, a photo pick): counted from before the first
+  // read, so Send waits for each batch to reach the tray whole (R1071C-04). Each one shows a
+  // chip that cancels it, Escape cancels them all, and FILE_READ_TIMEOUT_MS fails a stuck one,
+  // so no read holds Send forever (R1071C-05). The ref answers synchronous gates; the state
+  // renders.
+  const readingRef = useRef<readonly ReadingBatch[]>([]);
+  const [reading, setReading] = useState<readonly ReadingBatch[]>([]);
+  const nextBatch = useRef(0);
   const captureInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
   // The remote (cross-device) draft body currently offered as a local-wins conflict
@@ -747,7 +773,8 @@ export function Composer({
   const canSend =
     (draft.trim().length > 0 || (hasAttachments && pending?.mode !== "edit")) &&
     !disabled &&
-    !sending;
+    !sending &&
+    reading.length === 0;
 
   /**
    * Dispatch the draft into `context`, the room and reply/edit it was submitted
@@ -775,8 +802,14 @@ export function Composer({
     const trayAttachments = tray.getState().pending;
     const dispatchAttachments =
       message === undefined && onSendAttachments != null && !wasEdit && trayAttachments.length > 0;
-    if ((body.length === 0 && !dispatchAttachments) || disabled || sending) {
-      // Whitespace-only with no attachment / disabled / in-flight: never dispatch.
+    if (
+      (body.length === 0 && !dispatchAttachments) ||
+      disabled ||
+      sending ||
+      readingRef.current.length > 0
+    ) {
+      // Whitespace-only with no attachment / disabled / in-flight / a pasted or picked file
+      // still being read (it belongs to this message, R1071C-04): never dispatch.
       return;
     }
     // A dispatch consumes/replaces the composer content; a late mount restore must not
@@ -808,17 +841,18 @@ export function Composer({
     setError(null);
     try {
       if (dispatchAttachments && onSendAttachments != null) {
-        // A caption maps to a single media event, so it rides only when exactly
-        // one attachment is pending; with multiple, the text is sent separately.
-        const caption = trayAttachments.length === 1 && body.length > 0 ? body : undefined;
+        const caption =
+          (transport === "session" || trayAttachments.length === 1) && body.length > 0
+            ? body
+            : undefined;
         await onSendAttachments(trayAttachments, caption);
         // If the text did not ride as a caption (multiple attachments) but the
         // user typed a body, dispatch it as its own message.
         if (caption === undefined && body.length > 0) {
           await onSend(body, context);
         }
-        // Clear only on success so a failed enqueue keeps the tray + text.
-        tray.getState().clear();
+        // A selection added while IPC was pending belongs to the next send.
+        for (const attachment of trayAttachments) tray.getState().remove(attachment.id);
         spendDraft(ran);
       } else {
         if (message === undefined) {
@@ -992,7 +1026,7 @@ export function Composer({
    * room and reply/edit are fixed here, synchronously, and travel with it (R411).
    */
   function submit() {
-    if (inFlight.current || disabled || sending) {
+    if (inFlight.current || disabled || sending || readingRef.current.length > 0) {
       return;
     }
     inFlight.current = true;
@@ -1102,21 +1136,81 @@ export function Composer({
     }
   }
 
+  /**
+   * Stop holding Send for batch `id`. Returns whether it was still pending: `false` means it was
+   * already cancelled, timed out or landed, and whatever its read comes to is no longer wanted.
+   */
+  function settleBatch(id: number): boolean {
+    const before = readingRef.current;
+    const after = before.filter((batch) => batch.id !== id);
+    if (after.length === before.length) {
+      return false;
+    }
+    readingRef.current = after;
+    setReading(after);
+    return true;
+  }
+
+  /** Drop a batch still being read (its chip's remove control, or Escape): nothing of it joins. */
+  function cancelReading(batch: ReadingBatch) {
+    if (settleBatch(batch.id)) {
+      batch.cancel();
+    }
+  }
+
+  /**
+   * Read a batch of files into the tray, whole or not at all. The batch is pending from before
+   * its first read until it lands, and Send waits for every pending batch: a caption pasted with
+   * a file never leaves without it, and no message carries part of a pasted or picked batch
+   * (R1071C-04). A failed read adds none of the batch and throws for the caller to say so; what
+   * was read is dropped. A batch that is cancelled resolves quietly and adds nothing, even when
+   * its read finishes later; one still unread after FILE_READ_TIMEOUT_MS fails like a failed
+   * read (R1071C-05).
+   */
+  async function readIntoTray(label: string, read: () => Promise<PendingAttachment[]>) {
+    const id = nextBatch.current++;
+    let cancel = () => {};
+    const cancelled = new Promise<null>((resolve) => {
+      cancel = () => resolve(null);
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`the file read took longer than ${FILE_READ_TIMEOUT_MS} ms`)),
+        FILE_READ_TIMEOUT_MS,
+      );
+    });
+    readingRef.current = [...readingRef.current, { id, label, cancel }];
+    setReading(readingRef.current);
+    try {
+      const files = await Promise.race([read(), cancelled, deadline]);
+      // Only a batch nobody cancelled joins; a cancelled one's late bytes go nowhere.
+      if (settleBatch(id) && files !== null) {
+        tray.getState().addMany(files);
+      }
+    } catch (raw) {
+      if (settleBatch(id)) {
+        throw raw;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function readPhotos(input: HTMLInputElement) {
     const files = Array.from(input.files ?? []);
     setPhotoError(null);
     try {
-      for (const file of files) {
-        // A HEIC or other picture a model is not shown goes as JPEG when this
-        // webview can decode it, else as it is (R444/05).
-        const photo = await asShownPhoto(file, file.name || photoFilename());
-        tray.getState().add({
-          id: attachmentId(),
-          kind: "bytes",
-          ...photo,
-          size: photo.bytes.byteLength,
-        });
-      }
+      await readIntoTray(batchLabel(files, "photo"), async () => {
+        const read: PendingAttachment[] = [];
+        for (const file of files) {
+          // A HEIC or other picture a model is not shown goes as JPEG when this
+          // webview can decode it, else as it is (R444/05).
+          const photo = await asShownPhoto(file, file.name || photoFilename());
+          read.push({ id: attachmentId(), kind: "bytes", ...photo, size: photo.bytes.byteLength });
+        }
+        return read;
+      });
     } catch (raw) {
       logFailure("composer.photo")(raw);
       setPhotoError("keeper couldn't read this photo. Choose it again to retry.");
@@ -1126,34 +1220,56 @@ export function Composer({
   }
 
   /**
-   * Intercept a paste that carries an image: add it as a raw-bytes attachment
-   * (dispatched later as a raw binary IPC body, never base64). A non-image paste
-   * falls through to the default text paste unchanged.
+   * Paste files into the tray. Plain-text-only paste keeps the browser's own; a paste that also
+   * carries plain text (a screenshot with its caption) puts that text into the draft at the
+   * caret, as the browser would have, while the files are staged. Text and HTML items never
+   * become attachments (R1071C-01).
    */
   function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
-    if (!attachEnabled) {
-      return;
-    }
-    const imageItem = Array.from(e.clipboardData.items).find((it) => it.type.startsWith("image/"));
-    if (!imageItem) {
-      // Not an image → let the default text paste proceed.
-      return;
-    }
-    const file = imageItem.getAsFile();
-    if (!file) {
-      return;
-    }
+    if (!attachEnabled || sending) return;
+    const items = Array.from(e.clipboardData.items);
+    const files = items
+      .filter((item) =>
+        transport === "session" ? item.kind === "file" : item.type.startsWith("image/"),
+      )
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (files.length === 0) return;
     e.preventDefault();
-    void file.arrayBuffer().then((bytes) => {
-      const ext = file.type.split("/")[1] || "png";
-      tray.getState().add({
-        id: attachmentId(),
-        kind: "bytes",
-        bytes,
-        filename: file.name && file.name !== "" ? file.name : `pasted-image.${ext}`,
-        mime: file.type,
-        size: file.size,
-      });
+    const text = items.some((item) => item.kind === "string" && item.type === "text/plain")
+      ? e.clipboardData.getData("text/plain")
+      : "";
+    if (text !== "") {
+      const field = e.currentTarget;
+      const next =
+        field.value.slice(0, field.selectionStart) + text + field.value.slice(field.selectionEnd);
+      const at = field.selectionStart + text.length;
+      restoreConsumed.current = true;
+      insertedCaret.current = at;
+      setDraft(next);
+      setCaret(at);
+      if (pendingRef.current?.mode !== "edit") {
+        scheduleDraftSave(next);
+      }
+    }
+    // A new paste retires an earlier read's failure or timeout, as a new photo pick does.
+    setPhotoError(null);
+    void readIntoTray(batchLabel(files, "pasted file"), async () => {
+      const read: PendingAttachment[] = [];
+      for (const file of files) {
+        read.push({
+          id: attachmentId(),
+          kind: "bytes",
+          bytes: await file.arrayBuffer(),
+          filename: file.name || `pasted-file.${file.type.split("/")[1] || "bin"}`,
+          mime: file.type || "application/octet-stream",
+          size: file.size,
+        });
+      }
+      return read;
+    }).catch((raw: unknown) => {
+      logFailure("composer.paste")(raw);
+      setPhotoError("keeper couldn't read the pasted file. Paste it again to retry.");
     });
   }
 
@@ -1178,6 +1294,15 @@ export function Composer({
     // The open slash menu claims ↑/↓/Enter/Tab/Escape first; everything it does
     // not claim — and every key while it is closed — keeps its meaning below.
     if (menu.onKeyDown(e) || inline.onKeyDown(e)) {
+      return;
+    }
+    if (e.key === "Escape" && readingRef.current.length > 0) {
+      // Esc first drops every batch still being read (R1071C-05); the caption stays, and a
+      // second Esc cancels a pending reply/edit.
+      e.preventDefault();
+      for (const batch of readingRef.current) {
+        cancelReading(batch);
+      }
       return;
     }
     if (e.key === "Escape" && pending) {
@@ -1210,7 +1335,7 @@ export function Composer({
   }
 
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex min-w-0 flex-col gap-1">
       {pending && (
         <div className="flex items-center gap-2 rounded-md border border-border bg-muted/50 px-3 py-1.5">
           <div className="min-w-0 flex-1">
@@ -1260,19 +1385,29 @@ export function Composer({
           each showing the filename (+ size for pasted bytes). Removing a chip is a
           pre-upload cancel. */}
       {hasAttachments && pending?.mode !== "edit" && (
-        <ul aria-label="Pending attachments" className="flex flex-wrap gap-1.5">
+        <ul
+          aria-label="Pending attachments"
+          className="flex min-w-0 flex-wrap gap-1.5"
+          aria-live="polite"
+        >
           {attachments.map((attachment) => (
             <li
               key={attachment.id}
-              className="flex items-center gap-1.5 rounded-md border border-border bg-muted/50 py-1 pr-1 pl-2"
+              className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border bg-muted/50 py-1 pr-1 pl-2"
             >
-              <span className="max-w-[180px] truncate text-xs" title={chipLabel(attachment)}>
+              <span
+                className="min-w-0 flex-1 break-words text-xs [overflow-wrap:anywhere]"
+                title={chipLabel(attachment)}
+              >
                 {chipLabel(attachment)}
               </span>
               {attachment.kind === "bytes" && (
-                <span className="text-muted-foreground text-xs">
+                <span className="shrink-0 text-muted-foreground text-xs">
                   {formatFileSize(attachment.size)}
                 </span>
+              )}
+              {transport === "session" && attachment.kind === "path" && (
+                <span className="shrink-0 text-muted-foreground text-xs">Size on send</span>
               )}
               <IconHint label={`Remove ${chipLabel(attachment)}`}>
                 <Button
@@ -1280,7 +1415,41 @@ export function Composer({
                   variant="ghost"
                   size="icon-xs"
                   aria-label={`Remove ${chipLabel(attachment)}`}
+                  className={cn(transport === "session" && "size-11 shrink-0")}
+                  disabled={sending}
                   onClick={() => removeAttachment(attachment.id)}
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </Button>
+              </IconHint>
+            </li>
+          ))}
+        </ul>
+      )}
+      {/* Batches still being read (R1071C-04/-05): not yet sendable, so not in the tray above,
+          but each is visible and can be dropped; Send waits for the rest. */}
+      {reading.length > 0 && (
+        <ul aria-label="Files being read" className="flex min-w-0 flex-wrap gap-1.5">
+          {reading.map((batch) => (
+            <li
+              key={batch.id}
+              className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border border-dashed bg-muted/30 py-1 pr-1 pl-2"
+            >
+              <span
+                className="min-w-0 flex-1 break-words text-xs [overflow-wrap:anywhere]"
+                title={batch.label}
+              >
+                {batch.label}
+              </span>
+              <span className="shrink-0 text-muted-foreground text-xs">reading…</span>
+              <IconHint label={`Cancel reading ${batch.label}`}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Cancel reading ${batch.label}`}
+                  className={cn(transport === "session" && "size-11 shrink-0")}
+                  onClick={() => cancelReading(batch)}
                 >
                   <X aria-hidden="true" className="size-3" />
                 </Button>
@@ -1292,7 +1461,12 @@ export function Composer({
       {help !== null && (
         <SlashHelp rows={help.rows} escapeHint={help.escapeHint} onClose={() => setHelp(null)} />
       )}
-      <div className="relative flex items-end gap-2">
+      <div
+        className={cn(
+          "relative flex min-w-0 items-end gap-2",
+          transport === "session" && "flex-wrap",
+        )}
+      >
         <SlashMenuList menu={menu} />
         <InlineSlashList menu={inline} />
         {attachEnabled && pending?.mode !== "edit" && (
@@ -1442,6 +1616,7 @@ export function Composer({
           // ring/border color.
           className={cn(
             "min-h-9 min-w-0 flex-1 resize-none",
+            transport === "session" && "order-first basis-full",
             phone ? "max-h-[calc(5*1.5rem+1rem)]" : "max-h-[calc(8*1.5rem+1rem)]",
             incognitoEffective && "focus-visible:border-incognito focus-visible:ring-incognito/50",
           )}
@@ -1455,11 +1630,16 @@ export function Composer({
           // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
           // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
           // default button size.
-          className={cn(phone && "h-11 min-w-11")}
+          className={cn(phone && "h-11 min-w-11", transport === "session" && "ml-auto")}
         >
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
+      {reading.length > 0 && (
+        <p role="status" className="text-muted-foreground text-xs">
+          Reading the file to send…
+        </p>
+      )}
       {photoError !== null && (
         <p role="alert" className="text-destructive text-xs">
           {photoError}

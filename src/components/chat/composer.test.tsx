@@ -363,6 +363,67 @@ describe("Composer", () => {
     expect(attachmentsStore.getState().pending).toHaveLength(0);
   });
 
+  it("puts a mixed paste's plain text into the draft at the caret and stages only its file", async () => {
+    render(
+      <Composer
+        transport="session"
+        accountId="beta"
+        roomId="same.1"
+        onSend={vi.fn()}
+        onSendAttachments={vi.fn()}
+      />,
+    );
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "Look: done" } });
+    textarea.setSelectionRange(6, 6);
+    const file = new File([new Uint8Array([1, 2, 3])], "clipboard.png", { type: "image/png" });
+    const text = "Explain the highlighted rows. ";
+    const kept = fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [
+          { kind: "file", type: "image/png", getAsFile: () => file },
+          { kind: "string", type: "text/plain", getAsFile: () => null },
+          { kind: "string", type: "text/html", getAsFile: () => null },
+        ],
+        getData: (type: string) => (type === "text/plain" ? text : "<b>rows</b>"),
+      },
+    });
+    expect(kept).toBe(false);
+    await waitFor(() => expect(screen.getByText("clipboard.png")).toBeInTheDocument());
+    expect(textarea.value).toBe("Look: Explain the highlighted rows. done");
+    expect(textarea.selectionStart).toBe(6 + text.length);
+    const pending = attachmentsStore.getState().pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toEqual(
+      expect.objectContaining({ kind: "bytes", filename: "clipboard.png", mime: "image/png" }),
+    );
+  });
+
+  it("leaves a plain-text-only session paste to the browser", () => {
+    render(
+      <Composer
+        transport="session"
+        accountId="beta"
+        roomId="same.1"
+        onSend={vi.fn()}
+        onSendAttachments={vi.fn()}
+      />,
+    );
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    const kept = fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [
+          { kind: "string", type: "text/plain", getAsFile: () => null },
+          { kind: "string", type: "text/html", getAsFile: () => null },
+        ],
+        getData: () => "just words",
+      },
+    });
+    expect(kept).toBe(true);
+    expect(textarea.value).toBe("");
+    expect(attachmentsStore.getState().pending).toHaveLength(0);
+  });
+
   it("removes a chip when its × is clicked (pre-upload cancel)", async () => {
     open.mockResolvedValue("/home/alice/doc.pdf");
     render(
