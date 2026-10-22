@@ -44,7 +44,7 @@ use syncular_client::{
 };
 use tokio::sync::watch;
 
-use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, BLOB_CACHE_MAX_BYTES};
+use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, StagedBlob, BLOB_CACHE_MAX_BYTES};
 use crate::hq::port::{
     BlobBody, Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection,
     Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription,
@@ -618,13 +618,14 @@ impl BlobCache {
 
     /// Whether `blob_id`'s body is cached, and whether it is staged for
     /// upload, before a commit stages it.
-    fn held(&self, blob_id: &str) -> Result<Held, rusqlite::Error> {
+    fn held(&self, blob_id: &str) -> Result<StagedBlob, rusqlite::Error> {
         self.bodies.query_row(
             "SELECT EXISTS (SELECT 1 FROM _syncular_blobs WHERE blob_id = ?1), \
              EXISTS (SELECT 1 FROM _syncular_blob_uploads WHERE blob_id = ?1)",
             [blob_id],
             |row| {
-                Ok(Held {
+                Ok(StagedBlob {
+                    blob_id: blob_id.to_owned(),
                     body: row.get(0)?,
                     queued: row.get(1)?,
                 })
@@ -632,12 +633,14 @@ impl BlobCache {
         )
     }
 
-    /// A commit failed after `staged` were staged for it: each goes back to
-    /// how it was — unqueued if it was not queued, its body dropped if it
-    /// was not cached — unless something else has pinned it since.
-    fn unstage(&self, staged: &[(String, Held)]) -> Result<(), rusqlite::Error> {
+    /// A commit failed, or never finished, after `staged` were staged for
+    /// it: each goes back to how it was — unqueued if it was not queued, its
+    /// body dropped if it was not cached — unless a commit in the outbox pins
+    /// it, which is then the commit's own (it finished) or another's.
+    fn unstage(&self, staged: &[StagedBlob]) -> Result<(), rusqlite::Error> {
         let mut dropped = Vec::new();
-        for (blob_id, before) in staged {
+        for before in staged {
+            let blob_id = &before.blob_id;
             if !before.queued {
                 self.bodies.execute(
                     "DELETE FROM _syncular_blob_uploads WHERE blob_id = ?1 \
@@ -650,6 +653,20 @@ impl BlobCache {
             }
         }
         self.log.forget(&dropped)
+    }
+
+    /// A commit this replica began and never finished — the process died
+    /// between staging its first blob and putting its message in the outbox
+    /// — is undone: what it staged goes back as it was ([`Self::unstage`]),
+    /// so nothing is left queued for upload that no message names. Run when
+    /// the replica opens, before any round, and before every commit.
+    fn recover(&self) -> Result<(), rusqlite::Error> {
+        let unfinished = self.log.unfinished_commit()?;
+        if unfinished.is_empty() {
+            return Ok(());
+        }
+        self.unstage(&unfinished)?;
+        self.log.finish_commit()
     }
 
     /// The commits waiting in the outbox, with their operations.
@@ -714,12 +731,20 @@ impl BlobCache {
     }
 }
 
-/// A blob's state before a commit staged it.
-#[derive(Debug, Clone, Copy)]
-struct Held {
-    body: bool,
-    queued: bool,
+/// The stage-and-commit step cut off where a test says, as a process that
+/// dies there would be: after `uploads` blobs are staged, before anything
+/// else runs.
+#[cfg(test)]
+fn interrupt_after(uploads: usize) {
+    if tests::INTERRUPT_AFTER.with(|at| at.get() == Some(uploads)) {
+        tests::INTERRUPT_AFTER.with(|at| at.set(None));
+        panic!("the process died after staging {uploads} blob(s)");
+    }
 }
+
+#[cfg(not(test))]
+#[inline(always)]
+fn interrupt_after(_uploads: usize) {}
 
 /// Whether `values` (one operation's columns) reference `blob_id`: a column
 /// holding a blob reference whose `blobId` it is.
@@ -872,6 +897,9 @@ impl Owner {
             SyncClient::open_path_with_identity(spec.client_id.clone(), schema()?, limits, path)
                 .map_err(ReplicaError::Client)?;
         let cache = BlobCache::open(&spec.path)?;
+        cache.recover().map_err(|error| {
+            ReplicaError::Client(format!("the replica's unfinished commit: {error}"))
+        })?;
         let refusals = cache.standing_refusals().map_err(|error| {
             ReplicaError::Client(format!("the replica's upload refusals: {error}"))
         })?;
@@ -1080,6 +1108,7 @@ impl Owner {
                     }
                 }
                 let _ = reply.send(outcome);
+                self.prune_refusals();
             }
             Command::Commit(blobs, ops, reply) => {
                 let outcome = self.commit_with_blobs(&blobs, ops);
@@ -1128,25 +1157,43 @@ impl Owner {
 
     /// Stage `blobs`, then commit `ops`, in this one command: no round and
     /// no eviction between, so every blob stays pinned — by its upload row,
-    /// then by the commit's reference. On a failure what this staged goes
-    /// back as it was ([`BlobCache::unstage`]).
+    /// then by the commit's reference. What the blobs were before is kept
+    /// beside the replica first ([`AccessLog::begin_commit`]): on a failure
+    /// they go back as they were ([`BlobCache::unstage`]), and if the process
+    /// dies before the message is in the outbox the next open puts them back
+    /// ([`BlobCache::recover`]) — a blob is never left queued for upload
+    /// without the message that names it (R1071K-07).
     fn commit_with_blobs(
         &mut self,
         blobs: &[BlobBody],
         ops: Vec<Mutation>,
     ) -> Result<String, ReplicaError> {
-        let mut staged = Vec::with_capacity(blobs.len());
-        let outcome = self.stage_and_commit(blobs, ops, &mut staged);
-        match &outcome {
+        let storage = |error: rusqlite::Error| {
+            ReplicaError::Client(format!("the replica's blob cache: {error}"))
+        };
+        self.cache.recover().map_err(storage)?;
+        let before = blobs
+            .iter()
+            .map(|blob| self.cache.held(&blob.id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        self.cache.log.begin_commit(&before).map_err(storage)?;
+        let outcome = self.stage_and_commit(blobs, ops);
+        let settled = match &outcome {
             Ok(_) => {
                 for blob in blobs {
                     self.cache.touch(&self.database, &blob.id);
                 }
+                Ok(())
             }
-            Err(_) => {
-                if let Err(error) = self.cache.unstage(&staged) {
-                    tracing::warn!(database = %self.database, %error, "blobs staged for a failed commit could not be unstaged");
-                }
+            Err(_) => self.cache.unstage(&before),
+        };
+        // Kept until what it records is settled, so a failure to put a blob
+        // back is retried by the next commit or open.
+        match settled.and_then(|()| self.cache.log.finish_commit()) {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(database = %self.database, %error, "a commit's staged blobs could not be settled; the next commit or open does");
             }
         }
         outcome
@@ -1156,18 +1203,13 @@ impl Owner {
         &mut self,
         blobs: &[BlobBody],
         ops: Vec<Mutation>,
-        staged: &mut Vec<(String, Held)>,
     ) -> Result<String, ReplicaError> {
-        let storage = |error: rusqlite::Error| {
-            ReplicaError::Client(format!("the replica's blob cache: {error}"))
-        };
-        for blob in blobs {
-            let before = self.cache.held(&blob.id).map_err(storage)?;
+        for (staged, blob) in (1..).zip(blobs) {
             let reference = self
                 .client
                 .upload_blob(&blob.bytes, blob.media_type.clone(), None)
                 .map_err(ReplicaError::Client)?;
-            staged.push((blob.id.clone(), before));
+            interrupt_after(staged);
             if reference["blobId"].as_str() != Some(blob.id.as_str()) {
                 return Err(ReplicaError::Client(format!(
                     "the replica staged {} under another content address",
@@ -1388,8 +1430,36 @@ impl Owner {
             }
         }
         self.absorb_changes();
+        // An outcome may have made an upload refusal moot.
+        self.prune_refusals();
         // A commit the server took no longer pins its blobs.
         self.enforce_cache();
+    }
+
+    /// Drop the upload refusals that no longer stand — their commit neither
+    /// waits in the outbox nor stands refused — from beside the replica and
+    /// from what the readers see, as the outcomes move rather than only when
+    /// the replica opens again (R1071K-09). Nothing to do while none is held.
+    fn prune_refusals(&self) {
+        let held = self
+            .upload_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        if held == 0 {
+            return;
+        }
+        match self.cache.standing_refusals() {
+            Ok(standing) => {
+                *self
+                    .upload_refusals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = standing;
+            }
+            Err(error) => {
+                tracing::debug!(database = %self.database, %error, "the upload refusals were not pruned");
+            }
+        }
     }
 
     /// Keep the cached blob bodies under the cap ([`BlobCache::enforce`]).
@@ -1881,6 +1951,12 @@ pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
     use syncular_client::SyncReport;
+
+    thread_local! {
+        /// Where [`interrupt_after`] cuts the next commit on this thread.
+        pub(super) static INTERRUPT_AFTER: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
 
     fn failed(code: &str, status: Option<u64>) -> SyncOutcome {
         SyncOutcome::Failed {
@@ -2916,5 +2992,142 @@ pub(crate) mod tests {
             "the new body went, the cached and the pinned ones stayed"
         );
         assert_eq!(owner.client.status_snapshot().outbox, 1);
+    }
+
+    /// R1071K-09: a refusal whose commit no longer waits or stands refused is
+    /// dropped as the outcomes move — after a round — without the replica
+    /// opening again; one whose commit still waits stays.
+    #[test]
+    fn an_upload_refusal_made_moot_is_pruned_after_a_round_without_a_reopen() {
+        let (port, _seen) = blob_server(Vec::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = linked(dir.path(), port);
+        let (wake, _woken) = mpsc::channel();
+        let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(true)), wake).expect("opens");
+        bootstrapped(&spec.path);
+        let waiting: String = ask(&mut owner, |reply| {
+            Command::Mutate(vec![mutation(message("m-1"))], reply)
+        });
+        let refusal = |commit: &str| UploadRefusal {
+            commit_id: commit.to_owned(),
+            blob_id: sha(b"x"),
+            rejection: Rejection::new("blob.too_large", "too large"),
+            refused_rows: vec!["a-1".to_owned()],
+            commit_rows: vec!["m-1".to_owned(), "a-1".to_owned()],
+        };
+        let held = vec![refusal(&waiting), refusal("accepted-since")];
+        owner.cache.log.refuse(&held, 1).expect("kept");
+        *owner.upload_refusals.lock().expect("held") = held;
+
+        owner.round();
+        let commits = |refusals: &[UploadRefusal]| -> Vec<String> {
+            refusals.iter().map(|r| r.commit_id.clone()).collect()
+        };
+        assert_eq!(
+            commits(&owner.upload_refusals.lock().expect("held")),
+            vec![waiting.clone()],
+            "what the readers see"
+        );
+        assert_eq!(
+            commits(&owner.cache.log.refusals().expect("reads")),
+            vec![waiting],
+            "what is kept beside the replica"
+        );
+    }
+
+    /// R1071K-07: the process dies after a commit staged its first blobs and
+    /// before its message reached the outbox. The next open, before any
+    /// round, puts back what the dead commit staged — a blob another message
+    /// pins stays queued and pinned for it — so the round that follows
+    /// uploads nothing no message names.
+    #[test]
+    fn a_commit_cut_short_before_its_message_leaves_nothing_to_upload_after_a_relaunch() {
+        for cut in [1, 2] {
+            let (port, seen) = blob_server(Vec::new());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let spec = linked(dir.path(), port);
+            let open = || {
+                let (wake, _woken) = mpsc::channel();
+                let mut owner =
+                    Owner::open(&spec, Arc::new(AtomicBool::new(true)), wake).expect("opens");
+                // Cache pressure: every body the outbox does not pin goes.
+                owner.cache_max = 1;
+                owner
+            };
+            let mut owner = open();
+            bootstrapped(&spec.path);
+            // An earlier message, still waiting, pins `shared`.
+            let shared = vec![5u8; 50];
+            let first: String = ask(&mut owner, |reply| {
+                Command::Commit(
+                    vec![body(&shared)],
+                    vec![mutation(message("m-1")), attachment("a-1", "m-1", &shared)],
+                    reply,
+                )
+            });
+            // The next one attaches a new file, the same bytes again and a
+            // third file; the process dies after `cut` of them are staged.
+            let (fresh, last) = (vec![6u8; 60], vec![7u8; 70]);
+            INTERRUPT_AFTER.with(|at| at.set(Some(cut)));
+            let (reply, _answer) = mpsc::sync_channel(1);
+            let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.handle(Command::Commit(
+                    vec![body(&fresh), body(&shared), body(&last)],
+                    vec![
+                        mutation(message("m-2")),
+                        attachment("a-2", "m-2", &fresh),
+                        attachment("a-3", "m-2", &shared),
+                        attachment("a-4", "m-2", &last),
+                    ],
+                    reply,
+                ))
+            }));
+            assert!(died.is_err(), "cut {cut}: the process died mid-commit");
+            // Nothing of the dead process runs again: no cleanup, no round.
+            drop(owner);
+            let mut left = vec![sha(&fresh), sha(&shared)];
+            left.sort();
+            assert_eq!(
+                queued(&spec.path),
+                left,
+                "cut {cut}: the crash left the new file queued with no message"
+            );
+
+            let mut owner = open();
+            assert_eq!(
+                queued(&spec.path),
+                vec![sha(&shared)],
+                "cut {cut}: reopened, only what a waiting message names is queued"
+            );
+            assert_eq!(pins(&spec.path), vec![(first.clone(), sha(&shared))]);
+            assert_eq!(
+                owner.client.status_snapshot().outbox,
+                1,
+                "cut {cut}: only the first message waits"
+            );
+            owner.enforce_cache();
+            assert_eq!(
+                cached(&spec.path),
+                vec![sha(&shared)],
+                "cut {cut}: the dead commit's body is gone, the pinned one kept under pressure"
+            );
+            owner.round();
+            assert_eq!(
+                puts(&seen, &sha(&shared), 200),
+                1,
+                "cut {cut}: its message's file"
+            );
+            for orphan in [&fresh, &last] {
+                assert_eq!(
+                    seen.lock()
+                        .expect("seen")
+                        .iter()
+                        .filter(|(_, path, _)| path.contains(&sha(orphan)))
+                        .count(),
+                    0,
+                    "cut {cut}: nothing is uploaded without its message"
+                );
+            }
+        }
     }
 }

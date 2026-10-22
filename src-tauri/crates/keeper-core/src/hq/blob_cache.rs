@@ -19,7 +19,10 @@
 //! small SQLite file beside the replica ([`AccessLog`]) — and so is every
 //! refusal of a blob's upload the server sent, tied to the commits that
 //! referenced the blob, since resolving one takes the blob out of the
-//! replica's queue and nothing there would say why afterwards.
+//! replica's queue and nothing there would say why afterwards, and the blobs
+//! a commit is staging until its message is in the outbox, so a process that
+//! dies between the two leaves nothing queued for upload that no message
+//! names (R1071K-07).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -74,12 +77,23 @@ pub fn evictions(blobs: &[CachedBlob], max: u64) -> Vec<String> {
     dropped
 }
 
+/// A blob a commit stages, and how the replica held it before: whether its
+/// body was cached and whether it was already queued for upload. What putting
+/// it back as it was needs, after a commit that failed or never finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedBlob {
+    pub blob_id: String,
+    pub body: bool,
+    pub queued: bool,
+}
+
 /// When each blob of one replica was last used on this device, and the
 /// server's refusals of blob uploads: keeper's own file beside the replica
 /// (`<replica>.blob-access.sqlite`), never inside the client's, so a schema
 /// change there cannot take it and nothing here is mistaken for a synced
 /// table. Losing it costs the order (a body with no record counts from when
-/// it was cached) and the reason a refused file shows.
+/// it was cached), the reason a refused file shows, and the record of a
+/// commit a crash cut short.
 pub struct AccessLog {
     conn: Connection,
 }
@@ -100,9 +114,48 @@ impl AccessLog {
                code TEXT NOT NULL, message TEXT NOT NULL,
                refused_rows TEXT NOT NULL, commit_rows TEXT NOT NULL,
                at_ms INTEGER NOT NULL,
-               PRIMARY KEY (commit_id, blob_id));",
+               PRIMARY KEY (commit_id, blob_id));
+             CREATE TABLE IF NOT EXISTS unfinished_commit (
+               blob_id TEXT PRIMARY KEY, body INTEGER NOT NULL, queued INTEGER NOT NULL);",
         )?;
         Ok(AccessLog { conn })
+    }
+
+    /// A commit is about to stage `blobs`: kept, all or none, before the
+    /// first is staged, so a process that dies before the commit's message is
+    /// in the outbox leaves the record its next open puts them back by. A
+    /// blob named twice keeps its first state, the one before either staged.
+    pub fn begin_commit(&self, blobs: &[StagedBlob]) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        for blob in blobs {
+            tx.execute(
+                "INSERT OR IGNORE INTO unfinished_commit (blob_id, body, queued) VALUES (?1, ?2, ?3)",
+                params![blob.blob_id, blob.body, blob.queued],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// The blobs of a commit that began and never finished.
+    pub fn unfinished_commit(&self) -> Result<Vec<StagedBlob>, rusqlite::Error> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT blob_id, body, queued FROM unfinished_commit ORDER BY blob_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(StagedBlob {
+                blob_id: row.get(0)?,
+                body: row.get(1)?,
+                queued: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The commit finished — its message is in the outbox, or what it staged
+    /// is back as it was.
+    pub fn finish_commit(&self) -> Result<(), rusqlite::Error> {
+        self.conn.execute("DELETE FROM unfinished_commit", [])?;
+        Ok(())
     }
 
     /// Keep `refusals` (a later refusal of the same blob for the same
