@@ -141,6 +141,125 @@ Nixie client stood in for R-HQ-30's runtime half and wrote only an `agent_profil
 The Agents-window archive test assumes no agent answers its messages, and the pairing test needs
 two databases; neither fits this rig, which runs an agent on one database.
 
+## People in a session
+
+A session can hold several people. **People** in the session header opens a sheet (a side sheet
+on the desktop, a bottom sheet on a phone) listing the session's members — the owner, the other
+people and the agent — read by Rust from the session's `session_members` rows and the directory of
+the session's own database. Every message names its author from the `author_actor` the server
+stamped on the row; a client cannot choose it, and the server refuses a row that claims another
+author.
+
+Only the session's owner changes who is in it:
+
+- **Add** offers only the people of the session's database who are not in it yet — in a
+  `tgdrive` session never someone who belongs to `neuradrive` alone. Adding writes the session's
+  `invite`, so it can wait offline in the outbox; the person shows as *Joining…* until the server
+  has written their membership, and their devices then list the session and its newest page. The
+  server refuses an invite naming anyone outside the database, and an invite changed by anyone but
+  the owner; a refusal shows in the sheet. There is no invitation by address.
+- **Can read thinking and tool results** is a person's reader flag, off when they are added.
+  Turning it on lets the server send them the session's reasoning, tool calls and approvals after
+  their scope is refreshed; turning it off makes their devices evict those rows. Both are the
+  server's `grant_trace` / `revoke_trace` commands, so they need the database to be syncing; an
+  offline device says so and changes nothing. A device draws the thinking, tool steps and
+  approvals — in the session and in the decisions panel — only while its person's membership reads
+  the trace: from the moment it knows the flag is withdrawn or the person removed, none of them is
+  shown and keeper refuses a decision, even while rows not yet evicted (or a decision still in the
+  outbox) are on the device. The server refuses such a decision too (`hq.v8.not_reader`), and the
+  request says so in keeper's words.
+- **Remove** (with a confirmation) is the server's `remove_member`: the person leaves the invite,
+  their membership is deleted, and their devices drop the session and its rows, keeping only their
+  own writes still waiting to be sent.
+
+A server change whose answer never arrives (the connection dropped after the server acted) — or
+arrives and cannot be read — is not lost: keeper keeps the request until the server's own answer
+(applied, replayed or refused) settles it. The sheet says keeper did not hear back (or could not
+read the answer, which also says something must change before asking again — keeper never asks
+again by itself), the database syncs at once, and asking again about the same membership asks
+under the same request id, which the server answers from its record (`cached`) instead of acting
+twice — so a removal repeated after the person was invited again on the server does not remove
+their new membership. The membership is told by the fields fixed when it was made
+(`added_at_ms`, `added_by_actor`, `role`, which no write changes): a read point or a reader flag
+landing meanwhile is the same membership and keeps the request. The server stamps every new
+membership of a person in a session a later `added_at_ms` than any before it, even when they are
+invited again within the same millisecond, so two memberships never look alike. Once the device
+has seen them invited again (a new membership, stamped anew), Remove is a new removal.
+
+Every Remove and reader switch also names the membership it is about — the `added_at_ms` the
+sheet shows — and the server refuses it (`hq.member.changed`) when that person's membership is
+another one by now, or — for a reader switch — gone (a Remove of someone gone is refused as not a
+member): a decision about someone never lands on their next membership, which nobody decided
+about. The sheet then says so, and shows them as they are.
+
+A replayed answer is the end of that request: it ran before, and keeper asks nothing more of its
+own — it syncs and the sheet shows where things stand, which may be a change made since on another
+device. A new decision is the person's next switch or Remove, sent under a new request id about
+the membership shown then. A reader switch whose result the sheet has shown is settled even if its
+answer never came, so switching it again later — after it was undone on another device, say — is
+that new decision at once. Refusals are matched by the server's stable codes
+(`hq.remove_member.*`, `hq.member.changed`, `hq.v3.owner_only`,
+`hq.v11.invite_outside_directory`, `hq.v3.owner_cannot_leave`, `hq.v8.not_reader`); any other is
+shown as the server said it.
+
+A member who is not the owner sees the same list without those controls and may **Leave
+session**, which deletes their own membership; the server then takes them out of the invite. The
+owner has no Leave, since nobody else could change who is in the session and 106.4 has no
+transfer of ownership; the server refuses an owner's leave as well (`hq.v3.owner_cannot_leave`,
+R-HQ-40). If a device that held its person as a member leaves anyway and the server refuses, the
+session comes back and its sheet says the server refused the leave. If the session open on a
+device leaves its list — the person left or was removed — the window closes it and says so, and
+drops that note if the session comes back.
+
+Development fixtures: `?sessions=launch&people=member|refused|offline|long`, with
+`&platform=phone` for the phone shell.
+
+### Measured: many people against the real server
+
+2026-10-21, `hq_live.rs`'s `many_people_in_one_session_by_the_owner_and_the_server` on delectra:
+the keeper-hq server from a `git archive` of `hq/106-4-members` 654ec57, again of 7490af5 on
+this branch rebased onto 106.3's fix wave 9f7a93ba, and of 941ccdc after the review (Bun 1.2,
+over a throwaway Postgres 18), serving this branch's contract (schema 3) in place of the archive's
+own schema 2 — keeper-hq still pins schema 2, and a schema-3 client receives no rows from a
+schema-2 server. One
+real `keeper-agentd` served Nixie on `tgdrive` and another Dixi on `neuradrive`, from the e2e model
+stub; tgorka owns the session, kuba belongs to `tgdrive` alone and marta to `neuradrive` alone.
+
+- **Directory:** a `tgdrive` session offered only kuba and a `neuradrive` one only marta; keeper
+  refused adding marta to the `tgdrive` session, and an invite naming her written anyway was
+  refused by the server (`hq.v11.invite_outside_directory`).
+- **Add:** kuba's device listed the session 150–310 ms after the owner added him and showed its
+  newest page; his message showed on the owner's device as `kuba`.
+- **Authorship and ownership:** a message from kuba's device claiming tgorka was refused
+  (`hq.v1.author_actor`); an invite kuba wrote naming one more person was refused
+  (`hq.v3.owner_only`).
+- **Reader flag:** without it kuba held no `reasoning` or `tool_calls` row after a thinking
+  answer; granted, the reasoning reached him 170–240 ms later; withdrawn, his replica evicted
+  every reasoning, tool call and approval row of the session and kept the answers.
+- **Approvals follow the flag** (106.4 review, against keeper-hq 941ccdc with Nixie offered
+  `run`): granted, kuba was shown the agent's T2 approval and held its tool call; the moment his
+  device knew the flag was withdrawn his view showed no approval and nothing of the session waited
+  for him in the decisions panel (the window had already evicted the rows in that run, so the
+  rows-still-here boundary is covered by keeper-core's unit test, not by this run).
+- **Remove and leave:** removed by the owner, the session left kuba's list and every row of it
+  left his replica within about 110–120 ms, and he left the owner's sheet (and could be added
+  again); added again and leaving himself, he was gone from his list, the owner's sheet and the
+  invite.
+
+The *People* sheet was walked in the agent desktop's Chrome over CDP on the mock shell at 1280
+and 420 px (the phone shell): open and close (Close and Escape, focus back on **People**), add
+(*Joining…*, then a member), the reader switch on and off, remove with its confirmation (focus on
+Cancel, back on **Remove** after Cancel, on Close after removing), a member's view without the
+owner's controls and **Leave session** (the window closes the session and says so), the refused
+and offline sentences, and twelve-word names with no document or sheet overflow. Every button
+measured at least 44 × 44 px; the runs recorded no console error or failed request.
+
+After the 106.4 review the long-name fixture's removal confirmation was measured with it open: it
+had grown to 954 px (the sheet's scroll area 550–555 px wider than the sheet) and now fits — at
+1280 px a 383 px confirmation in the 416 px side sheet, at 420 px 388 px in the bottom sheet,
+neither scrolling sideways, its destructive control reading *Remove* with the person's whole name
+as its accessible name, both controls 44 px tall and at least 64 px wide.
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history

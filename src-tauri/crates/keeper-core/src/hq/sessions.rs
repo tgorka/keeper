@@ -306,9 +306,12 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 // Windows
 // ---------------------------------------------------------------------------
 
-/// The windows a replica holds, each along one scope variable.
-pub const WINDOWS: [(&str, &str); 8] = [
+/// The windows a replica holds, each along one scope variable. Every held
+/// session's members are held beside its row, so the People sheet reads
+/// who else is in it.
+pub const WINDOWS: [(&str, &str); 9] = [
     ("sessions", "session"),
+    ("session_members", "session"),
     ("turn_chunks", "session"),
     ("claims", "session"),
     ("session_tool_switches", "session"),
@@ -374,8 +377,21 @@ pub fn held(source: &Source) -> Vec<Held> {
     .collect()
 }
 
-/// Each window's units for one database: every session row; for each
-/// active session its streamed chunks, its claim and its tool switches, and
+/// Whether this person's membership of `session_id` reads its trace now: no
+/// membership (removed, or left) reads nothing. What a view shows of the
+/// trace asks this, never only whether the rows are still on the device.
+pub fn reads_trace(source: &Source, session_id: &str) -> bool {
+    read(
+        source,
+        "SELECT reads_trace FROM session_members WHERE session_id = ?1 AND actor_id = ?2",
+        &[Value::from(session_id), Value::from(source.actor.as_str())],
+    )
+    .first()
+    .is_some_and(|row| truthy(row, "reads_trace"))
+}
+
+/// Each window's units for one database: every session row and its members;
+/// for each active session its streamed chunks, its claim and its tool switches, and
 /// its newest months (widened by `widen` for an opened one); its trace
 /// months only where the person reads the trace, and their thinking only
 /// while `reasoning` is shown; nothing of an archived one.
@@ -409,8 +425,10 @@ pub fn plan(
     }
     let trace: Vec<String> = trace.into_iter().collect();
     let turns: Vec<String> = turns.into_iter().collect();
+    let sessions: Vec<String> = sessions.into_iter().collect();
     vec![
-        ("sessions", sessions.into_iter().collect()),
+        ("sessions", sessions.clone()),
+        ("session_members", sessions),
         ("turn_chunks", turns.clone()),
         ("claims", turns.clone()),
         ("session_tool_switches", turns),
@@ -979,6 +997,8 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(shown["sessions"], vec!["c.1", "c.2", "c.3", "c.4"]);
+        // Who else is in a session is held while the session is, archived too.
+        assert_eq!(shown["session_members"], vec!["c.1", "c.2", "c.3", "c.4"]);
         assert_eq!(shown["turn_chunks"], vec!["c.1", "c.3"]);
         assert_eq!(shown["claims"], vec!["c.1", "c.3"]);
         assert_eq!(shown["session_tool_switches"], vec!["c.1", "c.3"]);

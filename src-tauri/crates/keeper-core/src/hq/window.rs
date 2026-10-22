@@ -78,7 +78,7 @@ impl Hq {
             .collect()
     }
 
-    fn source(&self, database: &str) -> Result<Source, HqError> {
+    pub(crate) fn source(&self, database: &str) -> Result<Source, HqError> {
         self.sources()
             .into_iter()
             .find(|source| source.database == database)
@@ -202,6 +202,10 @@ impl Hq {
         let prefs = self.view_prefs();
         let now_ms = sessions::now_ms();
         let session = timeline::session_row(&source, &key.session_id);
+        // Read once for this pass: a member who does not read the trace now
+        // reads no trace presence, and the reasoning tails kept from before
+        // the flag was withdrawn (or the member removed) are dropped.
+        let reads_trace = sessions::reads_trace(&source, &key.session_id);
         let observe = |live: &mut live::Live| {
             let Some(session) = &session else { return };
             let presence = |scope: &str| {
@@ -211,13 +215,17 @@ impl Hq {
                 })
             };
             let on_session = presence(&format!("session:{}", key.session_id));
-            let on_trace: Vec<_> =
+            let on_trace: Vec<_> = if reads_trace {
                 sessions::newest_months(session.created_ms, session.last_activity_ms, now_ms)
                     .iter()
                     .flat_map(|m| {
                         presence(&format!("trace:{}", sessions::page_key(&key.session_id, m)))
                     })
-                    .collect();
+                    .collect()
+            } else {
+                live.forget_trace();
+                Vec::new()
+            };
             live.observe(
                 &on_session,
                 &on_trace,

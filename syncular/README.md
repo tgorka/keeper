@@ -204,11 +204,20 @@ commit.
    `agent_actor`, `created_by_actor`, `created_by_client` and `parent_session` never change. A
    session is inserted only by a person, or by an instance of an agent the registry lets start work;
    an instance of any other agent inserts only a child session whose `parent_session` is a session
-   of this database the agent is a member of.
+   of this database the agent is a member of. `invite` is changed only by the session's owner (the
+   person whose `session_members` row has role `owner`), compared as a set of actor ids. An invited
+   member or an agent instance that changes it is refused (`hq.v3.owner_only`). An instance that
+   inserts a delegated child may invite only people who are members of its parent session, and a
+   session an instance opens at the top level invites no one.
 4. **V4 — membership.** A client inserts only its own actor's `session_members` row, and only in
-   the commit that inserts the session; every other membership row is written by the service
-   client (an agent the session names, and each invited person). `reads_trace` is turned on for a
-   person only by the session's owner. A member may change only its own `read_until`.
+   the commit that inserts the session. Every other membership row is written by the service
+   client: the agent the session names, and each actor that an owner's change of `invite` newly
+   names. Someone who left or was removed comes back only when the owner invites them again;
+   staying in an `invite` they were already in does not bring them back. Another member's row is
+   deleted only by the owner, through `remove_member`. A member leaves by deleting its own row, and
+   the server then takes it out of `invite`; the owner's own row is not deleted
+   (`hq.v3.owner_cannot_leave`). `reads_trace` is turned on for a person only by the
+   session's owner. A member may change only its own `read_until`.
 5. **V5 — page keys.** As *Page keys* above.
 6. **V6 — one writer per answer.** `turn_chunks`, `reasoning`, `tool_calls`, agent `messages`, new
    `approvals` and `sessions.heard_until` are written only by the client holding the session's
@@ -217,7 +226,9 @@ commit.
    exactly one, and an update carries the version it read, so a second taker conflicts instead of
    overwriting.
 8. **V8 — approvals.** `pending` becomes `approved` or `denied` only by an actor named in
-   `approvers`, never by an agent, with `decided_by_actor` and `decided_by_client` the commit's;
+   `approvers`, never by an agent, with `decided_by_actor` and `decided_by_client` the commit's,
+   and only by a person or owner member of the session whose `reads_trace` holds in the commit's
+   candidate state — a removed or withdrawn reader is refused `hq.v8.not_reader`;
    `approved` becomes `consumed` only by the claim holder, with `consumed_by_client` the commit's;
    a decision on a tier-4 approval comes only from a client whose host is not the claim holder's
    host. A consumption carries the version it read, so a second consumer conflicts.
@@ -239,6 +250,48 @@ commit.
     person who is a member of the session.
 
 An attachment's `size` is at most 26,214,400 bytes and its message is in the same session.
+
+## Commands
+
+Registered commands go to `POST /<database>/operations` with `kind: "command"` (REMOTE §3).
+`params` is a JSON object with camelCase keys. Each command belongs only to the session's owner, on
+the database the session lives in, and lands as one ordinary commit authored by the calling client.
+A refusal answers `kind: "error"` with `code: "operation.forbidden"`. Params that are not
+`{ sessionId, actorId }` strings and an `expectedAddedAtMs` integer answer
+`operation.invalid_request` for `remove_member`, and `operation.forbidden` for `grant_trace` and
+`revoke_trace`.
+
+Each command names the membership it acts on: `expectedAddedAtMs` is the member's `added_at_ms`
+as the caller shows it, which the server stamps later for every new membership of a person in a
+session than for any before it, so no two memberships share one. Inside the command's
+transaction, a member whose membership now has another `added_at_ms` (removed and invited again
+since) is refused with `message: "hq.member.changed"`, and so is a member with none for
+`grant_trace` and `revoke_trace`; nothing is written. A command never lands on a membership
+nobody decided about.
+
+- `grant_trace` `{ sessionId, actorId, expectedAddedAtMs }` — turns `reads_trace` on for a person
+  member (D-34). The trace reaches their replicas after the scope refresh.
+- `revoke_trace` `{ sessionId, actorId, expectedAddedAtMs }` — turns it off. Their replicas evict
+  the trace.
+- `remove_member` `{ sessionId, actorId, expectedAddedAtMs }` — takes a person member out of
+  `invite` and deletes their `session_members` row in one commit. Their replicas drop the session
+  and its rows, except their own writes still in the outbox. A refusal names why in `message`:
+  `hq.remove_member.not_owner` (the caller is not the session's owner person on this database),
+  `hq.remove_member.self` (the owner themself), `hq.remove_member.not_member` (the actor is not a
+  member), `hq.remove_member.agent` (an agent member, including the session's own agent) or
+  `hq.member.changed`. `grant_trace` and `revoke_trace` refuse without a reason, except
+  `hq.member.changed`.
+
+A command sent again under a `requestId` the server already applied is answered from its record,
+before the member or the membership is looked at: `status: "cached"` with the first answer's
+`results` and `commitSeq`, never a second commit. A client whose answer was lost — or arrived
+unreadable, which says nothing about whether the command ran — asks again under the same
+`requestId` and the same params, and treats `cached` as the end of that request: it ran before, and
+the replica's next sync shows where things stand. It never follows a replayed answer with a
+request of its own; a new decision is a person's new action, under a new `requestId`, about the
+membership shown then. Only an answer it can read (applied, cached, rejected, or an `error`)
+settles the request. keeper asks again under the same id only about the same membership: one whose
+`added_at_ms`, `added_by_actor` and `role` (immutable, V4) are unchanged.
 
 ## The live check
 

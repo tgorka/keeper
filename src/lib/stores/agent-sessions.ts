@@ -17,6 +17,8 @@ interface AgentSessionsState {
   loaded: boolean;
   error: string | null;
   selected: AgentSessionRef | null;
+  /** The open session Rust's list dropped (left, or removed by its owner), until another opens. */
+  gone: { database: string; sessionId: string; title: string } | null;
   newSession: AgentDefaultSessionVm | null;
   apply: (batch: AgentSessionsBatch) => void;
   select: (target: AgentSessionRef | null) => void;
@@ -28,6 +30,7 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
   loaded: false,
   error: null,
   selected: null,
+  gone: null,
   newSession: null,
   apply: (batch) =>
     set((state) => {
@@ -48,9 +51,35 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
             break;
         }
       }
+      const { selected } = state;
+      const dropped = state.rows.find(
+        (row) => row.database === selected?.database && row.sessionId === selected.sessionId,
+      );
+      if (
+        dropped &&
+        !rows.some(
+          (row) => row.database === dropped.database && row.sessionId === dropped.sessionId,
+        )
+      ) {
+        return {
+          rows,
+          loaded: true,
+          error: null,
+          selected: null,
+          gone: { database: dropped.database, sessionId: dropped.sessionId, title: dropped.title },
+        };
+      }
+      // A refused leave (R-HQ-40) brings the session back: the note would no longer be true.
+      const { gone } = state;
+      if (
+        gone &&
+        rows.some((row) => row.database === gone.database && row.sessionId === gone.sessionId)
+      ) {
+        return { rows, loaded: true, error: null, gone: null };
+      }
       return { rows, loaded: true, error: null };
     }),
-  select: (selected) => set({ selected, newSession: null }),
+  select: (selected) => set({ selected, gone: null, newSession: null }),
 }));
 
 export function useAgentSessionsStore<T>(selector: (state: AgentSessionsState) => T): T {

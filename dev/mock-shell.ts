@@ -82,6 +82,7 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentSessionMembersVm,
   AgentSessionRowVm,
   AgentSessionsBatch,
   AgentSessionViewVm,
@@ -9828,6 +9829,184 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   },
 };
 
+// ?sessions=launch&people=member|refused|offline|long — a session's People sheet.
+const peopleScenario = new URLSearchParams(location.search).get("people");
+const peopleName = (name: string) =>
+  peopleScenario === "long" ? `${name} ${"Longname-".repeat(12)}` : name;
+type MockPerson = { actorId: string; name: string; dir: string[] };
+const peopleDirectory: MockPerson[] = [
+  { actorId: "ana", name: "Ana", dir: ["alpha", "beta"] },
+  { actorId: "ben", name: peopleName("Ben"), dir: ["alpha"] },
+  { actorId: "cal", name: peopleName("Cal"), dir: ["alpha"] },
+  // Marta belongs to beta alone: an alpha session never offers her.
+  { actorId: "marta", name: peopleName("Marta"), dir: ["beta"] },
+];
+const sessionMembers = new Map<string, AgentSessionMembersVm>(
+  sessionRows.map((row) => {
+    const owner = peopleScenario !== "member";
+    const ana = {
+      actorId: "ana",
+      name: "Ana",
+      mark: "A",
+      role: owner ? ("owner" as const) : ("person" as const),
+      readsTrace: owner,
+      me: true,
+      joining: false,
+      canSetReader: false,
+      canRemove: false,
+    };
+    const other =
+      row.database === "alpha"
+        ? { actorId: "ben", name: peopleName("Ben"), mark: "B" }
+        : { actorId: "marta", name: peopleName("Marta"), mark: "M" };
+    return [
+      JSON.stringify([row.database, row.sessionId]),
+      {
+        database: row.database,
+        sessionId: row.sessionId,
+        owner,
+        canLeave: !owner,
+        addable: [],
+        members: [
+          ana,
+          {
+            ...other,
+            role: owner ? ("person" as const) : ("owner" as const),
+            readsTrace: !owner,
+            me: false,
+            joining: false,
+            canSetReader: owner,
+            canRemove: owner,
+          },
+          {
+            actorId: row.agentActor,
+            name: row.agentName,
+            mark: row.agentMark,
+            role: "agent" as const,
+            readsTrace: true,
+            me: false,
+            joining: false,
+            canSetReader: false,
+            canRemove: false,
+          },
+        ],
+      },
+    ];
+  }),
+);
+const peopleWatchers = new Map<
+  string,
+  { key: string; channel: MockChannel<AgentSessionMembersVm> }
+>();
+/** Rust's derivation, mirrored for the fixture: who the owner may still add. */
+function peopleSheet(sheet: AgentSessionMembersVm): AgentSessionMembersVm {
+  const named = new Set(sheet.members.map((m) => m.actorId));
+  return {
+    ...sheet,
+    members: sheet.members.map((m) => ({ ...m })),
+    addable: sheet.owner
+      ? peopleDirectory
+          .filter((p) => p.dir.includes(sheet.database) && !named.has(p.actorId))
+          .map((p) => ({ actorId: p.actorId, name: p.name, mark: p.name[0] ?? "" }))
+      : [],
+  };
+}
+function publishPeople() {
+  for (const { key, channel } of peopleWatchers.values()) {
+    const sheet = sessionMembers.get(key);
+    if (sheet) channel.onmessage?.(peopleSheet(sheet));
+  }
+}
+function mockPeople(payload: Record<string, unknown>): AgentSessionMembersVm {
+  const sheet = sessionMembers.get(JSON.stringify([payload.database, payload.sessionId]));
+  if (!sheet) return hqRefuse("This conversation is not on this device.");
+  return sheet;
+}
+function peopleNeedServer(sheet: AgentSessionMembersVm) {
+  if (peopleScenario === "offline")
+    hqRefuse(
+      `This needs the server, and ${sheet.database} is not syncing on this device now. Try again when it is.`,
+    );
+  if (peopleScenario === "refused")
+    hqRefuse("The server refused: only the session's owner changes who is in it.");
+}
+const peopleHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  agent_session_members_subscribe: (payload) => {
+    const sheet = mockPeople(payload);
+    const id = `session-people-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentSessionMembersVm>;
+    peopleWatchers.set(id, { key: JSON.stringify([payload.database, payload.sessionId]), channel });
+    channel.onmessage?.(peopleSheet(sheet));
+    return id;
+  },
+  agent_session_members_unsubscribe: (payload) => {
+    peopleWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_member_add: (payload) => {
+    const sheet = mockPeople(payload);
+    const person = peopleSheet(sheet).addable.find((p) => p.actorId === payload.actorId);
+    if (!sheet.owner) return hqRefuse("Only the session's owner adds people.");
+    if (!person)
+      return hqRefuse(
+        `${String(payload.actorId)} is not a person of ${sheet.database}'s directory; a session adds only people of its own database.`,
+      );
+    const joining = {
+      ...person,
+      role: "person" as const,
+      readsTrace: false,
+      me: false,
+      joining: true,
+      canSetReader: false,
+      canRemove: false,
+    };
+    sheet.members.splice(sheet.members.length - 1, 0, joining);
+    publishPeople();
+    setTimeout(() => {
+      if (peopleScenario === "refused") {
+        sheet.members = sheet.members.filter((m) => m !== joining);
+        sheet.notice = `The server refused adding ${person.actorId}: only the session's owner adds people.`;
+      } else {
+        Object.assign(joining, { joining: false, canSetReader: true, canRemove: true });
+      }
+      publishPeople();
+    }, 600);
+    return null;
+  },
+  agent_session_member_reader_set: (payload) => {
+    const sheet = mockPeople(payload);
+    const member = sheet.members.find((m) => m.actorId === payload.actorId && m.canSetReader);
+    if (!member) return hqRefuse("Only another person's reading can be changed.");
+    peopleNeedServer(sheet);
+    member.readsTrace = payload.reads === true;
+    publishPeople();
+    return null;
+  },
+  agent_session_member_remove: (payload) => {
+    const sheet = mockPeople(payload);
+    if (!sheet.members.some((m) => m.actorId === payload.actorId && m.canRemove))
+      return hqRefuse("Only another person can be removed.");
+    peopleNeedServer(sheet);
+    sheet.members = sheet.members.filter((m) => m.actorId !== payload.actorId);
+    publishPeople();
+    return null;
+  },
+  agent_session_leave: (payload) => {
+    const sheet = mockPeople(payload);
+    if (!sheet.canLeave)
+      return hqRefuse("The owner cannot leave: nobody else could change who is in this session.");
+    const key = JSON.stringify([payload.database, payload.sessionId]);
+    sessionMembers.delete(key);
+    sessionViews.delete(key);
+    const at = sessionRows.findIndex(
+      (row) => row.database === payload.database && row.sessionId === payload.sessionId,
+    );
+    if (at >= 0) sessionRows.splice(at, 1);
+    publishSessions();
+    return null;
+  },
+};
+
 const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   hq_status_subscribe: (payload) => {
     const id = `hq-subscription-${hqWatchers.size + 1}`;
@@ -9903,6 +10082,7 @@ const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   ...hqHandlers,
   ...sessionHandlers,
+  ...peopleHandlers,
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
   failure_subscribe: (payload) => {

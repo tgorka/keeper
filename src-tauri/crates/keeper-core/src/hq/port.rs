@@ -144,6 +144,39 @@ pub struct ReplicaState {
     pub presence: u64,
 }
 
+/// What the server said when it refused a commit or an operation: its stable
+/// code (`hq.v8.not_reader`, `operation.forbidden`, …), matched exactly, and
+/// its message — which the server may leave equal to the code, and which
+/// for `remove_member` carries the reason (`hq.remove_member.not_owner`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    pub code: String,
+    pub message: String,
+}
+
+impl Rejection {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Rejection {
+        Rejection {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() || self.message == self.code {
+            f.write_str(&self.code)
+        } else {
+            write!(f, "{}: {}", self.code, self.message)
+        }
+    }
+}
+
+/// keeper's own code for a commit another device's change beat: the server
+/// kept theirs (a conflict outcome carries no code of its own).
+pub const CONFLICT: &str = "keeper.conflict";
+
 /// What became of a commit written here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivery {
@@ -151,8 +184,9 @@ pub enum Delivery {
     Pending,
     /// The server took it.
     Applied,
-    /// The server refused it: its sentence.
-    Refused(String),
+    /// The server refused it ([`CONFLICT`] when another device's change
+    /// came first).
+    Refused(Rejection),
     /// Not known here (never written, or its outcome was pruned).
     Unknown,
 }
@@ -163,6 +197,28 @@ pub enum ReplicaError {
     /// The client refused the call; its code and message.
     #[error("{0}")]
     Client(String),
+    /// The server answered a command and made no change: its code, its
+    /// message, and its word (`retryable`) whether the same command may
+    /// succeed later. A definite outcome.
+    #[error("{code}: {message}")]
+    Remote {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    /// A command was sent and no answer keeper can trust came back — the
+    /// connection failed, or the answer could not be read — so whether the
+    /// server made it is not known. Asking again under the same request id
+    /// answers it (the server replays a request it applied). `retryable` is
+    /// only the client's word on asking again now: `false` (an answer keeper
+    /// could not read) means something must change first, never that the
+    /// command was refused.
+    #[error("{code}: {message}")]
+    Unheard {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
     /// A network call on a replica that does not sync (local, refused or
     /// closed).
     #[error("this database is not syncing on this device")]
@@ -218,6 +274,17 @@ pub trait Replica: Send + Sync {
         operation_id: &str,
         params: Value,
     ) -> Result<Vec<Map<String, Value>>, ReplicaError>;
+    /// Run the server's registered command `operation_id` with `params`
+    /// under `request_id` (a retry with the same id is answered from the
+    /// server's cache): its writes reach the replica by sync, never here.
+    /// Like [`Replica::remote_query`], off the owner thread and refused
+    /// while the replica does not sync.
+    fn remote_command(
+        &self,
+        operation_id: &str,
+        request_id: &str,
+        params: Value,
+    ) -> Result<(), ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
     /// The state its owner last published.
@@ -315,6 +382,9 @@ pub(crate) mod fake {
             Ok(Delivery::Unknown)
         }
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            Err(ReplicaError::NotSyncing)
+        }
+        fn remote_command(&self, _: &str, _: &str, _: Value) -> Result<(), ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
         fn sync_now(&self) {}

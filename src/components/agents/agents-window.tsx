@@ -22,6 +22,7 @@ export function AgentsWindow() {
   const error = useAgentSessionsStore((s) => s.error);
   const selected = useAgentSessionsStore((s) => s.selected);
   const initial = useAgentSessionsStore((s) => s.newSession);
+  const gone = useAgentSessionsStore((s) => s.gone);
   const [creating, setCreating] = useState(false);
   const [filter, setFilter] = useState<"active" | "archived" | "all">("active");
   const { phone } = useShellLayout();
@@ -44,6 +45,10 @@ export function AgentsWindow() {
       origin.current = null;
     }
   }, [phone, showingDetail, selectedKey]);
+  // The open row left the list: its button is gone, so focus lands on a control that stays.
+  useEffect(() => {
+    if (gone) newButton.current?.focus();
+  }, [gone]);
   const visible = rows.filter(
     (row) => filter === "all" || row.archived === (filter === "archived"),
   );
@@ -126,6 +131,14 @@ export function AgentsWindow() {
             {error && (
               <p role="alert" className="p-3 text-destructive text-sm">
                 {error}
+              </p>
+            )}
+            {gone && (
+              <p
+                role="status"
+                className="p-3 text-muted-foreground text-sm [overflow-wrap:anywhere]"
+              >
+                You are no longer in “{gone.title}” ({gone.database}); it has left this device.
               </p>
             )}
             {!loaded && !error && (

@@ -354,6 +354,7 @@ export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
+export type { AgentDirectoryPersonVm } from "./gen/AgentDirectoryPersonVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
 export type { AgentLiveTurnVm } from "./gen/AgentLiveTurnVm";
 export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
@@ -365,6 +366,8 @@ export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
 export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
 export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
 export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
+export type { AgentMemberRoleVm } from "./gen/AgentMemberRoleVm";
+export type { AgentMemberVm } from "./gen/AgentMemberVm";
 export type { AgentMessageDetailsVm } from "./gen/AgentMessageDetailsVm";
 export type { AgentMessageVm } from "./gen/AgentMessageVm";
 export type { AgentModelBotVm } from "./gen/AgentModelBotVm";
@@ -389,6 +392,7 @@ export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+export type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 export type { AgentSessionRef } from "./gen/AgentSessionRef";
 export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
 export type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
@@ -876,6 +880,7 @@ import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+import type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 import type { AgentSessionRef } from "./gen/AgentSessionRef";
 import type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
 import type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
@@ -4157,6 +4162,48 @@ export async function agentSessionToolSet(
   on: boolean,
 ): Promise<void> {
   await invoke("agent_session_tool_set", { ...target, name, on });
+}
+
+/** A session's People sheet: its members and the people of its database the owner may add. */
+export async function agentSessionMembersSubscribe(
+  target: AgentSessionRef,
+  onSheet: (sheet: AgentSessionMembersVm) => void,
+): Promise<string> {
+  return await subscribeWithStringId<AgentSessionMembersVm>(
+    "agent_session_members_subscribe",
+    onSheet,
+    target,
+  );
+}
+
+export async function agentSessionMembersUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("agent_session_members_unsubscribe", { subscriptionId });
+}
+
+export async function agentSessionMemberAdd(
+  target: AgentSessionRef,
+  actorId: string,
+): Promise<void> {
+  await invoke<void>("agent_session_member_add", { ...target, actorId });
+}
+
+export async function agentSessionMemberReaderSet(
+  target: AgentSessionRef,
+  actorId: string,
+  reads: boolean,
+): Promise<void> {
+  await invoke<void>("agent_session_member_reader_set", { ...target, actorId, reads });
+}
+
+export async function agentSessionMemberRemove(
+  target: AgentSessionRef,
+  actorId: string,
+): Promise<void> {
+  await invoke<void>("agent_session_member_remove", { ...target, actorId });
+}
+
+export async function agentSessionLeave(target: AgentSessionRef): Promise<void> {
+  await invoke<void>("agent_session_leave", { ...target });
 }
 
 export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {

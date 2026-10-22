@@ -11,8 +11,9 @@
 //! seq 0, then the latest tail whose `from_seq` is the seq after them, until
 //! the turn's `messages` row replaces both. The reasoning folds the same way
 //! from seq 1 and its compacted row replaces it. A member who does not read
-//! the trace holds no reasoning, tool call or reasoning tail at all: the
-//! server sends them none (D-34), so nothing here hides anything.
+//! the trace is sent no reasoning, tool call or reasoning tail (D-34); rows
+//! and tails this device still holds from before the flag was withdrawn are
+//! neither drawn nor, for the tails, kept ([`Live::forget_trace`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -323,6 +324,15 @@ impl Live {
                 || now.saturating_duration_since(*since) >= LEASE
                 || now_ms - claim.renewed_at_ms >= STALE_MS
         });
+    }
+
+    /// The viewer no longer reads the trace (the flag withdrawn, or no
+    /// longer a member): every reasoning tail kept is dropped, so none is
+    /// held, let alone shown, past that moment.
+    pub fn forget_trace(&mut self) {
+        for turn in self.turns.values_mut() {
+            turn.reasoning = Tails::default();
+        }
     }
 
     /// Settle what `seen` — the snapshot a view was drawn from — tells of
