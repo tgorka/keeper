@@ -20,6 +20,7 @@
 //! KEEPER_HQ_LIVE_KILL=<for the killed instance, run last: a URL that SIGKILLs the agent's instance> \
 //! KEEPER_HQ_LIVE_INSTANCES=<for the default instance: two instance client ids of KEEPER_HQ_LIVE_AGENT, in both databases> \
 //! KEEPER_HQ_LIVE_INSTANCE_CTL=<for the default instance: a URL whose /kill/<client> SIGKILLs and /start/<client> starts one> \
+//! KEEPER_HQ_LIVE_NON_MEMBER=<for attachments: a person of the first database, never in the test's sessions> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
 //! ```
 //!
@@ -95,6 +96,9 @@ struct Relay {
     connections: Arc<AtomicU64>,
     sent: Arc<Mutex<Vec<u8>>>,
     generation: Arc<AtomicU64>,
+    /// Each read, in order: its connection, whether the device sent it, and
+    /// what the device sent (a server's answer is kept as its length only).
+    events: Arc<Mutex<Vec<(u64, bool, Vec<u8>)>>>,
 }
 
 impl Relay {
@@ -107,12 +111,14 @@ impl Relay {
             connections: Arc::new(AtomicU64::new(0)),
             sent: Arc::new(Mutex::new(Vec::new())),
             generation: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(Mutex::new(Vec::new())),
         };
-        let (up, connections, sent, generation) = (
+        let (up, connections, sent, generation, events) = (
             Arc::clone(&relay.up),
             Arc::clone(&relay.connections),
             Arc::clone(&relay.sent),
             Arc::clone(&relay.generation),
+            Arc::clone(&relay.events),
         );
         tokio::spawn(async move {
             loop {
@@ -123,12 +129,16 @@ impl Relay {
                     drop(client);
                     continue;
                 }
-                connections.fetch_add(1, Ordering::SeqCst);
+                let id = connections.fetch_add(1, Ordering::SeqCst);
                 let Ok(server) = TcpStream::connect(&upstream).await else {
                     continue;
                 };
                 let born = generation.load(Ordering::SeqCst);
-                let (generation, sent) = (Arc::clone(&generation), Arc::clone(&sent));
+                let (generation, sent, events) = (
+                    Arc::clone(&generation),
+                    Arc::clone(&sent),
+                    Arc::clone(&events),
+                );
                 tokio::spawn(async move {
                     let (mut client_read, mut client_write) = client.into_split();
                     let (mut server_read, mut server_write) = server.into_split();
@@ -141,12 +151,16 @@ impl Relay {
                                 Ok(0) | Err(_) => return,
                                 Ok(n) => {
                                     sent.lock().expect("sent").extend_from_slice(&up_buf[..n]);
+                                    events.lock().expect("events").push((id, true, up_buf[..n].to_vec()));
                                     if server_write.write_all(&up_buf[..n]).await.is_err() { return; }
                                 }
                             },
                             read = server_read.read(&mut down_buf) => match read {
                                 Ok(0) | Err(_) => return,
-                                Ok(n) => if client_write.write_all(&down_buf[..n]).await.is_err() { return; },
+                                Ok(n) => {
+                                    events.lock().expect("events").push((id, false, vec![0; 0]));
+                                    if client_write.write_all(&down_buf[..n]).await.is_err() { return; }
+                                }
                             },
                             () = tokio::time::sleep(Duration::from_millis(100)) => {}
                         }
@@ -177,6 +191,34 @@ impl Relay {
     fn sent_contains(&self, needle: &str) -> bool {
         let sent = self.sent.lock().expect("sent");
         sent.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    /// How many requests containing `needle` the server answered: each one
+    /// the device sent on a connection the server wrote back on after it. A
+    /// request sent again because its pooled connection had died (the
+    /// transport retries an idempotent request) reached no server.
+    fn answered_count(&self, needle: &str) -> usize {
+        let events = self.events.lock().expect("events");
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, up, bytes))| {
+                *up && bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+            })
+            .filter(|(at, (connection, _, _))| {
+                events[at + 1..]
+                    .iter()
+                    .any(|(later, up, _)| later == connection && !up)
+            })
+            .count()
+    }
+
+    /// How many times the device sent `needle` (a request line, say).
+    fn sent_count(&self, needle: &str) -> usize {
+        let sent = self.sent.lock().expect("sent");
+        sent.windows(needle.len())
+            .filter(|w| *w == needle.as_bytes())
+            .count()
     }
 }
 
@@ -2626,4 +2668,468 @@ fn label(hq: &Arc<Hq>, agent: &str, client: &str) -> String {
         .find(|a| a.agent_actor == agent)
         .and_then(|a| a.instances.into_iter().find(|i| i.client_id == client))
         .map_or_else(|| client.to_owned(), |i| i.label)
+}
+
+/// The chips of the message `body` in `key`'s view on `hq`, if it is shown.
+fn chips_of(
+    hq: &Arc<Hq>,
+    key: &keeper_core::hq::sessions::AgentSessionRef,
+    body: &str,
+) -> Option<(
+    Option<keeper_core::hq::timeline::AgentMessageStateVm>,
+    Vec<keeper_core::hq::attachments::AgentAttachmentVm>,
+)> {
+    let view = hq.session_view(key).ok()?;
+    let message = view.messages.into_iter().find(|m| m.body == body)?;
+    Some((message.state, message.attachments))
+}
+
+fn blob_id(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// Run a blocking `Hq` call off the async workers.
+async fn off<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(call).await.expect("joins")
+}
+
+/// Attachments against the real server (story 107.1): files attached on one
+/// device upload once and commit with their message in one commit; another
+/// device of the person shows the chips at once and downloads a file only
+/// when it is opened; attached offline, a file waits pinned across a
+/// relaunch and uploads once on reconnect; a person not in the session is
+/// refused the blob (`blob.forbidden`); a reference to a blob the server does
+/// not hold is refused (`blob.not_found`); a file one byte over the bound is
+/// refused on the device before anything is uploaded, and by the server when
+/// the device's check is skipped. Needs `KEEPER_HQ_LIVE_NON_MEMBER`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server; see the module docs"]
+async fn attachments_upload_before_reference_open_on_demand_and_are_refused_where_they_must_be() {
+    use keeper_core::hq::attachments::{AgentAttachmentStateVm as Chip, ATTACHMENT_MAX_BYTES};
+    use keeper_core::hq::port::Delivery;
+    use keeper_core::hq::timeline::AgentMessageStateVm;
+
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let databases: Vec<String> = env("KEEPER_HQ_LIVE_DATABASES")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    let database = databases[0].clone();
+    let non_member = env("KEEPER_HQ_LIVE_NON_MEMBER");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let upstream = server.trim_start_matches("http://").to_owned();
+
+    // The mac, behind a relay that counts every request it sends.
+    let relay = Relay::start(upstream).await;
+    let mac_device = device(&scratch.path().join("mac"));
+    let mac = hq(&mac_device, "hq_live attachments mac");
+    mac.start().await.expect("starts");
+    mac.set_server(&relay.url())
+        .await
+        .expect("stores the address");
+    mac.pair_redeem(&operator_code(&server, &operator, &actor).await)
+        .await
+        .expect("redeems");
+    let connected = |s: &HqStatusVm| {
+        s.databases.len() == databases.len()
+            && s.databases
+                .iter()
+                .all(|db| db.state == HqDatabaseState::Connected)
+    };
+    wait_status(&mac, "the mac connects", connected, Duration::from_secs(30)).await;
+    let phone = paired(
+        &device(&scratch.path().join("phone")),
+        &server,
+        &operator,
+        &actor,
+        databases.len(),
+    )
+    .await;
+    until(
+        &mac,
+        "the directory names the agent",
+        Duration::from_secs(30),
+        || {
+            mac.choices()
+                .ok()?
+                .into_iter()
+                .find(|c| c.agent_actor == agent && c.databases.contains(&database))
+                .map(|_| ())
+        },
+    )
+    .await;
+    let key = {
+        let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
+        off(move || mac.new_session(&database, &agent, "files for you")).await
+    }
+    .expect("a new session");
+    wait_status(
+        &mac,
+        "the session reaches the server",
+        |s| s.databases.iter().all(|db| db.waiting == 0),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // 1. Attach → upload → commit.
+    let files = scratch.path().join("files");
+    std::fs::create_dir_all(&files).expect("mkdir");
+    let csv = b"item,price\ntea,3\ncoffee,4\n".to_vec();
+    let png = {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend((0..4096u32).map(|i| (i % 251) as u8));
+        png
+    };
+    std::fs::write(files.join("prices.csv"), &csv).expect("writes");
+    std::fs::write(files.join("photo.png"), &png).expect("writes");
+    let (csv_id, png_id) = (blob_id(&csv), blob_id(&png));
+    let started = Instant::now();
+    {
+        let (mac, key, files) = (Arc::clone(&mac), key.clone(), files.clone());
+        off(move || {
+            mac.attach_paths(
+                &key,
+                &[files.join("prices.csv"), files.join("photo.png")],
+                "what costs more?",
+            )
+        })
+        .await
+        .expect("attaches");
+    }
+    let shown = chips_of(&mac, &key, "what costs more?").expect("shown at once");
+    assert_eq!(shown.1.len(), 2);
+    assert!(
+        shown
+            .1
+            .iter()
+            .all(|c| matches!(c.state, Chip::Uploading | Chip::Sent)),
+        "linked, a new chip uploads: {:?}",
+        shown.1
+    );
+    until(&mac, "the chips read sent", Duration::from_secs(30), || {
+        let (_, chips) = chips_of(&mac, &key, "what costs more?")?;
+        chips.iter().all(|c| c.state == Chip::Sent).then_some(())
+    })
+    .await;
+    let sent_in = started.elapsed();
+    for id in [&csv_id, &png_id] {
+        let put = format!("PUT /{database}/blobs/{id}");
+        assert_eq!(relay.answered_count(&put), 1, "{id} uploaded once");
+        println!("  {id}: {} PUT sent, 1 answered", relay.sent_count(&put));
+    }
+    println!(
+        "PASS attach → upload → commit: two chips sent {} ms after attaching, each blob PUT once",
+        sent_in.as_millis()
+    );
+
+    // 2. The phone shows the chips as soon as the message syncs, and
+    // downloads a file only when it is opened.
+    let phone_chips = until(
+        &phone,
+        "the phone shows the chips",
+        Duration::from_secs(30),
+        || {
+            let (_, chips) = chips_of(&phone, &key, "what costs more?")?;
+            (chips.len() == 2).then_some(chips)
+        },
+    )
+    .await;
+    assert!(phone_chips.iter().all(|c| c.state == Chip::Sent));
+    let cached = |hq: &Arc<Hq>| {
+        let (hq, database) = (Arc::clone(hq), database.clone());
+        off(move || hq.blob_cache_bytes(&database).expect("measures"))
+    };
+    assert_eq!(cached(&phone).await, 0, "nothing downloaded before an open");
+    let opened = {
+        let (phone, database, id) = (Arc::clone(&phone), database.clone(), csv_id.clone());
+        off(move || phone.open_blob(&database, &id)).await
+    }
+    .expect("opens");
+    assert_eq!(opened.bytes, csv);
+    assert_eq!(opened.mime, "text/plain; charset=utf-8");
+    assert_eq!(
+        cached(&phone).await,
+        csv.len() as u64,
+        "only the opened file"
+    );
+    println!(
+        "PASS the phone shows both chips and holds 0 bytes until one is opened; then {} bytes (blob_cache_bytes_approx)",
+        csv.len()
+    );
+
+    // 3. Offline: waiting, pinned across a relaunch, one upload on reconnect.
+    relay.cut();
+    wait_status(
+        &mac,
+        "the mac goes offline",
+        |s| {
+            s.databases
+                .iter()
+                .any(|db| db.name == database && db.state != HqDatabaseState::Connected)
+        },
+        Duration::from_secs(60),
+    )
+    .await;
+    let offline = b"written on a train\n".to_vec();
+    let offline_id = blob_id(&offline);
+    {
+        let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), offline.clone());
+        off(move || mac.attach_bytes(&key, "train.txt", "text/plain", bytes, "from the train"))
+            .await
+            .expect("attaches offline");
+    }
+    until(&mac, "the chip waits", Duration::from_secs(30), || {
+        let (_, chips) = chips_of(&mac, &key, "from the train")?;
+        (chips[0].state == Chip::Waiting).then_some(())
+    })
+    .await;
+    mac.shutdown().await;
+    drop(mac);
+    let mac = hq(&mac_device, "hq_live attachments mac, relaunched");
+    mac.start().await.expect("starts again");
+    until(
+        &mac,
+        "still waiting after a relaunch",
+        Duration::from_secs(30),
+        || {
+            let (_, chips) = chips_of(&mac, &key, "from the train")?;
+            (chips.first()?.state == Chip::Waiting).then_some(())
+        },
+    )
+    .await;
+    let replica = mac.replica(&database).expect("a replica");
+    let pinned = query(
+        &replica,
+        "SELECT count(*) AS n FROM _syncular_blob_uploads WHERE blob_id = ?1",
+        vec![json!(offline_id)],
+    )
+    .await;
+    assert_eq!(pinned[0]["n"], 1, "pinned in the replica file");
+    assert!(
+        chips_of(&phone, &key, "from the train").is_none(),
+        "the server holds no row while the mac is cut off"
+    );
+    relay.restore();
+    until(
+        &mac,
+        "sent after reconnecting",
+        Duration::from_secs(90),
+        || {
+            let (_, chips) = chips_of(&mac, &key, "from the train")?;
+            (chips.first()?.state == Chip::Sent).then_some(())
+        },
+    )
+    .await;
+    until(
+        &phone,
+        "the phone shows it once",
+        Duration::from_secs(30),
+        || chips_of(&phone, &key, "from the train").map(|_| ()),
+    )
+    .await;
+    let put = format!("PUT /{database}/blobs/{offline_id}");
+    assert_eq!(relay.answered_count(&put), 1, "uploaded once");
+    println!(
+        "  {offline_id}: {} PUT sent, 1 answered",
+        relay.sent_count(&put)
+    );
+    let phone_replica = phone.replica(&database).expect("a replica");
+    let rows = query(
+        &phone_replica,
+        "SELECT count(*) AS n FROM attachments \
+         WHERE session_id = ?1 AND json_extract(blob_ref, '$.blobId') = ?2",
+        vec![json!(key.session_id), json!(offline_id)],
+    )
+    .await;
+    assert_eq!(rows[0]["n"], 1, "one row in the session");
+    println!("PASS offline: waiting, pinned across a relaunch, sent on reconnect with one PUT and one row");
+
+    // 4. A person not in the session is refused the blob.
+    let (outsider, outsider_db) = non_member.split_once(':').expect("<actor>:<database>");
+    assert_eq!(outsider_db, database);
+    let stranger = paired(
+        &device(&scratch.path().join("stranger")),
+        &server,
+        &operator,
+        outsider,
+        1,
+    )
+    .await;
+    let refused = {
+        let replica = stranger.replica(&database).expect("a replica");
+        let id = csv_id.clone();
+        off(move || replica.fetch_blob(&id)).await
+    };
+    let error = refused
+        .expect_err("a non-member downloads nothing")
+        .to_string();
+    assert!(error.starts_with("blob.forbidden"), "{error}");
+    println!("PASS a non-member's token is refused the blob: {error}");
+
+    // 5. A reference to a blob the server does not hold is refused.
+    let source = mac
+        .sources()
+        .into_iter()
+        .find(|s| s.database == database)
+        .expect("the database");
+    let author = Author {
+        actor: source.actor.clone(),
+        client: source.client.clone(),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let ghost = blob_id(b"never uploaded");
+    let message_id = ulid::Ulid::new().to_string();
+    let commit = mutate(
+        &source.replica,
+        vec![
+            message(
+                &author,
+                &key.session_id,
+                &page_key(&key.session_id, now),
+                &message_id,
+                "a ghost file",
+                now,
+            ),
+            upsert(
+                "attachments",
+                by(
+                    &author,
+                    json!({
+                        "id": ulid::Ulid::new().to_string(), "session_id": key.session_id,
+                        "message_id": message_id,
+                        "blob_ref": format!(r#"{{"blobId":"{ghost}","byteLength":14}}"#),
+                        "name": "ghost.txt", "mime": "text/plain", "size": 14, "created_at_ms": now,
+                    }),
+                ),
+            ),
+        ],
+    )
+    .await;
+    source.replica.sync_now();
+    match delivered(&source.replica, &commit).await {
+        Delivery::Refused(rejection) => assert_eq!(rejection.code, "blob.not_found"),
+        other => panic!("a reference to a missing blob was {other:?}"),
+    }
+    let (state, chips) = until(&mac, "the refused chip", Duration::from_secs(30), || {
+        chips_of(&mac, &key, "a ghost file")
+    })
+    .await;
+    assert_eq!(state, Some(AgentMessageStateVm::Refused));
+    assert_eq!(chips[0].state, Chip::Refused);
+    println!(
+        "PASS a forced reference to a missing blob is refused (blob.not_found), shown: {}",
+        chips[0].sentence.as_deref().unwrap_or("")
+    );
+
+    // 6. One byte over the bound: refused on the device before any upload…
+    let huge = vec![0u8; ATTACHMENT_MAX_BYTES as usize + 1];
+    let huge_id = blob_id(&huge);
+    let refused = {
+        let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), huge.clone());
+        off(move || mac.attach_bytes(&key, "huge.zip", "application/zip", bytes, "too big")).await
+    };
+    let sentence = refused.expect_err("refused on the device").to_string();
+    assert_eq!(
+        sentence,
+        keeper_core::hq::attachments::too_large("huge.zip", ATTACHMENT_MAX_BYTES + 1)
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!relay.sent_contains(&huge_id), "nothing of it left the mac");
+    assert!(chips_of(&mac, &key, "too big").is_none());
+    println!("PASS 25 MiB + 1 refused on the device before any upload: {sentence}");
+    // …and by the server when a device skips the check.
+    let skipper = paired(
+        &device(&scratch.path().join("skipper")),
+        &server,
+        &operator,
+        &actor,
+        databases.len(),
+    )
+    .await;
+    // Its replica must hold the session first: a refused upload stops every
+    // round after it, the pull included.
+    until(
+        &skipper,
+        "the skipper holds the session",
+        Duration::from_secs(30),
+        || skipper.session_view(&key).ok().map(|_| ()),
+    )
+    .await;
+    let skip = skipper
+        .sources()
+        .into_iter()
+        .find(|s| s.database == database)
+        .expect("the database");
+    let staged = {
+        let replica = Arc::clone(&skip.replica);
+        off(move || replica.upload_blob(huge, Some("application/zip".to_owned()))).await
+    }
+    .expect("stages without the check");
+    assert_eq!(staged["blobId"], json!(huge_id));
+    let skip_author = Author {
+        actor: skip.actor.clone(),
+        client: skip.client.clone(),
+    };
+    let message_id = ulid::Ulid::new().to_string();
+    let size = ATTACHMENT_MAX_BYTES + 1;
+    mutate(
+        &skip.replica,
+        vec![
+            message(
+                &skip_author,
+                &key.session_id,
+                &page_key(&key.session_id, now),
+                &message_id,
+                "skipped the check",
+                now,
+            ),
+            upsert(
+                "attachments",
+                by(
+                    &skip_author,
+                    json!({
+                        "id": ulid::Ulid::new().to_string(), "session_id": key.session_id,
+                        "message_id": message_id,
+                        "blob_ref": format!(r#"{{"blobId":"{huge_id}","byteLength":{size}}}"#),
+                        "name": "huge.zip", "mime": "application/zip", "size": size,
+                        "created_at_ms": now,
+                    }),
+                ),
+            ),
+        ],
+    )
+    .await;
+    skip.replica.sync_now();
+    let refusal = until(
+        &skipper,
+        "the server refuses the upload",
+        Duration::from_secs(60),
+        || skip.replica.upload_refusal(),
+    )
+    .await;
+    assert_eq!(refusal.code, "blob.too_large");
+    let (_, chips) = until(
+        &skipper,
+        "the refused chip",
+        Duration::from_secs(30),
+        || {
+            let shown = chips_of(&skipper, &key, "skipped the check")?;
+            (shown.1.first()?.state == Chip::Refused).then_some(shown)
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        chips_of(&phone, &key, "skipped the check").is_none(),
+        "the server never held it"
+    );
+    println!(
+        "PASS 25 MiB + 1 with the check skipped: refused by the server ({}), shown: {}",
+        refusal.code,
+        chips[0].sentence.as_deref().unwrap_or("")
+    );
 }
