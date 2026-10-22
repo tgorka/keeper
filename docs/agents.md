@@ -18,7 +18,21 @@ database without a picker; an agent serving several asks where the session belon
 first message creates the session and message together. Message captions — **waiting**, **sent**,
 **taken** — come from Rust, not delivery/read receipts. The shared composer retains a refused
 send; database sessions never read or write Matrix drafts. An unsent draft lives only in the open
-composer and is not restored after leaving that session.
+composer and is not restored after leaving that session. New session is the exception: opening a
+session from anywhere — a row, a tapped notification — ends New session (one store transition,
+`agentSessionsStore.select`), and what was written there, with the agent and database chosen, is
+kept in the webview's store until New session opens again, where it is back in the composer.
+**Cancel** (or Escape on a phone) and a created session drop it; a relaunch does too.
+
+**With no server address set** (`agents.server_url` blank, or cleared after pairing) keeper
+contacts no agents server. A device that was paired keeps the databases of the server it last
+synced with (`hq/last-server.json`, its base URL and nothing else; the pairing stays in the
+keychain) listed and written to: New session offers their directories' agents, and a session or a
+message written there waits in that database's own outbox. Settings › Agents says *No server is
+set* on each such database with its count, and on the server line with their total. Nothing
+links, no discovery runs and no push target is sent; setting the address again links them, and
+*Forget* forgets that server. A device never paired holds no directory, so New session has no
+agent to offer and says so; nothing is written for it.
 
 Approval cards show the exact action and its binding digest. A decision is addressed to its
 database and session and bound to that digest; a server refusal stays beside the action. A queued
@@ -39,7 +53,10 @@ not migrated by this story. Instance selection is **Answers from** (below); mess
 attention state remain Rust-owned throughout.
 
 Browser checks use the development mock shell (`?sessions=launch`, optionally
-`&platform=phone`), not a server or a performance measurement. The installed macOS shell and the
+`&platform=phone`), not a server or a performance measurement. `?hq=cleared` is a device whose
+address was cleared after pairing (both databases held, writes counted per database);
+`window.__keeperMockPushTap({database, sessionId}, arriveAfterMs?)` is a tapped notification, and
+with `arriveAfterMs` a session that reaches the list only then. The installed macOS shell and the
 archived-session ≤1 s tailnet target still require the native/device gates; mock page timing is
 not evidence for that target.
 
@@ -476,7 +493,13 @@ address a file shadows (R1066K-03) — then starts the agents client alone, no M
 and no drive sync, and waits up to twenty seconds for the request to reach its replica and
 for the server to take the decision; otherwise the notification is replaced by *Open keeper
 to finish deciding.* with the reason. **A tap** opens the item's session in the Agents window
-(`use-push-open.ts`, `PushOpenVm::Session`).
+(`use-push-open.ts`, `PushOpenVm::Session`), over New session if that was open (its draft is
+kept, above). A session this device does not hold yet — Keeper was closed when it was created or
+the person added — is not a failure while it may still arrive: Rust answers its open as still
+arriving (`HqError::Arriving`, retriable) while the replicas are opening, the server has yet to
+say what is open, or its database syncs, and the view says so and asks again when Rust's list
+brings the session or its status moves. No timer: an address cleared, a removed device or a
+database not open to it ends the wait with Rust's sentence.
 
 **The Android tablet gets the agents server's push while keeper is running.** After Android
 has stopped keeper's process it does nothing with it: the distributor's message posts the
