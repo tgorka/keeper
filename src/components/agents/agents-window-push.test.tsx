@@ -69,6 +69,7 @@ vi.mock("@/lib/ipc/client", async (original) => ({
 }));
 
 const HELD = { database: "beta", sessionId: "held.1" };
+const LATE = { database: "beta", sessionId: "late.7" };
 
 function row(sessionId: string): AgentSessionRowVm {
   return {
@@ -184,5 +185,63 @@ describe("a tapped notification in the Agents window", () => {
     fireEvent.click(screen.getByRole("button", { name: "New session" }));
     await screen.findByRole("region", { name: "New session" });
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("");
+  });
+
+  it("opens a session first learned after the tap when Rust's list brings it", async () => {
+    mock.open.mockRejectedValueOnce({
+      code: "internal",
+      message:
+        "This conversation has not reached this device yet; it opens here when beta brings it.",
+      accountId: null,
+      retriable: true,
+    });
+    render(<Phone />);
+    await waitFor(() => expect(mock.list).not.toBeNull());
+    act(() => mock.list?.({ ops: [{ op: "reset", rows: [row(HELD.sessionId)] }], total: 1 }));
+
+    await tap(LATE);
+    expect(await screen.findByText(/has not reached this device yet/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(mock.open).toHaveBeenCalledTimes(1);
+
+    // The first replication brings it into the list: the open is asked again, once.
+    act(() =>
+      mock.list?.({ ops: [{ op: "insert", index: 0, row: row(LATE.sessionId) }], total: 2 }),
+    );
+    await waitFor(() => expect(mock.open).toHaveBeenCalledTimes(2));
+    expect(mock.open.mock.calls[1][0]).toEqual(LATE);
+    act(() => mock.view?.(view(LATE.sessionId)));
+    expect(screen.getByText("The answer in late.7")).toBeInTheDocument();
+    expect(screen.queryByText(/has not reached this device yet/)).not.toBeInTheDocument();
+    expect(agentSessionsStore.getState().selected).toEqual(LATE);
+  });
+
+  it("stops waiting at Rust's answer that the session will not come", async () => {
+    mock.open
+      .mockRejectedValueOnce({
+        code: "internal",
+        message: "keeper is still opening the conversations on this device.",
+        accountId: null,
+        retriable: true,
+      })
+      .mockRejectedValueOnce({
+        code: "internal",
+        message: "beta is not open to this device, so this conversation cannot come here.",
+        accountId: null,
+        retriable: false,
+      });
+    render(<Phone />);
+    await tap(LATE);
+    await screen.findByText(/still opening the conversations/);
+    await waitFor(() => expect(mock.status).not.toBeNull());
+
+    // The status moves (the copies opened, the server said what is open): Rust is asked
+    // again and its refusal ends the wait.
+    act(() => mock.status?.({} as HqStatusVm));
+    expect(await screen.findByRole("alert")).toHaveTextContent("beta is not open to this device");
+    expect(mock.open).toHaveBeenCalledTimes(2);
+    act(() => mock.status?.({} as HqStatusVm));
+    act(() => mock.list?.({ ops: [{ op: "reset", rows: [row(LATE.sessionId)] }], total: 1 }));
+    expect(mock.open).toHaveBeenCalledTimes(2);
   });
 });

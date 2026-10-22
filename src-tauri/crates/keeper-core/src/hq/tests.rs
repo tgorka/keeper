@@ -1140,3 +1140,52 @@ async fn a_removed_device_registers_no_push_target() {
     hq.set_push_target(None);
     assert!(push_targets_until(&world, 1).await.is_empty());
 }
+
+/// A notification may name a session this device does not hold yet
+/// (A106-03): opening it is `Arriving` while a round may still bring it, and
+/// a sentence once nothing will.
+#[tokio::test]
+async fn a_session_not_held_yet_is_arriving_until_nothing_can_bring_it() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["alpha"]);
+    *lock(&world.routes.discovery) = Some(Ok(found(&["alpha"])));
+    let hq = world.hq();
+    let key = |database: &str| sessions::AgentSessionRef {
+        database: database.to_owned(),
+        session_id: "ben.2.9".to_owned(),
+    };
+    // Before the copies open (a cold launch from the tap).
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Arriving(_))
+    ));
+    hq.start().await.expect("starts");
+    status_until(&hq, "alpha linked", |_| {
+        world.live("alpha").iter().any(|r| r.spec.link.is_some())
+    })
+    .await;
+    // alpha syncs: its session may still come.
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Arriving(_))
+    ));
+    // gamma is not open to this device: nothing brings it.
+    assert!(matches!(
+        hq.open_session(&key("gamma")),
+        Err(HqError::Sentence(s)) if s.contains("gamma is not open to this device")
+    ));
+    // Removed: nothing syncs any more.
+    hq.apply_discovery(generation(&hq), Err(RouteError::Unauthorized))
+        .await
+        .expect("applies");
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Sentence(s)) if s.starts_with("This device was removed")
+    ));
+    // No address: nothing syncs.
+    hq.set_server("").await.expect("clears");
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Sentence(s)) if s == "This conversation is not on this device."
+    ));
+}

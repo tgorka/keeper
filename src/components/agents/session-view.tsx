@@ -30,7 +30,10 @@ import {
   agentSessionOpen,
   agentSessionPageBack,
   agentSessionUnarchive,
+  hqStatusSubscribe,
+  hqStatusUnsubscribe,
 } from "@/lib/ipc/client";
+import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import {
   ConversationStoresProvider,
@@ -42,6 +45,8 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 export function SessionView({ target, onBack }: { target: AgentSessionRef; onBack?: () => void }) {
   const [vm, setVm] = useState<AgentSessionViewVm | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Rust's sentence while the session is not on this device yet but may still arrive.
+  const [arriving, setArriving] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [stores] = useState(createConversationStores);
@@ -61,17 +66,59 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
       if (active) setVm(next);
     })
       .then((subscription) => {
-        if (active) id = subscription;
-        else void agentSessionClose(subscription).catch(logFailure("agents.session.close"));
+        if (active) {
+          id = subscription;
+          setArriving(null);
+        } else void agentSessionClose(subscription).catch(logFailure("agents.session.close"));
       })
       .catch((raw: unknown) => {
-        if (active) setError(syncErrorMessage(raw, "keeper could not open this session."));
+        if (!active) return;
+        const message = syncErrorMessage(raw, "keeper could not open this session.");
+        // Rust says a refusal is retriable while the session may still arrive here.
+        if (typeof raw === "object" && raw !== null && "retriable" in raw && raw.retriable) {
+          setArriving(message);
+        } else {
+          setArriving(null);
+          setError(message);
+        }
       });
     return () => {
       active = false;
       if (id !== null) void agentSessionClose(id).catch(logFailure("agents.session.close"));
     };
   }, [database, sessionId, attempt]);
+
+  // A session a notification named before this device held it (or before its copies
+  // opened) opens when Rust's list brings it; Rust's status moving — copies opened,
+  // the device removed, the database no longer open — is asked about too, so a
+  // session that will not come ends in Rust's sentence, not a wait. No timer.
+  useEffect(() => {
+    if (arriving === null) return;
+    let active = true;
+    let status: string | null = null;
+    const again = () => {
+      if (active) setAttempt((n) => n + 1);
+    };
+    const offList = agentSessionsStore.subscribe((state, previous) => {
+      const now = state.rows.some((r) => r.database === database && r.sessionId === sessionId);
+      const before = previous.rows.some(
+        (r) => r.database === database && r.sessionId === sessionId,
+      );
+      if (now && !before) again();
+    });
+    void hqStatusSubscribe(again)
+      .then((subscription) => {
+        if (active) status = subscription;
+        else void hqStatusUnsubscribe(subscription).catch(logFailure("agents.session.arrival"));
+      })
+      .catch(logFailure("agents.session.arrival"));
+    return () => {
+      active = false;
+      offList();
+      if (status !== null)
+        void hqStatusUnsubscribe(status).catch(logFailure("agents.session.arrival"));
+    };
+  }, [arriving, database, sessionId]);
 
   useEffect(() => {
     if (!vm) return;
@@ -246,6 +293,11 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           )}
         </div>
       )}
+      {arriving && !error && (
+        <p role="status" className="px-3 py-2 text-muted-foreground text-sm">
+          {arriving}
+        </p>
+      )}
       {vm?.note && (
         <p role="status" className="px-3 py-2 text-muted-foreground text-sm">
           {vm.note}
@@ -274,7 +326,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             {vm.loadingEarlier ? "Loading earlier messages…" : "Earlier messages"}
           </Button>
         )}
-        {!vm?.complete && !error && (
+        {!vm?.complete && !error && !arriving && (
           <p role="status" className="text-muted-foreground text-sm">
             Loading messages…
           </p>

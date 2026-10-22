@@ -110,6 +110,12 @@ fn refusal_backoff(streak: u32) -> Duration {
 pub enum HqError {
     #[error("{0}")]
     Sentence(String),
+    /// What was asked for is not on this device yet, and may still arrive:
+    /// the replicas are still opening, or the database syncs (or the server
+    /// has yet to say whether it does). The sentence is shown while the
+    /// caller waits for the list or the status to move and asks again.
+    #[error("{0}")]
+    Arriving(String),
     #[error(transparent)]
     Core(#[from] CoreError),
     #[error("the agents' replicas on disk: {0}")]

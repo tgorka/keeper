@@ -213,12 +213,15 @@ pub(crate) fn service() -> Option<Arc<Hq>> {
     HQ.get().cloned()
 }
 
+/// An hq refusal as the webview sees it: one still [`HqError::Arriving`] is
+/// retriable — the caller asks again when the list or the status moves.
 fn error(error: HqError) -> IpcError {
+    let retriable = matches!(error, HqError::Arriving(_));
     IpcError {
         code: IpcErrorCode::Internal,
         message: error.to_string(),
         account_id: None,
-        retriable: false,
+        retriable,
     }
 }
 
