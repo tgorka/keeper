@@ -2,8 +2,8 @@
 //! and `keeper-sync`'s drive meet, with no window attached.
 //!
 //! The app links it and fills its ports with a webview channel, the voice
-//! turn, the notes vault and the approval sheet; a Linux host links it and
-//! fills them with a room. Nothing here names `tauri`, and
+//! turn, the notes vault and the approval sheet; keeper-hq's runtime links
+//! it and fills them with the agents' database. Nothing here names `tauri`, and
 //! `bun run check:agent-tauri-free` keeps it that way.
 //!
 //! - [`turn`] opens a turn: the rows, the replay, the grants, the request.
@@ -21,33 +21,27 @@
 //!   for a host whose record is a row rather than a room's file and event.
 //! - [`grants`] is where a turn's grants come from: the app's rows or an
 //!   agent's own `agent.toml`.
-//! - [`agent`] is an agent's turn in a session, over its held context;
-//!   [`writer`] writes the session's log, [`zone`] reads the drives' zones,
-//!   [`rooms`] decides invites and whose words are a turn, and
-//!   [`matrix_sink`] streams an answer as paced edits.
-//! - [`claims`] is which host writes a session: epoch claims with a settle
-//!   and a lease the writer checks; `hosts` (unix) is the placement, claims
-//!   and host manifest a host process runs each tick.
-//! - `runtime` (unix) is a Linux host's run loop; `desktop` (unix) is the
-//!   app's host over the app's own drives, pins and keychain.
+//! - [`approvals`] is what a call that waited for a person is told when it
+//!   was not done; [`agent`] the sentence a cut-off turn ends with.
+//! - [`zone`] reads the drives' zones.
 //! - `headless` (unix) is a Linux host's process layer: directories, secrets,
 //!   its own engine and provider rows.
 //! - [`seed`] writes an agents zone's seed and a new agent, never over a
-//!   file, and makes a proxy's DM with its `main` session.
+//!   file.
 //! - [`surface`] names a note the person looks at by its drive.
-//! - [`delegate`] hands work to another agent and answers a delegation;
-//!   [`ask`] asks a person through their proxy and relays the answer.
-//! - [`workflow`] opens a workflow's run in a session of its own: by
-//!   `workflow_start` or a due workflow card.
 //! - [`stewards`] makes a steward's triage and harvest sessions and says
 //!   which closed sessions wake her harvest.
-//! - [`doorbell`] rings the hosts that should fetch a push of agent work,
-//!   and fetches when it is rung.
+//!
+//! The agents' Matrix half — the Linux host's run loop over rooms, an
+//! agent's turn served from its room, the claims, placement and host
+//! manifests, the room sink and gates, the doorbell, delegation and asks
+//! through rooms, the maintenance jobs under a room's claim, This Mac as a
+//! host — left keeper in 108.2: the agents' runtime serves from the agents'
+//! database in keeper-hq.
 //!
 //! **A phone builds the read half only** (story 98.2, AD-413): under
-//! `cfg(phone)` (`build.rs` — an iOS or Android target) the session worker,
-//! [`writer`], the approvals writer in [`approvals`], the run writer in
-//! [`cards`] and every module built on them are absent, so a phone code path
+//! `cfg(phone)` (`build.rs` — an iOS or Android target) the run writer in
+//! [`cards`] and every module built on it are absent, so a phone code path
 //! that names one does not compile. [`sessions`] — the scan, the board and the
 //! journaled executor a card move runs through — stays.
 
@@ -60,43 +54,16 @@ pub mod approval;
 #[cfg(not(phone))]
 pub mod approvals;
 #[cfg(not(phone))]
-pub mod ask;
-#[cfg(not(phone))]
 pub mod attachments;
-#[cfg(all(unix, not(phone)))]
-pub mod avatar;
 pub mod bmad;
 #[cfg(not(phone))]
 pub mod cards;
-pub mod claims;
-#[cfg(all(unix, not(phone)))]
-pub mod consolidate;
-#[cfg(all(unix, not(phone)))]
-pub mod curate;
-#[cfg(not(phone))]
-pub mod deciding;
-#[cfg(not(phone))]
-pub mod delegate;
-#[cfg(all(unix, not(phone)))]
-pub mod desktop;
-#[cfg(all(unix, not(phone)))]
-pub mod dm_request;
-#[cfg(all(unix, not(phone)))]
-pub mod doorbell;
 pub mod drive;
-#[cfg(not(phone))]
-pub mod gate;
 pub mod grants;
 #[cfg(unix)]
 pub mod headless;
-#[cfg(not(phone))]
-pub mod helper;
 pub mod host;
-#[cfg(all(unix, not(phone)))]
-pub mod hosts;
 pub mod kvm;
-pub mod maintain;
-pub mod matrix_sink;
 #[cfg(not(phone))]
 pub mod mcp;
 pub mod memory;
@@ -105,10 +72,7 @@ pub mod parked;
 pub mod ports;
 pub mod previews;
 pub mod promote;
-pub mod rooms;
 pub mod run;
-#[cfg(all(unix, not(phone)))]
-pub mod runtime;
 #[cfg(not(phone))]
 pub mod search;
 #[cfg(not(phone))]
@@ -116,7 +80,6 @@ pub mod seed;
 #[cfg(not(phone))]
 pub mod served;
 pub mod sessions;
-pub mod sinks;
 pub mod skills;
 pub mod stewards;
 pub mod surface;
@@ -124,8 +87,4 @@ pub mod task;
 pub mod turn;
 #[cfg(not(phone))]
 pub mod web;
-#[cfg(not(phone))]
-pub mod workflow;
-#[cfg(not(phone))]
-pub mod writer;
 pub mod zone;
