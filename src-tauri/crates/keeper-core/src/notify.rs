@@ -32,7 +32,6 @@ use matrix_sdk::{Client, Room};
 
 use matrix_sdk::event_handler::{EventHandlerHandle, RawEvent};
 
-use crate::agents::room::{holds_agent_power, is_trusted_turn, AgentRoomKind};
 use crate::bridge;
 use crate::platform::Platform;
 use crate::vm::NotifyTarget;
@@ -591,22 +590,11 @@ pub fn register_notify_handler(
                     return;
                 }
 
-                // An agent's answer anchor (`…`) is a turn starting, not a message to
-                // read yet; its edits are skipped above (R45). Only the session room's
-                // agent can start one: anyone else's marker is an ordinary message
-                // (R30). The power levels are read only in a session room. A
-                // notification when the answer completes is deferred (98.1).
-                let agent_room = AgentRoomKind::of(room.room_type().as_ref());
-                if agent_room == Some(AgentRoomKind::Session) {
-                    let levels = room.power_levels().await.ok();
-                    if is_trusted_turn(
-                        agent_room,
-                        is_self,
-                        holds_agent_power(levels.as_ref(), &sender),
-                        Some(raw.0.get()),
-                    ) {
-                        return;
-                    }
+                // The agents' old rooms are in no list (108.2, UX-DR-E108-2), so
+                // nothing in one notifies: a notification would open a room
+                // keeper no longer shows.
+                if crate::old_agent_rooms::is_old_agent_room(room.room_type().as_ref()) {
+                    return;
                 }
 
                 // Resolve the room's synced push-rule verdict for THIS event from the raw

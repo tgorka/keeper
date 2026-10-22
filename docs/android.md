@@ -243,26 +243,15 @@ keeper ships no push server and never picks one (D-1, D-4).
    seconds — is not an answer: keeper changes nothing, a pusher registered
    before stays, and it asks again at the next start
    (`unifiedpush::pusher_change`). No other gateway is ever tried.
-4. On every signed-in account that holds agent session rooms keeper registers
-   an `event_id_only` pusher: app `dev.tgorka.keeper.android`, pushkey the
-   endpoint, `url` the gateway it found, and nothing else
-   (`PusherSpec::unifiedpush`). An account without agent rooms has this
-   device's pusher removed; so does every account when the endpoint changes,
-   the distributor drops keeper, or you sign out (best effort).
-5. A push carries the event's id. If keeper is still running in the
-   background, the account that knows the room reads the event in keeper's own
-   process and the same classifier as the iPhone's decides
-   (`push::shown_of`, `push::classify_notification`): an agent's approval
-   request in keeper's words, or your own agent's answer by its newest text.
-   Nothing else shows; the ids of other messages still pass through your
-   server, and keeper discards them.
-6. An approval offers **Approve once** and **Deny** when the whole payload
-   fits, else **Deny** only, as on the iPhone — and only on Android 12
-   (API 31) and later, where an action can require the device to be unlocked.
-   Before Android 12 the notification carries no actions; tapping it opens the
-   session room, where the card decides. An action sends exactly what the
-   notification showed, scope `once`; if it cannot within 20 seconds, the
-   notification is replaced by one asking you to finish in keeper.
+4. Before 108.2 keeper registered on every account that held agent session
+   rooms an `event_id_only` pusher to that gateway (app
+   `dev.tgorka.keeper.android`, pushkey the endpoint). The agents left Matrix,
+   so each new endpoint takes this device's pusher for it — and for the
+   endpoint before it — off every account and registers none
+   (`AccountManager::push_remove`, DW-E108-1; kept for one release). A
+   sign-out removes it from that account first (best effort).
+5. A push of the agents' old Matrix path (an event id) shows nothing.
+6. The notifications and their actions are the agents server's items' (7).
 7. **From the agents server** (106.6): the same endpoint and gateway are this
    device's push target on the agents server (`PUT /clients/self/push-target`,
    removed when the endpoint or the gateway goes). Its push names an item by
@@ -381,9 +370,9 @@ while text-to-speech plays — is story 98.4 #10, owed until its row is in
 These are the lines keeper shows in-app under **Settings → About → "On this
 tablet"** (on an Android phone the same lines say "phone"):
 
-- No agent runs on this tablet: your agents run on your Mac or your server, and keeper here talks to them.
+- No agent runs on this tablet: your agents run on the agents server you run, and keeper here talks to them.
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own storage: it syncs only when keeper opens, comes back in front or you pull to refresh, and nothing is merged on this tablet — the Mac merges.
-- The sessions board is here: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac. Bots talks to a model here, but the drive tools live on your Mac.
+- The sessions board is here: read a session's cards and move one with Move to…, and an agent's approvals are decided in Agents; creating and archiving sessions stays on your Mac. Bots talks to a model here, but the drive tools live on your Mac.
 - No screen recording and no transcription on this tablet.
 - keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived.
 - Voice works from Android 13: speech is recognised on this tablet and never sent to a server, and the answer is read aloud. There are no turn models here, so keeper waits for a pause after you stop. Turn listening on while keeper is in front and it listens while keeper stays in front with the screen on. Switching to another app or turning the screen off stops it, and it starts again whenever keeper is back in front, after a relaunch too. Where this device has no echo canceller, keeper stops listening while it speaks, so saying the stop word over an answer does nothing and the button stops it. It stops when you turn it off. Android shows its microphone indicator the whole time, and listening uses battery.
@@ -442,7 +431,7 @@ decision for each.
 | `web_auth_apple.rs` | kept: `ASWebAuthenticationSession` is iOS's |
 | `share_ios.rs` | kept: share-out is off on Android (`share_out` false) |
 | `ipc.rs` `device_ulid` recording refusal | **widened**: quotes `MobileRecorder::refused` on iOS and Android alike |
-| `agents_ipc.rs` `PLATFORM`, `sessions/lock.rs`, `browse.rs` | already Android-aware |
+| `sessions/lock.rs`, `browse.rs` | already Android-aware |
 
 ## Dependencies and licences
 

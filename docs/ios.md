@@ -671,11 +671,10 @@ existing install's accounts, messages and folder — the kalypso runs owed in th
 
 ## Push
 
-Epic 98, story 98.1 (AD-412, D-35). An agent's approval request and your own agent's
-answer reach the phone while keeper is closed — and nothing else shows. The pusher is the
-account's, though: your homeserver still sends your gateway, and the gateway Apple, the id
-of every other message that would notify, and this phone's extension discards it. Every
-other message notifies only while keeper is open, as before.
+Epic 98, story 98.1 (AD-412, D-35); since 108.2 from the agents server alone (106.6). An
+agent's approval request and your own agent's answer reach the phone while keeper is
+closed — and nothing else shows. Every other message notifies only while keeper is open,
+as before.
 
 **What it needs, none of it in this repository** (D-1, D-35: keeper ships no gateway and
 never chooses one):
@@ -697,19 +696,13 @@ in `keeper_core::agents::push`):
 - **The token.** keeper asks UIKit for remote notifications at every launch; the device
   token arrives through tao's app delegate, which keeper's patched tao gives the two
   selectors upstream lacks (`tools/tao/NOTICE`, change 3).
-- **The pusher.** Once keeper is in front and has the token, it registers on each signed-in
-  account that holds agent session rooms an `http` pusher to your gateway, format
-  `event_id_only`, app `dev.tgorka.keeper.ios.dev` or `dev.tgorka.keeper.ios` by the
-  `aps-environment` of the build's own provisioning profile (an App Store build has none
-  and is production; a profile that is there but cannot be read registers nothing, and the
-  log says so, rather than guess which of the two the token belongs to), and a
-  `default_payload` that runs the notification extension (`mutable-content`) and names
-  keeper's account id. On every other account, and on all of them when the field is empty
-  or holds an address keeper refuses, it removes the pusher. Signing out removes this
-  phone's pusher from that account first, best effort — offline it stays until the gateway
-  reports the token rejected. Your homeserver sends the gateway event ids, never messages;
-  keeper never contacts it. Changing the field registers again at once; an account that
-  gains its first agent room is registered at the next launch.
+- **The old pusher, removed.** Before 108.2 keeper registered on each signed-in account that
+  held agent session rooms an `http` pusher to your gateway (format `event_id_only`, app
+  `dev.tgorka.keeper.ios.dev` or `dev.tgorka.keeper.ios` by the build's `aps-environment`).
+  The agents left Matrix, so once keeper is in front and has the token it takes that pusher
+  off every signed-in account and registers none (`AccountManager::push_remove`, DW-E108-1;
+  the removal is kept for one release). Signing out removes it from that account first,
+  best effort.
 - **What shows** is the extension's decision ([The notification
   extension](#the-notification-extension)). If it cannot decide — the data has not moved
   into the App Group yet, the token expired, an event it cannot read — the notification
@@ -717,19 +710,8 @@ in `keeper_core::agents::push`):
   carried: the push is your homeserver's to write, so its alert, its category and any
   keeper key in it are never shown or acted on. Only a notification the extension composed
   carries the key (`keeper_shown`) the delegate and `push::action_decision` require.
-- **Actions.** An approval whose whole payload fits the notification offers *Approve once*
-  and *Deny*; any other offers *Deny* only. Both need the phone unlocked; *Deny* is drawn
-  as destructive. keeper owns the notification delegate (`Sources/keeper/KeeperPush.swift`)
-  and hands everything that is not its push to the notification plugin's. An action sends
-  exactly the record and digest the notification showed, scope `once`, through the same
-  decision the in-app card sends, which checks once more that the request is in the session
-  room with that digest; an action that launches keeper in the background signs in that one
-  account only and, while the request or its room has not reached the phone yet, tries for
-  twenty seconds. Any other refusal — the device is not cross-signed, another digest, no
-  longer waiting — is the answer at once, and a decision whose send failed is not sent
-  again. Then a new notification says *Open keeper to finish deciding.* with the reason,
-  and tapping it opens the session.
-- **Taps.** Tapping a keeper notification opens its session room in the Agents window.
+- **Actions and taps** are the agents server's items' (below). A notification of one of the
+  agents' old Matrix rooms is answered with nothing.
 
 **From the agents server (106.6).** The same token, app and gateway are also this phone's
 push target on the agents server (`PUT /clients/self/push-target`, removed when the field is
@@ -742,14 +724,11 @@ is the key `KEEPER_HQ_ITEM` (`keeper_iOS/en.lproj/Localizable.strings`, picked u
 `xcodegen generate` in `scripts/install-ios.sh`). See
 [agents.md](agents.md#a-push-from-the-agents-server) for what shows and what is proved.
 
-**Proved on Linux:** what a notification offers and sends, the pusher and the app id
-(`keeper-core/src/agents/push.rs` tests); that Synapse keeps the pusher keeper registers
-and removes it (`keeper-core/tests/agents_matrix_live.rs`,
-`the_homeserver_keeps_the_pusher_keeper_registers`, against the test homeserver); the
-webview's landing (`src/hooks/use-push-open.test.ts`). **Owed on the phone** after
-enrolment (98.1 #12): the token, the pusher on the owner's homeserver, the lock-screen
-actions with Face ID, the time an action takes from a background launch, and that a
-status update shows nothing.
+**Proved on Linux:** what a notification offers and sends, and the old pusher's identity
+(`keeper-core/src/agents/push.rs` tests); the webview's landing
+(`src/hooks/use-push-open.test.ts`). **Owed on the phone** after enrolment (98.1 #12): the
+token, the old pusher's removal from the owner's homeserver, the lock-screen actions with
+Face ID, and the time an action takes from a background launch.
 
 ## The folder on the phone
 
@@ -1068,7 +1047,7 @@ to finish with the screen locked):
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
-- The sessions board is here too: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac, with tasks, the self-hosted bridge runner, screen recording and the global summon hotkey. Bots talks to a model here, but the drive tools live on your Mac.
+- The sessions board is here too: read a session's cards and move one with Move to…, and an agent's approvals are decided in Agents; creating and archiving sessions stays on your Mac, with tasks, the self-hosted bridge runner, screen recording and the global summon hotkey. Bots talks to a model here, but the drive tools live on your Mac.
 - Updates arrive by reinstalling keeper from your Mac — Check for updates in About says when a new version is out — and its signature renews every 7 days.
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.

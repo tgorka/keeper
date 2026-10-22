@@ -408,36 +408,6 @@ pub fn hosts_unread(name: &str, why: &str) -> String {
 /// successful read that found none is an empty list, never an error.
 pub type Inventory<'a> = Result<&'a [ServingHost], &'a str>;
 
-/// The live hosts `manifests` name — each `(state key, sender, content)` of
-/// a `dev.keeper.agent.host` in a principal's control room, believed only
-/// from one of `agents` ([`crate::agents::host::accept`]) — other than `me`
-/// (this device's own host, whose build is the one saving), live at
-/// `now_ms`; each host once (story 101.6, R422).
-pub fn serving_from<'a>(
-    manifests: impl IntoIterator<Item = (&'a str, &'a matrix_sdk::ruma::UserId, &'a serde_json::Value)>,
-    agents: &[matrix_sdk::ruma::OwnedUserId],
-    now_ms: u64,
-    me: Option<&str>,
-) -> Vec<ServingHost> {
-    let mut hosts: Vec<ServingHost> = manifests
-        .into_iter()
-        .filter_map(|(key, sender, content)| {
-            crate::agents::host::accept(key, sender, content, agents).ok()
-        })
-        .filter(|manifest| Some(manifest.host.as_str()) != me && manifest.is_live(now_ms))
-        .map(|manifest| ServingHost {
-            sandbox: manifest.tools.iter().any(|tool| tool == "sandbox"),
-            host: manifest.host,
-            version: manifest.version,
-            agents: manifest.agents,
-            web_search: manifest.web_search,
-        })
-        .collect();
-    hosts.sort_by(|a, b| (&a.host, &a.version, &a.agents).cmp(&(&b.host, &b.version, &b.agents)));
-    hosts.dedup();
-    hosts
-}
-
 /// Whether a build of keeper `version` reads a key first released in
 /// `since`. The numbers are compared (`major.minor.patch`; anything after a
 /// `-` or `+` is not read); a version that does not read as one is no proof
@@ -916,51 +886,6 @@ mod tests {
         assert_eq!(
             older_hosts(&plain, "tgdrive/amelia", Err(HOSTS_UNREAD)),
             Ok(())
-        );
-    }
-
-    /// 101.6 #3 (R422): the hosts a save is checked against are the live
-    /// manifests an agent of these zones sent, this device's own left out.
-    #[test]
-    fn the_hosts_a_save_is_checked_against_are_the_live_ones_agents_sent() {
-        use matrix_sdk::ruma::{OwnedUserId, UserId};
-        let manifest = |host: &str, expires: &str| {
-            serde_json::json!({
-                "v": 1, "host": host, "principal": "tgorka", "version": "0.10.3",
-                "always_on": true, "tools": [], "drives": [], "bots": [],
-                "agents": ["tgdrive/tola-grey"],
-                "renewed_at": "2026-10-15T11:59:00Z", "expires_at": expires,
-            })
-        };
-        let tola = UserId::parse("@tola:example.org").expect("tola");
-        let eve = UserId::parse("@eve:example.org").expect("eve");
-        let agents: Vec<OwnedUserId> = vec![tola.clone()];
-        let now = 1_760_529_600_000; // 2025-10-15T12:00:00Z
-        let live = manifest("electra", "2099-01-01T00:00:00Z");
-        let gone = manifest("delectra", "2020-01-01T00:00:00Z");
-        let mine = manifest("hesperia", "2099-01-01T00:00:00Z");
-        let forged = manifest("kalypso", "2099-01-01T00:00:00Z");
-        let hosts = serving_from(
-            [
-                ("electra", &*tola, &live),
-                ("electra", &*tola, &live),
-                ("delectra", &*tola, &gone),
-                ("hesperia", &*tola, &mine),
-                ("kalypso", &*eve, &forged),
-            ],
-            &agents,
-            now,
-            Some("hesperia"),
-        );
-        assert_eq!(
-            hosts,
-            [ServingHost {
-                host: "electra".to_owned(),
-                version: "0.10.3".to_owned(),
-                agents: vec!["tgdrive/tola-grey".to_owned()],
-                web_search: None,
-                sandbox: false,
-            }]
         );
     }
 }

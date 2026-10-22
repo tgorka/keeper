@@ -30,7 +30,7 @@ use crate::hq::live::{
 };
 use crate::hq::port::ReplicaError;
 use crate::hq::sessions::{
-    earlier_months, int, is_ask, json, mark, month, newest_months, opt_text, page_key,
+    earlier_months, int, is_ask, is_heard, json, mark, month, newest_months, opt_text, page_key,
     previous_month, read, reads_trace, text, truthy, window, Source,
 };
 
@@ -344,6 +344,9 @@ pub fn view(
             .any(|m| incomplete.contains(&page_key(session_id, m)));
         (rows, oldest_shown > first, loading, complete, None)
     };
+    // A person's heard row is a mark for the claim holder, not a message
+    // (R-HQ-68): never drawn.
+    rows.retain(|row| text(row, "role") != "person" || !is_heard(&json(row, "metadata")));
     let taken = taken(source, session_id, &rows);
     let reads_trace = reads_trace(source, session_id);
     let extras = live::extras(source, session_id, reads_trace, opened.prefs.show_reasoning);

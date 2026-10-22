@@ -23,9 +23,19 @@ use super::home::{MenuAction, MenuItem};
 use super::memory::{MemorySnapshot, SEPARATOR};
 use super::skills::SkillsIndex;
 use super::soul::Soul;
-use crate::agents::events::Focus;
 use crate::bots::context_files::ContextBundle;
 use crate::bots::tools::FILE_CONTENT_IS_DATA;
+
+/// The note the person is looking at in the docked notes view: a drive, a
+/// drive-relative path and the heading above the caret (AD-382).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Focus {
+    pub drive: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+}
 
 /// Where and when a session runs: slot 5.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,121 +1,36 @@
-//! Where the person stopped listening to a spoken answer (AD-411, story 97.3).
+//! Where the person stopped listening to a spoken answer (AD-411, story 97.3):
+//! the replay's cut.
 //!
-//! When the person stops an answer keeper is speaking, their device sends
-//! `dev.keeper.agent.heard` ([`HeardContent`]) into the proxy's room: the
-//! answer's anchor, how many of its sentences the synthesiser finished and
-//! where the last of them ends. The owning host reads it here and writes one
-//! `heard` line; it never cancels the turn (R44, DW-419).
+//! A log's `heard` line marks one answer: how many of its sentences were
+//! finished aloud and where the last of them ends (`heard_until`). It never
+//! cancels the turn (R44, DW-419). Since 108.2 a person's device says where
+//! it stopped with a heard row in the agents' database
+//! (`keeper_core::hq::spoken`, R-HQ-68); the Matrix event the device sent
+//! before and its room drawing are gone. What stays is the rule both
+//! replays and the claim holder's next context apply:
 //!
-//! - **The answer is the room's.** An answer's room message is every round
-//!   of its turn joined the way the stream joined them ([`answer_text`]):
-//!   the rounds' `assistant` lines up to the closing one, which carries the
-//!   anchor. [`Answers`] follows a session's lines and keeps, per anchor,
-//!   those rounds.
-//! - **The host counts.** [`Answers::mark`] checks the event against the
-//!   answer and recomputes `heard_until` from `sentence` with the speech
-//!   segmenter's own cut ([`sentence_ends`]) over that text, so the mark does
-//!   not depend on which edit the device saw last; a device value that
-//!   disagrees is named and not used (Q9). An answer is marked once; an
-//!   answer its room never showed (withheld, R168) is counted over the
-//!   fixed sentence the room showed instead ([`NARROWER_THAN_ROOM`]) and
-//!   cut nothing.
+//! - **The answer is the stream's.** An answer is every round of its turn
+//!   joined the way the stream joined them ([`answer_text`]): the rounds'
+//!   `assistant` lines up to the closing one, which carries the anchor.
+//!   [`Answers`] follows a session's lines and keeps, per anchor, those
+//!   rounds.
 //! - **Both replays cut alike.** The cold replay and a served session's
 //!   context feed every conversation line to [`Answers::observe`], which
 //!   answers a `heard` line with the [`Cut`] to make: the rounds keep their
 //!   text up to `heard_until`, the round holding the cut gets
 //!   [`STOPPED_LISTENING`] after it, later rounds lose their text and keep
-//!   their tool calls. The log line keeps the whole answer; only the
-//!   replayed message is cut.
-//! - **The room draws it.** An agent room's header reader folds the person's
-//!   own sealed marks ([`RoomMarks`]); the timeline sends, beside the
-//!   stream, where each marked answer's heard text ends in the body it shows
-//!   ([`HeardMarkVm`], [`split_utf16`]) — recounted from `sentence` like the
-//!   host's, in UTF-16 so the front slices and counts nothing (UX-DR143).
+//!   their tool calls ([`cut_rounds`]). The log line keeps the whole answer;
+//!   only the replayed message is cut.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
-use matrix_sdk::ruma::{EventId, OwnedEventId, UserId};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use ts_rs::TS;
 use ulid::Ulid;
 
-use crate::agents::events::{CONTENT_VERSION, HEARD};
-use crate::agents::log::{
-    ApprovalState, HeardBody, HeardReason, LineBody, LogLine, NARROWER_THAN_ROOM, WITHHELD_CODE,
-};
+use crate::agents::log::{ApprovalState, LineBody, LogLine, WITHHELD_CODE};
 use crate::bots::chat::{ChatMessage, ContentPart};
-use crate::voice::speech::sentence_ends;
 
 /// What a cut answer says where the person stopped listening.
 pub const STOPPED_LISTENING: &str = "[The person stopped listening here.]";
-
-/// `dev.keeper.agent.heard` (timeline, encrypted), from the person's
-/// speaking device.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HeardContent {
-    pub v: u32,
-    /// The answer's anchor: the agent's message the device spoke.
-    pub anchor: OwnedEventId,
-    /// Where the last sentence the synthesiser finished ends in the
-    /// answer's text, in Unicode scalar values; `0` when none finished.
-    pub heard_until: u64,
-    /// How many of the answer's sentences the synthesiser finished.
-    pub sentence: u32,
-    pub reason: HeardReason,
-}
-
-impl HeardContent {
-    /// The event's content, if it reads as this version's.
-    pub fn read(content: &Value) -> Option<HeardContent> {
-        serde_json::from_value::<HeardContent>(content.clone())
-            .ok()
-            .filter(|heard| heard.v == CONTENT_VERSION)
-    }
-}
-
-/// Why a `heard` event is not logged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeardRefusal {
-    /// It does not read as a `heard` content of this version.
-    Unreadable,
-    /// Its anchor is no answer of this session.
-    NotAnAnswer,
-    /// The answer is marked already.
-    AlreadyMarked,
-    /// A compact replaced the answer in the session's context.
-    Gone,
-    /// It counts more sentences, or reaches further, than the answer holds.
-    PastTheAnswer,
-}
-
-/// A refused `heard` event, in the host's own log.
-pub const UNREADABLE_HEARD: &str = "a heard event that does not read as one is ignored";
-/// Its anchor is no answer here.
-pub const NOT_AN_ANSWER: &str = "a heard event names an answer of this session or it is ignored";
-/// A second mark of one answer.
-pub const ALREADY_MARKED: &str =
-    "an answer is marked once where the person stopped listening; a second mark is ignored";
-/// The answer was compacted away.
-pub const ANSWER_GONE: &str =
-    "the answer a heard event names was compacted, so there is nothing to mark";
-/// Past the answer's end.
-pub const PAST_THE_ANSWER: &str = "a heard event past the end of its answer is ignored";
-
-impl HeardRefusal {
-    /// The host's note for it.
-    pub fn note(self) -> &'static str {
-        match self {
-            Self::Unreadable => UNREADABLE_HEARD,
-            Self::NotAnAnswer => NOT_AN_ANSWER,
-            Self::AlreadyMarked => ALREADY_MARKED,
-            Self::Gone => ANSWER_GONE,
-            Self::PastTheAnswer => PAST_THE_ANSWER,
-        }
-    }
-}
 
 /// One anchored answer of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,14 +91,6 @@ pub fn message_text(message: &ChatMessage) -> String {
             _ => None,
         })
         .collect()
-}
-
-/// A mark the host logs, and the device's own `heard_until` when it
-/// disagreed with the host's count.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Marked {
-    pub body: HeardBody,
-    pub disagreed: Option<u64>,
 }
 
 /// A session's anchored answers, followed line by line in log order.
@@ -262,50 +169,6 @@ impl Answers {
             .get(anchor)
             .and_then(|key| self.answers.get(key))
     }
-
-    /// The `heard` line `content` makes, checked against its answer, whose
-    /// rounds' texts `texts` gives (`None` once a compact replaced one).
-    pub fn mark(
-        &self,
-        content: &HeardContent,
-        texts: impl FnOnce(&[Ulid]) -> Option<Vec<String>>,
-    ) -> Result<Marked, HeardRefusal> {
-        let answer = self
-            .anchored(content.anchor.as_str())
-            .ok_or(HeardRefusal::NotAnAnswer)?;
-        if answer.marked {
-            return Err(HeardRefusal::AlreadyMarked);
-        }
-        let assistant = *answer.rounds.last().ok_or(HeardRefusal::NotAnAnswer)?;
-        // What the room showed was the fixed sentence: the mark is counted
-        // over it like any answer, and cuts nothing.
-        let text: Cow<'static, str> = if answer.withheld {
-            Cow::Borrowed(NARROWER_THAN_ROOM)
-        } else {
-            Cow::Owned(answer_text(
-                &texts(&answer.rounds).ok_or(HeardRefusal::Gone)?,
-            ))
-        };
-        let ends = sentence_ends(&text);
-        let length = text.chars().count() as u64;
-        let sentence = usize::try_from(content.sentence).unwrap_or(usize::MAX);
-        if content.heard_until > length || sentence > ends.len() {
-            return Err(HeardRefusal::PastTheAnswer);
-        }
-        let heard_until = match sentence {
-            0 => 0,
-            n => ends[n - 1] as u64,
-        };
-        Ok(Marked {
-            body: HeardBody {
-                assistant,
-                heard_until,
-                sentence: content.sentence,
-                reason: content.reason,
-            },
-            disagreed: (heard_until != content.heard_until).then_some(content.heard_until),
-        })
-    }
 }
 
 /// The answer as its room showed it: each round's text, a blank line before
@@ -369,108 +232,20 @@ pub fn cut_rounds<S: AsRef<str>>(rounds: &[S], heard_until: u64) -> Option<Vec<S
     Some(kept)
 }
 
-/// Where the person stopped listening to an answer, as its agent room draws
-/// it (UX-DR143): the answer's render key and where what was heard ends in
-/// the body the room shows, in UTF-16 code units — what a JS string slices
-/// by, so the front counts nothing. Sent beside the stream
-/// (`TimelineBatch::heard`), never as an item (R33).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct HeardMarkVm {
-    /// The answer's stable opaque render key (its item's `unique_id`).
-    pub key: String,
-    /// The body's UTF-16 length of what was heard: the rule goes here and
-    /// the text after it is dimmed.
-    pub split_utf16: u32,
-}
-
-/// The marks the person's own devices left in a session room, by the
-/// answer's anchor: how many of its sentences were finished aloud. Only an
-/// event from the room's own user, sealed by a device of theirs
-/// ([`crate::agents::room::sealed_by_sender`], R185), that reads as
-/// [`HeardContent`] counts; of two marks of one answer the one with the
-/// smaller `origin_server_ts` stands — the room's order, as the host logs
-/// only the first ([`ALREADY_MARKED`]) — whichever the room folded first:
-/// back-pagination can bring the older mark after the newer (R327).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RoomMarks {
-    /// Each answer's mark: its `origin_server_ts` and its `sentence`.
-    by_anchor: HashMap<OwnedEventId, (u64, u32)>,
-}
-
-impl RoomMarks {
-    /// Fold one event (decrypted, as JSON) `own` reads, `sealed` whether a
-    /// device of its sender sealed it. Returns whether the marks changed.
-    pub fn apply(&mut self, event: &Value, own: &UserId, sealed: bool) -> bool {
-        if event["type"] != HEARD || event["sender"].as_str() != Some(own.as_str()) || !sealed {
-            return false;
-        }
-        let Some(heard) = HeardContent::read(&event["content"]) else {
-            return false;
-        };
-        let at = event["origin_server_ts"].as_u64().unwrap_or(u64::MAX);
-        match self.by_anchor.entry(heard.anchor) {
-            std::collections::hash_map::Entry::Occupied(mut entry) if at < entry.get().0 => {
-                entry.insert((at, heard.sentence));
-                true
-            }
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert((at, heard.sentence));
-                true
-            }
-        }
-    }
-
-    /// How many sentences of the answer anchored at `anchor` were heard,
-    /// if the person marked it.
-    pub fn sentence(&self, anchor: &EventId) -> Option<u32> {
-        self.by_anchor.get(anchor).map(|(_, sentence)| *sentence)
-    }
-
-    /// Whether no answer of the room is marked.
-    pub fn is_empty(&self) -> bool {
-        self.by_anchor.is_empty()
-    }
-}
-
-/// Where the room draws the mark in an answer whose body is `body` once
-/// `sentence` of its sentences were finished aloud: the end of that
-/// sentence by the speech segmenter's own cut ([`sentence_ends`]), as the
-/// host counts it — so the mark does not depend on which edit the device
-/// saw last — converted from Unicode scalar values to UTF-16 code units;
-/// `0` when none was finished. `None` when nothing but whitespace follows
-/// it (the answer was heard to its end) or the body does not hold that
-/// many sentences (yet).
-pub fn split_utf16(body: &str, sentence: u32) -> Option<u32> {
-    let ends = sentence_ends(body);
-    let end = match usize::try_from(sentence).ok()? {
-        0 => 0,
-        n => *ends.get(n - 1)?,
-    };
-    let mut heard = body.chars();
-    let units: usize = heard.by_ref().take(end).map(char::len_utf16).sum();
-    if heard.as_str().trim().is_empty() {
-        return None;
-    }
-    u32::try_from(units).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use chrono::{TimeZone, Utc};
-    use serde_json::json;
+    use serde_json::Value;
 
     use super::*;
     use crate::agents::label::{Integrity, Label, Readers};
     use crate::agents::log::reader::SessionLog;
     use crate::agents::log::replay::replay;
     use crate::agents::log::{
-        ApprovalBody, AssistantBody, ErrorBody, HostSlug, ToolCallBody, ToolOutcomeWord,
-        ToolResultBody, Usage, UserBody, LINE_VERSION,
+        ApprovalBody, AssistantBody, ErrorBody, HeardBody, HeardReason, HostSlug, ToolCallBody,
+        ToolOutcomeWord, ToolResultBody, Usage, UserBody, LINE_VERSION,
     };
     use crate::agents::nudge::TOOL_ROUND_FINISH;
     use crate::bots::chat::Role;
@@ -603,34 +378,6 @@ mod tests {
         }
     }
 
-    fn heard(anchor: &str, heard_until: u64, sentence: u32) -> HeardContent {
-        HeardContent::read(&json!({
-            "v": 1,
-            "anchor": anchor,
-            "heard_until": heard_until,
-            "sentence": sentence,
-            "reason": "stop",
-        }))
-        .expect("a heard content")
-    }
-
-    fn texts_of(log: &Log) -> impl Fn(&[Ulid]) -> Option<Vec<String>> + '_ {
-        |rounds| {
-            rounds
-                .iter()
-                .map(|id| {
-                    log.lines
-                        .iter()
-                        .find(|line| line.id == *id)
-                        .and_then(|line| match &line.body {
-                            LineBody::Assistant(body) => Some(body.text.clone()),
-                            _ => None,
-                        })
-                })
-                .collect()
-        }
-    }
-
     /// 97.3 #7 (the anchor → lines mapping): an anchor names its turn's
     /// rounds, from the question or from where a parked call resumed under a
     /// new anchor, and never a round a cut-off turn left behind; an answer
@@ -693,113 +440,6 @@ mod tests {
             Some((vec![half, partial], true))
         );
         assert_eq!(answer("$nope:h"), None);
-        assert_eq!(
-            answers.mark(&heard("$nope:h", 0, 0), texts_of(&log)),
-            Err(HeardRefusal::NotAnAnswer)
-        );
-    }
-
-    /// The `heard` line a mark of `assistant`'s answer makes.
-    fn logged(
-        assistant: Ulid,
-        heard_until: u64,
-        sentence: u32,
-        disagreed: Option<u64>,
-    ) -> Result<Marked, HeardRefusal> {
-        Ok(Marked {
-            body: HeardBody {
-                assistant,
-                heard_until,
-                sentence,
-                reason: HeardReason::Stop,
-            },
-            disagreed,
-        })
-    }
-
-    /// Q9: the host counts the sentences the device says it finished over
-    /// the answer as its room showed it (two rounds, a blank line between;
-    /// none before a closing line with no text) and logs that offset,
-    /// naming a device value that disagrees; a count or an offset past the
-    /// answer, a second mark and a compacted answer are refused; a withheld
-    /// answer is counted the same way over the sentence its room showed.
-    #[test]
-    fn the_host_counts_where_the_person_stopped() {
-        let mut log = Log::default();
-        log.user("q");
-        log.round("One. Two.", "c1");
-        let closing = log.said(None, "Three. Four.", Some("$a:h"));
-        let answers = log.answers();
-        // "One. Two.\n\nThree. Four." ends at 4, 9, 17 and 23.
-        let mark = |content| answers.mark(&content, texts_of(&log));
-        assert_eq!(mark(heard("$a:h", 17, 3)), logged(closing, 17, 3, None));
-        assert_eq!(mark(heard("$a:h", 12, 3)), logged(closing, 17, 3, Some(12)));
-        assert_eq!(mark(heard("$a:h", 0, 0)), logged(closing, 0, 0, None));
-        assert_eq!(mark(heard("$a:h", 23, 4)), logged(closing, 23, 4, None));
-        assert_eq!(mark(heard("$a:h", 23, 5)), Err(HeardRefusal::PastTheAnswer));
-        assert_eq!(mark(heard("$a:h", 24, 4)), Err(HeardRefusal::PastTheAnswer));
-        assert_eq!(
-            answers.mark(&heard("$a:h", 4, 1), |_| None),
-            Err(HeardRefusal::Gone)
-        );
-
-        let mut marked = log.answers();
-        marked.observe(&LogLine {
-            body: LineBody::Heard(HeardBody {
-                assistant: closing,
-                heard_until: 4,
-                sentence: 1,
-                reason: HeardReason::BargeIn,
-            }),
-            ..log.lines[0].clone()
-        });
-        assert_eq!(
-            marked.mark(&heard("$a:h", 9, 2), texts_of(&log)),
-            Err(HeardRefusal::AlreadyMarked)
-        );
-
-        // Closed by a line with no text (an `ask`): the room showed
-        // "One. Two." and nothing after it, so 11 is past its end.
-        let mut asked = Log::default();
-        asked.user("q");
-        asked.round("One. Two.", "c1");
-        asked.said(None, "", Some("$q:h"));
-        assert_eq!(
-            asked
-                .answers()
-                .mark(&heard("$q:h", 11, 2), texts_of(&asked)),
-            Err(HeardRefusal::PastTheAnswer)
-        );
-
-        // Withheld: counted over the sentence the room showed, whose
-        // sentences end at 90 and 119, never over the answer's own text.
-        let mut log = Log::default();
-        log.user("q");
-        let shown = log.said(None, "Secret words.", Some("$w:h"));
-        log.error(shown, WITHHELD_CODE);
-        let answers = log.answers();
-        let mark = |content| answers.mark(&content, |_| None);
-        assert_eq!(mark(heard("$w:h", 13, 1)), logged(shown, 90, 1, Some(13)));
-        assert_eq!(mark(heard("$w:h", 119, 2)), logged(shown, 119, 2, None));
-        assert_eq!(
-            mark(heard("$w:h", 120, 1)),
-            Err(HeardRefusal::PastTheAnswer)
-        );
-        assert_eq!(mark(heard("$w:h", 90, 3)), Err(HeardRefusal::PastTheAnswer));
-    }
-
-    /// The content reads only as this version's, with no field it does not
-    /// know.
-    #[test]
-    fn a_heard_content_reads_only_as_version_one() {
-        let content = json!({"v": 1, "anchor": "$a:h", "heard_until": 4, "sentence": 1, "reason": "barge_in"});
-        assert!(HeardContent::read(&content).is_some());
-        let mut later = content.clone();
-        later["v"] = json!(2);
-        assert_eq!(HeardContent::read(&later), None);
-        let mut more = content;
-        more["text"] = json!("what was said");
-        assert_eq!(HeardContent::read(&more), None);
     }
 
     fn assistant(text: &str, calls: &[&str]) -> (Role, String, Vec<String>) {
@@ -930,100 +570,5 @@ mod tests {
         let before = shape(&withheld.replayed());
         withheld.heard(closing, 4, 1);
         assert_eq!(shape(&withheld.replayed()), before);
-    }
-
-    const PERSON: &str = "@tgorka:example.org";
-
-    fn mark_event(sender: &str, anchor: &str, sentence: u32) -> Value {
-        mark_at(sender, anchor, sentence, 1)
-    }
-
-    fn mark_at(sender: &str, anchor: &str, sentence: u32, origin_server_ts: u64) -> Value {
-        json!({
-            "type": HEARD, "event_id": format!("$mark-{anchor}-{sentence}"), "sender": sender,
-            "origin_server_ts": origin_server_ts,
-            "content": {
-                "v": 1, "anchor": anchor, "heard_until": 0, "sentence": sentence,
-                "reason": "stop",
-            },
-        })
-    }
-
-    /// The room draws only the person's own marks, sealed by a device of
-    /// theirs, readable as this version's, and of one answer's the first in
-    /// the room's order, whichever was folded first (R327).
-    #[test]
-    fn the_room_folds_the_persons_own_sealed_marks() {
-        let own = UserId::parse(PERSON).expect("user");
-        let anchor = |id: &str| EventId::parse(id).expect("event");
-        let mut marks = RoomMarks::default();
-        assert!(marks.is_empty());
-
-        // Anyone else's, an unsealed one and another type are not marks.
-        assert!(!marks.apply(&mark_event("@nixi:example.org", "$a", 1), &own, true));
-        assert!(!marks.apply(&mark_event(PERSON, "$a", 1), &own, false));
-        let mut other = mark_event(PERSON, "$a", 1);
-        other["type"] = json!("dev.keeper.agent.surface.result");
-        assert!(!marks.apply(&other, &own, true));
-        // Unreadable: a newer version, an unknown field.
-        let mut newer = mark_event(PERSON, "$a", 1);
-        newer["content"]["v"] = json!(2);
-        assert!(!marks.apply(&newer, &own, true));
-        let mut extra = mark_event(PERSON, "$a", 1);
-        extra["content"]["cancel"] = json!(true);
-        assert!(!marks.apply(&extra, &own, true));
-        assert!(marks.is_empty());
-        assert_eq!(marks.sentence(&anchor("$a")), None);
-
-        assert!(marks.apply(&mark_event(PERSON, "$a", 2), &own, true));
-        assert!(marks.apply(&mark_event(PERSON, "$b", 0), &own, true));
-        // A second mark of one answer: the first stands.
-        assert!(!marks.apply(&mark_event(PERSON, "$a", 5), &own, true));
-        assert_eq!(marks.sentence(&anchor("$a")), Some(2));
-        assert_eq!(marks.sentence(&anchor("$b")), Some(0));
-        assert_eq!(marks.sentence(&anchor("$c")), None);
-
-        // R327 (01): the first in the room's order stands, though the newer
-        // mark was folded first (back-pagination brings the older later);
-        // a later one, or one at the same time, does not replace it.
-        let mut marks = RoomMarks::default();
-        assert!(marks.apply(&mark_at(PERSON, "$d", 5, 20), &own, true));
-        assert!(marks.apply(&mark_at(PERSON, "$d", 2, 10), &own, true));
-        assert_eq!(marks.sentence(&anchor("$d")), Some(2));
-        assert!(!marks.apply(&mark_at(PERSON, "$d", 7, 30), &own, true));
-        assert!(!marks.apply(&mark_at(PERSON, "$d", 9, 10), &own, true));
-        assert_eq!(marks.sentence(&anchor("$d")), Some(2));
-    }
-
-    /// The mark sits where the heard sentences end by the segmenter's cut,
-    /// in UTF-16 code units of the body (an astral character is two, a
-    /// combining mark one), and nowhere when the answer was heard to its end
-    /// or does not hold that many sentences.
-    #[test]
-    fn a_mark_splits_the_body_in_utf16_where_the_heard_sentences_end() {
-        let body = "Hi e\u{301} 😀. Zażółć gęślą!\nFour.\n";
-        let heard = |split: u32| {
-            let units: Vec<u16> = body.encode_utf16().collect();
-            String::from_utf16(&units[..split as usize]).expect("a split between characters")
-        };
-        assert_eq!(sentence_ends(body).len(), 3);
-
-        let first = split_utf16(body, 1).expect("one heard");
-        assert_eq!(
-            first, 9,
-            "eight scalar values: the combining acute one unit, the emoji two"
-        );
-        assert_eq!(heard(first), "Hi e\u{301} 😀.");
-        let second = split_utf16(body, 2).expect("two heard");
-        assert_eq!(heard(second), "Hi e\u{301} 😀. Zażółć gęślą!");
-        // None finished: the rule opens the answer.
-        assert_eq!(split_utf16(body, 0), Some(0));
-        // Heard to its end (trailing whitespace is nothing left), and past it.
-        assert_eq!(split_utf16(body, 3), None);
-        assert_eq!(split_utf16(body, 4), None);
-        assert_eq!(split_utf16(body, u32::MAX), None);
-        // A body still growing shows the mark once more of it follows.
-        assert_eq!(split_utf16("Hi 😀.", 1), None);
-        assert_eq!(split_utf16("Hi 😀. Zaż", 1), Some(6));
     }
 }

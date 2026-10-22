@@ -1,42 +1,61 @@
-//! Story 97.3 #6 (AD-411, Q3, Q17): how far the person heard a spoken agent
-//! answer, and which moves stop it.
+//! Story 97.3 #6 (AD-411, Q3, Q17), as 108.2 carries it (R-HQ-68): how far
+//! the person heard a spoken agent answer — the heard row's metadata — and
+//! which moves stop it.
 
-use keeper_core::agents::events::CONTENT_VERSION;
 use keeper_core::agents::log::HeardReason;
-use keeper_core::agents::spoken::HeardMark;
+use keeper_core::hq::sessions::AgentSessionRef;
+use keeper_core::hq::spoken::HeardMark;
 use keeper_core::voice::backchannel::Utterance;
 use keeper_core::voice::{Effect, TurnEvent, TurnState};
+use serde_json::json;
 
-/// 97.3 #6 (Q3): the mark counts the sentences the synthesiser read to
-/// their end, in the order they were handed to it, and ends where the
-/// last of them does; the one it was cut off in is not counted, and
-/// none finished is 0. A stop or a question over the answer marks it; an
+/// 97.3 #6 (Q3), R-HQ-68: the mark counts the sentences the synthesiser
+/// read to their end, in the order they were handed to it, and ends where
+/// the last of them does; the one it was cut off in is not counted, and none
+/// finished is 0. It names the answer by the question its turn answers and
+/// is the heard row's metadata: `kind: heard` and the contract's
+/// `heard_until` object. A stop or a question over the answer marks it; an
 /// answer heard to its end or ended by a failure does not.
 #[test]
 fn heard_until_counts_finished_sentences() {
-    let mut mark = HeardMark::new("@me:x".to_owned(), "!room:x".to_owned());
+    let key = AgentSessionRef {
+        database: "tgdrive".to_owned(),
+        session_id: "dev1.7".to_owned(),
+    };
+    let mut mark = HeardMark::new(key.clone(), "01QUESTION".to_owned());
     mark.handed(4);
-    assert_eq!(mark.content(HeardReason::Stop), None, "no anchor yet");
-    mark.anchored("$answer");
-    let content = mark.content(HeardReason::Stop).expect("anchored");
-    assert_eq!((content.heard_until, content.sentence), (0, 0));
-    assert_eq!(content.anchor.as_str(), "$answer");
-    assert_eq!(content.v, CONTENT_VERSION);
+    assert_eq!(mark.metadata(HeardReason::Stop), None, "no answer yet");
+    mark.anchored();
+    assert_eq!(
+        mark.metadata(HeardReason::Stop),
+        Some(
+            json!({"kind": "heard", "message": "01QUESTION", "heard_until": 0,
+                    "sentence": 0, "reason": "stop"})
+        )
+    );
+    assert_eq!(mark.key(), &key);
 
     mark.handed(15);
     mark.spoken();
     mark.handed(20);
     mark.spoken();
     // Stopped mid-sentence three.
-    let content = mark.content(HeardReason::BargeIn).expect("anchored");
-    assert_eq!((content.heard_until, content.sentence), (15, 2));
-    assert_eq!(content.reason, HeardReason::BargeIn);
-    mark.spoken();
-    mark.spoken();
-    let content = mark.content(HeardReason::Stop).expect("anchored");
     assert_eq!(
-        (content.heard_until, content.sentence),
-        (20, 3),
+        mark.metadata(HeardReason::BargeIn),
+        Some(
+            json!({"kind": "heard", "message": "01QUESTION", "heard_until": 15,
+                    "sentence": 2, "reason": "barge_in"})
+        )
+    );
+    mark.spoken();
+    mark.spoken();
+    let at_most = mark.metadata(HeardReason::Stop).expect("answered");
+    assert_eq!(
+        (
+            at_most["heard_until"].as_u64(),
+            at_most["sentence"].as_u64()
+        ),
+        (Some(20), Some(3)),
         "never past what was handed"
     );
 

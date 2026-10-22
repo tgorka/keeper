@@ -9,11 +9,6 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::agents::approval_card::ApprovalVm;
-use crate::agents::gate_room::GateLineVm;
-use crate::agents::heard::HeardMarkVm;
-use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
-use crate::agents::turn_marks::TurnMarkVm;
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
@@ -781,39 +776,6 @@ pub struct RoomVm {
     /// the keeper-local muted-Network set. Copied through to [`InboxRoomVm`] to render
     /// the mute glyph; never gates unread. Fail-open `None` on any read error.
     pub mute_state: MuteState,
-    /// Which agent room this is, from its create type and its status's
-    /// session kind (UX-DR132); absent for every other room. The merge puts a
-    /// session room in the Agents window only and a control room in none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_room: Option<AgentRoomKindVm>,
-    /// An agent room's agent's picture, as its header draws it (story 100.4,
-    /// R384): a URL for an `<img>`; absent for every other room and for an
-    /// agent with none, whose row keeps its initials.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_avatar: Option<String>,
-    /// An agent room's letter where it draws no picture: the initial of the
-    /// agent working it (story 101.1 #6, R416), never the initials of the
-    /// room's title; absent for every other room.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_mark: Option<String>,
-    /// An agent room's agent: the Matrix user id of the agent working it
-    /// (the delegate in a delegated room), read from its status (story
-    /// 102.7, R463) — what the row's default marker and its "Make default"
-    /// compare and store; absent for every other room and for an agent room
-    /// whose status was not read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent: Option<String>,
-    /// An agent room's state in the list (story 101.6, R421): needs you,
-    /// failed, working or done since the person last read it — Rust's word,
-    /// drawn by the row and never derived; absent for every other room and
-    /// for an agent room in none of them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_attention: Option<crate::agents::attention::AgentAttentionVm>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -1373,27 +1335,6 @@ pub enum TimelineItemVm {
         /// the frontend renders deterministic initials micro-avatars. An own
         /// message with a non-empty `readers` additionally shows a read tick.
         readers: Vec<String>,
-        /// The delegation this message hands on, when it is a brief its
-        /// room's creating agent sent (UX-DR135, R53), else `null` — a
-        /// delegate object from anyone else is an ordinary message. The
-        /// body is the brief. Boxed as `media` is; the binding stays
-        /// `BriefVm | null`.
-        brief: Option<Box<BriefVm>>,
-        /// In a gate room (UX-DR147), the outside system's request — once
-        /// the gate has spoken of it, its chip the gate's newest word on it
-        /// — or the gate's own word on one, by Rust's reading of the room
-        /// (`gate_room::GateView`); else `null`. Boxed as `brief` is; the
-        /// binding stays `GateLineVm | null`.
-        gate: Option<Box<GateLineVm>>,
-        /// In an agent session room, whether the agent's host took this own
-        /// message (story 102.4, R465) — drawn there in place of a read tick,
-        /// since the agent's receipt rides its claim renewals and says
-        /// nothing of the message; absent while neither is known and in
-        /// every other room. Boxed as `brief` is; the binding stays
-        /// `turn?: TurnMarkVm`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        turn: Option<Box<TurnMarkVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1439,16 +1380,6 @@ pub enum TimelineItemVm {
         /// the room's later sends wait behind it; `Sent` and `null` (someone
         /// else's deletion, or one the server confirmed) are deleted.
         send_state: Option<SendState>,
-    },
-    /// An approval request an agent of this session room sent (93.3): drawn
-    /// as its card, whose content and state ride beside the stream in
-    /// [`TimelineBatch::approvals`] under `id`. A request from anyone
-    /// without an agent's power, or an edit of one, is an `Other`.
-    Approval {
-        /// Stable opaque render key (the item's `unique_id`).
-        key: String,
-        /// The request's first record's id: its [`ApprovalVm`]'s `id`.
-        id: String,
     },
     /// Any non-text item (non-text msgtype, state/membership/profile change, or a
     /// virtual date-divider/read-marker item).
@@ -1537,29 +1468,6 @@ pub enum TimelineOp {
 pub struct TimelineBatch {
     /// The ordered ops to apply, in sequence.
     pub ops: Vec<TimelineOp>,
-    /// An agent room's header, sent on the first batch and on every batch
-    /// after it changed (ruling R33); absent in every other room and on a
-    /// batch where it did not change. A batch may carry a header and no ops.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub header: Option<AgentRoomHeaderVm>,
-    /// An agent session room's approval cards, every one, in the room's
-    /// order: sent on the first batch when there are any and on every
-    /// batch after they changed — a decision, a `consumed`, an expiry, this
-    /// device's verification or whether this app hosts the session. Absent
-    /// where nothing changed; the last list stands.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub approvals: Option<Vec<ApprovalVm>>,
-    /// An agent session room's marks of where the person stopped listening
-    /// to a spoken answer (97.3, UX-DR143), one per marked answer that is
-    /// loaded and was not heard to its end: sent on the first batch when
-    /// there are any and on every batch after they changed — a mark, or
-    /// the answer's body or its loading. Absent where nothing changed; the
-    /// last list stands.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub heard: Option<Vec<HeardMarkVm>>,
     /// The room's back-pagination status (102.6, R468): on the first batch
     /// always, then on a batch of its own whenever it changed — the
     /// timeline's history boundary needs no second subscription and no
@@ -1742,21 +1650,11 @@ pub enum EgressKind {
     /// a device-flow connection exists, and the organisation's GitHub broker
     /// plus GitHub's API while the descriptor names one.
     Forge,
-    /// An MCP server this Mac's agents use (96.2 #10): a `url` server's host
-    /// and port, never its path or token; a `command` server as the program
-    /// keeper starts, which reaches what it reaches with this Mac's rights.
-    /// Present only while Settings › Agents names one.
-    McpServer,
     /// The host of the push gateway the person named in `push.gateway_url`
     /// (98.1 #8, Q6). keeper never contacts it: the homeserver does, with
     /// event ids for this device. Present only on a phone, and only while
     /// the setting holds an address keeper registers.
     PushGateway,
-    /// The web search engine this Mac's agents search with (story 101.4,
-    /// R419): its host and port, never its path. Present only while
-    /// Settings › Agents › *Web search* names one; only agents a person
-    /// switched web search on for send it their queries.
-    WebSearch,
     /// The agents server the person named in `agents.server_url` (R-HQ-9):
     /// its host and port, never its path. One row for every database it
     /// serves this device. Present only while the setting holds an address
@@ -2071,36 +1969,6 @@ pub struct InboxRoomVm {
     /// (`Muted` → bell-off, `MentionOnly` → at-sign); `None` shows no glyph. Reflects
     /// durable mute only — never the global DND switch — and never gates unread.
     pub mute_state: MuteState,
-    /// Copied through from [`RoomVm::agent_room`]: `proxy` or `session` for a
-    /// row in the Agents window; absent for every other row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_room: Option<AgentRoomKindVm>,
-    /// An agent room's agent's picture, as its header draws it (story 100.4,
-    /// R384): a URL for an `<img>`; absent for every other room and for an
-    /// agent with none, whose row keeps its initials.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_avatar: Option<String>,
-    /// An agent room's letter where it draws no picture: the initial of the
-    /// agent working it (story 101.1 #6, R416), never the initials of the
-    /// room's title; absent for every other room.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_mark: Option<String>,
-    /// Copied through from [`RoomVm::agent`]: the Matrix user id of the
-    /// agent working this row's room (story 102.7, R463); absent for every
-    /// other row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent: Option<String>,
-    /// An agent room's state in the list (story 101.6, R421): needs you,
-    /// failed, working or done since the person last read it — Rust's word,
-    /// drawn by the row and never derived; absent for every other room and
-    /// for an agent room in none of them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_attention: Option<crate::agents::attention::AgentAttentionVm>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -2169,13 +2037,6 @@ pub struct InboxBatch {
     /// Archive window, so this is per-window, not a cross-account server total.
     #[ts(type = "number | null")]
     pub total: Option<u32>,
-    /// The Agents window only: why some of its rows are not live — kept
-    /// from the last run because an account could not start, or the kept
-    /// list could not be read or kept (story 102.5, R501, R381) — as the
-    /// sentence said above the list; absent when every row is live.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub note: Option<String>,
 }
 
 /// The single error envelope every fallible command rejects with (AD-8, AD-21).
@@ -7997,9 +7858,9 @@ pub struct VoiceWakeVm {
     /// never blank.
     pub stop_phrase: String,
     /// `bots.voice_target` as stored — the id of the pinned bot a spoken
-    /// turn goes to, or `agent:<room id>` for one of the person's proxy
-    /// conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
-    /// pinned bot most recently talked to".
+    /// turn goes to, or `agent:<agent>` for one of the person's agents
+    /// ([`VoiceAgentTargetVm::target`]); `None` means "the pinned bot most
+    /// recently talked to".
     pub voice_target: Option<String>,
     /// The turn models' line under the voice switch (UX-DR142, D-36):
     /// `keeper_core::voice::turn_models::turn_models_state` as transcription's
@@ -8029,24 +7890,22 @@ pub struct VoiceTargetSpeedVm {
     pub first_token_median_ms: Option<u64>,
 }
 
-/// One of the person's proxy conversations a spoken turn may go to
-/// (AD-384), from `voice_agent_targets`, listed by the voice target picker
-/// ("Speak to") after the pinned bots: the `main` DM first, then the
-/// conversations, per signed-in account.
+/// One of the person's agents a spoken turn may go to (AD-384; 108.2), from
+/// `voice_agent_targets`, listed by the voice target picker ("Speak to")
+/// after the pinned bots: every agent of every database this device holds
+/// (`keeper_core::hq`), by name. A question to one goes into that agent's
+/// main conversation ([`crate::hq::spoken`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct VoiceAgentTargetVm {
-    /// What `voice_target_set` stores to choose it, and what
-    /// `VoiceWakeVm.voiceTarget` reads back once chosen.
+    /// What `voice_target_set` stores to choose it (`agent:<agent>`), and
+    /// what `VoiceWakeVm.voiceTarget` reads back once chosen.
     pub target: String,
-    /// The account the room is on.
-    pub account_id: String,
-    pub room_id: String,
-    /// The room's name for the DM, the conversation's title otherwise.
+    /// The agent's actor id in its database.
+    pub agent: String,
+    /// The agent's name.
     pub name: String,
-    /// `main` (the DM) or `conversation`.
-    pub kind: crate::agents::session::SessionKind,
 }
 
 /// One thing the voice port did (Epic 65, Story 65.3, AD-192), from
@@ -8551,11 +8410,6 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
-            agent_room: None,
-            agent_avatar: None,
-            agent_mark: None,
-            agent: None,
-            agent_attention: None,
         }
     }
 
@@ -8596,7 +8450,6 @@ mod tests {
                 rooms: vec![sample_inbox_room()],
             }],
             total: Some(11),
-            note: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"total\":11"), "json was: {json}");
@@ -8740,11 +8593,6 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
-            agent_room: None,
-            agent_avatar: None,
-            agent_mark: None,
-            agent: None,
-            agent_attention: None,
         }
     }
 
@@ -8778,11 +8626,6 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
-            agent_room: None,
-            agent_avatar: None,
-            agent_mark: None,
-            agent: None,
-            agent_attention: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
@@ -9524,9 +9367,6 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
-            brief: None,
-            gate: None,
-            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -9551,9 +9391,6 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
-            brief: None,
-            gate: None,
-            turn: None,
         }
     }
 
@@ -9629,9 +9466,6 @@ mod tests {
             ],
             media: None,
             readers: Vec::new(),
-            brief: None,
-            gate: None,
-            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -9691,9 +9525,6 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
-            brief: None,
-            gate: None,
-            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -9775,9 +9606,6 @@ mod tests {
                     },
                 },
             ],
-            header: None,
-            approvals: None,
-            heard: None,
             pagination: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
@@ -9902,9 +9730,6 @@ mod tests {
                 caption: None,
             })),
             readers: Vec::new(),
-            brief: None,
-            gate: None,
-            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -9949,9 +9774,6 @@ mod tests {
                 "@bob:example.org".to_owned(),
                 "@carol:example.org".to_owned(),
             ],
-            brief: None,
-            gate: None,
-            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(

@@ -570,22 +570,6 @@ pub fn hosts_note(
     (!notes.is_empty()).then(|| notes.join(" "))
 }
 
-/// Each Settings › Agents row's web search as the hosts serving its agent
-/// make of it ([`hosts_note`]): `hosts` as this device last read them,
-/// `None` when it could not.
-pub fn with_hosts(rows: &mut [crate::agents::copy::AgentCopyVm], hosts: Option<&[ServingHost]>) {
-    for row in rows {
-        let agent = format!("{}/{}", row.drive, row.agent);
-        if let Some(vm) = row.web_search.as_mut() {
-            vm.host = vm
-                .unavailable
-                .is_none()
-                .then(|| hosts_note(&row.name, vm.level, &agent, hosts))
-                .flatten();
-        }
-    }
-}
-
 /// The first release that has a `web_search` tool (101.4).
 const SEARCH_SINCE: &str = "0.10.4";
 
@@ -801,93 +785,6 @@ mod tests {
             parse_answer(&engine_url, br#"{"results": []}"#),
             Ok(Vec::new())
         );
-    }
-
-    /// Story 102.3 #3 (DW-1471): each Settings row says what the live hosts
-    /// serving its agent make of its level — every one that cannot or does
-    /// not say it searches, or that none serves it, or that they were not
-    /// read — and nothing at *Off*, for an agent never offered a search, or
-    /// where every serving host searches. Another agent's host is not this
-    /// one's.
-    #[test]
-    fn a_rows_web_search_says_what_its_serving_hosts_make_of_it() {
-        let host = |slug: &str, version: &str, agent: &str, web_search| ServingHost {
-            host: slug.to_owned(),
-            version: version.to_owned(),
-            agents: vec![agent.to_owned()],
-            web_search,
-            sandbox: true,
-        };
-        let row = |level, unavailable: Option<&str>| crate::agents::copy::AgentCopyVm {
-            profile_id: "p1".to_owned(),
-            drive: "tgdrive".to_owned(),
-            agent: "nixi".to_owned(),
-            name: "Nixi".to_owned(),
-            matrix_user: "@nixi:example.org".to_owned(),
-            device: None,
-            host: None,
-            signed_in: true,
-            pin: None,
-            problem: None,
-            model: None,
-            web_search: Some(AgentWebSearchVm {
-                level,
-                locked: None,
-                unavailable: unavailable.map(str::to_owned),
-                warning: None,
-                host: None,
-            }),
-            console: None,
-            avatar_problem: None,
-        };
-        let said = |level, unavailable, hosts: Option<&[ServingHost]>| {
-            let mut rows = [row(level, unavailable)];
-            with_hosts(&mut rows, hosts);
-            rows[0].web_search.as_ref().and_then(|vm| vm.host.clone())
-        };
-        use WebSearchLevel::{Ask, Off, WithoutAsking};
-        let searching = [host("electra", "0.10.6", "tgdrive/nixi", Some(true))];
-        let none = [
-            host("electra", "0.10.6", "tgdrive/nixi", Some(false)),
-            host("kalypso", "0.9.0", "tgdrive/nixi", None),
-            host("argo", "0.10.6", "tgdrive/tola", Some(false)),
-        ];
-        assert_eq!(said(Ask, None, Some(&searching)), None);
-        let both = said(WithoutAsking, None, Some(&none)).expect("two hosts say why");
-        assert!(
-            both.contains("electra names no search engine")
-                && both.contains("kalypso runs keeper 0.9.0")
-                && !both.contains("argo"),
-            "{both}"
-        );
-        assert!(said(Ask, None, Some(&[]))
-            .expect("no host")
-            .starts_with("No live host serves Nixi now"));
-        assert!(said(Ask, None, None)
-            .expect("not read")
-            .contains("unknown on this host"));
-        assert_eq!(said(Off, None, Some(&none)), None);
-        assert_eq!(said(Ask, Some("Nixi is a gate."), Some(&none)), None);
-        // R483 (review R102T1-03): another principal's `electra` serving
-        // Lucyna says the opposite of Nixi's, in either order; the row
-        // follows the host it selected for Nixi, never the first `electra`.
-        for nixis in [true, false] {
-            let nixi = host("electra", "0.10.6", "tgdrive/nixi", Some(nixis));
-            let lucyna = host("electra", "0.10.6", "neuradrive/lucyna", Some(!nixis));
-            for hosts in [
-                [nixi.clone(), lucyna.clone()],
-                [lucyna.clone(), nixi.clone()],
-            ] {
-                let note = said(WithoutAsking, None, Some(&hosts));
-                if nixis {
-                    assert_eq!(note, None);
-                } else {
-                    assert!(note
-                        .expect("Nixi's electra names none")
-                        .contains("electra names no search engine"));
-                }
-            }
-        }
     }
 
     fn agent(kind: &str, extra: &str, local_only: bool) -> AgentConfig {

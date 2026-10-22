@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::agents::attention::AgentAttentionVm;
 use crate::hq::approvals::{self, AgentApprovalStateVm, AgentDecisionStateVm};
 use crate::hq::port::{ReplicaSpec, RowOp};
+use crate::hq::sessions::AgentAttentionVm;
 use crate::hq::sessions::{self, object, Source};
 use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, AgentMessageStateVm, Opened};
@@ -956,6 +956,50 @@ fn an_ask_followed_by_more_agent_words_still_needs_you_and_a_failed_turn_is_fail
         Some(AgentAttentionVm::Working),
         "a new turn supersedes a failed one"
     );
+}
+
+/// R-HQ-68: the person's heard row is a mark for the claim holder, not a
+/// message — the session draws none, and it answers no ask.
+#[test]
+fn a_heard_row_is_not_drawn_and_answers_no_ask() {
+    let w = world();
+    let t = now() - 60_000;
+    let mut ops = session("dev1.1", NIXIE, t, false, Some(t + 100));
+    ops.push(message("q1", "dev1.1", "person", t + 1, None, Value::Null));
+    ops.push(message(
+        "a1",
+        "dev1.1",
+        "agent",
+        t + 2,
+        Some("q1"),
+        json!({"kind": "ask", "options": ["yes", "no"]}),
+    ));
+    ops.push(message(
+        "h1",
+        "dev1.1",
+        "person",
+        t + 3,
+        None,
+        json!({"kind": "heard", "message": "q1", "heard_until": 12,
+               "sentence": 1, "reason": "stop"}),
+    ));
+    w.alpha.replica.mutate(ops).expect("seed");
+    let (view, _) = timeline::view(
+        &w.alpha,
+        "dev1.1",
+        &Opened::default(),
+        &HashMap::new(),
+        now(),
+    )
+    .expect("view");
+    let ids: Vec<&str> = view.messages.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(ids, ["body of q1", "body of a1"]);
+    assert_eq!(view.messages[1].ask.as_ref().map(|a| a.open), Some(true));
+    let row = sessions::list(std::slice::from_ref(&w.alpha), now())
+        .into_iter()
+        .find(|r| r.session_id == "dev1.1")
+        .expect("listed");
+    assert_eq!(row.attention, Some(AgentAttentionVm::NeedsYou));
 }
 
 #[test]

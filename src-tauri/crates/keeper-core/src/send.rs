@@ -16,19 +16,14 @@
 //! This is the contract that the future agent-proposal features are built on;
 //! treat it as binding, not advisory.
 //!
-//! - **Exactly three user-initiated dispatch triggers exist:**
-//!   [`SendTrigger::ComposerSend`] (the user sends from the composer),
+//! - **Exactly two user-initiated dispatch triggers exist:**
+//!   [`SendTrigger::ComposerSend`] (the user sends from the composer) and
 //!   [`SendTrigger::ApprovalPaneApprove`] (the user approves a pending draft in the
-//!   approval pane, Story 7.3) and [`SendTrigger::SpokenToAgent`] (the user spoke a
-//!   question to their own agent, ruling R31). All three — and only these three —
-//!   flow through the single [`submit`] gate. [`SendTrigger`] is a **closed set** of
-//!   exactly these three.
-//! - **A spoken send goes only to the person's own agent (R31).** The end of an
-//!   utterance is the person's send, so [`SendTrigger::SpokenToAgent`] skips the
-//!   Undo-Send hold; it is legal ONLY for a room whose agent-room kind is `main` or
-//!   `conversation` and whose proxy's human is the signed-in user, known — never
-//!   assumed (R72) — and the account's `admit_proxy_room` check runs before its one
-//!   call site, in the same function (`spoken_send`).
+//!   approval pane, Story 7.3). Both — and only these two — flow through the single
+//!   [`submit`] gate. [`SendTrigger`] is a **closed set** of exactly these two. (A
+//!   question spoken to the person's agent was a third, R31, while the agents had
+//!   Matrix rooms; since 108.2 it is a row in the agents' database,
+//!   `crate::hq::spoken`, and never reaches this gate.)
 //! - **No background, scheduled, automated, or bulk dispatch path exists or may be
 //!   added.** There is no timer, no queue drainer, no `approve-all`, and no
 //!   *unattended*, scheduled, or bulk send API. Every new plain-text message that
@@ -42,14 +37,14 @@
 //!   through the user pressing approve in the pane ([`SendTrigger::ApprovalPaneApprove`]).
 //!   Writing a draft never reaches this gate.
 //! - **Adding a trigger or any unattended send path is a new planning-level
-//!   decision, not merely a code change.** A fourth [`SendTrigger`] variant, a fourth
+//!   decision, not merely a code change.** A third [`SendTrigger`] variant, a third
 //!   [`submit`] caller, or any background/scheduled/automated/bulk send path is an
 //!   invariant breach: it must be raised as a planning decision, not slipped in as
-//!   an edit (the third, R31, was). Never add a `_ =>` wildcard arm to a
+//!   an edit. Never add a `_ =>` wildcard arm to a
 //!   [`SendTrigger`] match — it would silently absorb a new variant and defeat the
 //!   exhaustiveness gate.
 //!
-//! **Scope.** This three-trigger airlock governs *new plain-text message origination*
+//! **Scope.** This two-trigger airlock governs *new plain-text message origination*
 //! through [`submit`]. The sibling gates [`submit_reply`], [`submit_edit`],
 //! [`toggle_reaction`], [`redact`], and [`submit_attachment`] dispatch replies,
 //! edits, reactions, redactions, and media — each locked to a single call site by
@@ -60,12 +55,11 @@
 //!
 //! Enforcing guard tests (all in this module's `#[cfg(test)]` block plus the sibling
 //! `account.rs` scan they read): `submit_is_the_sole_send_dispatch_gate` (the SDK
-//! send verbs each stay one call site), `exactly_three_legal_dispatch_triggers` (the
-//! wildcard-free exhaustiveness gate — a fourth variant fails to compile), and
-//! `submit_has_exactly_the_three_user_initiated_callers` (a source scan of production
-//! `account.rs` — a fourth or background [`submit`] caller fails the count, a spoken
-//! send that does not first pass the proxy-room check or that could be held fails
-//! it, and so does a second `.send_raw(` beside the dock's closed agent-event sender).
+//! send verbs each stay one call site), `exactly_two_legal_dispatch_triggers` (the
+//! wildcard-free exhaustiveness gate — a third variant fails to compile), and
+//! `submit_has_exactly_the_two_user_initiated_callers` (a source scan of production
+//! `account.rs` — a third or background [`submit`] caller fails the count, and so
+//! does any `.send_raw(`: since 108.2 keeper sends no event of its own type).
 //!
 //! Secret containment (NFR-9): neither the message body, a txn id, an event id,
 //! nor a token ever reaches `tracing` — logs carry the opaque room id only, via
@@ -86,15 +80,14 @@ use crate::error::SendError;
 
 /// What caused a content dispatch through the single send gate (AD-13).
 ///
-/// This is a **closed set** of exactly three user-initiated triggers, the only three
-/// the send-gate contract names: [`SendTrigger::ComposerSend`] (a composer send),
+/// This is a **closed set** of exactly two user-initiated triggers, the only two
+/// the send-gate contract names: [`SendTrigger::ComposerSend`] (a composer send) and
 /// [`SendTrigger::ApprovalPaneApprove`] (approving a pending draft in the approval
-/// pane, Story 7.3) and [`SendTrigger::SpokenToAgent`] (a question spoken to the
-/// person's own agent, R31). These are the only legal dispatch triggers; all flow
-/// through the single [`submit`] gate. Adding a fourth variant is an AD-13 invariant
-/// breach requiring a new planning-level decision (see the module-level airlock
+/// pane, Story 7.3). These are the only legal dispatch triggers; both flow through
+/// the single [`submit`] gate. Adding a variant is an AD-13 invariant breach
+/// requiring a new planning-level decision (see the module-level airlock
 /// contract), and it will fail the wildcard-free exhaustiveness gate
-/// (`exactly_three_legal_dispatch_triggers`) at compile time. No match over this enum
+/// (`exactly_two_legal_dispatch_triggers`) at compile time. No match over this enum
 /// may use a `_ =>` wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendTrigger {
@@ -103,10 +96,6 @@ pub enum SendTrigger {
     /// A message dispatched by approving a pending draft in the approval pane
     /// (Story 7.3).
     ApprovalPaneApprove,
-    /// What the voice turn heard, sent to the person's own `main` or
-    /// `conversation` agent room as the person's message, with no Undo-Send
-    /// hold: the end of the utterance was the send (ruling R31).
-    SpokenToAgent,
 }
 
 impl SendTrigger {
@@ -116,7 +105,6 @@ impl SendTrigger {
         match self {
             SendTrigger::ComposerSend => "composer_send",
             SendTrigger::ApprovalPaneApprove => "approval_pane_approve",
-            SendTrigger::SpokenToAgent => "spoken_to_agent",
         }
     }
 }
@@ -572,9 +560,9 @@ pub async fn cancel(timeline: &Timeline, item_key: &str) -> Result<(), SendError
 mod tests {
     use super::SendTrigger;
 
-    /// AD-13 exhaustiveness gate: `SendTrigger` is the closed set of exactly the three
-    /// user-initiated dispatch triggers (the third, `SpokenToAgent`, by ruling R31).
-    /// This test is the **planning gate** — if a future change adds a fourth variant,
+    /// AD-13 exhaustiveness gate: `SendTrigger` is the closed set of exactly the two
+    /// user-initiated dispatch triggers.
+    /// This test is the **planning gate** — if a future change adds a variant,
     /// the wildcard-free `match` below fails to COMPILE here (and the length assert
     /// fails), forcing the change to be raised as a planning-level decision rather
     /// than slipped in as an edit.
@@ -582,12 +570,9 @@ mod tests {
     /// Do NOT add a `_ =>` arm to the match: a wildcard would silently absorb a new
     /// variant and defeat this gate.
     #[test]
-    fn exactly_three_legal_dispatch_triggers() {
-        const ALL_TRIGGERS: &[SendTrigger] = &[
-            SendTrigger::ComposerSend,
-            SendTrigger::ApprovalPaneApprove,
-            SendTrigger::SpokenToAgent,
-        ];
+    fn exactly_two_legal_dispatch_triggers() {
+        const ALL_TRIGGERS: &[SendTrigger] =
+            &[SendTrigger::ComposerSend, SendTrigger::ApprovalPaneApprove];
 
         // Wildcard-free exhaustive match: a new `SendTrigger` variant makes this
         // non-exhaustive and the crate fails to compile HERE. NO `_ =>` arm.
@@ -595,37 +580,29 @@ mod tests {
             match trigger {
                 SendTrigger::ComposerSend => {}
                 SendTrigger::ApprovalPaneApprove => {}
-                SendTrigger::SpokenToAgent => {}
             }
         }
 
         assert_eq!(
             ALL_TRIGGERS.len(),
-            3,
-            "AD-13: exactly three legal dispatch triggers must exist; found {}. \
-             A fourth trigger is an invariant breach requiring a planning decision.",
+            2,
+            "AD-13: exactly two legal dispatch triggers must exist; found {}. \
+             A third trigger is an invariant breach requiring a planning decision.",
             ALL_TRIGGERS.len()
         );
     }
 
-    /// AD-13 caller gate: `send::submit` has exactly the three user-initiated callers —
-    /// `send_text` (`ComposerSend`), `send_approval` (`ApprovalPaneApprove`) and
-    /// `spoken_send` (`SpokenToAgent`, R31) — and no fourth, background,
-    /// scheduled, or bulk caller, and no other public API dispatches. Scans the
-    /// PRODUCTION slice of `account.rs` (everything before its sole `#[cfg(test)]`
-    /// marker) so this guard's own literals never self-match.
+    /// AD-13 caller gate: `send::submit` has exactly the two user-initiated callers —
+    /// `send_text` (`ComposerSend`) and `send_approval` (`ApprovalPaneApprove`) — and
+    /// no third, background, scheduled, or bulk caller, and no other public API
+    /// dispatches. Scans the PRODUCTION slice of `account.rs` (everything before its
+    /// sole `#[cfg(test)]` marker) so this guard's own literals never self-match.
     ///
-    /// R31's room restriction is pinned here too: the spoken call site sits in
-    /// `spoken_send`, after that function asked `admit_proxy_room` — which admits
-    /// only the person's own `main`/`conversation` proxy room, failing closed on
-    /// whose proxy it is (R72) — and that function never reads the Undo-Send window
-    /// or holds the send. What the admission refuses is `proxy::admits`' tests'.
-    ///
-    /// A future fourth `send::submit(` call site (or a background/bulk dispatcher)
+    /// A future third `send::submit(` call site (or a background/bulk dispatcher)
     /// changes the count and fails this test, surfacing the change as an invariant
     /// breach needing a planning decision.
     #[test]
-    fn submit_has_exactly_the_three_user_initiated_callers() {
+    fn submit_has_exactly_the_two_user_initiated_callers() {
         let full = include_str!("account.rs");
 
         // The scan splits production off the test module on the sole `#[cfg(test)]`
@@ -652,15 +629,14 @@ mod tests {
         // `crate::send::submit(` prefix still matches `send::submit(` as a substring.
         let normalized: String = source.split_whitespace().collect();
 
-        // The gate must have exactly three call sites. The prose reference in rustdoc
+        // The gate must have exactly two call sites. The prose reference in rustdoc
         // is `[`send::submit`]` (no `(`), so it does not match.
         let submit_calls = normalized.matches("send::submit(").count();
         assert_eq!(
-            submit_calls, 3,
-            "AD-13: `send::submit(` must have exactly three production callers \
-             (composer + approval + spoken to the person's agent); found {submit_calls}. \
-             A fourth or background caller is an invariant breach requiring a planning \
-             decision."
+            submit_calls, 2,
+            "AD-13: `send::submit(` must have exactly two production callers \
+             (composer + approval); found {submit_calls}. A third or background caller \
+             is an invariant breach requiring a planning decision."
         );
 
         // Call forms (with `).await`) dodge the bracketed `[`SendTrigger::…`]` rustdoc
@@ -680,40 +656,6 @@ mod tests {
             approval_calls, 1,
             "AD-13: exactly one `ApprovalPaneApprove` dispatch call site expected; found {approval_calls}."
         );
-        let spoken: Vec<usize> = normalized
-            .match_indices("SendTrigger::SpokenToAgent).await")
-            .map(|(at, _)| at)
-            .collect();
-        assert_eq!(
-            spoken.len(),
-            1,
-            "AD-13: exactly one `SpokenToAgent` dispatch call site expected; found {}.",
-            spoken.len()
-        );
-        // R31: the spoken send's function, from its signature to the call.
-        let opener = "pubasyncfnspoken_send(";
-        let start = normalized[..spoken[0]].rfind(opener).expect(
-            "R31: the `SpokenToAgent` call site must be in `spoken_send`, \
-             which admits the room first",
-        );
-        let body = &normalized[start + opener.len()..spoken[0]];
-        assert!(
-            !["asyncfn", "pubfn", "pub(crate)fn", "}fn", ";fn"]
-                .iter()
-                .any(|opens| body.contains(opens)),
-            "R31: the `SpokenToAgent` call site must be in `spoken_send` itself"
-        );
-        let checked = body.find("admit_proxy_room(room,kinds,proxies)");
-        let sent = body.rfind("send::submit(");
-        assert!(
-            matches!((checked, sent), (Some(checked), Some(sent)) if checked < sent),
-            "R31: `spoken_send` must admit the room with `admit_proxy_room` (the person's \
-             own `main`/`conversation` agent room) before it calls `send::submit`"
-        );
-        assert!(
-            !body.contains("hold_send(") && !body.contains("get_undo_send_window("),
-            "R31: a spoken send to the person's agent is never held for Undo-Send"
-        );
 
         // AD-13 (Story 8.3): the deferred completion path. `send::dispatch(` is the
         // SDK-enqueue primitive; besides `submit` (which lives in send.rs, not
@@ -731,22 +673,16 @@ mod tests {
              second caller is an invariant breach requiring a planning decision."
         );
 
-        // The person's agent events (stories 91.2, 93.3) go out through
-        // `Room::send_raw`, which takes any event type: exactly one call site
-        // may exist in production `account.rs` — the private
-        // `send_agent_event`, whose input is the closed `AgentOutbound` (a
-        // scope, a request for a conversation, the device's surface result —
-        // `agents::device` sends its `expired` answers through it too, so no
-        // other file holds a `send_raw` — an approval decision, and a heard
-        // mark). A second
-        // one would be an open door for any event type — a status, a claim, a
-        // `consumed` — outside this airlock.
+        // `Room::send_raw` takes any event type. The person's agent events
+        // (stories 91.2, 93.3) went out through one, until the agents left
+        // Matrix (108.2): what keeper tells an agent is now a row on the agents
+        // server, so a `send_raw` here would be an open door for a
+        // `dev.keeper.agent.*` event nobody reads any more.
         let raw_calls = normalized.matches(".send_raw(").count();
         assert_eq!(
-            raw_calls, 1,
-            "AD-13: `.send_raw(` must have exactly one production call site in \
-             account.rs (`send_agent_event`, over the closed `AgentOutbound`); \
-             found {raw_calls}."
+            raw_calls, 0,
+            "AD-13: keeper sends no raw Matrix event since 108.2; found {raw_calls} \
+             `.send_raw(` call sites in account.rs."
         );
     }
 

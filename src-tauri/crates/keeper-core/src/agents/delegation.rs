@@ -17,13 +17,18 @@ use serde_json::{json, Value};
 use ulid::Ulid;
 
 use crate::agents::card;
-use crate::agents::events::{CONTENT_VERSION, DELEGATE};
 use crate::agents::home;
 use crate::agents::label::{Integrity, Label, Readers};
 use crate::agents::session::{
     Checkpoints, SessionAgent, SessionKind, SessionLimits, SessionParent, HOP_MAX,
 };
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
+
+/// The key inside a brief's message content carrying the delegation
+/// (ruling R53): who hands what to whom, under which label.
+pub const DELEGATE: &str = "dev.keeper.agent.delegate";
+/// The contents' schema version, `"v": 1`.
+pub const CONTENT_VERSION: u32 = 1;
 
 /// The child session's card, at its root.
 pub const CARD_FILE: &str = "brief.md";

@@ -22,10 +22,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ulid::Ulid;
 
-use crate::agents::events::{ANSWER, ASK, CONTENT_VERSION};
 use crate::agents::home::AgentKind;
 use crate::agents::label::{Label, Readers, Sink};
 use crate::agents::session::SessionKind;
+
+/// The key inside an agent's message content carrying a question for a
+/// person, through that person's proxy (AD-380, R99): the ask.
+pub const ASK: &str = "dev.keeper.agent.ask";
+/// The key inside a proxy's message content relaying its person's answer
+/// to an ask, into the asking room (R100).
+pub const ANSWER: &str = "dev.keeper.agent.answer";
+/// The contents' schema version, `"v": 1`.
+pub const CONTENT_VERSION: u32 = 1;
 
 /// What `ask_human` says when nobody can be asked and the question names
 /// no default (the epic's Q4).

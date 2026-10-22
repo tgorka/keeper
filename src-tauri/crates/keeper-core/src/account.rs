@@ -16,13 +16,11 @@
 //! plaintext beyond the rendered preview crosses IPC or reaches a `tracing` log
 //! (NFR-9).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::Future;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use matrix_sdk::encryption::VerificationState;
@@ -35,41 +33,17 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, StateEventType, SyncMessageLikeEvent,
 };
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
-use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
+use matrix_sdk_ui::room_list_service::filters::{new_filter_all, new_filter_non_left};
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::sync_service::{State, SyncService};
 use matrix_sdk_ui::timeline::{Timeline, TimelineBuilder};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-use crate::agents::approval_card::{self, ApprovalDecideReq, HostedRooms, Viewer, NOTE_MAX};
-use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
-use crate::agents::events::{
-    ApprovalDecisionContent, ConversationRequestContent, Focus, MainDmRequestContent, ScopeContent,
-    ScopeDrive, CONTENT_VERSION, MAIN_DM_ANSWER,
-};
-use crate::agents::events::{PresencePlatform, SurfaceResultContent};
-use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
-use crate::agents::heard::HeardContent;
-use crate::agents::launch::{
-    self, AgentsLaunchVm, LaunchFacts, LaunchReadiness, LaunchRoomVm, LaunchSource, MainDmAskVm,
-    ReadinessState, SetDefaultError, LAUNCH_READY_MS, LAUNCH_RECHECK_MS,
-};
-use crate::agents::list_rows::{ListRowStore, RowWriter};
-use crate::agents::main_dm;
-use crate::agents::proxy::{
-    self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
-    ProxyRoomVm,
-};
-use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds, AgentRoomKind};
-use crate::agents::session::SessionKind;
-use crate::agents::spoken::SpokenAnswer;
-use crate::agents::surface::{SurfaceAnswerReq, SurfaceRequestArrived};
-use crate::agents::waiting as agent_waiting;
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
@@ -88,7 +62,7 @@ use crate::error::{
     AccountError, BackupError, BridgeError, CoreError, InboxError, MediaError, SendError,
     TimelineError,
 };
-use crate::inbox::{AgentListTrouble, InboxMerger, NetworksSink, SpacesSink};
+use crate::inbox::{InboxMerger, NetworksSink, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
 use crate::notify::{self, NotifyConfig};
 use crate::palette::{PaletteEntry, PaletteIndex};
@@ -106,12 +80,8 @@ use crate::vm::{
     RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
-mod agent_list;
-use agent_list::AgentLists;
 mod inbox_owners;
 pub(crate) mod lifetime;
-pub use agent_list::AttentionBoard;
-use agent_list::{asks_answered_in, KEPT_ROWS_NOT_REMOVED};
 use inbox_owners::{InboxOwners, Owner};
 use lifetime::{AccountLifetimes, Lifetime};
 
@@ -165,14 +135,6 @@ pub type DraftMirrorSink = Box<dyn Fn(DraftMirrorBatch) -> bool + Send + Sync>;
 /// a Tauri `Channel::send`; tests capture into a vector. Returns `true` if the snapshot
 /// was delivered, `false` if the channel is closed (the producer then stops).
 pub type OutboxSink = Box<dyn Fn(OutboxVm) -> bool + Send + Sync>;
-
-/// Sink that receives each [`agent_waiting::AgentAsksVm`] snapshot (Story 101.3).
-/// The shell wraps a Tauri `Channel::send`; `false` once the channel is closed.
-pub type AgentAsksSink = Box<dyn Fn(agent_waiting::AgentAsksVm) -> bool + Send + Sync>;
-
-/// How long the questions' follower lets a burst of room changes settle
-/// before it reads them again (Story 101.3).
-const ASKS_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 mod open_views;
 
@@ -263,7 +225,6 @@ type ActivatedAccount = (
     EventHandlerHandle,
     EventHandlerHandle,
     EventHandlerHandle,
-    AccountAgents,
     JoinHandle<()>,
     tokio::sync::broadcast::Sender<OutboxChange>,
 );
@@ -353,10 +314,6 @@ struct AccountHandle {
     /// task. Aborted on `unsubscribe_outbox` and on shutdown; a producer whose sink
     /// closes ends on its own.
     outbox_subs: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
-    /// The account's agents on this device (91.3): its surface request
-    /// handler and presence publisher, started in [`activate`]; dropping the
-    /// handle stops both.
-    agents: AccountAgents,
 }
 
 /// A change signal broadcast on an account's outbox (Story 8.3). Carries no payload:
@@ -778,85 +735,13 @@ pub struct AccountManager {
     /// `static`) so there is no new global mutable state; the Settings command reads/sets
     /// it via [`AccountManager::dock_badge_mode_get`] / [`AccountManager::dock_badge_mode_set`].
     badge: Arc<BadgeConfig>,
-    /// The session kind of every agent room read so far (UX-DR132): fed by the
-    /// room list and by an open agent room's header, read by the room list.
-    agent_kinds: Arc<AgentKinds>,
-    /// The soul's mark of every agent whose zone is on this device (91.1
-    /// acceptance 6): the desktop's agents host replaces it on each scan
-    /// through [`AccountManager::agent_icons`]; on the phone it stays empty.
-    agent_icons: Arc<AgentIcons>,
-    /// Each control room's host manifests as the server last gave them
-    /// (story 102.3, R466): reused by the headers' refresh for a minute.
-    host_reads: HostReads,
-    /// The proxies whose agents zones are on this device (91.2): their person
-    /// and the drives a dock's scope chip offers. Replaced by the desktop's
-    /// agents host on each scan; empty on the phone.
-    agent_proxies: Arc<AgentProxies>,
-    /// Per (account, proxy room): the docked note's focus on its way there.
-    agent_focus: Arc<FocusLanes<(String, OwnedRoomId)>>,
-    /// The app's agents on this device (91.3): whether keeper is in front,
-    /// which view it shows, and the surface requests its accounts admit.
-    agent_device: Arc<AgentDevice>,
-    /// The session rooms whose agent this app hosts (93.3): the desktop's
-    /// agents host replaces them on each tick; empty on the phone.
-    agent_hosted: Arc<HostedRooms>,
-    /// The attached actions this app showed and found bound to their
-    /// digest, by `(account, room, binding digest)` (R186): only these are
-    /// approved.
-    agent_shown: Arc<std::sync::Mutex<std::collections::HashSet<(String, String, String)>>>,
-    /// Which signed-in accounts' room lists have finished their first sync
-    /// since launch (R397): what the launch into the default agent waits for.
-    launch_ready: LaunchReadiness,
-    /// What every account's agent rows say of their rooms now, written by
-    /// each account's list worker (story 102.5, R468).
-    agent_attention: Arc<AttentionBoard>,
-    /// Where each account's Agents rows are kept for the next launch (story
-    /// 102.5).
-    agent_list_rows: ListRowStore,
-    /// Each live account's list worker and seat finder, from its activation
-    /// to its teardown (story 102.5, R501).
-    agent_lists: AgentLists,
     /// Each account's lifetime: what its activation opens, its teardown ends
-    /// at its start, and every registration of its Agents list checks
-    /// (story 102.5, R516).
+    /// at its start, and every inbox producer of it checks (story 102.5,
+    /// R516).
     lifetimes: AccountLifetimes,
     /// Every inbox producer of every account, held until registered here,
     /// and which inbox subscription is the newest (story 102.5, R519).
     inbox_owners: InboxOwners,
-}
-
-/// The launch's view of the live accounts (R397): [`launch::resolve`] reads
-/// the key and the rooms here again whenever an account's readiness changes,
-/// and every [`LAUNCH_RECHECK_MS`] besides — an agent's status can become
-/// readable without any account finishing a sync.
-struct ManagerLaunch<'a> {
-    manager: &'a AccountManager,
-    data_dir: &'a Path,
-    ready: tokio::sync::watch::Receiver<ReadinessState>,
-}
-
-impl LaunchSource for ManagerLaunch<'_> {
-    fn chosen(&self) -> Result<Option<String>, CoreError> {
-        registry::get_agents_default(self.data_dir)
-    }
-
-    fn ready(&self) -> Option<u64> {
-        self.manager.launch_ready.ready()
-    }
-
-    fn facts(&self) -> impl Future<Output = LaunchFacts> + Send {
-        self.manager.agents_launch_facts()
-    }
-
-    fn changed(&mut self) -> impl Future<Output = ()> + Send {
-        let recheck = Duration::from_millis(LAUNCH_RECHECK_MS);
-        async move {
-            tokio::select! {
-                _ = self.ready.changed() => {}
-                () = tokio::time::sleep(recheck) => {}
-            }
-        }
-    }
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -947,18 +832,6 @@ impl AccountManager {
             palette: Arc::new(Mutex::new(PaletteIndex::new())),
             notify,
             badge,
-            agent_kinds: Arc::new(AgentKinds::kept(data_dir)),
-            agent_icons: Arc::new(AgentIcons::default()),
-            host_reads: HostReads::default(),
-            agent_proxies: Arc::new(AgentProxies::default()),
-            agent_focus: Arc::new(FocusLanes::default()),
-            agent_device: Arc::new(AgentDevice::default()),
-            agent_hosted: Arc::new(HostedRooms::default()),
-            agent_shown: Arc::default(),
-            launch_ready: LaunchReadiness::default(),
-            agent_attention: Arc::default(),
-            agent_list_rows: ListRowStore::new(data_dir),
-            agent_lists: AgentLists::default(),
             lifetimes: AccountLifetimes::default(),
             inbox_owners: InboxOwners::default(),
         }
@@ -1084,7 +957,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1094,7 +966,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1110,7 +982,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1150,7 +1021,6 @@ impl AccountManager {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
                             dead.outbox_scheduler.abort();
-                            drop(self.agent_lists.take(account_id));
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -1170,10 +1040,6 @@ impl AccountManager {
         // reads, so the glyph and notification suppression never diverge, and no
         // per-row SQLite open happens on the inbox hot path.
         let notify = self.notify.clone();
-        let kinds = self.agent_kinds.clone();
-        let icons = self.agent_icons.clone();
-        // An agent row's state is the list worker's (story 102.5).
-        let board = self.agent_attention.clone();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -1181,16 +1047,7 @@ impl AccountManager {
                 // `client` is captured to keep the account alive for the task's
                 // lifetime; the producer reads from the room list only.
                 let _keep_alive = client;
-                run_producer(
-                    room_list,
-                    sink,
-                    &account_id_owned,
-                    &notify,
-                    &kinds,
-                    &icons,
-                    &board,
-                )
-                .await;
+                run_producer(room_list, sink, &account_id_owned, &notify).await;
                 // A naturally-completed producer reaps its own subscription entry.
                 reaper_subs.lock().await.remove(&subscription_id);
             }
@@ -1224,13 +1081,12 @@ impl AccountManager {
     /// `inbox_sink`, the Archive window into `archive_sink`, the Pins window into
     /// `pins_sink` (seeded from keeper-local [`registry::get_pins`], Story 4.3),
     /// and the Favorites window into `favourites_sink` (SDK-sourced `m.favourite`
-    /// tag, Story 4.4), and the Agents window into `agents_sink` (every agent
-    /// session room and only there; control rooms in no window — UX-DR132).
-    /// Returns the inbox subscription id. Replacing an
+    /// tag, Story 4.4). An old agent room is in no window (108.2, UX-DR-E108-2:
+    /// [`crate::old_agent_rooms`]). Returns the inbox subscription id. Replacing an
     /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
     /// account) first tears the old one down. Adding the Nth account is identical
     /// to the 2nd — no count limit.
-    // Seven sinks (Inbox/Archive/Pins/Favorites/Agents/Spaces/Networks) plus `self` and the
+    // Six sinks (Inbox/Archive/Pins/Favorites/Spaces/Networks) plus `self` and the
     // platform each cross the IPC boundary as a distinct stream; grouping them into a
     // struct would only obscure the one-to-one channel mapping.
     #[allow(clippy::too_many_arguments)]
@@ -1241,7 +1097,6 @@ impl AccountManager {
         archive_sink: InboxSink,
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
-        agents_sink: InboxSink,
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
     ) -> Result<u64, CoreError> {
@@ -1271,12 +1126,6 @@ impl AccountManager {
             .map(|a| (a.vm.account_id.clone(), seen.of(&a.vm.account_id)))
             .collect();
         let ended = |account_id: &str| lives.get(account_id).is_some_and(Lifetime::ended);
-        // The launch (R397) waits for each of these to finish its first sync,
-        // as the newest subscription says (review R102L7-02).
-        self.inbox_owners.if_current(generation, || {
-            self.launch_ready
-                .expect(accounts.iter().map(|a| a.vm.account_id.clone()))
-        });
         // Seed the merger's pin map from keeper-local state (Story 4.3): pins have
         // no Matrix representation, so membership + order come from the registry.
         let data_dir = platform.data_dir()?;
@@ -1286,7 +1135,6 @@ impl AccountManager {
             archive_sink,
             pins_sink,
             favourites_sink,
-            agents_sink,
             pins,
             spaces_sink,
             networks_sink,
@@ -1328,21 +1176,6 @@ impl AccountManager {
                 .register_account(&restorable.vm.account_id, restorable.vm.hue_index)
                 .await;
         }
-        // The Agents rows kept from the last run are the Agents window's
-        // first emission, before any account is activated (story 102.5 #1,
-        // R468); the live rows replace them as each account's list lands.
-        for restorable in &accounts {
-            if ended(&restorable.vm.account_id) {
-                continue;
-            }
-            agent_list::draw_kept_rows(
-                &self.agent_list_rows,
-                &self.agent_attention,
-                &merger,
-                &restorable.vm.account_id,
-            )
-            .await;
-        }
         for restorable in accounts {
             // A newer subscription took over: this one builds nothing more.
             if !self.inbox_owners.is_current(generation) {
@@ -1361,9 +1194,7 @@ impl AccountManager {
             life.pause(lifetime::Pause::Acquiring).await;
             // Activate + acquire the room list. A single account's activation
             // failure is not fatal to the whole inbox: skip it so the other
-            // accounts keep syncing. Its Agents rows kept from the last run
-            // stay, and the list says they are not live (story 102.5, R501,
-            // R381); they go only when the account itself is removed.
+            // accounts keep syncing.
             let room_list = match self
                 .acquire_room_list(platform, &account_id, Some(session), &life)
                 .await
@@ -1379,8 +1210,6 @@ impl AccountManager {
                         error = %e,
                         "inbox: the account began closing while the inbox started; nothing of it is registered"
                     );
-                    self.inbox_owners
-                        .if_current(generation, || self.launch_ready.gone(&account_id));
                     merger.remove_account(&account_id).await;
                     continue;
                 }
@@ -1388,31 +1217,10 @@ impl AccountManager {
                     tracing::warn!(
                         account_id = %account_id,
                         error = %e,
-                        "inbox: account could not start; skipping (others keep syncing, its kept agents stay)"
+                        "inbox: account could not start; skipping (others keep syncing)"
                     );
-                    self.inbox_owners
-                        .if_current(generation, || self.launch_ready.gone(&account_id));
-                    merger
-                        .trouble(&account_id, AgentListTrouble::NotStarted, true)
-                        .await;
                     continue;
                 }
-            };
-            life.pause(lifetime::Pause::TakingWriter).await;
-            // The rows are kept for the next launch through a writer of the
-            // lifetime this subscription took before it awaited anything: a
-            // sign-out that began since gives it none, and this subscription
-            // then registers no producer of the account (R501, R516; review
-            // R102L6-01).
-            let Some(keep_for_task) = self.agent_list_rows.writer(&life) else {
-                tracing::warn!(
-                    account_id = %account_id,
-                    "inbox: the account began closing while its list started; no writer, no producer"
-                );
-                self.inbox_owners
-                    .if_current(generation, || self.launch_ready.gone(&account_id));
-                merger.remove_account(&account_id).await;
-                continue;
             };
             // The account is now live (acquire_room_list activated it): fetch its
             // `Client` to drive the Spaces producer (Story 4.5), which enumerates
@@ -1433,18 +1241,7 @@ impl AccountManager {
             // `MuteState` consults the same live muted-Network set the notify handler
             // reads (Story 10.2) — no per-row SQLite open on the inbox hot path.
             let notify_for_task = self.notify.clone();
-            let kinds_for_task = self.agent_kinds.clone();
-            let ready_for_task = self.launch_ready.clone();
-            let icons_for_task = self.agent_icons.clone();
-            let board_for_task = self.agent_attention.clone();
             let owner_for_task = owner.clone();
-            // The account's agent rows are read off the room list's path by
-            // its one worker, and the statuses out of the cache's reach are
-            // looked for by its one finder, both alive since its activation
-            // (story 102.5, R468, R501): the producer hands the worker the
-            // rooms it redrew and redraws the rows the worker's readings
-            // changed, for as long as it runs.
-            let worker_for_task = self.agent_lists.attach(&account_id);
             let producer = async move {
                 run_inbox_producer(
                     room_list,
@@ -1452,12 +1249,6 @@ impl AccountManager {
                         merger: merger_for_task,
                         account_id: &account_id,
                         notify: &notify_for_task,
-                        kinds: &kinds_for_task,
-                        launch_ready: &ready_for_task,
-                        icons: &icons_for_task,
-                        board: &board_for_task,
-                        worker: worker_for_task,
-                        keep: Some(keep_for_task),
                         owner: owner_for_task,
                     },
                 )
@@ -1465,8 +1256,8 @@ impl AccountManager {
             }
             .instrument(tracing::info_span!("inbox_producer", account_id = %account.account_id));
             if !self.inbox_owners.spawn(&owner, producer).await {
-                // Its lifetime ended or a newer subscription began since its
-                // writer was taken: nothing of it runs (the end of this
+                // Its lifetime ended or a newer subscription began since it
+                // was looked at: nothing of it runs (the end of this
                 // subscription says which).
                 continue;
             }
@@ -1541,8 +1332,6 @@ impl AccountManager {
                 account_id = %account_id,
                 "inbox: the account began closing while the inbox started; nothing of it is registered"
             );
-            self.inbox_owners
-                .if_current(generation, || self.launch_ready.gone(account_id));
             merger.remove_account(account_id).await;
         }
         tracing::info!(subscription_id, "merged inbox subscribed");
@@ -1611,7 +1400,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1621,7 +1409,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.wiring_in(life.clone()),
+                    life.clone(),
                 )
                 .await?;
                 accounts.insert(
@@ -1637,7 +1425,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1667,7 +1454,6 @@ impl AccountManager {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
                             dead.outbox_scheduler.abort();
-                            drop(self.agent_lists.take(account_id));
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -1713,7 +1499,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1723,7 +1508,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1739,7 +1524,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1784,7 +1568,6 @@ impl AccountManager {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
                             dead.outbox_scheduler.abort();
-                            drop(self.agent_lists.take(account_id));
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -1809,9 +1592,6 @@ impl AccountManager {
         let subscriber = open_views::sliding_sync(&sync);
         let room_id_task = room_id.clone();
         let room_id_log = room_id.clone();
-        let kinds = self.agent_kinds.clone();
-        let icons = self.agent_icons.clone();
-        let hosted = self.agent_hosted.clone();
         let span =
             tracing::info_span!("timeline_producer", account_id = %account_id, room_id = %room_id);
         // Held until its view is registered (R509): a producer whose sink is
@@ -1822,8 +1602,7 @@ impl AccountManager {
             subscriber.clone(),
             subs_arc.clone(),
             timelines_arc.clone(),
-            timeline::forward_timeline(open, room_id_task, sink, kinds, icons, hosted)
-                .instrument(span),
+            timeline::forward_timeline(open, room_id_task, sink).instrument(span),
         );
 
         {
@@ -1891,7 +1670,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1901,7 +1679,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1917,7 +1695,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -2019,7 +1796,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -2029,7 +1805,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -2045,7 +1821,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -2146,7 +1921,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -2156,7 +1930,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -2172,7 +1946,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -2317,7 +2090,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -2327,7 +2099,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -2343,7 +2115,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -2440,36 +2211,6 @@ impl AccountManager {
             })
     }
 
-    /// The display names of `users` as the first live account's homeserver
-    /// answers them (story 90.6: who a drive's pin names), asked all at once
-    /// and each awaited at most `within`, so a dead server a drive names
-    /// delays nothing past it. A user it cannot read in time is left out;
-    /// no live account answers nothing.
-    pub async fn display_names(
-        &self,
-        users: &[matrix_sdk::ruma::OwnedUserId],
-        within: std::time::Duration,
-    ) -> std::collections::BTreeMap<matrix_sdk::ruma::OwnedUserId, String> {
-        use matrix_sdk::ruma::api::client::profile::DisplayName;
-
-        let client = {
-            let accounts = self.accounts.lock().await;
-            accounts.values().next().map(|h| h.client.clone())
-        };
-        let Some(client) = client else {
-            return std::collections::BTreeMap::new();
-        };
-        names_within(users, within, |user| {
-            let account = client.account();
-            let user = user.clone();
-            async move {
-                let profile = account.fetch_user_profile_of(&user).await.ok()?;
-                profile.get_static::<DisplayName>().ok().flatten()
-            }
-        })
-        .await
-    }
-
     /// Resolve the account's live `Client` for a bridge entry point, activating
     /// the account on demand (Story 6.2, FR-25). The First-Run Wizard reaches
     /// bridge discovery right after Beeper login — before any room-list
@@ -2514,7 +2255,6 @@ impl AccountManager {
                 redaction_handler,
                 draft_handler,
                 notify_handler,
-                agents,
                 outbox_scheduler,
                 outbox_tx,
             ) = activate(
@@ -2524,7 +2264,7 @@ impl AccountManager {
                 self.archive.clone(),
                 self.draft_mirror_tx.clone(),
                 self.notify.clone(),
-                self.agents_wiring(account_id)?,
+                self.account_life(account_id)?,
             )
             .await?;
             accounts.insert(
@@ -2540,7 +2280,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                     login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     outbox_scheduler,
@@ -3585,7 +3324,6 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
-                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -3595,7 +3333,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(account_id)?,
+                    self.account_life(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -3611,7 +3349,6 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
-                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -4543,350 +4280,10 @@ impl AccountManager {
         Ok(())
     }
 
-    /// The live hosts of the principals whose control rooms this app's
-    /// accounts are in, other than `me` (this device's own host), with
-    /// their builds' versions, the agents they serve and what they can do,
-    /// believed from the agents whose zones are on this device: what a
-    /// person's save of an `agent.toml` key is checked against (story 101.6,
-    /// R422). Each control room's manifests are the server's room state,
-    /// read now ([`HostsFor::Save`], R466, R484): a store whose every
-    /// manifest is live still need not hold every host's, so it is never
-    /// believed for a save. A control room the server did not give them for
-    /// is [`model::HOSTS_UNREAD`], with a WARN naming why (R381, R436):
-    /// never mistaken for no host at all.
-    ///
-    /// [`model::HOSTS_UNREAD`]: crate::agents::model::HOSTS_UNREAD
-    pub async fn serving_hosts(
-        &self,
-        me: Option<&str>,
-    ) -> Result<Vec<crate::agents::model::ServingHost>, String> {
-        self.hosts_read(me, HostsFor::Save).await
-    }
-
-    /// Every live host serving this person's agents, this device's own
-    /// among them, for the agent rooms' headers and the Settings rows' note
-    /// (story 102.3): what each serving host can do beside what an
-    /// `agent.toml` asks for. Shown, never a save's check
-    /// ([`HostsFor::Showing`]): the store's manifests while every one it
-    /// holds is live, else a server read of the last
-    /// [`crate::agents::host::MANIFEST_RENEW_EVERY`], so a scan every few
-    /// seconds asks the server once a minute at most. The headers are told
-    /// what was read, or that it could not be.
-    pub async fn refresh_serving_hosts(&self) {
-        let read = self
-            .hosts_read(
-                None,
-                HostsFor::Showing(crate::agents::host::MANIFEST_RENEW_EVERY),
-            )
-            .await;
-        self.agent_icons.replace_hosts(read.ok());
-    }
-
-    async fn hosts_read(
-        &self,
-        me: Option<&str>,
-        purpose: HostsFor,
-    ) -> Result<Vec<crate::agents::model::ServingHost>, String> {
-        use matrix_sdk::ruma::OwnedUserId;
-        let agents: Vec<OwnedUserId> = self.agent_icons.agents().into_iter().collect();
-        let clients: Vec<Client> = {
-            let accounts = self.accounts.lock().await;
-            accounts
-                .values()
-                .map(|handle| handle.client.clone())
-                .collect()
-        };
-        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-        let mut manifests = Vec::new();
-        for client in clients {
-            manifests.extend(control_manifests(&client, now, &self.host_reads, purpose).await?);
-        }
-        Ok(crate::agents::model::serving_from(
-            manifests
-                .iter()
-                .map(|(key, sender, content)| (key.as_str(), &**sender, content)),
-            &agents,
-            now,
-            me,
-        ))
-    }
-
-    /// The soul's marks of the agents whose zones are on this device, shared
-    /// with the desktop's agents host, which replaces them on each scan; every
-    /// agent room header reads its agent's mark here (91.1 acceptance 6).
-    pub fn agent_icons(&self) -> Arc<AgentIcons> {
-        self.agent_icons.clone()
-    }
-
-    /// The proxies the dock knows from this device's agents zones (91.2): the
-    /// desktop's agents host replaces them on each scan.
-    pub fn agent_proxies(&self) -> Arc<AgentProxies> {
-        self.agent_proxies.clone()
-    }
-
-    /// What an account's agents are wired to at an activation, in a lifetime
-    /// begun now, under the accounts lock: none while the account is closing
-    /// (R516) — a sign-out or a teardown under way is not undone by an
-    /// activation that starts meanwhile.
-    fn agents_wiring(&self, account_id: &str) -> Result<AgentsWiring<'_>, CoreError> {
-        let life = self
-            .lifetimes
-            .begin(account_id)
-            .map_err(|_| account_closing(account_id))?;
-        Ok(self.wiring_in(life))
-    }
-
-    /// What an account's agents are wired to at an activation in `life`.
-    fn wiring_in(&self, life: Lifetime) -> AgentsWiring<'_> {
-        AgentsWiring {
-            device: &self.agent_device,
-            kinds: &self.agent_kinds,
-            proxies: &self.agent_proxies,
-            board: &self.agent_attention,
-            lists: &self.agent_lists,
-            life,
-        }
-    }
-
-    /// The person's proxy conversations on `account_id` (UX-DR130): every
-    /// agent session room [`proxy::admits`] admits, the DM first. A room
-    /// whose status is not read yet is not listed; nothing is listed for an
-    /// account that is not live.
-    pub async fn agent_rooms(&self, account_id: &str) -> Vec<ProxyRoomVm> {
-        self.agent_rooms_and_asks(account_id).await.0
-    }
-
-    /// [`Self::agent_rooms`], and the person's own proxies with no `main`
-    /// room among them — the ones keeper may ask for one (R416). An invite
-    /// to one of the person's agents' session rooms that is still waiting is
-    /// joined first ([`join_agent_invites`]).
-    async fn agent_rooms_and_asks(&self, account_id: &str) -> (Vec<ProxyRoomVm>, Vec<MainDmAskVm>) {
-        let client = {
-            let accounts = self.accounts.lock().await;
-            match accounts.get(account_id) {
-                Some(handle) => handle.client.clone(),
-                None => return (Vec::new(), Vec::new()),
-            }
-        };
-        agent_rooms_of(&client, account_id, &self.agent_kinds, &self.agent_proxies).await
-    }
-
-    /// [`Self::agent_rooms`], each with its state as its Agents window row
-    /// says it (story 101.6, R421, R453): what the notes dock lists. The
-    /// states are the list worker's ([`AttentionBoard`], story 102.5): the
-    /// dock reads no room again.
-    pub async fn agent_rooms_attended(&self, account_id: &str) -> Vec<ProxyRoomVm> {
-        let mut listed = self.agent_rooms(account_id).await;
-        for vm in &mut listed {
-            if let Ok(room) = RoomId::parse(&vm.room_id) {
-                vm.attention = self.agent_attention.said(account_id, &room);
-            }
-        }
-        listed
-    }
-
-    /// The live agent session room `room_id` on `account_id`.
-    async fn session_room(&self, account_id: &str, room_id: &str) -> Result<Room, CoreError> {
-        let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
-        let room = self
-            .room_for(account_id, &room_id)
-            .await
-            .map_err(|_| SendError::RoomNotFound)?;
-        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-            return Err(SendError::RoomNotFound.into());
-        }
-        Ok(room)
-    }
-
-    /// The live room `room_id` when it is one of the person's proxy rooms as
-    /// this account reads it ([`admit_proxy_room`]), with its kind and agent.
-    /// A scope, a focus or a request for a conversation is only ever sent
-    /// there (R29 F1: where power levels let the person).
-    async fn proxy_room(
-        &self,
-        account_id: &str,
-        room_id: &str,
-    ) -> Result<(Room, SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
-        let room = self.session_room(account_id, room_id).await?;
-        let (kind, agent) = admit_proxy_room(&room, &self.agent_kinds, &self.agent_proxies).await?;
-        Ok((room, kind, agent))
-    }
-
-    /// Ask the proxy for `drives` in scope in `room_id` (AD-382): the host
-    /// checks them against `[tools].drives`, keeps the home drive and logs a
-    /// `scope` line. The focus the host was last told travels with it, so a
-    /// scope change does not clear what the person is looking at; it waits
-    /// for the focus lane, so it never overtakes a clear on its way.
-    pub async fn agent_scope_set(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        drives: Vec<String>,
-    ) -> Result<(), CoreError> {
-        let (room, _, agent) = self.proxy_room(account_id, room_id).await?;
-        // Titles from this room's proxy only: two proxies may title one
-        // drive differently.
-        let titles: HashMap<String, String> = self
-            .agent_proxies
-            .snapshot()
-            .remove(&agent)
-            .map(|facts| facts.allowed)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|drive| (drive.id, drive.title))
-            .collect();
-        let lane = self
-            .agent_focus
-            .get(&(account_id.to_owned(), room.room_id().to_owned()));
-        let _held = match &lane {
-            Some(lane) => Some(lane.hold().await),
-            None => None,
-        };
-        let content = ScopeContent {
-            v: CONTENT_VERSION,
-            drives: Some(
-                drives
-                    .into_iter()
-                    .map(|id| ScopeDrive {
-                        title: titles.get(&id).cloned().unwrap_or_else(|| id.clone()),
-                        id,
-                    })
-                    .collect(),
-            ),
-            label: None,
-            focus: lane.as_ref().and_then(|lane| lane.last()),
-            set_by: room.own_user_id().to_owned(),
-        };
-        send_agent_event(&room, AgentOutbound::Scope(content)).await?;
-        Ok(())
-    }
-
-    /// The docked note in `room_id` changed, as the webview's call `seq`
-    /// says; `name` names it (blocking: the vault's index and the note) and
-    /// runs only once the change has been still a second
-    /// ([`crate::agents::focus`]). The change is registered before anything
-    /// is awaited, so a later [`Self::agent_focus_close`] always drops it.
-    pub async fn agent_focus(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        seq: u64,
-        name: impl FnOnce() -> Option<Focus> + Send + 'static,
-    ) -> Result<(), CoreError> {
-        let parsed = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
-        let lane = self.agent_focus.lane(&(account_id.to_owned(), parsed));
-        let namer = Box::new(move || -> Named {
-            Box::pin(async move { tokio::task::spawn_blocking(name).await.ok().flatten() })
-        });
-        if !lane.change(seq, namer) {
-            return Ok(());
-        }
-        if !lane.connected() {
-            match self.proxy_room(account_id, room_id).await {
-                Ok((room, _, _)) => lane.connect(Arc::new(RoomFocus(room))),
-                Err(error) => {
-                    lane.forget_pending();
-                    return Err(error);
-                }
-            }
-        }
-        lane.drive();
-        Ok(())
-    }
-
-    /// The dock closed on `room_id` (the webview's call `seq`): what waits is
-    /// dropped, and the host is told there is no focus when it was told of
-    /// one — after any focus already on its way. A clear that fails is
-    /// owed and tried again.
-    pub async fn agent_focus_close(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        seq: u64,
-    ) -> Result<(), CoreError> {
-        let parsed = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
-        self.agent_focus
-            .lane(&(account_id.to_owned(), parsed))
-            .close(Some(seq))
-            .await
-            .map_err(|error| SendError::Dispatch(error).into())
-    }
-
-    /// Ask the proxy for a new conversation, in its `main` DM `room_id`
-    /// (R36): the claim holder of the DM's session makes the room and its
-    /// session and invites the person. Returns the request's event id.
-    pub async fn agent_conversation_new(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        title: Option<String>,
-    ) -> Result<String, CoreError> {
-        let (room, kind, _) = self.proxy_room(account_id, room_id).await?;
-        if kind != SessionKind::Main {
-            return Err(CoreError::Unsupported(
-                "A new conversation is asked for in your proxy's DM.".to_owned(),
-            ));
-        }
-        let content = ConversationRequestContent {
-            v: CONTENT_VERSION,
-            title: title
-                .map(|title| title.trim().to_owned())
-                .filter(|title| !title.is_empty()),
-        };
-        send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
-    }
-
-    /// Open the person's `main` DM with `agent` on `account_id` (story 101.1
-    /// #4–#5, R416): the room when it is here; otherwise one
-    /// [`AgentOutbound::MainDmRequest`] into the control room the person
-    /// shares with the agent, whose host answers with the DM it opened (or
-    /// adopted) or a refusal. The invite is joined as it lands — `main` as
-    /// direct — and the room is answered once it admits as the person's DM,
-    /// waited for at most [`main_dm::MAIN_DM_WAIT`]. Every way it does not
-    /// open is a sentence for where the person is looking and a WARN.
-    pub async fn agent_main_dm_open(
-        &self,
-        account_id: &str,
-        agent: &str,
-    ) -> Result<LaunchRoomVm, CoreError> {
-        // The one deadline over the whole ask, from the moment it was made
-        // (R450): the account's client is looked up under it too — the
-        // accounts are held across an activation or a shutdown, which can
-        // outlast it (review-101rooms-2 02).
-        let deadline = tokio::time::Instant::now() + main_dm::MAIN_DM_WAIT;
-        let agent = UserId::parse(agent).map_err(|_| {
-            tracing::warn!(
-                account_id,
-                "agents: a DM was asked of a value that is not a user id"
-            );
-            CoreError::Unsupported(format!("\"{agent}\" is not a Matrix user id."))
-        })?;
-        let looked_up = tokio::time::timeout_at(deadline, async {
-            let accounts = self.accounts.lock().await;
-            accounts.get(account_id).map(|handle| handle.client.clone())
-        })
-        .await;
-        let client = match looked_up {
-            Ok(Some(client)) => client,
-            Ok(None) => return Err(SendError::RoomNotFound.into()),
-            Err(_) => return Err(CoreError::Unsupported(main_dm::not_reached_in_time(&agent))),
-        };
-        open_main_dm(
-            &client,
-            account_id,
-            &agent,
-            &self.agent_kinds,
-            &self.agent_proxies,
-            deadline,
-        )
-        .await
-    }
-
     /// What the messenger composer's slash commands may do in `room_id`
-    /// (Story 100.5, R385): which room it is — a chat, the person's agent DM,
-    /// another agent room — and what the person's power levels allow there.
-    /// Read from the room on every ask, never told by the webview; `replying`
-    /// is the composer's own state and is the one fact it passes.
+    /// (Story 100.5, R385): what the person's power levels allow there. Read
+    /// from the room on every ask, never told by the webview; `replying` is
+    /// the composer's own state and is the one fact it passes.
     ///
     /// A room without a power-levels event reads as the spec's defaults
     /// (`power_levels_or_default`), which is what the server enforces too.
@@ -4898,223 +4295,34 @@ impl AccountManager {
     ) -> Result<chat::commands::Context, CoreError> {
         let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
         let room = self.room_for(account_id, &parsed).await?;
-        let (kind, agent_home_here) =
-            if AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session) {
-                match admit_proxy_room(&room, &self.agent_kinds, &self.agent_proxies).await {
-                    Ok((SessionKind::Main, agent)) => (
-                        chat::commands::RoomKind::AgentMain,
-                        self.agent_icons.is_here(&agent),
-                    ),
-                    _ => (chat::commands::RoomKind::Agent, false),
-                }
-            } else {
-                (chat::commands::RoomKind::Chat, false)
-            };
         let me = room.own_user_id();
         let levels = room.power_levels_or_default().await;
         Ok(chat::commands::Context {
-            room: kind,
+            room: chat::commands::RoomKind::Chat,
             may_set_topic: levels.user_can_send_state(me, StateEventType::RoomTopic),
             may_invite: levels.user_can_invite(me),
             replying,
-            agent_home_here,
         })
     }
 
-    /// Follow the questions answered in `room_id` (Story 101.3, R431): one
-    /// snapshot now, then a fresh one whenever an agent's session room this
-    /// account reads changes in its event cache — an ask, an answer, a
-    /// redaction, an edit, wherever it lands — or this room's held sends or
-    /// send queue move, each change settled for [`ASKS_SETTLE`] first. A
-    /// snapshot equal to the last is not sent again. A read that fails is
-    /// logged at WARN and sent as the last questions with
-    /// [`agent_waiting::ASKS_UNAVAILABLE`] beside them (R381). Returns the
-    /// subscription id; [`Self::unsubscribe_agent_asks`] ends it.
-    pub async fn subscribe_agent_asks(
-        &self,
-        platform: &Arc<dyn Platform>,
-        account_id: &str,
-        room_id: &str,
-        sink: AgentAsksSink,
-    ) -> Result<u64, CoreError> {
-        let room_id = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
-        let data_dir = platform.data_dir()?;
-        let (client, subs, mut outbox) = {
-            let accounts = self.accounts.lock().await;
-            let handle = accounts
-                .get(account_id)
-                .ok_or(TimelineError::RoomNotFound)?;
-            (
-                handle.client.clone(),
-                handle.subscriptions.clone(),
-                handle.outbox_tx.subscribe(),
-            )
-        };
-        let (kinds, proxies) = (
-            Arc::clone(&self.agent_kinds),
-            Arc::clone(&self.agent_proxies),
-        );
-        let account = account_id.to_owned();
-        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
-        let reaper = subs.clone();
-        let span = tracing::info_span!("agent_asks_producer", account_id = %account_id, room_id = %room_id);
-        let task = tokio::spawn(
-            async move {
-                let mut rooms = client.event_cache().subscribe_to_room_generic_updates();
-                let mut queue = client.send_queue().subscribe();
-                let mut last: Option<agent_waiting::AgentAsksVm> = None;
-                loop {
-                    let read =
-                        read_agent_asks(&client, &data_dir, &account, &room_id, &kinds, &proxies)
-                            .await;
-                    let vm = match read {
-                        Ok(vm) => vm,
-                        Err(error) => {
-                            tracing::warn!(%error, "agents: the questions waiting here could not be read");
-                            agent_waiting::AgentAsksVm {
-                                asks: last.as_ref().map(|vm| vm.asks.clone()).unwrap_or_default(),
-                                note: Some(agent_waiting::ASKS_UNAVAILABLE.to_owned()),
-                            }
-                        }
-                    };
-                    if last.as_ref() != Some(&vm) {
-                        if !sink(vm.clone()) {
-                            break;
-                        }
-                        last = Some(vm);
-                    }
-                    let session = |id: &RoomId| {
-                        client.get_room(id).is_some_and(|room| {
-                            AgentRoomKind::of(room.room_type().as_ref())
-                                == Some(AgentRoomKind::Session)
-                        })
-                    };
-                    let open = loop {
-                        tokio::select! {
-                            update = rooms.recv() => match update {
-                                Ok(update) if session(&update.room_id) => break true,
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
-                            },
-                            update = queue.recv() => match update {
-                                Ok(update) if update.room_id == room_id => break true,
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
-                            },
-                            change = outbox.recv() => match change {
-                                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
-                            },
-                        }
-                    };
-                    if !open {
-                        break;
-                    }
-                    // A burst — a streamed answer's edits, a sync batch — is
-                    // one read.
-                    tokio::time::sleep(ASKS_SETTLE).await;
-                    while rooms.try_recv().is_ok() || queue.try_recv().is_ok() || outbox.try_recv().is_ok() {}
-                }
-                reaper.lock().await.remove(&subscription_id);
-            }
-            .instrument(span),
-        );
-        subs.lock().await.insert(subscription_id, task);
-        tracing::info!(account_id = %account_id, subscription_id, "agent asks subscribed");
-        Ok(subscription_id)
-    }
-
-    /// End one [`Self::subscribe_agent_asks`]. Idempotent.
-    pub async fn unsubscribe_agent_asks(&self, account_id: &str, subscription_id: u64) {
-        if self.abort_subscription(account_id, subscription_id).await {
-            tracing::info!(account_id = %account_id, subscription_id, "agent asks unsubscribed");
-        }
-    }
-
     /// What a `/` in the middle of a message may offer in `room_id` (Story
-    /// 101.3, R418): the room's kind as the whole-line commands read it, the
-    /// agent working its session when keeper has read one, and the agents this
-    /// account knows — the agents of its session rooms keeper has read, and
-    /// those whose homes are on this device — each with its display name where
-    /// a room of this account shows one.
+    /// 101.3, R418): a messenger room, so no agent mention and no file
+    /// reference (those were an agent room's, gone with the agents' Matrix
+    /// path in 108.2).
     pub async fn chat_inline_context(
         &self,
         account_id: &str,
         room_id: &str,
     ) -> Result<chat::inline::InlineContext, CoreError> {
-        let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
         let room = self
             .chat_command_context(account_id, room_id, false)
             .await?
             .room;
-        let client = {
-            let accounts = self.accounts.lock().await;
-            accounts
-                .get(account_id)
-                .ok_or(TimelineError::RoomNotFound)?
-                .client
-                .clone()
-        };
-        let mut agents: BTreeMap<matrix_sdk::ruma::OwnedUserId, Option<String>> = self
-            .agent_icons
-            .agents()
-            .into_iter()
-            .map(|agent| (agent, None))
-            .collect();
-        for joined in client.joined_rooms() {
-            if AgentRoomKind::of(joined.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-                continue;
-            }
-            let Some(agent) = self
-                .agent_kinds
-                .agent(joined.own_user_id(), joined.room_id())
-            else {
-                continue;
-            };
-            let named = agents.get(&agent).is_some_and(Option::is_some);
-            let name = if named {
-                None
-            } else {
-                joined
-                    .get_member_no_sync(&agent)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|member| member.display_name().map(str::to_owned))
-            };
-            let slot = agents.entry(agent).or_default();
-            if slot.is_none() {
-                *slot = name;
-            }
-        }
         Ok(chat::inline::InlineContext {
             room,
-            room_agent: client
-                .user_id()
-                .and_then(|own| self.agent_kinds.agent(own, &parsed)),
-            agents: agents
-                .into_iter()
-                .map(|(user, name)| chat::inline::InlineAgent { user, name })
-                .collect(),
+            room_agent: None,
+            agents: Vec::new(),
         })
-    }
-
-    /// The agent whose `main` DM `room_id` is (`/model`, R415): a room that is
-    /// not the person's proxy DM is refused, as `/new` is.
-    pub async fn proxy_main_agent(
-        &self,
-        account_id: &str,
-        room_id: &str,
-    ) -> Result<matrix_sdk::ruma::OwnedUserId, CoreError> {
-        let (_, kind, agent) = self.proxy_room(account_id, room_id).await?;
-        if kind != SessionKind::Main {
-            return Err(CoreError::Unsupported(
-                "An agent's model is changed in your DM with it.".to_owned(),
-            ));
-        }
-        Ok(agent)
     }
 
     /// Change `room_id`'s topic, as the person typed it after `/topic` (Story
@@ -5174,118 +4382,81 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Tell the agent in the person's proxy room `room_id` where they stopped
-    /// listening to its spoken answer (97.3, AD-411): `content` names the
-    /// answer's anchor and the sentences the synthesiser finished. Only a
-    /// proxy room of this account's is written to; the owning host decides
-    /// whether the mark counts. Returns the event's id, which the next
-    /// spoken question waits for, so the mark reaches the room first (Q10).
-    pub async fn agent_heard_send(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        content: HeardContent,
-    ) -> Result<String, CoreError> {
-        let (room, _, _) = self.proxy_room(account_id, room_id).await?;
-        send_agent_event(&room, AgentOutbound::Heard(content)).await
+    /// The agents' old rooms the live accounts are still in, joined or
+    /// invited (UX-DR-E108-2): every room whose create type is an agent
+    /// session or control room ([`crate::old_agent_rooms`]).
+    async fn old_agent_rooms_live(&self) -> Vec<(String, Room)> {
+        let accounts = self.accounts.lock().await;
+        let mut rooms = Vec::new();
+        for (account_id, handle) in accounts.iter() {
+            for room in handle.client.rooms() {
+                let held = matches!(
+                    room.state(),
+                    matrix_sdk::RoomState::Joined | matrix_sdk::RoomState::Invited
+                );
+                if held && crate::old_agent_rooms::is_old_agent_room(room.room_type().as_ref()) {
+                    rooms.push((account_id.clone(), room));
+                }
+            }
+        }
+        rooms
     }
 
-    /// Send the person's decision `req` on the approval card it names in the
-    /// session room `room_id` (93.3), from this device: [`decide_approval`]
-    /// with the rooms this app hosts and the attached actions it has shown
-    /// ([`Self::agent_approval_payload`], R186).
-    pub async fn agent_approval_decide(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        req: ApprovalDecideReq,
-    ) -> Result<(), CoreError> {
-        let room = self.session_room(account_id, room_id).await?;
-        let shown = |digest: &str| {
-            self.agent_shown
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains(&(account_id.to_owned(), room_id.to_owned(), digest.to_owned()))
-        };
-        decide_approval(&room, &self.agent_hosted, &shown, req).await
+    /// How many of the agents' old rooms the live accounts are still in, for
+    /// the *Leave old agent rooms* action (UX-DR-E108-2).
+    pub async fn old_agent_rooms(&self) -> crate::old_agent_rooms::OldAgentRoomsVm {
+        crate::old_agent_rooms::OldAgentRoomsVm {
+            remaining: u32::try_from(self.old_agent_rooms_live().await.len()).unwrap_or(u32::MAX),
+            ..Default::default()
+        }
     }
 
-    /// Send the decision a lock-screen action chose (98.1 #4, Q2;
-    /// `push::action_decision`). A notification's action may launch keeper
-    /// in the background with no window and no account live, so
-    /// `decision.account` — that one account only — is activated here when
-    /// it is not live; the decision then goes through
-    /// [`Self::agent_approval_decide`], whose card check is the local
-    /// re-check of what the notification carried: the record must be in the
-    /// session room as this phone syncs it, with that digest (R343). It is
-    /// tried again every second while the refusal is one the sync the
-    /// activation starts can still change ([`not_yet_synced`]) and `budget`
-    /// has not passed; any other refusal, and a dispatch error, is the
-    /// answer at once.
-    pub async fn agent_approval_decide_notified(
-        &self,
-        platform: &Arc<dyn Platform>,
-        decision: crate::agents::push::ActionDecision,
-        budget: std::time::Duration,
-    ) -> Result<(), CoreError> {
-        let deadline = tokio::time::Instant::now() + budget;
-        self.ensure_live(platform, &decision.account).await?;
-        until_synced(deadline, || {
-            self.agent_approval_decide(&decision.account, &decision.room, decision.req.clone())
-        })
-        .await
+    /// *Leave old agent rooms* (UX-DR-E108-2, DW-E108-8): leave every room of
+    /// the agents' old Matrix path the live accounts are in — an invite is
+    /// declined — and say how many were left and how many stayed. Only the
+    /// person's own membership changes; the agents' users, their devices and
+    /// the rooms themselves are the operator's to clean up. A room the
+    /// server refuses is logged at WARN with its account (R381).
+    pub async fn leave_old_agent_rooms(&self) -> crate::old_agent_rooms::OldAgentRoomsVm {
+        let mut left = 0u32;
+        let mut failed = 0u32;
+        for (account_id, room) in self.old_agent_rooms_live().await {
+            match room.leave().await {
+                Ok(()) => left += 1,
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(account_id = %account_id, room_id = %room.room_id(), %error, "agents: an old agent room could not be left");
+                }
+            }
+        }
+        tracing::info!(left, failed, "agents: left the old agent rooms");
+        crate::old_agent_rooms::OldAgentRoomsVm {
+            remaining: u32::try_from(self.old_agent_rooms_live().await.len()).unwrap_or(u32::MAX),
+            left,
+            failure: crate::old_agent_rooms::failure_sentence(failed),
+        }
     }
 
-    /// Register this phone's pusher on every signed-in account, each
-    /// activated when it is not live yet (98.1 #3, AD-412): the pusher
-    /// `push::PusherSpec::of_setting` builds over `stored` — the raw
-    /// `push.gateway_url` — set where the account holds agent session
-    /// rooms, removed everywhere else and wherever the setting registers
-    /// nothing ([`crate::agents::push::register`]). One outcome per account,
-    /// for the log.
-    pub async fn push_register(
-        &self,
-        platform: &Arc<dyn Platform>,
-        stored: Option<&str>,
-        environment: crate::agents::push::ApnsEnvironment,
-        token: &[u8],
-        device: &str,
-    ) -> Result<Vec<(String, Result<crate::agents::push::Registered, CoreError>)>, CoreError> {
-        use crate::agents::push;
-
-        self.push_register_each(
-            platform,
-            push::pusher_ids(environment, token),
-            None,
-            |account| push::PusherSpec::of_setting(stored, environment, token, account, device),
-        )
-        .await
-    }
-
-    /// Register a pusher on every signed-in account, each activated when it
-    /// is not live yet: `spec(account)` where the account holds agent
-    /// session rooms, else the pusher `ids` names is removed
-    /// ([`crate::agents::push::register`]). `stale` — a pusher this device
-    /// registered before under another identity (Android's previous
-    /// endpoint) — is removed first, best effort. One outcome per account,
-    /// for the log.
-    pub async fn push_register_each(
+    /// Take this phone's Matrix pusher off every signed-in account, each
+    /// activated when it is not live yet (DW-E108-1): the pusher `ids` names —
+    /// registered for the agents' Matrix rooms before 108.2 — and `stale`, a
+    /// pusher this device registered before under another identity
+    /// (Android's previous endpoint). One outcome per account, for the log.
+    pub async fn push_remove(
         &self,
         platform: &Arc<dyn Platform>,
         ids: crate::agents::push::PusherIds,
         stale: Option<crate::agents::push::PusherIds>,
-        spec: impl Fn(&str) -> Option<crate::agents::push::PusherSpec>,
-    ) -> Result<Vec<(String, Result<crate::agents::push::Registered, CoreError>)>, CoreError> {
+    ) -> Result<Vec<(String, Result<(), CoreError>)>, CoreError> {
         use crate::agents::push;
 
         let stale = stale.filter(|stale| *stale != ids);
         let mut outcomes = Vec::new();
         for row in registry::list_accounts(&platform.data_dir()?)? {
-            let spec = spec(&row.account_id);
             let outcome = match self.ensure_live(platform, &row.account_id).await {
                 Ok(client) => {
                     if let Some(stale) = stale.clone() {
-                        if let Err(error) = push::register(&client, stale, None).await {
+                        if let Err(error) = push::remove(&client, stale).await {
                             tracing::warn!(
                                 account_id = %row.account_id,
                                 %error,
@@ -5293,7 +4464,7 @@ impl AccountManager {
                             );
                         }
                     }
-                    push::register(&client, ids.clone(), spec.as_ref())
+                    push::remove(&client, ids.clone())
                         .await
                         .map_err(|error| CoreError::Internal(error.to_string()))
                 }
@@ -5302,310 +4473,6 @@ impl AccountManager {
             outcomes.push((row.account_id, outcome));
         }
         Ok(outcomes)
-    }
-
-    /// What a push that names `pushed` shows on Android (98.4 #3): the first
-    /// signed-in account that knows the room reads the event in this process
-    /// — waiting up to [`DECRYPT_BUDGET`](crate::agents::unifiedpush::DECRYPT_BUDGET) for its keys, which travel in
-    /// the sync beside it — and [`crate::agents::push::shown_of`] decides, as
-    /// the iPhone's extension does. `Ok(None)`: nothing shows — the classifier
-    /// dropped it, or no account here knows the room (a push keeper did not
-    /// ask for). `Err`: it could not be read, the generic notification.
-    pub async fn push_shown(
-        &self,
-        platform: &Arc<dyn Platform>,
-        pushed: &crate::agents::unifiedpush::PushedEvent,
-    ) -> Result<Option<(String, crate::agents::push::Shown)>, CoreError> {
-        use crate::agents::push;
-
-        let started = std::time::Instant::now();
-        for row in registry::list_accounts(&platform.data_dir()?)? {
-            let client = match self.ensure_live(platform, &row.account_id).await {
-                Ok(client) => client,
-                Err(error) => {
-                    tracing::warn!(account_id = %row.account_id, %error, "push: account not live");
-                    continue;
-                }
-            };
-            let Some(room) = client.get_room(&pushed.room_id) else {
-                continue;
-            };
-            let event = loop {
-                let event = room.event(&pushed.event_id, None).await.map_err(|error| {
-                    CoreError::Internal(format!("could not read the event: {error}"))
-                })?;
-                let still_sealed =
-                    push::json_of(&event).is_some_and(|json| json["type"] == "m.room.encrypted");
-                if !still_sealed || started.elapsed() >= crate::agents::unifiedpush::DECRYPT_BUDGET
-                {
-                    break event;
-                }
-                tokio::time::sleep(crate::agents::unifiedpush::DECRYPT_POLL).await;
-            };
-            return match push::shown_of(&client, &room, &event, started)
-                .await
-                .map_err(CoreError::Internal)?
-            {
-                push::Classified::Drop => Ok(None),
-                push::Classified::Show(shown) => Ok(Some((row.account_id, *shown))),
-            };
-        }
-        Ok(None)
-    }
-
-    /// The attached action of the approval `id` in the session room
-    /// `room_id`: [`approval_payload`]. Once shown, it may be approved from
-    /// this app (R186).
-    pub async fn agent_approval_payload(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        id: &str,
-    ) -> Result<crate::agents::approval_card::ApprovalPayloadVm, CoreError> {
-        let room = self.session_room(account_id, room_id).await?;
-        let (shown, digest) = approval_payload(&room, id).await?;
-        self.agent_shown
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((account_id.to_owned(), room_id.to_owned(), digest));
-        Ok(shown)
-    }
-
-    /// This account's own master key as a person compares it with what
-    /// `keeper-agentd status` prints (93.3 acceptance 7): the base64 in
-    /// groups of four; `None` while the account publishes no
-    /// cross-signing identity.
-    pub async fn agent_own_fingerprint(
-        &self,
-        account_id: &str,
-    ) -> Result<Option<String>, CoreError> {
-        let client = self.client_for(account_id).await?;
-        let Some(user) = client.user_id().map(ToOwned::to_owned) else {
-            return Ok(None);
-        };
-        let identity = client
-            .encryption()
-            .get_user_identity(&user)
-            .await
-            .map_err(|error| CoreError::Internal(error.to_string()))?;
-        Ok(identity
-            .as_ref()
-            .and_then(crate::agents::matrix::master_key_of)
-            .map(|key| crate::agents::trust::fingerprint(&key)))
-    }
-
-    /// The rooms whose agent this app hosts, shared with the desktop's
-    /// agents host, which replaces them on each tick; empty on the phone. A
-    /// T4 card in one of them is never decided from this app (S-22).
-    pub fn agent_hosted(&self) -> Arc<HostedRooms> {
-        self.agent_hosted.clone()
-    }
-
-    /// Every live account as the desktop's agents host trusts it (R87): its
-    /// user, this app's device of it, whether its own identity is verified
-    /// here and this device cross-signed by it, and its master key — what a
-    /// decision on a session this Mac hosts is judged against. Read again on
-    /// each scan; nothing is pinned or written.
-    pub async fn agent_own_accounts(&self) -> Vec<crate::agents::trust::OwnAccount> {
-        let clients: Vec<matrix_sdk::Client> = self
-            .accounts
-            .lock()
-            .await
-            .values()
-            .map(|handle| handle.client.clone())
-            .collect();
-        let mut own = Vec::with_capacity(clients.len());
-        for client in clients {
-            let (Some(user), Some(device)) = (
-                client.user_id().map(ToOwned::to_owned),
-                client.device_id().map(ToString::to_string),
-            ) else {
-                continue;
-            };
-            let identity = client
-                .encryption()
-                .get_user_identity(&user)
-                .await
-                .ok()
-                .flatten();
-            let cross_signed = crate::agents::room::own_device_cross_signed(&client).await;
-            own.push(crate::agents::trust::OwnAccount::read(
-                user,
-                device,
-                identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.is_verified()),
-                cross_signed,
-                identity
-                    .as_ref()
-                    .and_then(crate::agents::matrix::master_key_of),
-            ));
-        }
-        own.sort_by(|a, b| a.user.cmp(&b.user));
-        own
-    }
-
-    /// Every live account's proxy conversations, by account id (AD-384): the
-    /// rooms a spoken question may go to.
-    pub async fn agent_rooms_everywhere(&self) -> Vec<(String, ProxyRoomVm)> {
-        let account_ids: Vec<String> = self.accounts.lock().await.keys().cloned().collect();
-        let mut rooms = Vec::new();
-        for account_id in account_ids {
-            for room in self.agent_rooms(&account_id).await {
-                rooms.push((account_id.clone(), room));
-            }
-        }
-        rooms
-    }
-
-    /// What the launch rule reads (R383): how many agent session rooms the
-    /// live accounts have — the Agents window's rooms — and every account's
-    /// proxy conversations, accounts in id order so the same state always
-    /// opens the same room.
-    pub async fn agents_launch_facts(&self) -> LaunchFacts {
-        let mut account_ids: Vec<String> = self.accounts.lock().await.keys().cloned().collect();
-        account_ids.sort();
-        let mut facts = LaunchFacts::default();
-        for account_id in account_ids {
-            let client = {
-                let accounts = self.accounts.lock().await;
-                match accounts.get(&account_id) {
-                    Some(handle) => handle.client.clone(),
-                    None => continue,
-                }
-            };
-            facts.agent_rooms += client
-                .joined_rooms()
-                .iter()
-                .filter(|room| {
-                    AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session)
-                })
-                .count();
-            let (rooms, asks) = self.agent_rooms_and_asks(&account_id).await;
-            for room in rooms {
-                facts.proxies.push((account_id.clone(), room));
-            }
-            facts.askable.extend(asks);
-        }
-        facts
-    }
-
-    /// What keeper opens at launch (story 100.3, R383, R397):
-    /// [`launch::resolve`] over `agents.default`, the accounts' first-sync
-    /// readiness and [`Self::agents_launch_facts`] — answered once every
-    /// signed-in account has synced or the default agent's room is here,
-    /// never later than [`LAUNCH_READY_MS`].
-    pub async fn agents_launch(&self, data_dir: &Path) -> Result<AgentsLaunchVm, CoreError> {
-        let mut source = ManagerLaunch {
-            manager: self,
-            data_dir,
-            ready: self.launch_ready.subscribe(),
-        };
-        let vm = launch::resolve(&mut source, Duration::from_millis(LAUNCH_READY_MS)).await?;
-        launch::finish(data_dir, vm)
-    }
-
-    /// The default agent as Settings › Agents and the agent room's menu show
-    /// it, from what is here now ([`launch::read`]); never waits.
-    pub async fn agents_default(&self, data_dir: &Path) -> Result<AgentsLaunchVm, CoreError> {
-        launch::read(data_dir, &self.agents_launch_facts().await)
-    }
-
-    /// Store `agent` as the default agent (`None`: none) and answer with the
-    /// default agent as it now reads ([`launch::set_default`]; every failure
-    /// is logged at WARN there).
-    pub async fn agents_default_set(
-        &self,
-        data_dir: &Path,
-        agent: Option<&str>,
-    ) -> Result<AgentsLaunchVm, SetDefaultError> {
-        launch::set_default(data_dir, agent, &self.agents_launch_facts().await)
-    }
-
-    /// Send what the voice turn heard into `room_id`, the person's own
-    /// proxy conversation on `account_id`, as their message (AD-384) —
-    /// [`spoken_send`], with the conversation's open timeline when one is.
-    ///
-    /// Errors: a room that is not live → [`SendError::RoomNotFound`]; else
-    /// [`spoken_send`]'s.
-    pub async fn agent_spoken_send(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        text: &str,
-    ) -> Result<SpokenAnswer, CoreError> {
-        let room = self.session_room(account_id, room_id).await?;
-        let open = self
-            .open_timeline_for(account_id, room.room_id())
-            .await
-            .ok();
-        let answer = spoken_send(&room, &self.agent_kinds, &self.agent_proxies, open, text).await?;
-        tracing::info!(account_id = %account_id, room_id = %room.room_id(), "spoken question dispatched to the person's agent");
-        Ok(answer)
-    }
-
-    /// Every surface request a live account of this device admits from now
-    /// on (AD-383): the shell names its target and hands it to the notes
-    /// view.
-    pub fn surface_requests(&self) -> tokio::sync::broadcast::Receiver<SurfaceRequestArrived> {
-        self.agent_device.requests()
-    }
-
-    /// keeper came to the front or left it (the shell's window focus on the
-    /// desktop, the app's lifecycle on the phone): every live account's
-    /// presence follows after a second of stillness.
-    pub fn agent_presence_focus(&self, platform: PresencePlatform, focused: bool) {
-        self.agent_device.focus(platform, focused);
-    }
-
-    /// The primary view keeper shows (`notes`, `chats`): a view id only,
-    /// never a note (AD-383).
-    pub fn agent_presence_view(&self, view: &str) -> Result<(), CoreError> {
-        if !crate::agents::presence::is_view_id(view) {
-            return Err(CoreError::Unsupported(format!(
-                "\"{view}\" is not a view id."
-            )));
-        }
-        self.agent_device.view(view.to_owned());
-        Ok(())
-    }
-
-    /// The notes view's answer to the surface request `answer` names, sent
-    /// into the agent session room `room_id` it came from — only for a
-    /// request this device admitted and handed on, and only once. The
-    /// request is taken for the send and put back when the send fails
-    /// (offline for a second, a 429), so the notes view may answer again:
-    /// the person pressed *Apply* and the edit is in the note; the agent
-    /// must not be told `expired` for it.
-    pub async fn agent_surface_result(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        answer: SurfaceAnswerReq,
-    ) -> Result<(), CoreError> {
-        let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
-        let (client, taken) = {
-            let accounts = self.accounts.lock().await;
-            let handle = accounts.get(account_id).ok_or(SendError::RoomNotFound)?;
-            (
-                handle.client.clone(),
-                handle.agents.take(&room_id, &answer.request_id),
-            )
-        };
-        let Some(waiting) = taken else {
-            return Err(CoreError::Unsupported(
-                "No surface request of that id is waiting on this device.".to_owned(),
-            ));
-        };
-        let request_id = answer.request_id.clone();
-        let sent = send_surface_result(&client, &room_id, answer).await;
-        if sent.is_err() {
-            let accounts = self.accounts.lock().await;
-            if let Some(handle) = accounts.get(account_id) {
-                handle.agents.restore(request_id, waiting);
-            }
-        }
-        sent
     }
 
     /// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
@@ -6469,31 +5336,6 @@ impl AccountManager {
         Ok(bytes)
     }
 
-    /// The bytes behind an agent-avatar `keeper-media://` URL (story 100.4):
-    /// `user`'s profile avatar as `room_id` of `account_id` holds it, the
-    /// original ([`media::fetch_agent_avatar`]). Any account, room or member
-    /// it cannot resolve is [`MediaError::NotFound`].
-    pub async fn fetch_agent_avatar(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        user_id: &str,
-    ) -> Result<MediaBytes, CoreError> {
-        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| MediaError::NotFound)?;
-        let user_id =
-            matrix_sdk::ruma::OwnedUserId::try_from(user_id).map_err(|_| MediaError::NotFound)?;
-        let client = {
-            let accounts = self.accounts.lock().await;
-            accounts
-                .get(account_id)
-                .ok_or(MediaError::NotFound)?
-                .client
-                .clone()
-        };
-        let room = client.get_room(&room_id).ok_or(MediaError::NotFound)?;
-        Ok(media::fetch_agent_avatar(&client, &room, &user_id).await?)
-    }
-
     /// Resolve the exact open `Arc<Timeline>` for `room_id` on the live account,
     /// or a typed [`SendError::NoOpenTimeline`] if the account isn't live or no
     /// timeline for the room is subscribed.
@@ -6520,6 +5362,16 @@ impl AccountManager {
         Ok(timeline)
     }
 
+    /// A lifetime of `account_id` begun now, for an activation under the
+    /// accounts lock: refused while the account is closing (R516) — a
+    /// sign-out or a teardown under way is not undone by an activation that
+    /// starts meanwhile.
+    fn account_life(&self, account_id: &str) -> Result<Lifetime, CoreError> {
+        self.lifetimes
+            .begin(account_id)
+            .map_err(|_| account_closing(account_id))
+    }
+
     /// Tear down the whole account: remove it from the merged inbox (so its rooms
     /// leave immediately while other accounts keep syncing), abort every
     /// subscription, and drop the live `Client`/`SyncService`.
@@ -6534,15 +5386,6 @@ impl AccountManager {
 
     /// [`Self::shutdown`]'s work, its lifetime ended by the caller.
     async fn teardown(&self, account_id: &str) {
-        // The docked note's focus is cleared while the client can still send
-        // (quit, sign-out): the host would otherwise state it until its TTL.
-        // Bounded, so a homeserver that does not answer never holds the quit.
-        self.agent_focus
-            .close_where(
-                |(account, _)| account == account_id,
-                std::time::Duration::from_secs(1),
-            )
-            .await;
         // Drain the account's bridge-health monitor first (Story 6.5): abort its tick,
         // remove its mgmt-room handlers (which hold `Client` clones), and drop its
         // sessions from the shared health snapshot — so a signed-out account's health
@@ -6562,7 +5405,6 @@ impl AccountManager {
         inbox_owners::stop(self.inbox_owners.take_account(account_id)).await;
         {
             let inbox = self.inbox.lock().await;
-            self.launch_ready.gone(account_id);
             if let Some(handle) = inbox.as_ref() {
                 handle.merger.remove_account(account_id).await;
             }
@@ -6571,24 +5413,12 @@ impl AccountManager {
         // account's rooms stop being queryable (the whole index is only rebuilt on a
         // full inbox re-subscribe; single-account sign-out must prune here). Idempotent.
         self.palette.lock().await.remove_account(account_id);
-        // The account and its list worker and seat finder are taken out under
-        // the accounts lock every activation holds (R516, review R102L6-02): an
-        // activation under way when this began has published both by now, and
-        // one that starts later is refused while the account is closing.
+        // The account is taken out under the accounts lock every activation
+        // holds (R516, review R102L6-02): an activation under way when this
+        // began has published it by now, and one that starts later is refused
+        // while the account is closing.
         self.lifetimes.pause(lifetime::Pause::Detaching).await;
-        let (handle, list) = {
-            let mut accounts = self.accounts.lock().await;
-            (
-                accounts.remove(account_id),
-                self.agent_lists.take(account_id),
-            )
-        };
-        // The list worker and seat finder hold a `Client` clone (story 102.5,
-        // R501): stopped and awaited outside the lock, before `sign_out`
-        // deletes the store dir, as the producers above.
-        if let Some(list) = list {
-            list.stop().await;
-        }
+        let handle = self.accounts.lock().await.remove(account_id);
         if let Some(handle) = handle {
             // Remove the account-wide archive event handlers (Story 5.1/5.2) so no
             // further events are ingested and no redaction is marked after the
@@ -6604,15 +5434,6 @@ impl AccountManager {
             // account produces no further native notifications and no handler (holding
             // a `Client` clone) leaks past teardown.
             handle.client.remove_event_handler(handle.notify_handler);
-            // Say this device is no longer in front while the client can
-            // still send, bounded like the focus clear above (91.3 F4); then
-            // stop the account's surface request handler and presence
-            // publisher — the publisher holds a `Client` clone.
-            handle
-                .agents
-                .goodbye(std::time::Duration::from_secs(1))
-                .await;
-            drop(handle.agents);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -6682,9 +5503,8 @@ impl AccountManager {
     ) -> Result<(), CoreError> {
         if let Some(ids) = pusher {
             let removed = match self.ensure_live(platform, account_id).await {
-                Ok(client) => crate::agents::push::register(&client, ids, None)
+                Ok(client) => crate::agents::push::remove(&client, ids)
                     .await
-                    .map(|_| ())
                     .map_err(|error| CoreError::Internal(error.to_string())),
                 Err(error) => Err(error),
             };
@@ -6701,36 +5521,7 @@ impl AccountManager {
         // its session is gone by then, or, when its rows could not be removed,
         // it is still signed in and may start again.
         let _closing = self.lifetimes.close(account_id);
-        // The account's kept agent-room seats go with it: titles it read
-        // stay nobody's once it signed out (R451).
-        if let Some(own) = platform
-            .data_dir()
-            .ok()
-            .and_then(|dir| registry::get_account(&dir, account_id).ok().flatten())
-            .and_then(|row| matrix_sdk::ruma::OwnedUserId::try_from(row.user_id).ok())
-        {
-            self.agent_kinds.forget_account(&own);
-        }
         self.teardown(account_id).await;
-        // So do its kept Agents rows and what its rows said (story 102.5),
-        // once its producer — the rows' writer — is stopped.
-        self.agent_attention.forget(account_id);
-        // Its lifetime ended above, so a write queued before this ran never
-        // lands after it (R501, R516). A removal that fails is said — the
-        // sign-out fails before the session goes, so signing out again
-        // removes them.
-        let store = self.agent_list_rows.clone();
-        let forgotten = {
-            let account_id = account_id.to_owned();
-            tokio::task::spawn_blocking(move || store.forget(&account_id))
-                .await
-                .map_err(|error| CoreError::Internal(error.to_string()))
-                .and_then(|removed| removed)
-        };
-        if let Err(error) = forgotten {
-            tracing::warn!(account_id = %account_id, %error, "agents: a signed-out account's kept Agents rows could not be removed");
-            return Err(CoreError::Internal(KEPT_ROWS_NOT_REMOVED.to_owned()));
-        }
         crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
     }
@@ -6783,210 +5574,6 @@ impl AccountManager {
     }
 }
 
-/// `fetch` for every one of `users` at once, each answer awaited at most
-/// `within`: a user whose name is late or missing is left out.
-async fn names_within<F, Fut>(
-    users: &[matrix_sdk::ruma::OwnedUserId],
-    within: std::time::Duration,
-    fetch: F,
-) -> BTreeMap<matrix_sdk::ruma::OwnedUserId, String>
-where
-    F: Fn(&matrix_sdk::ruma::OwnedUserId) -> Fut,
-    Fut: Future<Output = Option<String>>,
-{
-    futures_util::future::join_all(users.iter().map(|user| {
-        let answer = tokio::time::timeout(within, fetch(user));
-        async move { Some((user.clone(), answer.await.ok().flatten()?)) }
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-/// The attached action of the approval `id` in the session room `room` —
-/// as pretty-printed JSON and, for a `run`, the typed run view an inline
-/// card draws (R231) — and the binding digest it was checked against
-/// (R186): its encrypted file fetched and decrypted through the media
-/// cache, and refused with a sentence unless its bytes are the file the
-/// request names and the action its digest and summary bind.
-pub async fn approval_payload(
-    room: &Room,
-    id: &str,
-) -> Result<(approval_card::ApprovalPayloadVm, String), CoreError> {
-    use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
-    use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
-    let refused = |sentence: &str| CoreError::Unsupported(sentence.to_owned());
-    let fold = agent_room::approvals_of(room).await;
-    let record = fold
-        .record(id)
-        .ok_or_else(|| refused(approval_card::NOT_FOUND))?;
-    if approval_card::binding(record) != approval_card::Binding::Attached {
-        return Err(refused(match record.file {
-            Some(_) => approval_card::PAYLOAD_REFUSED,
-            None => approval_card::NOT_ATTACHED,
-        }));
-    }
-    let file: EncryptedFile = record
-        .file
-        .clone()
-        .and_then(|file| serde_json::from_value(file).ok())
-        .ok_or_else(|| refused(approval_card::PAYLOAD_REFUSED))?;
-    let bytes = crate::media::fetch_source(
-        &room.client(),
-        MediaRequestParameters {
-            source: MediaSource::Encrypted(Box::new(file)),
-            format: MediaFormat::File,
-        },
-    )
-    .await
-    .map_err(|_| refused(approval_card::PAYLOAD_UNAVAILABLE))?;
-    let shown = approval_card::attached_payload(record, &bytes).map_err(CoreError::Unsupported)?;
-    Ok((shown, record.binding_digest.clone()))
-}
-
-/// Whether a lock-screen decision refused with `error` may still be sent as
-/// this process syncs: the session room is not in the store yet
-/// ([`SendError::RoomNotFound`]), or the request is not in its event cache
-/// yet ([`approval_card::NOT_FOUND`]). Every other refusal is the card's —
-/// another digest, no longer waiting, a scope it does not offer, not an
-/// approver, this device not cross-signed — which time does not change; and a
-/// dispatch error is never tried again, because that decision may already be
-/// in the room (R343).
-fn not_yet_synced(error: &CoreError) -> bool {
-    match error {
-        CoreError::Send(SendError::RoomNotFound) => true,
-        CoreError::Unsupported(sentence) => sentence == approval_card::NOT_FOUND,
-        _ => false,
-    }
-}
-
-/// `attempt`, again every second while it is refused [`not_yet_synced`] and
-/// the next try starts before `deadline`; its first other answer, or the
-/// last refusal, is the answer.
-async fn until_synced<F, Fut>(
-    deadline: tokio::time::Instant,
-    mut attempt: F,
-) -> Result<(), CoreError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<(), CoreError>>,
-{
-    const AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
-    loop {
-        match attempt().await {
-            Err(error)
-                if not_yet_synced(&error) && tokio::time::Instant::now() + AGAIN < deadline =>
-            {
-                tracing::debug!(%error, "a lock-screen decision is not sent yet; trying again");
-                tokio::time::sleep(AGAIN).await;
-            }
-            answer => return answer,
-        }
-    }
-}
-
-/// Send the person's decision `req` on the approval card it names in the
-/// session room `room`, from this device, through the one airlock
-/// ([`send_agent_event`]); `hosted` are the session rooms whose agent this
-/// app hosts and `shown` whether this app has shown the attached action
-/// with a binding digest. Refused at once, with the card's sentence, when
-/// the card would show no buttons: its digest does not bind what it shows,
-/// this device is not signed by its owner's cross-signing identity, the
-/// person is not an approver, at T4 not the requester or on the app that
-/// hosts the requesting session's agent; when the request is not in the
-/// room as the card shows it (another digest, a scope it does not offer,
-/// used or expired); or an approve of an attached action not shown (R186).
-/// A decision already in the room does not close the card: whether one
-/// counts is the owning host's (R187).
-pub async fn decide_approval(
-    room: &Room,
-    hosted: &HostedRooms,
-    shown: &(dyn Fn(&str) -> bool + Sync),
-    req: ApprovalDecideReq,
-) -> Result<(), CoreError> {
-    let viewer = Viewer {
-        own: room.own_user_id().to_owned(),
-        device_cross_signed: agent_room::own_device_cross_signed(&room.client()).await,
-        hosted: hosted.rooms(),
-    };
-    let fold = agent_room::approvals_of(room).await;
-    fold.decide(
-        &viewer,
-        &req,
-        chrono::Utc::now(),
-        &|user| user.to_string(),
-        shown,
-    )
-    .map_err(CoreError::Unsupported)?;
-    let content = ApprovalDecisionContent {
-        id: req.id,
-        binding_digest: req.binding_digest,
-        decision: req.decision,
-        scope: req.scope,
-        note: req
-            .note
-            .map(|note| note.trim().chars().take(NOTE_MAX).collect::<String>())
-            .filter(|note| !note.is_empty()),
-    };
-    send_agent_event(room, AgentOutbound::Decision(content))
-        .await
-        .map(|_| ())
-}
-
-/// Send one of the device's agent events ([`AgentOutbound`]: a scope, a
-/// request for a conversation or a surface result, nothing else) into
-/// `room` with `Room::send_raw` — this file's only `send_raw` — and only into an encrypted room (R30:
-/// every session room is); the event id. These are not messages, so they
-/// are outside AD-13's two dispatch triggers (`send.rs`'s Scope paragraph).
-/// The one state variant, the ask for a DM ([`AgentOutbound::state_key`]),
-/// is a control-room state event under the person's own key, as their
-/// presence is (R416).
-pub(crate) async fn send_agent_event(
-    room: &Room,
-    event: AgentOutbound,
-) -> Result<String, CoreError> {
-    if let Some(key) = event.state_key(room.own_user_id()) {
-        let content = event
-            .content()
-            .map_err(|error| CoreError::Internal(error.to_string()))?;
-        return room
-            .send_state_event_raw(event.event_type(), &key, content)
-            .await
-            .map(|sent| sent.event_id.to_string())
-            .map_err(|error| SendError::Dispatch(error.to_string()).into());
-    }
-    if !room.encryption_state().is_encrypted() {
-        return Err(CoreError::Unsupported(
-            proxy::Refusal::Unencrypted.to_string(),
-        ));
-    }
-    let content = event
-        .content()
-        .map_err(|error| CoreError::Internal(error.to_string()))?;
-    room.send_raw(event.event_type(), content)
-        .await
-        .map(|sent| sent.response.event_id.to_string())
-        .map_err(|error| SendError::Dispatch(error.to_string()).into())
-}
-
-/// What `activate` wires one account's agents (91.3) to: the app's device
-/// state, and what the dock reads a room's proxy from — the same reading
-/// the surface handler and the presence publisher use.
-struct AgentsWiring<'a> {
-    device: &'a AgentDevice,
-    kinds: &'a Arc<AgentKinds>,
-    proxies: &'a Arc<AgentProxies>,
-    /// Where the account's list worker writes its rows' states.
-    board: &'a Arc<AttentionBoard>,
-    /// Where the account's list worker and seat finder are kept until its
-    /// teardown.
-    lists: &'a AgentLists,
-    /// The lifetime this activation opened: the activation publishes
-    /// nothing once it ended (R516).
-    life: Lifetime,
-}
-
 /// What refuses work on an account whose lifetime ended or that is closing
 /// (R516, R381: said, and logged).
 fn account_closing(account_id: &str) -> CoreError {
@@ -6994,664 +5581,16 @@ fn account_closing(account_id: &str) -> CoreError {
     AccountError::SyncStart("this account is signing out or shutting down".to_owned()).into()
 }
 
-/// Send the notes view's `answer` into the session room `room_id`, as this
-/// device; `detail` is trimmed and clipped, and never note text.
-async fn send_surface_result(
-    client: &Client,
-    room_id: &RoomId,
-    answer: SurfaceAnswerReq,
-) -> Result<(), CoreError> {
-    let room = client.get_room(room_id).ok_or(SendError::RoomNotFound)?;
-    if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-        return Err(SendError::RoomNotFound.into());
-    }
-    let device = client
-        .device_id()
-        .map(ToString::to_string)
-        .ok_or_else(|| CoreError::Internal("this client has no device id".to_owned()))?;
-    let result = SurfaceResultContent {
-        v: CONTENT_VERSION,
-        request: answer.request_id,
-        device,
-        outcome: answer.outcome,
-        applied: answer.applied,
-        detail: answer
-            .detail
-            .map(|detail| detail.trim().chars().take(200).collect::<String>())
-            .filter(|detail| !detail.is_empty()),
-    };
-    send_agent_event(&room, AgentOutbound::SurfaceResult(result))
-        .await
-        .map(|_| ())
-}
-
-/// What `client`'s account knows of whose proxy an agent is (ruling R72):
-/// this device's zone facts, and the person's own `dev.keeper.agent.proxies`
-/// list. Read on every admission and listing, which is also when this
-/// keeper brings the list in line with its zone
-/// ([`KnownProxies::mirrored`]) — written only when that changes it, and
-/// never over a list of a version it does not read.
-pub(crate) async fn known_proxies(client: &Client, proxies: &AgentProxies) -> KnownProxies {
-    let stored = match client
-        .account()
-        .account_data::<ProxyListEventContent>()
-        .await
-    {
-        Ok(Some(raw)) => raw.deserialize().ok().map(|content| content.agents()),
-        Ok(None) => Some(Some(BTreeSet::new())),
-        Err(error) => {
-            tracing::warn!(%error, "agents: the person's proxy list could not be read");
-            None
-        }
-    };
-    let known = KnownProxies {
-        facts: proxies.snapshot(),
-        listed: stored.clone().flatten().unwrap_or_default(),
-    };
-    let (Some(Some(listed)), Some(me)) = (stored, client.user_id()) else {
-        return known;
-    };
-    let mirrored = known.mirrored(me);
-    if mirrored != listed && proxies.owes(me, &mirrored) {
-        if let Err(error) = client
-            .account()
-            .set_account_data(ProxyListEventContent::of(&mirrored))
-            .await
-        {
-            proxies.unwritten(me);
-            tracing::warn!(%error, "agents: the person's proxy list could not be written");
-        }
-    }
-    known
-}
-
-/// The agents `client`'s account knows (story 101.1, R416): its own proxies
-/// ([`proxy::own_proxies`] over `known`) and every agent at an agent's power
-/// in a control room one of them made — the principal's agents, who make
-/// the person's delegated and scheduled sessions.
-pub(crate) async fn known_agents(client: &Client, known: &KnownProxies) -> BTreeSet<OwnedUserId> {
-    let Some(me) = client.user_id().map(ToOwned::to_owned) else {
-        return BTreeSet::new();
-    };
-    let own = proxy::own_proxies(&me, known);
-    let mut agents = own.clone();
-    for room in client.joined_rooms() {
-        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control)
-            || !proxy::is_own_control_room(&room.creators().unwrap_or_default(), &own)
-        {
-            continue;
-        }
-        let Ok(levels) = room.power_levels().await else {
-            continue;
-        };
-        agents.extend(
-            levels
-                .users
-                .keys()
-                .filter(|user| **user != me && agent_room::holds_agent_power(Some(&levels), user))
-                .cloned(),
-        );
-    }
-    agents
-}
-
-/// Join `room`, an invite to this account, when [`proxy::joins_invite`]
-/// says it is one of the person's own agents' session rooms (R416). The
-/// SDK's join marks a direct invite — a `main` DM — in the person's
-/// `m.direct`, which is what admits it as their DM. Whether it joined; a
-/// failed join is a WARN, and the invite stays for the next look.
-pub async fn join_agent_invite(room: &Room, known: &BTreeSet<OwnedUserId>) -> bool {
-    if room.state() != matrix_sdk::RoomState::Invited {
-        return false;
-    }
-    let session = AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session);
-    if !session {
-        return false;
-    }
-    let Ok(invite) = room.invite_details().await else {
-        return false;
-    };
-    let creators = room.creators().unwrap_or_default();
-    if !proxy::joins_invite(session, &creators, &invite.inviter_id, known) {
-        tracing::debug!(room = %room.room_id(), inviter = %invite.inviter_id, "agents: an invite waits for the person");
-        return false;
-    }
-    match room.join().await {
-        Ok(()) => {
-            tracing::info!(room = %room.room_id(), inviter = %invite.inviter_id, "agents: joined an agent's session room on its invite");
-            true
-        }
-        Err(error) => {
-            tracing::warn!(room = %room.room_id(), %error, "agents: an agent's session room could not be joined");
-            false
-        }
-    }
-}
-
-/// Join every invite waiting on `client` that [`join_agent_invite`] takes:
-/// an invite that arrived while keeper was closed is joined at the next look.
-pub(crate) async fn join_agent_invites(client: &Client, proxies: &AgentProxies) -> usize {
-    let invited = client.invited_rooms();
-    if invited.is_empty() {
-        return 0;
-    }
-    let known = known_agents(client, &known_proxies(client, proxies).await).await;
-    let mut joined = 0;
-    for room in invited {
-        joined += usize::from(join_agent_invite(&room, &known).await);
-    }
-    joined
-}
-
-/// `agent`'s name as the account's agent rooms hold it, else its user id's
-/// localpart: what keeper calls an agent it has no DM with yet.
-async fn proxy_name(client: &Client, agent: &UserId) -> String {
-    for room in client.joined_rooms() {
-        if AgentRoomKind::of(room.room_type().as_ref()).is_none() {
-            continue;
-        }
-        let name = agent_room::agent_name(&room, agent).await;
-        if name != agent.localpart() {
-            return name;
-        }
-    }
-    agent.localpart().to_owned()
-}
-
-/// The control room `client`'s account shares with `agent`, one of its own
-/// proxies (`own`): one `agent` made, else one another own proxy made where
-/// `agent` holds an agent's power.
-async fn control_room_with(
-    client: &Client,
-    agent: &UserId,
-    own: &BTreeSet<OwnedUserId>,
-) -> Option<Room> {
-    let mut shared = None;
-    for room in client.joined_rooms() {
-        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control) {
-            continue;
-        }
-        let creators = room.creators().unwrap_or_default();
-        if creators.as_slice() == [agent.to_owned()] {
-            return Some(room);
-        }
-        if shared.is_none() && proxy::is_own_control_room(&creators, own) {
-            let levels = room.power_levels().await.ok();
-            if agent_room::holds_agent_power(levels.as_ref(), agent) {
-                shared = Some(room);
-            }
-        }
-    }
-    shared
-}
-
-/// The person's proxy conversations on `client`'s account (UX-DR130) —
-/// every agent session room [`proxy::admits`] admits, the DM first — and the
-/// person's own proxies with no `main` room among them, the ones keeper may
-/// ask for one (R416). An invite to one of the person's agents' session
-/// rooms that is still waiting is joined first ([`join_agent_invites`]).
-pub async fn agent_rooms_of(
-    client: &Client,
-    account_id: &str,
-    kinds: &AgentKinds,
-    proxies: &AgentProxies,
-) -> (Vec<ProxyRoomVm>, Vec<MainDmAskVm>) {
-    let Some(me) = client.user_id().map(ToOwned::to_owned) else {
-        return (Vec::new(), Vec::new());
-    };
-    join_agent_invites(client, proxies).await;
-    let mut rows = Vec::new();
-    for room in client.joined_rooms() {
-        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-            continue;
-        }
-        rows.push(proxy_row(room, kinds).await);
-    }
-    let known = known_proxies(client, proxies).await;
-    let rooms = proxy::proxy_rooms(&rows, &me, &known);
-    let mut asks = Vec::new();
-    for agent in proxy::own_proxies(&me, &known) {
-        let has_main = rooms
-            .iter()
-            .any(|room| room.kind == SessionKind::Main && room.agent == agent.as_str());
-        if has_main {
-            continue;
-        }
-        let name = proxy_name(client, &agent).await;
-        asks.push(MainDmAskVm {
-            account_id: account_id.to_owned(),
-            agent: agent.to_string(),
-            opening: launch::opening_sentence(&name),
-            name,
-        });
-    }
-    (rooms, asks)
-}
-
-/// Open the person's `main` DM with `agent` on `client`'s account (story
-/// 101.1 #4–#5, R416, R450): the room when it is here; otherwise one
-/// [`AgentOutbound::MainDmRequest`] into the control room the person shares
-/// with the agent, whose host answers with the DM it opened (or adopted) or
-/// a refusal. The answered room is joined — `main` as direct — its status
-/// searched for page after page, and it is answered once it admits as the
-/// person's DM. Everything of it is bounded by `deadline`
-/// ([`main_dm::open_within`]); every way it does not open is a sentence for
-/// where the person is looking and a WARN.
-pub async fn open_main_dm(
-    client: &Client,
-    account_id: &str,
-    agent: &UserId,
-    kinds: &AgentKinds,
-    proxies: &AgentProxies,
-    deadline: tokio::time::Instant,
-) -> Result<LaunchRoomVm, CoreError> {
-    let mut port = ClientDmOpening {
-        client,
-        account_id,
-        agent: agent.to_owned(),
-        kinds,
-        proxies,
-        answers: tokio::sync::Mutex::new(None),
-        _hearing: None,
-        request: None,
-    };
-    let opened = main_dm::open_within(&mut port, deadline)
-        .await
-        .map_err(CoreError::Unsupported)?;
-    tracing::info!(account_id, agent = %agent, room = %opened.room_id, "agents: the person's DM with an agent opened");
-    Ok(opened)
-}
-
-/// [`main_dm::DmOpening`] over one account's client.
-struct ClientDmOpening<'a> {
-    client: &'a Client,
-    account_id: &'a str,
-    agent: matrix_sdk::ruma::OwnedUserId,
-    kinds: &'a AgentKinds,
-    proxies: &'a AgentProxies,
-    /// The control room's answers, heard from before the request left.
-    answers: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<serde_json::Value>>>,
-    _hearing: Option<matrix_sdk::event_handler::EventHandlerDropGuard>,
-    /// The request's event id.
-    request: Option<String>,
-}
-
-impl ClientDmOpening<'_> {
-    /// The DM among `rooms` as the launch answers it.
-    fn main_in(&self, rooms: Vec<ProxyRoomVm>) -> Option<LaunchRoomVm> {
-        rooms
-            .into_iter()
-            .find(|room| room.kind == SessionKind::Main && room.agent == self.agent.as_str())
-            .map(|room| LaunchRoomVm {
-                account_id: self.account_id.to_owned(),
-                room_id: room.room_id,
-            })
-    }
-}
-
-impl main_dm::DmOpening for ClientDmOpening<'_> {
-    type Opened = LaunchRoomVm;
-
-    fn agent(&self) -> &UserId {
-        &self.agent
-    }
-
-    async fn found(&self) -> Option<LaunchRoomVm> {
-        // Only the rooms the agent made and this account marked direct with
-        // it — its DM, and seldom anything else — are read; no invite is
-        // joined (review-101rooms-2 06).
-        for room in self.client.joined_rooms() {
-            let own = room
-                .creators()
-                .is_some_and(|creators| creators.as_slice() == [self.agent.clone()]);
-            let direct = room
-                .direct_targets()
-                .iter()
-                .any(|target| target.as_user_id() == Some(self.agent.as_ref()));
-            if !own
-                || !direct
-                || AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session)
-            {
-                continue;
-            }
-            if let Ok((SessionKind::Main, agent)) =
-                admit_proxy_room(&room, self.kinds, self.proxies).await
-            {
-                if agent == self.agent {
-                    return Some(LaunchRoomVm {
-                        account_id: self.account_id.to_owned(),
-                        room_id: room.room_id().to_string(),
-                    });
-                }
-            }
-        }
-        None
-    }
-
-    async fn listed(&self) -> Option<LaunchRoomVm> {
-        let (rooms, _) =
-            agent_rooms_of(self.client, self.account_id, self.kinds, self.proxies).await;
-        self.main_in(rooms)
-    }
-
-    async fn name(&self) -> String {
-        proxy_name(self.client, &self.agent).await
-    }
-
-    async fn ask(&mut self) -> Result<(), String> {
-        let name = proxy_name(self.client, &self.agent).await;
-        let Some(me) = self.client.user_id().map(ToOwned::to_owned) else {
-            return Err(main_dm::not_sent_sentence(
-                &name,
-                "this account is not signed in",
-            ));
-        };
-        let known = known_proxies(self.client, self.proxies).await;
-        let own = proxy::own_proxies(&me, &known);
-        let Some(control) = control_room_with(self.client, &self.agent, &own).await else {
-            return Err(main_dm::no_control_room_sentence(&name));
-        };
-        // The answer is heard from before the request leaves, so a fast host
-        // is never missed.
-        let (answers, answered) = mpsc::unbounded_channel::<serde_json::Value>();
-        let handle = self.client.add_room_event_handler(
-            control.room_id(),
-            move |event: matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>| {
-                let answers = answers.clone();
-                async move {
-                    if event.get_field::<&str>("type").ok().flatten() == Some(MAIN_DM_ANSWER) {
-                        if let Ok(value) = event.deserialize_as::<serde_json::Value>() {
-                            let _ = answers.send(value);
-                        }
-                    }
-                }
-            },
-        );
-        self._hearing = Some(self.client.event_handler_drop_guard(handle));
-        *self.answers.get_mut() = Some(answered);
-        let request = MainDmRequestContent {
-            v: CONTENT_VERSION,
-            agent: self.agent.clone(),
-            ask: ulid::Ulid::new().to_string(),
-        };
-        let request = send_agent_event(&control, AgentOutbound::MainDmRequest(request))
-            .await
-            .map_err(|error| main_dm::not_sent_sentence(&name, &error.to_string()))?;
-        tracing::info!(account_id = self.account_id, agent = %self.agent, "agents: asked an agent to open the person's DM");
-        self.request = Some(request);
-        Ok(())
-    }
-
-    async fn answer(&self) -> main_dm::Answer {
-        let mut answers = self.answers.lock().await;
-        loop {
-            let (Some(answers), Some(request)) = (answers.as_mut(), self.request.as_deref()) else {
-                return std::future::pending().await;
-            };
-            let Some(answer) = answers.recv().await else {
-                return std::future::pending().await;
-            };
-            if answer["sender"].as_str() != Some(self.agent.as_str())
-                || answer["content"]["request"].as_str() != Some(request)
-            {
-                continue;
-            }
-            if let Some(refused) = answer["content"]["refused"].as_str() {
-                return main_dm::Answer::Refused(refused.to_owned());
-            }
-            if let Some(room) = answer["content"]["room"]
-                .as_str()
-                .and_then(|room| matrix_sdk::ruma::OwnedRoomId::try_from(room).ok())
-            {
-                return main_dm::Answer::Room(room);
-            }
-        }
-    }
-
-    async fn settle(&self, room: &RoomId) -> bool {
-        settle_answered_dm(self.client, room, &self.agent).await
-    }
-
-    async fn admit(&self, room: &RoomId) -> Option<LaunchRoomVm> {
-        let joined = self.client.get_room(room)?;
-        agent_room::HeaderReader::open_searching(joined.clone(), self.kinds).await;
-        match admit_proxy_room(&joined, self.kinds, self.proxies).await {
-            Ok((SessionKind::Main, agent)) if agent == self.agent => Some(LaunchRoomVm {
-                account_id: self.account_id.to_owned(),
-                room_id: room.to_string(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// Settle `room_id`, the room `agent`'s host answered with as the person's
-/// DM, on `client`'s account: an invite is joined, and the room — joined
-/// now or before, outside keeper included — is marked direct with `agent`
-/// unless it already is (a DM the person left and forgot lost its mark, and
-/// a re-invite does not carry one). Whether it is joined and direct now; a
-/// room not here yet (the invite has not arrived) or left is not, and the
-/// caller keeps the answer to settle it when it lands (R450). Failures are
-/// WARNs.
-pub async fn settle_answered_dm(client: &Client, room_id: &RoomId, agent: &UserId) -> bool {
-    let Some(room) = client.get_room(room_id) else {
-        return false;
-    };
-    let made_by_agent = room
-        .creators()
-        .is_some_and(|creators| creators.as_slice() == [agent.to_owned()]);
-    if !made_by_agent
-        || AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session)
-    {
-        tracing::warn!(room = %room.room_id(), "agents: the room an agent answered with is not its own session room");
-        return false;
-    }
-    match room.state() {
-        matrix_sdk::RoomState::Invited => {
-            if let Err(error) = room.join().await {
-                tracing::warn!(room = %room.room_id(), %error, "agents: the agent's DM could not be joined");
-                return false;
-            }
-        }
-        matrix_sdk::RoomState::Joined => {}
-        _ => return false,
-    }
-    let direct = room
-        .direct_targets()
-        .iter()
-        .any(|target| target.as_user_id() == Some(agent));
-    if !direct {
-        if let Err(error) = room.set_is_direct(true).await {
-            tracing::warn!(room = %room.room_id(), %error, "agents: the agent's DM could not be marked direct");
-            return false;
-        }
-    }
-    true
-}
-
-/// Whether `room` is one of its own user's proxy conversations
-/// ([`proxy::admits`] over [`known_proxies`]): its kind and agent, or
-/// `unsupported` with the refusal's sentence.
-pub async fn admit_proxy_room(
-    room: &Room,
-    kinds: &AgentKinds,
-    proxies: &AgentProxies,
-) -> Result<(SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
-    let row = admission_row(room.clone(), kinds).await;
-    let known = known_proxies(&room.client(), proxies).await;
-    let admitted = proxy::admits(&row, room.own_user_id(), &known)
-        .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
-    Ok((admitted.kind, admitted.agent.to_owned()))
-}
-
-/// The agent `room` admits as its own user's proxy, when it is one of their
-/// proxy conversations by what this client alone can read
-/// ([`proxy::admits`], R72) — a device with no agents zone, as the
-/// notification extension is. A push shows an answer there only from this
-/// agent (98.1 #1, R336).
-pub async fn proxy_answer_agent(room: &Room) -> Option<matrix_sdk::ruma::OwnedUserId> {
-    admit_proxy_room(room, &AgentKinds::default(), &AgentProxies::default())
-        .await
-        .ok()
-        .map(|(_, agent)| agent)
-}
-
-/// Send what the voice turn heard into `room`, its own user's proxy
-/// conversation, as their message (AD-384) — through the single dispatch
-/// gate with [`SendTrigger::SpokenToAgent`], legal only there (ruling R31,
-/// whose "the proxy's human is the signed-in user" R72 makes fail closed)
-/// and never held for Undo-Send: the end of the utterance was the send.
-/// The answer's watch is on the room's event cache before the send, and
-/// learns the question's event id from the send queue; it reads the answer
-/// as it grows. `open` is the conversation's timeline when one is open
-/// (no screen need be: the voice turn runs with none).
-///
-/// Errors: a blank text → [`SendError::EmptyBody`]; a room that is not the
-/// person's own `main`/`conversation` proxy room → `unsupported` with
-/// [`proxy::admits`]' reason, and nothing is sent; a transient-build
-/// failure → [`TimelineError::Build`]; an SDK enqueue failure →
-/// [`SendError::Dispatch`].
-pub async fn spoken_send(
-    room: &Room,
-    kinds: &AgentKinds,
-    proxies: &AgentProxies,
-    open: Option<Arc<Timeline>>,
-    text: &str,
-) -> Result<SpokenAnswer, CoreError> {
-    if text.trim().is_empty() {
-        return Err(SendError::EmptyBody.into());
-    }
-    let (_, agent) = admit_proxy_room(room, kinds, proxies).await?;
-    let mut answer = SpokenAnswer::watch(room, agent).await?;
-    let timeline = match open {
-        Some(timeline) => timeline,
-        None => Arc::new(
-            TimelineBuilder::new(room)
-                .build()
-                .await
-                .map_err(|e| TimelineError::Build(e.to_string()))?,
-        ),
-    };
-    // What was heard is text. One line, so the AD-13 caller scan reads the
-    // trigger at its call.
-    let kind = MessageKind::Text;
-    if let Some(handle) = send::submit(&timeline, text, kind, SendTrigger::SpokenToAgent).await? {
-        answer.sent(&handle, text);
-    }
-    Ok(answer)
-}
-
 /// Which Undo-Send window a room created with `room_type` holds a send for
-/// (Story 101.3, R418): an agent's session room is an agent room, every
+/// (Story 101.3, R418): an old agent session room is an agent room, every
 /// other room a chat (a control room has no composer).
 pub(crate) fn undo_room_of(
     room_type: Option<&matrix_sdk::ruma::room::RoomType>,
 ) -> registry::UndoRoom {
-    match AgentRoomKind::of(room_type) {
-        Some(AgentRoomKind::Session) => registry::UndoRoom::Agent,
-        _ => registry::UndoRoom::Chat,
-    }
-}
-
-/// The questions waiting for this person that are answered in `room_id`
-/// (Story 101.3, R430, R431), oldest first: [`asks_answered_in`] of that
-/// room.
-async fn read_agent_asks(
-    client: &Client,
-    data_dir: &Path,
-    account_id: &str,
-    room_id: &RoomId,
-    kinds: &AgentKinds,
-    proxies: &AgentProxies,
-) -> Result<agent_waiting::AgentAsksVm, CoreError> {
-    let here = client
-        .get_room(room_id)
-        .ok_or(TimelineError::RoomNotFound)?;
-    Ok(
-        asks_answered_in(&here, Some(data_dir), account_id, kinds, proxies)
-            .await
-            .unwrap_or_default(),
-    )
-}
-
-/// What a listing reads of a session room to decide whether it is one of the
-/// person's proxy conversations ([`proxy::admits`]): the event cache and the
-/// seat kept for it, never the server (story 102.5, R468) — a status out of
-/// the cache's reach is the seat finder's to look for.
-pub(crate) async fn proxy_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
-    let reader = agent_room::HeaderReader::open_row(room.clone(), kinds).await;
-    row_of(room, kinds, reader).await
-}
-
-/// [`proxy_row`] for one room the person acts in (an admission): a room
-/// with no seat kept is searched back a few pages for its status (R416).
-pub(crate) async fn admission_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
-    let reader = agent_room::HeaderReader::open_admitting(room.clone(), kinds).await;
-    row_of(room, kinds, reader).await
-}
-
-async fn row_of(room: Room, kinds: &AgentKinds, reader: agent_room::HeaderReader) -> ProxyRoomRow {
-    let room_id = room.room_id().to_string();
-    let name = room
-        .cached_display_name()
-        .map(|name| name.to_string())
-        .unwrap_or_else(|| room_id.clone());
-    let recency = room.recency_stamp().map_or(0, u64::from);
-    let encrypted = room
-        .latest_encryption_state()
-        .await
-        .is_ok_and(|state| state.is_encrypted());
-    let creators = room.creators().unwrap_or_default();
-    let direct_to = room
-        .direct_targets()
-        .iter()
-        .filter_map(|target| target.as_user_id().map(ToOwned::to_owned))
-        .collect();
-    let state = reader.state();
-    // The newer of the status read now and the seat the last one left names
-    // the room — with none in reach (buried under claim renewals, or not in
-    // the cache since a restart) the seat does (R416, R451).
-    let seat = kinds.seat_after(room.own_user_id(), room.room_id(), state);
-    let scope = seat
-        .as_ref()
-        .and_then(|seat| state.scope_drives_of(&seat.agent));
-    let agent_name = match &seat {
-        Some(seat) => Some(agent_room::agent_name(&room, &seat.agent).await),
-        None => None,
-    };
-    ProxyRoomRow {
-        room_id,
-        name,
-        kind: seat.as_ref().map(|seat| seat.kind),
-        agent: seat.as_ref().map(|seat| seat.agent.clone()),
-        title: seat.map(|seat| seat.title),
-        agent_name,
-        recency,
-        creators,
-        encrypted,
-        direct_to,
-        scope,
-    }
-}
-
-/// A focus lane's room: the focus goes there as a scope without drives.
-struct RoomFocus(Room);
-
-impl FocusPort for RoomFocus {
-    fn send(&self, focus: Option<Focus>) -> SendFuture<'_> {
-        Box::pin(async move {
-            let content = ScopeContent {
-                v: CONTENT_VERSION,
-                drives: None,
-                label: None,
-                focus,
-                set_by: self.0.own_user_id().to_owned(),
-            };
-            send_agent_event(&self.0, AgentOutbound::Scope(content))
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+    if crate::old_agent_rooms::is_old_session_room(room_type) {
+        registry::UndoRoom::Agent
+    } else {
+        registry::UndoRoom::Chat
     }
 }
 
@@ -7681,7 +5620,7 @@ fn recovery_key_keychain_key(account_id: &str) -> String {
 /// lifetime-of-account reconnect supervisor is spawned to re-enable the send
 /// queue on every transition back into `Running`; its `JoinHandle` is returned
 /// for the caller to store on the `AccountHandle`.
-#[tracing::instrument(skip(platform, session, archive, agents), fields(account_id = %account_id))]
+#[tracing::instrument(skip(platform, session, archive, life), fields(account_id = %account_id))]
 async fn activate(
     platform: &Arc<dyn Platform>,
     account_id: &str,
@@ -7689,7 +5628,7 @@ async fn activate(
     archive: Option<ArchiveHandle>,
     draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
     notify_config: Arc<NotifyConfig>,
-    agents: AgentsWiring<'_>,
+    life: Lifetime,
 ) -> Result<ActivatedAccount, CoreError> {
     // Use the blob the caller already holds when there is one; otherwise read it
     // here, once. `None` is the honest answer for the callers that activate an
@@ -7771,27 +5710,6 @@ async fn activate(
     // body is never logged; a notifier failure is swallowed and never blocks sync.
     let notify_handler =
         notify::register_notify_handler(&client, account_id, platform.clone(), notify_config);
-    // The agents' surface request handler (91.3) beside the notify handler,
-    // before sync starts, so a request in the first batch is read; and this
-    // device's presence publisher into the account's own control rooms. Both
-    // read which rooms are the person's proxy conversations as the dock does.
-    let lists = agents.lists;
-    let life = agents.life;
-    let list = agent_list::ListWorker {
-        client: client.clone(),
-        account_id: account_id.to_owned(),
-        kinds: Arc::clone(agents.kinds),
-        proxies: Arc::clone(agents.proxies),
-        data_dir: Some(data_dir.clone()),
-        board: Arc::clone(agents.board),
-    };
-    let agents = agent_device::register(
-        &client,
-        account_id,
-        agents.device,
-        Arc::clone(agents.kinds),
-        Arc::clone(agents.proxies),
-    );
 
     // Archive-first back-pagination enablement (Story 5.6, FR-17). Subscribe the
     // SDK event cache once here — alongside the archive/redaction handlers and
@@ -7879,8 +5797,6 @@ async fn activate(
         client.remove_event_handler(redaction_handler);
         client.remove_event_handler(draft_handler);
         client.remove_event_handler(notify_handler);
-        agents.goodbye(std::time::Duration::from_secs(1)).await;
-        drop(agents);
         sync.stop().await;
         reconnect_supervisor.abort();
         outbox_scheduler.abort();
@@ -7888,13 +5804,6 @@ async fn activate(
         let _ = session_persister.await;
         return Err(account_closing(account_id));
     }
-    life.pause(lifetime::Pause::StartingList).await;
-    // The account's Agents rows are read by one worker, and the statuses out
-    // of the cache's reach looked for by one finder, from now until the
-    // account's teardown, whatever surface reads them (story 102.5, R468,
-    // R501): started last, so an activation that fails leaves none running.
-    lists.start(list);
-
     Ok((
         client,
         sync,
@@ -7904,7 +5813,6 @@ async fn activate(
         redaction_handler,
         draft_handler,
         notify_handler,
-        agents,
         outbox_scheduler,
         outbox_tx,
     ))
@@ -8445,20 +6353,21 @@ fn map_encryption_status(state: &VerificationState) -> EncryptionStatus {
 
 /// Drive the recency-sorted entries stream, converting each `VectorDiff` batch
 /// into a [`RoomListBatch`] and forwarding it to `sink`. The stream yields
-/// nothing until the filter is set, then a `Reset` and live diffs. An agent
-/// row's state is what `board` says now (story 102.5).
+/// nothing until the filter is set, then a `Reset` and live diffs. The
+/// agents' old rooms are filtered out at the source
+/// ([`crate::old_agent_rooms::list_filter`]).
 async fn run_producer(
     room_list: RoomList,
     sink: BatchSink,
     account_id: &str,
     notify: &NotifyConfig,
-    kinds: &AgentKinds,
-    icons: &AgentIcons,
-    board: &AttentionBoard,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
-    if !controller.set_filter(Box::new(new_filter_non_left())) {
+    if !controller.set_filter(Box::new(new_filter_all(vec![
+        Box::new(new_filter_non_left()),
+        crate::old_agent_rooms::list_filter(),
+    ]))) {
         tracing::warn!(account_id = %account_id, "room list filter not applied (stream dropped)");
         return;
     }
@@ -8470,12 +6379,6 @@ async fn run_producer(
     // Once the loading-state stream terminates, its `select!` branch is disabled
     // so it is never re-polled after returning `None`.
     let mut loading_done = false;
-    // The rows as the stream left them, so a seat's changed kind, agent or
-    // title redraws the agent rooms' rows at once (R451).
-    let mut rows: matrix_sdk_ui::eyeball_im::Vector<RoomListItem> =
-        matrix_sdk_ui::eyeball_im::Vector::new();
-    let mut seats = kinds.subscribe();
-    let mut seats_open = true;
 
     futures_util::pin_mut!(stream);
     loop {
@@ -8485,8 +6388,7 @@ async fn run_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            diff.clone().apply(&mut rows);
-                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons, board).await);
+                            ops.push(diff_to_op(diff, notify).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -8499,17 +6401,6 @@ async fn run_producer(
                     }
                 }
             }
-            changed = seats.changed(), if seats_open => {
-                if changed.is_err() {
-                    seats_open = false;
-                    continue;
-                }
-                let ops = agent_rows(&rows, None, account_id, notify, kinds, icons, board).await;
-                if !ops.is_empty() && !(sink)(RoomListBatch { ops, total }) {
-                    tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
-                    break;
-                }
-            }
             maybe_state = loading_state.next(), if !loading_done => {
                 match maybe_state {
                     Some(state) => total = loaded_total(&state),
@@ -8520,84 +6411,15 @@ async fn run_producer(
     }
 }
 
-/// The agent rooms' rows of `rows` drawn again — every one, or those of
-/// `only` — as `Set` ops at their index. Nothing is read: each row says
-/// what `board` says of its room (story 102.5).
-async fn agent_rows(
-    rows: &matrix_sdk_ui::eyeball_im::Vector<RoomListItem>,
-    only: Option<&[OwnedRoomId]>,
-    account_id: &str,
-    notify: &NotifyConfig,
-    kinds: &AgentKinds,
-    icons: &AgentIcons,
-    board: &AttentionBoard,
-) -> Vec<RoomListOp> {
-    let mut ops = Vec::new();
-    for (index, item) in rows.iter().enumerate() {
-        if agent_room::AgentRoomKind::of(item.room_type().as_ref()).is_none()
-            || only.is_some_and(|only| !only.iter().any(|room| room == item.room_id()))
-        {
-            continue;
-        }
-        ops.push(RoomListOp::Set {
-            index: index as u32,
-            room: room_item_to_vm(item, account_id, notify, kinds, icons, board).await,
-        });
-    }
-    ops
-}
-
-/// The agent session rooms a room-list diff carries: rows the list redrew,
-/// whose state the list worker reads again (story 102.5).
-fn agent_rooms_in(diff: &VectorDiff<RoomListItem>) -> Vec<OwnedRoomId> {
-    let session = |item: &RoomListItem| {
-        (agent_room::AgentRoomKind::of(item.room_type().as_ref())
-            == Some(agent_room::AgentRoomKind::Session))
-        .then(|| item.room_id().to_owned())
-    };
-    match diff {
-        VectorDiff::Append { values } | VectorDiff::Reset { values } => {
-            values.iter().filter_map(session).collect()
-        }
-        VectorDiff::PushFront { value }
-        | VectorDiff::PushBack { value }
-        | VectorDiff::Insert { value, .. }
-        | VectorDiff::Set { value, .. } => session(value).into_iter().collect(),
-        VectorDiff::Clear
-        | VectorDiff::PopFront
-        | VectorDiff::PopBack
-        | VectorDiff::Remove { .. }
-        | VectorDiff::Truncate { .. } => Vec::new(),
-    }
-}
-
-/// How long the Agents rows settle before they are kept for the next run.
-const KEEP_SETTLE: Duration = Duration::from_secs(2);
-
-/// What one account's inbox producer draws with beyond its room list (story
-/// 102.5): the merger it feeds, the readiness it marks, where its agent
-/// rows' states are, the account's list worker it hands the rooms it redrew
-/// and hears the changed rows from, and where the Agents rows are kept for
-/// the next run.
+/// What one account's inbox producer draws with beyond its room list: the
+/// merger it feeds and its notify settings.
 struct InboxRows<'a> {
     merger: InboxMerger,
     account_id: &'a str,
     notify: &'a NotifyConfig,
-    kinds: &'a AgentKinds,
-    launch_ready: &'a LaunchReadiness,
-    icons: &'a AgentIcons,
-    board: &'a AttentionBoard,
-    /// The account's list worker ([`AgentLists::attach`]): where the rooms
-    /// the list redrew go, and where the rooms whose state it changed come
-    /// from; `None` for an account with none.
-    worker: Option<(
-        mpsc::UnboundedSender<agent_list::Due>,
-        broadcast::Receiver<Vec<OwnedRoomId>>,
-    )>,
-    keep: Option<RowWriter>,
     /// Its account's lifetime and its subscription, checked before each
-    /// emission and readiness it says (R519): a producer that outlived
-    /// either has no effect and stops.
+    /// emission (R519): a producer that outlived either has no effect and
+    /// stops.
     owner: Owner,
 }
 
@@ -8606,19 +6428,15 @@ struct InboxRows<'a> {
 /// the exact same conversion as [`run_producer`]) and hand it to the shared
 /// [`InboxMerger`], which folds it into that account's slot and re-emits the
 /// merged window. Stops when the merger reports the output channel is closed or
-/// the entries stream ends. A room list that cannot be read leaves the rows
-/// kept from the last run, said not live (R501).
+/// the entries stream ends.
 async fn run_inbox_producer(room_list: RoomList, inbox: InboxRows<'_>) {
     let loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
-    if !controller.set_filter(Box::new(new_filter_non_left())) {
+    if !controller.set_filter(Box::new(new_filter_all(vec![
+        Box::new(new_filter_non_left()),
+        crate::old_agent_rooms::list_filter(),
+    ]))) {
         tracing::warn!(account_id = %inbox.account_id, "inbox room list filter not applied (stream dropped)");
-        if inbox.owner.holds() {
-            inbox
-                .merger
-                .trouble(inbox.account_id, AgentListTrouble::NotStarted, true)
-                .await;
-        }
         return;
     }
     let _controller = controller;
@@ -8627,46 +6445,17 @@ async fn run_inbox_producer(room_list: RoomList, inbox: InboxRows<'_>) {
 }
 
 /// [`run_inbox_producer`] over any stream of room-list diffs and loading
-/// states. A row is drawn the moment its diff comes, from what the board
-/// says of its state: drawing never reads a room, so neither the first
-/// Agents batch nor the launch's readiness (R397) waits on a room's
-/// reading (story 102.5 #2, #4). The agent rooms a diff carries are handed
-/// to the list worker, and the rows whose state it changed are redrawn.
+/// states.
 async fn drive_inbox(
     stream: impl futures_util::Stream<Item = Vec<VectorDiff<RoomListItem>>>,
     initial: RoomListLoadingState,
     loading: impl futures_util::Stream<Item = RoomListLoadingState>,
     inbox: InboxRows<'_>,
 ) {
-    let (account_id, notify, kinds, icons, board) = (
-        inbox.account_id,
-        inbox.notify,
-        inbox.kinds,
-        inbox.icons,
-        inbox.board,
-    );
+    let (account_id, notify) = (inbox.account_id, inbox.notify);
     let merger = inbox.merger.clone();
-    let (due, mut redraws) = inbox.worker.unzip();
     let mut total = loaded_total(&initial);
-    // The room list's first sync is done once its loading state reads loaded
-    // (R397: what the launch into the default agent waits for).
-    if matches!(initial, RoomListLoadingState::Loaded { .. }) && inbox.owner.holds() {
-        inbox.launch_ready.loaded(account_id);
-    }
     let mut loading_done = false;
-    // The rows as the stream left them, so a change of the agents' pictures
-    // on this device (story 100.4), of a seat (R451) or of a room's state
-    // (story 102.5) redraws the agent rooms' rows at once.
-    let mut rows: matrix_sdk_ui::eyeball_im::Vector<RoomListItem> =
-        matrix_sdk_ui::eyeball_im::Vector::new();
-    let mut pictures = icons.subscribe();
-    let mut pictures_open = true;
-    let mut seats = kinds.subscribe();
-    let mut seats_open = true;
-    let mut changed_open = redraws.is_some();
-    // The Agents rows are kept for the next run once a change settles.
-    let mut keep_due: Option<tokio::time::Instant> = None;
-    let mut kept: Option<Vec<RoomVm>> = None;
 
     futures_util::pin_mut!(stream);
     futures_util::pin_mut!(loading);
@@ -8678,83 +6467,14 @@ async fn drive_inbox(
                     break;
                 };
                 let mut ops = Vec::with_capacity(diffs.len());
-                let mut redrawn = Vec::new();
                 for diff in diffs {
-                    redrawn.extend(agent_rooms_in(&diff));
-                    diff.clone().apply(&mut rows);
-                    ops.push(diff_to_op(diff, account_id, notify, kinds, icons, board).await);
-                }
-                if let (Some(due), false) = (&due, redrawn.is_empty()) {
-                    // A worker gone (its client shut down) reads nothing more;
-                    // the rows keep what the board says.
-                    let _ = due.send(agent_list::Due::Rooms(redrawn));
+                    ops.push(diff_to_op(diff, notify).await);
                 }
                 ops
             }
-            changed = pictures.changed(), if pictures_open => {
-                if changed.is_err() {
-                    pictures_open = false;
-                    continue;
-                }
-                agent_rows(&rows, None, account_id, notify, kinds, icons, board).await
-            }
-            changed = seats.changed(), if seats_open => {
-                if changed.is_err() {
-                    seats_open = false;
-                    continue;
-                }
-                // The worker watches the seats itself: this redraws the
-                // rows' kinds and titles from them.
-                agent_rows(&rows, None, account_id, notify, kinds, icons, board).await
-            }
-            read = async {
-                match redraws.as_mut() {
-                    Some(redraws) => redraws.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if changed_open => match read {
-                Ok(read) => {
-                    agent_rows(&rows, Some(&read), account_id, notify, kinds, icons, board).await
-                }
-                // Fallen behind the worker: every agent row is drawn again
-                // from the board.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    agent_rows(&rows, None, account_id, notify, kinds, icons, board).await
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    changed_open = false;
-                    continue;
-                }
-            },
-            () = async {
-                match keep_due {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                keep_due = None;
-                if let (Some(writer), Some(now)) =
-                    (inbox.keep.as_ref(), merger.live_agent_rows(account_id).await)
-                {
-                    if kept.as_ref() != Some(&now) {
-                        // Written off this loop; its outcome is the writer's
-                        // and the list's to say (R501).
-                        drop(agent_list::keep_rows(writer, &merger, account_id, now.clone()));
-                        kept = Some(now);
-                    }
-                }
-                continue;
-            }
             maybe_state = loading.next(), if !loading_done => {
                 match maybe_state {
-                    Some(state) => {
-                        if matches!(state, RoomListLoadingState::Loaded { .. })
-                            && inbox.owner.holds()
-                        {
-                            inbox.launch_ready.loaded(account_id);
-                        }
-                        total = loaded_total(&state);
-                    }
+                    Some(state) => total = loaded_total(&state),
                     None => loading_done = true,
                 }
                 continue;
@@ -8774,7 +6494,6 @@ async fn drive_inbox(
             tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
             break;
         }
-        keep_due.get_or_insert_with(|| tokio::time::Instant::now() + KEEP_SETTLE);
     }
 }
 
@@ -8965,7 +6684,9 @@ async fn compute_and_push_palette(
     let rooms = client.rooms();
     let mut entries: Vec<PaletteEntry> = Vec::with_capacity(rooms.len());
     for room in rooms {
-        if room.is_space() {
+        // A Space is no chat to open, and an old agent room is in no list
+        // (UX-DR-E108-2).
+        if room.is_space() || crate::old_agent_rooms::is_old_agent_room(room.room_type().as_ref()) {
             continue;
         }
         let room_id = room.room_id().to_string();
@@ -9019,15 +6740,8 @@ fn loaded_total(state: &RoomListLoadingState) -> Option<u32> {
 /// Convert a `VectorDiff<RoomListItem>` into a [`RoomListOp`], resolving each
 /// carried item to a [`RoomVm`] (async) before delegating to the pure
 /// [`vector_diff_to_op`] seam.
-async fn diff_to_op(
-    diff: VectorDiff<RoomListItem>,
-    account_id: &str,
-    notify: &NotifyConfig,
-    kinds: &AgentKinds,
-    icons: &AgentIcons,
-    board: &AttentionBoard,
-) -> RoomListOp {
-    let mapped = map_vector_diff(diff, account_id, notify, kinds, icons, board).await;
+async fn diff_to_op(diff: VectorDiff<RoomListItem>, notify: &NotifyConfig) -> RoomListOp {
+    let mapped = map_vector_diff(diff, notify).await;
     vector_diff_to_op(mapped)
 }
 
@@ -9037,46 +6751,41 @@ async fn diff_to_op(
 /// (display name / latest event / mute state) while the diff→op conversion is pure.
 /// `notify` threads the in-memory muted-Network set into the per-room [`MuteState`]
 /// resolution (Story 10.2) — the same live source the notify handler reads.
-/// `kinds` holds the agent rooms' session kinds read so far (UX-DR132).
 async fn map_vector_diff(
     diff: VectorDiff<RoomListItem>,
-    account_id: &str,
     notify: &NotifyConfig,
-    kinds: &AgentKinds,
-    icons: &AgentIcons,
-    board: &AttentionBoard,
 ) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons, board).await);
+                vms.push(room_item_to_vm(&item, notify).await);
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
+            value: room_item_to_vm(&value, notify).await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons, board).await);
+                vms.push(room_item_to_vm(&item, notify).await);
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -9143,16 +6852,8 @@ async fn resolve_mute_state(
 }
 
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
-/// latest-event text preview and timestamp. An agent room's state is what
-/// `board` says of it now (story 102.5): drawing a row never reads it.
-async fn room_item_to_vm(
-    item: &RoomListItem,
-    account_id: &str,
-    notify: &NotifyConfig,
-    kinds: &AgentKinds,
-    icons: &AgentIcons,
-    board: &AttentionBoard,
-) -> RoomVm {
+/// latest-event text preview and timestamp.
+async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
     if resolved.is_err() {
@@ -9207,41 +6908,6 @@ async fn room_item_to_vm(
     // any read error so a transient push-rule failure never blocks the inbox stream
     // and never touches the unread computation above.
     let mute_state = resolve_mute_state(item, network.as_deref(), notify).await;
-    // An agent room from its cached create type; a session room's proxy-or-watched
-    // from its status's session kind, never guessed (UX-DR132).
-    let agent_room = agent_room::room_kind_vm(item, kinds).await;
-    // The agent's picture on its row, in the Agents window (story 100.4).
-    let agent_avatar = match agent_room {
-        Some(agent_room::AgentRoomKindVm::Control) | None => None,
-        Some(_) => agent_room::row_picture(item, kinds, icons, account_id).await,
-    };
-    // A titled session is listed as "<agent> — <title>", and its row's letter
-    // is its agent's initial (story 101.1 #6, R416); the row names its agent
-    // for the default marker and "Make default" (story 102.7, R463).
-    let (display_name, agent_mark, agent) =
-        match (agent_room, kinds.seat(item.own_user_id(), item.room_id())) {
-            (Some(agent_room::AgentRoomKindVm::Control) | None, _) | (_, None) => {
-                (display_name, None, None)
-            }
-            (Some(_), Some(seat)) => {
-                let agent_name = agent_room::agent_name(item, &seat.agent).await;
-                let mark = agent_room::agent_mark(&agent_name);
-                let titled = agent_room::titled_room_name(seat.kind, &agent_name, &seat.title);
-                (
-                    titled.unwrap_or(display_name),
-                    mark,
-                    Some(seat.agent.to_string()),
-                )
-            }
-        };
-    // Whether the room needs the person, failed, works or finished unread
-    // (story 101.6, R421): Rust's word for the row, as the list worker last
-    // read it (story 102.5, R468).
-    let agent_attention = match agent_room {
-        Some(agent_room::AgentRoomKindVm::Control) | None => None,
-        Some(_) => board.said(account_id, item.room_id()),
-    };
-
     RoomVm {
         room_id,
         display_name,
@@ -9256,11 +6922,6 @@ async fn room_item_to_vm(
         network,
         network_id,
         mute_state,
-        agent_room,
-        agent_avatar,
-        agent_mark,
-        agent,
-        agent_attention,
     }
 }
 
@@ -9364,266 +7025,17 @@ pub fn vector_diff_to_op(diff: VectorDiff<RoomVm>) -> RoomListOp {
     }
 }
 
-/// A control room's `dev.keeper.agent.host` events, each as `(state key,
-/// sender, content)`.
-pub type Manifests = Vec<(String, OwnedUserId, serde_json::Value)>;
-
-/// Each control room's host manifests as the server last gave them, and
-/// when (story 102.3, R466).
-#[derive(Debug, Default)]
-pub struct HostReads(std::sync::Mutex<HashMap<OwnedRoomId, (std::time::Instant, Manifests)>>);
-
-impl HostReads {
-    fn recent(&self, room: &RoomId, within: Duration) -> Option<Manifests> {
-        let reads = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reads
-            .get(room)
-            .filter(|(at, _)| at.elapsed() < within)
-            .map(|(_, read)| read.clone())
-    }
-
-    fn keep(&self, room: OwnedRoomId, read: Manifests) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(room, (std::time::Instant::now(), read));
-    }
-}
-
-/// How long a control room's state read from the server may take (R466).
-pub const HOST_READ_WITHIN: Duration = Duration::from_secs(10);
-
-/// What the serving hosts are read for (story 102.3; R466, R484).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostsFor {
-    /// A person's save of an `agent.toml` key: every control room's state
-    /// as the server holds it now, every time. A store whose every
-    /// manifest is live proves only that those are live, never that it
-    /// holds every host's (the sliding sync keeps none of them fresh).
-    Save,
-    /// What a header or a Settings row shows: the store's manifests while
-    /// it holds at least one and every one is live, else a server read
-    /// younger than the window, else the server's now.
-    Showing(Duration),
-}
-
-/// The host manifests of `client`'s joined control rooms at `now_ms`
-/// (story 102.3, R466, R484), as `purpose` reads them: for a save, the
-/// server's (`GET /rooms/{id}/state`, bounded by [`HOST_READ_WITHIN`]) and
-/// nothing else; for showing, the store's while it holds them live, else a
-/// recent server read kept in `reads`, else the server's. A room whose
-/// manifests the server did not give is [`HOSTS_UNREAD`], with a WARN
-/// naming the room and why (R381): never read as no host at all.
-///
-/// [`HOSTS_UNREAD`]: crate::agents::model::HOSTS_UNREAD
-pub async fn control_manifests(
-    client: &Client,
-    now_ms: u64,
-    reads: &HostReads,
-    purpose: HostsFor,
-) -> Result<Manifests, String> {
-    let mut found = Vec::new();
-    for room in client.joined_rooms() {
-        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control) {
-            continue;
-        }
-        let room_id = room.room_id().to_owned();
-        if let HostsFor::Showing(within) = purpose {
-            if let Ok(stored) = stored_manifests(&room).await {
-                let live = |content: &serde_json::Value| {
-                    serde_json::from_value::<crate::agents::host::HostManifest>(content.clone())
-                        .is_ok_and(|manifest| manifest.is_live(now_ms))
-                };
-                if !stored.is_empty() && stored.iter().all(|(_, _, content)| live(content)) {
-                    found.extend(stored);
-                    continue;
-                }
-            }
-            if let Some(read) = reads.recent(&room_id, within) {
-                found.extend(read);
-                continue;
-            }
-        }
-        match server_manifests(client, &room_id).await {
-            Ok(read) => {
-                reads.keep(room_id, read.clone());
-                found.extend(read);
-            }
-            Err(error) => {
-                tracing::warn!(room = %room_id, %error, ?purpose, "agents: the server did not give a control room's host manifests; an agent.toml save that needs them is refused");
-                return Err(crate::agents::model::HOSTS_UNREAD.to_owned());
-            }
-        }
-    }
-    Ok(found)
-}
-
-/// `room`'s host manifests as this device's store holds them.
-async fn stored_manifests(room: &Room) -> Result<Manifests, String> {
-    use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
-    let states = room
-        .get_state_events(StateEventType::from(crate::agents::events::HOST))
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(states
-        .into_iter()
-        .filter_map(|state| match state {
-            RawAnySyncOrStrippedState::Sync(raw) => {
-                manifest_event(&raw.deserialize_as::<serde_json::Value>().ok()?)
-            }
-            RawAnySyncOrStrippedState::Stripped(_) => None,
-        })
-        .collect())
-}
-
-/// `room`'s host manifests as the server holds its state now.
-async fn server_manifests(client: &Client, room: &RoomId) -> Result<Manifests, String> {
-    use matrix_sdk::ruma::api::client::state::get_state_events;
-    let request = get_state_events::v3::Request::new(room.to_owned());
-    let response = tokio::time::timeout(HOST_READ_WITHIN, client.send(request))
-        .await
-        .map_err(|_| {
-            format!(
-                "the server did not answer within {} s",
-                HOST_READ_WITHIN.as_secs()
-            )
-        })?
-        .map_err(|error| error.to_string())?;
-    Ok(response
-        .room_state
-        .iter()
-        .filter_map(|raw| raw.deserialize_as::<serde_json::Value>().ok())
-        .filter(|event| event["type"] == crate::agents::events::HOST)
-        .filter_map(|event| manifest_event(&event))
-        .collect())
-}
-
-/// A host manifest event as `(state key, sender, content)`.
-fn manifest_event(event: &serde_json::Value) -> Option<(String, OwnedUserId, serde_json::Value)> {
-    let key = event["state_key"].as_str()?;
-    let sender = UserId::parse(event["sender"].as_str()?).ok()?;
-    Some((key.to_owned(), sender, event["content"].clone()))
-}
-
 #[cfg(test)]
 mod tests {
-    // Story 102.3 #1 (R466): the serving hosts' reader, in its own file.
-    mod hosts;
+    // R516, R519: the inbox producers against a sign-out, a shutdown and a
+    // newer subscription, over a loopback homeserver, in their own file.
+    mod inbox_lifetime;
 
     use super::*;
     use crate::error::CoreError;
     use crate::platform::SecretCache;
     use matrix_sdk_ui::eyeball_im::Vector;
     use std::path::PathBuf;
-
-    /// R343 (review 98apns-1, finding 04): a lock-screen decision is tried
-    /// again only while the sync the activation started can still change the
-    /// answer — the session room or the request not in this process's store
-    /// yet — and gives up at the budget with the last refusal. A refusal of
-    /// the card's is the answer at once, with its sentence; a decision whose
-    /// send failed is never sent a second time.
-    #[tokio::test(start_paused = true)]
-    async fn a_lock_screen_decision_waits_only_for_what_the_sync_can_bring() {
-        use std::sync::atomic::AtomicUsize;
-        let budget = std::time::Duration::from_secs(20);
-        let not_found = || CoreError::Unsupported(approval_card::NOT_FOUND.to_owned());
-
-        let tries = AtomicUsize::new(0);
-        let sent = until_synced(tokio::time::Instant::now() + budget, || {
-            let n = tries.fetch_add(1, Ordering::SeqCst);
-            async move {
-                match n {
-                    0 => Err(SendError::RoomNotFound.into()),
-                    1 => Err(not_found()),
-                    _ => Ok(()),
-                }
-            }
-        })
-        .await;
-        assert!(sent.is_ok(), "{sent:?}");
-        assert_eq!(tries.load(Ordering::SeqCst), 3);
-
-        let card = [
-            approval_card::OTHER_ACTION,
-            approval_card::NOT_WAITING,
-            approval_card::SCOPE_NOT_OFFERED,
-        ]
-        .map(|sentence| CoreError::Unsupported(sentence.to_owned()));
-        for refusal in card
-            .into_iter()
-            .chain([SendError::Dispatch("timed out".to_owned()).into()])
-        {
-            let expected = refusal.to_string();
-            let mut refusal = Some(refusal);
-            let tries = AtomicUsize::new(0);
-            let started = tokio::time::Instant::now();
-            let answer = until_synced(started + budget, || {
-                tries.fetch_add(1, Ordering::SeqCst);
-                let answer = refusal.take().map_or(Ok(()), Err);
-                async move { answer }
-            })
-            .await;
-            assert_eq!(
-                answer.map_err(|error| error.to_string()),
-                Err(expected.clone()),
-                "{expected}"
-            );
-            assert_eq!(tries.load(Ordering::SeqCst), 1, "{expected}");
-            assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{expected}");
-        }
-
-        let tries = AtomicUsize::new(0);
-        let started = tokio::time::Instant::now();
-        let never = until_synced(started + budget, || {
-            tries.fetch_add(1, Ordering::SeqCst);
-            async { Err(not_found()) }
-        })
-        .await;
-        assert_eq!(
-            never.map_err(|error| error.to_string()),
-            Err(not_found().to_string())
-        );
-        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
-        assert_eq!(tries.load(Ordering::SeqCst), 20);
-    }
-
-    /// Settings › Agents waits on these names before it renders: a server
-    /// that never answers costs `within` once, however many people it is
-    /// asked about, and the people who did answer keep their names.
-    #[tokio::test(start_paused = true)]
-    async fn display_names_wait_at_most_the_bound_for_everyone_together() {
-        use matrix_sdk::ruma::OwnedUserId;
-        let user = |id: &str| OwnedUserId::try_from(id).expect("user");
-        let users = [
-            user("@slow1:dead.example"),
-            user("@quick:example.org"),
-            user("@slow2:dead.example"),
-            user("@slow3:dead.example"),
-        ];
-        let within = std::time::Duration::from_secs(2);
-        let started = tokio::time::Instant::now();
-        let asked = names_within(&users, within, |user| {
-            let quick = user.server_name() == "example.org";
-            async move {
-                if quick {
-                    Some("Quick".to_owned())
-                } else {
-                    std::future::pending().await
-                }
-            }
-        });
-        let names = tokio::time::timeout(within * 10, asked)
-            .await
-            .expect("the names are answered within their bound");
-        assert_eq!(started.elapsed(), within);
-        assert_eq!(
-            names,
-            BTreeMap::from([(user("@quick:example.org"), "Quick".to_owned())])
-        );
-    }
 
     /// Fake platform with a fixed data dir, an in-memory keychain (so `activate`
     /// can read back a stored session), a **spy recorder** of every key passed to
@@ -9838,43 +7250,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// R450 (review-101rooms-2 02): the one deadline runs from the moment
-    /// the person asked, the account lookup included. With the accounts held
-    /// past it — a stand-in for an activation or a shutdown — the ask ends
-    /// at the deadline with the sentence and a WARN, not when the lock is
-    /// let go.
-    #[tokio::test(start_paused = true)]
-    async fn a_dm_asked_while_the_accounts_are_held_ends_at_the_deadline() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "keeper-account-dm-held-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
-        let activating = manager.accounts.lock().await;
-        let asked = tokio::time::Instant::now();
-        let (opened, log) = crate::agents::main_dm::tests::warned(
-            manager.agent_main_dm_open("01ARZ3NDEKTSV4RRFFQ69G5FAV", "@nixi:example.org"),
-        )
-        .await;
-        assert_eq!(asked.elapsed(), main_dm::MAIN_DM_WAIT);
-        drop(activating);
-        match opened.err() {
-            Some(CoreError::Unsupported(sentence)) => {
-                assert_eq!(sentence, main_dm::not_answered_sentence("nixi"));
-            }
-            other => panic!("the sentence at the deadline, not {other:?}"),
-        }
-        assert!(
-            log.contains("WARN") && log.contains("did not open"),
-            "{log}"
-        );
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
     /// R340 (review 98apns-1, finding 02): signing out first asks the
     /// homeserver to drop this phone's pusher, best effort — when it cannot
     /// (here: no session to ask with), the account is signed out all the
@@ -10037,7 +7412,6 @@ mod tests {
             _redaction_handler,
             _draft_handler,
             _notify_handler,
-            _agents,
             outbox_scheduler,
             _outbox_tx,
         ) = activated;
@@ -10122,16 +7496,9 @@ mod tests {
             None,
             draft_tx.clone(),
             Arc::new(NotifyConfig::new(true)),
-            AgentsWiring {
-                device: &AgentDevice::default(),
-                kinds: &Arc::default(),
-                proxies: &Arc::default(),
-                board: &Arc::default(),
-                lists: &AgentLists::default(),
-                life: AccountLifetimes::default()
-                    .begin(account_id)
-                    .expect("a lifetime"),
-            },
+            AccountLifetimes::default()
+                .begin(account_id)
+                .expect("a lifetime"),
         )
         .await
         .expect("offline activation succeeds");
@@ -10155,16 +7522,9 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
-            AgentsWiring {
-                device: &AgentDevice::default(),
-                kinds: &Arc::default(),
-                proxies: &Arc::default(),
-                board: &Arc::default(),
-                lists: &AgentLists::default(),
-                life: AccountLifetimes::default()
-                    .begin(account_id)
-                    .expect("a lifetime"),
-            },
+            AccountLifetimes::default()
+                .begin(account_id)
+                .expect("a lifetime"),
         )
         .await
         .expect("re-activation succeeds");
@@ -10198,16 +7558,9 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
-            AgentsWiring {
-                device: &AgentDevice::default(),
-                kinds: &Arc::default(),
-                proxies: &Arc::default(),
-                board: &Arc::default(),
-                lists: &AgentLists::default(),
-                life: AccountLifetimes::default()
-                    .begin(account_id)
-                    .expect("a lifetime"),
-            },
+            AccountLifetimes::default()
+                .begin(account_id)
+                .expect("a lifetime"),
         )
         .await
         .expect("activation succeeds even when backup exclusion fails");
@@ -10269,16 +7622,9 @@ mod tests {
                 None,
                 draft_tx.clone(),
                 Arc::new(NotifyConfig::new(true)),
-                AgentsWiring {
-                    device: &AgentDevice::default(),
-                    kinds: &Arc::default(),
-                    proxies: &Arc::default(),
-                    board: &Arc::default(),
-                    lists: &AgentLists::default(),
-                    life: AccountLifetimes::default()
-                        .begin(&vm.account_id)
-                        .expect("a lifetime"),
-                },
+                AccountLifetimes::default()
+                    .begin(&vm.account_id)
+                    .expect("a lifetime"),
             )
             .await
             .expect("offline activation succeeds");
@@ -10328,16 +7674,9 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
-            AgentsWiring {
-                device: &AgentDevice::default(),
-                kinds: &Arc::default(),
-                proxies: &Arc::default(),
-                board: &Arc::default(),
-                lists: &AgentLists::default(),
-                life: AccountLifetimes::default()
-                    .begin(account_id)
-                    .expect("a lifetime"),
-            },
+            AccountLifetimes::default()
+                .begin(account_id)
+                .expect("a lifetime"),
         )
         .await
         .expect("activation succeeds without a pre-read session");
@@ -10413,16 +7752,9 @@ mod tests {
                 None,
                 draft_tx.clone(),
                 Arc::new(NotifyConfig::new(true)),
-                AgentsWiring {
-                    device: &AgentDevice::default(),
-                    kinds: &Arc::default(),
-                    proxies: &Arc::default(),
-                    board: &Arc::default(),
-                    lists: &AgentLists::default(),
-                    life: AccountLifetimes::default()
-                        .begin(&vm.account_id)
-                        .expect("a lifetime"),
-                },
+                AccountLifetimes::default()
+                    .begin(&vm.account_id)
+                    .expect("a lifetime"),
             )
             .await
             .expect("offline activation succeeds");
@@ -10859,13 +8191,13 @@ mod tests {
     /// `dispatch_at_ts ≈ now + window*1000` and NO dispatch occurs (proven by the
     /// non-live account NOT returning `NoOpenTimeline`: the code never touched the
     /// gate). The body is preserved verbatim for later dispatch/undo.
-    /// Story 101.3 (R418): an agent's session room is held for the agent
+    /// Story 101.3 (R418): an old agent session room is held for the agent
     /// window; a chat, a space or a control room for the chats' window.
     #[test]
     fn only_a_session_room_is_held_for_the_agent_window() {
         use matrix_sdk::ruma::room::RoomType;
-        let session = RoomType::from(crate::agents::events::SESSION_ROOM_TYPE);
-        let control = RoomType::from(crate::agents::events::CONTROL_ROOM_TYPE);
+        let session = RoomType::from(crate::old_agent_rooms::SESSION_ROOM_TYPE);
+        let control = RoomType::from(crate::old_agent_rooms::CONTROL_ROOM_TYPE);
         assert_eq!(undo_room_of(Some(&session)), registry::UndoRoom::Agent);
         assert_eq!(undo_room_of(Some(&control)), registry::UndoRoom::Chat);
         assert_eq!(
@@ -11232,11 +8564,6 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
-            agent_room: None,
-            agent_avatar: None,
-            agent_mark: None,
-            agent: None,
-            agent_attention: None,
         }
     }
 
