@@ -1270,19 +1270,6 @@ fn reviewing_person(
         .ok_or_else(|| format!("{person} is not a Matrix user id."))
 }
 
-/// This device's pin of `profile`'s drive (R28 S-15): `None` when it holds
-/// none, or why its pins could not be read — the agent runtime refuses a
-/// promotion out on either.
-#[cfg(desktop)]
-fn drive_pin(
-    data_dir: &std::path::Path,
-    profile: &keeper_sync::SyncProfile,
-) -> Result<Option<keeper_core::agents::agentd::DrivePin>, String> {
-    keeper_core::agents::pins::pins(data_dir)
-        .map(|mut pins| pins.remove(&profile.id))
-        .map_err(|error| error.to_string())
-}
-
 /// One session's promote panel (FR-243, FR-244, UX-DR90, UX-DR137): its
 /// `## Promote` table row by row with each row's state, the workspace files
 /// no row names, its harvested notes and whether this device's person
@@ -1311,7 +1298,6 @@ pub async fn sessions_promote_panel(
         .ok_or_else(|| session_error(&session_id))?;
     let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let pin = drive_pin(&data_dir, &profile);
         let me = reviewing_person(&data_dir, &profile)
             .ok()
             .map(|person| format!("human:{person}"));
@@ -1321,7 +1307,10 @@ pub async fn sessions_promote_panel(
             &keeper_agent::promote::OutOf {
                 profile: &profile,
                 vault: &crate::agent_ports::drive::NotesVaultWriter,
-                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
+                // No device pins a drive since 108.2 (This Mac as a
+                // host is gone): a promotion out of an agent's session is
+                // refused as the runtime refuses one with no pin.
+                pin: Ok(None),
             },
             me.as_deref(),
             &intent,
@@ -1449,7 +1438,6 @@ pub async fn sessions_promote_to(
         let reviewer = person
             .as_deref()
             .map(|person| keeper_agent::promote::Reviewer { person, at: &at });
-        let pin = drive_pin(&data_dir, &profile);
         keeper_agent::promote::offer::promote_to(
             &zone,
             &row.path,
@@ -1461,7 +1449,10 @@ pub async fn sessions_promote_to(
             &keeper_agent::promote::OutOf {
                 profile: &profile,
                 vault: &crate::agent_ports::drive::NotesVaultWriter,
-                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
+                // No device pins a drive since 108.2 (This Mac as a
+                // host is gone): a promotion out of an agent's session is
+                // refused as the runtime refuses one with no pin.
+                pin: Ok(None),
             },
         )
     })
@@ -1507,16 +1498,11 @@ pub async fn sessions_knowledge_read(
     path: String,
     copy: bool,
 ) -> Result<keeper_core::sessions::offer::NoteTextVm, IpcError> {
-    let data_dir = state
-        .platform
-        .data_dir()
-        .map_err(crate::ipc::to_ipc_error)?;
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let row = crate::sessions_root::row_of(&root_id, &session_id)
         .ok_or_else(|| session_error(&session_id))?;
     let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let pin = drive_pin(&data_dir, &profile);
         keeper_agent::promote::offer::read_note(
             &zone,
             &row.path,
@@ -1525,7 +1511,10 @@ pub async fn sessions_knowledge_read(
             &keeper_agent::promote::OutOf {
                 profile: &profile,
                 vault: &crate::agent_ports::drive::NotesVaultWriter,
-                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
+                // No device pins a drive since 108.2 (This Mac as a
+                // host is gone): a promotion out of an agent's session is
+                // refused as the runtime refuses one with no pin.
+                pin: Ok(None),
             },
         )
     })
@@ -1593,7 +1582,6 @@ pub async fn sessions_knowledge_review(
     let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let localpart = reviewing_person(&data_dir, &profile)?;
-        let pin = drive_pin(&data_dir, &profile);
         let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         keeper_agent::promote::review(
             &zone,
@@ -1606,7 +1594,10 @@ pub async fn sessions_knowledge_review(
             &keeper_agent::promote::OutOf {
                 profile: &profile,
                 vault: &crate::agent_ports::drive::NotesVaultWriter,
-                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
+                // No device pins a drive since 108.2 (This Mac as a
+                // host is gone): a promotion out of an agent's session is
+                // refused as the runtime refuses one with no pin.
+                pin: Ok(None),
             },
         )
         .map_err(|error| error.to_string())

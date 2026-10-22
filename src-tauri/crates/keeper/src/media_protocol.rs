@@ -34,9 +34,7 @@
 //! copy. The droppable *decoded-image* memory lives in the WKWebView renderer,
 //! not here; the frontend sheds it on background by dropping image `src`.
 
-use keeper_core::media::{
-    parse_avatar_url, parse_media_url, AvatarHandle, MediaBytes, MediaHandle,
-};
+use keeper_core::media::{parse_media_url, MediaBytes, MediaHandle};
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{AppHandle, Manager, Runtime, UriSchemeResponder};
 
@@ -58,16 +56,6 @@ pub fn handle<R: Runtime>(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-
-    // An agent's profile avatar (story 100.4): the original bytes of one of
-    // the four picture formats, typed by keeper-core, never sniffed by the
-    // webview.
-    if let Some(avatar) = parse_avatar_url(&uri) {
-        tauri::async_runtime::spawn(async move {
-            responder.respond(avatar_response(&app, &avatar).await);
-        });
-        return;
-    }
 
     let Some(handle) = parse_media_url(&uri) else {
         // An unparsable / foreign handle → 404, never a panic or a blank.
@@ -113,45 +101,6 @@ async fn build_response<R: Runtime>(
     match range {
         Some(range) => partial_or_full(bytes, &mimetype, range),
         None => full_response(bytes, &mimetype),
-    }
-}
-
-/// An agent's profile avatar as one whole 200 with its picture type and
-/// `nosniff`, so an SVG is only ever an image (R384); anything keeper-core
-/// cannot resolve or does not recognise as a picture is a 404, and the
-/// webview draws the agent's mark instead.
-async fn avatar_response<R: Runtime>(
-    app: &AppHandle<R>,
-    avatar: &AvatarHandle,
-) -> Response<Vec<u8>> {
-    let state = app.state::<AppState>();
-    match state
-        .accounts
-        .fetch_agent_avatar(&avatar.account_id, &avatar.room_id, &avatar.user_id)
-        .await
-    {
-        Ok(MediaBytes { bytes, mimetype }) => {
-            let len = bytes.len();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mimetype)
-                .header(header::CONTENT_LENGTH, len)
-                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-                .body(bytes)
-                .unwrap_or_else(|_| not_found())
-        }
-        // A download that failed is said each time; keeper-core says a
-        // refused avatar (too large, not a picture) once itself (R399).
-        Err(
-            error @ keeper_core::error::CoreError::Media(keeper_core::error::MediaError::Fetch(_)),
-        ) => {
-            tracing::warn!(%error, "keeper-media: an agent's profile avatar could not be served; its mark is drawn instead");
-            not_found()
-        }
-        Err(error) => {
-            tracing::debug!(%error, "keeper-media: no agent's profile avatar to serve; its mark is drawn instead");
-            not_found()
-        }
     }
 }
 

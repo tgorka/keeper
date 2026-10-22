@@ -14,13 +14,16 @@
 //!   until the person confirms it. The distributor answers with an endpoint,
 //!   which keeper keeps (the egress list and a sign-out read it); keeper asks
 //!   the endpoint's server once whether it is a Matrix push gateway
-//!   (`unifiedpush::known_gateway`, `unifiedpush::discover_gateway`) and,
-//!   when it is, registers an `event_id_only` pusher to it on every account
-//!   that holds agent session rooms (`AccountManager::push_register_each`).
-//!   A definite other answer removes it, with a sentence naming the host —
+//!   (`unifiedpush::known_gateway`, `unifiedpush::discover_gateway`); a
+//!   definite other answer is said with a sentence naming the host —
 //!   Settings → Notifications shows it ([`status`], told on
 //!   [`STATUS_EVENT`]); a server keeper cannot reach changes nothing
 //!   (`unifiedpush::pusher_change`).
+//! - **The old pusher removed.** Before 108.2 every account that held agent
+//!   session rooms got an `event_id_only` Matrix pusher to that gateway; the
+//!   agents left Matrix, so each new endpoint takes the pusher for it and for
+//!   the endpoint before it off every account (`AccountManager::push_remove`,
+//!   DW-E108-1) and none is registered.
 //! - **The agents server** (106.6, AD-432). The same endpoint and gateway go
 //!   to keeper-hq as this device's push target
 //!   (`keeper_core::hq::push::PushTarget::unifiedpush`, through
@@ -31,20 +34,18 @@
 //!   (`unifiedpush::item_notification`); its actions write the decision row
 //!   (`Hq::decide_pushed`) and a tap opens the session.
 //! - **A push.** The distributor hands the gateway's notification to
-//!   `PushReceiver.kt`, which passes it here; the account that knows the
-//!   room reads the event and the iPhone's classifier decides what shows
-//!   (`AccountManager::push_shown`, `push::shown_of`), laid out by
-//!   `unifiedpush::phone_notification` and posted by the plugin. When keeper
-//!   is not running — Android stopped it — the receiver cannot ask, and
-//!   posts keeper's one generic notification itself.
+//!   `PushReceiver.kt`, which passes it here; an agents server item is read
+//!   as above. When keeper is not running — Android stopped it — the
+//!   receiver cannot ask, and posts keeper's one generic notification
+//!   itself.
 //! - **An action.** *Approve once* or *Deny* (Android 12 and later, after
 //!   the device is unlocked) reaches `PushActionReceiver.kt`, which passes
-//!   it here: `push::action_decision` derives the decision from what keeper
-//!   posted, `AccountManager::agent_approval_decide_notified` sends it
-//!   within `push::ACTION_BUDGET`, and the notification is removed — or
-//!   replaced by one asking the person to finish in keeper.
-//! - **A tap** opens the session room: [`take_open`] for the webview, told
-//!   on [`PUSH_OPEN_EVENT`], as on the iPhone.
+//!   it here: `keeper_core::hq::push::action_decision` derives the decision
+//!   from what keeper posted, it is written within `push::ACTION_BUDGET`,
+//!   and the notification is removed — or replaced by one asking the person
+//!   to finish in keeper.
+//! - **A tap** opens the session: [`take_open`] for the webview, told on
+//!   [`PUSH_OPEN_EVENT`], as on the iPhone.
 //!
 //! Nothing here decides: the distributor, the gateway, what a notification
 //! shows and offers, what an action sends and where a tap lands are
@@ -60,7 +61,7 @@ use keeper_core::agents::unifiedpush::{
     self as up, DiscoveryRefusal, Distributor, DistributorChoice, Endpoint, KeptEndpoint,
     PhoneNotification, PusherChange, UnifiedPushStatus, UnifiedPushVm,
 };
-use keeper_core::failure::{FailureOperation, PUSH_NOT_REGISTERED};
+use keeper_core::failure::FailureOperation;
 use keeper_core::org_account::layout::DeviceClass;
 use serde_json::{json, Value};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -286,10 +287,11 @@ fn received(event: Value) {
 
 /// The distributor the person confirmed gave keeper an endpoint: ask its
 /// server whether it is a Matrix gateway — unless keeper already knows
-/// (`unifiedpush::known_gateway`) — and, on an answer, keep the endpoint and
-/// register (or remove) the pusher on every account, removing the one for
-/// the endpoint before it if it changed. A server keeper cannot reach
-/// changes nothing (`unifiedpush::pusher_change`).
+/// (`unifiedpush::known_gateway`) — and, on an answer, keep the endpoint,
+/// hand the agents server its push target, and take the old Matrix pusher
+/// for this endpoint and the one before it off every account (DW-E108-1).
+/// A server keeper cannot reach changes nothing
+/// (`unifiedpush::pusher_change`).
 async fn new_endpoint(raw: String) {
     let Some(distributor) = DISTRIBUTOR
         .lock()
@@ -355,23 +357,12 @@ async fn new_endpoint(raw: String) {
     if let Err(error) = up::keep_endpoint(&data_dir, Some(&now)) {
         tracing::warn!(%error, "push: the endpoint could not be kept");
     }
-    let device = format!("keeper on {}", crate::android::device_model());
     let outcomes = state
         .accounts
-        .push_register_each(
+        .push_remove(
             &state.platform,
             endpoint.pusher_ids(),
             kept.map(|kept| kept.endpoint.pusher_ids()),
-            |account| {
-                gateway.as_ref().map(|gateway| {
-                    push::PusherSpec::unifiedpush(
-                        gateway.clone(),
-                        endpoint.clone(),
-                        account,
-                        &device,
-                    )
-                })
-            },
         )
         .await;
     log_outcomes(outcomes);
@@ -379,8 +370,9 @@ async fn new_endpoint(raw: String) {
 }
 
 /// No endpoint any more (no distributor, none confirmed — keeper asks —, a
-/// refused endpoint, a refused or dropped registration): remove the pusher
-/// of the one keeper kept from every account, forget it, and say why.
+/// refused endpoint, a refused or dropped registration): remove the old
+/// Matrix pusher of the one keeper kept from every account, forget it, and
+/// say why.
 async fn forget(why: UnifiedPushStatus) {
     set_status(why);
     crate::hq_ipc::set_push_target(None);
@@ -396,7 +388,7 @@ async fn forget(why: UnifiedPushStatus) {
     };
     let outcomes = state
         .accounts
-        .push_register_each(&state.platform, kept.pusher_ids(), None, |_| None)
+        .push_remove(&state.platform, kept.pusher_ids(), None)
         .await;
     log_outcomes(outcomes);
     if let Err(error) = up::keep_endpoint(&data_dir, None) {
@@ -404,55 +396,37 @@ async fn forget(why: UnifiedPushStatus) {
     }
 }
 
-/// Each account's registration outcome, for the log.
-type Outcomes = Result<
-    Vec<(
-        String,
-        Result<push::Registered, keeper_core::error::CoreError>,
-    )>,
-    keeper_core::error::CoreError,
->;
+/// Each account's removal outcome, for the log.
+type Outcomes =
+    Result<Vec<(String, Result<(), keeper_core::error::CoreError>)>, keeper_core::error::CoreError>;
 
+/// The old pusher's removal, per account: a failure is a WARN line and is
+/// tried again with the next endpoint or launch (DW-E108-1).
 fn log_outcomes(outcomes: Outcomes) {
     match outcomes {
         Ok(outcomes) => {
-            // The registration reached the accounts: a failure of push as a
-            // whole is over; each account's own outcome sets or clears its
-            // own (R387).
-            crate::failure_notice::recovered(FailureOperation::PushRegistration, None);
             for (account, outcome) in outcomes {
                 match outcome {
-                    Ok(registered) => {
-                        tracing::info!(account, ?registered, "push: pusher");
-                        crate::failure_notice::recovered(
-                            FailureOperation::PushRegistration,
-                            Some(account.as_str()),
-                        );
-                    }
-                    Err(error) => crate::failure_notice::tell(
-                        FailureOperation::PushRegistration,
-                        Some(account.as_str()),
-                        PUSH_NOT_REGISTERED,
-                        &error,
+                    Ok(()) => tracing::info!(account, "push: the old Matrix pusher is removed"),
+                    Err(error) => tracing::warn!(
+                        account,
+                        __omp_magic("", "error,")
+                        "push: the old Matrix pusher could not be removed"
                     ),
                 }
             }
         }
-        Err(error) => crate::failure_notice::tell(
-            FailureOperation::PushRegistration,
-            None,
-            PUSH_NOT_REGISTERED,
-            &error,
-        ),
+        Err(error) => {
+            tracing::warn!(%error, "push: the old Matrix pushers could not be removed")
+        }
     }
 }
 
-/// A push arrived while keeper runs: read what it names and post what the
-/// classifier says shows; keeper's generic words when it cannot be read.
+/// A push arrived while keeper runs: read the agents server item it names
+/// and post what the classifier says shows; keeper's generic words when it
+/// cannot be read. A push of the agents' old Matrix path (an event id,
+/// before 108.2) names nothing keeper reads any more and shows nothing.
 async fn message(body: String) {
-    let Some(app) = APP.get() else {
-        return;
-    };
     if let Some(pushed) = keeper_core::hq::push::PushedItem::of_notify(body.as_bytes()) {
         match crate::hq_ipc::read_pushed(&pushed).await {
             Ok(keeper_core::hq::push::HqClassified::Show(shown)) => {
@@ -470,34 +444,14 @@ async fn message(body: String) {
         }
         return;
     }
-    let Some(pushed) = up::pushed_event(body.as_bytes()) else {
-        return;
-    };
-    let state = app.state::<AppState>();
-    match state.accounts.push_shown(&state.platform, &pushed).await {
-        Ok(Some((account, shown))) => {
-            post(up::phone_notification(
-                &account,
-                pushed.room_id.as_str(),
-                pushed.event_id.as_str(),
-                &shown,
-                SDK_INT.load(Ordering::SeqCst),
-            ))
-            .await;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, "push: the pushed event could not be read");
-            post(up::generic_notification()).await;
-        }
-    }
+    tracing::info!("push: a push of the agents' old Matrix path, shown as nothing");
 }
 
-/// The person picked an action on the notification `tag`: send exactly the
-/// decision `push::action_decision` derives from what keeper posted, then
-/// remove the notification — or replace it with one asking to finish in
-/// keeper. A notification keeper did not compose decides nothing and is
-/// answered with nothing.
+/// The person picked an action on the notification `tag`: write exactly the
+/// decision `keeper_core::hq::push::action_decision` derives from what
+/// keeper posted, then remove the notification — or replace it with one
+/// asking to finish in keeper. A notification keeper did not compose decides
+/// nothing and is answered with nothing.
 async fn action(tag: String, category: String, action: String, user_info: String) {
     let Some(app) = APP.get() else {
         return;
@@ -518,44 +472,7 @@ async fn action(tag: String, category: String, action: String, user_info: String
         act_on_item(app, &tag, &tap).await;
         return;
     }
-    let decision = match push::action_decision(&tap) {
-        Ok(decision) => decision,
-        Err(push::ActionRefusal::NoApproval) => {
-            tracing::warn!("push: an action on a notification keeper did not compose");
-            return;
-        }
-        Err(refusal) => {
-            post(up::finish_in_keeper(
-                &tag,
-                &tap.user_info,
-                &refusal.to_string(),
-            ))
-            .await;
-            return;
-        }
-    };
-    let state = app.state::<AppState>();
-    match state
-        .accounts
-        .agent_approval_decide_notified(&state.platform, decision, push::ACTION_BUDGET)
-        .await
-    {
-        Ok(()) => {
-            if let Some(plugin) = PLUGIN.get() {
-                if let Err(error) = plugin
-                    .run_mobile_plugin_async::<Value>("cancel", json!({ "tag": tag }))
-                    .await
-                {
-                    tracing::warn!(%error, "push: the decided notification stays");
-                }
-            }
-        }
-        Err(error) => {
-            let why = crate::ipc::to_ipc_error(error).message;
-            tracing::warn!(why, "push: a decision from a notification was not sent");
-            post(up::finish_in_keeper(&tag, &tap.user_info, &why)).await;
-        }
-    }
+    tracing::warn!("push: an action on a notification keeper did not compose");
 }
 
 /// The decision an action on an agents item's notification `tag` sends,

@@ -13391,17 +13391,6 @@ pub async fn egress_list(
         descriptor.as_ref(),
         keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
     ));
-    // This Mac's MCP servers (96.2 #10) and web search engine (101.4,
-    // R419): the tables Settings › Agents writes, read in one snapshot on
-    // every call, each server's host or program once.
-    #[cfg(desktop)]
-    {
-        let tables = keeper_core::agents::mac_tables::read(&data_dir);
-        destinations.extend(keeper_core::egress::agent_egress(&tables.mcp));
-        destinations.extend(keeper_core::egress::web_search_egress(
-            tables.web_search.as_ref().ok().and_then(Option::as_ref),
-        ));
-    }
     // The push gateway the person named (98.1 #8, R330): only the iPhone
     // registers a pusher to it, and only while the setting holds an address
     // keeper registers; keeper never contacts it, its homeserver does.
@@ -13443,7 +13432,6 @@ pub async fn inbox_subscribe(
     archive: Channel<InboxBatch>,
     pins: Channel<InboxBatch>,
     favourites: Channel<InboxBatch>,
-    agents: Channel<InboxBatch>,
     spaces: Channel<SpacesSnapshot>,
     networks: Channel<NetworksSnapshot>,
 ) -> Result<u64, IpcError> {
@@ -13451,7 +13439,6 @@ pub async fn inbox_subscribe(
     let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
     let pins_sink = Box::new(move |batch: InboxBatch| pins.send(batch).is_ok());
     let favourites_sink = Box::new(move |batch: InboxBatch| favourites.send(batch).is_ok());
-    let agents_sink = Box::new(move |batch: InboxBatch| agents.send(batch).is_ok());
     // The aggregated Space list as a whole snapshot (Story 4.5).
     let spaces_sink = Box::new(move |snapshot: SpacesSnapshot| spaces.send(snapshot).is_ok());
     // The distinct-Networks list as a whole snapshot (Story 4.6).
@@ -13464,7 +13451,6 @@ pub async fn inbox_subscribe(
             archive_sink,
             pins_sink,
             favourites_sink,
-            agents_sink,
             spaces_sink,
             networks_sink,
         )
@@ -13516,6 +13502,26 @@ pub async fn inbox_unsubscribe(
 ) -> Result<(), IpcError> {
     state.accounts.unsubscribe_inbox(subscription_id).await;
     Ok(())
+}
+
+/// How many of the agents' old Matrix rooms the signed-in accounts are
+/// still in (108.2, UX-DR-E108-2): they are hidden from every list, and
+/// Settings › Agents offers *Leave old agent rooms* while any is left.
+#[tauri::command]
+pub async fn old_agent_rooms_get(
+    state: State<'_, AppState>,
+) -> Result<keeper_core::old_agent_rooms::OldAgentRoomsVm, IpcError> {
+    Ok(state.accounts.old_agent_rooms().await)
+}
+
+/// *Leave old agent rooms* (UX-DR-E108-2): every one of them the signed-in
+/// accounts are in is left, and the answer says how many were and what
+/// could not be. Which rooms are the agents' and the sentences are core's.
+#[tauri::command]
+pub async fn old_agent_rooms_leave(
+    state: State<'_, AppState>,
+) -> Result<keeper_core::old_agent_rooms::OldAgentRoomsVm, IpcError> {
+    Ok(state.accounts.leave_old_agent_rooms().await)
 }
 
 /// Sign out an account locally (AD-10, Story 1.8). Delegates to the core, which

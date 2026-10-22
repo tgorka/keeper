@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
+use keeper_core::hq::default_agent::DefaultAgentVm;
 use keeper_core::hq::instances::AgentInstancesVm;
 use keeper_core::hq::live::{AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::members::AgentSessionMembersVm;
@@ -19,11 +20,12 @@ use keeper_core::hq::sessions::{
     diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
     AgentSessionsOp,
 };
+use keeper_core::hq::spoken::{FollowSlot, SpokenStep};
 use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::timeline::AgentSessionViewVm;
 use keeper_core::hq::vm::{HqPairCodeVm, HqStatusVm};
 use keeper_core::hq::{Hq, HqError};
-use keeper_core::vm::{IpcError, IpcErrorCode};
+use keeper_core::vm::{IpcError, IpcErrorCode, VoiceAgentTargetVm};
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
@@ -811,6 +813,155 @@ pub fn agent_instances_unsubscribe(subscription_id: String) {
 #[tauri::command]
 pub async fn agent_instances_set(agent_actor: String, order: Vec<String>) -> Result<(), IpcError> {
     blocking(move |hq| hq.set_agent_instances(&agent_actor, &order)).await
+}
+
+/// Said to the webview when the default agent as keeper reads it moved
+/// (story 102.7, DW-1572, R488): a synced settings row, or the account's
+/// layers installed or cleared — never a row written beneath a file that
+/// keeps deciding it. The default agent's marker and menus read it again.
+/// Payload-free. Mirrors `AGENTS_DEFAULT_CHANGED_EVENT` in `client.ts`.
+pub const AGENTS_DEFAULT_CHANGED_EVENT: &str = "keeper://agents-default-changed";
+
+/// Tell the webview the default agent moved. Whether it did is
+/// `default_agent::DefaultAgentSeen::moved`'s answer, asked by the caller. A
+/// failure is a WARN line: the marker then follows at the next read.
+pub(crate) fn default_agent_applied(app: &tauri::AppHandle) {
+    if let Err(error) = app.emit(AGENTS_DEFAULT_CHANGED_EVENT, ()) {
+        tracing::warn!(%error, "agents: the webview was not told the default agent changed");
+    }
+}
+
+/// The default agent as Settings › Agents and the launch's chooser show it,
+/// from what the replicas hold now (never waits); a failure is reported by
+/// the webview.
+#[tauri::command]
+pub async fn agents_default_get() -> Result<DefaultAgentVm, IpcError> {
+    blocking(|hq| hq.default_agent()).await
+}
+
+/// Make `agent` (an actor id) the default agent, or clear it with `None`,
+/// and answer with the default agent as it now reads. Every failure is a
+/// WARN line (R381), the core's.
+#[tauri::command]
+pub async fn agents_default_set(agent: Option<String>) -> Result<DefaultAgentVm, IpcError> {
+    let hq = Arc::clone(hq()?);
+    tauri::async_runtime::spawn_blocking(move || hq.set_default_agent(agent.as_deref()))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: join.to_string(),
+            account_id: None,
+            retriable: true,
+        })?
+        .map_err(|refusal| IpcError {
+            code: IpcErrorCode::Internal,
+            message: refusal.to_string(),
+            account_id: None,
+            retriable: false,
+        })
+}
+
+/// The person put the launch's "Choose the agent keeper opens when it
+/// starts" away (story 102.7, R463): not shown again until keeper is
+/// updated. A failure is a WARN line (R381), the core's, and the webview
+/// says it.
+#[tauri::command]
+pub async fn agents_default_chooser_dismiss() -> Result<(), IpcError> {
+    blocking(|hq| hq.dismiss_default_chooser()).await
+}
+
+/// *Speak to*'s agents (AD-384, 108.2): every agent of every database this
+/// device holds, each with the value `voice_target_set` stores to choose
+/// it.
+#[tauri::command]
+pub async fn voice_agent_targets() -> Result<Vec<VoiceAgentTargetVm>, IpcError> {
+    blocking(|hq| hq.voice_agent_targets()).await
+}
+
+/// The send and then the following of the answer to the voice turn's
+/// current question, when it went to one of the person's agents: only that
+/// question's is ever kept ([`FollowSlot`]).
+static SPOKEN_ANSWER: Mutex<FollowSlot<JoinHandle<()>>> = Mutex::new(FollowSlot::new());
+
+fn spoken_answer() -> std::sync::MutexGuard<'static, FollowSlot<JoinHandle<()>>> {
+    SPOKEN_ANSWER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A new question was heard: an earlier one's send or answer is not the
+/// new turn's to speak (R44: the agent's turn is not cancelled; it finishes
+/// its answer in its session — where the person stopped listening is
+/// `voice_ipc`'s heard row, already on its way).
+pub(crate) fn drop_spoken_answer() {
+    let current = crate::voice_ipc::question_now();
+    if let Some(earlier) = spoken_answer().keep_only(current) {
+        earlier.abort();
+    }
+}
+
+/// Send what the voice turn heard as `question` to `agent`'s main
+/// conversation (AD-384, 108.2) and speak the answer as it grows. Called by
+/// `bots_ipc::send_spoken` for an agent target. Only the text leaves the
+/// device, as the person's own message row; where it goes and what of the
+/// answer is heard when are `keeper_core::hq::spoken`'s. The voice turn
+/// hears the send leave (`note_sent`, with the agent's name), the first
+/// words, the answer's start (for where the person stops listening,
+/// AD-411), each sentence with its end and the end — or the refusal or
+/// failure as its sentence — each for `question`. The work is in the slot
+/// before it starts: a question that is no longer the voice turn's never
+/// sends, and a newer one stops it.
+pub(crate) fn send_spoken(question: u64, agent: String, text: String) {
+    let work = tauri::async_runtime::spawn(async move {
+        let sent = blocking(move |hq| {
+            let ask = hq.spoken_send(&agent, &text)?;
+            let answer = hq.spoken_answer(&ask)?;
+            Ok((ask, answer))
+        })
+        .await;
+        let (ask, mut answer) = match sent {
+            Ok(sent) => sent,
+            Err(refusal) => {
+                tracing::warn!(message = %refusal.message, "agents: a spoken question was not sent");
+                crate::voice_ipc::answer_failed(question, refusal.message);
+                return;
+            }
+        };
+        tracing::info!(database = %ask.key.database, "agents: sent what the voice turn heard to the person's agent");
+        crate::voice_ipc::note_sent(question, answer.agent_name());
+        while let Some(step) = answer.next().await {
+            match step {
+                SpokenStep::FirstText { after_ms } => {
+                    crate::voice_ipc::note_answer_chunk(question, after_ms);
+                }
+                SpokenStep::Anchored => {
+                    crate::voice_ipc::answer_anchored(
+                        question,
+                        ask.key.clone(),
+                        ask.question.clone(),
+                    );
+                }
+                SpokenStep::Sentence(sentence) => {
+                    crate::voice_ipc::answer_sentence(question, sentence);
+                }
+                SpokenStep::Complete(rest) => crate::voice_ipc::answer_complete(question, rest),
+                SpokenStep::Failed(why) => crate::voice_ipc::answer_failed(question, why),
+            }
+        }
+    });
+    let current = crate::voice_ipc::question_now();
+    if let Some(stopped) = spoken_answer().install(question, current, work) {
+        stopped.abort();
+    }
+}
+
+/// Write where the person stopped hearing a spoken answer in `key` — the
+/// heard row whose `metadata` is [`keeper_core::hq::spoken::HeardMark`]'s
+/// (R-HQ-68). Called by `voice_ipc` by name, so no `voice*.rs` reaches the
+/// network.
+pub(crate) async fn spoken_heard(
+    key: AgentSessionRef,
+    metadata: serde_json::Value,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.spoken_heard(&key, metadata)).await
 }
 
 #[cfg(test)]
