@@ -8,7 +8,7 @@
 //! `Content-Range`), 416 (an unsatisfiable range), or 404 (parse/resolve/fetch
 //! failure). No media bytes ever traverse the IPC channel (AD-4).
 //!
-//! `get_media_content` is atomic in matrix-sdk 0.18 (whole `Vec<u8>`, no
+//! `get_media_content` is atomic in matrix-sdk 0.19 (whole `Vec<u8>`, no
 //! byte-progress callback), so the handler fetches the full (SDK-cached,
 //! decrypted) bytes and slices per `Range` in memory — the protocol is
 //! Range-capable *from the cache*, exactly as the AC requires. Retry is

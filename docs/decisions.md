@@ -1997,3 +1997,102 @@ them, download them from anyone else, send audio anywhere, or start the micropho
   (P13, rulings R14, R20, R24(10), R24(11); R29 F9). Owner is the architect. Epic 97 implements it: the `vad` and
   `smart_turn` model roles, `keeper-ported::smart_turn`, and the turn machine's pause-first
   barge-in; Epic 98 brings voice to Android.
+
+## D-37 — An agent's conversation is a row in a database the person runs, and keeper is only its client
+
+The owner asked whether Matrix adds latency ("czy matrix protokol dodaje dodatkowe latency? jesli
+tak to ile? oraz first time?") and proposed instead that a conversation be "zapisywana w basie danych
+(wszystkich potencjalnych uczestnikow rozmowy) i synchronizaowana z https://syncular.dev/", that
+"prawda jest baza", that "e2ee nie jest potrzebne", and that the server live apart — "moze zamkniete
+- opensource jest tylko client do ktorego mozna dodac wlasny serwer albo dzialac lokalnie"
+(2026-10-20). Matrix delivery between two agent copies was measured on the Synapse test homeserver at
+p50 617 ms and p95 1.14 s, and a spoken answer's first words at 2.5 s after the send
+(`docs/agents.md:3046-3081`); tuwunel's figure, D-32's own trigger, was never published. D-31 put a
+session's truth in a log in the drive and D-32 put every live exchange on Matrix. The same day he
+asked for "osobnej bazy dla tgdrive i neuradrive (nazwy baz - schematow w centralnej bazie
+postgres)", for Nixie to "ma swoje wyszukiwanie sieci", and for "tola grey i lucyna nowak … jak i
+dixi" to have containers of their own. This entry records where an agent's conversation lives now,
+who serves it, and what that costs.
+
+keeper will keep an agent's conversations — sessions, messages, answers as they stream, reasoning,
+tool calls, approvals, claims and attachments — as rows in syncular databases the person runs,
+keeper-hq's `tgdrive` and `neuradrive`, replicated into a local SQLite on every device and every
+agent instance that subscribes to them, and keeper will be only their client; it will **not** ship a
+default server URL, run the server or the agents itself, keep agent conversations in the drives or
+on Matrix, let a conversation cross from one database into the other, encrypt them end to end, or
+take a client's word for which device wrote a row.
+
+- **What changes:** one server on Bun and Hono with Postgres storage, in one container on electra,
+  tailnet-only, runs two independent `@syncular/server` instances — the databases `tgdrive` and
+  `neuradrive`, named after the drives whose readers they mirror — on two schemas of one database in
+  makistack's shared Postgres 18, each schema owned by its own role and dumped daily; each holds its
+  own ordered commit log, and fifteen tables, in an open contract under keeper's `syncular/`, hold
+  the conversation. A person is one actor and each device one client; an agent is one actor and each
+  instance (`nixie@electra`, `nixie@hesperia`) one client, with its own token whose hash only the
+  server keeps, bound to that client and to the databases it may open. A client subscribes to one or
+  both databases and keeps one local replica of each; a session lives in exactly one, and a
+  delegation, an invitation or an attachment never reaches the other. keeper shows both in one
+  Agents window, each session labelled with its database. An answer streams per token as an
+  ephemeral presence tail and is recorded as chunks about every second and one final message with
+  its metadata; reasoning, tool results and approvals go only to the session's readers. Long sessions
+  are windowed by month and archived ones leave the device. An open session is answered by the
+  instance holding its claim, a versioned row the server fences. Agents run in six makistack
+  containers that follow trust boundaries and principals, none mixing two — `nixie` (tgorka's proxy),
+  `mason` (the Mason family), `flotylla` (Argo and Skiff), `tola-grey` and `lucyna-novak` (Dr Tola
+  Grey and Dr Lucyna Novak, the stewards of tgdrive and neuradrive) and `dixi` (Marta's proxy) — from
+  definitions baked into keeper-hq's image; Nixie, Dixi and the Flotilla search the open web
+  themselves, and a session that read it is outside content under D-34. Attachments are syncular
+  blobs. Push is a server reaction. ⌘9 bots and the agents' Matrix path are removed; Matrix stays for
+  the messenger and its bridges. (AD-417…AD-433; FR-823…FR-871; NFR-123…NFR-128; Epics 103–108)
+- **Why a database the person runs:** a homeserver, a hub of keeper's own and a syncular server are
+  the same star; what changes is the centre — a committed delta pushed over a socket, estimated at one
+  tailnet round trip where Matrix measured 0.6–1.1 s — and the streaming primitive, a per-token
+  presence document where Matrix needed a durable edit every 400 ms. The rows are queryable, the
+  server checks every write, and its console says why a device does or does not see a row, which is
+  the "zdebugować, widać co się dzieje" the owner asked for (the keeper-hq research, §3, §4). Two
+  databases rather than one keep the drives' two audiences apart in Postgres itself: tgdrive is read
+  by tgorka alone, neuradrive by tgorka and Marta (D-34), and neither role can read the other's schema.
+- **Why keeper is only a client:** the owner asked for an open client "do ktorego mozna dodac wlasny
+  serwer albo dzialac lokalnie". The server and the agents are keeper-hq's, a closed repository of
+  independent modules; the contract between them is a schema, kept open in keeper because the client
+  generates its types from it. Without a server, keeper keeps its local database and an outbox that
+  waits.
+- **What it costs, stated so it is chosen:** there is no end-to-end encryption: the server, and
+  whoever operates it, reads everything an agent says, thinks and reads, and the tailnet is the only
+  protection on the wire. The server is TypeScript — syncular ships no Rust server — where the owner
+  preferred Rust. Upstream has one maintainer (about 1660 of about 1670 commits), and its Rust client
+  calls itself a proof of concept. One server is a single point of failure: offline-first limits the
+  damage — every replica keeps reading its history and every outbox keeps its writes until the server
+  returns — but while it is down no agent answers, in either database: the two share one server
+  process. A day of conversation can be lost (the daily dump), and agents that share a container
+  trust one runtime process.
+- **What stays true:** D-34 — no byte reaches an audience wider than its readers; readers become the
+  scope reasoning, tool results and approvals ride, the label check stays in the runtime, and an
+  agent subscribed to both databases keeps a memory in each, so what it learned in tgdrive never
+  reaches neuradrive's readers. One writer per session (D-31's rule, now the claim). An agent never
+  rewrites its own soul or tools. keeper opens no listening socket. Voice stays on the device (D-5,
+  D-36).
+- **What it supersedes:** D-31's "the session's log is the truth" for conversations (AD-365, AD-366),
+  and its agent homes in the drives for the agents keeper-hq runs — Nixie, the Masons, the Flotilla,
+  Dixi and the stewards Dr Tola Grey and Dr Lucyna Novak, whose drive session logs import into the
+  database of their drive (AD-427); D-32 entirely — for agents, AD-370…AD-374, AD-378, AD-379 and
+  AD-388.
+- **What it amends:** D-4 — the endpoint is still the person's: keeper ships no default server URL,
+  and keeper-hq is the operator's own deployment, not infrastructure of keeper's. D-33 — the sandbox
+  is kept, and is now also the boundary between an agent's tools and the runtime's tokens; tiers and
+  the digest binding are unchanged, and the approval is a row the server checks. D-35 — the push path
+  becomes a server reaction to the same owner-run gateway, carrying ids only.
+- **What is deferred, not refused:** ACP in either direction and an OpenAI-compatible adapter (Hermes'
+  `webui` stays until one exists); an invitation endpoint for people outside the tailnet; notes and the
+  drive in the database; a Rust server; an agent runtime independent of `keeper-core`. A peer-to-peer
+  channel beside the database is refused: it saves one tailnet half-trip and loses the history.
+- **Revisit triggers:** NFR-123 or NFR-124 measured above three times its target (p95 above 300 ms)
+  by story 103.1 or after, in either database; one database's load measured slowing the other's;
+  syncular abandoned upstream; people outside the tailnet becoming a goal. None reopens the second
+  paragraph: a default server URL is not a revisit, it is the different product D-4 refuses.
+- **Status / owner:** decided by the owner on 2026-10-20 ("podoba mi sie ten plan", messages 1–8)
+  and amended by him the same day (two databases as schemas, six containers, Nixie's own web search,
+  Dr Tola Grey, Dr Lucyna Novak and Dixi in containers of their own), pinned by the coordinator's
+  rulings (AD-417…AD-433). Owner is the architect. Epics 103–108 implement it: keeper-hq's `server/`,
+  `agent/` and `agents/`; keeper's `syncular/` contract, `keeper-llm` and syncular client;
+  makistack's six agent containers and the `keeper_hq` database with its two schemas.

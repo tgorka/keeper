@@ -8184,6 +8184,61 @@ function redrawAgentHeaders(): void {
  */
 const FIRST_BATCH_MS = Number(new URLSearchParams(window.location.search).get("firstbatch") ?? 0);
 
+/**
+ * `?deletions=1`: a plain room ends with this account's deletions in each
+ * state its queued redaction can be in — still queued, refused by the
+ * server, and done — so the stub's three faces can be looked at. Retry
+ * and Cancel are answered like Rust would: Cancel brings the message back,
+ * Retry queues the deletion again.
+ */
+const deletionsParam = new URLSearchParams(window.location.search).get("deletions") !== null;
+
+type RedactedItem = Extract<TimelineItemVm, { kind: "redacted" }>;
+
+function deletionStubs(): RedactedItem[] {
+  const stub = (key: string, sendState: RedactedItem["sendState"]): RedactedItem => ({
+    kind: "redacted",
+    key,
+    sender: "@tgorka:example.org",
+    senderDisplayName: "Tomasz",
+    timestamp: Date.now() - 60_000,
+    sendState,
+  });
+  return [
+    stub("deletion-sending", "sending"),
+    stub("deletion-failed", "failed"),
+    stub("deletion-done", null),
+  ];
+}
+
+/** Where each room's refused deletion sits in its timeline. */
+const failedDeletionIndex = new Map<string, number>();
+
+/** The deletion stubs a room ends with after its `before` items, when asked for. */
+function deletionStubsIn(roomId: string, before: number): RedactedItem[] {
+  if (!deletionsParam) {
+    return [];
+  }
+  failedDeletionIndex.set(roomId, before + 1);
+  return deletionStubs();
+}
+
+/** The refused deletion as Retry or Cancel leaves it, in the room it is in. */
+function resolveMockDeletion(payload: Record<string, unknown>, retried: boolean): null {
+  const key = String(payload.itemKey);
+  const roomId = String(payload.roomId);
+  const channel = historyChannels.get(roomId);
+  const index = failedDeletionIndex.get(roomId);
+  if (key !== "deletion-failed" || !channel || index === undefined) {
+    return null;
+  }
+  const item: TimelineItemVm = retried
+    ? { ...deletionStubs()[1], sendState: "sending" }
+    : textItem(key, "@tgorka:example.org", "Tomasz", "The message I tried to delete", 1);
+  channel.onmessage?.({ ops: [{ op: "set", index, item }] });
+  return null;
+}
+
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
   const id = nextTimelineSubscription++;
   if (FIRST_BATCH_MS > 0) {
@@ -8211,7 +8266,10 @@ function deliverMockTimeline(id: number, payload: Record<string, unknown>): void
       ops: [
         {
           op: "reset",
-          items: [textItem(`${roomId}-1`, "@marta:example.org", "Marta", "See you on Friday", 15)],
+          items: [
+            textItem(`${roomId}-1`, "@marta:example.org", "Marta", "See you on Friday", 15),
+            ...deletionStubsIn(roomId, 1),
+          ],
         },
       ],
       pagination: mockHistory,
@@ -8219,7 +8277,7 @@ function deliverMockTimeline(id: number, payload: Record<string, unknown>): void
     return;
   }
   channel.onmessage?.({
-    ops: [{ op: "reset", items: agent.items }],
+    ops: [{ op: "reset", items: [...agent.items, ...deletionStubsIn(roomId, agent.items.length)] }],
     header: withModelLine(agent.header),
     ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
     ...(roomId === GATE_ROOM && gateApprovals.length > 0 ? { approvals: gateApprovals } : {}),
@@ -9307,6 +9365,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   },
   // The harness's rooms hold their whole history: a page reaches the start.
   paginate_backwards: () => true,
+  send_retry: (payload) => resolveMockDeletion(payload, true),
+  cancel_send: (payload) => resolveMockDeletion(payload, false),
   load_earlier_messages: loadEarlierMock,
   timeline_subscribe: subscribeMockTimeline,
   timeline_unsubscribe: (payload) => {

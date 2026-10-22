@@ -1,0 +1,115 @@
+{
+  "manifestVersion": 1,
+  "migrations": "./migrations",
+  "queries": "./queries",
+  "naming": "preserve",
+  "output": {
+    "ir": "./syncular.ir.json",
+    "module": "./syncular.generated.ts",
+    "queryIr": "./syncular.queries.ir.json",
+    "queries": "./syncular.queries.ts"
+  },
+  "schemaVersions": [
+    { "version": 1, "through": "0001_initial" },
+    { "version": 2, "through": "0002_session_trust" }
+  ],
+  "tables": [
+    { "name": "actors", "scopes": ["dir:{dir}"] },
+    { "name": "clients", "scopes": ["dir:{dir}"] },
+    { "name": "agent_profiles", "scopes": ["dir:{dir}"] },
+    { "name": "sessions", "scopes": [{ "pattern": "session:{session}", "column": "id" }] },
+    {
+      "name": "session_members",
+      "scopes": [
+        { "pattern": "session:{session}", "column": "session_id" },
+        { "pattern": "member:{member}", "column": "actor_id" }
+      ]
+    },
+    {
+      "name": "claims",
+      "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
+    },
+    {
+      "name": "session_tool_switches",
+      "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
+    },
+    {
+      "name": "turn_chunks",
+      "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
+    },
+    {
+      "name": "attachments",
+      "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
+    },
+    { "name": "messages", "scopes": [{ "pattern": "page:{page}", "column": "page_key" }] },
+    { "name": "reasoning", "scopes": [{ "pattern": "trace:{trace}", "column": "page_key" }] },
+    { "name": "tool_calls", "scopes": [{ "pattern": "trace:{trace}", "column": "page_key" }] },
+    { "name": "approvals", "scopes": [{ "pattern": "trace:{trace}", "column": "page_key" }] },
+    {
+      "name": "instance_prefs",
+      "scopes": [{ "pattern": "actor:{actor}", "column": "person_actor" }]
+    },
+    {
+      "name": "agent_memory",
+      "scopes": [
+        { "pattern": "agent:{agent}", "column": "agent_actor" },
+        { "pattern": "family:{family}", "column": "family" }
+      ]
+    }
+  ],
+  "subscriptions": [
+    { "name": "directoryActors", "table": "actors", "scopes": { "dir": ["{database}"] } },
+    { "name": "directoryClients", "table": "clients", "scopes": { "dir": ["{database}"] } },
+    {
+      "name": "directoryAgentProfiles",
+      "table": "agent_profiles",
+      "scopes": { "dir": ["{database}"] }
+    },
+    {
+      "name": "memberships",
+      "table": "session_members",
+      "scopes": { "member": ["{actorId}"] }
+    },
+    { "name": "sessionRow", "table": "sessions", "scopes": { "session": ["{sessionId}"] } },
+    {
+      "name": "sessionMembers",
+      "table": "session_members",
+      "scopes": { "session": ["{sessionId}"] }
+    },
+    { "name": "sessionClaim", "table": "claims", "scopes": { "session": ["{sessionId}"] } },
+    {
+      "name": "sessionToolSwitches",
+      "table": "session_tool_switches",
+      "scopes": { "session": ["{sessionId}"] }
+    },
+    {
+      "name": "sessionTurnChunks",
+      "table": "turn_chunks",
+      "scopes": { "session": ["{sessionId}"] }
+    },
+    {
+      "name": "sessionAttachments",
+      "table": "attachments",
+      "scopes": { "session": ["{sessionId}"] }
+    },
+    { "name": "messagesPage", "table": "messages", "scopes": { "page": ["{pageKey}"] } },
+    { "name": "reasoningPage", "table": "reasoning", "scopes": { "trace": ["{pageKey}"] } },
+    { "name": "toolCallsPage", "table": "tool_calls", "scopes": { "trace": ["{pageKey}"] } },
+    { "name": "approvalsPage", "table": "approvals", "scopes": { "trace": ["{pageKey}"] } },
+    {
+      "name": "instancePrefs",
+      "table": "instance_prefs",
+      "scopes": { "actor": ["{actorId}"] }
+    },
+    {
+      "name": "agentMemoryOwn",
+      "table": "agent_memory",
+      "scopes": { "agent": ["{agentActor}"] }
+    },
+    {
+      "name": "agentMemoryFamily",
+      "table": "agent_memory",
+      "scopes": { "family": ["{family}"] }
+    }
+  ]
+}

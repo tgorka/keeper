@@ -30,7 +30,7 @@ use eyeball::Subscriber;
 use futures_util::{FutureExt, Stream, StreamExt};
 use matrix_sdk::encryption::VerificationState;
 use matrix_sdk::event_cache::PaginationStatus;
-use matrix_sdk::event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate};
+use matrix_sdk::event_cache::{self, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::{Client, Room, RoomInfo};
@@ -485,12 +485,14 @@ pub fn item_to_vm(
         // A redacted (deleted-for-everyone) message: surface an explicit honest
         // stub in place of a blank gap. The redacted event has no body to read;
         // only the sender, display name, and timestamp cross IPC (NFR-9, AD-1)
-        // (Story 3.8).
+        // (Story 3.8) — and, for this account's own deletion, where its queued
+        // redaction stands, since the stub shows before the server has it.
         MsgLikeKind::Redacted => TimelineItemVm::Redacted {
             key,
             sender: ev.sender().to_string(),
             sender_display_name,
             timestamp: i64::from(ev.timestamp().0),
+            send_state: ev.redaction_send_state().map(map_send_state),
         },
         // A custom event the agent filter admits: an approval request, drawn
         // as its card when an agent of the room sealed it.
@@ -1202,7 +1204,7 @@ fn info_changed(info: &mut Option<Subscriber<RoomInfo>>) -> bool {
 
 /// The next event-cache update, or never when there is no subscriber.
 async fn next_update(
-    updates: &mut Option<RoomEventCacheSubscriber>,
+    updates: &mut Option<event_cache::Subscriber<RoomEventCacheUpdate>>,
 ) -> Result<RoomEventCacheUpdate, RecvError> {
     match updates {
         Some(updates) => updates.recv().await,
@@ -1742,11 +1744,11 @@ fn map_pagination_status(status: PaginationStatus) -> PaginationStatusBatch {
 /// room list's 1, so a sync carrying a claim renewal and a status, or an
 /// answer's edits, is no longer `limited` and the event cache no longer
 /// unloads the open room to its last chunk under the person's eyes. The
-/// SDK replaces its whole subscription set on each call, so an empty set
-/// unsubscribes the last closed room; this is the set's one writer.
+/// SDK sets its subscriptions to exactly the given set on each call, so an
+/// empty set unsubscribes the last closed room; this is the set's one writer.
 pub async fn subscribe_open_rooms(room_list: &RoomListService, open: &BTreeSet<OwnedRoomId>) {
     let rooms: Vec<&RoomId> = open.iter().map(AsRef::as_ref).collect();
-    room_list.subscribe_to_rooms(&rooms).await;
+    room_list.set_room_subscriptions(&rooms).await;
 }
 
 /// Work the producer runs beside the stream: the header's search, a page
@@ -2005,6 +2007,7 @@ mod tests {
             sender: "@alice:example.org".to_owned(),
             sender_display_name: Some("Alice".to_owned()),
             timestamp: 1_720_000_000_000,
+            send_state: Some(SendState::Failed),
         };
         let json = serde_json::to_value(&vm).expect("VM serializes");
         assert_eq!(json["kind"], "redacted");
@@ -2012,6 +2015,7 @@ mod tests {
         assert_eq!(json["sender"], "@alice:example.org");
         assert_eq!(json["senderDisplayName"], "Alice");
         assert_eq!(json["timestamp"], 1_720_000_000_000_i64);
+        assert_eq!(json["sendState"], "failed");
         // No body/content is carried on a redacted stub (nothing to render).
         assert!(json.get("body").is_none());
     }

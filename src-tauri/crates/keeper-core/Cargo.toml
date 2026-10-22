@@ -54,7 +54,7 @@ rusqlite = { workspace = true, features = ["hooks"] }
 blake3 = { workspace = true }
 ulid = { workspace = true }
 # Random per-account SDK-store passphrase generation (Story 2.6, at-rest encryption).
-# matrix-sdk 0.18 already resolves rand 0.8 transitively; permissive (MIT/Apache).
+# Already resolved in the lock as rand 0.8 (oauth2, openidconnect); permissive (MIT/Apache).
 rand = "0.8"
 # The phone's release check reads GitHub's latest tag as a strict SemVer 2.0
 # version (story 102.9, R482). Already locked in the tree (tauri-utils,
@@ -113,6 +113,10 @@ unicode-normalization = { workspace = true }
 # merge feeds `agents::soul::soul_from_bmad`, agentskills' validator feeds
 # `agents::skills`. A pure path crate — no network, no runtime, no tauri.
 keeper-ported = { path = "../keeper-ported" }
+# OpenAI-compatible streaming, the provider quirks and the tool loop (AD-431),
+# re-exported at their old `bots::*` paths. An open crate with no keeper
+# dependency (`bun run check:llm-lean`).
+keeper-llm = { path = "../keeper-llm" }
 # Digests of an agent's composed prompt and memory snapshot, and the session
 # log's blob names (Epic 89, AD-363, AD-366). Both already resolved in
 # Cargo.lock for keeper-sync's LFS hashing, so the tree gains no package.
@@ -143,6 +147,10 @@ rsa = "0.9"
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# The timeline tests' event-cache store that can pause a page under the
+# cache's lock: the `EventCacheStore` trait and its in-memory store, which
+# `matrix-sdk` does not re-export. Already in the tree through it.
+matrix-sdk-base = "0.19"
 # The region difference hash's bounds are proved over real screenshots of
 # the Mac (PNG fixtures, 96.4 #5); the hash itself takes grey bytes.
 image = { workspace = true }

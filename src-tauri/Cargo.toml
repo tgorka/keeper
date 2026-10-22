@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-agent", "crates/keeper-agentd", "crates/keeper-nse"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse"]
 
 [workspace.package]
 version = "0.10.6"
@@ -58,12 +58,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Matrix core (homed in keeper-core; unused in 1.1 but owned here per AD-6)
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "qrcode", "sqlite", "sso-login"] }
-matrix-sdk-ui = "0.18"
+matrix-sdk = { version = "0.19", features = ["e2e-encryption", "qrcode", "sqlite", "sso-login"] }
+matrix-sdk-ui = "0.19"
 # A person's encrypted file decrypted from a bounded download (story 101.2,
 # R444): the SDK's own `AttachmentDecryptor`, with its SHA-256 integrity check,
 # which `matrix-sdk` does not re-export. Already in the tree through it.
-matrix-sdk-crypto = { version = "0.18", default-features = false }
+matrix-sdk-crypto = { version = "0.19", default-features = false }
 # QR-code rendering for device-verification *display* (Story 3.2). The matrix-sdk
 # `qrcode` feature (above) pulls this same crate for `QrVerification::to_qr_code`;
 # depended on directly for the `svg` renderer. `default-features = false` drops
@@ -92,7 +92,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # logout URL. `default-features = false` is load-bearing — the defaults pull
 # oauth2's reqwest 0.12 client and a second reqwest (and webpki-roots) into
 # the tree. The HTTP side is `oauth2-reqwest`, the maintainer's reqwest 0.13
-# adapter, already in the lock via matrix-sdk 0.18; it is pinned exactly
+# adapter, already in the lock via matrix-sdk 0.19; it is pinned exactly
 # because it is an alpha. Both MIT. `rsa` (verification only here) carries
 # RUSTSEC-2023-0071, which concerns private-key operations keeper never does.
 openidconnect = { version = "4.0.1", default-features = false }
@@ -198,9 +198,10 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
     # front" the JS lifecycle cannot give from the background.
     "UIApplication",
 ] }
-# Account registry + opaque account ids (both already present transitively via matrix-sdk).
+# Account registry + opaque account ids. rusqlite is also matrix-sdk's store engine:
+# the graph links one libsqlite3-sys (`bun run check:one-sqlite`).
 ulid = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # The classic NanoKVM's login (96.5, `keeper-ported::nanokvm`): its password
 # travels AES-256-CBC-encrypted under a key the reference publishes. Both
 # already in Cargo.lock (matrix-sdk-crypto, vodozemac); `MIT OR Apache-2.0`.

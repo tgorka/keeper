@@ -28,6 +28,11 @@ pub trait TurnSink: Send + Sync {
     /// sentences would otherwise end one at a line break the model never wrote.
     fn answer_text(&self, _text: &str) {}
 
+    /// A call the model asked for is about to run: told for each of a
+    /// round's calls before the first of them runs, with the wire id its
+    /// `ToolResult` carries. Only a room-free turn (`crate::served`) tells it.
+    fn tool_started(&self, _call: &keeper_core::bots::chat::ToolCall) {}
+
     /// The turn is over: its row is closed and `Closed` was sent (or the row
     /// was gone and there was nothing to send).
     fn ended(&self, _end: TurnEnd) {}

@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk::event_cache::{
-    EventCacheDropHandles, RoomEventCache, RoomEventCacheSubscriber, RoomEventCacheUpdate,
+    EventCacheDropHandles, RoomEventCache, RoomEventCacheUpdate, Subscriber,
 };
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedTransactionId, OwnedUserId, UserId};
 use matrix_sdk::send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendHandle};
@@ -560,7 +560,7 @@ pub struct SpokenAnswer {
     watch: SpokenWatch,
     feed: CacheFeed,
     cache: RoomEventCache,
-    updates: RoomEventCacheSubscriber,
+    updates: Subscriber<RoomEventCacheUpdate>,
     queue: broadcast::Receiver<RoomSendQueueUpdate>,
     /// The question as it went into the send queue: when, and its words.
     asking: Option<(MilliSecondsSinceUnixEpoch, String)>,

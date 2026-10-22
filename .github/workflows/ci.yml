@@ -20,6 +20,7 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - run: bun run lint
+      - run: bun run check:syncular
       - run: bun run typecheck
       - run: bun run test
       - name: PostHog provisioning safety (no credentials)
@@ -87,9 +88,7 @@ jobs:
           workspaces: src-tauri
       # Compile-only iOS gate (AD-32): no signing, no simulator, no Apple creds.
       # Blocks by failure; recorded as a required PR status check in docs/release.md.
-      # keeper-agentd is a Linux server binary (story 90.5): this is the iOS
-      # check's one form from here on.
-      - run: cargo check --workspace --exclude keeper-agentd --target aarch64-apple-ios
+      - run: cargo check --workspace --target aarch64-apple-ios
         working-directory: src-tauri
 
   android:
@@ -139,8 +138,6 @@ jobs:
       # No desktop plugin, no `keyring` (a mock store off Apple and desktop
       # Linux), no Apple framework and no `ort` in the Android graph.
       - run: bun run check:android-graph
-      # keeper-agentd is a Linux server binary (story 90.5) and never ships
-      # to a phone or tablet.
       - run: cargo check -p keeper -p keeper-core -p keeper-sync -p keeper-agent --target aarch64-linux-android
         working-directory: src-tauri
       - run: bun run tauri android build --debug --apk --target aarch64 --ci

@@ -19,6 +19,7 @@
 //! A `gate` session is offered neither proposal tool and is refused both.
 
 pub mod journal;
+pub mod rows;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};

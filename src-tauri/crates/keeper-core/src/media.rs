@@ -509,7 +509,7 @@ async fn content_request(
 ) -> Result<(String, Option<String>), Download> {
     use matrix_sdk::ruma::api::auth_scheme::SendAccessToken;
     use matrix_sdk::ruma::api::client::authenticated_media::get_content::v1 as authenticated;
-    use matrix_sdk::ruma::api::{Metadata, OutgoingRequest};
+    use matrix_sdk::ruma::api::{Metadata, OutgoingRequestExt};
     let failed = |what: &str| Download::Failed(what.to_owned());
     let versions = client
         .supported_versions()

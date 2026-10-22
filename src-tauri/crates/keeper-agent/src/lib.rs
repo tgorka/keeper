@@ -8,6 +8,8 @@
 //!
 //! - [`turn`] opens a turn: the rows, the replay, the grants, the request.
 //! - [`drive`] runs it: the tool loop, the partial row, the stream.
+//! - [`served`] runs an agent's turn from a person's message with no room:
+//!   the agent's loop and limits, streamed into the host's sink.
 //! - [`host`] is the drive tool host every tool call goes through.
 //! - [`task`] is the scheduled bot task, over the same arming.
 //! - [`sessions`] is the sessions runtime: one plan at a time per zone.
@@ -15,6 +17,8 @@
 //! - [`promote`] promotes a session's files into its artifacts and its
 //!   harvested notes into the drive's vault, and renders the promote panel.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
+//! - [`parked`] is the park and resume of an approval behind a record port,
+//!   for a host whose record is a row rather than a room's file and event.
 //! - [`grants`] is where a turn's grants come from: the app's rows or an
 //!   agent's own `agent.toml`.
 //! - [`agent`] is an agent's turn in a session, over its held context;
@@ -96,6 +100,8 @@ pub mod matrix_sink;
 #[cfg(not(phone))]
 pub mod mcp;
 pub mod memory;
+#[cfg(not(phone))]
+pub mod parked;
 pub mod ports;
 pub mod previews;
 pub mod promote;
@@ -107,6 +113,8 @@ pub mod runtime;
 pub mod search;
 #[cfg(not(phone))]
 pub mod seed;
+#[cfg(not(phone))]
+pub mod served;
 pub mod sessions;
 pub mod sinks;
 pub mod skills;

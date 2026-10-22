@@ -1469,7 +1469,12 @@ export function ConversationBody({
                 </li>
               ) : row.kind === "redacted" ? (
                 <li key={row.item.key}>
-                  <RedactedStub />
+                  <RedactedStub
+                    itemKey={row.item.key}
+                    sendState={row.item.sendState}
+                    onRetry={onRetry}
+                    onCancel={onCancelSend}
+                  />
                 </li>
               ) : row.kind === "approval" ? (
                 <li key={row.item.key}>

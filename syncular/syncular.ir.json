@@ -1,0 +1,1543 @@
+{
+  "irVersion": 1,
+  "schemaVersion": 2,
+  "schemaVersions": [
+    {
+      "version": 1,
+      "migrations": [
+        "0001_initial"
+      ]
+    },
+    {
+      "version": 2,
+      "migrations": [
+        "0002_session_trust"
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "name": "actors",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "display_name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "family",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "dir",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "dir:{dir}",
+          "variable": "dir",
+          "column": "dir"
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "clients",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "host",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "revoked_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "dir",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "dir:{dir}",
+          "variable": "dir",
+          "column": "dir"
+        }
+      ],
+      "references": [
+        {
+          "column": "actor_id",
+          "parentTable": "actors",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_clients_actor_id_ref",
+          "columns": [
+            "actor_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "clients_actor_id",
+          "columns": [
+            "actor_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "agent_profiles",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "avatar_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "definition_hash",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "image_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "started_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "dir",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "dir:{dir}",
+          "variable": "dir",
+          "column": "dir"
+        }
+      ],
+      "references": [
+        {
+          "column": "actor_id",
+          "parentTable": "actors",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_agent_profiles_actor_id_ref",
+          "columns": [
+            "actor_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "agent_profiles_actor_id",
+          "columns": [
+            "actor_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "sessions",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "agent_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_by_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_by_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "preferred_client",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "parent_session",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "invite",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "archived",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "heard_until",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "last_activity_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "trust",
+          "type": "string",
+          "nullable": true
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sessions_parent_session",
+          "columns": [
+            "parent_session"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "session_members",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "role",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reads_trace",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "added_by_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "added_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "read_until",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        },
+        {
+          "pattern": "member:{member}",
+          "variable": "member",
+          "column": "actor_id"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "session_members_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "session_members_actor_id",
+          "columns": [
+            "actor_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "claims",
+      "primaryKey": "session_id",
+      "columns": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "holder_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "holder_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "renewed_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "released",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        }
+      ],
+      "references": [
+        {
+          "column": "session_id",
+          "parentTable": "sessions",
+          "onDelete": "CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_claims_session_id_ref",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "claims_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "session_tool_switches",
+      "primaryKey": "session_id",
+      "columns": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "tools_off",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        }
+      ],
+      "references": [
+        {
+          "column": "session_id",
+          "parentTable": "sessions",
+          "onDelete": "CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_session_tool_switches_session_id_ref",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "session_tool_switches_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "turn_chunks",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "turn_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "seq",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        }
+      ],
+      "references": [
+        {
+          "column": "session_id",
+          "parentTable": "sessions",
+          "onDelete": "CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_turn_chunks_session_id_ref",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "turn_chunks_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "turn_chunks_turn_seq",
+          "columns": [
+            "turn_id",
+            "seq"
+          ],
+          "unique": true
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "attachments",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "message_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "blob_ref",
+          "type": "blob_ref",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "mime",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "size",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        }
+      ],
+      "references": [
+        {
+          "column": "session_id",
+          "parentTable": "sessions",
+          "onDelete": "CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_attachments_session_id_ref",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "attachments_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "attachments_message_id",
+          "columns": [
+            "message_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "messages",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "turn_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "role",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "body_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "metadata",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "page:{page}",
+          "variable": "page",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "messages_page",
+          "columns": [
+            "page_key",
+            "created_at_ms",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "messages_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "reasoning",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "turn_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "seq",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "compacted",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "trace:{trace}",
+          "variable": "trace",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "reasoning_page",
+          "columns": [
+            "page_key",
+            "created_at_ms",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "reasoning_turn",
+          "columns": [
+            "turn_id",
+            "seq"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "tool_calls",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "turn_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "args",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "result",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "result_blob",
+          "type": "blob_ref",
+          "nullable": true
+        },
+        {
+          "name": "started_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "ended_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "trace:{trace}",
+          "variable": "trace",
+          "column": "page_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "tool_calls_page",
+          "columns": [
+            "page_key",
+            "created_at_ms",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "tool_calls_turn_id",
+          "columns": [
+            "turn_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "approvals",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "page_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "tool_call_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "tier",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "binding_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "summary",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "approvers",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "decided_by_actor",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "decided_by_client",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "consumed_by_client",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "expires_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "trace:{trace}",
+          "variable": "trace",
+          "column": "page_key"
+        }
+      ],
+      "references": [
+        {
+          "column": "tool_call_id",
+          "parentTable": "tool_calls",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_approvals_tool_call_id_ref",
+          "columns": [
+            "tool_call_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "approvals_page",
+          "columns": [
+            "page_key",
+            "created_at_ms",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "approvals_tool_call_id",
+          "columns": [
+            "tool_call_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "instance_prefs",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "person_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "agent_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "default_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "fallback",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "actor:{actor}",
+          "variable": "actor",
+          "column": "person_actor"
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "agent_memory",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "agent_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "family",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "source_session",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "agent:{agent}",
+          "variable": "agent",
+          "column": "agent_actor"
+        },
+        {
+          "pattern": "family:{family}",
+          "variable": "family",
+          "column": "family"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "agent_memory_agent_kind",
+          "columns": [
+            "agent_actor",
+            "kind"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    }
+  ],
+  "subscriptions": [
+    {
+      "name": "directoryActors",
+      "table": "actors",
+      "scopes": [
+        {
+          "variable": "dir",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "directoryClients",
+      "table": "clients",
+      "scopes": [
+        {
+          "variable": "dir",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "directoryAgentProfiles",
+      "table": "agent_profiles",
+      "scopes": [
+        {
+          "variable": "dir",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "memberships",
+      "table": "session_members",
+      "scopes": [
+        {
+          "variable": "member",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "actorId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionRow",
+      "table": "sessions",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionMembers",
+      "table": "session_members",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionClaim",
+      "table": "claims",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionToolSwitches",
+      "table": "session_tool_switches",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionTurnChunks",
+      "table": "turn_chunks",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionAttachments",
+      "table": "attachments",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "messagesPage",
+      "table": "messages",
+      "scopes": [
+        {
+          "variable": "page",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "pageKey"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "reasoningPage",
+      "table": "reasoning",
+      "scopes": [
+        {
+          "variable": "trace",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "pageKey"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "toolCallsPage",
+      "table": "tool_calls",
+      "scopes": [
+        {
+          "variable": "trace",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "pageKey"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "approvalsPage",
+      "table": "approvals",
+      "scopes": [
+        {
+          "variable": "trace",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "pageKey"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "instancePrefs",
+      "table": "instance_prefs",
+      "scopes": [
+        {
+          "variable": "actor",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "actorId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "agentMemoryOwn",
+      "table": "agent_memory",
+      "scopes": [
+        {
+          "variable": "agent",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "agentActor"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "agentMemoryFamily",
+      "table": "agent_memory",
+      "scopes": [
+        {
+          "variable": "family",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "family"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "extensions": {}
+}

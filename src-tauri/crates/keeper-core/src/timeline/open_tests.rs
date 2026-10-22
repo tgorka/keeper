@@ -39,6 +39,8 @@ struct Server {
     /// The pages held unanswered, by their `from`: a request for one waits
     /// while it is held and is then refused, keeping its page for the next.
     held: HashSet<String>,
+    /// Whether a redaction is refused (403, unrecoverable) or accepted.
+    refuse_redactions: bool,
 }
 
 type Shared = Arc<(Mutex<Server>, Condvar)>;
@@ -53,6 +55,20 @@ fn answer(shared: &Shared, seen: &Seen) -> Reply {
             server.syncs.remove(0)
         };
         return Reply::json(200, &next.to_string());
+    }
+    if path.contains("/redact/") {
+        let refused = shared.0.lock().expect("server").refuse_redactions;
+        return if refused {
+            Reply::json(403, r#"{"errcode":"M_FORBIDDEN","error":"not yours"}"#)
+        } else {
+            Reply::json(200, r#"{"event_id":"$redaction:h"}"#)
+        };
+    }
+    if let Some((_, txn)) = path.split_once("/send/m.room.message/") {
+        return Reply::json(
+            200,
+            &json!({ "event_id": format!("$sent-{txn}:h") }).to_string(),
+        );
     }
     if path.ends_with("/messages") {
         let (lock, wake) = &**shared;
@@ -150,6 +166,25 @@ struct Device {
 
 impl Device {
     async fn new(pages: HashMap<String, Reply>) -> Device {
+        Device::with_builder(pages, Client::builder()).await
+    }
+
+    /// A device whose event cache pauses where `gate` says.
+    async fn gated(pages: HashMap<String, Reply>, gate: Arc<Gate>) -> Device {
+        use matrix_sdk::config::StoreConfig;
+        use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
+        let store = StoreConfig::new(CrossProcessLockConfig::multi_process("main"))
+            .event_cache_store(GatedStore {
+                inner: matrix_sdk_base::event_cache::store::MemoryStore::new(),
+                gate,
+            });
+        Device::with_builder(pages, Client::builder().store_config(store)).await
+    }
+
+    async fn with_builder(
+        pages: HashMap<String, Reply>,
+        builder: matrix_sdk::ClientBuilder,
+    ) -> Device {
         let shared: Shared = Arc::new((
             Mutex::new(Server {
                 syncs: Vec::new(),
@@ -157,12 +192,13 @@ impl Device {
                 search: json!({"chunk": [status_event(900)], "start": "s"}),
                 pages,
                 held: HashSet::new(),
+                refuse_redactions: false,
             }),
             Condvar::new(),
         ));
         let handler = Arc::clone(&shared);
         let fake = testing::serve(move |seen| answer(&handler, seen));
-        let client = Client::builder()
+        let client = builder
             .homeserver_url(&fake.base)
             .build()
             .await
@@ -933,4 +969,408 @@ async fn a_finder_look_past_an_undecryptable_event_never_searches_the_room_empty
         "the look that read the rest whole forgot the page it could not decrypt"
     );
     assert!(!kinds.searched_empty(&me, &room_id));
+}
+
+/// Where the event cache's store pauses: once armed, the next duplicate
+/// check of [`ROOM`]'s events — which the SDK runs while it holds the
+/// cache's one lock, every room's, to conclude a page from the server —
+/// waits until the gate opens.
+#[derive(Default)]
+struct Gate {
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::watch::Sender<bool>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl Gate {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn entered(&self) {
+        let _ = self.entered.subscribe().wait_for(|entered| *entered).await;
+    }
+
+    fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    async fn pass(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.send_replace(true);
+            let _ = self.open.subscribe().wait_for(|open| *open).await;
+        }
+    }
+}
+
+/// The in-memory event-cache store, paused by its [`Gate`].
+#[derive(Debug)]
+struct GatedStore {
+    inner: matrix_sdk_base::event_cache::store::MemoryStore,
+    gate: Arc<Gate>,
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gate")
+    }
+}
+
+mod gated_store {
+    use matrix_sdk::cross_process_lock::CrossProcessLockGeneration;
+    use matrix_sdk::linked_chunk::{
+        ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
+        RawChunk, Update,
+    };
+    use matrix_sdk::ruma::events::relation::RelationType;
+    use matrix_sdk::ruma::{EventId, OwnedEventId, RoomId};
+    use matrix_sdk_base::event_cache::store::{EventCacheStore, EventCacheStoreError};
+    use matrix_sdk_base::event_cache::thread::ThreadInfo;
+    use matrix_sdk_base::event_cache::{Event, Gap};
+
+    use super::{GatedStore, ROOM};
+
+    type Result<T> = std::result::Result<T, EventCacheStoreError>;
+
+    #[matrix_sdk::async_trait]
+    impl EventCacheStore for GatedStore {
+        type Error = EventCacheStoreError;
+
+        async fn try_take_leased_lock(
+            &self,
+            lease_duration_ms: u32,
+            key: &str,
+            holder: &str,
+        ) -> Result<Option<CrossProcessLockGeneration>> {
+            self.inner
+                .try_take_leased_lock(lease_duration_ms, key, holder)
+                .await
+        }
+
+        async fn handle_linked_chunk_updates(
+            &self,
+            linked_chunk_id: LinkedChunkId<'_>,
+            updates: Vec<Update<Event, Gap>>,
+        ) -> Result<()> {
+            self.inner
+                .handle_linked_chunk_updates(linked_chunk_id, updates)
+                .await
+        }
+
+        async fn load_all_chunks(
+            &self,
+            linked_chunk_id: LinkedChunkId<'_>,
+        ) -> Result<Vec<RawChunk<Event, Gap>>> {
+            self.inner.load_all_chunks(linked_chunk_id).await
+        }
+
+        async fn load_all_chunks_metadata(
+            &self,
+            linked_chunk_id: LinkedChunkId<'_>,
+        ) -> Result<Vec<ChunkMetadata>> {
+            self.inner.load_all_chunks_metadata(linked_chunk_id).await
+        }
+
+        async fn load_last_chunk(
+            &self,
+            linked_chunk_id: LinkedChunkId<'_>,
+        ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator)> {
+            self.inner.load_last_chunk(linked_chunk_id).await
+        }
+
+        async fn load_previous_chunk(
+            &self,
+            linked_chunk_id: LinkedChunkId<'_>,
+            before_chunk_identifier: ChunkIdentifier,
+        ) -> Result<Option<RawChunk<Event, Gap>>> {
+            self.inner
+                .load_previous_chunk(linked_chunk_id, before_chunk_identifier)
+                .await
+        }
+
+        async fn load_thread_info(
+            &self,
+            room_id: &RoomId,
+            thread_id: &EventId,
+        ) -> Result<ThreadInfo> {
+            self.inner.load_thread_info(room_id, thread_id).await
+        }
+
+        async fn update_thread_info(
+            &self,
+            room_id: &RoomId,
+            thread_id: &EventId,
+            thread_info: &ThreadInfo,
+        ) -> Result<()> {
+            self.inner
+                .update_thread_info(room_id, thread_id, thread_info)
+                .await
+        }
+
+        async fn clear_all_events(&self, room_id: Option<&RoomId>) -> Result<()> {
+            self.inner.clear_all_events(room_id).await
+        }
+
+        async fn filter_duplicated_events(
+            &self,
+            linked_chunk_id: LinkedChunkId<'_>,
+            events: Vec<OwnedEventId>,
+        ) -> Result<Vec<(OwnedEventId, Position)>> {
+            if matches!(linked_chunk_id, LinkedChunkId::Room(room) if room.as_str() == ROOM) {
+                self.gate.pass().await;
+            }
+            self.inner
+                .filter_duplicated_events(linked_chunk_id, events)
+                .await
+        }
+
+        async fn find_event(&self, room_id: &RoomId, event_id: &EventId) -> Result<Option<Event>> {
+            self.inner.find_event(room_id, event_id).await
+        }
+
+        async fn find_event_relations(
+            &self,
+            room_id: &RoomId,
+            event_id: &EventId,
+            filter: Option<&[RelationType]>,
+        ) -> Result<Vec<(Event, Option<Position>)>> {
+            self.inner
+                .find_event_relations(room_id, event_id, filter)
+                .await
+        }
+
+        async fn get_room_events(
+            &self,
+            room_id: &RoomId,
+            event_type: Option<&str>,
+            session_id: Option<&str>,
+        ) -> Result<Vec<Event>> {
+            self.inner
+                .get_room_events(room_id, event_type, session_id)
+                .await
+        }
+
+        async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<()> {
+            self.inner.save_event(room_id, event).await
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.inner.close().await
+        }
+
+        async fn reopen(&self) -> Result<()> {
+            self.inner.reopen().await
+        }
+
+        async fn optimize(&self) -> Result<()> {
+            self.inner.optimize().await
+        }
+
+        async fn get_size(&self) -> Result<Option<usize>> {
+            self.inner.get_size().await
+        }
+    }
+}
+
+const OTHER: &str = "!other:h";
+
+/// How many events `room`'s cache holds.
+async fn cached(client: &Client, room: &str) -> usize {
+    let room_id: OwnedRoomId = room.try_into().expect("room");
+    let room = client.get_room(&room_id).expect("room");
+    let (cache, _handles) = room.event_cache().await.expect("room cache");
+    cache.events().await.expect("cached events").len()
+}
+
+/// matrix-sdk 0.19 keeps one event-cache state for every room (#6629) and
+/// holds its lock across its store reads while it concludes a page. The
+/// producer keeps its fill page unpolled while it is busy in a branch that
+/// reads the cache — an approval refresh — so a page paused there must go
+/// on by itself once the store answers: the refresh ends, another room's
+/// cache is read (as admitting a room does), and the page lands in the
+/// timeline. It does because the SDK runs each back-pagination on a task
+/// of its own (`event_cache/caches/pagination.rs`); this fails if that stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fill_page_paused_in_the_cache_goes_on_while_its_producer_reads_the_cache() {
+    use crate::agents::room::approvals_of;
+
+    let gate = Arc::new(Gate::default());
+    let pages = HashMap::from([("p1".to_owned(), page(vec![said("older", 3)], None))]);
+    let device = Device::gated(pages, Arc::clone(&gate)).await;
+    device.release_search();
+    let mut body = sync(
+        1,
+        ROOM,
+        room_state(NIXI),
+        (100..112).map(|n| said(&format!("m{n}"), n)).collect(),
+        true,
+        &[NIXI],
+    );
+    body["rooms"]["join"][OTHER] = sync(
+        1,
+        OTHER,
+        room_state(NIXI),
+        vec![said("elsewhere", 1)],
+        false,
+        &[],
+    )["rooms"]["join"][OTHER]
+        .clone();
+    device.sync_cached(body).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while cached(&device.client, OTHER).await < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other room never cached"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let room_id: OwnedRoomId = ROOM.try_into().expect("room");
+    let other_id: OwnedRoomId = OTHER.try_into().expect("room");
+    let open = open_timeline(&device.client, &room_id, "acct")
+        .await
+        .expect("timeline");
+    let timeline = open.timeline();
+
+    gate.arm();
+    let mut page = super::fill_page(&timeline);
+    tokio::select! {
+        paged = &mut page => panic!("the page ended before its store read: {paged:?}"),
+        () = gate.entered() => {}
+    }
+    // The page holds the cache's lock and the producer, in another branch,
+    // reads the cache; `page` is not polled from here on, as the producer
+    // does not poll it meanwhile.
+    let (room, other) = (
+        device.client.get_room(&room_id).expect("room"),
+        device.client.get_room(&other_id).expect("other room"),
+    );
+    let refresh = tokio::spawn(async move {
+        approvals_of(&room).await;
+        approvals_of(&other).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !refresh.is_finished(),
+        "the page is paused under the cache's lock, so the refresh waits"
+    );
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(10), refresh)
+        .await
+        .expect("the cache stayed locked by a page nobody polled")
+        .expect("the refresh");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while cached(&device.client, ROOM).await < 13 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the page never landed while nobody polled it"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(page.await.is_ok(), "the page");
+}
+
+/// The redacted stub of `key`'s item, by its send state, if it is one.
+fn redacted(drawn: &Drawn, key: &str) -> Option<Option<crate::vm::SendState>> {
+    drawn.items().into_iter().find_map(|item| match item {
+        TimelineItemVm::Redacted {
+            key: k, send_state, ..
+        } if k == key => Some(send_state),
+        _ => None,
+    })
+}
+
+/// How many requests to `segment` the server has seen.
+fn requests_to(device: &Device, segment: &str) -> usize {
+    device
+        .fake
+        .requests()
+        .iter()
+        .filter(|seen| seen.path.contains(segment))
+        .count()
+}
+
+/// matrix-sdk-ui 0.19 queues a deletion (#6428), and a refused request
+/// holds the room's later sends behind it (#6843). The stub shows a refused
+/// deletion as failed, never as deleted; Cancel restores the message and the
+/// held send goes out; Retry queues the deletion again, and once the server
+/// takes it the stub is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_deletion_says_so_and_cancel_or_retry_resolve_it() {
+    use crate::send::{self, MessageKind, SendTrigger};
+    use crate::vm::SendState;
+
+    let device = Device::new(HashMap::new()).await;
+    device.release_search();
+    device.shared.0.lock().expect("server").refuse_redactions = true;
+    device
+        .sync_cached(sync(
+            1,
+            ROOM,
+            room_state(NIXI),
+            vec![
+                said("theirs", 1),
+                message(ME, json!({ "msgtype": "m.text", "body": "mine" }), 2),
+            ],
+            false,
+            &[NIXI],
+        ))
+        .await;
+    let (drawn, _asks, timeline) = device.open_asking().await;
+    drawn
+        .until("my message", |drawn| drawn_text(drawn, "mine"))
+        .await;
+    let key = drawn
+        .items()
+        .into_iter()
+        .find_map(|item| match item {
+            TimelineItemVm::Message { key, body, .. } if body == "mine" => Some(key),
+            _ => None,
+        })
+        .expect("my message's key");
+
+    send::redact(&timeline, &key, None).await.expect("queued");
+    drawn
+        .until("the refused deletion", |drawn| {
+            redacted(drawn, &key) == Some(Some(SendState::Failed))
+        })
+        .await;
+    send::submit(
+        &timeline,
+        "after",
+        MessageKind::Text,
+        SendTrigger::ComposerSend,
+    )
+    .await
+    .expect("queued");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        requests_to(&device, "/send/m.room.message/"),
+        0,
+        "a later send waits behind the refused deletion"
+    );
+
+    send::cancel(&timeline, &key).await.expect("cancelled");
+    drawn
+        .until("my message back, and the held send gone out", |drawn| {
+            redacted(drawn, &key).is_none()
+                && drawn_text(drawn, "mine")
+                && requests_to(&device, "/send/m.room.message/") == 1
+        })
+        .await;
+
+    send::redact(&timeline, &key, None).await.expect("queued");
+    drawn
+        .until("refused again", |drawn| {
+            redacted(drawn, &key) == Some(Some(SendState::Failed))
+        })
+        .await;
+    let refused = requests_to(&device, "/redact/");
+    device.shared.0.lock().expect("server").refuse_redactions = false;
+    send::retry(&timeline, &key).await.expect("retried");
+    drawn
+        .until("deleted once the server took it", |drawn| {
+            matches!(redacted(drawn, &key), Some(None | Some(SendState::Sent)))
+                && requests_to(&device, "/redact/") > refused
+        })
+        .await;
 }

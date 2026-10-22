@@ -295,19 +295,39 @@ async fn attempt<P: DmOpening>(
             }
             () = tokio::time::sleep(LOOK_AGAIN) => {}
         }
-        if let Some(room) = &answered {
-            if port.settle(room).await {
-                if let Some(open) = port.admit(room).await {
-                    return Ok(open);
+        // The listing is polled beside the step too: one left suspended in
+        // the middle of a room's read holds the SDK's event cache, whose
+        // lock every room shares, and the step's own read of the answered
+        // room would wait on it until the deadline.
+        let step = async {
+            if let Some(room) = &answered {
+                if port.settle(room).await {
+                    if let Some(open) = port.admit(room).await {
+                        return Some(open);
+                    }
                 }
             }
-        }
-        // Once answered, the answered room is the one to settle: the
-        // agent's other rooms are not read again meanwhile.
-        if answered.is_none() {
-            if let Some(open) = port.found().await {
-                return Ok(open);
+            // Once answered, the answered room is the one to settle: the
+            // agent's other rooms are not read again meanwhile.
+            if answered.is_none() {
+                return port.found().await;
             }
+            None
+        };
+        tokio::pin!(step);
+        let stepped = loop {
+            tokio::select! {
+                opened = &mut step => break opened,
+                listed = &mut listing => {
+                    if let Some(open) = listed {
+                        return Ok(open);
+                    }
+                    listing.set(list_after(port, LOOK_AGAIN));
+                }
+            }
+        };
+        if let Some(open) = stepped {
+            return Ok(open);
         }
     }
 }
@@ -453,6 +473,11 @@ pub(crate) mod tests {
         /// The join never answers.
         settle_hangs: bool,
         settled: std::sync::atomic::AtomicU32,
+        /// The SDK's event cache, one lock every room shares: the listing
+        /// holds it across a second of reading, and admitting needs it.
+        cache: Option<tokio::sync::Mutex<()>>,
+        /// How long the host takes to answer.
+        answer_after: Duration,
     }
 
     impl Fake {
@@ -468,6 +493,8 @@ pub(crate) mod tests {
                 settle_late: std::sync::atomic::AtomicU32::new(0),
                 settle_hangs: false,
                 settled: std::sync::atomic::AtomicU32::new(0),
+                cache: None,
+                answer_after: Duration::ZERO,
             }
         }
 
@@ -496,6 +523,10 @@ pub(crate) mod tests {
             if self.listing_hangs {
                 std::future::pending::<()>().await;
             }
+            if let Some(cache) = &self.cache {
+                let _reading = cache.lock().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             self.here.then(|| room("!here:example.org"))
         }
 
@@ -512,6 +543,7 @@ pub(crate) mod tests {
         }
 
         async fn answer(&self) -> Answer {
+            tokio::time::sleep(self.answer_after).await;
             let next = self.answers.lock().expect("answers").pop_front();
             match next {
                 Some(answer) => answer,
@@ -531,6 +563,9 @@ pub(crate) mod tests {
         }
 
         async fn admit(&self, room: &RoomId) -> Option<OwnedRoomId> {
+            if let Some(cache) = &self.cache {
+                let _reading = cache.lock().await;
+            }
             Some(room.to_owned())
         }
     }
@@ -668,5 +703,23 @@ pub(crate) mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the request went first"
         );
+    }
+
+    /// A listing caught in the middle of a room's read holds the event
+    /// cache every room shares; the answered room's admission waits on it,
+    /// so the listing is still driven while the answered room settles and
+    /// the DM opens once that read ends, not at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_holding_the_cache_does_not_starve_the_answered_room() {
+        let dm = room("!dm:example.org");
+        let mut port = Fake {
+            cache: Some(tokio::sync::Mutex::new(())),
+            answer_after: Duration::from_millis(100),
+            ..Fake::new()
+        }
+        .answering(Answer::Room(dm.clone()));
+        let asked = Instant::now();
+        assert_eq!(open_within(&mut port, asked + MAIN_DM_WAIT).await, Ok(dm));
+        assert!(asked.elapsed() < LOOK_AGAIN, "{:?}", asked.elapsed());
     }
 }

@@ -1,0 +1,9 @@
+-- The sessions an actor is a member of, most recently active first: the
+-- session list a replica draws from its `member:<actor_id>` window and the
+-- `session:<id>` windows that follow from it.
+query memberSessions(actorId: string) {
+  select sessions.id, sessions.title, sessions.status, sessions.agent_actor, sessions.parent_session, sessions.archived, sessions.heard_until, sessions.created_at_ms, sessions.last_activity_ms, session_members.role, session_members.reads_trace, session_members.read_until
+  from session_members join sessions on sessions.id = session_members.session_id
+  where session_members.actor_id = :actorId
+  order by sessions.last_activity_ms desc, sessions.id desc;
+}

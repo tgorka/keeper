@@ -2,7 +2,7 @@
 //!
 //! This module owns **every** recovery/backup SDK call, the `RecoveryState`, and
 //! all secret-storage / backup key material for an account. It goes through
-//! matrix-sdk 0.18's high-level [`Recovery`] API exclusively
+//! matrix-sdk 0.19's high-level [`Recovery`] API exclusively
 //! (`client.encryption().recovery()`) — never the low-level `backups()` /
 //! `secret_storage()` layers, which the SDK docs forbid mixing.
 //!

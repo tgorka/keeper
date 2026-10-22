@@ -430,19 +430,57 @@ pub async fn redact(
 /// `local_echo_send_handle()`, and calls `unwedge()` — re-driving the *existing*
 /// request in place (same `unique_id`, no duplicate bubble). Because it feeds no
 /// new content, it does not touch the single-gate invariant.
+///
+/// The item may instead be this account's own message whose queued deletion
+/// the server refused: the SDK gives a redaction no `unwedge`, so its request
+/// is aborted (the message shows again) and the deletion is queued anew
+/// through [`redact`], the one redaction gate.
 pub async fn retry(timeline: &Timeline, item_key: &str) -> Result<(), SendError> {
     let items = timeline.items().await;
-    let handle = items
+    let event = items
         .iter()
         .find(|item| item.unique_id().0 == item_key)
         .and_then(|item| item.as_event())
-        .and_then(|ev| ev.local_echo_send_handle())
         .ok_or(SendError::EchoNotFound)?;
+    if let Some(handle) = event.local_echo_send_handle() {
+        return handle
+            .unwedge()
+            .await
+            .map_err(|e| SendError::Dispatch(e.to_string()));
+    }
+    let (handle, reason) = queued_redaction(timeline, event)
+        .await
+        .ok_or(SendError::EchoNotFound)?;
+    drop(items);
     handle
-        .unwedge()
+        .abort()
         .await
         .map_err(|e| SendError::Dispatch(e.to_string()))?;
-    Ok(())
+    // The SDK stops a room's queue at any failed request; the refused one is
+    // gone now, so the room sends again.
+    timeline.room().send_queue().set_enabled(true);
+    redact(timeline, item_key, reason.as_deref()).await
+}
+
+/// This account's queued deletion of `event` and its reason, while the send
+/// queue still holds it: the handle the timeline item does not expose.
+async fn queued_redaction(
+    timeline: &Timeline,
+    event: &matrix_sdk_ui::timeline::EventTimelineItem,
+) -> Option<(matrix_sdk::send_queue::SendRedactionHandle, Option<String>)> {
+    use matrix_sdk::send_queue::LocalEchoContent;
+    event.redaction_send_state()?;
+    let event_id = event.event_id()?;
+    let (echoes, _updates) = timeline.room().send_queue().subscribe().await.ok()?;
+    echoes.into_iter().find_map(|echo| match echo.content {
+        LocalEchoContent::Redaction {
+            redacts,
+            reason,
+            send_handle,
+            ..
+        } if redacts == event_id => Some((send_handle, reason)),
+        _ => None,
+    })
 }
 
 /// The sole media-dispatch gate (FR-41, AD-13, Story 3.7, FR-13): enqueue an
@@ -497,20 +535,36 @@ pub async fn submit_attachment(
 /// aborted (the SDK emits a `CancelledLocalEvent` diff that removes the echo);
 /// `Ok(false)` means it had already been dispatched — a no-op that leaves the
 /// message sent. Feeds no new content, so it does not touch the single-gate rule.
+///
+/// On this account's own message whose deletion is still queued, it aborts
+/// the deletion instead: the message shows again, and the room's later sends,
+/// which wait behind a refused request, go on.
 pub async fn cancel(timeline: &Timeline, item_key: &str) -> Result<(), SendError> {
     let items = timeline.items().await;
-    let handle = items
+    let event = items
         .iter()
         .find(|item| item.unique_id().0 == item_key)
         .and_then(|item| item.as_event())
-        .and_then(|ev| ev.local_echo_send_handle())
         .ok_or(SendError::EchoNotFound)?;
     // Best-effort: `Ok(false)` (already dispatched) is not an error — the message
-    // simply stays sent.
+    // simply stays sent, or deleted.
+    if let Some(handle) = event.local_echo_send_handle() {
+        handle
+            .abort()
+            .await
+            .map_err(|e| SendError::Upload(e.to_string()))?;
+        return Ok(());
+    }
+    let (handle, _reason) = queued_redaction(timeline, event)
+        .await
+        .ok_or(SendError::EchoNotFound)?;
     handle
         .abort()
         .await
-        .map_err(|e| SendError::Upload(e.to_string()))?;
+        .map_err(|e| SendError::Dispatch(e.to_string()))?;
+    // The SDK stops a room's queue at any failed request; the refused one is
+    // gone now, so the room sends again.
+    timeline.room().send_queue().set_enabled(true);
     Ok(())
 }
 

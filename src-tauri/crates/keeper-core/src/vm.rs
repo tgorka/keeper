@@ -1432,6 +1432,13 @@ pub enum TimelineItemVm {
         /// The event origin timestamp: ms since the Unix epoch (UTC).
         #[ts(type = "number")]
         timestamp: i64,
+        /// Where this account's own deletion of it stands: the send queue
+        /// carries it, so it may not have reached the server yet. `Sending`
+        /// is not deleted yet; `Failed` was refused — the message is still on
+        /// the server, and Retry or Cancel (which restores it) resolve it, as
+        /// the room's later sends wait behind it; `Sent` and `null` (someone
+        /// else's deletion, or one the server confirmed) are deleted.
+        send_state: Option<SendState>,
     },
     /// An approval request an agent of this session room sent (93.3): drawn
     /// as its card, whose content and state ride beside the stream in

@@ -212,7 +212,7 @@ pub async fn endpoint_of(
     bot: Option<&str>,
 ) -> Result<Endpoint, AgentError> {
     let token = credential(env, &row.provider.id, bot).await?;
-    Ok(Endpoint::new(&row.provider, bot, token))
+    Ok(row.provider.endpoint(bot, token))
 }
 
 /// The silence budget for one provider: its override, or the policy default.

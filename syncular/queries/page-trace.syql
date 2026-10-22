@@ -1,0 +1,22 @@
+-- A month of one session's trace rows, oldest first: the reads a reader's
+-- window over `trace:<session_id>/<yyyy-mm>` answers.
+sync query pageReasoning(pageKey: string) {
+  select id, session_id, page_key, turn_id, seq, compacted, text, created_at_ms, author_actor, author_client
+  from reasoning
+  where reasoning.page_key = :pageKey
+  order by created_at_ms, id;
+}
+
+sync query pageToolCalls(pageKey: string) {
+  select id, session_id, page_key, turn_id, name, args, status, result, result_blob, started_at_ms, ended_at_ms, created_at_ms, author_actor, author_client
+  from tool_calls
+  where tool_calls.page_key = :pageKey
+  order by created_at_ms, id;
+}
+
+sync query pageApprovals(pageKey: string) {
+  select id, session_id, page_key, tool_call_id, tier, binding_digest, summary, approvers, state, decided_by_actor, decided_by_client, consumed_by_client, expires_at_ms, created_at_ms, author_actor, author_client
+  from approvals
+  where approvals.page_key = :pageKey
+  order by created_at_ms, id;
+}

@@ -1,0 +1,22 @@
+-- One month of one session's messages older than a (created_at_ms, id)
+-- cursor, newest first, at most pageSize rows and never more than 10,000.
+-- The read-only path for an archived session: a client that does not hold
+-- the month runs it as a registered remote query; a client that holds it
+-- reads its replica. The first page passes the cursor (9007199254740991, '').
+--
+-- Written in the SQL both SQLite and Postgres run: a registered query
+-- executes this text on the server's Postgres, and SYQL's own `limit`
+-- declaration lowers to SQLite's scalar min().
+sync query sessionPage(
+  pageKey: string,
+  beforeMs: integer,
+  beforeId: string,
+  pageSize: integer,
+) {
+  select id, session_id, page_key, turn_id, role, body, body_blob, metadata, created_at_ms, author_actor, author_client
+  from messages
+  where messages.page_key = :pageKey
+    and(messages.created_at_ms < :beforeMs or(messages.created_at_ms = :beforeMs and messages.id < :beforeId))
+  order by created_at_ms desc, id desc
+  limit case when :pageSize between 1 and 10000 then :pageSize else 10000 end;
+}
