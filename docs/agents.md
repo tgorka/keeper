@@ -599,7 +599,13 @@ picked, not when its bytes have been read: until every file of that paste or pic
 Send is disabled, Enter does nothing and the composer says *Reading the file to send…*; the
 batch then joins the tray whole, so a caption never leaves before its file and no message
 carries part of a multi-file paste. A failed read adds none of that batch and says so
-(R1071C-04).
+(R1071C-04). Each batch still being read shows as a *reading…* chip beside the tray, with a
+remove control; removing it, or pressing Escape in the composer, drops that batch (Escape
+drops all of them) and releases its hold on Send while the caption stays. A read still
+pending after `FILE_READ_TIMEOUT_MS` (60 s) fails like a failed read, with the same
+sentence. A dropped or failed batch's read that finishes later adds nothing: only a batch
+still pending when its read lands joins the tray, and every other batch keeps holding Send
+(R1071C-05).
 
 A message chip is a keyboard-reachable Open button: file icon, wrapping filename,
 Rust's size label and state beneath it. Its refusal sentence sits immediately below,

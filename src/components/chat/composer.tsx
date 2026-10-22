@@ -231,6 +231,26 @@ const DRAFT_MIRROR_DEBOUNCE_MS = 1000;
 export const DRAFT_NOT_SAVED =
   "keeper couldn't save this draft, so it is kept only while this chat stays open.";
 
+/**
+ * How long a pasted or picked batch may take to be read before it fails with its read-error
+ * sentence and stops holding Send (R1071C-05). Generous: a large file or a photo the webview
+ * re-encodes takes seconds, and the person can cancel the batch sooner from its chip or Escape.
+ */
+export const FILE_READ_TIMEOUT_MS = 60_000;
+
+/** A pasted or picked batch still being read: its tray chip and the way to drop it. */
+interface ReadingBatch {
+  id: number;
+  label: string;
+  /** Settles the batch's read as cancelled: whatever its files resolve to later is ignored. */
+  cancel: () => void;
+}
+
+/** What a batch's chip says it is reading: its one file's name, or how many files. */
+function batchLabel(files: readonly File[], fallback: string): string {
+  return files.length === 1 ? files[0].name || fallback : `${files.length} files`;
+}
+
 export function Composer({
   transport = "matrix",
   accountId,
@@ -273,9 +293,13 @@ export function Composer({
   const [cameraOpen, setCameraOpen] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
   // Batches of files still being read (a paste, a photo pick): counted from before the first
-  // read, so Send waits for each batch to reach the tray whole (R1071C-04).
-  const reads = useRef(0);
-  const [reading, setReading] = useState(false);
+  // read, so Send waits for each batch to reach the tray whole (R1071C-04). Each one shows a
+  // chip that cancels it, Escape cancels them all, and FILE_READ_TIMEOUT_MS fails a stuck one,
+  // so no read holds Send forever (R1071C-05). The ref answers synchronous gates; the state
+  // renders.
+  const readingRef = useRef<readonly ReadingBatch[]>([]);
+  const [reading, setReading] = useState<readonly ReadingBatch[]>([]);
+  const nextBatch = useRef(0);
   const captureInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
   // The remote (cross-device) draft body currently offered as a local-wins conflict
@@ -750,7 +774,7 @@ export function Composer({
     (draft.trim().length > 0 || (hasAttachments && pending?.mode !== "edit")) &&
     !disabled &&
     !sending &&
-    !reading;
+    reading.length === 0;
 
   /**
    * Dispatch the draft into `context`, the room and reply/edit it was submitted
@@ -778,7 +802,12 @@ export function Composer({
     const trayAttachments = tray.getState().pending;
     const dispatchAttachments =
       message === undefined && onSendAttachments != null && !wasEdit && trayAttachments.length > 0;
-    if ((body.length === 0 && !dispatchAttachments) || disabled || sending || reads.current > 0) {
+    if (
+      (body.length === 0 && !dispatchAttachments) ||
+      disabled ||
+      sending ||
+      readingRef.current.length > 0
+    ) {
       // Whitespace-only with no attachment / disabled / in-flight / a pasted or picked file
       // still being read (it belongs to this message, R1071C-04): never dispatch.
       return;
@@ -997,7 +1026,7 @@ export function Composer({
    * room and reply/edit are fixed here, synchronously, and travel with it (R411).
    */
   function submit() {
-    if (inFlight.current || disabled || sending || reads.current > 0) {
+    if (inFlight.current || disabled || sending || readingRef.current.length > 0) {
       return;
     }
     inFlight.current = true;
@@ -1108,19 +1137,63 @@ export function Composer({
   }
 
   /**
+   * Stop holding Send for batch `id`. Returns whether it was still pending: `false` means it was
+   * already cancelled, timed out or landed, and whatever its read comes to is no longer wanted.
+   */
+  function settleBatch(id: number): boolean {
+    const before = readingRef.current;
+    const after = before.filter((batch) => batch.id !== id);
+    if (after.length === before.length) {
+      return false;
+    }
+    readingRef.current = after;
+    setReading(after);
+    return true;
+  }
+
+  /** Drop a batch still being read (its chip's remove control, or Escape): nothing of it joins. */
+  function cancelReading(batch: ReadingBatch) {
+    if (settleBatch(batch.id)) {
+      batch.cancel();
+    }
+  }
+
+  /**
    * Read a batch of files into the tray, whole or not at all. The batch is pending from before
    * its first read until it lands, and Send waits for every pending batch: a caption pasted with
    * a file never leaves without it, and no message carries part of a pasted or picked batch
-   * (R1071C-04). A failed read adds none of the batch and says so; what was read is dropped.
+   * (R1071C-04). A failed read adds none of the batch and throws for the caller to say so; what
+   * was read is dropped. A batch that is cancelled resolves quietly and adds nothing, even when
+   * its read finishes later; one still unread after FILE_READ_TIMEOUT_MS fails like a failed
+   * read (R1071C-05).
    */
-  async function readIntoTray(read: () => Promise<PendingAttachment[]>) {
-    reads.current += 1;
-    setReading(true);
+  async function readIntoTray(label: string, read: () => Promise<PendingAttachment[]>) {
+    const id = nextBatch.current++;
+    let cancel = () => {};
+    const cancelled = new Promise<null>((resolve) => {
+      cancel = () => resolve(null);
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`the file read took longer than ${FILE_READ_TIMEOUT_MS} ms`)),
+        FILE_READ_TIMEOUT_MS,
+      );
+    });
+    readingRef.current = [...readingRef.current, { id, label, cancel }];
+    setReading(readingRef.current);
     try {
-      tray.getState().addMany(await read());
+      const files = await Promise.race([read(), cancelled, deadline]);
+      // Only a batch nobody cancelled joins; a cancelled one's late bytes go nowhere.
+      if (settleBatch(id) && files !== null) {
+        tray.getState().addMany(files);
+      }
+    } catch (raw) {
+      if (settleBatch(id)) {
+        throw raw;
+      }
     } finally {
-      reads.current -= 1;
-      setReading(reads.current > 0);
+      clearTimeout(timer);
     }
   }
 
@@ -1128,7 +1201,7 @@ export function Composer({
     const files = Array.from(input.files ?? []);
     setPhotoError(null);
     try {
-      await readIntoTray(async () => {
+      await readIntoTray(batchLabel(files, "photo"), async () => {
         const read: PendingAttachment[] = [];
         for (const file of files) {
           // A HEIC or other picture a model is not shown goes as JPEG when this
@@ -1179,7 +1252,9 @@ export function Composer({
         scheduleDraftSave(next);
       }
     }
-    void readIntoTray(async () => {
+    // A new paste retires an earlier read's failure or timeout, as a new photo pick does.
+    setPhotoError(null);
+    void readIntoTray(batchLabel(files, "pasted file"), async () => {
       const read: PendingAttachment[] = [];
       for (const file of files) {
         read.push({
@@ -1219,6 +1294,15 @@ export function Composer({
     // The open slash menu claims ↑/↓/Enter/Tab/Escape first; everything it does
     // not claim — and every key while it is closed — keeps its meaning below.
     if (menu.onKeyDown(e) || inline.onKeyDown(e)) {
+      return;
+    }
+    if (e.key === "Escape" && readingRef.current.length > 0) {
+      // Esc first drops every batch still being read (R1071C-05); the caption stays, and a
+      // second Esc cancels a pending reply/edit.
+      e.preventDefault();
+      for (const batch of readingRef.current) {
+        cancelReading(batch);
+      }
       return;
     }
     if (e.key === "Escape" && pending) {
@@ -1334,6 +1418,38 @@ export function Composer({
                   className={cn(transport === "session" && "size-11 shrink-0")}
                   disabled={sending}
                   onClick={() => removeAttachment(attachment.id)}
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </Button>
+              </IconHint>
+            </li>
+          ))}
+        </ul>
+      )}
+      {/* Batches still being read (R1071C-04/-05): not yet sendable, so not in the tray above,
+          but each is visible and can be dropped; Send waits for the rest. */}
+      {reading.length > 0 && (
+        <ul aria-label="Files being read" className="flex min-w-0 flex-wrap gap-1.5">
+          {reading.map((batch) => (
+            <li
+              key={batch.id}
+              className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border border-dashed bg-muted/30 py-1 pr-1 pl-2"
+            >
+              <span
+                className="min-w-0 flex-1 break-words text-xs [overflow-wrap:anywhere]"
+                title={batch.label}
+              >
+                {batch.label}
+              </span>
+              <span className="shrink-0 text-muted-foreground text-xs">reading…</span>
+              <IconHint label={`Cancel reading ${batch.label}`}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Cancel reading ${batch.label}`}
+                  className={cn(transport === "session" && "size-11 shrink-0")}
+                  onClick={() => cancelReading(batch)}
                 >
                   <X aria-hidden="true" className="size-3" />
                 </Button>
@@ -1519,7 +1635,7 @@ export function Composer({
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
-      {reading && (
+      {reading.length > 0 && (
         <p role="status" className="text-muted-foreground text-xs">
           Reading the file to send…
         </p>

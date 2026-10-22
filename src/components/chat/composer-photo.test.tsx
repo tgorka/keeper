@@ -141,7 +141,9 @@ describe("Composer photos", () => {
       expect(screen.queryByRole("list", { name: "Pending attachments" })).toBeNull(),
     );
     fireEvent.change(input, { target: { files: [file] } });
-    expect(await screen.findByText("garden.jpg")).toBeInTheDocument();
+    // The name shows on its reading chip first (R1071C-05); the tray is where it lands.
+    const tray = await screen.findByRole("list", { name: "Pending attachments" });
+    expect(within(tray).getByText("garden.jpg")).toBeInTheDocument();
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 

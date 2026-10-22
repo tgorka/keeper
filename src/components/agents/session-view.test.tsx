@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionView } from "@/components/agents/session-view";
+import { FILE_READ_TIMEOUT_MS } from "@/components/chat/composer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentSessionViewVm } from "@/lib/ipc/client";
@@ -295,6 +296,94 @@ describe("session composer attachments", () => {
       ["h1", "h2"],
       undefined,
     );
+  });
+
+  /** After a cancelled or failed batch: its late read adds nothing, and the text sends alone. */
+  async function lateReadAddsNothingAndTextSends(finish: () => Promise<void>, text: string) {
+    await finish();
+    expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Files being read" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(mock.send).toHaveBeenCalledOnce());
+    expect(mock.send).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, text);
+    expect(mock.bytes).not.toHaveBeenCalled();
+    expect(mock.commit).not.toHaveBeenCalled();
+  }
+
+  it("drops a stuck pasted file from its reading chip; its late read adds nothing (R1071C-05)", async () => {
+    await draw();
+    const held = pasteHeld(["held-never.csv"], "Original caption");
+    const reading = screen.getByRole("list", { name: "Files being read" });
+    expect(within(reading).getByText("held-never.csv")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel reading held-never.csv" }));
+    expect(screen.queryByRole("list", { name: "Files being read" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Original caption");
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+    await lateReadAddsNothingAndTextSends(() => held.finish(0), "Original caption");
+  });
+
+  it("drops every stuck read on Escape and keeps the caption (R1071C-05)", async () => {
+    await draw();
+    const held = pasteHeld(["held-never.csv"], "Escaped caption");
+    const field = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(screen.queryByRole("list", { name: "Files being read" })).not.toBeInTheDocument();
+    expect(field).toHaveValue("Escaped caption");
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+    await lateReadAddsNothingAndTextSends(() => held.finish(0), "Escaped caption");
+  });
+
+  it("cancelling one stuck read leaves another still holding Send (R1071C-05)", async () => {
+    await draw();
+    const abandoned = pasteHeld(["abandoned.csv"], "Only the kept file");
+    const kept = pasteHeld(["kept.csv"]);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel reading abandoned.csv" }));
+    // kept.csv is still being read: the caption must not leave without it (R1071C-04).
+    expect(screen.getByRole("button", { name: "Cancel reading kept.csv" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Message" }), { key: "Enter" });
+    await act(async () => {});
+    expect(mock.send).not.toHaveBeenCalled();
+    await kept.finish(0);
+    await abandoned.finish(0);
+    const tray = screen.getByRole("list", { name: "Pending attachments" });
+    expect(within(tray).getAllByRole("listitem")).toHaveLength(1);
+    expect(within(tray).getByText("kept.csv")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(mock.commit).toHaveBeenCalledOnce());
+    expect(mock.bytes).toHaveBeenCalledOnce();
+    expect(mock.commit).toHaveBeenCalledWith(
+      { database: "beta", sessionId: "same.1" },
+      ["h1"],
+      "Only the kept file",
+    );
+    expect(mock.send).not.toHaveBeenCalled();
+  });
+
+  it("fails a read still pending after the timeout with the read-error sentence (R1071C-05)", async () => {
+    await draw();
+    vi.useFakeTimers();
+    const held = pasteHeld(["slow.csv"], "Timed caption");
+    try {
+      await act(async () => vi.advanceTimersByTimeAsync(FILE_READ_TIMEOUT_MS - 1));
+      expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "keeper couldn't read the pasted file. Paste it again to retry.",
+    );
+    expect(screen.queryByRole("list", { name: "Files being read" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Timed caption");
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+    await lateReadAddsNothingAndTextSends(() => held.finish(0), "Timed caption");
+    // A later paste that reads retires the timed-out batch's sentence.
+    paste("next.csv");
+    await screen.findByRole("button", { name: "Remove next.csv" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("retains a new drop that arrives during a send and releases the native listener on close", async () => {
