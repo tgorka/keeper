@@ -272,6 +272,10 @@ export function Composer({
   const { phone } = useShellLayout();
   const [cameraOpen, setCameraOpen] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  // Batches of files still being read (a paste, a photo pick): counted from before the first
+  // read, so Send waits for each batch to reach the tray whole (R1071C-04).
+  const reads = useRef(0);
+  const [reading, setReading] = useState(false);
   const captureInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
   // The remote (cross-device) draft body currently offered as a local-wins conflict
@@ -745,7 +749,8 @@ export function Composer({
   const canSend =
     (draft.trim().length > 0 || (hasAttachments && pending?.mode !== "edit")) &&
     !disabled &&
-    !sending;
+    !sending &&
+    !reading;
 
   /**
    * Dispatch the draft into `context`, the room and reply/edit it was submitted
@@ -773,8 +778,9 @@ export function Composer({
     const trayAttachments = tray.getState().pending;
     const dispatchAttachments =
       message === undefined && onSendAttachments != null && !wasEdit && trayAttachments.length > 0;
-    if ((body.length === 0 && !dispatchAttachments) || disabled || sending) {
-      // Whitespace-only with no attachment / disabled / in-flight: never dispatch.
+    if ((body.length === 0 && !dispatchAttachments) || disabled || sending || reads.current > 0) {
+      // Whitespace-only with no attachment / disabled / in-flight / a pasted or picked file
+      // still being read (it belongs to this message, R1071C-04): never dispatch.
       return;
     }
     // A dispatch consumes/replaces the composer content; a late mount restore must not
@@ -991,7 +997,7 @@ export function Composer({
    * room and reply/edit are fixed here, synchronously, and travel with it (R411).
    */
   function submit() {
-    if (inFlight.current || disabled || sending) {
+    if (inFlight.current || disabled || sending || reads.current > 0) {
       return;
     }
     inFlight.current = true;
@@ -1101,21 +1107,37 @@ export function Composer({
     }
   }
 
+  /**
+   * Read a batch of files into the tray, whole or not at all. The batch is pending from before
+   * its first read until it lands, and Send waits for every pending batch: a caption pasted with
+   * a file never leaves without it, and no message carries part of a pasted or picked batch
+   * (R1071C-04). A failed read adds none of the batch and says so; what was read is dropped.
+   */
+  async function readIntoTray(read: () => Promise<PendingAttachment[]>) {
+    reads.current += 1;
+    setReading(true);
+    try {
+      tray.getState().addMany(await read());
+    } finally {
+      reads.current -= 1;
+      setReading(reads.current > 0);
+    }
+  }
+
   async function readPhotos(input: HTMLInputElement) {
     const files = Array.from(input.files ?? []);
     setPhotoError(null);
     try {
-      for (const file of files) {
-        // A HEIC or other picture a model is not shown goes as JPEG when this
-        // webview can decode it, else as it is (R444/05).
-        const photo = await asShownPhoto(file, file.name || photoFilename());
-        tray.getState().add({
-          id: attachmentId(),
-          kind: "bytes",
-          ...photo,
-          size: photo.bytes.byteLength,
-        });
-      }
+      await readIntoTray(async () => {
+        const read: PendingAttachment[] = [];
+        for (const file of files) {
+          // A HEIC or other picture a model is not shown goes as JPEG when this
+          // webview can decode it, else as it is (R444/05).
+          const photo = await asShownPhoto(file, file.name || photoFilename());
+          read.push({ id: attachmentId(), kind: "bytes", ...photo, size: photo.bytes.byteLength });
+        }
+        return read;
+      });
     } catch (raw) {
       logFailure("composer.photo")(raw);
       setPhotoError("keeper couldn't read this photo. Choose it again to retry.");
@@ -1157,24 +1179,23 @@ export function Composer({
         scheduleDraftSave(next);
       }
     }
-    void (async () => {
-      try {
-        for (const file of files) {
-          const bytes = await file.arrayBuffer();
-          tray.getState().add({
-            id: attachmentId(),
-            kind: "bytes",
-            bytes,
-            filename: file.name || `pasted-file.${file.type.split("/")[1] || "bin"}`,
-            mime: file.type || "application/octet-stream",
-            size: file.size,
-          });
-        }
-      } catch (raw) {
-        logFailure("composer.paste")(raw);
-        setPhotoError("keeper couldn't read the pasted file. Paste it again to retry.");
+    void readIntoTray(async () => {
+      const read: PendingAttachment[] = [];
+      for (const file of files) {
+        read.push({
+          id: attachmentId(),
+          kind: "bytes",
+          bytes: await file.arrayBuffer(),
+          filename: file.name || `pasted-file.${file.type.split("/")[1] || "bin"}`,
+          mime: file.type || "application/octet-stream",
+          size: file.size,
+        });
       }
-    })();
+      return read;
+    }).catch((raw: unknown) => {
+      logFailure("composer.paste")(raw);
+      setPhotoError("keeper couldn't read the pasted file. Paste it again to retry.");
+    });
   }
 
   /** Remove a pending attachment (a pre-upload cancel). */
@@ -1498,6 +1519,11 @@ export function Composer({
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
+      {reading && (
+        <p role="status" className="text-muted-foreground text-xs">
+          Reading the file to send…
+        </p>
+      )}
       {photoError !== null && (
         <p role="alert" className="text-destructive text-xs">
           {photoError}

@@ -218,6 +218,85 @@ describe("session composer attachments", () => {
     expect(mock.send).not.toHaveBeenCalled();
   });
 
+  /** A paste of `names` with `text`, each file's read held until `finish(i)` (R1071C-04). */
+  function pasteHeld(names: string[], text = "") {
+    const bytes = new TextEncoder().encode("item,price\ntea,3").buffer;
+    // The executor form: the project's ES2020 lib has no Promise.withResolvers.
+    const finishers: Array<(read: ArrayBuffer) => void> = [];
+    const reads = names.map(
+      () =>
+        new Promise<ArrayBuffer>((resolve) => {
+          finishers.push(resolve);
+        }),
+    );
+    const files = names.map((name, i) => ({
+      kind: "file",
+      type: "text/csv",
+      getAsFile: () => ({
+        name,
+        type: "text/csv",
+        size: bytes.byteLength,
+        arrayBuffer: () => reads[i],
+      }),
+    }));
+    const plain =
+      text === "" ? [] : [{ kind: "string", type: "text/plain", getAsFile: () => null }];
+    fireEvent.paste(screen.getByRole("textbox", { name: "Message" }), {
+      clipboardData: {
+        items: [...files, ...plain],
+        getData: (type: string) => (type === "text/plain" ? text : ""),
+      },
+    });
+    return { finish: (i: number) => act(async () => finishers[i](bytes)) };
+  }
+
+  it("holds Send while a pasted file is still being read, then sends its caption with it as one message", async () => {
+    await draw();
+    const held = pasteHeld(["delayed.csv"], "Explain these prices");
+    const field = screen.getByRole("textbox", { name: "Message" });
+    expect(field).toHaveValue("Explain these prices");
+    expect(screen.getByRole("status")).toHaveTextContent("Reading the file to send…");
+    // Neither the button nor Enter sends the caption without its file.
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    fireEvent.keyDown(field, { key: "Enter" });
+    await act(async () => {});
+    expect(mock.send).not.toHaveBeenCalled();
+    expect(mock.commit).not.toHaveBeenCalled();
+    expect(field).toHaveValue("Explain these prices");
+
+    await held.finish(0);
+    await screen.findByRole("button", { name: "Remove delayed.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(mock.commit).toHaveBeenCalledOnce());
+    expect(mock.commit).toHaveBeenCalledWith(
+      { database: "beta", sessionId: "same.1" },
+      ["h1"],
+      "Explain these prices",
+    );
+    expect(mock.send).not.toHaveBeenCalled();
+  });
+
+  it("shows no part of a multi-file paste while a later file is still being read", async () => {
+    await draw();
+    const held = pasteHeld(["first.csv", "second.csv"]);
+    await held.finish(0);
+    // The first file is read; the second is not: no partial selection, nothing sendable.
+    expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    await held.finish(1);
+    await screen.findByRole("button", { name: "Remove second.csv" });
+    expect(screen.getByRole("button", { name: "Remove first.csv" })).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(mock.commit).toHaveBeenCalledOnce());
+    expect(mock.commit).toHaveBeenCalledWith(
+      { database: "beta", sessionId: "same.1" },
+      ["h1", "h2"],
+      undefined,
+    );
+  });
+
   it("retains a new drop that arrives during a send and releases the native listener on close", async () => {
     const { unmount } = await draw();
     let complete: (() => void) | undefined;

@@ -594,7 +594,12 @@ what was staged is released, and the whole selection and the caption stay for a 
 Files added during a send stay selected for the next one. A paste that carries a file and
 plain text (a screenshot with its words) stages the file and puts the text into the draft at
 the caret; plain-text-only paste is the browser's own, and text or HTML never becomes an
-attachment (R1071C-01).
+attachment (R1071C-01). A pasted or picked file is selected from the moment it is pasted or
+picked, not when its bytes have been read: until every file of that paste or pick is read,
+Send is disabled, Enter does nothing and the composer says *Reading the file to send…*; the
+batch then joins the tray whole, so a caption never leaves before its file and no message
+carries part of a multi-file paste. A failed read adds none of that batch and says so
+(R1071C-04).
 
 A message chip is a keyboard-reachable Open button: file icon, wrapping filename,
 Rust's size label and state beneath it. Its refusal sentence sits immediately below,

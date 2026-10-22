@@ -164,6 +164,45 @@ describe("Composer photos", () => {
       }),
     ]);
   });
+
+  it("holds Send while chosen photos are still being read and adds them all at once (R1071C-04)", async () => {
+    layout.phone = true;
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: undefined });
+    const send = mountComposer();
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "My garden" } });
+    const finishers: Array<() => void> = [];
+    const photo = (name: string) => {
+      const bytes = new Uint8Array([10, 20, 30]).buffer;
+      const file = new File([bytes], name, { type: "image/jpeg" });
+      const read = new Promise<ArrayBuffer>((resolve) => {
+        finishers.push(() => resolve(bytes));
+      });
+      Object.defineProperty(file, "arrayBuffer", { value: () => read });
+      return file;
+    };
+    const input = screen.getByLabelText<HTMLInputElement>("Choose photo files");
+    fireEvent.change(input, { target: { files: [photo("one.jpg"), photo("two.jpg")] } });
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await act(async () => finishers[0]());
+    expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    expect(send).not.toHaveBeenCalled();
+    await act(async () => finishers[1]());
+    const tray = await screen.findByRole("list", { name: "Pending attachments" });
+    expect(within(tray).getByText("one.jpg")).toBeInTheDocument();
+    expect(within(tray).getByText("two.jpg")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({ filename: "one.jpg" }),
+          expect.objectContaining({ filename: "two.jpg" }),
+        ],
+        undefined,
+      ),
+    );
+  });
 });
 
 it("stops the old camera on device change and releases a replacement arriving after close", async () => {
