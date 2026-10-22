@@ -186,13 +186,22 @@ pub fn stage_path(path: &Path) -> Result<StagedFile, AttachError> {
     Ok(StagedFile { name, mime, bytes })
 }
 
+/// Refuse `bytes` bytes named `name` when they pass the bound, with
+/// [`too_large`]'s sentence. A caller that holds a body it has not copied yet
+/// (the shell's raw IPC body) asks this first, so an oversized paste is
+/// refused before anything allocates a second copy of it.
+pub fn within_bound(name: &str, bytes: u64) -> Result<(), AttachError> {
+    if bytes > ATTACHMENT_MAX_BYTES {
+        return Err(AttachError::TooLarge(too_large(&file_name(name), bytes)));
+    }
+    Ok(())
+}
+
 /// Stage pasted `bytes` named `name`, of type `mime` (guessed from the name
 /// when blank).
 pub fn stage_bytes(name: &str, mime: &str, bytes: Vec<u8>) -> Result<StagedFile, AttachError> {
+    within_bound(name, bytes.len() as u64)?;
     let name = file_name(name);
-    if bytes.len() as u64 > ATTACHMENT_MAX_BYTES {
-        return Err(AttachError::TooLarge(too_large(&name, bytes.len() as u64)));
-    }
     let mime = match mime.trim() {
         "" => mime_guess::from_path(&name)
             .first_or_octet_stream()

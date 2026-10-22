@@ -493,13 +493,25 @@ pub async fn agent_attach_path(
     .await
 }
 
-/// Attach a pasted file to a new message in a session. Its bytes ride as a
-/// raw IPC body (`InvokeBody::Raw`, never base64 or JSON), as
-/// `send_attachment_bytes`'s do; `x-database`, `x-session-id`, `x-mime`,
-/// and the percent-encoded `x-filename` and `x-caption` ride in headers.
-#[tauri::command]
-pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<(), IpcError> {
-    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+/// A pasted attachment as `agent_attach_bytes` receives it, read and
+/// checked: its body copied out of the request only once its length is
+/// within the contract's bound, so an oversized paste is refused with
+/// core's sentence before a second copy of it is allocated.
+#[derive(Debug)]
+struct RawAttachment {
+    database: String,
+    session_id: String,
+    mime: String,
+    name: String,
+    caption: String,
+    bytes: Vec<u8>,
+}
+
+fn raw_attachment(
+    body: &tauri::ipc::InvokeBody,
+    headers: &tauri::http::HeaderMap,
+) -> Result<RawAttachment, IpcError> {
+    let tauri::ipc::InvokeBody::Raw(borrowed) = body else {
         return Err(IpcError {
             code: IpcErrorCode::Internal,
             message: "a pasted attachment must be sent as a raw binary body".to_owned(),
@@ -507,14 +519,38 @@ pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<(), 
             retriable: false,
         });
     };
-    let bytes = bytes.clone();
-    let headers = request.headers();
+    let name =
+        crate::ipc::decode_header(headers, "x-filename").unwrap_or_else(|| "pasted".to_owned());
+    keeper_core::hq::attachments::within_bound(&name, borrowed.len() as u64)
+        .map_err(|refused| error(HqError::Sentence(refused.to_string())))?;
     let database = crate::ipc::required_header(headers, "x-database")?;
     let session_id = crate::ipc::required_header(headers, "x-session-id")?;
     let mime = crate::ipc::required_header(headers, "x-mime").unwrap_or_default();
-    let name =
-        crate::ipc::decode_header(headers, "x-filename").unwrap_or_else(|| "pasted".to_owned());
     let caption = crate::ipc::decode_header(headers, "x-caption").unwrap_or_default();
+    Ok(RawAttachment {
+        database,
+        session_id,
+        mime,
+        name,
+        caption,
+        bytes: borrowed.clone(),
+    })
+}
+
+/// Attach a pasted file to a new message in a session. Its bytes ride as a
+/// raw IPC body (`InvokeBody::Raw`, never base64 or JSON), as
+/// `send_attachment_bytes`'s do; `x-database`, `x-session-id`, `x-mime`,
+/// and the percent-encoded `x-filename` and `x-caption` ride in headers.
+#[tauri::command]
+pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<(), IpcError> {
+    let RawAttachment {
+        database,
+        session_id,
+        mime,
+        name,
+        caption,
+        bytes,
+    } = raw_attachment(request.body(), request.headers())?;
     blocking(move |hq| {
         hq.attach_bytes(
             &session(database, session_id),
@@ -761,4 +797,57 @@ pub fn agent_instances_unsubscribe(subscription_id: String) {
 #[tauri::command]
 pub async fn agent_instances_set(agent_actor: String, order: Vec<String>) -> Result<(), IpcError> {
     blocking(move |hq| hq.set_agent_instances(&agent_actor, &order)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keeper_core::hq::attachments::{too_large, ATTACHMENT_MAX_BYTES};
+
+    fn headers(pairs: &[(&'static str, &str)]) -> tauri::http::HeaderMap {
+        let mut headers = tauri::http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().expect("a header value"));
+        }
+        headers
+    }
+
+    #[test]
+    fn a_paste_over_the_bound_is_refused_with_cores_sentence_and_a_valid_one_is_read_whole() {
+        let over = usize::try_from(ATTACHMENT_MAX_BYTES).expect("fits") + 1;
+        let body = tauri::ipc::InvokeBody::Raw(vec![0u8; over]);
+        // Non-ASCII, percent-encoded: "café.zip". No database header: the
+        // bound is checked before anything else is read.
+        let refused = raw_attachment(&body, &headers(&[("x-filename", "caf%C3%A9.zip")]))
+            .expect_err("over the bound");
+        assert_eq!(
+            refused.message,
+            too_large("café.zip", ATTACHMENT_MAX_BYTES + 1)
+        );
+
+        let body = tauri::ipc::InvokeBody::Raw(b"tea,3\n".to_vec());
+        let read = raw_attachment(
+            &body,
+            &headers(&[
+                ("x-database", "alpha"),
+                ("x-session-id", "dev1.1"),
+                ("x-mime", "text/csv"),
+                ("x-filename", "pr%C3%ADces.csv"),
+                ("x-caption", "what%20costs%20more%3F"),
+            ]),
+        )
+        .expect("within the bound");
+        assert_eq!(read.database, "alpha");
+        assert_eq!(read.session_id, "dev1.1");
+        assert_eq!(read.mime, "text/csv");
+        assert_eq!(read.name, "príces.csv");
+        assert_eq!(read.caption, "what costs more?");
+        assert_eq!(read.bytes, b"tea,3\n");
+
+        let json = tauri::ipc::InvokeBody::Json(serde_json::json!({}));
+        assert!(
+            raw_attachment(&json, &headers(&[])).is_err(),
+            "not a raw body"
+        );
+    }
 }
