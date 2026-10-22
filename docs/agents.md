@@ -439,19 +439,31 @@ remove first (`hq::push::Fold`): those on the lock screen, those of the extensio
 arrived before it and those it handed iOS whenever they arrived, waiting until the deadline for
 the ones not there yet. iOS's expiry asks Rust too, at once and outside the serial queue, so
 the fallback removes the item's others instead of waiting behind the read that used the time
-up. A removal is kept until the extension sees the notification gone, and every later answer
-names it again meanwhile. A re-posted *Open keeper to finish deciding.* keeps the key too.
+up. Being named is not being handed (R1066K-07): an earlier delivery the fallback named while
+its read was still going shows when that read ends, and removes the fallback, so the one
+handed iOS last is the one left. A removal is kept until the extension sees the notification
+gone, and every later answer names it again meanwhile. A re-posted *Open keeper to finish
+deciding.* keeps the key too.
 
 This is best effort, not a guarantee: the record is the extension process's, a removal only
 applies to a notification already on the lock screen, and iOS may end an extension before it
 acts. **Proposed deferred work** (number to be assigned by the coordinator): *item-level
-collapse on the APNs request.* The push that reaches APNs carries `apns-collapse-id` = the item
-key, so iOS itself keeps one notification per item whatever the extension managed. Sygnal's APNs
+collapse on the APNs request.* The push that reaches APNs carries an `apns-collapse-id` derived
+from the item key, so iOS itself keeps one notification per item whatever the extension
+managed: `hq1-` followed by the unpadded base64url SHA-256 of the whole key
+`<database>/<kind>/<item id>` — 47 ASCII bytes for every item. Not the key itself: APNs refuses
+a collapse id over 64 bytes (`BadCollapseId`), and a valid key passes that easily (a database
+name may be 63 bytes and an item id 1024, and the id need not be ASCII). Not a truncation of it,
+nor the item id alone: two items sharing a prefix, or one id in two databases or of two kinds,
+would collapse into one notification. A digest of the full key is fixed-length, the same for
+every delivery of the item, distinct across namespaces, and computed from ids alone. Sygnal's APNs
 pushkin sends no collapse id, so this needs a gateway that sets one from the push's
 `keeper_hq` ids (a Sygnal change or a gateway of keeper's own; the agents server still sends
-ids only, D-35). The device run that proves it: on kalypso, three deliveries of one approval
-with the server blackholed (it accepts and never answers), plus one whose extension expires,
-leave exactly one notification on the lock screen.
+ids only, D-35). The runs that prove it: the gateway's tests include a key of the longest valid
+database name and a long item id (the header stays 47 bytes and APNs accepts it), and one item
+id in two databases and as two kinds (distinct collapse ids); on kalypso, three deliveries of
+one approval with the server blackholed (it accepts and never answers), plus one whose
+extension expires, leave exactly one notification on the lock screen.
 
 **An action** writes the decision row through the session's own replica, exactly as the card
 does (`Hq::decide_pushed`, `hq::approvals::decide_pushed`): the request and digest the

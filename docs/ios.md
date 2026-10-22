@@ -648,13 +648,16 @@ nothing. Each answer names the notifications with that key to remove first: thos
 lock screen, those that arrived before it and those handed iOS whenever they arrived — the
 ones not there yet awaited until the deadline (`awaits`). The expiry asks too
 (`{"hq_expired": …}`), at once and outside the serial queue, so the fallback removes the
-item's others rather than waiting behind the read that used the time up. A removal is kept
-until the Swift reports the notification gone from the lock screen (`{"hq_removed": […]}`)
-and named again meanwhile, by any later answer (`pending`). iOS names a remote notification
-itself and the gateway sends no APNs collapse id, so this is best effort and no guarantee:
+item's others rather than waiting behind the read that used the time up; an earlier delivery
+it named while still reading is not thereby finished, and when its read ends it shows and
+removes the fallback (R1066K-07). A removal is kept until the Swift reports the notification
+gone from the lock screen (`{"hq_removed": […]}`) and named again meanwhile, by any later
+answer (`pending`). iOS names a remote notification itself and the gateway sends no APNs
+collapse id, so this is best effort and no guarantee:
 the record is the extension process's, and a removal applies only to a notification already
-on the lock screen. The boundary that would guarantee it, an APNs collapse id equal to the
-item key, is proposed deferred work ([agents.md](agents.md#a-push-from-the-agents-server)).
+on the lock screen. The boundary that would guarantee it, an APNs collapse id derived from the
+item key — a fixed-length digest of it, since APNs takes at most 64 bytes and a valid key can be
+longer — is proposed deferred work ([agents.md](agents.md#a-push-from-the-agents-server)).
 
 Its memory under the 24 MB ceiling and its decryption on the phone are measured on the
 device after enrolment (98.1 #12), not here.
