@@ -46,9 +46,9 @@ use tokio::sync::watch;
 
 use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, BLOB_CACHE_MAX_BYTES};
 use crate::hq::port::{
-    Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection, Replica,
-    ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription, WindowBase,
-    WindowState, CONFLICT,
+    BlobBody, Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection,
+    Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription,
+    UploadRefusal, WindowBase, WindowState, CONFLICT,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -89,6 +89,9 @@ pub(crate) struct GatedTransport {
     /// the gate (nothing was sent), `Some(false)` when it went out and its
     /// transport failed, `Some(true)` when an answer's bytes came back.
     reached: Option<bool>,
+    /// The blob whose upload grant or `PUT` was asked for last: a round
+    /// that fails on an upload failed on this one.
+    upload: Option<String>,
 }
 
 impl GatedTransport {
@@ -165,6 +168,7 @@ impl Transport for GatedTransport {
         media_type: Option<&str>,
     ) -> Result<(), TransportError> {
         self.check()?;
+        self.upload = Some(blob_id.to_owned());
         self.inner.blob_upload(blob_id, bytes, media_type)
     }
     fn blob_download(&mut self, blob_id: &str) -> Result<BlobDownload, TransportError> {
@@ -182,6 +186,7 @@ impl Transport for GatedTransport {
         media_type: Option<&str>,
     ) -> Result<BlobUploadGrant, TransportError> {
         self.check()?;
+        self.upload = Some(blob_id.to_owned());
         self.inner
             .blob_upload_grant(blob_id, byte_length, media_type)
     }
@@ -610,6 +615,154 @@ impl BlobCache {
         self.log.forget(&dropped)?;
         Ok(dropped)
     }
+
+    /// Whether `blob_id`'s body is cached, and whether it is staged for
+    /// upload, before a commit stages it.
+    fn held(&self, blob_id: &str) -> Result<Held, rusqlite::Error> {
+        self.bodies.query_row(
+            "SELECT EXISTS (SELECT 1 FROM _syncular_blobs WHERE blob_id = ?1), \
+             EXISTS (SELECT 1 FROM _syncular_blob_uploads WHERE blob_id = ?1)",
+            [blob_id],
+            |row| {
+                Ok(Held {
+                    body: row.get(0)?,
+                    queued: row.get(1)?,
+                })
+            },
+        )
+    }
+
+    /// A commit failed after `staged` were staged for it: each goes back to
+    /// how it was — unqueued if it was not queued, its body dropped if it
+    /// was not cached — unless something else has pinned it since.
+    fn unstage(&self, staged: &[(String, Held)]) -> Result<(), rusqlite::Error> {
+        let mut dropped = Vec::new();
+        for (blob_id, before) in staged {
+            if !before.queued {
+                self.bodies.execute(
+                    "DELETE FROM _syncular_blob_uploads WHERE blob_id = ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM _syncular_blob_commit_refs r WHERE r.blob_id = ?1)",
+                    [blob_id],
+                )?;
+            }
+            if !before.body && self.bodies.execute(DROP_BODY, [blob_id])? > 0 {
+                dropped.push(blob_id.clone());
+            }
+        }
+        self.log.forget(&dropped)
+    }
+
+    /// The commits waiting in the outbox, with their operations.
+    fn outbox(&self) -> Result<Vec<(String, Vec<Value>)>, rusqlite::Error> {
+        let mut statement = self
+            .bodies
+            .prepare("SELECT commit_id, ops_json FROM _syncular_outbox")?;
+        let rows = statement.query_map([], |row| {
+            let commit: String = row.get(0)?;
+            let ops: String = row.get(1)?;
+            Ok((commit, ops))
+        })?;
+        rows.map(|row| {
+            row.map(|(commit, ops)| {
+                let ops = match serde_json::from_str::<Value>(&ops) {
+                    Ok(Value::Array(ops)) => ops,
+                    _ => Vec::new(),
+                };
+                (commit, ops)
+            })
+        })
+        .collect()
+    }
+
+    /// Take `blob_id` out of the upload queue and out of every commit's
+    /// pins: the server refused it, and every commit that pins it is one of
+    /// its dependents.
+    fn release(&self, blob_id: &str) -> Result<(), rusqlite::Error> {
+        self.bodies.execute(
+            "DELETE FROM _syncular_blob_uploads WHERE blob_id = ?1",
+            [blob_id],
+        )?;
+        self.bodies.execute(
+            "DELETE FROM _syncular_blob_commit_refs WHERE blob_id = ?1",
+            [blob_id],
+        )?;
+        Ok(())
+    }
+
+    /// The upload refusals still standing — their commit waits in the
+    /// outbox or stands refused in the outcome journal — after the others
+    /// are dropped.
+    fn standing_refusals(&self) -> Result<Vec<UploadRefusal>, rusqlite::Error> {
+        let mut standing = Vec::new();
+        let mut moot = Vec::new();
+        for refusal in self.log.refusals()? {
+            let live: bool = self.bodies.query_row(
+                "SELECT EXISTS (SELECT 1 FROM _syncular_outbox WHERE commit_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM _syncular_commit_outcomes WHERE client_commit_id = ?1 \
+                 AND resolution = 'active' AND status IN ('conflict', 'rejected'))",
+                [&refusal.commit_id],
+                |row| row.get(0),
+            )?;
+            if live {
+                standing.push(refusal);
+            } else {
+                moot.push(refusal.commit_id);
+            }
+        }
+        self.log.drop_refusals(&moot)?;
+        Ok(standing)
+    }
+}
+
+/// A blob's state before a commit staged it.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    body: bool,
+    queued: bool,
+}
+
+/// Whether `values` (one operation's columns) reference `blob_id`: a column
+/// holding a blob reference whose `blobId` it is.
+fn references(values: &Value, blob_id: &str) -> bool {
+    values.as_object().is_some_and(|columns| {
+        columns.values().any(|value| {
+            value
+                .as_str()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .is_some_and(|reference| {
+                    reference.get("blobId").and_then(Value::as_str) == Some(blob_id)
+                })
+        })
+    })
+}
+
+/// The refusal of `blob_id`'s upload, tied to the commit `commit_id` whose
+/// operations are `ops`; `None` when the commit does not reference it.
+fn refusal_of(
+    commit_id: &str,
+    ops: &[Value],
+    blob_id: &str,
+    rejection: &Rejection,
+) -> Option<UploadRefusal> {
+    let row_id = |op: &Value| op.get("rowId").and_then(Value::as_str).map(str::to_owned);
+    let refused_rows: Vec<String> = ops
+        .iter()
+        .filter(|op| {
+            op.get("values")
+                .is_some_and(|values| references(values, blob_id))
+        })
+        .filter_map(row_id)
+        .collect();
+    if refused_rows.is_empty() {
+        return None;
+    }
+    Some(UploadRefusal {
+        commit_id: commit_id.to_owned(),
+        blob_id: blob_id.to_owned(),
+        rejection: rejection.clone(),
+        refused_rows,
+        commit_rows: ops.iter().filter_map(row_id).collect(),
+    })
 }
 
 type Reply<T> = SyncSender<Result<T, ReplicaError>>;
@@ -626,7 +779,7 @@ enum Command {
     },
     Presence(String, Reply<Vec<Peer>>),
     Supersede(Vec<String>, String, Reply<()>),
-    Upload(Vec<u8>, Option<String>, Reply<Value>),
+    Commit(Vec<BlobBody>, Vec<Mutation>, Reply<String>),
     Fetch(String, Reply<Vec<u8>>),
     CacheBytes(Reply<u64>),
     SyncNow,
@@ -696,9 +849,9 @@ struct Owner {
     /// The most bytes of blob bodies kept beyond what the outbox pins.
     cache_max: u64,
     cache: BlobCache,
-    /// The server's refusal of the last upload a round tried, shared with
-    /// the replica's readers.
-    upload_refusal: Arc<Mutex<Option<Rejection>>>,
+    /// The server's standing refusals of uploads, as kept beside the
+    /// replica, shared with the replica's readers.
+    upload_refusals: Arc<Mutex<Vec<UploadRefusal>>>,
 }
 
 impl Owner {
@@ -719,6 +872,9 @@ impl Owner {
             SyncClient::open_path_with_identity(spec.client_id.clone(), schema()?, limits, path)
                 .map_err(ReplicaError::Client)?;
         let cache = BlobCache::open(&spec.path)?;
+        let refusals = cache.standing_refusals().map_err(|error| {
+            ReplicaError::Client(format!("the replica's upload refusals: {error}"))
+        })?;
         let (config, origin) = match &spec.link {
             Some(link) => {
                 let (config, origin) = link_config(link)?;
@@ -741,6 +897,7 @@ impl Owner {
             open: gate,
             origin,
             reached: None,
+            upload: None,
         };
         if !linked {
             client.set_transport_enabled(&mut transport, false);
@@ -784,7 +941,7 @@ impl Owner {
             state,
             cache_max: BLOB_CACHE_MAX_BYTES,
             cache,
-            upload_refusal: Arc::new(Mutex::new(None)),
+            upload_refusals: Arc::new(Mutex::new(refusals)),
         })
     }
 
@@ -924,18 +1081,8 @@ impl Owner {
                 }
                 let _ = reply.send(outcome);
             }
-            Command::Upload(bytes, media_type, reply) => {
-                let outcome = self
-                    .client
-                    .upload_blob(&bytes, media_type, None)
-                    .map_err(ReplicaError::Client);
-                if let Some(blob) = outcome
-                    .as_ref()
-                    .ok()
-                    .and_then(|reference| reference["blobId"].as_str())
-                {
-                    self.cache.touch(&self.database, blob);
-                }
+            Command::Commit(blobs, ops, reply) => {
+                let outcome = self.commit_with_blobs(&blobs, ops);
                 self.dirty |= outcome.is_ok();
                 let _ = reply.send(outcome);
                 self.enforce_cache();
@@ -977,6 +1124,104 @@ impl Owner {
             Command::Stop => return false,
         }
         true
+    }
+
+    /// Stage `blobs`, then commit `ops`, in this one command: no round and
+    /// no eviction between, so every blob stays pinned — by its upload row,
+    /// then by the commit's reference. On a failure what this staged goes
+    /// back as it was ([`BlobCache::unstage`]).
+    fn commit_with_blobs(
+        &mut self,
+        blobs: &[BlobBody],
+        ops: Vec<Mutation>,
+    ) -> Result<String, ReplicaError> {
+        let mut staged = Vec::with_capacity(blobs.len());
+        let outcome = self.stage_and_commit(blobs, ops, &mut staged);
+        match &outcome {
+            Ok(_) => {
+                for blob in blobs {
+                    self.cache.touch(&self.database, &blob.id);
+                }
+            }
+            Err(_) => {
+                if let Err(error) = self.cache.unstage(&staged) {
+                    tracing::warn!(database = %self.database, %error, "blobs staged for a failed commit could not be unstaged");
+                }
+            }
+        }
+        outcome
+    }
+
+    fn stage_and_commit(
+        &mut self,
+        blobs: &[BlobBody],
+        ops: Vec<Mutation>,
+        staged: &mut Vec<(String, Held)>,
+    ) -> Result<String, ReplicaError> {
+        let storage = |error: rusqlite::Error| {
+            ReplicaError::Client(format!("the replica's blob cache: {error}"))
+        };
+        for blob in blobs {
+            let before = self.cache.held(&blob.id).map_err(storage)?;
+            let reference = self
+                .client
+                .upload_blob(&blob.bytes, blob.media_type.clone(), None)
+                .map_err(ReplicaError::Client)?;
+            staged.push((blob.id.clone(), before));
+            if reference["blobId"].as_str() != Some(blob.id.as_str()) {
+                return Err(ReplicaError::Client(format!(
+                    "the replica staged {} under another content address",
+                    blob.id
+                )));
+            }
+        }
+        self.client
+            .mutate(ops)
+            .map_err(|error| ReplicaError::Client(format!("{}: {}", error.code, error.message)))
+    }
+
+    /// The server refused `blob_id`'s upload. The refusal is tied to every
+    /// commit in the outbox that references the blob and kept beside the
+    /// replica first; then the blob leaves the upload queue and those
+    /// commits' pins, so the next round uploads whatever else is staged and
+    /// pushes every commit — those too, which the server refuses without
+    /// the body, and whose rows the outcome journal then keeps. Nothing
+    /// else is touched: a commit that does not reference the blob, and
+    /// every other body it pins, stay as they are. Not kept, nothing is
+    /// released: the next round meets the same refusal and tries again.
+    fn resolve_refused_upload(&mut self, blob_id: &str, rejection: &Rejection) {
+        let outbox = match self.cache.outbox() {
+            Ok(outbox) => outbox,
+            Err(error) => {
+                tracing::warn!(database = %self.database, %error, "the commits behind a refused upload could not be read");
+                return;
+            }
+        };
+        let refusals: Vec<UploadRefusal> = outbox
+            .iter()
+            .filter_map(|(commit, ops)| refusal_of(commit, ops, blob_id, rejection))
+            .collect();
+        let kept = self
+            .cache
+            .log
+            .refuse(&refusals, crate::hq::sessions::now_ms())
+            .and_then(|()| self.cache.release(blob_id));
+        if let Err(error) = kept {
+            tracing::warn!(database = %self.database, %error, "a refused upload could not be resolved");
+            return;
+        }
+        let mut held = self
+            .upload_refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for refusal in refusals {
+            held.retain(|standing| {
+                standing.commit_id != refusal.commit_id || standing.blob_id != refusal.blob_id
+            });
+            held.push(refusal);
+        }
+        drop(held);
+        self.dirty = true;
     }
 
     /// Frames, the rounds they and the schedule ask for, and the socket.
@@ -1102,27 +1347,18 @@ impl Owner {
 
     fn round(&mut self) {
         self.dirty = false;
+        self.transport.upload = None;
         let outcome = self.client.sync_until_idle(&mut self.transport, None);
         if self.connected() {
             self.rounds_on_socket = self.rounds_on_socket.saturating_add(1);
         }
         let verdict = verdict(&outcome);
         self.schedule.round_done(&verdict, Instant::now());
-        match upload_refusal(&outcome) {
-            Some(refusal) => {
-                tracing::warn!(database = %self.database, code = %refusal.code, "the agents server refused an upload; nothing more is pushed until it is resolved");
-                *self
-                    .upload_refusal
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(refusal);
-            }
-            None if verdict == RoundVerdict::Answered => {
-                *self
-                    .upload_refusal
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = None;
-            }
-            None => {}
+        if let (Some(refusal), Some(blob)) =
+            (upload_refusal(&outcome), self.transport.upload.take())
+        {
+            tracing::warn!(database = %self.database, code = %refusal.code, %blob, "the agents server refused an upload; the commits that reference it go without it");
+            self.resolve_refused_upload(&blob, &refusal);
         }
         match verdict {
             RoundVerdict::Answered => {}
@@ -1241,7 +1477,7 @@ pub struct SyncularReplica {
     reader: Mutex<FileQuerySnapshotReader>,
     state: watch::Receiver<ReplicaState>,
     remote: Option<Remote>,
-    upload_refusal: Arc<Mutex<Option<Rejection>>>,
+    upload_refusals: Arc<Mutex<Vec<UploadRefusal>>>,
 }
 
 impl SyncularReplica {
@@ -1259,8 +1495,6 @@ impl SyncularReplica {
         let wake = commands.clone();
         let gate = Arc::new(AtomicBool::new(true));
         let owner_gate = Arc::clone(&gate);
-        let upload_refusal = Arc::new(Mutex::new(None));
-        let owner_refusal = Arc::clone(&upload_refusal);
         let remote = match (&spec.link, &spec.client_id) {
             (Some(link), Some(client_id)) => {
                 let (config, origin) = link_config(link)?;
@@ -1275,9 +1509,11 @@ impl SyncularReplica {
         let thread = std::thread::Builder::new()
             .name(format!("hq-{}", spec.database))
             .spawn(move || match Owner::open(&spec, owner_gate, wake) {
-                Ok(mut owner) => {
-                    owner.upload_refusal = owner_refusal;
-                    let _ = ready.send(Ok(owner.state.subscribe()));
+                Ok(owner) => {
+                    let _ = ready.send(Ok((
+                        owner.state.subscribe(),
+                        Arc::clone(&owner.upload_refusals),
+                    )));
                     owner.run(inbox);
                 }
                 Err(error) => {
@@ -1285,7 +1521,7 @@ impl SyncularReplica {
                 }
             })
             .map_err(|error| ReplicaError::Client(format!("owner thread: {error}")))?;
-        let state = opened.recv().map_err(|_| ReplicaError::Closed)??;
+        let (state, upload_refusals) = opened.recv().map_err(|_| ReplicaError::Closed)??;
         Ok(SyncularReplica {
             commands,
             gate,
@@ -1293,7 +1529,7 @@ impl SyncularReplica {
             reader: Mutex::new(FileQuerySnapshotReader::new(path)),
             state,
             remote,
-            upload_refusal,
+            upload_refusals,
         })
     }
 
@@ -1401,12 +1637,13 @@ impl Replica for SyncularReplica {
         self.ask(|reply| Command::Presence(scope_key.to_owned(), reply))
     }
 
-    fn upload_blob(
+    fn commit_with_blobs(
         &self,
-        bytes: Vec<u8>,
-        media_type: Option<String>,
-    ) -> Result<Value, ReplicaError> {
-        self.ask(|reply| Command::Upload(bytes, media_type, reply))
+        blobs: Vec<BlobBody>,
+        ops: Vec<RowOp>,
+    ) -> Result<String, ReplicaError> {
+        let ops = ops.into_iter().map(mutation).collect();
+        self.ask(|reply| Command::Commit(blobs, ops, reply))
     }
 
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
@@ -1500,8 +1737,8 @@ impl Replica for SyncularReplica {
         Ok(refused)
     }
 
-    fn upload_refusal(&self) -> Option<Rejection> {
-        self.upload_refusal
+    fn upload_refusals(&self) -> Vec<UploadRefusal> {
+        self.upload_refusals
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -1535,6 +1772,7 @@ impl Replica for SyncularReplica {
             open: Arc::clone(&self.gate),
             origin: Some(remote.origin.clone()),
             reached: None,
+            upload: None,
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
@@ -1562,6 +1800,7 @@ impl Replica for SyncularReplica {
             open: Arc::clone(&self.gate),
             origin: Some(remote.origin.clone()),
             reached: None,
+            upload: None,
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
@@ -1637,7 +1876,7 @@ impl Opener for SyncularOpener {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
@@ -1741,6 +1980,7 @@ mod tests {
                     .origin(),
             ),
             reached: None,
+            upload: None,
         }
     }
 
@@ -2194,7 +2434,7 @@ mod tests {
         (port, count)
     }
 
-    fn linked(dir: &std::path::Path, port: u16) -> ReplicaSpec {
+    pub(crate) fn linked(dir: &std::path::Path, port: u16) -> ReplicaSpec {
         ReplicaSpec {
             database: "alpha".to_owned(),
             path: dir.join("alpha.sqlite"),
@@ -2365,10 +2605,10 @@ mod tests {
         owner.cache_max = 250;
         // Staged here, 100 bytes: pinned until the server takes it.
         let pinned = vec![7u8; 100];
-        let reference: Value = ask(&mut owner, |reply| {
-            Command::Upload(pinned.clone(), Some("application/pdf".to_owned()), reply)
+        let _commit: String = ask(&mut owner, |reply| {
+            Command::Commit(vec![body(&pinned)], vec![mutation(message("m-1"))], reply)
         });
-        assert_eq!(reference["blobId"], json!(sha(&pinned)));
+        assert_eq!(queued(&spec.path), vec![sha(&pinned)]);
         // Three downloads of 80 bytes, cached in this order, long ago.
         let a = downloaded(&spec.path, &[1u8; 80], 1);
         let b = downloaded(&spec.path, &[2u8; 80], 2);
@@ -2399,5 +2639,282 @@ mod tests {
             vec![sha(&pinned)],
             "{a} and {d} evicted"
         );
+    }
+
+    pub(crate) fn body(bytes: &[u8]) -> BlobBody {
+        BlobBody {
+            id: sha(bytes),
+            bytes: bytes.to_vec(),
+            media_type: Some("application/octet-stream".to_owned()),
+        }
+    }
+
+    /// An `attachments` row of `message` naming `bytes`.
+    fn attachment(id: &str, message: &str, bytes: &[u8]) -> Mutation {
+        let Value::Object(values) = json!({
+            "id": id,
+            "session_id": "local.1",
+            "message_id": message,
+            "blob_ref": crate::hq::attachments::blob_ref(&sha(bytes), bytes.len() as u64, None, None),
+            "name": format!("{id}.bin"),
+            "mime": "application/octet-stream",
+            "size": bytes.len(),
+            "created_at_ms": 1_792_000_000_000_i64,
+            "author_actor": "",
+            "author_client": "",
+        }) else {
+            unreachable!("a literal object");
+        };
+        Mutation::Upsert {
+            table: "attachments".to_owned(),
+            values,
+            base_version: None,
+        }
+    }
+
+    /// The blobs the replica file still queues for upload.
+    pub(crate) fn queued(path: &std::path::Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("opens");
+        let mut ids: Vec<String> = conn
+            .prepare("SELECT blob_id FROM _syncular_blob_uploads")
+            .expect("prepares")
+            .query_map([], |row| row.get(0))
+            .expect("reads")
+            .collect::<Result<_, _>>()
+            .expect("reads");
+        ids.sort();
+        ids
+    }
+
+    /// The commits that pin each blob in the replica file, `(commit, blob)`.
+    pub(crate) fn pins(path: &std::path::Path) -> Vec<(String, String)> {
+        let conn = rusqlite::Connection::open(path).expect("opens");
+        let mut pins: Vec<(String, String)> = conn
+            .prepare("SELECT commit_id, blob_id FROM _syncular_blob_commit_refs")
+            .expect("prepares")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("reads")
+            .collect::<Result<_, _>>()
+            .expect("reads");
+        pins.sort();
+        pins
+    }
+
+    /// Mark the replica at `path` as bootstrapped against its server, as its
+    /// first round would: from then on a round uploads what is staged.
+    pub(crate) fn bootstrapped(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).expect("opens");
+        conn.busy_timeout(Duration::from_secs(5)).expect("timeout");
+        conn.execute(
+            "INSERT OR REPLACE INTO _syncular_meta (key, value) VALUES ('logEpoch', 'epoch-1')",
+            [],
+        )
+        .expect("bootstraps");
+    }
+
+    /// What a blob server saw: each request's method and path, and the
+    /// status it answered.
+    pub(crate) type Seen = Arc<Mutex<Vec<(String, String, u16)>>>;
+
+    /// A server for the blob half of a round: an upload grant is answered
+    /// `{}` (no signed URL: `PUT` it here) and a `PUT` `200`, unless
+    /// `refused` names the blob (then that status, on both); anything else
+    /// — the round's push, the socket — `503`: the network cut after the
+    /// upload and before the metadata exchange.
+    pub(crate) fn blob_server(refused: Vec<(String, u16)>) -> (u16, Seen) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(at + 4);
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                while request.len() < head_end + length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let mut words = head.split_whitespace();
+                let method = words.next().unwrap_or_default().to_owned();
+                let path = words.next().unwrap_or_default().to_owned();
+                let refusal = refused
+                    .iter()
+                    .find(|(blob, _)| path.contains(blob.as_str()))
+                    .map(|(_, status)| *status);
+                let (status, body) = match (method.as_str(), refusal) {
+                    (_, Some(status)) if path.contains("/blobs/") => (status, "{}"),
+                    ("POST", None) if path.ends_with("/upload-grant") => (200, "{}"),
+                    ("PUT", None) if path.contains("/blobs/") => (200, "{}"),
+                    _ => (503, r#"{"error":"unavailable"}"#),
+                };
+                log.lock().expect("seen").push((method, path, status));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (port, seen)
+    }
+
+    /// How many `PUT`s of `blob` the server answered with `status`.
+    pub(crate) fn puts(seen: &Seen, blob: &str, status: u16) -> usize {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .filter(|(method, path, answered)| {
+                method == "PUT" && path.ends_with(blob) && *answered == status
+            })
+            .count()
+    }
+
+    /// Whether a round reached its push (`/sync`) after `after` requests.
+    pub(crate) fn pushed_after(seen: &Seen, after: usize) -> bool {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .skip(after)
+            .any(|(method, path, _)| method == "POST" && path.ends_with("/sync"))
+    }
+
+    #[test]
+    fn a_blob_and_its_commit_are_one_step_so_a_put_before_the_push_leaves_it_pinned_across_a_relaunch(
+    ) {
+        let (port, seen) = blob_server(Vec::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = linked(dir.path(), port);
+        let open = || {
+            let (wake, _woken) = mpsc::channel();
+            let mut owner =
+                Owner::open(&spec, Arc::new(AtomicBool::new(true)), wake).expect("opens");
+            // Cache pressure: every body the outbox does not pin goes.
+            owner.cache_max = 1;
+            owner
+        };
+        let mut owner = open();
+        bootstrapped(&spec.path);
+        let (a, b) = (vec![1u8; 100], vec![2u8; 120]);
+        let commit: String = ask(&mut owner, |reply| {
+            Command::Commit(
+                vec![body(&a), body(&b)],
+                vec![
+                    mutation(message("m-1")),
+                    attachment("a-1", "m-1", &a),
+                    attachment("a-2", "m-1", &b),
+                ],
+                reply,
+            )
+        });
+        let mut want = vec![(commit.clone(), sha(&a)), (commit.clone(), sha(&b))];
+        want.sort();
+        assert_eq!(pins(&spec.path), want, "the commit pins both at once");
+
+        // The owner's very next round: both PUTs answered, then the push is
+        // cut — the server took the bodies, not the message.
+        owner.round();
+        for blob in [&a, &b] {
+            assert_eq!(puts(&seen, &sha(blob), 200), 1, "uploaded before the push");
+        }
+        assert!(pushed_after(&seen, 0), "the round went on to its push");
+        assert!(
+            queued(&spec.path).is_empty(),
+            "the server acknowledged both"
+        );
+        assert_eq!(pins(&spec.path), want, "the commit still pins both");
+        owner.enforce_cache();
+        let mut both = vec![sha(&a), sha(&b)];
+        both.sort();
+        assert_eq!(cached(&spec.path), both, "no eviction under pressure");
+
+        // A relaunch, still cut off after the uploads.
+        owner.stop();
+        drop(owner);
+        let mut owner = open();
+        owner.enforce_cache();
+        assert_eq!(cached(&spec.path), both, "kept across the relaunch");
+        assert_eq!(pins(&spec.path), want);
+        assert_eq!(
+            owner.client.status_snapshot().outbox,
+            1,
+            "the message waits"
+        );
+        owner.round();
+        owner.enforce_cache();
+        assert_eq!(
+            cached(&spec.path),
+            both,
+            "the bodies are there to send again"
+        );
+        assert_eq!(pins(&spec.path), want);
+    }
+
+    #[test]
+    fn a_commit_that_fails_takes_back_what_it_staged_and_nothing_anything_else_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("alpha.sqlite"));
+        let (wake, _woken) = mpsc::channel();
+        let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(false)), wake).expect("opens");
+        let shared = vec![5u8; 10];
+        let commit: String = ask(&mut owner, |reply| {
+            Command::Commit(
+                vec![body(&shared)],
+                vec![mutation(message("m-1")), attachment("a-1", "m-1", &shared)],
+                reply,
+            )
+        });
+        let opened = downloaded(&spec.path, &[6u8; 10], 1);
+        let fresh = vec![7u8; 10];
+        let (reply, answer) = mpsc::sync_channel(1);
+        let refused = Mutation::Upsert {
+            table: "no_such_table".to_owned(),
+            values: Map::from_iter([("id".to_owned(), json!("x"))]),
+            base_version: None,
+        };
+        assert!(owner.handle(Command::Commit(
+            vec![body(&shared), body(&[6u8; 10]), body(&fresh)],
+            vec![attachment("a-2", "m-2", &fresh), refused],
+            reply,
+        )));
+        assert!(
+            answer.recv().expect("answered").is_err(),
+            "the commit failed"
+        );
+        assert_eq!(
+            queued(&spec.path),
+            vec![sha(&shared)],
+            "only what the first commit staged"
+        );
+        assert_eq!(pins(&spec.path), vec![(commit, sha(&shared))]);
+        let mut kept = vec![sha(&shared), opened];
+        kept.sort();
+        assert_eq!(
+            cached(&spec.path),
+            kept,
+            "the new body went, the cached and the pinned ones stayed"
+        );
+        assert_eq!(owner.client.status_snapshot().outbox, 1);
     }
 }

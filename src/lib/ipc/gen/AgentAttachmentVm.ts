@@ -10,7 +10,8 @@ export type AgentAttachmentVm = { id: string, name: string, mime: string, size: 
  */
 sizeLabel: string, state: AgentAttachmentStateVm, 
 /**
- * Why the server refused it; only when refused.
+ * Why the server refused it, or the file it was blocked by; only when
+ * `refused` or `blocked`.
  */
 sentence?: string, 
 /**

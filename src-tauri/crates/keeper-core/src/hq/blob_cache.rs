@@ -16,12 +16,17 @@
 //! copy of something the person wrote. [`evictions`] is that rule; the
 //! adapter (`hq::syncular`) reads the facts from the replica file and drops
 //! what it names. When each body was last used is keeper's own record, in a
-//! small SQLite file beside the replica ([`AccessLog`]).
+//! small SQLite file beside the replica ([`AccessLog`]) — and so is every
+//! refusal of a blob's upload the server sent, tied to the commits that
+//! referenced the blob, since resolving one takes the blob out of the
+//! replica's queue and nothing there would say why afterwards.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
+
+use crate::hq::port::{Rejection, UploadRefusal};
 
 /// The most bytes of blob bodies one database's replica keeps beyond what its
 /// outbox pins: ten of the largest attachments a message may carry
@@ -69,11 +74,12 @@ pub fn evictions(blobs: &[CachedBlob], max: u64) -> Vec<String> {
     dropped
 }
 
-/// When each blob of one replica was last used on this device: keeper's own
-/// file beside the replica (`<replica>.blob-access.sqlite`), never inside the
-/// client's, so a schema change there cannot take it and nothing here is
-/// mistaken for a synced table. Losing it costs only the order: a body with
-/// no record counts from when it was cached.
+/// When each blob of one replica was last used on this device, and the
+/// server's refusals of blob uploads: keeper's own file beside the replica
+/// (`<replica>.blob-access.sqlite`), never inside the client's, so a schema
+/// change there cannot take it and nothing here is mistaken for a synced
+/// table. Losing it costs the order (a body with no record counts from when
+/// it was cached) and the reason a refused file shows.
 pub struct AccessLog {
     conn: Connection,
 }
@@ -88,9 +94,72 @@ impl AccessLog {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS used (blob_id TEXT PRIMARY KEY, at_ms INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS used (blob_id TEXT PRIMARY KEY, at_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS upload_refusals (
+               commit_id TEXT NOT NULL, blob_id TEXT NOT NULL,
+               code TEXT NOT NULL, message TEXT NOT NULL,
+               refused_rows TEXT NOT NULL, commit_rows TEXT NOT NULL,
+               at_ms INTEGER NOT NULL,
+               PRIMARY KEY (commit_id, blob_id));",
         )?;
         Ok(AccessLog { conn })
+    }
+
+    /// Keep `refusals` (a later refusal of the same blob for the same
+    /// commit replaces the earlier), all or none.
+    pub fn refuse(&self, refusals: &[UploadRefusal], at_ms: i64) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        for refusal in refusals {
+            tx.execute(
+                "INSERT INTO upload_refusals \
+                 (commit_id, blob_id, code, message, refused_rows, commit_rows, at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(commit_id, blob_id) DO UPDATE SET code = excluded.code, \
+                 message = excluded.message, refused_rows = excluded.refused_rows, \
+                 commit_rows = excluded.commit_rows, at_ms = excluded.at_ms",
+                params![
+                    refusal.commit_id,
+                    refusal.blob_id,
+                    refusal.rejection.code,
+                    refusal.rejection.message,
+                    serde_json::to_string(&refusal.refused_rows).unwrap_or_default(),
+                    serde_json::to_string(&refusal.commit_rows).unwrap_or_default(),
+                    at_ms,
+                ],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Every refusal kept, oldest first.
+    pub fn refusals(&self) -> Result<Vec<UploadRefusal>, rusqlite::Error> {
+        let mut statement = self.conn.prepare(
+            "SELECT commit_id, blob_id, code, message, refused_rows, commit_rows \
+             FROM upload_refusals ORDER BY at_ms, commit_id, blob_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let ids = |raw: String| serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+            Ok(UploadRefusal {
+                commit_id: row.get(0)?,
+                blob_id: row.get(1)?,
+                rejection: Rejection::new(row.get::<_, String>(2)?, row.get::<_, String>(3)?),
+                refused_rows: ids(row.get(4)?),
+                commit_rows: ids(row.get(5)?),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The refusals of `commit_ids` are moot: their commits are neither
+    /// waiting nor standing refused any more.
+    pub fn drop_refusals(&self, commit_ids: &[String]) -> Result<(), rusqlite::Error> {
+        let mut statement = self
+            .conn
+            .prepare("DELETE FROM upload_refusals WHERE commit_id = ?1")?;
+        for commit_id in commit_ids {
+            statement.execute(params![commit_id])?;
+        }
+        Ok(())
     }
 
     /// `blob_id` was opened or written now (`at_ms`).

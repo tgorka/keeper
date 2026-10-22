@@ -10,7 +10,10 @@
 //! An archived session holds no rows here. Opening it reads its newest page
 //! through the server's registered `sessionPage` query, read-only, page by
 //! page and month by month on scroll-back; a row this device still holds in
-//! its outbox is shown beside them.
+//! its outbox is shown beside them. While it is open its attachments' rows
+//! are held too (`sessions::plan`), so its files show as chips and open
+//! through the same row check as an active session's — their bytes only
+//! when a chip is opened.
 
 use std::collections::{HashMap, HashSet};
 

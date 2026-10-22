@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 use ts_rs::TS;
 
 use crate::asset_url::{self, UrlForm};
-use crate::hq::port::{LinkState, Rejection, ReplicaError, RowOp};
+use crate::hq::port::{BlobBody, LinkState, Rejection, ReplicaError, RowOp, UploadRefusal};
 use crate::hq::send::activity;
 use crate::hq::sessions::{authored, int, now_ms, object, person_message, read, text, Source};
 use crate::hq::timeline::session_row;
@@ -242,10 +242,19 @@ pub fn blob_ref(
     .unwrap_or_default()
 }
 
+/// A blob's content address: `sha256:` and its bytes' digest, in lowercase
+/// hex — the id the replica stages it under.
+fn content_address(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
 /// Attach `files` to a new message in `session_id` whose text is `caption`
-/// (it may be empty): each blob staged for upload first, then the message,
-/// its `attachments` rows and the session's last activity in one commit.
-/// The message's id.
+/// (it may be empty): each blob staged for upload and the message, its
+/// `attachments` rows and the session's last activity committed, in one step
+/// of the replica's owner — so no round can upload a blob, and nothing can
+/// evict it, before the commit that references it pins it. The message's
+/// id.
 pub fn attach(
     source: &Source,
     session_id: &str,
@@ -267,17 +276,11 @@ pub fn attach(
         caption
     };
     let mut ops = vec![person_message(source, session_id, &message_id, body, at)];
+    let mut blobs = Vec::with_capacity(files.len());
     for file in files {
         let StagedFile { name, mime, bytes } = file;
         let size = bytes.len() as u64;
-        let staged = source.replica.upload_blob(bytes, Some(mime.clone()))?;
-        let blob_id = staged
-            .get("blobId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ReplicaError::Client("the replica staged a blob without its id".to_owned())
-            })?
-            .to_owned();
+        let blob_id = content_address(&bytes);
         ops.push(RowOp::Upsert {
             table: "attachments".to_owned(),
             values: authored(
@@ -295,9 +298,14 @@ pub fn attach(
             ),
             base_version: None,
         });
+        blobs.push(BlobBody {
+            id: blob_id,
+            bytes,
+            media_type: Some(mime),
+        });
     }
     ops.push(activity(source, session_id, at));
-    source.replica.mutate(ops)?;
+    source.replica.commit_with_blobs(blobs, ops)?;
     source.replica.sync_now();
     Ok(message_id)
 }
@@ -355,6 +363,10 @@ pub enum AgentAttachmentStateVm {
     Sent,
     /// The server refused it; [`AgentAttachmentVm::sentence`] says why.
     Refused,
+    /// Not sent, and not refused itself: the server refused another file of
+    /// the same message, so the message went without that one and was
+    /// refused whole. [`AgentAttachmentVm::sentence`] names that file.
+    Blocked,
 }
 
 /// One attachment of a message: the chip.
@@ -370,7 +382,8 @@ pub struct AgentAttachmentVm {
     /// The size as a sentence says it (`2.4 MB`, `12 kB`).
     pub size_label: String,
     pub state: AgentAttachmentStateVm,
-    /// Why the server refused it; only when refused.
+    /// Why the server refused it, or the file it was blocked by; only when
+    /// `refused` or `blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub sentence: Option<String>,
@@ -412,8 +425,78 @@ fn chip(
     })
 }
 
+/// A file not sent because the server refused `refused` (other files of
+/// the same message), as the person reads it under the chip.
+pub fn blocked_sentence(name: &str, refused: &[String]) -> String {
+    let others = match refused {
+        [] => "another file".to_owned(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
+    format!(
+        "{name} was not sent: the agents server refused {others}, attached to the same message. Attach {name} again."
+    )
+}
+
+/// How the server's refusals of uploads bear on one commit's rows: which
+/// rows carry a refused blob (and why), and which rows' commit holds one.
+struct UploadRefusals<'a> {
+    refused: HashMap<&'a str, &'a UploadRefusal>,
+    in_commit: HashMap<&'a str, &'a UploadRefusal>,
+}
+
+impl<'a> UploadRefusals<'a> {
+    fn new(refusals: &'a [UploadRefusal]) -> UploadRefusals<'a> {
+        let mut refused = HashMap::new();
+        let mut in_commit = HashMap::new();
+        for refusal in refusals {
+            for row in &refusal.refused_rows {
+                refused.insert(row.as_str(), refusal);
+            }
+            for row in &refusal.commit_rows {
+                in_commit.insert(row.as_str(), refusal);
+            }
+        }
+        UploadRefusals { refused, in_commit }
+    }
+
+    /// The state and sentence of the row `id` named `name`, when an upload
+    /// refusal bears on it; `names` gives the name of a row by id, for a
+    /// file of the same message that was refused.
+    fn chip(
+        &self,
+        id: &str,
+        name: &str,
+        names: &HashMap<&str, &str>,
+    ) -> Option<(AgentAttachmentStateVm, String)> {
+        if let Some(refusal) = self.refused.get(id) {
+            return Some((
+                AgentAttachmentStateVm::Refused,
+                refusal_sentence(&refusal.rejection, name),
+            ));
+        }
+        let refusal = self.in_commit.get(id)?;
+        let mut refused: Vec<String> = self
+            .refused
+            .iter()
+            .filter(|(_, other)| other.commit_id == refusal.commit_id)
+            .filter_map(|(row, _)| names.get(row).map(|name| (*name).to_owned()))
+            .collect();
+        refused.sort();
+        refused.dedup();
+        Some((
+            AgentAttachmentStateVm::Blocked,
+            blocked_sentence(name, &refused),
+        ))
+    }
+}
+
 /// The chips of every message of `session_id` the replica holds, by message
-/// id, each message's in the order they were attached.
+/// id, each message's in the order they were attached. This device's file
+/// whose upload the server refused reads *refused* with the reason; another
+/// file of that message *blocked*, naming it; every other file of this
+/// device's not yet sent *uploading* or *waiting* — never refused for a
+/// file it is not.
 pub fn chips(source: &Source, session_id: &str) -> HashMap<String, Vec<AgentAttachmentVm>> {
     let rows = read(source, ATTACHMENTS, &[Value::from(session_id)]);
     if rows.is_empty() {
@@ -423,17 +506,20 @@ pub fn chips(source: &Source, session_id: &str) -> HashMap<String, Vec<AgentAtta
         source.replica.state().link,
         LinkState::Connecting | LinkState::Connected
     );
-    let refusal = source.replica.upload_refusal();
+    let held = source.replica.upload_refusals();
+    let refusals = UploadRefusals::new(&held);
+    let names: HashMap<&str, &str> = rows
+        .iter()
+        .map(|row| (text(row, "id"), text(row, "name")))
+        .collect();
     let mut by_message: HashMap<String, Vec<AgentAttachmentVm>> = HashMap::new();
     for row in &rows {
         let pending = text(row, "author_client") == source.client
             && int(row, "version").is_some_and(|version| version < 0);
-        let (state, sentence) = match (&refusal, pending) {
+        let refused = refusals.chip(text(row, "id"), text(row, "name"), &names);
+        let (state, sentence) = match (refused, pending) {
             (_, false) => (AgentAttachmentStateVm::Sent, None),
-            (Some(refusal), true) => (
-                AgentAttachmentStateVm::Refused,
-                Some(refusal_sentence(refusal, text(row, "name"))),
-            ),
+            (Some((state, sentence)), true) => (state, Some(sentence)),
             (None, true) if reaching => (AgentAttachmentStateVm::Uploading, None),
             (None, true) => (AgentAttachmentStateVm::Waiting, None),
         };
@@ -457,7 +543,9 @@ pub struct RefusedMessage {
 }
 
 /// The messages of `session_id` this device attached files to whose commit
-/// the server refused, its refusal standing, each chip with the reason.
+/// the server refused, its refusal standing, each chip with the reason: a
+/// file whose upload the server refused with that refusal, the message's
+/// other files *blocked* by it.
 pub fn refused_messages(source: &Source, session_id: &str) -> Vec<RefusedMessage> {
     let commits = match source.replica.refused_commits("attachments") {
         Ok(commits) => commits,
@@ -466,6 +554,8 @@ pub fn refused_messages(source: &Source, session_id: &str) -> Vec<RefusedMessage
             return Vec::new();
         }
     };
+    let held = source.replica.upload_refusals();
+    let refusals = UploadRefusals::new(&held);
     let in_session = |values: &Map<String, Value>| text(values, "session_id") == session_id;
     commits
         .into_iter()
@@ -475,13 +565,28 @@ pub fn refused_messages(source: &Source, session_id: &str) -> Vec<RefusedMessage
                 .iter()
                 .find(|(table, values)| table == "messages" && in_session(values))
                 .map(|(_, values)| values.clone())?;
-            let attachments = commit
+            let files: Vec<&Map<String, Value>> = commit
                 .rows
                 .iter()
                 .filter(|(table, values)| table == "attachments" && in_session(values))
-                .filter_map(|(_, row)| {
-                    let sentence = refusal_sentence(&commit.rejection, text(row, "name"));
-                    chip(source, row, AgentAttachmentStateVm::Refused, Some(sentence))
+                .map(|(_, values)| values)
+                .collect();
+            let names: HashMap<&str, &str> = files
+                .iter()
+                .map(|row| (text(row, "id"), text(row, "name")))
+                .collect();
+            let attachments = files
+                .iter()
+                .filter_map(|row| {
+                    let (state, sentence) = refusals
+                        .chip(text(row, "id"), text(row, "name"), &names)
+                        .unwrap_or_else(|| {
+                            (
+                                AgentAttachmentStateVm::Refused,
+                                refusal_sentence(&commit.rejection, text(row, "name")),
+                            )
+                        });
+                    chip(source, row, state, Some(sentence))
                 })
                 .collect::<Vec<_>>();
             (!attachments.is_empty()).then_some(RefusedMessage {

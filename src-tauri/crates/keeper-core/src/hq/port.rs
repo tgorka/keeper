@@ -231,6 +231,34 @@ pub struct RefusedCommit {
     pub rows: Vec<(String, Map<String, Value>)>,
 }
 
+/// A blob's bytes, staged with the commit that references them
+/// ([`Replica::commit_with_blobs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobBody {
+    /// Its content address, `sha256:<hex>`.
+    pub id: String,
+    pub bytes: Vec<u8>,
+    pub media_type: Option<String>,
+}
+
+/// The server's refusal of a blob's upload (`blob.too_large`,
+/// `blob.hash_mismatch`), tied to one commit written here that references
+/// the blob. The replica resolved it when it arrived: the blob is no longer
+/// staged or pinned for that commit, so the rounds behind it go on, and the
+/// commit goes to the server without its body, which refuses it — its rows
+/// then come back through the outcome journal ([`Replica::refused_commits`]).
+/// Kept beside the replica, so it outlives a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRefusal {
+    pub commit_id: String,
+    pub blob_id: String,
+    pub rejection: Rejection,
+    /// The ids of the commit's rows that reference the blob.
+    pub refused_rows: Vec<String>,
+    /// The ids of every row the commit writes.
+    pub commit_rows: Vec<String>,
+}
+
 /// Why a replica call failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicaError {
@@ -295,12 +323,17 @@ pub trait Replica: Send + Sync {
     fn set_presence(&self, scope_key: &str, doc: Option<Value>) -> Result<(), ReplicaError>;
     /// The peers present on `scope_key`.
     fn presence(&self, scope_key: &str) -> Result<Vec<Peer>, ReplicaError>;
-    /// Cache `bytes` and queue their upload; the blob reference a column holds.
-    fn upload_blob(
+    /// Stage `blobs` for upload and commit `ops`, which reference them, as
+    /// one step of the replica's owner: no round runs and nothing is
+    /// evicted between, so each blob is pinned throughout — staged, then
+    /// referenced by the commit until the server has it. When a blob or the
+    /// commit fails, what this call staged and nothing else holds is
+    /// unstaged again. The commit's id.
+    fn commit_with_blobs(
         &self,
-        bytes: Vec<u8>,
-        media_type: Option<String>,
-    ) -> Result<Value, ReplicaError>;
+        blobs: Vec<BlobBody>,
+        ops: Vec<RowOp>,
+    ) -> Result<String, ReplicaError>;
     /// A blob's bytes, from the cache or, while the replica syncs, its server.
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError>;
     /// What became of the commit `commit_id`. Answers from the file.
@@ -311,10 +344,10 @@ pub trait Replica: Send + Sync {
     /// The standing refusals of commits written here that wrote a row of
     /// `table`, newest first, with what each wrote. Answers from the file.
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError>;
-    /// The server's refusal of the last blob upload this replica tried
-    /// (`blob.too_large`, `blob.hash_mismatch`): nothing more is pushed
-    /// while it stands, and a round the server answers in full clears it.
-    fn upload_refusal(&self) -> Option<Rejection>;
+    /// The server's standing refusals of uploads of blobs commits written
+    /// here reference, each resolved ([`UploadRefusal`]). Answers from what
+    /// the replica kept beside its file, never the network.
+    fn upload_refusals(&self) -> Vec<UploadRefusal>;
     /// The bytes of blob bodies the replica caches, as its client reports
     /// them (`blob_cache_bytes_approx`).
     fn blob_cache_bytes(&self) -> Result<u64, ReplicaError>;
@@ -373,8 +406,8 @@ pub(crate) mod fake {
         pub(crate) rows: Mutex<Vec<Map<String, Value>>>,
         pub(crate) closed: AtomicBool,
         pub(crate) joined: AtomicBool,
-        /// What [`Replica::upload_refusal`] answers.
-        pub(crate) upload_refusal: Mutex<Option<Rejection>>,
+        /// What [`Replica::upload_refusals`] answers.
+        pub(crate) upload_refusals: Mutex<Vec<UploadRefusal>>,
         state: watch::Sender<ReplicaState>,
     }
 
@@ -433,8 +466,12 @@ pub(crate) mod fake {
         fn presence(&self, _: &str) -> Result<Vec<Peer>, ReplicaError> {
             Ok(Vec::new())
         }
-        fn upload_blob(&self, _: Vec<u8>, _: Option<String>) -> Result<Value, ReplicaError> {
-            Ok(Value::Null)
+        fn commit_with_blobs(
+            &self,
+            _: Vec<BlobBody>,
+            ops: Vec<RowOp>,
+        ) -> Result<String, ReplicaError> {
+            self.mutate(ops)
         }
         fn fetch_blob(&self, _: &str) -> Result<Vec<u8>, ReplicaError> {
             Ok(Vec::new())
@@ -448,11 +485,11 @@ pub(crate) mod fake {
         fn refused_commits(&self, _: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
             Ok(Vec::new())
         }
-        fn upload_refusal(&self) -> Option<Rejection> {
-            self.upload_refusal
+        fn upload_refusals(&self) -> Vec<UploadRefusal> {
+            self.upload_refusals
                 .lock()
-                .ok()
-                .and_then(|held| held.clone())
+                .map(|held| held.clone())
+                .unwrap_or_default()
         }
         fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
             Ok(0)
@@ -527,7 +564,7 @@ pub(crate) mod fake {
                 rows: Mutex::new(Vec::new()),
                 closed: AtomicBool::new(false),
                 joined: AtomicBool::new(false),
-                upload_refusal: Mutex::new(None),
+                upload_refusals: Mutex::new(Vec::new()),
                 state,
             });
             self.opened

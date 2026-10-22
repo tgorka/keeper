@@ -330,11 +330,14 @@ fn only_a_blob_an_attachment_names_opens_and_only_as_a_type_that_cannot_run() {
     .expect("attaches");
     let opened = open_blob(&alpha, &sha256(&page)).expect("opens");
     assert_eq!(opened.mime, "application/octet-stream");
-    // Staged bytes no attachment names are not served.
-    alpha
-        .replica
-        .upload_blob(b"loose".to_vec(), None)
-        .expect("stages");
+    // Bytes cached in the replica that no attachment names are not served.
+    file(dir.path())
+        .execute(
+            "INSERT INTO _syncular_blobs(blob_id, bytes, byte_length, media_type, created_at_ms) \
+             VALUES (?1, ?2, 5, NULL, 1)",
+            rusqlite::params![sha256(b"loose"), b"loose".to_vec()],
+        )
+        .expect("caches");
     assert_eq!(
         open_blob(&alpha, &sha256(b"loose")),
         Err(OpenError::NotHere)
@@ -404,19 +407,67 @@ fn a_chip_is_uploading_while_the_server_is_reachable_waiting_while_not_and_sent_
     // Another device's or person's is the server's, whatever this link.
     assert_eq!(state("ben.phone", -1, LinkState::Offline), Sent);
 
-    // An upload the server refused: this device's waiting chips say why.
-    let (held, src) = fake(vec![row("dev1", -1)], LinkState::Offline);
-    *held.upload_refusal.lock().expect("lock") =
-        Some(Rejection::new("blob.too_large", "too large"));
-    let chip = &chips(&src, "dev1.1")["m-1"][0];
-    assert_eq!(chip.state, Refused);
-    assert_eq!(
-        chip.sentence.as_deref(),
-        Some(refusal_sentence(&Rejection::new("blob.too_large", ""), "a.csv").as_str())
-    );
     let (held, src) = fake(vec![row("dev1", 7)], LinkState::Offline);
-    *held.upload_refusal.lock().expect("lock") = Some(Rejection::new("blob.too_large", ""));
+    *held.upload_refusals.lock().expect("lock") = vec![upload_refusal("att-1", &["att-1"])];
     assert_eq!(chips(&src, "dev1.1")["m-1"][0].state, Sent, "already sent");
+}
+
+/// The server's refusal of `blob.too_large` for the commit writing
+/// `commit_rows`, of the blob `refused` carry.
+fn upload_refusal(refused: &str, commit_rows: &[&str]) -> crate::hq::port::UploadRefusal {
+    crate::hq::port::UploadRefusal {
+        commit_id: "c-1".to_owned(),
+        blob_id: sha256(b"huge"),
+        rejection: Rejection::new("blob.too_large", "too large"),
+        refused_rows: vec![refused.to_owned()],
+        commit_rows: commit_rows.iter().map(|id| (*id).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn a_refused_upload_marks_its_own_file_refused_its_messages_others_blocked_and_no_other_file() {
+    use AgentAttachmentStateVm::*;
+    let file = |id: &str, message: &str, name: &str| {
+        json!({"id": id, "message_id": message, "name": name, "mime": "text/plain", "size": 3,
+               "blob_ref": format!(r#"{{"blobId":"{}","byteLength":3}}"#, sha256(name.as_bytes())),
+               "author_client": "dev1", "version": -1})
+    };
+    let (held, src) = fake(
+        vec![
+            file("a-huge", "m-1", "huge.zip"),
+            file("a-tiny", "m-1", "tiny.txt"),
+            file("a-else", "m-2", "else.txt"),
+        ],
+        LinkState::Connected,
+    );
+    *held.upload_refusals.lock().expect("lock") = vec![upload_refusal(
+        "a-huge",
+        &["m-1", "a-huge", "a-tiny", "dev1.1"],
+    )];
+    let chips = chips(&src, "dev1.1");
+    let huge = &chips["m-1"][0];
+    assert_eq!(huge.state, Refused);
+    assert_eq!(
+        huge.sentence.as_deref(),
+        Some(refusal_sentence(&Rejection::new("blob.too_large", ""), "huge.zip").as_str())
+    );
+    let tiny = &chips["m-1"][1];
+    assert_eq!(
+        tiny.state, Blocked,
+        "never accused of being too large itself"
+    );
+    assert_eq!(
+        tiny.sentence.as_deref(),
+        Some(blocked_sentence("tiny.txt", &["huge.zip".to_owned()]).as_str())
+    );
+    assert!(!tiny
+        .sentence
+        .as_deref()
+        .unwrap_or_default()
+        .contains("larger"));
+    // A file of another message, another commit: on its way, not refused.
+    assert_eq!(chips["m-2"][0].state, Uploading);
+    assert_eq!(chips["m-2"][0].sentence, None);
 }
 
 /// Record, as a round would, the server refusing commit `commit` that wrote
@@ -543,6 +594,212 @@ fn a_message_whose_files_the_server_refused_stays_shown_refused_with_the_reason(
              Attach it again."
         )
     );
+}
+
+#[test]
+fn a_message_refused_for_one_files_upload_shows_that_file_refused_and_its_other_blocked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path());
+    let at = 1_792_000_000_000_i64;
+    seed_session(&alpha, "dev1.1", at, false);
+    close(alpha);
+    let (huge, tiny) = (sha256(b"huge"), sha256(b"tiny"));
+    let page = sessions::page_key("dev1.1", &sessions::month(at + 5));
+    let attachment = |id: &str, blob: &str, name: &str| {
+        json!({"id": id, "session_id": "dev1.1", "message_id": "m-1",
+               "blob_ref": format!(r#"{{"blobId":"{blob}","byteLength":4}}"#),
+               "name": name, "mime": "text/plain", "size": 4,
+               "created_at_ms": at + 5, "author_actor": ANA, "author_client": "dev1"})
+    };
+    // The server refused the commit, which went without the refused body.
+    journal_refusal(
+        dir.path(),
+        "c-1",
+        &[
+            (
+                "messages",
+                json!({"id": "m-1", "session_id": "dev1.1", "page_key": page,
+                       "role": "person", "body": "two files", "created_at_ms": at + 5,
+                       "author_actor": ANA, "author_client": "dev1"}),
+            ),
+            ("attachments", attachment("a-huge", &huge, "huge.zip")),
+            ("attachments", attachment("a-tiny", &tiny, "tiny.txt")),
+        ],
+        "blob.not_found",
+    );
+    // …after its upload was refused, which the replica kept beside itself.
+    crate::hq::blob_cache::AccessLog::open(&crate::hq::blob_cache::AccessLog::beside(
+        &dir.path().join("alpha.sqlite"),
+    ))
+    .expect("opens")
+    .refuse(
+        &[crate::hq::port::UploadRefusal {
+            commit_id: "c-1".to_owned(),
+            blob_id: huge.clone(),
+            rejection: Rejection::new("blob.too_large", "too large"),
+            refused_rows: vec!["a-huge".to_owned()],
+            commit_rows: vec!["m-1".to_owned(), "a-huge".to_owned(), "a-tiny".to_owned()],
+        }],
+        1,
+    )
+    .expect("keeps");
+    let alpha = open(dir.path());
+    let (view, _) = timeline::view(
+        &alpha,
+        "dev1.1",
+        &Opened::default(),
+        &Default::default(),
+        at + 10,
+    )
+    .expect("a view");
+    let message = &view.messages[0];
+    assert_eq!(message.body, "two files", "the caption stays");
+    assert_eq!(message.state, Some(AgentMessageStateVm::Refused));
+    let states: Vec<_> = message
+        .attachments
+        .iter()
+        .map(|chip| (chip.name.as_str(), chip.state, chip.sentence.clone()))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (
+                "huge.zip",
+                AgentAttachmentStateVm::Refused,
+                Some(refusal_sentence(
+                    &Rejection::new("blob.too_large", ""),
+                    "huge.zip"
+                ))
+            ),
+            (
+                "tiny.txt",
+                AgentAttachmentStateVm::Blocked,
+                Some(blocked_sentence("tiny.txt", &["huge.zip".to_owned()]))
+            ),
+        ],
+        "the upload's refusal, not the commit's not_found, and only for its own file"
+    );
+}
+
+/// Wait up to a minute (the replica backs off after each failed round) for
+/// `ready`.
+fn eventually(what: &str, ready: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explained_after_a_relaunch(
+) {
+    use crate::hq::syncular::tests::{blob_server, bootstrapped, pins, puts, queued};
+    use AgentAttachmentStateVm::*;
+    let (huge, tiny, note) = (
+        b"pretend these are 26 MB".to_vec(),
+        b"tea,3\n".to_vec(),
+        b"a note".to_vec(),
+    );
+    let (port, seen) = blob_server(vec![(sha256(&huge), 413)]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path());
+    seed_session(&alpha, "dev1.1", 1_000, false);
+    seed_session(&alpha, "dev1.2", 1_000, false);
+    close(alpha);
+    bootstrapped(&dir.path().join("alpha.sqlite"));
+    let linked = || {
+        let mut spec = spec(dir.path());
+        spec.link = Some(crate::hq::port::Link {
+            base_url: format!("http://127.0.0.1:{port}/alpha"),
+            token: "0123456789abcdef".to_owned(),
+        });
+        source(Arc::new(SyncularReplica::open(spec).expect("opens")))
+    };
+    let alpha = linked();
+    // A file the server refuses ahead of a tiny one, in one message; another
+    // session's message after them.
+    attach(
+        &alpha,
+        "dev1.1",
+        "two files",
+        vec![
+            stage_bytes("huge.zip", "application/zip", huge.clone()).expect("stages"),
+            stage_bytes("tiny.csv", "text/csv", tiny.clone()).expect("stages"),
+        ],
+    )
+    .expect("attaches");
+    attach(
+        &alpha,
+        "dev1.2",
+        "elsewhere",
+        vec![stage_bytes("note.txt", "text/plain", note.clone()).expect("stages")],
+    )
+    .expect("attaches");
+    let refused_at = || {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .position(|(_, path, status)| *status == 413 && path.contains(&sha256(&huge)))
+    };
+    eventually(
+        "the server refuses huge.zip, then a round goes past it",
+        || {
+            refused_at().is_some_and(|at| {
+                crate::hq::syncular::tests::pushed_after(&seen, at + 1)
+                    && puts(&seen, &sha256(&note), 200) >= 1
+                    && puts(&seen, &sha256(&tiny), 200) >= 1
+            })
+        },
+    );
+    let path = dir.path().join("alpha.sqlite");
+    assert!(!queued(&path).contains(&sha256(&huge)), "no longer staged");
+    assert!(
+        pins(&path).iter().all(|(_, blob)| *blob != sha256(&huge)),
+        "no longer pinned"
+    );
+    assert!(
+        pins(&path).iter().any(|(_, blob)| *blob == sha256(&tiny)),
+        "the other body its commit names stays pinned"
+    );
+    let explained = |alpha: &Source| {
+        let held = alpha.replica.upload_refusals();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].blob_id, sha256(&huge));
+        assert_eq!(held[0].rejection.code, "blob.too_large");
+        let one = chips(alpha, "dev1.1");
+        let mut files: Vec<_> = one
+            .values()
+            .flatten()
+            .map(|chip| (chip.name.as_str(), chip.state))
+            .collect();
+        files.sort_by_key(|(name, _)| *name);
+        assert_eq!(files, [("huge.zip", Refused), ("tiny.csv", Blocked)]);
+        let other = chips(alpha, "dev1.2");
+        let note = &other.values().next().expect("its message")[0];
+        assert!(
+            matches!(note.state, Uploading | Waiting),
+            "another session's file is not refused: {note:?}"
+        );
+        assert_eq!(note.sentence, None);
+    };
+    explained(&alpha);
+    close(alpha);
+
+    // A relaunch: the refusal is still explained, still resolved.
+    let pushes = seen.lock().expect("seen").len();
+    let alpha = linked();
+    explained(&alpha);
+    eventually("a round after the relaunch reaches its push", || {
+        crate::hq::syncular::tests::pushed_after(&seen, pushes)
+    });
+    let refusals = seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .filter(|(_, path, status)| *status == 413 && path.contains(&sha256(&huge)))
+        .count();
+    assert_eq!(refusals, 1, "never tried again");
 }
 
 #[test]

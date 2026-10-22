@@ -3,4 +3,4 @@
 /**
  * Where an attachment stands.
  */
-export type AgentAttachmentStateVm = "uploading" | "waiting" | "sent" | "refused";
+export type AgentAttachmentStateVm = "uploading" | "waiting" | "sent" | "refused" | "blocked";

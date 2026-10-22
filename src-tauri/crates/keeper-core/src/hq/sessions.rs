@@ -396,7 +396,10 @@ pub fn reads_trace(source: &Source, session_id: &str) -> bool {
 /// and its attachments' rows (never their bytes), and
 /// its newest months (widened by `widen` for an opened one); its trace
 /// months only where the person reads the trace, and their thinking only
-/// while `reasoning` is shown; nothing of an archived one.
+/// while `reasoning` is shown. Of an archived one nothing — but its
+/// attachments' rows while it is opened (in `widen`): its messages come
+/// through the server's `sessionPage`, and its files' names, sizes and the
+/// right to open them come with these rows, which go again when it closes.
 pub fn plan(
     held: &[Held],
     widen: &HashMap<String, u32>,
@@ -405,15 +408,20 @@ pub fn plan(
 ) -> Vec<(&'static str, Vec<String>)> {
     let mut sessions = BTreeSet::new();
     let mut turns = BTreeSet::new();
+    let mut files = BTreeSet::new();
     let mut pages = BTreeSet::new();
     let mut trace = BTreeSet::new();
     for membership in held {
         sessions.insert(membership.id.clone());
         let Some(row) = membership.row else { continue };
         if row.archived {
+            if widen.contains_key(&membership.id) {
+                files.insert(membership.id.clone());
+            }
             continue;
         }
         turns.insert(membership.id.clone());
+        files.insert(membership.id.clone());
         let mut months = newest_months(row.created_ms, row.last_activity_ms, now_ms);
         let extra = widen.get(&membership.id).copied().unwrap_or(0);
         months.extend(earlier_months(row.created_ms, row.last_activity_ms, extra));
@@ -433,8 +441,8 @@ pub fn plan(
         ("session_members", sessions),
         ("turn_chunks", turns.clone()),
         ("claims", turns.clone()),
-        ("session_tool_switches", turns.clone()),
-        ("attachments", turns),
+        ("session_tool_switches", turns),
+        ("attachments", files.into_iter().collect()),
         ("messages", pages.into_iter().collect()),
         ("approvals", trace.clone()),
         (
@@ -1025,6 +1033,22 @@ mod tests {
             .collect();
         assert!(hidden["reasoning"].is_empty());
         assert_eq!(hidden["tool_calls"], vec!["c.1/2026-10"]);
+
+        // Opened, the archived session holds its attachments' rows — what
+        // its files are and that they may be opened — and nothing else of
+        // it; closed again, they go.
+        let opened: HashMap<_, _> = plan(
+            &held,
+            &HashMap::from([("c.2".to_owned(), 0)]),
+            true,
+            october,
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(opened["attachments"], vec!["c.1", "c.2", "c.3"]);
+        assert_eq!(opened["turn_chunks"], vec!["c.1", "c.3"]);
+        assert_eq!(opened["messages"], vec!["c.1/2026-10", "c.3/2026-10"]);
+        assert_eq!(opened["approvals"], vec!["c.1/2026-10"]);
     }
 
     #[test]
