@@ -59,6 +59,7 @@ import type {
   AgentApprovalVm,
   AgentAsksVm,
   AgentAskVm,
+  AgentAttachmentVm,
   AgentChoiceVm,
   AgentConsoleReq,
   AgentConsoleVm,
@@ -9497,6 +9498,141 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
   ]),
 );
 
+// ?sessions=launch&attachments=chips — the chip in every state (UX-DR-E107-1), in alpha's
+// device.1: a message whose files are uploading, waiting, sent and refused, and a message the
+// server refused whole because it refused one file's upload — that file `refused`, the other
+// `blocked` by it. `&attachments=offline` keeps a new attachment waiting; `refused` has the server
+// refuse the first file's upload, and so the message. The `url` is an object URL here; the
+// shell's is `keeper-hq-blob://`.
+const attachmentsScenario = new URLSearchParams(location.search).get("attachments");
+const ATTACHMENT_MAX_BYTES = 26_214_400;
+function mockSizeLabel(bytes: number): string {
+  const mb = 1024 * 1024;
+  return bytes >= mb
+    ? `${(Math.ceil((bytes * 10) / mb) / 10).toFixed(1)} MB`
+    : `${Math.ceil(bytes / 1024)} kB`;
+}
+/** `keeper_core::hq::attachments::blocked_sentence`. */
+function mockBlocked(name: string, refused: string): string {
+  return `${name} was not sent: the agents server refused ${refused}, attached to the same message. Attach ${name} again.`;
+}
+/** `refusal_sentence` of `blob.too_large`. */
+function mockTooLarge(name: string): string {
+  return `${name} is larger than the 25.0 MB the agents server takes from one message, so the server refused it.`;
+}
+function mockChip(
+  id: string,
+  name: string,
+  mime: string,
+  size: number,
+  state: AgentAttachmentVm["state"],
+  body: BlobPart = name,
+): AgentAttachmentVm {
+  return {
+    id,
+    name,
+    mime,
+    size,
+    sizeLabel: mockSizeLabel(size),
+    state,
+    ...(state === "refused"
+      ? {
+          sentence: `The agents server does not hold ${name}, so it refused the message that names it. Attach it again.`,
+        }
+      : {}),
+    ...(state === "blocked" ? { sentence: mockBlocked(name, "another file") } : {}),
+    url: URL.createObjectURL(new Blob([body], { type: mime })),
+  };
+}
+if (attachmentsScenario === "chips") {
+  const vm = sessionViews.get(JSON.stringify(["alpha", "device.1"]));
+  if (vm) {
+    const at = vm.messages[vm.messages.length - 1]?.createdAtMs ?? Date.now();
+    vm.messages.push(
+      {
+        id: "message-files",
+        role: "person",
+        authorActor: "ana",
+        authorName: "Ana",
+        body: "Here are the plan, the photo, the prices and the notes.",
+        createdAtMs: at + 1,
+        state: "waiting",
+        attachments: [
+          mockChip("att-1", "release-plan.pdf", "application/pdf", 2_516_582, "uploading"),
+          mockChip("att-2", "whiteboard.png", "image/png", 845_312, "waiting"),
+          mockChip("att-3", "prices.csv", "text/csv", 1_204, "sent", "item,price\ntea,3\n"),
+          mockChip("att-4", "notes.md", "text/markdown", 18_944, "refused"),
+        ],
+      },
+      {
+        id: "message-refused",
+        role: "person",
+        authorActor: "ana",
+        authorName: "Ana",
+        body: "",
+        createdAtMs: at + 2,
+        state: "refused",
+        attachments: [
+          {
+            ...mockChip("att-5", "site-video.mov", "video/quicktime", 27_262_976, "refused"),
+            sentence: mockTooLarge("site-video.mov"),
+          },
+          {
+            ...mockChip("att-6", "old-scan.heic", "image/heic", 3_408_000, "blocked"),
+            sentence: mockBlocked("old-scan.heic", "site-video.mov"),
+          },
+        ],
+      },
+    );
+  }
+}
+/**
+ * The files staged under a handle (Rust's `attachments::Staging`), each already the chip its
+ * message will show; `agent_attach_commit` makes them one message. The mock receives a raw body
+ * without its headers, so a pasted file is named `pasted` here.
+ */
+const mockStaged = new Map<string, AgentAttachmentVm>();
+function mockStage(chip: AgentAttachmentVm): string {
+  const handle = `staged-${++sessionSerial}`;
+  mockStaged.set(handle, chip);
+  return handle;
+}
+function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachmentVm[]) {
+  const message: AgentSessionViewVm["messages"][number] = {
+    id: `local-${++sessionSerial}`,
+    role: "person",
+    authorActor: "ana",
+    authorName: "Ana",
+    body: caption,
+    createdAtMs: Date.now(),
+    state: "waiting",
+    attachments: chips,
+  };
+  vm.messages.push(message);
+  publishSessions();
+  if (attachmentsScenario === "offline" || sessionScenario === "offline") return;
+  setTimeout(() => {
+    if (attachmentsScenario === "refused") {
+      message.state = "refused";
+      const [first, ...rest] = chips;
+      message.attachments = first
+        ? [
+            { ...first, state: "refused", sentence: mockTooLarge(first.name) },
+            ...rest.map((chip) => ({
+              ...chip,
+              state: "blocked" as const,
+              sentence: mockBlocked(chip.name, first.name),
+            })),
+          ]
+        : [];
+    } else {
+      message.state = "sent";
+      message.attachments = chips.map((chip) => ({ ...chip, state: "sent" }));
+    }
+    publishSessions();
+  }, 900);
+}
+
 /** The mock's source retains rows; only the reader's selected projection crosses IPC. */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   const prefs = heldViewPrefs();
@@ -9746,6 +9882,52 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         message.state = "sent";
         publishSessions();
       }, 500);
+    return null;
+  },
+  agent_attach_path: (payload) => {
+    mockSession(payload);
+    const paths = (payload.paths as string[]) ?? [];
+    return paths.map((path, index) =>
+      mockStage(
+        mockChip(
+          `att-${++sessionSerial}-${index}`,
+          path.split(/[\\/]/).pop() || "attachment",
+          "application/octet-stream",
+          4096,
+          "uploading",
+        ),
+      ),
+    );
+  },
+  agent_attach_bytes: (payload) => {
+    const bytes = payload as unknown as ArrayBuffer;
+    const size = bytes.byteLength ?? 0;
+    if (size > ATTACHMENT_MAX_BYTES)
+      hqRefuse(
+        `pasted is ${mockSizeLabel(size)} and an agent takes at most 25.0 MB from one message, so it did not get the file.`,
+      );
+    return mockStage(
+      mockChip(`att-${++sessionSerial}`, "pasted", "image/png", size, "uploading", bytes),
+    );
+  },
+  agent_attach_commit: (payload) => {
+    if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
+    const vm = mockSession(payload);
+    const handles = (payload.handles as string[]) ?? [];
+    const chips = handles.map((handle) => mockStaged.get(handle));
+    for (const handle of handles) mockStaged.delete(handle);
+    if (chips.length === 0) hqRefuse("Choose a file to attach.");
+    if (chips.some((chip) => chip === undefined))
+      hqRefuse("A file of this message is no longer ready to send. Attach it again.");
+    mockAttach(
+      vm,
+      String(payload.caption ?? ""),
+      chips.filter((chip): chip is AgentAttachmentVm => chip !== undefined),
+    );
+    return null;
+  },
+  agent_attach_release: (payload) => {
+    for (const handle of (payload.handles as string[]) ?? []) mockStaged.delete(handle);
     return null;
   },
   agent_session_archive: (payload) => {

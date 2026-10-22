@@ -513,6 +513,205 @@ while the first is read, three with the server blackholed, one whose extension e
 queued — and how many notifications iOS leaves) and the Android tablet through ntfy while
 keeper runs.
 
+## Files in an agents session
+
+Story 107.1 (FR-857…FR-860; AD-429, AD-433). A file or photo put in an agents session is a
+syncular blob of the session's own database: uploaded once, before anything references it, and
+referenced by `attachments` rows committed with the message whose text is the caption, in one
+commit. Nothing goes into a drive, and no bytes cross IPC as JSON: the paperclip and
+drag-and-drop hand Rust **paths** (`agent_attach_path`), a paste hands it a **raw IPC body** with
+the session, type and name in headers (`agent_attach_bytes`).
+
+**One Send, one message** (R1071C-02). Neither call writes anything: each reads and checks its
+files and stages them in the process under handles it returns (`attachments::Staging`), never in
+the replica, so nothing staged can reach the server. The composer's Send stages its whole
+selection — paths and pastes in any mix — then hands every handle with the caption to
+`agent_attach_commit`, which takes them all and commits them as **one** message, its text the
+caption, once; a handle no longer staged refuses the whole Send and commits nothing. Handles are
+spent by the commit, released by `agent_attach_release` when the composer drops them, and
+released with their session when its last view closes; a process that dies holding some leaves
+nothing behind.
+
+**The bound.** One file may have at most `attachmentMaxBytes` from the contract's
+`syncular/limits.json` — 26,214,400 bytes (25 MiB) — the number the server's validator reads too.
+A larger file is refused on the device before anything is uploaded or written, with the agent
+host's sentence (*huge.zip is 25.1 MB and an agent takes at most 25.0 MB from one message, so it
+did not get the file.*, `keeper_core::hq::attachments::too_large`, which `keeper-agent` now
+re-exports); the server refuses it again if a device skips the check. A paste is measured against
+the bound before the shell copies its raw body out of the request, so an oversized paste costs no
+second copy of itself.
+
+**Upload before reference.** keeper hands the bytes and the commit that names them to the replica
+in one call (`Replica::commit_with_blobs`), which its owner thread runs as one step: it caches each
+blob under its content address (`sha256:<hex>`) and queues its upload, then commits the message and
+its rows. No round runs and nothing is evicted between the two, so a blob is pinned throughout —
+by its upload row, then by the commit — and a round that uploads it and is then cut off before its
+push leaves it pinned by the commit, across a relaunch, until the server takes the message. If a
+blob or the commit fails, what that call staged and nothing else holds is unstaged again. What
+each blob was before the call (cached? already queued?) is written beside the replica
+(`<replica>.blob-access.sqlite`, `unfinished_commit`) before the first is staged and cleared once
+the message is in the outbox or the blobs are back: a process that dies in between leaves that
+record, and the next open puts the blobs back before any round, so no blob is ever uploaded
+without the message that names it; one another waiting message pins stays queued for it
+(R1071K-07). If putting them back fails too (storage full, say), the record stays and the
+replica's owner runs no round — a round uploads every queued blob, named or not — until it has
+put them back: it tries again on every wake, backing off while it fails, so neither another Send
+nor a relaunch is needed for a failed Send's file to stay on the device (R1071K-10). The
+replica's next round uploads every queued blob (`POST …/upload-grant`, then
+`PUT /<database>/blobs/<blobId>`) before it pushes the commit that names it. `blob_ref` is syncular's canonical BlobRef JSON,
+`{"blobId":…,"byteLength":…,"mediaType":…,"name":…}` in that key order. Offline, the staged blob
+is pinned in the replica file — it survives a relaunch — and uploads once on reconnect; the same
+bytes attached twice are one blob.
+
+**The chip** (`AgentMessageVm.attachments`, one `AgentAttachmentVm` per file: name, type, size and
+its label, state, the refusal sentence, and the URL that opens it). A chip of this device's
+message reads **uploading** while its commit is on its way to a server this device reaches,
+**waiting** while it cannot reach one (offline, no server, refused credential), **sent** once the
+server has it — always, for anyone else's — and **refused** with the server's reason as a sentence:
+the commit refused (`blob.not_found`, `hq.attachment_writer`, `hq.attachment_message`,
+`hq.attachment_size`, `hq.attachment_blob_ref`, `hq.attachment_blob_size`, `hq.v1.author_*`), or
+the file's upload (`blob.too_large`, `blob.hash_mismatch`). A refused commit's rows leave the
+replica, so its message is read back from the replica's outcome journal and shown in its place,
+state **refused**, with its caption.
+
+**A refused upload** is resolved where it arrives, so it never stops the replica. The adapter
+knows which blob the refused grant or `PUT` was for; it ties the refusal to every commit in the
+outbox that names that blob and keeps it beside the replica (`<actor>.blob-access.sqlite`, table
+`upload_refusals`), then takes the blob out of the upload queue and out of those commits' pins.
+The next round uploads whatever else is staged and pushes every commit — those too, which the
+server refuses without the body, so their messages come back through the outcome journal like any
+refused commit. Nothing else changes: other commits, and every other body those commits pin, stay
+as they were. That file's chip reads **refused** with the upload's reason; the other files of its
+message read **blocked**, naming it (*tiny.csv was not sent: the agents server refused huge.zip,
+attached to the same message. Attach tiny.csv again.*); no other message's file is touched. The
+explanation outlives a relaunch, and goes once its commit neither waits nor stands refused.
+
+The rows of an active session's attachments are held in a window beside its messages; their bytes
+are not. An archived session holds none — until it is opened: its messages come through the
+server's `sessionPage` and its attachments' rows are held while it is open (`sessions::plan`), so
+its chips show and its files open through the same row check, downloaded only when opened; the
+rows go again when it closes.
+
+**Opening.** A chip's URL is `keeper-hq-blob://blob/<database>/<blobId>` (on Android and Windows,
+`http://keeper-hq-blob.localhost/…`). The handler serves only a blob an `attachments` row of that
+replica names, from the replica's cache, and downloads it on the first open — a second device
+shows the chip as soon as the message syncs and downloads nothing until it is opened. It answers
+as `keeper-media://` does (200, 206 for a `Range`, 416, 404 for anything it will not serve) with
+`nosniff`, and serves pictures, sound, video and PDF as themselves, text as `text/plain`, and
+everything else — HTML and SVG among them — as `application/octet-stream`, so no attachment runs
+as a page.
+
+**The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
+outbox pins (`keeper_core::hq::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
+`blob_cache_max_bytes`): ten of the largest files a message may carry, so a session's recent files
+open again without a download, while a phone holding both databases spends at most half a
+gigabyte on them. Past the cap, the least recently opened body the outbox does not pin is evicted
+first — referenced or not; the next open downloads it again. A body the outbox pins (staged, or
+named by a commit the server has not taken) is never evicted, even when the pinned bodies alone
+pass the cap. When each body was last opened is kept beside the replica
+(`<actor>.blob-access.sqlite`); the cache's size is the client's `blob_cache_bytes_approx`
+(`Hq::blob_cache_bytes`).
+
+### Measured: attachments against the real server
+
+2026-10-22, `hq_live.rs`'s
+`attachments_upload_before_reference_open_on_demand_and_are_refused_where_they_must_be` on delectra:
+the keeper-hq server from a clean `git archive` of `hq/107-1-blobs` 307ed16 (its own contract,
+schema 3; Bun 1.2.23, both databases with their blob directories) over a throwaway Postgres 18,
+tgorka in both databases, kuba in `tgdrive` alone, Nixie in the directory with no instance running;
+the test binary built in the agent container, run through delectra's gate. Four runs in a row,
+03:01:18–03:02:02 UTC, and two more on the tree rebased onto 106.6's first review round,
+03:15:31–03:15:53 UTC, 8–13 s each, every one green:
+
+- **Attach → upload → commit:** a CSV and a PNG attached by path from the mac (behind a relay that
+  sees every byte it sends) showed two chips at once, *uploading*; both read *sent* 1.8–2.7 s
+  later. The server answered one `PUT /tgdrive/blobs/<blobId>` for each.
+- **Open on demand:** the phone showed both chips as soon as the message synced, holding 0 bytes
+  of blobs (`blob_cache_bytes_approx`); opening the CSV downloaded its 26 bytes, served as
+  `text/plain`, and the cache then held exactly those.
+- **Offline:** with the relay cut, a pasted file's chip read *waiting*; keeper was shut down and
+  started again on the same files, the chip still *waiting* and the blob still staged in the
+  replica file; the phone had no row. Restored, the chip read *sent*, the server had answered one
+  `PUT` for it, and the phone held one row.
+- **A non-member** (kuba's token) asking for the CSV's blob was refused `blob.forbidden`.
+- **A reference to a blob the server does not hold** was refused `blob.not_found`; the mac showed
+  the message *refused*, its chip saying *The agents server does not hold ghost.txt, so it refused
+  the message that names it. Attach it again.*
+- **One byte over 25 MiB** was refused on the mac before anything was sent (the agent host's
+  sentence); staged anyway on a fourth device that skipped the check, the server refused the upload
+  (413, `blob.too_large`), that device's chip read *refused* with keeper's sentence, and the phone
+  never saw the message.
+
+The server's log had no error line; it recorded each forced reference as `push.rejected`
+`blob.not_found`. Two earlier runs of the case failed on the test's own counting, not on keeper:
+one counted the offline file's rows across every session (the same bytes attached in the run
+before are a second row of one blob — content addressing, as it should be), and two saw the
+CSV's `PUT` request line twice: the transport sends an idempotent request again on a fresh
+connection when its pooled one has died [INFERENCE: not traced to the byte in those runs].
+
+**After the first review round** (Fix1071K, R1071K-01…06), 2026-10-22 04:01:22–04:02:27 UTC, the
+same server revision and rig, three runs in a row, 16 s each, every one green. The relay now
+rebuilds each connection's HTTP/1.1 exchanges from both directions' framing (start lines split
+across reads, several messages in one read, `Content-Length` and chunked bodies, an upgraded
+socket left alone), so the case counts the `PUT`s the device **sent** and those the server
+**acknowledged** (2xx) separately; each file above was sent once and acknowledged once. The run
+adds:
+
+- **Cut after the upload, before the push:** the relay let blob requests through and closed any
+  connection asking for anything else. A pasted file's `PUT` was acknowledged; the replica file
+  still held its body, pinned by the message's commit (`_syncular_blob_commit_refs`), and the phone
+  had no row. keeper was shut down and started again behind the same cut: still pinned, the chip
+  *waiting*. Restored: *sent*, the phone showed it and opened it. The device sent that `PUT` three
+  times and the server acknowledged three — once per round that reached it, since this server's
+  grant answers `{}` rather than *present* for a body it already holds.
+- **A refused upload no longer stops the replica:** the device that skipped the check staged
+  25 MiB + 1 with its message; the server refused the upload (413, `blob.too_large`); the
+  replica resolved it, pushed the message without the body, and the server refused that
+  (`blob.not_found`, *push references blob … which has not been uploaded*). The message stayed
+  shown with its caption, its chip *refused* with the upload's reason (*huge.zip is larger than
+  the 25.0 MB the agents server takes from one message, so the server refused it.*), and a new
+  session that device opened next reached the phone. Shut down and started again: the same
+  refusal, the same reason, and its next message reached the phone too.
+- **Archived, then opened:** archived on the mac, the session's attachment rows left the phone's
+  replica (0 rows); opened archived, its message came through `sessionPage` with both chips, the
+  cache held nothing more for showing them, and the PNG — never opened on the phone before —
+  opened, its bytes downloaded then.
+
+Development fixtures: `?sessions=launch&attachments=chips` (alpha's `device.1`: a message whose
+files are uploading, waiting, sent and refused, and a message refused whole for one file's upload,
+its other file blocked), with `attachments=offline` or `attachments=refused` for what a new
+attachment does.
+
+**Proved on Linux:** keeper-core over real on-disk replicas — the bound before anything is staged,
+one commit holding the message and its rows with canonical `blob_ref`s, the pin and one upload row
+across a relaunch, opening only what a row names and only as a type that cannot run, the chips'
+states and their order (the order the files were attached in: the rows' ids increase within the
+one millisecond their commit shares), a refused commit's message and chips, every refusal code's
+sentence, a refused upload's
+file *refused* and its message's others *blocked* with no other file touched, before and after
+the server answers the message, and a selection staged by path and by paste — or several pastes —
+sent once as one message with its caption once, a handle never committed released and a Send
+naming one committing nothing (`hq/attachments_tests.rs`); eviction order and the pin over the
+replica file, the reported size, staging and its commit as one step that a round right after —
+its `PUT` answered, its push cut — leaves pinned across a relaunch under cache pressure, a failed
+commit taking back only what it staged, a commit cut short by the process dying after its first
+upload and before its message leaving nothing to upload once reopened (a blob another waiting
+message pins kept), a failed Send whose clean-up failed too uploading nothing of it — no round
+while storage stays faulted, the same owner putting it back on its next wake once storage
+recovers, the waiting message's file uploaded — without a reopen or another commit, a refused
+upload resolved and explained across a relaunch while the next
+rounds go past it, a moot refusal pruned after a round without a reopen (`hq/syncular.rs`,
+`hq/blob_cache.rs`, against a local server that answers the blob requests and cuts the push); an
+opened archived session's attachments window (`hq/sessions.rs`); the relay's HTTP framing, a
+`100`/`103` before the final answer included (`tests/hq_live.rs`). **Inspection only:**
+`hq_ipc.rs`'s four commands — `agent_attach_path`/`agent_attach_bytes` stage and return handles,
+`agent_attach_commit` sends them as one message, `agent_attach_release` drops them;
+`agent_attach_bytes` checks the borrowed body's length against the bound before copying it, with
+a test of its own — `hq_blob_protocol.rs` and their registration in `lib.rs` (CI's macOS job
+compiles them). **Owed:**
+the chip and the composer's tray (the UI lane, UX-DR-E107-1), hesperia and kalypso (acceptance 1,
+9 and the installed apps).
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history

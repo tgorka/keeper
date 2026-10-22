@@ -27,12 +27,17 @@ use std::time::Duration;
 use keeper_core::bots::chat::{CancelSignal, ContentPart};
 use keeper_core::bots::deliverable;
 use keeper_core::bots::tools::FILE_CONTENT_IS_DATA;
+use keeper_core::hq::attachments::human;
+/// A file over [`MAX_BYTES`]: keeper-core's sentence, the one the composer
+/// says too.
+pub use keeper_core::hq::attachments::too_large;
 use serde_json::Value;
 
 /// The most bytes one message's file may have for an agent to get it: the
 /// file is refused before it is downloaded when the message says it is
-/// larger, and at the first byte past it as it arrives (R444/01).
-pub const MAX_BYTES: u64 = 25 * 1024 * 1024;
+/// larger, and at the first byte past it as it arrives (R444/01). The
+/// contract's `attachmentMaxBytes` (`syncular/limits.json`).
+pub const MAX_BYTES: u64 = keeper_core::hq::attachments::ATTACHMENT_MAX_BYTES;
 
 /// The most bytes of a PDF's text written beside it: the rest is cut off,
 /// and the file says where.
@@ -839,29 +844,6 @@ pub async fn shown(
         )));
     }
     (parts, notes)
-}
-
-/// How a byte count reads in a sentence: whole kB below a megabyte, one
-/// decimal of MB above — rounded up, in `u128`, so the largest size a
-/// message may claim reads too (R444/08).
-fn human(bytes: u64) -> String {
-    const MB: u128 = 1024 * 1024;
-    let bytes = u128::from(bytes);
-    if bytes >= MB {
-        let tenths = (bytes * 10).div_ceil(MB);
-        format!("{}.{} MB", tenths / 10, tenths % 10)
-    } else {
-        format!("{} kB", bytes.div_ceil(1024))
-    }
-}
-
-/// A file over [`MAX_BYTES`].
-pub fn too_large(name: &str, bytes: u64) -> String {
-    format!(
-        "{name} is {} and an agent takes at most {} from one message, so it did not get the file.",
-        human(bytes),
-        human(MAX_BYTES)
-    )
 }
 
 /// A host with no way to download from the room.
@@ -1802,16 +1784,6 @@ mod tests {
         let half = BACKGROUND.map(|under| ((u32::from(under) * 127 + 127) / 255) as u8);
         let shaded = copy.get_pixel(3 * side / 4, side / 2).0;
         assert!(near(shaded, half), "{shaded:?} for {half:?}");
-    }
-
-    /// R444/08: a size reads rounded up, never overflowing — the largest a
-    /// message may claim too — and a size past the bound never reads as it.
-    #[test]
-    fn a_size_reads_whatever_a_message_claims() {
-        assert!(too_large("x", u64::MAX).contains("17592186044416.0 MB"));
-        assert!(too_large("x", MAX_BYTES).starts_with("x is 25.0 MB"));
-        assert!(too_large("x", MAX_BYTES + 1).starts_with("x is 25.1 MB"));
-        assert_eq!(human(1024 * 1024 - 1), "1024 kB");
     }
 
     /// This test binary as a worker ([`worker_child`]), with the bounds a

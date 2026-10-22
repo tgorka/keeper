@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions};
+use crate::hq::attachments::{self, OpenedBlob};
 use crate::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
 use crate::hq::send;
 use crate::hq::sessions::{
@@ -392,9 +393,10 @@ impl Hq {
         Ok(())
     }
 
-    /// A stream stops showing `key`; with none left its widened months go.
+    /// A stream stops showing `key`; with none left its widened months go,
+    /// and so does every file its composer staged and did not send.
     pub fn close_session(&self, key: &AgentSessionRef) {
-        {
+        let gone = {
             let mut views = lock(&self.views);
             let gone = views.get_mut(key).is_some_and(|opened| {
                 opened.streams = opened.streams.saturating_sub(1);
@@ -403,6 +405,10 @@ impl Hq {
             if gone {
                 views.remove(key);
             }
+            gone
+        };
+        if gone {
+            self.staging.release_session(key);
         }
         self.touch();
     }
@@ -462,6 +468,77 @@ impl Hq {
     pub fn send(&self, key: &AgentSessionRef, body: &str) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
         send::send(&source, &key.session_id, body).map_err(sentence)
+    }
+
+    /// Stage the files at `paths` for a message of a session: every file
+    /// read and checked, so one over the bound or unreadable refuses them
+    /// all, with its sentence, and none is staged. A handle for each, in
+    /// order. Nothing reaches the replica until [`Hq::commit_attachments`].
+    pub fn stage_paths(
+        &self,
+        key: &AgentSessionRef,
+        paths: &[std::path::PathBuf],
+    ) -> Result<Vec<String>, HqError> {
+        self.source(&key.database)?;
+        let files = paths
+            .iter()
+            .map(|path| attachments::stage_path(path))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sentence)?;
+        Ok(files
+            .into_iter()
+            .map(|file| self.staging.stage(key, file))
+            .collect())
+    }
+
+    /// Stage pasted `bytes` named `name` for a message of a session; its
+    /// handle.
+    pub fn stage_bytes(
+        &self,
+        key: &AgentSessionRef,
+        name: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, HqError> {
+        self.source(&key.database)?;
+        let file = attachments::stage_bytes(name, mime, bytes).map_err(sentence)?;
+        Ok(self.staging.stage(key, file))
+    }
+
+    /// The composer's one Send: every file `handles` name, with `caption`
+    /// as its text, committed as one new message of the session — or
+    /// nothing, with the sentence. The handles are spent either way.
+    pub fn commit_attachments(
+        &self,
+        key: &AgentSessionRef,
+        handles: &[String],
+        caption: &str,
+    ) -> Result<(), HqError> {
+        let files = self.staging.take(key, handles).map_err(sentence)?;
+        let source = self.source(&key.database)?;
+        attachments::attach(&source, &key.session_id, caption, files).map_err(sentence)?;
+        self.touch();
+        Ok(())
+    }
+
+    /// The composer let go of `handles` without sending them.
+    pub fn release_attachments(&self, key: &AgentSessionRef, handles: &[String]) {
+        self.staging.release(key, handles);
+    }
+
+    /// A chip opened: `blob_id` of `database`, from this device's cache or
+    /// downloaded now. Blocking: a download waits for the replica's owner.
+    pub fn open_blob(&self, database: &str, blob_id: &str) -> Result<OpenedBlob, HqError> {
+        let source = self.source(database)?;
+        attachments::open_blob(&source, blob_id).map_err(sentence)
+    }
+
+    /// The bytes of blobs `database`'s replica caches on this device.
+    pub fn blob_cache_bytes(&self, database: &str) -> Result<u64, HqError> {
+        self.source(database)?
+            .replica
+            .blob_cache_bytes()
+            .map_err(sentence)
     }
 
     /// Open a session with `agent` in `database` and write its first

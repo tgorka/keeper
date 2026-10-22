@@ -20,6 +20,7 @@
 //! KEEPER_HQ_LIVE_KILL=<for the killed instance, run last: a URL that SIGKILLs the agent's instance> \
 //! KEEPER_HQ_LIVE_INSTANCES=<for the default instance: two instance client ids of KEEPER_HQ_LIVE_AGENT, in both databases> \
 //! KEEPER_HQ_LIVE_INSTANCE_CTL=<for the default instance: a URL whose /kill/<client> SIGKILLs and /start/<client> starts one> \
+//! KEEPER_HQ_LIVE_NON_MEMBER=<for attachments: a person of the first database, never in the test's sessions> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
 //! ```
 //!
@@ -86,15 +87,230 @@ impl Platform for Device {
     }
 }
 
-/// A TCP relay in front of the server: it can be cut and restored, and it
-/// counts the connections and the bytes a device sends, and whether they
-/// named a path.
+/// Where one direction of an HTTP/1.1 connection stands between messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Reading a start line and headers.
+    Head,
+    /// Inside a body of this many bytes still to come.
+    Body(usize),
+    /// Expecting a chunk-size line.
+    ChunkSize,
+    /// Inside a chunk of this many bytes still to come.
+    ChunkData(usize),
+    /// Expecting the CRLF that ends a chunk.
+    ChunkEnd,
+    /// Reading trailer lines after the last chunk.
+    Trailer,
+    /// Not HTTP any more (an upgraded socket, or a body that ends with the
+    /// connection): nothing more is framed.
+    Raw,
+}
+
+/// Splits one direction of a connection into HTTP/1.1 messages, whatever
+/// boundaries its reads fall on: a start line split across reads, several
+/// messages in one read, `Content-Length` and chunked bodies.
+#[derive(Debug)]
+struct Framer {
+    response: bool,
+    buf: Vec<u8>,
+    state: Framing,
+}
+
+impl Framer {
+    fn new(response: bool) -> Framer {
+        Framer {
+            response,
+            buf: Vec::new(),
+            state: Framing::Head,
+        }
+    }
+
+    /// Take `bytes`; the start lines of the messages whose heads they
+    /// completed, in order.
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut heads = Vec::new();
+        if self.state == Framing::Raw {
+            return heads;
+        }
+        self.buf.extend_from_slice(bytes);
+        loop {
+            match self.state {
+                Framing::Raw => {
+                    self.buf.clear();
+                    return heads;
+                }
+                Framing::Head => {
+                    let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        return heads;
+                    };
+                    let head = String::from_utf8_lossy(&self.buf[..end]).to_string();
+                    self.buf.drain(..end + 4);
+                    let mut lines = head.split("\r\n");
+                    let start = lines.next().unwrap_or_default().to_owned();
+                    let header = |name: &str| {
+                        head.split("\r\n").skip(1).find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.trim()
+                                .eq_ignore_ascii_case(name)
+                                .then(|| value.trim().to_ascii_lowercase())
+                        })
+                    };
+                    let status: Option<u16> = self
+                        .response
+                        .then(|| start.split_whitespace().nth(1)?.parse().ok())
+                        .flatten();
+                    let length = header("content-length").and_then(|n| n.parse::<usize>().ok());
+                    let chunked =
+                        header("transfer-encoding").is_some_and(|t| t.contains("chunked"));
+                    self.state = match status {
+                        Some(100..=199) if status != Some(101) => Framing::Head,
+                        Some(101) => Framing::Raw,
+                        Some(204 | 304) => Framing::Head,
+                        _ if !self.response && header("upgrade").is_some() => Framing::Raw,
+                        _ if chunked => Framing::ChunkSize,
+                        _ => match length {
+                            Some(0) => Framing::Head,
+                            Some(n) => Framing::Body(n),
+                            None if self.response => Framing::Raw,
+                            None => Framing::Head,
+                        },
+                    };
+                    heads.push(start);
+                }
+                Framing::Body(left) | Framing::ChunkData(left) => {
+                    let take = left.min(self.buf.len());
+                    self.buf.drain(..take);
+                    let rest = left - take;
+                    self.state = match (self.state, rest) {
+                        (Framing::Body(_), 0) => Framing::Head,
+                        (Framing::Body(_), n) => Framing::Body(n),
+                        (_, 0) => Framing::ChunkEnd,
+                        (_, n) => Framing::ChunkData(n),
+                    };
+                    if rest > 0 {
+                        return heads;
+                    }
+                }
+                Framing::ChunkEnd => {
+                    if self.buf.len() < 2 {
+                        return heads;
+                    }
+                    self.buf.drain(..2);
+                    self.state = Framing::ChunkSize;
+                }
+                Framing::ChunkSize | Framing::Trailer => {
+                    let Some(end) = self.buf.windows(2).position(|w| w == b"\r\n") else {
+                        return heads;
+                    };
+                    let line = String::from_utf8_lossy(&self.buf[..end]).to_string();
+                    self.buf.drain(..end + 2);
+                    self.state = if self.state == Framing::Trailer {
+                        if line.is_empty() {
+                            Framing::Head
+                        } else {
+                            Framing::Trailer
+                        }
+                    } else {
+                        let size = line.split(';').next().unwrap_or_default().trim();
+                        match usize::from_str_radix(size, 16) {
+                            Ok(0) => Framing::Trailer,
+                            Ok(n) => Framing::ChunkData(n),
+                            Err(_) => Framing::Raw,
+                        }
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// One request a device sent through a relay, and the status the server
+/// answered it with — `None` while no answer came (a request sent again on
+/// a fresh connection after its pooled one died stays unanswered here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Exchange {
+    connection: u64,
+    /// `METHOD /path`.
+    request: String,
+    status: Option<u16>,
+}
+
+/// Every exchange of a relay, rebuilt from the HTTP framing of each
+/// connection: a request when its head is complete, its answer the next
+/// response head on the same connection.
+#[derive(Debug, Default)]
+struct HttpLog {
+    exchanges: Vec<Exchange>,
+}
+
+impl HttpLog {
+    /// The device's request heads `heads` on `connection`.
+    fn requests(&mut self, connection: u64, heads: Vec<String>) {
+        for head in heads {
+            let mut words = head.split_whitespace();
+            let request = format!(
+                "{} {}",
+                words.next().unwrap_or_default(),
+                words.next().unwrap_or_default()
+            );
+            self.exchanges.push(Exchange {
+                connection,
+                request,
+                status: None,
+            });
+        }
+    }
+
+    /// The server's response heads `heads` on `connection`. An informational
+    /// one (1xx but `101`) is not the answer: its request waits for the final
+    /// one (R1071K-08).
+    fn responses(&mut self, connection: u64, heads: Vec<String>) {
+        for head in heads {
+            let Some(status) = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            if (100..200).contains(&status) && status != 101 {
+                continue;
+            }
+            if let Some(open) = self
+                .exchanges
+                .iter_mut()
+                .find(|e| e.connection == connection && e.status.is_none())
+            {
+                open.status = Some(status);
+            }
+        }
+    }
+
+    /// How many times the device sent `request` (`METHOD /path`).
+    fn attempts(&self, request: &str) -> usize {
+        self.exchanges
+            .iter()
+            .filter(|e| e.request == request)
+            .count()
+    }
+
+    /// How many of those the server answered with a 2xx.
+    fn acknowledged(&self, request: &str) -> usize {
+        self.exchanges
+            .iter()
+            .filter(|e| e.request == request && e.status.is_some_and(|s| (200..300).contains(&s)))
+            .count()
+    }
+}
+
+/// A TCP relay in front of the server: it can be cut and restored, or let
+/// through only blob requests; it keeps every byte a device sends and every
+/// HTTP exchange, rebuilt from both directions' framing.
 struct Relay {
     port: u16,
     up: Arc<AtomicBool>,
+    blobs_only: Arc<AtomicBool>,
     connections: Arc<AtomicU64>,
     sent: Arc<Mutex<Vec<u8>>>,
     generation: Arc<AtomicU64>,
+    log: Arc<Mutex<HttpLog>>,
 }
 
 impl Relay {
@@ -104,15 +320,19 @@ impl Relay {
         let relay = Relay {
             port,
             up: Arc::new(AtomicBool::new(true)),
+            blobs_only: Arc::new(AtomicBool::new(false)),
             connections: Arc::new(AtomicU64::new(0)),
             sent: Arc::new(Mutex::new(Vec::new())),
             generation: Arc::new(AtomicU64::new(0)),
+            log: Arc::new(Mutex::new(HttpLog::default())),
         };
-        let (up, connections, sent, generation) = (
+        let (up, blobs_only, connections, sent, generation, log) = (
             Arc::clone(&relay.up),
+            Arc::clone(&relay.blobs_only),
             Arc::clone(&relay.connections),
             Arc::clone(&relay.sent),
             Arc::clone(&relay.generation),
+            Arc::clone(&relay.log),
         );
         tokio::spawn(async move {
             loop {
@@ -123,16 +343,22 @@ impl Relay {
                     drop(client);
                     continue;
                 }
-                connections.fetch_add(1, Ordering::SeqCst);
+                let id = connections.fetch_add(1, Ordering::SeqCst);
                 let Ok(server) = TcpStream::connect(&upstream).await else {
                     continue;
                 };
                 let born = generation.load(Ordering::SeqCst);
-                let (generation, sent) = (Arc::clone(&generation), Arc::clone(&sent));
+                let (generation, sent, log, blobs_only) = (
+                    Arc::clone(&generation),
+                    Arc::clone(&sent),
+                    Arc::clone(&log),
+                    Arc::clone(&blobs_only),
+                );
                 tokio::spawn(async move {
                     let (mut client_read, mut client_write) = client.into_split();
                     let (mut server_read, mut server_write) = server.into_split();
                     let alive = || generation.load(Ordering::SeqCst) == born;
+                    let (mut requests, mut responses) = (Framer::new(false), Framer::new(true));
                     let mut up_buf = [0u8; 16 * 1024];
                     let mut down_buf = [0u8; 16 * 1024];
                     loop {
@@ -140,13 +366,26 @@ impl Relay {
                             read = client_read.read(&mut up_buf) => match read {
                                 Ok(0) | Err(_) => return,
                                 Ok(n) => {
+                                    let heads = requests.push(&up_buf[..n]);
+                                    // Blobs only: a request for anything
+                                    // else ends the connection unsent.
+                                    if blobs_only.load(Ordering::SeqCst)
+                                        && heads.iter().any(|head| !head.contains("/blobs/"))
+                                    {
+                                        return;
+                                    }
                                     sent.lock().expect("sent").extend_from_slice(&up_buf[..n]);
+                                    log.lock().expect("log").requests(id, heads);
                                     if server_write.write_all(&up_buf[..n]).await.is_err() { return; }
                                 }
                             },
                             read = server_read.read(&mut down_buf) => match read {
                                 Ok(0) | Err(_) => return,
-                                Ok(n) => if client_write.write_all(&down_buf[..n]).await.is_err() { return; },
+                                Ok(n) => {
+                                    let heads = responses.push(&down_buf[..n]);
+                                    log.lock().expect("log").responses(id, heads);
+                                    if client_write.write_all(&down_buf[..n]).await.is_err() { return; }
+                                }
                             },
                             () = tokio::time::sleep(Duration::from_millis(100)) => {}
                         }
@@ -170,7 +409,17 @@ impl Relay {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Let blob requests through and nothing else — the network cut after
+    /// an upload and before the metadata exchange: every open connection
+    /// (the socket among them) is dropped, and a connection that asks for
+    /// anything but a blob is closed before its request is sent.
+    fn blobs_only(&self) {
+        self.blobs_only.store(true, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn restore(&self) {
+        self.blobs_only.store(false, Ordering::SeqCst);
         self.up.store(true, Ordering::SeqCst);
     }
 
@@ -178,6 +427,101 @@ impl Relay {
         let sent = self.sent.lock().expect("sent");
         sent.windows(needle.len()).any(|w| w == needle.as_bytes())
     }
+
+    /// How many times the device sent `request` (`METHOD /path`).
+    fn attempts(&self, request: &str) -> usize {
+        self.log.lock().expect("log").attempts(request)
+    }
+
+    /// How many times the server answered `request` with a 2xx.
+    fn acknowledged(&self, request: &str) -> usize {
+        self.log.lock().expect("log").acknowledged(request)
+    }
+}
+
+#[test]
+fn the_relay_frames_requests_and_answers_whatever_the_reads_boundaries() {
+    let put = "PUT /db/blobs/sha256:ab";
+    let request = format!("{put} HTTP/1.1\r\nhost: x\r\ncontent-length: 5\r\n\r\nhello");
+    let answer = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+    // A head split byte by byte: one request, once.
+    let mut up = Framer::new(false);
+    let heads: Vec<String> = request
+        .as_bytes()
+        .iter()
+        .flat_map(|b| up.push(&[*b]))
+        .collect();
+    assert_eq!(heads, [format!("{put} HTTP/1.1")]);
+    // Two requests, a body and a sync, in one read; answered in one read
+    // (one chunked), then the second only.
+    let mut log = HttpLog::default();
+    let mut up = Framer::new(false);
+    let both = format!("{request}POST /db/sync HTTP/1.1\r\ncontent-length: 3\r\n\r\nabc");
+    log.requests(7, up.push(both.as_bytes()));
+    let mut down = Framer::new(true);
+    let chunked = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
+    log.responses(7, down.push(chunked.as_bytes()));
+    assert_eq!((log.attempts(put), log.acknowledged(put)), (1, 1));
+    assert_eq!(log.acknowledged("POST /db/sync"), 0, "not answered yet");
+    log.responses(
+        7,
+        down.push(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n"),
+    );
+    assert_eq!(
+        (
+            log.attempts("POST /db/sync"),
+            log.acknowledged("POST /db/sync")
+        ),
+        (1, 0),
+        "answered, not acknowledged"
+    );
+    // The same PUT sent again on a new connection whose answer never came:
+    // two attempts, one acknowledgement.
+    let mut again = Framer::new(false);
+    log.requests(8, again.push(request.as_bytes()));
+    assert_eq!((log.attempts(put), log.acknowledged(put)), (2, 1));
+    // An answer split across reads pairs with its request once whole.
+    let mut down = Framer::new(true);
+    log.responses(8, down.push(&answer.as_bytes()[..10]));
+    assert_eq!(log.acknowledged(put), 1);
+    log.responses(8, down.push(&answer.as_bytes()[10..]));
+    assert_eq!(log.acknowledged(put), 2);
+    // An upgraded socket is not framed.
+    let mut socket = Framer::new(true);
+    assert_eq!(
+        socket.push(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\nHTTP/1.1 200"),
+        ["HTTP/1.1 101 Switching Protocols"]
+    );
+    // R1071K-08: a 100 or 103 before the final answer is not the answer —
+    // coalesced into one read or split across reads, the final status goes
+    // to its own request, and a later request keeps waiting for its own.
+    let informational =
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nlink: </a>\r\n\r\n";
+    let ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+    let mut log = HttpLog::default();
+    let mut up = Framer::new(false);
+    log.requests(9, up.push(format!("{request}{request}").as_bytes()));
+    let mut down = Framer::new(true);
+    log.responses(9, down.push(format!("{informational}{ok}").as_bytes()));
+    assert_eq!(
+        (log.attempts(put), log.acknowledged(put)),
+        (2, 1),
+        "the first PUT has its 200, the second none yet"
+    );
+    let whole = format!("{informational}{ok}");
+    for byte in whole.as_bytes() {
+        log.responses(9, down.push(&[*byte]));
+    }
+    assert_eq!(
+        log.acknowledged(put),
+        2,
+        "the second PUT's 200, after its own 1xx"
+    );
+    assert!(
+        log.exchanges.iter().all(|e| e.status == Some(200)),
+        "no request was answered by a 1xx: {:?}",
+        log.exchanges
+    );
 }
 
 fn env(name: &str) -> String {
@@ -2626,4 +2970,688 @@ fn label(hq: &Arc<Hq>, agent: &str, client: &str) -> String {
         .find(|a| a.agent_actor == agent)
         .and_then(|a| a.instances.into_iter().find(|i| i.client_id == client))
         .map_or_else(|| client.to_owned(), |i| i.label)
+}
+
+/// The chips of the message `body` in `key`'s view on `hq`, if it is shown.
+fn chips_of(
+    hq: &Arc<Hq>,
+    key: &keeper_core::hq::sessions::AgentSessionRef,
+    body: &str,
+) -> Option<(
+    Option<keeper_core::hq::timeline::AgentMessageStateVm>,
+    Vec<keeper_core::hq::attachments::AgentAttachmentVm>,
+)> {
+    let view = hq.session_view(key).ok()?;
+    let message = view.messages.into_iter().find(|m| m.body == body)?;
+    Some((message.state, message.attachments))
+}
+
+fn blob_id(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// Run a blocking `Hq` call off the async workers.
+async fn off<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(call).await.expect("joins")
+}
+
+/// Attachments against the real server (story 107.1): files attached on one
+/// device upload once and commit with their message in one commit; another
+/// device of the person shows the chips at once and downloads a file only
+/// when it is opened; attached offline, a file waits pinned across a
+/// relaunch and uploads once on reconnect; cut off after its upload and
+/// before the metadata push, a file stays pinned by its message's commit
+/// across a relaunch and the message goes on reconnect; a person not in the
+/// session is refused the blob (`blob.forbidden`); a reference to a blob the
+/// server does not hold is refused (`blob.not_found`); a file one byte over
+/// the bound is refused on the device before anything is uploaded, and by
+/// the server when the device's check is skipped — which no longer stops that
+/// device's other writes, before or after a relaunch; archived, a session's
+/// files show again when it is opened and open on demand. Needs
+/// `KEEPER_HQ_LIVE_NON_MEMBER`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server; see the module docs"]
+async fn attachments_upload_before_reference_open_on_demand_and_are_refused_where_they_must_be() {
+    use keeper_core::hq::attachments::{AgentAttachmentStateVm as Chip, ATTACHMENT_MAX_BYTES};
+    use keeper_core::hq::port::{BlobBody, Delivery};
+    use keeper_core::hq::timeline::AgentMessageStateVm;
+
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let databases: Vec<String> = env("KEEPER_HQ_LIVE_DATABASES")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    let database = databases[0].clone();
+    let non_member = env("KEEPER_HQ_LIVE_NON_MEMBER");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let upstream = server.trim_start_matches("http://").to_owned();
+
+    // The mac, behind a relay that counts every request it sends.
+    let relay = Relay::start(upstream).await;
+    let mac_device = device(&scratch.path().join("mac"));
+    let mac = hq(&mac_device, "hq_live attachments mac");
+    mac.start().await.expect("starts");
+    mac.set_server(&relay.url())
+        .await
+        .expect("stores the address");
+    mac.pair_redeem(&operator_code(&server, &operator, &actor).await)
+        .await
+        .expect("redeems");
+    let connected = |s: &HqStatusVm| {
+        s.databases.len() == databases.len()
+            && s.databases
+                .iter()
+                .all(|db| db.state == HqDatabaseState::Connected)
+    };
+    wait_status(&mac, "the mac connects", connected, Duration::from_secs(30)).await;
+    let phone = paired(
+        &device(&scratch.path().join("phone")),
+        &server,
+        &operator,
+        &actor,
+        databases.len(),
+    )
+    .await;
+    until(
+        &mac,
+        "the directory names the agent",
+        Duration::from_secs(30),
+        || {
+            mac.choices()
+                .ok()?
+                .into_iter()
+                .find(|c| c.agent_actor == agent && c.databases.contains(&database))
+                .map(|_| ())
+        },
+    )
+    .await;
+    let key = {
+        let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
+        off(move || mac.new_session(&database, &agent, "files for you")).await
+    }
+    .expect("a new session");
+    wait_status(
+        &mac,
+        "the session reaches the server",
+        |s| s.databases.iter().all(|db| db.waiting == 0),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // 1. Attach → upload → commit.
+    let files = scratch.path().join("files");
+    std::fs::create_dir_all(&files).expect("mkdir");
+    let csv = b"item,price\ntea,3\ncoffee,4\n".to_vec();
+    let png = {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend((0..4096u32).map(|i| (i % 251) as u8));
+        png
+    };
+    std::fs::write(files.join("prices.csv"), &csv).expect("writes");
+    std::fs::write(files.join("photo.png"), &png).expect("writes");
+    let (csv_id, png_id) = (blob_id(&csv), blob_id(&png));
+    let started = Instant::now();
+    {
+        let (mac, key, files) = (Arc::clone(&mac), key.clone(), files.clone());
+        off(move || {
+            let handles =
+                mac.stage_paths(&key, &[files.join("prices.csv"), files.join("photo.png")])?;
+            mac.commit_attachments(&key, &handles, "what costs more?")
+        })
+        .await
+        .expect("attaches");
+    }
+    let shown = chips_of(&mac, &key, "what costs more?").expect("shown at once");
+    assert_eq!(shown.1.len(), 2);
+    assert!(
+        shown
+            .1
+            .iter()
+            .all(|c| matches!(c.state, Chip::Uploading | Chip::Sent)),
+        "linked, a new chip uploads: {:?}",
+        shown.1
+    );
+    until(&mac, "the chips read sent", Duration::from_secs(30), || {
+        let (_, chips) = chips_of(&mac, &key, "what costs more?")?;
+        chips.iter().all(|c| c.state == Chip::Sent).then_some(())
+    })
+    .await;
+    let sent_in = started.elapsed();
+    for id in [&csv_id, &png_id] {
+        let put = format!("PUT /{database}/blobs/{id}");
+        assert_eq!(relay.acknowledged(&put), 1, "{id} uploaded once");
+        println!("  {id}: {} PUT sent, 1 acknowledged", relay.attempts(&put));
+    }
+    println!(
+        "PASS attach → upload → commit: two chips sent {} ms after attaching, each blob PUT once",
+        sent_in.as_millis()
+    );
+
+    // 2. The phone shows the chips as soon as the message syncs, and
+    // downloads a file only when it is opened.
+    let phone_chips = until(
+        &phone,
+        "the phone shows the chips",
+        Duration::from_secs(30),
+        || {
+            let (_, chips) = chips_of(&phone, &key, "what costs more?")?;
+            (chips.len() == 2).then_some(chips)
+        },
+    )
+    .await;
+    assert!(phone_chips.iter().all(|c| c.state == Chip::Sent));
+    let cached = |hq: &Arc<Hq>| {
+        let (hq, database) = (Arc::clone(hq), database.clone());
+        off(move || hq.blob_cache_bytes(&database).expect("measures"))
+    };
+    assert_eq!(cached(&phone).await, 0, "nothing downloaded before an open");
+    let opened = {
+        let (phone, database, id) = (Arc::clone(&phone), database.clone(), csv_id.clone());
+        off(move || phone.open_blob(&database, &id)).await
+    }
+    .expect("opens");
+    assert_eq!(opened.bytes, csv);
+    assert_eq!(opened.mime, "text/plain; charset=utf-8");
+    assert_eq!(
+        cached(&phone).await,
+        csv.len() as u64,
+        "only the opened file"
+    );
+    println!(
+        "PASS the phone shows both chips and holds 0 bytes until one is opened; then {} bytes (blob_cache_bytes_approx)",
+        csv.len()
+    );
+
+    // 3. Offline: waiting, pinned across a relaunch, one upload on reconnect.
+    relay.cut();
+    wait_status(
+        &mac,
+        "the mac goes offline",
+        |s| {
+            s.databases
+                .iter()
+                .any(|db| db.name == database && db.state != HqDatabaseState::Connected)
+        },
+        Duration::from_secs(60),
+    )
+    .await;
+    let offline = b"written on a train\n".to_vec();
+    let offline_id = blob_id(&offline);
+    {
+        let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), offline.clone());
+        off(move || {
+            let handle = mac.stage_bytes(&key, "train.txt", "text/plain", bytes)?;
+            mac.commit_attachments(&key, &[handle], "from the train")
+        })
+        .await
+        .expect("attaches offline");
+    }
+    until(&mac, "the chip waits", Duration::from_secs(30), || {
+        let (_, chips) = chips_of(&mac, &key, "from the train")?;
+        (chips[0].state == Chip::Waiting).then_some(())
+    })
+    .await;
+    mac.shutdown().await;
+    drop(mac);
+    let mac = hq(&mac_device, "hq_live attachments mac, relaunched");
+    mac.start().await.expect("starts again");
+    until(
+        &mac,
+        "still waiting after a relaunch",
+        Duration::from_secs(30),
+        || {
+            let (_, chips) = chips_of(&mac, &key, "from the train")?;
+            (chips.first()?.state == Chip::Waiting).then_some(())
+        },
+    )
+    .await;
+    let replica = mac.replica(&database).expect("a replica");
+    let pinned = query(
+        &replica,
+        "SELECT count(*) AS n FROM _syncular_blob_uploads WHERE blob_id = ?1",
+        vec![json!(offline_id)],
+    )
+    .await;
+    assert_eq!(pinned[0]["n"], 1, "pinned in the replica file");
+    assert!(
+        chips_of(&phone, &key, "from the train").is_none(),
+        "the server holds no row while the mac is cut off"
+    );
+    relay.restore();
+    until(
+        &mac,
+        "sent after reconnecting",
+        Duration::from_secs(90),
+        || {
+            let (_, chips) = chips_of(&mac, &key, "from the train")?;
+            (chips.first()?.state == Chip::Sent).then_some(())
+        },
+    )
+    .await;
+    until(
+        &phone,
+        "the phone shows it once",
+        Duration::from_secs(30),
+        || chips_of(&phone, &key, "from the train").map(|_| ()),
+    )
+    .await;
+    let put = format!("PUT /{database}/blobs/{offline_id}");
+    assert_eq!(relay.acknowledged(&put), 1, "uploaded once");
+    println!(
+        "  {offline_id}: {} PUT sent, 1 acknowledged",
+        relay.attempts(&put)
+    );
+    let phone_replica = phone.replica(&database).expect("a replica");
+    let rows = query(
+        &phone_replica,
+        "SELECT count(*) AS n FROM attachments \
+         WHERE session_id = ?1 AND json_extract(blob_ref, '$.blobId') = ?2",
+        vec![json!(key.session_id), json!(offline_id)],
+    )
+    .await;
+    assert_eq!(rows[0]["n"], 1, "one row in the session");
+    println!("PASS offline: waiting, pinned across a relaunch, sent on reconnect with one PUT and one row");
+
+    // 3b. The network cut after the upload and before the metadata push:
+    // the server holds the body, not the message; the commit keeps the body
+    // pinned across a relaunch, and the message goes on reconnect.
+    relay.blobs_only();
+    let cut = b"uploaded, then the line went down\n".to_vec();
+    let cut_id = blob_id(&cut);
+    let cut_put = format!("PUT /{database}/blobs/{cut_id}");
+    {
+        let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), cut.clone());
+        off(move || {
+            let handle = mac.stage_bytes(&key, "cut.txt", "text/plain", bytes)?;
+            mac.commit_attachments(&key, &[handle], "cut after the upload")
+        })
+        .await
+        .expect("attaches");
+    }
+    until(
+        &mac,
+        "the server acknowledges the upload",
+        Duration::from_secs(60),
+        || (relay.acknowledged(&cut_put) >= 1).then_some(()),
+    )
+    .await;
+    let pinned_by_commit = |replica: Arc<dyn Replica>| {
+        let id = cut_id.clone();
+        async move {
+            let refs = query(
+                &replica,
+                "SELECT count(*) AS n FROM _syncular_blob_commit_refs WHERE blob_id = ?1",
+                vec![json!(id)],
+            )
+            .await;
+            let bodies = query(
+                &replica,
+                "SELECT count(*) AS n FROM _syncular_blobs WHERE blob_id = ?1",
+                vec![json!(id)],
+            )
+            .await;
+            (refs[0]["n"].as_u64(), bodies[0]["n"].as_u64())
+        }
+    };
+    assert_eq!(
+        pinned_by_commit(mac.replica(&database).expect("a replica")).await,
+        (Some(1), Some(1)),
+        "acknowledged, the body stays, pinned by the message's commit"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        chips_of(&phone, &key, "cut after the upload").is_none(),
+        "the metadata never reached the server"
+    );
+    mac.shutdown().await;
+    drop(mac);
+    let mac = hq(
+        &mac_device,
+        "hq_live attachments mac, relaunched after the cut",
+    );
+    mac.start().await.expect("starts again");
+    until(
+        &mac,
+        "the message waits after a relaunch",
+        Duration::from_secs(30),
+        || {
+            let (_, chips) = chips_of(&mac, &key, "cut after the upload")?;
+            matches!(chips.first()?.state, Chip::Waiting | Chip::Uploading).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        pinned_by_commit(mac.replica(&database).expect("a replica")).await,
+        (Some(1), Some(1)),
+        "still pinned after the relaunch"
+    );
+    relay.restore();
+    until(
+        &mac,
+        "sent once the line is back",
+        Duration::from_secs(90),
+        || {
+            let (_, chips) = chips_of(&mac, &key, "cut after the upload")?;
+            (chips.first()?.state == Chip::Sent).then_some(())
+        },
+    )
+    .await;
+    until(
+        &phone,
+        "the phone shows it",
+        Duration::from_secs(30),
+        || chips_of(&phone, &key, "cut after the upload").map(|_| ()),
+    )
+    .await;
+    let opened = {
+        let (phone, database, id) = (Arc::clone(&phone), database.clone(), cut_id.clone());
+        off(move || phone.open_blob(&database, &id)).await
+    }
+    .expect("opens");
+    assert_eq!(opened.bytes, cut);
+    println!(
+        "PASS cut after the PUT, before the push: pinned by its commit across a relaunch, sent on reconnect, opens on the phone ({} PUT sent, {} acknowledged)",
+        relay.attempts(&cut_put),
+        relay.acknowledged(&cut_put)
+    );
+
+    // 4. A person not in the session is refused the blob.
+    let (outsider, outsider_db) = non_member.split_once(':').expect("<actor>:<database>");
+    assert_eq!(outsider_db, database);
+    let stranger = paired(
+        &device(&scratch.path().join("stranger")),
+        &server,
+        &operator,
+        outsider,
+        1,
+    )
+    .await;
+    let refused = {
+        let replica = stranger.replica(&database).expect("a replica");
+        let id = csv_id.clone();
+        off(move || replica.fetch_blob(&id)).await
+    };
+    let error = refused
+        .expect_err("a non-member downloads nothing")
+        .to_string();
+    assert!(error.starts_with("blob.forbidden"), "{error}");
+    println!("PASS a non-member's token is refused the blob: {error}");
+
+    // 5. A reference to a blob the server does not hold is refused.
+    let source = mac
+        .sources()
+        .into_iter()
+        .find(|s| s.database == database)
+        .expect("the database");
+    let author = Author {
+        actor: source.actor.clone(),
+        client: source.client.clone(),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let ghost = blob_id(b"never uploaded");
+    let message_id = ulid::Ulid::new().to_string();
+    let commit = mutate(
+        &source.replica,
+        vec![
+            message(
+                &author,
+                &key.session_id,
+                &page_key(&key.session_id, now),
+                &message_id,
+                "a ghost file",
+                now,
+            ),
+            upsert(
+                "attachments",
+                by(
+                    &author,
+                    json!({
+                        "id": ulid::Ulid::new().to_string(), "session_id": key.session_id,
+                        "message_id": message_id,
+                        "blob_ref": format!(r#"{{"blobId":"{ghost}","byteLength":14}}"#),
+                        "name": "ghost.txt", "mime": "text/plain", "size": 14, "created_at_ms": now,
+                    }),
+                ),
+            ),
+        ],
+    )
+    .await;
+    source.replica.sync_now();
+    match delivered(&source.replica, &commit).await {
+        Delivery::Refused(rejection) => assert_eq!(rejection.code, "blob.not_found"),
+        other => panic!("a reference to a missing blob was {other:?}"),
+    }
+    let (state, chips) = until(&mac, "the refused chip", Duration::from_secs(30), || {
+        chips_of(&mac, &key, "a ghost file")
+    })
+    .await;
+    assert_eq!(state, Some(AgentMessageStateVm::Refused));
+    assert_eq!(chips[0].state, Chip::Refused);
+    println!(
+        "PASS a forced reference to a missing blob is refused (blob.not_found), shown: {}",
+        chips[0].sentence.as_deref().unwrap_or("")
+    );
+
+    // 6. One byte over the bound: refused on the device before any upload…
+    let huge = vec![0u8; ATTACHMENT_MAX_BYTES as usize + 1];
+    let huge_id = blob_id(&huge);
+    let refused = {
+        let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), huge.clone());
+        off(move || {
+            let handle = mac.stage_bytes(&key, "huge.zip", "application/zip", bytes)?;
+            mac.commit_attachments(&key, &[handle], "too big")
+        })
+        .await
+    };
+    let sentence = refused.expect_err("refused on the device").to_string();
+    assert_eq!(
+        sentence,
+        keeper_core::hq::attachments::too_large("huge.zip", ATTACHMENT_MAX_BYTES + 1)
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!relay.sent_contains(&huge_id), "nothing of it left the mac");
+    assert!(chips_of(&mac, &key, "too big").is_none());
+    println!("PASS 25 MiB + 1 refused on the device before any upload: {sentence}");
+    // …and by the server when a device skips the check.
+    let skipper_device = device(&scratch.path().join("skipper"));
+    let skipper = paired(&skipper_device, &server, &operator, &actor, databases.len()).await;
+    // Its replica must hold the session first, so the refused message has
+    // somewhere to be shown.
+    until(
+        &skipper,
+        "the skipper holds the session",
+        Duration::from_secs(30),
+        || skipper.session_view(&key).ok().map(|_| ()),
+    )
+    .await;
+    let skip = skipper
+        .sources()
+        .into_iter()
+        .find(|s| s.database == database)
+        .expect("the database");
+    let skip_author = Author {
+        actor: skip.actor.clone(),
+        client: skip.client.clone(),
+    };
+    let message_id = ulid::Ulid::new().to_string();
+    let size = ATTACHMENT_MAX_BYTES + 1;
+    let refused_commit = {
+        let replica = Arc::clone(&skip.replica);
+        let ops = vec![
+            message(
+                &skip_author,
+                &key.session_id,
+                &page_key(&key.session_id, now),
+                &message_id,
+                "skipped the check",
+                now,
+            ),
+            upsert(
+                "attachments",
+                by(
+                    &skip_author,
+                    json!({
+                        "id": ulid::Ulid::new().to_string(), "session_id": key.session_id,
+                        "message_id": message_id,
+                        "blob_ref": format!(r#"{{"blobId":"{huge_id}","byteLength":{size}}}"#),
+                        "name": "huge.zip", "mime": "application/zip", "size": size,
+                        "created_at_ms": now,
+                    }),
+                ),
+            ),
+        ];
+        let blob = BlobBody {
+            id: huge_id.clone(),
+            bytes: huge,
+            media_type: Some("application/zip".to_owned()),
+        };
+        off(move || replica.commit_with_blobs(vec![blob], ops)).await
+    }
+    .expect("staged and committed without the check");
+    skip.replica.sync_now();
+    let refusal = until(
+        &skipper,
+        "the server refuses the upload",
+        Duration::from_secs(60),
+        || {
+            skip.replica
+                .upload_refusals()
+                .into_iter()
+                .find(|r| r.blob_id == huge_id)
+        },
+    )
+    .await;
+    assert_eq!(refusal.rejection.code, "blob.too_large");
+    assert_eq!(refusal.commit_id, refused_commit);
+    let too_large_sentence = keeper_core::hq::attachments::refusal_sentence(
+        &keeper_core::hq::port::Rejection::new("blob.too_large", ""),
+        "huge.zip",
+    );
+    // Resolved: the commit goes without the body and the server refuses
+    // it; the message stays shown with its caption and the upload's reason.
+    let delivery = delivered(&skip.replica, &refused_commit).await;
+    assert!(matches!(delivery, Delivery::Refused(_)), "{delivery:?}");
+    let shown_refused = |hq: &Arc<Hq>| {
+        let (state, chips) = chips_of(hq, &key, "skipped the check")?;
+        (state == Some(AgentMessageStateVm::Refused)
+            && chips.first()?.state == Chip::Refused
+            && chips[0].sentence.as_deref() == Some(too_large_sentence.as_str()))
+        .then_some(())
+    };
+    until(
+        &skipper,
+        "the refused message, its caption and reason",
+        Duration::from_secs(30),
+        || shown_refused(&skipper),
+    )
+    .await;
+    // Every other write of that replica goes on: a new session.
+    let after = {
+        let (skipper, database, agent) = (Arc::clone(&skipper), database.clone(), agent.clone());
+        off(move || skipper.new_session(&database, &agent, "after the refusal")).await
+    }
+    .expect("a new session");
+    until(
+        &phone,
+        "the phone sees the skipper's next write",
+        Duration::from_secs(60),
+        || chips_of(&phone, &after, "after the refusal").map(|_| ()),
+    )
+    .await;
+    println!(
+        "PASS 25 MiB + 1 with the check skipped: the upload refused ({}), the message refused ({delivery:?}) and shown with its caption: {too_large_sentence}; a new session after it reached the phone",
+        refusal.rejection.code
+    );
+    // …and across a relaunch.
+    skipper.shutdown().await;
+    drop(skipper);
+    let skipper = hq(&skipper_device, "hq_live attachments skipper, relaunched");
+    skipper.start().await.expect("starts again");
+    // Started, it opens what it held, then each database again once its
+    // server is reached: write after that.
+    wait_status(
+        &skipper,
+        "the skipper connects again",
+        connected,
+        Duration::from_secs(30),
+    )
+    .await;
+    until(
+        &skipper,
+        "still explained after a relaunch",
+        Duration::from_secs(30),
+        || shown_refused(&skipper),
+    )
+    .await;
+    {
+        let (skipper, after) = (Arc::clone(&skipper), after.clone());
+        off(move || skipper.send(&after, "after the relaunch")).await
+    }
+    .expect("sends");
+    until(
+        &phone,
+        "the phone sees the message after the relaunch",
+        Duration::from_secs(60),
+        || chips_of(&phone, &after, "after the relaunch").map(|_| ()),
+    )
+    .await;
+    assert!(
+        chips_of(&phone, &key, "skipped the check").is_none(),
+        "the server never held it"
+    );
+    println!("PASS after a relaunch the refusal is still shown with its reason, and the next message is delivered");
+    skipper.shutdown().await;
+
+    // 8. Archived, its rows leave the phone; opened archived, its chips are
+    // back and a file never opened there opens — downloaded only then.
+    {
+        let (mac, key) = (Arc::clone(&mac), key.clone());
+        off(move || mac.set_archived(&key, true)).await
+    }
+    .expect("archives");
+    let phone_replica = phone.replica(&database).expect("a replica");
+    wait_rows(
+        &phone_replica,
+        "SELECT id FROM attachments WHERE session_id = ?1",
+        vec![json!(key.session_id)],
+        0,
+        Duration::from_secs(60),
+    )
+    .await;
+    let before = cached(&phone).await;
+    phone.open_session(&key).expect("opens archived");
+    let chips = until(
+        &phone,
+        "the archived session's chips",
+        Duration::from_secs(60),
+        || {
+            let (_, chips) = chips_of(&phone, &key, "what costs more?")?;
+            (chips.len() == 2).then_some(chips)
+        },
+    )
+    .await;
+    assert!(phone.session_view(&key).expect("a view").archived);
+    assert_eq!(
+        cached(&phone).await,
+        before,
+        "no body fetched by showing them"
+    );
+    let opened = {
+        let (phone, database, id) = (Arc::clone(&phone), database.clone(), png_id.clone());
+        off(move || phone.open_blob(&database, &id)).await
+    }
+    .expect("opens archived");
+    assert_eq!(opened.bytes, png);
+    assert_eq!(cached(&phone).await, before + png.len() as u64);
+    phone.close_session(&key);
+    println!(
+        "PASS archived: its attachment rows left the phone; opened archived, {} chips shown and photo.png opened on demand",
+        chips.len()
+    );
+    mac.shutdown().await;
+    phone.shutdown().await;
 }

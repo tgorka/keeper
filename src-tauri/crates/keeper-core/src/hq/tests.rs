@@ -650,12 +650,12 @@ impl Replica for Staged {
             _ => Ok(lock(&self.others).clone()),
         }
     }
-    fn upload_blob(
+    fn commit_with_blobs(
         &self,
-        b: Vec<u8>,
-        m: Option<String>,
-    ) -> Result<Value, crate::hq::port::ReplicaError> {
-        self.inner.upload_blob(b, m)
+        b: Vec<crate::hq::port::BlobBody>,
+        ops: Vec<RowOp>,
+    ) -> Result<String, crate::hq::port::ReplicaError> {
+        self.inner.commit_with_blobs(b, ops)
     }
     fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
         self.inner.fetch_blob(b)
@@ -672,6 +672,18 @@ impl Replica for Staged {
         row_id: &str,
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
         self.inner.row_writes(table, row_id)
+    }
+    fn refused_commits(
+        &self,
+        table: &str,
+    ) -> Result<Vec<crate::hq::port::RefusedCommit>, crate::hq::port::ReplicaError> {
+        self.inner.refused_commits(table)
+    }
+    fn upload_refusals(&self) -> Vec<crate::hq::port::UploadRefusal> {
+        self.inner.upload_refusals()
+    }
+    fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
+        self.inner.blob_cache_bytes()
     }
     fn supersede(
         &self,
