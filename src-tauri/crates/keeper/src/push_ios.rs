@@ -278,7 +278,11 @@ fn act_on_item(tap: &push::ActionTap) -> Option<Value> {
     match crate::hq_ipc::decide_pushed(app, &decision, push::ACTION_BUDGET) {
         Ok(_) => None,
         Err(why) => {
-            tracing::warn!(why, "push: a lock-screen decision was not sent");
+            tracing::warn!(
+                target: keeper_core::telemetry::SHELL_AGENTS_TARGET,
+                why,
+                "push: a lock-screen decision was not sent"
+            );
             Some(unfinished(&tap.user_info, &why))
         }
     }

@@ -491,14 +491,23 @@ pub struct LogSite<'a> {
     pub line: Option<u32>,
 }
 
+/// The shell's agents-server target (108.2, R1082-03): the shell's own
+/// `hq_*` modules log under it by their module path (`keeper_lib::hq_ipc`,
+/// `keeper_lib::hq_blob_protocol`), and a shell line elsewhere that carries
+/// the agents server's words — a refusal naming the person's databases, an
+/// item that could not be read — names it as its `target:`.
+pub const SHELL_AGENTS_TARGET: &str = "keeper_lib::hq";
+
 /// Agent content stays home (R461): a line under `keeper_agent…`,
-/// `keeper_core::agents…` or `keeper_core::hq…` (the agents' database, whose
-/// errors can quote a server's refusal of a row) leaves with its level,
-/// target, callsite and fingerprint, never its message.
+/// `keeper_core::agents…`, `keeper_core::hq…` (the agents' database, whose
+/// errors can quote a server's refusal of a row) or the shell's
+/// [`SHELL_AGENTS_TARGET`] leaves with its level, target, callsite and
+/// fingerprint, never its message.
 pub fn is_agent_target(target: &str) -> bool {
     target.starts_with("keeper_agent")
         || target.starts_with("keeper_core::agents")
         || target.starts_with("keeper_core::hq")
+        || target.starts_with(SHELL_AGENTS_TARGET)
 }
 
 /// A callsite's file as it may leave: a workspace path as compiled

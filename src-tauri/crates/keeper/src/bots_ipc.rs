@@ -857,7 +857,14 @@ pub async fn send_spoken(app: &AppHandle, question: u64, text: String) {
     let req = match outcome {
         Ok(req) => req,
         Err(refusal) => {
-            tracing::warn!(message = %refusal.message, "bots: a spoken turn was refused");
+            // The refusal can be the agents server's (a `voice_agent_targets`
+            // error) or name the person's agent or bot: it stays on this
+            // device (R1082-03).
+            tracing::warn!(
+                target: keeper_core::telemetry::SHELL_AGENTS_TARGET,
+                message = __omp_magic("", "refusal.message,")
+                "bots: a spoken turn was refused"
+            );
             crate::voice_ipc::answer_failed(question, refusal.message);
             return;
         }

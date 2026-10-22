@@ -438,7 +438,7 @@ async fn message(body: String) {
             }
             Ok(keeper_core::hq::push::HqClassified::Drop) => {}
             Err(why) => {
-                tracing::warn!(why, "push: the agents item could not be read");
+                tracing::warn!(target: keeper_core::telemetry::SHELL_AGENTS_TARGET, why, "push: the agents item could not be read");
                 post(up::generic_notification()).await;
             }
         }
@@ -514,7 +514,11 @@ async fn act_on_item(app: &AppHandle, tag: &str, tap: &push::ActionTap) {
             }
         }
         Err(why) => {
-            tracing::warn!(why, "push: a decision from a notification was not sent");
+            tracing::warn!(
+                target: keeper_core::telemetry::SHELL_AGENTS_TARGET,
+                why,
+                "push: a decision from a notification was not sent"
+            );
             post(up::finish_in_keeper(tag, &tap.user_info, &why)).await;
         }
     }

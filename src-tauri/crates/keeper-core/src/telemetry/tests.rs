@@ -568,6 +568,58 @@ fn agent_target_lines_leave_without_their_message() {
     assert!(payloads[2].contains("push held for PUBLIC_VISIBLE"));
 }
 
+/// R1082-03: the shell's agents-server lines stay home too. A spoken
+/// question refused because its agent works in several databases names them;
+/// logged by the shell's `hq_ipc` (its module target) or by another shell
+/// module under [`SHELL_AGENTS_TARGET`], the line leaves with its target and
+/// callsite and none of the names, at the log layer and at `capture_log`.
+#[test]
+fn the_shells_agents_server_lines_leave_without_the_persons_databases() {
+    let local = LocalDir::new();
+    let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+    telemetry
+        .set_consent(TelemetryConsentVm {
+            diagnostics: true,
+            product_analytics: true,
+            remote_config: true,
+        })
+        .expect("consent");
+    let refusal = crate::hq::spoken::unchosen_sentence(
+        "Nixie",
+        &["cancer-care".to_owned(), "private-employer".to_owned()],
+    );
+    forwarding(&telemetry, || {
+        tracing::warn!(target: "keeper_lib::hq_ipc", message = %refusal, "agents: a spoken question was not sent");
+        tracing::warn!(target: SHELL_AGENTS_TARGET, why = %refusal, "push: the agents item could not be read");
+        tracing::warn!(target: "keeper_lib::hq_blob_protocol", "not served: {refusal}");
+        tracing::warn!(target: "keeper_lib::sync_ipc", "push held for PUBLIC_VISIBLE");
+    });
+    telemetry.capture_log(
+        LogSite {
+            level: tracing::Level::WARN,
+            target: "keeper_lib::hq_ipc",
+            file: Some("crates/keeper/src/hq_ipc.rs"),
+            line: Some(920),
+        },
+        refusal.clone(),
+    );
+    let payloads = queued_payloads(&telemetry);
+    assert_eq!(payloads.len(), 5);
+    for payload in [&payloads[0], &payloads[1], &payloads[2], &payloads[4]] {
+        assert!(!payload.contains("cancer-care"), "{payload}");
+        assert!(!payload.contains("private-employer"), "{payload}");
+        assert!(!payload.contains("Nixie"), "{payload}");
+        assert!(payload.contains("$exception_fingerprint"), "{payload}");
+    }
+    assert!(payloads[0].contains("\"keeper_lib::hq_ipc\""));
+    assert!(payloads[1].contains("\"keeper_lib::hq\""));
+    assert!(payloads[2].contains("\"keeper_lib::hq_blob_protocol\""));
+    assert!(
+        payloads[3].contains("push held for PUBLIC_VISIBLE"),
+        "an ordinary shell line keeps its words"
+    );
+}
+
 /// R461: every WARN and ERROR — a panic line included — is forwarded with
 /// its fields, redacted; INFO and below never are.
 #[test]
