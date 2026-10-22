@@ -507,9 +507,18 @@ Story 107.1 (FR-857…FR-860; AD-429, AD-433). A file or photo put in an agents 
 syncular blob of the session's own database: uploaded once, before anything references it, and
 referenced by `attachments` rows committed with the message whose text is the caption, in one
 commit. Nothing goes into a drive, and no bytes cross IPC as JSON: the paperclip and
-drag-and-drop hand Rust **paths** (`agent_attach_path`, several files to one message), a paste
-hands it a **raw IPC body** with the session, type, name and caption in headers
-(`agent_attach_bytes`).
+drag-and-drop hand Rust **paths** (`agent_attach_path`), a paste hands it a **raw IPC body** with
+the session, type and name in headers (`agent_attach_bytes`).
+
+**One Send, one message** (R1071C-02). Neither call writes anything: each reads and checks its
+files and stages them in the process under handles it returns (`attachments::Staging`), never in
+the replica, so nothing staged can reach the server. The composer's Send stages its whole
+selection — paths and pastes in any mix — then hands every handle with the caption to
+`agent_attach_commit`, which takes them all and commits them as **one** message, its text the
+caption, once; a handle no longer staged refuses the whole Send and commits nothing. Handles are
+spent by the commit, released by `agent_attach_release` when the composer drops them, and
+released with their session when its last view closes; a process that dies holding some leaves
+nothing behind.
 
 **The bound.** One file may have at most `attachmentMaxBytes` from the contract's
 `syncular/limits.json` — 26,214,400 bytes (25 MiB) — the number the server's validator reads too.
@@ -526,7 +535,13 @@ blob under its content address (`sha256:<hex>`) and queues its upload, then comm
 its rows. No round runs and nothing is evicted between the two, so a blob is pinned throughout —
 by its upload row, then by the commit — and a round that uploads it and is then cut off before its
 push leaves it pinned by the commit, across a relaunch, until the server takes the message. If a
-blob or the commit fails, what that call staged and nothing else holds is unstaged again. The
+blob or the commit fails, what that call staged and nothing else holds is unstaged again. What
+each blob was before the call (cached? already queued?) is written beside the replica
+(`<replica>.blob-access.sqlite`, `unfinished_commit`) before the first is staged and cleared once
+the message is in the outbox or the blobs are back: a process that dies in between leaves that
+record, and the next open puts the blobs back before any round, so no blob is ever uploaded
+without the message that names it; one another waiting message pins stays queued for it
+(R1071K-07). The
 replica's next round uploads every queued blob (`POST …/upload-grant`, then
 `PUT /<database>/blobs/<blobId>`) before it pushes the commit that names it. `blob_ref` is syncular's canonical BlobRef JSON,
 `{"blobId":…,"byteLength":…,"mediaType":…,"name":…}` in that key order. Offline, the staged blob
@@ -657,16 +672,23 @@ one commit holding the message and its rows with canonical `blob_ref`s, the pin 
 across a relaunch, opening only what a row names and only as a type that cannot run, the chips'
 states, a refused commit's message and chips, every refusal code's sentence, a refused upload's
 file *refused* and its message's others *blocked* with no other file touched, before and after
-the server answers the message (`hq/attachments_tests.rs`); eviction order and the pin over the
+the server answers the message, and a selection staged by path and by paste — or several pastes —
+sent once as one message with its caption once, a handle never committed released and a Send
+naming one committing nothing (`hq/attachments_tests.rs`); eviction order and the pin over the
 replica file, the reported size, staging and its commit as one step that a round right after —
 its `PUT` answered, its push cut — leaves pinned across a relaunch under cache pressure, a failed
-commit taking back only what it staged, a refused upload resolved and explained across a relaunch
-while the next rounds go past it (`hq/syncular.rs`, `hq/blob_cache.rs`, against a local server
-that answers the blob requests and cuts the push); an opened archived session's attachments
-window (`hq/sessions.rs`); the relay's HTTP framing (`tests/hq_live.rs`). **Inspection only:**
-`hq_ipc.rs`'s two commands — `agent_attach_bytes` checks the borrowed body's length against the
-bound before copying it, with a test of its own — `hq_blob_protocol.rs` and its registration in
-`lib.rs` (CI's macOS job compiles them). **Owed:**
+commit taking back only what it staged, a commit cut short by the process dying after its first
+upload and before its message leaving nothing to upload once reopened (a blob another waiting
+message pins kept), a refused upload resolved and explained across a relaunch while the next
+rounds go past it, a moot refusal pruned after a round without a reopen (`hq/syncular.rs`,
+`hq/blob_cache.rs`, against a local server that answers the blob requests and cuts the push); an
+opened archived session's attachments window (`hq/sessions.rs`); the relay's HTTP framing, a
+`100`/`103` before the final answer included (`tests/hq_live.rs`). **Inspection only:**
+`hq_ipc.rs`'s four commands — `agent_attach_path`/`agent_attach_bytes` stage and return handles,
+`agent_attach_commit` sends them as one message, `agent_attach_release` drops them;
+`agent_attach_bytes` checks the borrowed body's length against the bound before copying it, with
+a test of its own — `hq_blob_protocol.rs` and their registration in `lib.rs` (CI's macOS job
+compiles them). **Owed:**
 the chip and the composer's tray (the UI lane, UX-DR-E107-1), hesperia and kalypso (acceptance 1,
 9 and the installed apps).
 
