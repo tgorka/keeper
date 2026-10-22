@@ -9606,7 +9606,10 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
     body: caption,
     createdAtMs: Date.now(),
     state: "waiting",
-    attachments: chips,
+    attachments:
+      attachmentsScenario === "offline" || sessionScenario === "offline"
+        ? chips.map((chip) => ({ ...chip, state: "waiting" }))
+        : chips,
   };
   vm.messages.push(message);
   publishSessions();

@@ -580,6 +580,26 @@ server's `sessionPage` and its attachments' rows are held while it is open (`ses
 its chips show and its files open through the same row check, downloaded only when opened; the
 rows go again when it closes.
 
+**Composer and chip layout (UX-DR-E107-1).** The session composer reuses the paperclip,
+native file drop, file paste, and the platform's Take photo / Choose photo controls.
+The existing photo-to-JPEG conversion remains in place; a Mac picker still passes the
+original file path. Selected files sit in a wrapping tray above a full-width text field,
+with removal buttons and the size for pasted/photos' bytes. A native path has no size
+metadata until Rust reads it: its tray says **Size on send**, never an invented number.
+After Send, Rust's message owns the chip and its size/state; the tray is not another
+outbox. Consecutive paths form one message; pasted/photo bodies use one raw IPC request
+each. The caption rides on the final request. Accepted selections leave the tray immediately,
+so a later refusal keeps only unsent files and the caption and a retry cannot duplicate
+accepted files. Files added during a send stay selected for the next one.
+
+A message chip is a keyboard-reachable Open button: file icon, wrapping filename,
+Rust's size label and state beneath it. Its refusal sentence sits immediately below,
+inside the same bordered card. State changes and refusals are announced politely.
+Cards use one column on a phone and two where space permits. The text field sits on its
+own row above the attachment toolbar and Send, leaving room to type at 320 px. An
+enqueue-time refusal appears under the composer, with the draft and unsent selections kept.
+No progress percentage, resend promise, or successful upload is invented in TypeScript.
+
 **Opening.** A chip's URL is `keeper-hq-blob://blob/<database>/<blobId>` (on Android and Windows,
 `http://keeper-hq-blob.localhost/…`). The handler serves only a blob an `attachments` row of that
 replica names, from the replica's cache, and downloads it on the first open — a second device
@@ -588,6 +608,15 @@ as `keeper-media://` does (200, 206 for a `Range`, 416, 404 for anything it will
 `nosniff`, and serves pictures, sound, video and PDF as themselves, text as `text/plain`, and
 everything else — HTML and SVG among them — as `application/octet-stream`, so no attachment runs
 as a page.
+
+Open mounts a modal preview only on activation, with the VM's URL unchanged on the first
+request. Raster images use an image element; other types use a sandboxed frame without
+script permission. The modal also offers Download file and Retry opening (a cache-busting
+query on the same scheme); no `fetch`, blob decoding, or base64 path is involved.
+Image load errors are announced. Frame HTTP failures are not reliably observable by the
+webview, so Retry remains available even when the embedded viewer cannot report its error.
+Closing returns focus to the chip. Installed WebKit/custom-scheme preview and download
+behavior still needs the hesperia/kalypso device check; Chrome's mock blob URL is not that proof.
 
 **The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
 outbox pins (`keeper_core::hq::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's

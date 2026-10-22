@@ -134,12 +134,10 @@ interface ComposerProps {
    */
   onSend: (body: string, context: SendContext, line?: string) => Promise<void>;
   /**
-   * Dispatch the pending attachments (Story 3.7). `caption` is the trimmed
-   * composer text, passed only when exactly one attachment is pending (otherwise
-   * `undefined` — a caption maps to a single media event). The parent routes each
-   * attachment to `sendAttachmentPath` / `sendAttachmentBytes`. Resolves when all
-   * are enqueued (the tray + draft then clear); rejects to keep the tray so the
-   * user can retry. Absent → the attach/paste affordances are inert.
+   * Dispatch the pending attachments. Session batches carry one caption; Matrix
+   * media carry a caption only for a single attachment. Resolves when enqueued;
+   * rejects to keep unaccepted selections and the draft available for retry.
+   * Absent → the attach/paste affordances are inert.
    */
   onSendAttachments?: (attachments: PendingAttachment[], caption?: string) => Promise<void>;
   /** When `true`, the composer is inert (no room loaded). */
@@ -808,17 +806,18 @@ export function Composer({
     setError(null);
     try {
       if (dispatchAttachments && onSendAttachments != null) {
-        // A caption maps to a single media event, so it rides only when exactly
-        // one attachment is pending; with multiple, the text is sent separately.
-        const caption = trayAttachments.length === 1 && body.length > 0 ? body : undefined;
+        const caption =
+          (transport === "session" || trayAttachments.length === 1) && body.length > 0
+            ? body
+            : undefined;
         await onSendAttachments(trayAttachments, caption);
         // If the text did not ride as a caption (multiple attachments) but the
         // user typed a body, dispatch it as its own message.
         if (caption === undefined && body.length > 0) {
           await onSend(body, context);
         }
-        // Clear only on success so a failed enqueue keeps the tray + text.
-        tray.getState().clear();
+        // A selection added while IPC was pending belongs to the next send.
+        for (const attachment of trayAttachments) tray.getState().remove(attachment.id);
         spendDraft(ran);
       } else {
         if (message === undefined) {
@@ -1125,36 +1124,35 @@ export function Composer({
     }
   }
 
-  /**
-   * Intercept a paste that carries an image: add it as a raw-bytes attachment
-   * (dispatched later as a raw binary IPC body, never base64). A non-image paste
-   * falls through to the default text paste unchanged.
-   */
+  /** Session paste accepts files; plain text keeps the browser's normal paste. */
   function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
-    if (!attachEnabled) {
-      return;
-    }
-    const imageItem = Array.from(e.clipboardData.items).find((it) => it.type.startsWith("image/"));
-    if (!imageItem) {
-      // Not an image → let the default text paste proceed.
-      return;
-    }
-    const file = imageItem.getAsFile();
-    if (!file) {
-      return;
-    }
+    if (!attachEnabled || sending) return;
+    const files = Array.from(e.clipboardData.items)
+      .filter((item) =>
+        transport === "session" ? item.kind === "file" : item.type.startsWith("image/"),
+      )
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (files.length === 0) return;
     e.preventDefault();
-    void file.arrayBuffer().then((bytes) => {
-      const ext = file.type.split("/")[1] || "png";
-      tray.getState().add({
-        id: attachmentId(),
-        kind: "bytes",
-        bytes,
-        filename: file.name && file.name !== "" ? file.name : `pasted-image.${ext}`,
-        mime: file.type,
-        size: file.size,
-      });
-    });
+    void (async () => {
+      try {
+        for (const file of files) {
+          const bytes = await file.arrayBuffer();
+          tray.getState().add({
+            id: attachmentId(),
+            kind: "bytes",
+            bytes,
+            filename: file.name || `pasted-file.${file.type.split("/")[1] || "bin"}`,
+            mime: file.type || "application/octet-stream",
+            size: file.size,
+          });
+        }
+      } catch (raw) {
+        logFailure("composer.paste")(raw);
+        setPhotoError("keeper couldn't read the pasted file. Paste it again to retry.");
+      }
+    })();
   }
 
   /** Remove a pending attachment (a pre-upload cancel). */
@@ -1210,7 +1208,7 @@ export function Composer({
   }
 
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex min-w-0 flex-col gap-1">
       {pending && (
         <div className="flex items-center gap-2 rounded-md border border-border bg-muted/50 px-3 py-1.5">
           <div className="min-w-0 flex-1">
@@ -1260,19 +1258,29 @@ export function Composer({
           each showing the filename (+ size for pasted bytes). Removing a chip is a
           pre-upload cancel. */}
       {hasAttachments && pending?.mode !== "edit" && (
-        <ul aria-label="Pending attachments" className="flex flex-wrap gap-1.5">
+        <ul
+          aria-label="Pending attachments"
+          className="flex min-w-0 flex-wrap gap-1.5"
+          aria-live="polite"
+        >
           {attachments.map((attachment) => (
             <li
               key={attachment.id}
-              className="flex items-center gap-1.5 rounded-md border border-border bg-muted/50 py-1 pr-1 pl-2"
+              className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border bg-muted/50 py-1 pr-1 pl-2"
             >
-              <span className="max-w-[180px] truncate text-xs" title={chipLabel(attachment)}>
+              <span
+                className="min-w-0 flex-1 break-words text-xs [overflow-wrap:anywhere]"
+                title={chipLabel(attachment)}
+              >
                 {chipLabel(attachment)}
               </span>
               {attachment.kind === "bytes" && (
-                <span className="text-muted-foreground text-xs">
+                <span className="shrink-0 text-muted-foreground text-xs">
                   {formatFileSize(attachment.size)}
                 </span>
+              )}
+              {transport === "session" && attachment.kind === "path" && (
+                <span className="shrink-0 text-muted-foreground text-xs">Size on send</span>
               )}
               <IconHint label={`Remove ${chipLabel(attachment)}`}>
                 <Button
@@ -1280,6 +1288,8 @@ export function Composer({
                   variant="ghost"
                   size="icon-xs"
                   aria-label={`Remove ${chipLabel(attachment)}`}
+                  className={cn(transport === "session" && "size-11 shrink-0")}
+                  disabled={sending}
                   onClick={() => removeAttachment(attachment.id)}
                 >
                   <X aria-hidden="true" className="size-3" />
@@ -1292,7 +1302,12 @@ export function Composer({
       {help !== null && (
         <SlashHelp rows={help.rows} escapeHint={help.escapeHint} onClose={() => setHelp(null)} />
       )}
-      <div className="relative flex items-end gap-2">
+      <div
+        className={cn(
+          "relative flex min-w-0 items-end gap-2",
+          transport === "session" && "flex-wrap",
+        )}
+      >
         <SlashMenuList menu={menu} />
         <InlineSlashList menu={inline} />
         {attachEnabled && pending?.mode !== "edit" && (
@@ -1442,6 +1457,7 @@ export function Composer({
           // ring/border color.
           className={cn(
             "min-h-9 min-w-0 flex-1 resize-none",
+            transport === "session" && "order-first basis-full",
             phone ? "max-h-[calc(5*1.5rem+1rem)]" : "max-h-[calc(8*1.5rem+1rem)]",
             incognitoEffective && "focus-visible:border-incognito focus-visible:ring-incognito/50",
           )}
@@ -1455,7 +1471,7 @@ export function Composer({
           // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
           // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
           // default button size.
-          className={cn(phone && "h-11 min-w-11")}
+          className={cn(phone && "h-11 min-w-11", transport === "session" && "ml-auto")}
         >
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
