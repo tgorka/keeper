@@ -18,6 +18,7 @@ keeper ships no server URL).
 | `syncular.ir.json` | the neutral schema IR a native client loads at runtime (generated) |
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
+| `limits.json` | the bounds both sides read: `attachmentMaxBytes`, the most bytes one attachment's blob may have (26,214,400); hand-written, never generated |
 
 Everything generated comes from `@syncular/typegen` 0.32.1 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -134,8 +135,11 @@ last wrote it. Times are UTC milliseconds since the epoch.
   person switched off for it, and `updated_at_ms`. There is no column that switches a tool on.
 - **`turn_chunks`** — the committed text of a streaming answer: `session_id`, `turn_id`, `seq`,
   `text`; deleted when the turn's message is written.
-- **`attachments`** — `session_id`, `message_id`, `blob_ref` (a syncular blob), `name`, `mime`,
-  `size` (bytes, at most 26,214,400), `created_at_ms`.
+- **`attachments`** — `session_id`, `message_id`, `blob_ref` (a syncular blob: canonical BlobRef JSON
+  `{blobId, byteLength, mediaType?, name?}` in that key order), `name`, `mime`, `size` (bytes, at
+  most `attachmentMaxBytes` from `limits.json`), `created_at_ms`. A client uploads the blob
+  (`PUT /<database>/blobs/<blobId>`) before it commits the row, and commits the message and its
+  `attachments` rows in one commit.
 - **`messages`** — `session_id`, `page_key`, `turn_id` (an agent's answer), `role` (`person` |
   `agent`), `body`, `body_blob` (a body too large to ride inline), `metadata` (JSON: model,
   usage, `ttft_ms`, `duration_ms`, finish reason). An agent's question to the person is an agent
@@ -249,7 +253,10 @@ commit.
     that lowers it is refused. It is raised only by the client holding the session's claim or by a
     person who is a member of the session.
 
-An attachment's `size` is at most 26,214,400 bytes and its message is in the same session.
+An attachment's `size` is at most `limits.json`'s `attachmentMaxBytes` (26,214,400) bytes, and so is
+its blob; its message is in the same session. A client refuses a larger file before it uploads
+anything, and the server refuses it again: the blob at the first byte past the bound
+(`blob.too_large`), the row by its `size` (`hq.attachment_size`).
 
 ## Commands
 
