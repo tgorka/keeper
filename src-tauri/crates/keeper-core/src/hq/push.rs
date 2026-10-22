@@ -36,8 +36,8 @@ use serde_json::{json, Map, Value};
 
 use crate::agents::approval_card::tier_word;
 use crate::agents::push::{
-    holds_misreading, misreads, open_body, shown_name, ActionRefusal, ActionTap, ApnsEnvironment,
-    Category, Gateway, NotificationAction, PushOpenVm, BODY_MAX_CHARS, SHOWN_INFO,
+    holds_unreadable, misreads, open_body, shown_name, unreadable, ActionRefusal, ActionTap,
+    ApnsEnvironment, Category, Gateway, NotificationAction, PushOpenVm, BODY_MAX_CHARS, SHOWN_INFO,
 };
 use crate::hq::routes::{is_database_name, Routes};
 use crate::hq::server::ServerUrl;
@@ -239,18 +239,21 @@ const PROMPT_VERBS: [&str; 2] = ["create_agent", "send_agent_prompt"];
 /// The whole request an approval would run, as a notification's body shows
 /// it: the tool, then its exact arguments as one line of JSON. `None` when
 /// keeper cannot show all of it: the server sent no tool call, or another
-/// approval's ([`item_row`]); the tool's name is empty or misreads; the
+/// approval's ([`item_row`]); the tool's name is empty or unreadable; the
 /// arguments are not an object (a raw string the runtime could not parse, a
 /// blob, nothing); or a string in them — key or value, at any depth — holds a
-/// line break, another control character or a bidirectional override.
+/// line break, another control character, a bidirectional override or a
+/// character a reader cannot see (a format character, a default-ignorable
+/// one, a variation selector, a tag: R1066K-05). Those are refused, never
+/// stripped and never escaped: what the person approves is what runs.
 pub fn request_line(call: Option<&Map<String, Value>>) -> Option<String> {
     let call = call?;
     let tool = text(call, "name");
-    if tool.is_empty() || tool.chars().any(misreads) {
+    if tool.is_empty() || tool.chars().any(unreadable) {
         return None;
     }
     let args = json_column(call, "args");
-    if !args.is_object() || holds_misreading(&args) {
+    if !args.is_object() || holds_unreadable(&args) {
         return None;
     }
     Some(format!("{tool} {}", serde_json::to_string(&args).ok()?))
@@ -1041,6 +1044,75 @@ mod tests {
         let mut no_call = approval("T1", "list files", "pending");
         no_call.row.insert("tool_call_id".to_owned(), Value::Null);
         assert!(!fits(&no_call.row, no_call.tool_call.as_ref()));
+    }
+
+    /// R1066K-05: a character a reader cannot see, anywhere in the request —
+    /// the tool's name, a key, a value, at any depth — offers *Deny* alone.
+    /// `rm report<U+200B>.txt` reads as `rm report.txt` and removes another
+    /// file. Nothing is stripped: the line keeper would show is refused.
+    #[test]
+    fn an_invisible_character_anywhere_in_the_request_offers_deny_alone() {
+        let summary = "Run `rm` in workspace/keeper";
+        let zwsp = Some(run(json!(["rm", "report\u{200b}.txt"])));
+        assert_eq!(request_line(zwsp.as_ref()), None);
+        deny_alone(&approval_with("T2", summary, zwsp), "U+200B in an argument");
+        for (call, why) in [
+            (
+                call("write", json!({"opts": {"pa\u{2060}th": "notes.md"}})),
+                "U+2060 in a nested key",
+            ),
+            (
+                call("write", json!({"opts": {"path": ["notes\u{00ad}.md"]}})),
+                "U+00AD in a nested value",
+            ),
+            (
+                call("mcp__fs__read\u{200b}", json!({"path": "a"})),
+                "U+200B in the tool's name",
+            ),
+        ] {
+            deny_alone(&approval_with("T2", summary, Some(call)), why);
+        }
+        // One of each class: format characters (Cf) inside and outside the
+        // default-ignorable set, the other default-ignorables, the variation
+        // selectors, the tag characters.
+        for (c, class) in [
+            ('\u{200b}', "Cf: zero width space"),
+            ('\u{feff}', "Cf: zero width no-break space"),
+            ('\u{0600}', "Cf, not default-ignorable: Arabic number sign"),
+            (
+                '\u{13430}',
+                "Cf, not default-ignorable: Egyptian hieroglyph joiner",
+            ),
+            (
+                '\u{034f}',
+                "default-ignorable Mn: combining grapheme joiner",
+            ),
+            ('\u{3164}', "default-ignorable Lo: Hangul filler"),
+            ('\u{2065}', "default-ignorable, unassigned"),
+            (
+                '\u{180b}',
+                "variation selector: Mongolian free variation selector",
+            ),
+            ('\u{fe0f}', "variation selector 16"),
+            ('\u{e0100}', "variation selector 17"),
+            ('\u{e0001}', "tag: language tag"),
+            ('\u{e0041}', "tag: tag latin capital A"),
+            ('\u{e007f}', "tag: cancel tag"),
+            ('\u{e0fff}', "default-ignorable, the tag plane's last"),
+        ] {
+            let value = format!("report{c}.txt");
+            deny_alone(
+                &approval_with("T2", summary, Some(run(json!(["rm", value])))),
+                class,
+            );
+        }
+        // Visible characters next to those ranges are shown and still fit.
+        for visible in ["café", "a\u{2010}b", "x\u{fe10}y", "\u{1bc9f}"] {
+            let read = approval_with("T2", summary, Some(run(json!(["cat", visible]))));
+            let shown = show(classify(&pushed(ItemKind::Approval), &read, ANA, 1_500));
+            assert_eq!(shown.category, Some(Category::Approval), "{visible}");
+            assert!(shown.body.contains(visible), "{visible}: {}", shown.body);
+        }
     }
 
     /// R1066K-01: keeper's summary of a call is not the call. A summary that

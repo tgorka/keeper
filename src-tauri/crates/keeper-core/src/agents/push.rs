@@ -550,15 +550,65 @@ pub(crate) fn misreads(c: char) -> bool {
         || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Every character a reader cannot see, as of Unicode 16.0 (R1066K-05):
+/// each format character (General_Category `Cf` — U+200B ZERO WIDTH SPACE,
+/// U+2060 WORD JOINER, U+00AD SOFT HYPHEN, …) and each
+/// Default_Ignorable_Code_Point, which takes in the variation selectors
+/// (U+180B…U+180F, U+FE00…U+FE0F, U+E0100…U+E01EF) and the tag characters
+/// (U+E0000…U+E007F, with the rest of that plane's ignorable block). The
+/// two sets merged into ranges; neither is ever stripped or normalised
+/// away, because the request without them is another request.
+const HIDDEN: [(char, char); 25] = [
+    ('\u{00ad}', '\u{00ad}'),
+    ('\u{034f}', '\u{034f}'),
+    ('\u{0600}', '\u{0605}'),
+    ('\u{061c}', '\u{061c}'),
+    ('\u{06dd}', '\u{06dd}'),
+    ('\u{070f}', '\u{070f}'),
+    ('\u{0890}', '\u{0891}'),
+    ('\u{08e2}', '\u{08e2}'),
+    ('\u{115f}', '\u{1160}'),
+    ('\u{17b4}', '\u{17b5}'),
+    ('\u{180b}', '\u{180f}'),
+    ('\u{200b}', '\u{200f}'),
+    ('\u{202a}', '\u{202e}'),
+    ('\u{2060}', '\u{206f}'),
+    ('\u{3164}', '\u{3164}'),
+    ('\u{fe00}', '\u{fe0f}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{ffa0}', '\u{ffa0}'),
+    ('\u{fff0}', '\u{fffb}'),
+    ('\u{110bd}', '\u{110bd}'),
+    ('\u{110cd}', '\u{110cd}'),
+    ('\u{13430}', '\u{1343f}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0000}', '\u{e0fff}'),
+];
+
+/// Whether `c` is one a reader cannot see ([`HIDDEN`]).
+pub(crate) fn hidden(c: char) -> bool {
+    HIDDEN
+        .iter()
+        .any(|(first, last)| (*first..=*last).contains(&c))
+}
+
+/// Whether `c` may not stand in a request a person approves from the lock
+/// screen: it [`misreads`], or it is [`hidden`]. Such a request is never
+/// rendered with escapes either: it is refused *Approve once* (R1066K-05).
+pub(crate) fn unreadable(c: char) -> bool {
+    misreads(c) || hidden(c)
+}
+
 /// Whether any string in `value` — a key or a value, at any depth — holds a
-/// character that [`misreads`].
-pub(crate) fn holds_misreading(value: &Value) -> bool {
+/// character that is [`unreadable`].
+pub(crate) fn holds_unreadable(value: &Value) -> bool {
     match value {
-        Value::String(text) => text.chars().any(misreads),
-        Value::Array(items) => items.iter().any(holds_misreading),
+        Value::String(text) => text.chars().any(unreadable),
+        Value::Array(items) => items.iter().any(holds_unreadable),
         Value::Object(map) => map
             .iter()
-            .any(|(key, value)| key.chars().any(misreads) || holds_misreading(value)),
+            .any(|(key, value)| key.chars().any(unreadable) || holds_unreadable(value)),
         _ => false,
     }
 }
@@ -589,14 +639,15 @@ fn is_paseo_prompt(record: &ApprovalRequestContent) -> bool {
 /// card's own test); not a networked `run`, whose released workspace the
 /// body cannot list; and the arguments as the body shows them are one line
 /// of at most [`BODY_MAX_CHARS`] characters in which no string holds a line
-/// break, another control character or a bidirectional override.
+/// break, another control character, a bidirectional override or a
+/// character a reader cannot see ([`unreadable`]).
 pub fn fits(record: &ApprovalRequestContent) -> bool {
     record.tier < 4
         && !is_paseo_prompt(record)
         && crate::agents::approval_card::binding(record)
             == crate::agents::approval_card::Binding::Inline
         && record.preconditions.workspace.is_none()
-        && !holds_misreading(&record.action.args)
+        && !holds_unreadable(&record.action.args)
         && payload_line(record).is_some_and(|line| line.chars().count() <= BODY_MAX_CHARS)
 }
 
@@ -1907,6 +1958,11 @@ mod tests {
         // An element holding a line break, or a bidirectional override.
         assert!(!fits_value(&run(3, json!(["printf", "a\nb"]))));
         assert!(!fits_value(&run(3, json!(["cat", "\u{202e}gnp.exe"]))));
+        // A character a reader cannot see (R1066K-05): a format character, a
+        // variation selector, a tag.
+        for hidden in ["report\u{200b}.txt", "a\u{fe0f}", "a\u{e0041}"] {
+            assert!(!fits_value(&run(3, json!(["rm", hidden]))), "{hidden:?}");
+        }
         // Paseo's prompt verbs, by the server's role, not its name.
         assert!(!fits_value(&mcp(Some("paseo"), "create_agent")));
         assert!(!fits_value(&mcp(Some("paseo"), "send_agent_prompt")));
