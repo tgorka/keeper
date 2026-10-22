@@ -80,12 +80,17 @@ pub fn init(app: &tauri::App) {
 
 /// The service, built and started now if it is not yet: setup's, or — on
 /// the iPhone, when an action on a notification launched keeper in the
-/// background and no setup runs — the only thing that launch opens.
+/// background and no setup runs — the only thing that launch opens. Either
+/// way the settings layers are installed first
+/// ([`crate::install_settings_layers`], a no-op after setup's), so
+/// `agents.server_url` is the effective setting — a file's address, never a
+/// stored one it shadows — and not the SQLite row alone (R1066K-03).
 pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
     if let Some(hq) = HQ.get() {
         return Arc::clone(hq);
     }
     let platform = Arc::clone(&app.state::<crate::ipc::AppState>().platform);
+    crate::install_settings_layers(platform.as_ref());
     let hq = Hq::new(
         platform,
         Arc::new(SyncularOpener),

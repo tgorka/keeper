@@ -296,6 +296,37 @@ fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
     )
 }
 
+/// The settings layers every launch reads through, once per process, before
+/// the first setting it reads: the TOML stack (AD-98/AD-99,
+/// `config::install_launch_layers`), the folder tier (AD-101's phase one: the
+/// host label and which folder is main), and the account's two layers (Epic
+/// 82, AD-309) from the clone already on disk — no network, nothing without
+/// `account.toml`, the write-back observer (Epic 84, AD-325) first so no write
+/// of a synced setting is missed.
+///
+/// `setup()` calls it; so does a launch that runs no setup — an action on a
+/// notification starting keeper in the background (`hq_ipc::ensure`) — so the
+/// agents server it starts is the one the effective `agents.server_url` names,
+/// not a stored value a file shadows (R1066K-03). It activates no Matrix
+/// account, starts no drive sync and opens no window.
+pub(crate) fn install_settings_layers(platform: &dyn keeper_core::platform::Platform) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let host = keeper_core::config::read_host_label();
+        // No `HOME`, no user-global layer — and therefore no main folder
+        // either, since only `~/.keeper/` may name one.
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        keeper_core::config::install_launch_layers(home.as_deref(), &host);
+        // Every target since Epic 66: the phone has folders now.
+        keeper_sync::profile::install_folder_tier(keeper_sync::profile::FolderTier::new(
+            host,
+            keeper_core::config::main_folder(),
+        ));
+        account_ipc::watch_settings();
+        account_ipc::boot(platform);
+    });
+}
+
 /// Application entry point. Registers the plugin set and the typed IPC command
 /// surface, then runs the Tauri event loop.
 ///
@@ -464,32 +495,11 @@ pub fn run() {
             // load is invisible by construction, and this is the only record of
             // it until someone opens Settings.
             if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
-                let host = keeper_core::config::read_host_label();
-                // No `HOME`, no user-global layer — and therefore no main
-                // folder either, since only `~/.keeper/` may name one. Not
-                // `temp_dir()` as a fallback the way `debug_log::app_log_path`
-                // uses one: a log file in `/tmp` is a lost log, but READING
-                // settings out of a world-writable directory would let any
-                // local process choose this app's hotkeys and sync paths.
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                let layers = match home.as_deref() {
-                    Some(home) => keeper_core::config::load_app_layers(home, &host),
-                    None => keeper_core::config::AppLayers::default(),
-                };
-                // Every target since Epic 66: the phone has folders now.
-                keeper_sync::profile::install_folder_tier(keeper_sync::profile::FolderTier::new(
-                    host,
-                    layers.main_folder.clone(),
-                ));
-                keeper_core::config::install(layers);
-                // The account's two layers (Epic 82, AD-309), from the clone
-                // already on disk, straight after the stack they sit inside
-                // and before the first setting either could change is read.
-                // No network, and nothing at all without `account.toml`.
-                // The write-back observer (Epic 84, AD-325) goes in first, so
-                // no write of a synced setting from here on is missed.
-                account_ipc::watch_settings();
-                account_ipc::boot(app.state::<ipc::AppState>().platform.as_ref());
+                // The file stack, the folder tier and the account's layers —
+                // the same call a background launch for a notification action
+                // makes before it starts the agents server (R1066K-03).
+                install_settings_layers(app.state::<ipc::AppState>().platform.as_ref());
+                let home = std::env::var_os("HOME");
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
                 // The account's consent through the layers just installed

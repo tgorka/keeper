@@ -863,6 +863,30 @@ pub fn install(layers: AppLayers) {
     }
 }
 
+/// Phase one for this launch, once per process: the stack under `home` —
+/// `~/.keeper/` and the main sync folder's files ([`load_app_layers`]) — read
+/// and [`install`]ed; no `home`, no file layer. Every launch that reads a
+/// setting calls this first: the app's setup, and a launch that runs no setup
+/// (an action on a notification starting keeper in the background), so both
+/// read the same effective settings and neither a value only a file sets nor a
+/// stored one a file shadows is misread (R1066K-03). `true` when this call
+/// installed the stack; a later call reads nothing and answers `false`.
+///
+/// Not `temp_dir()` without a `HOME`: reading settings out of a world-writable
+/// directory would let any local process choose this app's settings.
+pub fn install_launch_layers(home: Option<&Path>, host: &str) -> bool {
+    static LAUNCH: OnceLock<()> = OnceLock::new();
+    let mut installed = false;
+    LAUNCH.get_or_init(|| {
+        install(match home {
+            Some(home) => load_app_layers(home, host),
+            None => AppLayers::default(),
+        });
+        installed = true;
+    });
+    installed
+}
+
 /// The resolved value for `key`, or `None` when no layer sets it.
 ///
 /// Consulted by [`crate::registry::get_setting`] **before** it opens a database
