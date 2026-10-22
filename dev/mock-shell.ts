@@ -9500,8 +9500,10 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
 
 // ?sessions=launch&attachments=chips — the chip in every state (UX-DR-E107-1), in alpha's
 // device.1: a message whose files are uploading, waiting, sent and refused, and a message the
-// server refused whole. `&attachments=offline` keeps a new attachment waiting; `refused` has the
-// server refuse it. The `url` is an object URL here; the shell's is `keeper-hq-blob://`.
+// server refused whole because it refused one file's upload — that file `refused`, the other
+// `blocked` by it. `&attachments=offline` keeps a new attachment waiting; `refused` has the server
+// refuse the first file's upload, and so the message. The `url` is an object URL here; the
+// shell's is `keeper-hq-blob://`.
 const attachmentsScenario = new URLSearchParams(location.search).get("attachments");
 const ATTACHMENT_MAX_BYTES = 26_214_400;
 function mockSizeLabel(bytes: number): string {
@@ -9509,6 +9511,14 @@ function mockSizeLabel(bytes: number): string {
   return bytes >= mb
     ? `${(Math.ceil((bytes * 10) / mb) / 10).toFixed(1)} MB`
     : `${Math.ceil(bytes / 1024)} kB`;
+}
+/** `keeper_core::hq::attachments::blocked_sentence`. */
+function mockBlocked(name: string, refused: string): string {
+  return `${name} was not sent: the agents server refused ${refused}, attached to the same message. Attach ${name} again.`;
+}
+/** `refusal_sentence` of `blob.too_large`. */
+function mockTooLarge(name: string): string {
+  return `${name} is larger than the 25.0 MB the agents server takes from one message, so the server refused it.`;
 }
 function mockChip(
   id: string,
@@ -9530,6 +9540,7 @@ function mockChip(
           sentence: `The agents server does not hold ${name}, so it refused the message that names it. Attach it again.`,
         }
       : {}),
+    ...(state === "blocked" ? { sentence: mockBlocked(name, "another file") } : {}),
     url: URL.createObjectURL(new Blob([body], { type: mime })),
   };
 }
@@ -9561,7 +9572,16 @@ if (attachmentsScenario === "chips") {
         body: "",
         createdAtMs: at + 2,
         state: "refused",
-        attachments: [mockChip("att-5", "old-scan.heic", "image/heic", 3_408_000, "refused")],
+        attachments: [
+          {
+            ...mockChip("att-5", "site-video.mov", "video/quicktime", 27_262_976, "refused"),
+            sentence: mockTooLarge("site-video.mov"),
+          },
+          {
+            ...mockChip("att-6", "old-scan.heic", "image/heic", 3_408_000, "blocked"),
+            sentence: mockBlocked("old-scan.heic", "site-video.mov"),
+          },
+        ],
       },
     );
   }
@@ -9590,11 +9610,17 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
   setTimeout(() => {
     if (attachmentsScenario === "refused") {
       message.state = "refused";
-      message.attachments = chips.map((chip) => ({
-        ...chip,
-        state: "refused",
-        sentence: `The agents server does not hold ${chip.name}, so it refused the message that names it. Attach it again.`,
-      }));
+      const [first, ...rest] = chips;
+      message.attachments = first
+        ? [
+            { ...first, state: "refused", sentence: mockTooLarge(first.name) },
+            ...rest.map((chip) => ({
+              ...chip,
+              state: "blocked" as const,
+              sentence: mockBlocked(chip.name, first.name),
+            })),
+          ]
+        : [];
     } else {
       message.state = "sent";
       message.attachments = chips.map((chip) => ({ ...chip, state: "sent" }));
