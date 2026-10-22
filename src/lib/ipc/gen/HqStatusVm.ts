@@ -17,7 +17,8 @@ server: string | null, phase: HqPhase,
  */
 sentence: string, device: HqThisDeviceVm | null, databases: Array<HqDatabaseVm>, 
 /**
- * Commits written while no server was paired, waiting on this device.
+ * Commits waiting on this device that no server takes: the local
+ * replica's, and with no address set every held replica's.
  */
 waitingHere: number, 
 /**

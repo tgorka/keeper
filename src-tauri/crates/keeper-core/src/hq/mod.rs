@@ -199,6 +199,10 @@ struct Inner {
     server: Option<ServerUrl>,
     /// `agents.server_url` holds text the grammar refuses.
     address_refused: bool,
+    /// The pairing whose replicas are held: the configured server's, or —
+    /// with no address set — the one of the server this device last synced
+    /// with ([`databases::remembered_server`]), whose replicas stay listed
+    /// and written to and never link.
     pairing: Option<Pairing>,
     authorization: Authorization,
     local: Option<Arc<dyn Replica>>,
@@ -534,12 +538,23 @@ impl Hq {
             Some(Ok(Some(server))) => (Some(server), false),
             Some(Err(_)) => (None, true),
         };
-        let pairing = match &server {
-            Some(server) => self.read_pairing(server)?,
+        // With no address, the server this device last synced with keeps its
+        // replicas listed and written to; nothing of it links (106.1 AC 2).
+        let holding = match &server {
+            Some(server) => Some(server.clone()),
+            None => databases::remembered_server(&data_dir),
+        };
+        let pairing = match &holding {
+            Some(holding) => self.read_pairing(holding)?,
             None => None,
         };
-        let authorization = match (&server, &pairing) {
-            (Some(server), Some(_)) => Authorization::load(&data_dir, server),
+        if let (Some(server), Some(_)) = (&server, &pairing) {
+            if let Err(error) = databases::remember_server(&data_dir, server) {
+                tracing::warn!(%error, "which agents server this device syncs with could not be kept");
+            }
+        }
+        let authorization = match (&holding, &pairing) {
+            (Some(holding), Some(_)) => Authorization::load(&data_dir, holding),
             _ => Authorization::default(),
         };
         let (retired, generation) = {
@@ -574,13 +589,15 @@ impl Hq {
                 watch_presence: None,
             });
         }
-        let held = match (&server, &pairing) {
-            (Some(server), Some(pairing)) => databases::held(&data_dir, server, &pairing.actor_id),
+        let held = match (&holding, &pairing) {
+            (Some(holding), Some(pairing)) => {
+                databases::held(&data_dir, holding, &pairing.actor_id)
+            }
             _ => Vec::new(),
         };
-        if let (Some(server), Some(pairing)) = (&server, &pairing) {
+        if let (Some(holding), Some(pairing)) = (&holding, &pairing) {
             for name in &held {
-                specs.push(Self::spec(&data_dir, server, pairing, name, false));
+                specs.push(Self::spec(&data_dir, holding, pairing, name, false));
             }
         }
         let mut opened = self.open_all(specs).await?.into_iter();
@@ -612,8 +629,9 @@ impl Hq {
                 let task = self.watch_replica(name, &replica, generation);
                 inner.tasks.push(task);
             }
-            // A removed device asks nothing until it is paired again.
-            if pairing.is_some() && !authorization.removed {
+            // A removed device asks nothing until it is paired again, and
+            // with no address nothing is asked at all.
+            if server.is_some() && pairing.is_some() && !authorization.removed {
                 self.schedule_discovery(&mut inner, Duration::ZERO);
             }
         }
@@ -899,9 +917,20 @@ impl Hq {
     fn publish(&self) {
         let (snapshot, replicas, actor, me) = {
             let inner = lock(&self.inner);
-            let waiting_here = inner.local.as_ref().map_or(0, |local| {
-                u32::try_from(local.state().outbox).unwrap_or(u32::MAX)
-            });
+            // With no address, what waits in the last server's replicas waits
+            // here too: nothing takes it until an address is set again.
+            let waiting_here = inner
+                .local
+                .iter()
+                .chain(
+                    inner
+                        .dbs
+                        .iter()
+                        .filter(|_| inner.server.is_none())
+                        .map(|db| &db.replica),
+                )
+                .map(|replica| u32::try_from(replica.state().outbox).unwrap_or(u32::MAX))
+                .fold(0u32, u32::saturating_add);
             let host = inner.server.as_ref().map(ServerUrl::host);
             let removed = inner.authorization.removed;
             let phase = if inner.address_refused {
@@ -915,11 +944,15 @@ impl Hq {
             } else {
                 HqPhase::Paired
             };
+            // This device as a server knows it: nothing while no address is set,
+            // even with the last server's replicas held.
+            let paired = inner.server.as_ref().and(inner.pairing.as_ref());
+            let linkable = inner.server.is_some();
             let status = HqStatusVm {
                 server: inner.server.as_ref().map(|s| s.as_str().to_owned()),
                 phase,
                 sentence: phase_sentence(phase, host, waiting_here),
-                device: inner.pairing.as_ref().map(|pairing| HqThisDeviceVm {
+                device: paired.map(|pairing| HqThisDeviceVm {
                     client_id: pairing.client_id.clone(),
                     name: pairing.name.clone(),
                 }),
@@ -929,7 +962,7 @@ impl Hq {
                     .map(|db| {
                         let state = db.replica.state();
                         let open = inner.authorization.open.contains(&db.name);
-                        database_vm(&db.name, state.link, state.outbox, open, removed)
+                        database_vm(&db.name, state.link, state.outbox, linkable, open, removed)
                     })
                     .collect(),
                 waiting_here,
@@ -941,8 +974,8 @@ impl Hq {
             };
             let replicas: Vec<Arc<dyn Replica>> =
                 inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
-            let actor = inner.pairing.as_ref().map(|p| p.actor_id.clone());
-            let me = inner.pairing.as_ref().map(|p| p.client_id.clone());
+            let actor = paired.map(|p| p.actor_id.clone());
+            let me = paired.map(|p| p.client_id.clone());
             (status, replicas, actor, me)
         };
         let mut status = snapshot;
@@ -1160,6 +1193,9 @@ impl Hq {
             )));
         }
         self.platform.keychain_delete(&keychain_key(&server))?;
+        if let Err(error) = databases::forget_server(&data_dir, &server) {
+            tracing::warn!(%error, "keeper could not forget which agents server it synced with");
+        }
         lock(&self.inner).refusals.clear();
         self.restart().await?;
         Ok(self.status.borrow().clone())

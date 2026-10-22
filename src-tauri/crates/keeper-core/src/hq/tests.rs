@@ -1141,6 +1141,145 @@ async fn a_removed_device_registers_no_push_target() {
     assert!(push_targets_until(&world, 1).await.is_empty());
 }
 
+/// 106.1 AC 2 and invariant 2 through the calls 106.2's composer makes
+/// (A106-01): a device paired with a server whose address is then cleared
+/// keeps that server's databases listed and written to. A new session and a
+/// message wait in that database's own outbox, the count shows, nothing is
+/// asked of any server, and a relaunch keeps all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and_it_waits() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &[]);
+    let alpha = databases::replica(
+        &world.data_dir(),
+        &ServerUrl::parse("https://hq.example.org")
+            .expect("parses")
+            .expect("an address"),
+        "alpha",
+        "ana",
+    );
+    std::fs::create_dir_all(alpha.parent().expect("parent")).expect("mkdir");
+    let service = || {
+        Hq::new(
+            Arc::clone(&world.platform) as Arc<dyn Platform>,
+            Arc::new(syncular::SyncularOpener) as Arc<dyn Opener>,
+            Arc::clone(&world.routes) as Arc<dyn Routes>,
+            "keeper on test".to_owned(),
+        )
+    };
+    // The agent the replicated directory names in alpha.
+    {
+        let seed = syncular::SyncularReplica::open(ReplicaSpec {
+            database: "alpha".to_owned(),
+            path: alpha.clone(),
+            client_id: Some("ana.1".to_owned()),
+            link: None,
+            subscriptions: Vec::new(),
+            watch_presence: None,
+        })
+        .expect("opens");
+        seed.mutate(vec![RowOp::Upsert {
+            table: "actors".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": "nixie", "kind": "agent", "display_name": "Nixie", "family": null,
+                "dir": "alpha", "created_at_ms": 1, "author_actor": "server",
+                "author_client": "server"})),
+            base_version: None,
+        }])
+        .expect("seeds");
+        seed.close();
+        seed.join();
+    }
+    let hq = service();
+    hq.start().await.expect("starts");
+
+    let status = hq.set_server("").await.expect("clears");
+    assert_eq!(status.phase, HqPhase::NoServer);
+    assert_eq!(status.device, None);
+    let asked = world.routes.discovered.load(Ordering::SeqCst);
+    // What waits so far is the directory row seeded above.
+    let before = 1;
+    let held = status_until(&hq, "alpha held with no server", |s| {
+        s.databases.iter().any(|d| {
+            d.name == "alpha" && d.state == HqDatabaseState::NoServer && d.waiting == before
+        })
+    })
+    .await;
+    assert_eq!(held.waiting_here, before);
+
+    // New session offers the agent of the held database, and writes there.
+    let choices = hq.choices().expect("choices");
+    assert_eq!(
+        choices
+            .iter()
+            .map(|c| (c.agent_actor.as_str(), c.database.as_deref()))
+            .collect::<Vec<_>>(),
+        [("nixie", Some("alpha"))]
+    );
+    let key = hq
+        .new_session("alpha", "nixie", "plan the week")
+        .expect("a new session with no server");
+    assert_eq!(key.database, "alpha");
+    hq.send(&key, "and then the weekend").expect("a message");
+    let status = status_until(&hq, "both writes wait", |s| s.waiting_here == before + 2).await;
+    assert_eq!(status.databases[0].waiting, before + 2);
+    assert!(
+        status
+            .sentence
+            .ends_with(&format!("{} changes wait on this device.", before + 2)),
+        "{}",
+        status.sentence
+    );
+    assert!(hq
+        .sessions()
+        .iter()
+        .any(|row| row.database == "alpha" && row.session_id == key.session_id));
+    assert_eq!(world.routes.discovered.load(Ordering::SeqCst), asked);
+    assert!(lock(&world.routes.push_targets).is_empty());
+    assert!(hq.contacting().is_empty());
+
+    // A relaunch with no address keeps the session and what waits.
+    hq.shutdown().await;
+    let again = service();
+    again.start().await.expect("restarts");
+    let status = status_until(&again, "still waiting after a relaunch", |s| {
+        s.waiting_here == before + 2
+    })
+    .await;
+    assert_eq!(status.phase, HqPhase::NoServer);
+    assert!(again
+        .sessions()
+        .iter()
+        .any(|row| row.database == "alpha" && row.session_id == key.session_id));
+    assert_eq!(world.routes.discovered.load(Ordering::SeqCst), asked);
+    assert!(again.contacting().is_empty());
+
+    // Forgetting that server takes its replicas out of the list for good.
+    again
+        .set_server("https://hq.example.org")
+        .await
+        .expect("stores");
+    let removed = again.forget().await.expect("forgets");
+    assert!(removed.databases.is_empty());
+    again.set_server("").await.expect("clears");
+    assert!(again.sessions().is_empty());
+}
+
+/// A device never paired has no directory: New session has no agent to
+/// address and nothing is invented (A106-01, case b).
+#[tokio::test]
+async fn a_device_never_paired_offers_no_agent_and_asks_nothing() {
+    let world = World::new();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    assert!(hq.choices().expect("choices").is_empty());
+    assert!(matches!(
+        hq.new_session("local", "nixie", "hello"),
+        Err(HqError::Sentence(_))
+    ));
+    assert_eq!(world.routes.discovered.load(Ordering::SeqCst), 0);
+}
+
 /// A notification may name a session this device does not hold yet
 /// (A106-03): opening it is `Arriving` while a round may still bring it, and
 /// a sentence once nothing will.

@@ -10,6 +10,11 @@
 //! it), so a restart opens every held replica local-only and links only what
 //! that answer — or the next — authorised; a device the server removed stays
 //! removed until it is paired again.
+//!
+//! Which server this device last synced with is kept too
+//! ([`remember_server`], its base URL and nothing else): with the address
+//! cleared, that server's replicas stay listed and written to, and what is
+//! written waits in each one's outbox — no request is made.
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +31,54 @@ pub fn root(data_dir: &Path) -> PathBuf {
 /// The replica of what is written while no server is paired.
 pub fn local_replica(data_dir: &Path) -> PathBuf {
     root(data_dir).join("local").join("local.sqlite")
+}
+
+/// The server this device last held replicas of with a pairing.
+fn last_server_file(data_dir: &Path) -> PathBuf {
+    root(data_dir).join("last-server.json")
+}
+
+#[derive(Serialize, Deserialize)]
+struct LastServer {
+    server: String,
+}
+
+/// Remember `server` as the one this device last synced with; a no-op when
+/// it already is.
+pub fn remember_server(data_dir: &Path, server: &ServerUrl) -> std::io::Result<()> {
+    if remembered_server(data_dir).as_ref() == Some(server) {
+        return Ok(());
+    }
+    let path = last_server_file(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(&LastServer {
+        server: server.as_str().to_owned(),
+    })
+    .map_err(std::io::Error::other)?;
+    let staged = path.with_extension("json.new");
+    std::fs::write(&staged, bytes)?;
+    std::fs::rename(staged, path)
+}
+
+/// The server this device last synced with; nothing kept, unreadable, or no
+/// longer an address the grammar takes is none.
+pub fn remembered_server(data_dir: &Path) -> Option<ServerUrl> {
+    let bytes = std::fs::read(last_server_file(data_dir)).ok()?;
+    let last: LastServer = serde_json::from_slice(&bytes).ok()?;
+    ServerUrl::parse(&last.server).ok().flatten()
+}
+
+/// Forget that this device synced with `server`, when it is the one kept.
+pub fn forget_server(data_dir: &Path, server: &ServerUrl) -> std::io::Result<()> {
+    if remembered_server(data_dir).as_ref() != Some(server) {
+        return Ok(());
+    }
+    match std::fs::remove_file(last_server_file(data_dir)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// One server's directory.

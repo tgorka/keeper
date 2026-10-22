@@ -37,6 +37,9 @@ pub enum HqDatabaseState {
     NotOpen,
     /// The device was removed; the replica stays readable.
     Removed,
+    /// No server address is set: the replica stays readable and written to,
+    /// and what is written waits in its outbox.
+    NoServer,
 }
 
 /// One database the device holds a replica of.
@@ -74,7 +77,8 @@ pub struct HqStatusVm {
     pub sentence: String,
     pub device: Option<HqThisDeviceVm>,
     pub databases: Vec<HqDatabaseVm>,
-    /// Commits written while no server was paired, waiting on this device.
+    /// Commits waiting on this device that no server takes: the local
+    /// replica's, and with no address set every held replica's.
     pub waiting_here: u32,
     /// The person's devices, from the replicated directory; follows it.
     pub devices: Vec<HqDeviceVm>,
@@ -119,12 +123,14 @@ fn waiting_clause(waiting: u32) -> String {
     }
 }
 
-/// A database's state and line from its replica's link and outbox, and from
-/// what the server last said about the device and the database.
+/// A database's state and line from its replica's link and outbox, whether
+/// an address is set to link it to, and what the server last said about the
+/// device and the database.
 pub fn database_vm(
     name: &str,
     link: LinkState,
     outbox: usize,
+    linkable: bool,
     open: bool,
     removed: bool,
 ) -> HqDatabaseVm {
@@ -133,6 +139,11 @@ pub fn database_vm(
         (
             HqDatabaseState::Removed,
             "This device was removed; what it holds stays readable here.".to_owned(),
+        )
+    } else if !linkable {
+        (
+            HqDatabaseState::NoServer,
+            "No server is set; what you write here waits on this device.".to_owned(),
         )
     } else if !open {
         (
@@ -189,7 +200,8 @@ mod tests {
 
     #[test]
     fn a_database_line_follows_its_link_and_what_the_server_said() {
-        let vm = |link, outbox, open, removed| database_vm("alpha", link, outbox, open, removed);
+        let vm =
+            |link, outbox, open, removed| database_vm("alpha", link, outbox, true, open, removed);
         assert_eq!(
             vm(LinkState::Connected, 0, true, false).state,
             HqDatabaseState::Connected
@@ -221,6 +233,18 @@ mod tests {
         assert!(vm(LinkState::Refused, 1, true, true)
             .sentence
             .ends_with("1 change waits on this device."));
+        // With no address, what is held waits, whatever the server last said.
+        let unset = database_vm("alpha", LinkState::Local, 2, false, false, false);
+        assert_eq!(unset.state, HqDatabaseState::NoServer);
+        assert_eq!(
+            unset.sentence,
+            "No server is set; what you write here waits on this device. 2 changes wait on this \
+             device."
+        );
+        assert_eq!(
+            database_vm("alpha", LinkState::Local, 0, false, true, true).state,
+            HqDatabaseState::Removed
+        );
     }
 
     #[test]
