@@ -192,6 +192,11 @@ interface ComposerProps {
    * Rust about this room; a test passes its own.
    */
   resolveInline?: (before: string, after: string) => Promise<ChatInlinePreviewVm>;
+  /**
+   * The text in the field, after every change. A composer whose draft is not kept by
+   * Rust (New session) keeps it here; the composer never waits on it.
+   */
+  onDraftChange?: (draft: string) => void;
 }
 
 /**
@@ -267,6 +272,7 @@ export function Composer({
   onCommand,
   resolveCommand,
   resolveInline,
+  onDraftChange,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   // Where the caret is, `null` while text is selected: the mid-text `/` menu is
@@ -581,6 +587,11 @@ export function Composer({
   // taking `draft` as a dependency (which would re-run the effect every keystroke).
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const draftChanged = useRef(onDraftChange);
+  draftChanged.current = onDraftChange;
+  useEffect(() => {
+    draftChanged.current?.(draft);
+  }, [draft]);
   // Mirror the pending context in a ref so the remote-reconcile adopt callback can
   // check "am I editing?" without taking `pending` as a dependency (Story 7.2), and a
   // late `/` verdict can check whether its reply still stands (R411).

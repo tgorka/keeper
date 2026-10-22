@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Composer } from "@/components/chat/composer";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -16,6 +16,7 @@ import {
   agentSessionNew,
   agentsChoices,
 } from "@/lib/ipc/client";
+import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import {
   ConversationStoresProvider,
   createConversationStores,
@@ -31,13 +32,30 @@ export function NewSession({
   onCreated: (target: AgentSessionRef) => void;
   onCancel: () => void;
 }) {
+  // Words a screen that took over left here (a tapped notification) come back.
+  const [kept] = useState(() => agentSessionsStore.getState().newDraft);
+  const [opening] = useState(() => initial?.database ?? kept?.database ?? "");
   const [choices, setChoices] = useState<AgentChoiceVm[] | null>(null);
-  const [agent, setAgent] = useState(initial?.agentActor ?? "");
-  const [database, setDatabase] = useState(initial?.database ?? "");
+  const [agent, setAgent] = useState(initial?.agentActor ?? kept?.agentActor ?? "");
+  const [database, setDatabase] = useState(opening);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [stores] = useState(createConversationStores);
   const id = useId();
+  const written = useRef(kept?.body ?? "");
+  // What is written here is kept outside this screen, so leaving it any way but
+  // Cancel or Send keeps it.
+  const keep = useCallback(() => {
+    const body = written.current;
+    agentSessionsStore
+      .getState()
+      .keepNewDraft(body.trim() === "" ? null : { agentActor: agent, database, body });
+  }, [agent, database]);
+  useEffect(keep, [keep]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: once, into the composer just mounted
+  useEffect(() => {
+    if (kept?.body) stores.composer.getState().restore(opening, "new", kept.body);
+  }, []);
   // biome-ignore lint/correctness/useExhaustiveDependencies: explicit retry rereads the failed directory
   useEffect(() => {
     let active = true;
@@ -148,9 +166,14 @@ export function NewSession({
             accountId={database}
             roomId="new"
             disabled={!choice || !database}
+            onDraftChange={(text) => {
+              written.current = text;
+              keep();
+            }}
             onSend={async (body) => {
               if (!choice || !database) return;
               const target = await agentSessionNew(database, choice.agentActor, body);
+              agentSessionsStore.getState().keepNewDraft(null);
               onCreated(target);
             }}
           />
