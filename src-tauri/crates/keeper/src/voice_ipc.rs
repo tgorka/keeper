@@ -449,7 +449,7 @@ fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
                 Err(error) => {
                     tracing::warn!(
                         target: keeper_core::telemetry::SHELL_AGENTS_TARGET,
-                        message = __omp_magic("", "error.message,")
+                        message = %error.message,
                         "voice: could not tell the agent where the person stopped listening"
                     );
                 }
