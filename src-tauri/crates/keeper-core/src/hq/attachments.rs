@@ -341,6 +341,18 @@ fn content_address(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
+/// `count` row ids for one commit, increasing in the order they are taken.
+/// Rows that share a `created_at_ms` are listed by `id`, so ids drawn at
+/// random inside one millisecond would show a message's files in any order;
+/// these keep the order the person attached them in, on every device. One
+/// fresh ULID's time and random part, with the random part's top bit cleared
+/// so adding the index can never carry out of its 80 bits.
+fn ordered_ids(count: usize) -> impl Iterator<Item = String> {
+    let base = ulid::Ulid::new();
+    let (ms, random) = (base.timestamp_ms(), base.random() >> 1);
+    (0..count).map(move |index| ulid::Ulid::from_parts(ms, random + index as u128).to_string())
+}
+
 /// Attach `files` to a new message in `session_id` whose text is `caption`
 /// (it may be empty): each blob staged for upload and the message, its
 /// `attachments` rows and the session's last activity committed, in one step
@@ -369,7 +381,8 @@ pub fn attach(
     };
     let mut ops = vec![person_message(source, session_id, &message_id, body, at)];
     let mut blobs = Vec::with_capacity(files.len());
-    for file in files {
+    let ids = ordered_ids(files.len());
+    for (file, id) in files.into_iter().zip(ids) {
         let StagedFile { name, mime, bytes } = file;
         let size = bytes.len() as u64;
         let blob_id = content_address(&bytes);
@@ -378,7 +391,7 @@ pub fn attach(
             values: authored(
                 source,
                 object(serde_json::json!({
-                    "id": ulid::Ulid::new().to_string(),
+                    "id": id,
                     "session_id": session_id,
                     "message_id": message_id,
                     "blob_ref": blob_ref(&blob_id, size, Some(&mime), Some(&name)),

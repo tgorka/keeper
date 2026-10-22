@@ -240,6 +240,52 @@ fn attaching_stages_each_blob_and_commits_the_message_and_its_rows_in_one_commit
 }
 
 #[test]
+fn a_messages_chips_keep_the_order_the_files_were_attached_in() {
+    // Neither alphabetical nor any other order a sort could stumble into.
+    const NAMES: [&str; 8] = [
+        "zeta.txt",
+        "alpha.txt",
+        "mid.txt",
+        "beta.txt",
+        "omega.txt",
+        "delta.txt",
+        "kappa.txt",
+        "eta.txt",
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path());
+    // Every file of one commit shares its millisecond, so random ids inside
+    // it would pass one round in 8! — never 200 in a row.
+    for round in 0..200 {
+        let session = format!("dev1.{}", round + 1);
+        seed_session(&alpha, &session, 1_000, false);
+        let files = NAMES
+            .iter()
+            .map(|name| {
+                stage_bytes(name, "text/plain", format!("{round} {name}").into_bytes())
+                    .expect("stages")
+            })
+            .collect();
+        let message = attach(&alpha, &session, "", files).expect("attaches");
+        let (view, _) = timeline::view(
+            &alpha,
+            &session,
+            &Opened::default(),
+            &Default::default(),
+            2_000,
+        )
+        .expect("a view");
+        let shown = view
+            .messages
+            .iter()
+            .find(|m| m.id == message)
+            .expect("the message");
+        let order: Vec<&str> = shown.attachments.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(order, NAMES, "round {round}: the chips in attach order");
+    }
+}
+
+#[test]
 fn nothing_attached_an_archived_or_unknown_session_is_refused_and_writes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let alpha = open(dir.path());

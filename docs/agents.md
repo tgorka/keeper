@@ -673,7 +673,9 @@ attachment does.
 **Proved on Linux:** keeper-core over real on-disk replicas — the bound before anything is staged,
 one commit holding the message and its rows with canonical `blob_ref`s, the pin and one upload row
 across a relaunch, opening only what a row names and only as a type that cannot run, the chips'
-states, a refused commit's message and chips, every refusal code's sentence, a refused upload's
+states and their order (the order the files were attached in: the rows' ids increase within the
+one millisecond their commit shares), a refused commit's message and chips, every refusal code's
+sentence, a refused upload's
 file *refused* and its message's others *blocked* with no other file touched, before and after
 the server answers the message, and a selection staged by path and by paste — or several pastes —
 sent once as one message with its caption once, a handle never committed released and a Send
