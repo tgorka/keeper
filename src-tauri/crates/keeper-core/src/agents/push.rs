@@ -552,7 +552,7 @@ pub(crate) fn misreads(c: char) -> bool {
 
 /// Whether any string in `value` — a key or a value, at any depth — holds a
 /// character that [`misreads`].
-fn holds_misreading(value: &Value) -> bool {
+pub(crate) fn holds_misreading(value: &Value) -> bool {
     match value {
         Value::String(text) => text.chars().any(misreads),
         Value::Array(items) => items.iter().any(holds_misreading),

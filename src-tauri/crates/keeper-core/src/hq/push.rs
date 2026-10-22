@@ -10,7 +10,7 @@
 //!
 //! | item | shows |
 //! |---|---|
-//! | a pending approval this person may decide | keeper's words; *Approve once* and *Deny* only when the whole request fits the notification ([`fits`]) and is below T4, else *Deny* alone |
+//! | a pending approval this person may decide | keeper's words; *Approve once* and *Deny* only when the whole request — the tool call the server read with it, its tool and exact arguments — fits the notification ([`fits`]) and is below T4, else *Deny* alone |
 //! | an approval already decided, expired, or not this person's | keeper's words, no action |
 //! | an answer: an agent's message naming no `kind` | the agent and its newest words — the final row is the answer's last word |
 //! | anything else (an ask, a person's message, this person's own) | nothing |
@@ -19,7 +19,9 @@
 //! server or tailnet unreachable, a refusal, an answer naming another item —
 //! is the generic notification (`agents::push::GENERIC_TITLE`), with no
 //! actions. The same item may arrive twice; a notification is the item's,
-//! so the second replaces the first ([`replaces`], [`PushedItem::tag`]).
+//! so the second replaces the first: Android by its tag, the iPhone by the
+//! item key every notification of the item carries ([`Fold`],
+//! [`PushedItem::tag`]).
 //!
 //! The push target the server posts to — the person's gateway, this
 //! device's token and app — is [`PushTarget`], registered through
@@ -34,8 +36,8 @@ use serde_json::{json, Map, Value};
 
 use crate::agents::approval_card::tier_word;
 use crate::agents::push::{
-    misreads, open_body, shown_name, ActionRefusal, ActionTap, ApnsEnvironment, Category, Gateway,
-    NotificationAction, PushOpenVm, BODY_MAX_CHARS, SHOWN_INFO,
+    holds_misreading, misreads, open_body, shown_name, ActionRefusal, ActionTap, ApnsEnvironment,
+    Category, Gateway, NotificationAction, PushOpenVm, BODY_MAX_CHARS, SHOWN_INFO,
 };
 use crate::hq::routes::{is_database_name, Routes};
 use crate::hq::server::ServerUrl;
@@ -46,9 +48,15 @@ use crate::hq::{lock, Hq, HqError};
 /// `default_payload` (iOS reads it from `userInfo`).
 pub const PAYLOAD: &str = "keeper_hq";
 
-/// The key only a notification keeper composed carries the item under — for
-/// a tap ([`tap_target`]) and for folding a second delivery ([`replaces`]).
+/// The key only a notification keeper composed carries the item under, for
+/// a tap ([`tap_target`]).
 pub const ITEM_INFO: &str = "keeper_hq_item";
+
+/// The key every iPhone notification of an agents item carries its item key
+/// under ([`PushedItem::tag`]) — composed, generic or fallback — so a second
+/// delivery of the item replaces it ([`Fold`]). The generic one carries
+/// nothing else of keeper's: ids keeper validated, no words, no actions.
+pub const KEY_INFO: &str = "keeper_hq_key";
 
 /// The key an approval's notification carries the shown request under, for
 /// the action handler ([`action_decision`]).
@@ -119,8 +127,9 @@ impl PushedItem {
         Some(url)
     }
 
-    /// One notification per item: a second delivery of it replaces the
-    /// first (Android's tag; the iPhone's [`replaces`]).
+    /// The item's key, one notification per item: `<database>/<kind>/<id>`
+    /// (a database name holds no `/` and the kind is one of two words, so
+    /// two items never share one). Android's tag; the iPhone's [`KEY_INFO`].
     pub fn tag(&self) -> String {
         format!("{}/{}/{}", self.database, self.kind.as_str(), self.item_id)
     }
@@ -132,16 +141,23 @@ impl PushedItem {
             session_id: self.session_id.clone(),
         }
     }
+}
 
-    fn same_item(&self, other: &PushedItem) -> bool {
-        self.database == other.database && self.kind == other.kind && self.item_id == other.item_id
-    }
+/// What the server answered for an item: its row and, for an approval, the
+/// tool call it would run (the call's `tool_calls` row) when the server sent
+/// that call and it is the approval's own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemRead {
+    pub row: Map<String, Value>,
+    pub tool_call: Option<Map<String, Value>>,
 }
 
 /// The row the server answered for `pushed` (`{database, kind, session_id,
-/// item_id, row}`), when the answer is about exactly that item; else why it
-/// is not.
-pub fn item_row(pushed: &PushedItem, body: &[u8]) -> Result<Map<String, Value>, String> {
+/// item_id, row, tool_call}`), when the answer is about exactly that item;
+/// else why it is not. A `tool_call` that is not the approval's own call in
+/// the same session is not read: the approval is then one whose whole
+/// request keeper cannot show.
+pub fn item_row(pushed: &PushedItem, body: &[u8]) -> Result<ItemRead, String> {
     let answer: Value =
         serde_json::from_slice(body).map_err(|_| "the server's answer is not JSON".to_owned())?;
     let Value::Object(row) = answer["row"].clone() else {
@@ -156,7 +172,17 @@ pub fn item_row(pushed: &PushedItem, body: &[u8]) -> Result<Map<String, Value>, 
     if !named {
         return Err("the server answered about another item".to_owned());
     }
-    Ok(row)
+    let tool_call = match answer.get("tool_call") {
+        Some(Value::Object(call))
+            if pushed.kind == ItemKind::Approval
+                && opt_text(call, "id").is_some_and(|id| id == text(&row, "tool_call_id"))
+                && text(call, "session_id") == pushed.session_id =>
+        {
+            Some(call.clone())
+        }
+        _ => None,
+    };
+    Ok(ItemRead { row, tool_call })
 }
 
 /// The approval a notification shows, as its `userInfo` carries it to the
@@ -204,20 +230,56 @@ fn tier_of(row: &Map<String, Value>) -> Option<u8> {
         .filter(|n| *n <= 4)
 }
 
-/// Whether a notification may offer *Approve once* on the approval `row`:
-/// the person sees the whole request there and it is below T4. The item the
-/// server pushes is the approval row alone, so the request is its `summary`
-/// — keeper's own sentence for the call, written by the runtime — shown as
-/// the body: one line of at most [`BODY_MAX_CHARS`] characters with no line
-/// break, other control character or bidirectional override. An unknown
-/// tier is never below T4.
-pub fn fits(row: &Map<String, Value>) -> bool {
-    let summary = text(row, "summary");
+/// The verbs of a Paseo broker whose argument is a prompt that goes on to a
+/// model (R143, AD-407): never approved from a lock screen. The phone does
+/// not hold the server's binding that names a broker's role, so these verbs
+/// are excluded on every MCP server.
+const PROMPT_VERBS: [&str; 2] = ["create_agent", "send_agent_prompt"];
+
+/// The whole request an approval would run, as a notification's body shows
+/// it: the tool, then its exact arguments as one line of JSON. `None` when
+/// keeper cannot show all of it: the server sent no tool call, or another
+/// approval's ([`item_row`]); the tool's name is empty or misreads; the
+/// arguments are not an object (a raw string the runtime could not parse, a
+/// blob, nothing); or a string in them — key or value, at any depth — holds a
+/// line break, another control character or a bidirectional override.
+pub fn request_line(call: Option<&Map<String, Value>>) -> Option<String> {
+    let call = call?;
+    let tool = text(call, "name");
+    if tool.is_empty() || tool.chars().any(misreads) {
+        return None;
+    }
+    let args = json_column(call, "args");
+    if !args.is_object() || holds_misreading(&args) {
+        return None;
+    }
+    Some(format!("{tool} {}", serde_json::to_string(&args).ok()?))
+}
+
+/// Whether a notification may offer *Approve once* on the approval `row`
+/// whose tool call the server read is `call` (98.1 #11, S-10, kept for the
+/// agents server): the person sees all of it there. A known tier below T4;
+/// the approval names its tool call and the server sent exactly that call;
+/// not a Paseo prompt ([`PROMPT_VERBS`]); not a `run` asking for the
+/// network, whose released workspace the body cannot list; and the whole
+/// [`request_line`] is at most [`BODY_MAX_CHARS`] characters. The summary is
+/// keeper's sentence for the call, not the call: it never makes a request
+/// fit. An unknown tier is never below T4.
+pub fn fits(row: &Map<String, Value>, call: Option<&Map<String, Value>>) -> bool {
+    let Some(line) = request_line(call) else {
+        return false;
+    };
+    let (tool, args) = call
+        .map(|call| (text(call, "name"), json_column(call, "args")))
+        .unwrap_or_default();
+    let prompt =
+        crate::agents::mcp::decode(tool).is_some_and(|(_, verb)| PROMPT_VERBS.contains(&verb));
+    let networked = tool == crate::agents::run::RUN && args["network"].as_bool() == Some(true);
     tier_of(row).is_some_and(|tier| tier < 4)
-        && !summary.trim().is_empty()
-        && !summary.chars().any(misreads)
-        && summary.chars().count() <= BODY_MAX_CHARS
         && opt_text(row, "tool_call_id").is_some()
+        && !prompt
+        && !networked
+        && line.chars().count() <= BODY_MAX_CHARS
 }
 
 /// The words of an answer whose text is not in its row.
@@ -225,14 +287,12 @@ fn answered(agent: &str) -> String {
     format!("{agent} answered; open keeper to read it.")
 }
 
-/// What `row` — the item `pushed` names, read with `own`'s token — shows at
-/// `now_ms`.
-pub fn classify(
-    pushed: &PushedItem,
-    row: &Map<String, Value>,
-    own: &str,
-    now_ms: i64,
-) -> HqClassified {
+/// What `read` — the item `pushed` names, read with `own`'s token — shows at
+/// `now_ms`. A pending approval's title carries keeper's sentence for the
+/// call (its `summary`) when that reads as it is; the body offering
+/// *Approve once* is the whole request ([`request_line`]), never the summary.
+pub fn classify(pushed: &PushedItem, read: &ItemRead, own: &str, now_ms: i64) -> HqClassified {
+    let row = &read.row;
     let author = text(row, "author_actor");
     let agent = shown_name(author, author);
     let shown = |title: String, subtitle, body, category, approval| {
@@ -259,6 +319,12 @@ pub fn classify(
                 };
                 return shown(title, None, body.to_owned(), None, None);
             }
+            let summary = text(row, "summary");
+            let title = if summary.trim().is_empty() || summary.chars().any(misreads) {
+                title
+            } else {
+                format!("{agent} asks: {summary}")
+            };
             let approval = |category| {
                 Some(HqPushApproval {
                     database: pushed.database.clone(),
@@ -280,22 +346,23 @@ pub fn classify(
                 // the session, where the card says why.
                 return shown(title, None, open(tier), None, approval(None));
             }
-            if fits(row) {
-                shown(
+            match request_line(read.tool_call.as_ref())
+                .filter(|_| fits(row, read.tool_call.as_ref()))
+            {
+                Some(request) => shown(
                     title,
                     tier.map(tier_word),
-                    text(row, "summary").to_owned(),
+                    request,
                     Some(Category::Approval),
                     approval(Some(Category::Approval)),
-                )
-            } else {
-                shown(
+                ),
+                None => shown(
                     title,
                     None,
                     open(tier),
                     Some(Category::ApprovalOpen),
                     approval(Some(Category::ApprovalOpen)),
-                )
+                ),
             }
         }
         ItemKind::Message => {
@@ -321,30 +388,80 @@ pub fn classify(
 }
 
 /// A notification already on the lock screen, as the extension hands it
-/// over: its identifier, and the item it shows when keeper composed it.
+/// over: its identifier, and the item key keeper set on it ([`KEY_INFO`]);
+/// empty for one that shows no agents item.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Delivered {
     pub id: String,
     #[serde(default)]
-    pub item: Value,
+    pub key: String,
 }
 
-/// The notifications on the lock screen that show `pushed` already: a
-/// second delivery of an item replaces them, so the item is shown once.
-pub fn replaces(delivered: &[Delivered], pushed: &PushedItem) -> Vec<String> {
-    delivered
+/// A notification of an agents item this extension process handed to iOS
+/// earlier — shown, the generic one, or its fallback — that may not be on
+/// the lock screen yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handed {
+    pub id: String,
+    pub key: String,
+}
+
+/// What a delivery of an item does so the item shows once (R1066K-02): the
+/// key it carries, and the notifications of the same item it replaces.
+///
+/// The identity is the item's, never the delivery's: iOS names a remote
+/// notification itself (the gateway sends no APNs collapse id — Sygnal has
+/// none), and a local re-post would need the remote one to show nothing,
+/// which needs the filtering entitlement (DW-408). So every notification of
+/// an item — composed, generic, fallback — carries the item's [`KEY_INFO`],
+/// and a delivery removes every other notification with that key: those on
+/// the lock screen, and those this process handed iOS earlier, once they
+/// are there (`awaits`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Fold {
+    /// The item key this delivery's notification carries.
+    pub key: String,
+    /// The notifications to remove before this one shows.
+    pub replaces: Vec<String>,
+    /// The ones of `replaces` handed to iOS earlier and not yet on the lock
+    /// screen: removed once they are.
+    pub awaits: Vec<String>,
+}
+
+/// The fold of the delivery `own` of `pushed`: every notification on the
+/// lock screen (`delivered`) or handed to iOS before it (`earlier`) that
+/// carries the same item key, other than `own`.
+pub fn fold(pushed: &PushedItem, own: &str, delivered: &[Delivered], earlier: &[Handed]) -> Fold {
+    let key = pushed.tag();
+    let mut replaces: Vec<String> = Vec::new();
+    let shown = delivered.iter().map(|one| (&one.id, &one.key));
+    let handed = earlier.iter().map(|one| (&one.id, &one.key));
+    for (id, of) in shown.chain(handed) {
+        if *of == key && id != own && !replaces.contains(id) {
+            replaces.push(id.clone());
+        }
+    }
+    let awaits = earlier
         .iter()
-        .filter(|one| PushedItem::of_payload(&one.item).is_some_and(|item| item.same_item(pushed)))
+        .filter(|one| one.key == key && one.id != own)
+        .filter(|one| !delivered.iter().any(|d| d.id == one.id))
         .map(|one| one.id.clone())
-        .collect()
+        .collect();
+    Fold {
+        key,
+        replaces,
+        awaits,
+    }
 }
 
 /// The `userInfo` keys keeper sets on a notification it composed for
-/// `shown`: [`SHOWN_INFO`], the item and, for an approval, the request.
+/// `shown`: [`SHOWN_INFO`], the item, its key and, for an approval, the
+/// request.
 pub fn composed_info(shown: &HqShown) -> Value {
     let mut info = json!({
         SHOWN_INFO: true,
         ITEM_INFO: shown.item,
+        KEY_INFO: shown.item.tag(),
     });
     if let Some(approval) = &shown.approval {
         info[APPROVAL_INFO] = json!(approval);
@@ -375,10 +492,11 @@ pub fn tap_target(user_info: &Value) -> Option<PushOpenVm> {
 }
 
 /// The keys a notification keeper re-posts after an action carries, so a
-/// tap on it still opens the session: [`SHOWN_INFO`] and the item, nothing
-/// that decides.
+/// tap on it still opens the session and a later delivery of the item
+/// replaces it: [`SHOWN_INFO`], the item and its key, nothing that decides.
 pub fn reposted_info(user_info: &Value) -> Option<Value> {
-    composed_item(user_info).map(|item| json!({ SHOWN_INFO: true, ITEM_INFO: item }))
+    composed_item(user_info)
+        .map(|item| json!({ SHOWN_INFO: true, KEY_INFO: item.tag(), ITEM_INFO: item }))
 }
 
 /// The decision an action on an item's notification sends.
@@ -563,8 +681,8 @@ pub async fn read_item(
         .push_item(server, token, pushed)
         .await
         .map_err(|error| error.to_string())?;
-    let row = item_row(pushed, &body)?;
-    Ok(classify(pushed, &row, own, now_ms))
+    let read = item_row(pushed, &body)?;
+    Ok(classify(pushed, &read, own, now_ms))
 }
 
 impl Hq {
@@ -694,7 +812,7 @@ mod tests {
     }
 
     /// An approval row as the server's item route answers it.
-    fn approval(tier: &str, summary: &str, state: &str) -> Map<String, Value> {
+    fn approval_row(tier: &str, summary: &str, state: &str) -> Map<String, Value> {
         row(json!({
             "id": "01JAPPROVAL0000000000000001", "session_id": "ana.1.3",
             "page_key": "ana.1.3/2026-10", "tool_call_id": "call-1", "tier": tier,
@@ -703,6 +821,42 @@ mod tests {
             "consumed_by_client": null, "expires_at_ms": 2_000, "created_at_ms": 1_000,
             "author_actor": "nixie", "author_client": "nixie.electra",
         }))
+    }
+
+    /// The approval's tool call as the server's item route answers it, its
+    /// `args` column as given.
+    fn call_with_args(name: &str, args: Value) -> Map<String, Value> {
+        row(json!({
+            "id": "call-1", "session_id": "ana.1.3", "page_key": "ana.1.3/2026-10",
+            "turn_id": "t1", "name": name, "args": args, "status": "started",
+            "result": null, "result_blob": null, "started_at_ms": 900, "ended_at_ms": null,
+            "created_at_ms": 900, "author_actor": "nixie", "author_client": "nixie.electra",
+        }))
+    }
+
+    /// A tool call whose arguments are the JSON text the runtime wrote.
+    fn call(name: &str, args: Value) -> Map<String, Value> {
+        call_with_args(name, Value::from(args.to_string()))
+    }
+
+    fn run(argv: Value) -> Map<String, Value> {
+        call("run", json!({ "argv": argv }))
+    }
+
+    /// An approval read with its tool call, `git status`.
+    fn approval(tier: &str, summary: &str, state: &str) -> ItemRead {
+        ItemRead {
+            row: approval_row(tier, summary, state),
+            tool_call: Some(run(json!(["git", "status"]))),
+        }
+    }
+
+    /// A pending approval read with `call`.
+    fn approval_with(tier: &str, summary: &str, call: Option<Map<String, Value>>) -> ItemRead {
+        ItemRead {
+            row: approval_row(tier, summary, "pending"),
+            tool_call: call,
+        }
     }
 
     fn show(classified: HqClassified) -> HqShown {
@@ -771,17 +925,55 @@ mod tests {
         assert!(item_row(&neuradrive, answer("ana.1.3", &item.item_id).as_bytes()).is_err());
     }
 
+    /// R1066K-01: the tool call the server sends beside an approval is read
+    /// only when it is that approval's own call in that session.
+    #[test]
+    fn the_tool_call_is_read_only_when_it_is_the_approvals_own() {
+        let item = pushed(ItemKind::Approval);
+        let answer = |call: Value| {
+            json!({"database": "tgdrive", "kind": "approval", "session_id": "ana.1.3",
+                   "item_id": item.item_id,
+                   "row": approval_row("T2", "Run `git` in keeper", "pending"),
+                   "tool_call": call})
+            .to_string()
+        };
+        let own = Value::Object(run(json!(["git", "status"])));
+        let read = item_row(&item, answer(own.clone()).as_bytes()).expect("read");
+        assert_eq!(read.tool_call.map(Value::Object), Some(own.clone()));
+        let mut other_call = own.clone();
+        other_call["id"] = json!("call-2");
+        let mut other_session = own.clone();
+        other_session["session_id"] = json!("ana.1.4");
+        for not_its_own in [other_call, other_session, Value::Null, json!("call-1")] {
+            let read = item_row(&item, answer(not_its_own.clone()).as_bytes()).expect("read");
+            assert_eq!(read.tool_call, None, "{not_its_own}");
+        }
+        // A message carries no tool call.
+        let message = PushedItem {
+            kind: ItemKind::Message,
+            ..item.clone()
+        };
+        let body = json!({"database": "tgdrive", "kind": "message", "session_id": "ana.1.3",
+                          "item_id": item.item_id,
+                          "row": {"id": item.item_id, "session_id": "ana.1.3",
+                                  "tool_call_id": "call-1"},
+                          "tool_call": own});
+        let read = item_row(&message, body.to_string().as_bytes()).expect("read");
+        assert_eq!(read.tool_call, None);
+    }
+
     #[test]
     fn an_approval_that_fits_below_t4_offers_approve_once_in_keepers_words() {
         let shown = show(classify(
             &pushed(ItemKind::Approval),
-            &approval("T2", "Run `git status` in keeper", "pending"),
+            &approval("T2", "Run `git` in workspace/keeper", "pending"),
             ANA,
             1_500,
         ));
-        assert_eq!(shown.title, "nixie asks for a decision");
+        assert_eq!(shown.title, "nixie asks: Run `git` in workspace/keeper");
         assert_eq!(shown.subtitle.as_deref(), Some(tier_word(2).as_str()));
-        assert_eq!(shown.body, "Run `git status` in keeper");
+        // The body is the whole request: the tool and its exact arguments.
+        assert_eq!(shown.body, r#"run {"argv":["git","status"]}"#);
         assert_eq!(shown.category, Some(Category::Approval));
         assert_eq!(shown.thread_id, "tgdrive/ana.1.3");
         let approval = shown.approval.expect("the request");
@@ -796,58 +988,159 @@ mod tests {
         assert_eq!(approval.category, Some(Category::Approval));
     }
 
+    /// `read` shows with *Deny* alone: no *Approve once*, the body sends the
+    /// person to keeper.
+    fn deny_alone(read: &ItemRead, why: &str) {
+        let shown = show(classify(&pushed(ItemKind::Approval), read, ANA, 1_500));
+        assert_eq!(shown.category, Some(Category::ApprovalOpen), "{why}");
+        assert!(
+            shown.body.to_lowercase().contains("open keeper"),
+            "{why}: {}",
+            shown.body
+        );
+        assert_eq!(
+            shown.approval.and_then(|a| a.category),
+            Some(Category::ApprovalOpen),
+            "{why}"
+        );
+    }
+
     #[test]
     fn t4_a_long_or_misreading_request_or_an_unknown_tier_offers_deny_alone() {
-        let long = "x".repeat(BODY_MAX_CHARS + 1);
-        let exact = "x".repeat(BODY_MAX_CHARS);
-        for (tier, summary) in [
-            ("T4", "Delete the backups"),
-            ("T2", long.as_str()),
-            ("T2", "line one\nline two"),
-            ("T2", "safe \u{202e}txt.exe"),
-            ("T9", "list files"),
-            ("high", "list files"),
-            ("T2", "   "),
+        let summary = "Run `echo` in workspace/keeper";
+        let overhead = r#"run {"argv":["echo",""]}"#.chars().count();
+        let at = |chars: usize| Some(run(json!(["echo", "x".repeat(chars - overhead)])));
+        for (tier, call, why) in [
+            ("T4", at(40), "T4"),
+            ("T9", at(40), "an unknown tier"),
+            ("high", at(40), "a tier keeper does not read"),
+            ("T2", at(BODY_MAX_CHARS + 1), "one character over"),
+            ("T2", Some(run(json!(["printf", "a\nb"]))), "a line break"),
+            (
+                "T2",
+                Some(run(json!(["cat", "\u{202e}gnp.exe"]))),
+                "a bidi override",
+            ),
+            (
+                "T2",
+                Some(call("run", json!({"argv": ["ls"], "na\u{202e}me": 1}))),
+                "a misreading key",
+            ),
         ] {
-            let shown = show(classify(
-                &pushed(ItemKind::Approval),
-                &approval(tier, summary, "pending"),
-                ANA,
-                1_500,
-            ));
-            assert_eq!(
-                shown.category,
-                Some(Category::ApprovalOpen),
-                "{tier} {summary:?}"
-            );
-            assert!(
-                shown.body.to_lowercase().contains("open keeper"),
-                "{}",
-                shown.body
-            );
-            assert_eq!(
-                shown.approval.and_then(|a| a.category),
-                Some(Category::ApprovalOpen)
-            );
+            deny_alone(&approval_with(tier, summary, call), why);
         }
         // The boundary itself fits.
-        let shown = show(classify(
-            &pushed(ItemKind::Approval),
-            &approval("T3", &exact, "pending"),
-            ANA,
-            1_500,
-        ));
+        let exact = approval_with("T3", summary, at(BODY_MAX_CHARS));
+        assert_eq!(
+            request_line(exact.tool_call.as_ref()).map(|l| l.chars().count()),
+            Some(BODY_MAX_CHARS)
+        );
+        let shown = show(classify(&pushed(ItemKind::Approval), &exact, ANA, 1_500));
         assert_eq!(shown.category, Some(Category::Approval));
         // No tool call named: nothing to bind the decision to.
         let mut no_call = approval("T1", "list files", "pending");
-        no_call.insert("tool_call_id".to_owned(), Value::Null);
-        assert!(!fits(&no_call));
+        no_call.row.insert("tool_call_id".to_owned(), Value::Null);
+        assert!(!fits(&no_call.row, no_call.tool_call.as_ref()));
+    }
+
+    /// R1066K-01: keeper's summary of a call is not the call. A summary that
+    /// fits never offers *Approve once*; only the whole request can, and a
+    /// request keeper cannot show whole — absent, incomplete, a Paseo
+    /// prompt, a networked run — offers *Deny* alone.
+    #[test]
+    fn a_short_summary_never_makes_a_request_approvable() {
+        // The runtime's sentence names the program, not its arguments.
+        let summary = "Run `git` in workspace/keeper";
+        let long = run(json!([
+            "git",
+            "push",
+            "--force",
+            "origin",
+            "x".repeat(BODY_MAX_CHARS)
+        ]));
+        for (call, why) in [
+            (Some(long), "a short summary over long arguments"),
+            (None, "no tool call from the server"),
+            (
+                Some(call_with_args("run", json!("{\"argv\": [\"git\""))),
+                "arguments cut short",
+            ),
+            (
+                Some(call_with_args(
+                    "run",
+                    Value::from(json!("git push --force").to_string()),
+                )),
+                "raw arguments the runtime could not parse",
+            ),
+            (Some(call_with_args("run", Value::Null)), "no arguments"),
+            (
+                Some(call("run", json!(["git", "status"]))),
+                "arguments that are not an object",
+            ),
+            (Some(call("", json!({"argv": ["ls"]}))), "no tool name"),
+            (
+                Some(call(
+                    "mcp__paseo__create_agent",
+                    json!({"prompt": "fix it"}),
+                )),
+                "a Paseo start",
+            ),
+            (
+                Some(call(
+                    "mcp__paseo__send_agent_prompt",
+                    json!({"agentId": "a", "prompt": "go"}),
+                )),
+                "a Paseo steer",
+            ),
+            (
+                Some(call("mcp__broker2__create_agent", json!({"prompt": "go"}))),
+                "a prompt verb on another broker",
+            ),
+            (
+                Some(call(
+                    "run",
+                    json!({"argv": ["curl", "-I", "x"], "network": true}),
+                )),
+                "a networked run",
+            ),
+        ] {
+            deny_alone(&approval_with("T2", summary, call), why);
+        }
+        // Two argument lists under one summary show two bodies.
+        let bodies: Vec<String> = [json!(["git", "status"]), json!(["git", "reset", "--hard"])]
+            .into_iter()
+            .map(|argv| {
+                show(classify(
+                    &pushed(ItemKind::Approval),
+                    &approval_with("T2", summary, Some(run(argv))),
+                    ANA,
+                    1_500,
+                ))
+                .body
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                r#"run {"argv":["git","status"]}"#,
+                r#"run {"argv":["git","reset","--hard"]}"#
+            ]
+        );
+        // A broker's read verb is not a prompt.
+        let list = approval_with(
+            "T2",
+            "List Paseo runs",
+            Some(call("mcp__paseo__list_agents", json!({}))),
+        );
+        let shown = show(classify(&pushed(ItemKind::Approval), &list, ANA, 1_500));
+        assert_eq!(shown.category, Some(Category::Approval));
+        assert_eq!(shown.body, "mcp__paseo__list_agents {}");
     }
 
     #[test]
     fn an_approval_not_this_persons_decided_or_expired_offers_nothing() {
         let mut other = approval("T1", "list files", "pending");
-        other.insert("approvers".to_owned(), json!("[\"ben\"]"));
+        other.row.insert("approvers".to_owned(), json!("[\"ben\"]"));
         let shown = show(classify(&pushed(ItemKind::Approval), &other, ANA, 1_500));
         assert_eq!(shown.category, None);
         assert_eq!(shown.approval.and_then(|a| a.category), None);
@@ -862,17 +1155,21 @@ mod tests {
             assert_eq!(shown.category, None, "{state}");
             assert_eq!(shown.approval, None, "{state}");
             assert!(!shown.body.contains("list files"), "{state}");
+            assert!(!shown.body.contains("git"), "{state}");
         }
     }
 
-    fn message(role: &str, author: &str, body: &str, metadata: Value) -> Map<String, Value> {
-        row(json!({
-            "id": "01JAPPROVAL0000000000000001", "session_id": "ana.1.3",
-            "page_key": "ana.1.3/2026-10", "turn_id": "t1", "role": role, "body": body,
-            "body_blob": null,
-            "metadata": if metadata.is_null() { Value::Null } else { Value::from(metadata.to_string()) },
-            "created_at_ms": 1_000, "author_actor": author, "author_client": "c",
-        }))
+    fn message(role: &str, author: &str, body: &str, metadata: Value) -> ItemRead {
+        ItemRead {
+            row: row(json!({
+                "id": "01JAPPROVAL0000000000000001", "session_id": "ana.1.3",
+                "page_key": "ana.1.3/2026-10", "turn_id": "t1", "role": role, "body": body,
+                "body_blob": null,
+                "metadata": if metadata.is_null() { Value::Null } else { Value::from(metadata.to_string()) },
+                "created_at_ms": 1_000, "author_actor": author, "author_client": "c",
+            })),
+            tool_call: None,
+        }
     }
 
     #[test]
@@ -911,9 +1208,13 @@ mod tests {
         }
     }
 
+    /// R1066K-02: a delivery of an item replaces every other notification of
+    /// it — on the lock screen, or handed to iOS by this process before it
+    /// and not there yet — and nothing of another item, database or kind.
     #[test]
-    fn a_second_delivery_of_an_item_replaces_the_first() {
+    fn a_delivery_replaces_every_other_notification_of_its_item() {
         let item = pushed(ItemKind::Approval);
+        let key = |item: &PushedItem| item.tag();
         let other = PushedItem {
             item_id: "01JOTHER".to_owned(),
             ..item.clone()
@@ -922,26 +1223,75 @@ mod tests {
             database: "neuradrive".to_owned(),
             ..item.clone()
         };
-        let delivered = [
-            Delivered {
+        let as_message = PushedItem {
+            kind: ItemKind::Message,
+            ..item.clone()
+        };
+        let delivered = |pairs: &[(&str, String)]| -> Vec<Delivered> {
+            pairs
+                .iter()
+                .map(|(id, key)| Delivered {
+                    id: (*id).to_owned(),
+                    key: key.clone(),
+                })
+                .collect()
+        };
+        let on_screen = delivered(&[
+            ("first", key(&item)),
+            ("other", key(&other)),
+            ("elsewhere", key(&in_neuradrive)),
+            ("a-message", key(&as_message)),
+            ("matrix", String::new()),
+            ("me", key(&item)),
+        ]);
+        let folded = fold(&item, "me", &on_screen, &[]);
+        assert_eq!(folded.key, "tgdrive/approval/01JAPPROVAL0000000000000001");
+        assert_eq!(folded.replaces, ["first"]);
+        assert!(folded.awaits.is_empty());
+
+        // The first delivery is still on its way (handed, not on the lock
+        // screen): replaced once it is there.
+        let handed = [
+            Handed {
                 id: "first".to_owned(),
-                item: json!(item),
+                key: key(&item),
             },
-            Delivered {
+            Handed {
                 id: "other".to_owned(),
-                item: json!(other),
-            },
-            Delivered {
-                id: "elsewhere".to_owned(),
-                item: json!(in_neuradrive),
-            },
-            Delivered {
-                id: "matrix".to_owned(),
-                item: Value::Null,
+                key: key(&other),
             },
         ];
-        assert_eq!(replaces(&delivered, &item), ["first"]);
-        assert!(replaces(&[], &item).is_empty());
+        let folded = fold(&item, "second", &[], &handed);
+        assert_eq!(
+            (folded.replaces, folded.awaits),
+            (vec!["first".to_owned()], vec!["first".to_owned()])
+        );
+        // Handed and already there: replaced, not awaited, named once.
+        let folded = fold(
+            &item,
+            "second",
+            &delivered(&[("first", key(&item))]),
+            &handed,
+        );
+        assert_eq!(folded.replaces, ["first"]);
+        assert!(folded.awaits.is_empty());
+        assert!(fold(&item, "me", &[], &[]).replaces.is_empty());
+    }
+
+    #[test]
+    fn every_notification_keeper_composes_or_reposts_carries_the_item_key() {
+        let shown = show(classify(
+            &pushed(ItemKind::Approval),
+            &approval("T2", "list files", "pending"),
+            ANA,
+            1_500,
+        ));
+        let info = composed_info(&shown);
+        assert_eq!(info[KEY_INFO], json!(pushed(ItemKind::Approval).tag()));
+        assert_eq!(
+            reposted_info(&info).expect("composed")[KEY_INFO],
+            json!(pushed(ItemKind::Approval).tag())
+        );
     }
 
     fn tap(category: &str, action: &str, user_info: Value) -> ActionTap {

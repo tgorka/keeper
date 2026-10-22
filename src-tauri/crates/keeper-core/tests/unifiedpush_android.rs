@@ -483,7 +483,7 @@ fn an_unsent_decision_asks_the_person_to_finish_in_keeper() {
 /// replacement still opens the item's session.
 #[test]
 fn an_agents_item_is_one_notification_and_its_replacement_opens_the_session() {
-    use keeper_core::hq::push::{classify, HqClassified, ItemKind, PushedItem};
+    use keeper_core::hq::push::{classify, HqClassified, ItemKind, ItemRead, PushedItem};
 
     let pushed = PushedItem {
         database: "neuradrive".to_owned(),
@@ -495,9 +495,13 @@ fn an_agents_item_is_one_notification_and_its_replacement_opens_the_session() {
         "tier": "T1", "binding_digest": "d", "summary": "list files",
         "approvers": "[\"marta\"]", "state": "pending", "expires_at_ms": 2_000,
         "author_actor": "dixi"});
-    let HqClassified::Show(shown) =
-        classify(&pushed, row.as_object().expect("object"), "marta", 1_000)
-    else {
+    let call = json!({"id": "c1", "session_id": "marta.1.2", "name": "run",
+        "args": "{\"argv\":[\"ls\"]}"});
+    let read = ItemRead {
+        row: row.as_object().expect("object").clone(),
+        tool_call: call.as_object().cloned(),
+    };
+    let HqClassified::Show(shown) = classify(&pushed, &read, "marta", 1_000) else {
         panic!("shown")
     };
     let first = item_notification(&shown, 34);

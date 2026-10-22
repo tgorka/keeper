@@ -39,11 +39,22 @@
 //! and [`answer_item`] makes one authenticated read of that item
 //! (`GET /<database>/push/item/{kind}/{id}`) with the pairing of the server
 //! whose replica of that database this device holds, and asks
-//! [`keeper_core::hq::push::classify`] what shows: an [`NseAnswer::Item`],
-//! which names the earlier notifications of the same item it replaces. No
-//! store is opened and nothing is written; an item that cannot be read —
+//! [`keeper_core::hq::push::classify`] what shows: an [`NseAnswer::Item`].
+//! No store is opened and nothing is written; an item that cannot be read —
 //! no pairing, the server or the tailnet unreachable, a refusal — is the
 //! generic notification.
+//!
+//! **One notification per item (R1066K-02).** Before anything is read, the
+//! Swift asks for the item's key ([`KeyRequest`]): the key the delivery's
+//! notification carries whatever it turns out to be — composed, generic, or
+//! the fallback iOS shows when the extension runs out of time. That call
+//! also records the delivery as handed to iOS by this process ([`HANDED`]).
+//! Every answer about the item then names the notifications of the same
+//! item to remove first ([`keeper_core::hq::push::Fold`]): those on the lock
+//! screen, and those handed earlier by this process that are not there yet,
+//! which the Swift waits for. iOS names a remote notification itself and
+//! the gateway sends no collapse id, so this is the boundary: the item's
+//! key on the notification, and removal by key.
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
@@ -56,7 +67,7 @@ use keeper_core::agents::push::{shown_of, Classified, Shown};
 use keeper_core::auth::StoredSession;
 use keeper_core::container::{group_data_dir, MOVE_DONE};
 use keeper_core::hq::push::{
-    credential_for, read_item, replaces, Delivered, HqClassified, HqShown, PushedItem,
+    credential_for, fold, read_item, Delivered, Fold, Handed, HqClassified, HqShown, PushedItem,
 };
 use keeper_core::hq::routes::HttpRoutes;
 use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
@@ -94,26 +105,40 @@ pub struct NseRequest {
 }
 
 /// What the extension's Swift hands over for a push from the agents server,
-/// as JSON: the App Group container's root, the push's `keeper_hq`, the
-/// keychain's `agents-server/<base URL>` items by key, and the keeper
-/// notifications already on the lock screen.
+/// as JSON: the App Group container's root, the push's `keeper_hq`, this
+/// delivery's notification identifier, the keychain's `agents-server/<base
+/// URL>` items by key, and the keeper notifications already on the lock
+/// screen.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HqRequest {
     pub group: PathBuf,
     pub hq: serde_json::Value,
+    #[serde(default)]
+    pub identifier: String,
     #[serde(default)]
     pub pairings: BTreeMap<String, String>,
     #[serde(default)]
     pub delivered: Vec<Delivered>,
 }
 
-/// An agents server item to show, and the notifications of the same item it
-/// replaces (a second delivery shows once).
+/// The Swift's first call for a push from the agents server, before any
+/// read: the push's `keeper_hq` and this delivery's notification
+/// identifier. Answered with the item's key ([`NseAnswer::Key`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyRequest {
+    pub hq_key: serde_json::Value,
+    #[serde(default)]
+    pub identifier: String,
+}
+
+/// An agents server item to show, the key it carries and the notifications
+/// of the same item it replaces (a second delivery shows once).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ItemShown {
     #[serde(flatten)]
     pub shown: HqShown,
-    pub replaces: Vec<String>,
+    #[serde(flatten)]
+    pub fold: Fold,
 }
 
 /// What the extension does with the notification, as JSON (`kind` tags it).
@@ -128,14 +153,85 @@ pub enum NseAnswer {
     /// without the filtering entitlement is DW-408's question).
     Drop,
     /// Leave the notification as the gateway sent it; `why` goes to the
-    /// log ([`handle_json`] warns it through `tracing`).
-    Generic { why: String },
+    /// log ([`handle_json`] warns it through `tracing`). For an agents item,
+    /// `fold`: the item's key the generic notification carries — and nothing
+    /// else of keeper's — and what it replaces.
+    Generic {
+        why: String,
+        #[serde(flatten)]
+        fold: Option<Fold>,
+    },
+    /// The key every notification of the agents item this push names
+    /// carries ([`KeyRequest`]).
+    Key { key: String },
 }
 
 fn generic(why: impl std::fmt::Display) -> NseAnswer {
     NseAnswer::Generic {
         why: why.to_string(),
+        fold: None,
     }
+}
+
+/// How long a delivery this process handed to iOS is still waited for by a
+/// later one of the same item: longer than iOS gives the extension.
+const HANDED_FOR: Duration = Duration::from_secs(60);
+
+/// One delivery of an agents item this process handed to iOS.
+struct HandedOne {
+    id: String,
+    key: String,
+    at: Instant,
+}
+
+/// The deliveries of agents items this extension process has handed to
+/// iOS, in the order they arrived: what a later delivery of the same item
+/// removes, even before it is on the lock screen.
+static HANDED: Mutex<Vec<HandedOne>> = Mutex::new(Vec::new());
+
+fn handed() -> std::sync::MutexGuard<'static, Vec<HandedOne>> {
+    HANDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Record the delivery `id` of the item `key` as handed to iOS, once.
+fn hand(key: &str, id: &str) {
+    let mut all = handed();
+    all.retain(|one| one.at.elapsed() < HANDED_FOR);
+    if !id.is_empty() && !all.iter().any(|one| one.id == id) {
+        all.push(HandedOne {
+            id: id.to_owned(),
+            key: key.to_owned(),
+            at: Instant::now(),
+        });
+    }
+}
+
+/// The deliveries handed before `id` (all of them, for one never handed).
+fn handed_before(id: &str) -> Vec<Handed> {
+    let all = handed();
+    all.iter()
+        .filter(|one| one.at.elapsed() < HANDED_FOR)
+        .take_while(|one| one.id != id)
+        .map(|one| Handed {
+            id: one.id.clone(),
+            key: one.key.clone(),
+        })
+        .collect()
+}
+
+/// Forget the deliveries `ids`: removed, or shown as nothing.
+fn forget(ids: &[String]) {
+    handed().retain(|one| !ids.contains(&one.id));
+}
+
+/// The key of the item `request` names, its delivery recorded as handed.
+pub fn answer_key(request: &KeyRequest) -> NseAnswer {
+    let Some(pushed) = PushedItem::of_payload(&request.hq_key) else {
+        return generic("the push names no agents item");
+    };
+    let key = pushed.tag();
+    hand(&key, &request.identifier);
+    NseAnswer::Key { key }
 }
 
 /// `answer` as the JSON the Swift reads.
@@ -275,8 +371,9 @@ async fn decide(
 }
 
 /// What the lock screen shows for an agents server item (106.6): one read
-/// of the item with this device's pairing, classified on the phone.
-pub async fn answer_item(request: HqRequest) -> NseAnswer {
+/// of the item with this device's pairing, classified on the phone. What
+/// it replaces is [`folded`]'s.
+pub async fn answer_item(request: &HqRequest) -> NseAnswer {
     let data_dir = group_data_dir(&request.group);
     if !data_dir.join(MOVE_DONE).is_file() {
         return generic(NoStore::NotMoved);
@@ -299,11 +396,41 @@ pub async fn answer_item(request: HqRequest) -> NseAnswer {
     .await;
     match read {
         Ok(HqClassified::Show(shown)) => NseAnswer::Item(ItemShown {
-            replaces: replaces(&request.delivered, &pushed),
             shown: *shown,
+            fold: Fold::default(),
         }),
         Ok(HqClassified::Drop) => NseAnswer::Drop,
         Err(why) => generic(format!("the agents item could not be read: {why}")),
+    }
+}
+
+/// `answer` to the delivery `request`, with the item's key and what it
+/// replaces when it shows anything — the item, or the generic notification
+/// (whatever made it generic: no pairing, the tailnet off, too slow) — so
+/// the item shows once. A delivery that shows nothing is forgotten; one a
+/// fold names is forgotten too, as the Swift removes it.
+fn folded(request: &HqRequest, answer: NseAnswer) -> NseAnswer {
+    let Some(pushed) = PushedItem::of_payload(&request.hq) else {
+        return answer;
+    };
+    let own = request.identifier.as_str();
+    if answer == NseAnswer::Drop {
+        forget(&[own.to_owned()]);
+        return answer;
+    }
+    let item_fold = fold(&pushed, own, &request.delivered, &handed_before(own));
+    hand(&item_fold.key, own);
+    forget(&item_fold.replaces);
+    match answer {
+        NseAnswer::Item(item) => NseAnswer::Item(ItemShown {
+            fold: item_fold,
+            ..item
+        }),
+        NseAnswer::Generic { why, .. } => NseAnswer::Generic {
+            why,
+            fold: Some(item_fold),
+        },
+        other => other,
     }
 }
 
@@ -346,16 +473,24 @@ fn unwinding_stops_here(work: impl FnOnce() -> String + UnwindSafe) -> String {
 /// notification at a time ([`one_at_a_time`]). Why an answer is generic is
 /// warned through `tracing`.
 pub fn handle_json(request: &str) -> String {
-    let is_item = serde_json::from_str::<serde_json::Value>(request)
-        .is_ok_and(|value| value.get("hq").is_some());
-    let answer = if is_item {
+    let value = serde_json::from_str::<serde_json::Value>(request).ok();
+    let has = |key: &str| value.as_ref().is_some_and(|value| value.get(key).is_some());
+    let answer = if has("hq_key") {
+        // No read and no lock: this answers at once, even while another
+        // notification is being read.
+        match serde_json::from_str::<KeyRequest>(request) {
+            Err(_) => generic("the extension's request does not read"),
+            Ok(request) => answer_key(&request),
+        }
+    } else if has("hq") {
         match serde_json::from_str::<HqRequest>(request) {
             Err(_) => generic("the extension's request does not read"),
             Ok(request) => one_at_a_time(|| {
-                within_deadline(
-                    answer_item(request),
+                let answer = within_deadline(
+                    answer_item(&request),
                     "the agents item took too long to read",
-                )
+                );
+                folded(&request, answer)
             }),
         }
     } else {
@@ -366,14 +501,15 @@ pub fn handle_json(request: &str) -> String {
             }),
         }
     };
-    if let NseAnswer::Generic { why } = &answer {
+    if let NseAnswer::Generic { why, .. } = &answer {
         tracing::warn!(%why, "keeper-nse: the notification stays as the gateway sent it");
     }
     written(&answer)
 }
 
 /// The one C-ABI entry the extension's Swift calls: `request` is the JSON of
-/// an [`NseRequest`] or an [`HqRequest`]; the answer is the JSON of an [`NseAnswer`] — the
+/// an [`NseRequest`], a [`KeyRequest`] or an [`HqRequest`]; the answer is the
+/// JSON of an [`NseAnswer`] — the
 /// generic one when anything below panics — owned by the caller until it
 /// hands it to [`keeper_nse_free`]. Null only when the answer held a NUL
 /// byte, which JSON escapes never do.
@@ -664,6 +800,7 @@ mod item_tests {
     use super::*;
     use keeper_core::hq::server::ServerUrl;
     use serde_json::{json, Value};
+    use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -728,11 +865,23 @@ mod item_tests {
         group
     }
 
-    fn request(group: &std::path::Path, url: &str, delivered: Value) -> String {
+    fn payload(item: &str) -> Value {
+        json!({"database": "tgdrive", "session_id": "ana.1.3", "kind": "approval",
+               "item_id": item})
+    }
+
+    /// The Swift's read of the delivery `identifier` of `item`.
+    fn request_for(
+        group: &std::path::Path,
+        url: &str,
+        item: &str,
+        identifier: &str,
+        delivered: Value,
+    ) -> String {
         json!({
             "group": group,
-            "hq": {"database": "tgdrive", "session_id": "ana.1.3", "kind": "approval",
-                   "item_id": ITEM},
+            "hq": payload(item),
+            "identifier": identifier,
             "pairings": {
                 format!("agents-server/{url}"): json!({"token": TOKEN, "actorId": "ana",
                     "clientId": "ana.1", "name": "keeper on kalypso"}).to_string(),
@@ -743,18 +892,49 @@ mod item_tests {
         .to_string()
     }
 
-    /// The approval as the server's item route answers it (recorded shape).
-    fn approval(tier: &str, summary: &str) -> String {
+    fn request(group: &std::path::Path, url: &str, delivered: Value) -> String {
+        request_for(group, url, ITEM, "", delivered)
+    }
+
+    /// The Swift's first call for the delivery `identifier` of `item`.
+    fn key_of(item: &str, identifier: &str) -> Value {
+        answer(&handle_json(
+            &json!({"hq_key": payload(item), "identifier": identifier}).to_string(),
+        ))
+    }
+
+    /// The approval as the server's item route answers it (recorded shape),
+    /// with the tool call it runs.
+    fn approval_of(item: &str, tier: &str, summary: &str, tool_call: Value) -> String {
         json!({"database": "tgdrive", "kind": "approval", "session_id": "ana.1.3",
-            "item_id": ITEM, "row": {
-                "id": ITEM, "session_id": "ana.1.3", "page_key": "ana.1.3/2026-10",
+            "item_id": item, "row": {
+                "id": item, "session_id": "ana.1.3", "page_key": "ana.1.3/2026-10",
                 "tool_call_id": "call-1", "tier": tier, "binding_digest": "d1",
                 "summary": summary, "approvers": "[\"ana\"]", "state": "pending",
                 "decided_by_actor": null, "decided_by_client": null,
                 "consumed_by_client": null, "expires_at_ms": 4_102_444_800_000_i64,
                 "created_at_ms": 1_000, "author_actor": "nixie",
-                "author_client": "nixie.electra"}})
+                "author_client": "nixie.electra"},
+            "tool_call": tool_call})
         .to_string()
+    }
+
+    /// The approval's tool call as the server's item route answers it.
+    fn call(name: &str, args: Value) -> Value {
+        json!({"id": "call-1", "session_id": "ana.1.3", "page_key": "ana.1.3/2026-10",
+               "turn_id": "t1", "name": name, "args": args.to_string(), "status": "started",
+               "result": null, "result_blob": null, "started_at_ms": 900,
+               "ended_at_ms": null, "created_at_ms": 900, "author_actor": "nixie",
+               "author_client": "nixie.electra"})
+    }
+
+    fn approval(tier: &str, summary: &str) -> String {
+        approval_of(
+            ITEM,
+            tier,
+            summary,
+            call("run", json!({"argv": ["git", "status"]})),
+        )
     }
 
     fn answer(raw: &str) -> Value {
@@ -763,17 +943,17 @@ mod item_tests {
 
     #[test]
     fn an_approval_is_read_once_with_the_device_token_and_shown_in_keepers_words() {
-        let server = serve(200, approval("T2", "Run `git status` in keeper"));
+        let server = serve(200, approval("T2", "Run `git` in workspace/keeper"));
         let group = group(&server.url);
         let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
         assert_eq!(shown["kind"], "item", "{shown}");
-        assert_eq!(shown["title"], "nixie asks for a decision");
-        assert_eq!(shown["body"], "Run `git status` in keeper");
+        assert_eq!(shown["title"], "nixie asks: Run `git` in workspace/keeper");
+        assert_eq!(shown["body"], r#"run {"argv":["git","status"]}"#);
         assert_eq!(shown["category"], "KEEPER_APPROVAL");
         assert_eq!(shown["thread_id"], "tgdrive/ana.1.3");
         assert_eq!(shown["item"]["item_id"], ITEM);
         assert_eq!(shown["approval"]["binding_digest"], "d1");
-        assert_eq!(shown["replaces"], json!([]));
+        assert_eq!(shown["key"], format!("tgdrive/approval/{ITEM}"));
         assert_eq!(
             *server.seen.lock().expect("seen"),
             [(
@@ -786,15 +966,49 @@ mod item_tests {
 
     #[test]
     fn a_t4_or_long_request_offers_deny_alone() {
-        for (tier, summary) in [
-            ("T4", "Delete the backups".to_owned()),
-            ("T1", "x".repeat(121)),
+        let summary = "Run `echo` in workspace/keeper";
+        for (tier, argv) in [
+            ("T4", json!(["rm", "-rf", "backups"])),
+            ("T1", json!(["echo", "x".repeat(121)])),
         ] {
-            let server = serve(200, approval(tier, &summary));
+            let server = serve(
+                200,
+                approval_of(ITEM, tier, summary, call("run", json!({ "argv": argv }))),
+            );
             let group = group(&server.url);
             let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
             assert_eq!(shown["category"], "KEEPER_APPROVAL_OPEN", "{tier}");
-            assert_ne!(shown["body"], summary.as_str());
+            assert!(!shown["body"].as_str().expect("body").contains("argv"));
+        }
+    }
+
+    /// R1066K-01 through the extension: a short summary over a request
+    /// keeper cannot show whole offers *Deny* alone.
+    #[test]
+    fn a_short_summary_over_a_request_keeper_cannot_show_whole_offers_deny_alone() {
+        let summary = "Run `git` in workspace/keeper";
+        for tool_call in [
+            Value::Null,
+            call(
+                "run",
+                json!({"argv": ["git", "push", "--force", "x".repeat(120)]}),
+            ),
+            call("run", Value::from("git push --force")),
+            call("mcp__paseo__create_agent", json!({"prompt": "fix it"})),
+            call(
+                "mcp__paseo__send_agent_prompt",
+                json!({"agentId": "a", "prompt": "go"}),
+            ),
+        ] {
+            let server = serve(200, approval_of(ITEM, "T2", summary, tool_call.clone()));
+            let group = group(&server.url);
+            let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
+            assert_eq!(shown["kind"], "item", "{tool_call}");
+            assert_eq!(shown["category"], "KEEPER_APPROVAL_OPEN", "{tool_call}");
+            assert_eq!(
+                shown["approval"]["category"], "KEEPER_APPROVAL_OPEN",
+                "{tool_call}"
+            );
         }
     }
 
@@ -802,16 +1016,183 @@ mod item_tests {
     fn a_second_delivery_of_the_item_replaces_the_first() {
         let server = serve(200, approval("T2", "list files"));
         let group = group(&server.url);
-        let item = json!({"database": "tgdrive", "session_id": "ana.1.3", "kind": "approval",
-                          "item_id": ITEM});
         let delivered = json!([
-            {"id": "first-delivery", "item": item},
-            {"id": "another-item", "item": {"database": "tgdrive", "session_id": "ana.1.3",
-                                             "kind": "approval", "item_id": "01JOTHER"}},
-            {"id": "a-matrix-one"},
+            {"id": "first-delivery", "key": format!("tgdrive/approval/{ITEM}")},
+            {"id": "another-item", "key": "tgdrive/approval/01JOTHER"},
+            {"id": "a-matrix-one", "key": ""},
         ]);
         let shown = answer(&handle_json(&request(group.path(), &server.url, delivered)));
         assert_eq!(shown["replaces"], json!(["first-delivery"]));
+    }
+
+    /// The server or the tailnet unreachable: a port nothing listens on.
+    fn closed() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    }
+
+    /// R1066K-02, the tailnet off: every delivery is generic, each carries
+    /// the item's key and nothing else of keeper's, and each removes the one
+    /// before it — on the lock screen, or still on its way.
+    #[test]
+    fn deliveries_with_the_tailnet_off_leave_one_notification() {
+        const OFF: &str = "01JFOLDOFF0000000000000001";
+        let url = closed();
+        let group = group(&url);
+        let key = format!("tgdrive/approval/{OFF}");
+        assert_eq!(key_of(OFF, "off-1"), json!({"kind": "key", "key": key}));
+        let first = answer(&handle_json(&request_for(
+            group.path(),
+            &url,
+            OFF,
+            "off-1",
+            json!([]),
+        )));
+        assert_eq!(first["kind"], "generic");
+        assert_eq!(
+            (&first["key"], &first["replaces"]),
+            (&json!(key), &json!([]))
+        );
+        // The second arrives once the first is on the lock screen.
+        assert_eq!(key_of(OFF, "off-2")["key"], json!(key));
+        let second = answer(&handle_json(&request_for(
+            group.path(),
+            &url,
+            OFF,
+            "off-2",
+            json!([{"id": "off-1", "key": key}]),
+        )));
+        assert_eq!(second["kind"], "generic");
+        assert_eq!(second["replaces"], json!(["off-1"]));
+        assert_eq!(second["awaits"], json!([]));
+        // A third arrives while the second is handed but not yet shown.
+        key_of(OFF, "off-3");
+        let third = answer(&handle_json(&request_for(
+            group.path(),
+            &url,
+            OFF,
+            "off-3",
+            json!([]),
+        )));
+        assert_eq!(third["replaces"], json!(["off-2"]));
+        assert_eq!(third["awaits"], json!(["off-2"]));
+        // The generic answer carries ids keeper validated and nothing else.
+        let keys: BTreeSet<&str> = third
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["kind", "why", "key", "replaces", "awaits"])
+        );
+    }
+
+    /// R1066K-02, the tailnet on: the second delivery arrives while the first
+    /// is still being read. Deliveries are read one after the other, so the
+    /// second is read once the first is handed to iOS; it removes the first
+    /// whether or not iOS shows it yet, and the first never removes the
+    /// second.
+    #[test]
+    fn a_second_delivery_arriving_while_the_first_is_read_leaves_one_notification() {
+        const ON: &str = "01JFOLDON00000000000000001";
+        let server = serve(
+            200,
+            approval_of(ON, "T2", "list files", call("run", json!({"argv": ["ls"]}))),
+        );
+        let group = group(&server.url);
+        let key = format!("tgdrive/approval/{ON}");
+        // Both arrive before either is read.
+        key_of(ON, "on-1");
+        key_of(ON, "on-2");
+        let first = answer(&handle_json(&request_for(
+            group.path(),
+            &server.url,
+            ON,
+            "on-1",
+            json!([]),
+        )));
+        assert_eq!(first["kind"], "item");
+        assert_eq!(first["key"], json!(key));
+        assert_eq!(first["replaces"], json!([]), "never the later one");
+        let second = answer(&handle_json(&request_for(
+            group.path(),
+            &server.url,
+            ON,
+            "on-2",
+            json!([]),
+        )));
+        assert_eq!(second["kind"], "item");
+        assert_eq!(second["replaces"], json!(["on-1"]));
+        assert_eq!(second["awaits"], json!(["on-1"]));
+    }
+
+    /// R1066K-02, the fallback: a delivery the extension ran out of time on
+    /// is shown by iOS with its key; the next delivery of the item removes
+    /// it. A delivery that showed nothing is not waited for.
+    #[test]
+    fn a_fallback_is_replaced_and_a_dropped_delivery_is_not_waited_for() {
+        const LATE: &str = "01JFOLDLATE000000000000001";
+        let url = closed();
+        let late_group = group(&url);
+        key_of(LATE, "late-1"); // never answered: iOS showed the fallback
+        let next = answer(&handle_json(&request_for(
+            late_group.path(),
+            &url,
+            LATE,
+            "late-2",
+            json!([]),
+        )));
+        assert_eq!(next["replaces"], json!(["late-1"]));
+
+        const ASK: &str = "01JFOLDASK0000000000000001";
+        let ask = json!({"database": "tgdrive", "kind": "message", "session_id": "ana.1.3",
+            "item_id": ASK, "row": {"id": ASK, "session_id": "ana.1.3", "role": "agent",
+            "body": "Which one?", "metadata": "{\"kind\":\"ask\"}", "created_at_ms": 1_000,
+            "author_actor": "nixie", "author_client": "nixie.electra"}});
+        let server = serve(200, ask.to_string());
+        let ask_group = group(&server.url);
+        let message = |identifier: &str| {
+            request_for(ask_group.path(), &server.url, ASK, identifier, json!([]))
+                .replace("\"approval\"", "\"message\"")
+        };
+        let ask_payload = json!({"database": "tgdrive", "session_id": "ana.1.3",
+                                 "kind": "message", "item_id": ASK});
+        for identifier in ["ask-1", "ask-2"] {
+            handle_json(&json!({"hq_key": ask_payload, "identifier": identifier}).to_string());
+            assert_eq!(answer(&handle_json(&message(identifier)))["kind"], "drop");
+        }
+        // Neither is waited for by a later delivery that shows.
+        let later = folded(
+            &serde_json::from_str::<HqRequest>(&message("ask-3")).expect("request"),
+            generic("the tailnet is off"),
+        );
+        let NseAnswer::Generic {
+            fold: Some(later), ..
+        } = later
+        else {
+            panic!("a folded generic answer");
+        };
+        assert!(later.replaces.is_empty(), "{later:?}");
+    }
+
+    /// The generic metadata holds ids keeper validated: a push naming no
+    /// item keeper reads has no key at all.
+    #[test]
+    fn a_push_naming_no_readable_item_has_no_key() {
+        for hq in [
+            json!({"database": "../x", "session_id": "s", "kind": "approval", "item_id": "i"}),
+            json!({"database": "tgdrive", "session_id": "s", "kind": "approval",
+                   "item_id": "a\u{202e}b"}),
+            json!("tgdrive/approval/i"),
+        ] {
+            let shown = answer(&handle_json(
+                &json!({"hq_key": hq, "identifier": "bad-1"}).to_string(),
+            ));
+            assert_eq!(shown["kind"], "generic", "{hq}");
+            assert_eq!(shown.get("key"), None, "{hq}");
+        }
     }
 
     #[test]
@@ -857,11 +1238,7 @@ mod item_tests {
             assert_eq!(shown["kind"], "generic", "{status} {body}: {shown}");
         }
 
-        // The server or the tailnet unreachable: a port nothing listens on.
-        let closed = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            format!("http://{}", listener.local_addr().expect("addr"))
-        };
+        let closed = closed();
         let group_dir = group(&closed);
         let shown = answer(&handle_json(&request(group_dir.path(), &closed, json!([]))));
         assert_eq!(shown["kind"], "generic");
@@ -893,7 +1270,7 @@ mod item_tests {
         let server = serve(200, approval("T2", "list files"));
         let group = group(&server.url);
         let shown = answer(&handle_json(&request(group.path(), &server.url, json!([]))));
-        let keys: std::collections::BTreeSet<&str> = shown
+        let keys: BTreeSet<&str> = shown
             .as_object()
             .expect("object")
             .keys()
@@ -901,7 +1278,7 @@ mod item_tests {
             .collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from([
+            BTreeSet::from([
                 "kind",
                 "title",
                 "subtitle",
@@ -910,7 +1287,9 @@ mod item_tests {
                 "thread_id",
                 "item",
                 "approval",
+                "key",
                 "replaces",
+                "awaits",
             ])
         );
     }
