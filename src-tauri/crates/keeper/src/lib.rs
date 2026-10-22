@@ -1068,6 +1068,8 @@ pub fn run() {
                 hq_ipc::agent_send,
                 hq_ipc::agent_attach_path,
                 hq_ipc::agent_attach_bytes,
+                hq_ipc::agent_attach_commit,
+                hq_ipc::agent_attach_release,
                 hq_ipc::agent_session_new,
                 hq_ipc::agent_session_archive,
                 hq_ipc::agent_session_unarchive,

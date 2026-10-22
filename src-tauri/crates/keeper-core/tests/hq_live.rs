@@ -262,12 +262,17 @@ impl HttpLog {
         }
     }
 
-    /// The server's response heads `heads` on `connection`.
+    /// The server's response heads `heads` on `connection`. An informational
+    /// one (1xx but `101`) is not the answer: its request waits for the final
+    /// one (R1071K-08).
     fn responses(&mut self, connection: u64, heads: Vec<String>) {
         for head in heads {
             let Some(status) = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()) else {
                 continue;
             };
+            if (100..200).contains(&status) && status != 101 {
+                continue;
+            }
             if let Some(open) = self
                 .exchanges
                 .iter_mut()
@@ -486,6 +491,36 @@ fn the_relay_frames_requests_and_answers_whatever_the_reads_boundaries() {
     assert_eq!(
         socket.push(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\nHTTP/1.1 200"),
         ["HTTP/1.1 101 Switching Protocols"]
+    );
+    // R1071K-08: a 100 or 103 before the final answer is not the answer —
+    // coalesced into one read or split across reads, the final status goes
+    // to its own request, and a later request keeps waiting for its own.
+    let informational =
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nlink: </a>\r\n\r\n";
+    let ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+    let mut log = HttpLog::default();
+    let mut up = Framer::new(false);
+    log.requests(9, up.push(format!("{request}{request}").as_bytes()));
+    let mut down = Framer::new(true);
+    log.responses(9, down.push(format!("{informational}{ok}").as_bytes()));
+    assert_eq!(
+        (log.attempts(put), log.acknowledged(put)),
+        (2, 1),
+        "the first PUT has its 200, the second none yet"
+    );
+    let whole = format!("{informational}{ok}");
+    for byte in whole.as_bytes() {
+        log.responses(9, down.push(&[*byte]));
+    }
+    assert_eq!(
+        log.acknowledged(put),
+        2,
+        "the second PUT's 200, after its own 1xx"
+    );
+    assert!(
+        log.exchanges.iter().all(|e| e.status == Some(200)),
+        "no request was answered by a 1xx: {:?}",
+        log.exchanges
     );
 }
 
@@ -3063,11 +3098,9 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     {
         let (mac, key, files) = (Arc::clone(&mac), key.clone(), files.clone());
         off(move || {
-            mac.attach_paths(
-                &key,
-                &[files.join("prices.csv"), files.join("photo.png")],
-                "what costs more?",
-            )
+            let handles =
+                mac.stage_paths(&key, &[files.join("prices.csv"), files.join("photo.png")])?;
+            mac.commit_attachments(&key, &handles, "what costs more?")
         })
         .await
         .expect("attaches");
@@ -3150,9 +3183,12 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     let offline_id = blob_id(&offline);
     {
         let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), offline.clone());
-        off(move || mac.attach_bytes(&key, "train.txt", "text/plain", bytes, "from the train"))
-            .await
-            .expect("attaches offline");
+        off(move || {
+            let handle = mac.stage_bytes(&key, "train.txt", "text/plain", bytes)?;
+            mac.commit_attachments(&key, &[handle], "from the train")
+        })
+        .await
+        .expect("attaches offline");
     }
     until(&mac, "the chip waits", Duration::from_secs(30), || {
         let (_, chips) = chips_of(&mac, &key, "from the train")?;
@@ -3229,9 +3265,12 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     let cut_put = format!("PUT /{database}/blobs/{cut_id}");
     {
         let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), cut.clone());
-        off(move || mac.attach_bytes(&key, "cut.txt", "text/plain", bytes, "cut after the upload"))
-            .await
-            .expect("attaches");
+        off(move || {
+            let handle = mac.stage_bytes(&key, "cut.txt", "text/plain", bytes)?;
+            mac.commit_attachments(&key, &[handle], "cut after the upload")
+        })
+        .await
+        .expect("attaches");
     }
     until(
         &mac,
@@ -3402,7 +3441,11 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     let huge_id = blob_id(&huge);
     let refused = {
         let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), huge.clone());
-        off(move || mac.attach_bytes(&key, "huge.zip", "application/zip", bytes, "too big")).await
+        off(move || {
+            let handle = mac.stage_bytes(&key, "huge.zip", "application/zip", bytes)?;
+            mac.commit_attachments(&key, &[handle], "too big")
+        })
+        .await
     };
     let sentence = refused.expect_err("refused on the device").to_string();
     assert_eq!(

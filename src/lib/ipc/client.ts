@@ -4240,23 +4240,19 @@ export async function agentSend(target: AgentSessionRef, body: string): Promise<
 }
 
 /**
- * Attach the files at `paths` (the paperclip, drag-and-drop) to a new message in an agents
- * session, `caption` its text (story 107.1). Rust reads each file, so no bytes cross IPC; a file
- * over the contract's 25 MB bound refuses the message with its sentence before anything is
- * uploaded. The message and its chips arrive over the open session's view stream.
+ * Stage the files at `paths` (the paperclip, drag-and-drop) for a message of an agents session
+ * (story 107.1). Rust reads each file, so no bytes cross IPC. Resolves to one handle per path, in
+ * order; rejects with the sentence — a file over the contract's 25 MB bound among them — and then
+ * stages none. Nothing is written until {@link agentAttachCommit}.
  */
-export async function agentAttachPath(
-  target: AgentSessionRef,
-  paths: string[],
-  caption?: string,
-): Promise<void> {
-  await invoke<void>("agent_attach_path", { ...target, paths, caption: caption ?? null });
+export async function agentAttachPath(target: AgentSessionRef, paths: string[]): Promise<string[]> {
+  return await invoke<string[]>("agent_attach_path", { ...target, paths });
 }
 
 /**
- * Attach a pasted file to a new message in an agents session (story 107.1). The **bytes** ride as
- * a raw binary IPC body — never base64 inside JSON, as `sendAttachmentBytes` does for a Matrix
- * room — with the session, type and the percent-encoded name and caption in request headers.
+ * Stage a pasted file for a message of an agents session (story 107.1); resolves to its handle.
+ * The **bytes** ride as a raw binary IPC body — never base64 inside JSON, as `sendAttachmentBytes`
+ * does for a Matrix room — with the session, type and the percent-encoded name in request headers.
  * Rejects with the refusal sentence (a file over the bound among them).
  */
 export async function agentAttachBytes(
@@ -4264,20 +4260,16 @@ export async function agentAttachBytes(
   bytes: ArrayBuffer,
   filename: string,
   mime: string,
-  caption?: string,
-): Promise<void> {
+): Promise<string> {
   const headers: Record<string, string> = {
     "x-database": target.database,
     "x-session-id": target.sessionId,
     "x-filename": encodeURIComponent(filename),
     "x-mime": mime,
   };
-  if (caption != null && caption !== "") {
-    headers["x-caption"] = encodeURIComponent(caption);
-  }
   try {
     // Raw-body invoke: the `ArrayBuffer` becomes the `InvokeBody::Raw` payload.
-    await tauriInvoke<void>("agent_attach_bytes", bytes, { headers });
+    return await tauriInvoke<string>("agent_attach_bytes", bytes, { headers });
   } catch (raw) {
     if (isIpcError(raw)) {
       throw raw;
@@ -4289,6 +4281,27 @@ export async function agentAttachBytes(
       retriable: false,
     } satisfies IpcError;
   }
+}
+
+/**
+ * The composer's one Send (story 107.1): every staged file `handles` name, with `caption` as its
+ * text, committed by Rust as ONE new message — or nothing, rejecting with the sentence. The handles
+ * are spent either way. The message and its chips arrive over the open session's view stream.
+ */
+export async function agentAttachCommit(
+  target: AgentSessionRef,
+  handles: string[],
+  caption?: string,
+): Promise<void> {
+  await invoke<void>("agent_attach_commit", { ...target, handles, caption: caption ?? null });
+}
+
+/** Let go of staged files the composer will not send. */
+export async function agentAttachRelease(
+  target: AgentSessionRef,
+  handles: string[],
+): Promise<void> {
+  await invoke<void>("agent_attach_release", { ...target, handles });
 }
 
 export async function agentSessionNew(

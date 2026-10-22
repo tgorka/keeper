@@ -471,26 +471,19 @@ pub async fn agent_send(
     blocking(move |hq| hq.send(&session(database, session_id), &body)).await
 }
 
-/// Attach the files at `paths` (the paperclip, drag-and-drop) to a new
-/// message in a session, `caption` its text: Rust reads each file, so no
-/// bytes cross IPC. A file over the contract's bound refuses the message,
-/// with its sentence, before anything is uploaded.
+/// Stage the files at `paths` (the paperclip, drag-and-drop) for a message
+/// of a session: Rust reads each file, so no bytes cross IPC. A handle for
+/// each, in order; a file over the contract's bound, or one keeper cannot
+/// read, refuses them all with its sentence. Nothing is written until
+/// [`agent_attach_commit`].
 #[tauri::command]
 pub async fn agent_attach_path(
     database: String,
     session_id: String,
     paths: Vec<String>,
-    caption: Option<String>,
-) -> Result<(), IpcError> {
+) -> Result<Vec<String>, IpcError> {
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
-    blocking(move |hq| {
-        hq.attach_paths(
-            &session(database, session_id),
-            &paths,
-            caption.as_deref().unwrap_or(""),
-        )
-    })
-    .await
+    blocking(move |hq| hq.stage_paths(&session(database, session_id), &paths)).await
 }
 
 /// A pasted attachment as `agent_attach_bytes` receives it, read and
@@ -503,7 +496,6 @@ struct RawAttachment {
     session_id: String,
     mime: String,
     name: String,
-    caption: String,
     bytes: Vec<u8>,
 }
 
@@ -526,41 +518,60 @@ fn raw_attachment(
     let database = crate::ipc::required_header(headers, "x-database")?;
     let session_id = crate::ipc::required_header(headers, "x-session-id")?;
     let mime = crate::ipc::required_header(headers, "x-mime").unwrap_or_default();
-    let caption = crate::ipc::decode_header(headers, "x-caption").unwrap_or_default();
     Ok(RawAttachment {
         database,
         session_id,
         mime,
         name,
-        caption,
         bytes: borrowed.clone(),
     })
 }
 
-/// Attach a pasted file to a new message in a session. Its bytes ride as a
-/// raw IPC body (`InvokeBody::Raw`, never base64 or JSON), as
-/// `send_attachment_bytes`'s do; `x-database`, `x-session-id`, `x-mime`,
-/// and the percent-encoded `x-filename` and `x-caption` ride in headers.
+/// Stage a pasted file for a message of a session; its handle. Its bytes
+/// ride as a raw IPC body (`InvokeBody::Raw`, never base64 or JSON), as
+/// `send_attachment_bytes`'s do; `x-database`, `x-session-id`, `x-mime` and
+/// the percent-encoded `x-filename` ride in headers.
 #[tauri::command]
-pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<(), IpcError> {
+pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<String, IpcError> {
     let RawAttachment {
         database,
         session_id,
         mime,
         name,
-        caption,
         bytes,
     } = raw_attachment(request.body(), request.headers())?;
+    blocking(move |hq| hq.stage_bytes(&session(database, session_id), &name, &mime, bytes)).await
+}
+
+/// The composer's one Send: every staged file `handles` name, `caption` its
+/// text, committed as one new message of the session — or nothing, with the
+/// sentence. The handles are spent either way.
+#[tauri::command]
+pub async fn agent_attach_commit(
+    database: String,
+    session_id: String,
+    handles: Vec<String>,
+    caption: Option<String>,
+) -> Result<(), IpcError> {
     blocking(move |hq| {
-        hq.attach_bytes(
+        hq.commit_attachments(
             &session(database, session_id),
-            &name,
-            &mime,
-            bytes,
-            &caption,
+            &handles,
+            caption.as_deref().unwrap_or(""),
         )
     })
     .await
+}
+
+/// The composer let go of staged files without sending them.
+#[tauri::command]
+pub fn agent_attach_release(
+    database: String,
+    session_id: String,
+    handles: Vec<String>,
+) -> Result<(), IpcError> {
+    hq()?.release_attachments(&session(database, session_id), &handles);
+    Ok(())
 }
 
 /// Open a session with an agent in one database, with its first message.
@@ -833,7 +844,6 @@ mod tests {
                 ("x-session-id", "dev1.1"),
                 ("x-mime", "text/csv"),
                 ("x-filename", "pr%C3%ADces.csv"),
-                ("x-caption", "what%20costs%20more%3F"),
             ]),
         )
         .expect("within the bound");
@@ -841,7 +851,6 @@ mod tests {
         assert_eq!(read.session_id, "dev1.1");
         assert_eq!(read.mime, "text/csv");
         assert_eq!(read.name, "príces.csv");
-        assert_eq!(read.caption, "what costs more?");
         assert_eq!(read.bytes, b"tea,3\n");
 
         let json = tauri::ipc::InvokeBody::Json(serde_json::json!({}));

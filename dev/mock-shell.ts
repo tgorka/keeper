@@ -9586,12 +9586,16 @@ if (attachmentsScenario === "chips") {
     );
   }
 }
-/** The open session a pasted file goes to: the mock receives a raw body without its headers. */
-function lastOpenedSession(): AgentSessionViewVm {
-  const watched = [...sessionViewWatchers.values()].pop();
-  const vm = watched ? sessionViews.get(watched.key) : undefined;
-  if (!vm) return hqRefuse("This conversation is not on this device.");
-  return vm;
+/**
+ * The files staged under a handle (Rust's `attachments::Staging`), each already the chip its
+ * message will show; `agent_attach_commit` makes them one message. The mock receives a raw body
+ * without its headers, so a pasted file is named `pasted` here.
+ */
+const mockStaged = new Map<string, AgentAttachmentVm>();
+function mockStage(chip: AgentAttachmentVm): string {
+  const handle = `staged-${++sessionSerial}`;
+  mockStaged.set(handle, chip);
+  return handle;
 }
 function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachmentVm[]) {
   const message: AgentSessionViewVm["messages"][number] = {
@@ -9881,22 +9885,19 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     return null;
   },
   agent_attach_path: (payload) => {
-    if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
-    const vm = mockSession(payload);
+    mockSession(payload);
     const paths = (payload.paths as string[]) ?? [];
-    if (paths.length === 0) hqRefuse("Choose a file to attach.");
-    const chips = paths.map((path, index) => {
-      const name = path.split(/[\\/]/).pop() || "attachment";
-      return mockChip(
-        `att-${++sessionSerial}-${index}`,
-        name,
-        "application/octet-stream",
-        4096,
-        "uploading",
-      );
-    });
-    mockAttach(vm, String(payload.caption ?? ""), chips);
-    return null;
+    return paths.map((path, index) =>
+      mockStage(
+        mockChip(
+          `att-${++sessionSerial}-${index}`,
+          path.split(/[\\/]/).pop() || "attachment",
+          "application/octet-stream",
+          4096,
+          "uploading",
+        ),
+      ),
+    );
   },
   agent_attach_bytes: (payload) => {
     const bytes = payload as unknown as ArrayBuffer;
@@ -9905,10 +9906,28 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       hqRefuse(
         `pasted is ${mockSizeLabel(size)} and an agent takes at most 25.0 MB from one message, so it did not get the file.`,
       );
-    const vm = lastOpenedSession();
-    mockAttach(vm, "", [
+    return mockStage(
       mockChip(`att-${++sessionSerial}`, "pasted", "image/png", size, "uploading", bytes),
-    ]);
+    );
+  },
+  agent_attach_commit: (payload) => {
+    if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
+    const vm = mockSession(payload);
+    const handles = (payload.handles as string[]) ?? [];
+    const chips = handles.map((handle) => mockStaged.get(handle));
+    for (const handle of handles) mockStaged.delete(handle);
+    if (chips.length === 0) hqRefuse("Choose a file to attach.");
+    if (chips.some((chip) => chip === undefined))
+      hqRefuse("A file of this message is no longer ready to send. Attach it again.");
+    mockAttach(
+      vm,
+      String(payload.caption ?? ""),
+      chips.filter((chip): chip is AgentAttachmentVm => chip !== undefined),
+    );
+    return null;
+  },
+  agent_attach_release: (payload) => {
+    for (const handle of (payload.handles as string[]) ?? []) mockStaged.delete(handle);
     return null;
   },
   agent_session_archive: (payload) => {

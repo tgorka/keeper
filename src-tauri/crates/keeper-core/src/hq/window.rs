@@ -393,9 +393,10 @@ impl Hq {
         Ok(())
     }
 
-    /// A stream stops showing `key`; with none left its widened months go.
+    /// A stream stops showing `key`; with none left its widened months go,
+    /// and so does every file its composer staged and did not send.
     pub fn close_session(&self, key: &AgentSessionRef) {
-        {
+        let gone = {
             let mut views = lock(&self.views);
             let gone = views.get_mut(key).is_some_and(|opened| {
                 opened.streams = opened.streams.saturating_sub(1);
@@ -404,6 +405,10 @@ impl Hq {
             if gone {
                 views.remove(key);
             }
+            gone
+        };
+        if gone {
+            self.staging.release_session(key);
         }
         self.touch();
     }
@@ -465,40 +470,60 @@ impl Hq {
         send::send(&source, &key.session_id, body).map_err(sentence)
     }
 
-    /// Attach the files at `paths` to a new message in a session, `caption`
-    /// its text: every file read and checked first, so one over the bound
-    /// refuses the message before anything is uploaded or written.
-    pub fn attach_paths(
+    /// Stage the files at `paths` for a message of a session: every file
+    /// read and checked, so one over the bound or unreadable refuses them
+    /// all, with its sentence, and none is staged. A handle for each, in
+    /// order. Nothing reaches the replica until [`Hq::commit_attachments`].
+    pub fn stage_paths(
         &self,
         key: &AgentSessionRef,
         paths: &[std::path::PathBuf],
-        caption: &str,
-    ) -> Result<(), HqError> {
-        let source = self.source(&key.database)?;
+    ) -> Result<Vec<String>, HqError> {
+        self.source(&key.database)?;
         let files = paths
             .iter()
             .map(|path| attachments::stage_path(path))
             .collect::<Result<Vec<_>, _>>()
             .map_err(sentence)?;
-        attachments::attach(&source, &key.session_id, caption, files).map_err(sentence)?;
-        self.touch();
-        Ok(())
+        Ok(files
+            .into_iter()
+            .map(|file| self.staging.stage(key, file))
+            .collect())
     }
 
-    /// Attach pasted `bytes` named `name` to a new message in a session.
-    pub fn attach_bytes(
+    /// Stage pasted `bytes` named `name` for a message of a session; its
+    /// handle.
+    pub fn stage_bytes(
         &self,
         key: &AgentSessionRef,
         name: &str,
         mime: &str,
         bytes: Vec<u8>,
+    ) -> Result<String, HqError> {
+        self.source(&key.database)?;
+        let file = attachments::stage_bytes(name, mime, bytes).map_err(sentence)?;
+        Ok(self.staging.stage(key, file))
+    }
+
+    /// The composer's one Send: every file `handles` name, with `caption`
+    /// as its text, committed as one new message of the session — or
+    /// nothing, with the sentence. The handles are spent either way.
+    pub fn commit_attachments(
+        &self,
+        key: &AgentSessionRef,
+        handles: &[String],
         caption: &str,
     ) -> Result<(), HqError> {
+        let files = self.staging.take(key, handles).map_err(sentence)?;
         let source = self.source(&key.database)?;
-        let file = attachments::stage_bytes(name, mime, bytes).map_err(sentence)?;
-        attachments::attach(&source, &key.session_id, caption, vec![file]).map_err(sentence)?;
+        attachments::attach(&source, &key.session_id, caption, files).map_err(sentence)?;
         self.touch();
         Ok(())
+    }
+
+    /// The composer let go of `handles` without sending them.
+    pub fn release_attachments(&self, key: &AgentSessionRef, handles: &[String]) {
+        self.staging.release(key, handles);
     }
 
     /// A chip opened: `blob_id` of `database`, from this device's cache or

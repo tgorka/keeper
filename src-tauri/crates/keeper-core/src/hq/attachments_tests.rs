@@ -268,6 +268,199 @@ fn nothing_attached_an_archived_or_unknown_session_is_refused_and_writes_nothing
     );
 }
 
+fn key(session_id: &str) -> sessions::AgentSessionRef {
+    sessions::AgentSessionRef {
+        database: "alpha".to_owned(),
+        session_id: session_id.to_owned(),
+    }
+}
+
+/// The messages of `session_id` whose text is `body`.
+fn messages_saying(source: &Source, session_id: &str, body: &str) -> Vec<String> {
+    source
+        .replica
+        .query(
+            "SELECT id FROM messages WHERE session_id = ?1 AND body = ?2",
+            &[json!(session_id), json!(body)],
+        )
+        .expect("reads")
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The names of the files attached to `message`, sorted.
+fn attached_to(source: &Source, message: &str) -> Vec<String> {
+    let mut names: Vec<String> = source
+        .replica
+        .query(
+            "SELECT name FROM attachments WHERE message_id = ?1",
+            &[json!(message)],
+        )
+        .expect("reads")
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
+/// R1071C-02: a selection staged by path and by bytes, then sent once with
+/// its caption, is one message holding every file — the caption written
+/// once — and staging alone writes nothing.
+#[test]
+fn a_mixed_selection_staged_under_handles_is_one_message_with_its_caption_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path());
+    seed_session(&alpha, "dev1.1", 1_000, false);
+    let before = outbox(dir.path());
+    let csv = dir.path().join("prices.csv");
+    std::fs::write(&csv, b"item,price\ntea,3\n").expect("writes");
+    let staging = Staging::default();
+    let chat = key("dev1.1");
+    let handles = vec![
+        staging.stage(&chat, stage_path(&csv).expect("stages")),
+        staging.stage(
+            &chat,
+            stage_bytes("shot.png", "image/png", b"\x89PNG".to_vec()).expect("stages"),
+        ),
+        staging.stage(
+            &chat,
+            stage_bytes("notes.txt", "", b"remember".to_vec()).expect("stages"),
+        ),
+    ];
+    assert_eq!(outbox(dir.path()), before, "staging writes nothing");
+    assert_eq!(
+        count(
+            &file(dir.path()),
+            "SELECT count(*) FROM _syncular_blob_uploads"
+        ),
+        0,
+        "nothing staged reaches the upload queue"
+    );
+
+    let files = staging
+        .take(&chat, &handles)
+        .expect("every handle is staged");
+    let message = attach(&alpha, "dev1.1", "compare these", files).expect("attaches");
+    assert_eq!(outbox(dir.path()), before + 1, "one commit");
+    assert_eq!(
+        messages_saying(&alpha, "dev1.1", "compare these"),
+        vec![message.clone()],
+        "the caption is one message's text, once"
+    );
+    assert_eq!(
+        attached_to(&alpha, &message),
+        ["notes.txt", "prices.csv", "shot.png"]
+    );
+    assert_eq!(
+        count(&file(dir.path()), "SELECT count(*) FROM messages"),
+        1,
+        "no captionless message beside it"
+    );
+    assert!(staging.is_empty(), "a committed handle is spent");
+    assert_eq!(
+        staging.take(&chat, &handles),
+        Err(AttachError::Released),
+        "and cannot be sent twice"
+    );
+}
+
+/// R1071C-02: several pasted files, one Send, one message.
+#[test]
+fn several_pasted_files_sent_once_are_one_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path());
+    seed_session(&alpha, "dev1.1", 1_000, false);
+    let before = outbox(dir.path());
+    let staging = Staging::default();
+    let chat = key("dev1.1");
+    let handles: Vec<String> = ["first.csv", "second.csv", "third.csv"]
+        .iter()
+        .map(|name| {
+            staging.stage(
+                &chat,
+                stage_bytes(name, "text/csv", name.as_bytes().to_vec()).expect("stages"),
+            )
+        })
+        .collect();
+    let files = staging.take(&chat, &handles).expect("staged");
+    let message = attach(&alpha, "dev1.1", "Compare these files", files).expect("attaches");
+    assert_eq!(outbox(dir.path()), before + 1);
+    assert_eq!(
+        attached_to(&alpha, &message),
+        ["first.csv", "second.csv", "third.csv"]
+    );
+    assert_eq!(
+        messages_saying(&alpha, "dev1.1", "Compare these files").len(),
+        1
+    );
+    assert_eq!(count(&file(dir.path()), "SELECT count(*) FROM messages"), 1);
+}
+
+/// R1071C-02: a handle never committed is released — by the composer, by
+/// its session closing, or by a Send that names one no longer staged, which
+/// then commits nothing and releases the rest; another session's handle is
+/// neither taken nor released.
+#[test]
+fn a_handle_never_committed_is_released_and_a_send_naming_one_commits_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path());
+    seed_session(&alpha, "dev1.1", 1_000, false);
+    let before = outbox(dir.path());
+    let staging = Staging::default();
+    let (chat, other) = (key("dev1.1"), key("dev1.2"));
+    let bytes = |name: &str| stage_bytes(name, "", name.as_bytes().to_vec()).expect("stages");
+
+    // Removed from the tray.
+    let dropped = staging.stage(&chat, bytes("dropped.txt"));
+    let theirs = staging.stage(&other, bytes("theirs.txt"));
+    staging.release(&chat, std::slice::from_ref(&theirs));
+    assert_eq!(
+        staging.len(),
+        2,
+        "another session's handle is not this one's to release"
+    );
+    staging.release(&chat, std::slice::from_ref(&dropped));
+    assert_eq!(staging.len(), 1);
+    assert_eq!(
+        staging.take(&chat, std::slice::from_ref(&dropped)),
+        Err(AttachError::Released)
+    );
+
+    // A Send naming a released handle beside a staged one: nothing is
+    // committed, and the staged one is released with it.
+    let kept = staging.stage(&chat, bytes("kept.txt"));
+    assert_eq!(
+        staging.take(&chat, &[kept.clone(), dropped.clone()]),
+        Err(AttachError::Released)
+    );
+    assert_eq!(staging.len(), 1, "only the other session's file is left");
+    // Another session's handle cannot be sent from this one, and stays.
+    assert_eq!(
+        staging.take(&chat, std::slice::from_ref(&theirs)),
+        Err(AttachError::Released)
+    );
+    assert_eq!(staging.len(), 1);
+
+    // The session closed with a file still staged.
+    let left = staging.stage(&chat, bytes("left.txt"));
+    staging.release_session(&chat);
+    assert_eq!(
+        staging.take(&chat, std::slice::from_ref(&left)),
+        Err(AttachError::Released)
+    );
+    assert_eq!(staging.len(), 1, "the other session's file is not touched");
+    staging.release_session(&other);
+    assert!(staging.is_empty());
+    assert_eq!(staging.take(&chat, &[]), Err(AttachError::Nothing));
+
+    assert_eq!(outbox(dir.path()), before, "nothing was ever written");
+    let conn = file(dir.path());
+    assert_eq!(count(&conn, "SELECT count(*) FROM _syncular_blobs"), 0);
+    assert_eq!(count(&conn, "SELECT count(*) FROM messages"), 0);
+}
+
 #[test]
 fn offline_a_staged_blob_survives_a_relaunch_pinned_and_the_same_bytes_are_one_upload() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -241,6 +241,8 @@ pub struct Hq {
     views: Mutex<HashMap<sessions::AgentSessionRef, timeline::Opened>>,
     /// The units each replica's windows were last set to.
     windows: Mutex<HashMap<(String, &'static str), Vec<String>>>,
+    /// The files the composers staged, not sent yet ([`attachments::Staging`]).
+    staging: attachments::Staging,
     window_task: Mutex<Option<JoinHandle<()>>>,
     /// Decisions whose outcome the server still owes ([`approvals::Decisions`]).
     decisions: std::sync::OnceLock<approvals::Decisions>,
@@ -333,6 +335,7 @@ impl Hq {
             live: watch::channel(0).0,
             views: Mutex::default(),
             windows: Mutex::default(),
+            staging: attachments::Staging::default(),
             window_task: Mutex::default(),
             decisions: std::sync::OnceLock::new(),
             prefs: Mutex::default(),

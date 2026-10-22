@@ -7,7 +7,12 @@
 //!   drag-and-drop) or by bytes (a paste, which crosses IPC as a raw body).
 //!   A file over the contract's bound ([`ATTACHMENT_MAX_BYTES`], read from
 //!   `syncular/limits.json`) is refused here, with today's sentence
-//!   ([`too_large`]), before anything is uploaded or written.
+//!   ([`too_large`]), before anything is uploaded or written. A staged file
+//!   waits in this process under a handle ([`Staging`]) — not in the
+//!   replica, so nothing of it can reach the server — until the composer's
+//!   one Send commits every handle of its selection, with the caption, as
+//!   one message ([`Staging::take`], [`attach`]); a handle never committed is
+//!   released, and a process that dies holding one leaves nothing behind.
 //! - **Upload before reference.** The replica caches the bytes under their
 //!   content address (`sha256:<hex>`) and queues the upload; its next round
 //!   uploads every queued blob (`PUT /<database>/blobs/<blobId>`) before it
@@ -27,6 +32,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -35,7 +41,9 @@ use ts_rs::TS;
 use crate::asset_url::{self, UrlForm};
 use crate::hq::port::{BlobBody, LinkState, Rejection, ReplicaError, RowOp, UploadRefusal};
 use crate::hq::send::activity;
-use crate::hq::sessions::{authored, int, now_ms, object, person_message, read, text, Source};
+use crate::hq::sessions::{
+    authored, int, now_ms, object, person_message, read, text, AgentSessionRef, Source,
+};
 use crate::hq::timeline::session_row;
 
 /// The contract's bounds, `syncular/limits.json`, compiled into keeper.
@@ -116,6 +124,9 @@ pub enum AttachError {
     Archived,
     #[error("{0}")]
     Replica(#[from] ReplicaError),
+    /// A handle the composer named is no longer staged here.
+    #[error("A file of this message is no longer ready to send. Attach it again.")]
+    Released,
 }
 
 /// A file staged for one message: within the bound by construction.
@@ -138,6 +149,87 @@ impl StagedFile {
     }
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+}
+
+/// The files staged for messages not sent yet, each under the handle the
+/// composer holds for it and the session it was staged for. In memory only:
+/// what is staged is in no replica, so nothing of it reaches a server, and a
+/// process that dies leaves nothing to clean up.
+#[derive(Debug, Default)]
+pub struct Staging {
+    staged: Mutex<HashMap<String, (AgentSessionRef, StagedFile)>>,
+}
+
+impl Staging {
+    fn files(&self) -> std::sync::MutexGuard<'_, HashMap<String, (AgentSessionRef, StagedFile)>> {
+        self.staged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold `file` for a message of `key`; its handle.
+    pub fn stage(&self, key: &AgentSessionRef, file: StagedFile) -> String {
+        let handle = ulid::Ulid::new().to_string();
+        self.files().insert(handle.clone(), (key.clone(), file));
+        handle
+    }
+
+    /// Every file `handles` name for `key`, in that order, taken out of
+    /// staging — all of them, or none and [`AttachError::Released`] when one
+    /// is not staged for `key`; the others named are released either way, so
+    /// a Send that cannot commit leaves nothing staged behind it.
+    pub fn take(
+        &self,
+        key: &AgentSessionRef,
+        handles: &[String],
+    ) -> Result<Vec<StagedFile>, AttachError> {
+        let mut staged = self.files();
+        let mut files = Vec::with_capacity(handles.len());
+        let mut missing = false;
+        for handle in handles {
+            match staged.remove_entry(handle) {
+                Some((_, (owner, file))) if owner == *key => files.push(file),
+                // Another session's: not this Send's to take or release.
+                Some((handle, held)) => {
+                    staged.insert(handle, held);
+                    missing = true;
+                }
+                None => missing = true,
+            }
+        }
+        if missing {
+            return Err(AttachError::Released);
+        }
+        if files.is_empty() {
+            return Err(AttachError::Nothing);
+        }
+        Ok(files)
+    }
+
+    /// The composer let go of `handles` without sending them.
+    pub fn release(&self, key: &AgentSessionRef, handles: &[String]) {
+        let mut staged = self.files();
+        for handle in handles {
+            if staged.get(handle).is_some_and(|(owner, _)| owner == key) {
+                staged.remove(handle);
+            }
+        }
+    }
+
+    /// `key` is no longer open anywhere: its composer, and every file it
+    /// staged, are gone.
+    pub fn release_session(&self, key: &AgentSessionRef) {
+        self.files().retain(|_, (owner, _)| owner != key);
+    }
+
+    /// How many files are staged, for every session.
+    pub fn len(&self) -> usize {
+        self.files().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
