@@ -4,6 +4,7 @@ import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
 import { SessionControls } from "@/components/agents/session-controls";
+import { SessionInstances } from "@/components/agents/session-instances";
 import { SessionPeople } from "@/components/agents/session-people";
 import {
   SessionAnswerDetails,
@@ -161,6 +162,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           </Button>
         )}
       </header>
+      {vm?.answering && <SessionInstances answering={vm.answering} agentName={vm.agentName} />}
       {vm && <SessionControls vm={vm} />}
       {error && (
         <div

@@ -633,6 +633,20 @@ impl Replica for Staged {
     ) -> Result<crate::hq::port::Delivery, crate::hq::port::ReplicaError> {
         self.inner.delivery(commit)
     }
+    fn row_writes(
+        &self,
+        table: &str,
+        row_id: &str,
+    ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
+        self.inner.row_writes(table, row_id)
+    }
+    fn supersede(
+        &self,
+        commits: Vec<String>,
+        replacement: &str,
+    ) -> Result<(), crate::hq::port::ReplicaError> {
+        self.inner.supersede(commits, replacement)
+    }
     fn remote_query(
         &self,
         id: &str,

@@ -261,6 +261,27 @@ impl Hq {
         Ok(view)
     }
 
+    /// When an open session's stream reads it again with nothing changing:
+    /// soon while an answer is still arriving (one whose instance stopped
+    /// says so), and just after its claim's lease would lapse, so a header
+    /// naming a holder that stopped renewing says so with no new row
+    /// (R1065-05). `None`: only a change wakes it.
+    pub fn session_recheck(
+        &self,
+        key: &AgentSessionRef,
+        view: Option<&AgentSessionViewVm>,
+    ) -> Option<Duration> {
+        if view.is_some_and(|view| view.live.iter().any(|turn| !turn.stopped)) {
+            return Some(live::RECHECK);
+        }
+        let views = lock(&self.views);
+        let lapse = views
+            .get(key)?
+            .live
+            .lapses_in(std::time::Instant::now(), sessions::now_ms())?;
+        Some(lapse + Duration::from_millis(50))
+    }
+
     /// What this viewer sees, as the settings resolve it (a settings file
     /// wins), read once and kept until it is written here or
     /// [`Hq::reconcile`] finds it moved.

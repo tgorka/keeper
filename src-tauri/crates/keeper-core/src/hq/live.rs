@@ -326,6 +326,32 @@ impl Live {
         });
     }
 
+    /// Whether `claim` — the session's row now — has lapsed as this device
+    /// has watched it: released, unchanged a whole [`LEASE`], or renewed
+    /// [`STALE_MS`] ago by its own clock. A claim not watched yet is judged
+    /// by its own time alone.
+    pub fn claim_lapsed(&self, claim: &Claim, now_ms: i64) -> bool {
+        match &self.claim {
+            Some((held, _)) if held == claim => self.lapsed,
+            _ => claim.released || now_ms - claim.renewed_at_ms >= STALE_MS,
+        }
+    }
+
+    /// How long until the claim watched now lapses with nothing changing:
+    /// when a header naming its holder must be drawn again. `None` with no
+    /// claim, or one released, without a holder or lapsed already.
+    pub fn lapses_in(&self, now: Instant, now_ms: i64) -> Option<Duration> {
+        let (claim, since) = self.claim.as_ref()?;
+        if self.lapsed || claim.released || claim.holder_client.is_empty() {
+            return None;
+        }
+        let watched = LEASE.saturating_sub(now.saturating_duration_since(*since));
+        let stale = Duration::from_millis(
+            u64::try_from(claim.renewed_at_ms + STALE_MS - now_ms).unwrap_or(0),
+        );
+        Some(watched.min(stale))
+    }
+
     /// The viewer no longer reads the trace (the flag withdrawn, or no
     /// longer a member): every reasoning tail kept is dropped, so none is
     /// held, let alone shown, past that moment.

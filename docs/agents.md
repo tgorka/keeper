@@ -35,7 +35,7 @@ default session.
 
 **Earlier conversations** preserves earlier Matrix agent history as read-only. The former dock's
 Matrix note-focus and drive-scope controls are not sent to database agents: those carriers were
-not migrated by this story. Instance selection belongs to the subsequent story; message and
+not migrated by this story. Instance selection is **Answers from** (below); message and
 attention state remain Rust-owned throughout.
 
 Browser checks use the development mock shell (`?sessions=launch`, optionally
@@ -259,6 +259,116 @@ had grown to 954 px (the sheet's scroll area 550–555 px wider than the sheet) 
 1280 px a 383 px confirmation in the 416 px side sheet, at 420 px 388 px in the bottom sheet,
 neither scrolling sideways, its destructive control reading *Remove* with the person's whole name
 as its accessible name, both controls 44 px tall and at least 64 px wide.
+
+## Which instance answers
+
+An agent is one actor and can run as several instances — `nixie@electra` on the server and
+`nixie@hesperia` on a laptop are two clients of Nixie, sharing her sessions and memory through the
+server. **Settings › Agents & bots › Answers from** lists, per agent, its instances from the
+directory of each database you share with it (their `clients` rows, and the name, description and
+definition hash of their `agent_profiles` rows), each marked **Online**, **Offline** or
+**Not known here**. Online is the instance's presence on `dir:<database>`, which this device
+receives over its own socket; while that database does not sync on this device nobody here can
+tell, so it says **Not known here** rather than offline. A socket that has just connected is no
+answer either: the server sends the peers already on the key in the step that registers it, so the
+replica asks — a leave on `dir:<database>` (taken silently while the key is registered, refused
+while not) and one on a key it never holds (always refused, after the first) — and only once that
+second refusal comes alone does it treat the presence it holds as complete
+(`ReplicaState::presence_known`, keeper-hq's `PresenceGate`). Until then, and again after every
+reconnect, the instances are **Not known here**. Nothing of an old socket reaches a new one: the
+socket's reader shares one queue with the next socket's, so whenever keeper lets a socket go —
+lost, unreachable, refused or closed — it joins that reader and then drops every frame it left
+queued, before a new socket starts. A join of an instance that stopped while that socket died is
+therefore never shown on the next socket, whose snapshot does not mention it (row changes dropped
+with it come back in the next round, from the cursor they never moved).
+
+Choose the instance that answers your new sessions; the others answer, in the order shown, while
+it is offline (**Ask … earlier** / **later** reorders them). One instance alone is a whole choice.
+The choice is an `instance_prefs` row (default instance and ordered fallback) in your own `actor`
+scope — never a setting of this device — so every device of yours follows it after one sync. A row
+cannot cross databases (AD-433), so keeper writes a row into each database this device holds that
+you share with the agent: your order less the instances that database's directory does not list
+(R-HQ-43). No database ever receives a client id it does not list; one that lists none of the
+instances you chose gets no row change, and the section says so in that database's terms. The
+section shows one order — the rows written together last, merged back into one — and, whenever the
+databases' own orders differ, a write still waits or one was refused, each database's line: the
+order its row asks, **saved on this device, waiting to sync**, or the server's refusal. Above them
+it says where the choice is saved and where it waits (**Saved in tgdrive; waiting to sync to
+neuradrive.**), so a row that is the same here but not yet at its server is never shown as
+agreement. What waits is read from the replica's outbox and a refusal from its outcome journal —
+the replica file, scoped by server, person, database and row (`<person>/<agent>`) — so neither is
+lost when keeper quits, and another person's or server's never shows. A choice made on a device
+that holds only one of the databases reaches only that one (DW-E106-7); when a database's row is
+not the order shown, or a database refused it, **Apply this order to all databases** writes the
+order shown into each again without changing it, and a new write sets the earlier refusal aside.
+`agents.default` keeps its meaning: which agent keeper opens at launch, not which of its instances
+answers.
+
+The instances route by the row themselves (keeper-hq's `routing`): for a session nobody holds, the
+first instance of the order whose presence is online claims it, and with no row any online instance
+may. keeper records no instance on the session (`preferred_client` stays empty) and never pings an
+instance. An open session stays with the instance holding its claim; another takes it over only
+after the holder's lease lapses.
+
+An instance whose definition hash differs from its siblings' is marked **Different definition**,
+with the start of its hash: with a majority hash, the instances that differ from it; with no
+majority, every instance, since each differs from the others.
+
+The open session's header names the instance answering — the claim holder — and each instance's
+state, from the session's own database alone: **nixie@electra is answering.**; a holder whose
+presence is gone is still named, offline, until another takes the session over once the lease runs
+out; a session nobody holds names the instance that takes it next by your order, or says it waits
+when none of them is online. A holder whose claim stopped renewing — its row unchanged a whole
+lease as this device watched it, or renewed more than two minutes ago by its own clock — is named
+as the one that **held this conversation; its lease ran out**, never as answering, with the
+instance that takes it over next (never the lapsed one) or that it waits. The header is drawn again
+when the lease would lapse, with no new row to wake it.
+
+Development fixtures: `?sessions=launch&instances=two|offline|lapsed|disagree|stale|refused|long`,
+with `&platform=phone` for the phone shell. They keep the choice per agent and per database as Rust
+does: a write waits about 0.7 s for its server, `refused` has beta refuse it and keep its old row,
+`stale` adds an instance only alpha lists, and Researcher's single instance can be chosen.
+
+### Measured: two instances against the real server
+
+2026-10-21, `hq_live.rs`'s `two_instances_answer_by_the_persons_choice_and_who_is_online` on
+delectra, twice: the keeper-hq server from a clean `git archive` of `hq/106-3-tools` 3e8db43
+(schema 3, Bun 1.2.23 baseline) over a throwaway Postgres 18, the e2e model stub, and two real
+`keeper-agentd run` processes built from the same archive — `nixie.electra` and `nixie.hesperia`,
+each with its own token, home and state, both serving Nixie on `tgdrive` and `neuradrive`; tgorka
+in both, on two keeper-core devices ("mac" and "phone").
+
+- **The choice is a row:** `nixie.hesperia` chosen on the mac showed as the phone's choice 139 ms
+  and 55 ms after it was written, with no disagreement; each database held one `instance_prefs`
+  row `tgorka/nixie` naming it, authored by tgorka.
+- **New sessions follow it in both databases:** a new session in `tgdrive` and one in `neuradrive`
+  were taken by `nixie.hesperia` 0.6–1.2 s after they were written, the header saying
+  **nixie.hesperia is answering.**
+- **Offline, and the other answers:** with `nixie.hesperia` SIGKILLed, the mac's view showed
+  it offline 2–4 ms later (its socket closed, so the server sent its presence leave at once; a
+  partition that keeps the socket half-open waits for the server's presence expiry instead, which
+  this run did not exercise). A new session was taken by `nixie.electra` 0.5–1.2 s after it was
+  written, the header naming it. The two sessions the killed instance held said
+  **nixie.hesperia holds this conversation and is offline; …** until its lease lapsed, and were
+  taken over by `nixie.electra` 30.0–31.6 s after the kill.
+- **A held session stays with its holder:** with `nixie.hesperia` — the default — back online for
+  15 s, all three sessions stayed with `nixie.electra`.
+- **The new holder is named:** with `nixie.electra` SIGKILLed in turn, the header of the session it
+  held named `nixie.hesperia` 25.3 s and 26.8 s later, once the lease lapsed and it took over.
+
+The instances' labels are their client ids here because the rig's registry names each client by
+its id; the deployed registry names them `nixie@electra` and `nixie@hesperia`. The same with
+*nixie@hesperia*'s container on the Mac (105.3) and the installed apps is owed on the devices.
+
+After the 106.5 review the same case ran again on delectra against a clean `git archive` of
+keeper-hq `hq/106-3-tools` 6406b32, on the tree rebased onto 106.4's second review round. Both
+instances showed **Online** only once each device's presence ask had come back (4–37 ms after
+pairing). The choice showed on the phone 128 ms after the Mac wrote it, and the new sessions were
+taken in 0.5 s. With `nixie.hesperia` SIGKILLed it was **Offline** 108 ms later. The device named it
+as having held its sessions (**nixie.hesperia held this conversation; its lease ran out, so
+nixie.electra takes it over next.**) 29.4 s after the kill, before `nixie.electra` took them over at
+29.9–30.5 s. Nothing ever said a holder whose lease had run out was answering. The rest of the case
+held as before.
 
 ## Earlier Matrix agent hosting
 

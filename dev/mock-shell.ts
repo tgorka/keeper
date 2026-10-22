@@ -64,6 +64,7 @@ import type {
   AgentConsoleVm,
   AgentCopyVm,
   AgentFocusReq,
+  AgentInstancesVm,
   AgentMcpDraftVm,
   AgentMcpListVm,
   AgentMcpServerReq,
@@ -82,6 +83,7 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentSessionAnsweringVm,
   AgentSessionMembersVm,
   AgentSessionRowVm,
   AgentSessionsBatch,
@@ -10007,6 +10009,299 @@ const peopleHandlers: Record<string, (payload: Record<string, unknown>) => unkno
   },
 };
 
+// ?sessions=launch&instances=two|offline|lapsed|disagree|stale|refused|long — which instance of an
+// agent answers (Settings › Agents › Answers from) and the session header's instance line.
+// The words mirror Rust's `keeper_core::hq::instances`; the fixture is a viewing aid only.
+const instancesScenario = new URLSearchParams(location.search).get("instances");
+const instanceLabel = (label: string) =>
+  instancesScenario === "long" ? `${label}-${"very-long-host-name-".repeat(6)}` : label;
+type MockInstance = AgentInstancesVm["instances"][number];
+const mockInstances: MockInstance[] = [
+  {
+    clientId: "assistant.electra",
+    label: instanceLabel("assistant@electra"),
+    host: "electra",
+    description: "Ana's assistant",
+    databases: ["alpha", "beta"],
+    presence: instancesScenario === "offline" ? "offline" : "online",
+    definition: "3f9c2a71b0de",
+  },
+  {
+    clientId: "assistant.hesperia",
+    label: instanceLabel("assistant@hesperia"),
+    host: "hesperia",
+    description: "Ana's assistant",
+    databases: ["alpha", "beta"],
+    presence: "online",
+    definition: "3f9c2a71b0de",
+  },
+  ...(instancesScenario === "stale"
+    ? [
+        {
+          clientId: "assistant.laptop",
+          label: "assistant@laptop",
+          host: "laptop",
+          description: "Ana's assistant",
+          databases: ["alpha"],
+          presence: "offline" as const,
+          definition: "a01b44c9e2f7",
+        },
+      ]
+    : []),
+];
+for (const instance of mockInstances) {
+  if (instancesScenario === "stale" && instance.definition !== "3f9c2a71b0de")
+    instance.definitionDiffers =
+      "Runs a different definition from assistant@electra and assistant@hesperia: one of them runs an older or a newer image.";
+}
+// The person's choice is kept per agent and per database, the way Rust reads it: each database's
+// row is the order less the instances its directory lists (R-HQ-43), a write waits for its server
+// until it settles, and `refused` has beta's server refuse it — beta keeps the row it held.
+type MockRow = { order: string[]; updatedMs: number };
+type MockDatabase = {
+  /** The instances its directory lists. */
+  members: string[];
+  row?: MockRow;
+  pending: boolean;
+  refused?: string;
+};
+type MockAgent = {
+  name: string;
+  mark: string;
+  instances: MockInstance[];
+  databases: Record<string, MockDatabase>;
+};
+const mockAssistantIds = mockInstances.map((i) => i.clientId);
+const mockInstanceAgents: Record<string, MockAgent> = {
+  assistant: {
+    name: "Assistant",
+    mark: "A",
+    instances: mockInstances,
+    databases: {
+      alpha: {
+        members: mockAssistantIds,
+        row: { order: mockAssistantIds, updatedMs: 1 },
+        pending: false,
+      },
+      beta: {
+        members: mockInstances.filter((i) => i.databases.includes("beta")).map((i) => i.clientId),
+        row: {
+          order:
+            instancesScenario === "disagree"
+              ? ["assistant.hesperia", "assistant.electra"]
+              : mockInstances.filter((i) => i.databases.includes("beta")).map((i) => i.clientId),
+          updatedMs: instancesScenario === "disagree" ? 2 : 1,
+        },
+        pending: false,
+      },
+    },
+  },
+  researcher: {
+    name: "Researcher",
+    mark: "R",
+    instances: [
+      {
+        clientId: "researcher.electra",
+        label: "researcher@electra",
+        host: "electra",
+        databases: ["beta"],
+        presence: "unknown",
+        definition: "77aa01c3d9e0",
+      },
+    ],
+    databases: { beta: { members: ["researcher.electra"], pending: false } },
+  },
+};
+
+/** One order each row is a part of, as Rust merges the rows written together last. */
+function mockChosen(agent: MockAgent): string[] {
+  const rows = Object.values(agent.databases).flatMap((db) => (db.row ? [db.row] : []));
+  const newest = Math.max(...rows.map((row) => row.updatedMs));
+  let rest = rows.filter((row) => row.updatedMs === newest).map((row) => [...row.order]);
+  const out: string[] = [];
+  for (;;) {
+    rest = rest.filter((row) => row.length > 0);
+    if (rest.length === 0) return out;
+    const next = rest
+      .map((row) => row[0])
+      .find((head) => rest.every((row) => !row.slice(1).includes(head)));
+    if (next === undefined) return rows[0]?.order ?? [];
+    for (const row of rest) if (row[0] === next) row.shift();
+    out.push(next);
+  }
+}
+
+function mockAgentView(actor: string, agent: MockAgent): AgentInstancesVm {
+  const name = (id: string) => agent.instances.find((i) => i.clientId === id)?.label ?? id;
+  const asks = (order: string[]) =>
+    order.length === 0
+      ? "has no choice, so any online instance answers"
+      : `asks ${order.map(name).join(", then ")}`;
+  const order = mockChosen(agent);
+  const entries = Object.entries(agent.databases);
+  let differs = false;
+  let outside = false;
+  const saved: string[] = [];
+  const waiting: string[] = [];
+  const refusals: string[] = [];
+  const byDatabase = entries.map(([database, db]) => {
+    const row = db.row?.order ?? [];
+    const expected = order.filter((id) => db.members.includes(id));
+    if (expected.length > 0 && row.join() !== expected.join()) differs = true;
+    let sentence: string;
+    if (db.refused !== undefined) {
+      refusals.push(`The server refused your choice in ${database}: ${db.refused}.`);
+      sentence = `${database} refused your choice: ${db.refused}.`;
+    } else if (order.length > 0 && expected.length === 0) {
+      outside = true;
+      sentence = `None of the instances you chose is in ${database}, so its row is unchanged: it ${asks(row)}.`;
+    } else if (db.pending) {
+      waiting.push(database);
+      sentence = `${database} ${asks(row)}; saved on this device, waiting to sync.`;
+    } else {
+      if (expected.length > 0 && row.join() === expected.join()) saved.push(database);
+      sentence = `${database} ${asks(row)}.`;
+    }
+    return {
+      database,
+      order: row,
+      sentence,
+      pending: db.pending,
+      ...(db.refused !== undefined ? { refused: db.refused } : {}),
+    };
+  });
+  const and = (items: string[]) =>
+    items.length < 2
+      ? items.join("")
+      : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+  const ordersDiffer = byDatabase.some((db) => db.order.join() !== byDatabase[0].order.join());
+  const worthSaying =
+    entries.length > 1 && (ordersDiffer || outside || waiting.length > 0 || refusals.length > 0);
+  const ranked = [
+    ...order.flatMap((id) => agent.instances.filter((i) => i.clientId === id)),
+    ...agent.instances.filter((i) => !order.includes(i.clientId)),
+  ];
+  return {
+    agentActor: actor,
+    agentName: agent.name,
+    agentMark: agent.mark,
+    databases: entries.map(([database]) => database),
+    instances: ranked.map((instance) => {
+      const rank = order.indexOf(instance.clientId);
+      return rank < 0 ? instance : { ...instance, rank };
+    }),
+    ...(order[0] !== undefined ? { defaultClient: order[0] } : {}),
+    fallback: order.slice(1),
+    sentence: orderSentence(order, name),
+    ...(differs
+      ? {
+          disagreement: `Your databases differ: ${entries
+            .map(([database, db]) => `${database} ${asks(db.row?.order ?? [])}`)
+            .join("; ")}. Applying the order shown writes it into each.`,
+        }
+      : {}),
+    ...(waiting.length > 0
+      ? {
+          delivery:
+            saved.length > 0
+              ? `Saved in ${and(saved)}; waiting to sync to ${and(waiting)}.`
+              : `Saved on this device; waiting to sync to ${and(waiting)}.`,
+        }
+      : {}),
+    ...(refusals.length > 0 ? { notice: refusals.join(" ") } : {}),
+    reapply: differs || refusals.length > 0,
+    byDatabase: worthSaying ? byDatabase : [],
+  };
+}
+function orderSentence(order: string[], name: (id: string) => string): string {
+  const [first, ...rest] = order;
+  if (first === undefined)
+    return "No choice yet: a new session goes to whichever instance is online.";
+  if (rest.length === 0)
+    return `New sessions go to ${name(first)}; while it is offline they wait for it.`;
+  return `New sessions go to ${name(first)}; while it is offline, to ${rest.map(name).join(", then ")}.`;
+}
+function mockAgentInstances(): AgentInstancesVm[] {
+  return Object.entries(mockInstanceAgents).map(([actor, agent]) => mockAgentView(actor, agent));
+}
+function mockAnswering(): AgentSessionAnsweringVm {
+  const holder = instancesScenario === "offline" ? mockInstances[1] : mockInstances[0];
+  const lapsed = instancesScenario === "lapsed";
+  const next = mockInstances.find((i) => i !== holder && i.presence === "online");
+  return {
+    ...(lapsed ? {} : { holder: holder.clientId }),
+    sentence: lapsed
+      ? `${holder.label} held this conversation; its lease ran out, so ${next?.label ?? "one that is online"} takes it over next.`
+      : `${holder.label} is answering.`,
+    instances: [
+      holder,
+      ...mockInstances.filter((i) => i !== holder && i.databases.includes("alpha")),
+    ].map((i) => ({
+      clientId: i.clientId,
+      label: i.label,
+      presence: i.presence,
+      holds: i === holder && !lapsed,
+      lapsed: i === holder && lapsed,
+    })),
+  };
+}
+if (instancesScenario) {
+  for (const vm of sessionViews.values())
+    if (vm.agentActor === "assistant") vm.answering = mockAnswering();
+}
+const instanceWatchers = new Map<string, MockChannel<AgentInstancesVm[]>>();
+function publishInstances() {
+  for (const channel of instanceWatchers.values()) channel.onmessage?.(mockAgentInstances());
+}
+const instanceHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  agent_instances_subscribe: (payload) => {
+    const id = `agent-instances-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentInstancesVm[]>;
+    instanceWatchers.set(id, channel);
+    channel.onmessage?.(instancesScenario ? mockAgentInstances() : []);
+    return id;
+  },
+  agent_instances_unsubscribe: (payload) => {
+    instanceWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_instances_set: (payload) => {
+    const actor = String(payload.agentActor);
+    const order = (payload.order as string[]) ?? [];
+    const agent = mockInstanceAgents[actor];
+    if (agent === undefined) return hqRefuse(`${actor} is in no database this device holds.`);
+    if (order.length === 0) return hqRefuse("Choose the instance that answers first.");
+    const stranger = order.find((id) => !agent.instances.some((i) => i.clientId === id));
+    if (stranger !== undefined)
+      return hqRefuse(`${stranger} is not an instance of ${actor} in your databases.`);
+    const updatedMs = Date.now();
+    const before = new Map<string, MockRow | undefined>();
+    for (const [database, db] of Object.entries(agent.databases)) {
+      const part = order.filter((id) => db.members.includes(id));
+      if (part.length === 0) continue;
+      before.set(database, db.row);
+      db.row = { order: part, updatedMs };
+      db.pending = true;
+      db.refused = undefined;
+    }
+    publishInstances();
+    // Each server answers a moment later: it takes the write, or — `refused` — beta refuses it
+    // and keeps the row it held.
+    setTimeout(() => {
+      for (const [database, db] of Object.entries(agent.databases)) {
+        if (!before.has(database) || !db.pending) continue;
+        db.pending = false;
+        if (instancesScenario === "refused" && database === "beta") {
+          db.row = before.get(database);
+          db.refused = "hq.v9.person_actor";
+        }
+      }
+      publishInstances();
+    }, 700);
+    return null;
+  },
+};
+
 const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   hq_status_subscribe: (payload) => {
     const id = `hq-subscription-${hqWatchers.size + 1}`;
@@ -10083,6 +10378,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   ...hqHandlers,
   ...sessionHandlers,
   ...peopleHandlers,
+  ...instanceHandlers,
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
   failure_subscribe: (payload) => {

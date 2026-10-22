@@ -799,3 +799,112 @@ describe("live answer controls", () => {
     expect(screen.getByText("Not allowed here")).toBeVisible();
   });
 });
+
+describe("the session header's instance line (106.5)", () => {
+  it("names the instance Rust says holds the session and each instance's state, and follows Rust's next view", async () => {
+    draw();
+    await list();
+    await open("alpha", {
+      answering: {
+        holder: "nixie.electra",
+        sentence: "nixie@electra is answering.",
+        instances: [
+          {
+            clientId: "nixie.electra",
+            label: "nixie@electra",
+            presence: "online",
+            holds: true,
+            lapsed: false,
+          },
+          {
+            clientId: "nixie.hesperia",
+            label: "nixie@hesperia",
+            presence: "offline",
+            holds: false,
+            lapsed: false,
+          },
+        ],
+      },
+    });
+    expect(screen.getByText("nixie@electra is answering.")).toBeInTheDocument();
+    const line = screen.getByRole("list", { name: "Instances of Assistant" });
+    const items = within(line).getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "nixie@electraOnline· holds it",
+      "nixie@hesperiaOffline",
+    ]);
+    // electra stopped renewing and its lease ran out; nobody holds the session yet.
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          answering: {
+            sentence:
+              "nixie@electra held this conversation; its lease ran out, so nixie@hesperia takes it over next.",
+            instances: [
+              {
+                clientId: "nixie.electra",
+                label: "nixie@electra",
+                presence: "online",
+                holds: false,
+                lapsed: true,
+              },
+              {
+                clientId: "nixie.hesperia",
+                label: "nixie@hesperia",
+                presence: "online",
+                holds: false,
+                lapsed: false,
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    expect(screen.queryByText(/is answering/)).toBeNull();
+    expect(
+      within(screen.getByRole("list", { name: "Instances of Assistant" }))
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["nixie@electraOnline· its lease ran out", "nixie@hesperiaOnline"]);
+    // The holder stopped, its lease lapsed and hesperia took the session over.
+    act(() =>
+      mock.views.get("alpha")?.(
+        view("alpha", {
+          answering: {
+            holder: "nixie.hesperia",
+            sentence: "nixie@hesperia is answering.",
+            instances: [
+              {
+                clientId: "nixie.hesperia",
+                label: "nixie@hesperia",
+                presence: "online",
+                holds: true,
+                lapsed: false,
+              },
+              {
+                clientId: "nixie.electra",
+                label: "nixie@electra",
+                presence: "offline",
+                holds: false,
+                lapsed: false,
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    expect(screen.getByText("nixie@hesperia is answering.")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("list", { name: "Instances of Assistant" }))
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["nixie@hesperiaOnline· holds it", "nixie@electraOffline"]);
+  });
+
+  it("draws no instance line while Rust sends none", async () => {
+    draw();
+    await list();
+    await open("beta");
+    expect(screen.queryByRole("list", { name: "Instances of Assistant" })).not.toBeInTheDocument();
+  });
+});

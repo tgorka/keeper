@@ -28,7 +28,8 @@
 //! archived, through the server's registered `sessionPage` ([`timeline`]);
 //! messages and decisions written as rows into the session's own database
 //! ([`send`], [`approvals`]); who is in a session, from that database's
-//! directory alone ([`members`]).
+//! directory alone ([`members`]); which instance of an agent answers and
+//! who is online, and the person's choice of it ([`instances`]).
 //!
 //! The shell's `hq_ipc` is a call site and decides nothing. Tracing targets
 //! are `keeper_core::hq::*` and carry no row content.
@@ -36,6 +37,7 @@
 pub mod approvals;
 pub mod databases;
 pub mod identity;
+pub mod instances;
 pub mod live;
 pub mod members;
 pub mod pairing;
@@ -78,7 +80,8 @@ const KEYCHAIN_PREFIX: &str = "agents-server/";
 /// The directory subscriptions every linked replica holds: the database's
 /// actors and clients (the person's devices among them), by `dir`. Beside
 /// them each holds the person's memberships (`memberships`), from which the
-/// Agents window's windows follow ([`window`]).
+/// Agents window's windows follow ([`window`]), and the person's choice of
+/// which instance answers each agent (`preferences`, [`instances`]).
 const DIRECTORY: [(&str, &str); 3] = [
     ("directoryActors", "actors"),
     ("directoryClients", "clients"),
@@ -423,10 +426,16 @@ impl Hq {
                         table: "session_members".to_owned(),
                         scopes: vec![("member".to_owned(), vec![pairing.actor_id.clone()])],
                     }))
+                    .chain(std::iter::once(Subscription {
+                        id: "preferences".to_owned(),
+                        table: "instance_prefs".to_owned(),
+                        scopes: vec![("actor".to_owned(), vec![pairing.actor_id.clone()])],
+                    }))
                     .collect()
             } else {
                 Vec::new()
             },
+            watch_presence: linked.then(|| instances::dir_key(database)),
         }
     }
 
@@ -535,6 +544,7 @@ impl Hq {
                 client_id: None,
                 link: None,
                 subscriptions: Vec::new(),
+                watch_presence: None,
             });
         }
         let held = match (&server, &pairing) {

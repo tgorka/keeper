@@ -108,6 +108,10 @@ pub struct ReplicaSpec {
     /// Subscriptions the replica holds from its first round, registered
     /// before the owner touches the network.
     pub subscriptions: Vec<Subscription>,
+    /// A presence key one of those subscriptions registers (`dir:<database>`)
+    /// whose peers already present the replica asks after on every new
+    /// socket: [`ReplicaState::presence_known`].
+    pub watch_presence: Option<String>,
 }
 
 /// How a replica's connection stands.
@@ -142,6 +146,12 @@ pub struct ReplicaState {
     /// Bumped on every socket text frame, a presence fanout among them. A
     /// closing socket changes `link` instead, which is published anyway.
     pub presence: u64,
+    /// The peers already present on [`ReplicaSpec::watch_presence`] have
+    /// reached this replica over the current socket. A connected socket says
+    /// nothing of them yet: until this is true an empty
+    /// [`Replica::presence`] there is not "nobody is present". False while
+    /// the socket is down; every new socket starts false.
+    pub presence_known: bool,
 }
 
 /// What the server said when it refused a commit or an operation: its stable
@@ -189,6 +199,25 @@ pub enum Delivery {
     Refused(Rejection),
     /// Not known here (never written, or its outcome was pruned).
     Unknown,
+}
+
+/// A commit written here that the server refused, its refusal still
+/// standing: nothing written since has set it aside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub commit_id: String,
+    pub rejection: Rejection,
+}
+
+/// What this replica still owes the server, or was refused, for one row —
+/// read from the replica file (its outbox and its outcome journal), so it
+/// outlives a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RowWrites {
+    /// A commit writing the row waits in the outbox.
+    pub pending: bool,
+    /// The standing refusals of commits that wrote it, newest first.
+    pub refused: Vec<Refusal>,
 }
 
 /// Why a replica call failed.
@@ -265,6 +294,12 @@ pub trait Replica: Send + Sync {
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError>;
     /// What became of the commit `commit_id`. Answers from the file.
     fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError>;
+    /// What is owed, or was refused, of the writes made here to `table`'s
+    /// row `row_id`. Answers from the file.
+    fn row_writes(&self, table: &str, row_id: &str) -> Result<RowWrites, ReplicaError>;
+    /// Set the standing refusals `commit_ids` aside: `replacement`, written
+    /// since, writes their row again. Durable, like the refusals.
+    fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError>;
     /// Run the server's registered query `operation_id` with `params`: rows
     /// read on the server, never kept in the replica. Not on the owner
     /// thread, so it never waits behind a round; refused while the replica
@@ -324,6 +359,9 @@ pub(crate) mod fake {
         pub(crate) fn set(&self, link: LinkState) {
             self.state.send_modify(|state| state.link = link);
         }
+        pub(crate) fn set_presence_known(&self, known: bool) {
+            self.state.send_modify(|state| state.presence_known = known);
+        }
         /// Replace the rows every query answers, as a round would, and say
         /// the directory changed.
         pub(crate) fn replicate(&self, rows: Vec<Map<String, Value>>) {
@@ -380,6 +418,12 @@ pub(crate) mod fake {
         }
         fn delivery(&self, _: &str) -> Result<Delivery, ReplicaError> {
             Ok(Delivery::Unknown)
+        }
+        fn row_writes(&self, _: &str, _: &str) -> Result<RowWrites, ReplicaError> {
+            Ok(RowWrites::default())
+        }
+        fn supersede(&self, _: Vec<String>, _: &str) -> Result<(), ReplicaError> {
+            Ok(())
         }
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Err(ReplicaError::NotSyncing)
@@ -441,6 +485,7 @@ pub(crate) mod fake {
                 directory: 0,
                 rows: 0,
                 presence: 0,
+                presence_known: false,
             });
             let replica = Arc::new(FakeReplica {
                 spec,

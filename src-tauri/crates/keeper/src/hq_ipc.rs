@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
-use keeper_core::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
+use keeper_core::hq::instances::AgentInstancesVm;
+use keeper_core::hq::live::{AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::members::AgentSessionMembersVm;
 use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::sessions::{
@@ -320,23 +321,27 @@ pub fn agent_session_open(
                         tracing::debug!(%error, "an open agents session could not be read");
                     }
                 }
-                // An answer still arriving is read again on its own, so one
-                // whose instance stopped says so with nothing else moving.
-                let arriving = shown
-                    .as_ref()
-                    .is_some_and(|view| view.live.iter().any(|turn| !turn.stopped));
+                // Read again on its own when keeper-core says so: an answer
+                // still arriving (one whose instance stopped says so), or a
+                // claim whose lease lapses with nothing else moving.
+                let recheck = hq.session_recheck(&held, shown.as_ref());
                 let woke = async {
                     tokio::select! {
                         changed = changes.changed() => changed.is_ok(),
                         changed = tails.changed() => changed.is_ok(),
                     }
                 };
-                if arriving {
-                    if let Ok(false) = tokio::time::timeout(live::RECHECK, woke).await {
-                        return;
+                match recheck {
+                    Some(wait) => {
+                        if let Ok(false) = tokio::time::timeout(wait, woke).await {
+                            return;
+                        }
                     }
-                } else if !woke.await {
-                    return;
+                    None => {
+                        if !woke.await {
+                            return;
+                        }
+                    }
                 }
             }
         })
@@ -570,4 +575,57 @@ pub async fn agent_session_member_remove(
 #[tauri::command]
 pub async fn agent_session_leave(database: String, session_id: String) -> Result<(), IpcError> {
     blocking(move |hq| hq.leave_session(&session(database, session_id))).await
+}
+
+/// Stream every agent's instances — who is online, the definition each
+/// runs — and the person's choice of which answers, at once, then on every
+/// change of a row or of who is present.
+#[tauri::command]
+pub fn agent_instances_subscribe(
+    channel: Channel<Vec<AgentInstancesVm>>,
+) -> Result<String, IpcError> {
+    let hq = Arc::clone(hq()?);
+    let mut changes = hq.changes();
+    let mut present = hq.live_changes();
+    let start = move |id: String| {
+        tauri::async_runtime::spawn(async move {
+            let mut shown: Option<Vec<AgentInstancesVm>> = None;
+            loop {
+                let read = Arc::clone(&hq);
+                let Ok(agents) =
+                    tauri::async_runtime::spawn_blocking(move || read.agent_instances()).await
+                else {
+                    return;
+                };
+                if shown.as_ref() != Some(&agents) {
+                    if channel.send(agents.clone()).is_err() {
+                        end(&id);
+                        return;
+                    }
+                    shown = Some(agents);
+                }
+                let woke = tokio::select! {
+                    changed = changes.changed() => changed.is_ok(),
+                    changed = present.changed() => changed.is_ok(),
+                };
+                if !woke {
+                    return;
+                }
+            }
+        })
+    };
+    Ok(keep(None, start))
+}
+
+/// End an [`agent_instances_subscribe`] stream.
+#[tauri::command]
+pub fn agent_instances_unsubscribe(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// Choose which instance of an agent answers: `order`'s first, then the
+/// rest while it is offline — one row in each database shared with it.
+#[tauri::command]
+pub async fn agent_instances_set(agent_actor: String, order: Vec<String>) -> Result<(), IpcError> {
+    blocking(move |hq| hq.set_agent_instances(&agent_actor, &order)).await
 }
