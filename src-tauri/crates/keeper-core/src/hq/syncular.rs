@@ -877,6 +877,11 @@ struct Owner {
     /// The server's standing refusals of uploads, as kept beside the
     /// replica, shared with the replica's readers.
     upload_refusals: Arc<Mutex<Vec<UploadRefusal>>>,
+    /// A commit failed and putting back what it staged failed too: its
+    /// record waits beside the replica, and with it blobs queued for upload
+    /// that no message names. While it is `Some`, no round runs; each wake
+    /// tries again, on this backoff ([`Owner::settled`], R1071K-10).
+    settle: Option<Backoff>,
 }
 
 impl Owner {
@@ -970,6 +975,7 @@ impl Owner {
             cache_max: BLOB_CACHE_MAX_BYTES,
             cache,
             upload_refusals: Arc::new(Mutex::new(refusals)),
+            settle: None,
         })
     }
 
@@ -984,7 +990,11 @@ impl Owner {
 
     fn run(mut self, commands: Receiver<Command>) {
         loop {
-            let wake = if self.online() {
+            let wake = if let Some(settle) = &self.settle {
+                // Nothing goes out until the unsettled commit is put back;
+                // that is retried on its own backoff, online or not.
+                Some(settle.wait(Instant::now()))
+            } else if self.online() {
                 self.schedule.next_wake(
                     Instant::now(),
                     self.dirty || self.client.sync_needed(),
@@ -1162,7 +1172,9 @@ impl Owner {
     /// they go back as they were ([`BlobCache::unstage`]), and if the process
     /// dies before the message is in the outbox the next open puts them back
     /// ([`BlobCache::recover`]) — a blob is never left queued for upload
-    /// without the message that names it (R1071K-07).
+    /// without the message that names it (R1071K-07). If putting them back
+    /// fails, the record stays and no round runs until a wake puts them back
+    /// ([`Self::settled`], R1071K-10): a round uploads whatever is queued.
     fn commit_with_blobs(
         &mut self,
         blobs: &[BlobBody],
@@ -1172,6 +1184,7 @@ impl Owner {
             ReplicaError::Client(format!("the replica's blob cache: {error}"))
         };
         self.cache.recover().map_err(storage)?;
+        self.settle = None;
         let before = blobs
             .iter()
             .map(|blob| self.cache.held(&blob.id))
@@ -1193,7 +1206,8 @@ impl Owner {
         match settled.and_then(|()| self.cache.log.finish_commit()) {
             Ok(()) => {}
             Err(error) => {
-                tracing::warn!(database = %self.database, %error, "a commit's staged blobs could not be settled; the next commit or open does");
+                self.settle = Some(Backoff::default());
+                tracing::warn!(database = %self.database, %error, "a commit's staged blobs could not be settled; nothing is synced until they are");
             }
         }
         outcome
@@ -1266,9 +1280,10 @@ impl Owner {
         self.dirty = true;
     }
 
-    /// Frames, the rounds they and the schedule ask for, and the socket.
+    /// Frames, the rounds they and the schedule ask for, and the socket —
+    /// none of them until no commit's staged blobs wait to be put back.
     fn drive(&mut self) {
-        if !self.online() {
+        if !self.settled() || !self.online() {
             return;
         }
         self.take_frames();
@@ -1297,6 +1312,36 @@ impl Owner {
                 tracing::debug!(database = %self.database, %error, "agents server socket refused");
             }
         }
+    }
+
+    /// Whether nothing a failed commit staged waits to be put back — after
+    /// trying to put it back, when it does and its backoff allows (R1071K-10).
+    /// A failed commit whose clean-up failed too leaves blobs queued that no
+    /// message names, and a round uploads every queued blob: so no round runs
+    /// until [`BlobCache::recover`] succeeds. It is tried on every wake, not
+    /// only by the next commit or open; a failure keeps the record and backs
+    /// off.
+    fn settled(&mut self) -> bool {
+        let Some(mut settle) = self.settle else {
+            return true;
+        };
+        let now = Instant::now();
+        if !settle.ready(now) {
+            return false;
+        }
+        if let Err(error) = self.cache.recover() {
+            settle.fail(now);
+            self.settle = Some(settle);
+            tracing::warn!(
+                database = %self.database,
+                retry_in_ms = settle.wait(now).as_millis() as u64,
+                %error,
+                "a failed commit's staged blobs are still not put back; nothing is synced"
+            );
+            return false;
+        }
+        self.settle = None;
+        true
     }
 
     /// The frames the socket's reader queued since the last call.
@@ -3129,5 +3174,123 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// R1071K-10: a Send fails after staging a new file, and putting the
+    /// file back fails too (keeper's own connection to the replica cannot
+    /// write). While that lasts, driving the owner runs no round and the
+    /// record stays; once storage recovers, the same owner — not opened
+    /// again, no other commit — puts the file back on its next wake before
+    /// any round, so the failed Send's file is never uploaded, and the
+    /// waiting message's file goes as before.
+    #[test]
+    fn a_failed_send_whose_clean_up_failed_uploads_nothing_of_it_once_storage_recovers() {
+        let (port, seen) = blob_server(Vec::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = linked(dir.path(), port);
+        let (wake, _woken) = mpsc::channel();
+        let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(true)), wake).expect("opens");
+        bootstrapped(&spec.path);
+        // An unrelated message, committed and waiting, pins `kept`.
+        let kept = vec![5u8; 50];
+        let first: String = ask(&mut owner, |reply| {
+            Command::Commit(
+                vec![body(&kept)],
+                vec![mutation(message("m-1")), attachment("a-1", "m-1", &kept)],
+                reply,
+            )
+        });
+
+        // The storage fault: keeper's connection to the replica cannot write.
+        let fault = |owner: &Owner, on: bool| {
+            let pragma = if on { "ON" } else { "OFF" };
+            owner
+                .cache
+                .bodies
+                .execute_batch(&format!("PRAGMA query_only = {pragma}"))
+                .expect("the fault is set");
+        };
+        fault(&owner, true);
+        // The Send stages a new file; the rest of its commit fails, and so
+        // does putting the file back.
+        let fresh = vec![6u8; 60];
+        let refused = Mutation::Upsert {
+            table: "no_such_table".to_owned(),
+            values: Map::from_iter([("id".to_owned(), json!("x"))]),
+            base_version: None,
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        assert!(owner.handle(Command::Commit(
+            vec![body(&fresh)],
+            vec![attachment("a-2", "m-2", &fresh), refused],
+            reply,
+        )));
+        assert!(answer.recv().expect("answered").is_err(), "the Send failed");
+        let mut left = vec![sha(&fresh), sha(&kept)];
+        left.sort();
+        assert_eq!(
+            queued(&spec.path),
+            left,
+            "the failed clean-up left the new file queued with no message"
+        );
+        let recorded = |owner: &Owner| {
+            owner
+                .cache
+                .log
+                .unfinished_commit()
+                .expect("reads")
+                .into_iter()
+                .map(|blob| blob.blob_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(recorded(&owner), vec![sha(&fresh)], "its record is kept");
+
+        // While the fault stands, a wake runs no round and keeps the record.
+        owner.drive();
+        assert_eq!(
+            seen.lock().expect("seen").len(),
+            0,
+            "no round while the failed Send's file waits to be put back"
+        );
+        assert_eq!(
+            recorded(&owner),
+            vec![sha(&fresh)],
+            "a failed retry keeps it"
+        );
+
+        // Storage recovers. The same owner's next wake, past its backoff.
+        fault(&owner, false);
+        if let Some(settle) = owner.settle {
+            std::thread::sleep(settle.wait(Instant::now()));
+        }
+        owner.drive();
+        assert_eq!(
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .filter(|(_, path, _)| path.contains(&sha(&fresh)))
+                .count(),
+            0,
+            "the failed Send's file is never uploaded"
+        );
+        assert!(
+            !queued(&spec.path).contains(&sha(&fresh)),
+            "nor left queued"
+        );
+        assert_eq!(
+            pins(&spec.path),
+            vec![(first, sha(&kept))],
+            "no pin of the failed Send's file; the waiting message keeps its own"
+        );
+        assert!(!cached(&spec.path).contains(&sha(&fresh)), "its body went");
+        assert!(
+            recorded(&owner).is_empty(),
+            "the record is cleared once settled"
+        );
+        assert_eq!(
+            puts(&seen, &sha(&kept), 200),
+            1,
+            "the waiting message's file still goes"
+        );
     }
 }

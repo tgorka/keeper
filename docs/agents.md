@@ -541,7 +541,10 @@ each blob was before the call (cached? already queued?) is written beside the re
 the message is in the outbox or the blobs are back: a process that dies in between leaves that
 record, and the next open puts the blobs back before any round, so no blob is ever uploaded
 without the message that names it; one another waiting message pins stays queued for it
-(R1071K-07). The
+(R1071K-07). If putting them back fails too (storage full, say), the record stays and the
+replica's owner runs no round — a round uploads every queued blob, named or not — until it has
+put them back: it tries again on every wake, backing off while it fails, so neither another Send
+nor a relaunch is needed for a failed Send's file to stay on the device (R1071K-10). The
 replica's next round uploads every queued blob (`POST …/upload-grant`, then
 `PUT /<database>/blobs/<blobId>`) before it pushes the commit that names it. `blob_ref` is syncular's canonical BlobRef JSON,
 `{"blobId":…,"byteLength":…,"mediaType":…,"name":…}` in that key order. Offline, the staged blob
@@ -679,7 +682,10 @@ replica file, the reported size, staging and its commit as one step that a round
 its `PUT` answered, its push cut — leaves pinned across a relaunch under cache pressure, a failed
 commit taking back only what it staged, a commit cut short by the process dying after its first
 upload and before its message leaving nothing to upload once reopened (a blob another waiting
-message pins kept), a refused upload resolved and explained across a relaunch while the next
+message pins kept), a failed Send whose clean-up failed too uploading nothing of it — no round
+while storage stays faulted, the same owner putting it back on its next wake once storage
+recovers, the waiting message's file uploaded — without a reopen or another commit, a refused
+upload resolved and explained across a relaunch while the next
 rounds go past it, a moot refusal pruned after a round without a reopen (`hq/syncular.rs`,
 `hq/blob_cache.rs`, against a local server that answers the blob requests and cuts the push); an
 opened archived session's attachments window (`hq/sessions.rs`); the relay's HTTP framing, a
