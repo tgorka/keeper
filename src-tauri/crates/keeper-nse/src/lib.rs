@@ -57,18 +57,21 @@
 //! notifications of the same item to remove first
 //! ([`keeper_core::hq::push::Fold`]) — those on the lock screen, and those
 //! this process handed iOS or saw arrive earlier — and so does the
-//! fallback's ([`ExpiryRequest`]), which takes no lock and makes no read. A
-//! removal is kept until the Swift reports the notification gone
-//! ([`RemovedRequest`]); until then every later answer of any item names it
-//! again (`pending`).
+//! fallback's ([`ExpiryRequest`]), which takes no lock and makes no read.
+//! Being named is not being handed (R1066K-07): an earlier delivery the
+//! fallback named while it was still read shows when its read ends, and
+//! removes the fallback. A removal is kept until the Swift reports the
+//! notification gone ([`RemovedRequest`]); until then every later answer
+//! of any item names it again (`pending`).
 //!
 //! This is best effort, and the limit is the platform's: iOS names a remote
 //! notification itself, the person's gateway sends no APNs collapse id
 //! (Sygnal has none), the record is this extension process's, and a
 //! removal only applies to a notification already on the lock screen. No
 //! test here can show that iOS ends with one notification; the boundary
-//! that would guarantee it is a collapse id equal to the item key on the
-//! APNs request itself (`docs/agents.md`, the proposed deferred work).
+//! that would guarantee it is a collapse id derived from the item key (a
+//! fixed-length digest: APNs takes at most 64 bytes) on the APNs request
+//! itself (`docs/agents.md`, the proposed deferred work).
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
@@ -239,25 +242,22 @@ const REMEMBERED_FOR: Duration = Duration::from_secs(60);
 /// bounds what an extension process keeps.
 const PENDING_MAX: usize = 64;
 
-/// Where a delivery of an agents item is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    /// Its key was asked for; nothing of it is handed to iOS yet.
-    Arrived,
-    /// Its notification was handed to iOS: shown, generic, or the fallback.
-    Handed,
-    /// Handed, and a later answer named it for removal: kept, and named
-    /// again, until the Swift reports it removed from the lock screen.
-    Replaced,
-}
-
-/// One delivery of an agents item in this extension process.
+/// One delivery of an agents item in this extension process. Two facts,
+/// apart (R1066K-07): whether its own notification was handed to iOS, and
+/// whether another delivery's answer named it for removal. Naming one
+/// still being read does not hand it — its handler is still the Swift's,
+/// and it still shows.
 struct Delivery {
     id: String,
     key: String,
     arrived: Instant,
     deadline: Instant,
-    stage: Stage,
+    /// Its notification was handed to iOS: shown, generic, or the fallback.
+    handed: bool,
+    /// A later answer named it for removal: kept, and named again, until the
+    /// Swift reports it removed from the lock screen — or, named before it
+    /// was handed, until its own answer removes the one that named it.
+    named: bool,
 }
 
 /// The deliveries of agents items this extension process has seen, in the
@@ -266,14 +266,11 @@ static DELIVERIES: Mutex<Vec<Delivery>> = Mutex::new(Vec::new());
 
 fn deliveries() -> MutexGuard<'static, Vec<Delivery>> {
     let mut all = DELIVERIES.lock().unwrap_or_else(PoisonError::into_inner);
-    all.retain(|one| one.stage == Stage::Replaced || one.arrived.elapsed() < REMEMBERED_FOR);
-    let pending = all
-        .iter()
-        .filter(|one| one.stage == Stage::Replaced)
-        .count();
+    all.retain(|one| one.named || one.arrived.elapsed() < REMEMBERED_FOR);
+    let pending = all.iter().filter(|one| one.named).count();
     let mut over = pending.saturating_sub(PENDING_MAX);
     all.retain(|one| {
-        let drop = over > 0 && one.stage == Stage::Replaced;
+        let drop = over > 0 && one.named;
         over -= usize::from(drop);
         !drop
     });
@@ -300,7 +297,8 @@ pub fn answer_key(request: &KeyRequest) -> NseAnswer {
             key: key.clone(),
             arrived: now,
             deadline: now + budget,
-            stage: Stage::Arrived,
+            handed: false,
+            named: false,
         });
     }
     NseAnswer::Key {
@@ -310,12 +308,13 @@ pub fn answer_key(request: &KeyRequest) -> NseAnswer {
 }
 
 /// The deadline of the delivery `id`: its arrival's, or [`DEADLINE`] from
-/// now for one whose arrival was never recorded; `None` once its
-/// notification was handed to iOS (its fallback, at expiry).
+/// now for one whose arrival was never recorded; `None` once its own
+/// notification was handed to iOS (its fallback, at expiry). Being named
+/// for removal by another delivery does not end it.
 fn deadline_of(id: &str) -> Option<Instant> {
     match deliveries().iter().find(|one| one.id == id) {
         None => Some(Instant::now() + DEADLINE),
-        Some(one) => (one.stage == Stage::Arrived).then_some(one.deadline),
+        Some(one) => (!one.handed).then_some(one.deadline),
     }
 }
 
@@ -330,11 +329,18 @@ fn deadline_of(id: &str) -> Option<Instant> {
 /// is not handed yet removes this one when it is. Those not on the lock
 /// screen are awaited, except ones an earlier answer named already. Each
 /// named is kept until the Swift reports it gone ([`reconcile`]), and named
-/// again meanwhile: for its item in `replaces`, for any other in `pending`.
+/// again meanwhile: for its item in `replaces`, for any other in `pending`
+/// once it was handed (one not handed is on no lock screen to remove).
 ///
-/// A delivery that shows nothing is forgotten. One already handed to iOS —
-/// its fallback, at expiry — removes nothing more: its read's answer comes
-/// after iOS showed something for it, and what it would name may be newer.
+/// A delivery named before it was handed — a later one's expiry named it
+/// while it was still read (R1066K-07) — folds like any other: it removes
+/// the one that named it, which is handed and so among those it removes,
+/// and is no longer named itself; the last one handed is the one left.
+///
+/// A delivery that shows nothing is forgotten. One whose own notification
+/// was handed to iOS already — its fallback, at expiry — removes nothing
+/// more: its read's answer comes after iOS showed something for it, and
+/// what it would name may be newer.
 fn settle(pushed: &PushedItem, own: &str, delivered: &[Delivered], answer: NseAnswer) -> NseAnswer {
     let mut all = deliveries();
     let at = all.iter().position(|one| one.id == own);
@@ -342,7 +348,7 @@ fn settle(pushed: &PushedItem, own: &str, delivered: &[Delivered], answer: NseAn
         all.retain(|one| one.id != own);
         return answer;
     }
-    if at.is_some_and(|at| all[at].stage != Stage::Arrived) {
+    if at.is_some_and(|at| all[at].handed) {
         let fold = Fold {
             key: pushed.tag(),
             ..Fold::default()
@@ -358,26 +364,26 @@ fn settle(pushed: &PushedItem, own: &str, delivered: &[Delivered], answer: NseAn
     let earlier: Vec<Handed> = all
         .iter()
         .enumerate()
-        .filter(|(i, one)| {
-            one.id != own && (at.is_none_or(|at| *i < at) || one.stage != Stage::Arrived)
-        })
+        .filter(|(i, one)| one.id != own && (at.is_none_or(|at| *i < at) || one.handed))
         .map(|(_, one)| Handed {
             id: one.id.clone(),
             key: one.key.clone(),
         })
         .collect();
     let mut item_fold = fold(pushed, own, delivered, &earlier);
-    item_fold.awaits.retain(|id| {
-        !all.iter()
-            .any(|one| one.id == *id && one.stage == Stage::Replaced)
-    });
+    item_fold
+        .awaits
+        .retain(|id| !all.iter().any(|one| one.id == *id && one.named));
     for one in all.iter_mut() {
         if item_fold.replaces.contains(&one.id) {
-            one.stage = Stage::Replaced;
+            one.named = true;
         }
     }
     match at {
-        Some(at) => all[at].stage = Stage::Handed,
+        Some(at) => {
+            all[at].handed = true;
+            all[at].named = false;
+        }
         None if !own.is_empty() => {
             let now = Instant::now();
             all.push(Delivery {
@@ -385,14 +391,15 @@ fn settle(pushed: &PushedItem, own: &str, delivered: &[Delivered], answer: NseAn
                 key: item_fold.key.clone(),
                 arrived: now,
                 deadline: now,
-                stage: Stage::Handed,
+                handed: true,
+                named: false,
             });
         }
         None => {}
     }
     let pending = all
         .iter()
-        .filter(|one| one.stage == Stage::Replaced && one.key != item_fold.key)
+        .filter(|one| one.named && one.handed && one.key != item_fold.key)
         .map(|one| one.id.clone())
         .collect();
     drop(all);
@@ -1777,5 +1784,164 @@ mod item_tests {
         let left = pending(&next);
         assert!(left.contains("p-3"), "{left:?}");
         assert!(!left.contains("p-1") && !left.contains("p-2"), "{left:?}");
+    }
+
+    /// A listener that holds each request until `release` is sent (or
+    /// dropped), then answers it with 200 and `body`; each request it holds
+    /// is reported on `taken`. A read the test lets finish when it chooses.
+    fn serve_when_released(
+        body: String,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let (taken_tx, taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let _ = taken_tx.send(());
+                let _ = released.recv();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, taken, release)
+    }
+
+    fn ids(list: &Value) -> BTreeSet<String> {
+        list.as_array()
+            .expect("a list")
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The lock screen as the Swift keeps it: an answer's `replaces` and
+    /// `pending` removed (the fold, the expiry), then the delivery `own`
+    /// handed to iOS unless it shows nothing.
+    fn shown_after(screen: &mut Vec<String>, answer: &Value, own: &str) {
+        let removed: BTreeSet<String> = ids(&answer["replaces"])
+            .union(&ids(&answer["pending"]))
+            .cloned()
+            .collect();
+        screen.retain(|one| !removed.contains(one));
+        if answer["kind"] != "drop" {
+            screen.push(own.to_owned());
+        }
+    }
+
+    /// The fallback of the delivery `identifier` of `item`, as the Swift's
+    /// expiry asks for it: nothing on the lock screen known.
+    fn expire(item: &str, identifier: &str) -> Value {
+        answer(&handle_json(
+            &json!({"hq_expired": payload(item), "identifier": identifier, "delivered": []})
+                .to_string(),
+        ))
+    }
+
+    /// R1066K-07: two deliveries of one item arrive, the later one's
+    /// extension expires before the earlier one's read completes, and then
+    /// it completes — once with its read already at the server, once still
+    /// queued for its turn. The expiry names the earlier one, which is on
+    /// no lock screen yet; naming it does not hand it. So its read still
+    /// shows the item, and its answer removes the fallback: the lock screen
+    /// ends with exactly one notification of the item. Meanwhile no other
+    /// item's answer names the earlier one (`pending`), and once it shows,
+    /// none does: only the fallback stays named until reported gone.
+    #[test]
+    fn an_earlier_delivery_completing_after_a_later_ones_expiry_leaves_one_notification() {
+        let _slow = slow();
+        const READ: &str = "01JFOLDLATEREAD00000000001";
+        const QUEUED: &str = "01JFOLDLATEQUEUE0000000001";
+        const ELSEWHERE: &str = "01JFOLDELSEWHERE0000000001";
+        let item =
+            |id: &str| approval_of(id, "T2", "list files", call("run", json!({"argv": ["ls"]})));
+
+        // Its read already at the server when the later one expires.
+        let (url, taken, release) = serve_when_released(item(READ));
+        let read_group = group(&url);
+        let mut screen = Vec::new();
+        key_of(READ, "lr-b");
+        key_of(READ, "lr-c");
+        std::thread::scope(|scope| {
+            let earlier = scope.spawn(|| {
+                answer(&handle_json(&request_for(
+                    read_group.path(),
+                    &url,
+                    READ,
+                    "lr-b",
+                    json!([]),
+                )))
+            });
+            taken
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the earlier read reached the server");
+            let fallback = expire(READ, "lr-c");
+            assert_eq!(
+                (&fallback["kind"], &fallback["replaces"]),
+                (&json!("generic"), &json!(["lr-b"]))
+            );
+            shown_after(&mut screen, &fallback, "lr-c");
+            let elsewhere = expire(ELSEWHERE, "le-1");
+            assert!(
+                !ids(&elsewhere["pending"]).contains("lr-b"),
+                "named, not handed: {elsewhere}"
+            );
+            release.send(()).expect("release the read");
+            let late = earlier.join().expect("the earlier read");
+            assert_eq!(late["kind"], "item", "its content still shows: {late}");
+            assert_eq!(late["key"], json!(format!("tgdrive/approval/{READ}")));
+            assert_eq!(late["replaces"], json!(["lr-c"]), "{late}");
+            assert_eq!(late["awaits"], json!(["lr-c"]), "{late}");
+            shown_after(&mut screen, &late, "lr-b");
+        });
+        assert_eq!(screen, ["lr-b"], "one notification of the item");
+
+        // Still queued for its turn when the later one expires.
+        let server = serve(200, item(QUEUED));
+        let queued_group = group(&server.url);
+        let mut screen = Vec::new();
+        key_of(QUEUED, "lq-b");
+        key_of(QUEUED, "lq-c");
+        let fallback = expire(QUEUED, "lq-c");
+        assert_eq!(fallback["replaces"], json!(["lq-b"]));
+        shown_after(&mut screen, &fallback, "lq-c");
+        let late = answer(&handle_json(&request_for(
+            queued_group.path(),
+            &server.url,
+            QUEUED,
+            "lq-b",
+            json!([{"id": "lq-c", "key": format!("tgdrive/approval/{QUEUED}")}]),
+        )));
+        assert_eq!(late["kind"], "item", "its turn still reads: {late}");
+        assert_eq!(late["replaces"], json!(["lq-c"]), "{late}");
+        assert_eq!(late["awaits"], json!([]), "on the lock screen already");
+        shown_after(&mut screen, &late, "lq-b");
+        assert_eq!(screen, ["lq-b"], "one notification of the item");
+        assert_eq!(server.seen.lock().expect("seen").len(), 1, "one read");
+
+        // Once shown, the earlier ones are named by no one; the fallbacks
+        // stay named until reported gone.
+        let pending = ids(&expire(ELSEWHERE, "le-2")["pending"]);
+        for gone in ["lr-c", "lq-c"] {
+            assert!(pending.contains(gone), "{gone}: {pending:?}");
+        }
+        for shown in ["lr-b", "lq-b"] {
+            assert!(!pending.contains(shown), "{shown}: {pending:?}");
+        }
     }
 }
