@@ -2,8 +2,6 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AccountVm,
-  AgentRunVm,
-  ApprovalCardVm,
   HeldRestoreVm,
   IpcError,
   PaginationStatusBatch,
@@ -123,7 +121,6 @@ vi.mock("@tauri-apps/api/webview", () => ({
 
 import { COMPOSER_CONTEXT_CHANGED } from "@/components/chat/composer";
 import { ConversationPane } from "@/components/layout/conversation-pane";
-import { openAndFocus } from "@/lib/default-agent-actions";
 import type { CouplingCaveatVm, InboxRoomVm, IncognitoVm } from "@/lib/ipc/client";
 import { mirrorDraft, saveDraft } from "@/lib/ipc/client";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
@@ -133,7 +130,6 @@ import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { incognitoStore } from "@/lib/stores/incognito";
 import { outboxStore } from "@/lib/stores/outbox";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
-import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -162,8 +158,6 @@ function messageItem(key: string, sender: string, body: string): TimelineItemVm 
     reactions: [],
     media: null,
     readers: [],
-    brief: null,
-    gate: null,
   };
 }
 
@@ -296,8 +290,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
             { kind: "other", key: "o1" },
           ],
@@ -310,160 +302,6 @@ describe("ConversationPane", () => {
     });
     // The `Other` item is not rendered as a bubble.
     expect(screen.getByLabelText("Messages")).toBeInTheDocument();
-  });
-
-  it("draws an agent's approval request where it arrived, and follows the room's state beside the stream", async () => {
-    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
-    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
-      captured.onBatch = onBatch;
-      return Promise.resolve(1);
-    });
-    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
-    render(<ConversationPane {...noopProps()} />);
-    const card: ApprovalCardVm = {
-      id: "01A",
-      bindingDigest: "sha256:aa",
-      tier: 2,
-      tierWord: "T2: it changes something that can be put back",
-      summary: "Write `a.md` in tgdrive (3 bytes)",
-      tool: "drive_write",
-      payload: '{\n  "path": "a.md"\n}',
-      attachment: null,
-      approvers: [{ user: "@alice:example.org", name: "Alice" }],
-      anyone: false,
-      chain: [{ user: "@alice:example.org", name: "Alice" }],
-      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
-      expiresAt: 4_000_000_000_000,
-      state: { state: "pending" },
-      canDecide: true,
-      cannotDecide: null,
-      verify: false,
-      only: null,
-      declassify: null,
-      run: null,
-      kvm: null,
-      gate: null,
-    };
-
-    await waitFor(() => expect(captured.onBatch).not.toBeNull());
-    act(() => {
-      captured.onBatch?.({
-        ops: [
-          {
-            op: "reset",
-            items: [
-              messageItem("k1", "@nixi:example.org", "before"),
-              { kind: "approval", key: "ap", id: "01A" },
-              messageItem("k2", "@nixi:example.org", "after"),
-            ],
-          },
-        ],
-        approvals: [{ id: "01A", cards: [card], gate: null }],
-      });
-    });
-
-    const request = await screen.findByRole("article", {
-      name: "Approval request: Write a.md in tgdrive (3 bytes)",
-    });
-    const rows = within(screen.getByRole("list", { name: "Messages" })).getAllByRole("listitem");
-    const at = rows.findIndex((row) => row.contains(request));
-    expect(rows[at - 1]).toHaveTextContent("before");
-    expect(rows[at + 1]).toHaveTextContent("after");
-    expect(within(request).getByRole("button", { name: "Approve once" })).toBeInTheDocument();
-
-    // A decision echoed by the room arrives beside the stream, with no ops.
-    act(() => {
-      captured.onBatch?.({
-        ops: [],
-        approvals: [
-          {
-            id: "01A",
-            cards: [
-              {
-                ...card,
-                canDecide: false,
-                state: {
-                  state: "decided",
-                  decision: "deny",
-                  scope: "once",
-                  by: "@alice:example.org",
-                  byName: "Alice",
-                },
-              },
-            ],
-            gate: null,
-          },
-        ],
-      });
-    });
-    expect(await within(request).findByText("Denied by Alice.")).toBeInTheDocument();
-    expect(within(request).queryByRole("button", { name: "Approve once" })).toBeNull();
-  });
-
-  it("draws each approval request in the stream as its own request, whatever order the room lists them in", async () => {
-    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
-    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
-      captured.onBatch = onBatch;
-      return Promise.resolve(1);
-    });
-    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
-    render(<ConversationPane {...noopProps()} />);
-    const request = (id: string, summary: string): ApprovalCardVm => ({
-      id,
-      bindingDigest: `sha256:${id}`,
-      tier: 2,
-      tierWord: "T2: it changes something that can be put back",
-      summary,
-      tool: "drive_write",
-      payload: null,
-      attachment: null,
-      approvers: [{ user: "@alice:example.org", name: "Alice" }],
-      anyone: false,
-      chain: [{ user: "@alice:example.org", name: "Alice" }],
-      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
-      expiresAt: 4_000_000_000_000,
-      state: { state: "pending" },
-      canDecide: true,
-      cannotDecide: null,
-      verify: false,
-      only: null,
-      declassify: null,
-      run: null,
-      kvm: null,
-      gate: null,
-    });
-
-    await waitFor(() => expect(captured.onBatch).not.toBeNull());
-    act(() => {
-      captured.onBatch?.({
-        ops: [
-          {
-            op: "reset",
-            items: [
-              { kind: "approval", key: "ap1", id: "01A" },
-              messageItem("k1", "@nixi:example.org", "between"),
-              { kind: "approval", key: "ap2", id: "01B" },
-            ],
-          },
-        ],
-        approvals: [
-          { id: "01B", cards: [request("01B", "Write b.md in tgdrive")], gate: null },
-          { id: "01A", cards: [request("01A", "Write a.md in tgdrive")], gate: null },
-        ],
-      });
-    });
-
-    const first = await screen.findByRole("article", {
-      name: "Approval request: Write a.md in tgdrive",
-    });
-    const second = screen.getByRole("article", { name: "Approval request: Write b.md in tgdrive" });
-    // The rows in the stream's order, after the history boundary's own row.
-    const rows = within(screen.getByRole("list", { name: "Messages" }))
-      .getAllByRole("listitem")
-      .filter((row) => within(row).queryByText("Load earlier messages") === null);
-    expect(rows.findIndex((row) => row.contains(first))).toBe(0);
-    expect(rows[1]).toHaveTextContent("between");
-    expect(rows.findIndex((row) => row.contains(second))).toBe(2);
   });
 
   it("consumes Escape only when there is composer context to clear (phone-shell cascade)", async () => {
@@ -582,8 +420,6 @@ describe("ConversationPane", () => {
             reactions: [],
             media: null,
             readers: [],
-            brief: null,
-            gate: null,
           },
         },
       ],
@@ -626,8 +462,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
             {
               kind: "message",
@@ -643,8 +477,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1138,8 +970,6 @@ describe("ConversationPane", () => {
                 caption: null,
               },
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1181,8 +1011,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1228,8 +1056,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1301,8 +1127,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1356,8 +1180,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1419,8 +1241,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
             {
               kind: "message",
@@ -1436,8 +1256,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1496,8 +1314,6 @@ describe("ConversationPane", () => {
                 caption: null,
               },
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1606,8 +1422,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
             {
               kind: "message",
@@ -1623,8 +1437,6 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
-              brief: null,
-              gate: null,
             },
           ],
         },
@@ -1682,8 +1494,6 @@ describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
                 reactions: [],
                 media: null,
                 readers: [],
-                brief: null,
-                gate: null,
               },
             ],
           },
@@ -2667,176 +2477,6 @@ describe("ConversationPane — safe areas & keyboard-avoiding composer (Story 13
   });
 });
 
-describe("ConversationPane — an agent room", () => {
-  const NIXI = "@nixi:example.org";
-  const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
-
-  function agentHeader(
-    run: AgentRunVm,
-    caretKey: string | null,
-  ): NonNullable<TimelineBatch["header"]> {
-    return {
-      status: {
-        agent: NIXI,
-        agentName: "Nixi",
-        handle: "nixi@electra",
-        host: "electra",
-        title: "Nixi",
-        kind: "main",
-        run,
-        waiting: null,
-        detail: null,
-        unreadable: null,
-      },
-      scope: null,
-      label: null,
-      scopeUnreadable: null,
-      caretKey,
-      gate: null,
-    };
-  }
-
-  function open(props: { showHeader?: boolean } = {}) {
-    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
-      captured.onBatch = onBatch;
-      return Promise.resolve(1);
-    });
-    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!nixi:example.org" });
-    render(<ConversationPane {...noopProps()} {...props} />);
-  }
-
-  function push(batch: TimelineBatch) {
-    act(() => captured.onBatch?.(batch));
-  }
-
-  /** The message bubble (by its render key) that draws the growing caret, if any. */
-  function caretOwners(): string[] {
-    return Array.from(document.querySelectorAll('[data-slot="growing-caret"]')).map(
-      (caret) => caret.closest("[data-msg-key]")?.getAttribute("data-msg-key") ?? "",
-    );
-  }
-
-  const items = [
-    messageItem("question", "@alice:example.org", "What did I write?"),
-    messageItem("old-answer", NIXI, "Earlier answer"),
-    messageItem("answer", NIXI, "Synapse"),
-  ];
-
-  it("a gate's room offers nothing that writes into it: no composer, reply, edit, reaction or drop (UX-DR147)", async () => {
-    const released = vi.fn();
-    onDragDropEvent.mockImplementation(() => Promise.resolve(released));
-    open();
-    push({
-      ops: [{ op: "reset", items }],
-      header: {
-        ...agentHeader("done", null),
-        gate: { system: "github", peer: "@github:example.org", peerName: '"GitHub"' },
-      },
-    });
-    expect(await screen.findByTestId("gate-observer")).toBeInTheDocument();
-    expect(screen.queryByTestId("composer-footer")).toBeNull();
-    expect(screen.queryByPlaceholderText("Write a message…")).toBeNull();
-    await screen.findByText("Earlier answer");
-    expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Add reaction" })).toBeNull();
-    // The `r` key starts no reply on a selected line.
-    act(() => composerStore.getState().select("question"));
-    fireEvent.keyDown(screen.getByLabelText("Messages"), { key: "r" });
-    expect(composerStore.getState().pending).toBeNull();
-    // Every drop listener registered before the room was known is released.
-    expect(onDragDropEvent).toHaveBeenCalled();
-    await waitFor(() => expect(released).toHaveBeenCalledTimes(onDragDropEvent.mock.calls.length));
-    // Any other agent room keeps its composer and its line actions.
-    push({ ops: [], header: agentHeader("done", null) });
-    expect(await screen.findByTestId("composer-footer")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "Reply" }).length).toBeGreaterThan(0);
-    fireEvent.keyDown(screen.getByLabelText("Messages"), { key: "r" });
-    await waitFor(() => expect(composerStore.getState().pending).not.toBeNull());
-  });
-
-  it("draws the caret on the named answer only while the run is running, then removes it", async () => {
-    open();
-    push({ ops: [{ op: "reset", items }], header: agentHeader("running", "answer") });
-    await screen.findByText("Earlier answer");
-    expect(caretOwners()).toEqual(["answer"]);
-    expect(screen.getByText("(still writing)")).toBeInTheDocument();
-
-    // The answer grows by `set`; the header did not change, so the batch has none.
-    push({ ops: [{ op: "set", index: 2, item: messageItem("answer", NIXI, "Synapse took it") }] });
-    expect(await screen.findByText(/Synapse took it/)).toBeInTheDocument();
-    expect(caretOwners()).toEqual(["answer"]);
-
-    push({ ops: [], header: agentHeader("done", null) });
-    await waitFor(() => expect(caretOwners()).toEqual([]));
-    expect(screen.queryByText("(still writing)")).not.toBeInTheDocument();
-  });
-
-  it("draws no caret once the run has left running, whatever key the header still names", async () => {
-    open();
-    push({ ops: [{ op: "reset", items }], header: agentHeader("blocked", "answer") });
-    await screen.findByText("Earlier answer");
-    expect(caretOwners()).toEqual([]);
-  });
-
-  it("keeps the header through batches that carry none", async () => {
-    open();
-    push({ ops: [{ op: "reset", items }], header: agentHeader("running", "answer") });
-    push({ ops: [{ op: "pushBack", item: messageItem("more", NIXI, "More") }] });
-    await screen.findByText("More");
-    const region = screen.getByRole("region", { name: "Agent status" });
-    expect(within(region).getByText("nixi@electra")).toBeInTheDocument();
-    expect(within(region).getByTestId("agent-run")).toHaveTextContent(/^run: running$/);
-  });
-
-  it("shows the header on the phone, where the pane's own header row is hidden", async () => {
-    open({ showHeader: false });
-    push({ ops: [{ op: "reset", items }], header: agentHeader("idle", null) });
-    const region = await screen.findByRole("region", { name: "Agent status" });
-    expect(within(region).getByTestId("agent-run")).toHaveTextContent(/^run: idle$/);
-    expect(screen.queryByRole("button", { name: "Toggle detail panel" })).not.toBeInTheDocument();
-  });
-
-  it("draws no header in a room whose stream carries none", async () => {
-    open();
-    push({ ops: [{ op: "reset", items }] });
-    await screen.findByText("Earlier answer");
-    expect(screen.queryByRole("region", { name: "Agent status" })).not.toBeInTheDocument();
-    expect(caretOwners()).toEqual([]);
-  });
-
-  /** The message bubbles (by render key) that draw the heard mark (UX-DR143). */
-  function markOwners(): string[] {
-    return Array.from(document.querySelectorAll('[data-slot="heard-mark"]')).map(
-      (mark) => mark.closest("[data-msg-key]")?.getAttribute("data-msg-key") ?? "",
-    );
-  }
-
-  it("draws where the person stopped listening in the answer the mark names, and moves it as Rust does", async () => {
-    open();
-    push({
-      ops: [
-        {
-          op: "reset",
-          items: [
-            ...items.slice(0, 2),
-            messageItem("answer", NIXI, "Synapse took it. The cut sits at 45 KiB."),
-          ],
-        },
-      ],
-      header: agentHeader("done", null),
-      heard: [{ key: "answer", splitUtf16: 16 }],
-    });
-    await screen.findByText("Earlier answer");
-    expect(markOwners()).toEqual(["answer"]);
-    expect(screen.getByText("The cut sits at 45 KiB.")).toHaveClass("opacity-60");
-
-    // A batch beside the stream that names no answer clears it.
-    push({ ops: [], heard: [] });
-    await waitFor(() => expect(markOwners()).toEqual([]));
-    expect(screen.getByText("Synapse took it. The cut sits at 45 KiB.")).toBeInTheDocument();
-  });
-});
-
 describe("ConversationPane — an Undo lands in the room it was held in (R447)", () => {
   const roomA = "!room-a:example.org";
   const roomB = "!room-b:example.org";
@@ -2960,103 +2600,5 @@ describe("ConversationPane — an Undo lands in the room it was held in (R447)",
     );
     expect(sendReply).not.toHaveBeenCalled();
     expect(sendText).not.toHaveBeenCalled();
-  });
-});
-
-describe("ConversationPane — the default agent's composer takes focus once it can (story 102.7, R102L1-01)", () => {
-  const originalMatchMedia = window.matchMedia;
-  function viewport(width: number) {
-    window.matchMedia = vi.fn().mockImplementation((query: string) => {
-      const match = query.match(/max-width:\s*(\d+)px/);
-      return {
-        matches: width <= (match ? Number(match[1]) : Number.POSITIVE_INFINITY),
-        media: query,
-        onchange: null,
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-        addListener: vi.fn(),
-        removeListener: vi.fn(),
-        dispatchEvent: vi.fn(),
-      };
-    });
-  }
-  afterEach(() => {
-    window.matchMedia = originalMatchMedia;
-    primaryViewStore.getState().setView("inbox");
-    composerStore.setState({ focusWhenReady: null });
-  });
-
-  const nixi = { accountId: account.accountId, roomId: "!nixi-dm:example.org" };
-  const marta = { accountId: account.accountId, roomId: "!marta:example.org" };
-  const firstBatch: TimelineBatch = {
-    ops: [{ op: "reset", items: [messageItem("k1", "@nixi:example.org", "hello")] }],
-  };
-
-  /** The real pane, every room's first batch held until the test delivers it. */
-  function heldFirstBatches(): Map<string, (b: TimelineBatch) => void> {
-    const held = new Map<string, (b: TimelineBatch) => void>();
-    subscribeTimeline.mockImplementation((_a, roomId: string, onBatch) => {
-      held.set(roomId, onBatch);
-      return Promise.resolve(1);
-    });
-    primaryViewStore.getState().setView("agents");
-    render(<ConversationPane {...noopProps()} />);
-    return held;
-  }
-
-  /** Every macrotask the launch's old zero-delay focus would have fired in. */
-  async function letTimersRun() {
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-  }
-
-  it.each([
-    ["desktop", 1280],
-    ["phone", 390],
-  ])("%s: opened before its first batch, the composer is focused when the batch lands", async (_tier, width) => {
-    viewport(width);
-    const held = heldFirstBatches();
-    act(() => openAndFocus(nixi));
-    await waitFor(() => expect(held.has(nixi.roomId)).toBe(true));
-    await letTimersRun();
-    const field = screen.getByRole("textbox", { name: "Message" });
-    expect(field).toBeDisabled();
-    expect(field).not.toHaveFocus();
-
-    act(() => held.get(nixi.roomId)?.(firstBatch));
-    await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus());
-    expect(composerStore.getState().focusWhenReady).toBeNull();
-  });
-
-  it("the person opening another room before the batch keeps the focus out of both", async () => {
-    viewport(1280);
-    const held = heldFirstBatches();
-    act(() => openAndFocus(nixi));
-    await waitFor(() => expect(held.has(nixi.roomId)).toBe(true));
-    act(() => roomsStore.getState().selectRoom(marta));
-    await waitFor(() => expect(held.has(marta.roomId)).toBe(true));
-
-    act(() => held.get(marta.roomId)?.(firstBatch));
-    const field = await screen.findByRole("textbox", { name: "Message" });
-    await waitFor(() => expect(field).toBeEnabled());
-    await letTimersRun();
-    expect(field).not.toHaveFocus();
-    expect(composerStore.getState().focusWhenReady).toBeNull();
-  });
-
-  it("the person leaving for another window before the batch drops the request", async () => {
-    viewport(390);
-    const held = heldFirstBatches();
-    act(() => openAndFocus(nixi));
-    await waitFor(() => expect(held.has(nixi.roomId)).toBe(true));
-    act(() => primaryViewStore.getState().setView("inbox"));
-
-    act(() => held.get(nixi.roomId)?.(firstBatch));
-    const field = screen.getByRole("textbox", { name: "Message" });
-    await waitFor(() => expect(field).toBeEnabled());
-    await letTimersRun();
-    expect(field).not.toHaveFocus();
-    expect(composerStore.getState().focusWhenReady).toBeNull();
   });
 });

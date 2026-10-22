@@ -49,17 +49,3 @@ describe("RoomAvatar Network badge (Story 4.6)", () => {
     expect(screen.queryByLabelText(/network$/)).not.toBeInTheDocument();
   });
 });
-
-describe("RoomAvatar agent mark (story 101.1 #6)", () => {
-  it("draws a titled agent room's agent's initial, never the title's initials", () => {
-    // "nixi 2026-10-15" once drew "N2"; the row is Nixi's, so it draws "N".
-    render(
-      <RoomAvatar
-        room={room({ displayName: "Nixi — triage of inbox", agentRoom: "session", agentMark: "N" })}
-        size="lg"
-      />,
-    );
-    expect(screen.getByText("N")).toBeInTheDocument();
-    expect(screen.queryByText("NI")).not.toBeInTheDocument();
-  });
-});

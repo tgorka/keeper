@@ -33,7 +33,6 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { usePushOpen } from "@/hooks/use-push-open";
 
-const ROOM = { accountId: "01J9ZK0000000000000000ACCT", roomId: "!session:example.org" };
 const SESSION = { database: "tgdrive", sessionId: "ana.1.3" };
 
 beforeEach(() => {
@@ -74,15 +73,6 @@ describe("usePushOpen", () => {
     const before = takes;
     fireTapped?.();
     await waitFor(() => expect(takes).toBe(before + 1));
-    expect(agentSessionsStore.getState().selected).toBeNull();
-  });
-
-  it("still opens a Matrix agent room a notification of one names", async () => {
-    waiting = { kind: "room", ...ROOM };
-    renderHook(() => usePushOpen());
-
-    await waitFor(() => expect(roomsStore.getState().selected).toEqual(ROOM));
-    expect(primaryViewStore.getState().view).toBe("agents");
     expect(agentSessionsStore.getState().selected).toBeNull();
   });
 });

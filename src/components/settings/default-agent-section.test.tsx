@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentsLaunchVm } from "@/lib/ipc/client";
+import type { DefaultAgentVm } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
   agentsDefaultGet: vi.fn(),
@@ -17,21 +17,16 @@ import {
 import { agentsDefaultGet, agentsDefaultSet } from "@/lib/ipc/client";
 import { defaultAgentStore, readFailedSentence } from "@/lib/stores/default-agent";
 
-const NIXI = "@nixi:example.org";
-const TALA = "@tala:example.org";
+const NIXI = "nixie";
+const TALA = "tala";
 
-function vm(overrides: Partial<AgentsLaunchVm>): AgentsLaunchVm {
+function vm(overrides: Partial<DefaultAgentVm>): DefaultAgentVm {
   return {
-    view: "agents",
-    room: null,
     defaultAgent: null,
     reason: null,
-    announce: false,
     choices: [{ agent: NIXI, name: "Nixi" }],
     chooser: false,
     fileSet: null,
-    ask: null,
-    askable: [],
     ...overrides,
   };
 }
@@ -63,8 +58,8 @@ describe("DefaultAgentSection", () => {
     );
   });
 
-  it("keeps a stored agent with no room here selected, beside Rust's reason", async () => {
-    const reason = `Your default agent ${TALA} has no conversation with you here.`;
+  it("keeps a stored agent no database here names selected, beside Rust's reason", async () => {
+    const reason = `Your default agent ${TALA} is in none of the agents' databases this device holds.`;
     vi.mocked(agentsDefaultGet).mockResolvedValue(vm({ defaultAgent: TALA, reason }));
     render(<DefaultAgentSection open />);
     expect(await screen.findByRole("radio", { name: TALA })).toBeChecked();
@@ -83,7 +78,7 @@ describe("DefaultAgentSection", () => {
   });
 
   it("is absent with no agent to choose and none stored", async () => {
-    vi.mocked(agentsDefaultGet).mockResolvedValue(vm({ choices: [], view: "inbox" }));
+    vi.mocked(agentsDefaultGet).mockResolvedValue(vm({ choices: [] }));
     const { container } = render(<DefaultAgentSection open />);
     await waitFor(() => expect(agentsDefaultGet).toHaveBeenCalled());
     await waitFor(() => expect(defaultAgentStore.getState().vm).not.toBeNull());
@@ -92,7 +87,7 @@ describe("DefaultAgentSection", () => {
   });
 
   it("says a failed read even when what it holds has nothing to choose", async () => {
-    defaultAgentStore.setState({ vm: vm({ choices: [], view: "inbox" }) });
+    defaultAgentStore.setState({ vm: vm({ choices: [] }) });
     vi.mocked(agentsDefaultGet).mockRejectedValue(new Error("the settings table is locked"));
     render(<DefaultAgentSection open />);
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -102,7 +97,7 @@ describe("DefaultAgentSection", () => {
 
   it("names the file that decides the default, and shows the agent it opens", async () => {
     const fileSet =
-      "/etc/keeper.toml (user) sets agents.default to @nixi:example.org, so @nixi:example.org opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.";
+      "/etc/keeper.toml (user) sets agents.default to nixie, so nixie opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.";
     vi.mocked(agentsDefaultGet).mockResolvedValue(vm({ defaultAgent: NIXI, fileSet }));
     vi.mocked(agentsDefaultSet).mockResolvedValue(vm({ defaultAgent: NIXI, fileSet }));
     render(<DefaultAgentSection open />);

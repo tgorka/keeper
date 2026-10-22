@@ -1,7 +1,7 @@
 /**
- * The configured default agent, shared by Settings and the earlier Matrix
- * room menus. Rust supplies the choices and setting provenance. Database
- * session launch asks agentSessionDefault directly, not this legacy room VM.
+ * The configured default agent, as Settings shows it. Rust supplies the
+ * choices (the agents of the agents' databases this device holds) and the
+ * setting's provenance. The launch asks agentSessionDefault directly.
  *
  * Ordered (R397, R409): every read and save takes a sequence number. An old
  * response never replaces a saved choice or a newer failure. A read requested
@@ -18,10 +18,10 @@ import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import { reportFrontendError } from "@/lib/crash-report";
 import {
-  type AgentsLaunchVm,
   agentsDefaultChooserDismiss,
   agentsDefaultGet,
   agentsDefaultSet,
+  type DefaultAgentVm,
 } from "@/lib/ipc/client";
 
 /** Whether the phone's restored navigation put something on screen. */
@@ -29,7 +29,7 @@ export type NavRestore = "pending" | "restored" | "nothing";
 
 export interface DefaultAgentState {
   /** Rust's latest answer; `null` before the first one. */
-  vm: AgentsLaunchVm | null;
+  vm: DefaultAgentVm | null;
   /** The last failed read's sentence; `null` once a read succeeds. */
   readError: string | null;
   /** The last failed save's sentence; `null` once a save succeeds. */
@@ -40,7 +40,7 @@ export interface DefaultAgentState {
   /** Read the answer again. */
   load: () => Promise<void>;
   /** Make `agent` the default (`null`: none); the new answer, or `null` when not saved. */
-  choose: (agent: string | null) => Promise<AgentsLaunchVm | null>;
+  choose: (agent: string | null) => Promise<DefaultAgentVm | null>;
   setNavRestore: (navRestore: NavRestore) => void;
   /** The launch's chooser is on screen in the Agents window. */
   chooserOpen: boolean;

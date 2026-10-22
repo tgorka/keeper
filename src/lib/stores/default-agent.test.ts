@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentsLaunchVm } from "@/lib/ipc/client";
+import type { DefaultAgentVm } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
   agentsDefaultGet: vi.fn(),
@@ -10,30 +10,25 @@ vi.mock("@/lib/ipc/client", () => ({
 import { agentsDefaultGet, agentsDefaultSet, frontendErrorReport } from "@/lib/ipc/client";
 import { defaultAgentStore, readFailedSentence } from "@/lib/stores/default-agent";
 
-const NIXI = "@nixi:example.org";
-const TALA = "@tala:example.org";
+const NIXI = "nixie";
+const TALA = "tala";
 
-function answer(defaultAgent: string | null): AgentsLaunchVm {
+function answer(defaultAgent: string | null): DefaultAgentVm {
   return {
-    view: "agents",
-    room: null,
     defaultAgent,
     reason: null,
-    announce: false,
     choices: [
       { agent: NIXI, name: "Nixi" },
       { agent: TALA, name: "Tala" },
     ],
     chooser: false,
     fileSet: null,
-    ask: null,
-    askable: [],
   };
 }
 
 /** An answer the test settles when it chooses. The executor form, not
  *  `Promise.withResolvers`: the project compiles against `lib: ES2020`. */
-function pending<T = AgentsLaunchVm>(): {
+function pending<T = DefaultAgentVm>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
   reject: (error: unknown) => void;

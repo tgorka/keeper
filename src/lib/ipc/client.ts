@@ -13,6 +13,7 @@ import type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { CorrectionResultVm } from "./gen/CorrectionResultVm";
+import type { DefaultAgentVm } from "./gen/DefaultAgentVm";
 import type { DictionaryTermVm } from "./gen/DictionaryTermVm";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
@@ -23,7 +24,6 @@ import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
-import type { LaunchRoomVm } from "./gen/LaunchRoomVm";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { LineEditVm } from "./gen/LineEditVm";
 import type { LogUploadVm } from "./gen/LogUploadVm";
@@ -41,6 +41,7 @@ import type { MediaWindowVm } from "./gen/MediaWindowVm";
 import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
+import type { OldAgentRoomsVm } from "./gen/OldAgentRoomsVm";
 import type { PersonVm } from "./gen/PersonVm";
 import type { PushGatewayVm } from "./gen/PushGatewayVm";
 import type { PushOpenVm } from "./gen/PushOpenVm";
@@ -345,34 +346,21 @@ export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { AgentApprovalVm } from "./gen/AgentApprovalVm";
-export type { AgentAsksVm } from "./gen/AgentAsksVm";
-export type { AgentAskVm } from "./gen/AgentAskVm";
 export type { AgentAttachmentStateVm } from "./gen/AgentAttachmentStateVm";
 export type { AgentAttachmentVm } from "./gen/AgentAttachmentVm";
 export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
 export type { AgentChoiceVm } from "./gen/AgentChoiceVm";
 export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
-export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 export type { AgentDirectoryPersonVm } from "./gen/AgentDirectoryPersonVm";
-export type { AgentFocusReq } from "./gen/AgentFocusReq";
 export type { AgentInstancePresenceVm } from "./gen/AgentInstancePresenceVm";
 export type { AgentInstanceStateVm } from "./gen/AgentInstanceStateVm";
 export type { AgentInstancesDatabaseVm } from "./gen/AgentInstancesDatabaseVm";
 export type { AgentInstancesVm } from "./gen/AgentInstancesVm";
 export type { AgentInstanceVm } from "./gen/AgentInstanceVm";
 export type { AgentLiveTurnVm } from "./gen/AgentLiveTurnVm";
-export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
-export type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
-export type { AgentMcpListVm } from "./gen/AgentMcpListVm";
-export type { AgentMcpRowVm } from "./gen/AgentMcpRowVm";
-export type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
-export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
-export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
-export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
-export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
 export type { AgentMemberRoleVm } from "./gen/AgentMemberRoleVm";
 export type { AgentMemberVm } from "./gen/AgentMemberVm";
 export type { AgentMessageDetailsVm } from "./gen/AgentMessageDetailsVm";
@@ -381,16 +369,6 @@ export type { AgentModelBotVm } from "./gen/AgentModelBotVm";
 export type { AgentModelLineVm } from "./gen/AgentModelLineVm";
 export type { AgentModelReq } from "./gen/AgentModelReq";
 export type { AgentModelVm } from "./gen/AgentModelVm";
-export type { AgentPersonVm } from "./gen/AgentPersonVm";
-export type { AgentPinReq } from "./gen/AgentPinReq";
-export type { AgentPinState } from "./gen/AgentPinState";
-export type { AgentPinVm } from "./gen/AgentPinVm";
-export type { AgentRoomHeaderVm } from "./gen/AgentRoomHeaderVm";
-export type { AgentRoomKindVm } from "./gen/AgentRoomKindVm";
-export type { AgentRunVm } from "./gen/AgentRunVm";
-export type { AgentSandboxEnvVm } from "./gen/AgentSandboxEnvVm";
-export type { AgentSandboxReq } from "./gen/AgentSandboxReq";
-export type { AgentSandboxVm } from "./gen/AgentSandboxVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
 export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
 export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
@@ -406,24 +384,15 @@ export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
 export type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
 export type { AgentSessionToolVm } from "./gen/AgentSessionToolVm";
 export type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
-export type { AgentStatusVm } from "./gen/AgentStatusVm";
-export type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
 export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
 export type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
 export type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 export type { AgentWebSearchVm } from "./gen/AgentWebSearchVm";
-export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
-export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
-export type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
-export type { ApprovalPersonVm } from "./gen/ApprovalPersonVm";
 export type { ApprovalScope } from "./gen/ApprovalScope";
-export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
-export type { ApprovalVm } from "./gen/ApprovalVm";
 export type { ArtifactOfferVm } from "./gen/ArtifactOfferVm";
-export type { AskState } from "./gen/AskState";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
 export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
@@ -483,7 +452,6 @@ export type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
-export type { BriefVm } from "./gen/BriefVm";
 export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 export type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
@@ -496,7 +464,6 @@ export type { ChatInlinePreviewVm } from "./gen/ChatInlinePreviewVm";
 export type { ChatInlineRowVm } from "./gen/ChatInlineRowVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ChoiceVm } from "./gen/ChoiceVm";
-export type { ClaimsLease } from "./gen/ClaimsLease";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
@@ -512,8 +479,8 @@ export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
 export type { CredentialChoiceVm } from "./gen/CredentialChoiceVm";
 export type { DaemonPresence } from "./gen/DaemonPresence";
-export type { DeclassifyVm } from "./gen/DeclassifyVm";
 export type { DefaultAgentChoiceVm } from "./gen/DefaultAgentChoiceVm";
+export type { DefaultAgentVm } from "./gen/DefaultAgentVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DestinationVm } from "./gen/DestinationVm";
@@ -565,16 +532,8 @@ export type { ForgeReposVm } from "./gen/ForgeReposVm";
 export type { ForgeRepoVm } from "./gen/ForgeRepoVm";
 export type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 export type { ForgeStateVm } from "./gen/ForgeStateVm";
-export type { GateCardVm } from "./gen/GateCardVm";
-export type { GateHeaderVm } from "./gen/GateHeaderVm";
-export type { GateLineVm } from "./gen/GateLineVm";
-export type { GateReasonVm } from "./gen/GateReasonVm";
-export type { GateRoleVm } from "./gen/GateRoleVm";
-export type { GateRowVm } from "./gen/GateRowVm";
-export type { GateStepVm } from "./gen/GateStepVm";
 export type { GrantMode } from "./gen/GrantMode";
 export type { GrantScope } from "./gen/GrantScope";
-export type { HeardMarkVm } from "./gen/HeardMarkVm";
 export type { HeldFileVm } from "./gen/HeldFileVm";
 export type { HeldReplyVm } from "./gen/HeldReplyVm";
 export type { HeldRestoreVm } from "./gen/HeldRestoreVm";
@@ -596,15 +555,11 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { KnowledgeNoteVm } from "./gen/KnowledgeNoteVm";
 export type { LabelVm } from "./gen/LabelVm";
-export type { LaunchRoomVm } from "./gen/LaunchRoomVm";
-export type { LaunchView } from "./gen/LaunchView";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
-export type { LineSpan } from "./gen/LineSpan";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { LogUploadOutcomeVm } from "./gen/LogUploadOutcomeVm";
 export type { LogUploadVm } from "./gen/LogUploadVm";
-export type { MainDmAskVm } from "./gen/MainDmAskVm";
 export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
@@ -677,6 +632,7 @@ export type { NoteVaultVm } from "./gen/NoteVaultVm";
 export type { NoteWriteVm } from "./gen/NoteWriteVm";
 export type { NotificationPermission } from "./gen/NotificationPermission";
 export type { NotifyTarget } from "./gen/NotifyTarget";
+export type { OldAgentRoomsVm } from "./gen/OldAgentRoomsVm";
 export type { OrgAccountVm } from "./gen/OrgAccountVm";
 export type { OutboxVm } from "./gen/OutboxVm";
 export type { PacedWorkKind } from "./gen/PacedWorkKind";
@@ -704,7 +660,6 @@ export type { PromoteState } from "./gen/PromoteState";
 export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
-export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 export type { PushGatewayVm } from "./gen/PushGatewayVm";
 export type { PushOpenVm } from "./gen/PushOpenVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
@@ -744,8 +699,6 @@ export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
 export type { RunMode } from "./gen/RunMode";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
-export type { ScopeDriveVm } from "./gen/ScopeDriveVm";
-export type { ScopeOfferVm } from "./gen/ScopeOfferVm";
 export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
@@ -790,10 +743,6 @@ export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
-export type { SurfaceAnswerReq } from "./gen/SurfaceAnswerReq";
-export type { SurfaceOutcome } from "./gen/SurfaceOutcome";
-export type { SurfaceRequestVm } from "./gen/SurfaceRequestVm";
-export type { SurfaceTool } from "./gen/SurfaceTool";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
@@ -841,7 +790,6 @@ export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
 export type { TokenViaVm } from "./gen/TokenViaVm";
 export type { ToolName } from "./gen/ToolName";
-export type { TurnMarkVm } from "./gen/TurnMarkVm";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { UnifiedPushVm } from "./gen/UnifiedPushVm";
@@ -870,36 +818,16 @@ import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { AgentApprovalVm } from "./gen/AgentApprovalVm";
-import type { AgentAsksVm } from "./gen/AgentAsksVm";
 import type { AgentChoiceVm } from "./gen/AgentChoiceVm";
-import type { AgentConsoleReq } from "./gen/AgentConsoleReq";
-import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 import type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
-import type { AgentFocusReq } from "./gen/AgentFocusReq";
 import type { AgentInstancesVm } from "./gen/AgentInstancesVm";
-import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
-import type { AgentMcpListVm } from "./gen/AgentMcpListVm";
-import type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
-import type { AgentModelReq } from "./gen/AgentModelReq";
-import type { AgentPinReq } from "./gen/AgentPinReq";
-import type { AgentSandboxReq } from "./gen/AgentSandboxReq";
-import type { AgentSandboxVm } from "./gen/AgentSandboxVm";
-import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
-import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
-import type { AgentSeedReq } from "./gen/AgentSeedReq";
-import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 import type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 import type { AgentSessionRef } from "./gen/AgentSessionRef";
 import type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
 import type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
-import type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
 import type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
-import type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
-import type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
-import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
-import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
 import type { BbctlProgressVm } from "./gen/BbctlProgressVm";
@@ -936,7 +864,6 @@ import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 import type { ChatCommandPreviewVm } from "./gen/ChatCommandPreviewVm";
 import type { ChatInlinePreviewVm } from "./gen/ChatInlinePreviewVm";
 import type { ChoiceVm } from "./gen/ChoiceVm";
-import type { ClaimsLease } from "./gen/ClaimsLease";
 import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
@@ -1012,7 +939,6 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { PanelIntentVm } from "./gen/PanelIntentVm";
-import type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
 import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
@@ -1054,8 +980,6 @@ import type { SessionTaskMoveVm } from "./gen/SessionTaskMoveVm";
 import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
-import type { SurfaceAnswerReq } from "./gen/SurfaceAnswerReq";
-import type { SurfaceRequestVm } from "./gen/SurfaceRequestVm";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 import type { SyncFootprintVm } from "./gen/SyncFootprintVm";
@@ -1836,15 +1760,11 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
  * All channels arm their `onmessage` before `invoke` (the ordering is
  * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
  * command's params are `channel` (inbox), `archive`, `pins`, `favourites`,
- * `agents`, `spaces`, and `networks`. The `spaces` channel (Story 4.5) delivers
- * the aggregated Space list as a whole {@link SpacesSnapshot}; `networks` (Story
+ * `spaces`, and `networks`. The `spaces` channel (Story 4.5) delivers the
+ * aggregated Space list as a whole {@link SpacesSnapshot}; `networks` (Story
  * 4.6) delivers the distinct-Networks list as a whole {@link NetworksSnapshot}
- * (no diff protocol for either — the frontend replaces its list). `agents`
- * delivers the Agents window to `onAgents`: every agent session room, in
- * recency order, and only there, whatever Space or Network is selected — a
- * row's `agentRoom` says `proxy`, `session` or `unknown` (no status read
- * yet); an agents' control room is in no window (UX-DR132). Without
- * `onAgents` the Agents window's batches are dropped.
+ * (no diff protocol for either — the frontend replaces its list). The agents'
+ * old Matrix rooms are in no window (108.2, UX-DR-E108-2).
  */
 export async function subscribeInbox(
   onInbox: (batch: InboxBatch) => void,
@@ -1853,20 +1773,17 @@ export async function subscribeInbox(
   onFavourites: (batch: InboxBatch) => void,
   onSpaces: (snapshot: SpacesSnapshot) => void,
   onNetworks: (snapshot: NetworksSnapshot) => void,
-  onAgents?: (batch: InboxBatch) => void,
 ): Promise<number> {
   const channel = new Channel<InboxBatch>();
   const archive = new Channel<InboxBatch>();
   const pins = new Channel<InboxBatch>();
   const favourites = new Channel<InboxBatch>();
-  const agents = new Channel<InboxBatch>();
   const spaces = new Channel<SpacesSnapshot>();
   const networks = new Channel<NetworksSnapshot>();
   channel.onmessage = onInbox;
   archive.onmessage = onArchive;
   pins.onmessage = onPins;
   favourites.onmessage = onFavourites;
-  agents.onmessage = onAgents ?? (() => {});
   spaces.onmessage = onSpaces;
   networks.onmessage = onNetworks;
   return await invoke<number>("inbox_subscribe", {
@@ -1874,7 +1791,6 @@ export async function subscribeInbox(
     archive,
     pins,
     favourites,
-    agents,
     spaces,
     networks,
   });
@@ -8156,426 +8072,6 @@ export async function syncTaskSchedulePreview(expression: string): Promise<TaskS
 }
 
 // ---------------------------------------------------------------------------
-// Agents on this Mac (Story 90.6)
-//
-// Registered in the DESKTOP splice of the `invoke_handler` literal: a phone is
-// never an agents host. Settings renders the section only where
-// `CapabilitiesVm.botTools` is true, so nothing on a phone calls these.
-// ---------------------------------------------------------------------------
-
-/**
- * One row per agent of this person's folders flagged for agents: whether its
- * copy is signed in on this Mac, its drive's pin, and why it is not hosted
- * here when it is not. Empty where no flagged folder has an agent.
- *
- * Rejects with: `internal`.
- */
-export async function agentsCopies(): Promise<AgentCopyVm[]> {
-  return await invoke<AgentCopyVm[]>("agents_copies");
-}
-
-/**
- * Sign `agent` of the folder `profileId` in on this Mac. The first sign-in for
- * a drive pins `pin` — the owner, readers and local-only setting the person
- * was shown — and Rust refuses when `_drive.toml` says something else by now.
- * `pin` is `null` for a drive already pinned.
- *
- * Rejects with: `internal`, its message the sentence to show (a wrong password
- * included).
- */
-export async function agentsCopySignIn(
-  profileId: string,
-  agent: string,
-  password: string,
-  pin: AgentPinReq | null,
-): Promise<AgentCopyVm> {
-  return await invoke<AgentCopyVm>("agents_copy_sign_in", { profileId, agent, password, pin });
-}
-
-/**
- * *Review readers*: pin what `_drive.toml` says now for the folder
- * `profileId`, only when it is `pin` — what the person was shown. Nothing
- * re-pins without this call. Answers every row again.
- *
- * Rejects with: `internal`.
- */
-export async function agentsDriveRepin(
-  profileId: string,
-  pin: AgentPinReq,
-): Promise<AgentCopyVm[]> {
-  return await invoke<AgentCopyVm[]>("agents_drive_repin", { profileId, pin });
-}
-
-/**
- * *Set up agents* (story 91.5, UX-DR133): every synced folder that keeps agents
- * (`[folder.agents]`) with the drive id, owner and readers its form starts
- * from, the catalogue (Nixi, Dr Tola Grey, Dr Lucyna Novak), the signed-in
- * Matrix accounts, and the person's own bots. No bot is preselected (S-20).
- * A folder whose `problem` is set cannot be seeded from this Mac.
- *
- * Rejects with: `internal`.
- */
-export async function agentsSeedOffer(): Promise<AgentSeedOfferVm> {
-  return await invoke<AgentSeedOfferVm>("agents_seed_offer");
-}
-
-/**
- * The zone-relative files `req` would write and the ones it would leave (they
- * are there already; a seed never overwrites). Refused, with the sentence to
- * show, when `req.bot` is `null`, an id is not the catalogue's, the owner is
- * not a reader, or the owner and readers differ from this Mac's pin or from a
- * `_drive.toml` the seed would leave.
- *
- * Rejects with: `internal`, its message the sentence to show.
- */
-export async function agentsSeedPlan(req: AgentSeedReq): Promise<AgentSeedPlanVm> {
-  return await invoke<AgentSeedPlanVm>("agents_seed_plan", { req });
-}
-
-/**
- * Write `req`'s seed into the folder's agents zone, never over a file: what was
- * written, what was left, and the agents written — each signs in on its own
- * Settings › Agents row (`agentsCopySignIn`). Writes the zone only; signs
- * nothing in. Refused as `agentsSeedPlan` is.
- *
- * Rejects with: `internal`, its message the sentence to show.
- */
-export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResultVm> {
-  return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
-}
-
-/**
- * Settings › Agents: save one agent's bot and level (100.2 #4, R382). Rust
- * writes only `[model].bot` and `[model].effort` of its `agent.toml`, refuses a
- * file that changed since the row was read, and answers the rows as they read
- * now; a refusal rejects with its sentence.
- */
-export async function agentsModelSet(req: AgentModelReq): Promise<AgentCopyVm[]> {
-  return await invoke<AgentCopyVm[]>("agents_model_set", { req });
-}
-
-/**
- * Settings › Agents: save one agent's console (story 101.5, R420) — only
- * `[run].mode` and `[run].paths` of its `agent.toml`, written as the person
- * through the drive's write path. Resolves to the rows as they read now; a
- * refusal is Rust's sentence.
- */
-export async function agentsConsoleSet(req: AgentConsoleReq): Promise<AgentCopyVm[]> {
-  return await invoke<AgentCopyVm[]>("agents_console_set", { req });
-}
-
-/**
- * `/model` typed in the person's DM with an agent (story 100.5, DW-1431,
- * R415): `args` is what followed the name. Rust reads it against the agent's
- * `agent.toml` and saves through Settings › Agents' own write; the answer is
- * the sentence to show, a refusal rejects with its sentence.
- */
-export async function agentModelCommand(
-  accountId: string,
-  roomId: string,
-  args: string | null,
-): Promise<string> {
-  return await invoke<string>("agent_model_command", { accountId, roomId, args });
-}
-
-/**
- * Settings › Agents › *MCP servers* (story 96.2, UX-DR140): this Mac's own
- * servers as stored in `keeper.db`, whether each answers a running host built
- * on these very settings (`answer` is the sentence to show), and the tiers a
- * row may set as the cards name them; what each lists is its sheet's
- * (`agentsMcpDraft`). Never a token: `token`
- * only says the server is saved with one.
- *
- * Rejects with: `internal`.
- */
-export async function agentsMcpList(): Promise<AgentMcpListVm> {
-  return await invoke<AgentMcpListVm>("agents_mcp_list");
-}
-
-/**
- * What the sheet says for the server being edited, as a save of the draft
- * would be: a program's floor, a role's fixed table, every tool the saved
- * server listed while the draft still reaches it and every row, each with the
- * tier Rust gives it (a name that cannot travel redacted and bounded, with no
- * row key), and the rows a role does not take. Send it with `token: null`: the
- * draft's token is not read.
- *
- * Rejects with: `internal`, when this Mac's settings cannot be read.
- */
-export async function agentsMcpDraft(req: AgentMcpServerReq): Promise<AgentMcpDraftVm> {
-  return await invoke<AgentMcpDraftVm>("agents_mcp_draft", { req });
-}
-
-/**
- * Add or replace the server `req.name`, checked by the same `[[mcp]]` check
- * agentd's servers go through. `req.token` is write-only (`null` keeps the
- * saved one); `req.forgetToken` forgets it, whatever `req.token` says. Answers
- * the list again.
- *
- * Rejects with: `internal`, its message Rust's refusal to show verbatim.
- */
-export async function agentsMcpSave(req: AgentMcpServerReq): Promise<AgentMcpListVm> {
-  return await invoke<AgentMcpListVm>("agents_mcp_save", { req });
-}
-
-/**
- * Remove the server `name` and its token. Answers the list again.
- *
- * Rejects with: `internal`.
- */
-export async function agentsMcpRemove(name: string): Promise<AgentMcpListVm> {
-  return await invoke<AgentMcpListVm>("agents_mcp_remove", { name });
-}
-
-/**
- * This Mac's `[sandbox]` table (`read_exec`, `env`) and the line a probe of
- * that very table wrote (R213).
- *
- * Rejects with: `internal`.
- */
-export async function agentsSandboxGet(): Promise<AgentSandboxVm> {
-  return await invoke<AgentSandboxVm>("agents_sandbox_get");
-}
-
-/**
- * Replace this Mac's `[sandbox]` table, checked by the same `[sandbox]` check
- * agentd's goes through.
- *
- * Rejects with: `internal`, its message Rust's refusal to show verbatim.
- */
-export async function agentsSandboxSave(req: AgentSandboxReq): Promise<AgentSandboxVm> {
-  return await invoke<AgentSandboxVm>("agents_sandbox_save", { req });
-}
-
-/**
- * Settings › Agents: choose one agent's web search level (101.4 #3, R419,
- * R457). Rust writes only `[tools].allow` and `[web_search].ask` of its
- * `agent.toml`, refuses a file that changed since the row was read and any
- * level but off for a gate or a local-only agent, and answers the rows as they
- * read now; a refusal rejects with its sentence.
- */
-export async function agentsWebSearchSet(req: AgentWebSearchReq): Promise<AgentCopyVm[]> {
-  return await invoke<AgentCopyVm[]>("agents_web_search_set", { req });
-}
-
-/**
- * Settings › Agents › *Web search*: this Mac's engine (a SearXNG URL) as
- * stored in `keeper.db`, and why it is not used when it no longer checks.
- *
- * Rejects with: `internal`.
- */
-export async function agentsWebSearchGet(): Promise<AgentWebSearchUrlVm> {
-  return await invoke<AgentWebSearchUrlVm>("agents_web_search_get");
-}
-
-/**
- * Name this Mac's web search engine, checked by the same check agentd's
- * `[web_search] url` goes through; `""` names none. Answers it again.
- *
- * Rejects with: `internal`, its message Rust's refusal to show verbatim.
- */
-export async function agentsWebSearchSave(url: string): Promise<AgentWebSearchUrlVm> {
-  return await invoke<AgentWebSearchUrlVm>("agents_web_search_save", { url });
-}
-
-// ---------------------------------------------------------------------------
-// The proxy beside the notes view (story 91.2, UX-DR130)
-// ---------------------------------------------------------------------------
-
-/**
- * The person's proxy conversations on `accountId`: every agent session room
- * whose status says `main` (the DM, first — the dock's default) or
- * `conversation`, newest next. A room whose status is not read yet is not
- * listed. `allowed` is the drives the scope chip may offer (the home drive
- * first), `null` where the proxy's agents zone is not on this device (the
- * phone). Every target; never rejects (an account that is not live lists
- * nothing).
- */
-export async function agentRoomsList(accountId: string): Promise<ProxyRoomVm[]> {
-  return await invoke<ProxyRoomVm[]>("agent_rooms_list", { accountId });
-}
-
-/**
- * Ask the proxy in `roomId` for `drives` (ids) in scope. The proxy's host
- * keeps its home drive, refuses a drive outside its `[tools].drives` (named in
- * the room's status detail) and echoes the accepted scope, which the room's
- * header (`TimelineBatch.header.scope`) then shows — the chip reads the
- * header, not this call.
- *
- * Rejects with: `sendFailed` (no such room, or the send failed),
- * `unsupported` (the room is not one of the person's proxy conversations).
- */
-export async function agentScopeSet(
-  accountId: string,
-  roomId: string,
-  drives: string[],
-): Promise<void> {
-  await invoke<void>("agent_scope_set", { accountId, roomId, drives });
-}
-
-/**
- * The docked note changed (`focus`), or the dock closed (`null`). Call it on
- * every change of the active note, the caret's line or the buffer while the
- * dock is open, and again every `FOCUS_HEARTBEAT_MS` while it stays open:
- * Rust names the note's drive, path and heading once the change has been
- * still a second, sends it only when it changed (or the heartbeat is due),
- * and on close tells the proxy there is none. `seq` must grow with every
- * call, across reloads too: Rust drops a call older than one it has seen, so
- * a focus that arrives after the close it preceded is never sent.
- *
- * Rejects as `agentScopeSet`.
- */
-export async function agentFocus(
-  accountId: string,
-  roomId: string,
-  seq: number,
-  focus: AgentFocusReq | null,
-): Promise<void> {
-  await invoke<void>("agent_focus", { accountId, roomId, seq, focus });
-}
-
-/**
- * *New conversation*: ask the proxy, in its DM `roomId`, for a new
- * conversation titled `title` (blank: "conversation"). The proxy's host makes
- * the room and invites the person; it appears in `agentRoomsList` once its
- * status arrives. Resolves to the request's event id.
- *
- * Rejects as `agentScopeSet`; `unsupported` also when `roomId` is not the DM.
- */
-export async function agentConversationNew(
-  accountId: string,
-  roomId: string,
-  title: string | null,
-): Promise<string> {
-  return await invoke<string>("agent_conversation_new", { accountId, roomId, title });
-}
-
-/**
- * Open the person's `main` DM with `agent` on `accountId` (story 101.1, R416):
- * the room when it is here; otherwise Rust asks the agent's host for it through
- * the control room and answers once the room has landed, within 30 s. A
- * rejection's `message` is Rust's sentence for why it did not open.
- */
-export async function agentMainDmOpen(accountId: string, agent: string): Promise<LaunchRoomVm> {
-  return await invoke<LaunchRoomVm>("agent_main_dm_open", { accountId, agent });
-}
-
-/**
- * Follow the questions waiting for the person that are answered in `roomId`
- * (Story 101.3, R430, R431): Rust sends a snapshot now and another whenever an
- * agent's session room this account reads, or this room's held sends or send
- * queue, change — which asks wait, where each is answered, where its answer
- * stands and what keeper could not read are all Rust's. Choosing a choice is the
- * person's own message in the room ({@link sendText}), exactly what typing it
- * sends. Resolves with the subscription id.
- */
-export async function subscribeAgentAsks(
-  accountId: string,
-  roomId: string,
-  onBatch: (batch: AgentAsksVm) => void,
-): Promise<number> {
-  return await subscribe<AgentAsksVm>("agent_asks_subscribe", onBatch, { accountId, roomId });
-}
-
-/** End one {@link subscribeAgentAsks}. Idempotent. */
-export async function unsubscribeAgentAsks(accountId: string, id: number): Promise<void> {
-  await invoke<void>("agent_asks_unsubscribe", { accountId, subscriptionId: id });
-}
-
-/**
- * The person's decision on an approval card (93.3), sent from this device
- * into the session room `roomId`: `req.id` and `req.bindingDigest` are the
- * card's, `req.scope` one of its `scopes` (`once` with a deny). A decision in
- * the room is shown on the card (`decided`) but never closes it: the card
- * stays decidable until the agent uses an approval (`consumed`) or it
- * expires (`TimelineBatch.approvals`); whether a decision counts is the
- * agent's host's.
- *
- * Rejects with: `unsupported` and the card's own sentence where the card
- * shows no decide buttons (`cannotDecide`) or no longer matches the room, or
- * when approving an attached action (`attachment`) this app has not shown
- * through {@link agentApprovalPayload}; `sendFailed` (no such room, or the
- * send failed).
- */
-export async function agentApprovalDecide(
-  accountId: string,
-  roomId: string,
-  req: ApprovalDecideReq,
-): Promise<void> {
-  await invoke<void>("agent_approval_decide", { accountId, roomId, req });
-}
-
-/**
- * The attached action of the approval card `id` in the session room
- * `roomId` (a card whose `attachment` is set): as pretty-printed JSON
- * (`text`) and, for a `run`, the same typed run view an inline card draws
- * (`run`), its encrypted file fetched and checked against the card's
- * digest in Rust. Once shown, the action may be approved from this app.
- *
- * Rejects with `unsupported` and a sentence when the attachment is not the
- * action sent for approval, cannot be fetched now, or the card has none.
- */
-export async function agentApprovalPayload(
-  accountId: string,
-  roomId: string,
-  id: string,
-): Promise<ApprovalPayloadVm> {
-  return await invoke<ApprovalPayloadVm>("agent_approval_payload", { accountId, roomId, id });
-}
-
-/**
- * `accountId`'s own cross-signing master key, base64 in groups of four, for
- * the person to compare with `keeper-agentd status` before pinning it;
- * `null` while the account publishes no cross-signing identity.
- */
-export async function agentOwnFingerprint(accountId: string): Promise<string | null> {
-  return await invoke<string | null>("agent_own_fingerprint", { accountId });
-}
-
-/**
- * The surface requests this device executes (91.3, AD-383): every request an
- * agent's host sends to this device, from now on, with its `target` named by
- * Rust (a vault note, or a file for the Files preview). `range` counts the
- * editor buffer's lines (the body, without frontmatter), 1-based, inclusive.
- * A request whose note this device cannot name is answered `unavailable` by
- * Rust and never delivered. Answer each with {@link agentSurfaceResult}
- * before `expiresAtMs`.
- */
-export async function agentSurfaceSubscribe(
-  onRequest: (request: SurfaceRequestVm) => void,
-): Promise<void> {
-  const channel = new Channel<SurfaceRequestVm>();
-  channel.onmessage = onRequest;
-  await invoke<void>("agent_surface_subscribe", { channel });
-}
-
-/**
- * Answer the surface request `answer.requestId` that arrived in `roomId`:
- * `done` (with `applied` for a proposal), `declined`, or `unavailable` (the
- * buffer no longer holds `expected`, a range past the end). `detail` is a
- * short sentence, never note text.
- *
- * Rejects with: `unsupported` (no such request is waiting on this device —
- * answered already, or never handed on), `roomNotFound`.
- */
-export async function agentSurfaceResult(
-  accountId: string,
-  roomId: string,
-  answer: SurfaceAnswerReq,
-): Promise<void> {
-  await invoke<void>("agent_surface_result", { accountId, roomId, answer });
-}
-
-/**
- * The primary view keeper shows now (`notes`, `chats`, …): a lower-case view
- * id, published in this device's presence. Rejects with `unsupported` for
- * anything that is not a view id.
- */
-export async function agentPresenceView(view: string): Promise<void> {
-  await invoke<void>("agent_presence_view", { view });
-}
-
-// ---------------------------------------------------------------------------
 // Bots (Epic 61, Story 61.4)
 //
 // Every command in this block is registered in the SHARED half of the
@@ -9269,7 +8765,7 @@ export async function voiceWakeSet(
 
 /**
  * Choose where a spoken turn goes (Epic 67, AD-206; AD-384): a pinned bot's
- * id, a proxy conversation's `target` as {@link voiceAgentTargets} lists it,
+ * id, an agent's `target` as {@link voiceAgentTargets} lists it,
  * or `null` for "the pinned bot most recently talked to". Where a turn
  * actually goes is decided in `keeper_core::bots::voice_target` at send
  * time, never here; the fresh {@link VoiceWakeVm} says what was stored.
@@ -9281,33 +8777,35 @@ export async function voiceTargetSet(target: string | null): Promise<VoiceWakeVm
 }
 
 /**
- * The person's proxy conversations a spoken turn may go to (AD-384), on
- * every signed-in account, the DM first: what "Speak to" lists after the
- * pinned bots. Choose one with `voiceTargetSet(entry.target)`; once chosen,
- * `VoiceWakeVm.voiceTarget` equals that `target`. An empty list means the
- * person has no proxy conversation keeper can read yet.
+ * The agents a spoken turn may go to (AD-384, 108.2): every agent of every
+ * database this device holds — what "Speak to" lists after the pinned bots.
+ * Choose one with `voiceTargetSet(entry.target)`; once chosen,
+ * `VoiceWakeVm.voiceTarget` equals that `target`. An empty list means this
+ * device holds no agents' database yet.
  *
- * Never rejects.
+ * Rejects with: `internal` (the agents server is not started yet).
  */
 export async function voiceAgentTargets(): Promise<VoiceAgentTargetVm[]> {
   return await invoke<VoiceAgentTargetVm[]>("voice_agent_targets");
 }
 
 /**
- * The configured default agent and available choices for Settings › Agents
- * and the earlier Matrix agent room menu. Boot uses agentSessionDefault instead.
+ * The default agent and the agents one may choose, read from the agents'
+ * databases (108.2), for Settings › Agents and the launch's chooser. Boot
+ * opens it with agentSessionDefault.
  */
-export async function agentsDefaultGet(): Promise<AgentsLaunchVm> {
-  return await invoke<AgentsLaunchVm>("agents_default_get");
+export async function agentsDefaultGet(): Promise<DefaultAgentVm> {
+  return await invoke<DefaultAgentVm>("agents_default_get");
 }
 
 /**
- * Make `agent` (a Matrix user id) the default agent, or clear it with `null`.
- * Rejects with Rust's sentence when the value is not a user id or the setting
- * could not be written; resolves with the new answer.
+ * Make `agent` (an actor id, as {@link DefaultAgentVm.choices} names it) the
+ * default agent, or clear it with `null`. Rejects with Rust's sentence when
+ * the value is not an agent's id or the setting could not be written;
+ * resolves with the new answer.
  */
-export async function agentsDefaultSet(agent: string | null): Promise<AgentsLaunchVm> {
-  return await invoke<AgentsLaunchVm>("agents_default_set", { agent });
+export async function agentsDefaultSet(agent: string | null): Promise<DefaultAgentVm> {
+  return await invoke<DefaultAgentVm>("agents_default_set", { agent });
 }
 
 /**
@@ -9323,7 +8821,7 @@ export async function agentsDefaultChooserDismiss(): Promise<void> {
  * Said by Rust when the default agent as keeper reads it moved (story 102.7,
  * DW-1572, R488): a synced settings row, or the account's settings files
  * installed or cleared. Payload-free: read the default agent again. Mirrors
- * `AGENTS_DEFAULT_CHANGED_EVENT` in `agents_ipc.rs`.
+ * `AGENTS_DEFAULT_CHANGED_EVENT` in `hq_ipc.rs`.
  */
 export const AGENTS_DEFAULT_CHANGED_EVENT = "keeper://agents-default-changed";
 
@@ -9335,19 +8833,36 @@ export async function listenAgentsDefaultChanged(onChanged: () => void): Promise
 }
 
 /**
- * The lease this Mac takes a session's claim on while it hosts the person's
- * agents (R455): `short` unless the quarter-hour one was turned on.
+ * How many of the agents' old Matrix rooms the signed-in accounts are still
+ * in (108.2, UX-DR-E108-2). They are hidden from every list; Settings ›
+ * Agents offers {@link oldAgentRoomsLeave} while any is left. Never rejects
+ * for a room: an account that is not live counts none.
  */
-export async function agentsClaimsLeaseGet(): Promise<ClaimsLease> {
-  return await invoke<ClaimsLease>("agents_claims_lease_get");
+export async function oldAgentRoomsGet(): Promise<OldAgentRoomsVm> {
+  return await invoke<OldAgentRoomsVm>("old_agent_rooms_get");
 }
 
 /**
- * Store this Mac's claims lease; resolves with it as it now reads (a
- * settings file may still decide it), rejects with Rust's sentence.
+ * *Leave old agent rooms*: leave every one of them the signed-in accounts are
+ * in. Resolves with how many were left, how many remain and, when some could
+ * not be left, Rust's sentence saying so.
  */
-export async function agentsClaimsLeaseSet(lease: ClaimsLease): Promise<ClaimsLease> {
-  return await invoke<ClaimsLease>("agents_claims_lease_set", { lease });
+export async function oldAgentRoomsLeave(): Promise<OldAgentRoomsVm> {
+  return await invoke<OldAgentRoomsVm>("old_agent_rooms_leave");
+}
+
+/**
+ * The one-time notice *Speak to* shows after a choice naming one of the
+ * agents' old Matrix rooms was cleared at launch (108.2, UX-DR-E108-1);
+ * `null` once read, or when none was cleared.
+ */
+export async function voiceOldTargetNoticeGet(): Promise<string | null> {
+  return await invoke<string | null>("voice_old_target_notice_get");
+}
+
+/** The person read *Speak to*'s notice: Rust does not show it again. */
+export async function voiceOldTargetNoticeDismiss(): Promise<void> {
+  await invoke<null>("voice_old_target_notice_dismiss");
 }
 
 /**

@@ -60,8 +60,7 @@ vi.mock("@/lib/ipc/client", () => ({
     onFavourites: (b: InboxBatch) => void,
     onSpaces: (s: SpacesSnapshot) => void,
     onNetworks: (n: NetworksSnapshot) => void,
-    onAgents: (b: InboxBatch) => void,
-  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks, onAgents),
+  ) => subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks),
   unsubscribeInbox: (id: number) => unsubscribeInbox(id),
   setSpaceFilter: (accountId: string | null, spaceId: string | null) =>
     setSpaceFilter(accountId, spaceId),
@@ -249,7 +248,6 @@ describe("ChatListPane", () => {
     render(<ChatListPane />);
 
     expect(subscribeInbox).toHaveBeenCalledWith(
-      expect.any(Function),
       expect.any(Function),
       expect.any(Function),
       expect.any(Function),

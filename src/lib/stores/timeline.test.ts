@@ -1,11 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type {
-  AgentRoomHeaderVm,
-  ApprovalVm,
-  TimelineBatch,
-  TimelineItemVm,
-  TimelineOp,
-} from "@/lib/ipc/client";
+import type { TimelineBatch, TimelineItemVm, TimelineOp } from "@/lib/ipc/client";
 import { timelineStore } from "@/lib/stores/timeline";
 
 function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
@@ -23,8 +17,6 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     reactions: [],
     media: null,
     readers: [],
-    brief: null,
-    gate: null,
   };
 }
 
@@ -107,78 +99,5 @@ describe("timelineStore.applyBatch", () => {
     timelineStore.getState().applyBatch(batch([{ op: "reset", items: [message("a")] }]));
     timelineStore.getState().clear();
     expect(timelineStore.getState().items).toEqual([]);
-  });
-});
-
-describe("timelineStore header", () => {
-  const header = (caretKey: string | null): AgentRoomHeaderVm => ({
-    status: null,
-    scope: null,
-    label: null,
-    scopeUnreadable: null,
-    caretKey,
-    gate: null,
-  });
-
-  it("keeps the last header through batches that carry none, and replaces it when one does", () => {
-    timelineStore
-      .getState()
-      .applyBatch({ ops: [{ op: "reset", items: [message("a")] }], header: header("a") });
-    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
-    expect(timelineStore.getState().header).toEqual(header("a"));
-    // A header arriving alone is a batch with no ops.
-    timelineStore.getState().applyBatch({ ops: [], header: header(null) });
-    expect(timelineStore.getState().header).toEqual(header(null));
-    expect(keys()).toEqual(["a", "b"]);
-  });
-
-  it("clear drops the header with the room", () => {
-    timelineStore.getState().applyBatch({ ops: [], header: header("a") });
-    timelineStore.getState().clear();
-    expect(timelineStore.getState().header).toBeNull();
-  });
-});
-
-describe("timelineStore approvals", () => {
-  const approvals = (state: "pending" | "consumed"): ApprovalVm[] => [
-    {
-      id: "01A",
-      cards: [{ id: "01A", state: { state } } as ApprovalVm["cards"][number]],
-      gate: null,
-    },
-  ];
-
-  it("keeps the last cards through batches that carry none, and the room's clear drops them", () => {
-    timelineStore.getState().applyBatch({
-      ops: [{ op: "reset", items: [{ kind: "approval", key: "k", id: "01A" }] }],
-      approvals: approvals("pending"),
-    });
-    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
-    expect(timelineStore.getState().approvals).toEqual(approvals("pending"));
-    // A change beside the stream arrives as a batch with no ops.
-    timelineStore.getState().applyBatch({ ops: [], approvals: approvals("consumed") });
-    expect(timelineStore.getState().approvals).toEqual(approvals("consumed"));
-    expect(keys()).toEqual(["k", "b"]);
-    timelineStore.getState().clear();
-    expect(timelineStore.getState().approvals).toEqual([]);
-  });
-});
-
-describe("timelineStore heard marks (97.3, UX-DR143)", () => {
-  it("keeps the last marks through batches that carry none, an empty list clears them, and so does the room's clear", () => {
-    timelineStore.getState().applyBatch({
-      ops: [{ op: "reset", items: [message("answer")] }],
-      heard: [{ key: "answer", splitUtf16: 6 }],
-    });
-    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
-    expect(timelineStore.getState().heard).toEqual([{ key: "answer", splitUtf16: 6 }]);
-    // The answer grew past the mark: Rust sends the new list with no ops.
-    timelineStore.getState().applyBatch({ ops: [], heard: [{ key: "answer", splitUtf16: 12 }] });
-    expect(timelineStore.getState().heard).toEqual([{ key: "answer", splitUtf16: 12 }]);
-    timelineStore.getState().applyBatch({ ops: [], heard: [] });
-    expect(timelineStore.getState().heard).toEqual([]);
-    timelineStore.getState().applyBatch({ ops: [], heard: [{ key: "answer", splitUtf16: 6 }] });
-    timelineStore.getState().clear();
-    expect(timelineStore.getState().heard).toEqual([]);
   });
 });

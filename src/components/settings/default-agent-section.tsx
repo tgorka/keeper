@@ -1,16 +1,17 @@
 /**
  * Settings › Agents › Default agent (story 100.3, R383): the one agent keeper
- * opens at launch, chosen from the agents with a conversation here, or none.
+ * opens at launch, chosen from the agents of the agents' databases this device
+ * holds (108.2), or none.
  *
- * Every word but the copy is Rust's (`AgentsLaunchVm`): which agents may be
+ * Every word but the copy is Rust's (`DefaultAgentVm`): which agents may be
  * chosen, which one is stored, and — when the stored one does not open at
  * launch — why. A stored agent that is no longer among the choices stays
  * shown and selected beside that sentence, so the person sees what is set
  * and can change it. When a settings file decides the default, Rust's sentence
  * says so and names the file. A read or save that fails says so beside the
  * control — before the section would hide for having nothing to choose — and
- * reaches `keeper.log`. The choices are read again when the Agents window's
- * rooms change while Settings is open (R397).
+ * reaches `keeper.log`. The choices are read again when the agents the Agents
+ * window lists change while Settings is open (R397).
  *
  * On every tier: `agents.default` is a preference about the person, the phone
  * applies the same launch rule, and the key travels with the account's
@@ -21,15 +22,15 @@ import { useEffect, useId } from "react";
 import { FileControlled } from "@/components/settings/config-source-section";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { useAgentRoomsStore } from "@/lib/stores/agent-rooms";
+import { useAgentSessionsStore } from "@/lib/stores/agent-sessions";
 import { defaultAgentStore, useDefaultAgentStore } from "@/lib/stores/default-agent";
 
 export const DEFAULT_AGENT_TITLE = "Default agent";
 export const DEFAULT_AGENT_NOTE =
-  "When keeper starts and you have agent rooms, it opens Agents on this agent's conversation.";
+  "When keeper starts, it opens Agents on this agent's conversation.";
 export const DEFAULT_AGENT_NONE = "None";
 
-/** The radio value for "no default agent" (a user id never starts with a dash). */
+/** The radio value for "no default agent" (an agent's id never starts with a dash). */
 const NONE = "-";
 
 export function DefaultAgentSection({ open }: { open: boolean }) {
@@ -37,16 +38,18 @@ export function DefaultAgentSection({ open }: { open: boolean }) {
   const readError = useDefaultAgentStore((s) => s.readError);
   const saveError = useDefaultAgentStore((s) => s.saveError);
   const saving = useDefaultAgentStore((s) => s.saving);
-  const agentRooms = useAgentRoomsStore((s) => s.rooms.map((room) => room.roomId).join("\n"));
+  const agents = useAgentSessionsStore((s) =>
+    [...new Set(s.rows.map((row) => row.agentActor))].join("\n"),
+  );
   const id = useId();
   const error = readError ?? saveError;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the read is redone when the Agents window's rooms change while Settings is open, which is what `agentRooms` is for.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the read is redone when the Agents window's agents change while Settings is open, which is what `agents` is for.
   useEffect(() => {
     if (open) {
       void defaultAgentStore.getState().load();
     }
-  }, [open, agentRooms]);
+  }, [open, agents]);
 
   // Absent with nothing to choose, nothing chosen and no file deciding —
   // unless something failed, which is said here.

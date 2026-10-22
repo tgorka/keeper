@@ -47,7 +47,6 @@ import {
   unsubscribeInbox,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { chatListFocusStore, useChatListFocusNonce } from "@/lib/stores/chat-list-focus";
 import { columnFoldStore } from "@/lib/stores/column-fold";
@@ -181,7 +180,6 @@ function MatrixChatListPane() {
     // in cleanup instead would race the next mount.
     roomsStore.getState().clear();
     archiveRoomsStore.getState().clear();
-    agentRoomsStore.getState().clear();
     pinsRoomsStore.getState().clear();
     favoritesRoomsStore.getState().clear();
     // The Space list is replaced wholesale by each snapshot, so reset only the
@@ -224,12 +222,6 @@ function MatrixChatListPane() {
         favoritesRoomsStore.getState().applyBatch(b);
       }
     };
-    // Keep the transitional Matrix history mirror for existing room surfaces.
-    const onAgents = (b: InboxBatch) => {
-      if (!cancelled) {
-        agentRoomsStore.getState().applyBatch(b);
-      }
-    };
     const onSpaces = (snapshot: SpacesSnapshot) => {
       if (!cancelled) {
         spacesStore.getState().applySnapshot(snapshot);
@@ -263,7 +255,7 @@ function MatrixChatListPane() {
         }
       }
     };
-    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks, onAgents)
+    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.

@@ -16,11 +16,12 @@
  *    "Butler · first word ~25 s" from `voice_target_speeds`'s median, a bot
  *    with no median reads its name alone, and a failed read leaves the
  *    names.
- * 6. **The assistant's conversations** (AD-384) — listed after the bots, the
- *    DM first, one group per account when more than one has any and no group
- *    with none; choosing one stores its `agent:<room id>`, a stored one reads
- *    back as chosen, and one not listed yet stays chosen until the rooms
- *    arrive, never rewritten.
+ * 6. **The person's agents** (AD-384, 108.2) — listed after the bots in Rust's
+ *    order, one group and no group with none; choosing one stores its
+ *    `agent:<agent>`, a stored one reads back as chosen, and one not listed
+ *    yet stays chosen until the agents arrive, never rewritten.
+ * 7. **The old choice's notice** (UX-DR-E108-1) — Rust's one-time sentence
+ *    about a cleared choice of an old agent room is shown until dismissed.
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,24 +29,20 @@ import {
   BotVoiceTarget,
   VOICE_TARGET_AGENT_GROUP,
   VOICE_TARGET_LABEL,
+  VOICE_TARGET_NOTICE_DISMISS,
   VOICE_TARGET_RECENT_LABEL,
   VOICE_TARGET_UNLISTED_LABEL,
   voiceTargetOptionLabel,
 } from "@/components/bots/bot-voice-target";
-import type {
-  AccountVm,
-  BotVm,
-  VoiceAgentTargetVm,
-  VoiceTargetSpeedVm,
-  VoiceWakeVm,
-} from "@/lib/ipc/client";
-import { accountsStore } from "@/lib/stores/accounts";
+import type { BotVm, VoiceAgentTargetVm, VoiceTargetSpeedVm, VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceStore } from "@/lib/stores/voice";
 
 const botsBotsList = vi.fn<() => Promise<BotVm[]>>();
 const voiceTargetSet = vi.fn<(target: string | null) => Promise<VoiceWakeVm>>();
 const voiceTargetSpeeds = vi.fn<() => Promise<VoiceTargetSpeedVm[]>>();
 const voiceAgentTargets = vi.fn<() => Promise<VoiceAgentTargetVm[]>>();
+const voiceOldTargetNoticeGet = vi.fn<() => Promise<string | null>>();
+const voiceOldTargetNoticeDismiss = vi.fn<() => Promise<void>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
@@ -54,6 +51,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceTargetSet: (target: string | null) => voiceTargetSet(target),
     voiceTargetSpeeds: () => voiceTargetSpeeds(),
     voiceAgentTargets: () => voiceAgentTargets(),
+    voiceOldTargetNoticeGet: () => voiceOldTargetNoticeGet(),
+    voiceOldTargetNoticeDismiss: () => voiceOldTargetNoticeDismiss(),
   };
 });
 
@@ -84,27 +83,12 @@ function bot(id: string, name: string): BotVm {
 
 const BOTS = [bot("a", "Archivist"), bot("b", "Butler")];
 
-function account(accountId: string, userId: string): AccountVm {
-  return {
-    accountId,
-    userId,
-    homeserverUrl: "https://example.org",
-    hueIndex: 0,
-    provider: "password",
-  };
+function agent(actor: string, name: string): VoiceAgentTargetVm {
+  return { target: `agent:${actor}`, agent: actor, name };
 }
 
-function room(
-  accountId: string,
-  roomId: string,
-  name: string,
-  kind: "main" | "conversation",
-): VoiceAgentTargetVm {
-  return { target: `agent:${roomId}`, accountId, roomId, name, kind };
-}
-
-const DM = room("acc-1", "!dm:example.org", "Nixi", "main");
-const READING = room("acc-1", "!reading:example.org", "Nixi — reading list", "conversation");
+const NIXIE = agent("nixie", "Nixie");
+const TOLA = agent("tola-grey", "Dr Tola Grey");
 
 /** Every option's words, in the order the select offers them. */
 function optionTexts(): (string | null)[] {
@@ -119,9 +103,12 @@ beforeEach(() => {
   botsBotsList.mockResolvedValue(BOTS);
   voiceTargetSpeeds.mockResolvedValue([]);
   voiceAgentTargets.mockResolvedValue([]);
+  voiceOldTargetNoticeGet.mockReset();
+  voiceOldTargetNoticeGet.mockResolvedValue(null);
+  voiceOldTargetNoticeDismiss.mockReset();
+  voiceOldTargetNoticeDismiss.mockResolvedValue(undefined);
   voiceTargetSet.mockImplementation((target) => Promise.resolve({ ...WAKE, voiceTarget: target }));
   voiceStore.setState({ state: null, unavailable: null, wake: WAKE });
-  accountsStore.setState({ accounts: [account("acc-1", "@tg:example.org")] });
 });
 
 afterEach(() => {
@@ -226,111 +213,93 @@ describe("BotVoiceTarget", () => {
     expect(voiceTargetOptionLabel("ollama", 240)).toBe("ollama · first word ~1 s");
     expect(voiceTargetOptionLabel("new", null)).toBe("new");
   });
-  it("lists the assistant's conversations after the bots, the DM first, in one group", async () => {
-    voiceAgentTargets.mockResolvedValue([DM, READING]);
+  it("lists the person's agents after the bots, in Rust's order, in one group", async () => {
+    voiceAgentTargets.mockResolvedValue([NIXIE, TOLA]);
     render(<BotVoiceTarget />);
-    await screen.findByRole("option", { name: "Nixi — reading list" });
+    await screen.findByRole("option", { name: "Dr Tola Grey" });
     expect(optionTexts()).toEqual([
       VOICE_TARGET_RECENT_LABEL,
       "Archivist",
       "Butler",
-      "Nixi",
-      "Nixi — reading list",
+      "Nixie",
+      "Dr Tola Grey",
     ]);
     const group = screen.getByRole("group", { name: VOICE_TARGET_AGENT_GROUP });
     expect(
       within(group)
         .getAllByRole("option")
         .map((option) => option.textContent),
-    ).toEqual(["Nixi", "Nixi — reading list"]);
+    ).toEqual(["Nixie", "Dr Tola Grey"]);
   });
 
-  it("groups the conversations by account when two accounts have an assistant", async () => {
-    accountsStore.setState({
-      accounts: [account("acc-1", "@tg:example.org"), account("acc-2", "@tg:work.org")],
-    });
-    const workDm = room("acc-2", "!work-dm:work.org", "Nixi", "main");
-    voiceAgentTargets.mockResolvedValue([DM, READING, workDm]);
-    render(<BotVoiceTarget />);
-    const work = await screen.findByRole("group", {
-      name: `${VOICE_TARGET_AGENT_GROUP} · @tg:work.org`,
-    });
-    expect(
-      within(work)
-        .getAllByRole<HTMLOptionElement>("option")
-        .map((option) => option.value),
-    ).toEqual([workDm.target]);
-    const home = screen.getByRole("group", {
-      name: `${VOICE_TARGET_AGENT_GROUP} · @tg:example.org`,
-    });
-    expect(
-      within(home)
-        .getAllByRole<HTMLOptionElement>("option")
-        .map((option) => option.value),
-    ).toEqual([DM.target, READING.target]);
-  });
-
-  it("stores a chosen conversation as agent:<room id> and shows it chosen", async () => {
-    voiceAgentTargets.mockResolvedValue([DM, READING]);
+  it("stores a chosen agent as agent:<agent> and shows it chosen", async () => {
+    voiceAgentTargets.mockResolvedValue([NIXIE, TOLA]);
     render(<BotVoiceTarget />);
     const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
-    await screen.findByRole("option", { name: "Nixi — reading list" });
-    fireEvent.change(control, { target: { value: READING.target } });
-    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("agent:!reading:example.org"));
-    await waitFor(() => expect(control).toHaveValue(READING.target));
-    expect(voiceStore.getState().wake?.voiceTarget).toBe(READING.target);
+    await screen.findByRole("option", { name: "Dr Tola Grey" });
+    fireEvent.change(control, { target: { value: TOLA.target } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("agent:tola-grey"));
+    await waitFor(() => expect(control).toHaveValue(TOLA.target));
+    expect(voiceStore.getState().wake?.voiceTarget).toBe(TOLA.target);
   });
 
-  it("still stores a bot by its id beside the conversations", async () => {
-    voiceAgentTargets.mockResolvedValue([DM]);
+  it("still stores a bot by its id beside the agents", async () => {
+    voiceAgentTargets.mockResolvedValue([NIXIE]);
     render(<BotVoiceTarget />);
     const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
-    await screen.findByRole("option", { name: "Nixi" });
+    await screen.findByRole("option", { name: "Nixie" });
     fireEvent.change(control, { target: { value: "a" } });
     await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("a"));
     await waitFor(() => expect(control).toHaveValue("a"));
   });
 
-  it("reads a stored conversation back as that row chosen", async () => {
-    voiceStore.setState({ wake: { ...WAKE, voiceTarget: DM.target } });
-    voiceAgentTargets.mockResolvedValue([DM, READING]);
+  it("reads a stored agent back as that row chosen", async () => {
+    voiceStore.setState({ wake: { ...WAKE, voiceTarget: NIXIE.target } });
+    voiceAgentTargets.mockResolvedValue([NIXIE, TOLA]);
     render(<BotVoiceTarget />);
-    await screen.findByRole("option", { name: "Nixi — reading list" });
-    expect(screen.getByRole("combobox", { name: VOICE_TARGET_LABEL })).toHaveValue(DM.target);
-    expect(screen.getByRole("option", { name: "Nixi" })).toHaveProperty("selected", true);
+    await screen.findByRole("option", { name: "Dr Tola Grey" });
+    expect(screen.getByRole("combobox", { name: VOICE_TARGET_LABEL })).toHaveValue(NIXIE.target);
+    expect(screen.getByRole("option", { name: "Nixie" })).toHaveProperty("selected", true);
     expect(screen.queryByRole("option", { name: VOICE_TARGET_UNLISTED_LABEL })).toBeNull();
   });
 
-  it("keeps a stored conversation chosen until the rooms arrive late, never rewriting it", async () => {
+  it("keeps a stored agent chosen until the agents arrive late, never rewriting it", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    voiceStore.setState({ wake: { ...WAKE, voiceTarget: READING.target } });
-    // No pinned bot either: the stored conversation alone keeps the control.
+    voiceStore.setState({ wake: { ...WAKE, voiceTarget: TOLA.target } });
+    // No pinned bot either: the stored agent alone keeps the control.
     botsBotsList.mockResolvedValue([]);
     render(<BotVoiceTarget />);
     const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
-    expect(control).toHaveValue(READING.target);
+    expect(control).toHaveValue(TOLA.target);
     expect(screen.getByRole("option", { name: VOICE_TARGET_UNLISTED_LABEL })).toHaveProperty(
       "selected",
       true,
     );
 
-    voiceAgentTargets.mockResolvedValue([DM, READING]);
+    voiceAgentTargets.mockResolvedValue([NIXIE, TOLA]);
     await act(() => vi.advanceTimersByTimeAsync(5_000));
-    await screen.findByRole("option", { name: "Nixi — reading list" });
-    expect(control).toHaveValue(READING.target);
-    expect(screen.getByRole("option", { name: "Nixi — reading list" })).toHaveProperty(
-      "selected",
-      true,
-    );
+    await screen.findByRole("option", { name: "Dr Tola Grey" });
+    expect(control).toHaveValue(TOLA.target);
+    expect(screen.getByRole("option", { name: "Dr Tola Grey" })).toHaveProperty("selected", true);
     expect(screen.queryByRole("option", { name: VOICE_TARGET_UNLISTED_LABEL })).toBeNull();
     expect(voiceTargetSet).not.toHaveBeenCalled();
   });
 
-  it("offers the bots alone, with no empty group, when the assistant has no conversation", async () => {
+  it("offers the bots alone, with no empty group, when this device holds no agent", async () => {
     render(<BotVoiceTarget />);
     await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
     await waitFor(() => expect(voiceAgentTargets).toHaveBeenCalled());
     expect(optionTexts()).toEqual([VOICE_TARGET_RECENT_LABEL, "Archivist", "Butler"]);
     expect(screen.queryByRole("group")).toBeNull();
+  });
+
+  it("says once that an old room choice was cleared, until it is dismissed", async () => {
+    const said = "Speak to named a conversation of your assistant on Matrix.";
+    voiceOldTargetNoticeGet.mockResolvedValue(said);
+    render(<BotVoiceTarget />);
+    expect(await screen.findByRole("status")).toHaveTextContent(said);
+    fireEvent.click(screen.getByRole("button", { name: VOICE_TARGET_NOTICE_DISMISS }));
+    await waitFor(() => expect(voiceOldTargetNoticeDismiss).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(said)).toBeNull();
   });
 });

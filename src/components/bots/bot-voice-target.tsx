@@ -4,24 +4,26 @@
  * A turn the phrase started finishes in Rust with the screen locked
  * (AD-205), so where it goes cannot be read off the screen — there is
  * none — and is never guessed. It is chosen here: a select of the pinned
- * bots, then the person's own assistant's conversations (its DM first, then
- * each conversation, grouped by account when more than one has any), whose
- * unset state is "the pinned bot most recently talked to", the rule
- * `keeper_core::bots::voice_target::resolve` applies when nothing is chosen.
- * The choice is `bots.voice_target` — a bot id, or a conversation's
- * `agent:<room id>` — written through `voice_target_set` and read back as
+ * bots, then the person's agents — every agent of every agents' database
+ * this device holds (108.2) — whose unset state is "the pinned bot most
+ * recently talked to", the rule `keeper_core::bots::voice_target::resolve`
+ * applies when nothing is chosen. The choice is `bots.voice_target` — a bot
+ * id, or an agent's `agent:<agent>` — written through `voice_target_set` and
+ * read back as
  * `VoiceWakeVm.voiceTarget`, so the desktop's Settings, the desktop pane's
  * voice fold and the phone's Bots sheet — every place {@link BotVoiceWake}
  * renders — show one answer.
  *
  * The bots are read once on mount (`bots_bots_list`), the same read the
  * picker makes, because this control also lives in Settings, where the Bots
- * store may not have been filled. The conversations (`voice_agent_targets`)
- * are read on mount and on focus, and again after a growing pause while none
- * is listed or the chosen one is not: keeper may not have read the
- * assistant's rooms yet. A chosen conversation not (yet) listed still shows
- * as chosen, and is never rewritten here — if it really is gone, Rust
- * refuses the turn with a sentence naming this control. With nothing to
+ * store may not have been filled. The agents (`voice_agent_targets`) are
+ * read on mount and on focus, and again after a growing pause while none is
+ * listed or the chosen one is not: keeper may not have opened the agents'
+ * databases yet. A chosen agent not (yet) listed still shows as chosen, and
+ * is never rewritten here — if it really is gone, Rust refuses the turn with
+ * a sentence naming this control. A choice that named one of the agents' old
+ * Matrix rooms was cleared at launch, and Rust's one-time notice says so
+ * here until it is dismissed (UX-DR-E108-1). With nothing to
  * choose the control is absent (AD-27): the turn's own refusal — "choose a
  * bot to talk to under Bots" — is the sentence that says what to do, and a
  * select with one dead option would say it worse.
@@ -41,10 +43,11 @@ import type { BotVm, VoiceAgentTargetVm, VoiceTargetSpeedVm } from "@/lib/ipc/cl
 import {
   botsBotsList,
   voiceAgentTargets,
+  voiceOldTargetNoticeDismiss,
+  voiceOldTargetNoticeGet,
   voiceTargetSet,
   voiceTargetSpeeds,
 } from "@/lib/ipc/client";
-import { useAccountsStore } from "@/lib/stores/accounts";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { useVoiceStore, voiceStore } from "@/lib/stores/voice";
 
@@ -55,15 +58,17 @@ export const VOICE_TARGET_RECENT_LABEL = "Most recently talked to";
 /** What the choice is for. */
 export const VOICE_TARGET_NOTE =
   "Where a spoken question goes, whatever is open on the screen. A bot never talked to gets a new conversation.";
-/** The group of the assistant's conversations; the account follows with more than one. */
-export const VOICE_TARGET_AGENT_GROUP = "Your assistant";
-/** A chosen conversation of the assistant's that keeper has not listed (yet). */
-export const VOICE_TARGET_UNLISTED_LABEL = "Your assistant (not listed yet)";
+/** The group of the person's agents. */
+export const VOICE_TARGET_AGENT_GROUP = "Your agents";
+/** A chosen agent keeper has not listed (yet). */
+export const VOICE_TARGET_UNLISTED_LABEL = "An agent (not listed yet)";
+/** Puts Rust's one-time notice about a cleared old choice away. */
+export const VOICE_TARGET_NOTICE_DISMISS = "Dismiss";
 /** When the choice could not be written. */
 const VOICE_TARGET_WRITE_FAILED = "Could not save who to speak to.";
-/** What a stored choice of one of the assistant's conversations starts with (Rust's `AGENT_TARGET_PREFIX`). */
+/** What a stored choice of one of the person's agents starts with (Rust's `AGENT_TARGET_PREFIX`). */
 const AGENT_TARGET_PREFIX = "agent:";
-/** The first pause before looking for the conversations again, doubled up to the most. */
+/** The first pause before looking for the agents again, doubled up to the most. */
 const RELIST_FIRST_MS = 5_000;
 const RELIST_MOST_MS = 60_000;
 
@@ -88,12 +93,12 @@ export function voiceTargetOptionLabel(name: string, firstTokenMedianMs: number 
  */
 export function BotVoiceTarget({ className }: { className?: string } = {}) {
   const wake = useVoiceStore((s) => s.wake);
-  const accounts = useAccountsStore((s) => s.accounts);
   const selectId = useId();
   const [bots, setBots] = useState<BotVm[] | null>(null);
   const [agents, setAgents] = useState<VoiceAgentTargetVm[]>([]);
   const [speeds, setSpeeds] = useState<VoiceTargetSpeedVm[]>([]);
   const [refusal, setRefusal] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const alive = useRef(true);
   const generation = useRef(0);
@@ -128,6 +133,14 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           setBots([]);
         }
       });
+    void voiceOldTargetNoticeGet()
+      .then((read) => {
+        if (alive.current) {
+          setNotice(read);
+        }
+      })
+      // No notice to show: the choice reads as unset all the same.
+      .catch(logFailure("voice.oldTargetNotice"));
     void voiceTargetSpeeds()
       .then((read) => {
         if (alive.current) {
@@ -161,30 +174,28 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
     return () => clearTimeout(timer);
   }, [waiting, relist]);
 
-  if (wake === null || bots === null || (bots.length === 0 && agents.length === 0 && !unlisted)) {
+  if (
+    wake === null ||
+    bots === null ||
+    (bots.length === 0 && agents.length === 0 && !unlisted && notice === null)
+  ) {
     return null;
   }
 
   // A choice naming a bot that is no longer pinned reads as unset here, the
   // way Rust treats it at send time — so the select never shows a value its
-  // options do not have. One of the assistant's conversations shows as
-  // chosen listed or not: Rust either finds it or says so.
+  // options do not have. One of the person's agents shows as chosen listed
+  // or not: Rust either finds it or says so.
   const chosen =
     stored !== null &&
     (stored.startsWith(AGENT_TARGET_PREFIX) || bots.some((bot) => bot.id === stored))
       ? stored
       : null;
 
-  // The conversations account by account, each in Rust's order (the DM first).
-  const groups: { accountId: string; rows: VoiceAgentTargetVm[] }[] = [];
-  for (const agent of agents) {
-    const group = groups.find((g) => g.accountId === agent.accountId);
-    if (group) {
-      group.rows.push(agent);
-    } else {
-      groups.push({ accountId: agent.accountId, rows: [agent] });
-    }
-  }
+  const dismissNotice = () => {
+    setNotice(null);
+    void voiceOldTargetNoticeDismiss().catch(logFailure("voice.oldTargetNoticeDismiss"));
+  };
 
   const choose = (target: string | null) => {
     setBusy(true);
@@ -213,7 +224,7 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           value={chosen ?? ""}
           disabled={busy}
           onChange={(event) => choose(event.target.value === "" ? null : event.target.value)}
-          // A conversation made since the list was read is offered here.
+          // An agent added since the list was read is offered here.
           onFocus={relist}
           className="h-9 max-w-64 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -226,23 +237,15 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
               )}
             </option>
           ))}
-          {groups.map((group) => (
-            <optgroup
-              key={group.accountId}
-              // Two accounts' assistants may share a name; the account tells them apart.
-              label={
-                groups.length > 1
-                  ? `${VOICE_TARGET_AGENT_GROUP} · ${accounts.find((a) => a.accountId === group.accountId)?.userId ?? group.accountId}`
-                  : VOICE_TARGET_AGENT_GROUP
-              }
-            >
-              {group.rows.map((agent) => (
+          {agents.length > 0 && (
+            <optgroup label={VOICE_TARGET_AGENT_GROUP}>
+              {agents.map((agent) => (
                 <option key={agent.target} value={agent.target}>
                   {agent.name}
                 </option>
               ))}
             </optgroup>
-          ))}
+          )}
           {unlisted && stored !== null && (
             <optgroup label={VOICE_TARGET_AGENT_GROUP}>
               <option value={stored}>{VOICE_TARGET_UNLISTED_LABEL}</option>
@@ -253,6 +256,18 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}
+        </p>
+      )}
+      {notice !== null && (
+        <p role="status" className="flex items-start gap-2 text-xs">
+          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{notice}</span>
+          <button
+            type="button"
+            onClick={dismissNotice}
+            className="shrink-0 text-muted-foreground underline underline-offset-2 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {VOICE_TARGET_NOTICE_DISMISS}
+          </button>
         </p>
       )}
       <p className="text-muted-foreground text-xs">{VOICE_TARGET_NOTE}</p>
