@@ -397,43 +397,75 @@ device's token, the pairing of the server whose replica of that database this de
 
 | item | shows |
 |---|---|
-| a pending approval you may decide, below T4, whose summary fits (one line, at most 120 characters, no control or direction character) | *nixie asks for a decision*, the tier's words, the summary; **Approve once** and **Deny** |
-| the same at T4, longer, or of a tier keeper cannot read | the tier and *open keeper to read the whole request*; **Deny** only |
+| a pending approval you may decide, below T4, whose whole request fits — the tool call the server read with it, its tool and exact arguments on one line of at most 120 characters, no control or direction character in any of them; not a Paseo start or steer; not a `run` asking for the network | *nixie asks: \<keeper's summary\>*, the tier's words, the request (`run {"argv":["git","status"]}`); **Approve once** and **Deny** |
+| the same at T4, longer, of a tier keeper cannot read, or a request keeper cannot show whole (no tool call from the server, arguments it cannot read, a Paseo prompt, a networked run) | the tier and *open keeper to read the whole request*; **Deny** only |
 | an approval not yours, already decided or expired | keeper's words, no action |
 | your proxy's answer | the agent and its words |
 | an ask, a person's message, your own | nothing |
 
-The item the server pushes is the approval row alone, without its tool call, so "the whole
-request" the lock screen can show is the row's `summary` — keeper's own sentence for the
-call, which the runtime writes. Anything that cannot be read — no pairing, the server or the
-tailnet unreachable (DW-E106-5), a refusal (`401`, `403`, `404`), an answer about another
-item — is the generic notification with no actions. The same item may arrive twice; it shows
-once: the iPhone's extension removes an earlier notification of that item, Android tags the
-notification with it.
+The item read returns the approval row and, beside it, the tool call it runs (`tool_call`,
+the call's `tool_calls` row, read only when it is that approval's own call in that session);
+nothing of either reaches the gateway. keeper's summary is a sentence about the call
+(*Run \`git\` in workspace/keeper* names the program, not its arguments), so it goes in the
+title and never decides whether **Approve once** is offered: only the whole request does
+(R1066K-01, `hq::push::fits`, the same rules as a Matrix agent room's notification). Anything
+that cannot be read — no pairing, the server or the tailnet unreachable (DW-E106-5), a refusal
+(`401`, `403`, `404`), an answer about another item — is the generic notification with no
+actions.
+
+**The same item may arrive twice; it shows once.** Android tags the notification with the
+item. On the iPhone the identity is a key on the notification, `keeper_hq_key` =
+`<database>/<kind>/<item id>` (`hq::push::KEY_INFO`), not the notification's identifier: iOS
+names a remote notification itself, the person's gateway sends no APNs collapse id (Sygnal has
+none), and re-posting the notification locally would need the remote one to show nothing,
+which needs the filtering entitlement (DW-408). So the extension asks Rust for the item's key
+before it reads anything (`keeper_nse::answer_key`), and every notification of the item
+carries it — composed, generic, and the fallback iOS shows when the extension runs out of
+time — the generic one carrying nothing else of keeper's. Every answer then names the
+notifications with the same key to remove first (`hq::push::Fold`): those on the lock screen
+and those the extension process handed iOS earlier that are not there yet, which it waits up
+to two seconds for. A re-posted *Open keeper to finish deciding.* keeps the key too.
 
 **An action** writes the decision row through the session's own replica, exactly as the card
 does (`Hq::decide_pushed`, `hq::approvals::decide_pushed`): the request and digest the
 notification showed, only an action its category offered, never *Approve once* on a request
 the replica holds at T4 (the server's whole-commit validator refuses a T4 decision from the
 claim holder's host in any case, AD-428). On the iPhone an action that launches keeper in the
-background starts the agents client alone and waits up to twenty seconds for the request to
-reach its replica and for the server to take the decision; otherwise the notification is
-replaced by *Open keeper to finish deciding.* with the reason. **A tap** opens the item's
-session in the Agents window (`use-push-open.ts`, `PushOpenVm::Session`).
+background installs the settings layers first — the same files and account layers setup
+installs, so the server is the one the effective `agents.server_url` names, never a stored
+address a file shadows (R1066K-03) — then starts the agents client alone, no Matrix account
+and no drive sync, and waits up to twenty seconds for the request to reach its replica and
+for the server to take the decision; otherwise the notification is replaced by *Open keeper
+to finish deciding.* with the reason. **A tap** opens the item's session in the Agents window
+(`use-push-open.ts`, `PushOpenVm::Session`).
 
-**Proved on Linux:** the table, the fit, the ids grammar, folding a second delivery, the
-actions and the tap (`keeper-core/src/hq/push.rs` tests); the push target sent once per wish,
-cleared with the gateway, retried at the next discovery and never from a removed device
-(`hq/tests.rs`); the decision row written after the request arrives, T4 refused, a missing
-request refused at the deadline (`hq/window_tests.rs`); the extension's read over a real HTTP
-listener answering recorded item JSON — one `GET` with the bearer token, the generic
-notification for every refusal and an unreachable server (`keeper-nse` tests); Android's one
-notification per item (`keeper-core/tests/unifiedpush_android.rs`); the webview's landing
-(`src/hooks/use-push-open.test.ts`). **Inspection only:** `push_ios.rs`, `push_android.rs`,
-`hq_ipc.rs`, `NotificationService.swift` (CI's macOS and iOS jobs compile the Rust; the Swift
-is compiled only by the device build). **Owed on devices:** kalypso (the token reaching the
-server, the notification through Sygnal, the actions with Face ID, the tap, the generic
-notification with the tailnet off) and the Android tablet through ntfy.
+**The Android tablet gets the agents server's push while keeper is running.** After Android
+has stopped keeper's process it does nothing with it: the distributor's message posts the
+generic notification, and an action on a notification posted earlier cannot decide. That is
+deferred by the owner (R-HQ-58, DW-E106-15: the cold-start item read, a decision queued from
+an already-shown action, the session target kept through the replacement), to be revisited
+with the tablet for a device run.
+
+**Proved on Linux:** the table, the fit over the whole request, the ids grammar, the fold of
+a second delivery, the actions and the tap (`keeper-core/src/hq/push.rs` tests); the push
+target sent once per wish, cleared with the gateway, retried at the next discovery and never
+from a removed device (`hq/tests.rs`); the decision row written after the request arrives, T4
+refused, a missing request refused at the deadline (`hq/window_tests.rs`); a cold launch
+starting the server a layer names, with no stored address and over a different stored one
+(`keeper-core/tests/hq_cold_action.rs`); the extension's read over a real HTTP listener
+answering recorded item JSON — one `GET` with the bearer token, the generic notification for
+every refusal and an unreachable server, a short summary over a request it cannot show whole
+offering *Deny* alone, and two deliveries leaving one notification with the tailnet off and
+on, the second arriving while the first is read, a fallback replaced (`keeper-nse` tests);
+Android's one notification per item (`keeper-core/tests/unifiedpush_android.rs`); the
+webview's landing (`src/hooks/use-push-open.test.ts`). **Inspection only:** `push_ios.rs`,
+`push_android.rs`, `hq_ipc.rs`, `lib.rs`'s `install_settings_layers`,
+`NotificationService.swift` (CI's macOS and iOS jobs compile the Rust; the Swift is compiled
+only by the device build). **Owed on devices:** kalypso (the token reaching the server, the
+notification through Sygnal, the actions with Face ID from a cold launch with the server set
+only in a settings file, the tap, the generic notification with the tailnet off, two
+deliveries of one item showing once — the second arriving while the first is read, and after
+a fallback) and the Android tablet through ntfy while keeper runs.
 
 ## Earlier Matrix agent hosting
 

@@ -635,9 +635,17 @@ already delivered, through the same `keeper_nse_handle` (no new C export). Rust
 lives in the App Group (`hq/servers/…`, kept out of backup like every replica), makes one
 `GET /<database>/push/item/{kind}/{id}` with that token, and asks
 `keeper_core::hq::push::classify` what shows ([agents.md](agents.md#a-push-from-the-agents-server)).
-It opens no store and writes nothing; it answers `item`, with the earlier notifications of
-the same item to remove, so a second delivery shows once. Unreadable is the generic
-notification.
+It opens no store and writes nothing. Unreadable is the generic notification.
+
+One notification per item (R1066K-02): before the read, the Swift asks Rust for the item's
+key (`keeper_nse::answer_key`, `{"hq_key": …, "identifier": …}` through the same entry), and
+every notification of the item carries it as `keeper_hq_key` — composed, generic, and the
+fallback iOS shows when the extension runs out of time; the generic one carries nothing else
+of keeper's. Each answer names the notifications with that key to remove first: those on the
+lock screen, and those this extension process handed iOS earlier that are not there yet
+(`awaits`), which the Swift waits up to two seconds for. iOS names a remote notification
+itself and the gateway sends no APNs collapse id, so the item's key on the notification is the
+boundary, not its identifier.
 
 Its memory under the 24 MB ceiling and its decryption on the phone are measured on the
 device after enrolment (98.1 #12), not here.
