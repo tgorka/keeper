@@ -263,7 +263,19 @@ keeper ships no push server and never picks one (D-1, D-4).
    session room, where the card decides. An action sends exactly what the
    notification showed, scope `once`; if it cannot within 20 seconds, the
    notification is replaced by one asking you to finish in keeper.
-7. Once Android has stopped keeper, a push cannot be read — keeper's accounts
+7. **From the agents server** (106.6): the same endpoint and gateway are this
+   device's push target on the agents server (`PUT /clients/self/push-target`,
+   removed when the endpoint or the gateway goes). Its push names an item by
+   ids; keeper reads that item from the server with this device's pairing and
+   posts what the iPhone would show, one notification per item, so a second
+   delivery replaces the first. Its actions write the decision row through the
+   session's replica; a tap opens the session in the Agents window
+   ([agents.md](agents.md#a-push-from-the-agents-server)). This works **while
+   keeper is running**; after Android has stopped keeper's process it does
+   nothing more than step 8, and an action on a notification posted earlier
+   cannot decide — deferred by the owner (R-HQ-58, DW-E106-15). Owed on the
+   tablet.
+8. Once Android has stopped keeper, a push cannot be read — keeper's accounts
    and keys start with its window — so keeper posts one notification of its own
    words ("Open keeper to see what arrived."), and each such push replaces the
    last.

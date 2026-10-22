@@ -370,6 +370,149 @@ nixie.electra takes it over next.**) 29.4 s after the kill, before `nixie.electr
 29.9–30.5 s. Nothing ever said a holder whose lease had run out was answering. The rest of the case
 held as before.
 
+## A push from the agents server
+
+Story 106.6 (FR-855, FR-856; AD-432, D-35, R-HQ-44). With keeper closed, the phone learns of
+two things and nothing else: an approval waiting for you, and your own proxy's answer
+(Nixie's for tgorka, Dixi's for Marta) in a session you are in. Asks are not pushed.
+
+**What the phone registers.** The iPhone's APNs token (as Sygnal reads a pushkey, base64)
+and its app (`dev.tgorka.keeper.ios` or `.ios.dev`, by the build's `aps-environment`), or
+Android's UnifiedPush endpoint and its app (`dev.tgorka.keeper.android`), go to the agents
+server with your existing push gateway (`push.gateway_url` on the iPhone, read through the
+same grammar; the gateway discovered on the endpoint's server on Android) as this device's
+push target: `PUT /clients/self/push-target`, once per change and again after every start
+(`keeper_core::hq::push::PushTarget`, `Hq::set_push_target`). Clearing the gateway, or
+Android losing its endpoint, sends `DELETE`. A device not paired, or removed, sends nothing.
+
+**What the server sends.** Ids only, in the Matrix Push Gateway's `notify` shape: `event_id`
+is the item, `room_id` the session, `default_payload.keeper_hq` names
+`{database, session_id, kind, item_id}`; the iPhone's adds `mutable-content` and an alert
+that is only a key (`KEEPER_HQ_ITEM`, localised on the phone as *Open keeper to see what
+arrived.*). No title, text or summary reaches the gateway.
+
+**What the phone shows** is decided on the phone (`keeper_core::hq::push::classify`), from
+one authenticated read of the item: `GET /<database>/push/item/{kind}/{id}` with this
+device's token, the pairing of the server whose replica of that database this device holds.
+
+| item | shows |
+|---|---|
+| a pending approval you may decide, below T4, whose whole request fits — the tool call the server read with it, its tool and exact arguments on one line of at most 120 characters, no control or direction character and no character a reader cannot see in any of them; not a Paseo start or steer; not a `run` asking for the network | *nixie asks: \<keeper's summary\>*, the tier's words, the request (`run {"argv":["git","status"]}`); **Approve once** and **Deny** |
+| the same at T4, longer, of a tier keeper cannot read, or a request keeper cannot show whole (no tool call from the server, arguments it cannot read, an invisible character, a Paseo prompt, a networked run) | the tier and *open keeper to read the whole request*; **Deny** only |
+| an approval not yours, already decided or expired | keeper's words, no action |
+| your proxy's answer | the agent and its words |
+| an ask, a person's message, your own | nothing |
+
+The item read returns the approval row and, beside it, the tool call it runs (`tool_call`,
+the call's `tool_calls` row, read only when it is that approval's own call in that session);
+nothing of either reaches the gateway. keeper's summary is a sentence about the call
+(*Run \`git\` in workspace/keeper* names the program, not its arguments), so it goes in the
+title and never decides whether **Approve once** is offered: only the whole request does
+(R1066K-01, `hq::push::fits`, the same rules as a Matrix agent room's notification). Anything
+that cannot be read — no pairing, the server or the tailnet unreachable (DW-E106-5), a refusal
+(`401`, `403`, `404`), an answer about another item — is the generic notification with no
+actions.
+
+**A character a reader cannot see refuses Approve once (R1066K-05).** `rm report<U+200B>.txt`
+reads as `rm report.txt` on a lock screen and removes another file. So the tool's name, every
+key and every value, at any depth, is checked against every Unicode format character
+(General_Category `Cf`, U+200B, U+2060, U+00AD, …) and every Default_Ignorable_Code_Point —
+the variation selectors and the tag characters among them — as of Unicode 16.0
+(`agents::push::HIDDEN`). Keeper neither strips them nor renders them as escapes: such a
+request offers **Deny** alone and *open keeper to read the whole request*, on the agents server
+and in a Matrix agent room alike. A request whose text legitimately holds one (an emoji with a
+variation selector) is decided in keeper.
+
+**The same item may arrive twice; keeper tries to show it once.** Android tags the
+notification with the item. On the iPhone the identity is a key on the notification,
+`keeper_hq_key` = `<database>/<kind>/<item id>` (`hq::push::KEY_INFO`), not the notification's
+identifier: iOS names a remote notification itself, the person's gateway sends no APNs
+collapse id (Sygnal has none), and re-posting the notification locally would need the remote
+one to show nothing, which needs the filtering entitlement (DW-408). So on arrival the
+extension asks Rust for the item's key before it reads anything (`keeper_nse::answer_key`),
+and every notification of the item carries it — composed, generic, and the fallback shown when
+the extension runs out of time — the generic one carrying nothing else of keeper's. That call
+starts the delivery's one deadline (twenty seconds, `keeper_nse::DEADLINE`), which the wait for
+its turn, the read and the waits on the notification center share; a delivery still queued at
+it reads nothing (R1066K-06). Every answer then names the notifications with the same key to
+remove first (`hq::push::Fold`): those on the lock screen, those of the extension process that
+arrived before it and those it handed iOS whenever they arrived, waiting until the deadline for
+the ones not there yet. iOS's expiry asks Rust too, at once and outside the serial queue, so
+the fallback removes the item's others instead of waiting behind the read that used the time
+up. Being named is not being handed (R1066K-07): an earlier delivery the fallback named while
+its read was still going shows when that read ends, and removes the fallback, so the one
+handed iOS last is the one left. A removal is kept until the extension sees the notification
+gone, and every later answer names it again meanwhile. A re-posted *Open keeper to finish
+deciding.* keeps the key too.
+
+This is best effort, not a guarantee: the record is the extension process's, a removal only
+applies to a notification already on the lock screen, and iOS may end an extension before it
+acts. **Proposed deferred work** (number to be assigned by the coordinator): *item-level
+collapse on the APNs request.* The push that reaches APNs carries an `apns-collapse-id` derived
+from the item key, so iOS itself keeps one notification per item whatever the extension
+managed: `hq1-` followed by the unpadded base64url SHA-256 of the whole key
+`<database>/<kind>/<item id>` — 47 ASCII bytes for every item. Not the key itself: APNs refuses
+a collapse id over 64 bytes (`BadCollapseId`), and a valid key passes that easily (a database
+name may be 63 bytes and an item id 1024, and the id need not be ASCII). Not a truncation of it,
+nor the item id alone: two items sharing a prefix, or one id in two databases or of two kinds,
+would collapse into one notification. A digest of the full key is fixed-length, the same for
+every delivery of the item, distinct across namespaces, and computed from ids alone. Sygnal's APNs
+pushkin sends no collapse id, so this needs a gateway that sets one from the push's
+`keeper_hq` ids (a Sygnal change or a gateway of keeper's own; the agents server still sends
+ids only, D-35). The runs that prove it: the gateway's tests include a key of the longest valid
+database name and a long item id (the header stays 47 bytes and APNs accepts it), and one item
+id in two databases and as two kinds (distinct collapse ids); on kalypso, three deliveries of
+one approval with the server blackholed (it accepts and never answers), plus one whose
+extension expires, leave exactly one notification on the lock screen.
+
+**An action** writes the decision row through the session's own replica, exactly as the card
+does (`Hq::decide_pushed`, `hq::approvals::decide_pushed`): the request and digest the
+notification showed, only an action its category offered, never *Approve once* on a request
+the replica holds at T4 (the server's whole-commit validator refuses a T4 decision from the
+claim holder's host in any case, AD-428). On the iPhone an action that launches keeper in the
+background installs the settings layers first — the same files and account layers setup
+installs, so the server is the one the effective `agents.server_url` names, never a stored
+address a file shadows (R1066K-03) — then starts the agents client alone, no Matrix account
+and no drive sync, and waits up to twenty seconds for the request to reach its replica and
+for the server to take the decision; otherwise the notification is replaced by *Open keeper
+to finish deciding.* with the reason. **A tap** opens the item's session in the Agents window
+(`use-push-open.ts`, `PushOpenVm::Session`).
+
+**The Android tablet gets the agents server's push while keeper is running.** After Android
+has stopped keeper's process it does nothing with it: the distributor's message posts the
+generic notification, and an action on a notification posted earlier cannot decide. That is
+deferred by the owner (R-HQ-58, DW-E106-15: the cold-start item read, a decision queued from
+an already-shown action, the session target kept through the replacement), to be revisited
+with the tablet for a device run.
+
+**Proved on Linux:** the table, the fit over the whole request, an invisible character of
+every class refusing *Approve once*, the ids grammar, the fold of a second delivery, the
+actions and the tap (`keeper-core/src/hq/push.rs` tests); the push
+target sent once per wish, cleared with the gateway, retried at the next discovery and never
+from a removed device (`hq/tests.rs`); the decision row written after the request arrives, T4
+refused, a missing request refused at the deadline (`hq/window_tests.rs`); a cold launch
+starting the server a layer names, with no stored address and over a different stored one
+(`keeper-core/tests/hq_cold_action.rs`); the extension's read over a real HTTP listener
+answering recorded item JSON — one `GET` with the bearer token, the generic notification for
+every refusal and an unreachable server, a short summary over a request it cannot show whole
+offering *Deny* alone, and two deliveries naming the right removals with the tailnet off and
+on, the second arriving while the first is read, a fallback replaced; three deliveries queued
+behind a server that takes the connection and never answers ending within one deadline; the
+expiry of a delivery queued behind such a read answered at once with the item's removals, the
+queued read giving up at its own deadline and removing nothing after it; a removal named again
+until it is reported gone (`keeper-nse` tests). What iOS then shows is not proved anywhere off
+the device. Android's one notification per item (`keeper-core/tests/unifiedpush_android.rs`);
+the webview's landing (`src/hooks/use-push-open.test.ts`). **Inspection only:** `push_ios.rs`,
+`push_android.rs`, `hq_ipc.rs`, `lib.rs`'s `install_settings_layers`,
+`NotificationService.swift` (CI's macOS and iOS jobs compile the Rust; the Swift is compiled
+only by the device build). **Owed on devices:** kalypso (the token reaching the server, the
+notification through Sygnal, the actions with Face ID from a cold launch with the server set
+only in a settings file, the tap, the generic notification with the tailnet off, an approval
+with U+200B in an argument offering *Deny* alone, deliveries of one item — the second arriving
+while the first is read, three with the server blackholed, one whose extension expires while
+queued — and how many notifications iOS leaves) and the Android tablet through ntfy while
+keeper runs.
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history

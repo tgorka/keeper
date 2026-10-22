@@ -626,6 +626,39 @@ request in keeper's own words, an answer of your own agent, or nothing.
   program, so `KEEPER_IOS_FREE_TEAM=1` removes the target from the remote copy of
   `project.yml` with the entitlements.
 
+**An agents server item** (story 106.6, AD-432). A push from the agents server names an
+item by ids alone (`keeper_hq`). The Swift then hands Rust the keychain's
+`agents-server/<base URL>` pairings — written by the app's ordinary `keychain_set`, which on
+the iPhone lands in the shared group the extension names — and the keeper notifications
+already delivered, through the same `keeper_nse_handle` (no new C export). Rust
+(`keeper_nse::answer_item`) picks the pairing of the server whose replica of that database
+lives in the App Group (`hq/servers/…`, kept out of backup like every replica), makes one
+`GET /<database>/push/item/{kind}/{id}` with that token, and asks
+`keeper_core::hq::push::classify` what shows ([agents.md](agents.md#a-push-from-the-agents-server)).
+It opens no store and writes nothing. Unreadable is the generic notification.
+
+One notification per item, as far as an extension can (R1066K-02, R1066K-06): on arrival,
+before the read, the Swift asks Rust for the item's key (`keeper_nse::answer_key`,
+`{"hq_key": …, "identifier": …}` through the same entry), and every notification of the item
+carries it as `keeper_hq_key` — composed, generic, and the fallback shown when the extension
+runs out of time; the generic one carries nothing else of keeper's. That call also starts the
+delivery's one deadline (twenty seconds, `keeper_nse::DEADLINE`), shared by the wait for its
+turn, the read and every wait on the notification center: a delivery still queued at it reads
+nothing. Each answer names the notifications with that key to remove first: those on the
+lock screen, those that arrived before it and those handed iOS whenever they arrived — the
+ones not there yet awaited until the deadline (`awaits`). The expiry asks too
+(`{"hq_expired": …}`), at once and outside the serial queue, so the fallback removes the
+item's others rather than waiting behind the read that used the time up; an earlier delivery
+it named while still reading is not thereby finished, and when its read ends it shows and
+removes the fallback (R1066K-07). A removal is kept until the Swift reports the notification
+gone from the lock screen (`{"hq_removed": […]}`) and named again meanwhile, by any later
+answer (`pending`). iOS names a remote notification itself and the gateway sends no APNs
+collapse id, so this is best effort and no guarantee:
+the record is the extension process's, and a removal applies only to a notification already
+on the lock screen. The boundary that would guarantee it, an APNs collapse id derived from the
+item key — a fixed-length digest of it, since APNs takes at most 64 bytes and a valid key can be
+longer — is proposed deferred work ([agents.md](agents.md#a-push-from-the-agents-server)).
+
 Its memory under the 24 MB ceiling and its decryption on the phone are measured on the
 device after enrolment (98.1 #12), not here.
 
@@ -697,6 +730,17 @@ in `keeper_core::agents::push`):
   again. Then a new notification says *Open keeper to finish deciding.* with the reason,
   and tapping it opens the session.
 - **Taps.** Tapping a keeper notification opens its session room in the Agents window.
+
+**From the agents server (106.6).** The same token, app and gateway are also this phone's
+push target on the agents server (`PUT /clients/self/push-target`, removed when the field is
+cleared), so its approvals and your proxy's answers arrive as ids through the same gateway;
+the extension reads the item from the server with this device's token
+([The notification extension](#the-notification-extension)). *Approve once* and *Deny* on
+such a notification write the decision row through the session's replica; an action that
+launches keeper in the background starts only the agents client. The alert the server sends
+is the key `KEEPER_HQ_ITEM` (`keeper_iOS/en.lproj/Localizable.strings`, picked up by
+`xcodegen generate` in `scripts/install-ios.sh`). See
+[agents.md](agents.md#a-push-from-the-agents-server) for what shows and what is proved.
 
 **Proved on Linux:** what a notification offers and sends, the pusher and the app id
 (`keeper-core/src/agents/push.rs` tests); that Synapse keeps the pusher keeper registers

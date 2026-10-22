@@ -1,8 +1,11 @@
-//! The server's root routes, outside every database's mount: discovery
-//! (`GET /databases`), pairing (`POST /pair/start`, `POST /pair/redeem`) and
-//! revocation (`POST /clients/{id}/revoke`). Each request carries the device's
-//! token as a bearer credential and nothing else of it; no response body is
-//! ever logged, because a redeem's body is the token.
+//! The server's routes outside syncular's own protocol: at the root,
+//! discovery (`GET /databases`), pairing (`POST /pair/start`,
+//! `POST /pair/redeem`), revocation (`POST /clients/{id}/revoke`) and this
+//! device's push target (`PUT`/`DELETE /clients/self/push-target`); in a
+//! database's mount, the one item a push names
+//! (`GET /<database>/push/item/{kind}/{id}`). Each request carries the
+//! device's token as a bearer credential and nothing else of it; no response
+//! body is ever logged, because a redeem's body is the token.
 
 use serde::Deserialize;
 use std::future::Future;
@@ -10,6 +13,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::hq::pairing::PairingCode;
+use crate::hq::push::{PushTarget, PushedItem};
 use crate::hq::server::ServerUrl;
 
 /// How long one root request may take. Discovery runs at every start, so a
@@ -168,6 +172,22 @@ pub trait Routes: Send + Sync {
         token: &'a str,
         client_id: &'a str,
     ) -> Answer<'a, ()>;
+    /// `PUT /clients/self/push-target` (`DELETE` for `None`): where the
+    /// server's push reaction posts for this device, on every database its
+    /// token opens.
+    fn set_push_target<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        target: Option<&'a PushTarget>,
+    ) -> Answer<'a, ()>;
+    /// `GET /<database>/push/item/{kind}/{id}`: the answer's bytes.
+    fn push_item<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        pushed: &'a PushedItem,
+    ) -> Answer<'a, Vec<u8>>;
 }
 
 /// The root routes over HTTP, with no redirect followed.
@@ -194,6 +214,22 @@ impl Default for HttpRoutes {
 }
 
 impl Routes for HttpRoutes {
+    fn set_push_target<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        target: Option<&'a PushTarget>,
+    ) -> Answer<'a, ()> {
+        Box::pin(set_push_target(&self.http, server, token, target))
+    }
+    fn push_item<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+        pushed: &'a PushedItem,
+    ) -> Answer<'a, Vec<u8>> {
+        Box::pin(push_item(&self.http, server, token, pushed))
+    }
     fn discover<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Discovery> {
         Box::pin(discover(&self.http, server, token))
     }
@@ -323,6 +359,41 @@ async fn revoke(
     )
     .await?;
     Ok(())
+}
+
+/// `PUT /clients/self/push-target` with `target`, or `DELETE` it for none.
+async fn set_push_target(
+    http: &reqwest::Client,
+    server: &ServerUrl,
+    token: &str,
+    target: Option<&PushTarget>,
+) -> Result<(), RouteError> {
+    let route = server.route("/clients/self/push-target");
+    let request = match target {
+        Some(target) => http.put(route).json(&target.body()),
+        None => http.delete(route),
+    };
+    send(request.bearer_auth(token)).await?;
+    Ok(())
+}
+
+/// `GET /<database>/push/item/{kind}/{id}`: the answer's bytes, which
+/// [`crate::hq::push::item_row`] reads.
+async fn push_item(
+    http: &reqwest::Client,
+    server: &ServerUrl,
+    token: &str,
+    pushed: &PushedItem,
+) -> Result<Vec<u8>, RouteError> {
+    let url = pushed
+        .url(server)
+        .ok_or_else(|| RouteError::Unexpected("an item keeper cannot address".to_owned()))?;
+    let response = send(http.get(url).bearer_auth(token)).await?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| RouteError::Unreachable(error.without_url().to_string()))?;
+    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]

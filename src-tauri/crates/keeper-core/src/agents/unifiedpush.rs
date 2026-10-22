@@ -45,8 +45,8 @@ use serde_json::{json, Value};
 use ts_rs::TS;
 
 use crate::agents::push::{
-    Category, Gateway, PushApproval, PushOpenVm, Shown, APPROVAL_INFO, FINISH_IN_KEEPER,
-    GENERIC_BODY, GENERIC_TITLE, NOTIFY_PATH, PAYLOAD_ACCOUNT, SHOWN_INFO,
+    Category, Gateway, PushApproval, Shown, APPROVAL_INFO, FINISH_IN_KEEPER, GENERIC_BODY,
+    GENERIC_TITLE, NOTIFY_PATH, PAYLOAD_ACCOUNT, SHOWN_INFO,
 };
 
 /// The pusher's `app_id` on Android: one app for every Android build, since
@@ -535,11 +535,10 @@ pub fn generic_notification() -> PhoneNotification {
 
 /// The notification that replaces one whose action could not be sent: asks
 /// the person to finish in keeper (`why`, when known, says why), no actions,
-/// and a tap opens the session room the first one named
-/// ([`crate::agents::push::tap_target`]) — `user_info` carries
-/// [`SHOWN_INFO`] only when that one did.
+/// and a tap opens where the first one did — the agents server session, or
+/// the Matrix session room ([`crate::agents::push::reposted_info`]) —
+/// `user_info` carries [`SHOWN_INFO`] only when that one did.
 pub fn finish_in_keeper(tag: &str, user_info: &Value, why: &str) -> PhoneNotification {
-    let target = crate::agents::push::tap_target(user_info);
     let body = if why.is_empty() {
         FINISH_IN_KEEPER.to_owned()
     } else {
@@ -547,27 +546,49 @@ pub fn finish_in_keeper(tag: &str, user_info: &Value, why: &str) -> PhoneNotific
     };
     PhoneNotification {
         tag: tag.to_owned(),
-        group: target
-            .as_ref()
-            .map_or_else(|| GENERIC_TAG.to_owned(), |target| target.room_id.clone()),
+        group: crate::agents::push::reposted_group(user_info)
+            .unwrap_or_else(|| GENERIC_TAG.to_owned()),
         title: GENERIC_TITLE.to_owned(),
         subtitle: None,
         body,
         category: None,
         actions: Vec::new(),
-        user_info: target.map_or_else(
-            || json!({}),
-            |PushOpenVm {
-                 account_id,
-                 room_id,
-             }| {
-                json!({
-                    PAYLOAD_ACCOUNT: account_id,
-                    SHOWN_INFO: true,
-                    "room_id": room_id,
-                })
-            },
-        ),
+        user_info: crate::agents::push::reposted_info(user_info).unwrap_or_else(|| json!({})),
+    }
+}
+
+/// What `shown` — an agents server item read in keeper — posts on a device
+/// of API level `sdk_int`: the iPhone's words; its category's actions only
+/// from [`ACTIONS_NEED_UNLOCK_FROM`] — below that no category and no
+/// actions, and the request it carries says so, so no action can name one;
+/// `user_info` keeper's composed keys ([`crate::hq::push::composed_info`]).
+/// One notification per item: its tag is the item's, so a second delivery
+/// replaces the first.
+pub fn item_notification(shown: &crate::hq::push::HqShown, sdk_int: u32) -> PhoneNotification {
+    let actionable = sdk_int >= ACTIONS_NEED_UNLOCK_FROM;
+    let category = shown.category.filter(|_| actionable);
+    let mut shown = shown.clone();
+    if let Some(approval) = shown.approval.as_mut() {
+        approval.category = approval.category.filter(|_| actionable);
+    }
+    PhoneNotification {
+        tag: shown.item.tag(),
+        group: shown.thread_id.clone(),
+        title: shown.title.clone(),
+        subtitle: shown.subtitle.clone(),
+        body: shown.body.clone(),
+        category: category.map(|category| category.id().to_owned()),
+        actions: category
+            .map(Category::actions)
+            .unwrap_or_default()
+            .iter()
+            .map(|action| PhoneAction {
+                id: action.id().to_owned(),
+                label: action.label().to_owned(),
+                destructive: action.destructive(),
+            })
+            .collect(),
+        user_info: crate::hq::push::composed_info(&shown),
     }
 }
 

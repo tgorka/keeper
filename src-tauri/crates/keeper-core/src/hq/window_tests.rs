@@ -1046,3 +1046,116 @@ fn a_decision_names_this_person_and_device_on_the_version_it_read() {
         "an optimistic row has no server version to send"
     );
 }
+
+fn pushed_decision(id: &str, approve: bool) -> crate::hq::push::HqActionDecision {
+    crate::hq::push::HqActionDecision {
+        session: sessions::AgentSessionRef {
+            database: "alpha".to_owned(),
+            session_id: "dev1.1".to_owned(),
+        },
+        approval_id: id.to_owned(),
+        binding_digest: format!("digest-{id}"),
+        approve,
+    }
+}
+
+/// 106.6: *Approve once* from the lock screen writes the decision row
+/// through the session's replica — waiting while a background launch's
+/// replica fills — bound to the digest the notification showed, as this
+/// person and this device.
+#[test]
+fn a_lock_screen_decision_waits_for_the_request_then_writes_the_row() {
+    let w = world();
+    let decisions = approvals::Decisions::load(w._dir.path().join("decisions.json"));
+    let t = now() - 60_000;
+    let alpha = w.alpha.clone();
+    // The request arrives while the action waits, as a first sync would.
+    let arriving = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut ops = session("dev1.1", NIXIE, t, false, None);
+        ops.extend(approval("ap1", "dev1.1", t, &[ANA], true));
+        alpha.replica.mutate(ops).expect("seed");
+    });
+    let refusal = approvals::decide_pushed(
+        || Some(w.alpha.clone()),
+        &decisions,
+        &pushed_decision("ap1", true),
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .expect_err("no server: not sent within the action");
+    arriving.join().expect("seeded");
+    assert_eq!(
+        refusal.to_string(),
+        "Decided here; it reaches alpha when this device does."
+    );
+    let decided = approvals::of_session(
+        &w.alpha,
+        "dev1.1",
+        &sessions::directory(&w.alpha),
+        &HashMap::new(),
+        now(),
+    );
+    assert_eq!(decided[0].state, AgentApprovalStateVm::Approved);
+    let row = &w
+        .alpha
+        .replica
+        .query(
+            "SELECT decided_by_actor, decided_by_client FROM approvals WHERE id = 'ap1'",
+            &[],
+        )
+        .expect("reads")[0];
+    assert_eq!(row["decided_by_actor"], ANA);
+    assert_eq!(row["decided_by_client"], "dev1");
+}
+
+/// The replica's own tier decides: *Approve once* on a T4 request is
+/// refused whatever the notification carried, *Deny* is written; a request
+/// that never arrives is refused at the deadline with why; a digest that
+/// changed is refused.
+#[test]
+fn a_lock_screen_decision_never_approves_t4_and_says_why_it_was_not_sent() {
+    let w = world();
+    let decisions = approvals::Decisions::load(w._dir.path().join("decisions.json"));
+    let t = now() - 60_000;
+    let mut ops = session("dev1.1", NIXIE, t, false, None);
+    ops.extend(approval("ap4", "dev1.1", t, &[ANA], true));
+    ops.push(upsert(
+        "approvals",
+        serde_json::json!({"id": "ap4", "session_id": "dev1.1",
+            "page_key": sessions::page_key("dev1.1", &sessions::month(t)),
+            "tool_call_id": "call-ap4", "tier": "T4", "binding_digest": "digest-ap4",
+            "summary": "delete the backups", "approvers": "[\"ana\"]", "state": "pending",
+            "decided_by_actor": null, "decided_by_client": null, "consumed_by_client": null,
+            "expires_at_ms": t + 3_600_000, "created_at_ms": t,
+            "author_actor": NIXIE, "author_client": "nixie.box"}),
+    ));
+    w.alpha.replica.mutate(ops).expect("seed");
+    let soon = || std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let decide = |decision| {
+        approvals::decide_pushed(|| Some(w.alpha.clone()), &decisions, &decision, soon())
+            .map_err(|refusal| refusal.to_string())
+    };
+    assert_eq!(
+        decide(pushed_decision("ap4", true)),
+        Err(approvals::NOT_FROM_A_NOTIFICATION.to_owned())
+    );
+    assert_eq!(
+        decide(pushed_decision("ap4", false)),
+        Err("Decided here; it reaches alpha when this device does.".to_owned()),
+        "Deny is written"
+    );
+    assert_eq!(
+        decide(pushed_decision("gone", true)),
+        Err("This request is not on this device any more.".to_owned())
+    );
+    let stale = crate::hq::push::HqActionDecision {
+        binding_digest: "other".to_owned(),
+        ..pushed_decision("ap4", false)
+    };
+    assert!(decide(stale).is_err());
+    assert_eq!(
+        approvals::decide_pushed(|| None, &decisions, &pushed_decision("ap4", false), soon())
+            .map_err(|r| r.to_string()),
+        Err("This device does not hold alpha yet.".to_owned())
+    );
+}

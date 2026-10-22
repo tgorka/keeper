@@ -21,6 +21,15 @@
 //!   Settings → Notifications shows it ([`status`], told on
 //!   [`STATUS_EVENT`]); a server keeper cannot reach changes nothing
 //!   (`unifiedpush::pusher_change`).
+//! - **The agents server** (106.6, AD-432). The same endpoint and gateway go
+//!   to keeper-hq as this device's push target
+//!   (`keeper_core::hq::push::PushTarget::unifiedpush`, through
+//!   [`crate::hq_ipc::set_push_target`]); losing the endpoint or the gateway
+//!   removes it. A push from the server names an item by ids; keeper reads
+//!   that item with the device's pairing (`Hq::read_pushed`) and posts what
+//!   `keeper_core::hq::push::classify` says, one notification per item
+//!   (`unifiedpush::item_notification`); its actions write the decision row
+//!   (`Hq::decide_pushed`) and a tap opens the session.
 //! - **A push.** The distributor hands the gateway's notification to
 //!   `PushReceiver.kt`, which passes it here; the account that knows the
 //!   room reads the event and the iPhone's classifier decides what shows
@@ -333,6 +342,11 @@ async fn new_endpoint(raw: String) {
             (None, UnifiedPushStatus::Refused(refusal))
         }
     };
+    crate::hq_ipc::set_push_target(
+        gateway.as_ref().map(|gateway| {
+            keeper_core::hq::push::PushTarget::unifiedpush(gateway.clone(), &endpoint)
+        }),
+    );
     let now = KeptEndpoint {
         endpoint: endpoint.clone(),
         distributor,
@@ -369,6 +383,7 @@ async fn new_endpoint(raw: String) {
 /// of the one keeper kept from every account, forget it, and say why.
 async fn forget(why: UnifiedPushStatus) {
     set_status(why);
+    crate::hq_ipc::set_push_target(None);
     let Some(app) = APP.get() else {
         return;
     };
@@ -438,6 +453,23 @@ async fn message(body: String) {
     let Some(app) = APP.get() else {
         return;
     };
+    if let Some(pushed) = keeper_core::hq::push::PushedItem::of_notify(body.as_bytes()) {
+        match crate::hq_ipc::read_pushed(&pushed).await {
+            Ok(keeper_core::hq::push::HqClassified::Show(shown)) => {
+                post(up::item_notification(
+                    &shown,
+                    SDK_INT.load(Ordering::SeqCst),
+                ))
+                .await;
+            }
+            Ok(keeper_core::hq::push::HqClassified::Drop) => {}
+            Err(why) => {
+                tracing::warn!(why, "push: the agents item could not be read");
+                post(up::generic_notification()).await;
+            }
+        }
+        return;
+    }
     let Some(pushed) = up::pushed_event(body.as_bytes()) else {
         return;
     };
@@ -482,6 +514,10 @@ async fn action(tag: String, category: String, action: String, user_info: String
         action,
         user_info,
     };
+    if keeper_core::hq::push::is_composed(&tap.user_info) {
+        act_on_item(app, &tag, &tap).await;
+        return;
+    }
     let decision = match push::action_decision(&tap) {
         Ok(decision) => decision,
         Err(push::ActionRefusal::NoApproval) => {
@@ -522,12 +558,57 @@ async fn action(tag: String, category: String, action: String, user_info: String
     }
 }
 
-/// Keep the room the tapped notification whose `user_info` this is opens,
-/// and tell the webview.
+/// The decision an action on an agents item's notification `tag` sends,
+/// written through the session's replica: the notification is removed once
+/// the server took it, else replaced by one asking to finish in keeper.
+async fn act_on_item(app: &AppHandle, tag: &str, tap: &push::ActionTap) {
+    let decision = match keeper_core::hq::push::action_decision(tap) {
+        Ok(decision) => decision,
+        Err(push::ActionRefusal::NoApproval) => {
+            tracing::warn!("push: an action on a notification keeper did not compose");
+            return;
+        }
+        Err(refusal) => {
+            post(up::finish_in_keeper(
+                tag,
+                &tap.user_info,
+                &refusal.to_string(),
+            ))
+            .await;
+            return;
+        }
+    };
+    let deciding = app.clone();
+    let sent = tauri::async_runtime::spawn_blocking(move || {
+        crate::hq_ipc::decide_pushed(&deciding, &decision, push::ACTION_BUDGET)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|sent| sent);
+    match sent {
+        Ok(_) => {
+            if let Some(plugin) = PLUGIN.get() {
+                if let Err(error) = plugin
+                    .run_mobile_plugin_async::<Value>("cancel", json!({ "tag": tag }))
+                    .await
+                {
+                    tracing::warn!(%error, "push: the decided notification stays");
+                }
+            }
+        }
+        Err(why) => {
+            tracing::warn!(why, "push: a decision from a notification was not sent");
+            post(up::finish_in_keeper(tag, &tap.user_info, &why)).await;
+        }
+    }
+}
+
+/// Keep where the tapped notification whose `user_info` this is opens, and
+/// tell the webview.
 fn open(user_info: &str) {
     let Some(target) = serde_json::from_str::<Value>(user_info)
         .ok()
-        .and_then(|info| push::tap_target(&info))
+        .and_then(|info| push::open_target(&info))
     else {
         return;
     };

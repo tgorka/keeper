@@ -7,6 +7,12 @@
 //! `gen/apple/KeeperNotify`) decides what a push shows; this module does the
 //! rest of the phone's part:
 //!
+//! - **The agents server's push target** (106.6, AD-432). The same token,
+//!   app id and gateway go to keeper-hq as this device's push target
+//!   (`keeper_core::hq::push::PushTarget::apns`, `PUT /clients/self/push-target`
+//!   through [`crate::hq_ipc::set_push_target`]); a cleared gateway removes
+//!   it. The server then posts an item's ids, and the extension reads the
+//!   item (`keeper_nse::answer_item`).
 //! - **The token and the pusher.** tao's app delegate hands the APNs device
 //!   token to [`token_arrived`] (the `tools/tao` patch, NOTICE change 3); once
 //!   keeper is set up, every signed-in account that holds agent session rooms
@@ -19,13 +25,17 @@
 //!   is not keeper's push to the notification plugin's own delegate, which
 //!   drops push-triggered responses (codemap §0 item 1), and registers the two
 //!   categories Rust describes (`push::registered_categories`).
-//! - **An action.** *Approve once* or *Deny* on the lock screen calls
-//!   [`keeper_push_action`], which sends exactly the decision
+//! - **An action.** *Approve once* or *Deny* on an agents server item's
+//!   notification writes the decision row through the session's replica
+//!   (`keeper_core::hq::push::action_decision`, `Hq::decide_pushed`); a
+//!   background launch for it starts only that client
+//!   ([`crate::hq_ipc::ensure`]). On a Matrix agent room's notification,
+//!   [`keeper_push_action`] sends exactly the decision
 //!   `push::action_decision` derives from what the notification showed,
 //!   activating only that account when keeper was launched for it in the
 //!   background, within [`push::ACTION_BUDGET`]; when it cannot, the answer is
 //!   a notification asking the person to finish in keeper.
-//! - **A tap.** [`keeper_push_open`] keeps the session room to open and tells
+//! - **A tap.** [`keeper_push_open`] keeps the session (or Matrix room) to open and tells
 //!   the webview, which takes it with `push_open_take` — on mount, for a tap
 //!   that launched keeper, and on [`PUSH_OPEN_EVENT`] otherwise.
 //!
@@ -196,6 +206,12 @@ pub fn register_soon() {
                 return;
             }
         };
+        // The agents server's push target: the same gateway, token and app.
+        crate::hq_ipc::set_push_target(keeper_core::hq::push::PushTarget::apns(
+            stored.as_deref(),
+            environment,
+            &token,
+        ));
         let device = format!("keeper on {}", crate::account_ipc::device_model());
         match state
             .accounts
@@ -254,6 +270,9 @@ fn act(request: &str) -> Option<Value> {
             return None;
         }
     };
+    if keeper_core::hq::push::is_composed(&tap.user_info) {
+        return act_on_item(&tap);
+    }
     let decision = match push::action_decision(&tap) {
         Ok(decision) => decision,
         Err(push::ActionRefusal::NoApproval) => {
@@ -281,12 +300,35 @@ fn act(request: &str) -> Option<Value> {
     }
 }
 
+/// The decision an action on an agents server item's notification sends,
+/// written through the session's replica (106.6): `None` once the server
+/// took it, else the notification asking the person to finish in keeper.
+fn act_on_item(tap: &push::ActionTap) -> Option<Value> {
+    let decision = match keeper_core::hq::push::action_decision(tap) {
+        Ok(decision) => decision,
+        Err(push::ActionRefusal::NoApproval) => {
+            tracing::warn!("push: an action on a notification keeper did not compose");
+            return None;
+        }
+        Err(refusal) => return Some(unfinished(&tap.user_info, &refusal.to_string())),
+    };
+    let Some(app) = APP.get() else {
+        return Some(unfinished(&tap.user_info, ""));
+    };
+    match crate::hq_ipc::decide_pushed(app, &decision, push::ACTION_BUDGET) {
+        Ok(_) => None,
+        Err(why) => {
+            tracing::warn!(why, "push: a lock-screen decision was not sent");
+            Some(unfinished(&tap.user_info, &why))
+        }
+    }
+}
+
 /// The notification that asks the person to finish a decision in keeper,
-/// tapping which opens the session room the action's notification named.
-/// keeper composes it, so it carries `push::SHOWN_INFO` — what the delegate
-/// and `push::tap_target` route a tap by.
+/// tapping which opens where the action's notification did — the session,
+/// or the Matrix room. keeper composes it, so it carries `push::SHOWN_INFO`
+/// — what the delegate and `push::open_target` route a tap by.
 fn unfinished(user_info: &Value, why: &str) -> Value {
-    let target = push::tap_target(user_info);
     let body = if why.is_empty() {
         push::FINISH_IN_KEEPER.to_owned()
     } else {
@@ -295,12 +337,8 @@ fn unfinished(user_info: &Value, why: &str) -> Value {
     json!({
         "title": push::GENERIC_TITLE,
         "body": body,
-        "thread_id": target.as_ref().map(|t| t.room_id.clone()),
-        "user_info": target.map(|t| json!({
-            push::PAYLOAD_ACCOUNT: t.account_id,
-            push::SHOWN_INFO: true,
-            "room_id": t.room_id,
-        })),
+        "thread_id": push::reposted_group(user_info),
+        "user_info": push::reposted_info(user_info),
     })
 }
 
@@ -350,8 +388,9 @@ pub unsafe extern "C" fn keeper_push_action(request: *const c_char) -> *mut c_ch
 }
 
 /// The person tapped a keeper notification (`KeeperPush.swift`, the main
-/// thread). `user_info` is the notification's `userInfo` as JSON; the room
-/// it opens ([`push::tap_target`]) waits for the webview, which is told.
+/// thread). `user_info` is the notification's `userInfo` as JSON; the
+/// session or room it opens ([`push::open_target`]) waits for the webview,
+/// which is told.
 ///
 /// # Safety
 /// `user_info` is null or a NUL-terminated buffer valid for the call.
@@ -364,12 +403,12 @@ pub unsafe extern "C" fn keeper_push_open(user_info: *const c_char) {
     let _ = std::panic::catch_unwind(|| open(&user_info));
 }
 
-/// Keep the room the tapped notification whose `userInfo` this is opens, and
+/// Keep where the tapped notification whose `userInfo` this is opens, and
 /// tell the webview.
 fn open(user_info: &str) {
     let Some(target) = serde_json::from_str::<Value>(user_info)
         .ok()
-        .and_then(|info| push::tap_target(&info))
+        .and_then(|info| push::open_target(&info))
     else {
         return;
     };

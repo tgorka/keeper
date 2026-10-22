@@ -1,0 +1,5 @@
+/* What iOS shows for a push from the agents server when the notification
+   extension cannot say more (106.6): the server's push carries no words, only
+   this key (`aps.alert.loc-key`). keeper's generic sentence
+   (`keeper_core::agents::push::GENERIC_BODY`). */
+"KEEPER_HQ_ITEM" = "Open keeper to see what arrived.";
