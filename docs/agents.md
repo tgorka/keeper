@@ -826,8 +826,9 @@ The flag is `agents` on the profile, written in the folder file as:
 subfolder = "80-agents"
 ```
 
-The Sync form shows the same flag as **This folder keeps agents**. The switch is on screen only
-while **This folder has sessions** is on.
+Since keeper 108.2 the Sync form no longer shows this flag: the agents moved to the agents server,
+and a folder that names `agents` keeps the field readable and inert, so its folder file is never
+refused (DW-E108-2). Saving the folder in the form leaves the field as it is.
 
 keeper refuses a subfolder that is empty, `.`, absolute, or that escapes the folder (`..`). It also
 refuses an agents zone that is, contains, or sits inside the notes vault, the recordings root, the
