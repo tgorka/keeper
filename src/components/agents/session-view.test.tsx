@@ -11,6 +11,8 @@ const mock = vi.hoisted(() => ({
   release: vi.fn(),
   path: vi.fn(),
   bytes: vi.fn(),
+  commit: vi.fn(),
+  releaseHandles: vi.fn(),
   send: vi.fn(),
   picker: vi.fn(),
 }));
@@ -33,6 +35,8 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentSessionClose: vi.fn().mockResolvedValue(undefined),
   agentAttachPath: mock.path,
   agentAttachBytes: mock.bytes,
+  agentAttachCommit: mock.commit,
+  agentAttachRelease: mock.releaseHandles,
   agentSend: mock.send,
 }));
 const vm: AgentSessionViewVm = {
@@ -85,12 +89,19 @@ function paste(name: string, mime = "text/csv") {
     },
   });
 }
+let staged = 0;
 beforeEach(() => {
   vi.clearAllMocks();
   mock.view = null;
   mock.drop = null;
-  mock.path.mockReset().mockResolvedValue(undefined);
-  mock.bytes.mockReset().mockResolvedValue(undefined);
+  staged = 0;
+  // Rust stages each file under a handle; the mock names them in staging order.
+  mock.path
+    .mockReset()
+    .mockImplementation(async (_target, paths: string[]) => paths.map(() => `h${++staged}`));
+  mock.bytes.mockReset().mockImplementation(async () => `h${++staged}`);
+  mock.commit.mockReset().mockResolvedValue(undefined);
+  mock.releaseHandles.mockReset().mockResolvedValue(undefined);
   mock.send.mockReset().mockResolvedValue(undefined);
   mock.picker.mockReset().mockResolvedValue(["/tmp/plan.pdf", "/tmp/prices.csv"]);
 });
@@ -105,12 +116,16 @@ describe("session composer attachments", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(mock.path).toHaveBeenCalledWith(
+      expect(mock.commit).toHaveBeenCalledWith(
         { database: "beta", sessionId: "same.1" },
-        ["/tmp/plan.pdf", "/tmp/prices.csv"],
+        ["h1", "h2"],
         "Read both files",
       ),
     );
+    expect(mock.path).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, [
+      "/tmp/plan.pdf",
+      "/tmp/prices.csv",
+    ]);
     await waitFor(() =>
       expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument(),
     );
@@ -131,12 +146,45 @@ describe("session composer attachments", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(sentence);
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Keep my caption");
+    expect(mock.commit).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Remove huge.zip" }));
     expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument();
     expect(mock.send).not.toHaveBeenCalled();
   });
 
-  it("does not resend accepted paths when a later pasted file is refused and retried", async () => {
+  it("sends a mixed selection of a dropped path and two pastes as one message with its caption", async () => {
+    await draw();
+    act(() => mock.drop?.({ payload: { type: "drop", paths: ["/tmp/notes.md"] } }));
+    paste("first.csv");
+    await screen.findByRole("button", { name: "Remove first.csv" });
+    paste("second.csv");
+    await screen.findByRole("button", { name: "Remove second.csv" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "Compare these two files" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument(),
+    );
+    // Staging carries no caption; the one commit carries every handle and the caption once.
+    expect(mock.path).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, [
+      "/tmp/notes.md",
+    ]);
+    expect(mock.bytes.mock.calls.map((call) => call.slice(2))).toEqual([
+      ["first.csv", "text/csv"],
+      ["second.csv", "text/csv"],
+    ]);
+    expect(mock.commit).toHaveBeenCalledOnce();
+    expect(mock.commit).toHaveBeenCalledWith(
+      { database: "beta", sessionId: "same.1" },
+      ["h1", "h2", "h3"],
+      "Compare these two files",
+    );
+    expect(mock.send).not.toHaveBeenCalled();
+    expect(mock.releaseHandles).not.toHaveBeenCalled();
+  });
+
+  it("commits nothing when a later file is refused at staging, releases what was staged, and retries whole", async () => {
     await draw();
     act(() => mock.drop?.({ payload: { type: "drop", paths: ["/tmp/notes.md"] } }));
     paste("prices.csv");
@@ -146,24 +194,34 @@ describe("session composer attachments", () => {
       target: { value: "Review these" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await screen.findByRole("alert");
-    expect(screen.queryByRole("button", { name: "Remove notes.md" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The pasted file could not be staged.",
+    );
+    expect(mock.commit).not.toHaveBeenCalled();
+    expect(mock.releaseHandles).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, [
+      "h1",
+    ]);
+    // Nothing was sent, so the whole selection and the caption stay.
+    expect(screen.getByRole("button", { name: "Remove notes.md" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove prices.csv" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Review these");
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
       expect(screen.queryByRole("list", { name: "Pending attachments" })).not.toBeInTheDocument(),
     );
-    expect(mock.path).toHaveBeenCalledTimes(1);
-    expect(mock.bytes).toHaveBeenCalledTimes(2);
-    expect(mock.bytes.mock.calls[1][0]).toEqual({ database: "beta", sessionId: "same.1" });
-    expect(mock.bytes.mock.calls[1].slice(2)).toEqual(["prices.csv", "text/csv", "Review these"]);
+    expect(mock.commit).toHaveBeenCalledOnce();
+    expect(mock.commit).toHaveBeenCalledWith(
+      { database: "beta", sessionId: "same.1" },
+      ["h2", "h3"],
+      "Review these",
+    );
     expect(mock.send).not.toHaveBeenCalled();
   });
 
   it("retains a new drop that arrives during a send and releases the native listener on close", async () => {
     const { unmount } = await draw();
     let complete: (() => void) | undefined;
-    mock.path.mockImplementation(
+    mock.commit.mockImplementation(
       () =>
         new Promise<void>((resolve) => {
           complete = resolve;
@@ -172,6 +230,7 @@ describe("session composer attachments", () => {
     act(() => mock.drop?.({ payload: { type: "drop", paths: ["/tmp/first.md"] } }));
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     act(() => mock.drop?.({ payload: { type: "drop", paths: ["/tmp/next.md"] } }));
+    await waitFor(() => expect(complete).toBeDefined());
     await act(async () => complete?.());
     const tray = screen.getByRole("list", { name: "Pending attachments" });
     expect(within(tray).getByRole("button", { name: "Remove next.md" })).toBeInTheDocument();

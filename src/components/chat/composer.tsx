@@ -1124,10 +1124,16 @@ export function Composer({
     }
   }
 
-  /** Session paste accepts files; plain text keeps the browser's normal paste. */
+  /**
+   * Paste files into the tray. Plain-text-only paste keeps the browser's own; a paste that also
+   * carries plain text (a screenshot with its caption) puts that text into the draft at the
+   * caret, as the browser would have, while the files are staged. Text and HTML items never
+   * become attachments (R1071C-01).
+   */
   function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
     if (!attachEnabled || sending) return;
-    const files = Array.from(e.clipboardData.items)
+    const items = Array.from(e.clipboardData.items);
+    const files = items
       .filter((item) =>
         transport === "session" ? item.kind === "file" : item.type.startsWith("image/"),
       )
@@ -1135,6 +1141,22 @@ export function Composer({
       .filter((file): file is File => file !== null);
     if (files.length === 0) return;
     e.preventDefault();
+    const text = items.some((item) => item.kind === "string" && item.type === "text/plain")
+      ? e.clipboardData.getData("text/plain")
+      : "";
+    if (text !== "") {
+      const field = e.currentTarget;
+      const next =
+        field.value.slice(0, field.selectionStart) + text + field.value.slice(field.selectionEnd);
+      const at = field.selectionStart + text.length;
+      restoreConsumed.current = true;
+      insertedCaret.current = at;
+      setDraft(next);
+      setCaret(at);
+      if (pendingRef.current?.mode !== "edit") {
+        scheduleDraftSave(next);
+      }
+    }
     void (async () => {
       try {
         for (const file of files) {

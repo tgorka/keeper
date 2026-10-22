@@ -587,14 +587,20 @@ original file path. Selected files sit in a wrapping tray above a full-width tex
 with removal buttons and the size for pasted/photos' bytes. A native path has no size
 metadata until Rust reads it: its tray says **Size on send**, never an invented number.
 After Send, Rust's message owns the chip and its size/state; the tray is not another
-outbox. Consecutive paths form one message; pasted/photo bodies use one raw IPC request
-each. The caption rides on the final request. Accepted selections leave the tray immediately,
-so a later refusal keeps only unsent files and the caption and a retry cannot duplicate
-accepted files. Files added during a send stay selected for the next one.
+outbox. Send stages the whole selection under Rust handles (paths in one call per run of
+them, each pasted/photo body as its raw IPC request), then one `agent_attach_commit` sends
+them all with the caption as one message (R1071C-02). A staging refusal commits nothing:
+what was staged is released, and the whole selection and the caption stay for a retry.
+Files added during a send stay selected for the next one. A paste that carries a file and
+plain text (a screenshot with its words) stages the file and puts the text into the draft at
+the caret; plain-text-only paste is the browser's own, and text or HTML never becomes an
+attachment (R1071C-01).
 
 A message chip is a keyboard-reachable Open button: file icon, wrapping filename,
 Rust's size label and state beneath it. Its refusal sentence sits immediately below,
-inside the same bordered card. State changes and refusals are announced politely.
+inside the same bordered card. A *blocked* file — not refused itself; another file of its
+message was — reads **not sent** in its label, description and announcement, with Rust's
+sentence in neutral text; only the refused file is styled as an error (R1071C-03). State changes and refusals are announced politely.
 Cards use one column on a phone and two where space permits. The text field sits on its
 own row above the attachment toolbar and Send, leaving room to type at 320 px. An
 enqueue-time refusal appears under the composer, with the draft and unsent selections kept.

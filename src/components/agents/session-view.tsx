@@ -21,7 +21,9 @@ import {
   type AgentSessionRef,
   type AgentSessionViewVm,
   agentAttachBytes,
+  agentAttachCommit,
   agentAttachPath,
+  agentAttachRelease,
   agentSend,
   agentSessionArchive,
   agentSessionClose,
@@ -117,37 +119,37 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   }, [vm?.complete, vm?.readOnly, stores]);
 
   async function attach(pending: PendingAttachment[], caption?: string) {
-    // The path API accepts a batch; raw-body IPC accepts one pasted/photo file.
-    // Keep order, caption the last batch, and retire only accepted selections so
-    // retrying a later refusal cannot duplicate files already written by Rust.
-    for (let index = 0; index < pending.length; ) {
-      const attachment = pending[index];
-      if (attachment.kind === "path") {
-        const batch: (typeof attachment)[] = [];
-        while (index < pending.length) {
-          const next = pending[index];
-          if (next.kind !== "path") break;
-          batch.push(next);
+    // Rust stages every selection under a handle (paths in one call per run of
+    // them, each paste or photo as its raw body), then one commit writes them
+    // all with the caption as ONE message. A staging refusal commits nothing:
+    // what was staged is released and the whole selection stays in the tray.
+    const handles: string[] = [];
+    try {
+      for (let index = 0; index < pending.length; ) {
+        const attachment = pending[index];
+        if (attachment.kind === "path") {
+          const paths: string[] = [];
+          while (index < pending.length) {
+            const next = pending[index];
+            if (next.kind !== "path") break;
+            paths.push(next.path);
+            index += 1;
+          }
+          handles.push(...(await agentAttachPath(target, paths)));
+        } else {
           index += 1;
+          handles.push(
+            await agentAttachBytes(target, attachment.bytes, attachment.filename, attachment.mime),
+          );
         }
-        await agentAttachPath(
-          target,
-          batch.map((file) => file.path),
-          index === pending.length ? caption : undefined,
-        );
-        for (const file of batch) stores.attachments.getState().remove(file.id);
-      } else {
-        index += 1;
-        await agentAttachBytes(
-          target,
-          attachment.bytes,
-          attachment.filename,
-          attachment.mime,
-          index === pending.length ? caption : undefined,
-        );
-        stores.attachments.getState().remove(attachment.id);
       }
+    } catch (raw) {
+      if (handles.length > 0) {
+        void agentAttachRelease(target, handles).catch(logFailure("agents.attach.release"));
+      }
+      throw raw;
     }
+    await agentAttachCommit(target, handles, caption);
   }
 
   const pageBack = async () => {

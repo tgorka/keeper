@@ -10,6 +10,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import type { AgentAttachmentVm } from "@/lib/ipc/client";
+import { cn } from "@/lib/utils";
 
 /** Metadata only until Open: never mount a thumbnail that downloads another member's file. */
 export function SessionAttachments({ attachments }: { attachments: AgentAttachmentVm[] }) {
@@ -25,6 +26,9 @@ export function SessionAttachments({ attachments }: { attachments: AgentAttachme
 function AttachmentChip({ attachment }: { attachment: AgentAttachmentVm }) {
   const description = useId();
   const [open, setOpen] = useState(false);
+  // `blocked`: the server never judged this file — another file of its message was refused — so
+  // it reads "not sent", never like the refused one (R1071C-03).
+  const state = attachment.state === "blocked" ? "not sent" : attachment.state;
   return (
     <li className="min-w-0 rounded-lg border border-border bg-muted/30">
       <Dialog open={open} onOpenChange={setOpen}>
@@ -41,7 +45,7 @@ function AttachmentChip({ attachment }: { attachment: AgentAttachmentVm }) {
                 {attachment.name}
               </span>
               <span id={description} className="block text-muted-foreground text-xs">
-                {attachment.sizeLabel} · {attachment.state}
+                {attachment.sizeLabel} · {state}
               </span>
             </span>
             <span className="shrink-0 text-muted-foreground text-xs">Open</span>
@@ -49,10 +53,15 @@ function AttachmentChip({ attachment }: { attachment: AgentAttachmentVm }) {
         </DialogTrigger>
         <div role="status" aria-live="polite" aria-atomic="true">
           <span className="sr-only">
-            {attachment.name}: {attachment.state}
+            {attachment.name}: {state}
           </span>
           {attachment.sentence && (
-            <p className="px-3 pb-3 text-destructive text-sm [overflow-wrap:anywhere]">
+            <p
+              className={cn(
+                "px-3 pb-3 text-sm [overflow-wrap:anywhere]",
+                attachment.state === "refused" ? "text-destructive" : "text-muted-foreground",
+              )}
+            >
               {attachment.sentence}
             </p>
           )}

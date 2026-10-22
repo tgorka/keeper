@@ -49,6 +49,35 @@ describe("session attachment chips", () => {
     expect(screen.getAllByText(sentence)).toHaveLength(1);
   });
 
+  it("reads a blocked file as not sent, never styled as the refused one, Rust's sentences verbatim", () => {
+    const refusedSentence =
+      "huge.zip is larger than the 25.0 MB the agents server takes from one message, so the server refused it.";
+    const blockedSentence =
+      "tiny.csv was not sent: the agents server refused huge.zip, attached to the same message. Attach tiny.csv again.";
+    render(
+      <SessionAttachments
+        attachments={[
+          { ...file, id: "huge", name: "huge.zip", state: "refused", sentence: refusedSentence },
+          { ...file, id: "tiny", name: "tiny.csv", state: "blocked", sentence: blockedSentence },
+        ]}
+      />,
+    );
+    const tiny = screen.getByRole("button", { name: "Open tiny.csv" });
+    expect(tiny).toHaveAccessibleDescription("2 kB · not sent");
+    const [hugeStatus, tinyStatus] = screen.getAllByRole("status");
+    expect(tinyStatus).toHaveTextContent(`tiny.csv: not sent${blockedSentence}`);
+    expect(tinyStatus).not.toHaveTextContent("blocked");
+    expect(screen.getByText(blockedSentence)).not.toHaveClass("text-destructive");
+    expect(screen.getByText(blockedSentence)).toHaveClass("text-muted-foreground");
+    // Only the file the server actually refused carries the error styling.
+    expect(screen.getByRole("button", { name: "Open huge.zip" })).toHaveAccessibleDescription(
+      "2 kB · refused",
+    );
+    expect(hugeStatus).toHaveTextContent(`huge.zip: refused${refusedSentence}`);
+    expect(screen.getByText(refusedSentence)).toHaveClass("text-destructive");
+    expect(document.querySelectorAll(".text-destructive")).toHaveLength(1);
+  });
+
   it("opens the opaque scheme URL only on request and removes the preview on close", async () => {
     render(<SessionAttachments attachments={[file]} />);
     expect(screen.queryByTitle("Preview prices.csv")).not.toBeInTheDocument();
