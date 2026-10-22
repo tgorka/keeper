@@ -501,6 +501,116 @@ while the first is read, three with the server blackholed, one whose extension e
 queued — and how many notifications iOS leaves) and the Android tablet through ntfy while
 keeper runs.
 
+## Files in an agents session
+
+Story 107.1 (FR-857…FR-860; AD-429, AD-433). A file or photo put in an agents session is a
+syncular blob of the session's own database: uploaded once, before anything references it, and
+referenced by `attachments` rows committed with the message whose text is the caption, in one
+commit. Nothing goes into a drive, and no bytes cross IPC as JSON: the paperclip and
+drag-and-drop hand Rust **paths** (`agent_attach_path`, several files to one message), a paste
+hands it a **raw IPC body** with the session, type, name and caption in headers
+(`agent_attach_bytes`).
+
+**The bound.** One file may have at most `attachmentMaxBytes` from the contract's
+`syncular/limits.json` — 26,214,400 bytes (25 MiB) — the number the server's validator reads too.
+A larger file is refused on the device before anything is uploaded or written, with the agent
+host's sentence (*huge.zip is 25.1 MB and an agent takes at most 25.0 MB from one message, so it
+did not get the file.*, `keeper_core::hq::attachments::too_large`, which `keeper-agent` now
+re-exports); the server refuses it again if a device skips the check.
+
+**Upload before reference.** keeper hands the bytes to the replica, which caches them under their
+content address (`sha256:<hex>`) and queues the upload; the replica's next round uploads every
+queued blob (`POST …/upload-grant`, then `PUT /<database>/blobs/<blobId>`) before it pushes the
+commit that names it. `blob_ref` is syncular's canonical BlobRef JSON,
+`{"blobId":…,"byteLength":…,"mediaType":…,"name":…}` in that key order. Offline, the staged blob
+is pinned in the replica file — it survives a relaunch — and uploads once on reconnect; the same
+bytes attached twice are one blob.
+
+**The chip** (`AgentMessageVm.attachments`, one `AgentAttachmentVm` per file: name, type, size and
+its label, state, the refusal sentence, and the URL that opens it). A chip of this device's
+message reads **uploading** while its commit is on its way to a server this device reaches,
+**waiting** while it cannot reach one (offline, no server, refused credential), **sent** once the
+server has it — always, for anyone else's — and **refused** with the server's reason as a sentence:
+the commit refused (`blob.not_found`, `hq.attachment_writer`, `hq.attachment_message`,
+`hq.attachment_size`, `hq.attachment_blob_ref`, `hq.attachment_blob_size`, `hq.v1.author_*`), or
+the upload (`blob.too_large`, `blob.hash_mismatch`; then nothing more of this device is pushed
+until it is resolved). A refused commit's rows leave the replica, so its message is read back from
+the replica's outcome journal and shown in its place, state **refused**. The rows of an active
+session's attachments are held in a window beside its messages; their bytes are not.
+
+**Opening.** A chip's URL is `keeper-hq-blob://blob/<database>/<blobId>` (on Android and Windows,
+`http://keeper-hq-blob.localhost/…`). The handler serves only a blob an `attachments` row of that
+replica names, from the replica's cache, and downloads it on the first open — a second device
+shows the chip as soon as the message syncs and downloads nothing until it is opened. It answers
+as `keeper-media://` does (200, 206 for a `Range`, 416, 404 for anything it will not serve) with
+`nosniff`, and serves pictures, sound, video and PDF as themselves, text as `text/plain`, and
+everything else — HTML and SVG among them — as `application/octet-stream`, so no attachment runs
+as a page.
+
+**The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
+outbox pins (`keeper_core::hq::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
+`blob_cache_max_bytes`): ten of the largest files a message may carry, so a session's recent files
+open again without a download, while a phone holding both databases spends at most half a
+gigabyte on them. Past the cap, the least recently opened body the outbox does not pin is evicted
+first — referenced or not; the next open downloads it again. A body the outbox pins (staged, or
+named by a commit the server has not taken) is never evicted, even when the pinned bodies alone
+pass the cap. When each body was last opened is kept beside the replica
+(`<actor>.blob-access.sqlite`); the cache's size is the client's `blob_cache_bytes_approx`
+(`Hq::blob_cache_bytes`).
+
+### Measured: attachments against the real server
+
+2026-10-22, `hq_live.rs`'s
+`attachments_upload_before_reference_open_on_demand_and_are_refused_where_they_must_be` on delectra:
+the keeper-hq server from a clean `git archive` of `hq/107-1-blobs` 307ed16 (its own contract,
+schema 3; Bun 1.2.23, both databases with their blob directories) over a throwaway Postgres 18,
+tgorka in both databases, kuba in `tgdrive` alone, Nixie in the directory with no instance running;
+the test binary built in the agent container, run through delectra's gate. Four runs in a row,
+03:01:18–03:02:02 UTC, about 10.5 s each, every one green:
+
+- **Attach → upload → commit:** a CSV and a PNG attached by path from the mac (behind a relay that
+  sees every byte it sends) showed two chips at once, *uploading*; both read *sent* 2.5–2.7 s
+  later. The server answered one `PUT /tgdrive/blobs/<blobId>` for each.
+- **Open on demand:** the phone showed both chips as soon as the message synced, holding 0 bytes
+  of blobs (`blob_cache_bytes_approx`); opening the CSV downloaded its 26 bytes, served as
+  `text/plain`, and the cache then held exactly those.
+- **Offline:** with the relay cut, a pasted file's chip read *waiting*; keeper was shut down and
+  started again on the same files, the chip still *waiting* and the blob still staged in the
+  replica file; the phone had no row. Restored, the chip read *sent*, the server had answered one
+  `PUT` for it, and the phone held one row.
+- **A non-member** (kuba's token) asking for the CSV's blob was refused `blob.forbidden`.
+- **A reference to a blob the server does not hold** was refused `blob.not_found`; the mac showed
+  the message *refused*, its chip saying *The agents server does not hold ghost.txt, so it refused
+  the message that names it. Attach it again.*
+- **One byte over 25 MiB** was refused on the mac before anything was sent (the agent host's
+  sentence); staged anyway on a fourth device that skipped the check, the server refused the upload
+  (413, `blob.too_large`), that device's chip read *refused* with keeper's sentence, and the phone
+  never saw the message.
+
+The server's log had no error line; it recorded each forced reference as `push.rejected`
+`blob.not_found`. Two earlier runs of the case failed on the test's own counting, not on keeper:
+one counted the offline file's rows across every session (the same bytes attached in the run
+before are a second row of one blob — content addressing, as it should be), and two saw the
+CSV's `PUT` request line twice. The relay drops a client's connection when the server closes its
+side, and the transport sends an idempotent request again on a fresh connection when its pooled
+one has died [INFERENCE: not traced to the byte in those runs]; the case now counts the uploads
+the server answered (a request on a connection the server wrote back on after it), and in the four
+runs above each file's `PUT` was sent once.
+
+Development fixtures: `?sessions=launch&attachments=chips` (alpha's `device.1`: a message whose
+files are uploading, waiting, sent and refused, and a message refused whole), with
+`attachments=offline` or `attachments=refused` for what a new attachment does.
+
+**Proved on Linux:** keeper-core over real on-disk replicas — the bound before anything is staged,
+one commit holding the message and its rows with canonical `blob_ref`s, the pin and one upload row
+across a relaunch, opening only what a row names and only as a type that cannot run, the chips'
+states, a refused commit's message and chips, every refusal code's sentence
+(`hq/attachments_tests.rs`); eviction order and the pin over the replica file, and the reported
+size (`hq/syncular.rs`, `hq/blob_cache.rs`). **Inspection only:** `hq_ipc.rs`'s two commands,
+`hq_blob_protocol.rs` and its registration in `lib.rs` (CI's macOS job compiles them). **Owed:**
+the chip and the composer's tray (the UI lane, UX-DR-E107-1), hesperia and kalypso (acceptance 1,
+9 and the installed apps).
+
 ## Earlier Matrix agent hosting
 
 The remaining sections describe the earlier drive-and-Matrix host, retained while its history
