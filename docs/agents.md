@@ -566,10 +566,11 @@ the keeper-hq server from a clean `git archive` of `hq/107-1-blobs` 307ed16 (its
 schema 3; Bun 1.2.23, both databases with their blob directories) over a throwaway Postgres 18,
 tgorka in both databases, kuba in `tgdrive` alone, Nixie in the directory with no instance running;
 the test binary built in the agent container, run through delectra's gate. Four runs in a row,
-03:01:18–03:02:02 UTC, about 10.5 s each, every one green:
+03:01:18–03:02:02 UTC, and two more on the tree rebased onto 106.6's first review round,
+03:15:31–03:15:53 UTC, 8–13 s each, every one green:
 
 - **Attach → upload → commit:** a CSV and a PNG attached by path from the mac (behind a relay that
-  sees every byte it sends) showed two chips at once, *uploading*; both read *sent* 2.5–2.7 s
+  sees every byte it sends) showed two chips at once, *uploading*; both read *sent* 1.8–2.7 s
   later. The server answered one `PUT /tgdrive/blobs/<blobId>` for each.
 - **Open on demand:** the phone showed both chips as soon as the message synced, holding 0 bytes
   of blobs (`blob_cache_bytes_approx`); opening the CSV downloaded its 26 bytes, served as
@@ -594,7 +595,7 @@ before are a second row of one blob — content addressing, as it should be), an
 CSV's `PUT` request line twice. The relay drops a client's connection when the server closes its
 side, and the transport sends an idempotent request again on a fresh connection when its pooled
 one has died [INFERENCE: not traced to the byte in those runs]; the case now counts the uploads
-the server answered (a request on a connection the server wrote back on after it), and in the four
+the server answered (a request on a connection the server wrote back on after it), and in the six
 runs above each file's `PUT` was sent once.
 
 Development fixtures: `?sessions=launch&attachments=chips` (alpha's `device.1`: a message whose

@@ -87,6 +87,10 @@ impl Platform for Device {
     }
 }
 
+/// Each read a relay forwards, in order: its connection, whether the device
+/// sent it, and what the device sent (a server's answer is kept as nothing).
+type Events = Arc<Mutex<Vec<(u64, bool, Vec<u8>)>>>;
+
 /// A TCP relay in front of the server: it can be cut and restored, and it
 /// counts the connections and the bytes a device sends, and whether they
 /// named a path.
@@ -96,9 +100,7 @@ struct Relay {
     connections: Arc<AtomicU64>,
     sent: Arc<Mutex<Vec<u8>>>,
     generation: Arc<AtomicU64>,
-    /// Each read, in order: its connection, whether the device sent it, and
-    /// what the device sent (a server's answer is kept as its length only).
-    events: Arc<Mutex<Vec<(u64, bool, Vec<u8>)>>>,
+    events: Events,
 }
 
 impl Relay {
