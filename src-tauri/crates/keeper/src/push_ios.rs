@@ -13,12 +13,13 @@
 //!   through [`crate::hq_ipc::set_push_target`]); a cleared gateway removes
 //!   it. The server then posts an item's ids, and the extension reads the
 //!   item (`keeper_nse::answer_item`).
-//! - **The token and the pusher.** tao's app delegate hands the APNs device
-//!   token to [`token_arrived`] (the `tools/tao` patch, NOTICE change 3); once
-//!   keeper is set up, every signed-in account that holds agent session rooms
-//!   gets an `event_id_only` pusher to the gateway the person typed
-//!   (`AccountManager::push_register`, `keeper_core::agents::push::PusherSpec`).
-//!   The app id follows the build's own `aps-environment`
+//! - **The token, and the old pusher removed.** tao's app delegate hands the
+//!   APNs device token to [`token_arrived`] (the `tools/tao` patch, NOTICE
+//!   change 3). Before 108.2 every signed-in account that held agent session
+//!   rooms got a Matrix pusher for this token; the agents left Matrix, so
+//!   once keeper is set up that pusher is taken off every account
+//!   (`AccountManager::push_remove`, DW-E108-1) and none is registered. The
+//!   app id follows the build's own `aps-environment`
 //!   ([`ApnsEnvironment::of_profile`] over `embedded.mobileprovision`).
 //! - **The delegate.** `gen/apple/Sources/keeper/KeeperPush.swift` becomes
 //!   `UNUserNotificationCenter`'s delegate, forwarding every notification that
@@ -29,13 +30,10 @@
 //!   notification writes the decision row through the session's replica
 //!   (`keeper_core::hq::push::action_decision`, `Hq::decide_pushed`); a
 //!   background launch for it starts only that client
-//!   ([`crate::hq_ipc::ensure`]). On a Matrix agent room's notification,
-//!   [`keeper_push_action`] sends exactly the decision
-//!   `push::action_decision` derives from what the notification showed,
-//!   activating only that account when keeper was launched for it in the
-//!   background, within [`push::ACTION_BUDGET`]; when it cannot, the answer is
-//!   a notification asking the person to finish in keeper.
-//! - **A tap.** [`keeper_push_open`] keeps the session (or Matrix room) to open and tells
+//!   ([`crate::hq_ipc::ensure`]), within [`push::ACTION_BUDGET`]; when it
+//!   cannot, the answer is a notification asking the person to finish in
+//!   keeper.
+//! - **A tap.** [`keeper_push_open`] keeps the session to open and tells
 //!   the webview, which takes it with `push_open_take` — on mount, for a tap
 //!   that launched keeper, and on [`PUSH_OPEN_EVENT`] otherwise.
 //!
@@ -51,7 +49,7 @@
 //! that runs `setup()` (`tools/tao/src/platform_impl/ios/app_state.rs`,
 //! `did_finish_launching`). The plugins are initialised in `build`, so the
 //! plugin's delegate is already there to be wrapped. [`set_up`] runs from
-//! `setup()`: only then are pushers registered, because registering activates
+//! `setup()`: only then are old pushers removed, because removing one activates
 //! every account, which a background launch for one action must not do.
 
 use std::ffi::{c_char, CStr, CString};
@@ -76,7 +74,7 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 static TOKEN: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 /// Whether `setup()` has run: the app is in front, its accounts are being
-/// signed in, and pushers may be registered.
+/// signed in, and the old pusher may be removed.
 static SET_UP: AtomicBool = AtomicBool::new(false);
 
 /// The session room the last tapped notification opens, until the webview
@@ -91,8 +89,9 @@ pub fn install(app: &AppHandle) {
     bridge_install();
 }
 
-/// keeper is set up (`setup()`): register this phone's pusher once the
-/// token is known, and make sure the delegate is still keeper's.
+/// keeper is set up (`setup()`): hand the agents server this phone's push
+/// target and remove its old Matrix pusher once the token is known, and make
+/// sure the delegate is still keeper's.
 pub fn set_up() {
     SET_UP.store(true, Ordering::SeqCst);
     bridge_install();
@@ -122,11 +121,11 @@ fn token_arrived(token: &[u8]) {
 }
 
 /// iOS gave no token: a build without `aps-environment` (every free
-/// Personal Team) or no network. No pusher is registered.
+/// Personal Team) or no network. No push target is handed over.
 fn token_refused(why: &str) {
     tracing::warn!(
         why,
-        "push: iOS gave keeper no device token, so no pusher is registered"
+        "push: iOS gave keeper no device token, so no push target is handed over"
     );
 }
 
@@ -148,8 +147,8 @@ fn environment() -> Option<ApnsEnvironment> {
             tracing::warn!(
                 %error,
                 "push: this build's provisioning profile could not be read, so whether its \
-                 token is the sandbox's (development) or production's is unknown; no pusher \
-                 is registered"
+                 token is the sandbox's (development) or production's is unknown; no push \
+                 target is handed over"
             );
             None
         }
@@ -167,9 +166,10 @@ pub fn pusher_ids() -> Option<push::PusherIds> {
     Some(push::pusher_ids(environment()?, &token))
 }
 
-/// Register (or remove) this phone's pusher on every account, in the
-/// background: after setup once the token is known, and when the person
-/// changes the gateway (`ipc::push_gateway_set`).
+/// Hand the agents server this phone's push target, and take this phone's
+/// old Matrix pusher off every account (DW-E108-1), in the background: after
+/// setup once the token is known, and when the person changes the gateway
+/// (`ipc::push_gateway_set`).
 pub fn register_soon() {
     if !SET_UP.load(Ordering::SeqCst) {
         return;
@@ -185,7 +185,7 @@ pub fn register_soon() {
         return;
     };
     let Some(environment) = environment() else {
-        tracing::info!("push: this build has no APNs environment; no pusher is registered");
+        tracing::info!("push: this build has no APNs environment; no push target is handed over");
         return;
     };
     tauri::async_runtime::spawn(async move {
@@ -212,56 +212,39 @@ pub fn register_soon() {
             environment,
             &token,
         ));
-        let device = format!("keeper on {}", crate::account_ipc::device_model());
+        crate::failure_notice::recovered(FailureOperation::PushRegistration, None);
+        // The Matrix pusher this phone registered before 108.2, taken off
+        // every account: a failure is a WARN line and is tried again at the
+        // next launch (DW-E108-1).
         match state
             .accounts
-            .push_register(
-                &state.platform,
-                stored.as_deref(),
-                environment,
-                &token,
-                &device,
-            )
+            .push_remove(&state.platform, push::pusher_ids(environment, &token), None)
             .await
         {
             Ok(outcomes) => {
-                // The registration reached the accounts: a failure of push as
-                // a whole is over; each account's own outcome sets or clears
-                // its own (R387).
-                crate::failure_notice::recovered(FailureOperation::PushRegistration, None);
                 for (account, outcome) in outcomes {
                     match outcome {
-                        Ok(registered) => {
-                            tracing::info!(account, ?registered, "push: pusher registered");
-                            crate::failure_notice::recovered(
-                                FailureOperation::PushRegistration,
-                                Some(account.as_str()),
-                            );
-                        }
-                        Err(error) => crate::failure_notice::tell(
-                            FailureOperation::PushRegistration,
-                            Some(account.as_str()),
-                            PUSH_NOT_REGISTERED,
-                            &error,
+                        Ok(()) => tracing::info!(account, "push: the old Matrix pusher is removed"),
+                        Err(error) => tracing::warn!(
+                            account,
+                            __omp_magic("", "error,")
+                            "push: the old Matrix pusher could not be removed"
                         ),
                     }
                 }
             }
-            Err(error) => crate::failure_notice::tell(
-                FailureOperation::PushRegistration,
-                None,
-                PUSH_NOT_REGISTERED,
-                &error,
-            ),
+            Err(error) => {
+                tracing::warn!(%error, "push: the old Matrix pushers could not be removed")
+            }
         }
     });
 }
 
 /// The decision an action sends, or the notification to post when it was
-/// not sent: `None` once the decision is in the room, and for a
-/// notification that names no approval keeper composed — a push as the
-/// gateway sent it (`push::SHOWN_INFO`, R343) is not answered with keeper's
-/// words either.
+/// not sent: `None` once the decision is written, and for a notification
+/// that names no agents server item keeper composed — a push as the gateway
+/// sent it (`push::SHOWN_INFO`, R343), or one of the agents' old Matrix
+/// rooms from before 108.2, is not answered with keeper's words either.
 fn act(request: &str) -> Option<Value> {
     let tap: push::ActionTap = match serde_json::from_str(request) {
         Ok(tap) => tap,
@@ -273,31 +256,8 @@ fn act(request: &str) -> Option<Value> {
     if keeper_core::hq::push::is_composed(&tap.user_info) {
         return act_on_item(&tap);
     }
-    let decision = match push::action_decision(&tap) {
-        Ok(decision) => decision,
-        Err(push::ActionRefusal::NoApproval) => {
-            tracing::warn!("push: an action on a notification keeper did not compose");
-            return None;
-        }
-        Err(refusal) => return Some(unfinished(&tap.user_info, &refusal.to_string())),
-    };
-    let Some(app) = APP.get() else {
-        return Some(unfinished(&tap.user_info, ""));
-    };
-    let state = app.state::<AppState>();
-    let sent = tauri::async_runtime::block_on(state.accounts.agent_approval_decide_notified(
-        &state.platform,
-        decision,
-        push::ACTION_BUDGET,
-    ));
-    match sent {
-        Ok(()) => None,
-        Err(error) => {
-            let why = crate::ipc::to_ipc_error(error).message;
-            tracing::warn!(why, "push: a lock-screen decision was not sent");
-            Some(unfinished(&tap.user_info, &why))
-        }
-    }
+    tracing::warn!("push: an action on a notification keeper did not compose");
+    None
 }
 
 /// The decision an action on an agents server item's notification sends,
@@ -325,8 +285,8 @@ fn act_on_item(tap: &push::ActionTap) -> Option<Value> {
 }
 
 /// The notification that asks the person to finish a decision in keeper,
-/// tapping which opens where the action's notification did — the session,
-/// or the Matrix room. keeper composes it, so it carries `push::SHOWN_INFO`
+/// tapping which opens where the action's notification did — the session.
+/// keeper composes it, so it carries `push::SHOWN_INFO`
 /// — what the delegate and `push::open_target` route a tap by.
 fn unfinished(user_info: &Value, why: &str) -> Value {
     let body = if why.is_empty() {

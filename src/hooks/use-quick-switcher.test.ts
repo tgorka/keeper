@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { composerStore } from "@/lib/stores/composer";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -116,17 +115,6 @@ describe("useQuickSwitcher", () => {
     renderHook(() => useQuickSwitcher());
     press({ ctrl: true });
     expect(roomsStore.getState().selected).toEqual({ accountId: ACC, roomId: "!y" });
-  });
-
-  it("cycles the agents window when the agents view is active", () => {
-    roomsStore.setState({ rooms: [room("!chat")] });
-    agentRoomsStore.setState({ rooms: [room("!nixi"), room("!tola")] });
-    primaryViewStore.setState({ view: "agents" });
-    roomsStore.getState().selectRoom({ accountId: ACC, roomId: "!nixi" });
-    renderHook(() => useQuickSwitcher());
-    press({ ctrl: true });
-    expect(roomsStore.getState().selected).toEqual({ accountId: ACC, roomId: "!tola" });
-    agentRoomsStore.getState().clear();
   });
 
   it("honors the account-switcher display filter", () => {

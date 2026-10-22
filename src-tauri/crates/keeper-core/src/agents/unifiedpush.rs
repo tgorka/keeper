@@ -16,7 +16,7 @@
 //! the UnifiedPush convention is a `GET` of [`NOTIFY_PATH`] on the endpoint's
 //! host answering `{"unifiedpush":{"gateway":"matrix"}}` ([`discover_gateway`])
 //! — and when it is, that address, read through [`Gateway::parse`], is the
-//! pusher's gateway ([`PusherSpec::unifiedpush`](crate::agents::push::PusherSpec::unifiedpush)).
+//! push target's gateway ([`crate::hq::push::PushTarget::unifiedpush`]).
 //! A definite other answer is refused with a sentence naming the host, and
 //! no pusher is registered; a server keeper cannot reach changes nothing
 //! ([`pusher_change`]). So on Android, and only there, keeper itself
@@ -25,15 +25,14 @@
 //!
 //! # What a push shows
 //!
-//! The gateway forwards the homeserver's `event_id_only` notification to the
-//! endpoint, and the distributor hands its bytes to keeper's receiver
-//! ([`pushed_event`]). keeper reads the one event with the account that knows
-//! the room, in its own process, and the iPhone's classifier decides what
-//! shows ([`crate::agents::push::shown_of`]) — one table for both phones.
-//! [`phone_notification`] lays the answer out for Android's notification
+//! The agents server's push names one item, which keeper reads and the
+//! iPhone's table decides ([`crate::hq::push`]) — one table for both phones.
+//! [`item_notification`] lays the answer out for Android's notification
 //! manager: the categories' actions only from Android 12 (API 31), the first
 //! that can require an unlocked device for an action (Q12); before it, no
-//! actions — the notification opens keeper.
+//! actions — the notification opens keeper. The Matrix pusher this phone
+//! registered before 108.2 is only removed now ([`Endpoint::pusher_ids`],
+//! DW-E108-1).
 //!
 //! The shell's `push_android.rs` and the Kotlin in `gen/android` carry these
 //! answers and decide nothing (AD-55/AD-56).
@@ -45,8 +44,7 @@ use serde_json::{json, Value};
 use ts_rs::TS;
 
 use crate::agents::push::{
-    Category, Gateway, PushApproval, Shown, APPROVAL_INFO, FINISH_IN_KEEPER, GENERIC_BODY,
-    GENERIC_TITLE, NOTIFY_PATH, PAYLOAD_ACCOUNT, SHOWN_INFO,
+    Category, Gateway, FINISH_IN_KEEPER, GENERIC_BODY, GENERIC_TITLE, NOTIFY_PATH,
 };
 
 /// The pusher's `app_id` on Android: one app for every Android build, since
@@ -66,14 +64,6 @@ pub const ACTIONS_NEED_UNLOCK_FROM: u32 = 31;
 /// How long keeper waits for the endpoint's server to answer whether it is a
 /// Matrix gateway.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long keeper waits, on Android, for the keys of a pushed event it
-/// cannot decrypt yet: they travel to this device in the sync beside the
-/// push.
-pub const DECRYPT_BUDGET: Duration = Duration::from_secs(10);
-
-/// How often the pushed event is read again while its keys are waited for.
-pub const DECRYPT_POLL: Duration = Duration::from_millis(1500);
 
 /// The most of an answer to the discovery question keeper reads; the answer
 /// it accepts is a few dozen bytes.
@@ -360,26 +350,6 @@ pub async fn discover_gateway(
     gateway_of_answer(endpoint, status, &body)
 }
 
-/// The event a push names: the homeserver's notification as the gateway
-/// forwarded it (Push Gateway API, `{"notification": {"room_id",
-/// "event_id", …}}`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushedEvent {
-    pub room_id: matrix_sdk::ruma::OwnedRoomId,
-    pub event_id: matrix_sdk::ruma::OwnedEventId,
-}
-
-/// The room and event a push's bytes name; `None` for anything else — a
-/// count-only notification, or bytes that are not the gateway's JSON.
-pub fn pushed_event(message: &[u8]) -> Option<PushedEvent> {
-    let message: Value = serde_json::from_slice(message).ok()?;
-    let notification = &message["notification"];
-    Some(PushedEvent {
-        room_id: matrix_sdk::ruma::RoomId::parse(notification["room_id"].as_str()?).ok()?,
-        event_id: matrix_sdk::ruma::EventId::parse(notification["event_id"].as_str()?).ok()?,
-    })
-}
-
 /// A UnifiedPush distributor installed on this device: its package, and the
 /// name Android shows for it. Any app can declare itself a distributor, so
 /// both are shown whenever one is named — a name alone can be borrowed.
@@ -462,61 +432,6 @@ pub struct PhoneNotification {
     pub user_info: Value,
 }
 
-/// What `shown` — read for `account` from the event `event_id` of `room_id`
-/// — posts on a device of API level `sdk_int`: the iPhone's words; its
-/// category's actions only from [`ACTIONS_NEED_UNLOCK_FROM`] — below that no
-/// category and no actions, and the record it carries says so, so no action
-/// can name one; `user_info` the account, the room, the record and
-/// [`SHOWN_INFO`], which only a notification keeper composed carries
-/// (`push::action_decision`, `push::tap_target`). One notification per
-/// approval, per answer (its edits replace it) or else per event.
-pub fn phone_notification(
-    account: &str,
-    room_id: &str,
-    event_id: &str,
-    shown: &Shown,
-    sdk_int: u32,
-) -> PhoneNotification {
-    let actionable = sdk_int >= ACTIONS_NEED_UNLOCK_FROM;
-    let category = shown.category.filter(|_| actionable);
-    let approval = shown.approval.clone().map(|approval| PushApproval {
-        category: approval.category.filter(|_| actionable),
-        ..approval
-    });
-    let tag = approval
-        .as_ref()
-        .map(|approval| approval.id.clone())
-        .or_else(|| shown.answer.clone())
-        .unwrap_or_else(|| event_id.to_owned());
-    let mut user_info = json!({
-        PAYLOAD_ACCOUNT: account,
-        SHOWN_INFO: true,
-        "room_id": room_id,
-    });
-    if let Some(approval) = &approval {
-        user_info[APPROVAL_INFO] = json!(approval);
-    }
-    PhoneNotification {
-        tag,
-        group: shown.thread_id.clone(),
-        title: shown.title.clone(),
-        subtitle: shown.subtitle.clone(),
-        body: shown.body.clone(),
-        category: category.map(|category| category.id().to_owned()),
-        actions: category
-            .map(Category::actions)
-            .unwrap_or_default()
-            .iter()
-            .map(|action| PhoneAction {
-                id: action.id().to_owned(),
-                label: action.label().to_owned(),
-                destructive: action.destructive(),
-            })
-            .collect(),
-        user_info,
-    }
-}
-
 /// The notification keeper posts when a push arrived and it cannot say what
 /// it was: keeper's own words, no actions, opening keeper; one at a time
 /// ([`GENERIC_TAG`]).
@@ -535,9 +450,9 @@ pub fn generic_notification() -> PhoneNotification {
 
 /// The notification that replaces one whose action could not be sent: asks
 /// the person to finish in keeper (`why`, when known, says why), no actions,
-/// and a tap opens where the first one did — the agents server session, or
-/// the Matrix session room ([`crate::agents::push::reposted_info`]) —
-/// `user_info` carries [`SHOWN_INFO`] only when that one did.
+/// and a tap opens where the first one did — the agents server session
+/// ([`crate::agents::push::reposted_info`]) — `user_info` carries
+/// [`crate::agents::push::SHOWN_INFO`] only when that one did.
 pub fn finish_in_keeper(tag: &str, user_info: &Value, why: &str) -> PhoneNotification {
     let body = if why.is_empty() {
         FINISH_IN_KEEPER.to_owned()

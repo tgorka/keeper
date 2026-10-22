@@ -29,12 +29,13 @@
 //! the synthesiser adds its end; each utterance the port reports read to
 //! its end ([`TurnEvent::SentenceSpoken`]) counts. When a move stops the
 //! answer — the stop phrase, a stop by hand, a question asked over it —
-//! [`HeardMark::reason`] says so, and the mark's content goes into the
-//! agent's room through `agent_heard_send` before anything else: the next
-//! spoken question — asked over the answer, or after a stop — waits for the
-//! mark's event id before it is submitted, so the agent's next turn is cut
-//! where the person stopped; it waits at most [`HEARD_MARK_WAIT`], then goes
-//! without it. The mark is a mark, not a cancel (R44, DW-419).
+//! [`HeardMark::reason`] says so, and the mark goes into the agent's session
+//! as a heard row through `hq_ipc::spoken_heard` before anything else
+//! (R-HQ-68): the next spoken question — asked over the answer, or after a
+//! stop — waits for the row to be written before it is submitted, so the
+//! agent's next turn is cut where the person stopped; it waits at most
+//! [`HEARD_MARK_WAIT`], then goes without it. The mark is a mark, not a
+//! cancel (R44, DW-419).
 //!
 //! # The one lock, and who never takes it
 //!
@@ -72,7 +73,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use keeper_core::agents::spoken::{HeardMark, HEARD_MARK_WAIT};
+use keeper_core::hq::sessions::AgentSessionRef;
+use keeper_core::hq::spoken::{HeardMark, HEARD_MARK_WAIT};
 use keeper_core::failure::FailureOperation;
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
@@ -408,7 +410,7 @@ fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
         .and_then(|table| HeardMark::reason(&state_before, table, &effects));
     let stopped = match voice.mark.take() {
         Some((asked, mark)) if reason.is_some() && Some(asked) == question_before => {
-            reason.and_then(|reason| mark.content(reason).map(|content| (mark, content)))
+            reason.and_then(|reason| mark.metadata(reason).map(|metadata| (mark, metadata)))
         }
         Some((asked, mark)) if Some(asked) == voice.turn.question() => {
             voice.mark = Some((asked, mark));
@@ -436,22 +438,16 @@ fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
         tracing::warn!("voice: a question or a heard mark before boot; nothing to send it with");
         return;
     };
-    if let Some((mark, content)) = stopped {
+    if let Some((mark, metadata)) = stopped {
         let earlier = voice.sending_mark.take();
-        let app = app.clone();
         voice.sending_mark = Some(tauri::async_runtime::spawn(async move {
             after_mark(earlier).await;
-            let state = app.state::<AppState>();
-            match state
-                .accounts
-                .agent_heard_send(mark.account_id(), mark.room_id(), content)
-                .await
-            {
-                Ok(event) => {
-                    tracing::info!(%event, "voice: told the agent where the person stopped listening")
+            match crate::hq_ipc::spoken_heard(mark.key().clone(), metadata).await {
+                Ok(()) => {
+                    tracing::info!("voice: told the agent where the person stopped listening")
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "voice: could not tell the agent where the person stopped listening");
+                    tracing::warn!(message = %error.message, "voice: could not tell the agent where the person stopped listening");
                 }
             }
         }));
@@ -515,14 +511,14 @@ fn hand(voice: &mut Voice, question: u64, end: usize) {
     }
 }
 
-/// The agent's message `anchor` in `room_id` on `account_id` answers
-/// `question` (AD-384): from here on, how far the person heard it is kept,
-/// while the question is the turn's.
-pub fn answer_anchored(question: u64, account_id: String, room_id: String, anchor: &str) {
+/// The agent's answer to the message `asked` in session `key` began, and
+/// it answers `question` (AD-384): from here on, how far the person heard
+/// it is kept, while the question is the turn's.
+pub fn answer_anchored(question: u64, key: AgentSessionRef, asked: String) {
     let mut voice = voice();
     if voice.turn.owns_answer(question) {
-        let mut mark = HeardMark::new(account_id, room_id);
-        mark.anchored(anchor);
+        let mut mark = HeardMark::new(key, asked);
+        mark.anchored();
         voice.mark = Some((question, mark));
     }
 }
@@ -1056,12 +1052,12 @@ pub fn voice_wake_set(
 }
 
 /// Choose where a spoken turn goes (Epic 67, AD-206; AD-384): a pinned
-/// bot's id, a proxy conversation's `agent:<room id>` (as
-/// `voice_agent_targets` lists it), or `None` for "the pinned bot most
-/// recently talked to". Persisted as given; where a turn actually goes is
-/// `keeper_core::bots::voice_target::resolve`'s answer at send time, so a
-/// bot unpinned after being chosen is skipped rather than written to, and a
-/// room that is no longer the person's proxy conversation is refused.
+/// bot's id, one of the person's agents as `agent:<agent>` (as
+/// `voice_agent_targets` lists it, 108.2), or `None` for "the pinned bot
+/// most recently talked to". Persisted as given; where a turn actually goes
+/// is `keeper_core::bots::voice_target::resolve`'s answer at send time, so a
+/// bot unpinned after being chosen is skipped rather than written to, and an
+/// agent no database this device holds names is refused.
 /// Returns the wake VM, whose `voice_target` is what was stored.
 #[tauri::command]
 pub fn voice_target_set(
@@ -1073,6 +1069,22 @@ pub fn voice_target_set(
     registry::set_bots_voice_target(&data_dir, chosen).map_err(to_ipc_error)?;
     let port = Arc::clone(&voice().port);
     persisted_wake_vm(&data_dir, port.as_ref())
+}
+
+/// The one-time notice *Speak to* shows once a choice naming one of the
+/// agents' old Matrix rooms was cleared at launch (UX-DR-E108-1); `None`
+/// once read, or when none was cleared.
+#[tauri::command]
+pub fn voice_old_target_notice_get(state: State<'_, AppState>) -> Result<Option<String>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    registry::get_voice_old_target_notice(&data_dir).map_err(to_ipc_error)
+}
+
+/// The person read *Speak to*'s notice: it is not shown again.
+#[tauri::command]
+pub fn voice_old_target_notice_dismiss(state: State<'_, AppState>) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    registry::dismiss_voice_old_target_notice(&data_dir).map_err(to_ipc_error)
 }
 
 /// Flip the wake switch (Epic 68, Story 68.4, AD-218): the one command the

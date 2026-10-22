@@ -453,20 +453,10 @@ pub const KEYS: &[KeySpec] = &[
         family: false,
         scope: Scope::UserGlobal,
         settable: Settable::AnyLayer,
-        shape: Shape::MatrixUserId,
+        shape: Shape::Text,
         default: "",
-        summary: "The default agent: one agent's Matrix user id. At launch, an account with at least one agent room opens the Agents window, on this agent's main conversation when it has one on this account; otherwise nothing is selected and Settings › Agents says why. Blank means no default agent; with no agent rooms, keeper opens the Inbox as before (R383).",
-        example: "\"@nixi:example.org\"",
-    },
-    KeySpec {
-        key: "agents.claims_lease",
-        family: false,
-        scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
-        shape: Shape::Choice(&["short", "quarter-hour"]),
-        default: "short",
-        summary: "Which lease this Mac takes a session's claim on while it hosts your agents (R455). `short` renews it every minute. `quarter-hour` renews it every 15 minutes, so a quiet room is not filled with renewals, and is taken only while every live host in the control room says it reads it; turn it on only after every device and keeper-agentd that serves your agents runs a build that reads it (keeper-agentd's own is `[claims] lease` in `agentd.toml`).",
-        example: "\"quarter-hour\"",
+        summary: "The default agent: one agent's id in the agents' databases this device holds. Launch and the notes dock open its main conversation; when no held database names it, nothing is selected and Settings › Agents says why. A Matrix user id stored before keeper 0.11 reads as the agent its localpart names. Blank means no default agent (R383).",
+        example: "\"nixie\"",
     },
     KeySpec {
         key: "agents.server_url",
@@ -1175,6 +1165,20 @@ pub const KEYS: &[KeySpec] = &[
         shape: Shape::Json,
         default: "[]",
         summary: "Recovered recording sessions the person has acknowledged.",
+        example: "",
+    },
+    KeySpec {
+        key: "ui.voice_old_target_notice",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is a one-time latch keeper sets when it cleared a Speak to choice that named an \
+             agent's old Matrix room, and pre-setting it in a file would show a notice about \
+             nothing",
+        ),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether Speak to still says, once, that its choice named one of the agents' old Matrix rooms and was cleared (108.2).",
         example: "",
     },
     // ---- undo send -------------------------------------------------------

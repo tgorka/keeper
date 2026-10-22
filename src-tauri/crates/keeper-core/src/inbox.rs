@@ -19,12 +19,11 @@
 //! no new virtualization is introduced here (full unified-inbox organization is
 //! Epic 4).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::agents::room::AgentRoomKindVm;
 use crate::badge::{self, BadgeConfig};
 use crate::platform::Platform;
 use crate::vm::{
@@ -52,50 +51,13 @@ pub type SpacesSink = Box<dyn Fn(SpacesSnapshot) -> bool + Send + Sync>;
 /// of the merge).
 pub type NetworksSink = Box<dyn Fn(NetworksSnapshot) -> bool + Send + Sync>;
 
-/// Why some of the Agents window's rows are not live (story 102.5, R501,
-/// R381): each is said above the list, in the window's batches
-/// ([`InboxBatch::note`]), beside the WARN its cause logged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AgentListTrouble {
-    /// The account could not be started (or its room list read): its rows
-    /// are the ones kept from its last run. Cleared by its first live
-    /// batch; its rows go only when the account is removed.
-    NotStarted,
-    /// The rows kept from the last run could not be read: the account's
-    /// agents appear once it is live. Cleared by its first live batch.
-    KeptUnread,
-    /// The rows could not be kept for the next run. Cleared once a later
-    /// snapshot is kept.
-    KeptUnwritten,
-}
-
-impl AgentListTrouble {
-    /// The sentence the Agents list says for it.
-    pub fn sentence(self) -> &'static str {
-        match self {
-            AgentListTrouble::NotStarted => {
-                "keeper could not start one of your accounts just now, so its agents are shown as keeper last saw them."
-            }
-            AgentListTrouble::KeptUnread => {
-                "keeper could not read the agents it kept from last time, so they appear once your account has synced."
-            }
-            AgentListTrouble::KeptUnwritten => {
-                "keeper could not keep this list for next time, so the next launch shows your agents only once your account has synced."
-            }
-        }
-    }
-}
-
 /// One account's contribution to the merged inbox: its opaque id, hue index, and
 /// the current room window it is streaming.
 struct AccountSlot {
     hue_index: u8,
     /// The account's current room window, mirrored from its per-account
-    /// `RoomListBatch` ops — recency-ordered within the account. Until its
-    /// first batch, the Agents rows kept from its last run (story 102.5).
+    /// `RoomListBatch` ops — recency-ordered within the account.
     rooms: Vec<RoomVm>,
-    /// Whether `rooms` is the live window: its producer's first batch came.
-    live: bool,
 }
 
 /// Shared per-account merge state feeding one merged-inbox subscription.
@@ -121,9 +83,6 @@ struct MergeState {
     /// Receives the Archive window
     /// (`!pinned && !is_favourite && is_archived && !is_unread`) (Story 4.2).
     archive_sink: InboxSink,
-    /// Receives the Agents window: every agent session room, recency order,
-    /// and nothing else (UX-DR132). Control rooms are in no window.
-    agents_sink: InboxSink,
     /// Keeper-local pin membership + order, keyed by `(account_id, room_id)` →
     /// `sort_order` (ascending). Reloaded from the registry and pushed in whole via
     /// [`InboxMerger::update_pins`] on every pin mutation (Story 4.3). A room in
@@ -168,9 +127,6 @@ struct MergeState {
     /// [`AccountManager`](crate::account::AccountManager); the Settings command mutates it
     /// live and can re-poke the merger to reapply.
     badge: Arc<BadgeConfig>,
-    /// Why each account's Agents rows are not live, said above the Agents
-    /// list (story 102.5, R501).
-    troubles: BTreeMap<String, BTreeSet<AgentListTrouble>>,
     /// Set once any sink reports its channel is closed, so later producer
     /// updates stop trying to emit.
     closed: bool,
@@ -190,10 +146,8 @@ impl InboxMerger {
     /// only in the Favorites window. `pins` seeds the initial pin map (from
     /// [`crate::registry::get_pins`]); it is replaced whole by [`Self::update_pins`]
     /// on every mutation. Favourite state is SDK-sourced (the `m.favourite` notable
-    /// tag), so it needs no seed and no out-of-band poke. `agents_sink` receives
-    /// the Agents window: every agent session room, whatever its pin, favourite
-    /// or archive state, and only there (UX-DR132).
-    // The five inbox windows, the spaces/networks snapshots, the pin seed, and the
+    /// tag), so it needs no seed and no out-of-band poke.
+    // The four inbox windows, the spaces/networks snapshots, the pin seed, and the
     // platform + badge config each cross a distinct concern; grouping them into a struct
     // would only obscure the one-to-one wiring the shell threads through.
     #[allow(clippy::too_many_arguments)]
@@ -202,7 +156,6 @@ impl InboxMerger {
         archive_sink: InboxSink,
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
-        agents_sink: InboxSink,
         pins: HashMap<(String, String), i64>,
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
@@ -216,7 +169,6 @@ impl InboxMerger {
                 favourites_sink,
                 inbox_sink,
                 archive_sink,
-                agents_sink,
                 pins,
                 spaces_sink,
                 account_spaces: HashMap::new(),
@@ -226,7 +178,6 @@ impl InboxMerger {
                 selected_network: None,
                 platform,
                 badge,
-                troubles: BTreeMap::new(),
                 closed: false,
             })),
         }
@@ -242,60 +193,7 @@ impl InboxMerger {
             .or_insert_with(|| AccountSlot {
                 hue_index,
                 rooms: Vec::new(),
-                live: false,
             });
-    }
-
-    /// Draw `rows` — an account's Agents rows kept from its last run — in
-    /// the Agents window until the account's first live batch replaces them
-    /// (story 102.5, R468), and emit the Agents window alone: the other
-    /// windows wait for the live lists, so none of them is drawn empty in
-    /// the meantime. A slot already live, or not registered, is left as it is.
-    pub async fn seed_agents(&self, account_id: &str, rows: Vec<RoomVm>) {
-        let mut state = self.inner.lock().await;
-        match state.accounts.get_mut(account_id) {
-            Some(slot) if !slot.live => slot.rooms = rows,
-            _ => return,
-        }
-        emit_agents(&mut state);
-    }
-
-    /// `account_id`'s Agents rows as its live window holds them now — what
-    /// is kept for the next run (story 102.5); `None` before its first live
-    /// batch.
-    pub async fn live_agent_rows(&self, account_id: &str) -> Option<Vec<RoomVm>> {
-        let state = self.inner.lock().await;
-        let slot = state.accounts.get(account_id).filter(|slot| slot.live)?;
-        Some(
-            slot.rooms
-                .iter()
-                .filter(|room| {
-                    room.agent_room
-                        .is_some_and(|kind| kind != AgentRoomKindVm::Control)
-                })
-                .cloned()
-                .collect(),
-        )
-    }
-
-    /// Say (`on`) or stop saying `trouble` of `account_id`'s Agents rows
-    /// above the list (story 102.5, R501), re-emitting the Agents window
-    /// when that changed what it says. Nothing for an account not
-    /// registered.
-    pub async fn trouble(&self, account_id: &str, trouble: AgentListTrouble, on: bool) {
-        let mut state = self.inner.lock().await;
-        if !state.accounts.contains_key(account_id) {
-            return;
-        }
-        let troubles = state.troubles.entry(account_id.to_owned()).or_default();
-        let changed = if on {
-            troubles.insert(trouble)
-        } else {
-            troubles.remove(&trouble)
-        };
-        if changed {
-            emit_agents(&mut state);
-        }
     }
 
     /// Remove an account slot (sign-out / shutdown) and re-emit the merged
@@ -303,7 +201,6 @@ impl InboxMerger {
     pub async fn remove_account(&self, account_id: &str) {
         let mut state = self.inner.lock().await;
         let had_account = state.accounts.remove(account_id).is_some();
-        state.troubles.remove(account_id);
         // Drop the account's Spaces + child memberships (Story 4.5), and clear the
         // Space filter if it was owned by the removed account so the inbox returns
         // to the full unfiltered windows.
@@ -428,21 +325,7 @@ impl InboxMerger {
             return false;
         }
         if let Some(slot) = state.accounts.get_mut(account_id) {
-            // The first live batch replaces the kept rows: its ops index the
-            // SDK's list, which the kept rows are not; and it is the live
-            // list the troubles of not having one were about.
-            let first = !slot.live;
-            if first {
-                slot.rooms.clear();
-                slot.live = true;
-            }
             slot.rooms = apply_room_list_batch(std::mem::take(&mut slot.rooms), &batch);
-            if first {
-                if let Some(troubles) = state.troubles.get_mut(account_id) {
-                    troubles.remove(&AgentListTrouble::NotStarted);
-                    troubles.remove(&AgentListTrouble::KeptUnread);
-                }
-            }
         }
         emit(&mut state)
     }
@@ -504,14 +387,7 @@ fn emit(state: &mut MergeState) -> bool {
             state.selected_network = None;
         }
     }
-    // Agent session rooms live in the Agents window only (UX-DR132): split them
-    // off before the Space and Network filters, which narrow the chat windows
-    // only (an agent room has no Network, and the Agents window lists every
-    // agent the person has, whatever Space is selected), and before the
-    // pin/favourite/archive partition so no other window shows one.
-    let (agent_rooms, mut merged): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
-        .into_iter()
-        .partition(|room| room.agent_room.is_some());
+    let mut merged = merged;
     // Apply the ephemeral Space filter *before* the pins/favorites/inbox/archive
     // partition (Story 4.5), so precedence (Pins > Favorites > Archive/Inbox) and
     // per-window recency order are preserved within the filtered subset and each
@@ -571,43 +447,31 @@ fn emit(state: &mut MergeState) -> bool {
         ops: vec![InboxOp::Reset {
             rooms: pinned_rooms,
         }],
-        note: None,
     };
     let favourites_batch = InboxBatch {
         total: Some(favourite_rooms.len() as u32),
         ops: vec![InboxOp::Reset {
             rooms: favourite_rooms,
         }],
-        note: None,
     };
     let inbox_batch = InboxBatch {
         total: Some(inbox_rooms.len() as u32),
         ops: vec![InboxOp::Reset { rooms: inbox_rooms }],
-        note: None,
     };
     let archive_batch = InboxBatch {
         total: Some(archive_rooms.len() as u32),
         ops: vec![InboxOp::Reset {
             rooms: archive_rooms,
         }],
-        note: None,
     };
-    let agents_batch = InboxBatch {
-        total: Some(agent_rooms.len() as u32),
-        ops: vec![InboxOp::Reset { rooms: agent_rooms }],
-        note: agents_note(&state.troubles),
-    };
-    // Emit all five windows; a close on any sink stops all future emissions.
+    // Emit all four windows; a close on any sink stops all future emissions.
     let pins_ok = (state.pins_sink)(pins_batch);
     let favourites_ok = (state.favourites_sink)(favourites_batch);
     let inbox_ok = (state.inbox_sink)(inbox_batch);
     let archive_ok = (state.archive_sink)(archive_batch);
-    let agents_ok = (state.agents_sink)(agents_batch);
-    if !pins_ok || !favourites_ok || !inbox_ok || !archive_ok || !agents_ok {
+    if !pins_ok || !favourites_ok || !inbox_ok || !archive_ok {
         state.closed = true;
-        tracing::info!(
-            "pins/favorites/inbox/archive/agents channel closed; stopping merged emissions"
-        );
+        tracing::info!("pins/favorites/inbox/archive channel closed; stopping merged emissions");
         return false;
     }
     // Push the distinct-Networks snapshot LAST — after the four windows are emitted
@@ -616,41 +480,6 @@ fn emit(state: &mut MergeState) -> bool {
     // live/closed state so a networks-channel close still stops future emissions.
     push_networks(network_names, &state.networks_sink, &mut state.closed);
     !state.closed
-}
-
-/// What the Agents list says above its rows: each trouble any account has,
-/// once, in [`AgentListTrouble`]'s order; `None` when there is none.
-fn agents_note(troubles: &BTreeMap<String, BTreeSet<AgentListTrouble>>) -> Option<String> {
-    let said: BTreeSet<AgentListTrouble> = troubles.values().flatten().copied().collect();
-    (!said.is_empty()).then(|| {
-        said.into_iter()
-            .map(AgentListTrouble::sentence)
-            .collect::<Vec<_>>()
-            .join(" ")
-    })
-}
-
-/// Emit the Agents window alone (story 102.5): what [`emit`] sends it, from
-/// the same merge.
-fn emit_agents(state: &mut MergeState) -> bool {
-    if state.closed {
-        return false;
-    }
-    let agent_rooms: Vec<InboxRoomVm> = merge(&state.accounts)
-        .into_iter()
-        .filter(|room| room.agent_room.is_some())
-        .collect();
-    let batch = InboxBatch {
-        total: Some(agent_rooms.len() as u32),
-        ops: vec![InboxOp::Reset { rooms: agent_rooms }],
-        note: agents_note(&state.troubles),
-    };
-    if !(state.agents_sink)(batch) {
-        state.closed = true;
-        tracing::info!("agents channel closed; stopping merged emissions");
-        return false;
-    }
-    true
 }
 
 /// Emit the aggregated Space list as one whole [`SpacesSnapshot`] into the spaces
@@ -733,10 +562,9 @@ fn merge(accounts: &HashMap<String, AccountSlot>) -> Vec<InboxRoomVm> {
         let slot = &accounts[id];
         for room in &slot.rooms {
             // Space rooms are containers, not chats — never in any chat window
-            // (Story 4.5) — and an agents' control room is in no window either
-            // (UX-DR132). Both flags live only on `RoomVm`, so drop them here
+            // (Story 4.5). The flag lives only on `RoomVm`, so drop them here
             // before projecting to `InboxRoomVm`.
-            if room.is_space || room.agent_room == Some(AgentRoomKindVm::Control) {
+            if room.is_space {
                 continue;
             }
             rows.push(to_inbox_room(id, slot.hue_index, room));
@@ -784,12 +612,6 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         // at projection time (Story 10.2), copied straight through — it drives the row
         // mute glyph and never gates the unread computation above.
         mute_state: room.mute_state,
-        // Proxy or watched session, read on the `RoomVm`; the merge routes on it.
-        agent_room: room.agent_room,
-        agent_avatar: room.agent_avatar.clone(),
-        agent_mark: room.agent_mark.clone(),
-        agent: room.agent.clone(),
-        agent_attention: room.agent_attention,
     }
 }
 
@@ -923,11 +745,6 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: crate::vm::MuteState::None,
-            agent_room: None,
-            agent_avatar: None,
-            agent_mark: None,
-            agent: None,
-            agent_attention: None,
         }
     }
 
@@ -968,7 +785,6 @@ mod tests {
         AccountSlot {
             hue_index: hue,
             rooms,
-            live: true,
         }
     }
 
@@ -1020,11 +836,6 @@ mod tests {
             network: Some("Telegram".to_owned()),
             network_id: Some("telegram".to_owned()),
             mute_state: crate::vm::MuteState::Muted,
-            agent_room: None,
-            agent_avatar: None,
-            agent_mark: None,
-            agent: None,
-            agent_attention: None,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
@@ -1147,7 +958,7 @@ mod tests {
     /// The dock badge is wired to a discarded no-op platform in mode `All`; badge-
     /// asserting tests use [`badge_merger`] instead to hold the recording handle.
     fn capturing_merger_with_pins(pins: HashMap<(String, String), i64>) -> CapturingMerger {
-        let (merger, inbox, archive, pins_cap, favourites, _agents, spaces, networks, _platform) =
+        let (merger, inbox, archive, pins_cap, favourites, spaces, networks, _platform) =
             capturing_merger_with_pins_and_badge(pins, DockBadgeMode::All);
         (
             merger, inbox, archive, pins_cap, favourites, spaces, networks,
@@ -1158,33 +969,15 @@ mod tests {
     /// test can assert the OS dock badge the merger pushes on each merged-state change
     /// (Story 10.3). Returns `(merger, recording_platform)`.
     fn badge_merger(mode: DockBadgeMode) -> (InboxMerger, Arc<BadgeRecordingPlatform>) {
-        let (merger, _inbox, _archive, _pins, _favourites, _agents, _spaces, _networks, platform) =
+        let (merger, _inbox, _archive, _pins, _favourites, _spaces, _networks, platform) =
             capturing_merger_with_pins_and_badge(HashMap::new(), mode);
         (merger, platform)
-    }
-
-    /// A merger seeded with `pins`, returning its five window captures:
-    /// `(merger, inbox, archive, pins, favourites, agents)`.
-    fn agents_merger(
-        pins: HashMap<(String, String), i64>,
-    ) -> (
-        InboxMerger,
-        Captured,
-        Captured,
-        Captured,
-        Captured,
-        Captured,
-    ) {
-        let (merger, inbox, archive, pins_cap, favourites, agents, _spaces, _networks, _platform) =
-            capturing_merger_with_pins_and_badge(pins, DockBadgeMode::All);
-        (merger, inbox, archive, pins_cap, favourites, agents)
     }
 
     /// The [`CapturingMerger`] captures plus the [`BadgeRecordingPlatform`] the merger
     /// pushes dock badges through.
     type CapturingMergerWithBadge = (
         InboxMerger,
-        Captured,
         Captured,
         Captured,
         Captured,
@@ -1205,14 +998,12 @@ mod tests {
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let favourites: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
-        let agents: Captured = Arc::new(StdMutex::new(Vec::new()));
         let spaces: CapturedSpaces = Arc::new(StdMutex::new(Vec::new()));
         let networks: CapturedNetworks = Arc::new(StdMutex::new(Vec::new()));
         let inbox_store = inbox.clone();
         let archive_store = archive.clone();
         let pins_store = pins_cap.clone();
         let favourites_store = favourites.clone();
-        let agents_store = agents.clone();
         let spaces_store = spaces.clone();
         let networks_store = networks.clone();
         let platform = Arc::new(BadgeRecordingPlatform::default());
@@ -1235,10 +1026,6 @@ mod tests {
                 favourites_store.lock().expect("lock").push(batch);
                 true
             }),
-            Box::new(move |batch: InboxBatch| {
-                agents_store.lock().expect("lock").push(batch);
-                true
-            }),
             pins,
             Box::new(move |snapshot: SpacesSnapshot| {
                 spaces_store.lock().expect("lock").push(snapshot);
@@ -1252,7 +1039,7 @@ mod tests {
             badge,
         );
         (
-            merger, inbox, archive, pins_cap, favourites, agents, spaces, networks, platform,
+            merger, inbox, archive, pins_cap, favourites, spaces, networks, platform,
         )
     }
 
@@ -1757,277 +1544,6 @@ mod tests {
         assert_eq!(last_reset_ids(&archive), Vec::<String>::new());
         assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
         assert_eq!(last_reset_ids(&favourites), Vec::<String>::new());
-    }
-
-    /// A room of the agents' kind `agent_room`.
-    fn room_agent(id: &str, ts: Option<i64>, agent_room: AgentRoomKindVm) -> RoomVm {
-        RoomVm {
-            agent_room: Some(agent_room),
-            ..room(id, ts)
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_session_rooms_are_in_the_agents_window_only() {
-        // A proxy conversation, a watched session and a session room whose kind
-        // is not read yet go to the Agents window, in recency order, even when
-        // pinned, favourited, archived or unread.
-        let pins = pin_map(&[("acctA", "!pinned-agent", 0)]);
-        let (merger, inbox, archive, pins_cap, favourites, agents) = agents_merger(pins);
-        merger.register_account("acctA", 0).await;
-        merger
-            .apply_account_batch(
-                "acctA",
-                RoomListBatch {
-                    ops: vec![RoomListOp::Reset {
-                        rooms: vec![
-                            room_agent("!dm", Some(100), AgentRoomKindVm::Proxy),
-                            room_agent("!new", Some(50), AgentRoomKindVm::Unknown),
-                            room_flags("!chat", Some(400), false, false),
-                            room_agent("!pinned-agent", Some(500), AgentRoomKindVm::Session),
-                            RoomVm {
-                                agent_room: Some(AgentRoomKindVm::Session),
-                                ..room_fav("!fav-agent", Some(300), true, true)
-                            },
-                            RoomVm {
-                                agent_room: Some(AgentRoomKindVm::Proxy),
-                                ..room_flags("!archived-agent", Some(200), true, false)
-                            },
-                        ],
-                    }],
-                    total: Some(6),
-                },
-            )
-            .await;
-        assert_eq!(
-            last_reset_ids(&agents),
-            [
-                "!pinned-agent",
-                "!fav-agent",
-                "!archived-agent",
-                "!dm",
-                "!new"
-            ]
-        );
-        assert_eq!(last_reset_ids(&inbox), ["!chat"]);
-        assert_eq!(last_reset_ids(&archive), Vec::<String>::new());
-        assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
-        assert_eq!(last_reset_ids(&favourites), Vec::<String>::new());
-        let rows = agents.lock().expect("lock");
-        let InboxOp::Reset { rooms } = &rows.last().expect("a batch").ops[0] else {
-            panic!("expected Reset");
-        };
-        let dm = rooms.iter().find(|r| r.room_id == "!dm").expect("the dm");
-        assert_eq!(dm.agent_room, Some(AgentRoomKindVm::Proxy));
-    }
-
-    #[tokio::test]
-    async fn control_rooms_are_in_no_window() {
-        let pins = pin_map(&[("acctA", "!control", 0)]);
-        let (merger, inbox, archive, pins_cap, favourites, agents) = agents_merger(pins);
-        merger.register_account("acctA", 0).await;
-        merger
-            .apply_account_batch(
-                "acctA",
-                RoomListBatch {
-                    ops: vec![RoomListOp::Reset {
-                        rooms: vec![
-                            room_agent("!control", Some(500), AgentRoomKindVm::Control),
-                            RoomVm {
-                                agent_room: Some(AgentRoomKindVm::Control),
-                                ..room_fav("!fav-control", Some(400), true, true)
-                            },
-                            room_flags("!chat", Some(100), false, false),
-                        ],
-                    }],
-                    total: Some(3),
-                },
-            )
-            .await;
-        assert_eq!(last_reset_ids(&inbox), ["!chat"]);
-        for window in [&archive, &pins_cap, &favourites, &agents] {
-            assert_eq!(last_reset_ids(window), Vec::<String>::new());
-        }
-    }
-
-    #[tokio::test]
-    async fn the_agents_window_is_not_narrowed_by_a_space_or_a_network() {
-        let (merger, inbox, _archive, _pins, _favourites, agents) = agents_merger(HashMap::new());
-        merger.register_account("acctA", 0).await;
-        merger
-            .apply_account_batch(
-                "acctA",
-                RoomListBatch {
-                    ops: vec![RoomListOp::Reset {
-                        rooms: vec![
-                            room_net("!tg", Some(400), "Telegram"),
-                            room_agent("!dm", Some(300), AgentRoomKindVm::Proxy),
-                            room_agent("!watched", Some(200), AgentRoomKindVm::Session),
-                        ],
-                    }],
-                    total: Some(3),
-                },
-            )
-            .await;
-        merger
-            .update_spaces(
-                "acctA",
-                vec![space_vm("acctA", "!s")],
-                membership(&[("!s", &["!tg"])]),
-            )
-            .await;
-        merger.set_network_filter(Some("Telegram".to_owned())).await;
-        assert_eq!(last_reset_ids(&inbox), ["!tg"]);
-        assert_eq!(last_reset_ids(&agents), ["!dm", "!watched"]);
-        merger
-            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
-            .await;
-        assert_eq!(last_reset_ids(&agents), ["!dm", "!watched"]);
-    }
-
-    /// Story 102.5 #1 (R468): the rows kept from the last run are drawn in
-    /// the Agents window alone — no other window is emitted, so none is drawn
-    /// empty — and the account's first live batch replaces them rather than
-    /// being applied on top of them; a seed after that changes nothing.
-    #[tokio::test]
-    async fn kept_agent_rows_are_drawn_alone_until_the_live_list_replaces_them() {
-        let (merger, inbox, archive, pins_cap, favourites, agents) = agents_merger(HashMap::new());
-        merger.register_account("acctA", 0).await;
-        merger
-            .seed_agents(
-                "acctA",
-                vec![
-                    room_agent("!kept-dm", Some(300), AgentRoomKindVm::Proxy),
-                    room_agent("!kept-gone", Some(200), AgentRoomKindVm::Session),
-                ],
-            )
-            .await;
-        assert_eq!(last_reset_ids(&agents), ["!kept-dm", "!kept-gone"]);
-        for window in [&inbox, &archive, &pins_cap, &favourites] {
-            assert!(window.lock().expect("lock").is_empty(), "not drawn yet");
-        }
-        assert_eq!(merger.live_agent_rows("acctA").await, None);
-
-        merger
-            .apply_account_batch(
-                "acctA",
-                RoomListBatch {
-                    ops: vec![RoomListOp::Append {
-                        rooms: vec![
-                            room_agent("!kept-dm", Some(400), AgentRoomKindVm::Proxy),
-                            room_flags("!chat", Some(100), false, false),
-                        ],
-                    }],
-                    total: Some(2),
-                },
-            )
-            .await;
-        assert_eq!(
-            last_reset_ids(&agents),
-            ["!kept-dm"],
-            "the live list replaced them"
-        );
-        assert_eq!(last_reset_ids(&inbox), ["!chat"]);
-        let live = merger.live_agent_rows("acctA").await.expect("live");
-        assert_eq!(live.len(), 1);
-
-        merger
-            .seed_agents(
-                "acctA",
-                vec![room_agent("!stale", Some(900), AgentRoomKindVm::Proxy)],
-            )
-            .await;
-        assert_eq!(
-            last_reset_ids(&agents),
-            ["!kept-dm"],
-            "a live slot is not reseeded"
-        );
-    }
-
-    /// The note of the last batch captured in `store`.
-    fn last_note(store: &Captured) -> Option<String> {
-        store
-            .lock()
-            .expect("lock")
-            .last()
-            .and_then(|batch| batch.note.clone())
-    }
-
-    /// Story 102.5 (R501, review R102L5-04): an account that could not start
-    /// keeps its kept rows — another account going live beside it does not
-    /// take them — and the Agents list says why, in no other window; its own
-    /// first live batch replaces them and ends the sentence. A trouble that
-    /// is not cleared by going live (a list not kept) stays said; the
-    /// account's removal ends it.
-    #[tokio::test]
-    async fn an_account_that_could_not_start_keeps_its_rows_and_the_list_says_so() {
-        let (merger, inbox, _archive, _pins, _favourites, agents) = agents_merger(HashMap::new());
-        merger.register_account("acctA", 0).await;
-        merger.register_account("acctB", 1).await;
-        merger
-            .seed_agents(
-                "acctA",
-                vec![room_agent("!a-kept", Some(300), AgentRoomKindVm::Proxy)],
-            )
-            .await;
-        merger
-            .seed_agents(
-                "acctB",
-                vec![room_agent("!b-kept", Some(200), AgentRoomKindVm::Proxy)],
-            )
-            .await;
-        merger
-            .trouble("acctA", AgentListTrouble::NotStarted, true)
-            .await;
-        let said = AgentListTrouble::NotStarted.sentence().to_owned();
-        assert_eq!(last_note(&agents), Some(said.clone()));
-
-        merger
-            .apply_account_batch(
-                "acctB",
-                RoomListBatch {
-                    ops: vec![RoomListOp::Append {
-                        rooms: vec![room_agent("!b-live", Some(400), AgentRoomKindVm::Proxy)],
-                    }],
-                    total: Some(1),
-                },
-            )
-            .await;
-        assert_eq!(last_reset_ids(&agents), ["!b-live", "!a-kept"]);
-        assert_eq!(last_note(&agents), Some(said.clone()), "still not live");
-        assert_eq!(last_note(&inbox), None, "said in the Agents list alone");
-
-        merger
-            .trouble("acctB", AgentListTrouble::KeptUnwritten, true)
-            .await;
-        assert_eq!(
-            last_note(&agents),
-            Some(format!(
-                "{said} {}",
-                AgentListTrouble::KeptUnwritten.sentence()
-            ))
-        );
-
-        merger
-            .apply_account_batch(
-                "acctA",
-                RoomListBatch {
-                    ops: vec![RoomListOp::Append {
-                        rooms: vec![room_agent("!a-live", Some(500), AgentRoomKindVm::Proxy)],
-                    }],
-                    total: Some(1),
-                },
-            )
-            .await;
-        assert_eq!(last_reset_ids(&agents), ["!a-live", "!b-live"]);
-        assert_eq!(
-            last_note(&agents),
-            Some(AgentListTrouble::KeptUnwritten.sentence().to_owned()),
-            "live now; the other account's list is still not kept"
-        );
-
-        merger.remove_account("acctB").await;
-        assert_eq!(last_note(&agents), None);
     }
 
     #[tokio::test]

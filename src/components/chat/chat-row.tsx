@@ -32,22 +32,14 @@
  * notable tag (best-effort, no optimistic overlay). While the user has zero
  * favourites a one-time muted hint (UX-DR13) sits by the Favorite item explaining
  * the section; it disappears once any favourite exists.
- *
- * An agent row (story 102.7, R463) whose agent is the default agent — the one
- * keeper opens at launch, as Rust reads `agents.default` — wears a "Default"
- * marker before its name (before, so the name's truncation never cuts it),
- * titled "Opens when keeper starts" and said in the row's name; its menu
- * offers "Make default", or "Default" checked, which stops it being one.
  */
 
-import { AtSign, BellOff, Eye, Pencil } from "lucide-react";
+import { AtSign, BellOff, Pencil } from "lucide-react";
 import { forwardRef, type MouseEvent as ReactMouseEvent } from "react";
-import { AgentAttentionMark, agentAttentionLabel } from "@/components/agents/agent-attention";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
   ContextMenu,
-  ContextMenuCheckboxItem,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuLabel,
@@ -66,7 +58,6 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
-import { saveDefaultAgent } from "@/lib/default-agent-actions";
 import { logFailure, sayFailure } from "@/lib/failure";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { ChatNotifyMode, InboxRoomVm } from "@/lib/ipc/client";
@@ -82,16 +73,11 @@ import {
   unpinRoom,
 } from "@/lib/ipc/client";
 import { useBridgeHealth } from "@/lib/stores/bridge-health";
-import { useDefaultAgentStore } from "@/lib/stores/default-agent";
 import { useHasDraft } from "@/lib/stores/drafts";
 import { useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
-/** The default agent's marker on its rows, and what it means (R463). */
-export const DEFAULT_AGENT_MARKER = "Default";
-export const DEFAULT_AGENT_MARKER_TITLE = "Opens when keeper starts";
-export const MAKE_DEFAULT_ROW_LABEL = "Make default";
 
 /**
  * The settled width (px) of the trailing swipe's revealed action pair (Story
@@ -249,29 +235,6 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
   // replaced rather than appended. A room that cannot be reached has to say so
   // in the name, or the lamp is a picture and nothing else.
   const healthLabel = affectedHealth === null ? "" : `, ${BRIDGE_HEALTH_LABEL[affectedHealth]}`;
-  // An agent room says which kind it is (UX-DR132): a proxy conversation is one
-  // the person talks in; a session is one they watch and decide approvals in;
-  // a room whose kind keeper has not read yet claims neither. Only the session
-  // wears a visible mark — it is the exception in the window.
-  const agentLabel =
-    room.agentRoom === "proxy"
-      ? ", an agent conversation"
-      : room.agentRoom === "session"
-        ? ", an agent session you watch"
-        : room.agentRoom === "unknown"
-          ? ", an agent room"
-          : "";
-  // Whether the agent needs the person, failed, works or finished unread
-  // (story 101.6, R421) — Rust's word, said in the name as it is drawn.
-  const attention = room.agentAttention ?? null;
-  const attentionLabel = agentAttentionLabel(attention);
-  // The agent keeper opens at launch, as Rust reads it (R463): its rows say
-  // so, and every agent row may be made the default from its menu.
-  const agent = room.agent ?? null;
-  const defaultAgent = useDefaultAgentStore((s) => s.vm?.defaultAgent ?? null);
-  const savingDefault = useDefaultAgentStore((s) => s.saving);
-  const isDefault = agent !== null && agent === defaultAgent;
-  const defaultLabel = isDefault ? ", default agent, opens when keeper starts" : "";
 
   // ---- Phone touch idioms (Story 13.6) ------------------------------------
   // Long-press opens the identical ContextMenu above (the non-gesture duplicate
@@ -317,7 +280,7 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       type="button"
       tabIndex={tabIndex}
       onClick={onRowClick}
-      aria-label={`Conversation with ${room.displayName}${agentLabel}${defaultLabel}${attentionLabel}${unreadLabel}${healthLabel}`}
+      aria-label={`Conversation with ${room.displayName}${unreadLabel}${healthLabel}`}
       aria-current={selected ? "true" : undefined}
       className={cn(
         "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
@@ -350,17 +313,6 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
                 data-testid="bridge-health-dot"
               />
             )}
-            {/* Before the name, which truncates: the marker is never cut. */}
-            {isDefault && (
-              <span
-                aria-hidden="true"
-                data-testid="default-agent-marker"
-                title={DEFAULT_AGENT_MARKER_TITLE}
-                className="inline-flex shrink-0 items-center rounded-sm bg-secondary px-1 font-medium text-[0.6875rem] text-secondary-foreground leading-4"
-              >
-                {DEFAULT_AGENT_MARKER}
-              </span>
-            )}
             <span className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}>
               {room.displayName}
             </span>
@@ -384,15 +336,8 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
           {/* A column of times read down the list: tabular so a 1 is as wide as
               a 7 and the column edge does not ripple row to row. Sans, not the
               register's mono, because this slot also says "Yesterday". */}
-          {/* An agent room's state stands where its time would (t3code's
-              sidebar): what the person wants to know of an agent is whether
-              it needs them, not when it last spoke. */}
-          {attention !== null ? (
-            <AgentAttentionMark state={attention} />
-          ) : (
-            timestamp !== null && (
-              <span className="figures shrink-0 text-muted-foreground text-xs">{timestamp}</span>
-            )
+          {timestamp !== null && (
+            <span className="figures shrink-0 text-muted-foreground text-xs">{timestamp}</span>
           )}
         </div>
         <div className="flex items-center justify-between gap-2">
@@ -404,15 +349,6 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
               >
                 <Pencil aria-hidden="true" className="size-3" />
                 Draft
-              </span>
-            )}
-            {room.agentRoom === "session" && (
-              <span
-                data-testid="watching-marker"
-                className="inline-flex shrink-0 items-center gap-1"
-              >
-                <Eye aria-hidden="true" className="size-3" />
-                Watching
               </span>
             )}
             <span className="truncate">{room.lastMessage ?? ""}</span>
@@ -586,21 +522,6 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
           <ContextMenuItem className={menuItemClass} onSelect={onFavorite}>
             Favorite
           </ContextMenuItem>
-        )}
-        {agent !== null && (
-          <>
-            <ContextMenuSeparator />
-            {/* Checked on the default agent's rows; choosing it there stops
-                the agent opening at launch (R463). */}
-            <ContextMenuCheckboxItem
-              className={menuItemClass}
-              checked={isDefault}
-              disabled={savingDefault}
-              onSelect={() => void saveDefaultAgent(isDefault ? null : agent)}
-            >
-              {isDefault ? DEFAULT_AGENT_MARKER : MAKE_DEFAULT_ROW_LABEL}
-            </ContextMenuCheckboxItem>
-          </>
         )}
         <ContextMenuSeparator />
         <ContextMenuSub>

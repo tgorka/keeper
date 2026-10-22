@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::bots::{self, store, voice_target};
+use crate::bots::{self, store};
 use crate::config::keys::{self, Scope, Shape};
 use crate::error::CoreError;
 use crate::registry::{self, EmbeddingModel};
@@ -816,8 +816,8 @@ pub fn to_portable(key: &str, stored: &str, catalog: &Catalog) -> Option<String>
         return catalog.drive_reference(id);
     }
     match key {
-        // A room id is the same on every device; a bot id is not.
-        VOICE_TARGET_KEY if voice_target::agent_room_of(id).is_some() => Some(id.to_owned()),
+        // An agent's id is the same on every device; a bot id is not.
+        VOICE_TARGET_KEY if crate::hq::spoken::target_agent(id).is_some() => Some(id.to_owned()),
         VOICE_TARGET_KEY => {
             let (_, provider_id, target) = catalog.bots.iter().find(|(bot_id, ..)| bot_id == id)?;
             Some(catalog.provider(provider_id)?.bot_reference(target))
@@ -887,7 +887,7 @@ pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<Str
     match key {
         // Only a person's tap opens the microphone; "off" travels freely.
         WAKE_ENABLED_KEY if portable == "1" => None,
-        VOICE_TARGET_KEY if voice_target::agent_room_of(portable).is_some() => {
+        VOICE_TARGET_KEY if crate::hq::spoken::target_agent(portable).is_some() => {
             Some(portable.to_owned())
         }
         VOICE_TARGET_KEY => catalog
@@ -1859,13 +1859,14 @@ mod tests {
         );
     }
 
-    /// A voice target naming an agent room travels as it is stored: a room
+    /// A voice target naming an agent travels as it is stored: an agent's
     /// id is the same on every device. A bot target still travels as its
-    /// reference, and an unknown bot still stays home.
+    /// reference, and an unknown bot still stays home; so does a value naming
+    /// one of the agents' old Matrix rooms (108.2), which names no agent.
     #[test]
     fn an_agent_voice_target_is_portable_verbatim() {
         let catalog = catalog();
-        let agent = "agent:!dm:server";
+        let agent = "agent:nixie";
         let portable = to_portable(VOICE_TARGET_KEY, agent, &catalog);
         assert_eq!(portable.as_deref(), Some(agent));
         assert_eq!(
@@ -1881,10 +1882,12 @@ mod tests {
             to_portable(VOICE_TARGET_KEY, "01BOT", &catalog).as_deref(),
             Some(BOT)
         );
-        // `agent:` with no room names nothing: it is neither passed through
-        // nor read as a bot.
-        assert_eq!(to_portable(VOICE_TARGET_KEY, "agent:", &catalog), None);
-        assert_eq!(from_portable(VOICE_TARGET_KEY, "agent:", &catalog), None);
+        // `agent:` with no agent, or an old room, names nothing: it is
+        // neither passed through nor read as a bot.
+        for nothing in ["agent:", "agent:!dm:server"] {
+            assert_eq!(to_portable(VOICE_TARGET_KEY, nothing, &catalog), None);
+            assert_eq!(from_portable(VOICE_TARGET_KEY, nothing, &catalog), None);
+        }
     }
 
     #[test]

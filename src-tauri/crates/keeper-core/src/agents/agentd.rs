@@ -23,6 +23,40 @@ use crate::agents::label::Readers;
 use crate::bots::url::{parse_base_url, BaseUrl};
 use crate::bots::ProviderKind;
 
+
+/// Which lease `[claims] lease` in `agentd.toml` lets a session's claim run
+/// on (R455): `short` — the minute lease — unless the operator turned the
+/// quarter-hour one on after every host serving the agents runs a build that
+/// reads it. (Moved here from the agents' Matrix claims, 108.2: the desktop
+/// host's `agents.claims_lease` is gone with it.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClaimsLease {
+    /// The minute lease, always: the default.
+    #[default]
+    Short,
+    /// The quarter-hour lease, while every live host advertises it.
+    QuarterHour,
+}
+
+impl ClaimsLease {
+    /// The value as `agentd.toml` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimsLease::Short => "short",
+            ClaimsLease::QuarterHour => "quarter-hour",
+        }
+    }
+
+    /// `short` or `quarter-hour`; anything else is not a choice.
+    pub fn parse(raw: &str) -> Option<ClaimsLease> {
+        match raw.trim() {
+            "short" => Some(ClaimsLease::Short),
+            "quarter-hour" => Some(ClaimsLease::QuarterHour),
+            _ => None,
+        }
+    }
+}
+
 /// The grammar this build reads.
 pub const GRAMMAR_VERSION: i64 = 1;
 
@@ -62,7 +96,7 @@ pub struct AgentdConfig {
     /// `[claims] lease` (R455): `short` (the default, absent included) or
     /// `quarter-hour`, which an operator writes only once every device and
     /// agentd serving these agents runs a build that reads it.
-    pub claims_lease: crate::agents::claim::ClaimsLease,
+    pub claims_lease: ClaimsLease,
     /// `[web_search].url` (story 101.4, R419): the SearXNG JSON engine this
     /// host's agents search with, for those whose `[tools].allow` names
     /// `web_search`; `None` offers none of them a search.
@@ -505,8 +539,7 @@ impl AgentdConfig {
 /// `[claims] lease`: absent (or the table absent) is the minute lease.
 fn claims_lease(
     raw: Option<RawClaims>,
-) -> Result<crate::agents::claim::ClaimsLease, ConfigRefusal> {
-    use crate::agents::claim::ClaimsLease;
+) -> Result<ClaimsLease, ConfigRefusal> {
     match raw.and_then(|claims| claims.lease) {
         None => Ok(ClaimsLease::Short),
         Some(lease) => ClaimsLease::parse(&lease).ok_or_else(|| {
@@ -808,7 +841,6 @@ readers     = ["@tgorka:example.org"]
     /// with the two choices, and an unknown key in the table is refused too.
     #[test]
     fn the_quarter_hour_lease_is_on_only_where_the_file_says_so() {
-        use crate::agents::claim::ClaimsLease;
         let lease = |text: &str| AgentdConfig::parse(text).expect("parses").claims_lease;
         assert_eq!(lease(EXAMPLE), ClaimsLease::Short);
         let table = |body: &str| format!("{EXAMPLE}\n[claims]\n{body}\n");

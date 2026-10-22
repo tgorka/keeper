@@ -11,34 +11,18 @@
 //! device applies), and any other `avatar.*` beside them, is an
 //! [`AvatarProblem`]: a sentence for the agent's settings row and a WARN line
 //! (R381), never a picture. A pointer whose object is not on the device is
-//! no picture there: the agent keeps its letter and nothing is published.
+//! no picture there: the agent keeps its letter.
 //!
 //! Where the zone is on the device the picture is drawn from the drive
-//! (`keeper-file://`, [`crate::file_asset::file_url_in`]). Elsewhere — the
-//! phone, another Mac, another client — it is the agent's Matrix profile
-//! avatar, which a host serving the agent sets from the same file when its
-//! content hash changes ([`publish`]) — only while it holds the agent's
-//! picture claim in the control room (`keeper-agent`'s `avatar`, R399) —
-//! recording what it published in the agent's own account data
-//! ([`AvatarRecordContent`]) so neither a tick, a restart nor another host
-//! uploads an unchanged file again. A device draws that profile avatar from
-//! the original media, never a server thumbnail, and never more than
-//! [`MAX_BYTES`] of it ([`crate::media::fetch_agent_avatar`]).
+//! (`keeper-file://`, [`crate::file_asset::file_url_in`]). (Before 108.2 a
+//! host also published it as the agent's Matrix profile avatar; that half
+//! went with the agents' Matrix path.)
 //!
 //! An SVG is only ever an `<img>` source served as `image/svg+xml` with
-//! `nosniff` (`note_protocol::mime_for`, the shell's `keeper-media` avatar
-//! answer): it is never inlined into the DOM, so its script never runs.
+//! `nosniff` (`note_protocol::mime_for`): it is never inlined into the DOM,
+//! so its script never runs.
 
-use std::future::Future;
-use std::time::{Duration, Instant};
-
-use matrix_sdk::ruma::events::macros::EventContent;
-use matrix_sdk::ruma::{MxcUri, OwnedMxcUri};
-use matrix_sdk::Client;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-use crate::agents::events::CONTENT_VERSION;
 
 /// The picture's file names in a home, the preferred first.
 pub const FILE_NAMES: [&str; 4] = ["avatar.svg", "avatar.png", "avatar.webp", "avatar.jpg"];
@@ -52,13 +36,6 @@ pub const MAX_BYTES: u64 = 256 * 1024;
 /// byte-order mark, an XML declaration, comments, processing instructions
 /// and a doctype.
 pub const SVG_PROLOGUE_MAX: usize = 4 * 1024;
-
-/// How long after a failed publication the host tries the same file again.
-pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
-
-/// How long a host waits to look again when another host held the agent's
-/// picture claim: that host is publishing, and its record is read then.
-pub const HELD_ELSEWHERE_RETRY: Duration = Duration::from_secs(60);
 
 /// The `Content-Type` of one of [`FILE_NAMES`]: from the extension, never
 /// sniffed.
@@ -372,209 +349,6 @@ fn after_doctype(text: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// `dev.keeper.agent.avatar` (global account data of the agent's own
-/// account): the picture its host last published — the file's hash and the
-/// profile avatar it became. A host whose file hashes the same, and whose
-/// profile still holds that `mxc`, uploads nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, EventContent)]
-#[ruma_event(type = "dev.keeper.agent.avatar", kind = GlobalAccountData)]
-pub struct AvatarRecordContent {
-    pub v: u32,
-    pub hash: String,
-    pub mxc: OwnedMxcUri,
-}
-
-/// Whether the profile already shows the file of `hash`: the record names
-/// that hash and the `mxc` the profile holds now. A profile someone changed
-/// since, or a record of another version, is published again.
-pub fn is_current(
-    record: Option<&AvatarRecordContent>,
-    profile: Option<&MxcUri>,
-    hash: &str,
-) -> bool {
-    record.is_some_and(|record| {
-        record.v == CONTENT_VERSION && record.hash == hash && Some(&*record.mxc) == profile
-    })
-}
-
-/// What [`publish`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Published {
-    /// The profile already showed this file: nothing was uploaded.
-    Unchanged,
-    /// The file was uploaded and is the profile avatar now.
-    Uploaded(OwnedMxcUri),
-}
-
-/// The agent's own account on its homeserver, as a publication reads and
-/// writes it. Each error is a sentence's clause: no URL, no token.
-pub trait AvatarPort: Sync {
-    /// The agent's [`AvatarRecordContent`], when it has one this build reads.
-    fn record(&self) -> impl Future<Output = Result<Option<AvatarRecordContent>, String>> + Send;
-    /// The profile avatar the agent's profile holds now.
-    fn profile(&self) -> impl Future<Output = Result<Option<OwnedMxcUri>, String>> + Send;
-    /// Upload `bytes`, typed `mime`.
-    fn upload(
-        &self,
-        mime: &'static str,
-        bytes: Vec<u8>,
-    ) -> impl Future<Output = Result<OwnedMxcUri, String>> + Send;
-    /// Make `mxc` the profile avatar.
-    fn set_profile(&self, mxc: &MxcUri) -> impl Future<Output = Result<(), String>> + Send;
-    /// Write `record` as the agent's [`AvatarRecordContent`].
-    fn write_record(
-        &self,
-        record: AvatarRecordContent,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-}
-
-impl AvatarPort for Client {
-    async fn record(&self) -> Result<Option<AvatarRecordContent>, String> {
-        Ok(self
-            .account()
-            .fetch_account_data_static::<AvatarRecordContent>()
-            .await
-            .map_err(|error| format!("its record could not be read: {error}"))?
-            .and_then(|raw| raw.deserialize().ok()))
-    }
-
-    async fn profile(&self) -> Result<Option<OwnedMxcUri>, String> {
-        self.account()
-            .get_avatar_url()
-            .await
-            .map_err(|error| format!("its profile could not be read: {error}"))
-    }
-
-    async fn upload(&self, mime: &'static str, bytes: Vec<u8>) -> Result<OwnedMxcUri, String> {
-        let mime: mime::Mime = mime
-            .parse()
-            .map_err(|_| format!("{mime} is not a media type"))?;
-        Ok(self
-            .media()
-            .upload(&mime, bytes, None)
-            .await
-            .map_err(|error| format!("the upload failed: {error}"))?
-            .content_uri)
-    }
-
-    async fn set_profile(&self, mxc: &MxcUri) -> Result<(), String> {
-        self.account()
-            .set_avatar_url(Some(mxc))
-            .await
-            .map_err(|error| format!("the profile could not be set: {error}"))
-    }
-
-    async fn write_record(&self, record: AvatarRecordContent) -> Result<(), String> {
-        self.account()
-            .set_account_data(record)
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("its record could not be written: {error}"))
-    }
-}
-
-/// Whether the agent's profile shows the file of `hash` now, by its record
-/// and its profile as the server holds them: what a host asks before it
-/// takes the agent's picture claim, so an unchanged file — a file put back
-/// to what was published included — settles without a claim or an upload.
-pub async fn is_published(port: &impl AvatarPort, hash: &str) -> Result<bool, String> {
-    let record = port.record().await?;
-    let profile = port.profile().await?;
-    Ok(is_current(record.as_ref(), profile.as_deref(), hash))
-}
-
-/// Make `file` the profile avatar of `port`'s agent, unless the record and
-/// the profile say it already is: read them from the server again, and only
-/// when they do not match upload the bytes (typed by the file's extension),
-/// set the avatar and write the record. Called by the holder of the agent's
-/// picture claim. The error is a sentence's clause: no URL, no token.
-pub async fn publish(port: &impl AvatarPort, file: &AvatarFile) -> Result<Published, String> {
-    if is_published(port, &file.hash).await? {
-        return Ok(Published::Unchanged);
-    }
-    let mxc = port.upload(file.mime, file.bytes.clone()).await?;
-    port.set_profile(&mxc).await?;
-    port.write_record(AvatarRecordContent {
-        v: CONTENT_VERSION,
-        hash: file.hash.clone(),
-        mxc: mxc.clone(),
-    })
-    .await?;
-    Ok(Published::Uploaded(mxc))
-}
-
-/// A host's memory of one agent's publication: the hash its profile is
-/// known to show — set only by a publication that succeeded — and when the
-/// file of a hash not settled is to be tried again, so a scan asks the
-/// server only when the file changed, a failure is tried again after
-/// [`RETRY_AFTER`] and a claim held elsewhere after
-/// [`HELD_ELSEWHERE_RETRY`].
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct PublishMemo {
-    settled: Option<String>,
-    again: Option<(String, Instant)>,
-}
-
-/// One host's failed publication of an agent's picture, as a settings row
-/// says it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishFailure {
-    /// The host whose publication failed, when it is not this device.
-    pub host: Option<String>,
-    /// What failed: a [`publish`] clause.
-    pub error: String,
-}
-
-/// The settings row's sentence for `failure`, naming the agent.
-pub fn publish_failed(agent: &str, failure: &PublishFailure) -> String {
-    let minutes = RETRY_AFTER.as_secs() / 60;
-    let error = &failure.error;
-    match &failure.host {
-        None => format!(
-            "{agent}'s picture could not be set as its Matrix profile avatar ({error}); devices without the drive keep showing its letter. keeper tries again in {minutes} minutes."
-        ),
-        Some(host) => format!(
-            "{agent}'s picture could not be set as its Matrix profile avatar on {host} ({error}); devices without the drive keep showing its letter. {host} tries again in {minutes} minutes."
-        ),
-    }
-}
-
-impl PublishMemo {
-    /// Whether the file of `hash` is to be published at `now`.
-    pub fn due(&self, hash: &str, now: Instant) -> bool {
-        if self.settled.as_deref() == Some(hash) {
-            return false;
-        }
-        match &self.again {
-            Some((waiting, at)) if waiting == hash => now >= *at,
-            _ => true,
-        }
-    }
-
-    /// The profile shows the file of `hash`.
-    pub fn settle(&mut self, hash: &str) {
-        self.settled = Some(hash.to_owned());
-        self.again = None;
-    }
-
-    /// Publishing the file of `hash` failed at `now`. Whatever was settled
-    /// is not known any more — the attempt may have changed the profile —
-    /// so the next file, the settled one put back included, is asked of
-    /// the server.
-    pub fn fail(&mut self, hash: &str, now: Instant) {
-        self.settled = None;
-        self.again = Some((hash.to_owned(), now + RETRY_AFTER));
-    }
-
-    /// Another host held the agent's picture claim at `now`: it publishes,
-    /// and the file of `hash` is looked at again after
-    /// [`HELD_ELSEWHERE_RETRY`].
-    pub fn held_elsewhere(&mut self, hash: &str, now: Instant) {
-        self.settled = None;
-        self.again = Some((hash.to_owned(), now + HELD_ELSEWHERE_RETRY));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,80 +542,4 @@ mod tests {
         assert_eq!(sniff(past.as_bytes()), None);
     }
 
-    fn record(hash: &str, mxc: &str) -> AvatarRecordContent {
-        AvatarRecordContent {
-            v: CONTENT_VERSION,
-            hash: hash.to_owned(),
-            mxc: mxc.into(),
-        }
-    }
-
-    #[test]
-    fn the_profile_is_current_only_for_the_recorded_hash_and_mxc() {
-        let mxc: &MxcUri = "mxc://example.org/a".into();
-        let other: &MxcUri = "mxc://example.org/b".into();
-        assert!(is_current(
-            Some(&record("h", "mxc://example.org/a")),
-            Some(mxc),
-            "h"
-        ));
-        assert!(!is_current(
-            Some(&record("h", "mxc://example.org/a")),
-            Some(mxc),
-            "changed"
-        ));
-        assert!(!is_current(
-            Some(&record("h", "mxc://example.org/a")),
-            Some(other),
-            "h"
-        ));
-        assert!(!is_current(
-            Some(&record("h", "mxc://example.org/a")),
-            None,
-            "h"
-        ));
-        assert!(!is_current(None, Some(mxc), "h"));
-        let newer = AvatarRecordContent {
-            v: CONTENT_VERSION + 1,
-            ..record("h", "mxc://example.org/a")
-        };
-        assert!(!is_current(Some(&newer), Some(mxc), "h"));
-    }
-
-    #[test]
-    fn a_settled_hash_is_not_due_and_a_failure_waits_ten_minutes() {
-        let start = Instant::now();
-        let mut memo = PublishMemo::default();
-        assert!(memo.due("a", start));
-        memo.fail("a", start);
-        assert!(!memo.due("a", start + RETRY_AFTER - Duration::from_secs(1)));
-        assert!(memo.due("a", start + RETRY_AFTER));
-        assert!(
-            memo.due("b", start),
-            "a changed file is not held by an old failure"
-        );
-        memo.settle("a");
-        assert!(!memo.due("a", start + RETRY_AFTER * 3));
-        assert!(memo.due("b", start));
-    }
-
-    /// R399 #3: A settled, B failed — the attempt may have changed the
-    /// profile — then the file put back to A is asked of the server at
-    /// once, never held back by A's old settlement or B's backoff.
-    #[test]
-    fn a_failure_unsettles_so_the_file_put_back_is_asked_again() {
-        let start = Instant::now();
-        let mut memo = PublishMemo::default();
-        memo.settle("a");
-        assert!(!memo.due("a", start));
-        memo.fail("b", start);
-        assert!(!memo.due("b", start), "the failure waits");
-        assert!(memo.due("a", start), "the settled file is asked again");
-        let mut held = PublishMemo::default();
-        held.settle("a");
-        held.held_elsewhere("b", start);
-        assert!(held.due("a", start));
-        assert!(!held.due("b", start));
-        assert!(held.due("b", start + HELD_ELSEWHERE_RETRY));
-    }
 }

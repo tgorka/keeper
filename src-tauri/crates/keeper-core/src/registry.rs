@@ -1098,9 +1098,9 @@ pub fn set_bots_voice_target(data_dir: &Path, target: Option<&str>) -> Result<()
 }
 
 /// The `settings` key naming the default agent (Epic 100, story 100.3,
-/// R383): one agent's Matrix user id, or absent/blank for none. Which room
-/// opens at launch, and why none does, is
-/// `keeper_core::agents::launch::choose`'s answer.
+/// R383): one agent's actor id in the agents' databases (108.2; a Matrix user
+/// id stored before reads as its localpart), or absent/blank for none. What
+/// Settings shows of it is `keeper_core::hq::default_agent`'s answer.
 pub(crate) const AGENTS_DEFAULT_KEY: &str = "agents.default";
 
 /// Read the default agent as stored, trimmed. Absent or blank ⇒ `None`. Not
@@ -1112,7 +1112,7 @@ pub fn get_agents_default(data_dir: &Path) -> Result<Option<String>, CoreError> 
 }
 
 /// Write the default agent: `None` clears it. Stored trimmed; the caller
-/// checked the shape (`keeper_core::agents::launch::set_default`).
+/// checked the shape (`keeper_core::hq::default_agent::store`).
 pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), CoreError> {
     set_setting(
         data_dir,
@@ -1137,7 +1137,7 @@ pub fn get_default_agent_chooser_dismissed(data_dir: &Path) -> Result<Option<Str
 }
 
 /// Record that the chooser was put away in keeper `version`
-/// (`keeper_core::agents::launch::dismiss_chooser`).
+/// (`keeper_core::hq::default_agent::dismiss_chooser`).
 pub fn set_default_agent_chooser_dismissed(
     data_dir: &Path,
     version: &str,
@@ -1145,27 +1145,55 @@ pub fn set_default_agent_chooser_dismissed(
     set_setting(data_dir, UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY, version)
 }
 
-/// The `settings` key naming the lease this desktop host takes a session's
-/// claim on (R455): `short` (absent included) or `quarter-hour`.
+/// The setting this desktop host's claims lease lived in before 108.2
+/// (`short` or `quarter-hour`): removed at first launch with the agents'
+/// Matrix path ([`crate::agents_cleanup`]).
 pub const AGENTS_CLAIMS_LEASE_KEY: &str = "agents.claims_lease";
 
-/// Read this desktop host's claims lease. Absent, blank or a value that is
-/// not one of the two is the minute lease: a quarter-hour lease is never
-/// taken on a value nobody chose.
-pub fn get_agents_claims_lease(
-    data_dir: &Path,
-) -> Result<crate::agents::claim::ClaimsLease, CoreError> {
-    Ok(get_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY)?
-        .and_then(|value| crate::agents::claim::ClaimsLease::parse(&value))
-        .unwrap_or_default())
+/// Remove `agents.claims_lease` from this device's table; whether a row was
+/// there.
+pub fn remove_agents_claims_lease(data_dir: &Path) -> Result<bool, CoreError> {
+    let held = stored_settings(data_dir, &[AGENTS_CLAIMS_LEASE_KEY])?
+        .contains_key(AGENTS_CLAIMS_LEASE_KEY);
+    if held {
+        delete_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY)?;
+    }
+    Ok(held)
 }
 
-/// Write this desktop host's claims lease.
-pub fn set_agents_claims_lease(
-    data_dir: &Path,
-    lease: crate::agents::claim::ClaimsLease,
-) -> Result<(), CoreError> {
-    set_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY, lease.as_str())
+/// The `settings` key latching the one-time notice that *Speak to* named
+/// one of the agents' old Matrix rooms and was read as unset (108.2,
+/// UX-DR-E108-1): `1` until the person dismisses it.
+const UI_VOICE_OLD_TARGET_NOTICE_KEY: &str = "ui.voice_old_target_notice";
+
+/// When `bots.voice_target` as this device's table holds it names one of
+/// the agents' old Matrix rooms (`agent:!room…`), clear it and latch the
+/// notice; whether it did. A value a settings file sets is the file's, and
+/// is only ever read as no choice.
+pub fn clear_old_voice_target(data_dir: &Path) -> Result<bool, CoreError> {
+    let stored = stored_settings(data_dir, &[BOTS_VOICE_TARGET_KEY])?
+        .remove(BOTS_VOICE_TARGET_KEY);
+    if !stored
+        .as_deref()
+        .is_some_and(crate::hq::spoken::is_old_room_target)
+    {
+        return Ok(false);
+    }
+    delete_setting(data_dir, BOTS_VOICE_TARGET_KEY)?;
+    set_setting(data_dir, UI_VOICE_OLD_TARGET_NOTICE_KEY, "1")?;
+    Ok(true)
+}
+
+/// The one-time notice *Speak to* shows after an old room target was
+/// cleared; `None` once dismissed (or never latched).
+pub fn get_voice_old_target_notice(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok((get_setting(data_dir, UI_VOICE_OLD_TARGET_NOTICE_KEY)?.as_deref() == Some("1"))
+        .then(|| crate::hq::spoken::OLD_ROOM_TARGET_NOTICE.to_owned()))
+}
+
+/// The person read the notice: it is not shown again.
+pub fn dismiss_voice_old_target_notice(data_dir: &Path) -> Result<(), CoreError> {
+    delete_setting(data_dir, UI_VOICE_OLD_TARGET_NOTICE_KEY)
 }
 
 /// The `settings` key holding the stop phrase as typed (Epic 67, Story 67.3,

@@ -1,34 +1,28 @@
 //! keeper's iPhone notification extension (Epic 98, story 98.1; AD-412,
 //! R24(14), the codemap's Q7 (a)).
 //!
-//! A push carries an event id and nothing else. iOS starts the `KeeperNotify`
-//! extension — a second process, under a 24 MB ceiling, beside the app — and
-//! its Swift (`gen/apple/KeeperNotify/NotificationService.swift`) reads the
-//! account's session and store passphrase from the shared Keychain group and
-//! hands them here with the App Group container's root, the room and the
-//! event. This crate opens that one account's store, fetches and decrypts
-//! the one event through matrix-sdk-ui's notification client, and asks
-//! [`keeper_core::agents::push::classify_notification`] what the lock screen
-//! shows: an [`NseAnswer`].
+//! iOS starts the `KeeperNotify` extension — a second process, under a 24 MB
+//! ceiling, beside the app — for each push, and its Swift
+//! (`gen/apple/KeeperNotify/NotificationService.swift`) hands the push here
+//! as JSON; [`handle_json`] answers what the lock screen shows: an
+//! [`NseAnswer`].
 //!
+//! - **Agents server items only (108.2).** Before 108.2 a push could name a
+//!   Matrix event of an agent's room, which this crate decrypted through its
+//!   own matrix-sdk client. Those rooms are gone, the phone takes its Matrix
+//!   pusher off every account (DW-E108-1), and a push of that kind that still
+//!   arrives is left as the gateway sent it: this crate links no Matrix
+//!   client at all.
 //! - **Nothing before the move.** The app moves its data directory into the
 //!   App Group container once (`keeper_core::container`), and that move
-//!   refuses a destination holding files it did not put there. So this
-//!   crate looks at the group's data directory only through [`store_of`],
-//!   which reads three things — the move's [`MOVE_DONE`] marker, the
-//!   account's `sdk` directory, the registry's row — and creates nothing;
-//!   until all three are there the answer is [`NseAnswer::Generic`], the
-//!   notification as the gateway sent it.
-//! - **One process among two.** The store is opened with its own
-//!   cross-process lock holder ([`HOLDER`]); the notification client takes
-//!   its own (`notifications`). The session is restored without refreshing
-//!   tokens: an OAuth refresh token is used once, and a refresh here would
-//!   strand the app's. An expired token is a generic notification.
-//! - **One room.** Only the room the push names is loaded from the store.
+//!   refuses a destination holding files it did not put there. Until the
+//!   move's [`MOVE_DONE`] marker is there the answer is
+//!   [`NseAnswer::Generic`], the notification as the gateway sent it, and
+//!   nothing is created.
 //! - **One notification at a time.** iOS may run several of the service's
 //!   `didReceive` at once in one extension process; the Swift hands them to
 //!   one serial queue, and [`handle_json`] holds a process-wide lock, so
-//!   one client lives at a time under the 24 MB ceiling (R339).
+//!   one read runs at a time under the 24 MB ceiling (R339).
 //! - **No unwinding across the C ABI.** A panic below [`keeper_nse_handle`]
 //!   is the generic notification, not an aborted extension.
 //!
@@ -77,53 +71,29 @@ use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
 use std::future::Future;
 use std::panic::UnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
-use keeper_core::agents::push::{shown_of, Classified, Shown};
-use keeper_core::auth::StoredSession;
 use keeper_core::container::{group_data_dir, MOVE_DONE};
 use keeper_core::hq::push::{
     credential_for, fold, read_item, Delivered, Fold, Handed, HqClassified, HqShown, PushedItem,
 };
 use keeper_core::hq::routes::HttpRoutes;
-use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
-use matrix_sdk::store::RoomLoadSettings;
-use matrix_sdk::Client;
-use matrix_sdk_ui::notification_client::{
-    NotificationClient, NotificationProcessSetup, NotificationStatus,
-};
 use serde::{Deserialize, Serialize};
-
-/// The cross-process lock holder of the extension's client; the app's is
-/// the SDK's default, `main`.
-pub const HOLDER: &str = "nse";
 
 /// The whole of the extension's work for one notification: iOS gives an
 /// extension about thirty seconds before it shows the best attempt, and
 /// this leaves it room. An agents item's runs from its arrival
 /// ([`KeyRequest`]) through its wait for a turn, its read and the Swift's
-/// waits on the notification center; a Matrix event's from its turn.
+/// waits on the notification center.
 pub const DEADLINE: Duration = Duration::from_secs(20);
 
-/// What the extension's Swift hands over, as JSON.
-#[derive(Debug, Clone, Deserialize)]
-pub struct NseRequest {
-    /// The App Group container's root (`FileManager.containerURL`).
-    pub group: PathBuf,
-    /// keeper's local account id, from the push's payload
-    /// (`push::PAYLOAD_ACCOUNT`).
-    pub account: String,
-    pub room_id: String,
-    pub event_id: String,
-    /// The Keychain's `session/<account>`.
-    pub session: String,
-    /// The Keychain's `store_passphrase/<account>`, when the store was made
-    /// encrypted.
-    pub passphrase: Option<String>,
-}
+/// Why the extension reads nothing before the app's data is in the App
+/// Group container: no App Group in this build's signature, or the move
+/// has not finished.
+const NOT_MOVED: &str =
+    "keeper's data is not in the shared container yet, so the extension opens nothing";
 
 /// What the extension's Swift hands over for a push from the agents server,
 /// as JSON: the App Group container's root, the push's `keeper_hq`, this
@@ -203,8 +173,6 @@ pub struct ItemShown {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum NseAnswer {
-    /// Show this.
-    Show(Shown),
     /// Show this agents server item in place of `replaces`.
     Item(ItemShown),
     /// Show nothing of it (whether iOS lets an extension show nothing
@@ -451,143 +419,13 @@ fn written(answer: &NseAnswer) -> String {
         .unwrap_or_else(|_| r#"{"kind":"generic","why":"the answer does not write"}"#.to_owned())
 }
 
-/// The store a push's account is in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Store {
-    pub sdk_dir: PathBuf,
-    pub homeserver: String,
-}
-
-/// Why there is no store to open: each means a generic notification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NoStore {
-    /// The push named no account id keeper makes (a ULID).
-    NotAnAccount,
-    /// The app's data is not in the group container: no App Group in this
-    /// build's signature, or the move has not finished.
-    NotMoved,
-    /// No such account in the moved directory.
-    NoAccount,
-    /// The registry could not be read.
-    Unreadable(String),
-}
-
-impl std::fmt::Display for NoStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NoStore::NotAnAccount => write!(f, "the push names no keeper account"),
-            NoStore::NotMoved => write!(
-                f,
-                "keeper's data is not in the shared container yet, so the extension opens nothing"
-            ),
-            NoStore::NoAccount => write!(f, "the shared container holds no such account"),
-            NoStore::Unreadable(why) => write!(f, "the account registry could not be read: {why}"),
-        }
-    }
-}
-
-/// The store of `account` in the App Group container whose root is
-/// `group`, by reading only: the account id is keeper's (a ULID, so it is
-/// one plain path segment), the group's data directory holds the finished
-/// move's [`MOVE_DONE`], the account's `sdk` directory is there, and the
-/// registry names its homeserver. Creates nothing, wherever it stops.
-pub fn store_of(group: &Path, account: &str) -> Result<Store, NoStore> {
-    if ulid::Ulid::from_string(account).is_err() {
-        return Err(NoStore::NotAnAccount);
-    }
-    let data_dir = group_data_dir(group);
-    if !data_dir.join(MOVE_DONE).is_file() {
-        return Err(NoStore::NotMoved);
-    }
-    let sdk_dir = data_dir.join("accounts").join(account).join("sdk");
-    if !sdk_dir.is_dir() {
-        return Err(NoStore::NoAccount);
-    }
-    match keeper_core::registry::homeserver_of_existing(&data_dir, account) {
-        Ok(Some(homeserver)) => Ok(Store {
-            sdk_dir,
-            homeserver,
-        }),
-        Ok(None) => Err(NoStore::NoAccount),
-        Err(e) => Err(NoStore::Unreadable(e.to_string())),
-    }
-}
-
-/// What the lock screen shows for `request`.
-pub async fn answer(request: NseRequest) -> NseAnswer {
-    let started = Instant::now();
-    let store = match store_of(&request.group, &request.account) {
-        Ok(store) => store,
-        Err(why) => return generic(why),
-    };
-    let (Ok(room_id), Ok(event_id)) = (
-        RoomId::parse(&request.room_id),
-        EventId::parse(&request.event_id),
-    ) else {
-        return generic("the push named no room and event");
-    };
-    decide(&store, &request, room_id, event_id, started)
-        .await
-        .unwrap_or_else(generic)
-}
-
-async fn decide(
-    store: &Store,
-    request: &NseRequest,
-    room_id: OwnedRoomId,
-    event_id: OwnedEventId,
-    started: Instant,
-) -> Result<NseAnswer, String> {
-    let stored = StoredSession::from_json(&request.session).map_err(|e| e.to_string())?;
-    let client = Client::builder()
-        .homeserver_url(&store.homeserver)
-        .sqlite_store(&store.sdk_dir, request.passphrase.as_deref())
-        .cross_process_store_config(CrossProcessLockConfig::multi_process(HOLDER))
-        .build()
-        .await
-        .map_err(|e| format!("could not open the store: {e}"))?;
-    stored
-        .restore_into_loading(&client, RoomLoadSettings::One(room_id.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
-    let notifications =
-        NotificationClient::new(client.clone(), NotificationProcessSetup::MultipleProcesses)
-            .await
-            .map_err(|e| format!("could not start the notification client: {e}"))?;
-    match notifications
-        .get_notification(&room_id, &event_id)
-        .await
-        .map_err(|e| format!("could not fetch the event: {e}"))?
-    {
-        NotificationStatus::Event(_) => {}
-        NotificationStatus::EventFilteredOut | NotificationStatus::EventRedacted => {
-            return Ok(NseAnswer::Drop)
-        }
-        NotificationStatus::EventNotFound => {
-            return Err("the homeserver did not return the event".to_owned())
-        }
-    }
-    let room = notifications
-        .get_room(&room_id)
-        .or_else(|| client.get_room(&room_id))
-        .ok_or("the room is not known")?;
-    let event = room
-        .event(&event_id, None)
-        .await
-        .map_err(|e| format!("could not read the event: {e}"))?;
-    match shown_of(&client, &room, &event, started).await? {
-        Classified::Drop => Ok(NseAnswer::Drop),
-        Classified::Show(shown) => Ok(NseAnswer::Show(*shown)),
-    }
-}
-
 /// What the lock screen shows for an agents server item (106.6): one read
 /// of the item with this device's pairing, classified on the phone. What
 /// it removes is [`settle`]'s.
 pub async fn answer_item(request: &HqRequest) -> NseAnswer {
     let data_dir = group_data_dir(&request.group);
     if !data_dir.join(MOVE_DONE).is_file() {
-        return generic(NoStore::NotMoved);
+        return generic(NOT_MOVED);
     }
     let Some(pushed) = PushedItem::of_payload(&request.hq) else {
         return generic("the push names no agents item");
@@ -655,24 +493,17 @@ fn by(deadline: Instant, work: impl Future<Output = NseAnswer>, slow: &str) -> N
     }
 }
 
-/// The lock that keeps one notification's client alive at a time in this
-/// process (R339): two concurrent clients would each open the store, the
-/// crypto store and a sliding sync with the same lock holder and connection
-/// id, under one 24 MB ceiling.
+/// The lock that keeps one notification's read at a time in this process
+/// (R339): under one 24 MB ceiling.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-/// `work`, while no other notification of this process is being read. A
-/// panic in an earlier one does not stop this one: its poison is cleared.
-fn one_at_a_time<T>(work: impl FnOnce() -> T) -> T {
-    let _held = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-    work()
-}
 
 /// How often a delivery waiting for its turn looks again.
 const TURN_POLL: Duration = Duration::from_millis(5);
 
-/// [`one_at_a_time`], waiting for the turn no later than `deadline`: `None`
-/// when it passes first, and `work` is not run.
+/// `work`, while no other notification of this process is being read,
+/// waiting for the turn no later than `deadline`: `None` when it passes
+/// first, and `work` is not run. A panic in an earlier one does not stop
+/// this one: its poison is cleared.
 fn one_at_a_time_until<T>(deadline: Instant, work: impl FnOnce() -> T) -> Option<T> {
     loop {
         let _held = match ONE_AT_A_TIME.try_lock() {
@@ -697,9 +528,8 @@ fn unwinding_stops_here(work: impl FnOnce() -> String + UnwindSafe) -> String {
 }
 
 /// The extension's request as JSON in, its [`NseAnswer`] as JSON out, else
-/// generic; one read at a time ([`one_at_a_time`]). A Matrix event is
-/// answered within [`DEADLINE`] of its turn; an agents item by the deadline
-/// its arrival set ([`answer_in_time`]). The arrival, the expiry and the
+/// generic; one read at a time ([`one_at_a_time_until`]). An agents item is
+/// answered by the deadline its arrival set ([`answer_in_time`]). The arrival, the expiry and the
 /// report of a removal take no lock and read nothing. Why an answer is
 /// generic is warned through `tracing`.
 pub fn handle_json(request: &str) -> String {
@@ -729,16 +559,10 @@ pub fn handle_json(request: &str) -> String {
             }
         }
     } else {
-        match serde_json::from_str::<NseRequest>(request) {
-            Err(_) => unread(),
-            Ok(request) => one_at_a_time(|| {
-                by(
-                    Instant::now() + DEADLINE,
-                    answer(request),
-                    "the event took too long to read",
-                )
-            }),
-        }
+        // A push of the agents' old Matrix path (an event id, before 108.2):
+        // keeper reads no agent room any more, and the app takes its
+        // pusher off the account (DW-E108-1).
+        generic("a Matrix push: keeper no longer reads the agents' rooms")
     };
     if let NseAnswer::Generic { why, .. } = &answer {
         tracing::warn!(%why, "keeper-nse: the notification stays as the gateway sent it");
@@ -747,7 +571,7 @@ pub fn handle_json(request: &str) -> String {
 }
 
 /// The one C-ABI entry the extension's Swift calls: `request` is the JSON of
-/// an [`NseRequest`], a [`KeyRequest`], an [`HqRequest`], an
+/// a [`KeyRequest`], an [`HqRequest`], an
 /// [`ExpiryRequest`] or a [`RemovedRequest`]; the answer is the JSON of an
 /// [`NseAnswer`] — the
 /// generic one when anything below panics — owned by the caller until it
@@ -795,147 +619,18 @@ pub unsafe extern "C" fn keeper_nse_free(answer: *mut c_char) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value;
-
-    const ACCOUNT: &str = "01J9ZK3Y6V5T4R3Q2P1N0M9K8J";
-
-    /// Every path under `root`, relative, with each file's length.
-    fn tree(root: &Path) -> Vec<(PathBuf, u64)> {
-        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push((path.strip_prefix(root).expect("under").to_owned(), len));
-                if path.is_dir() {
-                    walk(root, &path, out);
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort();
-        out
-    }
-
-    fn request(group: &Path, account: &str) -> String {
-        serde_json::json!({
-            "group": group, "account": account, "room_id": "!r:example.org",
-            "event_id": "$e:example.org", "session": "{}", "passphrase": null,
-        })
-        .to_string()
-    }
-
-    fn generic_kind(answer: &str) -> bool {
-        serde_json::from_str::<Value>(answer).expect("json")["kind"] == "generic"
-    }
-
-    /// The coordinator's contract for rung 3 (rung 2's move refuses a
-    /// destination holding files it did not put there): before the move's
-    /// marker exists, the extension shows the generic notification and
-    /// creates nothing — not the group's data directory, not a file in it.
-    #[test]
-    fn nothing_is_touched_before_the_move_finished() {
-        let group = tempfile::tempdir().expect("group");
-        let answer = handle_json(&request(group.path(), ACCOUNT));
-        assert!(generic_kind(&answer), "{answer}");
-        assert_eq!(tree(group.path()), Vec::new());
-        assert!(!group_data_dir(group.path()).exists());
-
-        // A move under way: the journal and an account already moved, no
-        // marker yet.
-        let data = group_data_dir(group.path());
-        std::fs::create_dir_all(data.join("accounts").join(ACCOUNT).join("sdk")).expect("sdk");
-        std::fs::write(data.join(keeper_core::container::MOVE_JOURNAL), "/old").expect("journal");
-        let before = tree(group.path());
-        let answer = handle_json(&request(group.path(), ACCOUNT));
-        assert!(generic_kind(&answer), "{answer}");
-        assert_eq!(store_of(group.path(), ACCOUNT), Err(NoStore::NotMoved));
-        assert_eq!(tree(group.path()), before);
-    }
-
-    /// After the move, the store is the named account's own, read without
-    /// a write: an id that is not keeper's, an account not moved, or one
-    /// without a registry row is generic, and nothing is created.
-    #[test]
-    fn the_store_is_the_moved_accounts_own() {
-        let group = tempfile::tempdir().expect("group");
-        let data = group_data_dir(group.path());
-        std::fs::create_dir_all(&data).expect("data");
-        std::fs::write(data.join(MOVE_DONE), "/old").expect("marker");
-        let before = tree(group.path());
-
-        for account in ["../../x", "", "accounts"] {
-            assert_eq!(
-                store_of(group.path(), account),
-                Err(NoStore::NotAnAccount),
-                "{account}"
-            );
-        }
-        assert_eq!(store_of(group.path(), ACCOUNT), Err(NoStore::NoAccount));
-        assert_eq!(tree(group.path()), before);
-
-        let sdk = data.join("accounts").join(ACCOUNT).join("sdk");
-        std::fs::create_dir_all(&sdk).expect("sdk");
-        let before = tree(group.path());
-        assert_eq!(store_of(group.path(), ACCOUNT), Err(NoStore::NoAccount));
-        assert_eq!(tree(group.path()), before, "no keeper.db is created");
-
-        keeper_core::registry::insert_account(
-            &data,
-            ACCOUNT,
-            "@tgorka:example.org",
-            "https://matrix.example.org",
-            "DEV",
-            1,
-            0,
-            "password",
-        )
-        .expect("row");
-        assert_eq!(
-            store_of(group.path(), ACCOUNT),
-            Ok(Store {
-                sdk_dir: sdk,
-                homeserver: "https://matrix.example.org".to_owned(),
-            })
-        );
-        let other = "01J9ZK3Y6V5T4R3Q2P1N0M9K8K";
-        std::fs::create_dir_all(data.join("accounts").join(other).join("sdk")).expect("sdk");
-        assert_eq!(store_of(group.path(), other), Err(NoStore::NoAccount));
-
-        // A registry row whose store did not move: opening it would create
-        // the store's directory, so it is not opened.
-        let unmoved = "01J9ZK3Y6V5T4R3Q2P1N0M9K8M";
-        keeper_core::registry::insert_account(
-            &data,
-            unmoved,
-            "@marta:example.org",
-            "https://matrix.example.org",
-            "DEV2",
-            1,
-            1,
-            "password",
-        )
-        .expect("row");
-        assert_eq!(store_of(group.path(), unmoved), Err(NoStore::NoAccount));
-        assert!(!data.join("accounts").join(unmoved).exists());
-    }
-}
-
-#[cfg(test)]
 mod one_at_a_time_tests {
     use super::*;
-    use keeper_core::agents::push::{Category, PushApproval};
     use serde_json::Value;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// R339: two notifications read at once in one process never have two
-    /// clients alive together.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// R339: two notifications read at once in one process are read one
+    /// after the other.
     #[test]
     fn two_notifications_at_once_are_read_one_after_the_other() {
         let inside = AtomicUsize::new(0);
@@ -943,7 +638,7 @@ mod one_at_a_time_tests {
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 scope.spawn(|| {
-                    one_at_a_time(|| {
+                    one_at_a_time_until(far(), || {
                         let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
                         most.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(200));
@@ -960,15 +655,34 @@ mod one_at_a_time_tests {
     #[test]
     fn a_panic_is_the_generic_notification() {
         let answer = std::panic::catch_unwind(|| {
-            unwinding_stops_here(|| one_at_a_time(|| panic!("inside the SDK")))
+            unwinding_stops_here(|| one_at_a_time_until(far(), || panic!("inside")).unwrap_or_default())
         });
         let answer = answer.expect("the panic stopped at the C ABI");
         assert_eq!(
             serde_json::from_str::<Value>(&answer).expect("json")["kind"],
             "generic"
         );
-        let next = std::panic::catch_unwind(|| one_at_a_time(|| 7));
-        assert_eq!(next.ok(), Some(7));
+        let next = std::panic::catch_unwind(|| one_at_a_time_until(far(), || 7));
+        assert_eq!(next.ok(), Some(Some(7)));
+    }
+
+    /// 108.2: a push of the agents' old Matrix path — an account, a room and
+    /// an event, no agents item — is the notification as the gateway sent
+    /// it; nothing is opened.
+    #[test]
+    fn a_matrix_push_is_left_as_the_gateway_sent_it() {
+        let group = tempfile::tempdir().expect("group");
+        let answer = handle_json(
+            &serde_json::json!({
+                "group": group.path(), "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "room_id": "!r:example.org", "event_id": "$e:example.org",
+                "session": "{}", "passphrase": null,
+            })
+            .to_string(),
+        );
+        let answer: Value = serde_json::from_str(&answer).expect("json");
+        assert_eq!(answer["kind"], "generic");
+        assert!(std::fs::read_dir(group.path()).expect("group").next().is_none());
     }
 
     fn keys(value: &Value) -> BTreeSet<&str> {
@@ -980,48 +694,10 @@ mod one_at_a_time_tests {
             .collect()
     }
 
-    /// The wire the Swift reads (`NotificationService.swift`) and rung 4's
-    /// action handler reads back from `userInfo["keeper_approval"]`: a
+    /// The wire the Swift reads (`NotificationService.swift`): a
     /// cross-language contract, so its keys are pinned here.
     #[test]
     fn the_answer_has_the_keys_the_swift_reads() {
-        let approval = PushApproval {
-            room: "!r:example.org".to_owned(),
-            id: "01A".to_owned(),
-            binding_digest: "d".to_owned(),
-            tier: 2,
-            category: Some(Category::Approval),
-        };
-        let show = serde_json::to_value(NseAnswer::Show(Shown {
-            title: "t".to_owned(),
-            subtitle: Some("s".to_owned()),
-            body: "b".to_owned(),
-            category: Some(Category::Approval),
-            thread_id: "!r:example.org".to_owned(),
-            approval: Some(approval),
-            answer: None,
-        }))
-        .expect("json");
-        assert_eq!(
-            keys(&show),
-            BTreeSet::from([
-                "kind",
-                "title",
-                "subtitle",
-                "body",
-                "category",
-                "thread_id",
-                "approval",
-                "answer",
-            ])
-        );
-        assert_eq!(show["kind"], "show");
-        assert_eq!(show["category"], Category::Approval.id());
-        assert_eq!(
-            keys(&show["approval"]),
-            BTreeSet::from(["room", "id", "binding_digest", "tier", "category"])
-        );
-        assert_eq!(show["approval"]["category"], Category::Approval.id());
         assert_eq!(
             serde_json::to_value(NseAnswer::Drop).expect("json"),
             serde_json::json!({"kind": "drop"})

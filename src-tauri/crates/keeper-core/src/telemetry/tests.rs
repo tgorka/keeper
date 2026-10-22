@@ -519,8 +519,9 @@ fn queued_payloads(telemetry: &Telemetry) -> Vec<String> {
         .collect()
 }
 
-/// S-19 as amended by R461: a line under `keeper_agent…` or
-/// `keeper_core::agents…` leaves with its level, target, callsite and
+/// S-19 as amended by R461: a line under `keeper_agent…`,
+/// `keeper_core::agents…` or `keeper_core::hq…` (since 108.2 the agents'
+/// targets are the database's and the served turn's) leaves with its level, target, callsite and
 /// fingerprint — never its message or its fields (spans, tool arguments,
 /// paths, provider errors) — at either boundary: the log layer, and
 /// [`Telemetry::capture_log`] handed a non-empty private message directly.
@@ -537,8 +538,8 @@ fn agent_target_lines_leave_without_their_message() {
         })
         .expect("consent");
     forwarding(&telemetry, || {
-        tracing::error!(target: "keeper_agent::runtime", path = "60-sessions/active/plan", "agentd: PRIVATE_SENTINEL turn");
-        tracing::warn!(target: "keeper_core::agents::matrix", error = "PRIVATE_SENTINEL", "a provider error");
+        tracing::error!(target: "keeper_agent::served", path = "60-sessions/active/plan", "agentd: PRIVATE_SENTINEL turn");
+        tracing::warn!(target: "keeper_core::hq::spoken", error = "PRIVATE_SENTINEL", "a provider error");
         tracing::warn!(target: "keeper::sync", "push held for PUBLIC_VISIBLE");
         tracing::warn!(target: "keeper_core::hq::syncular", why = "PRIVATE_SENTINEL", "agents server not reached");
     });
@@ -560,8 +561,8 @@ fn agent_target_lines_leave_without_their_message() {
         assert!(payload.contains("\"log_line\""), "{payload}");
         assert!(payload.contains("$exception_fingerprint"), "{payload}");
     }
-    assert!(payloads[0].contains("\"keeper_agent::runtime\""));
-    assert!(payloads[1].contains("\"keeper_core::agents::matrix\""));
+    assert!(payloads[0].contains("\"keeper_agent::served\""));
+    assert!(payloads[1].contains("\"keeper_core::hq::spoken\""));
     assert!(payloads[3].contains("\"keeper_core::hq::syncular\""));
     assert!(payloads[4].contains("\"keeper_agent::tools\""));
     assert!(payloads[2].contains("push held for PUBLIC_VISIBLE"));

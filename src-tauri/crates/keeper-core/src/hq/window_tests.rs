@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::agents::attention::AgentAttentionVm;
+use crate::hq::sessions::AgentAttentionVm;
 use crate::hq::approvals::{self, AgentApprovalStateVm, AgentDecisionStateVm};
 use crate::hq::port::{ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, object, Source};

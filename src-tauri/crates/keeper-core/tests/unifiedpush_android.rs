@@ -1,49 +1,26 @@
 //! Android push's pure half (Epic 98, story 98.4 #1, #3; the epic's Q11,
-//! Q12): the UnifiedPush pusher, the endpoint's grammar, the discovery
-//! answer, what a push names, the distributor keeper registers with, and what
-//! a notification posts and offers on Android — `keeper_core::agents::unifiedpush`.
+//! Q12; 106.6): the endpoint's grammar, the discovery answer, the
+//! distributor keeper registers with, what an agents item's notification
+//! posts and offers on Android, and the Matrix pusher it now only removes
+//! (108.2, DW-E108-1) — `keeper_core::agents::unifiedpush`.
 //! The request half of discovery is `unifiedpush_gateway_discovery.rs`.
 
-use keeper_core::agents::push::{
-    action_decision, tap_target, ActionRefusal, ActionTap, Category, PushApproval, PushOpenVm,
-    PusherSpec, Shown, FINISH_IN_KEEPER,
-};
+use keeper_core::agents::push::PushOpenVm;
 use keeper_core::agents::unifiedpush::*;
 use serde_json::json;
 
-const ACCOUNT: &str = "01J0000000000000000000000A";
-const ROOM: &str = "!session:example.org";
 const NTFY: &str = "https://ntfy.example/upAbc?up=1";
 
 fn endpoint(raw: &str) -> Endpoint {
     Endpoint::parse(raw).expect("an endpoint keeper registers")
 }
 
-/// 98.4 #1: the Android pusher is an `http` pusher whose pushkey is the
-/// endpoint, whose `url` is the discovered gateway and whose format is
-/// `event_id_only`, under the Android app id — and it carries nothing
-/// else for the homeserver to forward: no APNs payload, no account.
+/// DW-E108-1: the pusher an Android phone registered before 108.2 — and
+/// now only removes — is named by its endpoint and the Android app id.
 #[test]
-fn unifiedpush_pusher_spec() {
-    let ntfy = endpoint(NTFY);
-    let gateway = gateway_of_answer(&ntfy, 200, br#"{"unifiedpush":{"gateway":"matrix"}}"#)
-        .expect("ntfy is a Matrix gateway");
-    let spec = PusherSpec::unifiedpush(gateway, ntfy.clone(), ACCOUNT, "keeper on Tab S9");
-    let pusher = serde_json::to_value(spec.pusher()).expect("serialises");
-    assert_eq!(pusher["kind"], "http");
-    assert_eq!(pusher["app_id"], APP_ID);
-    assert_eq!(pusher["pushkey"], NTFY);
-    assert_eq!(pusher["device_display_name"], "keeper on Tab S9");
+fn the_pusher_removed_is_the_endpoint_under_the_android_app() {
     assert_eq!(
-        pusher["data"],
-        json!({
-            "url": "https://ntfy.example/_matrix/push/v1/notify",
-            "format": "event_id_only",
-        })
-    );
-    assert_eq!(spec.ids(), ntfy.pusher_ids());
-    assert_eq!(
-        ntfy.pusher_ids(),
+        endpoint(NTFY).pusher_ids(),
         matrix_sdk::ruma::api::client::push::PusherIds::new(NTFY.to_owned(), APP_ID.to_owned())
     );
 }
@@ -146,36 +123,6 @@ fn only_a_matrix_answer_makes_the_endpoints_server_the_gateway() {
             kind: "webpush".to_owned()
         })
     );
-}
-
-/// The gateway's forwarded notification names its room and event;
-/// anything without both, or that is not that JSON, names nothing.
-#[test]
-fn a_push_names_the_room_and_event_of_the_homeservers_notification() {
-    let forwarded = json!({"notification": {
-        "event_id": "$ask:example.org", "room_id": ROOM, "counts": {"unread": 1},
-        "devices": [{"app_id": APP_ID, "pushkey": NTFY}],
-    }});
-    assert_eq!(
-        pushed_event(forwarded.to_string().as_bytes()),
-        Some(PushedEvent {
-            room_id: matrix_sdk::ruma::OwnedRoomId::try_from(ROOM).expect("room"),
-            event_id: matrix_sdk::ruma::OwnedEventId::try_from("$ask:example.org").expect("event"),
-        })
-    );
-    for nothing in [
-        json!({"notification": {"counts": {"unread": 0}}}),
-        json!({"notification": {"room_id": ROOM}}),
-        json!({"notification": {"room_id": "not a room", "event_id": "$e:x"}}),
-        json!({"room_id": ROOM, "event_id": "$e:x"}),
-    ] {
-        assert_eq!(
-            pushed_event(nothing.to_string().as_bytes()),
-            None,
-            "{nothing}"
-        );
-    }
-    assert_eq!(pushed_event(b"not json"), None);
 }
 
 fn distributor(package: &str, label: &str) -> Distributor {
@@ -345,136 +292,6 @@ fn the_mock_shells_push_status_is_rusts() {
         "rerun with KEEPER_WRITE_FIXTURES=1 to rewrite {}",
         path.display()
     );
-}
-
-fn approval_shown(category: Option<Category>, tier: u8) -> Shown {
-    Shown {
-        title: "Nixi asks: run git push".to_owned(),
-        subtitle: None,
-        body: "T3 — [\"git\",\"push\"]".to_owned(),
-        category,
-        thread_id: ROOM.to_owned(),
-        approval: Some(PushApproval {
-            room: ROOM.to_owned(),
-            id: "01APPROVAL".to_owned(),
-            binding_digest: "d1".to_owned(),
-            tier,
-            category,
-        }),
-        answer: None,
-    }
-}
-
-/// 98.4 #3, Q12: from Android 12 an approval posts with its category's
-/// actions, and an action on what was posted decides exactly the record
-/// shown — the iPhone's `action_decision` over Android's notification.
-/// Before Android 12 the same approval posts with no category and no
-/// actions, and its record carries none, so no action decides anything;
-/// a tap still opens the session room.
-#[test]
-fn a_notification_offers_actions_only_where_android_can_require_unlock() {
-    let shown = approval_shown(Some(Category::Approval), 3);
-    let posted = phone_notification(ACCOUNT, ROOM, "$ask:example.org", &shown, 31);
-    assert_eq!(posted.category.as_deref(), Some("KEEPER_APPROVAL"));
-    assert_eq!(
-        posted
-            .actions
-            .iter()
-            .map(|a| (a.id.as_str(), a.destructive))
-            .collect::<Vec<_>>(),
-        [("KEEPER_APPROVE_ONCE", false), ("KEEPER_DENY", true)]
-    );
-    assert_eq!(posted.tag, "01APPROVAL");
-    let tap = |posted: &PhoneNotification, action: &str| ActionTap {
-        category: posted.category.clone().unwrap_or_default(),
-        action: action.to_owned(),
-        user_info: posted.user_info.clone(),
-    };
-    let decided = action_decision(&tap(&posted, "KEEPER_APPROVE_ONCE")).expect("offered");
-    assert_eq!(decided.account, ACCOUNT);
-    assert_eq!(decided.room, ROOM);
-    assert_eq!(decided.req.id, "01APPROVAL");
-    assert_eq!(decided.req.binding_digest, "d1");
-
-    let old = phone_notification(ACCOUNT, ROOM, "$ask:example.org", &shown, 30);
-    assert_eq!(old.category, None);
-    assert!(old.actions.is_empty());
-    for action in ["KEEPER_APPROVE_ONCE", "KEEPER_DENY"] {
-        for category in ["", "KEEPER_APPROVAL"] {
-            let forged = ActionTap {
-                category: category.to_owned(),
-                ..tap(&old, action)
-            };
-            assert_eq!(
-                action_decision(&forged).map(|_| ()),
-                Err(ActionRefusal::NotOffered),
-                "{action} on {category:?}"
-            );
-        }
-    }
-    assert_eq!(
-        tap_target(&old.user_info),
-        Some(PushOpenVm::Room {
-            account_id: ACCOUNT.to_owned(),
-            room_id: ROOM.to_owned()
-        })
-    );
-}
-
-/// An answer is one notification its edits replace; an event that is
-/// neither an approval nor an answer is its own.
-#[test]
-fn an_answer_is_one_notification_its_edits_replace() {
-    let answer = Shown {
-        title: "Nixi".to_owned(),
-        subtitle: None,
-        body: "Done.".to_owned(),
-        category: None,
-        thread_id: ROOM.to_owned(),
-        approval: None,
-        answer: Some("$anchor:example.org".to_owned()),
-    };
-    let first = phone_notification(ACCOUNT, ROOM, "$anchor:example.org", &answer, 34);
-    let edit = phone_notification(ACCOUNT, ROOM, "$edit:example.org", &answer, 34);
-    assert_eq!(first.tag, "$anchor:example.org");
-    assert_eq!(edit.tag, first.tag);
-    assert!(edit.actions.is_empty());
-    let plain = Shown {
-        answer: None,
-        ..answer
-    };
-    assert_eq!(
-        phone_notification(ACCOUNT, ROOM, "$other:example.org", &plain, 34).tag,
-        "$other:example.org"
-    );
-}
-
-/// A decision that could not be sent replaces its notification with one
-/// that opens the same room and offers nothing; one that names no room
-/// keeper composed opens nothing.
-#[test]
-fn an_unsent_decision_asks_the_person_to_finish_in_keeper() {
-    let posted = phone_notification(
-        ACCOUNT,
-        ROOM,
-        "$ask:example.org",
-        &approval_shown(Some(Category::Approval), 3),
-        34,
-    );
-    let finish = finish_in_keeper(&posted.tag, &posted.user_info, "The card is gone.");
-    assert_eq!(finish.tag, posted.tag);
-    assert!(finish.actions.is_empty() && finish.category.is_none());
-    assert_eq!(finish.body, format!("{FINISH_IN_KEEPER} The card is gone."));
-    assert_eq!(
-        tap_target(&finish.user_info),
-        Some(PushOpenVm::Room {
-            account_id: ACCOUNT.to_owned(),
-            room_id: ROOM.to_owned()
-        })
-    );
-    let unknown = finish_in_keeper("t", &json!({"room_id": ROOM}), "");
-    assert_eq!(unknown.body, FINISH_IN_KEEPER);
-    assert_eq!(tap_target(&unknown.user_info), None);
 }
 
 /// 106.6 #6, #7: an agents server item posts one notification per item on

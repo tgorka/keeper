@@ -64,12 +64,6 @@ import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import type { MarkdownPreview } from "@/components/viewers/markdown-preview";
 import { type ViewMode, viewModeCookie, viewModeFor } from "@/components/viewers/view-mode";
 import { useNotesBody } from "@/hooks/use-notes-body";
-import {
-  applySurfaceProposal,
-  type SurfaceEditor,
-  takeSurfaceRequests,
-  watchSurfaceNote,
-} from "@/lib/agents/surface";
 import { logFailure } from "@/lib/failure";
 import {
   mediaBlockCheck,
@@ -118,7 +112,6 @@ import { MediaPickerDialog } from "./media-picker-dialog";
 import { NoteActions } from "./note-actions";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NOTE_HISTORY_LABEL, NoteHistoryPanel } from "./note-history-panel";
-import { NoteSurfaceStrips } from "./note-surface-strips";
 import {
   PROPERTIES_LABEL,
   PropertiesPanel,
@@ -254,12 +247,12 @@ function PanelUnavailable({
 }
 
 /**
- * The handful of operations the surface needs from the lazily loaded editor.
+ * The handful of operations the note editor needs from the lazily loaded editor.
  *
  * Naming them here is what lets every `@codemirror/*` value stay inside the
  * boot closure: nothing outside it holds an editor type at runtime.
  */
-interface EditorRuntime extends SurfaceEditor {
+interface EditorRuntime {
   /** Adopt text that came from outside this buffer, minimally and unrecorded. */
   applyExternal: (text: string) => void;
   /**
@@ -719,7 +712,6 @@ export function NoteEditor({
         media,
         widgetSlash,
         mediaHints,
-        agent,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -747,8 +739,6 @@ export function NoteEditor({
         import("./editor/widget-slash"),
         // Keys, values and refusals while a media block's source is open.
         import("./editor/media-hints"),
-        // An agent's highlight and pointer: tiny, but CodeMirror.
-        import("./editor/agent-marks"),
       ]);
       if (disposed) {
         return;
@@ -902,7 +892,6 @@ export function NoteEditor({
             // Escape first closes Find, then simplifies a selection via the
             // default keymap; with neither present, it dismisses list marks.
             preview.searchMarks(),
-            agent.agentMarks(),
             rendering.of(noteViewRef.current === "note" ? rendered : []),
             view.EditorView.updateListener.of((update) => {
               if (
@@ -1056,7 +1045,6 @@ export function NoteEditor({
           });
       });
       refreshMarks();
-      let stopSurface = () => {};
 
       runtimeRef.current = {
         applyExternal: (text: string) => adopt(text, true),
@@ -1097,14 +1085,8 @@ export function NoteEditor({
         },
         text: () => editorView.state.doc.toString(),
         focus: () => editorView.focus(),
-        hasFocus: () => editorView.hasFocus,
-        reveal: (span, caret) => agent.revealLines(editorView, span, caret),
-        highlight: (span) => agent.highlightLines(editorView, span),
-        point: (span) => agent.pointAtLines(editorView, span),
-        replaceLines: (span, text) => agent.replaceLines(editorView, span, text),
         destroy: () => {
           marksGeneration += 1;
-          stopSurface();
           stopFilters();
           stopDocument();
           resizes?.disconnect();
@@ -1132,15 +1114,6 @@ export function NoteEditor({
       if (opened.text !== "") {
         takeMarkerRef.current();
       }
-      // What an agent asked of this note: its highlight, and requests
-      // that arrived before the note did or arrive while it is open. After the
-      // caret hint, so an `open` is the last word on where the caret goes.
-      stopSurface = watchSurfaceNote(
-        vaultId,
-        noteId,
-        runtimeRef.current,
-        () => readNoteDocument(vaultId, noteId).externalEdition > 0,
-      );
     })();
 
     return () => {
@@ -1225,7 +1198,6 @@ export function NoteEditor({
       consumeCaretHint(vaultId, noteId);
     }
     takeMarkerRef.current();
-    takeSurfaceRequests(vaultId, noteId, runtime);
   }, [vaultId, noteId, externalEdition]);
 
   useEffect(() => {
@@ -1689,20 +1661,6 @@ export function NoteEditor({
           setMode("conflict");
         }}
       />
-
-      {/* An agent's highlight and proposal (UX-DR131): beside the change
-          bar, never a modal and never taking focus. */}
-      {noteId === null ? null : (
-        <NoteSurfaceStrips
-          vaultId={vaultId}
-          noteId={noteId}
-          onApply={() => {
-            if (runtimeRef.current !== null) {
-              applySurfaceProposal(vaultId, noteId, runtimeRef.current);
-            }
-          }}
-        />
-      )}
 
       {/* One band, one edge. These four strips are all the same kind of thing —
           "here is what keeper did to your file after you asked for something

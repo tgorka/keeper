@@ -860,14 +860,14 @@ enum Found {
 /// `keeper.toml`, sign-out, forget, a refused sign-in — re-reads consent and
 /// then tells the webview when the default agent moved, since no settings row
 /// moves when the account's files set `agents.default`. Whether it moved is
-/// core's answer (`launch::layers_observer`). Before anything installs a
+/// core's answer (`default_agent::layers_observer`). Before anything installs a
 /// layer, so no transition is missed; before the app is up (launch's `boot`)
 /// nothing listens, so no default is compared.
 pub fn watch_layers(app: &tauri::App) {
     use tauri::Manager;
 
     let (consent, moved) = (app.handle().clone(), app.handle().clone());
-    keeper_core::config::set_account_layers_observer(keeper_core::agents::launch::layers_observer(
+    keeper_core::config::set_account_layers_observer(keeper_core::hq::default_agent::layers_observer(
         move || {
             crate::telemetry_ipc::consent_changed(&consent, "an account settings file changed");
             // An account layer may name, change or clear the agents server.
@@ -883,7 +883,7 @@ pub fn watch_layers(app: &tauri::App) {
                 }
             }
         },
-        move || crate::agents_ipc::default_agent_applied(&moved),
+        move || crate::hq_ipc::default_agent_applied(&moved),
     ));
 }
 

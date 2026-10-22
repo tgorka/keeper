@@ -2,7 +2,6 @@ import { Plus } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AgentAttentionMark, agentAttentionLabel } from "@/components/agents/agent-attention";
 import { DatabaseDecisionsPanel } from "@/components/agents/decisions-panel";
-import { EarlierConversations } from "@/components/agents/earlier-conversations";
 import { NewSession } from "@/components/agents/new-session";
 import { SessionView } from "@/components/agents/session-view";
 import { Button } from "@/components/ui/button";
@@ -206,7 +205,6 @@ export function AgentsWindow() {
                 </li>
               ))}
             </ul>
-            <EarlierConversations />
           </div>
         </section>
       )}

@@ -441,64 +441,6 @@ pub fn forge_egress(
     endpoints
 }
 
-/// This Mac's MCP servers (96.2 #10), as [`EgressKind::McpServer`] rows: a
-/// `url` server's host and port once however many servers share it — never
-/// its path, a user or a token — and a `command` server as the program
-/// keeper starts, once however many start it, which reaches whatever it
-/// reaches with the Mac's rights. A host and a program are never one row,
-/// whatever they are named (R276). Kept beside [`compute_egress`] for
-/// [`forge_egress`]'s reason: the shell appends it from the Mac's own
-/// table. No server, no row.
-pub fn agent_egress(servers: &[crate::agents::mcp::McpEntry]) -> Vec<EgressEndpointVm> {
-    use crate::agents::mcp::{url_host, McpTransport};
-    let mut endpoints: Vec<EgressEndpointVm> = Vec::new();
-    let mut seen: Vec<(bool, String)> = Vec::new();
-    for server in servers {
-        let (program, url, label) = match &server.transport {
-            McpTransport::Url(url) => {
-                let Some(host) = url_host(url) else { continue };
-                (false, host, "MCP server".to_owned())
-            }
-            McpTransport::Command(argv) => (
-                true,
-                argv[0].clone(),
-                format!("A program you configured: `{}`", argv[0]),
-            ),
-        };
-        if seen.contains(&(program, url.clone())) {
-            continue;
-        }
-        seen.push((program, url.clone()));
-        endpoints.push(EgressEndpointVm {
-            url,
-            kind: EgressKind::McpServer,
-            label,
-        });
-    }
-    endpoints
-}
-
-/// The row an egress list carries for the web search engine (101.4, R419).
-pub const WEB_SEARCH_LABEL: &str =
-    "Web search engine — the agents you switched web search on for send it their queries";
-
-/// This Mac's web search engine (story 101.4, R419), as one
-/// [`EgressKind::WebSearch`] row: its host and port as an MCP server's row
-/// is composed, never its path. No engine, no row. Kept beside
-/// [`compute_egress`] for [`forge_egress`]'s reason: the shell appends it
-/// from the Mac's own table.
-pub fn web_search_egress(engine: Option<&crate::bots::url::BaseUrl>) -> Vec<EgressEndpointVm> {
-    engine
-        .and_then(|engine| crate::agents::mcp::url_host(&engine.normalized))
-        .map(|host| EgressEndpointVm {
-            url: host,
-            kind: EgressKind::WebSearch,
-            label: WEB_SEARCH_LABEL.to_owned(),
-        })
-        .into_iter()
-        .collect()
-}
-
 /// The row an egress list carries for the push gateway (98.1 #8, Q6).
 pub const PUSH_GATEWAY_LABEL: &str =
     "Push gateway — your homeserver sends it event ids for this device";
@@ -1137,9 +1079,7 @@ mod tests {
             EgressKind::Telemetry,
             EgressKind::Account,
             EgressKind::Forge,
-            EgressKind::McpServer,
             EgressKind::PushGateway,
-            EgressKind::WebSearch,
             EgressKind::AgentsServer,
         ];
 
@@ -1155,9 +1095,7 @@ mod tests {
                 EgressKind::Telemetry => {}
                 EgressKind::Account => {}
                 EgressKind::Forge => {}
-                EgressKind::McpServer => {}
                 EgressKind::PushGateway => {}
-                EgressKind::WebSearch => {}
                 EgressKind::AgentsServer => {}
             }
         }
@@ -1190,14 +1128,7 @@ mod tests {
         let enterprise = account_fixture(ENTERPRISE);
         connect(&p, &enterprise, "ghe");
         out.extend(forge_egress(&p, Some(&enterprise), None));
-        out.extend(agent_egress(&mcp_servers(&[(
-            "notes",
-            "https://notes.example.org/mcp",
-        )])));
         out.extend(push_egress(Some("https://push.example.org")));
-        out.extend(web_search_egress(Some(
-            &crate::agents::web_search::parse_url("http://127.0.0.1:5191").expect("engine"),
-        )));
 
         for kind in ALL_KINDS {
             assert!(
@@ -1230,76 +1161,6 @@ mod tests {
         assert!(org_account_egress(None, None).is_empty());
         // keeper's own GitHub client exists, but nothing is connected to it.
         assert!(forge_egress(&p, None, Some("Iv1.builtin")).is_empty());
-    }
-
-    /// `[[mcp]]` entries as the one check makes them: `(name, where)`, a
-    /// `where` with a scheme a URL with a token, else a program.
-    fn mcp_servers(servers: &[(&str, &str)]) -> Vec<crate::agents::mcp::McpEntry> {
-        let raw = servers
-            .iter()
-            .map(|(name, at)| {
-                let program = !at.contains("://");
-                crate::agents::mcp::RawMcp {
-                    name: (*name).to_owned(),
-                    url: (!program).then(|| (*at).to_owned()),
-                    command: program.then(|| vec![(*at).to_owned(), "--stdio".to_owned()]),
-                    credential: (!program).then(|| format!("secret:{name}")),
-                    readers: None,
-                    role: None,
-                    fingerprint: None,
-                    trust_annotations: false,
-                    tier: Vec::new(),
-                }
-            })
-            .collect();
-        crate::agents::mcp::check(raw, &[], crate::agents::mac_tables::MAC).expect("servers")
-    }
-
-    /// 96.2 #10: each `url` server's host (with its port) once, never its
-    /// path, query or token; each `command` server as the program keeper
-    /// starts, once; no server, no row.
-    #[test]
-    fn a_web_search_engine_is_disclosed_by_host_and_port_only() {
-        let engine =
-            crate::agents::web_search::parse_url("http://127.0.0.1:5191/searx").expect("an engine");
-        let rows = web_search_egress(Some(&engine));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].url, "127.0.0.1:5191");
-        assert_eq!(rows[0].kind, EgressKind::WebSearch);
-        assert!(web_search_egress(None).is_empty());
-    }
-
-    #[test]
-    fn mcp_servers_are_disclosed_by_host_and_program() {
-        assert!(agent_egress(&[]).is_empty());
-        let out = agent_egress(&mcp_servers(&[
-            ("notes", "https://notes.example.org/mcp?key=v"),
-            ("notes-b", "https://notes.example.org/other"),
-            ("local", "http://127.0.0.1:8931/mcp"),
-            ("kid", "/opt/bin/kid-mcp"),
-            ("kid-b", "/opt/bin/kid-mcp"),
-        ]));
-        let rows: Vec<(EgressKind, &str, &str)> = out
-            .iter()
-            .map(|e| (e.kind, e.url.as_str(), e.label.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                (EgressKind::McpServer, "notes.example.org", "MCP server"),
-                (EgressKind::McpServer, "127.0.0.1:8931", "MCP server"),
-                (
-                    EgressKind::McpServer,
-                    "/opt/bin/kid-mcp",
-                    "A program you configured: `/opt/bin/kid-mcp`"
-                ),
-            ]
-        );
-        let shown = format!("{out:?}");
-        assert!(
-            !shown.contains("/mcp") && !shown.contains("key=") && !shown.contains("secret"),
-            "{shown}"
-        );
     }
 
     /// 98.1 #8: the gateway the person set is one row, its host — and its
@@ -1362,31 +1223,6 @@ mod tests {
         );
         assert!(!rows[0].label.contains("upAbc"), "{}", rows[0].label);
         assert!(unifiedpush_egress(None).is_empty());
-    }
-
-    /// R96MM2-05: a URL's host and a program of the same name are two
-    /// disclosures, whichever server comes first.
-    #[test]
-    fn a_host_and_a_program_of_one_name_are_both_disclosed() {
-        let host = ("a-url", "http://localhost/mcp");
-        let program = ("b-program", "localhost");
-        let both = |first, second| {
-            let mut rows: Vec<(String, String)> = agent_egress(&mcp_servers(&[first, second]))
-                .into_iter()
-                .map(|e| (e.url, e.label))
-                .collect();
-            rows.sort();
-            rows
-        };
-        let expected = vec![
-            (
-                "localhost".to_owned(),
-                "A program you configured: `localhost`".to_owned(),
-            ),
-            ("localhost".to_owned(), "MCP server".to_owned()),
-        ];
-        assert_eq!(both(host, program), expected);
-        assert_eq!(both(program, host), expected);
     }
 
     const ENTERPRISE: &str = r#""config": { "url": "https://git.acme.dev/c.git" },

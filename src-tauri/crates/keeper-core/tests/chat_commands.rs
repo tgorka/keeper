@@ -1,5 +1,6 @@
 //! Story 100.5 — the messenger's slash commands: what a `/` line means in a
-//! chat and in an agent room, and what keeper says when it means nothing.
+//! chat, and what keeper says when it means nothing. (The agent rooms' `/new`
+//! and `/model` left with the agents' Matrix path, 108.2.)
 //!
 //! Every assertion is about a decision. That the composer shows a refusal and
 //! sends nothing, that Escape dismisses the menu, that `/leave` asks first —
@@ -20,21 +21,6 @@ fn chat() -> Context {
         may_set_topic: true,
         may_invite: true,
         replying: false,
-        agent_home_here: true,
-    }
-}
-
-fn agent_dm() -> Context {
-    Context {
-        room: RoomKind::AgentMain,
-        ..chat()
-    }
-}
-
-fn agent_conversation() -> Context {
-    Context {
-        room: RoomKind::Agent,
-        ..chat()
     }
 }
 
@@ -68,42 +54,21 @@ fn names(draft: &str, ctx: &Context) -> Vec<&'static str> {
 // Which commands a room offers
 // ---------------------------------------------------------------------------
 
-/// A chat lists the chat set and help; an agent DM lists the agent set; an
-/// agent conversation lists only help — absent, not greyed (AD-27).
+/// A chat lists the chat set and help (108.2: the agent rooms' `/new` and
+/// `/model` are gone, and a chat never offers them).
 #[test]
-fn each_room_lists_only_the_commands_it_offers() {
+fn a_chat_lists_the_chat_set_and_help() {
     assert_eq!(
         names("/", &chat()),
         ["me", "shrug", "plain", "topic", "invite", "leave", "help"]
     );
-    assert_eq!(names("/", &agent_dm()), ["new", "model", "help"]);
-    assert_eq!(names("/", &agent_conversation()), ["help"]);
-}
-
-/// A real command typed where it is not offered is refused with "not here",
-/// never run, never sent as text, and never mistaken for its neighbour.
-#[test]
-fn a_command_from_the_other_set_is_refused_where_it_is_not_offered() {
-    assert_eq!(
-        refused(resolve("/new plans", &chat())),
-        RefusalReason::NotHere { name: "new" }
-    );
-    assert_eq!(
-        refused(resolve("/leave", &agent_dm())),
-        RefusalReason::NotHere { name: "leave" }
-    );
-    assert_eq!(
-        refused(resolve("/new", &agent_conversation())),
-        RefusalReason::NotHere { name: "new" }
-    );
-}
-
-/// A prefix reaches only what this room offers: `/c` is help's alias in a chat
-/// and the new conversation's alias in the agent DM.
-#[test]
-fn a_prefix_reaches_only_what_the_room_offers() {
     assert_eq!(commanded(resolve("/c", &chat())).0, "help");
-    assert_eq!(commanded(resolve("/c", &agent_dm())).0, "new");
+    for gone in ["/new plans", "/model Opus"] {
+        assert!(
+            matches!(refused(resolve(gone, &chat())), RefusalReason::Unknown { .. }),
+            "{gone}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +129,7 @@ fn me_is_an_action_and_shrug_and_plain_are_text() {
 }
 
 #[test]
-fn topic_invite_leave_new_and_help_are_acts_on_the_room() {
+fn topic_invite_leave_and_help_are_acts_on_the_room() {
     assert_eq!(
         commanded(resolve("/topic Release on Friday", &chat())),
         ("topic", Some("Release on Friday".to_owned()))
@@ -174,15 +139,7 @@ fn topic_invite_leave_new_and_help_are_acts_on_the_room() {
         ("invite", Some("@bob:example.org".to_owned()))
     );
     assert_eq!(commanded(resolve("/leave", &chat())), ("leave", None));
-    assert_eq!(
-        commanded(resolve("/new Trip plans", &agent_dm())),
-        ("new", Some("Trip plans".to_owned()))
-    );
-    assert_eq!(commanded(resolve("/new", &agent_dm())), ("new", None));
-    assert_eq!(
-        commanded(resolve("/help", &agent_conversation())),
-        ("help", None)
-    );
+    assert_eq!(commanded(resolve("/help", &chat())), ("help", None));
 }
 
 /// An invitee that is not a Matrix id is refused before anything leaves.
@@ -289,43 +246,6 @@ fn me_is_refused_while_a_reply_is_pending() {
 // Unknown commands, the escape, and prose
 // ---------------------------------------------------------------------------
 
-/// DW-1431 (R415): `/model` in the agent DM is an act carrying what followed
-/// it; where the agent's home is not on this device it is listed with its
-/// reason and refused, never run; a chat does not offer it.
-#[test]
-fn model_is_the_agent_dms_and_needs_the_home_here() {
-    assert_eq!(
-        commanded(resolve("/model Opus high", &agent_dm())),
-        ("model", Some("Opus high".to_owned()))
-    );
-    assert_eq!(commanded(resolve("/model", &agent_dm())), ("model", None));
-    assert_eq!(commanded(resolve("/mo", &agent_dm())).0, "model");
-    let away = Context {
-        agent_home_here: false,
-        ..agent_dm()
-    };
-    let spec = COMMANDS
-        .iter()
-        .find(|spec| spec.name == "model")
-        .expect("registered");
-    assert_eq!(
-        availability(spec, &away),
-        Availability::Unavailable(Need::HomeHere)
-    );
-    assert_eq!(names("/mod", &away), ["model"], "listed, with its reason");
-    assert_eq!(
-        refused(resolve("/model Opus", &away)),
-        RefusalReason::Unavailable {
-            name: "model",
-            need: Need::HomeHere
-        }
-    );
-    assert_eq!(
-        refused(resolve("/model", &chat())),
-        RefusalReason::NotHere { name: "model" }
-    );
-}
-
 /// An unknown command is a refusal that names the nearest offered command and
 /// is never text — and the nearest is chosen among what this room offers.
 #[test]
@@ -336,14 +256,7 @@ fn an_unknown_command_is_refused_and_names_the_nearest_offered() {
             nearest: Some("topic")
         }
     );
-    // In the agent DM `/nwe` is near /new, which a chat does not offer.
-    assert_eq!(
-        refused(resolve("/nwe", &agent_dm())),
-        RefusalReason::Unknown {
-            nearest: Some("new")
-        }
-    );
-    // A chat never names it.
+    // A chat never names a command it does not offer.
     let RefusalReason::Unknown { nearest } = refused(resolve("/nwe", &chat())) else {
         panic!("expected an unknown-command refusal");
     };
@@ -357,7 +270,7 @@ fn an_unknown_command_is_refused_and_names_the_nearest_offered() {
 #[test]
 fn a_doubled_slash_sends_one_and_prose_is_untouched() {
     assert_eq!(text(resolve("//etc/hosts", &chat())), "/etc/hosts");
-    assert_eq!(text(resolve("//me", &agent_dm())), "/me");
+    assert_eq!(text(resolve("//me", &chat())), "/me");
     assert_eq!(text(resolve("see /etc", &chat())), "see /etc");
     assert_eq!(text(resolve("/", &chat())), "/");
     // A multi-line draft is prose even when it starts with a slash.

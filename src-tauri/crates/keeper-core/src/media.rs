@@ -323,146 +323,6 @@ fn msgtype_of(item: &Arc<matrix_sdk_ui::timeline::TimelineItem>) -> Option<Messa
     Some(message.msgtype().clone())
 }
 
-/// The fixed host of a `keeper-media://` URL that names an agent's profile
-/// avatar rather than a timeline item (story 100.4).
-const AVATAR_HOST: &str = "avatar";
-
-/// A resolved agent-avatar handle: the room and the member whose profile
-/// avatar it names. Carries no `mxc`: the member's avatar is read again from
-/// the room's state when the bytes are fetched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AvatarHandle {
-    pub account_id: String,
-    pub room_id: String,
-    pub user_id: String,
-}
-
-/// The URL of `user`'s profile avatar as `room` of `account_id` holds it, in
-/// `form`: `keeper-media://avatar/<account>/<room>/<user>?v=<version>`,
-/// each segment percent-encoded. `version` changes with the avatar, so a
-/// webview never draws a replaced picture from its cache; it is a hash, never
-/// the `mxc` itself (AD-4).
-pub fn avatar_url_in(
-    form: UrlForm,
-    account_id: &str,
-    room_id: &str,
-    user_id: &str,
-    version: &str,
-) -> String {
-    let mut url = Url::parse(&format!("{SCHEME}://{AVATAR_HOST}"))
-        .expect("static keeper-media base URL is always valid");
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .expect("keeper-media URL always has a base");
-        segments.push(account_id).push(room_id).push(user_id);
-    }
-    url.query_pairs_mut().append_pair("v", version);
-    let rest = url.as_str().get(SCHEME.len() + 3..).unwrap_or_default();
-    asset_url::compose(form, SCHEME, rest)
-}
-
-/// Parse an agent-avatar URL in either spelling, or `None` for anything
-/// else (an item's URL included). The version is a cache key and is dropped.
-pub fn parse_avatar_url(raw: &str) -> Option<AvatarHandle> {
-    let rest = asset_url::strip(raw, SCHEME)?;
-    let url = Url::parse(&asset_url::compose(UrlForm::Scheme, SCHEME, rest)).ok()?;
-    if url.host_str() != Some(AVATAR_HOST) {
-        return None;
-    }
-    let segments: Vec<String> = url
-        .path_segments()?
-        .map(percent_decode)
-        .collect::<Option<Vec<String>>>()?;
-    let [account_id, room_id, user_id] = segments.as_slice() else {
-        return None;
-    };
-    Some(AvatarHandle {
-        account_id: account_id.clone(),
-        room_id: room_id.clone(),
-        user_id: user_id.clone(),
-    })
-}
-
-/// The profile avatar of `user` as `room`'s state holds it, downloaded
-/// whole — the original, never a server thumbnail: an SVG has none worth
-/// drawing, and a thumbnail would be the server's rendering of a file
-/// keeper only ever hands to an `<img>` — and never past
-/// [`crate::agents::avatar::MAX_BYTES`] (R399): a declared size past it is
-/// refused before a byte is read, and a body that runs past it is cut off
-/// there. Nothing of it goes to the SDK's media cache, so no original past
-/// the bound is ever kept. Served only for a member holding an agent's
-/// power in the room (an agent's picture, story 100.4) and only in one of
-/// the four picture formats ([`crate::agents::avatar::sniff`]); anything
-/// else is [`MediaError::NotFound`], and the device draws the agent's
-/// letter. A profile avatar refused as too large or as no picture is a WARN
-/// line once in this process, and is not downloaded again.
-pub async fn fetch_agent_avatar(
-    client: &Client,
-    room: &matrix_sdk::Room,
-    user: &matrix_sdk::ruma::UserId,
-) -> Result<MediaBytes, MediaError> {
-    let levels = room.power_levels().await.ok();
-    if !crate::agents::room::holds_agent_power(levels.as_ref(), user) {
-        return Err(MediaError::NotFound);
-    }
-    let mxc = room
-        .get_member_no_sync(user)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|member| member.avatar_url().map(ToOwned::to_owned))
-        .ok_or(MediaError::NotFound)?;
-    if refused_avatars()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&mxc)
-    {
-        return Err(MediaError::NotFound);
-    }
-    let refuse = |why: &str| {
-        refused_avatars()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(mxc.clone());
-        tracing::warn!(
-            room = %room.room_id(),
-            agent = %user,
-            "keeper-media: an agent's profile avatar {why}; its letter is drawn instead"
-        );
-        MediaError::NotFound
-    };
-    let bytes = match download_avatar(client, &mxc).await {
-        Ok(bytes) => bytes,
-        Err(Download::TooLarge(bytes)) => {
-            return Err(refuse(&format!(
-                "is larger than {} KiB ({} KiB or more), so it is not downloaded",
-                crate::agents::avatar::MAX_BYTES / 1024,
-                bytes.div_ceil(1024)
-            )))
-        }
-        Err(Download::Failed(error)) => return Err(MediaError::Fetch(error)),
-    };
-    let Some(mimetype) = crate::agents::avatar::sniff(&bytes) else {
-        return Err(refuse("is not a PNG, JPEG, WebP or SVG image"));
-    };
-    Ok(MediaBytes {
-        bytes,
-        mimetype: mimetype.to_owned(),
-    })
-}
-
-/// The profile avatars this process refused, by `mxc`: each is said once
-/// and never downloaded again (a changed avatar is another `mxc`).
-fn refused_avatars() -> &'static std::sync::Mutex<std::collections::HashSet<OwnedMxcUri>> {
-    static REFUSED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<OwnedMxcUri>>> =
-        std::sync::LazyLock::new(Default::default);
-    &REFUSED
-}
-
-/// How long a profile avatar's download may take, whole.
-const AVATAR_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Why a bounded download brought nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Download {
@@ -480,24 +340,6 @@ impl std::fmt::Display for Download {
             Download::Failed(why) => f.write_str(why),
         }
     }
-}
-
-/// The original of the plain media `mxc`, through the homeserver's
-/// authenticated media endpoint where it has one (else the legacy one), as
-/// the SDK chooses — read at most [`crate::agents::avatar::MAX_BYTES`].
-async fn download_avatar(client: &Client, mxc: &MxcUri) -> Result<Vec<u8>, Download> {
-    let (url, authorization) = content_request(client, mxc).await?;
-    let http = reqwest::Client::builder()
-        .timeout(AVATAR_DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|_| Download::Failed("no HTTP client could be made".to_owned()))?;
-    download(
-        &http,
-        &url,
-        authorization.as_deref(),
-        crate::agents::avatar::MAX_BYTES,
-    )
-    .await
 }
 
 /// The URL of `mxc`'s original and the `Authorization` it is fetched with:
@@ -760,35 +602,6 @@ mod tests {
             fetched(refused, max).await,
             Err(Download::Failed(_))
         ));
-    }
-
-    #[test]
-    fn an_avatar_url_round_trips_in_both_forms_and_is_no_item_url() {
-        for form in [UrlForm::Scheme, UrlForm::Localhost] {
-            let url = avatar_url_in(form, "acct/1", "!r:h", "@nixi:example.org", "abc123");
-            assert_eq!(
-                parse_avatar_url(&url),
-                Some(AvatarHandle {
-                    account_id: "acct/1".into(),
-                    room_id: "!r:h".into(),
-                    user_id: "@nixi:example.org".into(),
-                }),
-                "{url}"
-            );
-            assert_eq!(parse_media_url(&url), None, "{url}");
-            assert!(!url.contains("mxc"), "{url}");
-        }
-        let item = media_url("a", "!r:h", "k", MediaVariant::Full);
-        assert_eq!(parse_avatar_url(&item), None);
-        // Three segments under the item host are no avatar either.
-        assert_eq!(
-            parse_avatar_url("keeper-media://media/a/!r:h/@u:h?v=1"),
-            None
-        );
-        assert_ne!(
-            avatar_url_in(UrlForm::Scheme, "a", "!r:h", "@u:h", "one"),
-            avatar_url_in(UrlForm::Scheme, "a", "!r:h", "@u:h", "two"),
-        );
     }
 
     #[test]
