@@ -114,7 +114,10 @@ last wrote it. Times are UTC milliseconds since the epoch.
   the server's own tables, outside every scope, because a synced row reaches every client of its
   scope.
 - **`agent_profiles`** — what an agent instance says about itself: `actor_id`, `name`,
-  `description`, `avatar_blob`, `definition_hash`, `image_digest`, `started_at_ms`, `dir`.
+  `description`, `avatar_blob`, `definition_hash`, `image_digest`, `started_at_ms`, `dir`, `tools`
+  (schema 3: a JSON array of the tool names the instance offers — its definition's tools less
+  those its container withholds — written when it starts; absent until an instance says, and a
+  client then offers no tool switch).
 - **`sessions`** — `title`, `status`, `agent_actor`, `created_by_actor`, `created_by_client`,
   `preferred_client` (the instance the person asked for), `parent_session` (a delegated child's
   parent), `invite` (a JSON array of actor ids), `archived`, `heard_until` (the claim holder's mark
@@ -135,7 +138,10 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `size` (bytes, at most 26,214,400), `created_at_ms`.
 - **`messages`** — `session_id`, `page_key`, `turn_id` (an agent's answer), `role` (`person` |
   `agent`), `body`, `body_blob` (a body too large to ride inline), `metadata` (JSON: model,
-  usage, `ttft_ms`, `duration_ms`, finish reason).
+  usage, `ttft_ms`, `duration_ms`, finish reason). An agent's question to the person is an agent
+  message whose `metadata` holds `"kind": "ask"` and, when it offers answers, `"options"` (an
+  array of strings); the person answers with an ordinary person message, and the ask is open until
+  one is written after it.
 - **`reasoning`** — `session_id`, `page_key`, `turn_id`, `seq`, `compacted` (true on the one row
   that replaces a turn's chunks after compaction), `text`.
 - **`tool_calls`** — `session_id`, `page_key`, `turn_id`, `name`, `args` (JSON), `status`,
@@ -156,6 +162,28 @@ last wrote it. Times are UTC milliseconds since the epoch.
 Declared references, enforced by the server at commit: `clients` and `agent_profiles` need their
 actor; `claims`, `session_tool_switches`, `turn_chunks` and `attachments` need their session and go
 with it; an approval needs its tool call.
+
+## The live answer
+
+An answer being written reaches its viewers by two paths that keep no order between them. The
+instance holding the claim commits its text as `turn_chunks` — seq 0 an empty anchor written
+before the turn starts, then each committed piece under the next seq — and publishes what it has
+not committed yet as presence: `{turn, from_seq, text, tool}` on `session:{session_id}` (`tool`
+the name of the tool being called, or null) and, for readers only, `{turn, from_seq, reasoning}`
+on `trace:{page_key}` of the month the turn opened in. A tail's `from_seq` is the seq its text will
+be committed under. The reasoning commits as `reasoning` rows from seq 1, compacted at the end into
+one row (`compacted`, seq 0) holding all of it. The turn ends in one commit: the agent's `messages`
+row (`turn_id` the turn), every `turn_chunks` row of the turn deleted; the documents are cleared
+after.
+
+**The viewer rule.** A viewer renders a turn that is still being written as the turn's
+`turn_chunks` contiguous from seq 0, followed by the latest `text` it has seen on
+`session:{session_id}` whose `from_seq` is the seq after the last of them; it keeps the latest tail
+for each `from_seq` — through a presence leave — until that seq's chunk arrives, and replaces both
+with the agent's `messages` row for the turn (`turn_id`) once it holds it. The reasoning follows
+the same rule from seq 1, and the compacted row replaces it. A tail that runs ahead of the chunks is
+buffered until they arrive, so what a viewer shows only grows, and is always a prefix of the
+answer.
 
 ## What the server enforces
 

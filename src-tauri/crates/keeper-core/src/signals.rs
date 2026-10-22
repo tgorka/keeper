@@ -293,6 +293,11 @@ mod tests {
     /// tokens are spelled split (built by concatenation below) so this file does not trip
     /// its own scan. The sibling `keeper/src` directory must resolve at runtime — a
     /// missing dir fails the scan loudly rather than silently skipping the IPC crate.
+    ///
+    /// One directory is not scanned: `keeper-core/src/hq/`, the agents' syncular
+    /// database. Its presence is syncular's ephemeral document on a scope key of that
+    /// database (SPEC §8.6), seen only by that scope's members, never a Matrix user's
+    /// online status, and it has no path to the homeserver.
     #[test]
     fn presence_is_withheld_everywhere() {
         use std::path::{Path, PathBuf};
@@ -328,6 +333,8 @@ mod tests {
         let mut sources = Vec::new();
         collect_rs(&core_src, &mut sources);
         collect_rs(&ipc_src, &mut sources);
+        let agents_database = core_src.join("hq");
+        sources.retain(|path| !path.starts_with(&agents_database));
         assert!(
             !sources.is_empty(),
             "guard scanned no sources — src dir resolution failed"

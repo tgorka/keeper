@@ -1,8 +1,151 @@
 # Agents
 
-Agents are named souls that live in a drive, work in that drive's sessions and talk over
-Matrix. This is the operator document: what is on disk, what keeper reads and writes, what
-it never touches, and what to do when something is wrong. The design reasoning lives in
+## The Agents window on this device
+
+The Agents window reads Rust's local database sessions, not Matrix rooms. Sessions from every
+database this device holds share one list. Each row and the opened session's header name the
+database; identical session ids in two databases remain separate conversations. Rows show the
+agent, last activity and Rust's attention state. **Active**, **Archived** and **All** change only
+which rows are shown, never their order or the underlying subscription.
+
+Opening a session shows its newest visible page. **Earlier messages**, or scrolling to the top,
+asks Rust to widen the history window. **Archive session** keeps the list row and marks the
+session archived; **Unarchive session** continues it. An archived read-only page has no composer.
+The frontend does not download all history to assemble a conversation.
+
+**New session** offers the database directory's agents. An agent serving one database names that
+database without a picker; an agent serving several asks where the session belongs. Sending the
+first message creates the session and message together. Message captions — **waiting**, **sent**,
+**taken** — come from Rust, not delivery/read receipts. The shared composer retains a refused
+send; database sessions never read or write Matrix drafts. An unsent draft lives only in the open
+composer and is not restored after leaving that session.
+
+Approval cards show the exact action and its binding digest. A decision is addressed to its
+database and session and bound to that digest; a server refusal stays beside the action. A queued
+decision is not final: if Rust reports it refused and decidable again, the same card permits a
+new decision. The
+**Waiting for you** group collects pending decisions across databases. A question in a message
+offers its options, or the normal composer for a free-text answer; Rust closes the question after
+the person's reply. On phones the list and conversation are separate screens. Opening a session
+focuses **Back to sessions**, not the composer, so it does not summon the software keyboard.
+**Back to sessions** or **Escape** returns focus to the originating database-qualified row;
+an open selector consumes Escape before the screen does. The Notes dock and tablet assistant
+sheet use the same list mirror with independent selections, and launch opens Rust's local
+default session.
+
+**Earlier conversations** preserves earlier Matrix agent history as read-only. The former dock's
+Matrix note-focus and drive-scope controls are not sent to database agents: those carriers were
+not migrated by this story. Instance selection belongs to the subsequent story; message and
+attention state remain Rust-owned throughout.
+
+Browser checks use the development mock shell (`?sessions=launch`, optionally
+`&platform=phone`), not a server or a performance measurement. The installed macOS shell and the
+archived-session ≤1 s tailnet target still require the native/device gates; mock page timing is
+not evidence for that target.
+
+## Live answers, thinking and details
+
+An open answer grows as its text arrives. Its current tool is named below the text. Tool-call
+disclosures show a reader when a call starts, when it finishes or is refused, and its result.
+The transcript scrolls inside its own viewport: a growing answer does not move the composer or
+replace an unsent draft. Scrolling back stops following the newest text until you return to the
+bottom. If the claim ends without a final message, the retained text says **The answer stopped.**
+
+**Show thinking** and **Show details** start off and are your preferences on every device
+(`agents.show_reasoning`, `agents.show_details`, user-global, settable in a settings file).
+Changing one writes only that preference. The switches show the preferences as they hold now,
+carried with the open session's view: a change synced from another device or a settings file
+reaches open sessions and their switches too. A settings file that sets one keeps it — the
+switch stays as the file says and **Saved, but a settings file keeps this preference as it is.**
+appears beside it.
+Thinking is offered only to a person who can read the session's trace, and reasoning enters the
+view only while that preference is on. It remains readable after the answer finishes. A person
+without trace access receives no reasoning or tool-result rows; the current tool's name is public
+to the session, not its arguments or result. These are server/Rust boundaries, not CSS hiding.
+
+**Show details** reveals the final answer's model, reported input/output/total tokens, time to
+first token, duration, finish reason and error. Missing measurements have no label and are never
+filled with zero. A reported zero remains a real measurement. Answer markdown renders inert text:
+model-written HTML does not become HTML, and model-written links do not navigate.
+
+**Tools** contains only tools the answering instance offers, from its definition and container.
+Switching off narrows that set; switching on restores an offered tool and never adds one. An
+unknown or absent offered-tools list renders no Tools control, and neither does a session that
+cannot be changed here (archived). Changes wait for Rust's view; a
+refusal is visible beside the controls. **Untrusted** marks a session that has read outside content;
+consequential actions still need a person.
+
+The viewer rule is Rust's: “A viewer renders a turn that is still being written as the turn's
+`turn_chunks` contiguous from seq 0, followed by the latest `text` it has seen on
+`session:{session_id}` whose `from_seq` is the seq after the last of them; it keeps the latest tail
+for each `from_seq` — through a presence leave — until that seq's chunk arrives, and replaces both
+with the agent's `messages` row for the turn (`turn_id`) once it holds it.” The frontend renders
+that projection, never folds chunks or presence itself.
+
+Development fixtures: `?sessions=launch&live=stream`, with `&platform=phone` for the phone shell.
+`live=error`, `stopped`, `nonreader`, `no-tools`, `untrusted`, `long`, `refused` and `pinned` cover
+provider error, ended claim, trace exclusion, absent offers, outside-content marker, long strings,
+refused preference/tool writes and a settings file keeping Show details off. Timed mock deltas
+are UI evidence only, not a server or latency proof.
+
+### Measured: live-answer presentation
+
+2026-10-20, real app in the agent-desktop Chrome with the development mock shell, at 1280 × 900
+and 420 × 900. During an 18-second timed answer, 171 desktop and 175 phone geometry samples
+kept the composer's top at exactly 850.5 px and 844 px respectively (0 px movement); its draft
+and textarea node were retained. The long-string phone case also held 844 px across 175 samples.
+There was no document-width overflow. Phone controls — thinking/details, Tools, offered switches,
+tool disclosure, code-copy, Back, Archive and Send — measured at least 44 × 44 px. Both preferences
+were exercised on/off and survived mock-shell reloads; offered tools were switched off and back on.
+
+ARIA snapshots and screenshots covered live text, tool start/completion, thinking on/off, final
+details, provider error, stopped answer, nonreader, absent tools, refused writes and long output.
+The stopped notice sits after the retained answer so it remains visible at the reading edge,
+rather than disappearing above a long reply. These successful runs recorded no browser console
+errors or failed network requests. The mock's persisted preferences are not proof of native
+settings storage; Rust and the native shell gates own that boundary. Layout geometry is browser
+evidence, not a claim that jsdom measures layout.
+
+The native tailnet p95 publish-to-receive target (NFR-124) requires the real agent and viewer
+timestamps. Browser mock timing does not measure it; no native latency result is claimed here.
+
+### Measured: a live answer against the real server
+
+2026-10-21, `hq_live.rs`'s three live-answer tests on one Linux host: the keeper-hq server
+(`hq/104-5-claims` 2dc38f4, Bun 1.4.2, serving this branch's contract, schema 3) over a throwaway
+Postgres 18 on delectra, one real `keeper-agentd run` serving Nixie on `tgdrive` from the e2e model
+stub (40 reasoning tokens, then 240 answer tokens, 25 ms apart), and keeper-core viewers. A second
+Nixie client stood in for R-HQ-30's runtime half and wrote only an `agent_profiles` row whose
+`tools` named `journal_append` and `journal_read`.
+
+- **Growing answer** (four runs): the owner's view grew in 151–223 steps over about 6 s, median
+  step 25 ms, each step a prefix of the final 1,090 bytes, the last equal to the final row. A
+  second device that paired and opened mid-answer showed at once at least what the first had
+  shown by then (98/98, 118/118, 146/146, 274/274 bytes), then the same final row byte for byte.
+  With *Show details* on, the final row showed model, 50/240/290 tokens, time to first token
+  27–33 ms and duration about 7.1 s. With *Show thinking* on, the thinking streamed and stayed.
+- **Model to viewer** (three runs, 544 steps): from the stub emitting a token to keeper-core's
+  session view first showing that length, p50 3.6 ms, p95 21.5 ms, p99 256 ms, max 556 ms. The
+  outliers fall while the second device pairs in the same process. This is one host over
+  loopback and includes the instance's work, so it is **not** NFR-124's figure: the tailnet
+  publish-to-receive p95 (electra → hesperia) is still owed.
+- **Non-reader:** a person invited when the session opened saw the answer grow and the same
+  final row, was shown no thinking or tool step with *Show thinking* on, and held no
+  `reasoning` or `tool_calls` row for the session.
+- **Tool switches:** both offered tools were listed on. `journal_append` switched off on the
+  owner's device showed off on the guest's, and the next turn offered the model only
+  `journal_read`; switched back on, the next turn offered both. A name not offered was refused.
+- **Killed instance:** SIGKILLed with 202 bytes shown, the view kept those 202 bytes and said the
+  answer stopped 28.7 s later, once the claim's lease had lapsed.
+
+The Agents-window archive test assumes no agent answers its messages, and the pairing test needs
+two databases; neither fits this rig, which runs an agent on one database.
+
+## Earlier Matrix agent hosting
+
+The remaining sections describe the earlier drive-and-Matrix host, retained while its history
+and hosting paths are retired. They do not describe the database-backed Agents window above.
+The design reasoning lives in
 `_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-AGENTS.md`
 (AD-360…AD-416) and the evidence in `_bmad-output/planning-artifacts/research-agents-2026-10-02.md`;
 the decisions are D-31…D-36 in `docs/decisions.md`.
@@ -5224,3 +5367,19 @@ asks one pull, and the room's real members — the visitor at power 0 among them
 check only with the visitor known as an agent. **Owed:** NFR-122 on the tailnet — p95 from a push
 on electra or hesperia to the other host holding the commit, by doorbell, at most 15 s over 100
 session changes — is an operator measurement on the two hosts (DW-452).
+
+### Measured: archived-session VM readiness (NFR-127 supporting evidence)
+
+2026-10-20, `hq_live.rs` `agents_window_archive_and_an_archived_session_opens_within_a_second`:
+the keeper-hq server (Bun 1.2.23, both databases, a throwaway Postgres 18) on delectra, keeper-core's
+client in a Linux container reaching it over the tailnet. One device wrote a session of 1,000
+messages into `tgdrive` (each read *sent* once the server took it); a second device listed it from
+its replica with its database, held its 1,000 messages, archived it (0 of them left in its
+replica, the row still listed as archived), then opened it archived 20 times. The newest page of
+50, read through the registered `sessionPage` query, reached keeper-core's complete session VM
+in **min 11.8 ms, median 15.6 ms, p95 17.3 ms, max 21.2 ms**. These are Linux/delectra
+**VM-readiness** measurements: the timer stops at `session_view().complete`, before Tauri IPC or
+frontend rendering. Reading back fetched the next 50; unarchiving restored the 1,000 rows.
+**NFR-127's native end-to-end ≤1 s rendered-page gate remains unverified:** measure from opening
+the archived session through its newest page being painted in the installed app, from hesperia
+against electra. These supporting numbers do not satisfy that native gate.

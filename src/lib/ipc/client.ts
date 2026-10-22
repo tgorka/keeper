@@ -344,13 +344,18 @@ export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
+export type { AgentApprovalVm } from "./gen/AgentApprovalVm";
 export type { AgentAsksVm } from "./gen/AgentAsksVm";
 export type { AgentAskVm } from "./gen/AgentAskVm";
 export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
+export type { AgentChoiceVm } from "./gen/AgentChoiceVm";
 export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
+export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
+export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
+export type { AgentLiveTurnVm } from "./gen/AgentLiveTurnVm";
 export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
 export type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
 export type { AgentMcpListVm } from "./gen/AgentMcpListVm";
@@ -360,6 +365,8 @@ export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
 export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
 export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
 export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
+export type { AgentMessageDetailsVm } from "./gen/AgentMessageDetailsVm";
+export type { AgentMessageVm } from "./gen/AgentMessageVm";
 export type { AgentModelBotVm } from "./gen/AgentModelBotVm";
 export type { AgentModelLineVm } from "./gen/AgentModelLineVm";
 export type { AgentModelReq } from "./gen/AgentModelReq";
@@ -382,8 +389,15 @@ export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+export type { AgentSessionRef } from "./gen/AgentSessionRef";
+export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
+export type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
+export type { AgentSessionToolVm } from "./gen/AgentSessionToolVm";
+export type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
 export type { AgentStatusVm } from "./gen/AgentStatusVm";
 export type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
+export type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
 export type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 export type { AgentWebSearchVm } from "./gen/AgentWebSearchVm";
@@ -554,6 +568,13 @@ export type { HeldReplyVm } from "./gen/HeldReplyVm";
 export type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
+export type { HqDatabaseState } from "./gen/HqDatabaseState";
+export type { HqDatabaseVm } from "./gen/HqDatabaseVm";
+export type { HqDeviceVm } from "./gen/HqDeviceVm";
+export type { HqPairCodeVm } from "./gen/HqPairCodeVm";
+export type { HqPhase } from "./gen/HqPhase";
+export type { HqStatusVm } from "./gen/HqStatusVm";
+export type { HqThisDeviceVm } from "./gen/HqThisDeviceVm";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
@@ -836,9 +857,13 @@ export type { WordsVm } from "./gen/WordsVm";
 import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
+import type { AgentApprovalVm } from "./gen/AgentApprovalVm";
 import type { AgentAsksVm } from "./gen/AgentAsksVm";
+import type { AgentChoiceVm } from "./gen/AgentChoiceVm";
 import type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
+import type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
+import type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 import type { AgentFocusReq } from "./gen/AgentFocusReq";
 import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
 import type { AgentMcpListVm } from "./gen/AgentMcpListVm";
@@ -851,7 +876,11 @@ import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+import type { AgentSessionRef } from "./gen/AgentSessionRef";
+import type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
+import type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
 import type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+import type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 import type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
 import type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
@@ -913,6 +942,8 @@ import type { ForgeReposVm } from "./gen/ForgeReposVm";
 import type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 import type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 import type { HotkeyVm } from "./gen/HotkeyVm";
+import type { HqPairCodeVm } from "./gen/HqPairCodeVm";
+import type { HqStatusVm } from "./gen/HqStatusVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { MenuSectionVm } from "./gen/MenuSectionVm";
@@ -4057,6 +4088,168 @@ export async function failureSubscribe(onState: (state: FailureStateVm) => void)
 /** End a {@link failureSubscribe} stream. */
 export async function failureUnsubscribe(subscriptionId: string): Promise<void> {
   await invoke<void>("failure_unsubscribe", { subscriptionId });
+}
+
+export async function agentSessionApprovalDecide(
+  target: AgentSessionRef,
+  approvalId: string,
+  bindingDigest: string,
+  approve: boolean,
+): Promise<AgentDecisionOutcomeVm> {
+  return await invoke<AgentDecisionOutcomeVm>("agent_session_approval_decide", {
+    ...target,
+    approvalId,
+    bindingDigest,
+    approve,
+  });
+}
+
+export async function agentApprovalsSubscribe(
+  onRows: (rows: AgentApprovalVm[]) => void,
+): Promise<string> {
+  return await subscribeWithStringId<AgentApprovalVm[]>("agent_approvals_subscribe", onRows);
+}
+
+export async function agentApprovalsUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("agent_approvals_unsubscribe", { subscriptionId });
+}
+
+/** Local database session VMs: every address includes its database. */
+export async function agentsSessionsSubscribe(
+  onBatch: (batch: AgentSessionsBatch) => void,
+): Promise<string> {
+  return await subscribeWithStringId<AgentSessionsBatch>("agents_sessions_subscribe", onBatch);
+}
+
+export async function agentsSessionsUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("agents_sessions_unsubscribe", { subscriptionId });
+}
+
+export async function agentSessionOpen(
+  target: AgentSessionRef,
+  onView: (view: AgentSessionViewVm) => void,
+): Promise<string> {
+  return await subscribeWithStringId<AgentSessionViewVm>("agent_session_open", onView, target);
+}
+
+export async function agentSessionClose(subscriptionId: string): Promise<void> {
+  await invoke<void>("agent_session_close", { subscriptionId });
+}
+
+export async function agentSessionPageBack(target: AgentSessionRef): Promise<void> {
+  await invoke<void>("agent_session_page_back", { ...target });
+}
+
+export async function agentViewPrefsSet(
+  patch: Partial<AgentViewPrefsVm>,
+): Promise<AgentViewPrefsVm> {
+  return await invoke("agent_view_prefs_set", {
+    patch: {
+      showReasoning: patch.showReasoning ?? null,
+      showDetails: patch.showDetails ?? null,
+    },
+  });
+}
+
+export async function agentSessionToolSet(
+  target: AgentSessionRef,
+  name: string,
+  on: boolean,
+): Promise<void> {
+  await invoke("agent_session_tool_set", { ...target, name, on });
+}
+
+export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {
+  await invoke<void>("agent_send", { ...target, body });
+}
+
+export async function agentSessionNew(
+  database: string,
+  agentActor: string,
+  body: string,
+): Promise<AgentSessionRef> {
+  return await invoke<AgentSessionRef>("agent_session_new", { database, agentActor, body });
+}
+
+export async function agentSessionArchive(target: AgentSessionRef): Promise<void> {
+  await invoke<void>("agent_session_archive", { ...target });
+}
+
+export async function agentSessionUnarchive(target: AgentSessionRef): Promise<void> {
+  await invoke<void>("agent_session_unarchive", { ...target });
+}
+
+export async function agentsChoices(): Promise<AgentChoiceVm[]> {
+  return await invoke<AgentChoiceVm[]>("agents_choices");
+}
+
+export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | null> {
+  return await invoke<AgentDefaultSessionVm | null>("agent_session_default");
+}
+
+/**
+ * Stream the agents server's status (AD-418): the server row, each database's line and what
+ * waits on this device — Rust's sentences — at once and at every change. Resolves with the
+ * subscription id for {@link hqStatusUnsubscribe}.
+ */
+export async function hqStatusSubscribe(onStatus: (status: HqStatusVm) => void): Promise<string> {
+  return await subscribeWithStringId<HqStatusVm>("hq_status_subscribe", onStatus);
+}
+
+/** End an {@link hqStatusSubscribe} stream. */
+export async function hqStatusUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("hq_status_unsubscribe", { subscriptionId });
+}
+
+/**
+ * Set `agents.server_url`: `""` clears it. Rejects with Rust's sentence, storing nothing,
+ * when the address is not one keeper contacts; resolves with the status after.
+ */
+export async function hqServerSet(url: string): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_server_set", { url });
+}
+
+/** Forget the server: this device's pairing with it and its replicas here. */
+export async function hqServerForget(): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_server_forget");
+}
+
+/** A code, and its QR, another device of this person can redeem. */
+export async function hqPairStart(): Promise<HqPairCodeVm> {
+  return await invoke<HqPairCodeVm>("hq_pair_start");
+}
+
+/** Redeem a code typed or pasted on this device; rejects with Rust's sentence. */
+export async function hqPairRedeem(code: string): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_pair_redeem", { code });
+}
+
+/**
+ * Remove one of the person's devices from the server; resolves with the status after. The
+ * Devices list in the status follows when the server's directory replicates.
+ */
+export async function hqDeviceRevoke(clientId: string): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_device_revoke", { clientId });
+}
+
+/** Pair with the server of the link a scanned QR opened (`HqStatusVm.offer`). */
+export async function hqPairOfferAccept(): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_pair_offer_accept");
+}
+
+/** Forget the link a scanned QR opened. */
+export async function hqPairOfferDismiss(): Promise<void> {
+  await invoke<void>("hq_pair_offer_dismiss");
+}
+
+/** Raised when a `keeper://agents/pair` link opened keeper; Rust holds the link. */
+export const HQ_PAIR_OFFER_EVENT = "hq-pair-offer";
+
+/** Subscribe to {@link HQ_PAIR_OFFER_EVENT}; resolves with an unlisten function. */
+export async function listenHqPairOffer(onOffer: () => void): Promise<() => void> {
+  return await listen(HQ_PAIR_OFFER_EVENT, () => {
+    onOffer();
+  });
 }
 
 /** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */
@@ -8960,20 +9153,8 @@ export async function voiceAgentTargets(): Promise<VoiceAgentTargetVm[]> {
 }
 
 /**
- * What keeper opens at launch (story 100.3, R383): the Agents window when the
- * signed-in accounts have an agent room, else the Inbox; the default agent's
- * `main` room when it has one here (`room`), else nothing selected and
- * `reason` says why. Rust decides; the boot effect asks once, after the
- * accounts are hydrated and the Agents window's first rooms arrived, and
- * applies the answer once. A `reason` is also a WARN line in `keeper.log`.
- */
-export async function agentsLaunch(): Promise<AgentsLaunchVm> {
-  return await invoke<AgentsLaunchVm>("agents_launch");
-}
-
-/**
- * The default agent as Settings › Agents and the agent room's menu show it:
- * the same answer as {@link agentsLaunch}, read again (no log line).
+ * The configured default agent and available choices for Settings › Agents
+ * and the earlier Matrix agent room menu. Boot uses agentSessionDefault instead.
  */
 export async function agentsDefaultGet(): Promise<AgentsLaunchVm> {
   return await invoke<AgentsLaunchVm>("agents_default_get");

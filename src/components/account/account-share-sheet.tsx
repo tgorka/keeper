@@ -42,7 +42,7 @@ export const SHARE_COPIED_LABEL = "Copied";
 export const SHARE_READING = "Making the setup link…";
 export const SHARE_FAILED = "keeper couldn't make a setup link.";
 export const SHARE_COPY_FAILED = "keeper couldn't copy the link. Select it above and copy it.";
-/** How long "Copied" stays before the button reads "Copy link" again (bot-answer.tsx's value). */
+/** How long "Copied" stays before the button reads "Copy link" again (agent-answer.tsx's value). */
 export const SHARE_COPIED_RESET_MS = 2000;
 /** The code's own edge, not the card's (DESIGN.md: the QR is at least 240 px). */
 const QR_PX = 240;

@@ -43,12 +43,13 @@ import {
   Shield,
   ShieldAlert,
 } from "lucide-react";
-import { type ReactNode, useId, useState } from "react";
+import { type ReactNode, useEffect, useId, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { logFailure } from "@/lib/failure";
 import {
+  type AgentApprovalVm,
   type ApprovalCardVm,
   type ApprovalDecision,
   type ApprovalPayloadVm,
@@ -57,6 +58,7 @@ import {
   type ApprovalVm,
   agentApprovalDecide,
   agentApprovalPayload,
+  agentSessionApprovalDecide,
 } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
@@ -971,5 +973,92 @@ export function ApprovalRequest({
         />
       )}
     </section>
+  );
+}
+
+/** A database approval is bound to the exact action and digest Rust supplied. */
+export function DatabaseApprovalCard({ approval }: { approval: AgentApprovalVm }) {
+  const [sending, setSending] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: an authoritative state transition retires an earlier command failure
+  useEffect(() => {
+    setFailure(null);
+  }, [approval.state, approval.canDecide, approval.sentence]);
+  const decide = async (approve: boolean) => {
+    if (sending || !approval.canDecide) return;
+    setSending(true);
+    setFailure(null);
+    try {
+      await agentSessionApprovalDecide(
+        { database: approval.database, sessionId: approval.sessionId },
+        approval.id,
+        approval.bindingDigest,
+        approve,
+      );
+    } catch (raw) {
+      setFailure(syncErrorMessage(raw, APPROVAL_DECIDE_FAILED));
+    } finally {
+      setSending(false);
+    }
+  };
+  const weight = TIER_WEIGHT[Number(approval.tier.replace("T", ""))] ?? HEAVIEST;
+  const Icon = weight.icon;
+  return (
+    <article
+      aria-label={`Approval: ${approval.summary}`}
+      className={cn("min-w-0 rounded-md border border-border bg-card p-3", weight.edge)}
+    >
+      <div
+        className={cn("mb-2 flex flex-wrap items-center gap-2 font-medium text-sm", weight.tone)}
+      >
+        <Icon className="size-4" aria-hidden="true" />
+        <span>{approval.tier}</span>
+        <span>{approval.toolName}</span>
+        <span className="break-all text-muted-foreground text-xs">{approval.database}</span>
+      </div>
+      <p className="break-words text-sm">{approval.summary}</p>
+      {approval.action !== undefined && (
+        <figure aria-label="Exact action">
+          <pre className="my-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-muted p-2 text-xs [overflow-wrap:anywhere]">
+            {approval.action}
+          </pre>
+        </figure>
+      )}
+      <details className="my-2 text-muted-foreground text-xs">
+        <summary className="min-h-11 min-w-11 cursor-pointer content-center">
+          Binding digest
+        </summary>
+        <p className="break-all">{approval.bindingDigest}</p>
+      </details>
+      <p role={approval.refused ? "alert" : "status"} className="text-muted-foreground text-xs">
+        {approval.sentence}
+      </p>
+      {failure && !approval.refused && (
+        <p role="alert" className="mt-2 text-destructive text-sm">
+          {failure}
+        </p>
+      )}
+      {approval.canDecide && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button
+            className="min-h-11 min-w-11"
+            size="sm"
+            disabled={sending}
+            onClick={() => void decide(true)}
+          >
+            Approve once
+          </Button>
+          <Button
+            size="sm"
+            className="min-h-11 min-w-11"
+            variant="outline"
+            disabled={sending}
+            onClick={() => void decide(false)}
+          >
+            Deny
+          </Button>
+        </div>
+      )}
+    </article>
   );
 }

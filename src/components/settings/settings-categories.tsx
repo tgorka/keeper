@@ -332,7 +332,9 @@ export function SettingsCategories({
   if (layout === "rail") {
     return (
       <div className="flex min-h-0 min-w-0 flex-1">
-        <div className="w-52 shrink-0 overflow-y-auto border-border border-r p-2">{list}</div>
+        <div className="w-52 shrink-0 overflow-y-auto border-border border-r p-2 last:border-r-0">
+          {list}
+        </div>
         <ScrollArea className="min-h-0 flex-1" fitWidth>
           <div className="p-4">{body}</div>
         </ScrollArea>

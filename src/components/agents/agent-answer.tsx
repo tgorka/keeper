@@ -1,7 +1,7 @@
 /**
  * One answer's body, rendered (Epic 61, Story 61.5).
  *
- * The parse lives in `src/lib/bots-markdown.ts`; this file is only the mapping
+ * The parse lives in `src/lib/agents/markdown.ts`; this file is only the mapping
  * from its blocks to elements. Three properties are load-bearing enough that
  * changing this file without re-reading them will break something a test names:
  *
@@ -10,7 +10,7 @@
  *    would fetch it. `note_protocol.rs` already stated the position — "a note
  *    that auto-fetches a URL an agent wrote is a tracking pixel" — and an
  *    answer is a longer string an agent wrote. A `<script>` the model emits is
- *    a paragraph of characters, and `bot-answer.test.tsx` asserts it.
+ *    a paragraph of characters, and `agent-answer.test.tsx` asserts it.
  * 2. **A link is text, not a destination.** The label and, when it differs, the
  *    URL are both shown; neither is clickable. Making it clickable is a
  *    separate decision about opening an external browser from a model's output,
@@ -36,7 +36,7 @@ import {
   type MdBlock,
   type MdInline,
   parseAnswer,
-} from "@/lib/bots-markdown";
+} from "@/lib/agents/markdown";
 import { sayFailure } from "@/lib/failure";
 import { cn } from "@/lib/utils";
 
@@ -154,12 +154,14 @@ function CodeBlock({
       data-language={language ?? ""}
     >
       <div className="flex items-center justify-between gap-2 border-border border-b bg-muted px-2 py-1">
-        <span className="text-muted-foreground text-xs">{language ?? BOT_CODE_PLAIN_LABEL}</span>
+        <span className="min-w-0 break-all text-muted-foreground text-xs">
+          {language ?? BOT_CODE_PLAIN_LABEL}
+        </span>
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="h-6 px-2 text-xs"
+          className="h-6 shrink-0 px-2 text-xs max-md:h-auto max-md:min-h-11"
           onClick={() => {
             // The code is on screen either way, but a copy that did not happen
             // is said, so nobody pastes something else believing it went.
@@ -291,7 +293,7 @@ function BlockList({ blocks }: { blocks: MdBlock[] }) {
   );
 }
 
-export function BotAnswer({ body }: { body: string }) {
+export function AgentAnswer({ body }: { body: string }) {
   // Deliberately not `useMemo`: the parse is a function of `body`, and `body`
   // changes on every delta, so a memo would only add a cache that never hits.
   // The saving that matters is per-block, and it is the memo above.

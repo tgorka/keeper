@@ -216,7 +216,7 @@ function clipped(text: string): { text: string; notice: string | null } {
 }
 
 /** One tool call: a collapsed disclosure that opens onto what was exchanged. */
-export function BotToolCallRow({ call }: { call: BotToolCallVm }) {
+export function AgentToolCallRow({ call }: { call: BotToolCallVm }) {
   const [open, setOpen] = useState(false);
   const bodyId = useId();
   const refused = call.refusal !== null || call.outcome === "refused";
@@ -313,12 +313,12 @@ export function BotToolCallRow({ call }: { call: BotToolCallVm }) {
  * the count; with neither, nothing at all — an empty element in a flex column
  * still spends its parent's gap.
  */
-export function BotToolCall({ count, calls = [] }: { count: number; calls?: BotToolCallVm[] }) {
+export function AgentToolCall({ count, calls = [] }: { count: number; calls?: BotToolCallVm[] }) {
   if (calls.length > 0) {
     return (
       <ul aria-label={BOT_TOOL_LIST_LABEL} className="flex min-w-0 flex-col gap-1">
         {calls.map((call) => (
-          <BotToolCallRow call={call} key={call.id} />
+          <AgentToolCallRow call={call} key={call.id} />
         ))}
       </ul>
     );

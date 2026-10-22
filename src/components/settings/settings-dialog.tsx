@@ -9,6 +9,7 @@ import { SessionsSettingsSection } from "@/components/sessions/sessions-settings
 import { AboutSection } from "@/components/settings/about-section";
 import { AccountSection } from "@/components/settings/account-section";
 import { AgentsSection } from "@/components/settings/agents-section";
+import { AgentsServerSection } from "@/components/settings/agents-server-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
@@ -278,6 +279,9 @@ export function SettingsBody({
     // and the key travels with the account — and absent where there is no
     // agent to choose and none stored (AD-27).
     "default-agent": { node: <DefaultAgentSection open={open} /> },
+    // The agents server (AD-418, AD-422): on every tier and behind no
+    // capability — a phone pairs and syncs its agents' databases the same way.
+    "agents-server": { node: <AgentsServerSection open={open} /> },
     // Story 90.6: this Mac as a host for your agents. On `botTools` for the
     // grants' reason — a host reads drives, and a phone is never one — and
     // absent besides where no flagged folder holds an agent (AD-27).

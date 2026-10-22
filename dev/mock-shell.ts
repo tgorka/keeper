@@ -56,8 +56,10 @@ import type {
   AccountShareVm,
   AccountStateVm,
   AccountVm,
+  AgentApprovalVm,
   AgentAsksVm,
   AgentAskVm,
+  AgentChoiceVm,
   AgentConsoleReq,
   AgentConsoleVm,
   AgentCopyVm,
@@ -80,6 +82,9 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentSessionRowVm,
+  AgentSessionsBatch,
+  AgentSessionViewVm,
   AgentsLaunchVm,
   AgentWebSearchReq,
   AgentWebSearchUrlVm,
@@ -140,6 +145,8 @@ import type {
   HeldRestoreVm,
   HeldSendVm,
   HotkeyVm,
+  HqPairCodeVm,
+  HqStatusVm,
   InboxBatch,
   InboxRoomVm,
   IpcError,
@@ -9202,7 +9209,700 @@ function mockAgentAsks(roomId: string): AgentAsksVm {
   return { asks: [ask], note };
 }
 
+/**
+ * The agents server (Epic 106, `keeper_core::hq`). Every sentence is copied from `hq::vm`;
+ * the address grammar is Rust's (`hq::server::ServerUrl::parse`) and this answers its common
+ * shapes. Names are invented: databases `alpha` and `beta`, the person's devices "keeper on
+ * laptop" and "keeper on phone". `?hq=` picks the state Settings › Agents › Agents server
+ * opens on: absent — no server; `connected` — paired, both databases connected; `notopen` —
+ * one database no longer open to this device; `removed` — this device was removed;
+ * `notpaired` — an address and no pairing; `offer` — a scanned pairing QR waits for the
+ * person to confirm it.
+ */
+const hqParam = new URLSearchParams(window.location.search).get("hq");
+const HQ_SERVER = "https://agents.example.org";
+const HQ_HOST = "agents.example.org";
+const hqDb = (
+  name: string,
+  state: HqStatusVm["databases"][number]["state"],
+): HqStatusVm["databases"][number] => ({
+  name,
+  state,
+  waiting: 0,
+  sentence: {
+    connecting: "Connecting…",
+    connected: "Connected.",
+    offline: "Can't reach the server; keeper keeps trying.",
+    notOpen: "Not open to this device any more; what it holds stays readable here.",
+    removed: "This device was removed; what it holds stays readable here.",
+  }[state],
+});
+const HQ_DEVICE = { clientId: "ana.0a1b2c3d", name: "keeper on laptop" };
+let hqDevices: HqStatusVm["devices"] = [
+  { ...HQ_DEVICE, addedAtMs: Date.UTC(2026, 9, 20), thisDevice: true, revoked: false },
+  {
+    clientId: "ana.9f8e7d6c",
+    name: "keeper on phone",
+    addedAtMs: Date.UTC(2026, 9, 20),
+    thisDevice: false,
+    revoked: false,
+  },
+];
+const HQ_NOT_PAIRED = `This device is not paired with ${HQ_HOST}. Type the code a paired device shows under Add a device.`;
+const hqNone: HqStatusVm = {
+  server: null,
+  phase: "noServer",
+  sentence:
+    "No server is set. What you write to your agents waits on this device. 2 changes wait on this device.",
+  device: null,
+  databases: [],
+  waitingHere: 2,
+  devices: [],
+  offer: null,
+};
+function hqPairedStatus(beta: HqStatusVm["databases"][number]["state"]): HqStatusVm {
+  return {
+    server: HQ_SERVER,
+    phase: "paired",
+    sentence: `Paired with ${HQ_HOST}.`,
+    device: HQ_DEVICE,
+    databases: [hqDb("alpha", "connected"), hqDb("beta", beta)],
+    waitingHere: 0,
+    devices: hqDevices,
+    offer: null,
+  };
+}
+function hqFixture(): HqStatusVm {
+  switch (hqParam) {
+    case "connected":
+      return hqPairedStatus("connected");
+    case "notopen":
+      return hqPairedStatus("notOpen");
+    case "removed":
+      return {
+        server: HQ_SERVER,
+        phase: "removed",
+        sentence: `This device was removed from ${HQ_HOST}. It no longer syncs, and what it holds stays readable here until you remove it.`,
+        device: HQ_DEVICE,
+        databases: [hqDb("alpha", "removed"), hqDb("beta", "removed")],
+        waitingHere: 0,
+        devices: [],
+        offer: null,
+      };
+    case "notpaired":
+      return {
+        ...hqNone,
+        server: HQ_SERVER,
+        phase: "notPaired",
+        sentence: HQ_NOT_PAIRED,
+        waitingHere: 0,
+      };
+    case "offer":
+      return { ...hqNone, offer: HQ_HOST };
+    default:
+      return hqNone;
+  }
+}
+let hqStatus: HqStatusVm = hqFixture();
+const hqWatchers = new Map<string, MockChannel<HqStatusVm>>();
+function hqPublish(next: HqStatusVm): HqStatusVm {
+  hqStatus = next;
+  for (const channel of hqWatchers.values()) channel.onmessage?.(hqStatus);
+  return hqStatus;
+}
+function hqRefuse(message: string): never {
+  throw { code: "internal", message, accountId: null, retriable: false };
+}
+const sessionScenario = new URLSearchParams(location.search).get("sessions");
+// ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused|pinned
+const liveScenario = new URLSearchParams(location.search).get("live");
+/**
+ * The answer preferences survive a reload in `sessionStorage`, as the capture
+ * sources do, read on first use rather than at import.
+ */
+const AGENT_VIEW_PREFS_KEY = "keeper.mock-shell.agentViewPrefs";
+let agentViewPrefs: { showReasoning: boolean; showDetails: boolean } | null = null;
+function viewPrefs(): { showReasoning: boolean; showDetails: boolean } {
+  if (agentViewPrefs) return agentViewPrefs;
+  const shipped = { showReasoning: false, showDetails: false };
+  let read = shipped;
+  try {
+    const stored = sessionStorage.getItem(AGENT_VIEW_PREFS_KEY);
+    if (stored !== null) read = { ...shipped, ...JSON.parse(stored) };
+  } catch {
+    // Unreadable: the shipped defaults, as a fresh profile would have.
+  }
+  agentViewPrefs = read;
+  return read;
+}
+/**
+ * The preferences as they hold: what was chosen, with `live=pinned` standing in
+ * for a settings file that keeps Show details off whatever is chosen.
+ */
+function heldViewPrefs(): { showReasoning: boolean; showDetails: boolean } {
+  return liveScenario === "pinned" ? { ...viewPrefs(), showDetails: false } : { ...viewPrefs() };
+}
+const sessionChoices: AgentChoiceVm[] = [
+  {
+    agentActor: "assistant",
+    agentName: "Assistant",
+    agentMark: "A",
+    databases: ["alpha", "beta"],
+    database: null,
+    ask: true,
+  },
+  {
+    agentActor: "researcher",
+    agentName: "Researcher",
+    agentMark: "R",
+    databases: ["beta"],
+    database: "beta",
+    ask: false,
+  },
+];
+let sessionSerial = 0;
+const sessionRows: AgentSessionRowVm[] =
+  sessionScenario === "empty"
+    ? []
+    : [
+        {
+          database: "alpha",
+          sessionId: "device.1",
+          title:
+            sessionScenario === "long"
+              ? `Release-${"long-title-".repeat(30)}`
+              : "Plan the next release",
+          agentActor: "assistant",
+          agentName: "Assistant",
+          agentMark: "A",
+          archived: false,
+          lastActivityMs: Date.now(),
+          attention: "needsYou",
+        },
+        {
+          database: "beta",
+          sessionId: "device.1",
+          title: "Review the research notes",
+          agentActor: "assistant",
+          agentName: "Assistant",
+          agentMark: "A",
+          archived: false,
+          lastActivityMs: Date.now() - 3600000,
+          attention: "needsYou",
+        },
+        {
+          database: "alpha",
+          sessionId: "device.2",
+          title: "Archive — one thousand messages",
+          agentActor: "assistant",
+          agentName: "Assistant",
+          agentMark: "A",
+          archived: true,
+          lastActivityMs: Date.now() - 86400000,
+        },
+      ];
+const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includes(
+  sessionScenario ?? "",
+)
+  ? []
+  : [
+      {
+        id: "approval-1",
+        database: "alpha",
+        sessionId: "device.1",
+        toolName: "write_file",
+        tier: "T3",
+        summary: "Write the release checklist",
+        bindingDigest: "sha256:fixture-release",
+        action: JSON.stringify(
+          {
+            path: "release/checklist.md",
+            body:
+              sessionScenario === "long" ? "long-content-".repeat(80) : "Review acceptance checks",
+          },
+          null,
+          2,
+        ),
+        expiresAtMs: Date.now() + 3600000,
+        createdAtMs: Date.now(),
+        state: "pending",
+        canDecide: true,
+        sentence: "Waiting for you",
+      },
+    ];
+const approvalWatchers = new Map<string, MockChannel<AgentApprovalVm[]>>();
+const sessionViews = new Map<string, AgentSessionViewVm>(
+  sessionRows.map((row) => [
+    JSON.stringify([row.database, row.sessionId]),
+    {
+      ...row,
+      readOnly: row.archived,
+      hasEarlier: row.archived,
+      loadingEarlier: false,
+      complete: true,
+      readsTrace: liveScenario !== "nonreader",
+      untrusted: liveScenario === "untrusted" || liveScenario === "stream",
+      live: [],
+      prefs: { showReasoning: false, showDetails: false },
+      tools:
+        liveScenario === "no-tools"
+          ? []
+          : [
+              { name: "web_search", on: true },
+              { name: "read_file", on: false },
+            ],
+      approvals: row.database === "alpha" && row.sessionId === "device.1" ? sessionApprovals : [],
+      messages: [
+        {
+          id: "message-999",
+          role: "person",
+          authorActor: "ana",
+          authorName: "Ana",
+          body:
+            row.database === "alpha"
+              ? "What should we prepare for the next release?"
+              : "Please review the research notes in beta.",
+          createdAtMs: row.lastActivityMs - 60000,
+          state: "taken",
+        },
+        {
+          id: "message-1000",
+          role: "agent",
+          authorActor: "assistant",
+          authorName: "Assistant",
+          body:
+            row.database === "alpha"
+              ? "Start with the acceptance checks, then review the changes with the team. This is the newest page held on this device."
+              : "The notes in beta are ready to review. This session is separate from the one with the same id in alpha.",
+          createdAtMs: row.lastActivityMs,
+        },
+        ...(row.database === "beta"
+          ? [
+              {
+                id: "ask-1",
+                role: "agent" as const,
+                authorActor: "assistant",
+                authorName: "Assistant",
+                body: "Which notes should I review first?",
+                createdAtMs: row.lastActivityMs + 1,
+                ask: { options: ["Research", "Release"], open: true },
+              },
+            ]
+          : []),
+      ],
+    },
+  ]),
+);
+
+/** The mock's source retains rows; only the reader's selected projection crosses IPC. */
+function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
+  const prefs = heldViewPrefs();
+  return {
+    ...vm,
+    prefs,
+    approvals: vm.readsTrace ? vm.approvals : [],
+    tools: vm.tools.map((tool) => ({ ...tool })),
+    messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
+      ...message,
+      ...(prefs.showDetails && details ? { details } : {}),
+      ...(vm.readsTrace && prefs.showReasoning && reasoning ? { reasoning } : {}),
+      ...(vm.readsTrace && steps ? { steps } : {}),
+    })),
+    live: vm.live.map(({ reasoning, steps, ...turn }) => ({
+      ...turn,
+      ...(vm.readsTrace && prefs.showReasoning && reasoning ? { reasoning } : {}),
+      steps: vm.readsTrace ? steps.map((step) => ({ ...step })) : [],
+    })),
+  };
+}
+
+const startedLiveFixtures = new Set<string>();
+function startLiveFixture(vm: AgentSessionViewVm) {
+  const key = JSON.stringify([vm.database, vm.sessionId]);
+  if (!liveScenario || vm.archived || startedLiveFixtures.has(key)) return;
+  startedLiveFixtures.add(key);
+  vm.approvals = [];
+  const turn: AgentSessionViewVm["live"][number] = {
+    turnId: `live-${vm.database}`,
+    text: "",
+    steps: [],
+    stopped: false,
+  };
+  vm.live = [turn];
+  const text =
+    "## Release checks\n\nStart with the acceptance checks, then review the changes with Ana and Ben.\n\n" +
+    Array.from(
+      { length: 16 },
+      (_, index) =>
+        `${index + 1}. Verify the visible behavior and record the result before publishing.\n`,
+    ).join("") +
+    "\n```text\nRun the acceptance checks before publishing.\n```\n" +
+    (liveScenario === "long" ? `\n${"long-result-".repeat(80)}` : "");
+  let tick = 0;
+  const timer = setInterval(() => {
+    tick += 1;
+    turn.text = text.slice(0, Math.ceil((text.length * Math.min(tick, 90)) / 90));
+    turn.reasoning = "I will separate the acceptance checks from the release notes.".slice(
+      0,
+      tick * 3,
+    );
+    if (tick === 4) {
+      turn.tool = "web_search";
+      turn.steps = [
+        { id: "tool-live", name: "web_search", status: "started", startedAtMs: Date.now() },
+      ];
+    }
+    if (tick === 24) {
+      delete turn.tool;
+      turn.steps[0] = {
+        ...turn.steps[0],
+        status: "done",
+        result: "Found the release checklist. No files changed.",
+        endedAtMs: Date.now(),
+      };
+    }
+    if (tick === 90) {
+      clearInterval(timer);
+      if (liveScenario === "stopped") turn.stopped = true;
+      else {
+        vm.messages.push({
+          id: `final-${vm.database}`,
+          role: "agent",
+          authorActor: "assistant",
+          authorName: "Assistant",
+          body: turn.text,
+          createdAtMs: Date.now(),
+          reasoning: turn.reasoning,
+          steps: turn.steps,
+          details: {
+            model: "example-model",
+            promptTokens: 120,
+            completionTokens: 310,
+            totalTokens: 430,
+            ttftMs: 84,
+            durationMs: 18000,
+            finish: liveScenario === "error" ? "error" : "stop",
+            ...(liveScenario === "error" ? { error: "The provider stopped responding." } : {}),
+          },
+        });
+        vm.live = [];
+      }
+    }
+    publishSessions();
+  }, 200);
+}
+const sessionListWatchers = new Map<string, MockChannel<AgentSessionsBatch>>();
+const sessionViewWatchers = new Map<
+  string,
+  { key: string; channel: MockChannel<AgentSessionViewVm> }
+>();
+function publishSessions() {
+  for (const channel of approvalWatchers.values())
+    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide));
+  for (const channel of sessionListWatchers.values())
+    channel.onmessage?.({ ops: [{ op: "reset", rows: sessionRows }], total: sessionRows.length });
+  for (const { key, channel } of sessionViewWatchers.values()) {
+    const vm = sessionViews.get(key);
+    if (vm) channel.onmessage?.(sessionViewerVm(vm));
+  }
+}
+function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
+  const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
+  if (!vm) return hqRefuse("This session is not on this device.");
+  return vm;
+}
+const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  agent_view_prefs_set: (payload) => {
+    if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
+    const patch = payload.patch as { showReasoning: boolean | null; showDetails: boolean | null };
+    const held = viewPrefs();
+    agentViewPrefs = {
+      showReasoning: patch.showReasoning ?? held.showReasoning,
+      showDetails: patch.showDetails ?? held.showDetails,
+    };
+    try {
+      sessionStorage.setItem(AGENT_VIEW_PREFS_KEY, JSON.stringify(agentViewPrefs));
+    } catch {
+      // A harness that cannot write still answers honestly for this page.
+    }
+    publishSessions();
+    return heldViewPrefs();
+  },
+  agent_session_tool_set: (payload) => {
+    const vm = mockSession(payload);
+    const tool = vm.tools.find((tool) => tool.name === payload.name);
+    if (!tool || vm.readOnly) hqRefuse("This agent does not offer that tool here.");
+    if (liveScenario === "refused") hqRefuse("This device cannot change the session's tools.");
+    tool.on = payload.on === true;
+    publishSessions();
+    return null;
+  },
+  agent_approvals_subscribe: (payload) => {
+    const id = `session-approvals-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentApprovalVm[]>;
+    approvalWatchers.set(id, channel);
+    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide));
+    return id;
+  },
+  agent_approvals_unsubscribe: (payload) => {
+    approvalWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_approval_decide: (payload) => {
+    const row = sessionApprovals.find(
+      (row) =>
+        row.database === payload.database &&
+        row.sessionId === payload.sessionId &&
+        row.id === payload.approvalId,
+    );
+    if (!row?.canDecide) return hqRefuse("This approval has already been decided.");
+    if (row.bindingDigest !== payload.bindingDigest)
+      return hqRefuse("The action changed. Read it again before deciding.");
+    if (sessionScenario === "refused")
+      return hqRefuse("This T4 action must be approved from another host.");
+    delete row.refused;
+    row.state = payload.approve ? "approved" : "denied";
+    row.canDecide = false;
+    row.sentence = payload.approve ? "Approved by Ana" : "Denied by Ana";
+    publishSessions();
+    if (sessionScenario === "queued") {
+      setTimeout(() => {
+        row.state = "pending";
+        row.canDecide = true;
+        row.refused = "This device cannot approve this action.";
+        row.sentence = `The server refused your decision: ${row.refused}`;
+        publishSessions();
+      }, 400);
+      return { state: "waiting", sentence: "The decision waits on this device." };
+    }
+    return { state: "sent", sentence: "Your decision was sent." };
+  },
+  agents_sessions_subscribe: (payload) => {
+    if (sessionScenario === "error") hqRefuse("keeper could not read the sessions on this device.");
+    const id = `session-list-${++sessionSerial}`;
+    sessionListWatchers.set(id, payload.channel as MockChannel<AgentSessionsBatch>);
+    if (sessionScenario !== "loading") publishSessions();
+    return id;
+  },
+  agents_sessions_unsubscribe: (payload) => {
+    sessionListWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_open: (payload) => {
+    if (sessionScenario === "open-error") hqRefuse("This session is not open to this device.");
+    const vm = mockSession(payload);
+    const id = `session-view-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentSessionViewVm>;
+    sessionViewWatchers.set(id, {
+      key: JSON.stringify([payload.database, payload.sessionId]),
+      channel,
+    });
+    startLiveFixture(vm);
+    channel.onmessage?.(sessionViewerVm(vm));
+    return id;
+  },
+  agent_session_close: (payload) => {
+    sessionViewWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_page_back: (payload) => {
+    const vm = mockSession(payload);
+    vm.messages = [
+      {
+        id: "message-998",
+        role: "person",
+        authorActor: "ben",
+        authorName: "Ben",
+        body: "An earlier month, loaded only when requested.",
+        createdAtMs: Date.now() - 31 * 86400000,
+        state: "taken",
+      },
+      ...vm.messages,
+    ];
+    vm.hasEarlier = false;
+    publishSessions();
+    return null;
+  },
+  agent_send: (payload) => {
+    if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
+    const vm = mockSession(payload);
+    for (const message of vm.messages) if (message.ask) message.ask.open = false;
+    const message = {
+      id: `local-${++sessionSerial}`,
+      role: "person" as const,
+      authorActor: "ana",
+      authorName: "Ana",
+      body: String(payload.body),
+      createdAtMs: Date.now(),
+      state: "waiting" as "waiting" | "sent" | "taken",
+    };
+    vm.messages.push(message);
+    publishSessions();
+    if (sessionScenario !== "offline")
+      setTimeout(() => {
+        message.state = "sent";
+        publishSessions();
+      }, 500);
+    return null;
+  },
+  agent_session_archive: (payload) => {
+    const vm = mockSession(payload);
+    vm.archived = true;
+    vm.readOnly = true;
+    const row = sessionRows.find(
+      (row) => row.database === vm.database && row.sessionId === vm.sessionId,
+    );
+    if (row) row.archived = true;
+    publishSessions();
+    return null;
+  },
+  agent_session_unarchive: (payload) => {
+    const vm = mockSession(payload);
+    vm.archived = false;
+    vm.readOnly = false;
+    const row = sessionRows.find(
+      (row) => row.database === vm.database && row.sessionId === vm.sessionId,
+    );
+    if (row) row.archived = false;
+    publishSessions();
+    return null;
+  },
+  agents_choices: () =>
+    sessionScenario === "choices-error"
+      ? hqRefuse("The database directory is unavailable.")
+      : sessionChoices,
+  agent_session_default: () =>
+    sessionScenario === "launch"
+      ? {
+          agentActor: "assistant",
+          agentName: "Assistant",
+          database: "alpha",
+          sessionId: "device.1",
+        }
+      : null,
+  agent_session_new: (payload) => {
+    if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");
+    const choice = sessionChoices.find(
+      (choice) =>
+        choice.agentActor === payload.agentActor &&
+        choice.databases.includes(String(payload.database)),
+    );
+    if (!choice) return hqRefuse("That agent does not serve this database.");
+    const row: AgentSessionRowVm = {
+      database: String(payload.database),
+      sessionId: `device.${++sessionSerial + 10}`,
+      title: String(payload.body).split("\n")[0],
+      agentActor: choice.agentActor,
+      agentName: choice.agentName,
+      agentMark: choice.agentMark,
+      archived: false,
+      lastActivityMs: Date.now(),
+    };
+    sessionRows.unshift(row);
+    sessionViews.set(JSON.stringify([row.database, row.sessionId]), {
+      ...row,
+      readOnly: false,
+      complete: true,
+      hasEarlier: false,
+      loadingEarlier: false,
+      readsTrace: true,
+      untrusted: false,
+      live: [],
+      tools: [],
+      prefs: { showReasoning: false, showDetails: false },
+      approvals: [],
+      messages: [
+        {
+          id: `local-${sessionSerial}`,
+          role: "person",
+          authorActor: "ana",
+          authorName: "Ana",
+          body: String(payload.body),
+          createdAtMs: Date.now(),
+          state: "waiting",
+        },
+      ],
+    });
+    publishSessions();
+    return { database: row.database, sessionId: row.sessionId };
+  },
+};
+
+const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  hq_status_subscribe: (payload) => {
+    const id = `hq-subscription-${hqWatchers.size + 1}`;
+    const channel = payload.channel as MockChannel<HqStatusVm>;
+    hqWatchers.set(id, channel);
+    channel.onmessage?.(hqStatus);
+    return id;
+  },
+  hq_status_unsubscribe: (payload) => {
+    hqWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  hq_server_set: (payload) => {
+    const typed = String(payload.url ?? "").trim();
+    if (typed === "") return hqPublish({ ...hqNone, waitingHere: 0 });
+    if (!typed.includes("://")) {
+      hqRefuse(
+        "A server address starts with https:// or http://, as in https://agents.example.org.",
+      );
+    }
+    const scheme = typed.split("://")[0] ?? "";
+    if (scheme !== "https" && scheme !== "http") {
+      hqRefuse(
+        `keeper reaches your agents server over https:// or http://, and this address starts with ${scheme}://.`,
+      );
+    }
+    const server = typed.replace(/\/$/, "");
+    const host = server.split("://")[1]?.split("/")[0] ?? server;
+    return hqPublish({
+      ...hqNone,
+      server,
+      phase: "notPaired",
+      sentence: `This device is not paired with ${host}. Type the code a paired device shows under Add a device.`,
+      waitingHere: 0,
+    });
+  },
+  hq_server_forget: () =>
+    hqPublish({
+      ...hqNone,
+      server: HQ_SERVER,
+      phase: "notPaired",
+      sentence: HQ_NOT_PAIRED,
+      waitingHere: 0,
+    }),
+  hq_pair_redeem: (payload) => {
+    const code = String(payload.code ?? "").replace(/[\s-]/g, "");
+    if (code.length !== 24) {
+      hqRefuse(`A pairing code has 24 characters; this has ${code.length}.`);
+    }
+    if (hqStatus.server === null) {
+      hqRefuse("Set your agents server's address first; the code is for that server.");
+    }
+    return hqPublish(hqPairedStatus("connected"));
+  },
+  hq_pair_offer_accept: () => hqPublish(hqPairedStatus("connected")),
+  hq_pair_offer_dismiss: () => {
+    hqPublish({ ...hqStatus, offer: null });
+    return null;
+  },
+  hq_pair_start: (): HqPairCodeVm => ({
+    code: "7K2M-Q9XD-4HTR-8BWN-3CVE-6PJA",
+    qrSvg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29 29"><rect width="29" height="29" fill="#fff"/><path d="M1 1h7v7H1zM21 1h7v7h-7zM1 21h7v7H1zM11 11h7v7h-7z" fill="#000"/></svg>`,
+    expiresAtMs: Date.now() + 10 * 60 * 1000,
+  }),
+  hq_device_revoke: (payload) => {
+    hqDevices = hqDevices.map((device) =>
+      device.clientId === payload.clientId ? { ...device, revoked: true } : device,
+    );
+    return hqPublish({ ...hqStatus, devices: hqDevices });
+  },
+};
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  ...hqHandlers,
+  ...sessionHandlers,
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
   failure_subscribe: (payload) => {

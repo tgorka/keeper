@@ -124,6 +124,11 @@ fn route_links(app: &AppHandle, urls: &[url::Url], oauth: &dyn Fn(&str) -> bool)
         return;
     }
     for url in urls {
+        if keeper_core::hq::pairing::is_link(url.as_str()) {
+            tracing::debug!("deep-link: received keeper://agents/pair URL");
+            crate::hq_ipc::link_arrived(app, url.as_str());
+            continue;
+        }
         if crate::account_ipc::is_setup_link(url) {
             tracing::debug!("deep-link: received keeper://setup URL");
             crate::account_ipc::setup_link_arrived(app, url.as_str());

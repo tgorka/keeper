@@ -82,6 +82,7 @@
  */
 import { MessagesSquare, Plus } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AgentMetaToggle } from "@/components/agents/agent-message-meta";
 import { BotApprovalHost } from "@/components/bots/bot-approval-dialog";
 import { BotAttachmentStrip, useBotImagePaste } from "@/components/bots/bot-attachment";
 import { BotComposer } from "@/components/bots/bot-composer";
@@ -89,7 +90,6 @@ import { BotConversation } from "@/components/bots/bot-conversation";
 import { BotEmptyState, type BotsEmptyKind } from "@/components/bots/bot-empty-state";
 import { BotGrantBar } from "@/components/bots/bot-grant-bar";
 import { BotListeningToggle } from "@/components/bots/bot-listening-toggle";
-import { BotMetaToggle } from "@/components/bots/bot-message-meta";
 import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL, BotSessionList } from "@/components/bots/bot-session-list";
@@ -387,7 +387,7 @@ export function BotsPane() {
               phrase, the sentence and the refusal. */}
           <BotListeningToggle />
           {/* Story 61.8's metadata toggle. It hydrates itself. */}
-          <BotMetaToggle />
+          <AgentMetaToggle />
         </div>
       </header>
 

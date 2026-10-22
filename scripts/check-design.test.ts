@@ -29,8 +29,8 @@ import {
 } from "./check-design.mjs";
 
 const CSS = readFileSync("src/index.css", "utf8");
-const PICKER = readFileSync("src/components/bots/bot-identity.tsx", "utf8");
-const VALIDATOR = readFileSync("src-tauri/crates/keeper-core/src/bots/identity.rs", "utf8");
+const PICKER = readFileSync("src/components/agents/identity.tsx", "utf8");
+const VALIDATOR = readFileSync("src-tauri/crates/keeper-core/src/hq/identity.rs", "utf8");
 
 const THEMES = { light: themeBlock(CSS, ":root {"), dark: themeBlock(CSS, ".dark {") };
 const NAMES = readNameList(PICKER, "BOT_IDENTITY_COLOURS") ?? [];

@@ -1220,6 +1220,67 @@ pub fn set_push_gateway_url(
     )
 }
 
+/// The agents server's base URL (AD-418, D-4): absent or blank = no server.
+/// User-global, so a person's devices name the same server; the token each
+/// holds for it is per device and lives in the keychain, never here (AD-422).
+const AGENTS_SERVER_URL_KEY: &str = "agents.server_url";
+
+/// Read `agents.server_url` as stored, trimmed; absent or blank ⇒ `None`.
+/// Raw, not parsed: a layer file can set any text, and what Settings shows of
+/// a value keeper will not contact is `hq::vm::HqStatusVm`'s answer.
+pub fn get_agents_server_url(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_SERVER_URL_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write `agents.server_url`: a parsed address, or `None` to clear it — so
+/// keeper never writes an address it would not contact.
+pub fn set_agents_server_url(
+    data_dir: &Path,
+    server: Option<&crate::hq::server::ServerUrl>,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_SERVER_URL_KEY,
+        server
+            .map(crate::hq::server::ServerUrl::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+/// Whether an agent's thinking is shown; `"1"`/`"0"`, absent = off. A
+/// person's preference, the same on every device; who may read the thinking
+/// at all is the session's reader flag, not this key.
+const AGENTS_SHOW_REASONING_KEY: &str = "agents.show_reasoning";
+
+/// Whether an agent answer's details are shown; `"1"`/`"0"`, absent = off.
+const AGENTS_SHOW_DETAILS_KEY: &str = "agents.show_details";
+
+pub fn get_agents_show_reasoning(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_SHOW_REASONING_KEY)?.as_deref() == Some("1"))
+}
+
+pub fn set_agents_show_reasoning(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_SHOW_REASONING_KEY,
+        if shown { "1" } else { "0" },
+    )
+}
+
+pub fn get_agents_show_details(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_SHOW_DETAILS_KEY)?.as_deref() == Some("1"))
+}
+
+pub fn set_agents_show_details(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_SHOW_DETAILS_KEY,
+        if shown { "1" } else { "0" },
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";

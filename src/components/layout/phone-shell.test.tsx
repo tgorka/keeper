@@ -59,6 +59,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   return {
     ...actual,
     subscribeInbox: (...handlers: unknown[]) => subscribeInbox(...handlers),
+    agentsSessionsSubscribe: vi.fn(async () => "database-sessions"),
+    agentsSessionsUnsubscribe: vi.fn(async () => {}),
+    agentApprovalsSubscribe: vi.fn(async () => "database-approvals"),
+    agentApprovalsUnsubscribe: vi.fn(async () => {}),
     unsubscribeInbox: vi.fn(async (): Promise<void> => {}),
     listDrafts: vi.fn(async (): Promise<Array<[string, string]>> => []),
     getFavoritesCollapsed: vi.fn(async (): Promise<boolean> => false),
@@ -2047,4 +2051,14 @@ describe("PhoneShell on an Android tablet", () => {
       view.unmount();
     }
   });
+});
+
+it("closes the navigation drawer when entering the database Agents window", async () => {
+  render(<PhoneShell />);
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+  const navigation = await screen.findByRole("dialog", { name: "Navigation" });
+  fireEvent.click(within(navigation).getByRole("button", { name: "Agents" }));
+  await waitFor(() => expect(leadingDrawerStore.getState().isOpen).toBe(false));
+  expect(await screen.findByRole("region", { name: "Agent sessions" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
 });

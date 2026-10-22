@@ -508,8 +508,8 @@ function checkNonWebColour(file) {
  *   - the closed set of names the picker offers, in `bot-identity.tsx`;
  *   - the closed set `keeper-core` will accept, in `bots/identity.rs`.
  */
-const IDENTITY_PALETTE_SOURCE = "src/components/bots/bot-identity.tsx";
-const IDENTITY_PALETTE_RUST = "src-tauri/crates/keeper-core/src/bots/identity.rs";
+const IDENTITY_PALETTE_SOURCE = "src/components/agents/identity.tsx";
+const IDENTITY_PALETTE_RUST = "src-tauri/crates/keeper-core/src/hq/identity.rs";
 /** The `--bot-ink-*` prefix every palette token carries. */
 export const IDENTITY_INK_PREFIX = "bot-ink-";
 /**

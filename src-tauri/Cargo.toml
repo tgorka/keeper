@@ -202,6 +202,13 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
 # the graph links one libsqlite3-sys (`bun run check:one-sqlite`).
 ulid = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# The agents' database (AD-418, AD-421): the person's own syncular server, one
+# local replica per database the device's token opens. Consumed by keeper-core
+# only, behind `keeper_core::hq`'s port. Apache-2.0; its `native-transport`
+# is ureq 3, tungstenite 0.30 (rustls, webpki roots), url 2 and polling 3 —
+# all already in Cargo.lock — and it links the rusqlite above, so the graph
+# still holds one libsqlite3-sys (`bun run check:one-sqlite`).
+syncular-client = { version = "=0.32.1", features = ["native-transport"] }
 # The classic NanoKVM's login (96.5, `keeper-ported::nanokvm`): its password
 # travels AES-256-CBC-encrypted under a key the reference publishes. Both
 # already in Cargo.lock (matrix-sdk-crypto, vodozemac); `MIT OR Apache-2.0`.

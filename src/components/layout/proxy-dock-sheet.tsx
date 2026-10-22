@@ -1,13 +1,6 @@
 /**
- * The proxy dock on a tablet (Epic 98, story 98.3 #5, UX-DR146): the person's
- * proxy room — the DM with it by default, or one of its conversations — as a
- * sheet over the phone's surfaces, opened from the Inbox header.
- *
- * The same body as the desktop's Notes dock (`DockBody`), under stores of its
- * own, so opening it never changes which room the chat has selected. Mounted
- * only when the shell is a tablet (`useShellLayout().tablet`); a phone keeps
- * its proxy DM as one more room in the Inbox. Over the Inbox no note is in
- * front of the person, so the sheet tells the proxy none.
+ * The tablet's assistant sheet shares the Notes dock's database sessions
+ * mirror. Selection is local to the sheet, never the Agents window's.
  */
 import { MessagesSquare } from "lucide-react";
 import { useState } from "react";
@@ -49,7 +42,7 @@ export function ProxyDockSheet() {
           </header>
           {open && (
             <div className="flex min-h-0 flex-1 flex-col">
-              <DockBody tellsNote={false} />
+              <DockBody />
             </div>
           )}
         </SheetContent>

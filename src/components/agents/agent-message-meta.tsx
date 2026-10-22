@@ -180,7 +180,7 @@ export function metaCaption(message: BotMessageVm): string {
   return parts.join(" · ");
 }
 
-export function BotMessageMeta({ message }: { message: BotMessageVm }) {
+export function AgentMessageMeta({ message }: { message: BotMessageVm }) {
   const shown = useBotsStore((state) => state.metaShown);
   const [open, setOpen] = useState(false);
   const panelId = useId();
@@ -257,7 +257,7 @@ export function BotMessageMeta({ message }: { message: BotMessageVm }) {
  * default and the honest floor: claiming the caption is on when keeper could
  * not read the setting would be the claim that lies.
  */
-export function BotMetaToggle() {
+export function AgentMetaToggle() {
   const shown = useBotsStore((state) => state.metaShown);
 
   useEffect(() => {

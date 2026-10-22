@@ -1,27 +1,18 @@
 /**
- * The default agent (story 100.3, R383, R397): Rust's answer to "what opens at
- * launch, and which agent is the default", as the boot effect, Settings ›
- * Agents and the agent room's menu share it. A pure mirror of
- * `AgentsLaunchVm` — which room opens, which agents may be chosen, why the
- * default does not open and which file decides it are all Rust's — plus the
- * last failed read's and save's sentences, shown where the person is looking.
+ * The configured default agent, shared by Settings and the earlier Matrix
+ * room menus. Rust supplies the choices and setting provenance. Database
+ * session launch asks agentSessionDefault directly, not this legacy room VM.
  *
- * Ordered (R397, R409): every launch, read and save takes a sequence number
- * when it is issued, and an answer — success or failure — older than the
- * newest one applied is dropped, so a launch or a Settings read issued before
- * a save can never replace the saved choice, nor an old failure a newer
- * answer. A launch or read asked for while a save is out waits for it and is
- * issued after it: Rust may still read the old value until the save commits,
- * so a read that overlapped the save could not be trusted either way round.
+ * Ordered (R397, R409): every read and save takes a sequence number. An old
+ * response never replaces a saved choice or a newer failure. A read requested
+ * while a save is out waits for it, because Rust may still hold the old value.
  *
  * `navRestore` is the phone's half of the launch rule: the phone applies it
  * only when its restored navigation (Story 14.4) had nothing to restore, so
  * the boot effect waits for `use-nav-state-persistence` to say which.
  *
- * `chooserOpen` is the launch's "Choose the agent keeper opens when it
- * starts" (story 102.7, R463): opened by the launch when Rust says so
- * (`AgentsLaunchVm.chooser`), closed by a choice or by putting it away —
- * which Rust records so it is not offered again until keeper is updated.
+ * `chooserOpen` controls the earlier non-blocking default-agent picker. A
+ * dismissal is recorded by Rust so it is not offered again until an update.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -31,7 +22,6 @@ import {
   agentsDefaultChooserDismiss,
   agentsDefaultGet,
   agentsDefaultSet,
-  agentsLaunch,
 } from "@/lib/ipc/client";
 
 /** Whether the phone's restored navigation put something on screen. */
@@ -47,8 +37,6 @@ export interface DefaultAgentState {
   /** A save is in flight. */
   saving: boolean;
   navRestore: NavRestore;
-  /** What keeper opens at launch: mirrored here, and returned to apply. */
-  launch: () => Promise<AgentsLaunchVm>;
   /** Read the answer again. */
   load: () => Promise<void>;
   /** Make `agent` the default (`null`: none); the new answer, or `null` when not saved. */
@@ -115,12 +103,6 @@ export const defaultAgentStore = createStore<DefaultAgentState>()((set) => {
     saveError: null,
     saving: false,
     navRestore: "pending",
-    launch: async () => {
-      const seq = await issue();
-      const vm = await agentsLaunch();
-      apply(seq, { vm, readError: null });
-      return vm;
-    },
     load: async () => {
       const seq = await issue();
       try {

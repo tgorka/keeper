@@ -1,380 +1,71 @@
-import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, AgentsLaunchVm } from "@/lib/ipc/client";
-
-vi.mock("@/lib/ipc/client", () => ({
-  agentsLaunch: vi.fn(),
-  agentsDefaultGet: vi.fn(),
-  agentsDefaultSet: vi.fn(),
-  agentMainDmOpen: vi.fn(),
-  navStateGet: vi.fn(),
-  navStateSet: vi.fn(() => Promise.resolve()),
-  navStateClear: vi.fn(() => Promise.resolve()),
-  frontendErrorReport: vi.fn(() => Promise.resolve()),
-  telemetryCapture: vi.fn(() => Promise.resolve()),
-}));
-vi.mock("sonner", () => ({
-  toast: Object.assign(vi.fn(), {
-    error: vi.fn(),
-    loading: vi.fn(() => "waiting"),
-    dismiss: vi.fn(),
-  }),
-}));
-
-import { toast } from "sonner";
-import {
-  launchFailedSentence,
-  REASON_NOTICE_MS,
-  useLaunchIntoAgents,
-} from "@/hooks/use-launch-into-agents";
-import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
-import {
-  agentMainDmOpen,
-  agentsLaunch,
-  frontendErrorReport,
-  navStateGet,
-  telemetryCapture,
-} from "@/lib/ipc/client";
-import { accountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useLaunchIntoAgents } from "@/hooks/use-launch-into-agents";
+import type { AgentDefaultSessionVm } from "@/lib/ipc/client";
+import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
-import { composerStore } from "@/lib/stores/composer";
 import { defaultAgentStore } from "@/lib/stores/default-agent";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
-const mockLaunch = vi.mocked(agentsLaunch);
-
-const account: AccountVm = {
-  accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-  userId: "@alice:example.org",
-  homeserverUrl: "https://matrix.example.org/",
-  hueIndex: 0,
-  provider: "password",
+const launch = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/ipc/client", () => ({ agentSessionDefault: launch }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+const target: AgentDefaultSessionVm = {
+  agentActor: "assistant",
+  agentName: "Assistant",
+  database: "beta",
+  sessionId: "device.1",
 };
-
-const DM = { accountId: account.accountId, roomId: "!nixi-dm:example.org" };
-
-function answer(overrides: Partial<AgentsLaunchVm>): AgentsLaunchVm {
-  return {
-    view: "agents",
-    room: null,
-    defaultAgent: null,
-    reason: null,
-    announce: false,
-    choices: [],
-    chooser: false,
-    fileSet: null,
-    ask: null,
-    askable: [],
-    ...overrides,
-  };
-}
-
-/** The desktop tier: a tier-telling capability present. */
-const DESKTOP = { ...DEFAULT_CAPABILITIES, trayIcon: true, globalHotkey: true };
-
-function boot({ phone = false }: { phone?: boolean } = {}): void {
-  act(() => {
-    capabilitiesStore.getState().applySnapshot(phone ? DEFAULT_CAPABILITIES : DESKTOP);
-    accountsStore.getState().hydrateAll([account]);
-    accountsStore.getState().markHydrated();
+beforeEach(() => {
+  launch.mockReset().mockResolvedValue(target);
+  capabilitiesStore.setState({
+    capabilities: { ...DEFAULT_CAPABILITIES, trayIcon: true },
+    hydrated: true,
   });
-}
-
-/** Flush the effects and the launch answer's promise chain (microtasks only). */
-async function settle(): Promise<void> {
-  await act(async () => {
-    for (let tick = 0; tick < 5; tick += 1) {
-      await Promise.resolve();
-    }
-  });
-}
-
-function reset(): void {
-  mockLaunch.mockReset();
-  vi.mocked(agentMainDmOpen).mockReset();
-  vi.mocked(toast).mockClear();
-  vi.mocked(toast.loading).mockClear();
-  vi.mocked(toast.error).mockClear();
-  vi.mocked(frontendErrorReport).mockClear();
-  vi.mocked(telemetryCapture).mockClear();
-  accountsStore.getState().clear();
-  accountsStore.setState({ hydrated: false });
-  agentRoomsStore.getState().clear();
-  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  defaultAgentStore.setState({ navRestore: "nothing" });
+  agentSessionsStore.setState({ selected: null, newSession: null });
   primaryViewStore.getState().setView("inbox");
   roomsStore.getState().selectRoom(null);
-  composerStore.setState({ focusWhenReady: null });
-  defaultAgentStore.setState({
-    vm: null,
-    readError: null,
-    saveError: null,
-    saving: false,
-    navRestore: "pending",
-    chooserOpen: false,
-  });
-}
-
-beforeEach(reset);
-afterEach(reset);
-
-describe("useLaunchIntoAgents", () => {
-  it("asks once the accounts are hydrated, without waiting for the Agents window, and opens the default agent's room", async () => {
-    mockLaunch.mockResolvedValue(answer({ room: DM, defaultAgent: "@nixi:example.org" }));
+});
+describe("database default-agent launch", () => {
+  it("opens Rust's database-qualified local default without a Matrix account", async () => {
     renderHook(() => useLaunchIntoAgents());
-    await settle();
-    expect(mockLaunch).not.toHaveBeenCalled();
-    // Rust decides when it knows (R397): the Agents window has streamed
-    // nothing yet, and the question is asked all the same.
-    boot();
-    await settle();
-    expect(agentRoomsStore.getState().total).toBeNull();
-    expect(mockLaunch).toHaveBeenCalledTimes(1);
-    expect(primaryViewStore.getState().view).toBe("agents");
-    expect(roomsStore.getState().selected).toEqual(DM);
-    // Its composer is asked to take focus once it is enabled (R102L1-01).
-    expect(composerStore.getState().focusWhenReady).toEqual(DM);
-    expect(defaultAgentStore.getState().vm?.defaultAgent).toBe("@nixi:example.org");
-    // Counted once as the closed surface, nothing about the agent or room (DW-1410).
-    expect(telemetryCapture).toHaveBeenCalledTimes(1);
-    expect(telemetryCapture).toHaveBeenCalledWith({
-      kind: "interaction",
-      durationMs: null,
-      surface: "launchDefaultAgent",
-    });
-  });
-
-  it("asks the default agent for its conversation when it has none here, and opens it when it lands (101.1 #4)", async () => {
-    const ask = {
-      accountId: account.accountId,
-      agent: "@nixi:example.org",
-      name: "Nixi",
-      opening: "Opening a conversation with Nixi…",
-    };
-    let land: (room: typeof DM) => void = () => {};
-    vi.mocked(agentMainDmOpen).mockReturnValue(
-      new Promise((resolve) => {
-        land = resolve;
+    await waitFor(() =>
+      expect(agentSessionsStore.getState().selected).toEqual({
+        database: "beta",
+        sessionId: "device.1",
       }),
     );
-    mockLaunch.mockResolvedValue(answer({ defaultAgent: ask.agent, ask }));
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
     expect(primaryViewStore.getState().view).toBe("agents");
-    expect(agentMainDmOpen).toHaveBeenCalledWith(account.accountId, ask.agent);
-    expect(toast.loading).toHaveBeenCalledWith("Opening a conversation with Nixi…");
-    expect(roomsStore.getState().selected).toBeNull();
-
-    land(DM);
-    await settle();
-    expect(roomsStore.getState().selected).toEqual(DM);
-  });
-
-  it("leaves the person where they went while the conversation was being opened (101.1 #4)", async () => {
-    const ask = {
-      accountId: account.accountId,
-      agent: "@nixi:example.org",
-      name: "Nixi",
-      opening: "Opening a conversation with Nixi…",
-    };
-    let land: (room: typeof DM) => void = () => {};
-    vi.mocked(agentMainDmOpen).mockReturnValue(
-      new Promise((resolve) => {
-        land = resolve;
-      }),
-    );
-    mockLaunch.mockResolvedValue(answer({ defaultAgent: ask.agent, ask }));
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    const elsewhere = { accountId: account.accountId, roomId: "!marta:example.org" };
-    act(() => roomsStore.getState().selectRoom(elsewhere));
-
-    land(DM);
-    await settle();
-    expect(roomsStore.getState().selected).toEqual(elsewhere);
-  });
-
-  it("applies the answer once: a later return to the Inbox and new batches stay put", async () => {
-    mockLaunch.mockResolvedValue(answer({ room: DM }));
-    const { rerender } = renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("agents");
-
-    act(() => {
-      primaryViewStore.getState().setView("inbox");
-      roomsStore.getState().selectRoom(null);
-      agentRoomsStore.getState().applyBatch({ ops: [{ op: "reset", rooms: [] }], total: 3 });
-    });
-    rerender();
-    await settle();
-    expect(mockLaunch).toHaveBeenCalledTimes(1);
-    expect(primaryViewStore.getState().view).toBe("inbox");
     expect(roomsStore.getState().selected).toBeNull();
   });
-
-  it("does not ask again when the accounts hydrate again after the launch", async () => {
-    mockLaunch.mockResolvedValue(answer({ room: DM }));
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    // An account added: the accounts re-hydrate; the person has not moved.
-    act(() => {
-      accountsStore.getState().clear();
-      accountsStore.setState({ hydrated: false });
-    });
-    await settle();
-    boot();
-    await settle();
-    expect(mockLaunch).toHaveBeenCalledTimes(1);
-  });
-
-  it("never overrides the person's navigation made before the answer lands", async () => {
-    let resolve: (vm: AgentsLaunchVm) => void = () => {};
-    mockLaunch.mockReturnValue(
-      new Promise<AgentsLaunchVm>((done) => {
+  it("does not replace navigation made while the answer was pending", async () => {
+    let resolve: (value: AgentDefaultSessionVm) => void = () => {};
+    launch.mockReturnValue(
+      new Promise<AgentDefaultSessionVm>((done) => {
         resolve = done;
       }),
     );
     renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    const marta = { accountId: account.accountId, roomId: "!marta:example.org" };
-    act(() => roomsStore.getState().selectRoom(marta));
-    resolve(answer({ room: DM }));
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("inbox");
-    expect(roomsStore.getState().selected).toEqual(marta);
-    expect(telemetryCapture).not.toHaveBeenCalled();
+    act(() => primaryViewStore.getState().setView("settings"));
+    await act(async () => resolve(target));
+    expect(primaryViewStore.getState().view).toBe("settings");
+    expect(agentSessionsStore.getState().selected).toBeNull();
   });
-
-  it("opens Agents with nothing selected and says why when the default has no room here", async () => {
-    const reason = "Your default agent @tala:example.org has no conversation with you here.";
-    mockLaunch.mockResolvedValue(
-      answer({ defaultAgent: "@tala:example.org", reason, announce: true }),
+  it("restores a phone's navigation instead of launching over it", async () => {
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES });
+    defaultAgentStore.setState({ navRestore: "restored" });
+    renderHook(() => useLaunchIntoAgents());
+    await act(async () => {});
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it("opens a new-session composer when the default has no session yet", async () => {
+    launch.mockResolvedValue({ ...target, sessionId: null });
+    renderHook(() => useLaunchIntoAgents());
+    await waitFor(() =>
+      expect(agentSessionsStore.getState().newSession).toEqual({ ...target, sessionId: null }),
     );
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("agents");
-    expect(roomsStore.getState().selected).toBeNull();
-    expect(toast).toHaveBeenCalledWith(reason, { duration: REASON_NOTICE_MS });
-  });
-
-  it("leaves the Inbox quietly when Rust found no agent room", async () => {
-    // A finished look with no agent room (R398): the reason is Settings' only.
-    const reason = "You have no agent rooms on this device yet, so keeper opens the Inbox.";
-    mockLaunch.mockResolvedValue(
-      answer({ view: "inbox", defaultAgent: "@nixi:example.org", reason }),
-    );
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(mockLaunch).toHaveBeenCalledTimes(1);
-    expect(primaryViewStore.getState().view).toBe("inbox");
-    expect(toast).not.toHaveBeenCalled();
-    expect(telemetryCapture).not.toHaveBeenCalled();
-  });
-
-  it("keeps the Inbox and says why when the launch stopped waiting before it saw a room", async () => {
-    // R100L3-01: the first look never finished, so the Inbox is not "no agent
-    // rooms" — Rust announces its reason and the person reads it.
-    const reason =
-      "Your conversation with your default agent @nixi:example.org has not arrived yet, so keeper opens the Inbox. It is in Agents once it arrives.";
-    mockLaunch.mockResolvedValue(
-      answer({ view: "inbox", defaultAgent: "@nixi:example.org", reason, announce: true }),
-    );
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("inbox");
-    expect(roomsStore.getState().selected).toBeNull();
-    expect(toast).toHaveBeenCalledWith(reason, { duration: REASON_NOTICE_MS });
-    expect(telemetryCapture).not.toHaveBeenCalled();
-  });
-
-  it("keeps the Inbox, says so and logs when Rust cannot answer", async () => {
-    mockLaunch.mockRejectedValue({ message: "the settings table is locked" });
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("inbox");
-    expect(toast.error).toHaveBeenCalledWith(
-      launchFailedSentence({ message: "the settings table is locked" }),
-    );
-    expect(frontendErrorReport).toHaveBeenCalledTimes(1);
-  });
-
-  it("asks once which agent opens when Rust says nothing is chosen (R463)", async () => {
-    mockLaunch.mockResolvedValue(
-      answer({ chooser: true, choices: [{ agent: "@nixi:example.org", name: "Nixi" }] }),
-    );
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("agents");
-    expect(roomsStore.getState().selected).toBeNull();
-    expect(defaultAgentStore.getState().chooserOpen).toBe(true);
-    expect(toast).not.toHaveBeenCalled();
-  });
-
-  it("does not ask when Rust does not say to", async () => {
-    mockLaunch.mockResolvedValue(
-      answer({ chooser: false, choices: [{ agent: "@nixi:example.org", name: "Nixi" }] }),
-    );
-    renderHook(() => useLaunchIntoAgents());
-    boot();
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("agents");
-    expect(defaultAgentStore.getState().chooserOpen).toBe(false);
-  });
-
-  it("on a cold phone launch the restore has nothing, and the default's conversation opens focused (R463)", async () => {
-    // A true app kill restarts Rust fresh: no stored navigation.
-    vi.mocked(navStateGet).mockResolvedValue(null);
-    mockLaunch.mockResolvedValue(answer({ room: DM, defaultAgent: "@nixi:example.org" }));
-    renderHook(() => {
-      useNavStatePersistence();
-      useLaunchIntoAgents();
-    });
-    boot({ phone: true });
-    await settle();
-    await vi.waitFor(() => expect(roomsStore.getState().selected).toEqual(DM));
-    expect(defaultAgentStore.getState().navRestore).toBe("nothing");
-    expect(primaryViewStore.getState().view).toBe("agents");
-    expect(composerStore.getState().focusWhenReady).toEqual(DM);
-    expect(roomsStore.getState().selected).toEqual(DM);
-  });
-
-  it("on the phone waits for the restore and applies only when nothing was restored", async () => {
-    mockLaunch.mockResolvedValue(answer({ room: DM }));
-    renderHook(() => useLaunchIntoAgents());
-    boot({ phone: true });
-    await settle();
-    expect(mockLaunch).not.toHaveBeenCalled();
-
-    act(() => defaultAgentStore.getState().setNavRestore("nothing"));
-    await settle();
-    expect(primaryViewStore.getState().view).toBe("agents");
-    expect(roomsStore.getState().selected).toEqual(DM);
-    // The phone shows the conversation with its composer focused (R463).
-    expect(composerStore.getState().focusWhenReady).toEqual(DM);
-  });
-
-  it("on the phone leaves a restored room where it was", async () => {
-    mockLaunch.mockResolvedValue(answer({ room: DM }));
-    // The restore selected the room before this hook attached.
-    const restored = { accountId: account.accountId, roomId: "!restored:example.org" };
-    roomsStore.getState().selectRoom(restored);
-    renderHook(() => useLaunchIntoAgents());
-    boot({ phone: true });
-    act(() => defaultAgentStore.getState().setNavRestore("restored"));
-    await settle();
-    expect(mockLaunch).not.toHaveBeenCalled();
-    expect(roomsStore.getState().selected).toEqual(restored);
-    expect(primaryViewStore.getState().view).toBe("inbox");
+    expect(agentSessionsStore.getState().selected).toBeNull();
   });
 });

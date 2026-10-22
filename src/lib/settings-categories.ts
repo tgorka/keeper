@@ -26,6 +26,7 @@ export const SETTINGS_SECTION_IDS = [
   "notifications",
   "background",
   "default-agent",
+  "agents-server",
   "agents",
   "bots",
   "bot-grants",
@@ -77,7 +78,7 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategory[] = [
   {
     id: "agents",
     title: "Agents & bots",
-    sections: ["default-agent", "agents", "bots", "bot-grants", "sessions"],
+    sections: ["default-agent", "agents-server", "agents", "bots", "bot-grants", "sessions"],
   },
   { id: "notes", title: "Notes", sections: ["capture", "notes-search"] },
   { id: "sync", title: "Sync & drives", sections: ["sync", "tasks", "sync-git"] },

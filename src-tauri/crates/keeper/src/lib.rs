@@ -60,6 +60,8 @@ mod file_protocol;
 mod forge_ipc;
 #[cfg(desktop)]
 mod hotkey;
+// The agents server (Epic 106): every target, so the phone pairs too.
+mod hq_ipc;
 mod ipc;
 mod lifecycle;
 mod macos_version;
@@ -531,6 +533,9 @@ pub fn run() {
                 // handle for the spoken send (Epic 67, AD-205).
                 voice_ipc::boot(app.handle(), &data_dir);
             }
+            // The agents server (AD-418): after the layers, so its address is
+            // read through them; opens the replicas this device holds.
+            hq_ipc::init(app);
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
             // starts a turn (Story 63.5, FR-422), an organisation account's
@@ -1021,6 +1026,36 @@ pub fn run() {
                 // config_layers not found" would force the Settings surface to
                 // special-case a call it can always make.
                 ipc::config_layers,
+                // The agents server (AD-418, AD-422), every target: a phone
+                // pairs and syncs its agents' databases the same way.
+                hq_ipc::hq_status_subscribe,
+                hq_ipc::hq_status_unsubscribe,
+                hq_ipc::hq_server_set,
+                hq_ipc::hq_server_forget,
+                hq_ipc::hq_pair_start,
+                hq_ipc::hq_pair_redeem,
+                hq_ipc::hq_pair_offer_accept,
+                hq_ipc::hq_pair_offer_dismiss,
+                hq_ipc::hq_device_revoke,
+                // The Agents window on the replicas: the list, an open
+                // session, writing, archiving, approvals.
+                hq_ipc::agents_sessions_subscribe,
+                hq_ipc::agents_sessions_unsubscribe,
+                hq_ipc::agent_session_open,
+                hq_ipc::agent_session_close,
+                hq_ipc::agent_session_page_back,
+                hq_ipc::agent_send,
+                hq_ipc::agent_session_new,
+                hq_ipc::agent_session_archive,
+                hq_ipc::agent_session_unarchive,
+                hq_ipc::agents_choices,
+                hq_ipc::agent_session_default,
+                hq_ipc::agent_approvals_subscribe,
+                hq_ipc::agent_approvals_unsubscribe,
+                hq_ipc::agent_session_approval_decide,
+                // What a viewer chose to see, and a session's tool switches.
+                hq_ipc::agent_view_prefs_set,
+                hq_ipc::agent_session_tool_set,
                 // The Bots surface's sync-free half (Epic 61, Story 61.4;
                 // split in Story 62.1), in the shared body for
                 // `config_layers`' reason: `keeper_core::bots` has no desktop

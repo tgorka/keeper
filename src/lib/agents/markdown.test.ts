@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { type MdBlock, type MdInline, parseAnswer } from "@/lib/bots-markdown";
+import { type MdBlock, type MdInline, parseAnswer } from "@/lib/agents/markdown";
 
 /** The plain text of a run tree, for assertions that do not care about the
  *  emphasis structure carrying it. */

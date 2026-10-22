@@ -8,6 +8,10 @@
     {
       "name": "0002_session_trust",
       "sha256": "c7b8cb3bdd61e7199aa178b0b639dbc412de77c51a044b3830c8b7bdaf2a6edc"
+    },
+    {
+      "name": "0003_agent_profile_tools",
+      "sha256": "cfbe97c7f13cf5b4f3bb7c12f776a71914c5d96f14bfc6b1cdedad2c1f1558d0"
     }
   ],
   "head": {
@@ -167,6 +171,11 @@
             "name": "author_client",
             "type": "string",
             "nullable": false
+          },
+          {
+            "name": "tools",
+            "type": "json",
+            "nullable": true
           }
         ]
       },

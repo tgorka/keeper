@@ -4685,6 +4685,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "syncular-client",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -8461,6 +8462,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "syncular-client"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24b696b2175eee2ed4ddb7c1cd1e07fb02a04fbc8d9e92252fc3c63051555a21"
+dependencies = [
+ "polling",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "syncular-ssp2",
+ "tungstenite",
+ "ureq",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "syncular-ssp2"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd23e66162082b61159778f8a4b9a88a2cbb52a0c59a15706836bc08dc4e68a5"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9499,8 +9527,11 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.2",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.11.0",
  "thiserror 2.0.21",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -9692,6 +9723,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
 dependencies = [
  "base64 0.23.1",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",
@@ -9699,7 +9731,7 @@ dependencies = [
  "socks",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -10056,6 +10088,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]

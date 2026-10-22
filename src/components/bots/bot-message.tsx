@@ -1,11 +1,9 @@
 /**
  * One row of a conversation (Epic 61, Story 61.4).
  *
- * It composes and decides nothing else: {@link BotAnswer} for the body (Story
- * 61.5 replaces it), {@link BotMessageMeta} for the caption (61.8), and
- * {@link BotToolCall} for the tool line (61.11's UI). Splitting them this way
- * is what lets three later stories each own one file instead of three stories
- * editing this one.
+ * It composes and decides nothing else: {@link AgentAnswer} for the body,
+ * {@link AgentMessageMeta} for the caption, and {@link AgentToolCall} for the
+ * tool line. These shared renderers also serve the database Agents surface.
  *
  * **The partial caption is this story's, and it is the honest half of the
  * streaming contract.** A row marked `partial` is a row Rust never closed
@@ -18,11 +16,11 @@
  * read alike — so `streaming` is a separate prop rather than derived from the
  * flag. The store holds the subscription id for exactly this reason.
  */
-import { BotAnswer } from "@/components/bots/bot-answer";
+import { AgentAnswer } from "@/components/agents/agent-answer";
+import { AgentMessageMeta } from "@/components/agents/agent-message-meta";
+import { AgentToolCall } from "@/components/agents/agent-tool-call";
 import { BotReplyPaths } from "@/components/bots/bot-attachment";
 import { BotContextNote } from "@/components/bots/bot-context-note";
-import { BotMessageMeta } from "@/components/bots/bot-message-meta";
-import { BotToolCall } from "@/components/bots/bot-tool-call";
 import { Button } from "@/components/ui/button";
 import type { BotContextBundleVm, BotMessageVm, BotToolCallVm } from "@/lib/ipc/client";
 import { useBotsStore } from "@/lib/stores/bots";
@@ -90,8 +88,8 @@ export function BotMessage({
       data-role={message.role}
       data-partial={message.partial ? "true" : "false"}
     >
-      <BotAnswer body={message.content} />
-      <BotToolCall count={message.toolCallCount} calls={calls} />
+      <AgentAnswer body={message.content} />
+      <AgentToolCall count={message.toolCallCount} calls={calls} />
       <BotContextNote bundle={bundle} />
       {!own && (
         <BotReplyPaths sessionId={message.sessionId} body={message.content} streaming={streaming} />
@@ -111,7 +109,7 @@ export function BotMessage({
           {BOT_PARTIAL_CAPTION}
         </p>
       )}
-      <BotMessageMeta message={message} />
+      <AgentMessageMeta message={message} />
       {onRetry !== null && (
         <div className="flex">
           <Button type="button" variant="outline" size="sm" onClick={onRetry}>

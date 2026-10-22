@@ -28,14 +28,15 @@
  * hides the open conversation's own bot is worse than a strip that is full.
  *
  * **Identity is shape and mark first, colour second.** The cell comes from
- * {@link "@/components/bots/bot-identity"}, which paints no ink at all without
+ * {@link "@/components/agents/identity"}, which paints no ink at all without
  * a shape (`DESIGN.md:172`), and every button's accessible name carries the
  * identity in words — so two bots that differ only in their ink are two
  * different bots to a screen reader and to anybody who cannot tell the two inks
  * apart.
  */
 import { useRef, useState } from "react";
-import { BotIdentityCell, BotIdentityPicker, botPinLabel } from "@/components/bots/bot-identity";
+import { BotIdentityCell, botPinLabel } from "@/components/agents/identity";
+import { BotIdentityPicker } from "@/components/bots/bot-identity";
 import {
   AlertDialog,
   AlertDialogAction,
