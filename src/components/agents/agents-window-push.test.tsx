@@ -240,8 +240,36 @@ describe("a tapped notification in the Agents window", () => {
     act(() => mock.status?.({} as HqStatusVm));
     expect(await screen.findByRole("alert")).toHaveTextContent("beta is not open to this device");
     expect(mock.open).toHaveBeenCalledTimes(2);
+    // A refusal is not waited on: the status moving asks nothing more.
     act(() => mock.status?.({} as HqStatusVm));
-    act(() => mock.list?.({ ops: [{ op: "reset", rows: [row(LATE.sessionId)] }], total: 1 }));
+    act(() => mock.list?.({ ops: [{ op: "reset", rows: [row(HELD.sessionId)] }], total: 1 }));
     expect(mock.open).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a held session tapped while keeper reopens its copies, when the list brings it", async () => {
+    // Keeper relaunched by the tap: the copy holding the session is still opening, and
+    // the open is refused before it is — as Rust answered before A106-03's round 2
+    // (terminal), or as it answers now (still arriving). Either way the session opens
+    // when Rust's list brings it, with no second tap.
+    mock.open.mockRejectedValueOnce({
+      code: "internal",
+      message: "This conversation is not on this device.",
+      accountId: null,
+      retriable: false,
+    });
+    render(<Phone />);
+    await waitFor(() => expect(mock.list).not.toBeNull());
+    act(() => mock.list?.({ ops: [{ op: "reset", rows: [] }], total: 0 }));
+    await tap(HELD);
+    expect(await screen.findByRole("alert")).toHaveTextContent("not on this device");
+    expect(mock.open).toHaveBeenCalledTimes(1);
+
+    // The copy opened: Rust's list brings the session.
+    act(() => mock.list?.({ ops: [{ op: "reset", rows: [row(HELD.sessionId)] }], total: 1 }));
+    await waitFor(() => expect(mock.open).toHaveBeenCalledTimes(2));
+    expect(mock.open.mock.calls[1][0]).toEqual(HELD);
+    act(() => mock.view?.(view(HELD.sessionId)));
+    expect(screen.getByText("The answer in held.1")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

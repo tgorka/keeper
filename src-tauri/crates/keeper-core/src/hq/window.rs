@@ -19,7 +19,7 @@ use crate::hq::sessions::{
 };
 use crate::hq::timeline::{self, AgentSessionViewVm, Opened};
 use crate::hq::vm::{phase_sentence, HqPhase};
-use crate::hq::{lock, sentence, Hq, HqError};
+use crate::hq::{lock, sentence, Hq, HqError, LocalOpen};
 
 /// Every archive fetch's token, so an answer for a view that has moved on
 /// is told apart from the one it waits for.
@@ -400,13 +400,23 @@ impl Hq {
     }
 
     /// Why a session of `database` this device does not hold cannot open:
-    /// still arriving, or not coming. Reads the configuration only.
+    /// still arriving — the replicas on disk are still opening, or a round
+    /// may bring it — or not coming. Reads the configuration only.
     fn not_here(&self, database: &str) -> HqError {
         let inner = lock(&self.inner);
-        if inner.generation == 0 {
-            return HqError::Arriving(
-                "keeper is still opening the conversations on this device.".to_owned(),
-            );
+        match &inner.local_open {
+            // Not open yet is not absent, whatever the configuration says.
+            LocalOpen::Opening => {
+                return HqError::Arriving(
+                    "keeper is still opening the conversations on this device.".to_owned(),
+                )
+            }
+            LocalOpen::Failed(why) => {
+                return HqError::Sentence(format!(
+                    "keeper could not open the conversations on this device: {why}"
+                ))
+            }
+            LocalOpen::Open => {}
         }
         let (Some(server), Some(_)) = (&inner.server, &inner.pairing) else {
             // Nothing syncs, so what is not here does not come.

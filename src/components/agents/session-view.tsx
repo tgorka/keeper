@@ -89,24 +89,31 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   }, [database, sessionId, attempt]);
 
   // A session a notification named before this device held it (or before its copies
-  // opened) opens when Rust's list brings it; Rust's status moving — copies opened,
-  // the device removed, the database no longer open — is asked about too, so a
-  // session that will not come ends in Rust's sentence, not a wait. No timer.
+  // opened) opens when Rust's list brings it. That holds after a refusal too: the
+  // session appearing in Rust's list is Rust saying it is here now, so the open is
+  // asked again on that transition alone — never on a timer.
+  const unopened = vm === null && (arriving !== null || error !== null);
   useEffect(() => {
-    if (arriving === null) return;
-    let active = true;
-    let status: string | null = null;
-    const again = () => {
-      if (active) setAttempt((n) => n + 1);
-    };
-    const offList = agentSessionsStore.subscribe((state, previous) => {
+    if (!unopened) return;
+    return agentSessionsStore.subscribe((state, previous) => {
       const now = state.rows.some((r) => r.database === database && r.sessionId === sessionId);
       const before = previous.rows.some(
         (r) => r.database === database && r.sessionId === sessionId,
       );
-      if (now && !before) again();
+      if (now && !before) setAttempt((n) => n + 1);
     });
-    void hqStatusSubscribe(again)
+  }, [unopened, database, sessionId]);
+
+  // While Rust says the session may still arrive, its status moving — copies opened,
+  // the device removed, the database no longer open — is asked about too, so a
+  // session that will not come ends in Rust's sentence, not a wait.
+  useEffect(() => {
+    if (arriving === null) return;
+    let active = true;
+    let status: string | null = null;
+    void hqStatusSubscribe(() => {
+      if (active) setAttempt((n) => n + 1);
+    })
       .then((subscription) => {
         if (active) status = subscription;
         else void hqStatusUnsubscribe(subscription).catch(logFailure("agents.session.arrival"));
@@ -114,11 +121,10 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
       .catch(logFailure("agents.session.arrival"));
     return () => {
       active = false;
-      offList();
       if (status !== null)
         void hqStatusUnsubscribe(status).catch(logFailure("agents.session.arrival"));
     };
-  }, [arriving, database, sessionId]);
+  }, [arriving]);
 
   useEffect(() => {
     if (!vm) return;

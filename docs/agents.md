@@ -496,10 +496,13 @@ to finish deciding.* with the reason. **A tap** opens the item's session in the 
 (`use-push-open.ts`, `PushOpenVm::Session`), over New session if that was open (its draft is
 kept, above). A session this device does not hold yet — Keeper was closed when it was created or
 the person added — is not a failure while it may still arrive: Rust answers its open as still
-arriving (`HqError::Arriving`, retriable) while the replicas are opening, the server has yet to
-say what is open, or its database syncs, and the view says so and asks again when Rust's list
-brings the session or its status moves. No timer: an address cleared, a removed device or a
-database not open to it ends the wait with Rust's sentence.
+arriving (`HqError::Arriving`, retriable) while the replicas on disk are opening — every
+restart, a relaunch from the tap included, whatever the address — the server has yet to say what
+is open, or its database syncs, and the view says so and asks again when Rust's list brings the
+session or its status moves (a restart always moves it once its replicas are open, or failed).
+No timer: once the replicas are open, an address cleared, a removed device or a database not
+open to it ends the wait with Rust's sentence. Even after a refusal, the session appearing in
+Rust's list opens it.
 
 **The Android tablet gets the agents server's push while keeper is running.** After Android
 has stopped keeper's process it does nothing with it: the distributor's message posts the

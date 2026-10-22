@@ -194,6 +194,19 @@ struct Refusal {
     until: Option<Instant>,
 }
 
+/// Where this run's opening of the replicas on disk stands. Until it
+/// settles, what is not found may simply not be open yet.
+#[derive(Debug, Default)]
+enum LocalOpen {
+    /// Not started, or a restart is opening the replicas now.
+    #[default]
+    Opening,
+    /// Every replica this configuration holds is open.
+    Open,
+    /// The last restart failed; its sentence.
+    Failed(String),
+}
+
 #[derive(Default)]
 struct Inner {
     server: Option<ServerUrl>,
@@ -205,6 +218,8 @@ struct Inner {
     /// and written to and never link.
     pairing: Option<Pairing>,
     authorization: Authorization,
+    /// Whether the replicas on disk are open yet ([`Hq::restart`]).
+    local_open: LocalOpen,
     local: Option<Arc<dyn Replica>>,
     dbs: Vec<Db>,
     /// Bumped on every reconfiguration, so work of an older one lands nowhere.
@@ -529,8 +544,24 @@ impl Hq {
         }
     }
 
-    /// The lifecycle lock is held.
+    /// The lifecycle lock is held. While the replicas on disk reopen, a
+    /// session not found is still arriving ([`LocalOpen`]); once they are
+    /// open, or the reopen failed, every open waiting on them is told to ask
+    /// again through the status — even when it reads the same.
     async fn restart(&self) -> Result<(), HqError> {
+        lock(&self.inner).local_open = LocalOpen::Opening;
+        let reopened = self.reopen().await;
+        if let Err(error) = &reopened {
+            lock(&self.inner).local_open = LocalOpen::Failed(error.to_string());
+        }
+        self.publish();
+        self.status.send_modify(|_| {});
+        reopened
+    }
+
+    /// [`Hq::restart`]'s work: settles [`LocalOpen::Open`] with the replicas
+    /// it installs.
+    async fn reopen(&self) -> Result<(), HqError> {
         let data_dir = self.data_dir()?;
         let stored = crate::registry::get_agents_server_url(&data_dir)?;
         let (server, address_refused) = match stored.as_deref().map(ServerUrl::parse) {
@@ -634,8 +665,8 @@ impl Hq {
             if server.is_some() && pairing.is_some() && !authorization.removed {
                 self.schedule_discovery(&mut inner, Duration::ZERO);
             }
+            inner.local_open = LocalOpen::Open;
         }
-        self.publish();
         Ok(())
     }
 
