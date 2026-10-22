@@ -397,8 +397,8 @@ device's token, the pairing of the server whose replica of that database this de
 
 | item | shows |
 |---|---|
-| a pending approval you may decide, below T4, whose whole request fits — the tool call the server read with it, its tool and exact arguments on one line of at most 120 characters, no control or direction character in any of them; not a Paseo start or steer; not a `run` asking for the network | *nixie asks: \<keeper's summary\>*, the tier's words, the request (`run {"argv":["git","status"]}`); **Approve once** and **Deny** |
-| the same at T4, longer, of a tier keeper cannot read, or a request keeper cannot show whole (no tool call from the server, arguments it cannot read, a Paseo prompt, a networked run) | the tier and *open keeper to read the whole request*; **Deny** only |
+| a pending approval you may decide, below T4, whose whole request fits — the tool call the server read with it, its tool and exact arguments on one line of at most 120 characters, no control or direction character and no character a reader cannot see in any of them; not a Paseo start or steer; not a `run` asking for the network | *nixie asks: \<keeper's summary\>*, the tier's words, the request (`run {"argv":["git","status"]}`); **Approve once** and **Deny** |
+| the same at T4, longer, of a tier keeper cannot read, or a request keeper cannot show whole (no tool call from the server, arguments it cannot read, an invisible character, a Paseo prompt, a networked run) | the tier and *open keeper to read the whole request*; **Deny** only |
 | an approval not yours, already decided or expired | keeper's words, no action |
 | your proxy's answer | the agent and its words |
 | an ask, a person's message, your own | nothing |
@@ -413,18 +413,45 @@ that cannot be read — no pairing, the server or the tailnet unreachable (DW-E1
 (`401`, `403`, `404`), an answer about another item — is the generic notification with no
 actions.
 
-**The same item may arrive twice; it shows once.** Android tags the notification with the
-item. On the iPhone the identity is a key on the notification, `keeper_hq_key` =
-`<database>/<kind>/<item id>` (`hq::push::KEY_INFO`), not the notification's identifier: iOS
-names a remote notification itself, the person's gateway sends no APNs collapse id (Sygnal has
-none), and re-posting the notification locally would need the remote one to show nothing,
-which needs the filtering entitlement (DW-408). So the extension asks Rust for the item's key
-before it reads anything (`keeper_nse::answer_key`), and every notification of the item
-carries it — composed, generic, and the fallback iOS shows when the extension runs out of
-time — the generic one carrying nothing else of keeper's. Every answer then names the
-notifications with the same key to remove first (`hq::push::Fold`): those on the lock screen
-and those the extension process handed iOS earlier that are not there yet, which it waits up
-to two seconds for. A re-posted *Open keeper to finish deciding.* keeps the key too.
+**A character a reader cannot see refuses Approve once (R1066K-05).** `rm report<U+200B>.txt`
+reads as `rm report.txt` on a lock screen and removes another file. So the tool's name, every
+key and every value, at any depth, is checked against every Unicode format character
+(General_Category `Cf`, U+200B, U+2060, U+00AD, …) and every Default_Ignorable_Code_Point —
+the variation selectors and the tag characters among them — as of Unicode 16.0
+(`agents::push::HIDDEN`). Keeper neither strips them nor renders them as escapes: such a
+request offers **Deny** alone and *open keeper to read the whole request*, on the agents server
+and in a Matrix agent room alike. A request whose text legitimately holds one (an emoji with a
+variation selector) is decided in keeper.
+
+**The same item may arrive twice; keeper tries to show it once.** Android tags the
+notification with the item. On the iPhone the identity is a key on the notification,
+`keeper_hq_key` = `<database>/<kind>/<item id>` (`hq::push::KEY_INFO`), not the notification's
+identifier: iOS names a remote notification itself, the person's gateway sends no APNs
+collapse id (Sygnal has none), and re-posting the notification locally would need the remote
+one to show nothing, which needs the filtering entitlement (DW-408). So on arrival the
+extension asks Rust for the item's key before it reads anything (`keeper_nse::answer_key`),
+and every notification of the item carries it — composed, generic, and the fallback shown when
+the extension runs out of time — the generic one carrying nothing else of keeper's. That call
+starts the delivery's one deadline (twenty seconds, `keeper_nse::DEADLINE`), which the wait for
+its turn, the read and the waits on the notification center share; a delivery still queued at
+it reads nothing (R1066K-06). Every answer then names the notifications with the same key to
+remove first (`hq::push::Fold`): those on the lock screen, those of the extension process that
+arrived before it and those it handed iOS whenever they arrived, waiting until the deadline for
+the ones not there yet. iOS's expiry asks Rust too, at once and outside the serial queue, so
+the fallback removes the item's others instead of waiting behind the read that used the time
+up. A removal is kept until the extension sees the notification gone, and every later answer
+names it again meanwhile. A re-posted *Open keeper to finish deciding.* keeps the key too.
+
+This is best effort, not a guarantee: the record is the extension process's, a removal only
+applies to a notification already on the lock screen, and iOS may end an extension before it
+acts. **Proposed deferred work** (number to be assigned by the coordinator): *item-level
+collapse on the APNs request.* The push that reaches APNs carries `apns-collapse-id` = the item
+key, so iOS itself keeps one notification per item whatever the extension managed. Sygnal's APNs
+pushkin sends no collapse id, so this needs a gateway that sets one from the push's
+`keeper_hq` ids (a Sygnal change or a gateway of keeper's own; the agents server still sends
+ids only, D-35). The device run that proves it: on kalypso, three deliveries of one approval
+with the server blackholed (it accepts and never answers), plus one whose extension expires,
+leave exactly one notification on the lock screen.
 
 **An action** writes the decision row through the session's own replica, exactly as the card
 does (`Hq::decide_pushed`, `hq::approvals::decide_pushed`): the request and digest the
@@ -446,8 +473,9 @@ deferred by the owner (R-HQ-58, DW-E106-15: the cold-start item read, a decision
 an already-shown action, the session target kept through the replacement), to be revisited
 with the tablet for a device run.
 
-**Proved on Linux:** the table, the fit over the whole request, the ids grammar, the fold of
-a second delivery, the actions and the tap (`keeper-core/src/hq/push.rs` tests); the push
+**Proved on Linux:** the table, the fit over the whole request, an invisible character of
+every class refusing *Approve once*, the ids grammar, the fold of a second delivery, the
+actions and the tap (`keeper-core/src/hq/push.rs` tests); the push
 target sent once per wish, cleared with the gateway, retried at the next discovery and never
 from a removed device (`hq/tests.rs`); the decision row written after the request arrives, T4
 refused, a missing request refused at the deadline (`hq/window_tests.rs`); a cold launch
@@ -455,17 +483,23 @@ starting the server a layer names, with no stored address and over a different s
 (`keeper-core/tests/hq_cold_action.rs`); the extension's read over a real HTTP listener
 answering recorded item JSON — one `GET` with the bearer token, the generic notification for
 every refusal and an unreachable server, a short summary over a request it cannot show whole
-offering *Deny* alone, and two deliveries leaving one notification with the tailnet off and
-on, the second arriving while the first is read, a fallback replaced (`keeper-nse` tests);
-Android's one notification per item (`keeper-core/tests/unifiedpush_android.rs`); the
-webview's landing (`src/hooks/use-push-open.test.ts`). **Inspection only:** `push_ios.rs`,
+offering *Deny* alone, and two deliveries naming the right removals with the tailnet off and
+on, the second arriving while the first is read, a fallback replaced; three deliveries queued
+behind a server that takes the connection and never answers ending within one deadline; the
+expiry of a delivery queued behind such a read answered at once with the item's removals, the
+queued read giving up at its own deadline and removing nothing after it; a removal named again
+until it is reported gone (`keeper-nse` tests). What iOS then shows is not proved anywhere off
+the device. Android's one notification per item (`keeper-core/tests/unifiedpush_android.rs`);
+the webview's landing (`src/hooks/use-push-open.test.ts`). **Inspection only:** `push_ios.rs`,
 `push_android.rs`, `hq_ipc.rs`, `lib.rs`'s `install_settings_layers`,
 `NotificationService.swift` (CI's macOS and iOS jobs compile the Rust; the Swift is compiled
 only by the device build). **Owed on devices:** kalypso (the token reaching the server, the
 notification through Sygnal, the actions with Face ID from a cold launch with the server set
-only in a settings file, the tap, the generic notification with the tailnet off, two
-deliveries of one item showing once — the second arriving while the first is read, and after
-a fallback) and the Android tablet through ntfy while keeper runs.
+only in a settings file, the tap, the generic notification with the tailnet off, an approval
+with U+200B in an argument offering *Deny* alone, deliveries of one item — the second arriving
+while the first is read, three with the server blackholed, one whose extension expires while
+queued — and how many notifications iOS leaves) and the Android tablet through ntfy while
+keeper runs.
 
 ## Earlier Matrix agent hosting
 

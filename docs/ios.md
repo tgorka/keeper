@@ -637,15 +637,24 @@ lives in the App Group (`hq/servers/…`, kept out of backup like every replica)
 `keeper_core::hq::push::classify` what shows ([agents.md](agents.md#a-push-from-the-agents-server)).
 It opens no store and writes nothing. Unreadable is the generic notification.
 
-One notification per item (R1066K-02): before the read, the Swift asks Rust for the item's
-key (`keeper_nse::answer_key`, `{"hq_key": …, "identifier": …}` through the same entry), and
-every notification of the item carries it as `keeper_hq_key` — composed, generic, and the
-fallback iOS shows when the extension runs out of time; the generic one carries nothing else
-of keeper's. Each answer names the notifications with that key to remove first: those on the
-lock screen, and those this extension process handed iOS earlier that are not there yet
-(`awaits`), which the Swift waits up to two seconds for. iOS names a remote notification
-itself and the gateway sends no APNs collapse id, so the item's key on the notification is the
-boundary, not its identifier.
+One notification per item, as far as an extension can (R1066K-02, R1066K-06): on arrival,
+before the read, the Swift asks Rust for the item's key (`keeper_nse::answer_key`,
+`{"hq_key": …, "identifier": …}` through the same entry), and every notification of the item
+carries it as `keeper_hq_key` — composed, generic, and the fallback shown when the extension
+runs out of time; the generic one carries nothing else of keeper's. That call also starts the
+delivery's one deadline (twenty seconds, `keeper_nse::DEADLINE`), shared by the wait for its
+turn, the read and every wait on the notification center: a delivery still queued at it reads
+nothing. Each answer names the notifications with that key to remove first: those on the
+lock screen, those that arrived before it and those handed iOS whenever they arrived — the
+ones not there yet awaited until the deadline (`awaits`). The expiry asks too
+(`{"hq_expired": …}`), at once and outside the serial queue, so the fallback removes the
+item's others rather than waiting behind the read that used the time up. A removal is kept
+until the Swift reports the notification gone from the lock screen (`{"hq_removed": […]}`)
+and named again meanwhile, by any later answer (`pending`). iOS names a remote notification
+itself and the gateway sends no APNs collapse id, so this is best effort and no guarantee:
+the record is the extension process's, and a removal applies only to a notification already
+on the lock screen. The boundary that would guarantee it, an APNs collapse id equal to the
+item key, is proposed deferred work ([agents.md](agents.md#a-push-from-the-agents-server)).
 
 Its memory under the 24 MB ceiling and its decryption on the phone are measured on the
 device after enrolment (98.1 #12), not here.
