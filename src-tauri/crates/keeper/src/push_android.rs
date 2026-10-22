@@ -410,7 +410,7 @@ fn log_outcomes(outcomes: Outcomes) {
                     Ok(()) => tracing::info!(account, "push: the old Matrix pusher is removed"),
                     Err(error) => tracing::warn!(
                         account,
-                        __omp_magic("", "error,")
+                        %error,
                         "push: the old Matrix pusher could not be removed"
                     ),
                 }

@@ -227,7 +227,7 @@ pub fn register_soon() {
                         Ok(()) => tracing::info!(account, "push: the old Matrix pusher is removed"),
                         Err(error) => tracing::warn!(
                             account,
-                            __omp_magic("", "error,")
+                            %error,
                             "push: the old Matrix pusher could not be removed"
                         ),
                     }
