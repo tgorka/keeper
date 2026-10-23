@@ -174,6 +174,33 @@ const MENU = {
   }),
 };
 
+it("runs a session slash command without an emote transport and never sends it as prose", async () => {
+  const onCommand = vi.fn(async () => null);
+  const onSend = vi.fn(async () => {});
+  render(
+    <Composer
+      transport="session"
+      accountId="alpha"
+      roomId="session-command"
+      onSend={onSend}
+      onCommand={onCommand}
+      resolveCommand={async (draft) =>
+        preview(draft, {
+          rows: [row("clean")],
+          verdict: { kind: "command", name: "clean", args: null },
+        })
+      }
+    />,
+  );
+  const field = screen.getByLabelText<HTMLTextAreaElement>("Message");
+  type(field, "/clean");
+  await screen.findByLabelText(SLASH_MENU_LABEL);
+  key(field);
+  await waitFor(() => expect(onCommand).toHaveBeenCalledWith({ name: "clean", args: null }));
+  expect(onSend).not.toHaveBeenCalled();
+  await waitFor(() => expect(field).toHaveValue(""));
+});
+
 describe("Composer slash menu", () => {
   it("opens over a leading slash with Rust's rows, and asks nothing about prose", async () => {
     const { field, resolveCommand } = mount(MENU);

@@ -5,12 +5,22 @@ import { type AgentSessionViewVm, agentSessionToolSet } from "@/lib/ipc/client";
 import { setAgentViewPrefs, useAgentViewPrefsWrite } from "@/lib/stores/agent-view-prefs";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
-export function SessionControls({ vm }: { vm: AgentSessionViewVm }) {
+export function SessionControls({
+  vm,
+  toolsOpen: controlled,
+  onToolsOpenChange,
+}: {
+  vm: AgentSessionViewVm;
+  toolsOpen?: boolean;
+  onToolsOpenChange?: (open: boolean) => void;
+}) {
   // The switches show the preferences as Rust resolves them now, carried with
   // the view: switched on another device or in a settings file, they follow.
   const { prefs } = vm;
   const write = useAgentViewPrefsWrite();
-  const [toolsOpen, setToolsOpen] = useState(false);
+  const [ownToolsOpen, setOwnToolsOpen] = useState(false);
+  const toolsOpen = controlled ?? ownToolsOpen;
+  const setToolsOpen = onToolsOpenChange ?? setOwnToolsOpen;
   const [pending, setPending] = useState<string | null>(null);
   const writing = useRef(false);
   const [error, setError] = useState<string | null>(null);

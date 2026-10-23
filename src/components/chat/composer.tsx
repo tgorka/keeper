@@ -919,7 +919,10 @@ export function Composer({
   // Slash commands (Story 100.5) — off while editing (the text is that
   // message's body) and while attachments wait (the text is their caption).
   const commandsEnabled =
-    onCommand != null && onSendEmote != null && pending?.mode !== "edit" && !hasAttachments;
+    onCommand != null &&
+    (onSendEmote != null || (transport === "session" && resolveCommand != null)) &&
+    pending?.mode !== "edit" &&
+    !hasAttachments;
   const replying = pending?.mode === "reply";
   const resolve = useCallback(
     (line: string) =>
@@ -1088,7 +1091,10 @@ export function Composer({
   // The mid-text `/` (Story 101.3, R418): wherever the composer has a slash
   // menu, except over a whole-line command, which is that menu's.
   const inlineEnabled =
-    onCommand != null && onSendEmote != null && !(commandsEnabled && isCommandLine(draft));
+    transport !== "session" &&
+    onCommand != null &&
+    onSendEmote != null &&
+    !(commandsEnabled && isCommandLine(draft));
   const resolveInlineHere = useCallback(
     (before: string, after: string) =>
       resolveInline != null

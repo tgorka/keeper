@@ -945,8 +945,11 @@ pub fn create_with_first(
         ),
         base_version: None,
     };
-    let first = person_message(source, &id, first, body, at);
-    source.replica.mutate(vec![session, member, first])?;
+    let mut ops = vec![session, member];
+    if !body.is_empty() {
+        ops.push(person_message(source, &id, first, body, at));
+    }
+    source.replica.mutate(ops)?;
     source.replica.sync_now();
     Ok(id)
 }
