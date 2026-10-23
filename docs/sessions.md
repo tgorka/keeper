@@ -94,11 +94,13 @@ for whoever, or whatever, is handed the folder with no other context.
 about *versioning*, not about kind, and no tag can replace that.
 
 **An agent's session is a flat session plus three agent files** — `agent.toml`, `log/`
-and `approvals/` — and its `AGENTS.md` says so: `log/` and `approvals/` are keeper's, never
-edited or deleted by hand. None of them is markdown, so none enters the pool or a space; the
-board reads an agent session's run state, label and claim from `.keeper/agents.db`, never
-from the log. The formats and the rules are in `docs/agents.md` (*A session an agent works
-in*, *The log*).
+and `approvals/` — and its `AGENTS.md` says so: `log/` and `approvals/` were the drive host's,
+never edited or deleted by hand. Agents worked in the drives until they moved to keeper-hq
+(Epic 108); no agent writes these files now, and the conversations they hold were imported once
+into the agents' databases (`docs/agents.md` § *Imported history*). None of them is markdown,
+so none enters the pool or a space; the board reads an agent session's run state, label and
+claim from `.keeper/agents.db`, never from the log. The formats and the rules are in
+`docs/agents.md` as of keeper `d4a3e689` (*A session an agent works in*, *The log*).
 
 **Markdown is found wherever it sits.** keeper reads a session's markdown in
 subdirectories too, so a `spaces/`, a `log/` or any folder you make is a real home: the
@@ -957,17 +959,17 @@ fractional number, so dragging one card rewrites one file rather than renumberin
 everything below it. A `status:` keeper cannot read is shown as unreadable rather than
 quietly filed under "to do".
 
-**A card an agent works is still a card in its column.** Its `run:` (`queued`, `running`,
-`waiting`, `blocked`, `review`, `failed`) is the agent's run, written by keeper's host, never a
-fifth column: `status: todo` with `run: blocked` sits in *To do*. Each card's view model carries
+**A card an agent worked is still a card in its column.** Its `run:` (`queued`, `running`,
+`waiting`, `blocked`, `review`, `failed`) is the agent's run, written by the drive host before the
+agents moved to keeper-hq — nothing writes it now (DW-E108-3) — never a fifth column: `status: todo` with `run: blocked` sits in *To do*. Each card's view model carries
 its agent keys — who it is for, the host it is pinned to, who asked, its schedule and whether it
 reads, the mark of a schedule an agent wrote and of a card made from outside content — and, from
 the session's log, the host it runs on now and why it waits. Moving a card writes `status:` and
 `order:` and leaves every agent key as it was; the write is guarded on the exact bytes the move was
 computed from, so a card the host changed meanwhile (its `run:`) is refused rather than written
 back, and moving it again reads it afresh. A key written twice, or in a form the reader does not
-model, shows as unreadable rather than missing. The keys and who writes them are in
-`docs/agents.md` (*Cards*).
+model, shows as unreadable rather than missing. The keys and who wrote them are in
+`docs/agents.md` as of keeper `d4a3e689` (*Cards*).
 On the card, under its title: the run as a badge with its word (a value keeper cannot read
 says *run unreadable* with what the file holds), a line naming the agent, where it runs or
 why it waits, and who asked, the schedule (or *schedule unreadable*), the *outside content*
@@ -1110,8 +1112,8 @@ alone); a quiet `missing source`, which is what a workspace cleaned up at archiv
 file that is there but could not be read, one behind a folder that may not be searched, or two
 that differ when which changed last is not known; and an unreadable line, shown exactly as written — plus
 the `workspace/` files no row names, each one action from promotion (listed, never read), and
-the session's harvested notes (`artifacts/knowledge/`, see `docs/agents.md` § *Knowledge from
-sessions*). What it could not see — a folder that would not list, more than 4096 files — it
+the session's harvested notes (`artifacts/knowledge/`, which the stewards wrote before the
+agents moved to keeper-hq; `docs/agents.md` § *Knowledge from sessions* as of keeper `d4a3e689`). What it could not see — a folder that would not list, more than 4096 files — it
 says. `sessions_promote` copies a `workspace/` file into `artifacts/` once it has been still
 for the profile's settle window and read whole as one version — otherwise "still being written;
 try again in a moment" — copying exactly the bytes that were read, and records its one row in
