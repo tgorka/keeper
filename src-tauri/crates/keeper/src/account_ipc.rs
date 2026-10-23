@@ -41,7 +41,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use keeper_core::bots::{self, Provider, ProviderKind};
 use keeper_core::config::{self as layers, AccountLayerSource};
 use keeper_core::error::CoreError;
 use keeper_core::forges::{self, tokens::ForgeError, ForgeSource};
@@ -53,7 +52,7 @@ use keeper_core::org_account::layout::{
     self, DeviceClass, DeviceEntry, PlanInput, RepoFiles, Resolution, UserRecord,
 };
 use keeper_core::org_account::manifest::{
-    self, BotsFile, DriveRecord, DrivesFile, MatrixFile, MatrixRecord, ProviderRecord,
+    self, DriveRecord, DrivesFile, MatrixFile, MatrixRecord, ProviderRecord, ProvidersFile,
 };
 use keeper_core::org_account::session::{self, GitAuth, Identity};
 use keeper_core::org_account::settings_sync::{
@@ -66,6 +65,7 @@ use keeper_core::org_account::state::{
 };
 use keeper_core::org_account::{log_upload, oidc, AccountError};
 use keeper_core::platform::Platform;
+use keeper_core::providers::{self, Provider, ProviderKind};
 use keeper_core::registry;
 use keeper_core::transcription::models as model_files;
 use keeper_core::vm::{IpcError, IpcErrorCode};
@@ -123,11 +123,11 @@ struct Inner {
     /// Setups resolved but not yet confirmed, by `setup_id`. Nothing is
     /// written before the person presses Continue.
     setups: HashMap<String, (AccountDescriptor, Option<url::Url>)>,
-    /// Drives, bot providers and Matrix accounts the person uses on other
+    /// Drives, model providers and Matrix accounts the person uses on other
     /// devices and not on this one, from the last sync that read them.
     offers: AccountOffersVm,
-    /// The providers in the person's `bots.toml` as the last sync left it —
-    /// what adding an offered provider reads its bots from.
+    /// The providers in the person's providers file (`bots.toml`) as the last
+    /// sync left it — what adding an offered provider reads.
     offered_providers: Vec<ProviderRecord>,
     /// What restoring this device did and what waits (AD-329). Its
     /// `listening_off` is computed once per sync and cleared the moment the
@@ -162,7 +162,7 @@ struct Runtime {
     /// launched keeper), delivered from [`account_subscribe`].
     pending_link: Mutex<Option<String>>,
     webview_listening: AtomicBool,
-    /// A synced setting, drive, provider, bot or Matrix account changed here
+    /// A synced setting, drive, provider or Matrix account changed here
     /// since the last sync began: the next sync skips the throttle, and a
     /// sync that finds one set when it ends runs once more (AD-325).
     dirty: AtomicBool,
@@ -215,7 +215,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The account's HTTP client, for the bots and drive credential paths too.
+/// The account's HTTP client, for the provider and drive credential paths too.
 pub fn http() -> Result<&'static reqwest::Client, String> {
     HTTP.as_ref().map_err(Clone::clone)
 }
@@ -385,23 +385,22 @@ pub async fn access_token(platform: &dyn Platform) -> Result<String, AccountErro
     oidc::access_token(platform, http, &d).await
 }
 
-/// A bot provider's bearer token: the account's access token when the
+/// A model provider's bearer token: the account's access token when the
 /// provider is set to "Use my account", else its keychain item as before.
 ///
 /// The in-memory descriptor is the "an account is configured" flag: without
 /// one, the keychain is read exactly as before — no registry row, no HTTP
 /// client (NFR-92).
-pub async fn bot_credential(
+pub async fn provider_credential(
     platform: &dyn Platform,
     provider_id: &str,
-    bot: Option<&str>,
 ) -> Result<Option<String>, AccountError> {
     let Some(account) = descriptor() else {
-        return keeper_core::bots::resolve_token(platform, provider_id, bot)
+        return keeper_core::providers::resolve_token(platform, provider_id)
             .map_err(|error| AccountError::Internal(error.to_string()));
     };
     let http = http().map_err(AccountError::Internal)?;
-    keeper_core::bots::resolve_credential(platform, http, Some(&account), provider_id, bot).await
+    keeper_core::providers::resolve_credential(platform, http, Some(&account), provider_id).await
 }
 
 /// Whether a provider has a credential to send: one set to the configured
@@ -424,7 +423,7 @@ pub fn provider_has_credential(platform: &dyn Platform, provider_id: &str) -> bo
             return true;
         }
     }
-    keeper_core::bots::resolve_token(platform, provider_id, None)
+    keeper_core::providers::resolve_token(platform, provider_id)
         .unwrap_or_else(|error| {
             tracing::warn!(
                 %error,
@@ -1111,7 +1110,7 @@ pub fn daily_tick() {
 /// with the observer suppressed, so they never count as a local change.
 pub fn watch_settings() {
     registry::set_setting_observer(Box::new(|key: &str| {
-        if key == "bots.wake_enabled" {
+        if key == "voice.wake_enabled" {
             wake_chosen();
         }
         if matches!(
@@ -1127,7 +1126,7 @@ pub fn watch_settings() {
 }
 
 /// Something the person's files carry changed on this device: a synced
-/// setting, or a drive, bot provider, bot, credential choice or Matrix
+/// setting, or a drive, model provider, credential choice or Matrix
 /// account added or removed. The next sync runs now rather than after the
 /// throttle; one already running runs once more when it ends. Nothing at
 /// all without an account.
@@ -2217,7 +2216,8 @@ struct SettingsInput {
 }
 
 const DRIVES_MANIFEST: &str = "drives";
-const BOTS_MANIFEST: &str = "bots";
+/// The providers' offer base, under the name older builds wrote (DW-E108-6).
+const PROVIDERS_MANIFEST: &str = "bots";
 const MATRIX_MANIFEST: &str = "matrix";
 
 /// A manifest base as stored, or `None` when there is none or it does not
@@ -2294,7 +2294,7 @@ async fn sync_settings(
                 base_device,
                 manifest_bases: ManifestBases {
                     drives: manifest_base(&data_dir, id, DRIVES_MANIFEST)?,
-                    providers: manifest_base(&data_dir, id, BOTS_MANIFEST)?,
+                    providers: manifest_base(&data_dir, id, PROVIDERS_MANIFEST)?,
                     matrix: manifest_base(&data_dir, id, MATRIX_MANIFEST)?,
                 },
                 mine,
@@ -2459,7 +2459,7 @@ async fn sync_settings(
     record_manifest_base(
         &data_dir,
         id,
-        BOTS_MANIFEST,
+        PROVIDERS_MANIFEST,
         planned.providers.as_ref(),
         Some(mine.providers.as_slice()),
         landed,
@@ -2493,9 +2493,9 @@ async fn sync_settings(
     let device_values = planned.device.as_ref().map(|file| file.merged.file.clone());
     // Read outside the lock, once per sync: every view reads the cached bool.
     let listening_off = device_values.as_ref().map(|values| {
-        let wake = registry::stored_settings(&data_dir, &["bots.wake_enabled"])
+        let wake = registry::stored_settings(&data_dir, &["voice.wake_enabled"])
             .ok()
-            .and_then(|rows| rows.get("bots.wake_enabled").cloned());
+            .and_then(|rows| rows.get("voice.wake_enabled").cloned());
         settings_sync::listening_off(values, wake.as_deref())
     });
     update(|inner| {
@@ -2536,47 +2536,23 @@ async fn restore(
     let account_id = input.descriptor.id.clone();
     let first = !input.restored;
     let catalog = &input.mine.catalog;
-    let (plan, present_grants) = match tip.as_ref().filter(|_| first) {
-        Some(file) => {
-            let drives: Vec<_> = catalog
-                .drives
-                .iter()
-                .map(|drive| {
-                    settings_sync::DriveRef::named(&drive.remote_url, &drive.branch, &drive.name)
-                })
-                .collect();
-            let providers: Vec<_> = catalog.providers.iter().map(|(_, p)| p.clone()).collect();
-            let matrix: Vec<String> = input
-                .mine
-                .matrix
-                .iter()
-                .map(|m| m.user_id.clone())
-                .collect();
-            // Grants of the providers this device already has: the plan
-            // leaves those providers out, not their folder permissions.
-            let present_grants = file
-                .providers
-                .iter()
-                .filter(|p| providers.contains(&p.key()))
-                .flat_map(|p| {
-                    let reference = p.key().reference();
-                    p.grants
-                        .iter()
-                        .map(move |grant| device_state::PendingGrant {
-                            provider: reference.clone(),
-                            grant: grant.clone(),
-                        })
-                })
-                .collect();
-            (
-                Some(device_state::restore_plan(
-                    file, &drives, &providers, &matrix,
-                )),
-                present_grants,
-            )
-        }
-        None => (None, Vec::new()),
-    };
+    let plan = tip.as_ref().filter(|_| first).map(|file| {
+        let drives: Vec<_> = catalog
+            .drives
+            .iter()
+            .map(|drive| {
+                settings_sync::DriveRef::named(&drive.remote_url, &drive.branch, &drive.name)
+            })
+            .collect();
+        let providers: Vec<_> = catalog.providers.iter().map(|(_, p)| p.clone()).collect();
+        let matrix: Vec<String> = input
+            .mine
+            .matrix
+            .iter()
+            .map(|m| m.user_id.clone())
+            .collect();
+        device_state::restore_plan(file, &drives, &providers, &matrix)
+    });
     // A Matrix account signed in here since is no longer waiting.
     pending.matrix.retain(|waiting| {
         !input
@@ -2607,7 +2583,6 @@ async fn restore(
                 &data_dir,
                 &account_id,
                 plan,
-                present_grants,
                 &mut pending,
             );
             (outcome, pending)
@@ -2929,9 +2904,9 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
         })
     });
     let providers = {
-        let rel = manifest::bots_path(login);
+        let rel = manifest::providers_path(login);
         readable(&files, &rel).and_then(|current| {
-            let remote = parse_manifest(&rel, current.as_deref(), BotsFile::parse)?;
+            let remote = parse_manifest(&rel, current.as_deref(), ProvidersFile::parse)?;
             let merged = manifest::merge_providers(
                 &remote.providers,
                 &input.mine.providers,
@@ -2941,7 +2916,7 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
                 input.restored,
             );
             let unchanged = merged == remote.providers;
-            let file = BotsFile {
+            let file = ProvidersFile {
                 providers: merged,
                 ..remote
             };
@@ -3253,7 +3228,7 @@ pub fn setup_link_arrived(app: &AppHandle, link: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Drives and bot providers (AD-315)
+// Drives and model providers (AD-315)
 // ---------------------------------------------------------------------------
 
 /// The profile id in a sync credential key, `sync/<pid>/credential`.
@@ -3537,7 +3512,7 @@ fn credential_source_value(stored: Option<String>) -> String {
 /// A source the frontend sent, and the account it binds to: `account`
 /// needs a configured account, whose id the row then records.
 /// `drive_sources` is the repository sources a drive may sign in with
-/// (`forge:<id>`, stored verbatim); `None` for a bot provider, which takes
+/// (`forge:<id>`, stored verbatim); `None` for a model provider, which takes
 /// none of them.
 fn parse_source(
     source: &str,
@@ -3674,7 +3649,7 @@ pub async fn account_setup_confirm(
     let slug = layout::device_slug(&device_name);
 
     let gate = stop_running().await;
-    // One account per install. The session, the drives and bot providers set
+    // One account per install. The session, the drives and model providers set
     // to use it, its per-account state and its clone belong to the
     // descriptor they were made under: a different account, or the same id
     // pointing at another identity provider, client or repository, starts
@@ -4070,7 +4045,7 @@ fn present_end_session(
 }
 
 /// Remove what this device keeps for account `account_id`: the drives' and
-/// bot providers' "use my account" rows bound to it, its per-account
+/// model providers' "use my account" rows bound to it, its per-account
 /// registry state and its clone. The server's repository is untouched.
 fn forget_local_state(data_dir: &Path, account_id: &str) -> Result<(), IpcError> {
     registry::clear_credential_sources(data_dir, account_id).map_err(to_ipc_error)?;
@@ -4262,7 +4237,7 @@ fn profile_remote(state: &AppState, profile_id: &str) -> Result<String, IpcError
 }
 
 #[tauri::command]
-pub fn bots_provider_credential_source_get(
+pub fn provider_credential_source_get(
     state: State<'_, AppState>,
     provider_id: String,
 ) -> Result<String, IpcError> {
@@ -4273,7 +4248,7 @@ pub fn bots_provider_credential_source_get(
 }
 
 #[tauri::command]
-pub fn bots_provider_credential_source_set(
+pub fn provider_credential_source_set(
     state: State<'_, AppState>,
     provider_id: String,
     source: String,
@@ -4291,8 +4266,8 @@ pub fn bots_provider_credential_source_set(
     Ok(())
 }
 
-/// Add a bot provider the person uses on another device, with its bots, set
-/// to use the account (AD-323). Only for an offer whose credential is the
+/// Add a model provider the person uses on another device, set to use the
+/// account (AD-323). Only for an offer whose credential is the
 /// account, while the account is usable: any other needs a key, which only
 /// the person can give, so the frontend opens the filled-in form instead.
 #[tauri::command]
@@ -4338,15 +4313,9 @@ pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Re
             record.kind
         )));
     };
-    let base_url = bots::parse_base_url(&record.base_url)
+    let base_url = providers::parse_base_url(&record.base_url)
         .map_err(|error| refusal(format!("{}: {error}", record.base_url)))?
         .normalized;
-    // Every target is checked before anything is written, so a refusal
-    // leaves no half-added provider behind.
-    for bot in &record.bots {
-        bots::parse_bot_target(&bot.target)
-            .map_err(|error| refusal(format!("{}: {error}", bot.target)))?;
-    }
     let provider = Provider {
         id: keeper_agent::turn::new_id(),
         kind,
@@ -4354,14 +4323,13 @@ pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Re
         base_url,
         created_ms: now_ms(),
     };
-    // All or nothing: a provider without its account credential or some of
-    // its bots is not what the person asked for.
+    // All or nothing: a provider without its account credential is not what
+    // the person asked for.
     account_restore::add_provider(
         &data_dir,
         &provider,
         Some(&account_id),
         record.read_timeout_ms,
-        record.bots.clone(),
     )
     .map_err(to_ipc_error)?;
     update(|inner| {
@@ -4535,7 +4503,7 @@ mod tests {
     }
 
     /// A drive may sign in with a repository source this device has, and
-    /// needs no account for it; a bot provider never takes one.
+    /// needs no account for it; a model provider never takes one.
     #[test]
     fn a_forge_source_is_for_drives_and_must_exist() {
         let github = ForgeSource {

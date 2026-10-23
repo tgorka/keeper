@@ -77,7 +77,7 @@ describe("the counted wait (AD-215)", () => {
   const sentAtMs = 1_700_000_000_000;
 
   it("counts whole seconds from Rust's sentAtMs and names the bot", () => {
-    const waiting: VoiceStateVm = { kind: "sending", answering: false, bot: "nixie", sentAtMs };
+    const waiting: VoiceStateVm = { kind: "sending", answering: false, agent: "nixie", sentAtMs };
     expect(voiceWaitWord(waiting, sentAtMs)).toBe("Waiting for nixie · 0 s");
     expect(voiceWaitWord(waiting, sentAtMs + 12_400)).toBe("Waiting for nixie · 12 s");
     // A bot Rust did not name is not invented.
@@ -94,7 +94,7 @@ describe("the counted wait (AD-215)", () => {
         {
           kind: "sending",
           answering: true,
-          bot: "nixie",
+          agent: "nixie",
           sentAtMs,
           firstTokenMs: sentAtMs + 28_550,
         },

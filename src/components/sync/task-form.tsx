@@ -72,23 +72,8 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
 import { logFailure, sayFailure } from "@/lib/failure";
-import type {
-  BotModelVm,
-  BotVm,
-  FilesListingVm,
-  SyncProfileVm,
-  TaskSchedulePreviewVm,
-  TaskVm,
-} from "@/lib/ipc/client";
-import {
-  botsBotsList,
-  botsModelsList,
-  syncBrowse,
-  syncProfiles,
-  syncTaskSave,
-  syncTaskSchedulePreview,
-} from "@/lib/ipc/client";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
+import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
 import { syncErrorMessage, TASK_KINDS, TASK_MISSED_POLICIES, TASK_MODES } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -172,7 +157,7 @@ export const TASK_FORM_KIND_LABEL = "Kind";
  * author would introduce here is the same drift AD-C7 forbids in the spellings.
  */
 export const TASK_FORM_KIND_NOTE =
-  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation. gc repacks the folder's git objects in a quiet window, so a long-lived folder's store stays bounded; keeper seeds one per folder, weekly. bot runs a saved prompt with the chosen bot and model, under existing grants only. copy copies between two local folders once per run, without a sync relationship.";
+  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation. gc repacks the folder's git objects in a quiet window, so a long-lived folder's store stays bounded; keeper seeds one per folder, weekly. copy copies between two local folders once per run, without a sync relationship.";
 
 export const TASK_FORM_MODE_LABEL = "Mode";
 /** The three modes, accurate to `tasks::decide` and no longer than that. */
@@ -512,10 +497,6 @@ export const TASK_FORM_SCHEDULE_HINT = `${TASK_FORM_SCHEDULE_NOTE} ${TASK_SCHEDU
 export const TASK_FORM_REPLACE_EXISTING_NOTE =
   "Left off, identical files are skipped and differing files are left alone and reported.";
 
-/** What running a saved prompt reads, and what it is still not allowed to do. */
-export const TASK_FORM_PROMPT_NOTE =
-  "The runner reads the chosen .md under this folder, without its frontmatter or first heading. Existing grants apply; a write that needs approval is refused when nobody is there.";
-
 /** Matches the two native `<select>`s in `session-space-editor.tsx`. */
 const SELECT_CLASS =
   "h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
@@ -548,9 +529,6 @@ type TaskFormValues = {
    * `"120"` is not silently a two-minute delay the form then refuses.
    */
   missedDelayMinutes: string;
-  botId: string;
-  promptSubpath: string;
-  model: string;
   copySource: string;
   copyDestination: string;
   replaceExisting: boolean;
@@ -595,7 +573,6 @@ export function TaskForm({
   onSavingChange?: (saving: boolean) => void;
 }) {
   const editing = task !== undefined;
-  const botTools = useCapabilitiesStore((state) => state.capabilities.botTools);
   // Seeded once, deliberately (see `task` above).
   const [form, setForm] = useState<TaskFormValues>(() =>
     task === undefined
@@ -614,9 +591,6 @@ export function TaskForm({
           // otherwise, which is the same compatibility argument the policy above
           // makes.
           missedDelayMinutes: "",
-          botId: "",
-          promptSubpath: "",
-          model: "",
           copySource: "",
           copyDestination: "",
           replaceExisting: false,
@@ -651,9 +625,6 @@ export function TaskForm({
           // build could not have written.
           missedDelayMinutes:
             task.missedDelayMs === null ? "" : String(Math.round(task.missedDelayMs / 60_000)),
-          botId: task.botId ?? "",
-          promptSubpath: task.promptSubpath ?? "",
-          model: task.model ?? "",
           copySource: task.copySource ?? "",
           copyDestination: task.copyDestination ?? "",
           replaceExisting: task.replaceExisting,
@@ -891,9 +862,6 @@ export function TaskForm({
         enabled: form.enabled,
         // Copy names native paths, not a sync relationship.
         profileId: form.kind === "copy" || form.profileId === "" ? null : form.profileId,
-        botId: form.botId === "" ? null : form.botId,
-        promptSubpath: form.promptSubpath === "" ? null : form.promptSubpath,
-        model: form.model === "" ? null : form.model,
         copySource: form.copySource === "" ? null : form.copySource,
         copyDestination: form.copyDestination === "" ? null : form.copyDestination,
         replaceExisting: form.replaceExisting,
@@ -998,26 +966,16 @@ export function TaskForm({
       <div className={TASK_FORM_ROW_CLASS}>
         <div className={TASK_FORM_LABEL_CLASS}>
           <Label htmlFor={`${fieldId}-kind`}>{TASK_FORM_KIND_LABEL}</Label>
-          {/* The bot sentence is dropped on a build without bot tools for the
-              reason it always was: a menu that cannot offer `bot` must not
-              explain it. */}
-          <FieldHint
-            label={botTools ? TASK_FORM_KIND_NOTE : TASK_FORM_KIND_NOTE.replace(/bot [^.]+\. /, "")}
-          />
+          <FieldHint label={TASK_FORM_KIND_NOTE} />
         </div>
         <select
           id={`${fieldId}-kind`}
           className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value={form.kind === "bot" && !botTools ? "" : form.kind}
+          value={form.kind}
           disabled={saving}
           onChange={(event) => setForm((live) => ({ ...live, kind: event.target.value }))}
         >
-          {form.kind === "bot" && !botTools && (
-            <option value="" disabled>
-              Unavailable on this build
-            </option>
-          )}
-          {TASK_KINDS.filter((kind) => kind !== "bot" || botTools).map((kind) => (
+          {TASK_KINDS.map((kind) => (
             <option key={kind} value={kind}>
               {kind}
             </option>
@@ -1081,7 +1039,6 @@ export function TaskForm({
                 setForm((live) => ({
                   ...live,
                   profileId: event.target.value,
-                  promptSubpath: "",
                 }))
               }
             >
@@ -1107,14 +1064,6 @@ export function TaskForm({
             </p>
           )}
         </>
-      )}
-      {form.kind === "bot" && botTools && (
-        <BotTaskFields
-          form={form}
-          fieldId={fieldId}
-          saving={saving}
-          onChange={(values) => setForm((live) => ({ ...live, ...values }))}
-        />
       )}
       {form.kind === "copy" && (
         <CopyTaskFields
@@ -1275,255 +1224,6 @@ type KindFieldsProps = {
   saving: boolean;
   onChange: (values: Partial<TaskFormValues>) => void;
 };
-
-function BotTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
-  const [bots, setBots] = useState<BotVm[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    void botsBotsList().then(
-      (rows) => {
-        if (live) setBots(rows);
-      },
-      (raw) => {
-        if (live) setError(syncErrorMessage(raw));
-      },
-    );
-    return () => {
-      live = false;
-    };
-  }, []);
-  const selected = bots?.find((bot) => bot.id === form.botId);
-  return (
-    <fieldset className="flex min-w-0 flex-col gap-2 rounded-md border p-3" disabled={saving}>
-      <legend className="px-1 text-sm font-medium">Bot task</legend>
-      <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-bot`}>Bot</Label>
-        <select
-          id={`${fieldId}-bot`}
-          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value={form.botId}
-          onChange={(event) => onChange({ botId: event.target.value, model: "" })}
-        >
-          <option value="">Choose a bot…</option>
-          {bots?.map((bot) => (
-            <option key={bot.id} value={bot.id}>
-              {bot.name}
-            </option>
-          ))}
-          {form.botId !== "" && !selected && (
-            <option value={form.botId}>{form.botId} — not listed</option>
-          )}
-        </select>
-      </div>
-      {error !== null ? (
-        <p role="status" className="text-destructive text-xs">
-          {error}
-        </p>
-      ) : bots === null ? (
-        <p className="text-muted-foreground text-xs">Reading bots…</p>
-      ) : (
-        bots.length === 0 && (
-          <p className="text-muted-foreground text-xs">
-            No bots are pinned. Add one in Bots first.
-          </p>
-        )
-      )}
-      <TaskModelPicker
-        key={`model:${form.botId}`}
-        bot={selected}
-        value={form.model}
-        fieldId={fieldId}
-        onChange={(model) => onChange({ model })}
-      />
-      <TaskPromptPicker
-        key={`prompt:${form.profileId}`}
-        profileId={form.profileId}
-        value={form.promptSubpath}
-        hint={TASK_FORM_PROMPT_NOTE}
-        onChange={(promptSubpath) => onChange({ promptSubpath })}
-      />
-    </fieldset>
-  );
-}
-
-function TaskModelPicker({
-  bot,
-  value,
-  fieldId,
-  onChange,
-}: {
-  bot: BotVm | undefined;
-  value: string;
-  fieldId: string;
-  onChange: (model: string) => void;
-}) {
-  const [models, setModels] = useState<BotModelVm[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    if (!bot) return;
-    let live = true;
-    void botsModelsList(bot.providerId, bot.target).then(
-      (rows) => {
-        if (live) setModels(rows);
-      },
-      (raw) => {
-        if (live) setError(syncErrorMessage(raw));
-      },
-    );
-    return () => {
-      live = false;
-    };
-  }, [bot]);
-  return (
-    <>
-      <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-model`}>Model</Label>
-        <select
-          id={`${fieldId}-model`}
-          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-        >
-          <option value="">Choose a model…</option>
-          {models?.map((model) => (
-            <option key={model.id} value={model.id}>
-              {model.id}
-            </option>
-          ))}
-          {value !== "" && !models?.some((model) => model.id === value) && (
-            <option value={value}>{value} — not listed</option>
-          )}
-        </select>
-      </div>
-      {error !== null ? (
-        <p role="status" className="text-destructive text-xs">
-          {error}
-        </p>
-      ) : !bot ? (
-        <p className="text-muted-foreground text-xs">Choose a bot to read its models.</p>
-      ) : models === null ? (
-        <p className="text-muted-foreground text-xs">Reading models…</p>
-      ) : (
-        models.length === 0 && (
-          <p className="text-muted-foreground text-xs">This bot offers no models.</p>
-        )
-      )}
-    </>
-  );
-}
-
-function TaskPromptPicker({
-  profileId,
-  value,
-  hint,
-  onChange,
-}: {
-  profileId: string;
-  value: string;
-  /** What the runner will do with the chosen file — the fieldset's standing
-   *  prose, now beside the heading it was under rather than below the list. */
-  hint: string;
-  onChange: (subpath: string) => void;
-}) {
-  const [subpath, setSubpath] = useState("");
-  const [listing, setListing] = useState<FilesListingVm | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [readVersion, setReadVersion] = useState(0);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `readVersion` is a deliberate re-run trigger, not a read — Retry bumps it so the same folder and subpath are browsed again after a refusal.
-  useEffect(() => {
-    if (profileId === "") return;
-    let live = true;
-    setListing(null);
-    setError(null);
-    void syncBrowse(profileId, subpath).then(
-      (read) => {
-        if (live) setListing(read);
-      },
-      (raw) => {
-        if (live) setError(syncErrorMessage(raw));
-      },
-    );
-    return () => {
-      live = false;
-    };
-  }, [profileId, subpath, readVersion]);
-  const entries =
-    listing?.state === "listed"
-      ? (listing.entries?.filter(
-          (entry) => entry.kind === "folder" || entry.name.toLowerCase().endsWith(".md"),
-        ) ?? [])
-      : [];
-  return (
-    <section aria-label="Prompt file" className="flex min-w-0 flex-col gap-2">
-      <div className={TASK_FORM_LABEL_CLASS}>
-        <span className="text-sm font-medium">Prompt file</span>
-        <FieldHint label={hint} />
-      </div>
-      <p className="break-all font-mono text-xs">{value || "No prompt chosen"}</p>
-      {profileId === "" ? (
-        <p className="text-muted-foreground text-xs">
-          Choose a folder above to browse its .md files.
-        </p>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" size="sm" variant="outline" onClick={() => setSubpath("")}>
-              Folder root
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={() => setReadVersion((n) => n + 1)}
-            >
-              Refresh files
-            </Button>
-            <span className="break-all text-muted-foreground text-xs">{subpath || "/"}</span>
-          </div>
-          {error !== null ? (
-            <p role="status" className="text-destructive text-xs">
-              {error}
-            </p>
-          ) : listing === null ? (
-            <p className="text-muted-foreground text-xs">Reading files…</p>
-          ) : (
-            <p className="text-muted-foreground text-xs">
-              {listing.detail ??
-                (listing.state !== "listed"
-                  ? "This folder cannot be read."
-                  : entries.length === 0
-                    ? "No folders or .md files here."
-                    : null)}
-            </p>
-          )}
-          {entries.length > 0 && (
-            <ul className="max-h-48 overflow-y-auto rounded-md border">
-              {entries.map((entry) => (
-                <li key={entry.relativePath}>
-                  <button
-                    type="button"
-                    className="w-full break-all px-3 py-2 text-left text-sm hover:bg-accent focus-visible:bg-accent"
-                    aria-pressed={
-                      entry.kind === "folder" ? undefined : value === entry.relativePath
-                    }
-                    onClick={() =>
-                      entry.kind === "folder"
-                        ? setSubpath(entry.relativePath)
-                        : onChange(entry.relativePath)
-                    }
-                  >
-                    {entry.kind === "folder" ? `Open folder: ${entry.name}` : entry.name}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </>
-      )}
-    </section>
-  );
-}
 
 function CopyTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
   const pick = async (key: "copySource" | "copyDestination") => {

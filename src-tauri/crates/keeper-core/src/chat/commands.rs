@@ -1,13 +1,12 @@
 //! Slash commands in the messenger composer (Story 100.5, R385; the agent
 //! rooms' `/new` and `/model` left with the agents' Matrix path, 108.2).
 //!
-//! **What a `/` line means is decided here and nowhere else**, exactly as
-//! `crate::bots::commands` decides it for the ⌘9 bot composer (AD-55): the
+//! **What a `/` line means is decided here and nowhere else** (AD-55): the
 //! composer asks [`crate::vm::ChatCommandPreviewVm`] what its draft is and obeys.
 //! A matcher in TypeScript beside this one would be a second opinion about what
 //! `/to` means, and the one a person is looking at is always the other one.
 //!
-//! # The rules, shared with the bot composer
+//! # The rules
 //!
 //! 1. **Exact beats prefix, and an alias is exact** — name, then alias, then
 //!    the first prefix in registry order ([`COMMANDS`] order is a decision).
@@ -17,10 +16,10 @@
 //! 3. **An unknown command is refused in place and is never sent as text.**
 //!    The refusal names the nearest command offered here.
 //! 4. **`//` sends a literal slash** — `//etc` is the text `/etc`
-//!    ([`ESCAPE_HINT`], the bot composer's own sentence), at any length.
+//!    ([`ESCAPE_HINT`]), at any length.
 //! 5. **A command line has a bound, and crossing it is a refusal**
 //!    ([`TOO_LONG`]): one line, one leading slash, more than
-//!    [`MAX_COMMAND_CHARS`](crate::bots::commands::MAX_COMMAND_CHARS) bytes is
+//!    [`MAX_COMMAND_CHARS`] bytes is
 //!    refused in place, never sent as the text of a command nobody ran (R393).
 //!
 //! # Where each command acts
@@ -34,7 +33,76 @@
 
 use matrix_sdk::ruma::UserId;
 
-use crate::bots::commands::{command_token, distance, ArgMode, ESCAPE_HINT};
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+/// The one sentence the empty state and `/help` both teach, because rule 4 is
+/// the only part of this surface a person cannot guess from the menu.
+pub const ESCAPE_HINT: &str =
+    "To send a message that starts with a slash, double it: //etc sends /etc as text.";
+
+/// The longest draft this module will reason about as a possible command.
+///
+/// A bound rather than a taste: the draft is tokenized on every keystroke, and
+/// a pasted megabyte beginning with a slash would be scanned on each one. A
+/// command line is one short line by construction, so anything longer is prose
+/// and is treated as prose without being measured twice.
+pub const MAX_COMMAND_CHARS: usize = 512;
+
+/// What a command does with the text after its name (Story 61.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ArgMode {
+    /// Nothing may follow.
+    None,
+    /// One argument is required, and its absence is a refusal naming the hint
+    /// rather than a command that quietly did nothing.
+    Required,
+    /// Everything after the name is one optional argument, verbatim.
+    OptionalRest,
+}
+
+/// The token typed after a leading slash, lowercased, or `None` when the draft
+/// is not a command line at all (Story 61.9).
+///
+/// A command line is **one line, one slash, nothing before it** — the note
+/// editor's `slash-menu.ts:22` narrowness restated for a textarea. A doubled
+/// slash is the escape and is therefore not a command line, which is why this
+/// returns `None` for it rather than a token of `"/etc"`.
+pub fn command_token(draft: &str) -> Option<&str> {
+    if draft.len() > MAX_COMMAND_CHARS || draft.contains('\n') {
+        return None;
+    }
+    let rest = draft.strip_prefix('/')?;
+    if rest.starts_with('/') {
+        return None;
+    }
+    Some(match rest.split_once(char::is_whitespace) {
+        Some((token, _)) => token,
+        None => rest,
+    })
+}
+
+/// Levenshtein distance in characters, two rows of state.
+///
+/// Written here rather than taken as a dependency: it runs over a handful of
+/// seven-character names once per refusal, and the crate's rule is that a new
+/// dependency needs a reason bigger than twenty lines.
+fn distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, lc) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, rc) in right.iter().enumerate() {
+            let substitute = previous[j] + usize::from(lc != *rc);
+            current[j + 1] = substitute.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
 
 /// `/me`
 pub const DESC_ME: &str = "Send the text as an action, the way \"* Ana waves\" reads.";
@@ -74,13 +142,12 @@ pub const UNKNOWN_NO_NEAR: &str =
     "keeper has no command by that name here, and nothing in the list is close to it. Nothing \
      was sent. Type /help for the list.";
 
-/// A one-line `/` draft over
-/// [`MAX_COMMAND_CHARS`](crate::bots::commands::MAX_COMMAND_CHARS) bytes (rule 5).
+/// A one-line `/` draft over [`MAX_COMMAND_CHARS`] bytes (rule 5).
 pub const TOO_LONG: &str = "That line is too long for a command, so nothing was sent. Shorten it, \
      or start it with // to send it as a message.";
 
-/// How far a typo may be from a name and still be named (the bot composer's
-/// bound: `histroy → history`, not `hello → help`).
+/// How far a typo may be from a name and still be named (`histroy → history`,
+/// not `hello → help`).
 const NEAREST_MAX_DISTANCE: usize = 3;
 
 /// Which room a composer is in, as far as commands care.

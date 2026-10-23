@@ -28,9 +28,8 @@
  * stores; it reads the tier at dispatch and opens the right one.
  */
 
-import { toggleBotMessageDetails } from "@/components/agents/agent-message-meta";
-import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import { transcribeAFile } from "@/components/transcription/transcribe-a-file";
+import { toggleVoiceListening } from "@/components/voice/listening-toggle";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
 import { isPhoneTier } from "@/hooks/use-shell-layout";
@@ -188,18 +187,11 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     primaryViewStore.getState().setView("tasks");
   },
 
-  // --- Bots (Epic 61, FR-384) --- registry-gated on the `bots` capability in
-  // Rust, which is its own flag rather than the one Notes, Sessions and Tasks
-  // share (see `BOTS_CATEGORY`). One verb, and it is the metadata toggle rather
-  // than the view: ⌘9 and the sidebar row already open the pane, and what had
-  // no second surface was the switch. Routed through the SAME function the
-  // pane's own chip calls, so the two provably do one thing (UX-DR42).
-  "bots-toggle-metadata": () => toggleBotMessageDetails(),
-  // Listening for the wake phrase (Epic 68, AD-218): the same verb the pane
-  // headers on both tiers call, and the same Rust command the tray calls.
+  // --- Voice (Epic 68, AD-218) --- listening for the wake phrase: the same
+  // verb Settings › Voice calls, and the same Rust command the tray calls.
   // Registry-gated in Rust on the voice port's answer, so it only reaches
   // this dispatch where something can listen (AD-27).
-  "bots-toggle-listening": () => toggleVoiceListening(),
+  "voice-toggle-listening": () => toggleVoiceListening(),
 
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),

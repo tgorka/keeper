@@ -8,8 +8,4 @@ key: string, kind: string, name: string, baseUrl: string,
 /**
  * `account` or `own`.
  */
-credential: string, 
-/**
- * Bot names, in pin order.
- */
-bots: Array<string>, devices: Array<string>, };
+credential: string, devices: Array<string>, };

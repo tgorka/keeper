@@ -365,13 +365,10 @@ mod tests {
     fn an_old_speak_to_room_is_cleared_once_with_a_notice() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = FakePlatform::default();
-        registry::set_bots_voice_target(dir.path(), Some("agent:!dm:example.org"))
+        registry::set_voice_target(dir.path(), Some("agent:!dm:example.org"))
             .expect("an old choice");
         assert!(run(&platform, dir.path()).voice_target);
-        assert_eq!(
-            registry::get_bots_voice_target(dir.path()).expect("read"),
-            None
-        );
+        assert_eq!(registry::get_voice_target(dir.path()).expect("read"), None);
         assert_eq!(
             registry::get_voice_old_target_notice(dir.path()).expect("read"),
             Some(crate::hq::spoken::OLD_ROOM_TARGET_NOTICE.to_owned())
@@ -383,10 +380,10 @@ mod tests {
         );
 
         for kept in ["agent:nixie", "01JBOT"] {
-            registry::set_bots_voice_target(dir.path(), Some(kept)).expect("a choice");
+            registry::set_voice_target(dir.path(), Some(kept)).expect("a choice");
             assert!(!run(&platform, dir.path()).voice_target, "{kept}");
             assert_eq!(
-                registry::get_bots_voice_target(dir.path())
+                registry::get_voice_target(dir.path())
                     .expect("read")
                     .as_deref(),
                 Some(kept)

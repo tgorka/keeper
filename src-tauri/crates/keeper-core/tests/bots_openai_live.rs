@@ -38,16 +38,13 @@ use keeper_core::bots::tools::{
     ToolName, ToolOutcome,
 };
 use keeper_core::bots::{
-    discover, http, parse_base_url, voice_target, Bot, BotHealthState, Endpoint, ProviderKind,
+    discover, http, parse_base_url, Endpoint, ProviderHealthState, ProviderKind,
 };
-use keeper_core::vm::{BotPresence, BotReach};
+use keeper_core::vm::ProviderReach;
 
 /// The file the model must read, and the phrase its answer must quote.
 const SMOKE_PATH: &str = "notes/keeper-smoke.md";
 const SMOKE_PHRASE: &str = "QUARTZ-HERON-4417";
-
-/// A model id no endpoint lists.
-const ABSENT_MODEL: &str = "keeper-no-such-model";
 
 /// A key the endpoint must refuse. Shaped like nothing real.
 const WRONG_TOKEN: &str = "keeper-smoke-wrong-key-0000";
@@ -244,10 +241,10 @@ async fn an_openai_endpoint_lists_answers_and_runs_keepers_tools() {
         "health: reach={:?} status={:?} reason={:?}",
         health.reach, health.status, health.reason
     ));
-    assert_eq!(health.reach, BotReach::Online);
+    assert_eq!(health.reach, ProviderReach::Online);
     assert_eq!(
         discover::health_state(&health),
-        BotHealthState::Reachable,
+        ProviderHealthState::Reachable,
         "{:?}",
         health.reason
     );
@@ -265,19 +262,13 @@ async fn an_openai_endpoint_lists_answers_and_runs_keepers_tools() {
     );
     let model = match std::env::var("KEEPER_OPENAI_SMOKE_MODEL") {
         Ok(model) if !model.trim().is_empty() => model.trim().to_owned(),
-        _ => {
-            let bot = Bot {
-                id: "smoke".to_owned(),
-                provider_id: "smoke".to_owned(),
-                target: "smoke".to_owned(),
-                name: "Smoke".to_owned(),
-                pin_order: 0,
-                identity: Default::default(),
-                created_ms: 0,
-            };
-            voice_target::model_for(&bot, ProviderKind::OpenAi, &[], &models)
-                .expect("the endpoint lists a model keeper would chat with")
-        }
+        // The first listed model that can chat: one whose name does not say
+        // `embed`.
+        _ => models
+            .iter()
+            .find(|m| !m.id.to_ascii_lowercase().contains("embed"))
+            .map(|m| m.id.clone())
+            .expect("the endpoint lists a model keeper would chat with"),
     };
     assert!(
         models.iter().any(|m| m.id == model),
@@ -287,27 +278,6 @@ async fn an_openai_endpoint_lists_answers_and_runs_keepers_tools() {
     say.say(format!(
         "models: {} listed; chatting with {model}",
         models.len()
-    ));
-
-    // Presence is membership in the list.
-    let present = discover::probe_bot(&client, &endpoint(Some(&model), &token), &model).await;
-    assert_eq!(
-        present.presence,
-        Some(BotPresence::Exists),
-        "{:?}",
-        present.reason
-    );
-    let absent =
-        discover::probe_bot(&client, &endpoint(Some(ABSENT_MODEL), &token), ABSENT_MODEL).await;
-    assert_eq!(
-        absent.presence,
-        Some(BotPresence::Absent),
-        "{:?}",
-        absent.reason
-    );
-    say.say(format!(
-        "probe: {model} exists; {ABSENT_MODEL} absent ({:?})",
-        absent.reason
     ));
 
     // A tool call survives the conversion, and the answer quotes the file.
@@ -469,7 +439,7 @@ async fn an_openai_endpoint_lists_answers_and_runs_keepers_tools() {
     ));
     assert_eq!(
         discover::health_state(&refused),
-        BotHealthState::Unauthorized
+        ProviderHealthState::Unauthorized
     );
     let status = refused.status.unwrap_or_default();
     assert_eq!(

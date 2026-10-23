@@ -906,7 +906,7 @@ pub(crate) fn drop_spoken_answer() {
 
 /// Send what the voice turn heard as `question` to `agent`'s main
 /// conversation (AD-384, 108.2) and speak the answer as it grows. Called by
-/// `bots_ipc::send_spoken` for an agent target. Only the text leaves the
+/// `voice_ipc::send_spoken` once *Speak to* resolves to an agent. Only the text leaves the
 /// device, as the person's own message row; where it goes and what of the
 /// answer is heard when are `keeper_core::hq::spoken`'s. The voice turn
 /// hears the send leave (`note_sent`, with the agent's name), the first

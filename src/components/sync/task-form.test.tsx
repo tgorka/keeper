@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { clearMocks } from "@tauri-apps/api/mocks";
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installMockShell } from "../../../dev/mock-shell";
 
@@ -34,9 +34,6 @@ vi.mock("@/lib/ipc/client", () => ({
   // it undefined would be exercising the effect's `catch` in every test that
   // touches the field.
   syncTaskSchedulePreview: vi.fn(),
-  botsBotsList: vi.fn(),
-  botsModelsList: vi.fn(),
-  syncBrowse: vi.fn(),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
@@ -91,22 +88,8 @@ import {
   taskFormUnlistedProfileText,
 } from "@/components/sync/task-form";
 import type * as IpcClient from "@/lib/ipc/client";
-import type {
-  BotVm,
-  FilesEntryVm,
-  FilesListingVm,
-  SyncProfileVm,
-  TaskSchedulePreviewVm,
-  TaskVm,
-} from "@/lib/ipc/client";
-import {
-  botsBotsList,
-  botsModelsList,
-  syncBrowse,
-  syncProfiles,
-  syncTaskSave,
-  syncTaskSchedulePreview,
-} from "@/lib/ipc/client";
+import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
+import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { TASK_KINDS } from "@/lib/stores/sync";
 
@@ -137,9 +120,6 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     updatedMs: NOW - 60_000,
     onMissed: "run_now",
     missedDelayMs: null,
-    botId: null,
-    promptSubpath: null,
-    model: null,
     copySource: null,
     copyDestination: null,
     copySourceFacts: null,
@@ -207,9 +187,7 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
 }
 
 beforeEach(() => {
-  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, botTools: true });
-  vi.mocked(botsBotsList).mockResolvedValue([]);
-  vi.mocked(botsModelsList).mockResolvedValue([]);
+  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
   mockProfiles.mockResolvedValue([]);
   // Echoing and empty by default: the echo keeps the staleness guard satisfied
   // for every test that is not about staleness, and no instants means no preview
@@ -232,55 +210,6 @@ async function useDevSave() {
   const client = await vi.importActual<typeof IpcClient>("@/lib/ipc/client");
   mockSave.mockImplementation(client.syncTaskSave);
 }
-
-function promptEntry(
-  name: string,
-  relativePath: string,
-  kind: FilesEntryVm["kind"] = "file",
-): FilesEntryVm {
-  return {
-    name,
-    relativePath,
-    kind,
-    absolutePath: `/held/${relativePath}`,
-    sync: { status: "synced", detail: null },
-    size: null,
-    lfsOid: null,
-    mtimeMs: null,
-    release: null,
-    folderRole: null,
-    transcribable: false,
-    transcript: null,
-    virtualChildren: 0,
-    virtualBytes: 0,
-    write: { writable: true, reason: null, caveat: null, caveatShort: null },
-  };
-}
-
-function promptListing(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
-  return {
-    profileId: "01FOLDER",
-    subpath,
-    entries,
-    state: "listed",
-    detail: null,
-    truncated: false,
-    stale: false,
-    write: { writable: true, reason: null, caveat: null, caveatShort: null },
-  };
-}
-
-const BOT: BotVm = {
-  id: "bot-one",
-  providerId: "provider-one",
-  target: "assistant",
-  name: "Field assistant",
-  pinOrder: 0,
-  shape: null,
-  colour: null,
-  mark: null,
-  createdMs: NOW,
-};
 
 describe("TaskForm creation and new kinds", () => {
   it("accepts an untouched add form through the refusing dev shell", async () => {
@@ -316,147 +245,6 @@ describe("TaskForm creation and new kinds", () => {
     ).toBeTruthy();
     expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
     expect(saved).not.toHaveBeenCalled();
-  });
-
-  it("omits bot kind and fields when this build cannot reach the drive", async () => {
-    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
-    render(
-      <TaskForm
-        task={taskVm({
-          kind: "bot",
-          botId: BOT.id,
-          model: "model-one",
-          promptSubpath: "prompt.md",
-        })}
-      />,
-    );
-    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
-    expect(screen.queryByRole("option", { name: "bot" })).toBeNull();
-    expect(screen.queryByLabelText("Bot")).toBeNull();
-    expect(screen.queryByLabelText("Model")).toBeNull();
-    expect(screen.queryByRole("region", { name: "Prompt file" })).toBeNull();
-    expect(botsBotsList).not.toHaveBeenCalled();
-    expect(botsModelsList).not.toHaveBeenCalled();
-    expect(syncBrowse).not.toHaveBeenCalled();
-  });
-
-  it("browses returned folder paths and saves the chosen prompt, bot and model", async () => {
-    await useDevSave();
-    mockProfiles.mockResolvedValue([profileVm()]);
-    vi.mocked(botsBotsList).mockResolvedValue([BOT]);
-    vi.mocked(botsModelsList).mockResolvedValue([
-      {
-        id: "model-one",
-        family: null,
-        parameterSize: null,
-        quantization: null,
-        sizeBytes: null,
-        contextWindow: null,
-        maxOutputTokens: null,
-        vision: null,
-        tools: null,
-        reasoning: null,
-        embedding: null,
-        capabilities: [],
-      },
-    ]);
-    vi.mocked(syncBrowse).mockImplementation(async (_id, subpath) =>
-      subpath === ""
-        ? promptListing("", [
-            promptEntry("Prompts", "rust-returned-folder", "folder"),
-            promptEntry("ignore.txt", "ignore.txt"),
-          ])
-        : promptListing(subpath, [
-            promptEntry("Review.md", "rust-returned-folder/exact prompt.md"),
-          ]),
-    );
-    const saved = vi.fn();
-    render(<TaskForm onSaved={saved} />);
-    fireEvent.change(screen.getByLabelText("Kind"), { target: { value: "bot" } });
-    fireEvent.change(screen.getByLabelText("Bot"), {
-      target: {
-        value: (await screen.findByRole("option", { name: BOT.name })).getAttribute("value"),
-      },
-    });
-    await screen.findByRole("option", { name: "model-one" });
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "model-one" } });
-    await screen.findByRole("option", { name: "field notes" });
-    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "01FOLDER" } });
-    fireEvent.click(await screen.findByRole("button", { name: "Open folder: Prompts" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Review.md" }));
-    expect(screen.queryByRole("button", { name: "ignore.txt" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
-    await waitFor(() =>
-      expect(saved).toHaveBeenCalledWith(
-        expect.objectContaining({
-          kind: "bot",
-          botId: BOT.id,
-          model: "model-one",
-          profileId: "01FOLDER",
-          promptSubpath: "rust-returned-folder/exact prompt.md",
-        }),
-      ),
-    );
-  });
-
-  it("keeps stored bot/model choices while reads fail and distinguishes an unavailable folder from an empty one", async () => {
-    const stored = taskVm({
-      kind: "bot",
-      botId: BOT.id,
-      model: "stored-model",
-      profileId: "01FOLDER",
-      promptSubpath: "kept.md",
-    });
-    vi.mocked(botsBotsList).mockResolvedValue([BOT]);
-    vi.mocked(botsModelsList).mockRejectedValue({ message: "Model endpoint is offline" });
-    vi.mocked(syncBrowse).mockResolvedValue({
-      ...promptListing("", []),
-      state: "missing",
-      entries: null,
-      detail: "This folder is not mounted",
-    });
-    mockSave.mockResolvedValue(stored);
-    render(<TaskForm task={stored} />);
-    expect(screen.getByText("Reading bots…")).toBeInTheDocument();
-    expect(screen.getByLabelText("Bot")).toHaveValue(BOT.id);
-    expect(screen.getByLabelText("Model")).toHaveValue("stored-model");
-    await screen.findByText("Model endpoint is offline");
-    await screen.findByText("This folder is not mounted");
-    expect(screen.queryByText("No folders or .md files here.")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
-    await waitFor(() =>
-      expect(mockSave).toHaveBeenCalledWith(
-        expect.objectContaining({
-          botId: BOT.id,
-          model: "stored-model",
-          promptSubpath: "kept.md",
-        }),
-      ),
-    );
-  });
-
-  it("discards a late prompt listing after the chosen profile changes", async () => {
-    let finishOld: (listing: FilesListingVm) => void = () => {};
-    vi.mocked(syncBrowse)
-      .mockReturnValueOnce(
-        new Promise((resolve) => {
-          finishOld = resolve;
-        }),
-      )
-      .mockResolvedValue(promptListing("", []));
-    mockProfiles.mockResolvedValue([
-      profileVm(),
-      profileVm({ id: "second", name: "Other folder" }),
-    ]);
-    render(
-      <TaskForm task={taskVm({ kind: "bot", profileId: "01FOLDER", promptSubpath: "old.md" })} />,
-    );
-    await screen.findByRole("option", { name: "Other folder" });
-    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "second" } });
-    await screen.findByText("No folders or .md files here.");
-    await act(async () => finishOld(promptListing("", [promptEntry("wrong.md", "wrong.md")])));
-    await waitFor(() => expect(screen.getByText("No prompt chosen")).toBeInTheDocument());
-    expect(screen.queryByRole("button", { name: "wrong.md" })).toBeNull();
   });
 
   it("lets the backend refuse missing copy paths, then saves native paths", async () => {
@@ -602,9 +390,6 @@ describe("TaskForm, adding a task", () => {
         baselineUpdatedMs: null,
         // The other kinds' keys, absent on a sync row. Each is the one key of
         // its kind, so nothing can enumerate a second target per row (AD-139).
-        botId: null,
-        promptSubpath: null,
-        model: null,
         copySource: null,
         copyDestination: null,
         replaceExisting: false,

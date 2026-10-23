@@ -128,7 +128,7 @@ const NOTE_EMPTY_SLOT: &str = "\u{2014}";
 const VOICE_STATUS_ID: &str = "tray-voice-status";
 const VOICE_TALK_ID: &str = "tray-voice-talk";
 /// The listening switch (Epic 68, AD-218): one item that flips
-/// `bots.wake_enabled` through `voice_ipc::voice_wake_toggle` — the same
+/// `voice.wake_enabled` through `voice_ipc::voice_wake_toggle` — the same
 /// command the palette, the native menu and the pane headers call — and
 /// whose label names the state ("Listening on · hey nixie"). Built with
 /// the two above, so it is absent exactly where they are.
@@ -669,15 +669,15 @@ fn build_voice_items(app: &AppHandle) -> Option<VoiceItems> {
 }
 
 /// The listening item's words from the stored choice (Epic 68, AD-218):
-/// `bots.wake_enabled` and the phrase as typed, read from the registry —
+/// `voice.wake_enabled` and the phrase as typed, read from the registry —
 /// the choice, not the turn's arm, for `tray_listening_label`'s reason.
 /// `None` when the registry could not be read (no data dir yet, a failed
 /// open); the caller keeps the previous words.
 fn listening_label(app: &AppHandle) -> Option<String> {
     let state = app.try_state::<crate::ipc::AppState>()?;
     let data_dir = state.platform.data_dir().ok()?;
-    let enabled = keeper_core::registry::get_bots_wake_enabled(&data_dir).ok()?;
-    let phrase = keeper_core::registry::get_bots_wake_phrase(&data_dir).ok()?;
+    let enabled = keeper_core::registry::get_voice_wake_enabled(&data_dir).ok()?;
+    let phrase = keeper_core::registry::get_voice_wake_phrase(&data_dir).ok()?;
     Some(keeper_core::voice_reach::tray_listening_label(
         enabled, &phrase,
     ))

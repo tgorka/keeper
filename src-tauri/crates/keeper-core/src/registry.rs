@@ -181,7 +181,159 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
     ensure_hue_index_column(&conn)?;
     ensure_provider_column(&conn)?;
     ensure_incognito_column(&conn)?;
+    retire_bots(&conn)?;
     Ok(conn)
+}
+
+/// The `settings` row that records [`retire_bots`] ran on this install.
+const BOTS_RETIRED_KEY: &str = "upgrade.bots_retired";
+
+/// The `keeper.db` tables the ⌘9 bots surface kept, children before parents
+/// so no foreign key blocks a drop. `bot_providers` is not among them: notes
+/// search keeps its embedding provider there ([`crate::providers::store`]).
+const RETIRED_BOT_TABLES: [&str; 6] = [
+    "bot_grants",
+    "bot_audit",
+    "bot_messages",
+    "bot_dismissed_remote_sessions",
+    "bot_sessions",
+    "bots",
+];
+
+/// The voice settings that lived under the bots surface's keys, and the keys
+/// they live under now (AD-179: voice is not a bot feature).
+pub const RETIRED_VOICE_KEYS: [(&str, &str); 5] = [
+    ("bots.wake_enabled", VOICE_WAKE_ENABLED_KEY),
+    ("bots.wake_phrase", VOICE_WAKE_PHRASE_KEY),
+    ("bots.voice_locale", VOICE_LOCALE_KEY),
+    ("bots.stop_phrase", VOICE_STOP_PHRASE_KEY),
+    ("bots.voice_target", VOICE_TARGET_KEY),
+];
+
+/// The setting the bots surface kept that nothing reads any more: an agent's
+/// answer details are `agents.show_details`.
+pub const RETIRED_BOT_SETTING: &str = "bots.message_details";
+
+/// Whether `key` is one Story 108.3a retired: a `bots.*` voice key or
+/// [`RETIRED_BOT_SETTING`].
+pub fn is_retired_bot_key(key: &str) -> bool {
+    key == RETIRED_BOT_SETTING || RETIRED_VOICE_KEYS.iter().any(|(old, _)| *old == key)
+}
+
+/// Settings an older build wrote, read under the keys voice has now (Story
+/// 108.3a): each `bots.*` voice key becomes its `voice.*` key unless the same
+/// source already holds that one, `bots.voice_target` only when it names an
+/// agent room, and `bots.message_details` is dropped — the moves
+/// [`retire_bots`] makes in `keeper.db` once, for every other place a value
+/// can live: a `keeper.toml` layer, a synced settings file and its base.
+/// `text` reads an entry's value as a string, where it is one.
+///
+/// What the renamed key is then allowed to do is the new key's rule: a layer
+/// still may not arm the microphone, because `voice.wake_enabled` is refused
+/// from files exactly as `bots.wake_enabled` was.
+pub fn retire_bot_keys<V>(
+    entries: Vec<(String, V)>,
+    text: impl Fn(&V) -> Option<&str>,
+) -> Vec<(String, V)> {
+    let present: std::collections::BTreeSet<String> =
+        entries.iter().map(|(key, _)| key.clone()).collect();
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if key == RETIRED_BOT_SETTING {
+                return None;
+            }
+            let Some(new) = RETIRED_VOICE_KEYS
+                .iter()
+                .find(|(old, _)| *old == key)
+                .map(|(_, new)| *new)
+            else {
+                return Some((key, value));
+            };
+            if present.contains(new) {
+                return None;
+            }
+            // Only a choice of an agent moves — or one of the agents' old
+            // Matrix rooms, which `clear_old_voice_target` then clears with
+            // its notice (108.2); a pinned bot's id names nothing now.
+            if new == VOICE_TARGET_KEY
+                && !text(&value).is_some_and(|value| {
+                    value
+                        .trim()
+                        .starts_with(crate::hq::spoken::AGENT_TARGET_PREFIX)
+                })
+            {
+                return None;
+            }
+            Some((new.to_owned(), value))
+        })
+        .collect()
+}
+
+/// Take what the ⌘9 bots surface left in `keeper.db` out, once (Story 108.3a,
+/// FR-866): its tables are dropped — `bot_providers` stays — and the voice
+/// settings move from the `bots.*` keys to `voice.*`.
+///
+/// A value already under the new key wins over the old one. `bots.voice_target`
+/// moves only when it names an agent room: a pinned bot's id names nothing
+/// once the bots are gone, and *Speak to* reads it as unset.
+///
+/// Once, not on every open: the agent runtime still in keeper until Story
+/// 108.3c may create some of these tables again while it runs, and dropping
+/// them under it on the next open would be data loss rather than an upgrade.
+/// The marker is written in the same transaction as the drops.
+fn retire_bots(conn: &Connection) -> Result<(), CoreError> {
+    let err = |what: &str, e: rusqlite::Error| {
+        CoreError::Internal(format!("could not retire the bots' {what}: {e}"))
+    };
+    let done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+            rusqlite::params![BOTS_RETIRED_KEY],
+            |r| r.get(0),
+        )
+        .map_err(|e| err("marker", e))?;
+    if done {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| err("transaction", e))?;
+    for table in RETIRED_BOT_TABLES {
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))
+            .map_err(|e| err("tables", e))?;
+    }
+    for (old, new) in RETIRED_VOICE_KEYS {
+        let agent_only = if old == "bots.voice_target" {
+            " AND value LIKE 'agent:%'"
+        } else {
+            ""
+        };
+        tx.execute(
+            &format!(
+                "INSERT INTO settings(key, value) SELECT ?2, value FROM settings \
+                 WHERE key = ?1{agent_only} ON CONFLICT(key) DO NOTHING"
+            ),
+            rusqlite::params![old, new],
+        )
+        .map_err(|e| err("voice settings", e))?;
+        tx.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            rusqlite::params![old],
+        )
+        .map_err(|e| err("voice settings", e))?;
+    }
+    tx.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        rusqlite::params![RETIRED_BOT_SETTING],
+    )
+    .map_err(|e| err("settings", e))?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, '1')",
+        rusqlite::params![BOTS_RETIRED_KEY],
+    )
+    .map_err(|e| err("marker", e))?;
+    tx.commit().map_err(|e| err("transaction", e))
 }
 
 /// Read a single settings value by key, or `None` when unset.
@@ -964,47 +1116,16 @@ pub fn set_sessions_spaces_folded(data_dir: &Path, folded: bool) -> Result<(), C
     )
 }
 
-/// The `settings` key holding whether a bot answer shows its metadata caption
-/// (Story 61.8, FR-384). Stored as `"1"`/`"0"`; absent = off.
-const BOTS_MESSAGE_DETAILS_KEY: &str = "bots.message_details";
-
-/// Read whether an answer's metadata caption is shown (Story 61.8, FR-384).
-/// Absent / anything-but-`"1"` ⇒ `false`.
-///
-/// **Off is the default, and that is a decision rather than an accident.** The
-/// numbers are recorded on every row whatever this says — an endpoint's token
-/// counts and the measured time to the first token are written by the stream
-/// driver, not by the view — so switching the caption on later still explains
-/// answers that arrived before anybody asked. What defaults off is the
-/// *showing*: a conversation is read for what the model said, and a row that
-/// leads with a request id is a debugger, not a reply.
-pub fn get_bots_message_details(data_dir: &Path) -> Result<bool, CoreError> {
-    Ok(get_setting(data_dir, BOTS_MESSAGE_DETAILS_KEY)?.as_deref() == Some("1"))
-}
-
-/// Write whether an answer's metadata caption is shown (Story 61.8, FR-384).
-/// Persists `"1"`/`"0"` into the `settings` k/v table under
-/// `bots.message_details` — the same literal the key is registered with
-/// (`Shape::Flag01` in [`crate::config::keys`]), so a `keeper.toml` that sets
-/// the key and a toggle in the pane cannot mean opposite things.
-pub fn set_bots_message_details(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
-    set_setting(
-        data_dir,
-        BOTS_MESSAGE_DETAILS_KEY,
-        if shown { "1" } else { "0" },
-    )
-}
-
 /// The `settings` key holding whether the wake phrase is armed (Story 62.5,
 /// FR-405). Stored as `"1"`/`"0"`; absent = off — listening is chosen, never
 /// found on.
-const BOTS_WAKE_ENABLED_KEY: &str = "bots.wake_enabled";
+const VOICE_WAKE_ENABLED_KEY: &str = "voice.wake_enabled";
 
 /// The `settings` key holding the wake phrase as typed (Story 62.5, FR-404).
 /// Absent or blank = [`crate::voice::DEFAULT_WAKE_PHRASE`]. Stored raw, not
 /// normalised: the text box shows back what the person typed, and
 /// `WakePhrase::parse` decides matching form every time it is armed.
-const BOTS_WAKE_PHRASE_KEY: &str = "bots.wake_phrase";
+const VOICE_WAKE_PHRASE_KEY: &str = "voice.wake_phrase";
 
 /// Read whether the wake phrase is armed (Story 62.5, FR-405). Absent /
 /// anything-but-`"1"` ⇒ `false`.
@@ -1012,17 +1133,17 @@ const BOTS_WAKE_PHRASE_KEY: &str = "bots.wake_phrase";
 /// Off is the whole point: an open microphone is a deliberate act, and a
 /// fresh install that listened would be the silent always-on listener the
 /// epic refuses. The switch, not the phrase, is what a person chooses.
-pub fn get_bots_wake_enabled(data_dir: &Path) -> Result<bool, CoreError> {
-    Ok(get_setting(data_dir, BOTS_WAKE_ENABLED_KEY)?.as_deref() == Some("1"))
+pub fn get_voice_wake_enabled(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, VOICE_WAKE_ENABLED_KEY)?.as_deref() == Some("1"))
 }
 
 /// Write whether the wake phrase is armed (Story 62.5, FR-405). Persists
-/// `"1"`/`"0"` under `bots.wake_enabled` — the literal the key is registered
+/// `"1"`/`"0"` under `voice.wake_enabled` — the literal the key is registered
 /// with (`Shape::Flag01` in [`crate::config::keys`]).
-pub fn set_bots_wake_enabled(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+pub fn set_voice_wake_enabled(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
     set_setting(
         data_dir,
-        BOTS_WAKE_ENABLED_KEY,
+        VOICE_WAKE_ENABLED_KEY,
         if enabled { "1" } else { "0" },
     )
 }
@@ -1030,17 +1151,17 @@ pub fn set_bots_wake_enabled(data_dir: &Path, enabled: bool) -> Result<(), CoreE
 /// Read the wake phrase as typed (Story 62.5, FR-404). Absent or blank ⇒
 /// [`crate::voice::DEFAULT_WAKE_PHRASE`], so the box is never empty and the
 /// switch has something to arm on a fresh install.
-pub fn get_bots_wake_phrase(data_dir: &Path) -> Result<String, CoreError> {
-    Ok(get_setting(data_dir, BOTS_WAKE_PHRASE_KEY)?
+pub fn get_voice_wake_phrase(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, VOICE_WAKE_PHRASE_KEY)?
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::voice::DEFAULT_WAKE_PHRASE.to_owned()))
 }
 
 /// Write the wake phrase as typed (Story 62.5, FR-404). Stored verbatim under
-/// `bots.wake_phrase`; validation is `WakePhrase::parse`'s, run by the caller
+/// `voice.wake_phrase`; validation is `WakePhrase::parse`'s, run by the caller
 /// before this is reached, so the table never holds a phrase that was refused.
-pub fn set_bots_wake_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreError> {
-    set_setting(data_dir, BOTS_WAKE_PHRASE_KEY, phrase)
+pub fn set_voice_wake_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, VOICE_WAKE_PHRASE_KEY, phrase)
 }
 
 /// The `settings` key holding the recogniser's language (Epic 63). Absent or
@@ -1048,51 +1169,50 @@ pub fn set_bots_wake_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreErr
 /// system locale when it can run on the device and the first that can
 /// otherwise. Stored as typed (`pl-PL` or `pl_PL`); the comparison that
 /// matters normalises, so the table never needs to.
-const BOTS_VOICE_LOCALE_KEY: &str = "bots.voice_locale";
+const VOICE_LOCALE_KEY: &str = "voice.locale";
 
 /// Read the chosen recogniser language (Epic 63). Absent or blank ⇒ `None`,
 /// "choose for me".
-pub fn get_bots_voice_locale(data_dir: &Path) -> Result<Option<String>, CoreError> {
-    Ok(get_setting(data_dir, BOTS_VOICE_LOCALE_KEY)?
+pub fn get_voice_locale(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, VOICE_LOCALE_KEY)?
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty()))
 }
 
 /// Write the chosen recogniser language (Epic 63): `None` clears the choice
-/// back to "choose for me". Stored trimmed under `bots.voice_locale`; whether
+/// back to "choose for me". Stored trimmed under `voice.locale`; whether
 /// the locale can run here is `keeper_core::voice::locale::choose`'s answer,
 /// given to the caller before this is reached, and a locale that cannot is
 /// still stored — the person's choice is recorded and refused, not silently
 /// replaced.
-pub fn set_bots_voice_locale(data_dir: &Path, locale: Option<&str>) -> Result<(), CoreError> {
+pub fn set_voice_locale(data_dir: &Path, locale: Option<&str>) -> Result<(), CoreError> {
     set_setting(
         data_dir,
-        BOTS_VOICE_LOCALE_KEY,
+        VOICE_LOCALE_KEY,
         locale.map(str::trim).unwrap_or_default(),
     )
 }
 
 /// The `settings` key holding where a spoken turn goes (Epic 67,
-/// Story 67.1, AD-206; AD-384): a bot id, `agent:<room id>` for one of the
-/// person's proxy conversations, or absent/blank for "the pinned bot most
-/// recently talked to". What happens with each, and when there is nothing
-/// to talk to, is `keeper_core::bots::voice_target::resolve`'s answer.
-const BOTS_VOICE_TARGET_KEY: &str = "bots.voice_target";
+/// Story 67.1, AD-206; AD-384; 108.2): `agent:<agent>` for one of the
+/// person's agents, or absent/blank for nothing chosen. What happens
+/// with each is `keeper_core::voice::target::resolve`'s answer.
+const VOICE_TARGET_KEY: &str = "voice.target";
 
-/// Read the chosen voice target (AD-206). Absent or blank ⇒ `None`, "the
-/// pinned bot most recently talked to".
-pub fn get_bots_voice_target(data_dir: &Path) -> Result<Option<String>, CoreError> {
-    Ok(get_setting(data_dir, BOTS_VOICE_TARGET_KEY)?
+/// Read the chosen voice target (AD-206). Absent or blank ⇒ `None`, nothing
+/// chosen.
+pub fn get_voice_target(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, VOICE_TARGET_KEY)?
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty()))
 }
 
-/// Write the chosen voice target (AD-206): `None` clears the choice back to
-/// "most recently talked to". Stored trimmed under `bots.voice_target`.
-pub fn set_bots_voice_target(data_dir: &Path, target: Option<&str>) -> Result<(), CoreError> {
+/// Write the chosen voice target (AD-206): `None` clears the choice. Stored
+/// trimmed under `voice.target`.
+pub fn set_voice_target(data_dir: &Path, target: Option<&str>) -> Result<(), CoreError> {
     set_setting(
         data_dir,
-        BOTS_VOICE_TARGET_KEY,
+        VOICE_TARGET_KEY,
         target.map(str::trim).unwrap_or_default(),
     )
 }
@@ -1166,19 +1286,19 @@ pub fn remove_agents_claims_lease(data_dir: &Path) -> Result<bool, CoreError> {
 /// UX-DR-E108-1): `1` until the person dismisses it.
 const UI_VOICE_OLD_TARGET_NOTICE_KEY: &str = "ui.voice_old_target_notice";
 
-/// When `bots.voice_target` as this device's table holds it names one of
+/// When `voice.target` as this device's table holds it names one of
 /// the agents' old Matrix rooms (`agent:!room…`), clear it and latch the
 /// notice; whether it did. A value a settings file sets is the file's, and
 /// is only ever read as no choice.
 pub fn clear_old_voice_target(data_dir: &Path) -> Result<bool, CoreError> {
-    let stored = stored_settings(data_dir, &[BOTS_VOICE_TARGET_KEY])?.remove(BOTS_VOICE_TARGET_KEY);
+    let stored = stored_settings(data_dir, &[VOICE_TARGET_KEY])?.remove(VOICE_TARGET_KEY);
     if !stored
         .as_deref()
         .is_some_and(crate::hq::spoken::is_old_room_target)
     {
         return Ok(false);
     }
-    delete_setting(data_dir, BOTS_VOICE_TARGET_KEY)?;
+    delete_setting(data_dir, VOICE_TARGET_KEY)?;
     set_setting(data_dir, UI_VOICE_OLD_TARGET_NOTICE_KEY, "1")?;
     Ok(true)
 }
@@ -1201,22 +1321,22 @@ pub fn dismiss_voice_old_target_notice(data_dir: &Path) -> Result<(), CoreError>
 /// AD-208) — the word that ends a spoken answer. Absent or blank =
 /// [`crate::voice::DEFAULT_STOP_PHRASE`]. Stored raw, like the wake phrase:
 /// `WakePhrase::parse_stop` decides matching form every time it is set.
-const BOTS_STOP_PHRASE_KEY: &str = "bots.stop_phrase";
+const VOICE_STOP_PHRASE_KEY: &str = "voice.stop_phrase";
 
 /// Read the stop phrase as typed (AD-208). Absent or blank ⇒
 /// [`crate::voice::DEFAULT_STOP_PHRASE`], so an answer can always be
 /// stopped by a word.
-pub fn get_bots_stop_phrase(data_dir: &Path) -> Result<String, CoreError> {
-    Ok(get_setting(data_dir, BOTS_STOP_PHRASE_KEY)?
+pub fn get_voice_stop_phrase(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, VOICE_STOP_PHRASE_KEY)?
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::voice::DEFAULT_STOP_PHRASE.to_owned()))
 }
 
 /// Write the stop phrase as typed (AD-208). Stored verbatim under
-/// `bots.stop_phrase`; validation is `WakePhrase::parse_stop`'s, run by the
+/// `voice.stop_phrase`; validation is `WakePhrase::parse_stop`'s, run by the
 /// caller before this is reached.
-pub fn set_bots_stop_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreError> {
-    set_setting(data_dir, BOTS_STOP_PHRASE_KEY, phrase)
+pub fn set_voice_stop_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, VOICE_STOP_PHRASE_KEY, phrase)
 }
 
 /// The `settings` key holding the push gateway the person runs (Epic 98,
@@ -2276,7 +2396,7 @@ fn sync_credential_source_key(profile_id: &str) -> String {
     format!("{SYNC_CREDENTIAL_SOURCE_PREFIX}{profile_id}")
 }
 
-/// `bots.provider_credential_source.<provider_id>`: where a bot provider's
+/// `bots.provider_credential_source.<provider_id>`: where a provider's
 /// bearer token comes from (Epic 82, AD-315).
 fn bots_provider_credential_source_key(provider_id: &str) -> String {
     format!("{BOTS_CREDENTIAL_SOURCE_PREFIX}{provider_id}")
@@ -2344,7 +2464,7 @@ pub fn set_sync_credential_source(
     }
 }
 
-/// Whether bot provider `provider_id` sends the configured account's access
+/// Whether provider `provider_id` sends the configured account's access
 /// token (`Some("account")`) or its own keychain item (`None`), by the same
 /// rule as [`get_sync_credential_source`].
 pub fn get_bots_provider_credential_source(
@@ -2361,7 +2481,7 @@ pub fn get_bots_provider_credential_source(
     ))
 }
 
-/// Opt bot provider `provider_id` into or out of the account credential.
+/// Opt provider `provider_id` into or out of the account credential.
 pub fn set_bots_provider_credential_source(
     data_dir: &Path,
     provider_id: &str,
@@ -2378,7 +2498,7 @@ pub fn set_bots_provider_credential_source(
     }
 }
 
-/// Delete every drive and bot-provider credential-source row bound to
+/// Delete every drive and provider credential-source row bound to
 /// `account_id` — on forget, and when another account replaces it — so those
 /// drives and providers fall back to their own keychain items.
 pub fn clear_credential_sources(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
@@ -2566,8 +2686,7 @@ pub fn set_account_restored(data_dir: &Path, account_id: &str) -> Result<(), Cor
 }
 
 /// `account.<id>.restore_pending`: what a restore could not create yet — a
-/// drive whose folder's parent is missing (an unmounted volume), a bot grant
-/// whose drive is not here yet — as JSON, retried on every later sync.
+/// drive whose folder's parent is missing (an unmounted volume) — as JSON, retried on every later sync.
 fn account_restore_pending_key(account_id: &str) -> String {
     format!("account.{account_id}.restore_pending")
 }
@@ -6588,125 +6707,102 @@ mod tests {
     }
 
     #[test]
-    fn bots_message_details_defaults_off_and_round_trips() {
-        let dir = temp_dir();
-        // Absent ⇒ off: a conversation is read for what the model said.
-        assert!(!get_bots_message_details(&dir).expect("read default"));
-        set_bots_message_details(&dir, true).expect("switch details on");
-        assert!(get_bots_message_details(&dir).expect("read back on"));
-        set_bots_message_details(&dir, false).expect("switch details off");
-        assert!(!get_bots_message_details(&dir).expect("read back off"));
-        // The stored text, not just the round trip: the getter compares against
-        // `"1"`, and the key is registered `Shape::Flag01`, so a writer that put
-        // `"true"` here would round-trip through itself and still invert every
-        // `keeper.toml` that sets the key (config/mod.rs:394-399).
-        set_bots_message_details(&dir, true).expect("switch on again");
-        assert_eq!(
-            get_setting(&dir, "bots.message_details").expect("read raw"),
-            Some("1".to_owned())
-        );
-        set_bots_message_details(&dir, false).expect("switch off again");
-        assert_eq!(
-            get_setting(&dir, "bots.message_details").expect("read raw"),
-            Some("0".to_owned())
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bots_wake_enabled_defaults_off_and_round_trips() {
+    fn voice_wake_enabled_defaults_off_and_round_trips() {
         let dir = temp_dir();
         // Absent ⇒ off: an open microphone is chosen, never found on.
-        assert!(!get_bots_wake_enabled(&dir).expect("read default"));
-        set_bots_wake_enabled(&dir, true).expect("arm");
-        assert!(get_bots_wake_enabled(&dir).expect("read back on"));
+        assert!(!get_voice_wake_enabled(&dir).expect("read default"));
+        set_voice_wake_enabled(&dir, true).expect("arm");
+        assert!(get_voice_wake_enabled(&dir).expect("read back on"));
         assert_eq!(
-            get_setting(&dir, "bots.wake_enabled").expect("read raw"),
+            get_setting(&dir, "voice.wake_enabled").expect("read raw"),
             Some("1".to_owned())
         );
-        set_bots_wake_enabled(&dir, false).expect("disarm");
-        assert!(!get_bots_wake_enabled(&dir).expect("read back off"));
+        set_voice_wake_enabled(&dir, false).expect("disarm");
+        assert!(!get_voice_wake_enabled(&dir).expect("read back off"));
         assert_eq!(
-            get_setting(&dir, "bots.wake_enabled").expect("read raw"),
+            get_setting(&dir, "voice.wake_enabled").expect("read raw"),
             Some("0".to_owned())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn bots_wake_phrase_defaults_to_nixie_and_round_trips_verbatim() {
+    fn voice_wake_phrase_defaults_to_nixie_and_round_trips_verbatim() {
         let dir = temp_dir();
         assert_eq!(
-            get_bots_wake_phrase(&dir).expect("read default"),
+            get_voice_wake_phrase(&dir).expect("read default"),
             crate::voice::DEFAULT_WAKE_PHRASE
         );
-        set_bots_wake_phrase(&dir, "Hej Keeper").expect("write");
+        set_voice_wake_phrase(&dir, "Hej Keeper").expect("write");
         // Verbatim: the box shows back what was typed; matching form is
         // `WakePhrase::parse`'s business at arm time.
-        assert_eq!(get_bots_wake_phrase(&dir).expect("read back"), "Hej Keeper");
-        // Blank falls back to the default rather than arming nothing.
-        set_bots_wake_phrase(&dir, "   ").expect("write blank");
         assert_eq!(
-            get_bots_wake_phrase(&dir).expect("read blank"),
+            get_voice_wake_phrase(&dir).expect("read back"),
+            "Hej Keeper"
+        );
+        // Blank falls back to the default rather than arming nothing.
+        set_voice_wake_phrase(&dir, "   ").expect("write blank");
+        assert_eq!(
+            get_voice_wake_phrase(&dir).expect("read blank"),
             crate::voice::DEFAULT_WAKE_PHRASE
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn bots_voice_locale_defaults_to_unset_and_clears_to_unset() {
+    fn voice_locale_defaults_to_unset_and_clears_to_unset() {
         let dir = temp_dir();
         // Absent ⇒ "choose for me".
-        assert_eq!(get_bots_voice_locale(&dir).expect("read default"), None);
-        set_bots_voice_locale(&dir, Some(" pl_PL ")).expect("write");
+        assert_eq!(get_voice_locale(&dir).expect("read default"), None);
+        set_voice_locale(&dir, Some(" pl_PL ")).expect("write");
         // Trimmed, otherwise as typed: the comparison normalises, the table
         // does not.
         assert_eq!(
-            get_bots_voice_locale(&dir).expect("read back"),
+            get_voice_locale(&dir).expect("read back"),
             Some("pl_PL".to_owned())
         );
-        set_bots_voice_locale(&dir, None).expect("clear");
-        assert_eq!(get_bots_voice_locale(&dir).expect("read cleared"), None);
+        set_voice_locale(&dir, None).expect("clear");
+        assert_eq!(get_voice_locale(&dir).expect("read cleared"), None);
         assert_eq!(
-            get_setting(&dir, "bots.voice_locale").expect("read raw"),
+            get_setting(&dir, "voice.locale").expect("read raw"),
             Some(String::new())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn bots_voice_target_defaults_to_unset_and_clears_to_unset() {
+    fn voice_target_defaults_to_unset_and_clears_to_unset() {
         let dir = temp_dir();
-        // Absent ⇒ "the pinned bot most recently talked to".
-        assert_eq!(get_bots_voice_target(&dir).expect("read default"), None);
-        set_bots_voice_target(&dir, Some(" 01ARZ3NDEKTSV4RRFFQ69G5FAV ")).expect("write");
+        // Absent ⇒ nothing chosen.
+        assert_eq!(get_voice_target(&dir).expect("read default"), None);
+        set_voice_target(&dir, Some(" agent:nixie ")).expect("write");
         assert_eq!(
-            get_bots_voice_target(&dir).expect("read back"),
-            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+            get_voice_target(&dir).expect("read back"),
+            Some("agent:nixie".to_owned())
         );
-        set_bots_voice_target(&dir, None).expect("clear");
-        assert_eq!(get_bots_voice_target(&dir).expect("read cleared"), None);
+        set_voice_target(&dir, None).expect("clear");
+        assert_eq!(get_voice_target(&dir).expect("read cleared"), None);
         assert_eq!(
-            get_setting(&dir, "bots.voice_target").expect("read raw"),
+            get_setting(&dir, "voice.target").expect("read raw"),
             Some(String::new())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn bots_stop_phrase_defaults_to_stop_and_round_trips_verbatim() {
+    fn voice_stop_phrase_defaults_to_stop_and_round_trips_verbatim() {
         let dir = temp_dir();
         assert_eq!(
-            get_bots_stop_phrase(&dir).expect("read default"),
+            get_voice_stop_phrase(&dir).expect("read default"),
             crate::voice::DEFAULT_STOP_PHRASE
         );
-        set_bots_stop_phrase(&dir, "Dość").expect("write");
-        assert_eq!(get_bots_stop_phrase(&dir).expect("read back"), "Dość");
+        set_voice_stop_phrase(&dir, "Dość").expect("write");
+        assert_eq!(get_voice_stop_phrase(&dir).expect("read back"), "Dość");
         // Blank falls back to the default rather than leaving an answer
         // nothing can stop.
-        set_bots_stop_phrase(&dir, "   ").expect("write blank");
+        set_voice_stop_phrase(&dir, "   ").expect("write blank");
         assert_eq!(
-            get_bots_stop_phrase(&dir).expect("read blank"),
+            get_voice_stop_phrase(&dir).expect("read blank"),
             crate::voice::DEFAULT_STOP_PHRASE
         );
         let _ = std::fs::remove_dir_all(&dir);

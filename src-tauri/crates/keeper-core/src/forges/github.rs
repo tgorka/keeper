@@ -16,7 +16,10 @@ pub const PAGE_CAP: usize = 10;
 /// "GitHub refused the list" and hides every repository.
 pub fn get(http: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
     http.get(url)
-        .header(reqwest::header::USER_AGENT, crate::bots::http::USER_AGENT)
+        .header(
+            reqwest::header::USER_AGENT,
+            crate::providers::http::USER_AGENT,
+        )
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
 }

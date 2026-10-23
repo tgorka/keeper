@@ -12,13 +12,13 @@ import {
 import { logFailure } from "@/lib/failure";
 import {
   type BotModelVm,
-  botsModelsList,
-  botsProvidersList,
   type EmbeddingModelVm,
   notesEmbeddingModelGet,
   notesEmbeddingModelSet,
   notesServiceFileNamesGet,
   notesServiceFileNamesSet,
+  providerModels,
+  providersList,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { useNotesSearchState } from "@/lib/stores/notes-search-state";
@@ -60,11 +60,11 @@ export function SearchSettingsSection({ open }: { open: boolean }) {
         if (live) setError("Notes search settings could not be read.");
       });
     if (showEmbedding)
-      void botsProvidersList()
+      void providersList()
         .then(async (providers) => {
           const rows = await Promise.allSettled(
             providers.map(async (provider) => {
-              const models = await botsModelsList(provider.id);
+              const models = await providerModels(provider.id);
               return models
                 .filter((each) => each.embedding !== false)
                 .map((each) => ({

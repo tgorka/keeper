@@ -14,26 +14,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use keeper_core::bots::grant::GrantScope;
-use keeper_core::bots::store;
 use keeper_core::error::CoreError;
-use keeper_core::org_account::device_state::{
-    DeviceStateFile, GrantState, MatrixState, ProviderState,
-};
-use keeper_core::org_account::manifest::{
-    self, BotRecord, DriveRecord, MatrixRecord, ProviderRecord,
-};
+use keeper_core::org_account::device_state::{DeviceStateFile, MatrixState, ProviderState};
+use keeper_core::org_account::manifest::{self, DriveRecord, MatrixRecord, ProviderRecord};
 use keeper_core::org_account::settings_sync::{self, Catalog, LocalDrive, Merged, Values};
 use keeper_core::platform::Platform;
+use keeper_core::providers::store;
 use keeper_core::registry;
 use keeper_sync::SyncProfile;
 use tauri::AppHandle;
 
-/// How a grant over every drive is named in the device file, where any
-/// other grant names its drive by reference.
-pub(crate) const EVERY_DRIVE: &str = "*";
-
-/// This device's drives, bot providers and Matrix accounts as the person's
+/// This device's drives, model providers and Matrix accounts as the person's
 /// manifests describe them, plus the catalog that translates the settings
 /// that name one of them.
 pub(crate) struct Mine {
@@ -132,7 +123,6 @@ pub(crate) fn gather(
     let catalog = catalog(platform.as_ref(), data_dir, account_id, drive_refs)?;
 
     let listing = store::list_providers(data_dir)?;
-    let grants = store::list_grants(data_dir)?.rows;
     let mut providers = Vec::with_capacity(listing.rows.len());
     let mut provider_states = Vec::with_capacity(listing.rows.len());
     for row in &listing.rows {
@@ -143,18 +133,6 @@ pub(crate) fn gather(
             Some(account_id),
         )?
         .is_some();
-        let bots: Vec<BotRecord> = store::list_bots_for_provider(data_dir, &provider.id)?
-            .into_iter()
-            .map(|bot| BotRecord {
-                target: bot.target,
-                name: bot.name,
-                pin_order: bot.pin_order,
-                shape: bot.identity.shape,
-                colour: bot.identity.colour,
-                mark: bot.identity.mark,
-                extra: BTreeMap::new(),
-            })
-            .collect();
         let credential = if bound { "account" } else { "own" };
         let read_timeout_ms = row.read_timeout_ms.and_then(|ms| u64::try_from(ms).ok());
         provider_states.push(ProviderState {
@@ -163,12 +141,6 @@ pub(crate) fn gather(
             base_url: provider.base_url.clone(),
             read_timeout_ms,
             credential: credential.to_owned(),
-            bots: bots.clone(),
-            grants: grants
-                .iter()
-                .filter(|row| row.revoked_ms.is_none() && row.grant.provider_id == provider.id)
-                .filter_map(|row| grant_state(&row.grant, &catalog))
-                .collect(),
             extra: BTreeMap::new(),
         });
         providers.push(ProviderRecord {
@@ -177,7 +149,6 @@ pub(crate) fn gather(
             base_url: provider.base_url.clone(),
             credential: credential.to_owned(),
             read_timeout_ms,
-            bots,
             devices: Vec::new(),
             extra: BTreeMap::new(),
         });
@@ -246,7 +217,7 @@ pub(crate) fn catalog(
     account_id: &str,
     drives: Option<Vec<LocalDrive>>,
 ) -> Result<Catalog, CoreError> {
-    let mut catalog = Catalog::with_bots(data_dir, drives)?;
+    let mut catalog = Catalog::with_providers(data_dir, drives)?;
     catalog.account_id = Some(account_id.to_owned());
     let descriptor = crate::account_ipc::descriptor().filter(|d| d.id == account_id);
     if let Some(d) = &descriptor {
@@ -260,82 +231,6 @@ pub(crate) fn catalog(
         keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
     );
     Ok(catalog)
-}
-
-/// A live grant as the device file carries it: its bot by target, its drive
-/// by reference ([`EVERY_DRIVE`] for the whole drive). `None` for a grant
-/// naming a bot or drive this device no longer has.
-fn grant_state(grant: &keeper_core::bots::grant::Grant, catalog: &Catalog) -> Option<GrantState> {
-    let bot = match &grant.bot_id {
-        None => None,
-        Some(id) => Some(
-            catalog
-                .bots
-                .iter()
-                .find(|(bot_id, ..)| bot_id == id)
-                .map(|(_, _, target)| target.clone())?,
-        ),
-    };
-    let drive = match grant.scope.profile_id() {
-        None => EVERY_DRIVE.to_owned(),
-        Some(profile_id) => catalog.drive_reference(profile_id)?,
-    };
-    Some(GrantState {
-        bot,
-        drive,
-        subtree: grant.scope.subpath().map(str::to_owned),
-        mode: grant.mode.as_registry_str().to_owned(),
-        extra: BTreeMap::new(),
-    })
-}
-
-/// A grant from the device file as this device stores it, for the provider
-/// `provider_id`: its bot resolved among that provider's bots by target, its
-/// drive by reference. `None` when the drive is not here (the grant then
-/// waits), `Err` when it can never be made (an unknown mode, a bad subtree,
-/// a bot the provider does not have).
-pub(crate) fn grant_of(
-    state: &GrantState,
-    provider_id: &str,
-    bots: &[keeper_core::bots::Bot],
-    catalog: &Catalog,
-) -> Result<Option<keeper_core::bots::grant::Grant>, String> {
-    use keeper_core::bots::grant::{parse_subpath, Grant, GrantMode};
-
-    let mode = GrantMode::from_registry_str(&state.mode)
-        .ok_or_else(|| format!("\"{}\" is not a grant mode", state.mode))?;
-    let bot_id = match &state.bot {
-        None => None,
-        Some(target) => Some(
-            bots.iter()
-                .find(|bot| bot.provider_id == provider_id && bot.target == *target)
-                .map(|bot| bot.id.clone())
-                .ok_or_else(|| format!("the provider has no bot {target}"))?,
-        ),
-    };
-    let scope = if state.drive == EVERY_DRIVE {
-        GrantScope::Drive
-    } else {
-        let Some(profile_id) = catalog.resolve_drive(&state.drive) else {
-            return Ok(None);
-        };
-        let profile_id = profile_id.to_owned();
-        match &state.subtree {
-            None => GrantScope::Profile { profile_id },
-            Some(subtree) => GrantScope::Subtree {
-                profile_id,
-                subpath: parse_subpath(subtree).map_err(|e| format!("{subtree}: {e}"))?,
-            },
-        }
-    };
-    Ok(Some(Grant {
-        id: keeper_agent::turn::new_id(),
-        provider_id: provider_id.to_owned(),
-        bot_id,
-        scope,
-        mode,
-        created_ms: chrono::Utc::now().timestamp_millis(),
-    }))
 }
 
 /// Which credential a drive uses, as the manifest names it: the account when
@@ -425,7 +320,7 @@ fn route(key: &str) -> Route {
         "notify.dock_badge_mode" => Route::DockBadge,
         "system.menu_bar_presence" => Route::MenuBar,
         "debug.mode" => Route::DebugMode,
-        "bots.wake_enabled" | "bots.wake_phrase" | "bots.stop_phrase" | "bots.voice_locale" => {
+        "voice.wake_enabled" | "voice.wake_phrase" | "voice.stop_phrase" | "voice.locale" => {
             Route::Voice
         }
         "notes.embedding_model" => Route::EmbeddingModel,
@@ -699,14 +594,14 @@ mod tests {
             ("notify.dock_badge_mode", Route::DockBadge),
             ("system.menu_bar_presence", Route::MenuBar),
             ("incognito.global", Route::Registry),
-            ("bots.message_details", Route::Registry),
             ("debug.mode", Route::DebugMode),
             ("telemetry.diagnostics", Route::Telemetry),
             ("telemetry.product_analytics", Route::Telemetry),
-            ("bots.wake_enabled", Route::Voice),
-            ("bots.wake_phrase", Route::Voice),
-            ("bots.stop_phrase", Route::Voice),
-            ("bots.voice_locale", Route::Voice),
+            ("voice.wake_enabled", Route::Voice),
+            ("voice.wake_phrase", Route::Voice),
+            ("voice.stop_phrase", Route::Voice),
+            ("voice.locale", Route::Voice),
+            ("voice.target", Route::Registry),
             ("notes.embedding_model", Route::EmbeddingModel),
             ("tasks.ledger_vault", Route::LedgerVault),
             ("sync.git_path", Route::GitPath),

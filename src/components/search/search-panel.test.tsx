@@ -87,7 +87,7 @@ describe("SearchPanel", () => {
     // The phone is not a Mac. The panel is shared byte-for-byte with the desktop
     // overlay, so the phone gets the device-neutral sentence rather than a
     // guessed model name.
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
     render(<SearchPanel active scope="global" chatLock={null} onClose={vi.fn()} />);
     expect(screen.getByText(SEARCH_OFFLINE_DEVICE_SENTENCE)).toBeInTheDocument();
     expect(screen.queryByText(/on this Mac/)).not.toBeInTheDocument();

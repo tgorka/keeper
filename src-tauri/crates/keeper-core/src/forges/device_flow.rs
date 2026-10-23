@@ -88,7 +88,10 @@ fn form(http: &reqwest::Client, url: String, fields: &[(&str, &str)]) -> reqwest
         .extend_pairs(fields)
         .finish();
     http.post(url)
-        .header(reqwest::header::USER_AGENT, crate::bots::http::USER_AGENT)
+        .header(
+            reqwest::header::USER_AGENT,
+            crate::providers::http::USER_AGENT,
+        )
         .header(reqwest::header::ACCEPT, "application/json")
         .header(
             reqwest::header::CONTENT_TYPE,

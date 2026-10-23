@@ -35,10 +35,9 @@ const LIB_RS = file("src-tauri/crates/keeper/src/lib.rs");
 const CLIENT_TS = file("src/lib/ipc/client.ts");
 const VITE_CONFIG = file("vite.config.ts");
 const VOICE_MAIN = file("src/voice-main.tsx");
-const AGENT_PORTS_RS = file("src-tauri/crates/keeper/src/agent_ports.rs");
-const BOT_VOICE_MIC_TSX = file("src/components/bots/bot-voice-mic.tsx");
-const BOT_VOICE_WAKE_TSX = file("src/components/bots/bot-voice-wake.tsx");
-const BOT_VOICE_TARGET_TSX = file("src/components/bots/bot-voice-target.tsx");
+const VOICE_MIC_TSX = file("src/components/voice/voice-mic.tsx");
+const VOICE_WAKE_TSX = file("src/components/voice/voice-wake.tsx");
+const VOICE_TARGET_TSX = file("src/components/voice/voice-target.tsx");
 
 const capability = JSON.parse(file("src-tauri/crates/keeper/capabilities/voice.json")) as {
   windows: string[];
@@ -123,29 +122,29 @@ describe("the voice pill window", () => {
 
 /**
  * Epic 67 (AD-205): the hands-free turn is Rust's from the phrase to the
- * last word. The shell performs `SendText` and drives `Speak`; the webview
- * observes the stream through one forwarded event and drives nothing.
+ * last word. The shell performs `SendText` — to the agent *Speak to* names
+ * (AD-384; 108.2; Story 108.3a) — and drives `Speak`; the webview drives
+ * nothing.
  */
 describe("the spoken turn (Epic 67, AD-205)", () => {
-  it("forwards the spoken stream under one event name, emitted in Rust and listened for in client.ts", () => {
-    const emitted = /pub const SPOKEN_STREAM_EVENT: &str = "([^"]+)";/.exec(AGENT_PORTS_RS)?.[1];
-    const listened = /export const BOTS_SPOKEN_STREAM_EVENT = "([^"]+)";/.exec(CLIENT_TS)?.[1];
-    expect(emitted).toBeDefined();
-    expect(listened).toBe(emitted);
-  });
-
-  it("performs SendText in the shell", () => {
+  it("performs SendText in the shell, through the agent send", () => {
     expect(VOICE_IPC_RS).toMatch(/Effect::SendText\(text\) => Some\(text\)/);
-    expect(VOICE_IPC_RS).toMatch(/crate::bots_ipc::send_spoken\(&app, [^)]*\)\.await/);
+    expect(VOICE_IPC_RS).toMatch(/send_spoken\(&dir, question, text\)\.await/);
+    // The agents' half — the database write and the answer's follow — is
+    // `hq_ipc`'s, so no `voice*.rs` reaches the network (NFR-50).
+    expect(VOICE_IPC_RS).toMatch(/crate::hq_ipc::send_spoken\(question, agent, text\)/);
+    expect(VOICE_IPC_RS).toMatch(/crate::hq_ipc::spoken_agents\(\)/);
     // The command the webview used to speak with is gone on both sides.
     expect(LIB_RS).not.toContain("voice_ipc::voice_speak");
     expect(CLIENT_TS).not.toContain('"voice_speak"');
   });
 
   it("has no voice component that sends a message or reads an answer aloud", () => {
-    for (const source of [BOT_VOICE_MIC_TSX, BOT_VOICE_WAKE_TSX, BOT_VOICE_TARGET_TSX]) {
-      expect(source).not.toContain("botsChatSend");
-      expect(source).not.toContain("voiceSpeak");
+    for (const source of [VOICE_MIC_TSX, VOICE_WAKE_TSX, VOICE_TARGET_TSX]) {
+      const imported = [...source.matchAll(/import \{([^}]*)\} from "@\/lib\/ipc\/client"/g)]
+        .flatMap((match) => match[1].split(","))
+        .map((name) => name.trim());
+      expect(imported.filter((name) => /send|speak/i.test(name))).toEqual([]);
     }
   });
 });

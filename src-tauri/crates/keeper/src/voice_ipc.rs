@@ -6,7 +6,7 @@
 //! [`Turn`], one port, and one channel; a command translates its arguments
 //! into a [`TurnEvent`] or a [`WakePhrase`], hands it to
 //! [`Turn::drive`], and streams the resulting [`VoiceStateVm`] to the
-//! webview — the way the bots surface streams its answer, with a `Channel`.
+//! webview with a `Channel`.
 //!
 //! # The turn is Rust's from the phrase to the last word (Epic 67, AD-205)
 //!
@@ -14,12 +14,11 @@
 //! was heard, and reading the answer aloud. On a phone whose screen is
 //! locked the webview does not run, so the turn parked in `Heard` until
 //! somebody opened keeper. Now [`transition`] performs [`Effect::SendText`]
-//! itself — it hands the text to [`crate::bots_ipc::send_spoken`], which
-//! opens the stream the way `bots_chat_send` does — and the stream's close
-//! calls back into [`answer_complete`] (or [`answer_failed`]), which drives
-//! the `Speak`. The webview observes the turn through the snapshots it
-//! already watches and the stream events the shell forwards to it; it
-//! drives nothing.
+//! itself — [`send_spoken`] resolves the target chosen under *Speak to*
+//! (`keeper_core::voice::target`) and hands the text to the agent send —
+//! and the answer's close calls back into [`answer_complete`] (or
+//! [`answer_failed`]), which drives the `Speak`. The webview observes the
+//! turn through the snapshots it already watches; it drives nothing.
 //!
 //! # Where the person stopped listening (AD-411, Q10, Q17)
 //!
@@ -117,12 +116,13 @@ struct Voice {
     /// later mark.
     sending_mark: Option<tauri::async_runtime::JoinHandle<()>>,
     /// Where the registry is, kept from [`boot`] for the re-arm hooks
-    /// (Epic 65, AD-190): a lifecycle event and the port's own resume arrive
-    /// with no `State` in hand. `None` only before boot.
+    /// (Epic 65, AD-190) and the spoken send (Epic 67, AD-205): a lifecycle
+    /// event, the port's own resume and a `SendText` effect arrive with no
+    /// `State` in hand. `None` only before boot.
     data_dir: Option<PathBuf>,
-    /// The app, kept from [`boot`] so a `SendText` effect — which arrives
-    /// from the port with nothing but the turn in hand — can reach the bots
-    /// adapter and its store (Epic 67, AD-205). `None` only before boot.
+    /// The app, kept from [`boot`] so a change the person did not make here
+    /// can be announced to every window ([`VOICE_WAKE_EVENT`]). `None` only
+    /// before boot.
     app: Option<AppHandle>,
 }
 
@@ -144,7 +144,7 @@ fn voice() -> MutexGuard<'static, Voice> {
     });
     // A poisoned lock means a transition panicked. The turn is a value the
     // next event overwrites and the watcher a channel; refusing every later
-    // command would be the worse failure — `bots_ipc::streams`'s reasoning.
+    // command would be the worse failure.
     VOICE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -344,9 +344,9 @@ fn meter(level: f32) {
 /// Apply one event, stream the snapshot, and arm the silence clock.
 ///
 /// Since Epic 67 (AD-205) this is also where a [`Effect::SendText`] is
-/// carried out: the text the turn heard goes to the bots adapter on the
-/// runtime, off this lock — `send_spoken` reads the store and the network,
-/// and the turn's own `note_sent` will want the lock back. The question's
+/// carried out: the text the turn heard goes to [`send_spoken`] on the
+/// runtime, off this lock — it reads the store and the agents, and the
+/// turn's own `note_sent` will want the lock back. The question's
 /// generation goes with it, taken from the turn under this lock before
 /// anything is awaited: every report of the send carries it back, and only
 /// the turn's current question's moves the turn ([`Turn::owns_answer`]).
@@ -434,7 +434,7 @@ fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
     if stopped.is_none() && question.is_none() {
         return;
     }
-    let Some(app) = voice.app.clone() else {
+    let Some(dir) = voice.data_dir.clone() else {
         tracing::warn!("voice: a question or a heard mark before boot; nothing to send it with");
         return;
     };
@@ -464,9 +464,56 @@ fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
         drop(voice);
         tauri::async_runtime::spawn(async move {
             after_mark(mark).await;
-            crate::bots_ipc::send_spoken(&app, question, text).await;
+            send_spoken(&dir, question, text).await;
         });
     }
+}
+
+/// Send what the voice turn heard as `question` to the agent chosen under
+/// *Speak to* (AD-206, AD-384; 108.2): `voice.target` resolved by
+/// `keeper_core::voice::target` against the agents of the databases this
+/// device holds, then `hq_ipc::send_spoken`, which writes the question into
+/// that agent's main conversation through `Hq::spoken_send` and reports back
+/// to the turn as the answer grows. Every refusal ends the turn on its
+/// sentence and nothing is sent anywhere: nothing chosen, an agent no held
+/// database names, the replicas still opening (`Hq::spoken_agents`), and —
+/// from the send itself — an agent with several databases and none chosen.
+/// The refusal names the person's agent or the agents server, so it is
+/// logged under the shell's agents target and stays on this device
+/// (R1082-03). No network is reached from here: the agents' half is
+/// `hq_ipc`'s.
+async fn send_spoken(dir: &Path, question: u64, text: String) {
+    // A new question: an earlier one's answer is not this turn's to speak.
+    crate::hq_ipc::drop_spoken_answer();
+    match spoken_agent(dir).await {
+        Ok(agent) => crate::hq_ipc::send_spoken(question, agent, text),
+        Err(sentence) => {
+            tracing::warn!(
+                target: keeper_core::telemetry::SHELL_AGENTS_TARGET,
+                message = __omp_magic("", "sentence,")
+                "voice: a spoken question was refused"
+            );
+            answer_failed(question, sentence);
+        }
+    }
+}
+
+/// The agent a spoken question goes to, or the sentence that says why there
+/// is none. The agents are read only when the choice names one: an unset
+/// choice is refused without opening the databases.
+async fn spoken_agent(dir: &Path) -> Result<String, String> {
+    use keeper_core::voice::target;
+    let chosen = registry::get_voice_target(dir).map_err(|error| error.to_string())?;
+    let agents = match chosen
+        .as_deref()
+        .and_then(keeper_core::hq::spoken::target_agent)
+    {
+        Some(_) => crate::hq_ipc::spoken_agents()
+            .await
+            .map_err(|refusal| refusal.message)?,
+        None => Vec::new(),
+    };
+    target::resolve(chosen.as_deref(), &agents).map_err(|refusal| refusal.message().to_owned())
 }
 
 /// Wait for the heard mark still being sent, if one is, at most
@@ -491,7 +538,7 @@ pub fn question_now() -> Option<u64> {
 }
 
 /// One sentence of the spoken turn's answer to `question` has arrived (Epic
-/// 68, AD-214): the bots adapter calls this from the stream as its
+/// 68, AD-214): the agent send calls this from the answer as its
 /// segmenter closes each one. The first takes the turn to `Speaking` with a
 /// `Speak`; every later one is an `Enqueue` behind it. Only the turn whose
 /// question it is moves.
@@ -528,7 +575,7 @@ pub fn answer_anchored(question: u64, key: AgentSessionRef, asked: String) {
 }
 
 /// The spoken turn's answer to `question` has finished arriving (Epic 67,
-/// AD-205; Epic 68, AD-214): the bots adapter calls this from the stream's
+/// AD-205; Epic 68, AD-214): the agent send calls this from the answer's
 /// clean close with what was left after the last sentence it handed out —
 /// the whole answer when nothing was streamed sentence by sentence, nothing
 /// when the last sentence closed it. The turn queues the rest, and from
@@ -570,13 +617,13 @@ pub fn answer_stopped(question: u64) {
 }
 
 /// The request for what the turn heard as `question` has left (Story 64.3,
-/// AD-186), to the bot named `bot`: the bots adapter calls this as it
-/// spawns a turn's driver. Only a turn in `Heard` whose question it is
+/// AD-186), to the agent named `name`: the agent send calls this as the
+/// question leaves. Only a turn in `Heard` whose question it is
 /// moves — to `Sending` — so a typed message leaving while no voice turn
 /// runs, or an earlier question's send landing late, is nothing here. The
 /// moment is stamped on the turn (AD-215), so the surface can count from
 /// it.
-pub fn note_sent(question: u64, bot: &str) {
+pub fn note_sent(question: u64, name: &str) {
     let awaiting = {
         let mut voice = voice();
         let awaiting = matches!(voice.turn.state(), TurnState::Heard { .. })
@@ -584,7 +631,7 @@ pub fn note_sent(question: u64, bot: &str) {
         if awaiting {
             voice
                 .turn
-                .note_sent(bot.to_owned(), crate::voice_log::now_ms());
+                .note_sent(name.to_owned(), crate::voice_log::now_ms());
         }
         awaiting
     };
@@ -594,8 +641,8 @@ pub fn note_sent(question: u64, bot: &str) {
 }
 
 /// The first token of the answer to `question` arrived, `after_ms` after
-/// the request left (Story 64.3, AD-186; Epic 68, AD-215): the bots adapter
-/// calls this on the stream's first delta. Only a turn in `Sending` whose
+/// the request left (Story 64.3, AD-186; Epic 68, AD-215): the agent send
+/// calls this on the answer's first words. Only a turn in `Sending` whose
 /// question it is that has not yet seen one moves, so a stream that is not
 /// the voice turn's costs a lock and nothing else. The wait is stamped on
 /// the turn and recorded in the ring as `first_token` — the provider's
@@ -619,28 +666,6 @@ pub fn note_answer_chunk(question: u64, after_ms: u64) {
     if thinking {
         transition(TurnEvent::AnswerChunk);
     }
-}
-
-/// The language a send made right now is asked in, when it belongs to a
-/// voice turn (Epic 64, AD-182): the listening locale in force —
-/// `wake_vm`'s own expression — while `Turn::awaiting_send`, otherwise
-/// `None`. The bots adapter reads it to decide whether the per-turn
-/// instruction goes on the request; the rule is the turn's, read once.
-pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
-    let port = {
-        let voice = voice();
-        if !voice.turn.awaiting_send() {
-            return None;
-        }
-        Arc::clone(&voice.port)
-    };
-    let chosen = registry::get_bots_voice_locale(data_dir)
-        .map_err(|error| {
-            tracing::warn!(%error, "voice: could not read bots.voice_locale for the spoken turn");
-        })
-        .ok()?;
-    let locale::DeviceLocales { system, on_device } = port.locales();
-    Some(locale::in_force(chosen.as_deref(), &system, &on_device))
 }
 
 /// What every change does once the turn has moved: push the snapshot, tell
@@ -865,24 +890,24 @@ pub fn voice_stop() -> Result<(), IpcError> {
 /// to the port (Epic 63), so its next availability probe and request run
 /// `keeper_core::voice::locale::choose` over it — [`voice_locale_set`] does
 /// the same after a change — gives the turn its stop phrase (Epic 67,
-/// AD-208), and keeps `data_dir` for [`voice_rearm`] and `app` for the
-/// spoken send. No decision here: the port asks core which locale the
+/// AD-208), and keeps `data_dir` for [`voice_rearm`] and the spoken send,
+/// and `app` for the wake event. No decision here: the port asks core which locale the
 /// answer is, and `WakePhrase::parse_stop` decides what a stop phrase is.
 pub fn boot(app: &AppHandle, data_dir: &Path) {
     let mut voice = voice();
     voice.data_dir = Some(data_dir.to_owned());
     voice.app = Some(app.clone());
-    match registry::get_bots_voice_locale(data_dir) {
+    match registry::get_voice_locale(data_dir) {
         Ok(requested) => {
             tracing::info!(?requested, "voice: locale choice loaded");
             voice.port.set_locale(requested);
         }
         Err(error) => {
-            tracing::warn!(%error, "voice: could not read bots.voice_locale; choosing for the person");
+            tracing::warn!(%error, "voice: could not read voice.locale; choosing for the person");
             voice.port.set_locale(None);
         }
     }
-    match registry::get_bots_stop_phrase(data_dir) {
+    match registry::get_voice_stop_phrase(data_dir) {
         Ok(phrase) => {
             let parsed = WakePhrase::parse_stop(&phrase);
             if let Err(why) = &parsed {
@@ -891,7 +916,7 @@ pub fn boot(app: &AppHandle, data_dir: &Path) {
             voice.turn.set_stop(parsed.ok());
         }
         Err(error) => {
-            tracing::warn!(%error, "voice: could not read bots.stop_phrase; no word stops an answer");
+            tracing::warn!(%error, "voice: could not read voice.stop_phrase; no word stops an answer");
             voice.turn.set_stop(None);
         }
     }
@@ -920,9 +945,9 @@ fn wake_vm(
     phrase: String,
     port: &dyn VoicePort,
 ) -> Result<VoiceWakeVm, IpcError> {
-    let locale_chosen = registry::get_bots_voice_locale(data_dir).map_err(to_ipc_error)?;
-    let stop_phrase = registry::get_bots_stop_phrase(data_dir).map_err(to_ipc_error)?;
-    let voice_target = registry::get_bots_voice_target(data_dir).map_err(to_ipc_error)?;
+    let locale_chosen = registry::get_voice_locale(data_dir).map_err(to_ipc_error)?;
+    let stop_phrase = registry::get_voice_stop_phrase(data_dir).map_err(to_ipc_error)?;
+    let voice_target = registry::get_voice_target(data_dir).map_err(to_ipc_error)?;
     let locale::DeviceLocales { system, on_device } = port.locales();
     // The port's own platform, not one const for every target: a Mac was
     // showing iOS's sentence under its switch (screenshot, 2026-09-04). A
@@ -952,8 +977,8 @@ fn wake_vm(
 
 /// The wake VM from the persisted switch and phrase.
 fn persisted_wake_vm(data_dir: &Path, port: &dyn VoicePort) -> Result<VoiceWakeVm, IpcError> {
-    let enabled = registry::get_bots_wake_enabled(data_dir).map_err(to_ipc_error)?;
-    let phrase = registry::get_bots_wake_phrase(data_dir).map_err(to_ipc_error)?;
+    let enabled = registry::get_voice_wake_enabled(data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_voice_wake_phrase(data_dir).map_err(to_ipc_error)?;
     wake_vm(data_dir, enabled, phrase, port)
 }
 
@@ -1040,9 +1065,9 @@ pub fn voice_wake_set(
     let parsed = WakePhrase::parse(&phrase).map_err(|why| refused(why.to_string()))?;
     let stop = WakePhrase::parse_stop(&stop_phrase).map_err(|why| refused(why.to_string()))?;
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    registry::set_bots_wake_phrase(&data_dir, phrase.trim()).map_err(to_ipc_error)?;
-    registry::set_bots_stop_phrase(&data_dir, stop_phrase.trim()).map_err(to_ipc_error)?;
-    registry::set_bots_wake_enabled(&data_dir, enabled).map_err(to_ipc_error)?;
+    registry::set_voice_wake_phrase(&data_dir, phrase.trim()).map_err(to_ipc_error)?;
+    registry::set_voice_stop_phrase(&data_dir, stop_phrase.trim()).map_err(to_ipc_error)?;
+    registry::set_voice_wake_enabled(&data_dir, enabled).map_err(to_ipc_error)?;
     let mut voice = voice();
     voice.turn.set_stop(Some(stop));
     arm(&mut voice, enabled.then_some(parsed));
@@ -1055,13 +1080,12 @@ pub fn voice_wake_set(
     wake_vm(&data_dir, enabled, phrase.trim().to_owned(), port.as_ref())
 }
 
-/// Choose where a spoken turn goes (Epic 67, AD-206; AD-384): a pinned
-/// bot's id, one of the person's agents as `agent:<agent>` (as
-/// `voice_agent_targets` lists it, 108.2), or `None` for "the pinned bot
-/// most recently talked to". Persisted as given; where a turn actually goes
-/// is `keeper_core::bots::voice_target::resolve`'s answer at send time, so a
-/// bot unpinned after being chosen is skipped rather than written to, and an
-/// agent no database this device holds names is refused.
+/// Choose where a spoken turn goes (Epic 67, AD-206; AD-384): one of the
+/// person's agents as `agent:<agent>` (as `voice_agent_targets` lists it,
+/// 108.2), or `None` for nothing chosen. Persisted as given under
+/// `voice.target`; where a turn actually goes is
+/// `keeper_core::voice::target::resolve`'s answer at send time, so an agent
+/// no database this device holds names is refused.
 /// Returns the wake VM, whose `voice_target` is what was stored.
 #[tauri::command]
 pub fn voice_target_set(
@@ -1070,7 +1094,7 @@ pub fn voice_target_set(
 ) -> Result<VoiceWakeVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let chosen = target.as_deref().map(str::trim).filter(|id| !id.is_empty());
-    registry::set_bots_voice_target(&data_dir, chosen).map_err(to_ipc_error)?;
+    registry::set_voice_target(&data_dir, chosen).map_err(to_ipc_error)?;
     let port = Arc::clone(&voice().port);
     persisted_wake_vm(&data_dir, port.as_ref())
 }
@@ -1092,9 +1116,9 @@ pub fn voice_old_target_notice_dismiss(state: State<'_, AppState>) -> Result<(),
 }
 
 /// Flip the wake switch (Epic 68, Story 68.4, AD-218): the one command the
-/// palette, the native menu, the pane headers on both tiers and the tray
-/// call, so five surfaces are one setting. The rule is the pane's switch's
-/// (`bot-voice-wake.tsx`'s `save`), kept here so no surface can skip it:
+/// palette, the native menu, Settings › Voice and the tray call, so every
+/// surface is one setting. The rule is the pane's switch's
+/// (`voice-wake.tsx`'s `save`), kept here so no surface can skip it:
 /// switching ON is a deliberate voice act, so the recogniser and the
 /// microphone are asked for by name first ([`voice_authorize`], FR-408);
 /// what is written is the person's choice whatever the port answered
@@ -1106,7 +1130,7 @@ pub fn voice_old_target_notice_dismiss(state: State<'_, AppState>) -> Result<(),
 #[tauri::command]
 pub async fn voice_wake_toggle(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let enabled = !registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    let enabled = !registry::get_voice_wake_enabled(&data_dir).map_err(to_ipc_error)?;
     if enabled {
         // The verdict is the port's to show beside the switch; the surface
         // re-reads availability after the flip, as the locale picker does.
@@ -1114,38 +1138,9 @@ pub async fn voice_wake_toggle(state: State<'_, AppState>) -> Result<VoiceWakeVm
             tracing::info!(?why, "voice: listening switched on under a refusal");
         }
     }
-    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
-    let stop_phrase = registry::get_bots_stop_phrase(&data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_voice_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let stop_phrase = registry::get_voice_stop_phrase(&data_dir).map_err(to_ipc_error)?;
     voice_wake_set(state, enabled, phrase, stop_phrase)
-}
-
-/// How fast each pinned bot starts answering (Epic 68, Story 68.4, AD-216),
-/// for the voice target picker: `bot_messages` already holds `ttft_ms` per
-/// answer, and `keeper_core::bots::voice_target::median_first_token` over
-/// each bot's last ten is the number. One row per pinned bot, in the pinned
-/// order, `None` where fewer than three answers were measured. Nothing is
-/// measured here and nothing leaves the device.
-#[tauri::command]
-pub fn voice_target_speeds(
-    state: State<'_, AppState>,
-) -> Result<Vec<keeper_core::vm::VoiceTargetSpeedVm>, IpcError> {
-    use keeper_core::bots::voice_target::{median_first_token, FIRST_TOKEN_WINDOW};
-    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let bots = keeper_core::bots::store::list_bots(&data_dir).map_err(to_ipc_error)?;
-    bots.into_iter()
-        .map(|bot| {
-            let samples = keeper_core::bots::session::first_token_samples(
-                &data_dir,
-                &bot.id,
-                FIRST_TOKEN_WINDOW,
-            )
-            .map_err(to_ipc_error)?;
-            Ok(keeper_core::vm::VoiceTargetSpeedVm {
-                bot_id: bot.id,
-                first_token_median_ms: median_first_token(&samples),
-            })
-        })
-        .collect()
 }
 
 /// Whether this build has a voice port at all (AD-179), for the gates that
@@ -1183,7 +1178,7 @@ pub fn voice_locale_set(
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_owned);
-    registry::set_bots_voice_locale(&data_dir, requested.as_deref()).map_err(to_ipc_error)?;
+    registry::set_voice_locale(&data_dir, requested.as_deref()).map_err(to_ipc_error)?;
     let mut voice = voice();
     voice.port.set_locale(requested);
     // Only the device held for the phrase is restarted here. Mid-turn the
@@ -1196,8 +1191,8 @@ pub fn voice_locale_set(
     } else {
         rearm_locked(&mut voice, &data_dir)?;
     }
-    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
-    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let enabled = registry::get_voice_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_voice_wake_phrase(&data_dir).map_err(to_ipc_error)?;
     let port = Arc::clone(&voice.port);
     wake_vm(&data_dir, enabled, phrase, port.as_ref())
 }
@@ -1205,18 +1200,18 @@ pub fn voice_locale_set(
 /// Arm the phrase again from the persisted choice when AD-190's rule says
 /// so (Epic 65, Story 65.2): the switch is on, nothing is listening for it,
 /// and the port no longer refuses. The three facts are gathered here — the
-/// registry's `bots.wake_enabled`, [`Turn::armed`], the port's availability
+/// registry's `voice.wake_enabled`, [`Turn::armed`], the port's availability
 /// — and `keeper_core::voice::should_rearm` decides. Returns whether an arm
 /// was run; a refused arm is reported through the turn as ever.
 fn rearm_locked(voice: &mut Voice, data_dir: &Path) -> Result<bool, IpcError> {
-    let intent = registry::get_bots_wake_enabled(data_dir).map_err(to_ipc_error)?;
+    let intent = registry::get_voice_wake_enabled(data_dir).map_err(to_ipc_error)?;
     let armed = voice.turn.armed();
     let cleared = voice.port.availability().is_ok();
     if !should_rearm(intent, armed, cleared) {
         tracing::debug!(intent, armed, cleared, "voice: not re-arming");
         return Ok(false);
     }
-    let phrase = registry::get_bots_wake_phrase(data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_voice_wake_phrase(data_dir).map_err(to_ipc_error)?;
     let parsed = WakePhrase::parse(&phrase).map_err(|why| refused(why.to_string()))?;
     tracing::info!("voice: the refusal cleared; arming the phrase again");
     arm(voice, Some(parsed));
@@ -1301,10 +1296,10 @@ fn synced_voice_settings(
     data_dir: &Path,
 ) -> Result<(Option<String>, bool, String, String), keeper_core::error::CoreError> {
     Ok((
-        registry::get_bots_voice_locale(data_dir)?,
-        registry::get_bots_wake_enabled(data_dir)?,
-        registry::get_bots_wake_phrase(data_dir)?,
-        registry::get_bots_stop_phrase(data_dir)?,
+        registry::get_voice_locale(data_dir)?,
+        registry::get_voice_wake_enabled(data_dir)?,
+        registry::get_voice_wake_phrase(data_dir)?,
+        registry::get_voice_stop_phrase(data_dir)?,
     ))
 }
 
@@ -1501,7 +1496,7 @@ mod tests {
         let question = question_now().expect("the question is out");
         note_sent(question, "nixie");
         note_answer_chunk(question, 2_000);
-        // The stream, as `bots_ipc::drive` cuts it: three chunks close two
+        // The answer, as a segmenter cuts it: three chunks close two
         // sentences and leave a tail for the close.
         let mut segmenter = keeper_core::voice::speech::Segmenter::new();
         for chunk in ["The sky is", " blue. The grass", " is green. And"] {

@@ -18,7 +18,7 @@
 //! `supportedLocales()` once, classifies each by
 //! `supportsOnDeviceRecognition` (cached — it costs a recogniser per
 //! locale — and refreshed when the person changes the choice), and hands
-//! that list, the system locale and `bots.voice_locale` (via
+//! that list, the system locale and `voice.locale` (via
 //! [`VoicePort::set_locale`]) to `keeper_core::voice::locale::choose`, which
 //! answers the locale to build the recogniser for or the refusal to show.
 //! A Polish-language phone whose only on-device models are English is not
@@ -545,7 +545,7 @@ struct Worker {
     /// interruption's begin or end) or the capture last came back; against
     /// [`RESUME_FAILURES_TOLERATED`].
     failed_resumes: u32,
-    /// The person's choice of locale (`bots.voice_locale`); `None` is
+    /// The person's choice of locale (`voice.locale`); `None` is
     /// "choose for me". Handed to `locale::choose` with `locales`.
     requested: Option<String>,
     /// The enumeration of `supportedLocales()` by on-device support, filled

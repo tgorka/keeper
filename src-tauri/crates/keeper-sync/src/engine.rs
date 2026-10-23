@@ -4520,11 +4520,6 @@ impl Engine {
             // verification writes nothing at all, so there is not even a
             // deletion for a provenance to be attached to.
             tasks::TaskKind::Verify => self.perform_verify_task(task, profiles).await,
-            // No `source` either, and no folder walk at all: a bot run reads
-            // one prompt file and writes nothing to the worktree. It is the
-            // one kind whose work happens outside this crate (AD-224), so the
-            // arm is a resolve, a read and one call through the port.
-            tasks::TaskKind::Bot => self.perform_bot_task(task, profiles).await,
             tasks::TaskKind::Copy => {
                 return self
                     .perform_copy_task(task, profiles, run_trigger, run_id)
@@ -4562,9 +4557,12 @@ impl Engine {
             } else {
                 "keep"
             },
-            task.bot_id.as_deref().unwrap_or(""),
-            task.prompt_subpath.as_deref().unwrap_or(""),
-            task.model.as_deref().unwrap_or(""),
+            // Three fields the retired scheduled-prompt kind filled (Story
+            // 108.3a), empty on every kind that is left. Kept as empty fields
+            // so every mark already in a ledger keeps its fingerprint.
+            "",
+            "",
+            "",
         ])
     }
 
@@ -5341,172 +5339,6 @@ impl Engine {
         }
     }
 
-    /// One prompt, asked of one bot, through the port (Story 69.4, AD-224).
-    ///
-    /// Everything this arm does itself is a path and a file: it finds the
-    /// profile, resolves `prompt_subpath` inside it through
-    /// [`crate::browse::resolve`] — the same containment every other path in
-    /// this crate goes through (AD-65), so a row edited by hand cannot read
-    /// `../../.ssh/id_rsa` — and reads the text. It parses nothing: markdown
-    /// and frontmatter are `keeper-core`'s and this crate is
-    /// `keeper-core`-free (AD-40).
-    ///
-    /// A host with no runner is the ordinary case, not an error condition:
-    /// `keeper-syncd` has none, so it records
-    /// [`crate::platform::NO_BOT_RUNNER_SENTENCE`] and leaves the row for the
-    /// host that can (NFR-43's shape — listed, never run, and now also
-    /// *said*). No `Busy`: this kind takes no reservation.
-    async fn perform_bot_task(
-        &self,
-        task: &db::TaskRow,
-        profiles: &[SyncProfile],
-    ) -> (tasks::TaskOutcome, String) {
-        let (Some(bot_id), Some(prompt_subpath)) =
-            (task.bot_id.as_deref(), task.prompt_subpath.as_deref())
-        else {
-            // A bot row without both is a row the save door refuses; reaching
-            // here means the database was edited by something else.
-            return (
-                tasks::TaskOutcome::Failed,
-                "this bot task names no bot or no prompt file".to_owned(),
-            );
-        };
-        let Some(profile_id) = task.profile_id.as_deref() else {
-            // Host-wide has no meaning for a prompt: a prompt file lives in
-            // exactly one folder.
-            return (
-                tasks::TaskOutcome::Failed,
-                "a bot task names one folder; this row names none".to_owned(),
-            );
-        };
-        let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) else {
-            return (
-                tasks::TaskOutcome::Failed,
-                format!("no such folder: {profile_id}"),
-            );
-        };
-        if !profile.enabled {
-            // A pause is an answer, as it is for every other kind.
-            return (
-                tasks::TaskOutcome::Deferred,
-                format!("{} is paused, so nothing was asked", profile.name),
-            );
-        }
-        let resolved = match crate::browse::resolve(&profile.local_path, prompt_subpath) {
-            Err(refusal) => {
-                return (tasks::TaskOutcome::Failed, refusal.to_string());
-            }
-            Ok(None) => {
-                return (
-                    tasks::TaskOutcome::Failed,
-                    format!("{prompt_subpath} is not in {}", profile.name),
-                );
-            }
-            Ok(Some(path)) => path,
-        };
-        // A virtual prompt would be its pointer text, which is not a prompt.
-        // Reading it as one would send 130 bytes of `oid sha256:…` to a model,
-        // so the refusal names what to do instead.
-        let prompt_text = match std::fs::read_to_string(&resolved) {
-            Ok(text) => text,
-            Err(error) => {
-                return (
-                    tasks::TaskOutcome::Failed,
-                    format!("could not read {prompt_subpath}: {error}"),
-                );
-            }
-        };
-        if crate::lfs::pointer::Pointer::parse(prompt_text.as_bytes()).is_some() {
-            return (
-                tasks::TaskOutcome::Failed,
-                format!("{prompt_subpath} is not fetched yet, so its text is a pointer; fetch it and run again"),
-            );
-        }
-        let Some(runner) = self.platform.bot_task_runner() else {
-            return (
-                tasks::TaskOutcome::Deferred,
-                crate::platform::NO_BOT_RUNNER_SENTENCE.to_owned(),
-            );
-        };
-        let record = runner
-            .run(crate::platform::BotTaskSpec {
-                task_id: task.id.clone(),
-                profile_id: profile.id.clone(),
-                bot_id: bot_id.to_owned(),
-                model: task.model.clone(),
-                prompt_subpath: prompt_subpath.to_owned(),
-                prompt_text,
-            })
-            .await;
-        let detail = Self::bot_run_detail(&record);
-        (record.outcome, detail)
-    }
-
-    /// The one line `task_runs.detail` keeps for a bot run, until Story 69.5
-    /// writes the log the session keeps.
-    ///
-    /// The answer's opening is what a person recognises the run by, so it
-    /// leads; the counts follow. An error record has no answer, so its
-    /// sentences are the line — the first two, because a detail is one line
-    /// and a stream that broke usually says the same thing twice.
-    ///
-    /// A refused tool call is named here and not left to the audit log. A
-    /// scheduled run has no approver, so `grant::decide`'s every `Ask` becomes
-    /// a refusal (AD-244) and the model carries on — which is right, and which
-    /// means a run that wrote nothing at all still ends `Ok`. The outcome stays
-    /// `Ok` because the turn did finish; what must not happen is the Tasks pane
-    /// reading "Succeeded" with no hint that the one thing the prompt asked for
-    /// was declined. So the count leads the counts, and the first refusal's own
-    /// words follow it, bounded like the answer is.
-    fn bot_run_detail(record: &crate::platform::BotRunRecord) -> String {
-        if !record.errors.is_empty() {
-            return record
-                .errors
-                .iter()
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("; ");
-        }
-        let head: String = record
-            .answer
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let head = if head.chars().count() > 80 {
-            let mut cut: String = head.chars().take(80).collect();
-            cut.push('…');
-            cut
-        } else if head.is_empty() {
-            "no answer arrived".to_owned()
-        } else {
-            head
-        };
-        let mut parts = vec![format!("{:.1}s", record.ms as f64 / 1000.0)];
-        if record.tool_calls > 0 {
-            parts.push(format!("{} tool calls", record.tool_calls));
-        }
-        if let Some(tokens) = record.completion_tokens {
-            parts.push(format!("{tokens} tokens"));
-        }
-        let (refused, remarked): (Vec<&String>, Vec<&String>) = record
-            .warnings
-            .iter()
-            .partition(|warning| warning.contains(crate::platform::TOOL_REFUSED_MARK));
-        if let Some(first) = refused.first() {
-            let mut head = first.split_whitespace().collect::<Vec<_>>().join(" ");
-            if head.chars().count() > 60 {
-                head = head.chars().take(60).collect::<String>();
-                head.push('…');
-            }
-            parts.push(format!("{} refused ({head})", refused.len()));
-        }
-        if !remarked.is_empty() {
-            parts.push(format!("{} warnings", remarked.len()));
-        }
-        format!("{head} — {}", parts.join(", "))
-    }
-
     /// One `git gc --quiet` over the named folder, or over every enabled
     /// folder when the task is host-wide (Epic 70, Story 70.7, AD-234).
     ///
@@ -5535,7 +5367,7 @@ impl Engine {
     ///
     /// [`GitCli::gc`] refuses on a `Gix` engine before any spawn, with the
     /// sentence `phone_refusal(Verb::Gc)` already carries. That is
-    /// [`tasks::TaskOutcome::Deferred`] on the bot arm's precedent (NFR-43's
+    /// [`tasks::TaskOutcome::Deferred`] (NFR-43's
     /// shape: listed, never run, and *said*) rather than `Failed`: the phone
     /// seeds no such row, so one reaching here was written by hand, and a
     /// failure notification every retry for a decision the phone recorded
@@ -13497,6 +13329,12 @@ impl Engine {
         self.with_db(db::list_tasks)
     }
 
+    /// Put the Tasks list's notice about the scheduled-prompt tasks this build
+    /// removed away ([`db::dismiss_retired_tasks`], Story 108.3a).
+    pub fn dismiss_retired_tasks(&self) -> Result<()> {
+        self.with_db(db::dismiss_retired_tasks)
+    }
+
     /// One task's run history, newest first.
     pub fn task_history(&self, id: &str, limit: usize) -> Result<Vec<db::TaskRunRow>> {
         self.with_db(|conn| db::task_runs(conn, id, limit))
@@ -20273,9 +20111,6 @@ mod tests {
             id: id.to_owned(),
             profile_id: profile_id.map(str::to_owned),
             kind: tasks::TaskKind::Sync,
-            bot_id: None,
-            prompt_subpath: None,
-            model: None,
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
@@ -24184,64 +24019,6 @@ mod tests {
         };
         engine.drop_excluded(&p, &mut ordinary).expect("no-op");
         assert_eq!(ordinary.modified, [PathBuf::from("notes/one.md")]);
-    }
-
-    /// A scheduled bot run has no approver, so a write outside an approved
-    /// subtree is refused and the turn carries on (AD-244). The outcome is
-    /// therefore `Ok` — and the line the Tasks pane shows must still say that
-    /// something was declined, or a run that did nothing reads as one that did.
-    #[test]
-    fn a_bot_run_that_was_refused_says_so_in_its_one_line() {
-        let record = crate::platform::BotRunRecord {
-            outcome: crate::tasks::TaskOutcome::Ok,
-            answer: "I could not write the summary.".to_owned(),
-            tool_calls: 2,
-            warnings: vec![
-                "write refused: no grant covers 40-media/summaries/2026-09.md".to_owned(),
-            ],
-            errors: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: Some(41),
-            ms: 2_500,
-            finish_reason: None,
-            model: None,
-        };
-        let detail = Engine::bot_run_detail(&record);
-        assert!(
-            detail.contains("1 refused"),
-            "the count of declined calls is the fact a person acts on, got {detail}"
-        );
-        assert!(
-            detail.contains("40-media/summaries/2026-09.md"),
-            "and the first refusal's own words say which write it was, got {detail}"
-        );
-        // A warning is not a refusal: the runner writes remarks into the same
-        // vector (a model that answered under another name, a truncated
-        // answer), and counting one of those as a declined write would tell a
-        // person to go looking for something that never happened. The mark is
-        // what tells them apart.
-        let remarked = crate::platform::BotRunRecord {
-            warnings: vec!["requested model llama; llama:8b answered".to_owned()],
-            ..record.clone()
-        };
-        let detail = Engine::bot_run_detail(&remarked);
-        assert!(
-            !detail.contains("refused"),
-            "a remark is not a refusal, got {detail}"
-        );
-        assert!(
-            detail.contains("1 warnings"),
-            "but it is still worth the one line saying there was one, got {detail}"
-        );
-        let clean = crate::platform::BotRunRecord {
-            warnings: Vec::new(),
-            ..record
-        };
-        let detail = Engine::bot_run_detail(&clean);
-        assert!(
-            !detail.contains("refused") && !detail.contains("warnings"),
-            "and a run with neither says nothing about either, got {detail}"
-        );
     }
 
     #[test]
