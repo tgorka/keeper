@@ -1091,7 +1091,7 @@ pub type AfterLayers = Box<dyn FnOnce() + Send>;
 /// new ones do — how a value only a layer file sets (diagnostics consent,
 /// R496; the default agent, R488) takes effect without a settings row
 /// moving, and how a move of it is told apart from layers reinstalled
-/// unchanged. [`crate::agents::launch::layers_observer`] is the one keeper
+/// unchanged. [`crate::hq::default_agent::layers_observer`] is the one keeper
 /// installs.
 pub type AccountLayersObserver = Box<dyn Fn() -> AfterLayers + Send + Sync>;
 

@@ -11,6 +11,7 @@
 
 pub mod account;
 pub mod agents;
+pub mod agents_cleanup;
 pub mod archive;
 pub mod asset_url;
 pub mod auth;
@@ -39,6 +40,7 @@ pub mod media;
 pub mod notes;
 pub mod notify;
 pub mod oauth;
+pub mod old_agent_rooms;
 pub mod org_account;
 pub mod palette;
 pub mod panels;

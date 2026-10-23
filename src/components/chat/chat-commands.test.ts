@@ -5,8 +5,6 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  CHAT_MODEL_FAILED,
-  CHAT_NEW_ASKED,
   CHAT_TOPIC_FAILED,
   chatCommandHost,
   chatInviteFailed,
@@ -22,10 +20,6 @@ function host(fail = false) {
   const deps = {
     setTopic: vi.fn(act),
     invite: vi.fn(act),
-    newConversation: vi.fn(act),
-    model: vi.fn((args: string | null) =>
-      fail ? Promise.reject(new Error("bridge gone")) : Promise.resolve(`said ${args}`),
-    ),
     askLeave: vi.fn(),
   };
   return { deps, run: chatCommandHost(deps) };
@@ -43,11 +37,6 @@ describe("chatCommandHost", () => {
     expect(deps.setTopic).toHaveBeenCalledWith("Friday");
     await run({ name: "invite", args: "@bob:example.org" });
     expect(deps.invite).toHaveBeenCalledWith("@bob:example.org");
-    expect(await run({ name: "new", args: null })).toEqual({
-      tone: "done",
-      message: CHAT_NEW_ASKED,
-    });
-    expect(deps.newConversation).toHaveBeenCalledWith(null);
     expect(reportFrontendError).not.toHaveBeenCalled();
   });
 
@@ -62,35 +51,6 @@ describe("chatCommandHost", () => {
       message: chatInviteFailed("@bob:example.org"),
     });
     expect(reportFrontendError).toHaveBeenCalledTimes(2);
-  });
-
-  // DW-1431 (R415): `/model` shows Rust's own sentence — what the agent runs
-  // on, or now runs on — and a refusal shows Rust's sentence, logged.
-  it("runs /model through Rust and shows its sentence, or its refusal", async () => {
-    const { deps, run } = host();
-    expect(await run({ name: "model", args: "Opus high" })).toEqual({
-      tone: "done",
-      message: "said Opus high",
-    });
-    expect(deps.model).toHaveBeenCalledWith("Opus high");
-    expect(reportFrontendError).not.toHaveBeenCalled();
-
-    const refusal = { code: "internal", message: 'Nixi cannot run on "gpt-9".', retriable: false };
-    deps.model.mockRejectedValueOnce(refusal);
-    expect(await run({ name: "model", args: "gpt-9" })).toEqual({
-      tone: "failed",
-      message: refusal.message,
-    });
-    expect(reportFrontendError).toHaveBeenCalledTimes(1);
-  });
-
-  it("says /model failed when the bridge itself threw", async () => {
-    const { run } = host(true);
-    expect(await run({ name: "model", args: null })).toEqual({
-      tone: "failed",
-      message: CHAT_MODEL_FAILED,
-    });
-    expect(reportFrontendError).toHaveBeenCalledTimes(1);
   });
 
   it("only asks before leaving", async () => {

@@ -15,7 +15,6 @@ import type {
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { composerStore } from "@/lib/stores/composer";
@@ -170,12 +169,6 @@ import { SETTINGS_PHONE_BACK_TO_LIST } from "@/components/layout/settings-pane";
 import { sidebarViews } from "@/components/layout/sidebar-pane";
 import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
 import { VERIFY_BANNER_TEXT } from "@/components/layout/verify-banner";
-import {
-  SESSIONS_PHONE_OPEN_ROOM,
-  SESSIONS_PHONE_ROOM_ABSENT,
-  SESSIONS_PHONE_ROOMS_READING,
-  sessionsPhoneOpenCardRoom,
-} from "@/components/sessions/sessions-phone-pane";
 import {
   SETTINGS_BACK_LABEL,
   SETTINGS_CATEGORIES_LABEL,
@@ -1768,8 +1761,6 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
 describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
   const PHONE_WITH_ZONE = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
   const SESSION_ROOM = "!session-room:example.org";
-  /** A second account on this phone: the one whose Agents window holds the session's room. */
-  const APPROVER_ACCOUNT = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
 
   const root: SessionRootVm = {
     id: "p1",
@@ -1843,119 +1834,15 @@ describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
     };
   }
 
-  /** Open Sessions, then the session's board. */
-  async function openBoard() {
-    capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
-    render(<PhoneShell />);
-    act(() => {
-      primaryViewStore.getState().setView("sessions");
-    });
-    fireEvent.click(await screen.findByRole("button", { name: new RegExp(row.title) }));
-    return await screen.findByRole("button", {
-      name: sessionsPhoneOpenCardRoom("Approve the budget line"),
-    });
-  }
-
   beforeEach(() => {
     resetSessionsRootsStoreForTest();
     resetSessionsListStoreForTest();
-    agentRoomsStore.getState().clear();
     sessionsRoots.mockResolvedValue([root]);
     sessionsList.mockResolvedValue([row]);
+  });
+
+  it("a session that names an agent's old room offers no way into it (108.2)", async () => {
     sessionsDetail.mockResolvedValue(detail(SESSION_ROOM));
-  });
-
-  it("a card opens its session's room on the account that holds it, over the board", async () => {
-    const card = await openBoard();
-    act(() => {
-      agentRoomsStore.getState().applyBatch({
-        ops: [
-          {
-            op: "reset",
-            rooms: [
-              { ...inboxRoom("!other:example.org", "Another agent"), accountId: account.accountId },
-              { ...inboxRoom(SESSION_ROOM, "Tola — budget"), accountId: APPROVER_ACCOUNT },
-            ],
-          },
-        ],
-        total: 2,
-      });
-    });
-
-    fireEvent.click(card);
-
-    // The room where 93.3's card is decided, on the account whose window holds it.
-    expect(roomsStore.getState().selected).toEqual({
-      accountId: APPROVER_ACCOUNT,
-      roomId: SESSION_ROOM,
-    });
-    // Backing out of the room lands on the board again, not on a chat list.
-    // The room's back button names where it goes: the board, not the Inbox.
-    fireEvent.click(within(stackLevel(1)).getByRole("button", { name: "Back to Sessions" }));
-    await waitFor(() => expect(roomsStore.getState().selected).toBeNull());
-    expect(primaryViewStore.getState().view).toBe("sessions");
-    expect(
-      await screen.findByRole("button", {
-        name: sessionsPhoneOpenCardRoom("Approve the budget line"),
-      }),
-    ).toBeVisible();
-  });
-
-  it("says so, and opens nothing, when no account on this phone is in the room", async () => {
-    const card = await openBoard();
-    act(() => {
-      agentRoomsStore.getState().applyBatch({
-        ops: [{ op: "reset", rooms: [inboxRoom("!other:example.org", "Another agent")] }],
-        total: 1,
-      });
-    });
-
-    fireEvent.click(card);
-
-    expect(roomsStore.getState().selected).toBeNull();
-    expect(await screen.findByText(SESSIONS_PHONE_ROOM_ABSENT)).toHaveAttribute("role", "status");
-  });
-
-  it("before the Agents window has arrived, says keeper is still reading, not that the room is absent", async () => {
-    const card = await openBoard();
-
-    fireEvent.click(card);
-
-    expect(roomsStore.getState().selected).toBeNull();
-    expect(await screen.findByText(SESSIONS_PHONE_ROOMS_READING)).toHaveAttribute("role", "status");
-    expect(screen.queryByText(SESSIONS_PHONE_ROOM_ABSENT)).toBeNull();
-  });
-
-  it("the board's page survives the room round trip", async () => {
-    const card = await openBoard();
-    act(() => {
-      agentRoomsStore.getState().applyBatch({
-        ops: [
-          {
-            op: "reset",
-            rooms: [{ ...inboxRoom(SESSION_ROOM, "Tola — budget"), accountId: APPROVER_ACCOUNT }],
-          },
-        ],
-        total: 1,
-      });
-    });
-    const columns = screen.getByRole("navigation", { name: "Columns" });
-    fireEvent.click(within(columns).getByRole("button", { name: /^Deferred/ }));
-
-    fireEvent.click(card);
-    // The room covers the board, and the board's level goes once its slide ends.
-    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Columns" })).toBeNull());
-    fireEvent.click(within(stackLevel(1)).getByRole("button", { name: "Back to Sessions" }));
-
-    const back = await screen.findByRole("navigation", { name: "Columns" });
-    expect(within(back).getByRole("button", { name: /^Deferred/ })).toHaveAttribute(
-      "aria-current",
-      "true",
-    );
-  });
-
-  it("a person's session has no room, so its cards open nothing", async () => {
-    sessionsDetail.mockResolvedValue(detail(null));
     capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
     render(<PhoneShell />);
     act(() => {
@@ -1964,10 +1851,8 @@ describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
     fireEvent.click(await screen.findByRole("button", { name: new RegExp(row.title) }));
 
     expect(await screen.findByText("Approve the budget line")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: sessionsPhoneOpenCardRoom("Approve the budget line") }),
-    ).toBeNull();
-    expect(screen.queryByRole("button", { name: SESSIONS_PHONE_OPEN_ROOM })).toBeNull();
+    expect(screen.queryByRole("button", { name: /session's room/i })).toBeNull();
+    expect(roomsStore.getState().selected).toBeNull();
   });
 });
 

@@ -20,11 +20,4 @@ ops: Array<InboxOp>,
  * when known. Since Story 4.2 the merge is split into an Inbox and an
  * Archive window, so this is per-window, not a cross-account server total.
  */
-total: number | null, 
-/**
- * The Agents window only: why some of its rows are not live — kept
- * from the last run because an account could not start, or the kept
- * list could not be read or kept (story 102.5, R501, R381) — as the
- * sentence said above the list; absent when every row is live.
- */
-note?: string, };
+total: number | null, };

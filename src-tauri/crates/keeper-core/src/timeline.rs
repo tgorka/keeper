@@ -20,20 +20,16 @@
 //! material, event raw JSON, or crypto state cross IPC; `tracing` logs carry the
 //! opaque room id only — never a message body.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-use eyeball::Subscriber;
-use futures_util::{FutureExt, Stream, StreamExt};
-use matrix_sdk::encryption::VerificationState;
+use futures_util::{Stream, StreamExt};
 use matrix_sdk::event_cache::PaginationStatus;
-use matrix_sdk::event_cache::{self, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
-use matrix_sdk::{Client, Room, RoomInfo};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use matrix_sdk::Client;
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::room_list_service::RoomListService;
 use matrix_sdk_ui::timeline::{
@@ -41,19 +37,8 @@ use matrix_sdk_ui::timeline::{
     TimelineItemContent, TimelineItemKind, TimelineReadReceiptTracking,
 };
 use matrix_sdk_ui::Timeline;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::watch;
 
 use crate::account::TimelineSink;
-use crate::agents::approval_card::{ApprovalVm, HostedRooms, Viewer};
-use crate::agents::events::FINAL_CUT_BYTES;
-use crate::agents::gate_room::{GateInput, GateView};
-use crate::agents::heard::{split_utf16, HeardMarkVm, RoomMarks};
-use crate::agents::room::{
-    self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderFound, HeaderReader,
-    TurnTrust,
-};
-use crate::agents::turn_marks::{turn_marks, HostWrites, MarkInput, TurnMarkVm};
 use crate::error::TimelineError;
 use crate::media::{self, MediaVariant};
 use crate::vm::{
@@ -71,24 +56,6 @@ type ReplyIndex = HashMap<OwnedEventId, String>;
 
 /// Defensive upper bound on a decoded message body before it crosses IPC.
 const MAX_BODY_CHARS: usize = 4096;
-
-/// The bound on an agent's streamed answer (R42): its host cuts it at
-/// [`FINAL_CUT_BYTES`] and closes it with a sentence naming the artifact, for
-/// which 90.5's live measurement leaves 512 bytes.
-const MAX_TURN_BODY_CHARS: usize = FINAL_CUT_BYTES + 512;
-
-/// How a message is drawn: whether it shows "Edited", and the most characters
-/// of its body that cross IPC. An agent's streamed answer (`trusted_turn`,
-/// [`TurnTrust::is_turn`]) is one message growing by edits, never a
-/// correction, and is bounded by the host's cut, not the message cap (91.1
-/// acceptance 4, R42).
-fn message_shape(trusted_turn: bool, is_edited: bool) -> (bool, usize) {
-    if trusted_turn {
-        (false, MAX_TURN_BODY_CHARS)
-    } else {
-        (is_edited, MAX_BODY_CHARS)
-    }
-}
 
 /// Extract the plain-text body of a message when its msgtype is renderable text.
 ///
@@ -374,21 +341,6 @@ fn readers_of<'a>(
         .collect()
 }
 
-/// [`readers_of`] in the room `turns` reads: in an agent session room
-/// without anyone holding an agent's power there — its receipt rides its
-/// claim renewals and says nothing of the message (story 102.4, R465).
-fn readers_here<'a>(
-    receipt_users: impl Iterator<Item = &'a OwnedUserId>,
-    own_user_id: &UserId,
-    turns: TurnTrust<'_>,
-) -> Vec<String> {
-    let session = turns.kind == Some(AgentRoomKind::Session);
-    readers_of(
-        receipt_users.filter(|user| !session || !turns.is_agent(user)),
-        own_user_id,
-    )
-}
-
 /// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`], resolving a
 /// reply's quoted-original key through the producer's `event_id → unique_id`
 /// `index` and aggregating reactions against the account's own `own_user_id`.
@@ -405,16 +357,14 @@ fn readers_here<'a>(
 /// deletion shows an explicit "Message deleted" stub rather than a silent gap
 /// (Story 3.8). Everything else (non-text msgtype, other content kinds, and
 /// virtual items) becomes a [`TimelineItemVm::Other`] carrying only the stable
-/// opaque key, so diff indices stay aligned. A message `turns` trusts as an
-/// agent's streamed answer is shaped by [`message_shape`]. All accessors are
-/// sync (`VectorDiff::map` is sync).
+/// opaque key, so diff indices stay aligned. All accessors are sync
+/// (`VectorDiff::map` is sync).
 pub fn item_to_vm(
     item: &TimelineItem,
     index: &ReplyIndex,
     own_user_id: &UserId,
     account_id: &str,
     room_id: &str,
-    turns: TurnTrust<'_>,
 ) -> TimelineItemVm {
     let key = item.unique_id().0.clone();
     let TimelineItemKind::Event(ev) = item.kind() else {
@@ -444,33 +394,19 @@ pub fn item_to_vm(
                 // Neither media nor renderable text (e.g. location): render nothing.
                 (None, None) => return TimelineItemVm::Other { key },
             };
-            let json = ev.original_json().map(|raw| raw.json().get());
-            let (is_edited, max_body) = message_shape(
-                turns.is_turn(own_user_id, ev.sender(), json),
-                message.is_edited(),
-            );
             TimelineItemVm::Message {
                 key,
                 sender: ev.sender().to_string(),
                 sender_display_name,
-                body: truncate_body(body, max_body),
+                body: truncate_body(body, MAX_BODY_CHARS),
                 timestamp: i64::from(ev.timestamp().0),
                 is_own: ev.is_own(),
                 send_state: ev.send_state().map(map_send_state),
-                is_edited,
+                is_edited: message.is_edited(),
                 reply: reply_preview(ev.content(), index).map(Box::new),
                 reactions: reaction_groups(ev.content(), own_user_id),
                 media: media.map(Box::new),
-                readers: readers_here(ev.read_receipts().keys(), own_user_id, turns),
-                brief: turns
-                    .brief(own_user_id, ev.sender(), json, message.is_edited())
-                    .map(Box::new),
-                gate: gate_input(item)
-                    .and_then(|message| turns.gate_line(own_user_id, message))
-                    .map(Box::new),
-                // Drawn by the session room's header fold over the loaded
-                // items ([`AgentHeader::mark`]), never by one item alone.
-                turn: None,
+                readers: readers_of(ev.read_receipts().keys(), own_user_id),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -494,16 +430,6 @@ pub fn item_to_vm(
             timestamp: i64::from(ev.timestamp().0),
             send_state: ev.redaction_send_state().map(map_send_state),
         },
-        // A custom event the agent filter admits: an approval request, drawn
-        // as its card when an agent of the room sealed it.
-        MsgLikeKind::Other(_) => {
-            let json = ev.original_json().map(|raw| raw.json().get());
-            let sealed = room::sealed_by_sender(ev.encryption_info());
-            match turns.approval(own_user_id, ev.sender(), json, sealed) {
-                Some(id) => TimelineItemVm::Approval { key, id },
-                None => TimelineItemVm::Other { key },
-            }
-        }
         _ => TimelineItemVm::Other { key },
     }
 }
@@ -569,7 +495,6 @@ fn map_diff_indexing(
     own_user_id: &UserId,
     account_id: &str,
     room_id: &str,
-    turns: TurnTrust<'_>,
 ) -> VectorDiff<TimelineItemVm> {
     match &diff {
         VectorDiff::Clear => index.clear(),
@@ -596,7 +521,7 @@ fn map_diff_indexing(
         | VectorDiff::Remove { .. }
         | VectorDiff::Truncate { .. } => {}
     }
-    diff.map(|item| item_to_vm(&item, index, own_user_id, account_id, room_id, turns))
+    diff.map(|item| item_to_vm(&item, index, own_user_id, account_id, room_id))
 }
 
 /// A boxed, `Send` timeline diff stream (the concrete `impl Stream` from
@@ -625,10 +550,6 @@ pub struct OpenTimeline {
     /// (Story 3.6, AD-4). Never a token or secret — the same opaque id the
     /// frontend already holds.
     account_id: String,
-    /// The room, for an agent session room's header reader.
-    room: Room,
-    /// The agent room this is, from its create type; `None` for every other.
-    agent: Option<AgentRoomKind>,
     /// The person's asks for older history the producer takes.
     asks: HistoryAsks,
 }
@@ -697,12 +618,8 @@ pub async fn open_timeline(
     // exactly the items keeper renders — so each member's read position populates
     // the `readers` field of its latest-read message. Everything else about the
     // build (subscribe snapshot-then-diff, the shared `Arc<Timeline>`) is preserved.
-    // An agent room keeps the SDK's filter and drops the hosts' claim and host
-    // state (R33); every other room's filter is the SDK default exactly.
-    let agent = AgentRoomKind::of(room.room_type().as_ref());
     let timeline = TimelineBuilder::new(&room)
         .track_read_marker_and_receipts(TimelineReadReceiptTracking::MessageLikeEvents)
-        .event_filter(room::agent_event_filter(agent))
         .build()
         .await
         .map_err(|e| TimelineError::Build(e.to_string()))?;
@@ -713,639 +630,40 @@ pub async fn open_timeline(
         stream: Box::pin(stream),
         own_user_id,
         account_id: account_id.to_owned(),
-        room,
-        agent,
         asks: HistoryAsks::default(),
     })
-}
-
-/// The header beside an agent session room's timeline (R33): its reader,
-/// the newest answer anchor the caret may sit on, the header last sent, so
-/// a batch carries one only when it changed, and the items as the batches
-/// sent so far left them, so a brief is drawn again when what it rests on
-/// changes (R117).
-struct AgentHeader {
-    reader: HeaderReader,
-    own_user_id: OwnedUserId,
-    /// The account the room is read for: an agent's profile avatar is
-    /// served for it (story 100.4).
-    account_id: String,
-    /// The newest answer anchor by origin time: `(ms, render key)`.
-    newest_turn: Option<(u64, String)>,
-    sent: Option<AgentRoomHeaderVm>,
-    kinds: Arc<AgentKinds>,
-    icons: Arc<AgentIcons>,
-    loaded: Vector<Arc<TimelineItem>>,
-    /// The approval cards last sent; `None` before the first read.
-    approvals_sent: Option<Vec<ApprovalVm>>,
-    /// The person's marks of where they stopped listening last sent;
-    /// `None` before the first read.
-    heard_sent: Option<Vec<HeardMarkVm>>,
-    /// Whether this device is cross-signed by its owner, as last read.
-    cross_signed: bool,
-    /// The rooms whose agent this app hosts.
-    hosted: Arc<HostedRooms>,
-    /// In a gate room, what its loaded timeline says of each request
-    /// (UX-DR147); `None` in any other session room.
-    gate: Option<GateView>,
-    /// Whether the agent's host took each own loaded message, by render key
-    /// (story 102.4, R465): drawn on every message op the producer sends.
-    turn_marks: HashMap<String, TurnMarkVm>,
-    /// The messages already logged as not taken, so each is one WARN line.
-    warned: HashSet<String>,
-    /// The room, for those lines.
-    room_id: OwnedRoomId,
-}
-
-/// What redraws the approval cards without an event in the room: this
-/// device's verification and the rooms this app hosts changing.
-struct Recheck {
-    verification: Subscriber<VerificationState>,
-    hosted: watch::Receiver<u64>,
-}
-
-/// The next change [`Recheck`] watches, or `expiry` passing; never when
-/// there is nothing to watch.
-async fn next_recheck(recheck: &mut Option<Recheck>, expiry: Option<DateTime<Utc>>) {
-    let Some(recheck) = recheck else {
-        return std::future::pending().await;
-    };
-    let expired = async {
-        match expiry {
-            Some(at) => tokio::time::sleep((at - Utc::now()).to_std().unwrap_or_default()).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        state = recheck.verification.next() => {
-            if state.is_none() {
-                std::future::pending::<()>().await;
-            }
-        }
-        changed = recheck.hosted.changed() => {
-            if changed.is_err() {
-                std::future::pending::<()>().await;
-            }
-        }
-        () = expired => {}
-    }
-}
-
-impl AgentHeader {
-    /// Who may stream an answer or hand work on here: an agent of this
-    /// session room, under what the reader last read of it, and in a gate
-    /// room what its loaded timeline says of each request.
-    fn turns(&self) -> TurnTrust<'_> {
-        TurnTrust {
-            gate: self.gate.as_ref(),
-            ..self.reader.turns()
-        }
-    }
-
-    /// Read the gate room's requests again from the loaded items — only
-    /// in a room whose status says it is a gate's; the positions of the
-    /// loaded messages drawn differently now.
-    fn regate(&mut self) -> Vec<usize> {
-        let view = self.reader.state().gate_system().is_some().then(|| {
-            let turns = self.reader.turns();
-            GateView::of(
-                self.loaded.iter().filter_map(|item| gate_input(item)),
-                &self.own_user_id,
-                &|user| turns.is_agent(user),
-            )
-        });
-        if view == self.gate {
-            return Vec::new();
-        }
-        let before = std::mem::replace(&mut self.gate, view);
-        self.gated(TurnTrust {
-            gate: before.as_ref(),
-            ..self.reader.turns()
-        })
-    }
-
-    /// The positions of the loaded messages whose gate line `before` drew
-    /// otherwise than the room draws it now.
-    fn gated(&self, before: TurnTrust<'_>) -> Vec<usize> {
-        let after = self.turns();
-        let own = &self.own_user_id;
-        self.loaded
-            .iter()
-            .enumerate()
-            .filter_map(|(at, item)| {
-                let message = gate_input(item)?;
-                (before.gate_line(own, message) != after.gate_line(own, message)).then_some(at)
-            })
-            .collect()
-    }
-
-    /// Note the answer anchors among `items` (a snapshot when `reset`).
-    fn see(&mut self, items: &[&Arc<TimelineItem>], reset: bool) {
-        let held = if reset { None } else { self.newest_turn.take() };
-        let turns = self.turns();
-        let own = &self.own_user_id;
-        let seen = items.iter().filter_map(|item| {
-            let ev = item.as_event()?;
-            let json = ev.original_json().map(|raw| raw.json().get());
-            if !turns.is_turn(own, ev.sender(), json) {
-                return None;
-            }
-            Some((u64::from(ev.timestamp().0), item.unique_id().0.as_str()))
-        });
-        let newest = room::newest_turn(held, seen);
-        self.newest_turn = newest;
-    }
-
-    /// Note the answer anchors a diff carries, and the items it leaves.
-    fn see_diff(&mut self, diff: &VectorDiff<Arc<TimelineItem>>) {
-        match diff {
-            VectorDiff::Clear => self.newest_turn = None,
-            VectorDiff::Reset { values } => self.see(&values.iter().collect::<Vec<_>>(), true),
-            VectorDiff::Append { values } => self.see(&values.iter().collect::<Vec<_>>(), false),
-            VectorDiff::PushFront { value }
-            | VectorDiff::PushBack { value }
-            | VectorDiff::Insert { value, .. }
-            | VectorDiff::Set { value, .. } => self.see(&[value], false),
-            VectorDiff::PopFront
-            | VectorDiff::PopBack
-            | VectorDiff::Remove { .. }
-            | VectorDiff::Truncate { .. } => {}
-        }
-        diff.clone().apply(&mut self.loaded);
-    }
-
-    /// The header when it differs from the one last sent.
-    async fn changed(&mut self) -> Option<AgentRoomHeaderVm> {
-        let peer = self
-            .gate
-            .as_ref()
-            .and_then(GateView::peer)
-            .map(ToOwned::to_owned);
-        let header = self
-            .reader
-            .header(
-                &self.icons,
-                &self.account_id,
-                self.newest_turn.as_ref().map(|(_, key)| key.as_str()),
-                peer.as_deref(),
-            )
-            .await;
-        if self.sent.as_ref() == Some(&header) {
-            return None;
-        }
-        self.sent = Some(header.clone());
-        Some(header)
-    }
-
-    /// The room's approval cards when they differ from the ones last sent;
-    /// a room with none sends none until it has one.
-    async fn approvals_changed(&mut self) -> Option<Vec<ApprovalVm>> {
-        let viewer = Viewer {
-            own: self.own_user_id.clone(),
-            device_cross_signed: self.cross_signed,
-            hosted: self.hosted.rooms(),
-        };
-        let approvals = self.reader.approvals(&viewer, Utc::now()).await;
-        let first = self.approvals_sent.is_none();
-        if self.approvals_sent.as_ref() == Some(&approvals) {
-            return None;
-        }
-        self.approvals_sent = Some(approvals.clone());
-        (!(first && approvals.is_empty())).then_some(approvals)
-    }
-
-    /// Where the person stopped listening in each loaded answer they
-    /// marked, when it differs from what was last sent; a room with none
-    /// sends none until it has one.
-    fn heard_changed(&mut self) -> Option<Vec<HeardMarkVm>> {
-        let marks = self.reader.marks();
-        let heard: Vec<HeardMarkVm> = if marks.is_empty() {
-            Vec::new()
-        } else {
-            let turns = self.turns();
-            self.loaded
-                .iter()
-                .filter_map(|item| heard_mark(item, marks, &self.own_user_id, turns))
-                .collect()
-        };
-        let first = self.heard_sent.is_none();
-        if self.heard_sent.as_ref() == Some(&heard) {
-            return None;
-        }
-        self.heard_sent = Some(heard.clone());
-        (!(first && heard.is_empty())).then_some(heard)
-    }
-
-    /// Read again whose brief to draw, who reads it and, in a gate room,
-    /// what the gate said of each request under the power read now (its
-    /// view keys requests and the peer on who holds an agent's power); the
-    /// positions of the loaded messages it draws differently now.
-    async fn rebrief(&mut self) -> Vec<usize> {
-        let before = self.reader.refresh(&self.icons).await;
-        let mut positions = self.rebriefed(before.turns());
-        positions.extend(self.regate());
-        positions.extend(self.remark());
-        positions.sort_unstable();
-        positions.dedup();
-        positions
-    }
-
-    /// The positions of the loaded messages drawn differently now than
-    /// under `before`: its brief, or its gate line (whose sender holds an
-    /// agent's power may have changed).
-    fn rebriefed(&self, before: TurnTrust<'_>) -> Vec<usize> {
-        let mut positions = room::rebriefed(
-            self.loaded.iter().map(|item| brief_input(item)),
-            &self.own_user_id,
-            before,
-            self.turns(),
-        );
-        if self.gate.is_some() {
-            positions.extend(self.gated(TurnTrust {
-                gate: self.gate.as_ref(),
-                ..before
-            }));
-            positions.sort_unstable();
-            positions.dedup();
-        }
-        positions
-    }
-
-    /// The `Set`s that draw the loaded items at `positions` again.
-    fn redraw(
-        &self,
-        positions: Vec<usize>,
-        index: &ReplyIndex,
-        account_id: &str,
-        room_id: &str,
-    ) -> Vec<TimelineOp> {
-        let turns = self.turns();
-        positions
-            .into_iter()
-            .map(|at| TimelineOp::Set {
-                index: at as u32,
-                item: item_to_vm(
-                    &self.loaded[at],
-                    index,
-                    &self.own_user_id,
-                    account_id,
-                    room_id,
-                    turns,
-                ),
-            })
-            .collect()
-    }
-
-    /// Read again whether the agent's host took each own loaded message
-    /// (R465), against what the reader last read of its writes and its
-    /// status; the positions of the loaded messages drawn differently now.
-    /// A message newly not taken — said under it where the person looks —
-    /// is a WARN line too, once (R381).
-    fn remark(&mut self) -> Vec<usize> {
-        let marks = {
-            let turns = self.turns();
-            let inputs: Vec<MarkInput<'_>> = self
-                .loaded
-                .iter()
-                .filter_map(|item| mark_input(item, turns))
-                .collect();
-            let agent = self
-                .sent
-                .as_ref()
-                .and_then(|header| header.status.as_ref())
-                .map_or("This agent", |status| status.agent_name.as_str());
-            let host = HostWrites {
-                last_write: self.reader.agent_wrote(),
-                run: self.reader.state().host_run(),
-            };
-            turn_marks(&inputs, host, agent)
-        };
-        for (key, mark) in &marks {
-            if matches!(mark, TurnMarkVm::NotTaken { .. }) && self.warned.insert(key.clone()) {
-                tracing::warn!(room_id = %self.room_id, "agent room: the agent's host did not take a message the person sent");
-            }
-        }
-        let positions = self
-            .loaded
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                let key = item.unique_id().0.as_str();
-                marks.get(key) != self.turn_marks.get(key)
-            })
-            .map(|(at, _)| at)
-            .collect();
-        self.turn_marks = marks;
-        positions
-    }
-
-    /// Draw the turn marks on every message `ops` carry.
-    fn mark(&self, ops: &mut [TimelineOp]) {
-        let mut draw = |item: &mut TimelineItemVm| {
-            if let TimelineItemVm::Message { key, turn, .. } = item {
-                *turn = self.turn_marks.get(key.as_str()).cloned().map(Box::new);
-            }
-        };
-        for op in ops {
-            match op {
-                TimelineOp::Append { items } | TimelineOp::Reset { items } => {
-                    items.iter_mut().for_each(&mut draw);
-                }
-                TimelineOp::PushFront { item }
-                | TimelineOp::PushBack { item }
-                | TimelineOp::Insert { item, .. }
-                | TimelineOp::Set { item, .. } => draw(item),
-                TimelineOp::Clear
-                | TimelineOp::PopFront
-                | TimelineOp::PopBack
-                | TimelineOp::Remove { .. }
-                | TimelineOp::Truncate { .. } => {}
-            }
-        }
-    }
-}
-
-/// A loaded message as [`turn_marks`] reads it: its key, event id, whether
-/// it is own, its time, whether its sender holds an agent's power and its
-/// original event; `None` for any other item.
-fn mark_input<'a>(item: &'a TimelineItem, turns: TurnTrust<'_>) -> Option<MarkInput<'a>> {
-    let ev = item.as_event()?;
-    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
-        return None;
-    };
-    let MsgLikeKind::Message(_) = &msg_like.kind else {
-        return None;
-    };
-    Some(MarkInput {
-        key: item.unique_id().0.as_str(),
-        event: ev.event_id().map(EventId::as_str),
-        own: ev.is_own(),
-        ts: u64::from(ev.timestamp().0),
-        agent: turns.is_agent(ev.sender()),
-        json: ev.original_json().map(|raw| raw.json().get()),
-    })
-}
-
-/// A loaded item as [`room::rebriefed`] reads it: a message's sender, its
-/// original event and whether it was edited; `None` for any other item.
-fn brief_input(item: &TimelineItem) -> Option<(&UserId, Option<&str>, bool)> {
-    let ev = item.as_event()?;
-    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
-        return None;
-    };
-    let MsgLikeKind::Message(message) = &msg_like.kind else {
-        return None;
-    };
-    Some((
-        ev.sender(),
-        ev.original_json().map(|raw| raw.json().get()),
-        message.is_edited(),
-    ))
-}
-
-/// A loaded item as a gate room reads it ([`GateView`]): a message's event
-/// id, sender, original event, whether it was edited and its sender's
-/// display name; `None` for any other item.
-fn gate_input(item: &TimelineItem) -> Option<GateInput<'_>> {
-    let ev = item.as_event()?;
-    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
-        return None;
-    };
-    let MsgLikeKind::Message(message) = &msg_like.kind else {
-        return None;
-    };
-    Some(GateInput {
-        event: ev.event_id().map(EventId::as_str),
-        sender: ev.sender(),
-        json: ev.original_json().map(|raw| raw.json().get()),
-        edited: message.is_edited(),
-        name: match ev.sender_profile() {
-            TimelineDetails::Ready(profile) => profile.display_name.as_deref(),
-            _ => None,
-        },
-    })
-}
-
-/// The mark the room draws in `item` (97.3, UX-DR143): an agent's streamed
-/// answer ([`TurnTrust::is_turn`]) `marks` holds the person's mark of,
-/// split where the body it shows was heard until ([`split_utf16`]).
-fn heard_mark(
-    item: &TimelineItem,
-    marks: &RoomMarks,
-    own: &UserId,
-    turns: TurnTrust<'_>,
-) -> Option<HeardMarkVm> {
-    let ev = item.as_event()?;
-    let sentence = marks.sentence(ev.event_id()?)?;
-    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
-        return None;
-    };
-    let MsgLikeKind::Message(message) = &msg_like.kind else {
-        return None;
-    };
-    let json = ev.original_json().map(|raw| raw.json().get());
-    if !turns.is_turn(own, ev.sender(), json) {
-        return None;
-    }
-    let body = truncate_body(text_body(message.msgtype())?, MAX_TURN_BODY_CHARS);
-    Some(HeardMarkVm {
-        key: item.unique_id().0.clone(),
-        split_utf16: split_utf16(&body, sentence)?,
-    })
-}
-
-/// A fetch of an agent room's members from the server.
-type MemberFetch = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-/// Start fetching `room`'s members when the store does not hold them all
-/// and no fetch runs (R117): beside the timeline, never before it. A failed
-/// fetch leaves the roster unknown, so every brief narrowed; the room's
-/// next change starts another.
-fn fetch_members(fetch: &mut Option<MemberFetch>, reader: &HeaderReader, room: &Room) {
-    if fetch.is_some() || reader.members_synced() {
-        return;
-    }
-    let room = room.clone();
-    *fetch = Some(Box::pin(async move {
-        if let Err(error) = room.sync_members().await {
-            tracing::warn!(room_id = %room.room_id(), %error, "agent room: members not fetched");
-        }
-    }));
-}
-
-/// The end of the running member fetch, or never when none runs.
-async fn next_fetch(fetch: &mut Option<MemberFetch>) {
-    match fetch {
-        Some(fetch) => fetch.as_mut().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// The next change of the room's info — a sync that touched it, its
-/// members fetched or marked missing — or never when there is no
-/// subscriber.
-async fn next_info(info: &mut Option<Subscriber<RoomInfo>>) {
-    match info {
-        Some(info) => {
-            if info.next_ref().await.is_none() {
-                std::future::pending::<()>().await;
-            }
-        }
-        None => std::future::pending().await,
-    }
-}
-
-/// Whether the room's info changed since it was last read, without
-/// waiting; reading it marks it read.
-fn info_changed(info: &mut Option<Subscriber<RoomInfo>>) -> bool {
-    info.as_mut()
-        .is_some_and(|info| info.next_ref().now_or_never().flatten().is_some())
-}
-
-/// The next event-cache update, or never when there is no subscriber.
-async fn next_update(
-    updates: &mut Option<event_cache::Subscriber<RoomEventCacheUpdate>>,
-) -> Result<RoomEventCacheUpdate, RecvError> {
-    match updates {
-        Some(updates) => updates.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// The next change of the agents' marks, or never when there is no receiver.
-async fn next_mark_change(marks: &mut Option<watch::Receiver<u64>>) {
-    match marks {
-        Some(marks) => {
-            // The sender lives as long as the header holding the marks; a
-            // closed one has nothing more to say.
-            if marks.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
-        }
-        None => std::future::pending().await,
-    }
 }
 
 /// Emit the cached snapshot as a `Reset`, then forward each `VectorDiff` batch
 /// verbatim to `sink`.
 ///
-/// In an agent session room the header rides on the first batch, and on any
-/// later batch after it changed: a timeline diff that moves the caret, or an
-/// event-cache update carrying a status or scope, which the timeline never
-/// shows, or a change of the agents' marks, each sent as a batch with no ops
-/// (R33). `kinds` learns the session's kind for the room list; `icons` marks
-/// the agent with its soul's icon where its zone is on this device. A message
-/// is an agent's growing answer only from a sender with an agent's power
-/// under the room's levels as the header last read them.
-///
-/// A brief (R114, R117) is drawn from what the store holds when the snapshot
-/// is sent — the member list only when the store holds it whole, else every
-/// brief narrowed — and a member list it lacks is fetched beside the
-/// timeline, never before the first batch. Whenever the room changes — a
-/// sync that touched it, a gap, its members fetched — or the agents this
-/// device knows change, every loaded message whose brief is drawn
-/// differently now is sent again as a `Set`, ahead of any items that came
-/// with the change.
-///
-/// The person's marks of where they stopped listening to a spoken answer
-/// (97.3, UX-DR143) ride beside the stream like the approval cards: read
-/// again whenever the loaded items, a mark or whose answers count change,
-/// and sent when they differ from the last sent.
-///
-/// Opening is instant (102.6, R468): the first batch — the snapshot, the
-/// header as the event cache alone reads it, and the room's back-pagination
-/// status — is sent before the header looks at a seat or searches the
-/// server's history for a status out of the cache's reach (R416); what that
-/// search finds arrives as a header of its own, and the search reads past
-/// the event cache so it never meets a page of pagination (R510). A window
-/// that draws fewer than `FILL_DRAWN` items then fills itself here, a page
-/// of `FILL_PAGE` events at a time, up to `FILL_PAGES` pages, until it
-/// draws enough or reaches the room's start as the SDK says it now — a
-/// limited sync that unloads the window fills it again (R509). A failed or
-/// stalled page (`FILL_DEADLINE`) is said as [`PaginationState::Failed`]
-/// and a WARN, and not asked again until the person asks through
-/// [`HistoryAsks`], which pages on until something older shows. The status
-/// rides on every batch where it changed.
+/// Opening is instant (102.6, R468): the first batch — the snapshot and the
+/// room's back-pagination status — is sent at once. A window that draws
+/// fewer than `FILL_DRAWN` items then fills itself here, a page of
+/// `FILL_PAGE` events at a time, up to `FILL_PAGES` pages, until it draws
+/// enough or reaches the room's start as the SDK says it now — a limited sync
+/// that unloads the window fills it again (R509). A failed or stalled page
+/// (`FILL_DEADLINE`) is said as [`PaginationState::Failed`] and a WARN, and
+/// not asked again until the person asks through [`HistoryAsks`], which pages
+/// on until something older shows. The status rides on every batch where it
+/// changed.
 ///
 /// The `Timeline` is kept alive for the whole loop — its drop handle cancels the
 /// SDK's background timeline tasks (AD-19). The producer breaks when the channel
 /// closes (`sink` returns `false`) or the stream ends.
-pub async fn forward_timeline(
-    open: OpenTimeline,
-    room_id: OwnedRoomId,
-    sink: TimelineSink,
-    kinds: Arc<AgentKinds>,
-    icons: Arc<AgentIcons>,
-    hosted: Arc<HostedRooms>,
-) {
+pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: TimelineSink) {
     let OpenTimeline {
         timeline,
         initial,
         mut stream,
         own_user_id,
         account_id,
-        room,
-        agent,
         asks,
     } = open;
 
     // The room id string is stable for the whole producer; capture it once for the
     // media-URL coordinates threaded into every mapped item.
     let room_id_str = room_id.to_string();
-
-    // A session room's header, and the subscriptions that keep it current.
-    // Each is taken before the room is read, so no change falls between the
-    // read and the first wait.
-    let mut fetch: Option<MemberFetch> = None;
-    let (mut header, mut updates, mut marks, mut info, mut recheck, _cache_handles) =
-        if agent == Some(AgentRoomKind::Session) {
-            let (updates, handles) = match room.event_cache().await {
-                Ok((cache, handles)) => match cache.subscribe().await {
-                    Ok((_, updates)) => (Some(updates), Some(handles)),
-                    Err(_) => (None, Some(handles)),
-                },
-                Err(_) => (None, None),
-            };
-            let marks = icons.subscribe();
-            let info = room.subscribe_info();
-            let recheck = Recheck {
-                verification: room.client().encryption().verification_state(),
-                hosted: hosted.subscribe(),
-            };
-            // The cache alone: no seat, no search before the first batch (R468).
-            let mut reader = HeaderReader::read_cached(room.clone()).await;
-            reader.refresh(&icons).await;
-            fetch_members(&mut fetch, &reader, &room);
-            let mut header = AgentHeader {
-                reader,
-                own_user_id: own_user_id.clone(),
-                account_id: account_id.clone(),
-                newest_turn: None,
-                sent: None,
-                kinds,
-                icons,
-                loaded: initial.clone(),
-                approvals_sent: None,
-                heard_sent: None,
-                cross_signed: room::own_device_cross_signed(&room.client()).await,
-                hosted,
-                gate: None,
-                turn_marks: HashMap::new(),
-                warned: HashSet::new(),
-                room_id: room_id.clone(),
-            };
-            header.regate();
-            (
-                Some(header),
-                updates,
-                Some(marks),
-                Some(info),
-                Some(recheck),
-                handles,
-            )
-        } else {
-            (None, None, None, None, None, None)
-        };
 
     // The producer-owned `event_id → unique_id` index. Built from the snapshot,
     // then kept current across each diff so a reply resolves an earlier-mapped
@@ -1355,30 +673,12 @@ pub async fn forward_timeline(
         index_item(&mut index, item);
     }
 
-    let turns = header
-        .as_ref()
-        .map_or_else(TurnTrust::default, AgentHeader::turns);
-    let mut reset = vec![TimelineOp::Reset {
+    let reset = vec![TimelineOp::Reset {
         items: initial
             .iter()
-            .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str, turns))
+            .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str))
             .collect(),
     }];
-    let (first_header, first_approvals, first_heard) = match &mut header {
-        Some(header) => {
-            header.see(&initial.iter().collect::<Vec<_>>(), true);
-            let changed = header.changed().await;
-            // The agent's name for a message not taken is the header's.
-            header.remark();
-            header.mark(&mut reset);
-            (
-                changed,
-                header.approvals_changed().await,
-                header.heard_changed(),
-            )
-        }
-        None => (None, None, None),
-    };
     // The back-pagination status rides on the stream, its snapshot on the
     // first batch (102.6): a focused timeline has none and reads as idle.
     // What the SDK says is the window's current state, not a lasting fact:
@@ -1405,28 +705,12 @@ pub async fn forward_timeline(
     let mut status_sent = fill.said(sdk_status, shown.drawn(), false);
     let first = TimelineBatch {
         ops: reset,
-        header: first_header,
-        approvals: first_approvals,
-        heard: first_heard,
         pagination: Some(status_sent),
     };
     if !sink(first) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
         return;
     }
-
-    // Only now the header's seat, and its search of the server's history
-    // (R416) beside the stream: what it finds is a header-only batch. The
-    // search reads past the room's event cache (R510), so it never meets a
-    // page of the window's own fill or of anyone's pagination. The
-    // conversation comes first; the header fills in after it.
-    let mut search: Option<Pending<HeaderFound>> = header.as_ref().and_then(|header| {
-        header.reader.remember(&header.kinds);
-        header
-            .reader
-            .search(&header.kinds)
-            .map(|search| Box::pin(search) as Pending<HeaderFound>)
-    });
 
     loop {
         // A window that draws too little pages back on its own, one page at
@@ -1435,13 +719,6 @@ pub async fn forward_timeline(
             fill.pages += 1;
             filling = Some(fill_page(&timeline));
         }
-        // When the next waiting approval card expires: it is drawn again then.
-        let expiry = header
-            .as_ref()
-            .and_then(|header| header.reader.next_expiry(Utc::now()));
-        // What a branch sends: the briefs drawn again, then its own ops,
-        // and the header and the approval cards when they changed; an empty
-        // batch is not sent.
         let mut batch = tokio::select! {
             diffs = stream.next() => {
                 let Some(diffs) = diffs else {
@@ -1449,175 +726,24 @@ pub async fn forward_timeline(
                 };
                 // Items arrived: what the last fill page brought is counted.
                 fill.settling = None;
-                let mut ops = Vec::new();
-                if let Some(header) = &mut header {
-                    // A change of the room that came with these items is
-                    // read first, so they are drawn under it.
-                    if info_changed(&mut info) {
-                        let positions = header.rebrief().await;
-                        ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                        fetch_members(&mut fetch, &header.reader, &room);
-                    }
-                    for diff in &diffs {
-                        header.see_diff(diff);
-                    }
-                }
-                // A gate's word on a request redraws the request it names,
-                // after the items that carry it.
-                let regated = header.as_mut().map(AgentHeader::regate).unwrap_or_default();
-                let turns = header
-                    .as_ref()
-                    .map_or_else(TurnTrust::default, AgentHeader::turns);
-                ops.extend(diffs.into_iter().map(|d| {
-                    timeline_diff_to_op(map_diff_indexing(
-                        d,
-                        &mut index,
-                        &own_user_id,
-                        &account_id,
-                        &room_id_str,
-                        turns,
-                    ))
-                }));
-                if let Some(header) = &mut header {
-                    // Whether the host took a person's message may change
-                    // with these items: its anchor, its notice (R465).
-                    let mut positions = regated;
-                    positions.extend(header.remark());
-                    positions.sort_unstable();
-                    positions.dedup();
-                    ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
-                }
+                let ops: Vec<TimelineOp> = diffs
+                    .into_iter()
+                    .map(|d| {
+                        timeline_diff_to_op(map_diff_indexing(
+                            d,
+                            &mut index,
+                            &own_user_id,
+                            &account_id,
+                            &room_id_str,
+                        ))
+                    })
+                    .collect();
                 // A window the SDK reset — a limited sync unloads it to its
                 // last chunk — is filled again from its new start (R509).
                 if ops.iter().any(|op| matches!(op, TimelineOp::Clear | TimelineOp::Reset { .. })) {
                     fill.pages = 0;
                 }
-                let (changed, heard) = match &mut header {
-                    Some(header) => (header.changed().await, header.heard_changed()),
-                    None => (None, None),
-                };
-                TimelineBatch { ops, header: changed, approvals: None, heard, pagination: None }
-            }
-            update = next_update(&mut updates) => {
-                let Some(header) = &mut header else {
-                    continue;
-                };
-                // Whose status counts is read before the update is folded.
-                let mut ops = Vec::new();
-                if info_changed(&mut info) {
-                    let positions = header.rebrief().await;
-                    ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                    fetch_members(&mut fetch, &header.reader, &room);
-                }
-                let folded = match update {
-                    Ok(update) => header.reader.update(&update, &header.kinds),
-                    // Missed updates: read the header again from the cache,
-                    // and search the server beside the stream as at open
-                    // (R468), never inline.
-                    Err(RecvError::Lagged(_)) => {
-                        let mut reader = HeaderReader::read_cached(room.clone()).await;
-                        reader.refresh(&header.icons).await;
-                        reader.remember(&header.kinds);
-                        search = reader
-                            .search(&header.kinds)
-                            .map(|search| Box::pin(search) as Pending<HeaderFound>);
-                        let old = std::mem::replace(&mut header.reader, reader);
-                        let positions = header.rebriefed(old.turns());
-                        ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
-                        fetch_members(&mut fetch, &header.reader, &room);
-                        true
-                    }
-                    Err(RecvError::Closed) => {
-                        updates = None;
-                        false
-                    }
-                };
-                // A status may say only now that this is a gate's room; a
-                // host's renewal or status moves whether a person's message
-                // reads as not taken (R465).
-                let mut positions = if folded { header.regate() } else { Vec::new() };
-                positions.extend(header.remark());
-                positions.sort_unstable();
-                positions.dedup();
-                ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
-                let changed = if folded { header.changed().await } else { None };
-                let approvals = if folded {
-                    header.approvals_changed().await
-                } else {
-                    None
-                };
-                let heard = if folded { header.heard_changed() } else { None };
-                TimelineBatch { ops, header: changed, approvals, heard, pagination: None }
-            }
-            () = next_info(&mut info) => {
-                let Some(header) = &mut header else {
-                    continue;
-                };
-                let positions = header.rebrief().await;
-                fetch_members(&mut fetch, &header.reader, &room);
-                let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch {
-                    ops,
-                    // A gate room's peer is read again with its levels.
-                    header: header.changed().await,
-                    approvals: None,
-                    heard: header.heard_changed(),
-                    pagination: None,
-                }
-            }
-            () = next_fetch(&mut fetch) => {
-                // A fetch that completes the list marks the room's members
-                // synced, a room-info change the branch above redraws on; a
-                // failure is tried again at the room's next change.
-                fetch = None;
-                continue;
-            }
-            () = next_mark_change(&mut marks) => {
-                let Some(header) = &mut header else {
-                    continue;
-                };
-                // The agents this device knows may have changed with them.
-                let positions = header.rebrief().await;
-                let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch {
-                    ops,
-                    header: header.changed().await,
-                    approvals: None,
-                    heard: header.heard_changed(),
-                    pagination: None,
-                }
-            }
-            () = next_recheck(&mut recheck, expiry) => {
-                let Some(header) = &mut header else {
-                    continue;
-                };
-                header.cross_signed = room::own_device_cross_signed(&room.client()).await;
-                TimelineBatch {
-                    ops: Vec::new(),
-                    header: None,
-                    approvals: header.approvals_changed().await,
-                    heard: None,
-                    pagination: None,
-                }
-            }
-            found = next_done(&mut search) => {
-                search = None;
-                let Some(header) = &mut header else {
-                    continue;
-                };
-                if !header.reader.fold_found(found, &header.kinds) {
-                    continue;
-                }
-                // A status may say only now that this is a gate's room.
-                let positions = header.regate();
-                let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch {
-                    ops,
-                    header: header.changed().await,
-                    approvals: header.approvals_changed().await,
-                    heard: header.heard_changed(),
-                    pagination: None,
-                }
+                TimelineBatch { ops, pagination: None }
             }
             paged = next_done(&mut filling) => {
                 filling = None;
@@ -1655,10 +781,6 @@ pub async fn forward_timeline(
                 TimelineBatch::default()
             }
         };
-        // Every message an op carries is drawn with its turn mark (R465).
-        if let Some(header) = &header {
-            header.mark(&mut batch.ops);
-        }
         shown.apply(&batch.ops);
         // The status the boundary shows, sent where it changed.
         let status = fill.said(sdk_status, shown.drawn(), filling.is_some());
@@ -1666,12 +788,7 @@ pub async fn forward_timeline(
             status_sent = status;
             batch.pagination = Some(status);
         }
-        if batch.ops.is_empty()
-            && batch.header.is_none()
-            && batch.approvals.is_none()
-            && batch.heard.is_none()
-            && batch.pagination.is_none()
-        {
+        if batch.ops.is_empty() && batch.pagination.is_none() {
             continue;
         }
         if !sink(batch) {
@@ -1956,9 +1073,6 @@ impl Shown {
 }
 
 #[cfg(test)]
-mod brief_tests;
-
-#[cfg(test)]
 mod open_tests;
 
 #[cfg(test)]
@@ -1983,9 +1097,6 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
-            brief: None,
-            gate: None,
-            turn: None,
         }
     }
 
@@ -2283,45 +1394,6 @@ mod tests {
         assert!(readers_of(keys.iter(), own).is_empty());
     }
 
-    /// Story 102.4, R465: in an agent session room the agent — whoever
-    /// holds an agent's power — is never a reader, so its claim renewals
-    /// draw no read tick; another person still is, and every other room
-    /// keeps the agent's receipt as any member's.
-    #[test]
-    fn an_agent_is_no_reader_in_its_session_room() {
-        use matrix_sdk::ruma::{owned_user_id, user_id};
-        let levels = crate::agents::room::power_levels_for(&[
-            ("@nixi:example.org", 50),
-            ("@tgorka:example.org", 100),
-        ]);
-        let own = user_id!("@tgorka:example.org");
-        let keys = [
-            owned_user_id!("@nixi:example.org"),
-            owned_user_id!("@marta:example.org"),
-        ];
-        let session = TurnTrust {
-            kind: Some(AgentRoomKind::Session),
-            levels: Some(&levels),
-            ..TurnTrust::default()
-        };
-        assert_eq!(
-            readers_here(keys.iter(), own, session),
-            ["@marta:example.org"]
-        );
-        let control = TurnTrust {
-            kind: Some(AgentRoomKind::Control),
-            ..session
-        };
-        assert_eq!(
-            readers_here(keys.iter(), own, control),
-            ["@nixi:example.org", "@marta:example.org"]
-        );
-        assert_eq!(
-            readers_here(keys.iter(), own, TurnTrust::default()).len(),
-            2
-        );
-    }
-
     #[test]
     fn map_pagination_status_paginating_shows_spinner_not_start() {
         let batch = map_pagination_status(PaginationStatus::Paginating);
@@ -2414,82 +1486,6 @@ mod tests {
     #[test]
     fn truncate_body_keeps_short_bodies() {
         assert_eq!(truncate_body("hello".to_owned(), MAX_BODY_CHARS), "hello");
-    }
-
-    fn turn_json() -> String {
-        serde_json::json!({
-            "type": "m.room.message", "sender": "@nixi:example.org",
-            "content": {
-                "msgtype": "m.text", "body": "…",
-                "dev.keeper.agent.turn": {"session": "s", "line": "l"},
-            },
-        })
-        .to_string()
-    }
-
-    /// A message's shape in an agent session room where Nixi holds an
-    /// agent's power and the own user 100: `(is_edited, cap)` of an edited
-    /// message from `sender` whose original is `json`.
-    fn shape_in_session(sender: &str, json: Option<&str>) -> (bool, usize) {
-        let levels = crate::agents::room::power_levels_for(&[
-            ("@nixi:example.org", 50),
-            ("@tgorka:example.org", 100),
-        ]);
-        let turns = TurnTrust {
-            kind: Some(AgentRoomKind::Session),
-            levels: Some(&levels),
-            ..TurnTrust::default()
-        };
-        let own = UserId::parse("@tgorka:example.org").expect("user");
-        let sender = UserId::parse(sender).expect("user");
-        message_shape(turns.is_turn(&own, &sender, json), true)
-    }
-
-    #[test]
-    fn an_agents_own_stream_is_not_marked_edited() {
-        let turn = turn_json();
-        let plain = r#"{"type":"m.room.message","content":{"msgtype":"m.text","body":"hi"}}"#;
-        // An answer's anchor from the agent: one message, however many edits.
-        assert_eq!(
-            shape_in_session("@nixi:example.org", Some(&turn)),
-            (false, MAX_TURN_BODY_CHARS)
-        );
-        // The agent's own edited message without the marker keeps its mark.
-        assert_eq!(
-            shape_in_session("@nixi:example.org", Some(plain)),
-            (true, MAX_BODY_CHARS)
-        );
-        // A person's marked message is a person's message: edited, and capped.
-        assert_eq!(
-            shape_in_session("@marta:example.org", Some(&turn)),
-            (true, MAX_BODY_CHARS)
-        );
-        assert_eq!(
-            shape_in_session("@tgorka:example.org", Some(&turn)),
-            (true, MAX_BODY_CHARS)
-        );
-        // Outside an agent session room the marker means nothing.
-        let own = UserId::parse("@tgorka:example.org").expect("user");
-        let nixi = UserId::parse("@nixi:example.org").expect("user");
-        let ordinary = TurnTrust::default().is_turn(&own, &nixi, Some(&turn));
-        assert_eq!(message_shape(ordinary, true), (true, MAX_BODY_CHARS));
-    }
-
-    #[test]
-    fn an_answer_is_cut_at_the_hosts_cut_not_the_message_cap() {
-        // The longest final answer a host sends: its cut and the artifact sentence.
-        let answer = format!(
-            "{}\n\nThe full answer is in artifacts/answer-01J.md",
-            "a".repeat(FINAL_CUT_BYTES)
-        );
-        let (_, turn_cap) = message_shape(true, true);
-        assert_eq!(truncate_body(answer.clone(), turn_cap), answer);
-        let (_, message_cap) = message_shape(false, false);
-        assert_eq!(message_cap, MAX_BODY_CHARS);
-        assert_eq!(
-            truncate_body(answer, message_cap).chars().count(),
-            MAX_BODY_CHARS
-        );
     }
 
     #[test]

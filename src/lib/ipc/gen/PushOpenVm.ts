@@ -2,8 +2,6 @@
 
 /**
  * Where tapping a keeper notification opens (UX-DR144): a session in the
- * Agents window, named by its database (106.6, AD-433) — or, for a
- * notification of a Matrix agent room, that room in its account, until
- * 108.2 removes those.
+ * Agents window, named by its database (106.6, AD-433).
  */
-export type PushOpenVm = { "kind": "session", database: string, sessionId: string, } | { "kind": "room", accountId: string, roomId: string, };
+export type PushOpenVm = { "kind": "session", database: string, sessionId: string, };

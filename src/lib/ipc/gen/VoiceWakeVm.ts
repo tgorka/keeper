@@ -48,9 +48,9 @@ onDeviceLocales: Array<string>,
 stopPhrase: string, 
 /**
  * `bots.voice_target` as stored — the id of the pinned bot a spoken
- * turn goes to, or `agent:<room id>` for one of the person's proxy
- * conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
- * pinned bot most recently talked to".
+ * turn goes to, or `agent:<agent>` for one of the person's agents
+ * ([`VoiceAgentTargetVm::target`]); `None` means "the pinned bot most
+ * recently talked to".
  */
 voiceTarget: string | null, 
 /**

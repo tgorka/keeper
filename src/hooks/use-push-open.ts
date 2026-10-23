@@ -16,7 +16,6 @@ import { logFailure, sayFailure } from "@/lib/failure";
 import { listenPushOpen, pushOpenTake } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import { primaryViewStore } from "@/lib/stores/primary-view";
-import { roomsStore } from "@/lib/stores/rooms";
 
 async function openWaiting(): Promise<void> {
   const target = await pushOpenTake();
@@ -24,13 +23,7 @@ async function openWaiting(): Promise<void> {
     return;
   }
   primaryViewStore.getState().setView("agents");
-  if (target.kind === "session") {
-    agentSessionsStore
-      .getState()
-      .select({ database: target.database, sessionId: target.sessionId });
-    return;
-  }
-  roomsStore.getState().selectRoom({ accountId: target.accountId, roomId: target.roomId });
+  agentSessionsStore.getState().select({ database: target.database, sessionId: target.sessionId });
 }
 
 export function usePushOpen(): void {

@@ -4,7 +4,7 @@
 //!
 //! Whether to pause, resume or stop is `keeper_core::voice`'s
 //! (`Effect::PauseSpeaking`, `Effect::ContinueSpeaking`); how far the person
-//! heard is `keeper_core::agents::spoken::HeardMark`'s count of the
+//! heard is `keeper_core::hq::spoken::HeardMark`'s count of the
 //! utterances this file reports finished. A delegate, not the ports'
 //! `isSpeaking` poll, reports them: the poll sees only the whole queue
 //! drain, and a sentence the synthesiser was cut off in must not count

@@ -1,5 +1,5 @@
-//! Slash commands in the messenger composer — chats and agent rooms (Story
-//! 100.5, R385).
+//! Slash commands in the messenger composer (Story 100.5, R385; the agent
+//! rooms' `/new` and `/model` left with the agents' Matrix path, 108.2).
 //!
 //! **What a `/` line means is decided here and nowhere else**, exactly as
 //! `crate::bots::commands` decides it for the ⌘9 bot composer (AD-55): the
@@ -12,9 +12,8 @@
 //! 1. **Exact beats prefix, and an alias is exact** — name, then alias, then
 //!    the first prefix in registry order ([`COMMANDS`] order is a decision).
 //! 2. **A command that cannot work in this room is absent, not disabled**
-//!    (AD-27): the chat set is offered in a chat, the agent set in an agent
-//!    room. A command whose precondition is merely unmet right now — a power
-//!    level, a reply in progress — is listed with the reason.
+//!    (AD-27). A command whose precondition is merely unmet right now — a
+//!    power level, a reply in progress — is listed with the reason.
 //! 3. **An unknown command is refused in place and is never sent as text.**
 //!    The refusal names the nearest command offered here.
 //! 4. **`//` sends a literal slash** — `//etc` is the text `/etc`
@@ -30,20 +29,8 @@
 //! Rust beside the others: `/me` is an `m.emote` through the single send gate
 //! (`send::submit`, the composer's own trigger), `/shrug` and `/plain` are
 //! ordinary text through the same gate, `/topic`, `/invite` and `/leave` are
-//! `Accounts::room_set_topic`, `room_invite` and `room_leave`, `/new` is the
-//! agent DM's existing *new conversation* request, and `/model` is Settings ›
-//! Agents' own model save (Story 100.2, [`crate::agents::model::command`]).
-//! Nothing here speaks Matrix: it only decides.
-//!
-//! # The agent room's set is what keeper already offers there
-//!
-//! `/new` (the DM's *new conversation*), `/model` (the agent's model and level,
-//! as Settings › Agents saves them; listed with its reason where the agent's
-//! home is not on this device, R415) and `/help`. Stop and pause have no
-//! device-side verb on this base (the host owns a run), a typed approval would
-//! decide a card without the card being read (an approval is decided on its
-//! card, never by a line), and the scope is edited beside the notes dock — so
-//! none of those is a command here, and none is listed.
+//! `Accounts::room_set_topic`, `room_invite` and `room_leave`. Nothing here
+//! speaks Matrix: it only decides.
 
 use matrix_sdk::ruma::UserId;
 
@@ -61,11 +48,6 @@ pub const DESC_TOPIC: &str = "Change this room's topic for everyone in it.";
 pub const DESC_INVITE: &str = "Invite someone to this room by their Matrix id.";
 /// `/leave`
 pub const DESC_LEAVE: &str = "Leave this room, after you confirm.";
-/// `/new`
-pub const DESC_NEW: &str = "Ask your agent for a new conversation, with an optional title.";
-/// `/model`
-pub const DESC_MODEL: &str =
-    "Say which model and reasoning level your agent runs on, or change them.";
 /// `/help`
 pub const DESC_HELP: &str = "List the commands this room offers.";
 
@@ -104,14 +86,8 @@ const NEAREST_MAX_DISTANCE: usize = 3;
 /// Which room a composer is in, as far as commands care.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomKind {
-    /// Any room that is not one of the person's agent rooms.
+    /// A messenger room.
     Chat,
-    /// The person's `main` DM with their agent — where a new conversation is
-    /// asked for.
-    AgentMain,
-    /// Any other agent room: a conversation, or a session room keeper reads
-    /// as an agent's but not as the person's own proxy.
-    Agent,
 }
 
 /// Which rooms offer a command (rule 2).
@@ -119,8 +95,6 @@ pub enum RoomKind {
 pub enum Place {
     /// Chats only.
     Chat,
-    /// The agent DM only.
-    AgentMain,
     /// Every room with a composer.
     Everywhere,
 }
@@ -134,8 +108,6 @@ pub enum Need {
     Invite,
     /// No reply is pending in the composer.
     NoReply,
-    /// The agent's home — its `agent.toml` — is on this device (R415).
-    HomeHere,
 }
 
 impl Need {
@@ -145,7 +117,6 @@ impl Need {
             Need::SetTopic => NEED_TOPIC_POWER,
             Need::Invite => NEED_INVITE_POWER,
             Need::NoReply => NEED_NO_REPLY,
-            Need::HomeHere => crate::agents::model::HOME_NOT_HERE,
         }
     }
 }
@@ -172,10 +143,8 @@ pub struct CommandSpec {
 
 /// Every command, in resolution order (rule 1).
 ///
-/// The chat set first, then the agent set, then `/help`. `/me` precedes
-/// `/shrug` so that `/m` is the action — the frequent act earns the short
-/// spelling; `/new` precedes `/help` so that `/h` reaches help only through its
-/// alias.
+/// The chat set first, then `/help`. `/me` precedes `/shrug` so that `/m` is
+/// the action — the frequent act earns the short spelling.
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "me",
@@ -232,24 +201,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         needs: &[],
     },
     CommandSpec {
-        name: "new",
-        aliases: &["conversation"],
-        description: DESC_NEW,
-        args: ArgMode::OptionalRest,
-        arg_hint: Some("a title"),
-        place: Place::AgentMain,
-        needs: &[],
-    },
-    CommandSpec {
-        name: "model",
-        aliases: &[],
-        description: DESC_MODEL,
-        args: ArgMode::OptionalRest,
-        arg_hint: Some("a bot, a level"),
-        place: Place::AgentMain,
-        needs: &[Need::HomeHere],
-    },
-    CommandSpec {
         name: "help",
         aliases: &["h", "commands"],
         description: DESC_HELP,
@@ -273,9 +224,6 @@ pub struct Context {
     pub may_invite: bool,
     /// Whether a reply is pending in the composer.
     pub replying: bool,
-    /// Whether the room's agent's home is on this device, where its
-    /// `agent.toml` can be written (`AgentIcons::is_here`); `false` in a chat.
-    pub agent_home_here: bool,
 }
 
 /// Whether a command may run right now, and why not.
@@ -363,7 +311,6 @@ pub fn offered(spec: &CommandSpec, ctx: &Context) -> bool {
     match spec.place {
         Place::Everywhere => true,
         Place::Chat => ctx.room == RoomKind::Chat,
-        Place::AgentMain => ctx.room == RoomKind::AgentMain,
     }
 }
 
@@ -374,7 +321,6 @@ pub fn availability(spec: &CommandSpec, ctx: &Context) -> Availability {
             Need::SetTopic => ctx.may_set_topic,
             Need::Invite => ctx.may_invite,
             Need::NoReply => !ctx.replying,
-            Need::HomeHere => ctx.agent_home_here,
         };
         if !holds {
             return Availability::Unavailable(*need);

@@ -34,11 +34,16 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::agents::approval_card::tier_word;
 use crate::agents::push::{
-    holds_unreadable, misreads, open_body, shown_name, unreadable, ActionRefusal, ActionTap,
-    ApnsEnvironment, Category, Gateway, NotificationAction, PushOpenVm, BODY_MAX_CHARS, SHOWN_INFO,
+    holds_unreadable, misreads, open_body, shown_name, tier_word, unreadable, ActionRefusal,
+    ActionTap, ApnsEnvironment, Category, Gateway, NotificationAction, PushOpenVm, BODY_MAX_CHARS,
+    SHOWN_INFO,
 };
+
+/// What a streamed answer's row says before its first words (the agents'
+/// Matrix anchor's placeholder, kept by rows an agent wrote that way): a
+/// notification never shows it.
+const PLACEHOLDER: &str = "…";
 use crate::hq::routes::{is_database_name, Routes};
 use crate::hq::server::ServerUrl;
 use crate::hq::sessions::{int, json as json_column, names, opt_text, text, AgentSessionRef};
@@ -379,12 +384,11 @@ pub fn classify(pushed: &PushedItem, read: &ItemRead, own: &str, now_ms: i64) ->
                 return HqClassified::Drop;
             }
             let words = text(row, "body");
-            let body =
-                if words.trim().is_empty() || words.trim() == crate::agents::events::PLACEHOLDER {
-                    answered(agent)
-                } else {
-                    words.to_owned()
-                };
+            let body = if words.trim().is_empty() || words.trim() == PLACEHOLDER {
+                answered(agent)
+            } else {
+                words.to_owned()
+            };
             shown(agent.to_owned(), None, body, None, None)
         }
     }

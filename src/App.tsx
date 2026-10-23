@@ -24,7 +24,6 @@ import { useRecordingRemoved } from "@/hooks/use-recording-removed";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { useTelemetryReadiness } from "@/hooks/use-telemetry";
 import { useWebviewGuard } from "@/hooks/use-webview-guard";
-import { startAgentSurface } from "@/lib/agents/surface";
 import { logFailure } from "@/lib/failure";
 import { encryptionPosture, firstRunSetupSkippedGet, telemetryStudyStop } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -66,12 +65,6 @@ function App() {
   // Background failures Rust tells (R381): a toast, and the line under the
   // surface's own switch.
   useFailureNotices();
-  // Surface requests from the person's own agent: opened at once,
-  // because Rust drops a request nobody subscribed for yet; and the primary
-  // view this device's presence publishes.
-  useEffect(() => {
-    startAgentSurface();
-  }, []);
   // Attempt a one-shot boot session-restore before deciding what to render.
   useSessionRestore();
   // Mirror the Rust-served per-platform capability handshake once at startup

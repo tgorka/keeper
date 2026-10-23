@@ -3,8 +3,7 @@
  *
  * Wires `⌃Tab` → next chat and `⌃⇧Tab` → previous chat, cycling the open
  * conversation over the currently rendered, Rust-recency-ordered window (the inbox
- * window when `primaryView === "inbox"`, the archive window when `"archive"`, the
- * agents window when `"agents"`),
+ * window when `primaryView === "inbox"`, the archive window when `"archive"`),
  * honoring the active account-switcher display filter. It only moves a cursor over
  * the array Rust already ordered — never sorts, re-sorts, or re-derives order in TS
  * (AD-20). Selecting a chat opens it (`selectRoom`) and drops focus into the
@@ -16,7 +15,6 @@
 import { useEffect } from "react";
 import { renderedWindowRooms } from "@/lib/rendered-window";
 import { accountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { composerStore } from "@/lib/stores/composer";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -38,7 +36,6 @@ export function useQuickSwitcher(): void {
         {
           inbox: roomsStore.getState().rooms,
           archive: archiveRoomsStore.getState().rooms,
-          agents: agentRoomsStore.getState().rooms,
         },
         accountsStore.getState().filterAccountId,
       );

@@ -733,7 +733,7 @@ describe("SyncSection add-profile form", () => {
         recordingsSubfolder: null,
         voices: false,
         voicesSubfolder: null,
-        agents: false,
+        agents: null,
         agentsSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,

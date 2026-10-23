@@ -110,7 +110,6 @@ import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
-import { useSurfaceStore } from "@/lib/agents/surface";
 import { logFailure } from "@/lib/failure";
 import { syncNow } from "@/lib/ipc/client";
 import { type PhoneSurface, phoneSurfaceFor } from "@/lib/phone-surfaces";
@@ -391,20 +390,6 @@ export function PhoneShell() {
       shown === null || shown.page === page ? shown : { ...shown, page },
     );
   }, []);
-
-  // An agent's surface request brought a note forward: the request
-  // already made Notes the view and the note the active panel, so show it —
-  // over a room too, since a selected room outranks every view level.
-  const revealed = useSurfaceStore((s) => s.revealed);
-  const seenRevealed = useRef(revealed);
-  useEffect(() => {
-    if (revealed === seenRevealed.current) {
-      return;
-    }
-    seenRevealed.current = revealed;
-    roomsStore.getState().selectRoom(null);
-    setPushedSurface("notes");
-  }, [revealed]);
 
   // DW-109 (phone-scoped): a selection change never lands on Detail — close it
   // whenever `selected` changes so a room (re)selected with Detail open resolves

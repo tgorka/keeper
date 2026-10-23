@@ -33,7 +33,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keeper_core::agents::drive::DriveDecl;
-use keeper_core::agents::label::{check_sink, Label, Sink, SinkVerdict};
+use keeper_core::agents::label::{
+    check_sink, label_drive_read, okf_label_facts, Author, Label, ReadFacts, Sink, SinkVerdict,
+};
 use keeper_core::agents::search::{
     self as shape, Found, Hit, Query, Said, DRIVE_SEARCH, EMBED_MILLIS, LINES_PER_HIT,
     MAX_FILE_BYTES, SCAN_BYTES, SCAN_FILES, SCAN_MILLIS,
@@ -430,12 +432,30 @@ fn read_admitted(
 /// stricter of the two places' (R195's rule for a drive read), taken from
 /// the bytes read, never from a later look at the file.
 fn label_of(decl: &DriveDecl, requested: &str, landed: &str, text: &str) -> Label {
-    let asked = crate::agent::file_label(decl, requested, text);
+    let asked = file_label(decl, requested, text);
     if requested == landed {
         asked
     } else {
-        asked.join(&crate::agent::file_label(decl, landed, text))
+        asked.join(&file_label(decl, landed, text))
     }
+}
+
+/// The label of what was read of the file at `path` of the drive `decl`
+/// declares, from `text`, its head: 89.4's `label_drive_read` with an
+/// author this host cannot name (DW-431), the file's OKF keys and its
+/// `integrity:` mark.
+fn file_label(decl: &DriveDecl, path: &str, text: &str) -> Label {
+    let okf = okf_label_facts(text);
+    label_drive_read(
+        decl,
+        &ReadFacts {
+            path: path.to_owned(),
+            last_author: Author::Unknown,
+            okf_human_reviewed: okf.human_reviewed,
+            okf_external_source: okf.external_source,
+            card_untrusted: keeper_core::agents::card::marked_untrusted(text),
+        },
+    )
 }
 
 /// What a read text comes to as a result: its title and type as the

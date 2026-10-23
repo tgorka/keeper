@@ -519,8 +519,9 @@ fn queued_payloads(telemetry: &Telemetry) -> Vec<String> {
         .collect()
 }
 
-/// S-19 as amended by R461: a line under `keeper_agent…` or
-/// `keeper_core::agents…` leaves with its level, target, callsite and
+/// S-19 as amended by R461: a line under `keeper_agent…`,
+/// `keeper_core::agents…` or `keeper_core::hq…` (since 108.2 the agents'
+/// targets are the database's and the served turn's) leaves with its level, target, callsite and
 /// fingerprint — never its message or its fields (spans, tool arguments,
 /// paths, provider errors) — at either boundary: the log layer, and
 /// [`Telemetry::capture_log`] handed a non-empty private message directly.
@@ -537,8 +538,8 @@ fn agent_target_lines_leave_without_their_message() {
         })
         .expect("consent");
     forwarding(&telemetry, || {
-        tracing::error!(target: "keeper_agent::runtime", path = "60-sessions/active/plan", "agentd: PRIVATE_SENTINEL turn");
-        tracing::warn!(target: "keeper_core::agents::matrix", error = "PRIVATE_SENTINEL", "a provider error");
+        tracing::error!(target: "keeper_agent::served", path = "60-sessions/active/plan", "agentd: PRIVATE_SENTINEL turn");
+        tracing::warn!(target: "keeper_core::hq::spoken", error = "PRIVATE_SENTINEL", "a provider error");
         tracing::warn!(target: "keeper::sync", "push held for PUBLIC_VISIBLE");
         tracing::warn!(target: "keeper_core::hq::syncular", why = "PRIVATE_SENTINEL", "agents server not reached");
     });
@@ -560,11 +561,63 @@ fn agent_target_lines_leave_without_their_message() {
         assert!(payload.contains("\"log_line\""), "{payload}");
         assert!(payload.contains("$exception_fingerprint"), "{payload}");
     }
-    assert!(payloads[0].contains("\"keeper_agent::runtime\""));
-    assert!(payloads[1].contains("\"keeper_core::agents::matrix\""));
+    assert!(payloads[0].contains("\"keeper_agent::served\""));
+    assert!(payloads[1].contains("\"keeper_core::hq::spoken\""));
     assert!(payloads[3].contains("\"keeper_core::hq::syncular\""));
     assert!(payloads[4].contains("\"keeper_agent::tools\""));
     assert!(payloads[2].contains("push held for PUBLIC_VISIBLE"));
+}
+
+/// R1082-03: the shell's agents-server lines stay home too. A spoken
+/// question refused because its agent works in several databases names them;
+/// logged by the shell's `hq_ipc` (its module target) or by another shell
+/// module under [`SHELL_AGENTS_TARGET`], the line leaves with its target and
+/// callsite and none of the names, at the log layer and at `capture_log`.
+#[test]
+fn the_shells_agents_server_lines_leave_without_the_persons_databases() {
+    let local = LocalDir::new();
+    let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+    telemetry
+        .set_consent(TelemetryConsentVm {
+            diagnostics: true,
+            product_analytics: true,
+            remote_config: true,
+        })
+        .expect("consent");
+    let refusal = crate::hq::spoken::unchosen_sentence(
+        "Nixie",
+        &["cancer-care".to_owned(), "private-employer".to_owned()],
+    );
+    forwarding(&telemetry, || {
+        tracing::warn!(target: "keeper_lib::hq_ipc", message = %refusal, "agents: a spoken question was not sent");
+        tracing::warn!(target: SHELL_AGENTS_TARGET, why = %refusal, "push: the agents item could not be read");
+        tracing::warn!(target: "keeper_lib::hq_blob_protocol", "not served: {refusal}");
+        tracing::warn!(target: "keeper_lib::sync_ipc", "push held for PUBLIC_VISIBLE");
+    });
+    telemetry.capture_log(
+        LogSite {
+            level: tracing::Level::WARN,
+            target: "keeper_lib::hq_ipc",
+            file: Some("crates/keeper/src/hq_ipc.rs"),
+            line: Some(920),
+        },
+        refusal.clone(),
+    );
+    let payloads = queued_payloads(&telemetry);
+    assert_eq!(payloads.len(), 5);
+    for payload in [&payloads[0], &payloads[1], &payloads[2], &payloads[4]] {
+        assert!(!payload.contains("cancer-care"), "{payload}");
+        assert!(!payload.contains("private-employer"), "{payload}");
+        assert!(!payload.contains("Nixie"), "{payload}");
+        assert!(payload.contains("$exception_fingerprint"), "{payload}");
+    }
+    assert!(payloads[0].contains("\"keeper_lib::hq_ipc\""));
+    assert!(payloads[1].contains("\"keeper_lib::hq\""));
+    assert!(payloads[2].contains("\"keeper_lib::hq_blob_protocol\""));
+    assert!(
+        payloads[3].contains("push held for PUBLIC_VISIBLE"),
+        "an ordinary shell line keeps its words"
+    );
 }
 
 /// R461: every WARN and ERROR — a panic line included — is forwarded with

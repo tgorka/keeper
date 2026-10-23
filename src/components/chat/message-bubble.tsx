@@ -9,37 +9,14 @@
  * a text message renders its body. A reply shows the quoted original inline
  * (clickable → jump to original) and an edited message shows an "Edited" caption
  * (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
- *
- * A brief (UX-DR135) — the message a delegating agent hands work on with, which
- * Rust marks only by the host's own rule, from an agent this device knows — is
- * the same bubble on a card surface with a left accent, named "Brief from … for
- * …": who the work is handed to above the text, the card's title, and the
- * drives in scope under it. Under a narrowed label Rust sends neither title nor
- * drives, and the bubble says it draws them only for a room it knows may read
- * them. The text is the message's, shown as any message is (R115). A forged
- * brief arrives as an ordinary message and is drawn as one.
- *
- * In a gate room (UX-DR147) Rust marks the outside system's requests — once the
- * gate has spoken of them — and the gate's word on each (`item.gate`): a request
- * is the system's text quoted as data on a dashed surface under its state chip,
- * the gate's word an agent message headed by the request it speaks of
- * ({@link GateHead}).
  */
 
-import { Forward } from "lucide-react";
 import { EditHistoryPopover } from "@/components/chat/edit-history-popover";
-import {
-  GateHead,
-  GateRequestText,
-  gateBubbleClass,
-  gateLineName,
-} from "@/components/chat/gate-line";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
 import { CURATED_EMOJI } from "@/components/chat/reaction-popover";
 import { ReadReceipts } from "@/components/chat/read-receipts";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -51,13 +28,7 @@ import {
 import { useLongPress } from "@/hooks/use-long-press";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { formatMessageTime } from "@/lib/format-time";
-import type {
-  BriefVm,
-  ReactionGroupVm,
-  ReplyPreviewVm,
-  TimelineItemVm,
-  TurnMarkVm,
-} from "@/lib/ipc/client";
+import type { ReactionGroupVm, ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The `message`-variant of {@link TimelineItemVm} (the only kind this renders). */
@@ -151,19 +122,6 @@ interface MessageBubbleProps {
    * When absent, no Cancel affordance renders.
    */
   onCancelSend?: (key: string) => void;
-  /**
-   * Whether this is an agent's answer still being written: the newest turn of
-   * an agent room whose run is `running`. Draws a caret after the text, and
-   * says so to a screen reader, until the run leaves `running`.
-   */
-  growing?: boolean;
-  /**
-   * Where the person stopped listening to this spoken answer (97.3,
-   * UX-DR143): the body's UTF-16 index Rust computed. A thin rule with
-   * "You stopped listening here" is drawn there and the text after it is
-   * dimmed; absent when the answer was not stopped or was heard to its end.
-   */
-  heardUntil?: number;
 }
 
 /**
@@ -198,8 +156,6 @@ export function MessageBubble({
   onToggleReaction,
   onOpenPreview,
   onCancelSend,
-  growing = false,
-  heardUntil,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -220,35 +176,14 @@ export function MessageBubble({
   const longPress = useLongPress();
   const touchMenu = phone && Boolean(onReply || onEdit || onDelete || onToggleReaction);
 
-  const brief = item.brief;
-  const gate = item.gate;
   const bubbleClass = cn(
     "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
-    gate !== null
-      ? gateBubbleClass(gate)
-      : brief !== null
-        ? "border border-border border-l-2 border-l-primary bg-card text-foreground"
-        : isOwn
-          ? "bg-primary text-primary-foreground"
-          : "bg-muted text-foreground",
+    isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
     selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
   );
-  // A brief is a named group, so a screen reader hears whose hand-off it is
-  // before the text.
-  const briefGroup =
-    gate !== null
-      ? ({ role: "group", "aria-label": gateLineName(gate, displayName) } as const)
-      : brief !== null
-        ? ({
-            role: "group",
-            "aria-label": `Brief from ${displayName} for ${brief.toName}`,
-          } as const)
-        : {};
 
   const bubbleContent = (
     <>
-      {gate !== null && <GateHead line={gate} />}
-      {brief !== null && <BriefHead brief={brief} />}
       {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
       {item.media && (
         <div className="mb-1">
@@ -266,34 +201,8 @@ export function MessageBubble({
         </div>
       )}
       {/* Text/caption: rendered only when there is a body (a media message
-          may carry an empty caption) or an answer is still growing into one. */}
-      {gate?.role === "request" && <GateRequestText body={item.body} />}
-      {gate?.role !== "request" && (item.body !== "" || growing) && (
-        <p className="whitespace-pre-wrap break-words">
-          {heardUntil === undefined ? (
-            item.body
-          ) : (
-            <>
-              {item.body.slice(0, heardUntil)}
-              <HeardRule />
-              <span data-slot="unheard" className="opacity-60">
-                {item.body.slice(heardUntil).trimStart()}
-              </span>
-            </>
-          )}
-          {growing && (
-            <>
-              <span
-                aria-hidden="true"
-                data-slot="growing-caret"
-                className="ml-0.5 inline-block h-[1em] w-0.5 bg-current align-text-bottom motion-safe:animate-pulse"
-              />
-              <span className="sr-only"> (still writing)</span>
-            </>
-          )}
-        </p>
-      )}
-      {brief !== null && <BriefFoot brief={brief} />}
+          may carry an empty caption). */}
+      {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
       <div className="mt-1 flex items-center justify-end gap-1">
         {item.isEdited && (
           <EditedCaption
@@ -328,15 +237,12 @@ export function MessageBubble({
     <div
       data-slot="bubble-long-press"
       className={cn(bubbleClass, "touch-callout-none select-none")}
-      {...briefGroup}
       {...longPress}
     >
       {bubbleContent}
     </div>
   ) : (
-    <div className={bubbleClass} {...briefGroup}>
-      {bubbleContent}
-    </div>
+    <div className={bubbleClass}>{bubbleContent}</div>
   );
 
   return (
@@ -362,10 +268,8 @@ export function MessageBubble({
 
       <div className={cn("flex min-w-0 flex-col", isOwn ? "items-end" : "items-start")}>
         {!grouped && !isOwn && (
-          // A gate room's request names its sender as Rust quoted it: the
-          // outside system chose that name.
           <span className="mb-0.5 px-1 font-medium text-muted-foreground text-xs">
-            {gate?.senderName ?? displayName}
+            {displayName}
           </span>
         )}
         <div className={cn("flex items-center gap-1", isOwn ? "flex-row-reverse" : "flex-row")}>
@@ -449,67 +353,12 @@ export function MessageBubble({
           offline={offline}
           reducedCapability={reducedCapability}
           readCount={item.readers.length}
-          turn={item.turn ?? null}
         />
         {/* Read-receipt micro-avatar cluster (Story 3.9): the other members whose
             read receipt sits on this message. Renders nothing when empty. */}
         <ReadReceipts readers={item.readers} isOwn={isOwn} />
       </div>
     </div>
-  );
-}
-
-/**
- * Where the person stopped listening to a spoken answer (UX-DR143): a thin rule
- * with its words, on its own line inside the answer's text.
- */
-function HeardRule() {
-  return (
-    <span data-slot="heard-mark" className="my-1.5 flex items-center gap-2 text-xs opacity-70">
-      <span className="shrink-0">You stopped listening here</span>
-      <span aria-hidden="true" className="h-px min-w-4 flex-1 bg-current opacity-50" />
-    </span>
-  );
-}
-
-/** Above a brief's text: whom the work is handed to, and its card's title. */
-function BriefHead({ brief }: { brief: BriefVm }) {
-  return (
-    <div className="mb-1">
-      <span className="flex items-center gap-1 font-medium text-muted-foreground text-xs">
-        <Forward aria-hidden="true" className="size-3 shrink-0" />
-        Brief for {brief.toName}
-      </span>
-      {brief.title !== null && <span className="block font-medium">{brief.title}</span>}
-    </div>
-  );
-}
-
-/**
- * Under a brief's text: the drives in scope as the agent-room header draws them,
- * or — under a narrowed label — why there are none. The sentence speaks of the
- * title and drives only: the text above it is the message itself (R115).
- */
-function BriefFoot({ brief }: { brief: BriefVm }) {
-  if (brief.narrowed) {
-    return (
-      <p className="mt-1 text-muted-foreground text-xs">
-        keeper shows a brief's card title and drives only when it knows everyone in this room may
-        read them.
-      </p>
-    );
-  }
-  if (brief.drives.length === 0) {
-    return null;
-  }
-  return (
-    <ul aria-label="Drives in scope" className="mt-1 flex flex-wrap gap-1">
-      {brief.drives.map((drive) => (
-        <li key={drive}>
-          <Badge variant="secondary">{drive}</Badge>
-        </li>
-      ))}
-    </ul>
   );
 }
 
@@ -654,12 +503,6 @@ interface SendStateCaptionProps {
    * member has read it, the caption shows an explicit "Read ✓" tick.
    */
   readCount?: number;
-  /**
-   * In an agent session room, whether the agent's host took this message
-   * (story 102.4, R465): Rust's reading of the room, drawn in place of a read
-   * tick there. `null` while neither is known, and in every other room.
-   */
-  turn?: TurnMarkVm | null;
 }
 
 /**
@@ -672,9 +515,7 @@ interface SendStateCaptionProps {
  * instead of `Sending…` — on the reduced-capability (iOS) tier the wording is
  * `Queued — sends when keeper is open and back online`, honest about
  * foreground-only sync (Story 14.6). A sent own message that at least one other member has read
- * shows an explicit `Read ✓` tick instead of `Sent` (Story 3.9). In an agent session room an own
- * message the agent's host took shows `Taken ✓`, and one it did not take says so in a sentence
- * (story 102.4, R465); either comes before the read tick. A remote message
+ * shows an explicit `Read ✓` tick instead of `Sent` (Story 3.9). A remote message
  * (`sendState: null`) with no readers renders nothing.
  */
 function SendStateCaption({
@@ -686,7 +527,6 @@ function SendStateCaption({
   offline,
   reducedCapability,
   readCount = 0,
-  turn = null,
 }: SendStateCaptionProps) {
   if (state === "failed") {
     return (
@@ -699,22 +539,6 @@ function SendStateCaption({
           Retry
         </Button>
       </div>
-    );
-  }
-  // In an agent session room the host's turn state says what a read tick cannot
-  // (R465): taken, or not taken with why — whatever other members read.
-  if (state === null && isOwn && turn?.state === "taken") {
-    return (
-      <span className="mt-0.5 text-muted-foreground text-xs">
-        Taken <span aria-hidden="true">✓</span>
-      </span>
-    );
-  }
-  if (state === null && isOwn && turn?.state === "notTaken") {
-    return (
-      <span role="status" className="mt-0.5 max-w-80 text-held text-xs">
-        {turn.sentence}
-      </span>
     );
   }
   // A sent own message read by ≥1 other member shows an explicit read tick. This

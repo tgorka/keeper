@@ -166,8 +166,6 @@ describe("undoHeldSend (shared undo effect, Story 8.4)", () => {
           reactions: [],
           media: null,
           readers: [],
-          brief: null,
-          gate: null,
         },
       ],
     });

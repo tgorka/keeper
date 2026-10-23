@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DemoBatch, InboxBatch, IpcError, NetworksSnapshot, SpacesSnapshot } from "./client";
+import type { DemoBatch, IpcError, NetworksSnapshot, SpacesSnapshot } from "./client";
 import {
   chatNotifyModeGet,
   chatNotifyModeSet,
@@ -100,9 +100,8 @@ describe("subscribe", () => {
 });
 
 describe("subscribeInbox", () => {
-  it("opens seven channels and forwards the agents, spaces and networks streams", async () => {
+  it("opens six channels and forwards the spaces and networks streams", async () => {
     invokeMock.mockResolvedValueOnce(3);
-    const agents: InboxBatch[] = [];
     const spaces: SpacesSnapshot[] = [];
     const networks: NetworksSnapshot[] = [];
 
@@ -117,29 +116,19 @@ describe("subscribeInbox", () => {
       (n) => {
         networks.push(n);
       },
-      (b) => {
-        agents.push(b);
-      },
     );
     expect(id).toBe(3);
 
-    // Seven channels created; the command receives all seven (inbox/archive/pins/
-    // favourites/agents/spaces/networks).
-    expect(channelInstances).toHaveLength(7);
+    // Six channels created; the command receives all six (inbox/archive/pins/
+    // favourites/spaces/networks) and no agents channel (108.2).
+    expect(channelInstances).toHaveLength(6);
     const [, args] = invokeMock.mock.calls[0];
-    expect(args).toHaveProperty("agents");
+    expect(args).not.toHaveProperty("agents");
     expect(args).toHaveProperty("spaces");
     expect(args).toHaveProperty("networks");
 
-    // The agents channel drives the Agents window into onAgents.
-    const agentsChannel = channelInstances[4] as {
-      onmessage: ((message: InboxBatch) => void) | null;
-    };
-    agentsChannel.onmessage?.({ ops: [{ op: "reset", rooms: [] }], total: 0 });
-    expect(agents).toHaveLength(1);
-
     // The spaces channel drives the spaces snapshot into onSpaces.
-    const spacesChannel = channelInstances[5] as {
+    const spacesChannel = channelInstances[4] as {
       onmessage: ((message: SpacesSnapshot) => void) | null;
     };
     spacesChannel.onmessage?.({
@@ -149,7 +138,7 @@ describe("subscribeInbox", () => {
     expect(spaces[0].spaces[0].name).toBe("Design");
 
     // The networks channel (Story 4.6) drives the networks snapshot into onNetworks.
-    const networksChannel = channelInstances[6] as {
+    const networksChannel = channelInstances[5] as {
       onmessage: ((message: NetworksSnapshot) => void) | null;
     };
     networksChannel.onmessage?.({ networks: [{ name: "Telegram" }] });

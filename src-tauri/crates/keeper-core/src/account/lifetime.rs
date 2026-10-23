@@ -1,9 +1,8 @@
 //! One account's lifetime in this process (story 102.5; R516, review
 //! R102L6-01, R102L6-02).
 //!
-//! Everything account-scoped the Agents list starts — the kept-row writer,
-//! the inbox producer, the list worker and the seat finder — is started by
-//! work that awaits: an activation, a room list's acquisition. A sign-out or
+//! Everything account-scoped the inbox starts — its producers — is started
+//! by work that awaits: an activation, a room list's acquisition. A sign-out or
 //! a teardown that runs meanwhile cannot stop what is not registered yet, so
 //! that work carries a [`Lifetime`] taken *before* it awaits anything, and
 //! every place it publishes something checks it:
@@ -192,18 +191,14 @@ impl Lifetime {
 pub(crate) enum Pause {
     /// A subscription is about to acquire an account's room list.
     Acquiring,
-    /// A subscription holds the account's room list, its writer not taken.
-    TakingWriter,
     /// A subscription built every producer, none published.
     Publishing,
     /// An activation built everything, its lifetime not checked.
     CheckingLife,
-    /// An activation checked its lifetime, its list worker not started.
-    StartingList,
     /// A teardown ended the lifetime; the account's inbox producers are
     /// not stopped yet.
     StoppingProducers,
-    /// A teardown is about to take the account and its list worker out.
+    /// A teardown is about to take the account out.
     Detaching,
 }
 
@@ -272,11 +267,6 @@ impl AccountLifetimes {
                 release: release_rx,
             });
         Paused { reached, release }
-    }
-
-    /// `account` is closing now.
-    pub(crate) fn is_closing(&self, account: &str) -> bool {
-        self.shared.life(account).closing > 0
     }
 }
 

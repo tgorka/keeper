@@ -346,51 +346,7 @@ fn drive_path(folder: &str, rel: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-    use crate::notes::index::{IndexBuilder, IndexEntry};
-    use crate::notes::order::NoteOrder;
-
-    fn entry(path: &str, title: &str) -> IndexEntry {
-        IndexEntry {
-            link_predicates: Default::default(),
-            id: format!("id:{path}"),
-            path: path.to_owned(),
-            title: title.to_owned(),
-            size: 0,
-            mtime_ns: 0,
-            ino: 0,
-            created_ms: 0,
-            updated_ms: 0,
-            tags: Vec::new(),
-            fields: BTreeMap::new(),
-            links: Vec::new(),
-            flags: Vec::new(),
-            snippet: String::new(),
-            order: NoteOrder::default(),
-        }
-    }
-
-    fn agent(user: &str, name: Option<&str>) -> InlineAgent {
-        InlineAgent {
-            user: OwnedUserId::try_from(user).expect("user"),
-            name: name.map(str::to_owned),
-        }
-    }
-
-    fn agent_room() -> InlineContext {
-        InlineContext {
-            room: RoomKind::Agent,
-            room_agent: Some(OwnedUserId::try_from("@nixi:example.org").expect("user")),
-            agents: vec![
-                agent("@nixi:example.org", Some("Nixi")),
-                agent("@tola-grey:example.org", Some("Tola Grey")),
-                agent("@amelia:example.org", None),
-                agent("@tola-grey:example.org", Some("Tola Grey")),
-            ],
-        }
-    }
 
     fn inserts(rows: &[InlineItem]) -> Vec<(InlineKind, &str)> {
         rows.iter()
@@ -414,158 +370,20 @@ mod tests {
         assert_eq!(token(&long, ""), None, "past the bound");
     }
 
-    fn found(paths: &[&str]) -> Vec<String> {
-        paths.iter().map(|path| (*path).to_owned()).collect()
-    }
-
-    /// In an agent room: the other agents this account knows by id or a word
-    /// of their name (the room's own agent left out, each once), `/shrug`,
-    /// and files by name or a note's title; a chat offers `/shrug` alone.
+    /// A messenger room offers `/shrug` alone and walks no drive (108.2: the
+    /// agent rooms' mentions and file references are gone with them).
     #[test]
-    fn an_agent_room_offers_mentions_shrug_and_files_and_a_chat_only_shrug() {
-        let index = IndexBuilder::from_entries(vec![
-            entry("plans/trip.md", "Trip to Tatry"),
-            entry("journal/tola-notes.md", "Notes for Tola"),
-        ])
-        .snapshot();
-        let walked = found(&["notes/journal/tola-notes.md", "scans/tola-passport.pdf"]);
-        let drives = [InlineDrive {
-            id: "01TG",
-            name: "tgdrive",
-            found: &walked,
-            capped: false,
-            notes: Some(("notes/", &index)),
-        }];
-        let ctx = agent_room();
-        assert_eq!(
-            inserts(&menu("/", &ctx, &drives)),
-            vec![
-                (InlineKind::Mention, "@amelia"),
-                (InlineKind::Mention, "@tola-grey"),
-                (InlineKind::Shrug, SHRUG),
-            ],
-            "an empty query lists agents and /shrug, never arbitrary files"
-        );
-        assert_eq!(
-            inserts(&menu("/to", &ctx, &drives)),
-            vec![
-                (InlineKind::Mention, "@tola-grey"),
-                (InlineKind::File, "tgdrive:notes/journal/tola-notes.md"),
-                (InlineKind::File, "tgdrive:scans/tola-passport.pdf"),
-                (InlineKind::File, "tgdrive:notes/plans/trip.md"),
-            ],
-            "a file name of any kind or a word of a note's title reaches the file"
-        );
-        assert_eq!(
-            inserts(&menu("/grey", &ctx, &drives)),
-            vec![(InlineKind::Mention, "@tola-grey")],
-            "a word of the name reaches the agent"
-        );
-        assert!(
-            menu("/nixi", &ctx, &drives).is_empty(),
-            "the room's own agent"
-        );
+    fn a_chat_offers_only_shrug() {
         let chat = InlineContext {
             room: RoomKind::Chat,
-            ..agent_room()
+            room_agent: None,
+            agents: Vec::new(),
         };
         assert_eq!(
-            inserts(&menu("/", &chat, &drives)),
+            inserts(&menu("/", &chat, &[])),
             vec![(InlineKind::Shrug, SHRUG)]
         );
-        assert!(menu("/to", &chat, &drives).is_empty());
+        assert!(menu("/to", &chat, &[]).is_empty());
         assert_eq!(file_query("/to", &chat), None, "a chat walks no drive");
-    }
-
-    /// R430 07: a drive with no notes vault offers its pdf and csv by name;
-    /// two drives holding one path offer two rows, each its own key and an
-    /// insert that names its drive; a drive name two drives share, or one
-    /// that is not one word, gives way to the drive's id.
-    #[test]
-    fn a_file_reference_names_its_drive() {
-        let budget = found(&["trips/tatry-budget.csv", "scans/tatry-map.pdf"]);
-        let same = found(&["trips/tatry-budget.csv"]);
-        let drives = [
-            InlineDrive {
-                id: "01TG",
-                name: "tgdrive",
-                found: &budget,
-                capped: false,
-                notes: None,
-            },
-            InlineDrive {
-                id: "01WORK",
-                name: "work",
-                found: &same,
-                capped: true,
-                notes: None,
-            },
-        ];
-        let rows = menu("/tatry", &agent_room(), &drives);
-        assert_eq!(
-            inserts(&rows),
-            vec![
-                (InlineKind::File, "tgdrive:trips/tatry-budget.csv"),
-                (InlineKind::File, "tgdrive:scans/tatry-map.pdf"),
-                (InlineKind::File, "work:trips/tatry-budget.csv"),
-            ]
-        );
-        let keys: Vec<&str> = rows.iter().map(|row| row.key.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec![
-                "file:01TG:trips/tatry-budget.csv",
-                "file:01TG:scans/tatry-map.pdf",
-                "file:01WORK:trips/tatry-budget.csv",
-            ]
-        );
-        assert_eq!(rows[0].label, "tatry-budget.csv");
-        assert_eq!(
-            files_note("/tatry", &agent_room(), &drives, false).as_deref(),
-            Some(INLINE_FILES_IN_PART),
-            "a drive searched in part says so"
-        );
-
-        let twins = [
-            InlineDrive {
-                name: "Drive",
-                ..drives[0].clone()
-            },
-            InlineDrive {
-                name: "Drive",
-                ..drives[1].clone()
-            },
-        ];
-        let spaced = [InlineDrive {
-            name: "My Drive",
-            ..drives[0].clone()
-        }];
-        assert_eq!(
-            menu("/tatry", &agent_room(), &twins)[2].insert,
-            "01WORK:trips/tatry-budget.csv"
-        );
-        assert_eq!(
-            menu("/tatry", &agent_room(), &spaced)[0].insert,
-            "01TG:trips/tatry-budget.csv"
-        );
-    }
-
-    /// Files whose name begins with the query come before those that merely
-    /// contain it, and the list is bounded.
-    #[test]
-    fn files_are_ranked_by_name_start_and_bounded() {
-        let mut walked: Vec<String> = (0..10).map(|n| format!("a/old-plan-{n}.md")).collect();
-        walked.push("z/plan.md".to_owned());
-        let drives = [InlineDrive {
-            id: "01D",
-            name: "d",
-            found: &walked,
-            capped: false,
-            notes: None,
-        }];
-        let rows = menu("/plan", &agent_room(), &drives);
-        assert_eq!(rows.len(), MAX_INLINE_FILES);
-        assert_eq!(rows[0].insert, "d:z/plan.md");
-        assert_eq!(rows[1].insert, "d:a/old-plan-0.md");
     }
 }

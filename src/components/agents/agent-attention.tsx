@@ -1,9 +1,9 @@
 /**
- * An agent room's state in the list (story 101.6, R421): who needs you, who
+ * A session's state in the Agents list (story 101.6, R421): who needs you, who
  * failed, who is working, who finished since you last read them.
  *
- * Rust decides the state (`InboxRoomVm.agentAttention`, keeper-core
- * `agents::attention`) and this draws it, never deriving it: t3code's new
+ * Rust decides the state (`AgentSessionRowVm.attention`, keeper-core
+ * `hq::sessions`) and this draws it, never deriving it: t3code's new
  * sidebar shape — an icon and a word where the row's time would be — in
  * Paseo's colours (needs you amber, failed red, working blue, done green).
  * *Unknown* is Rust saying it could not read all it needs to say nothing
@@ -26,7 +26,7 @@ import {
   CircleHelp,
   MessageCircleQuestion,
 } from "lucide-react";
-import type { AgentAttentionVm, InboxRoomVm } from "@/lib/ipc/client";
+import type { AgentAttentionVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The word each state shows. */
@@ -70,18 +70,6 @@ export const AGENT_ATTENTION_UNKNOWN =
 /** The `, needs you` an agent row's accessible name ends with; empty for none. */
 export function agentAttentionLabel(state: AgentAttentionVm | null | undefined): string {
   return state == null ? "" : `, ${AGENT_ATTENTION_LABEL[state]}`;
-}
-
-/** The state Rust gave the Agents window's row of `{accountId, roomId}`, if any. */
-export function agentAttentionOf(
-  rooms: readonly InboxRoomVm[],
-  accountId: string,
-  roomId: string,
-): AgentAttentionVm | null {
-  return (
-    rooms.find((room) => room.accountId === accountId && room.roomId === roomId)?.agentAttention ??
-    null
-  );
 }
 
 export function AgentAttentionMark({

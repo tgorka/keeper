@@ -3,9 +3,9 @@
  *
  * The quick-switcher and unread-jump chords operate on exactly the window the
  * chat-list pane is currently rendering: the inbox window when
- * `primaryView === "inbox"`, the archive window when `"archive"`, the agents
- * window when `"agents"`, and nothing when a non-chat view
- * ("bridges"/"approval"/"recording") replaces the cluster. The account-switcher's
+ * `primaryView === "inbox"` and the archive window when `"archive"`, and
+ * nothing when another view — the Agents window, whose sessions are not rooms
+ * (108.2), "bridges", "approval", "recording" — replaces the cluster. The account-switcher's
  * pure display filter is applied the same way the pane applies it — hiding
  * non-matching rows without touching the Rust-authoritative order. This is a
  * read-only projection: it only slices/filters the arrays Rust already ordered,
@@ -18,7 +18,6 @@ import type { PrimaryView } from "@/lib/stores/primary-view";
 export interface ChatWindows {
   inbox: InboxRoomVm[];
   archive: InboxRoomVm[];
-  agents: InboxRoomVm[];
 }
 
 /**
@@ -33,7 +32,7 @@ export function renderedWindowRooms(
   windows: ChatWindows,
   filterAccountId: string | null,
 ): InboxRoomVm[] | null {
-  if (view !== "inbox" && view !== "archive" && view !== "agents") {
+  if (view !== "inbox" && view !== "archive") {
     return null;
   }
   const active = windows[view];

@@ -403,21 +403,10 @@ impl Hq {
     /// still arriving — the replicas on disk are still opening, or a round
     /// may bring it — or not coming. Reads the configuration only.
     fn not_here(&self, database: &str) -> HqError {
-        let inner = lock(&self.inner);
-        match &inner.local_open {
-            // Not open yet is not absent, whatever the configuration says.
-            LocalOpen::Opening => {
-                return HqError::Arriving(
-                    "keeper is still opening the conversations on this device.".to_owned(),
-                )
-            }
-            LocalOpen::Failed(why) => {
-                return HqError::Sentence(format!(
-                    "keeper could not open the conversations on this device: {why}"
-                ))
-            }
-            LocalOpen::Open => {}
+        if let Some(refusal) = self.not_open() {
+            return refusal;
         }
+        let inner = lock(&self.inner);
         let (Some(server), Some(_)) = (&inner.server, &inner.pairing) else {
             // Nothing syncs, so what is not here does not come.
             return HqError::Sentence("This conversation is not on this device.".to_owned());
@@ -434,6 +423,22 @@ impl Hq {
         HqError::Sentence(format!(
             "{database} is not open to this device, so this conversation cannot come here."
         ))
+    }
+
+    /// Why nothing held can be read yet, while the replicas on disk are not
+    /// open: still opening is [`HqError::Arriving`] — not open yet is not
+    /// absent, whatever the configuration says — and a failed reopen its
+    /// sentence. `None` once they are open.
+    pub(crate) fn not_open(&self) -> Option<HqError> {
+        match &lock(&self.inner).local_open {
+            LocalOpen::Opening => Some(HqError::Arriving(
+                "keeper is still opening the conversations on this device.".to_owned(),
+            )),
+            LocalOpen::Failed(why) => Some(HqError::Sentence(format!(
+                "keeper could not open the conversations on this device: {why}"
+            ))),
+            LocalOpen::Open => None,
+        }
     }
 
     /// A stream stops showing `key`; with none left its widened months go,

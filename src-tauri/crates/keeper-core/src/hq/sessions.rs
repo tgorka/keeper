@@ -23,8 +23,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use crate::agents::attention::AgentAttentionVm;
 use crate::hq::port::{Replica, ReplicaError, RowOp, WindowBase};
+
+/// A session's state in the Agents list; a session in none of them carries
+/// none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AgentAttentionVm {
+    /// An approval or a question waits for this person.
+    NeedsYou,
+    /// keeper could not read all it needs to say nothing waits for this
+    /// person.
+    Unknown,
+    /// The session is blocked.
+    Failed,
+    /// The session is running.
+    Working,
+    /// The session finished after the person last read it.
+    DoneUnread,
+}
 
 /// One database this device holds, and who this device is in it.
 #[derive(Clone)]
@@ -552,6 +570,7 @@ fn needs_you(source: &Source, now_ms: i64) -> HashSet<String> {
         "SELECT m.session_id AS session_id, m.metadata AS metadata \
          FROM messages m WHERE m.role = 'agent' AND NOT EXISTS (SELECT 1 FROM messages p \
          WHERE p.session_id = m.session_id AND p.role = 'person' \
+         AND (p.metadata IS NULL OR json_extract(p.metadata, '$.kind') IS NOT 'heard') \
          AND (p.created_at_ms > m.created_at_ms \
          OR (p.created_at_ms = m.created_at_ms AND p.id > m.id)))",
         &[],
@@ -569,6 +588,14 @@ fn needs_you(source: &Source, now_ms: i64) -> HashSet<String> {
 /// An agent message whose metadata says it asks the person (R-HQ-28).
 pub fn is_ask(metadata: &Value) -> bool {
     metadata.get("kind").and_then(Value::as_str) == Some("ask")
+}
+
+/// Whether a message's metadata makes it a person's heard row (R-HQ-68,
+/// AD-411): where the person stopped hearing a spoken answer, written for
+/// the claim holder to copy into `sessions.heard_until`. It is no message:
+/// the Agents window draws none, and it answers no ask.
+pub fn is_heard(metadata: &Value) -> bool {
+    metadata.get("kind").and_then(Value::as_str) == Some(crate::hq::spoken::HEARD_KIND)
 }
 
 /// Every database's rows in one list: the most recent activity first, then
@@ -865,6 +892,17 @@ static CREATING: Mutex<()> = Mutex::new(());
 /// message, in one commit, offline if need be (the server grants each
 /// client its next session ids).
 pub fn create(source: &Source, agent: &str, body: &str) -> Result<String, ReplicaError> {
+    create_with_first(source, agent, body, &ulid::Ulid::new().to_string())
+}
+
+/// [`create`], its first message's id `first` — what a spoken question's
+/// answer names (`crate::hq::spoken`).
+pub fn create_with_first(
+    source: &Source,
+    agent: &str,
+    body: &str,
+    first: &str,
+) -> Result<String, ReplicaError> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let at = now_ms();
     let id = next_session_id(source);
@@ -907,7 +945,7 @@ pub fn create(source: &Source, agent: &str, body: &str) -> Result<String, Replic
         ),
         base_version: None,
     };
-    let first = person_message(source, &id, &ulid::Ulid::new().to_string(), body, at);
+    let first = person_message(source, &id, first, body, at);
     source.replica.mutate(vec![session, member, first])?;
     source.replica.sync_now();
     Ok(id)

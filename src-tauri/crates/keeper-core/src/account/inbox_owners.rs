@@ -256,19 +256,6 @@ impl InboxOwners {
 }
 
 #[cfg(test)]
-impl Owner {
-    /// A producer's owner whose account was just activated and whose
-    /// subscription is the only one.
-    pub(crate) fn live(account: &str) -> Owner {
-        let lifetimes = super::lifetime::AccountLifetimes::default();
-        let life = lifetimes.begin(account).expect("a fresh account opens");
-        let owners = InboxOwners::default();
-        let (generation, _) = owners.begin();
-        owners.owner(generation, &life)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

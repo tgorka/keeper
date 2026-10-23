@@ -47,7 +47,15 @@ fn at(text: &str) -> chrono::DateTime<chrono::Local> {
         .with_timezone(&chrono::Local)
 }
 
-/// Make `duty`'s session as her host does, its room `room`.
+/// Where [`make`] left `duty`'s session.
+#[derive(Debug, Clone)]
+struct Made {
+    path: String,
+    folder_made: bool,
+}
+
+/// Make `duty`'s session as her host does, its room `room`: the folder is
+/// written once, and a second make finds it.
 fn make(
     zone: &Path,
     config: &AgentConfig,
@@ -55,10 +63,22 @@ fn make(
     duty: Duty,
     room_name: &str,
     now: chrono::DateTime<chrono::Local>,
-) -> crate::seed::Settled {
+) -> Made {
     let agent = session(config, decl, duty, &room(room_name), now);
     let files = folder_files(config, decl, duty, zone).expect("her files");
-    crate::seed::make_folder(zone, &agent, files, true, now, &|| true).expect("made")
+    std::fs::create_dir_all(zone).expect("zone");
+    match verbs::create_claimed_session(zone, &agent, files, now, &|| true).expect("made") {
+        verbs::CreateOutcome::Created { path, .. } => Made {
+            path,
+            folder_made: true,
+        },
+        verbs::CreateOutcome::Existed { .. } => Made {
+            path: verbs::find(zone, &agent.id.to_string())
+                .expect("the session it found")
+                .path,
+            folder_made: false,
+        },
+    }
 }
 
 fn card_text(zone: &Path, path: &str, duty: Duty) -> Option<String> {
@@ -68,8 +88,7 @@ fn card_text(zone: &Path, path: &str, duty: Duty) -> Option<String> {
 /// 92.5 acceptance 6: each duty's session is made once, under its derived
 /// id, holding one `@daily` card of hers whose body is her menu's prompts,
 /// with no `scheduled_by` — so it is due without anyone's tick. Made again,
-/// the folder is found, the room just made is the one to discard, and the
-/// card is never written again: the owner's edit is kept and a deleted card
+/// the folder is found and the card is never written again: the owner's edit is kept and a deleted card
 /// stays deleted.
 #[test]
 fn a_stewards_own_cards_are_made_once_and_kept_as_the_owner_left_them() {
@@ -118,8 +137,6 @@ fn a_stewards_own_cards_are_made_once_and_kept_as_the_owner_left_them() {
         let again = make(&zone, &tola, &choices.decl, duty, "again", now);
         assert!(!again.folder_made);
         assert_eq!(again.path, made.path);
-        assert_eq!(again.room, room(duty.name()));
-        assert_eq!(again.discard, Some(room("again")));
 
         // The owner's edit is kept; a deleted card is not made again.
         let edited = text.replace("@daily", "@weekly");
@@ -166,7 +183,7 @@ fn archive(zone: &Path, id: &str) -> (String, String) {
 fn harvest_all(
     harvester: &mut Harvester,
     zone: &Path,
-    harvest: &crate::seed::Settled,
+    harvest: &Made,
     agent: &SessionAgent,
     now: Instant,
     steps: usize,
@@ -237,7 +254,7 @@ async fn what_closes_after_her_harvest_began_is_harvested_whenever_it_opened() {
     );
 
     // Her harvest folder renamed: a new harvester, the same answer.
-    let renamed = crate::seed::Settled {
+    let renamed = Made {
         path: "active/renamed".to_owned(),
         ..harvest.clone()
     };

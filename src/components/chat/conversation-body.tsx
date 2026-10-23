@@ -25,7 +25,6 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   type KeyboardEvent,
-  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -34,9 +33,6 @@ import {
   useState,
   type WheelEvent,
 } from "react";
-import { ApprovalRequest } from "@/components/agents/approval-card";
-import { DecisionsPanel } from "@/components/agents/decisions-panel";
-import { AgentRoomHeader } from "@/components/chat/agent-room-header";
 import { chatCommandHost } from "@/components/chat/chat-commands";
 import { Composer, type SendContext } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
@@ -50,11 +46,8 @@ import { UndoSendPill } from "@/components/chat/undo-send-pill";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useShellLayout } from "@/hooks/use-shell-layout";
-import { useWaitingAsks } from "@/hooks/use-waiting-asks";
 import { logFailure, sayFailure } from "@/lib/failure";
 import type {
-  AgentRoomHeaderVm,
-  ApprovalVm,
   PaginationStatusBatch,
   TimelineBatch,
   TimelineItemVm,
@@ -62,8 +55,6 @@ import type {
   TypistVm,
 } from "@/lib/ipc/client";
 import {
-  agentConversationNew,
-  agentModelCommand,
   cancelSend,
   editMessage,
   loadEarlierMessages,
@@ -166,11 +157,6 @@ interface ConversationBodyProps {
    * the note's.
    */
   acceptsWindowDrops: boolean;
-  /**
-   * A control drawn in an agent room's header beside its scope chip — the
-   * dock's scope editor. Absent, the scope is read-only.
-   */
-  scopeControl?: (header: AgentRoomHeaderVm) => ReactNode;
 }
 
 /** The `utd`-variant of {@link TimelineItemVm} (rendered as an honest stub). */
@@ -179,24 +165,18 @@ type UtdVm = Extract<TimelineItemVm, { kind: "utd" }>;
 /** The `redacted`-variant of {@link TimelineItemVm} (rendered as an honest stub). */
 type RedactedVm = Extract<TimelineItemVm, { kind: "redacted" }>;
 
-/** The `approval`-variant of {@link TimelineItemVm}: where an agent's request arrived. */
-type ApprovalItemVm = Extract<TimelineItemVm, { kind: "approval" }>;
-
 /**
  * A renderable timeline row. A `message` row is a text bubble paired with whether
  * it continues a same-sender run (`grouped`) and whether it ends one (`groupTail`
  * — the transient send-state caption renders only on the tail). A `utd` row is an
  * undecryptable-event stub and a `redacted` row is a deleted-message stub (Story
  * 3.8); both are never grouped, break same-sender runs, and are emitted (not
- * skipped like `other`), so they render inline and never blank. An `approval`
- * row is an agent's request with its cards, drawn where it arrived (UX-DR136),
- * and breaks a run the same way.
+ * skipped like `other`), so they render inline and never blank.
  */
 type RenderedRow =
   | { kind: "message"; item: MessageVm; grouped: boolean; groupTail: boolean }
   | { kind: "utd"; item: UtdVm }
-  | { kind: "redacted"; item: RedactedVm }
-  | { kind: "approval"; item: ApprovalItemVm; approval: ApprovalVm };
+  | { kind: "redacted"; item: RedactedVm };
 
 /**
  * Project the streamed timeline into the renderable row sequence, computing
@@ -208,7 +188,7 @@ type RenderedRow =
  * break a run (an interleaved non-text item ungroups the next message and ends
  * the current run).
  */
-function toRenderedRows(items: TimelineItemVm[], approvals: ApprovalVm[]): RenderedRow[] {
+function toRenderedRows(items: TimelineItemVm[]): RenderedRow[] {
   const rendered: RenderedRow[] = [];
   let prevSender: string | null = null;
 
@@ -235,16 +215,6 @@ function toRenderedRows(items: TimelineItemVm[], approvals: ApprovalVm[]): Rende
       rendered.push({ kind: "redacted", item });
       continue;
     }
-    if (item.kind === "approval") {
-      // Its cards travel beside the stream, in the batch that placed it; an
-      // item whose cards are not here draws nothing, but still ends the run.
-      closeRun();
-      const approval = approvals.find((a) => a.id === item.id);
-      if (approval !== undefined) {
-        rendered.push({ kind: "approval", item, approval });
-      }
-      continue;
-    }
     if (item.kind !== "message") {
       // A non-rendered item breaks the same-sender run.
       closeRun();
@@ -266,16 +236,11 @@ function toRenderedRows(items: TimelineItemVm[], approvals: ApprovalVm[]): Rende
   return rendered;
 }
 
-/** What a gate room says where the composer would be (UX-DR147). */
-export const GATE_OBSERVER =
-  "You watch this room: what is written here reaches the outside system and whoever it shares with. Decide its tickets on the hour's card.";
-
 export function ConversationBody({
   accountId,
   roomId,
   followsSearch,
   acceptsWindowDrops,
-  scopeControl,
 }: ConversationBodyProps) {
   const stores = useConversationStores();
   const { timeline, composer, attachments: tray } = stores;
@@ -287,33 +252,6 @@ export function ConversationBody({
   // render key, scrolled to, and tinted once the target room's timeline is loaded.
   const focusEvent = useRoomsStore((s) => (followsSearch ? s.focusEvent : null));
   const items = useConversationTimeline((s) => s.items);
-  // An agent room's header (status line, scope and label chips), `null` in
-  // every other room. Drawn on the phone too: it is not part of the pane's
-  // own header row.
-  const agentHeader = useConversationTimeline((s) => s.header);
-  // A gate's room (UX-DR147): the person watches. Everything that would write
-  // into it — the composer, reply, edit, reactions, dropped files, typing — is
-  // absent; the guard is the host ignoring an observer's text, this is UX.
-  const gateRoom = agentHeader?.gate != null;
-  // An agent room's approval requests, by id; the stream's `approval` items say
-  // where each is drawn.
-  const approvals = useConversationTimeline((s) => s.approvals);
-  // The questions answered in this room (Story 101.3, R430, R431): in the
-  // person's own rooms with a proxy — its DM and its conversations — as Rust
-  // follows them across every agent room this account reads.
-  const proxyKind = agentHeader?.status?.kind;
-  const waitingAsks = useWaitingAsks(
-    accountId,
-    roomId,
-    proxyKind === "main" || proxyKind === "conversation",
-  );
-  // Where the person stopped listening to a spoken answer, by its key: Rust
-  // sends the split already in the body's UTF-16 units (UX-DR143).
-  const heard = useConversationTimeline((s) => s.heard);
-  // The answer that draws the growing caret: Rust names it only while the run
-  // is `running`, and the run is checked here as well so a header that moved
-  // on to `done` can never leave a caret behind.
-  const caretKey = agentHeader?.status?.run === "running" ? agentHeader.caretKey : null;
   const pending = useConversationComposer((s) => s.pending);
   const selectedKey = useConversationComposer((s) => s.selectedKey);
   // The open conversation's account status drives the "Queued" caption. An empty
@@ -608,7 +546,7 @@ export function ConversationBody({
   // asynchronously, so a late listener is unlistened immediately if we already
   // unmounted.
   useEffect(() => {
-    if (gateRoom || !acceptsWindowDrops || accountId === null || roomId === null) {
+    if (!acceptsWindowDrops || accountId === null || roomId === null) {
       return;
     }
     let unlisten: (() => void) | null = null;
@@ -649,7 +587,7 @@ export function ConversationBody({
       cancelled = true;
       unlisten?.();
     };
-  }, [accountId, roomId, acceptsWindowDrops, gateRoom, tray]);
+  }, [accountId, roomId, acceptsWindowDrops, tray]);
 
   // Whether the window can scroll at all (R509): one that cannot — a phone
   // showing a few short items — emits no `scroll` and on touch no `wheel`, so
@@ -692,7 +630,7 @@ export function ConversationBody({
     prevItemCount.current = items.length;
   }, [items]);
 
-  const rows = toRenderedRows(items, approvals);
+  const rows = toRenderedRows(items);
   const roomLoaded = accountId !== null && roomId !== null && loaded && !errored;
   const hasRows = rows.length > 0;
 
@@ -859,8 +797,6 @@ export function ConversationBody({
       chatCommandHost({
         setTopic: (topic) => roomSetTopic(accountId ?? "", roomId ?? "", topic),
         invite: (userId) => roomInvite(accountId ?? "", roomId ?? "", userId),
-        newConversation: (title) => agentConversationNew(accountId ?? "", roomId ?? "", title),
-        model: (args) => agentModelCommand(accountId ?? "", roomId ?? "", args),
         askLeave: () => {
           if (accountId !== null && roomId !== null) {
             setLeaveTarget({ accountId, roomId });
@@ -1033,7 +969,7 @@ export function ConversationBody({
   const onReply = useCallback(
     (key: string) => {
       const target = items.find((it) => it.kind === "message" && it.key === key);
-      if (gateRoom || target?.kind !== "message") {
+      if (target?.kind !== "message") {
         return;
       }
       composer.getState().startReply({
@@ -1042,19 +978,19 @@ export function ConversationBody({
         bodyPreview: replyPreviewOf(target.body),
       });
     },
-    [items, composer, gateRoom],
+    [items, composer],
   );
 
   const onEdit = useCallback(
     (key: string) => {
       const target = items.find((it) => it.kind === "message" && it.key === key);
       // Only own text messages are editable (Rust also gates on `is_editable()`).
-      if (gateRoom || target?.kind !== "message" || !target.isOwn) {
+      if (target?.kind !== "message" || !target.isOwn) {
         return;
       }
       composer.getState().startEdit({ targetKey: key, body: target.body }, "");
     },
-    [items, composer, gateRoom],
+    [items, composer],
   );
 
   // Resolve a Delete intent on a HELD (still-in-window) bubble as an UNDO, never a
@@ -1113,14 +1049,14 @@ export function ConversationBody({
   // said, never an unhandled promise.
   const onToggleReaction = useCallback(
     (key: string, emoji: string) => {
-      if (gateRoom || accountId === null || roomId === null) {
+      if (accountId === null || roomId === null) {
         return;
       }
       toggleReaction(accountId, roomId, key, emoji).catch(
         sayFailure("conversation.toggleReaction", "keeper couldn't change the reaction."),
       );
     },
-    [accountId, roomId, gateRoom],
+    [accountId, roomId],
   );
 
   // Open the Quick-Look preview overlay for a media message (Story 3.6). The
@@ -1392,9 +1328,6 @@ export function ConversationBody({
 
   return (
     <div ref={rootRef} className="contents">
-      {roomId !== null && agentHeader !== null && (
-        <AgentRoomHeader header={agentHeader} scopeControl={scopeControl?.(agentHeader)} />
-      )}
       {roomId === null ? (
         <div className="flex flex-1 items-center justify-center p-8">
           <p className="max-w-sm text-center text-muted-foreground text-sm">
@@ -1476,14 +1409,6 @@ export function ConversationBody({
                     onCancel={onCancelSend}
                   />
                 </li>
-              ) : row.kind === "approval" ? (
-                <li key={row.item.key}>
-                  <ApprovalRequest
-                    approval={row.approval}
-                    accountId={accountId ?? ""}
-                    roomId={roomId}
-                  />
-                </li>
               ) : (
                 <li key={row.item.key}>
                   <MessageBubble
@@ -1495,16 +1420,14 @@ export function ConversationBody({
                     onRetry={onRetry}
                     offline={offline}
                     reducedCapability={reducedCapability}
-                    onReply={gateRoom ? undefined : onReply}
-                    onEdit={gateRoom ? undefined : onEdit}
+                    onReply={onReply}
+                    onEdit={onEdit}
                     onDelete={onDelete}
                     onJumpTo={onJumpTo}
                     selected={selectedKey === row.item.key}
-                    onToggleReaction={gateRoom ? undefined : onToggleReaction}
+                    onToggleReaction={onToggleReaction}
                     onOpenPreview={onOpenPreview}
                     onCancelSend={onCancelSend}
-                    growing={caretKey === row.item.key}
-                    heardUntil={heard.find((mark) => mark.key === row.item.key)?.splitUtf16}
                   />
                 </li>
               ),
@@ -1566,18 +1489,7 @@ export function ConversationBody({
           </ol>
         </div>
       )}
-      {roomId !== null && gateRoom && (
-        // A gate's room (UX-DR147): the person watches; anything written here
-        // would reach the outside system and whoever it shares with, and the
-        // gate never takes it as a request. The only control is the hour's card.
-        <p
-          data-testid="gate-observer"
-          className="shrink-0 border-border border-t px-4 py-3 text-center text-muted-foreground text-xs"
-        >
-          {GATE_OBSERVER}
-        </p>
-      )}
-      {roomId !== null && !gateRoom && (
+      {roomId !== null && (
         <div
           data-testid="composer-footer"
           // Phone (Story 13.5): the footer bottom-insets by the live keyboard
@@ -1608,19 +1520,6 @@ export function ConversationBody({
             {/* Typing indicator (Story 3.9): "<name> is typing…" between the
                 timeline and composer; renders an empty live region when idle. */}
             <TypingIndicator typists={typists} />
-            {/* Decisions panel (Story 101.3, R418): what waits for this person in
-                this agent room — an approval this device may decide, a question
-                answered in this DM — numbered, above the composer. */}
-            {accountId !== null && roomId !== null && agentHeader !== null && (
-              <DecisionsPanel
-                key={`decisions:${accountId}:${roomId}`}
-                accountId={accountId}
-                roomId={roomId}
-                approvals={approvals}
-                asks={waitingAsks}
-                scope={rootRef}
-              />
-            )}
             <Composer
               // Key on the full (account, room) identity, not roomId alone: a draft is
               // keyed by (accountId, roomId) and roomId is not unique across accounts

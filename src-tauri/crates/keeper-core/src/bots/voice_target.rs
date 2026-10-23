@@ -17,14 +17,16 @@
 //!    the switch's refusal is shown and recorded in the ring. Nothing is
 //!    sent to a bot nobody chose.
 //!
-//! `bots.voice_target` may instead name one of the person's own proxy
-//! conversations as `agent:<room id>` (AD-384, ruling R31): the question
-//! goes into that room as the person's own message. A room id is the same
-//! on every device, so the value travels as it is (`settings_sync`). The
-//! room must be one the account reads as its proxy's `main` or
-//! `conversation` room *now* — a choice that is no longer one is refused
-//! with [`AGENT_ROOM_GONE_SENTENCE`], never sent elsewhere, and never read
-//! as "the most recent bot": the person chose to talk to their agent.
+//! `bots.voice_target` may instead name one of the person's agents as
+//! `agent:<agent>` (AD-384; 108.2): the question goes into that agent's main
+//! conversation in the agents' databases (`crate::hq::spoken`). An agent's
+//! id is the same on every device, so the value travels as it is
+//! (`settings_sync`). The agent must be one a database this device holds
+//! names *now* — a choice that is no longer one is refused with
+//! [`crate::hq::spoken::AGENT_GONE_SENTENCE`], never sent elsewhere, and
+//! never read as "the most recent bot": the person chose to talk to their
+//! agent. A value naming one of the agents' old Matrix rooms
+//! (`agent:!room…`, before 108.2) is read as no choice.
 //!
 //! The model a spoken turn sends is decided here too ([`model_for`], AD-217):
 //! the one that last answered in the target conversation, else the
@@ -36,57 +38,17 @@
 //! can show each pinned bot's median first token over its last ten answers.
 //! Nothing is measured that is not already stored.
 
-use crate::agents::proxy::ProxyRoomVm;
 use crate::bots::session::{BotMessage, BotSession};
 use crate::bots::{Bot, ProviderKind};
-use crate::vm::{BotModelVm, VoiceAgentTargetVm};
+use crate::hq::spoken::{
+    is_old_room_target, target_agent, AGENT_GONE_SENTENCE, AGENT_TARGET_PREFIX,
+};
+use crate::vm::BotModelVm;
 
 /// The sentence a spoken turn is refused with when there is no bot to send
 /// it to. Shown beside the switch (AD-190), spoken by the lock-screen banner
 /// (AD-207) and recorded in the ring (AD-192) — one wording, here.
 pub const NO_TARGET_SENTENCE: &str = "Nothing to talk to yet: choose a bot to talk to under Bots.";
-
-/// The sentence a spoken turn is refused with when `bots.voice_target`
-/// names an agent room that is not one of the person's proxy conversations
-/// on any signed-in account.
-pub const AGENT_ROOM_GONE_SENTENCE: &str =
-    "The conversation chosen under Speak to is not one of your assistant's here: choose again under Speak to.";
-
-/// How `bots.voice_target` names an agent room: this prefix and the room id.
-pub const AGENT_TARGET_PREFIX: &str = "agent:";
-
-/// The stored value that names agent room `room_id`.
-pub fn agent_target(room_id: &str) -> String {
-    format!("{AGENT_TARGET_PREFIX}{room_id}")
-}
-
-/// The room a stored value names, when it names an agent room.
-pub fn agent_room_of(chosen: &str) -> Option<&str> {
-    chosen
-        .strip_prefix(AGENT_TARGET_PREFIX)
-        .map(str::trim)
-        .filter(|room| !room.is_empty())
-}
-
-/// The picker's agent entries from every live account's proxy conversations
-/// in their order (`AccountManager::agent_rooms_everywhere`), each with the
-/// value that chooses it; a room listed twice is offered once.
-pub fn agent_targets(rooms: Vec<(String, ProxyRoomVm)>) -> Vec<VoiceAgentTargetVm> {
-    let mut targets: Vec<VoiceAgentTargetVm> = Vec::with_capacity(rooms.len());
-    for (account_id, room) in rooms {
-        if targets.iter().any(|target| target.room_id == room.room_id) {
-            continue;
-        }
-        targets.push(VoiceAgentTargetVm {
-            target: agent_target(&room.room_id),
-            account_id,
-            room_id: room.room_id,
-            name: room.name,
-            kind: room.kind,
-        });
-    }
-    targets
-}
 
 /// Where a spoken turn goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,10 +61,10 @@ pub enum VoiceTarget {
         /// to be opened on it.
         session_id: Option<String>,
     },
-    /// One of the person's proxy conversations (R31).
+    /// One of the person's agents (108.2): its main conversation.
     Agent {
-        /// The room's id.
-        room_id: String,
+        /// The agent's actor id.
+        agent: String,
     },
 }
 
@@ -116,9 +78,8 @@ pub enum SpokenRefusal {
         /// The bot's display name.
         bot: String,
     },
-    /// The chosen agent room is not one of the person's proxy
-    /// conversations on any signed-in account.
-    AgentRoomGone,
+    /// The chosen agent is in none of the databases this device holds.
+    AgentGone,
 }
 
 impl SpokenRefusal {
@@ -129,7 +90,7 @@ impl SpokenRefusal {
             Self::NoModel { bot } => format!(
                 "{bot} offers no model to answer with: open a conversation with it under Bots and choose one."
             ),
-            Self::AgentRoomGone => AGENT_ROOM_GONE_SENTENCE.to_owned(),
+            Self::AgentGone => AGENT_GONE_SENTENCE.to_owned(),
         }
     }
 }
@@ -138,27 +99,29 @@ impl SpokenRefusal {
 ///
 /// `chosen` is `bots.voice_target` as stored; `bots` every pinned bot;
 /// `sessions` every live conversation, newest activity first, as
-/// `session::list_sessions(dir, false)` lists them; `agent_rooms` the ids
-/// of every room a signed-in account reads as its person's proxy
-/// conversation (`proxy::proxy_rooms`). Never `chosen` when it names a bot
-/// that is no longer pinned: an unpinned bot is not a bot to talk to, so
-/// the rule falls through to the most recent — a choice that went stale is
-/// treated as no choice, never as a send to a bot the list does not show.
-/// An agent room is different: it is the person's own agent, and a choice
-/// of it that went stale is refused rather than sent to a bot instead.
+/// `session::list_sessions(dir, false)` lists them; `agents` the actor id
+/// of every agent a database this device holds names
+/// (`crate::hq::spoken::targets`). Never `chosen` when it names a bot that
+/// is no longer pinned: an unpinned bot is not a bot to talk to, so the rule
+/// falls through to the most recent — a choice that went stale is treated as
+/// no choice, never as a send to a bot the list does not show. An agent is
+/// different: it is the person's own, and a choice of it that went stale is
+/// refused rather than sent to a bot instead. A value naming one of the
+/// agents' old Matrix rooms is no choice (UX-DR-E108-1).
 pub fn resolve(
     chosen: Option<&str>,
     bots: &[Bot],
     sessions: &[BotSession],
-    agent_rooms: &[String],
+    agents: &[String],
 ) -> Result<VoiceTarget, SpokenRefusal> {
-    if let Some(chosen) = chosen.filter(|chosen| chosen.starts_with(AGENT_TARGET_PREFIX)) {
-        return agent_room_of(chosen)
-            .and_then(|room| agent_rooms.iter().find(|listed| listed.as_str() == room))
+    let chosen = chosen.filter(|chosen| !is_old_room_target(chosen));
+    if let Some(chosen) = chosen.filter(|chosen| chosen.trim().starts_with(AGENT_TARGET_PREFIX)) {
+        return target_agent(chosen)
+            .and_then(|agent| agents.iter().find(|listed| listed.as_str() == agent))
             .map(|listed| VoiceTarget::Agent {
-                room_id: listed.clone(),
+                agent: listed.clone(),
             })
-            .ok_or(SpokenRefusal::AgentRoomGone);
+            .ok_or(SpokenRefusal::AgentGone);
     }
     let pinned = |id: &str| bots.iter().any(|bot| bot.id == id);
     if let Some(bot_id) = chosen.filter(|id| pinned(id)) {
@@ -416,35 +379,42 @@ mod tests {
         );
     }
 
-    /// AD-384: `agent:<room>` names one of the person's proxy
-    /// conversations and goes there — never to a bot, and never to a room
-    /// the account does not read as its proxy's, which is refused with the
-    /// sentence naming *Speak to* even when bots could answer.
+    /// AD-384, 108.2: `agent:<agent>` names one of the person's agents and
+    /// goes to it — never to a bot, and never to an agent no held database
+    /// names, which is refused with the sentence naming *Speak to* even when
+    /// bots could answer. A value naming one of the agents' old Matrix rooms
+    /// is no choice: the most recent bot answers (UX-DR-E108-1).
     #[test]
-    fn a_voice_target_may_be_the_proxy_room() {
+    fn a_voice_target_may_be_an_agent() {
         let bots = [bot("a")];
         let sessions = [session("s1", "a", 10)];
-        let mine = ["!dm:server".to_owned(), "!talk:server".to_owned()];
-        assert_eq!(agent_target("!dm:server"), "agent:!dm:server");
+        let mine = ["nixie".to_owned(), "tola-grey".to_owned()];
         assert_eq!(
-            resolve(Some("agent:!dm:server"), &bots, &sessions, &mine),
+            resolve(Some("agent:nixie"), &bots, &sessions, &mine),
             Ok(VoiceTarget::Agent {
-                room_id: "!dm:server".to_owned()
+                agent: "nixie".to_owned()
             })
         );
         assert_eq!(
-            resolve(Some("agent:!talk:server"), &[], &[], &mine),
+            resolve(Some("agent:tola-grey"), &[], &[], &mine),
             Ok(VoiceTarget::Agent {
-                room_id: "!talk:server".to_owned()
+                agent: "tola-grey".to_owned()
             })
         );
-        for stale in ["agent:!elsewhere:server", "agent:", "agent:  "] {
-            let refused =
-                resolve(Some(stale), &bots, &sessions, &mine).expect_err("not my proxy's room");
-            assert_eq!(refused, SpokenRefusal::AgentRoomGone, "{stale}");
+        for stale in ["agent:dixie", "agent:", "agent:  "] {
+            let refused = resolve(Some(stale), &bots, &sessions, &mine).expect_err("not held");
+            assert_eq!(refused, SpokenRefusal::AgentGone, "{stale}");
             assert!(refused.message().contains("Speak to"));
         }
-        // A bare id is a bot id, as before: an agent room is never guessed.
+        assert_eq!(
+            resolve(Some("agent:!dm:server"), &bots, &sessions, &mine),
+            Ok(VoiceTarget::Bot {
+                bot_id: "a".to_owned(),
+                session_id: Some("s1".to_owned())
+            }),
+            "an old room is no choice"
+        );
+        // A bare id is a bot id, as before: an agent is never guessed.
         assert_eq!(
             resolve(Some("a"), &bots, &sessions, &mine),
             Ok(VoiceTarget::Bot {

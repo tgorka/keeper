@@ -12,23 +12,9 @@
  * The chat's open room is {@link timelineStore}; a second open timeline (the
  * notes view's dock) makes its own with {@link createTimelineStore}, so it
  * never disturbs the chat's.
- *
- * In an agent room the stream also carries the room's header beside the ops
- * ({@link AgentRoomHeaderVm}), its approval cards ({@link ApprovalVm}, the
- * `approval` items name them by `id`) and where the person stopped listening
- * to a spoken answer ({@link HeardMarkVm}, by the answer's `key`). Rust sends
- * each on the first batch and again only when it changed, so a batch without
- * one leaves the last standing.
  */
 import { createStore, type StoreApi } from "zustand/vanilla";
-import type {
-  AgentRoomHeaderVm,
-  ApprovalVm,
-  HeardMarkVm,
-  TimelineBatch,
-  TimelineItemVm,
-  TimelineOp,
-} from "@/lib/ipc/client";
+import type { TimelineBatch, TimelineItemVm, TimelineOp } from "@/lib/ipc/client";
 import { applyDiffOp } from "@/lib/stores/vector-diff";
 
 /**
@@ -44,15 +30,6 @@ function applyOp(items: TimelineItemVm[], op: TimelineOp): TimelineItemVm[] {
 export interface TimelineState {
   /** The ordered timeline, exactly as Rust streamed it. */
   items: TimelineItemVm[];
-  /** The agent room's header, or `null` in every other room. */
-  header: AgentRoomHeaderVm | null;
-  /** The agent room's approval cards, every one; empty in every other room. */
-  approvals: ApprovalVm[];
-  /**
-   * Where the person stopped listening to each marked answer, by its `key`;
-   * empty in every other room.
-   */
-  heard: HeardMarkVm[];
   /** Apply one streamed batch (its ops in sequence). */
   applyBatch: (batch: TimelineBatch) => void;
   /** Reset to the empty state (on room change / unsubscribe). */
@@ -63,17 +40,11 @@ export interface TimelineState {
 export function createTimelineStore(): StoreApi<TimelineState> {
   return createStore<TimelineState>()((set) => ({
     items: [],
-    header: null,
-    approvals: [],
-    heard: [],
     applyBatch: (batch) =>
       set((state) => ({
         items: batch.ops.reduce(applyOp, state.items),
-        header: batch.header ?? state.header,
-        approvals: batch.approvals ?? state.approvals,
-        heard: batch.heard ?? state.heard,
       })),
-    clear: () => set({ items: [], header: null, approvals: [], heard: [] }),
+    clear: () => set({ items: [] }),
   }));
 }
 

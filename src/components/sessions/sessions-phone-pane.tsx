@@ -46,16 +46,9 @@
  * here but whose push did not (`SessionTaskMoveVm.unpushed`, R346) is said too,
  * and the board re-reads, because the card has moved on this phone.
  *
- * An agent's session carries its room (`SessionDetailVm.room`). Tapping a card
- * of that session opens the room, where 93.3's approval card is decided by the
- * same Matrix event a Mac sends (AD-395) — the phone never reads or writes a
- * session's `approvals/`. The room is opened on the account the Agents window
- * streams it for: that window is Rust's list of every agent room this phone's
- * accounts are in, so a room it does not hold is one no account here can open,
- * and the card says so instead of opening nothing — once the window has
- * arrived: before its first batch, nothing is known yet, and the card says
- * keeper is still reading the rooms rather than that no account is in this one.
- * The view stays Sessions, so popping the room lands back on the board.
+ * An agent's session in a drive may still name the Matrix room it was worked
+ * in before 108.2; that room is one of the agents' old rooms, which keeper no
+ * longer opens, so the board offers no way into it.
  *
  * # The reads
  *
@@ -64,7 +57,6 @@
  * which on a phone fires after each sync pass rescans the zone, since nothing
  * watches a folder there (`sessions_root::phone_synced`).
  */
-import { MessageSquare } from "lucide-react";
 import { type Ref, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   PHONE_BACK_TO_INBOX,
@@ -92,10 +84,8 @@ import { Button } from "@/components/ui/button";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
 import { logFailure } from "@/lib/failure";
-import type { InboxRoomVm, SessionDetailVm, SessionRowVm } from "@/lib/ipc/client";
+import type { SessionDetailVm, SessionRowVm } from "@/lib/ipc/client";
 import { listenSessionsChanged, sessionsDetail, sessionsTaskMove } from "@/lib/ipc/client";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
-import { type RoomSelection, roomsStore } from "@/lib/stores/rooms";
 import { useSessionsListStore } from "@/lib/stores/sessions-list";
 import {
   refreshSessionsRoots,
@@ -107,14 +97,6 @@ import { cn } from "@/lib/utils";
 
 /** The board level's back control: the level beneath it is the sessions list. */
 export const SESSIONS_PHONE_BACK_TO_LIST = `Back to ${SESSIONS_PANE_TITLE}`;
-
-/** The session's own way into its room, beside the board. */
-export const SESSIONS_PHONE_OPEN_ROOM = "Open the session's room";
-
-/** A card's way into its session's room, as its accessible name. */
-export function sessionsPhoneOpenCardRoom(title: string): string {
-  return `${title} — open the session's room`;
-}
 
 /** The per-card picker: what it says before a column is chosen. */
 export const SESSIONS_PHONE_MOVE_TO = "Move to…";
@@ -134,14 +116,6 @@ export const SESSIONS_PHONE_NO_TASKS =
 /** The zone has no sessions at all. */
 export const SESSIONS_PHONE_NO_SESSIONS = "No sessions in this folder yet.";
 
-/** The session's room is not one any account on this phone streams. */
-export const SESSIONS_PHONE_ROOM_ABSENT =
-  "None of the accounts on this phone is in this session's room, so keeper cannot open it here.";
-
-/** A card tapped before the Agents window's first batch: nothing is known yet. */
-export const SESSIONS_PHONE_ROOMS_READING =
-  "keeper is still reading the rooms on this phone. Try again in a moment.";
-
 /**
  * How long the pager waits after its last `scroll` before deciding which page
  * it rests on, where the WebView sends no `scrollend`. Longer than a frame of a
@@ -151,36 +125,6 @@ const PAGE_SETTLE_MS = 150;
 
 /** The board while its first read is out. */
 export const SESSIONS_PHONE_READING = "Reading the board…";
-
-/**
- * Where `roomId` opens on this phone: the Agents window's row for it, which
- * carries the account it was streamed for — or `null` when no account here
- * holds that room. First match wins, in Rust's recency order, as everywhere a
- * window row is looked up (`use-selected-room-vm.ts`).
- */
-export function sessionRoomOnThisPhone(
-  roomId: string,
-  agentRooms: readonly InboxRoomVm[],
-): RoomSelection | null {
-  const row = agentRooms.find((room) => room.roomId === roomId);
-  return row === undefined ? null : { accountId: row.accountId, roomId: row.roomId };
-}
-
-/**
- * Open `roomId` over the board, or say why not. The primary view stays
- * Sessions: a selected room outranks every view level, so the room covers the
- * board, and popping it lands on the board again rather than on a chat list.
- */
-function openSessionRoom(roomId: string): string | null {
-  const { rooms, total } = agentRoomsStore.getState();
-  const target = sessionRoomOnThisPhone(roomId, rooms);
-  if (target === null) {
-    // `total === null` is "not streamed yet", never "absent".
-    return total === null ? SESSIONS_PHONE_ROOMS_READING : SESSIONS_PHONE_ROOM_ABSENT;
-  }
-  roomsStore.getState().selectRoom(target);
-  return null;
-}
 
 /**
  * Level 1: the zone's sessions. A row pushes its board.
@@ -402,7 +346,6 @@ export function SessionsPhoneBoard({
       box.scrollLeft = initialRef.current * box.clientWidth;
     }
   }, [hasPager]);
-  const room = detail?.room ?? null;
 
   const move = async (key: string, status: string) => {
     setNotice(null);
@@ -424,12 +367,6 @@ export function SessionsPhoneBoard({
       logFailure("sessions.taskMove")(refusal);
       // keeper's own sentence when it sent one (UX-DR43).
       setNotice(syncErrorMessage(refusal, SESSION_BOARD_MOVE_FAILED));
-    }
-  };
-
-  const openRoom = () => {
-    if (room !== null) {
-      setNotice(openSessionRoom(room));
     }
   };
 
@@ -473,14 +410,6 @@ export function SessionsPhoneBoard({
       >
         <h1 className="min-w-0 flex-1 truncate font-heading text-title">{detail?.title ?? ""}</h1>
       </PhoneBackBar>
-      {room !== null && (
-        <div className="shrink-0 border-border border-b px-2 py-2">
-          <Button type="button" variant="outline" onClick={openRoom} className="min-h-11 w-full">
-            <MessageSquare aria-hidden="true" />
-            {SESSIONS_PHONE_OPEN_ROOM}
-          </Button>
-        </div>
-      )}
       {(error !== null || notice !== null) && (
         <p
           role={error !== null ? "alert" : "status"}
@@ -548,7 +477,6 @@ export function SessionsPhoneBoard({
                       <PhoneCard
                         key={card.key}
                         card={card}
-                        onOpen={room !== null ? openRoom : undefined}
                         onMove={(status) => void move(card.key, status)}
                       />
                     ))
@@ -564,36 +492,15 @@ export function SessionsPhoneBoard({
 }
 
 /**
- * One card: what is worked, by whom, where — and *Move to…*. A card of an
- * agent's session is a button into that session's room.
+ * One card: what is worked, by whom, where — and *Move to…*.
  */
-function PhoneCard({
-  card,
-  onOpen,
-  onMove,
-}: {
-  card: BoardCard;
-  /** Open the session's room; absent for a session that has none. */
-  onOpen?: () => void;
-  onMove: (status: string) => void;
-}) {
+function PhoneCard({ card, onMove }: { card: BoardCard; onMove: (status: string) => void }) {
   return (
     <li
       data-card-key={card.key}
       className="flex flex-col gap-1.5 rounded-md border border-border bg-card px-3 py-2"
     >
-      {onOpen !== undefined ? (
-        <button
-          type="button"
-          onClick={onOpen}
-          aria-label={sessionsPhoneOpenCardRoom(card.title)}
-          className="min-h-11 text-left font-medium text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {card.title}
-        </button>
-      ) : (
-        <p className="font-medium text-sm">{card.title}</p>
-      )}
+      <p className="font-medium text-sm">{card.title}</p>
       {/* No `onAllow`: the command is the desktop's, so the block names where to allow. */}
       {card.agent != null && <BoardCardAgent agent={card.agent} title={card.title} />}
       {/* A native picker, as every sessions surface uses: on a phone it is the

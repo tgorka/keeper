@@ -1,13 +1,8 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  AGENT_ATTENTION_LABEL,
-  AGENT_ATTENTION_UNKNOWN,
-} from "@/components/agents/agent-attention";
 import { ChatRow } from "@/components/chat/chat-row";
-import type { AgentsLaunchVm, BridgeHealth, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
+import type { BridgeHealth, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
-import { defaultAgentStore } from "@/lib/stores/default-agent";
 import { draftsStore } from "@/lib/stores/drafts";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -27,20 +22,13 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     favoriteRoom: vi.fn(async () => {}),
     unfavoriteRoom: vi.fn(async () => {}),
     chatNotifyModeSet: vi.fn(async () => {}),
-    agentsDefaultSet: vi.fn(),
-    agentsDefaultGet: vi.fn(),
-    listenAgentsDefaultChanged: vi.fn(),
   };
 });
 
-import { useDefaultAgentFollowsSync } from "@/hooks/use-default-agent-follows-sync";
 import {
-  agentsDefaultGet,
-  agentsDefaultSet,
   archiveRoom,
   chatNotifyModeSet,
   favoriteRoom,
-  listenAgentsDefaultChanged,
   markRoomRead,
   markRoomUnread,
   pinRoom,
@@ -48,12 +36,6 @@ import {
   unfavoriteRoom,
   unpinRoom,
 } from "@/lib/ipc/client";
-
-/** The app-wide follower of a synced default agent, mounted beside the rows alone. */
-function FollowsSync() {
-  useDefaultAgentFollowsSync();
-  return null;
-}
 
 /** Seed the Favorites-window mirror's total so the discovery hint hides. */
 function setFavoritesTotal(total: number): void {
@@ -870,190 +852,5 @@ describe("ChatRow phone touch idioms", () => {
     // The next tap opens the conversation as usual.
     fireEvent.click(screen.getByRole("button", { name: "Conversation with Alice Smith" }));
     expect(onSelect).toHaveBeenCalledTimes(1);
-  });
-  it("an agent room says Rust's state for it, drawn and in its name (story 101.6)", () => {
-    const agent = (agentAttention?: InboxRoomVm["agentAttention"]) =>
-      room({ agentRoom: "proxy", ...(agentAttention ? { agentAttention } : {}) });
-    const { rerender } = render(<ChatRow room={agent("needsYou")} />);
-    expect(
-      screen.getByRole("button", {
-        name: "Conversation with Alice Smith, an agent conversation, needs you",
-      }),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("agent-attention")).toHaveTextContent("Needs you");
-
-    rerender(<ChatRow room={agent("doneUnread")} />);
-    expect(
-      screen.getByRole("button", {
-        name: "Conversation with Alice Smith, an agent conversation, done, unread",
-      }),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("agent-attention")).toHaveTextContent("Done");
-
-    rerender(<ChatRow room={agent("working")} />);
-    expect(screen.getByTestId("agent-attention")).toHaveTextContent("Working");
-
-    // Rust could not read all it needs (R381, R453): the row says so in its
-    // name, and the mark carries the sentence where the person looks.
-    rerender(<ChatRow room={agent("unknown")} />);
-    expect(
-      screen.getByRole("button", {
-        name: `Conversation with Alice Smith, an agent conversation, ${AGENT_ATTENTION_LABEL.unknown}`,
-      }),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("agent-attention")).toHaveAttribute("title", AGENT_ATTENTION_UNKNOWN);
-
-    rerender(<ChatRow room={agent()} />);
-    expect(screen.queryByTestId("agent-attention")).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Conversation with Alice Smith, an agent conversation" }),
-    ).toBeInTheDocument();
-  });
-});
-
-describe("ChatRow default agent (story 102.7, R463)", () => {
-  const NIXI = "@nixi:example.org";
-  const TOLA = "@tola:example.org";
-
-  function launchVm(defaultAgent: string | null): AgentsLaunchVm {
-    return {
-      view: "agents",
-      room: null,
-      defaultAgent,
-      reason: null,
-      announce: false,
-      choices: [{ agent: NIXI, name: "Nixi" }],
-      chooser: false,
-      fileSet: null,
-      ask: null,
-      askable: [],
-    };
-  }
-  const nixiRow = room({
-    roomId: "!nixi-reading:example.org",
-    displayName: "Nixi — reading list",
-    agentRoom: "proxy",
-    agent: NIXI,
-  });
-  const tolaRow = room({
-    roomId: "!tola-review:example.org",
-    displayName: "Dr Tola Grey — review",
-    agentRoom: "session",
-    agent: TOLA,
-  });
-
-  afterEach(() => {
-    vi.mocked(agentsDefaultSet).mockReset();
-    defaultAgentStore.setState({ vm: null, saving: false, saveError: null });
-  });
-
-  it("marks the default agent's rows before the truncating name and says so in the row's name", () => {
-    defaultAgentStore.setState({ vm: launchVm(NIXI) });
-    render(
-      <>
-        <ChatRow room={nixiRow} />
-        <ChatRow room={tolaRow} />
-      </>,
-    );
-    const markers = screen.getAllByTestId("default-agent-marker");
-    expect(markers).toHaveLength(1);
-    expect(markers[0]).toHaveAttribute("title", "Opens when keeper starts");
-    const nixi = screen.getByRole("button", { name: /Nixi — reading list/ });
-    expect(nixi).toContainElement(markers[0]);
-    expect(nixi.getAttribute("aria-label")).toContain("default agent, opens when keeper starts");
-    // Before the name: the name's truncation can never cut it.
-    const name = within(nixi).getByText("Nixi — reading list");
-    expect(
-      markers[0].compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    const tola = screen.getByRole("button", { name: /Dr Tola Grey/ });
-    expect(tola.getAttribute("aria-label")).not.toContain("default agent");
-  });
-
-  it("draws no marker before keeper has read the default, nor for a row with no agent", () => {
-    render(<ChatRow room={nixiRow} />);
-    expect(screen.queryByTestId("default-agent-marker")).toBeNull();
-    act(() => defaultAgentStore.setState({ vm: launchVm(NIXI) }));
-    render(<ChatRow room={room({ roomId: "!x:example.org", agentRoom: "unknown" })} />);
-    expect(screen.getAllByTestId("default-agent-marker")).toHaveLength(1);
-  });
-
-  it("Make default on any agent row stores its agent, and the marker moves", async () => {
-    defaultAgentStore.setState({ vm: launchVm(NIXI) });
-    vi.mocked(agentsDefaultSet).mockResolvedValue(launchVm(TOLA));
-    render(
-      <>
-        <ChatRow room={nixiRow} />
-        <ChatRow room={tolaRow} />
-      </>,
-    );
-    fireEvent.contextMenu(screen.getByRole("button", { name: /Dr Tola Grey/ }));
-    const item = await screen.findByRole("menuitemcheckbox", { name: "Make default" });
-    expect(item).toHaveAttribute("aria-checked", "false");
-    fireEvent.click(item);
-    await waitFor(() => expect(agentsDefaultSet).toHaveBeenCalledWith(TOLA));
-    await waitFor(() =>
-      expect(
-        within(screen.getByRole("button", { name: /Dr Tola Grey/ })).getByTestId(
-          "default-agent-marker",
-        ),
-      ).toBeInTheDocument(),
-    );
-    expect(
-      within(screen.getByRole("button", { name: /Nixi — reading list/ })).queryByTestId(
-        "default-agent-marker",
-      ),
-    ).toBeNull();
-  });
-
-  it("the default's row offers Default, checked, which stops it opening at launch", async () => {
-    defaultAgentStore.setState({ vm: launchVm(NIXI) });
-    vi.mocked(agentsDefaultSet).mockResolvedValue(launchVm(null));
-    render(<ChatRow room={nixiRow} />);
-    fireEvent.contextMenu(screen.getByRole("button", { name: /Nixi — reading list/ }));
-    const item = await screen.findByRole("menuitemcheckbox", { name: "Default" });
-    expect(item).toHaveAttribute("aria-checked", "true");
-    fireEvent.click(item);
-    await waitFor(() => expect(agentsDefaultSet).toHaveBeenCalledWith(null));
-  });
-
-  it("a row with no agent offers neither", async () => {
-    defaultAgentStore.setState({ vm: launchVm(NIXI) });
-    render(<ChatRow room={room()} />);
-    fireEvent.contextMenu(screen.getByRole("button"));
-    await screen.findByText("Archive");
-    expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
-  });
-
-  it("follows a default another device chose once the setting syncs here, with only the list open (DW-1572)", async () => {
-    let synced: () => void = () => {};
-    vi.mocked(listenAgentsDefaultChanged).mockImplementation(async (onChanged) => {
-      synced = onChanged;
-      return () => {};
-    });
-    defaultAgentStore.setState({ vm: launchVm(NIXI) });
-    vi.mocked(agentsDefaultGet).mockResolvedValue(launchVm(TOLA));
-    render(
-      <>
-        <FollowsSync />
-        <ChatRow room={nixiRow} />
-        <ChatRow room={tolaRow} />
-      </>,
-    );
-    await waitFor(() => expect(listenAgentsDefaultChanged).toHaveBeenCalledTimes(1));
-    const marker = (name: RegExp) =>
-      within(screen.getByRole("button", { name })).queryByTestId("default-agent-marker");
-    expect(marker(/Nixi — reading list/)).toBeInTheDocument();
-
-    // Rust says a sync wrote `agents.default`: Tola, chosen on another device.
-    await act(async () => synced());
-    await waitFor(() => expect(marker(/Dr Tola Grey/)).toBeInTheDocument());
-    expect(marker(/Nixi — reading list/)).toBeNull();
-    expect(agentsDefaultGet).toHaveBeenCalledTimes(1);
-    fireEvent.contextMenu(screen.getByRole("button", { name: /Dr Tola Grey/ }));
-    expect(await screen.findByRole("menuitemcheckbox", { name: "Default" })).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
   });
 });
