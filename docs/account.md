@@ -10,9 +10,9 @@ This is the user and operator document. It covers:
 - how a device is set up;
 - what keeper reads and writes in the repository;
 - where the account's settings sit among the other layer files;
-- how your settings, drives, bot providers and Matrix accounts travel between your devices,
+- how your settings, drives, model providers and Matrix accounts travel between your devices,
   and how a reinstalled device restores itself;
-- how one sign-in serves your drives, your bots and your Matrix account;
+- how one sign-in serves your drives, your model providers and your Matrix account;
 - how to browse your repositories on your account's forge and on GitHub, and add them as
   drives, including GitHub access through your organization's broker;
 - what happens offline, at sign-out and when you forget the account;
@@ -35,12 +35,12 @@ evidence.
   QR code, or a pasted URL.
 - **The sign-in** is your organisation's own login page, in the system's sign-in window.
   keeper never sees your password. The token it gets back is kept in the OS keychain and is
-  a general credential: the config repository uses it, and so can a drive or a bot provider
+  a general credential: the config repository uses it, and so can a drive or a model provider
   if you choose. The same sign-in session also opens your Matrix account when your
-  homeserver trusts the same provider (see *One sign-in: drives, bots and Matrix*).
+  homeserver trusts the same provider (see *One sign-in: drives, model providers and Matrix*).
 - **The directory** is `<your login>/` in the config repository. keeper creates it from a
   template on your first sign-in and adds each device you use to it. It applies the pins
-  in it as layer files, keeps your preferences, drives, bot providers and Matrix accounts
+  in it as layer files, keeps your preferences, drives, model providers and Matrix accounts
   there in step with every device, and restores a reinstalled device from it.
 
 **keeper works fully without an account.** With no descriptor nothing changes: no file is
@@ -354,7 +354,7 @@ screen. Continue only for hosts you recognise.
 
 If this install has already registered this device for the account (you are setting the
 same account up again), the sheet says so: "This device is already in your settings
-repository; keeper will restore its drives, bots and settings." A freshly installed keeper
+repository; keeper will restore its drives, model providers and settings." A freshly installed keeper
 cannot know this yet, because it has no copy of the repository. It finds out at its first
 sync, keeps the name, and restores itself (see *A device that comes back*).
 
@@ -550,9 +550,9 @@ keeper-config.git/
     keeper.macbook.toml          # your pinned settings, this device only
     settings.toml                # your preferences, every device (keeper keeps it in step)
     settings.macbook.toml        # your preferences, this device only (keeper keeps it in step)
-    device.macbook.toml          # this device's drives, bots and accounts, so it can be restored (keeper writes it)
+    device.macbook.toml          # this device's drives, model providers and accounts, so it can be restored (keeper writes it)
     drives.toml                  # the drives you use, and on which devices
-    bots.toml                    # your bot providers and their bots
+    bots.toml                    # your model providers (the name older devices read, DW-E108-6)
     matrix.toml                  # your Matrix accounts
     devices/
       macbook.toml               # name, class, platform, created, machine (a fingerprint, below), version, commit, updated
@@ -606,7 +606,7 @@ Settings › Account shows *keeper 0.8.33* beside each device that records one.
    `_template/class/<class>.toml` exists, copy it to `<login>/keeper.<device>.toml`. Commit
    and push.
 5. **A later launch** finds everything present and creates nothing.
-6. **Every sync** merges your settings files and your lists of drives, bot providers and
+6. **Every sync** merges your settings files and your lists of drives, model providers and
    Matrix accounts, and describes this device in its own file. It rewrites and pushes them
    only when their content changed (see *Your settings, drives and accounts travel*).
    When this device's own record names another `version` than the keeper running, or
@@ -770,7 +770,7 @@ other layer files' faults.
 
 ## Your settings, drives and accounts travel
 
-Your preferences, the drives you sync, your bot providers and your Matrix accounts follow
+Your preferences, the drives you sync, your model providers and your Matrix accounts follow
 you from device to device through your directory in the config repository. keeper keeps
 six files there in step with your devices. Apart from this device's log (see *This
 device's log*), they are the only files it ever rewrites. One of them describes this
@@ -785,7 +785,7 @@ device so completely that a reinstalled device restores itself from it.
 - **`<login>/settings.<device>.toml`** holds this device's own settings: its hotkeys, which
   drive is its notes vault and which its tasks ledger, where it records, which `git`
   program it uses, whether its local store is encrypted, whether it listens for a phrase
-  and in which language, the notes list's last choices, and whether each drive and bot
+  and in which language, the notes list's last choices, and whether each drive and model
   provider uses your account. These are the keys under *Keys only `keeper.<host>.toml`
   may set*, plus the few that describe this device (see *What travels from this
   device, and what never does*).
@@ -852,7 +852,7 @@ the next launch (DW-301).
 ### What travels from this device, and what never does
 
 - **Secrets never travel.** No token, password, session, keychain item or credential
-  value is ever written to the repository. A drive or a bot provider records only *which*
+  value is ever written to the repository. A drive or a model provider records only *which*
   credential it uses: `account`, `own` (a token or key in this device's keychain) or
   `none`.
 - **The settings that describe this device travel in `settings.<device>.toml`,** and each
@@ -861,16 +861,17 @@ the next launch (DW-301).
     added after it. An account already on the device keeps the store it has, because
     changing that would re-key it (DW-315);
   - **`sync.git_path`** applies only where that program exists on this disk;
-  - **`bots.voice_locale`** applies only where the recogniser can run that language.
+  - **`voice.locale`** applies only where the recogniser can run that language.
     Otherwise it is refused, never replaced;
-  - **`bots.wake_enabled`** can travel off, but never on (see *Listening is yours to
+  - **`voice.wake_enabled`** can travel off, but never on (see *Listening is yours to
     switch on*);
   - **`notes.hide_service_files`** and **`notes.include_private`**, the notes list's last
     choices;
-  - **whether each drive and bot provider uses your account**, as
+  - **whether each drive and model provider uses your account**, as
     `"sync.credential_source.drive:<remote>#<branch>" = "account"` or
-    `"bots.provider_credential_source.provider:<kind>:<base URL>" = "account"`. A drive or
-    provider that uses the keychain has no entry. The value applies only as the account
+    `"bots.provider_credential_source.provider:<kind>:<base URL>" = "account"` (the
+    `bots.` name is kept for devices on older builds, DW-E108-6). A drive or provider that
+    uses the keychain has no entry. The value applies only as the account
     you are signed in to, and only to a drive or provider this device has. Otherwise it
     stays in the file and waits, like any reference (below). A drive added from a
     repository source records that source instead, as `"forge:<source id>"` (for example
@@ -887,19 +888,19 @@ the next launch (DW-301).
   here too (DW-306, DW-307). These are the rest of *Keys no file may set* in
   `docs/settings-keys.md`, and keeper.db's own tables.
 
-### Drives, bots and folders are named, not numbered
+### Drives, providers and folders are named, not numbered
 
-A vault, a ledger drive, a recording destination, the voice target and the embedding
-model's provider are each stored as an id that keeper mints separately on every device.
-The settings files carry a reference instead:
+A vault, a ledger drive, a recording destination and the embedding model's provider are
+each stored as an id that keeper mints separately on every device. The settings files carry
+a reference instead; the voice target names an agent by its id, which is the same
+everywhere:
 
 | Reference | Used by |
 | --- | --- |
 | `drive:<remote URL>#<branch>` | `notes.active_vault`, `tasks.ledger_vault`, `recording.destination_profile_id` |
 | `drive:<remote URL>#<branch>^<name>` | the same, when two of this device's drives share a repository and branch |
 | `provider:<kind>:<base URL>` | the provider inside `notes.embedding_model` |
-| `bot:<kind>:<base URL>#<target>` | `bots.voice_target` |
-| `agent:<room id>` — as stored, a room id being the same on every device | `bots.voice_target`, when it names one of your assistant's conversations |
+| `agent:<agent>` — as stored, an agent's id being the same on every device | `voice.target` |
 
 Remote and base URLs are compared in a normalized form: the scheme and host lower-cased, a
 trailing `/` or `.git` dropped, and any user name or password removed. So
@@ -913,12 +914,14 @@ repository here, or else to the one whose name sorts first. Renaming one of two 
 drives changes its reference for your other devices (DW-316).
 
 A reference that does not resolve on this device, because you have not added that drive
-or bot here yet, stays in the file and is not applied. It does not count as a change made
-here, so this device never deletes it or pushes its own value over it. Once you add the
-drive or bot, the next sync applies it. A recording folder (`recording.destination_dir`)
+or provider here yet, stays in the file and is not applied. It does not count as a change
+made here, so this device never deletes it or pushes its own value over it. Once you add the
+drive or provider, the next sync applies it. A `voice.target` of the older forms — a bot
+(`bot:…`), or one of the agents' old Matrix rooms (`agent:!…`) — names nothing and does not
+travel. A recording folder (`recording.destination_dir`)
 works the same way: it applies only when that folder exists on this device.
 
-### Drives, bot providers and Matrix accounts are offered
+### Drives, model providers and Matrix accounts are offered
 
 Three more files list what you use, and on which devices:
 - **`drives.toml`:** each drive's name, remote URL and branch; its roles (notes,
@@ -926,8 +929,10 @@ Three more files list what you use, and on which devices:
   (excludes, the LFS threshold, virtual-file patterns and size floor, the release time,
   tags, the commit subject); and whether it uses your account, its own token, or none.
   The local folder, the direction and the other per-device choices stay on each device.
-- **`bots.toml`:** each bot provider's kind, name, base URL and read timeout, whether it
-  uses your account or its own key, and its pinned bots (target, name, order and look).
+- **`bots.toml`:** each model provider's kind, name, base URL and read timeout, and whether
+  it uses your account or its own key. The file keeps its name for devices on older builds
+  (DW-E108-6), and a list of bots one of them wrote under a provider is kept as it is and
+  not read.
 - **`matrix.toml`:** each Matrix account's user id, its homeserver, and how it signs in
   (password, SSO or Beeper).
 
@@ -946,19 +951,19 @@ account**:
   have it. *Add…* opens the add-folder form filled in, and you choose the folder (on iOS
   keeper assigns it, as usual). When the drive uses your account and the account is
   signed in, the account is already chosen.
-- **Settings › Bots** lists each provider with its kind, host and bots. When it uses your
-  account and the account is usable, *Add* adds it and its bots in one step. Otherwise
-  *Add…* opens the provider form filled in and asks for its key.
+- **Settings › Notes › Model providers** lists each provider with its kind and host. When it
+  uses your account and the account is usable, *Add* adds it in one step. Otherwise *Add…*
+  opens the provider form filled in and asks for its key.
 - **Adding a Matrix account**, and the first-run step, show one button per account. It
   fills in the homeserver and user name on the Password tab, or opens the Beeper tab for
   a Beeper account (DW-305), and you then sign in as usual. An account that signs in with
-  single sign-on starts that sign-in on the same click (see *One sign-in: drives, bots
-  and Matrix*).
+  single sign-on starts that sign-in on the same click (see *One sign-in: drives, model
+  providers and Matrix*).
 
 Each block appears only when it has something to offer. An offer stays until you add it
 here, or until no other device uses it (DW-304). Settings › Account sums it up in one
 line, for example: "Your settings sync with this account. Last synced 14:02. On your
-other devices: 2 drives, 1 bot provider, 1 Matrix account."
+other devices: 2 drives, 1 model provider, 1 Matrix account."
 
 ### This device's own file
 
@@ -967,8 +972,8 @@ other devices: 2 drives, 1 bot provider, 1 Matrix account."
   repository it keeps, its LFS and virtual-file settings, its roles and templates, its
   watch windows, its recordings policy, and its schedules (kind, schedule, mode, on or off).
   Only keeper's internal id for the drive and the disk it was last seen on are left out;
-- **every bot provider**: kind, name, base URL, read timeout, whether it uses your account
-  or its own key, its bots, and the folders each bot may reach;
+- **every model provider**: kind, name, base URL, read timeout, and whether it uses your
+  account or its own key;
 - **every Matrix account**: user id, homeserver, how it signs in, its colour, its incognito
   choice and the networks you muted.
 
@@ -992,15 +997,14 @@ repository*):
    in), that drive waits: Settings › Account says "Waiting for /Volumes/Field to restore
    Field recordings.", and keeper restores it at the first sync after the disk is back. On
    iPhone and iPad keeper places the folder itself, as usual.
-3. **Bot providers** are added with their bots and the folders each bot may reach. A
-   provider that uses your account works at once. One with its own key asks for the key.
-   Permission for a folder that is still waiting waits with the folder.
+3. **Model providers** are added. A provider that uses your account works at once. One with
+   its own key asks for the key.
 4. **A Matrix account** that signs in with single sign-on starts one sign-in, which you
-   finish (see *One sign-in: drives, bots and Matrix*). Accounts that sign in with a
+   finish (see *One sign-in: drives, model providers and Matrix*). Accounts that sign in with a
    password or through Beeper are offered on the sign-in screen, as before. Its colour,
    incognito choice and muted networks apply when you add it.
 
-Settings › Account then says what came back, for example: "Restored 2 drives, 1 bot
+Settings › Account then says what came back, for example: "Restored 2 drives, 1 model
 provider and your settings from your account." Nothing already on the device is changed
 or added twice.
 
@@ -1017,14 +1021,14 @@ travels. Switching it on is only ever your tap, on the device that will listen. 
 restore finds that listening was on for this device, Settings › Account says "Listening
 for your wake phrase was on for this device." and offers **Turn listening on**. The button
 checks the switch first, and asks for the microphone by name, as the switch does. No
-layer file can set it either: `bots.wake_enabled` in a `keeper.toml` is refused, as
+layer file can set it either: `voice.wake_enabled` in a `keeper.toml` is refused, as
 `sdk_encryption` is.
 
 ### When it syncs
 
 Besides launch, focus, *Sync now* and the daily pull (see *Syncing, and being offline*),
 a change that travels starts a sync by itself: changing a synced setting, or adding or
-removing a drive, a bot provider, a bot or a Matrix account. The 15-minute limit does not
+removing a drive, a model provider or a Matrix account. The 15-minute limit does not
 hold it back.
 Changes made while a sync runs go in the next one. Offline, they wait and are pushed at
 the next sync that reaches the repository. Values a sync applies never start another
@@ -1037,7 +1041,7 @@ keeper writes only in your own directory. The repository's permissions decide wh
 can. In a repository where everyone can write everywhere, anyone with access can edit
 your settings files, just as they can edit your `keeper.toml`, and keeper applies what it
 finds (DW-303).
-That includes whether a drive or bot provider uses your account, which travels in your
+That includes whether a drive or model provider uses your account, which travels in your
 device settings file: someone who can push could switch one of your drives to it.
 
 Signing out, or forgetting the account, stops the syncing. Values that already synced
@@ -1136,18 +1140,18 @@ link. The files in the repository are untouched.
 Settings › Account then shows the paste field again. **The repository on the server, and
 every other device and person, are untouched.**
 
-## One sign-in: drives, bots and Matrix
+## One sign-in: drives, model providers and Matrix
 
-One sign-in to your organisation serves the config repository, your drives, your bot
+One sign-in to your organisation serves the config repository, your drives, your model
 providers and your Matrix account. Each is your choice, per drive, per provider and per
 account. Nothing switches over by itself.
 
-**Drives and bot providers.** When an account is signed in, two forms offer **Use my
+**Drives and model providers.** When an account is signed in, two forms offer **Use my
 {name} account**:
 - **The drive form.** The drive then asks the account for a token on each operation,
   instead of storing a pasted token. The token field disappears, and no per-drive keychain
   item is created.
-- **A bot provider's form.** The provider sends `Authorization: Bearer {access token}`.
+- **A model provider's form.** The provider sends `Authorization: Bearer {access token}`.
 
 Choosing the keychain again brings the token field back. The choice travels in your
 device settings file, so a restored device uses the account for the same drives and
@@ -1169,7 +1173,7 @@ API. It does not use `config.auth`'s scheme. Gitea, Forgejo and oauth2-proxy acc
 form, and Forgejo reads such a user name as its own OAuth2 token too. GitLab documents only
 the password form. The forge's token is only ever sent to the forge's host.
 
-**Bot providers** always get the sign-in token, as Bearer. The provider has to accept it:
+**Model providers** always get the sign-in token, as Bearer. The provider has to accept it:
 - a gateway behind your identity provider does;
 - Ollama has no authentication and ignores it;
 - a gateway with its own static key, such as Hermes in the owner's setup, or an `openai`
@@ -1358,7 +1362,7 @@ grants is not an outage. The sheet says "Your account has no GitHub access on
 
 **Which sign-in a drive added this way uses:**
 - **A repository on your account's forge** uses your account, so it gets the forge's own
-  token (see *One sign-in: drives, bots and Matrix*).
+  token (see *One sign-in: drives, model providers and Matrix*).
 - **A GitHub repository** uses its source, recorded as `forge:<source id>`, for example
   `forge:github`.
   - Through a broker, the drive gets a one-hour token for its one repository: with write
@@ -1511,7 +1515,7 @@ lists nothing.
   remote is on another host gets no token from that source, and cannot be set to use it.
   The setup sheet lists every such host before anything is written.
 - **Nothing secret travels in your settings.** The settings files, the lists of drives,
-  bot providers and Matrix accounts, and this device's own file carry values and
+  model providers and Matrix accounts, and this device's own file carry values and
   descriptions only: never a token, password, session, keychain item or credential. A
   drive's remote is written without any user name or password. A drive or provider
   records only which credential it uses (`account`, `own` or `none`). A drive added from a
@@ -1691,7 +1695,7 @@ that person's other devices of the same class has one. Both are optional and use
 | A drive that signs in through a repository source | settings key `sync.credential_source.<profile_id>` = `forge:<source id>`; in `<login>/settings.<device>.toml` as `sync.credential_source.<drive reference>` = `"forge:<source id>"` |
 | A broker's tokens, repository lists | memory only, for as long as keeper runs |
 | Your preferences | `<login>/settings.toml` (every device), `<login>/settings.<device>.toml` (this device) |
-| Your drives, bot providers and Matrix accounts | `<login>/drives.toml`, `<login>/bots.toml`, `<login>/matrix.toml` |
+| Your drives, model providers and Matrix accounts | `<login>/drives.toml`, `<login>/bots.toml`, `<login>/matrix.toml` |
 | This device, so it can be restored | `<login>/device.<device>.toml` (written only by that device) |
 | This device's log | `<login>/logs/<device>.log` (written only by that device); daily while `diagnostics.log_upload` is on, and on *Send log now* |
 | Settings templates (optional) | `_template/settings.toml`, `_template/settings/<class>.toml` |
