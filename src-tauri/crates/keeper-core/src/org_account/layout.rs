@@ -308,7 +308,7 @@ pub fn unusable_files(files: &dyn RepoFiles, login: &str, device: &str) -> Vec<S
         settings_sync::shared_path(login),
         settings_sync::device_path(login, device),
         manifest::drives_path(login),
-        manifest::bots_path(login),
+        manifest::providers_path(login),
         manifest::matrix_path(login),
         device_state::path(login, device),
     ]

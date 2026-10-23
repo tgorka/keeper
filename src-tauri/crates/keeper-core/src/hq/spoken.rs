@@ -2,7 +2,7 @@
 //! (AD-384, AD-411; story 108.2, R-HQ-67, R-HQ-68).
 //!
 //! *Speak to* names an agent of the databases this device holds
-//! (`bots.voice_target = agent:<agent>`, [`agent_target`]); the list it is
+//! (`voice.target = agent:<agent>`, [`agent_target`]); the list it is
 //! chosen from is every agent of every held database ([`targets`]). Before
 //! 108.2 the value named one of the person's proxy rooms on Matrix
 //! (`agent:!room…`); such a value is read as no choice, once, with a notice
@@ -64,7 +64,7 @@ use crate::voice::{Effect, TurnEvent, TurnState};
 /// The `kind` of a person's heard row's metadata (R-HQ-68).
 pub const HEARD_KIND: &str = "heard";
 
-/// How `bots.voice_target` names an agent: this prefix and its actor id.
+/// How `voice.target` names an agent: this prefix and its actor id.
 pub const AGENT_TARGET_PREFIX: &str = "agent:";
 
 /// How long a spoken question waits for its answer to start.

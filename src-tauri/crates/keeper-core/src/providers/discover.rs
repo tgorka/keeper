@@ -1,7 +1,7 @@
-//! What can this endpoint actually do — models, capabilities, health, and the
-//! one question that has no answer (Story 61.3, FR-375, FR-376, FR-377).
+//! What can this endpoint actually do — models, capabilities and health
+//! (Story 61.3, FR-375, FR-377).
 //!
-//! Four questions, and this module is honest about which of them it can answer:
+//! Two questions, and this module is honest about how well it can answer them:
 //!
 //! 1. **Is it there, and what is it?** [`health`] asks one cheap route per
 //!    kind — Ollama's `GET /api/version`, Hermes' `GET /health`, both of
@@ -14,12 +14,6 @@
 //!    Hermes, because the first is the roster and only the second knows what a
 //!    model supports (R1 §2.9, §4.3), and `GET /v1/models` alone for an
 //!    OpenAI-compatible endpoint, which states no capabilities at all (AD-151).
-//! 3. **Does this bot exist?** [`probe_bot`] verifies a *named* bot, and
-//!    distinguishes "no such bot" from "keeper's credential was refused" from
-//!    "nothing answered" — three different sentences for a user about to
-//!    retype a name that was right all along.
-//! 4. **Which bots exist?** Ollama and an OpenAI-compatible endpoint list
-//!    them; Hermes cannot say. See [`NO_BOT_ROSTER`] and [`enumerate_bots`].
 //!
 //! # The tri-state, which is the load-bearing rule here
 //!
@@ -48,10 +42,10 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::bots::error::BotsError;
-use crate::bots::http;
-use crate::bots::{BotHealthState, Endpoint, ProviderKind};
-use crate::vm::{BotModelVm, BotPresence, BotProbeVm, BotReach};
+use super::error::BotsError;
+use super::http;
+use super::{Endpoint, ProviderHealthState, ProviderKind};
+use crate::vm::{BotModelVm, ProviderProbeVm, ProviderReach};
 
 /// How long a discovery request may deliver **nothing** before it is a failure.
 ///
@@ -82,22 +76,6 @@ pub const DISCOVERY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// `Response::text`/`Response::json` on an unbounded body is a promise to
 /// allocate whatever the far end sends.
 pub const MAX_DISCOVERY_BODY: usize = 1024 * 1024;
-
-/// Why keeper does not list the bots on a Hermes endpoint — written once, so
-/// the pane, the empty state and the docs quote the same words.
-///
-/// This is not a gap in the implementation. The bearer-authenticated API server
-/// has no profile roster at all: its complete route table (R1 §2.2, read from
-/// `_http_route_table()`) contains no such route, and the two doors that do list
-/// profiles need credentials keeper is not given — the dashboard's
-/// `GET /api/profiles` behind an `X-Hermes-Session-Token`, and the TUI gateway's
-/// `profiles.list` over a JSON-RPC websocket keeper does not speak (R1 §4.2).
-/// So keeper ships verification rather than enumeration: a bot is named by the
-/// person who has one, and [`probe_bot`] confirms it is really there.
-pub const NO_BOT_ROSTER: &str = "keeper cannot list the bots on a Hermes endpoint. \
-     The key you gave it opens the chat API, and that API has no route that names \
-     the profiles behind it — a roster needs a door keeper is not handed. Type a \
-     bot's name and keeper will check it exists before you rely on it.";
 
 /// The HTTP client every discovery route shares.
 ///
@@ -146,19 +124,19 @@ pub fn probes_model_capabilities(kind: ProviderKind) -> bool {
 ///
 /// Never an `Err`: an endpoint that refused keeper's credential, or that never
 /// answered, is a *fact about the endpoint* the surface has to print, so it
-/// comes back as a [`BotProbeVm`] with [`BotReach::Offline`] or a status and a
+/// comes back as a [`ProviderProbeVm`] with [`ProviderReach::Offline`] or a status and a
 /// reason. The only thing this cannot report is a version the endpoint did not
 /// state, and `None` there is not a fault.
-pub async fn health(client: &reqwest::Client, endpoint: &Endpoint) -> BotProbeVm {
+pub async fn health(client: &reqwest::Client, endpoint: &Endpoint) -> ProviderProbeVm {
     let path = health_route(endpoint.kind);
     let label = format!("GET {path}");
     let started = Instant::now();
     let request = match http::authorize(client.get(endpoint.url(path)), endpoint.token.as_deref()) {
         Ok(request) => request,
-        Err(err) => return unreachable_probe(None, err.to_string()),
+        Err(err) => return unreachable_probe(err.to_string()),
     };
     match request.send().await {
-        Err(err) => unreachable_probe(None, BotsError::transport(err).to_string()),
+        Err(err) => unreachable_probe(BotsError::transport(err).to_string()),
         Ok(response) => {
             let round_trip_ms = elapsed_ms(started);
             let status = response.status();
@@ -170,13 +148,11 @@ pub async fn health(client: &reqwest::Client, endpoint: &Endpoint) -> BotProbeVm
                     Some(status_sentence(status.as_u16(), path, endpoint.kind)),
                 )
             };
-            BotProbeVm {
-                reach: BotReach::Online,
+            ProviderProbeVm {
+                reach: ProviderReach::Online,
                 status: Some(status.as_u16()),
                 version,
                 round_trip_ms: Some(round_trip_ms),
-                bot: None,
-                presence: None,
                 reason,
             }
         }
@@ -190,21 +166,21 @@ pub async fn health(client: &reqwest::Client, endpoint: &Endpoint) -> BotProbeVm
 /// which mean keeper genuinely does not know. `401`/`403` is its own state
 /// because it is its own sentence — the endpoint is there, and on a Hermes
 /// profile prefix it may want that profile's own key (R1 §9.2) — while any
-/// other unexpected status leaves the verdict [`BotHealthState::Unknown`]: a
+/// other unexpected status leaves the verdict [`ProviderHealthState::Unknown`]: a
 /// `502` from a reverse proxy says nothing about the endpoint behind it, and
 /// recording that as `Unreachable` would be a claim keeper cannot support.
 ///
-/// [`BotHealthState::SecretMissing`] is never produced here: it is a fact about
+/// [`ProviderHealthState::SecretMissing`] is never produced here: it is a fact about
 /// keeper's own keychain that Story 61.1 establishes before a request is built,
 /// not something an endpoint can tell you.
-pub fn health_state(probe: &BotProbeVm) -> BotHealthState {
+pub fn health_state(probe: &ProviderProbeVm) -> ProviderHealthState {
     match (probe.reach, probe.status) {
-        (BotReach::Offline, _) => BotHealthState::Unreachable,
-        (BotReach::Online, Some(401 | 403)) => BotHealthState::Unauthorized,
-        (BotReach::Online, Some(status)) if (200..300).contains(&status) => {
-            BotHealthState::Reachable
+        (ProviderReach::Offline, _) => ProviderHealthState::Unreachable,
+        (ProviderReach::Online, Some(401 | 403)) => ProviderHealthState::Unauthorized,
+        (ProviderReach::Online, Some(status)) if (200..300).contains(&status) => {
+            ProviderHealthState::Reachable
         }
-        (BotReach::Online, _) => BotHealthState::Unknown,
+        (ProviderReach::Online, _) => ProviderHealthState::Unknown,
     }
 }
 
@@ -221,73 +197,6 @@ pub async fn models(
         ProviderKind::Ollama => ollama_models(client, endpoint).await,
         ProviderKind::Hermes => hermes_models(client, endpoint).await,
         ProviderKind::OpenAi => openai_models(client, endpoint).await,
-    }
-}
-
-/// Whether a named bot is really there.
-///
-/// **Hermes**: every api-server route is registered a second time under
-/// `/p/{profile}`, so a bearer client can *address* any bot by URL prefix
-/// (R1 §2.2) — keeper asks that prefix for its own model list and reads the
-/// answer. `404` is "no such profile on this gateway"; `401`/`403` is "that
-/// prefix wants its own key" and emphatically **not** absence, because a
-/// profile served by a different `API_SERVER_KEY` answers exactly that way
-/// (R1 §9.2); anything else, or nothing at all, is [`BotPresence::Unknown`].
-///
-/// **Ollama**: a bot is a model tag, so the probe is a lookup in the tag list.
-///
-/// **OpenAi**: a bot is a model id, so the probe is a lookup in `/v1/models`.
-///
-/// The prefixed URL is built by [`Endpoint::url`] from a copy of the caller's
-/// endpoint carrying `bot`, never by string arithmetic here — one place in the
-/// tree knows how a Hermes profile prefix is spelled.
-pub async fn probe_bot(client: &reqwest::Client, endpoint: &Endpoint, bot: &str) -> BotProbeVm {
-    match endpoint.kind {
-        ProviderKind::Hermes => probe_hermes_profile(client, endpoint, bot).await,
-        ProviderKind::Ollama => probe_ollama_tag(client, endpoint, bot).await,
-        ProviderKind::OpenAi => probe_openai_model(client, endpoint, bot).await,
-    }
-}
-
-/// The answer to "which bots exist here?", including the answer that is a
-/// refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BotRoster {
-    /// The endpoint can be asked, and these are its bots. Ollama's are its
-    /// model tags (`/api/tags`); an OpenAI-compatible endpoint's are its model
-    /// ids (`/v1/models`).
-    Enumerated(Vec<String>),
-    /// The endpoint cannot be asked, and this is the sentence that says why.
-    /// Always [`NO_BOT_ROSTER`] today; typed as an outcome rather than an error
-    /// because nothing failed — keeper was never given the door.
-    Unavailable {
-        /// Ready to print, in the house voice, identical everywhere.
-        reason: &'static str,
-    },
-}
-
-/// List the bots at an endpoint, or say why that cannot be done.
-///
-/// For Ollama and an OpenAI-compatible endpoint this is real enumeration. For
-/// Hermes it is deliberately **not implemented**, and the reason is
-/// [`NO_BOT_ROSTER`] — the bearer API exposes no roster (R1 §4.2). No request
-/// is sent in that case: keeper does not probe a route it has read the source
-/// of and knows is absent.
-pub async fn enumerate_bots(
-    client: &reqwest::Client,
-    endpoint: &Endpoint,
-) -> Result<BotRoster, BotsError> {
-    match endpoint.kind {
-        ProviderKind::Hermes => Ok(BotRoster::Unavailable {
-            reason: NO_BOT_ROSTER,
-        }),
-        ProviderKind::Ollama | ProviderKind::OpenAi => Ok(BotRoster::Enumerated(
-            models(client, endpoint)
-                .await?
-                .into_iter()
-                .map(|model| model.id)
-                .collect(),
-        )),
     }
 }
 
@@ -359,7 +268,7 @@ async fn ollama_models(
     Ok(rows.into_iter().filter_map(tag_to_vm).collect())
 }
 
-/// The shared `/api/tags` fetch, so the bot probe and the model list read the
+/// The shared `/api/tags` fetch, so the health probe and the model list read the
 /// same route through the same parser.
 async fn ollama_tags(
     client: &reqwest::Client,
@@ -446,41 +355,6 @@ fn capability_flags(capabilities: Option<&[String]>) -> CapabilityFlags {
         reasoning: has("thinking"),
         embedding: has("embedding"),
         capabilities: list.to_vec(),
-    }
-}
-
-/// The probe for an Ollama "bot", which is a model tag.
-async fn probe_ollama_tag(client: &reqwest::Client, endpoint: &Endpoint, bot: &str) -> BotProbeVm {
-    const PATH: &str = "/api/tags";
-    let started = Instant::now();
-    match ollama_tags(client, endpoint, PATH).await {
-        Ok(rows) => {
-            let present = rows
-                .into_iter()
-                .filter_map(tag_to_vm)
-                .any(|model| model.id == bot);
-            BotProbeVm {
-                reach: BotReach::Online,
-                status: Some(200),
-                version: None,
-                round_trip_ms: Some(elapsed_ms(started)),
-                bot: Some(bot.to_owned()),
-                presence: Some(if present {
-                    BotPresence::Exists
-                } else {
-                    BotPresence::Absent
-                }),
-                reason: if present {
-                    None
-                } else {
-                    Some(format!(
-                        "This Ollama has no model tagged \"{bot}\". Pull it there, or pick one \
-                         of the models it already has."
-                    ))
-                },
-            }
-        }
-        Err(err) => probe_from_error(err, bot, PATH, endpoint.kind, elapsed_ms(started)),
     }
 }
 
@@ -594,85 +468,6 @@ async fn hermes_model_options(
     Ok(hints)
 }
 
-/// Ask a Hermes profile prefix for its own model list.
-async fn probe_hermes_profile(
-    client: &reqwest::Client,
-    endpoint: &Endpoint,
-    bot: &str,
-) -> BotProbeVm {
-    const PATH: &str = "/v1/models";
-    let scoped = Endpoint {
-        kind: endpoint.kind,
-        base_url: endpoint.base_url.clone(),
-        bot: Some(bot.to_owned()),
-        token: endpoint.token.clone(),
-    };
-    let started = Instant::now();
-    let request = match http::authorize(client.get(scoped.url(PATH)), scoped.token.as_deref()) {
-        Ok(request) => request,
-        Err(err) => return probe_from_error(err, bot, PATH, scoped.kind, elapsed_ms(started)),
-    };
-    match request.send().await {
-        Err(err) => probe_from_error(
-            BotsError::transport(err),
-            bot,
-            PATH,
-            scoped.kind,
-            elapsed_ms(started),
-        ),
-        Ok(response) => {
-            let round_trip_ms = elapsed_ms(started);
-            let status = response.status().as_u16();
-            let (presence, reason) = hermes_presence(status, bot);
-            BotProbeVm {
-                reach: BotReach::Online,
-                status: Some(status),
-                version: None,
-                round_trip_ms: Some(round_trip_ms),
-                bot: Some(bot.to_owned()),
-                presence: Some(presence),
-                reason,
-            }
-        }
-    }
-}
-
-/// The three-way discrimination this story exists for, kept as one pure
-/// decision so nothing downstream re-derives it.
-///
-/// `404` is absence — the gateway serves no such profile. `401`/`403` is not:
-/// a profile served under its own `API_SERVER_KEY` refuses the default key with
-/// exactly that status (R1 §9.2), so the bot may well exist and keeper simply
-/// was not allowed to look. Every other status is unknown too, because a `500`
-/// or a `502` says something about the gateway and nothing about the bot.
-fn hermes_presence(status: u16, bot: &str) -> (BotPresence, Option<String>) {
-    match status {
-        200..=299 => (BotPresence::Exists, None),
-        404 => (
-            BotPresence::Absent,
-            Some(format!(
-                "This Hermes gateway serves no bot named \"{bot}\". Check the spelling, or ask \
-                 whoever runs it which profiles it has."
-            )),
-        ),
-        401 | 403 => (
-            BotPresence::Unknown,
-            Some(format!(
-                "\"{bot}\" refused keeper's key ({status}), so keeper cannot say whether it \
-                 exists. A Hermes profile can be served under its own key — if this bot has one, \
-                 add it as its own provider."
-            )),
-        ),
-        other => (
-            BotPresence::Unknown,
-            Some(format!(
-                "The gateway answered {other} when keeper asked about \"{bot}\", which says \
-                 something about the gateway and nothing about the bot. Try again in a moment."
-            )),
-        ),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // OpenAI-compatible
 // ---------------------------------------------------------------------------
@@ -715,39 +510,6 @@ async fn openai_model_ids(
         }
     }
     Ok(ids)
-}
-
-/// The probe for an OpenAI-compatible "bot", which is a model id.
-async fn probe_openai_model(
-    client: &reqwest::Client,
-    endpoint: &Endpoint,
-    bot: &str,
-) -> BotProbeVm {
-    let started = Instant::now();
-    match openai_model_ids(client, endpoint).await {
-        Ok(ids) => {
-            let present = ids.iter().any(|id| id == bot);
-            BotProbeVm {
-                reach: BotReach::Online,
-                status: Some(200),
-                version: None,
-                round_trip_ms: Some(elapsed_ms(started)),
-                bot: Some(bot.to_owned()),
-                presence: Some(if present {
-                    BotPresence::Exists
-                } else {
-                    BotPresence::Absent
-                }),
-                reason: (!present).then(|| {
-                    format!(
-                        "This endpoint lists no model named \"{bot}\". Pick one of the models it \
-                         lists."
-                    )
-                }),
-            }
-        }
-        Err(err) => probe_from_error(err, bot, OPENAI_MODELS, endpoint.kind, elapsed_ms(started)),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,47 +620,13 @@ fn status_sentence(status: u16, path: &str, kind: ProviderKind) -> String {
 }
 
 /// Nothing answered.
-///
-/// A probe that named a bot comes back [`BotPresence::Unknown`] and never
-/// `Absent`: keeper could not ask, which is a different sentence from "it is
-/// not there" for a user about to retype a name that was right all along. A
-/// provider probe named no bot, so it reports no presence at all.
-fn unreachable_probe(bot: Option<String>, reason: String) -> BotProbeVm {
-    BotProbeVm {
-        reach: BotReach::Offline,
+fn unreachable_probe(reason: String) -> ProviderProbeVm {
+    ProviderProbeVm {
+        reach: ProviderReach::Offline,
         status: None,
         version: None,
         round_trip_ms: None,
-        presence: bot.as_ref().map(|_| BotPresence::Unknown),
-        bot,
         reason: Some(reason),
-    }
-}
-
-/// A failed request during a bot probe.
-///
-/// Offline when nothing answered; an answer keeper could not use otherwise.
-/// [`BotPresence::Unknown`] either way — a transport failure and a `500` both
-/// say nothing about the bot — with the house sentence for a status, and the
-/// error's own credential-free sentence for everything else.
-fn probe_from_error(
-    err: BotsError,
-    bot: &str,
-    path: &str,
-    kind: ProviderKind,
-    round_trip_ms: i64,
-) -> BotProbeVm {
-    match &err {
-        BotsError::Status { status, .. } => BotProbeVm {
-            reach: BotReach::Online,
-            status: Some(*status),
-            version: None,
-            round_trip_ms: Some(round_trip_ms),
-            bot: Some(bot.to_owned()),
-            presence: Some(BotPresence::Unknown),
-            reason: Some(status_sentence(*status, path, kind)),
-        },
-        _ => unreachable_probe(Some(bot.to_owned()), err.to_string()),
     }
 }
 
@@ -1123,14 +851,5 @@ mod tests {
         let list = vec!["embedding".to_owned()];
         assert_eq!(capability_flags(Some(&list)).embedding, Some(true));
         assert_eq!(hermes_vm("model".into(), None).embedding, None);
-    }
-
-    #[test]
-    fn a_404_is_absence_and_a_401_is_not() {
-        assert_eq!(hermes_presence(404, "ghost").0, BotPresence::Absent);
-        assert_eq!(hermes_presence(401, "ghost").0, BotPresence::Unknown);
-        assert_eq!(hermes_presence(403, "ghost").0, BotPresence::Unknown);
-        assert_eq!(hermes_presence(500, "ghost").0, BotPresence::Unknown);
-        assert_eq!(hermes_presence(200, "ghost").0, BotPresence::Exists);
     }
 }

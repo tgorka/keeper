@@ -8,9 +8,8 @@
  * blob in a row, and because a state the SQL can filter on is a state the
  * surface can list without reading every row into memory.
  *
- * [`BotHealthState::Unknown`] is the default and the honest answer before a
- * probe: the epic's rule is that a capability keeper could not read is
- * `unknown` and never `false`, and a provider keeper has not called yet is the
- * same shape of fact.
+ * [`ProviderHealthState::Unknown`] is the default and the honest answer
+ * before a probe: a capability keeper could not read is `unknown` and never
+ * `false`, and a provider keeper has not called yet is the same shape of fact.
  */
-export type BotHealthState = "unknown" | "reachable" | "unreachable" | "unauthorized" | "secretMissing";
+export type ProviderHealthState = "unknown" | "reachable" | "unreachable" | "unauthorized" | "secretMissing";

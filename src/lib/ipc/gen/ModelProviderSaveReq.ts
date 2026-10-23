@@ -8,7 +8,7 @@ import type { ProviderKind } from "./ProviderKind";
  * add, `id` present is an edit of that row. Two shapes would be two chances
  * to validate the same base URL differently.
  */
-export type BotProviderSaveReq = { 
+export type ModelProviderSaveReq = { 
 /**
  * The row to rewrite, or `null` to add one.
  */
@@ -22,7 +22,7 @@ kind: ProviderKind,
  */
 name: string, 
 /**
- * The base URL, as typed. Validated by `keeper_core::bots::parse_base_url`
+ * The base URL, as typed. Validated by `keeper_core::providers::parse_base_url`
  * and never by the frontend, so there is one grammar.
  */
 baseUrl: string, 
@@ -31,7 +31,7 @@ baseUrl: string,
  * whatever is there alone.
  *
  * `null` is "unchanged" and not "clear": an edit form cannot render the
- * stored token — there is no field on [`BotProviderVm`] that could carry
+ * stored token — there is no field on [`ModelProviderVm`] that could carry
  * it — so a save that treated an empty field as a deletion would silently
  * unauthenticate a working provider every time somebody renamed it. Use
  * [`Self::clear_token`] to mean deletion.

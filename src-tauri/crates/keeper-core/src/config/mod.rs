@@ -616,7 +616,13 @@ pub fn parse_layer_file(
                     ));
                     continue;
                 }
-                for (key, raw) in flatten_settings("", table) {
+                // A pin an older build accepted under a `bots.*` voice key
+                // reads as its `voice.*` key (Story 108.3a), then meets the
+                // new key's rules like any other line.
+                let flat = crate::registry::retire_bot_keys(flatten_settings("", table), |raw| {
+                    raw.as_str()
+                });
+                for (key, raw) in flat {
                     let key = &key;
                     if let Err(reason) = keys::layer_may_set(key, tier.machine_scoped()) {
                         file.faults.push(fault(
@@ -1357,6 +1363,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Story 108.3a (R1083A-01): a `keeper.toml` written before the voice keys
+    /// left the bots pins its voice under `bots.*`. Those pins keep working
+    /// as the `voice.*` keys, in every tier that took them and with the
+    /// tiers' order intact; a `voice.*` line beside its old spelling in the
+    /// same file wins; a pinned bot as the target names nothing and is gone;
+    /// the retired details switch is gone; and a file still may not arm the
+    /// microphone under either spelling.
+    #[test]
+    fn a_layer_pinned_under_the_bots_voice_keys_keeps_its_values() {
+        let home = temp_dir();
+        let main = home.join("tgdrive");
+        std::fs::create_dir_all(&main).expect("create the main folder");
+        write(
+            &keeper_dir(&home).join("keeper.toml"),
+            &format!(
+                "mainSyncFolder = {:?}\n\
+                 [settings]\n\
+                 \"bots.wake_phrase\" = \"computer\"\n\
+                 \"bots.voice_locale\" = \"pl-PL\"\n\
+                 \"bots.stop_phrase\" = \"enough\"\n\
+                 \"voice.stop_phrase\" = \"halt\"\n\
+                 \"bots.voice_target\" = \"agent:nixie\"\n\
+                 \"bots.message_details\" = true\n",
+                main.display().to_string()
+            ),
+        );
+        // The main folder's own file, a later tier, pinned the old spelling too.
+        write(
+            &keeper_dir(&main).join("keeper.toml"),
+            "[settings]\n\"bots.voice_locale\" = \"en-US\"\n",
+        );
+
+        let layers = load_app_layers(&home, "testbox");
+        assert!(layers.faults.is_empty(), "faults: {:?}", layers.faults);
+        assert_eq!(
+            value(&layers, "voice.wake_phrase").as_deref(),
+            Some("computer")
+        );
+        assert_eq!(value(&layers, "voice.stop_phrase").as_deref(), Some("halt"));
+        assert_eq!(
+            value(&layers, "voice.target").as_deref(),
+            Some("agent:nixie")
+        );
+        assert_eq!(value(&layers, "voice.locale").as_deref(), Some("en-US"));
+        assert_eq!(
+            tier_of(&layers, "voice.locale"),
+            Some(LayerTier::MainShared)
+        );
+        assert_eq!(
+            tier_of(&layers, "voice.wake_phrase"),
+            Some(LayerTier::UserGlobal)
+        );
+        assert!(
+            layers.overrides.keys().all(|key| !key.starts_with("bots.")),
+            "{:?}",
+            layers.overrides.keys().collect::<Vec<_>>()
+        );
+
+        // A pinned bot's id is not carried over, and arming stays refused.
+        write(
+            &keeper_dir(&home).join("keeper.toml"),
+            "[settings]\n\"bots.voice_target\" = \"01BOTID\"\n\"bots.wake_enabled\" = true\n",
+        );
+        let layers = load_app_layers(&home, "testbox");
+        assert_eq!(value(&layers, "voice.target"), None);
+        assert_eq!(value(&layers, "voice.wake_enabled"), None);
+        assert_eq!(
+            layers.faults.iter().map(|f| f.kind).collect::<Vec<_>>(),
+            vec![LayerFaultKind::KeyRefused],
+            "{:?}",
+            layers.faults
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The precedence claim, stated as an ordering rather than an outcome: for
     /// any two adjacent tiers the later one wins. This is what fails when the
     /// tiers are read in the wrong order but each individual file still parses.
@@ -2002,12 +2083,12 @@ mod tests {
         );
     }
 
-    /// No file at any tier arms the microphone: a pin of `bots.wake_enabled`
+    /// No file at any tier arms the microphone: a pin of `voice.wake_enabled`
     /// — this machine's, the account's or the main folder's — is refused by
     /// name and never reaches the resolved settings.
     #[test]
     fn no_layer_may_switch_the_wake_phrase_on() {
-        let text = "[settings]\n\"bots.wake_enabled\" = true\n";
+        let text = "[settings]\n\"voice.wake_enabled\" = true\n";
         for tier in [
             LayerTier::UserGlobal,
             LayerTier::UserGlobalMachine,
@@ -2017,13 +2098,16 @@ mod tests {
             LayerTier::MainMachine,
         ] {
             let file = parse_layer_file(Path::new("/x/keeper.testbox.toml"), tier, None, text);
-            assert!(!file.settings.contains_key("bots.wake_enabled"), "{tier:?}");
+            assert!(
+                !file.settings.contains_key("voice.wake_enabled"),
+                "{tier:?}"
+            );
             let refusal = file
                 .faults
                 .iter()
                 .find(|f| f.kind == LayerFaultKind::KeyRefused)
                 .unwrap_or_else(|| panic!("{tier:?} must refuse it"));
-            assert_eq!(refusal.key.as_deref(), Some("bots.wake_enabled"));
+            assert_eq!(refusal.key.as_deref(), Some("voice.wake_enabled"));
         }
     }
 

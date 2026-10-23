@@ -1,4 +1,4 @@
-//! Discovery against a real socket (Story 61.3, FR-375, FR-376, FR-377).
+//! Provider discovery against a real socket (Story 61.3, FR-375, FR-377).
 //!
 //! Every assertion here goes through `reqwest`, a TCP connection and a real
 //! HTTP response, because the risk in this story lives entirely in the impure
@@ -18,13 +18,13 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use keeper_core::bots::discover::{self, BotRoster};
-use keeper_core::bots::{Endpoint, ProviderKind};
-use keeper_core::vm::{BotPresence, BotReach};
+use keeper_core::providers::discover;
+use keeper_core::providers::{Endpoint, ProviderKind};
+use keeper_core::vm::ProviderReach;
 
 /// The credential every test sends, so its absence from an error string is a
 /// claim a test can make. Not a real token shape for any product.
-const TOKEN: &str = "bots-discover-test-credential";
+const TOKEN: &str = "providers-discover-test-credential";
 
 /// One route: an exact path, the status to answer with, and the body.
 #[derive(Clone)]
@@ -332,94 +332,6 @@ async fn discover_hermes_models_survive_options_being_unavailable() {
 }
 
 #[tokio::test]
-async fn discover_bot_probe_404_means_the_bot_does_not_exist() {
-    let stub = Stub::start(vec![failing("/p/ghost/v1/models", 404)]);
-    let endpoint = stub.endpoint(ProviderKind::Hermes);
-
-    let probe = discover::probe_bot(&client(), &endpoint, "ghost").await;
-
-    assert_eq!(probe.reach, BotReach::Online, "the gateway answered");
-    assert_eq!(probe.status, Some(404));
-    assert_eq!(probe.presence, Some(BotPresence::Absent));
-    let reason = probe.reason.expect("a 404 carries its own sentence");
-    assert!(
-        reason.contains("ghost"),
-        "the sentence names the bot: {reason}"
-    );
-    assert!(
-        !reason.contains(TOKEN),
-        "no sentence carries the credential: {reason}"
-    );
-    assert_eq!(
-        stub.requests(),
-        vec!["GET /p/ghost/v1/models".to_owned()],
-        "the profile prefix is how a bot is addressed on the wire"
-    );
-}
-
-#[tokio::test]
-async fn discover_bot_probe_401_is_a_different_answer_from_404() {
-    let stub = Stub::start(vec![failing("/p/locked/v1/models", 401)]);
-    let endpoint = stub.endpoint(ProviderKind::Hermes);
-
-    let probe = discover::probe_bot(&client(), &endpoint, "locked").await;
-
-    assert_eq!(probe.reach, BotReach::Online);
-    assert_eq!(probe.status, Some(401));
-    assert_eq!(
-        probe.presence,
-        Some(BotPresence::Unknown),
-        "a refused credential says nothing about whether the bot exists — a Hermes profile \
-         served under its own key answers exactly this way"
-    );
-    let reason = probe.reason.expect("a 401 carries its own sentence");
-    assert!(
-        reason.contains("key"),
-        "the sentence sends the user to the credential: {reason}"
-    );
-    assert!(!reason.contains(TOKEN), "and never prints it: {reason}");
-}
-
-#[tokio::test]
-async fn discover_bot_probe_cannot_tell_when_nothing_answers() {
-    // A port that was bound and released: the kernel refuses the connection
-    // instantly, so nothing is resolved and no timeout is waited out.
-    let closed = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let port = closed.local_addr().expect("read the bound port").port();
-    drop(closed);
-
-    let endpoint = Endpoint {
-        kind: ProviderKind::Hermes,
-        base_url: format!("http://127.0.0.1:{port}"),
-        bot: None,
-        token: Some(TOKEN.to_owned()),
-    };
-
-    let probe = discover::probe_bot(&client(), &endpoint, "ghost").await;
-
-    assert_eq!(
-        probe.reach,
-        BotReach::Offline,
-        "the same word the app already uses for a remote it cannot reach"
-    );
-    assert_eq!(probe.status, None, "there was no answer to have a status");
-    assert_eq!(
-        probe.presence,
-        Some(BotPresence::Unknown),
-        "cannot tell — never Absent, which would send the user to retype a name that was right"
-    );
-    let reason = probe.reason.expect("an unreachable endpoint says so");
-    assert!(
-        !reason.contains(TOKEN),
-        "no credential in the reason: {reason}"
-    );
-    assert!(
-        !reason.contains(&format!("127.0.0.1:{port}")),
-        "and no URL either, because a base URL may carry userinfo: {reason}"
-    );
-}
-
-#[tokio::test]
 async fn discover_malformed_json_names_the_endpoint_and_not_the_token() {
     let stub = Stub::start(vec![route("/api/tags", "{\"models\": [ this is not json")]);
     let endpoint = stub.endpoint(ProviderKind::Ollama);
@@ -444,7 +356,7 @@ async fn discover_malformed_json_names_the_endpoint_and_not_the_token() {
 async fn discover_health_reads_the_version_each_kind_reports() {
     let ollama = Stub::start(vec![route("/api/version", "{\"version\":\"0.33.2\"}")]);
     let probe = discover::health(&client(), &ollama.endpoint(ProviderKind::Ollama)).await;
-    assert_eq!(probe.reach, BotReach::Online);
+    assert_eq!(probe.reach, ProviderReach::Online);
     assert_eq!(probe.status, Some(200));
     assert_eq!(probe.version.as_deref(), Some("0.33.2"));
     assert!(
@@ -481,12 +393,11 @@ async fn discover_health_of_a_dead_endpoint_is_offline_and_unreachable() {
     };
     let probe = discover::health(&client(), &endpoint).await;
 
-    assert_eq!(probe.reach, BotReach::Offline);
+    assert_eq!(probe.reach, ProviderReach::Offline);
     assert_eq!(probe.version, None);
-    assert_eq!(probe.presence, None, "no bot was named, so none is judged");
     assert_eq!(
         discover::health_state(&probe),
-        keeper_core::bots::BotHealthState::Unreachable,
+        keeper_core::providers::ProviderHealthState::Unreachable,
         "the verdict the provider row stores is derived here, not in the shell"
     );
 }
@@ -498,69 +409,12 @@ async fn discover_health_of_a_refusing_endpoint_is_online_and_unauthorized() {
 
     assert_eq!(
         probe.reach,
-        BotReach::Online,
+        ProviderReach::Online,
         "an answer keeper did not like is still an answer"
     );
     assert_eq!(
         discover::health_state(&probe),
-        keeper_core::bots::BotHealthState::Unauthorized
-    );
-}
-
-#[tokio::test]
-async fn discover_ollama_bot_is_a_model_tag() {
-    let stub = Stub::start(vec![route("/api/tags", TAGS_WITH_CAPABILITIES)]);
-    let endpoint = stub.endpoint(ProviderKind::Ollama);
-    let client = client();
-
-    let present = discover::probe_bot(&client, &endpoint, "deepseek-r1:latest").await;
-    assert_eq!(present.presence, Some(BotPresence::Exists));
-    assert_eq!(present.reason, None);
-
-    let missing = discover::probe_bot(&client, &endpoint, "not-pulled:latest").await;
-    assert_eq!(
-        missing.presence,
-        Some(BotPresence::Absent),
-        "the tag list answered, and it does not contain that tag"
-    );
-    assert!(
-        missing
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("not-pulled:latest")),
-        "the sentence names the tag"
-    );
-}
-
-#[tokio::test]
-async fn discover_enumerate_bots_lists_ollama_tags_and_refuses_hermes_with_a_reason() {
-    let stub = Stub::start(vec![route("/api/tags", TAGS_WITH_CAPABILITIES)]);
-    let client = client();
-
-    let ollama = discover::enumerate_bots(&client, &stub.endpoint(ProviderKind::Ollama))
-        .await
-        .expect("the tag list parses");
-    assert_eq!(
-        ollama,
-        BotRoster::Enumerated(vec!["deepseek-r1:latest".to_owned()]),
-        "an Ollama bot is a model tag, and those it does list"
-    );
-
-    let hermes = discover::enumerate_bots(&client, &stub.endpoint(ProviderKind::Hermes))
-        .await
-        .expect("a refusal is an outcome, not a failure");
-    assert_eq!(
-        hermes,
-        BotRoster::Unavailable {
-            reason: discover::NO_BOT_ROSTER
-        },
-        "the bearer API has no roster route, so keeper says so in one sentence written once"
-    );
-    assert_eq!(
-        stub.requests(),
-        vec!["GET /api/tags".to_owned()],
-        "the Hermes refusal sends no request at all — keeper does not probe a route it has \
-         read the source of and knows is absent"
+        keeper_core::providers::ProviderHealthState::Unauthorized
     );
 }
 
@@ -582,15 +436,6 @@ fn openai_refusal(status: u16) -> String {
     )
 }
 
-/// An `openai` endpoint addressing a bot, the way a turn builds one — the case
-/// where a Hermes endpoint would gain `/p/{bot}` and this one must not.
-fn openai_bot_endpoint(stub: &Stub, bot: &str) -> Endpoint {
-    Endpoint {
-        bot: Some(bot.to_owned()),
-        ..stub.endpoint(ProviderKind::OpenAi)
-    }
-}
-
 #[tokio::test]
 async fn discover_openai_health_is_one_get_of_v1_models() {
     let stub = Stub::start(vec![
@@ -602,13 +447,13 @@ async fn discover_openai_health_is_one_get_of_v1_models() {
     ]);
     let probe = discover::health(&client(), &stub.endpoint(ProviderKind::OpenAi)).await;
 
-    assert_eq!(probe.reach, BotReach::Online);
+    assert_eq!(probe.reach, ProviderReach::Online);
     assert_eq!(probe.status, Some(200));
     assert_eq!(probe.version, None, "the dialect states no version");
     assert_eq!(probe.reason, None);
     assert_eq!(
         discover::health_state(&probe),
-        keeper_core::bots::BotHealthState::Reachable
+        keeper_core::providers::ProviderHealthState::Reachable
     );
     assert_eq!(stub.requests(), vec!["GET /v1/models".to_owned()]);
 }
@@ -647,98 +492,18 @@ async fn discover_openai_models_are_the_listed_ids_with_capabilities_unknown() {
 }
 
 #[tokio::test]
-async fn discover_openai_bot_is_a_listed_model_and_no_path_gains_a_profile_prefix() {
-    let stub = Stub::start(vec![route("/v1/models", OPENAI_MODELS)]);
-    let client = client();
-
-    let present = discover::probe_bot(
-        &client,
-        &openai_bot_endpoint(&stub, "gpt-6-astra"),
-        "gpt-6-astra",
-    )
-    .await;
-    assert_eq!(present.presence, Some(BotPresence::Exists));
-    assert_eq!(present.reason, None);
-
-    let missing = discover::probe_bot(
-        &client,
-        &openai_bot_endpoint(&stub, "keeper-no-such-model"),
-        "keeper-no-such-model",
-    )
-    .await;
-    assert_eq!(
-        missing.presence,
-        Some(BotPresence::Absent),
-        "the list answered, and it does not name that model"
-    );
-    assert!(
-        missing
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("keeper-no-such-model")),
-        "the sentence names the model"
-    );
-
-    let addressed = openai_bot_endpoint(&stub, "gpt-6-astra");
-    discover::health(&client, &addressed).await;
-    discover::models(&client, &addressed)
-        .await
-        .expect("the model list parses");
-    assert_eq!(
-        addressed.url("/v1/chat/completions"),
-        format!("{}/v1/chat/completions", stub.base_url()),
-        "the chat route is the base URL's, the model goes in the body"
-    );
-    let requests = stub.requests();
-    assert_eq!(requests.len(), 4);
-    assert!(
-        requests.iter().all(|line| line == "GET /v1/models"),
-        "no path gains a /p/ prefix: {requests:?}"
-    );
-}
-
-#[tokio::test]
-async fn discover_openai_enumerates_its_models() {
-    let stub = Stub::start(vec![route("/v1/models", OPENAI_MODELS)]);
-    let roster = discover::enumerate_bots(&client(), &stub.endpoint(ProviderKind::OpenAi))
-        .await
-        .expect("the model list parses");
-    assert_eq!(
-        roster,
-        BotRoster::Enumerated(vec![
-            "claude-opus-5-5".to_owned(),
-            "gpt-6-astra".to_owned(),
-            "gemini-3-pro".to_owned(),
-        ])
-    );
-}
-
-#[tokio::test]
 async fn discover_openai_refusing_the_key_is_unauthorized_with_its_own_sentence() {
     let stub = Stub::start(vec![failing("/v1/models", 401)]);
     let client = client();
 
     let health = discover::health(&client, &stub.endpoint(ProviderKind::OpenAi)).await;
-    assert_eq!(health.reach, BotReach::Online);
+    assert_eq!(health.reach, ProviderReach::Online);
     assert_eq!(health.status, Some(401));
     assert_eq!(
         discover::health_state(&health),
-        keeper_core::bots::BotHealthState::Unauthorized
+        keeper_core::providers::ProviderHealthState::Unauthorized
     );
     assert_eq!(health.reason, Some(openai_refusal(401)));
-
-    let probe = discover::probe_bot(
-        &client,
-        &openai_bot_endpoint(&stub, "gpt-6-astra"),
-        "gpt-6-astra",
-    )
-    .await;
-    assert_eq!(
-        probe.presence,
-        Some(BotPresence::Unknown),
-        "a refused key says nothing about the model"
-    );
-    assert_eq!(probe.reason, Some(openai_refusal(401)));
 
     let err = discover::models(&client, &stub.endpoint(ProviderKind::OpenAi))
         .await
@@ -746,7 +511,7 @@ async fn discover_openai_refusing_the_key_is_unauthorized_with_its_own_sentence(
     assert!(!err.to_string().contains(TOKEN), "{err}");
     assert_eq!(
         stub.requests(),
-        vec!["GET /v1/models".to_owned(); 3],
+        vec!["GET /v1/models".to_owned(); 2],
         "every refusal came from /v1/models, never a prefixed path"
     );
 }

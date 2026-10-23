@@ -13,7 +13,6 @@ use std::time::Duration;
 use keeper_agent::approval::{self, SinkApprover};
 use keeper_agent::drive;
 use keeper_agent::ports::{ApprovalPort, ProfileSource, TurnSink};
-use keeper_agent::task::TaskRunner;
 use keeper_agent::turn::{self, DrivePorts, TurnEnv, TurnOrigin};
 use keeper_core::bots::audit::{self, AuditOutcome, AuditVerdict};
 use keeper_core::bots::grant::{Grant, GrantMode, GrantScope};
@@ -21,7 +20,6 @@ use keeper_core::bots::{session, store, Bot, Provider, ProviderKind};
 use keeper_core::error::CoreError;
 use keeper_core::platform::Platform;
 use keeper_core::vm::{BotChatSendReq, BotStreamEvent};
-use keeper_sync::platform::{BotTaskRunner, BotTaskSpec};
 use keeper_sync::SyncProfile;
 use serde_json::{json, Value};
 
@@ -571,42 +569,6 @@ async fn the_extracted_turn_reproduces_the_goldens() {
             "the {name} scenario moved"
         );
     }
-
-    stub.log
-        .lock()
-        .expect("log")
-        .queue
-        .extend(read_then_answer());
-    let record = TaskRunner::new(env.clone())
-        .run(BotTaskSpec {
-            task_id: "task".to_owned(),
-            profile_id: "folder".to_owned(),
-            bot_id: "bot".to_owned(),
-            model: Some("model".to_owned()),
-            prompt_subpath: "prompt.md".to_owned(),
-            prompt_text: "# Task\n\nRead notes/hello.md and report its first line.\n".to_owned(),
-        })
-        .await;
-    let produced = json!({
-        "record": {
-            "outcome": format!("{:?}", record.outcome),
-            "answer": record.answer,
-            "tool_calls": record.tool_calls,
-            "warnings": record.warnings,
-            "errors": record.errors,
-            "prompt_tokens": record.prompt_tokens,
-            "completion_tokens": record.completion_tokens,
-            "finish_reason": record.finish_reason,
-            "model": record.model,
-        },
-        "stub": take_log(&stub.log),
-        "audit": audit_rows(&dir, "task:"),
-    });
-    assert_eq!(
-        mask(produced, &roots),
-        golden("task"),
-        "the task scenario moved"
-    );
 }
 
 /// The spoken turn's case: its stream is an app-wide event rather than a

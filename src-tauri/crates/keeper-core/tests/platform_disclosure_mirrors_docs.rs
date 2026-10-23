@@ -54,21 +54,6 @@ fn the_tablet_disclosure_is_docs_android_limitations_list_in_order() {
 }
 
 #[test]
-fn each_reduced_build_names_what_bots_does_not_do_there() {
-    // FR-400: the drive tools are on the Mac, and a phone or a tablet says so
-    // where the person reads what the build lacks — not only in a doc.
-    for device in [Device::Iphone, Device::AndroidTablet, Device::AndroidPhone] {
-        assert!(
-            disclosure(device)
-                .lines
-                .iter()
-                .any(|line| line.contains("drive tools live on your Mac")),
-            "{device:?}"
-        );
-    }
-}
-
-#[test]
 fn an_android_phone_is_never_called_a_tablet() {
     let phone = disclosure(Device::AndroidPhone);
     assert_eq!(phone.heading, "On this phone");

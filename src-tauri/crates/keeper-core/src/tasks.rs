@@ -351,9 +351,6 @@ pub struct TaskVm {
     pub enabled: bool,
     /// The profile this task is scoped to, `null` for host-wide work.
     pub profile_id: Option<String>,
-    pub bot_id: Option<String>,
-    pub prompt_subpath: Option<String>,
-    pub model: Option<String>,
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub copy_source_facts: Option<TaskPathFactsVm>,
@@ -466,6 +463,10 @@ pub struct TaskListingVm {
     pub tasks: Vec<TaskVm>,
     /// Every unreadable task row (NFR-43).
     pub unknown: Vec<UnknownTaskVm>,
+    /// The names of stored tasks this build removed because keeper no longer
+    /// runs a prompt on a schedule (Story 108.3a, UX-DR-E108-3) — the Tasks
+    /// list's one notice, until it is put away. Empty almost always.
+    pub retired: Vec<String>,
 }
 
 /// A save request from the Tasks view.
@@ -488,9 +489,6 @@ pub struct TaskSaveReq {
     pub enabled: bool,
     /// The profile to scope it to, `null` for host-wide.
     pub profile_id: Option<String>,
-    pub bot_id: Option<String>,
-    pub prompt_subpath: Option<String>,
-    pub model: Option<String>,
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,

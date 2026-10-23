@@ -7,7 +7,7 @@ import type { RestoreSignInVm } from "./RestoreSignInVm";
  */
 export type AccountRestoreVm = { 
 /**
- * "Restored 2 drives, 1 bot provider and your settings from your
+ * "Restored 2 drives, 1 model provider and your settings from your
  * account." once a restore ran.
  */
 sentence: string | null, 

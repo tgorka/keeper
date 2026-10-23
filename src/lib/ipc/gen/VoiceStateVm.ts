@@ -61,10 +61,10 @@ level: number | null, } | { "kind": "sending",
  */
 answering: boolean, 
 /**
- * The bot the question went to, by its display name — "Waiting
+ * The agent the question went to, by its display name — "Waiting
  * for nixie" — or `None` before the shell stamped the request.
  */
-bot?: string | null, 
+agent?: string | null, 
 /**
  * When the request left, milliseconds since the Unix epoch, or
  * `None` before the shell stamped it.

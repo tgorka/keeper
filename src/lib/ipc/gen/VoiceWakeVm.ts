@@ -4,7 +4,7 @@ import type { ModelsStateVm } from "./ModelsStateVm";
 /**
  * The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406),
  * the recogniser's language (Epic 63), the stop phrase (Epic 67, AD-208)
- * and the bot a spoken turn goes to (Epic 67, AD-206), from `voice_wake_get`
+ * and where a spoken turn goes (Epic 67, AD-206), from `voice_wake_get`
  * and back from `voice_wake_set`, `voice_locale_set` and `voice_target_set`.
  *
  * `limits` is the port's own `VoicePlatform::limits` carried to the surface
@@ -33,7 +33,7 @@ limits: string,
  */
 locale: string, 
 /**
- * `bots.voice_locale` as stored; `None` means "choose for me".
+ * `voice.locale` as stored; `None` means "choose for me".
  */
 localeChosen: string | null, 
 /**
@@ -42,15 +42,15 @@ localeChosen: string | null,
  */
 onDeviceLocales: Array<string>, 
 /**
- * The word that ends a spoken answer, as typed (`bots.stop_phrase`);
+ * The word that ends a spoken answer, as typed (`voice.stop_phrase`);
  * never blank.
  */
 stopPhrase: string, 
 /**
- * `bots.voice_target` as stored — the id of the pinned bot a spoken
- * turn goes to, or `agent:<agent>` for one of the person's agents
- * ([`VoiceAgentTargetVm::target`]); `None` means "the pinned bot most
- * recently talked to".
+ * `voice.target` as stored — `agent:<agent>` for one of the person's
+ * agents ([`VoiceAgentTargetVm::target`]); `None` means nothing is
+ * chosen, and a spoken turn is refused until something is
+ * (`keeper_core::voice::target::resolve`).
  */
 voiceTarget: string | null, 
 /**

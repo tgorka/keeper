@@ -9,9 +9,9 @@
  * classification. `Homeserver` is an account's Matrix homeserver; `Beeper` is the
  * `api.beeper.com` login/service endpoint present exactly when a Beeper account
  * exists; `GitRemote` is the host of one folder-sync profile's remote repository;
- * `BotProvider` is the host of one configured AI provider; `Update` is the
- * signed-update endpoint the app checks. Serializes to
- * `"homeserver" | "beeper" | "gitRemote" | "botProvider" | "update"`.
+ * `ModelProvider` is the host of one model provider notes search calls; `Update` is
+ * the signed-update endpoint the app checks. Serializes to
+ * `"homeserver" | "beeper" | "gitRemote" | "modelProvider" | "update"`.
  *
  * The container rename is `camelCase` rather than `lowercase` (Story 23.7) so a
  * multi-word variant reads as `gitRemote` on the wire, matching every other
@@ -19,4 +19,4 @@
  * pre-existing single-word variants serialize identically under either rule, so
  * this changed no existing wire value.
  */
-export type EgressKind = "homeserver" | "beeper" | "gitRemote" | "botProvider" | "update" | "telemetry" | "account" | "forge" | "pushGateway" | "agentsServer";
+export type EgressKind = "homeserver" | "beeper" | "gitRemote" | "modelProvider" | "update" | "telemetry" | "account" | "forge" | "pushGateway" | "agentsServer";

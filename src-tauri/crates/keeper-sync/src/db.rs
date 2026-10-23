@@ -420,6 +420,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     ensure_task_columns(conn)?;
     ensure_task_run_columns(conn)?;
     ensure_prune_default(conn)?;
+    retire_bot_tasks(conn)?;
     Ok(())
 }
 
@@ -705,22 +706,10 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
     if !existing.iter().any(|c| c == "missed_delay_ms") {
         conn.execute("ALTER TABLE tasks ADD COLUMN missed_delay_ms INTEGER", [])?;
     }
-    // Story 69.4's three, all nullable and all `NULL` on every row of the three
-    // older kinds: a `bot` task names a bot, a prompt file and (optionally) a
-    // model, and the row is the one place those facts may live — three columns
-    // rather than one JSON blob, by AD-139, so nothing can ever enumerate more
-    // than one target per row. `prompt_subpath` is **profile-relative**, the
-    // same spelling every other path this crate stores. AD-244 allows any
-    // markdown prompt under the profile, not just a session's prompts folder.
-    if !existing.iter().any(|c| c == "bot_id") {
-        conn.execute("ALTER TABLE tasks ADD COLUMN bot_id TEXT", [])?;
-    }
-    if !existing.iter().any(|c| c == "prompt_subpath") {
-        conn.execute("ALTER TABLE tasks ADD COLUMN prompt_subpath TEXT", [])?;
-    }
-    if !existing.iter().any(|c| c == "model") {
-        conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT", [])?;
-    }
+    // `bot_id`, `prompt_subpath` and `model` were story 69.4's scheduled-prompt
+    // columns. The kind they served left with the ⌘9 surface (Story 108.3a,
+    // `retire_bot_tasks`); an install that had them keeps them, unread and
+    // unwritten, for the reason the copy date window's columns below stay.
     // `modified_after_ms` and `modified_before_ms` were story 72.9's copy date
     // window (AD-245). AD-256 rescinded it: a date somebody has to type is a
     // worse answer to "copy what changed" than the mark keeper now writes for
@@ -4026,7 +4015,7 @@ pub const TASK_RUNS_CAP: usize = 50;
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
                             on_missed, description, missed_delay_ms, \
-                            bot_id, prompt_subpath, model, copy_source, copy_destination, \
+                            copy_source, copy_destination, \
                             replace_existing, prune_destination, refresh_missing, copy_lookback_ms";
 
 /// One stored task.
@@ -4082,23 +4071,6 @@ pub struct TaskRow {
     /// missed windows. Refused outside [`crate::tasks::validate_missed_delay_ms`]'
     /// bounds at the write door, and honoured as stored on the read path.
     pub missed_delay_ms: Option<i64>,
-    /// The bot a `bot` task asks, as an opaque id into the shell's bot store,
-    /// or `None` on every other kind (Story 69.4, AD-224).
-    ///
-    /// Stored verbatim and not checked here: `keeper.db` — where bots live —
-    /// is a database this crate cannot see (AD-40), so whether the id names a
-    /// bot is the shell's question at save and the runner's at run.
-    pub bot_id: Option<String>,
-    /// The prompt file a `bot` task sends, **profile-relative**, or `None` on
-    /// every other kind (Story 69.4, AD-224).
-    ///
-    /// The same spelling every path this crate stores has, and resolved at run
-    /// through `browse::resolve` — the one join a root and a subpath are
-    /// allowed (AD-65). Any markdown file under the profile may be a prompt
-    /// (AD-244); the shell checks that shape at save.
-    pub prompt_subpath: Option<String>,
-    /// The model a `bot` task sends as. A runner refuses an absent model.
-    pub model: Option<String>,
     /// Absolute native-picker paths, stored verbatim (AD-C1).
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
@@ -4153,6 +4125,10 @@ pub struct UnknownTask {
 pub struct TaskListing {
     pub tasks: Vec<TaskRow>,
     pub unknown: Vec<UnknownTask>,
+    /// The names of the scheduled-prompt tasks [`retire_bot_tasks`] removed,
+    /// until a person dismisses the Tasks list's notice about them
+    /// ([`dismiss_retired_tasks`]).
+    pub retired: Vec<String>,
 }
 
 /// One attempt at one task.
@@ -4213,9 +4189,6 @@ type StoredTask = (
     Option<i64>,
     Option<String>,
     Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
     bool,
     bool,
     bool,
@@ -4246,12 +4219,6 @@ type StoredTask = (
 /// for a reason that is cosmetic in one case and recoverable in the other, which
 /// is the outcome NFR-43 is about. An unreadable delay reads as *not chosen*, so
 /// the task falls back to the constant and keeps running.
-///
-/// Story 69.4's `bot_id`, `prompt_subpath` and `model` take the same fallback
-/// for a different reason: `None` is not the answer there but the **arm's**
-/// question — a `bot` row with no bot or no prompt is a run the arm refuses
-/// by name, which is a recorded failure a person can act on, where an
-/// unreadable row is a task that silently never ran.
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     Ok((
         row.get(0)?,
@@ -4271,11 +4238,8 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(14).unwrap_or_default(),
         row.get(15).unwrap_or_default(),
         row.get(16).unwrap_or_default(),
-        row.get(17).unwrap_or_default(),
-        row.get(18).unwrap_or_default(),
-        row.get(19).unwrap_or_default(),
-        row.get(20).unwrap_or(true),
-        row.get(21)
+        row.get(17).unwrap_or(true),
+        row.get(18)
             .unwrap_or(crate::tasks::COPY_LOOKBACK_DEFAULT_MS),
     ))
 }
@@ -4303,9 +4267,6 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         on_missed,
         description,
         missed_delay_ms,
-        bot_id,
-        prompt_subpath,
-        model,
         copy_source,
         copy_destination,
         replace_existing,
@@ -4342,9 +4303,6 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         on_missed,
         description,
         missed_delay_ms,
-        bot_id,
-        prompt_subpath,
-        model,
         copy_source,
         copy_destination,
         replace_existing,
@@ -4448,17 +4406,6 @@ pub fn upsert_task(
     crate::tasks::validate_id(&task.id)?;
     crate::tasks::validate_copy_lookback_ms(task.copy_lookback_ms)?;
     let required: &[(Option<&str>, &str)] = match task.kind {
-        // A bot task's prompt is a subpath, so a row with no folder names a
-        // file under nothing: `perform_bot_task` refuses it on every run
-        // ("a bot task names one folder; this row names none"). A row that can
-        // only ever fail is what the write door exists to prevent, so the
-        // folder is required here beside the other two rather than discovered
-        // a window later.
-        TaskKind::Bot => &[
-            (task.bot_id.as_deref(), "a bot"),
-            (task.prompt_subpath.as_deref(), "a prompt file"),
-            (task.profile_id.as_deref(), "a folder"),
-        ],
         TaskKind::Copy => &[
             (task.copy_source.as_deref(), "a source path"),
             (task.copy_destination.as_deref(), "a destination path"),
@@ -4604,11 +4551,11 @@ pub fn upsert_task(
     tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
                             updated_ms, running_host, lease_until_ms, on_missed,
-                            description, missed_delay_ms, bot_id, prompt_subpath, model,
+                            description, missed_delay_ms,
                             copy_source, copy_destination, replace_existing,
                             prune_destination, refresh_missing, copy_lookback_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11,
-                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                 ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(id) DO UPDATE SET
              profile_id      = excluded.profile_id,
              kind            = excluded.kind,
@@ -4620,9 +4567,6 @@ pub fn upsert_task(
              on_missed       = excluded.on_missed,
              description     = excluded.description,
              missed_delay_ms = excluded.missed_delay_ms,
-             bot_id = excluded.bot_id,
-             prompt_subpath = excluded.prompt_subpath,
-             model = excluded.model,
              copy_source = excluded.copy_source,
              copy_destination = excluded.copy_destination,
              replace_existing = excluded.replace_existing,
@@ -4641,9 +4585,6 @@ pub fn upsert_task(
             task.on_missed.as_str(),
             &task.description,
             task.missed_delay_ms,
-            &task.bot_id,
-            &task.prompt_subpath,
-            &task.model,
             &task.copy_source,
             &task.copy_destination,
             task.replace_existing,
@@ -4910,7 +4851,78 @@ pub fn list_tasks(conn: &Connection) -> Result<TaskListing> {
             }
         }
     }
+    listing.retired = retired_tasks(conn)?;
     Ok(listing)
+}
+
+/// The `meta` key holding the names [`retire_bot_tasks`] removed, as a JSON
+/// array, until the notice is dismissed.
+const RETIRED_TASKS_KEY: &str = "tasks.retired_bot_tasks";
+
+/// Take every stored task of the kind the ⌘9 surface ran — a prompt sent to a
+/// bot on a schedule — out of `sync.db` (Story 108.3a, UX-DR-E108-3).
+///
+/// Each removed task is named once in a WARN line, its run history goes with
+/// it, and its name is kept for the Tasks list's one notice. Idempotent: once
+/// no such row is left there is nothing to do, so it runs on every open
+/// without a marker, and a row an older build on the same machine writes
+/// later is removed the same way.
+fn retire_bot_tasks(conn: &Connection) -> Result<()> {
+    let removed: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT id, description FROM tasks WHERE kind = 'bot'")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1).unwrap_or_default())))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let mut names = retired_tasks(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    for (id, description) in &removed {
+        tracing::warn!(
+            task = %id,
+            "removed a scheduled prompt task: keeper no longer runs prompts on a schedule"
+        );
+        tx.execute("DELETE FROM task_runs WHERE task_id = ?1", [id])?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+        let name = description
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id);
+        names.push(name.to_owned());
+    }
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (
+            RETIRED_TASKS_KEY,
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned()),
+        ),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The names [`retire_bot_tasks`] removed and nobody has dismissed yet. A
+/// value that does not parse reads as none: it is a notice, not a record.
+pub fn retired_tasks(conn: &Connection) -> Result<Vec<String>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [RETIRED_TASKS_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default())
+}
+
+/// Put the Tasks list's notice about removed tasks away.
+pub fn dismiss_retired_tasks(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", [RETIRED_TASKS_KEY])?;
+    Ok(())
 }
 
 /// One task by id, or `Ok(None)`.
@@ -5533,9 +5545,6 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
             description: Some(GC_TASK_DESCRIPTION.to_owned()),
             missed_delay_ms: None,
-            bot_id: None,
-            prompt_subpath: None,
-            model: None,
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
@@ -5612,9 +5621,6 @@ pub fn seed_clock_tasks(conn: &Connection, now_ms: i64) -> Result<()> {
                     on_missed: crate::tasks::TaskMissedPolicy::RunNow,
                     description: Some(description.to_owned()),
                     missed_delay_ms: None,
-                    bot_id: None,
-                    prompt_subpath: None,
-                    model: None,
                     copy_source: None,
                     copy_destination: None,
                     replace_existing: false,
@@ -8276,9 +8282,6 @@ mod tests {
             id: id.to_owned(),
             profile_id: Some("p".to_owned()),
             kind: TaskKind::Sync,
-            bot_id: None,
-            prompt_subpath: None,
-            model: None,
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
@@ -8299,44 +8302,14 @@ mod tests {
     }
 
     #[test]
-    fn bot_task_columns_survive_insert_and_update() {
-        let c = conn();
-        let mut row = task("bot-columns", None, TaskMode::Manual);
-        row.kind = TaskKind::Bot;
-        for suffix in ["first", "edited"] {
-            row.bot_id = Some(format!("bot-{suffix}"));
-            row.prompt_subpath = Some(format!("prompts/{suffix}.md"));
-            row.model = Some(format!("model-{suffix}"));
-            upsert_task(&c, &row, None).expect("save bot task");
-            let stored = get_task(&c, &row.id).expect("read").expect("task");
-            assert_eq!(stored.bot_id, row.bot_id, "bot id survives the write door");
-            assert_eq!(stored.prompt_subpath, row.prompt_subpath);
-            assert_eq!(stored.model, row.model);
-        }
-    }
-
-    #[test]
     fn task_write_door_refuses_missing_kind_targets() {
         let c = conn();
         for (kind, missing) in [
-            (TaskKind::Bot, "a bot"),
-            (TaskKind::Bot, "a prompt file"),
-            (TaskKind::Bot, "a folder"),
             (TaskKind::Copy, "a source path"),
             (TaskKind::Copy, "a destination path"),
         ] {
             let mut row = task("missing-target", None, TaskMode::Manual);
             row.kind = kind;
-            if missing == "a prompt file" {
-                row.bot_id = Some("bot".into());
-            }
-            if missing == "a folder" {
-                // Everything a bot task needs except the folder its prompt path
-                // is relative to: a row the engine could only ever refuse.
-                row.bot_id = Some("bot".into());
-                row.prompt_subpath = Some("prompts/10-summarise.md".into());
-                row.profile_id = None;
-            }
             if missing == "a destination path" {
                 row.copy_source = Some("/source".into());
             }
@@ -8536,11 +8509,6 @@ mod tests {
                 "on_missed",
                 "description",
                 "missed_delay_ms",
-                // Story 69.4's three, additive and nullable through
-                // `ensure_task_columns` like every late column before them.
-                "bot_id",
-                "prompt_subpath",
-                "model",
                 // Story 72.7's three, the same additive path: a `copy` task's
                 // two absolute paths and its replace choice. Its date window
                 // was two more columns here until AD-256 rescinded it — a
@@ -9183,7 +9151,6 @@ mod tests {
             TaskKind::Sync,
             TaskKind::Release,
             TaskKind::Verify,
-            TaskKind::Bot,
             TaskKind::Copy,
             TaskKind::Gc,
         ]
@@ -9193,12 +9160,8 @@ mod tests {
             let id = format!("01K{n}");
             let mut row = task(&id, Some("every 5m"), TaskMode::Scheduled);
             row.kind = kind;
-            // The two kinds whose write door demands a target; everything else
+            // The kind whose write door demands a target; everything else
             // about this row is identical, which is the point.
-            if kind == TaskKind::Bot {
-                row.bot_id = Some("bot".into());
-                row.prompt_subpath = Some("prompts/10.md".into());
-            }
             if kind == TaskKind::Copy {
                 row.copy_source = Some("/source".into());
                 row.copy_destination = Some("/destination".into());

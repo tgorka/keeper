@@ -10,4 +10,4 @@
  * connection pill calls a dead homeserver `offline` too. A chat endpoint that
  * does not answer is the same event, so it gets the same word.
  */
-export type BotReach = "online" | "offline";
+export type ProviderReach = "online" | "offline";

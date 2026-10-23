@@ -4,7 +4,7 @@
 //! A phone has no console beside it. When the phrase is armed and nothing
 //! answers, the only thing that can say why is the port itself — so the
 //! shell feeds every arm, refusal, interruption, resume, roll and turn
-//! transition into this ring, and Settings → Bots on the phone reads it back,
+//! transition into this ring, and Settings → Voice on the phone reads it back,
 //! newest first. It is a view of memory: nothing is written to disk and
 //! nothing leaves the device (AD-196).
 //!

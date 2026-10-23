@@ -2,10 +2,10 @@
 
 /**
  * One of the person's agents a spoken turn may go to (AD-384; 108.2), from
- * `voice_agent_targets`, listed by the voice target picker ("Speak to")
- * after the pinned bots: every agent of every database this device holds
- * (`keeper_core::hq`), by name. A question to one goes into that agent's
- * main conversation ([`crate::hq::spoken`]).
+ * `voice_agent_targets`, listed by the voice target picker ("Speak to"):
+ * every agent of every database this device holds (`keeper_core::hq`), by
+ * name. A question to one goes into that agent's main conversation
+ * ([`crate::hq::spoken`]).
  */
 export type VoiceAgentTargetVm = { 
 /**
