@@ -236,10 +236,10 @@ reductions are unit-tested beside the git-remote cases in `keeper-core::egress` 
 de-duplicated, ordered after the sync remotes and before the update endpoint, and gone entirely
 when the last provider is removed.
 
-Since Epic 67 (AD-205, AD-211) a *spoken* question reaches this same endpoint from Rust —
-`bots_ipc::send_spoken` runs the one `keeper_agent::turn::open_turn` a typed message runs
-(`src-tauri/crates/keeper/src/bots_ipc.rs`, `send_spoken`), with the same request, the same
-host and nothing new on the wire — and the lock-screen banner that says what was heard is a
+From Epic 67 (AD-205, AD-211) until Story 108.3 a *spoken* question reached this same endpoint
+from Rust, through the ⌘9 bots' turn. Since 108.2 and 108.3 it is a message to an agent in the
+agents' database, written through `keeper_core::hq`; the model is the agent runtime's, in
+keeper-hq, so keeper sends nothing new to this endpoint for it — and the lock-screen banner that says what was heard is a
 local notification posted by the app process with no trigger and no push
 (`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,
 no token), so the row above is unchanged and no row is added.
