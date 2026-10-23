@@ -1141,3 +1141,13 @@ shown ≤ 1 s on the tailnet).
   NFR-127 figure (keeper-hq `docs/e2e.md`).
 - **Not measured:** the native gate, from opening an archived session in the installed app on
   hesperia to its newest page being painted, against electra — for an imported session too.
+
+**On devices.** Each row is owed until a run on the device fills it in, with the device, its OS,
+the build and the date:
+
+| run | story | device | figure | result |
+| --- | --- | --- | --- | --- |
+| the tablet's first device run | 98.3 #7 | the Android tablet | the run's checks (`docs/android.md`) | owed |
+| push latency through ntfy, send to notification, twenty pushes | 98.4 #10 | the Android tablet | p95 | owed |
+| a spoken question and its answer, talking over it, echo cancelling | 98.4 #10 | the Android tablet | the run's facts (`docs/android.md` § *Voice*) | owed |
+| push latency through Sygnal, send to banner, twenty notifications | 98.1 #12 | kalypso | p95, and the extension's peak memory under 24 MB | owed |

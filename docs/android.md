@@ -204,7 +204,7 @@ keeper ships no push server and never picks one (D-1, D-4).
 **What you set up (operator actions).**
 
 - A UnifiedPush server that is also a Matrix push gateway, reachable over
-  `https://` by your homeserver and by this device — ntfy (Apache-2.0) is one:
+  `https://` by your agents server and by this device — ntfy (Apache-2.0) is one:
   it answers the Matrix push path on its own address. keeper registers push
   only over `https://`.
 - The distributor app for it on this device — the ntfy app, pointed at that
@@ -280,8 +280,9 @@ before the confirmation was added; the confirmation's Kotlin (the
 distributors' names), the notification intents' data URIs and the status-bar
 icon are checked by inspection, and `push_android.rs` type-checked for
 `aarch64-linux-android`; neither has been linked into an APK or run — CI's
-`android` job is the first build. The device run — the pusher on tuwunel,
-an approval from the lock screen, push latency — is story 98.4 #10, owed until
+`android` job is the first build. The device run — the old pusher's removal
+from tuwunel, an approval from the lock screen through the agents server, push
+latency — is story 98.4 #10, owed until
 its row is in `docs/agents.md` § *Measured*. What is still open: push only
 while keeper runs (DW-1310), registration only when the distributor answers at
 start (DW-1311), no way to switch to another distributor while the confirmed
