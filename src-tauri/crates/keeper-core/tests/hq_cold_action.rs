@@ -75,6 +75,7 @@ async fn cold_start(data_dir: &Path) -> Option<String> {
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
         format!("keeper on {HOST}"),
+        || HOST.to_owned(),
     );
     if let Err(error) = hq.start().await {
         panic!("the service did not start: {error}");

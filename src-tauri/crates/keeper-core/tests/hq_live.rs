@@ -537,11 +537,13 @@ fn device(dir: &Path) -> Arc<Device> {
 }
 
 fn hq(device: &Arc<Device>, name: &str) -> Arc<Hq> {
+    let host = name.to_owned();
     Hq::new(
         Arc::clone(device) as Arc<dyn Platform>,
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
         name.to_owned(),
+        move || host.clone(),
     )
 }
 
