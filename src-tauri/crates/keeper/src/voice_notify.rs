@@ -128,11 +128,11 @@ pub fn observe(snapshot: &VoiceStateVm) {
         let wait = match snapshot {
             VoiceStateVm::Sending {
                 answering: false,
-                bot,
+                agent,
                 sent_at_ms: Some(sent),
                 ..
             } => Some(waiting(
-                bot.as_deref(),
+                agent.as_deref(),
                 crate::voice_log::now_ms().saturating_sub(*sent),
             )),
             VoiceStateVm::Sending {

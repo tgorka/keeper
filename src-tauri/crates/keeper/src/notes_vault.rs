@@ -199,7 +199,7 @@ enum Work {
     Embedded {
         generation: u64,
         model: String,
-        rows: Result<Vec<(i64, String, Vec<f32>)>, keeper_core::bots::embed::EmbedError>,
+        rows: Result<Vec<(i64, String, Vec<f32>)>, keeper_core::providers::embed::EmbedError>,
     },
     /// The provenance projection came back. Origin is a *git* fact the pure
     /// index cannot know, so it arrives as a second pass over the entry set:
@@ -1112,7 +1112,7 @@ struct EmbeddingBackfill {
     complete: bool,
     lexical_refused: bool,
     retry_at: Option<Instant>,
-    provider_revision: Option<keeper_core::bots::store::ProviderRow>,
+    provider_revision: Option<keeper_core::providers::store::ProviderRow>,
 }
 
 fn publish_search_stats(index: &SearchIndex, progress: &watch::Sender<NoteSearchStateVm>) {
@@ -1237,15 +1237,15 @@ async fn sync_search(
 pub(crate) async fn embedding_endpoint(
     platform: &dyn Platform,
     provider: &str,
-) -> Result<keeper_core::bots::Endpoint, String> {
-    use keeper_core::bots::store;
+) -> Result<keeper_core::providers::Endpoint, String> {
+    use keeper_core::providers::store;
     let dir = platform
         .data_dir()
         .map_err(|_| "Could not read embedding settings.")?;
     let row = store::get_provider(&dir, provider)
         .map_err(|_| "Could not read the embedding provider.")?
         .ok_or("Embedding provider is missing — choose one in Settings.")?;
-    let token = crate::account_ipc::bot_credential(platform, provider, None)
+    let token = crate::account_ipc::provider_credential(platform, provider)
         .await
         .map_err(|_| "Could not read the embedding provider credential.")?;
     Ok(row.provider.endpoint(None, token))
@@ -1253,7 +1253,7 @@ pub(crate) async fn embedding_endpoint(
 
 pub(crate) fn embedding_client() -> Result<&'static reqwest::Client, &'static str> {
     static CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
-        keeper_core::bots::http::client(keeper_core::bots::http::READ_TIMEOUT)
+        keeper_core::providers::http::client(keeper_core::providers::http::READ_TIMEOUT)
             .map_err(|error| error.to_string())
     });
     CLIENT
@@ -1268,7 +1268,7 @@ async fn embed_tick(
     sender: &mpsc::WeakUnboundedSender<Work>,
     backfill: &mut EmbeddingBackfill,
 ) {
-    use keeper_core::bots::{embed, store};
+    use keeper_core::providers::{embed, store};
     if backfill.running
         || backfill.complete
         || backfill.lexical_refused
@@ -1362,7 +1362,7 @@ async fn embed_tick(
         .as_ref()
         .and_then(|row| row.read_timeout_ms)
         .filter(|ms| *ms > 0)
-        .map_or(keeper_core::bots::http::READ_TIMEOUT, |ms| {
+        .map_or(keeper_core::providers::http::READ_TIMEOUT, |ms| {
             Duration::from_millis(ms.unsigned_abs())
         });
     let client = match embedding_client() {
