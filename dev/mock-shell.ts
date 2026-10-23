@@ -167,6 +167,7 @@ import type {
   PlatformVm,
   PromoteState,
   ProxyRoomVm,
+  PushOpenVm,
   RecordingCaptureSourcesVm,
   RecordingRemovalPreviewVm,
   RecordingRemovedVm,
@@ -206,7 +207,7 @@ import type {
   VoiceWakeVm,
   WebSearchLevel,
 } from "@/lib/ipc/client";
-import { UNIFIEDPUSH_STATUS_EVENT, VOICE_WAKE_EVENT } from "@/lib/ipc/client";
+import { PUSH_OPEN_EVENT, UNIFIEDPUSH_STATUS_EVENT, VOICE_WAKE_EVENT } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { platformStore } from "@/lib/stores/platform";
 // The phone's and the tablet's "On this …" lists are composed in Rust
@@ -9239,6 +9240,7 @@ const hqDb = (
     offline: "Can't reach the server; keeper keeps trying.",
     notOpen: "Not open to this device any more; what it holds stays readable here.",
     removed: "This device was removed; what it holds stays readable here.",
+    noServer: "No server is set; what you write here waits on this device.",
   }[state],
 });
 const HQ_DEVICE = { clientId: "ana.0a1b2c3d", name: "keeper on laptop" };
@@ -9303,9 +9305,38 @@ function hqFixture(): HqStatusVm {
       };
     case "offer":
       return { ...hqNone, offer: HQ_HOST };
+    // ?hq=cleared — paired once, then the address cleared (A106-01): the last server's
+    // databases stay listed and written to, and what is written waits in each one.
+    case "cleared":
+      return hqCleared({ alpha: 0, beta: 0 });
     default:
       return hqNone;
   }
+}
+function hqCleared(waiting: Record<string, number>): HqStatusVm {
+  const all = Object.values(waiting).reduce((sum, n) => sum + n, 0);
+  const clause = (n: number) =>
+    n === 0
+      ? ""
+      : n === 1
+        ? " 1 change waits on this device."
+        : ` ${n} changes wait on this device.`;
+  return {
+    ...hqNone,
+    sentence: `No server is set. What you write to your agents waits on this device.${clause(all)}`,
+    databases: Object.entries(waiting).map(([name, n]) => {
+      const db = hqDb(name, "noServer");
+      return { ...db, waiting: n, sentence: `${db.sentence}${clause(n)}` };
+    }),
+    waitingHere: all,
+  };
+}
+/** One more write waits in `database` while no address is set (?hq=cleared). */
+function hqClearedWrite(database: string): void {
+  if (hqParam !== "cleared") return;
+  const waiting = Object.fromEntries(hqStatus.databases.map((db) => [db.name, db.waiting]));
+  waiting[database] = (waiting[database] ?? 0) + 1;
+  hqPublish(hqCleared(waiting));
 }
 let hqStatus: HqStatusVm = hqFixture();
 const hqWatchers = new Map<string, MockChannel<HqStatusVm>>();
@@ -9832,6 +9863,14 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   },
   agent_session_open: (payload) => {
     if (sessionScenario === "open-error") hqRefuse("This session is not open to this device.");
+    if (pushArriving.has(JSON.stringify([payload.database, payload.sessionId]))) {
+      throw {
+        code: "internal",
+        message: `This conversation has not reached this device yet; it opens here when ${String(payload.database)} brings it.`,
+        accountId: null,
+        retriable: true,
+      };
+    }
     const vm = mockSession(payload);
     const id = `session-view-${++sessionSerial}`;
     const channel = payload.channel as MockChannel<AgentSessionViewVm>;
@@ -9880,7 +9919,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     };
     vm.messages.push(message);
     publishSessions();
-    if (sessionScenario !== "offline")
+    hqClearedWrite(String(payload.database));
+    if (sessionScenario !== "offline" && hqParam !== "cleared")
       setTimeout(() => {
         message.state = "sent";
         publishSessions();
@@ -10012,6 +10052,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       ],
     });
     publishSessions();
+    hqClearedWrite(row.database);
     return { database: row.database, sessionId: row.sessionId };
   },
 };
@@ -10565,7 +10606,11 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   ...peopleHandlers,
   ...instanceHandlers,
   push_gateway_get: () => pushGateway,
-  push_open_take: () => null,
+  push_open_take: () => {
+    const target = pushWaiting;
+    pushWaiting = null;
+    return target;
+  },
   failure_subscribe: (payload) => {
     const id = `failure-subscription-${failureWatchers.size + 1}`;
     const channel = payload.channel as MockChannel<FailureStateVm>;
@@ -12957,6 +13002,59 @@ function realShellPresent(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
+// A tapped notification (106.6, A106-02/03): `window.__keeperMockPushTap({database,
+// sessionId}, arriveAfterMs?)` keeps the target where `push_open_take` answers and emits
+// `push://open`, as the phone's shell does. With `arriveAfterMs`, a session this device
+// does not hold yet is refused as still arriving until it lands in the list then.
+let pushWaiting: PushOpenVm | null = null;
+const pushArriving = new Set<string>();
+function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?: number): void {
+  const key = JSON.stringify([target.database, target.sessionId]);
+  if (arriveAfterMs !== undefined && !sessionViews.has(key)) {
+    pushArriving.add(key);
+    window.setTimeout(() => {
+      const row: AgentSessionRowVm = {
+        database: target.database,
+        sessionId: target.sessionId,
+        title: "Arrived after the tap",
+        agentActor: "researcher",
+        agentName: "Researcher",
+        agentMark: "R",
+        archived: false,
+        lastActivityMs: Date.now(),
+      };
+      sessionRows.unshift(row);
+      sessionViews.set(key, {
+        ...row,
+        readOnly: false,
+        complete: true,
+        hasEarlier: false,
+        loadingEarlier: false,
+        readsTrace: true,
+        untrusted: false,
+        live: [],
+        tools: [],
+        prefs: { showReasoning: false, showDetails: false },
+        approvals: [],
+        messages: [
+          {
+            id: `arrived-${target.sessionId}`,
+            role: "agent",
+            authorActor: "researcher",
+            authorName: "Researcher",
+            body: "The answer the notification was about.",
+            createdAtMs: Date.now(),
+          },
+        ],
+      });
+      pushArriving.delete(key);
+      publishSessions();
+    }, arriveAfterMs);
+  }
+  pushWaiting = { kind: "session", ...target };
+  void emit(PUSH_OPEN_EVENT);
+}
+
 export function installMockShell(): void {
   if (realShellPresent()) {
     return;
@@ -12993,5 +13091,6 @@ export function installMockShell(): void {
   // What the shell's initialization script writes before the bundle runs
   // (`ipc::platform_plugin`): applied here, before the app mounts.
   platformStore.getState().applySnapshot(MOCK_PLATFORM_FACTS);
+  (window as unknown as { __keeperMockPushTap: typeof pushTap }).__keeperMockPushTap = pushTap;
   document.documentElement.dataset.mockShell = "on";
 }

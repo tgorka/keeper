@@ -1140,3 +1140,274 @@ async fn a_removed_device_registers_no_push_target() {
     hq.set_push_target(None);
     assert!(push_targets_until(&world, 1).await.is_empty());
 }
+
+/// A device paired with `hq.example.org` holding a real replica of alpha
+/// whose directory names the agent nixie.
+fn paired_holding_alpha(world: &World) {
+    world.paired("https://hq.example.org", &[]);
+    let alpha = databases::replica(
+        &world.data_dir(),
+        &ServerUrl::parse("https://hq.example.org")
+            .expect("parses")
+            .expect("an address"),
+        "alpha",
+        "ana",
+    );
+    std::fs::create_dir_all(alpha.parent().expect("parent")).expect("mkdir");
+    let seed = syncular::SyncularReplica::open(ReplicaSpec {
+        database: "alpha".to_owned(),
+        path: alpha,
+        client_id: Some("ana.1".to_owned()),
+        link: None,
+        subscriptions: Vec::new(),
+        watch_presence: None,
+    })
+    .expect("opens");
+    seed.mutate(vec![RowOp::Upsert {
+        table: "actors".to_owned(),
+        values: sessions::object(serde_json::json!({
+            "id": "nixie", "kind": "agent", "display_name": "Nixie", "family": null,
+            "dir": "alpha", "created_at_ms": 1, "author_actor": "server",
+            "author_client": "server"})),
+        base_version: None,
+    }])
+    .expect("seeds");
+    seed.close();
+    seed.join();
+}
+
+/// A service over `world` opening real replicas through `opener`.
+fn real_hq(world: &World, opener: Arc<dyn Opener>) -> Arc<Hq> {
+    Hq::new(
+        Arc::clone(&world.platform) as Arc<dyn Platform>,
+        opener,
+        Arc::clone(&world.routes) as Arc<dyn Routes>,
+        "keeper on test".to_owned(),
+    )
+}
+
+/// 106.1 AC 2 and invariant 2 through the calls 106.2's composer makes
+/// (A106-01): a device paired with a server whose address is then cleared
+/// keeps that server's databases listed and written to. A new session and a
+/// message wait in that database's own outbox, the count shows, nothing is
+/// asked of any server, and a relaunch keeps all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and_it_waits() {
+    let world = World::new();
+    paired_holding_alpha(&world);
+    let service = || real_hq(&world, Arc::new(syncular::SyncularOpener));
+    let hq = service();
+    hq.start().await.expect("starts");
+
+    let status = hq.set_server("").await.expect("clears");
+    assert_eq!(status.phase, HqPhase::NoServer);
+    assert_eq!(status.device, None);
+    let asked = world.routes.discovered.load(Ordering::SeqCst);
+    // What waits so far is the directory row seeded above.
+    let before = 1;
+    let held = status_until(&hq, "alpha held with no server", |s| {
+        s.databases.iter().any(|d| {
+            d.name == "alpha" && d.state == HqDatabaseState::NoServer && d.waiting == before
+        })
+    })
+    .await;
+    assert_eq!(held.waiting_here, before);
+
+    // New session offers the agent of the held database, and writes there.
+    let choices = hq.choices().expect("choices");
+    assert_eq!(
+        choices
+            .iter()
+            .map(|c| (c.agent_actor.as_str(), c.database.as_deref()))
+            .collect::<Vec<_>>(),
+        [("nixie", Some("alpha"))]
+    );
+    let key = hq
+        .new_session("alpha", "nixie", "plan the week")
+        .expect("a new session with no server");
+    assert_eq!(key.database, "alpha");
+    hq.send(&key, "and then the weekend").expect("a message");
+    let status = status_until(&hq, "both writes wait", |s| s.waiting_here == before + 2).await;
+    assert_eq!(status.databases[0].waiting, before + 2);
+    assert!(
+        status
+            .sentence
+            .ends_with(&format!("{} changes wait on this device.", before + 2)),
+        "{}",
+        status.sentence
+    );
+    assert!(hq
+        .sessions()
+        .iter()
+        .any(|row| row.database == "alpha" && row.session_id == key.session_id));
+    assert_eq!(world.routes.discovered.load(Ordering::SeqCst), asked);
+    assert!(lock(&world.routes.push_targets).is_empty());
+    assert!(hq.contacting().is_empty());
+
+    // A relaunch with no address keeps the session and what waits.
+    hq.shutdown().await;
+    let again = service();
+    again.start().await.expect("restarts");
+    let status = status_until(&again, "still waiting after a relaunch", |s| {
+        s.waiting_here == before + 2
+    })
+    .await;
+    assert_eq!(status.phase, HqPhase::NoServer);
+    assert!(again
+        .sessions()
+        .iter()
+        .any(|row| row.database == "alpha" && row.session_id == key.session_id));
+    assert_eq!(world.routes.discovered.load(Ordering::SeqCst), asked);
+    assert!(again.contacting().is_empty());
+
+    // Forgetting that server takes its replicas out of the list for good.
+    again
+        .set_server("https://hq.example.org")
+        .await
+        .expect("stores");
+    let removed = again.forget().await.expect("forgets");
+    assert!(removed.databases.is_empty());
+    again.set_server("").await.expect("clears");
+    assert!(again.sessions().is_empty());
+}
+
+/// A device never paired has no directory: New session has no agent to
+/// address and nothing is invented (A106-01, case b).
+#[tokio::test]
+async fn a_device_never_paired_offers_no_agent_and_asks_nothing() {
+    let world = World::new();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    assert!(hq.choices().expect("choices").is_empty());
+    assert!(matches!(
+        hq.new_session("local", "nixie", "hello"),
+        Err(HqError::Sentence(_))
+    ));
+    assert_eq!(world.routes.discovered.load(Ordering::SeqCst), 0);
+}
+
+/// A notification may name a session this device does not hold yet
+/// (A106-03): opening it is `Arriving` while a round may still bring it, and
+/// a sentence once nothing will.
+#[tokio::test]
+async fn a_session_not_held_yet_is_arriving_until_nothing_can_bring_it() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["alpha"]);
+    *lock(&world.routes.discovery) = Some(Ok(found(&["alpha"])));
+    let hq = world.hq();
+    let key = |database: &str| sessions::AgentSessionRef {
+        database: database.to_owned(),
+        session_id: "ben.2.9".to_owned(),
+    };
+    // Before the copies open (a cold launch from the tap).
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Arriving(_))
+    ));
+    hq.start().await.expect("starts");
+    status_until(&hq, "alpha linked", |_| {
+        world.live("alpha").iter().any(|r| r.spec.link.is_some())
+    })
+    .await;
+    // alpha syncs: its session may still come.
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Arriving(_))
+    ));
+    // gamma is not open to this device: nothing brings it.
+    assert!(matches!(
+        hq.open_session(&key("gamma")),
+        Err(HqError::Sentence(s)) if s.contains("gamma is not open to this device")
+    ));
+    // Removed: nothing syncs any more.
+    hq.apply_discovery(generation(&hq), Err(RouteError::Unauthorized))
+        .await
+        .expect("applies");
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Sentence(s)) if s.starts_with("This device was removed")
+    ));
+    // No address: nothing syncs.
+    hq.set_server("").await.expect("clears");
+    assert!(matches!(
+        hq.open_session(&key("alpha")),
+        Err(HqError::Sentence(s)) if s == "This conversation is not on this device."
+    ));
+}
+
+/// Opens real replicas, holding `database`'s open until released: says when
+/// that open has begun, then waits on the release.
+struct HeldOpener {
+    database: &'static str,
+    entered: Arc<tokio::sync::Notify>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Opener for HeldOpener {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+        if spec.database == self.database {
+            let release = lock(&self.release).take();
+            if let Some(release) = release {
+                self.entered.notify_one();
+                let _ = release.recv();
+            }
+        }
+        syncular::SyncularOpener.open(spec)
+    }
+}
+
+/// The audit's round-2 case (A106-03): paired, the address cleared, a
+/// session written and kept, keeper relaunched — and a tapped notification
+/// opens that session while the held replica is still opening. That is
+/// arriving, never "not on this device"; once the replica is open, the same
+/// session opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens() {
+    let world = World::new();
+    paired_holding_alpha(&world);
+    let first = real_hq(&world, Arc::new(syncular::SyncularOpener));
+    first.start().await.expect("starts");
+    first.set_server("").await.expect("clears");
+    status_until(&first, "alpha held with no server", |s| {
+        s.databases.iter().any(|d| d.name == "alpha")
+    })
+    .await;
+    let key = first
+        .new_session("alpha", "nixie", "plan the week")
+        .expect("a session");
+    first.shutdown().await;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, held) = std::sync::mpsc::channel();
+    let opener = Arc::new(HeldOpener {
+        database: "alpha",
+        entered: Arc::clone(&entered),
+        release: Mutex::new(Some(held)),
+    });
+    let again = real_hq(&world, opener);
+    let starting = {
+        let again = Arc::clone(&again);
+        tokio::spawn(async move { again.start().await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("alpha's open begins");
+    let early = again.open_session(&key);
+    release.send(()).expect("releases");
+    starting.await.expect("joins").expect("starts");
+    assert!(
+        matches!(&early, Err(HqError::Arriving(_))),
+        "opened while its replica was opening: {early:?}"
+    );
+    again
+        .open_session(&key)
+        .expect("opens once the replica is open");
+    // Opened, and nothing absent is said to be on its way any more.
+    assert!(matches!(
+        again.open_session(&sessions::AgentSessionRef {
+            database: "alpha".to_owned(),
+            session_id: "ben.2.9".to_owned(),
+        }),
+        Err(HqError::Sentence(s)) if s == "This conversation is not on this device."
+    ));
+}

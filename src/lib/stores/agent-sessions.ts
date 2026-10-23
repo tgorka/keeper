@@ -12,6 +12,13 @@ import {
 } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
+/** What the person had written in New session, kept while another screen is shown. */
+export interface NewSessionDraft {
+  agentActor: string;
+  database: string;
+  body: string;
+}
+
 interface AgentSessionsState {
   rows: AgentSessionRowVm[];
   loaded: boolean;
@@ -20,8 +27,22 @@ interface AgentSessionsState {
   /** The open session Rust's list dropped (left, or removed by its owner), until another opens. */
   gone: { database: string; sessionId: string; title: string } | null;
   newSession: AgentDefaultSessionVm | null;
+  /** New session is open because the person asked for it. */
+  creating: boolean;
+  /**
+   * The words New session holds, so a screen that takes over — a tapped notification —
+   * does not lose them: New session shows them again when it next opens. Cancel and a
+   * created session drop them.
+   */
+  newDraft: NewSessionDraft | null;
   apply: (batch: AgentSessionsBatch) => void;
+  /**
+   * The one way anything opens a session or goes back to the list: it ends New session,
+   * whatever opened it, and keeps {@link newDraft}.
+   */
   select: (target: AgentSessionRef | null) => void;
+  startNew: () => void;
+  keepNewDraft: (draft: NewSessionDraft | null) => void;
 }
 
 /** Rust owns order, attention and membership; this store only applies its diffs. */
@@ -32,6 +53,8 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
   selected: null,
   gone: null,
   newSession: null,
+  creating: false,
+  newDraft: null,
   apply: (batch) =>
     set((state) => {
       let rows = [...state.rows];
@@ -79,7 +102,9 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
       }
       return { rows, loaded: true, error: null };
     }),
-  select: (selected) => set({ selected, gone: null, newSession: null }),
+  select: (selected) => set({ selected, gone: null, newSession: null, creating: false }),
+  startNew: () => set({ selected: null, gone: null, newSession: null, creating: true }),
+  keepNewDraft: (newDraft) => set({ newDraft }),
 }));
 
 export function useAgentSessionsStore<T>(selector: (state: AgentSessionsState) => T): T {

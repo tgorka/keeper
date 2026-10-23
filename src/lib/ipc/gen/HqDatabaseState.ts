@@ -3,4 +3,4 @@
 /**
  * One database's state on this device.
  */
-export type HqDatabaseState = "connecting" | "connected" | "offline" | "notOpen" | "removed";
+export type HqDatabaseState = "connecting" | "connected" | "offline" | "notOpen" | "removed" | "noServer";

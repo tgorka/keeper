@@ -23,7 +23,7 @@ export function AgentsWindow() {
   const selected = useAgentSessionsStore((s) => s.selected);
   const initial = useAgentSessionsStore((s) => s.newSession);
   const gone = useAgentSessionsStore((s) => s.gone);
-  const [creating, setCreating] = useState(false);
+  const creating = useAgentSessionsStore((s) => s.creating);
   const [filter, setFilter] = useState<"active" | "archived" | "all">("active");
   const { phone } = useShellLayout();
   const newOpen = creating || initial !== null;
@@ -54,9 +54,13 @@ export function AgentsWindow() {
   );
   const back = useCallback(() => {
     restoreFocus.current = phone;
-    setCreating(false);
     agentSessionsStore.getState().select(null);
   }, [phone]);
+  // Cancel (or Escape) is the person leaving New session: its words go with it.
+  const cancel = useCallback(() => {
+    agentSessionsStore.getState().keepNewDraft(null);
+    back();
+  }, [back]);
   useEffect(() => {
     if (!phone || !showingDetail) return;
     const onKey = (event: KeyboardEvent) => {
@@ -69,11 +73,12 @@ export function AgentsWindow() {
       )
         return;
       event.preventDefault();
-      back();
+      if (newOpen) cancel();
+      else back();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [phone, showingDetail, back]);
+  }, [phone, showingDetail, newOpen, back, cancel]);
   return (
     <section
       ref={root}
@@ -102,8 +107,7 @@ export function AgentsWindow() {
               aria-label="New session"
               onClick={() => {
                 origin.current = "new";
-                agentSessionsStore.getState().select(null);
-                setCreating(true);
+                agentSessionsStore.getState().startNew();
               }}
             >
               <Plus aria-hidden="true" />
@@ -177,7 +181,6 @@ export function AgentsWindow() {
                     )}
                     onClick={() => {
                       origin.current = JSON.stringify([row.database, row.sessionId]);
-                      setCreating(false);
                       agentSessionsStore
                         .getState()
                         .select({ database: row.database, sessionId: row.sessionId });
@@ -213,11 +216,8 @@ export function AgentsWindow() {
       {newOpen ? (
         <NewSession
           initial={initial}
-          onCancel={back}
-          onCreated={(target) => {
-            setCreating(false);
-            agentSessionsStore.getState().select(target);
-          }}
+          onCancel={cancel}
+          onCreated={(target) => agentSessionsStore.getState().select(target)}
         />
       ) : selected ? (
         <SessionView

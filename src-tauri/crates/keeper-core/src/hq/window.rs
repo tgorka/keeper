@@ -18,7 +18,8 @@ use crate::hq::sessions::{
     self, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionRowVm, Source,
 };
 use crate::hq::timeline::{self, AgentSessionViewVm, Opened};
-use crate::hq::{lock, sentence, Hq, HqError};
+use crate::hq::vm::{phase_sentence, HqPhase};
+use crate::hq::{lock, sentence, Hq, HqError, LocalOpen};
 
 /// Every archive fetch's token, so an answer for a view that has moved on
 /// is told apart from the one it waits for.
@@ -374,12 +375,17 @@ impl Hq {
     }
 
     /// A stream begins showing `key`: its window holds it (an archived one
-    /// starts reading through the server).
+    /// starts reading through the server). A session this device does not
+    /// hold is [`HqError::Arriving`] while a round may still bring it — the
+    /// replicas are opening, or its database syncs — and a sentence once
+    /// nothing will: no server, a removed device, a database not open to it.
     pub fn open_session(&self, key: &AgentSessionRef) -> Result<(), HqError> {
-        let source = self.source(&key.database)?;
-        let session = timeline::session_row(&source, &key.session_id).ok_or_else(|| {
-            HqError::Sentence("This conversation is not on this device.".to_owned())
-        })?;
+        let held = self.source(&key.database).ok().and_then(|source| {
+            timeline::session_row(&source, &key.session_id).map(|session| (source, session))
+        });
+        let Some((source, session)) = held else {
+            return Err(self.not_here(&key.database));
+        };
         let fetch = {
             let mut views = lock(&self.views);
             let opened = views.entry(key.clone()).or_default();
@@ -391,6 +397,43 @@ impl Hq {
         }
         self.touch();
         Ok(())
+    }
+
+    /// Why a session of `database` this device does not hold cannot open:
+    /// still arriving — the replicas on disk are still opening, or a round
+    /// may bring it — or not coming. Reads the configuration only.
+    fn not_here(&self, database: &str) -> HqError {
+        let inner = lock(&self.inner);
+        match &inner.local_open {
+            // Not open yet is not absent, whatever the configuration says.
+            LocalOpen::Opening => {
+                return HqError::Arriving(
+                    "keeper is still opening the conversations on this device.".to_owned(),
+                )
+            }
+            LocalOpen::Failed(why) => {
+                return HqError::Sentence(format!(
+                    "keeper could not open the conversations on this device: {why}"
+                ))
+            }
+            LocalOpen::Open => {}
+        }
+        let (Some(server), Some(_)) = (&inner.server, &inner.pairing) else {
+            // Nothing syncs, so what is not here does not come.
+            return HqError::Sentence("This conversation is not on this device.".to_owned());
+        };
+        if inner.authorization.removed {
+            return HqError::Sentence(phase_sentence(HqPhase::Removed, Some(server.host()), 0));
+        }
+        if inner.discovering || inner.authorization.open.iter().any(|open| open == database) {
+            return HqError::Arriving(format!(
+                "This conversation has not reached this device yet; it opens here when {database} \
+                 brings it."
+            ));
+        }
+        HqError::Sentence(format!(
+            "{database} is not open to this device, so this conversation cannot come here."
+        ))
     }
 
     /// A stream stops showing `key`; with none left its widened months go,
