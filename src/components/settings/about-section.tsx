@@ -117,7 +117,7 @@ const SEND_LOG_NEEDS_ACCOUNT =
 export const MACOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
   "Speech is recognised on this Mac itself and never sent to a server; a language whose on-device recogniser is not installed is refused, not uploaded.",
   "The microphone is open only while voice is on — after you press Talk, the hotkey or the tray item, or while it listens for your wake phrase — and the system microphone indicator shows it.",
-  "Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.",
+  "Nothing is recorded or uploaded; what you said reaches only the agents server you configured, as text, for the agent you chose.",
   "keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.",
 ];
 

@@ -443,7 +443,7 @@ pub fn forge_egress(
 
 /// The row an egress list carries for the push gateway (98.1 #8, Q6).
 pub const PUSH_GATEWAY_LABEL: &str =
-    "Push gateway — your homeserver sends it event ids for this device";
+    "Push gateway — the agents server sends it ids for this device";
 
 /// The push gateway the person named (98.1 #8, Q6; NFR-121), as one
 /// [`EgressKind::PushGateway`] row: its host, and its port when the address
@@ -475,7 +475,7 @@ pub fn push_egress(stored: Option<&str>) -> Vec<EgressEndpointVm> {
 /// it: once per endpoint, to ask whether it is a Matrix gateway.
 pub fn unifiedpush_label(distributor: &crate::agents::unifiedpush::Distributor) -> String {
     format!(
-        "UnifiedPush server of {} — keeper asks it, once per address, whether it is a Matrix push gateway; your homeserver sends it event ids for this device",
+        "UnifiedPush server of {} — keeper asks it, once per address, whether it is a Matrix push gateway; the agents server sends it ids for this device",
         distributor.named()
     )
 }

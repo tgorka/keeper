@@ -6,7 +6,7 @@ This document is the canonical, diffable record of every network destination kee
 and it is enforced in two ways:
 
 1. **In the app.** Settings → About renders the *live* egress list, computed in Rust from your
-   actual signed-in accounts, folder-sync profiles, bot providers and local observability
+   actual signed-in accounts, folder-sync profiles, model providers and local observability
    policy (`egress::compute_egress`, wired through `egress_list`). Entries derive from
    the same accounts, profiles, providers and consent/study state that control those
    features, rather than a hand-maintained account or folder list. The `api.beeper.com`
@@ -23,18 +23,16 @@ and it is enforced in two ways:
 | Each account's **Matrix homeserver** (e.g. `https://matrix.example.org`) | One entry per distinct homeserver you are signed into (duplicates collapse to one) | All Matrix protocol traffic — sync, sending, media, key backup, verification. |
 | **`api.beeper.com`** | Only when at least one account is a Beeper account (by provider tag **or** by homeserver host `matrix.beeper.com`) | Beeper's unofficial email-code login and account service. Appears exactly once. |
 | Each sync profile's **git remote host** (e.g. `github.com`, `forgejo.example.org`) | One entry per distinct remote *host* across your folder-sync profiles (duplicates collapse to one); absent entirely for a profile whose remote is a local path or a pendrive, which reaches no network | Fetch, push and LFS transfer for that folder. Only the **host** is shown — never the repository path, the username, or a credential that a badly-stored profile put in the URL. See `egress::remote_host`. |
-| Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes, Ollama or OpenAI-compatible (`openai`) endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
+| Each configured **model provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across Settings › Notes › *Model providers* (duplicates collapse to one), labelled *Notes search provider*; absent entirely when no provider is configured, which is how keeper ships | Embeddings for notes search, the model list its picker reads, and *Test*, against the Hermes, Ollama or OpenAI-compatible (`openai`) endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
 | Each **organisation account destination** (e.g. `id.acme.dev`, `git.acme.dev`) | Only while an account is set up in Settings › Account (`~/.keeper/account.toml`); absent entirely without one, which is how keeper ships. One entry per distinct host the account's descriptor names: its identity provider and any endpoint it overrides, the address the setup link was read from (while keeper still knows it), the settings repository and its `api_base`, and in `oauth` mode the forge's own sign-in | Sign-in, token refresh and sign-out against the identity provider; fetch and push of your own directory in the settings repository; reading the descriptor once when you paste or open a setup link (HTTPS only, no redirects, 64 KiB cap). The push includes **this device's log**: the newest 512 KB of `keeper.log`, cut at a line, replacing `<login>/logs/<device>.log`, where everyone with access to the repository can read it. Before it leaves, every line is scrubbed: your home folder is written as `~`, and URL user names and passwords, credential-named query and fragment parameters (`access_token`, `code`, `client_secret`, …) and `Authorization`, `Bearer` and `Basic` values as `***`. The rest of the log goes as it is — account and Matrix ids, device and microphone names, paths outside your home folder, error text. It goes once a day while **Send this device's log to your account daily** in Settings › About (`diagnostics.log_upload`) is on, which it is unless switched off, and whenever you press **Send log now** there. See `docs/account.md` § *This device's log*. Only the **host** is shown. The identity provider's discovery document may name further hosts (for example a `jwks_uri` on a CDN); those are the provider's choice and are reached only as it names them. See `egress::org_account_egress`. |
 | **GitHub, for browsing repositories** (`api.github.com`; also `github.com` with a connection) | Only while GitHub is a repository source in use. While the account's descriptor names a GitHub broker (`[github_broker]`): `api.github.com`, the host the broker's tokens are sent to. While this device holds a GitHub connection made with *Connect GitHub*: that source's web host and API host, `github.com` and `api.github.com`. Absent otherwise, which is how keeper ships, since keeper's own GitHub app is not registered yet | `api.github.com`: listing the repositories the person may reach (`/installation/repositories` with a broker's token; `/user` and `/user/repos` with a connection). `github.com`: *Connect GitHub*'s device code, the wait for approval, and the refresh of an expiring connection. A GitHub drive's git and LFS traffic is the sync-remote row above. Only the **host** is shown, labelled *`<source name>` repositories* (*GitHub repositories* for the `github` source). See `egress::forge_egress` and the browsing chapter below. |
 | **The GitHub broker's host** (e.g. `broker.acme.dev`) | Only while the account's descriptor names `[github_broker]`; absent without an account | `GET /v1/whoami` and `POST /v1/token`, each carrying the account's sign-in access token, to get one-hour GitHub tokens for listing and for GitHub drives. See `docs/account.md` § *GitHub through your organization's broker*. Only the **host** is shown, labelled *GitHub access broker*. See `egress::forge_egress`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | On a cadence while the app runs (about every 6 hours, starting 2 minutes after launch) while **Update automatically** is on, and on every "Check for updates" click. Off — the switch in Settings → About, or `update.auto = false` in a config file — leaves the click as the only time it is contacted | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | While an update is downloading: either one the user chose to install, or one the background updater found while **Update automatically** is on | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
 | **`api.github.com/repos/tgorka/keeper/releases/latest`** (the phone tier's release check) | Only on an iPhone or Android build, and only when the person presses **Check for updates** in Settings › About; listed there instead of the desktop updater's `latest.json`, which these builds never contact | Reads the latest release's tag, unauthenticated, with a 15-second timeout and a 1 MiB cap, to say whether a newer keeper is out (story 102.9, R464). Downloads and installs nothing — a new build is installed from the Mac. |
-| Each **MCP server this Mac's agents use** (e.g. `notes.example.org`, `127.0.0.1:8931`) | Only while Settings › Agents › *MCP servers* names one, which is how keeper does not ship; one entry per distinct host and port. A server keeper starts as a program is listed as *A program you configured: `<program>`*, once per program — never folded into a host of the same name | `initialize`, `tools/list` at each renewal of the Mac's host manifest (60 s) while it hosts agents, and each call an agent that lists the server makes — tiered, audited and checked against the server's `readers` first (docs/agents.md § *MCP servers*). Only the **host** is shown, never the path or the bearer token, which is sent to that host alone. A program reaches whatever it reaches with your rights; keeper cannot see where. See `egress::agent_egress`. |
-| **The web search engine this Mac's agents use** (e.g. `127.0.0.1:8888`, `search.example.org`) | Only while Settings › Agents › *Web search* names one, which is how keeper does not ship; one entry, its host and its port, never its path. Only agents a person set *Web search* to *Ask* or *Without asking* for send it anything (docs/agents.md § *Searching the web*) | Each `web_search` call: `GET <url>/search?q=<query>&format=json`, following no redirect. The query is the agent's words, so it leaves the Mac — from a session whose label names its readers only after a person approves that exact query to that engine (R428), unless a person chose *Without asking* for that agent (R457); a session whose label is `local_only` sends none. What comes back reaches the model as outside data, at most 10 results. |
-| **The agents server you run** (e.g. `agents.example.org`, `100.64.0.7:8790`) | Only while Settings › Agents › *Agents server* (`agents.server_url`) holds an address keeper contacts — keeper ships none (D-4, AD-418); one entry, its host and its port when the address names one, never its path, however many of its databases this device holds; absent when the setting is blank or refused. Requests start only once this device is paired with it | `GET /databases` at every start and after pairing (which databases this device's token opens), `POST /pair/redeem` once with the code you typed or the QR you scanned and confirmed, `POST /pair/start` when you press *Add a device*, `POST /clients/{id}/revoke` when you remove a device, and per database `<base>/<database>/sync` rounds (one at least every 5 s while paired, backing off to one a minute when the server cannot be reached) plus one WebSocket at `<base>/<database>/realtime`. Every request carries this device's token, which lives only in the keychain. Blob and segment URLs the server hands out are fetched only on the server's own host and port; one naming any other host is refused, so this row is the whole of it. When the address changes or is cleared, the old host stays listed until its last request has ended. Once the server refuses the token (the device was removed) keeper sends it nothing more, after a restart too, until the device is paired again |
-| **The push gateway you run** (e.g. `push.example.org`, `push.example.org:8443`) | Only on a phone, only while Settings › Notifications › *Push gateway* (`push.gateway_url`) holds an address keeper registers — `https://`, no user name or password, the push path — which is how keeper does not ship; one entry, the host and the port when the address names one, labelled *Push gateway — your homeserver sends it event ids for this device* | keeper itself never contacts it. It registers the address with each signed-in homeserver as this phone's `event_id_only` pusher (iPhone, Epic 98 story 98.1, `docs/ios.md` § *Push*), and the **homeserver** sends it, for this device, the event id of every message of that account that would notify, which it relays to Apple's push service; the notification's words are decrypted on the phone, which shows only agents' approval requests and your own agent's answers and discards the rest. Only the host is shown, never the path. See `egress::push_egress`. |
-| **Your UnifiedPush server** (e.g. `ntfy.example.org`) — Android | Only on Android, only after you confirmed a UnifiedPush distributor in Settings › Notifications and it gave keeper an endpoint (kept as `unifiedpush-endpoint` in the data directory); one entry, the endpoint's host and its port when it names one, labelled with the distributor by name and package — *UnifiedPush server of ntfy (io.heckel.ntfy) — keeper asks it, once per address, whether it is a Matrix push gateway; your homeserver sends it event ids for this device* | Unlike the iPhone's gateway, **keeper itself contacts it**, once per endpoint: `GET https://<host>/_matrix/push/v1/notify`, no redirects followed, 10 s, answer read up to 16 KiB — asking whether it is a Matrix push gateway (`agents::unifiedpush::discover_gateway`, story 98.4). When it answers so, keeper registers that same address with each signed-in homeserver holding agent rooms as this device's `event_id_only` pusher, and the **homeserver** sends it the event id of every message of that account that would notify, which it forwards to the distributor on this device; keeper reads the event itself and shows only agents' approval requests and your own agent's answers. The endpoint's path and query are a secret (anyone holding them can post to this device) and are never shown. See `egress::unifiedpush_egress`, `docs/android.md` § *Push*. |
+| **The agents server you run** (e.g. `agents.example.org`, `100.64.0.7:8790`) | Only while Settings › Agents & voice › *Agents server* (`agents.server_url`) holds an address keeper contacts — keeper ships none (D-4, AD-418); one entry, its host and its port when the address names one, never its path, however many of its databases this device holds; absent when the setting is blank or refused. Requests start only once this device is paired with it | `GET /databases` at every start and after pairing (which databases this device's token opens), `POST /pair/redeem` once with the code you typed or the QR you scanned and confirmed, `POST /pair/start` when you press *Add a device*, `POST /clients/{id}/revoke` when you remove a device, `PUT`/`DELETE /clients/self/push-target` on a phone when its push gateway or endpoint changes (`docs/agents.md` § *A push from the agents server*), and per database: `<base>/<database>/sync` rounds (one at least every 5 s while paired, backing off to one a minute when the server cannot be reached) and one WebSocket at `<base>/<database>/realtime`, which carries the rows and presence — who is online, and an answer as it streams; an attachment's upload (`POST …/upload-grant`, then `PUT <base>/<database>/blobs/<blobId>`) before the message that names it, and its download when you open it; and, on a phone, `GET <base>/<database>/push/item/{kind}/{id}` for the one item a push names. Every request carries this device's token, which lives only in the keychain. Blob and segment URLs the server hands out are fetched only on the server's own host and port; one naming any other host is refused, so this row is the whole of it. When the address changes or is cleared, the old host stays listed until its last request has ended. Once the server refuses the token (the device was removed) keeper sends it nothing more, after a restart too, until the device is paired again |
+| **The push gateway you run** (e.g. `push.example.org`, `push.example.org:8443`) | Only on a phone, only while Settings › Notifications › *Push gateway* (`push.gateway_url`) holds an address keeper registers — `https://`, no user name or password, the push path — which is how keeper does not ship; one entry, the host and the port when the address names one, labelled *Push gateway — the agents server sends it ids for this device* | keeper itself never contacts it. It sends the address to the agents server as this device's push target (the row above, iPhone, `docs/ios.md` § *Push*), and the **agents server** sends it ids only — the database, the session, the kind and the item, never words — which it relays to Apple's push service. The phone reads the item from the agents server with its own token and shows only an approval waiting for you or your own agent's answer (`docs/agents.md` § *A push from the agents server*). keeper registers no pusher with a homeserver: one an older build registered is removed from each account (DW-E108-1). Only the host is shown, never the path. See `egress::push_egress`. |
+| **Your UnifiedPush server** (e.g. `ntfy.example.org`) — Android | Only on Android, only after you confirmed a UnifiedPush distributor in Settings › Notifications and it gave keeper an endpoint (kept as `unifiedpush-endpoint` in the data directory); one entry, the endpoint's host and its port when it names one, labelled with the distributor by name and package — *UnifiedPush server of ntfy (io.heckel.ntfy) — keeper asks it, once per address, whether it is a Matrix push gateway; the agents server sends it ids for this device* | Unlike the iPhone's gateway, **keeper itself contacts it**, once per endpoint: `GET https://<host>/_matrix/push/v1/notify`, no redirects followed, 10 s, answer read up to 16 KiB — asking whether it is a Matrix push gateway (`agents::unifiedpush::discover_gateway`, story 98.4). The agents server's push uses that gateway shape. When it answers so, keeper sends that same address to the agents server as this device's push target, and the **agents server** sends it ids only, which it forwards to the distributor on this device; keeper reads the item from the agents server and shows only an approval waiting for you or your own agent's answer. keeper registers no pusher with a homeserver: one an older build registered is removed from each account (DW-E108-1). The endpoint's path and query are a secret (anyone holding them can post to this device) and are never shown. See `egress::unifiedpush_egress`, `docs/android.md` § *Push*. |
 | **`us.i.posthog.com`** | Only when configured and a relevant local observability category is enabled, or an explicitly started synthetic study is active; all default off | Closed diagnostic/product observations, OTLP diagnostic records/traces, separately consented public remote configuration, or content-isolated synthetic study replay/heatmaps. No raw app log export. See the consent boundary below. |
 
 ### The folder-sync daemon
@@ -57,24 +55,13 @@ the download against the `.sha256` published beside it. That authenticates the t
 publisher — a weaker guarantee than the app's minisign check, stated plainly rather than implied
 to be equivalent.
 
-### The agents' Linux host
+### The agents' hosts
 
-`keeper-agentd` (docs/agents.md § *keeper-agentd*) reaches only what its `agentd.toml` names, and
-registers no telemetry or export of any kind — no PostHog, no OTLP; `bun run check:agentd-lean`
-keeps those crates out of its build.
-
-| Destination | When | Why |
-| --- | --- | --- |
-| **`[homeserver].url`'s host** | While `run` serves, and on `init` and `login` | The agents' Matrix traffic: each copy's sign-in, `/sync`, the rooms it joins, the anchors and edits of its answers, its status anchor. One homeserver per host; agentd listens on nothing. |
-| **Each `[[providers]] base_url`'s host** | Each turn of an agent whose `[model].bot` names that provider, and the model probe while arming it | Chat completions for the agent's own model, the one the person chose for it. Only providers the file names are reached; a session whose label is `local_only` reaches none but a local (`ollama`) one. |
-| **Each `[[drives]] remote`'s host**, and the LFS destinations the daemon rows above describe | Each drive's checkout and every sync while `run` serves | Fetch and push of the drives, through agentd's own engine: the sessions' logs and artifacts reach the drive this way. |
-| **A host an approved `run` with network names** (docs/agents.md § *Running a command*) | Only after a person approves that one run | Whatever its program reaches — keeper cannot list it ahead, so each such run is approved on its own (T3), and that approval is the person configuring that destination (NFR-121). The run sees only its session's `workspace/`, exactly as its card listed it; no drive, no `.keeper/`, no credential of the host's. The same holds on the Mac. |
-| **Each `[[mcp]] url`'s host** (docs/agents.md § *MCP servers*) | Connecting (`initialize`, `notifications/initialized`) at start and again whenever the connection was lost; `tools/list` beside every manifest renewal (60 s), whenever the server says its tools changed, and before an approval of one of its tools is used; each call an agent that lists the server makes, and a `notifications/cancelled` when that call is stopped or times out | The MCP servers the file names: only those, never one a drive or a session names. Each call is tiered, audited and checked against the server's `readers` before it is sent; a `credential` is sent to that host alone, and redirects are not followed. |
-| **Each `[[kvm]] url`'s host** (docs/agents.md § *Another machine through a KVM*) | Each `kvm_snapshot`, and each `kvm_act` a person approved together with the fresh frame read before it is used | A classic NanoKVM keeper speaks itself: its login, one MJPEG frame, the WebSocket inputs and the paste and power requests, all over TLS pinned by the entry's `fingerprint`. Each input is checked against the entry's `readers` before anything is sent; a NanoKVM-Go is reached as its `[[mcp]] url` row above. |
-| **`[web_search] url`'s host** (docs/agents.md § *Searching the web*) | Each `web_search` call of an agent whose `[tools].allow` names it | `GET <url>/search?q=<query>&format=json` to the SearXNG the operator named — on electra `http://127.0.0.1:5191`, written by makistack — following no redirect, at most 10 s and 2 MiB. The query is the agent's words: from a session whose label names its readers it is sent only after a person approves that exact query to that engine (R428), unless a person chose *Without asking* for that agent (`[web_search] ask = false`, R457); a `local_only` session sends none. |
-| **Whatever a `[[mcp]] command` program reaches** | While `run` serves | A program you configured, started as agentd's child with agentd's rights: keeper cannot see where it connects, so its tools are never below T2. |
-
-No other destination: no update check, and no telemetry destination at all.
+keeper runs no agent, so no agent's traffic is keeper's. The agents run in keeper-hq's containers
+(`docs/agents.md`): what they reach — the model provider, the open web, the Paseo broker, MCP
+servers — is keeper-hq's and its operator's to disclose, in keeper-hq's documentation and
+makistack's `docs/runbooks/keeper-agents.md`. From keeper the only agents destination is the
+agents server row above.
 
 ## Bridges add no distinct egress
 
@@ -192,25 +179,25 @@ can be checked against the code (`keeper-core/src/forges/`, the shell's `forge_i
   (`/app/installations/…/access_tokens`) and the identity provider's JWKS. Those are the
   broker's destinations, not keeper's.
 
-## An AI provider is a destination you typed, disclosed as a host
+## A model provider is a destination you typed, disclosed as a host
 
-The Bots surface (⌘9, Epic 61) talks to a model over the OpenAI-compatible wire, and a model
-lives at an endpoint. That endpoint is the one destination in this document that **exists only
-because you typed it**: keeper ships no default endpoint, no hosted model and no proxy of its own,
-so a fresh install has no provider row here at all, and adding one in Settings → Bots is the act
-that creates the destination. Removing the provider removes the row on the next open, with no
-cache to go stale. Like the consent boundary below, this makes the destination explicit:
+Notes search asks a model for the meaning of your notes, over the OpenAI-compatible wire, and a
+model lives at an endpoint (Epic 61's providers, kept for notes search when Story 108.3a removed
+the ⌘9 bots). That endpoint **exists only because you typed it**: keeper ships no default
+endpoint, no hosted model and no proxy of its own, so a fresh install has no provider row here at
+all, and adding one in Settings › Notes › *Model providers* is the act that creates the
+destination. Removing the provider removes the row on the next open, with no cache to go stale. Like the consent boundary below, this makes the destination explicit:
 keeper sends only the declared feature's data to the listed server. Adding an AI
 provider does not enable observability or approve AI analysis of diagnostics or replay.
 The provider reasoning is recorded as `docs/decisions.md` D-4.
 
-The row is **derived, never hand-written**. `EgressKind::BotProvider` is computed by
-`egress::compute_egress` from `bots::store::provider_base_urls`, read from the same store the
-chat itself reads, exactly as the git-remote rows are read from the sync profiles the engine
+The row is **derived, never hand-written**. `EgressKind::ModelProvider` is computed by
+`egress::compute_egress` from `providers::store::provider_base_urls`, read from the same store
+notes search reads, exactly as the git-remote rows are read from the sync profiles the engine
 drives (AD-53). And it is reduced by the **same** `egress::remote_host` a git remote goes
 through — not a second reduction that would have to be kept in step with it — so the list shows
 `gw.example.org`, not `https://gw.example.org/v1` and not `/p/<profile>/v1`. The base-URL grammar
-in `bots::url` already refuses userinfo and a query string, so a credential cannot legally reach
+in `providers::url` already refuses userinfo and a query string, so a credential cannot legally reach
 this function from a provider row; it is stripped anyway, because Settings → About is a screen
 people share and the row that leaks a token is the one written by a build whose grammar was
 looser than this one. Two providers on one host are one entry, for the reason the sync-remote
@@ -221,7 +208,7 @@ Ollama's documentation points every user at `http://localhost:11434`; Hermes' ap
 `127.0.0.1:8642` by default. A blocklist over private ranges — the standard SSRF advice for a
 server accepting arbitrary URLs — would reject the endpoints the feature exists to reach, so
 keeper answers the SSRF question the way it answers every other reach-outside question: by
-disclosure plus an explicit user act. `bots::url::parse_base_url` accepts a loopback, private or
+disclosure plus an explicit user act. `providers::url::parse_base_url` accepts a loopback, private or
 link-local host and marks it `is_private` so the surface can say which side of your network the
 bytes stay on; the About list then shows `localhost` or `127.0.0.1` as a row like any other. A
 row that reads `127.0.0.1` is the list telling you the bytes did not leave the machine, which is
@@ -236,17 +223,16 @@ reductions are unit-tested beside the git-remote cases in `keeper-core::egress` 
 de-duplicated, ordered after the sync remotes and before the update endpoint, and gone entirely
 when the last provider is removed.
 
-From Epic 67 (AD-205, AD-211) until Story 108.3 a *spoken* question reached this same endpoint
-from Rust, through the ⌘9 bots' turn. Since 108.2 and 108.3 it is a message to an agent in the
-agents' database, written through `keeper_core::hq`; the model is the agent runtime's, in
-keeper-hq, so keeper sends nothing new to this endpoint for it — and the lock-screen banner that says what was heard is a
-local notification posted by the app process with no trigger and no push
-(`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,
-no token), so the row above is unchanged and no row is added.
+A *spoken* question does not reach this endpoint. It is a message to an agent in the agents'
+database, written through `keeper_core::hq` (`docs/agents.md` § *Talking to an agent*), and the
+model that answers it is the agent's, run by keeper-hq. The lock-screen banner that says what was
+heard is a local notification posted by the app process with no trigger and no push
+(`crates/keeper/src/voice_notify.rs:198-213`, `UNUserNotificationCenter` in-process; no APNs, no
+token), so no row is added.
 
 Since Epic 76 (AD-264, NFR-67) the notes search index can ask this same endpoint for
 **embeddings** — `POST /v1/embeddings` on the provider a person chose in Settings → Notes
-search, sent from `keeper-core::bots::embed` on the same client with the same host — and it is
+search, sent from `keeper-core::providers::embed` on the same client with the same host — and it is
 the *only* place a note's text ever leaves the process: one chunk of a note per input, in
 batches of at most 32, and never while no embedding model is chosen. keeper ships no model,
 downloads no weights, and adds no destination (huggingface.co and its kin are refused by D-4 and
@@ -257,10 +243,10 @@ Since Epic 89 (AD-369, NFR-121) a provider may be of a third kind, `openai`: any
 OpenAI-compatible endpoint, such as a CLIProxyAPI on your own tailnet. It adds **no row of its
 own**. It is a provider row like the other two — the host of the base URL you typed, through the
 same `egress::remote_host`, port and path dropped — and every request it makes goes to that host:
-`GET /v1/models` for *Test*, the model list and a bot probe (the dialect has no health or version
-route, and `/v1/models` is the one route it cannot lack), and `POST /v1/chat/completions` for a
-turn. No path gains a profile prefix. keeper ships no default for it either (D-4): the endpoint is
-yours. What the gateway does with a turn — which upstream it forwards to — is the gateway's
+`GET /v1/models` for *Test* and the model list (the dialect has no health or version route, and
+`/v1/models` is the one route it cannot lack), and `POST /v1/embeddings` for notes search. No path
+gains a profile prefix. keeper ships no default for it either (D-4): the endpoint is yours. What
+the gateway does with a request — which upstream it forwards to — is the gateway's
 configuration and not keeper's to disclose; keeper lists where *its* bytes go, and they go to the
 host you typed. `egress::tests::an_openai_provider_discloses_exactly_its_host_once` pins the one
 row.
@@ -313,9 +299,10 @@ and lives outside that set.
 ## Voice adds no egress
 
 Talk mode (Epic 62 on the phone, Epic 63 on the Mac) turns speech into text, sends that text to
-the bot as an ordinary message, and speaks the answer — and none of the three steps contacts a
-network host the table above does not already name. The message goes to the provider row you
-typed, exactly as a typed message would. Recognition is Apple's on-device recogniser: every
+an agent as an ordinary message, and speaks the answer — and none of the three steps contacts a
+network host the table above does not already name. The message is a row in the agents' database,
+sent to the agents server row exactly as a typed message would be (`docs/agents.md` § *Talking to
+an agent*). Recognition is Apple's on-device recogniser: every
 request either port builds sets `requiresOnDeviceRecognition = true`, and the port checks the
 recogniser's `supportsOnDeviceRecognition` before it builds one. Apple's recogniser will
 otherwise fall back to Apple's servers, and that fallback would be a destination this file does
@@ -362,7 +349,7 @@ and fails when the two lists differ. Edit both together or neither.
 
 - Speech is recognised on this Mac itself and never sent to a server; a language whose on-device recogniser is not installed is refused, not uploaded.
 - The microphone is open only while voice is on — after you press Talk, the hotkey or the tray item, or while it listens for your wake phrase — and the system microphone indicator shows it.
-- Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.
+- Nothing is recorded or uploaded; what you said reaches only the agents server you configured, as text, for the agent you chose.
 - keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.
 
 The Android port (`crates/keeper/src/voice_android.rs` over `gen/android/…/VoicePlugin.kt`,
@@ -396,14 +383,11 @@ in another language's voice and never sent anywhere to be spoken. The binding is
 described above covers it: `voice_on_device` reads `voice_macos.rs` and `voice_ios.rs` off
 disk and fails the build if a network API appears in either.
 
-One request body changes, to a row this file already lists. A turn that began by voice carries
-one extra system sentence to the provider host you typed — *"The person asked this aloud and
-your answer will be read aloud to them. Answer in Polish (pl-PL)."* (`speech.rs:112-117`),
-prepended in `src-tauri/crates/keeper/src/bots_ipc.rs:1155-1168` only when the voice turn is
-the one awaiting this send. A typed turn adds nothing and its body is byte-identical to before,
-which `keeper-core/tests/bots_remote_session.rs:631` asserts through the fake gateway. The sentence
-names the listening language, which is already a setting on that device; it discloses nothing
-the provider did not receive as the question itself.
+No request body changes for a spoken question. It is written as the words the voice turn heard,
+with no metadata and no extra sentence, exactly as a typed message is
+(`keeper-core/src/hq/spoken.rs:579-630`), so the agents server receives nothing a typed question
+would not carry. Which language the answer is spoken in is chosen on the device from the answer's
+own text, as above.
 
 The audio level (Story 64.3, AD-186) never leaves the process either. The input tap that hands
 every buffer to the recogniser also reads the same buffer's samples and computes an RMS in
@@ -419,73 +403,21 @@ before the meter looks at it.
 Epic 65 adds nothing to the table above (AD-196): the voice port's record is a bounded ring in
 memory (`keeper-core/src/voice/events.rs:8-9`, `:26` — 200 entries, nothing written to disk,
 read back by the `voice_events` command in `src-tauri/crates/keeper/src/voice_log.rs:81` and
-shown under Settings → Bots on the phone with the sentence "Kept in memory only — nothing is
-written or sent", `src/components/settings/bots-section.tsx:188-189`), and the Live Activity
+shown under Settings › Agents & voice › *Voice* on the phone with the sentence "Kept in memory
+only — nothing is written or sent", `src/components/settings/voice-section.tsx:46-47`), and the
+Live Activity
 is started, updated and ended from the app process with `pushType: nil`
 (`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs push
 for the activity and no push token for it; the app's push entitlement and App Group (Epic 98)
-are for push — agents' approval requests and your own agent's answers, through the gateway row above (`docs/ios.md` § *Push*) — never the island — so nothing about what the phone heard leaves the device
+are for push — agents' approval requests and your own agent's answers, through the gateway row
+above (`docs/ios.md` § *Push*) — never the island — so nothing about what the phone heard leaves
+the device
 (Apple, `Activity.request(attributes:content:pushType:)`,
 `https://developer.apple.com/documentation/activitykit/activity`, and *Displaying live data
 with Live Activities*, both read 2026-09-05; Epic 65, AD-194, AD-196). The `voice_on_device`
 source scan described above picks up every `voice*.rs` in the shell crate by prefix
 (`keeper-core/tests/voice_on_device.rs:38-56`), so the island's Rust side (`voice_island.rs`)
 is inside the network-API scan without being named.
-
-## One conversation on two devices adds no egress
-
-Epic 63 lets a conversation started on the phone be read and followed on the Mac, and the other
-way round, and it adds **no destination**: every request it makes goes to the Hermes host that
-is already the provider row above (AD-178). What changed is how much of that host keeper reads.
-Stated so the per-release diff of this file can be checked against the code:
-
-| Request | Added by | Purpose |
-| --- | --- | --- |
-| `GET /v1/capabilities` | Story 63.6 (`keeper-core/src/bots/remote.rs:71`, `:179-216`) | Once per provider: does this Hermes keep sessions and honour the continuity header. An endpoint that answers nothing, a non-success status or non-JSON is an endpoint without the feature, and keeper behaves as it did before. Never sent to an Ollama endpoint. |
-| `X-Hermes-Session-Id` on the existing chat request | Story 63.6 (`remote.rs:68`, `:113-118`) | Names the session a turn continues, so two devices land in one Hermes session instead of minting one each. A header on a request this file already lists, not a new request. |
-| `GET /api/sessions` | Story 63.6 (`remote.rs:74`, `:334-348`) | The session list, read when the endpoint said it has one; `keeper.db` alone when it did not. |
-| `GET /api/sessions/{id}/messages` | Story 63.6 on open, re-read by Story 63.7 while a session is live elsewhere (`remote.rs:392-393`; `keeper-core/src/bots/follow.rs:13-22`) | The transcript. Following another device's turn is this same read repeated at 2 s, 5 s, then 15 s intervals and stopped after five quiet minutes (`follow.rs:44-63`); keeper never opens `GET /v1/runs/{id}/events` against a run it did not start, because that queue is destructive and a second reader steals from the first (`follow.rs:7-11`, AD-177). |
-
-### Why the token-by-token mirror is a destination change, and is not built
-
-The owner asked to see the other device's transcript grow word by word. Hermes cannot serve
-that (the queue above), and the only route that can is relaying the live transcript into a
-Matrix room, as one message per turn edited in place with `m.replace` as tokens arrive. **That
-adds no host** — the homeserver is already the first row of the table above — **and it is still
-a change to this file**, because this file is the answer to *where do these bytes go*, and a
-relay changes the answer for transcripts: today a conversation persists on the Hermes host you
-typed and in `keeper.db`; relayed, it also persists on the homeserver, in a room, in every
-device's key backup, and in every server the room is federated to. Under NFR-11 a new place
-transcripts *live* is an architecture-level change even when it is not a new place keeper
-*connects*, so it is recorded here as refused-for-now with its arithmetic, and in the deferral
-ledger as DW-224, rather than attempted quietly.
-
-The arithmetic that makes it a bad trade today, on a default Synapse:
-
-- **Rate.** Synapse's default `rc_message` is `per_second: 0.2, burst_count: 10`
-  (Synapse, "Configuring Synapse", `rc_message`,
-  `https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html#rc_message`).
-  Sustained, that is one event every five seconds. A relay editing once per second spends its
-  burst of ten in 10 ÷ (1 − 0.2) = 12.5 seconds and is then throttled to one edit per five
-  seconds with `M_LIMIT_EXCEEDED` between — so a 1 Hz loop degrades after about twelve seconds
-  of a single answer, and every answer longer than that arrives in five-second lurches. Raising
-  the limit is a per-homeserver operator setting, which a client keeper cannot assume and a
-  Beeper account cannot change at all.
-- **Size.** An event is capped at 65536 bytes of canonical JSON (Matrix Client-Server API,
-  "Size limits", `https://spec.matrix.org/latest/client-server-api/#size-limits`), and an
-  `m.replace` edit carries the whole new body in `m.new_content`, not a delta. Each edit
-  re-sends everything said so far, so a transcript approaching the cap stops being editable
-  at all, and the bytes sent grow quadratically with the answer's length.
-- **Cleartext.** In an encrypted room the body is encrypted, but the relation is not:
-  `m.relates_to` on an edit is kept in the cleartext part of the event so the server can
-  aggregate it (Matrix Client-Server API, "Relationships between events",
-  `https://spec.matrix.org/latest/client-server-api/#forming-relationships-between-events`).
-  Every edit therefore tells the homeserver, in the clear, which message is being rewritten and
-  how often — the cadence of the model's output, which is metadata this file would have to
-  disclose as leaving the device.
-
-What ships instead is step-level following on the Hermes host already listed, and the
-interface says "following" rather than "streaming" (Story 63.7, AD-177).
 
 ## The observability consent boundary
 
@@ -502,11 +434,11 @@ host `us.posthog.com` is used only by separate maintainer tooling, not by the ap
 | Diagnostics | Closed readiness/interaction durations, a closed microphone-loss cause per recording (`removed`, `stalled` or `silent`), content-free operation traces, and — since epic 102 (R461) — every `WARN`/`ERROR` line keeper logs and every error the webview reports, as a `$exception` with level, target, file:line, a fingerprint and the message **redacted** (Matrix ids, emails, URL paths and queries, home-relative paths, hex runs ≥ 16, base64 runs ≥ 24, `syt_`/`phc_`/bearer tokens and values after `token=`/`key=`/`password=` removed; at most 1,000 characters); a line under an agent target leaves without its message | Unredacted text, stack payloads or a line's raw fields; an agent line's message or fields; the microphone's name or anything recorded |
 | Product statistics | Closed events for opening the command palette or settings | Search text, command names, setting values, person profiles or account identifiers |
 | Remote configuration | A request for the public `keeper-client-config` flag payload and a bounded support sentence | Collection, consent, security policy, destinations, grants, encryption changes or synchronized user preferences |
-| Synthetic usability study | Replay/heatmaps of a separate synthetic surface after explicit per-session start | Normal-app DOM or real account, drive, note, bot or recording content |
+| Synthetic usability study | Replay/heatmaps of a separate synthetic surface after explicit per-session start | Normal-app DOM or real account, drive, note, agent or recording content |
 
 Normal observations carry a random installation identifier, never a Matrix ID
 or email, and no implicit cross-device identity. Payloads exclude messages,
-filenames, local paths, notes, credentials, recordings, bot prompts/responses,
+filenames, local paths, notes, credentials, recordings, agent conversations,
 normal-app URLs, arbitrary DOM attributes, console values and network bodies.
 Recording sends no content and adds no destination, and on-device speech
 guarantees are unchanged; the one recording signal is the closed microphone-loss
