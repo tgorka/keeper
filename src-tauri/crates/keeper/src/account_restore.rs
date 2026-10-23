@@ -638,7 +638,7 @@ fn add_provider_state(
         .map_err(|error| format!("{}: {error}", state.base_url))?
         .normalized;
     let provider = Provider {
-        id: keeper_agent::turn::new_id(),
+        id: keeper_agent::sessions::new_id(),
         kind,
         name: state.name.clone(),
         base_url,

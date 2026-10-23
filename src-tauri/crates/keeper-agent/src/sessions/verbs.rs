@@ -356,7 +356,7 @@ fn create_with(
                 .collect();
         // Minted here rather than handed in: they name the seed files, not
         // the session, and nothing retries by them.
-        let ulids: Vec<String> = (0..3).map(|_| crate::turn::new_id()).collect();
+        let ulids: Vec<String> = (0..3).map(|_| crate::sessions::new_id()).collect();
         let seeds =
             template::default_template(&title, &date, &stamp, [&ulids[0], &ulids[1], &ulids[2]]);
         for file in seeds {

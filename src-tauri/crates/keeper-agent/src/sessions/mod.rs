@@ -11,6 +11,11 @@ pub mod write;
 
 use std::path::{Path, PathBuf};
 
+/// A fresh opaque id, in the shape every other keeper record uses.
+pub fn new_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
 /// Finish every interrupted plan in these zones, each under its lock — what a
 /// host does at start, before its first verb. Returns the zones whose plan
 /// could not be finished, with why; the rest are clean.
