@@ -89,7 +89,7 @@ describe("AccountSetupSheet", () => {
     expect(screen.queryByLabelText(SETUP_DEVICE_LABEL)).not.toBeInTheDocument();
     expect(
       screen.getByText(
-        "This device is already in your settings repository; keeper will restore its drives, bots and settings.",
+        "This device is already in your settings repository; keeper will restore its drives, model providers and settings.",
       ),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: SETUP_CONTINUE_LABEL }));

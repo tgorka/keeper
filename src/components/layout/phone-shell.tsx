@@ -31,15 +31,12 @@
  *
  * Story 62.2 (FR-397, FR-398, AD-163) gives the stack its first non-chat
  * surfaces, by the same rule: a level is derived from state that already
- * exists, here `primaryViewStore.view`. With no room selected, the Bots view
- * (gated on `capabilities.bots` — absent, not disabled, where false) and the
- * Settings view each push a level 1 over the Inbox with a "Back to Inbox"
- * bar, and Bots pushes its conversation as level 2 over its list — one thing
- * at a time, two views rather than two columns. A selected room outranks a
+ * exists, here `primaryViewStore.view`. With no room selected, a view such
+ * as Settings pushes a level 1 over the Inbox with a "Back to Inbox" bar —
+ * one thing at a time, views rather than columns. A selected room outranks a
  * view level: a notification tap lands on the Room, and popping it returns
  * to whatever view was under it. Back, edge-swipe and Escape pop these
- * levels through the same `onBack`; the Bots surface adds no navigation of
- * its own (`bots-phone-pane.tsx`). Settings' category (Story 102.8) is a
+ * levels through the same `onBack`. Settings' category (Story 102.8) is a
  * sub-level of its view level held here, so that same `onBack` returns a
  * category to the category list before it returns to the Inbox.
  *
@@ -61,9 +58,9 @@
  * one listing, one file — and keeps its own navigation inside the level, so
  * the stack sees one surface and pops it as a whole.
  *
- * Story 66.4 (FR-467…FR-469, AD-200) adds Notes as the Bots shape: the list at
- * level 1, the note at level 2 (`notes-phone-pane.tsx`), the second level
- * pushed through the same `pushedSurface` state the Bots conversation uses.
+ * Story 66.4 (FR-467…FR-469, AD-200) adds Notes: the list at level 1, the
+ * note at level 2 (`notes-phone-pane.tsx`), the second level pushed through
+ * the `pushedSurface` state.
  * Quick capture is a sheet mounted beside the drawer (`CapturePhoneSheet`).
  */
 import { RefreshCw, WifiOff } from "lucide-react";
@@ -82,7 +79,6 @@ import {
 import { AccountStatusPill, useAccountStatusShown } from "@/components/account/account-status-line";
 import { AgentsWindow } from "@/components/agents/agents-window";
 import { ApprovalPane } from "@/components/approval/approval-pane";
-import { BotsPhoneConversation, BotsPhoneList } from "@/components/bots/bots-phone-pane";
 import { CapturePhoneSheet } from "@/components/capture/capture-phone-sheet";
 import { FilesPhonePane } from "@/components/files/files-phone-pane";
 import { BridgesPane } from "@/components/layout/bridges-pane";
@@ -310,9 +306,9 @@ export function PhoneShell() {
 
   // Story 62.2 / 66.1 / 66.4: the view levels. With no room selected, a view
   // the phone has a surface for occupies level 1 (`phoneSurfaceFor` is the
-  // table; Bots, Sync, Files and Notes only where their capability is on —
-  // absent, never a dead level), and a surface's pushed second view — the
-  // Bots conversation, the open note — level 2. A selected room outranks them
+  // table; Sync, Files and Notes only where their capability is on — absent,
+  // never a dead level), and a surface's pushed second view — the open note,
+  // a session's board — level 2. A selected room outranks them
   // all: a notification tap must land on the Room.
   const view = usePrimaryView();
   const capabilities = useCapabilitiesStore((s) => s.capabilities);
@@ -412,7 +408,7 @@ export function PhoneShell() {
   }, [selected]);
 
   // Pop exactly one level: Detail closes back to the Room; the Room clears the
-  // selection back to the Inbox; the Bots conversation closes back to its list;
+  // selection back to the Inbox; a pushed second view closes back to its list;
   // a view level returns to the Inbox view. Read the stores imperatively so
   // the handler never closes over stale render state.
   const onBack = () => {
@@ -1050,8 +1046,8 @@ export function PhoneShell() {
       </StackLevel>
       {/* Story 62.2 / 66.1 — the view levels, occupying levels 1 and 2 only
           while no room is selected (the room levels above are closed then, so
-          the two families never share a level). Bots is the list, then the
-          conversation; Notes is the list, then the note (66.4); Sessions is
+          the two families never share a level). Notes is the list, then the
+          note (66.4); Sessions is
           the zone's sessions, then one session's board (98.2); Approvals,
           Bridges, Sync, Files and Settings are the same panes the desktop
           renders, under one "Back to Inbox" bar. A new surface is one more
@@ -1069,13 +1065,7 @@ export function PhoneShell() {
         className="absolute inset-0 z-10"
       >
         {level === 1 && edgeSwipeZone}
-        {shownSurface === "bots" ? (
-          <BotsPhoneList
-            onBack={onBack}
-            backRef={surfaceBack1Ref}
-            onOpen={() => setPushedSurface("bots")}
-          />
-        ) : shownSurface === "notes" ? (
+        {shownSurface === "notes" ? (
           <NotesPhoneList onBack={onBack} backRef={surfaceBack1Ref} onOpen={pushNotes} />
         ) : shownSurface === "sessions" ? (
           <SessionsPhoneList onBack={onBack} backRef={surfaceBack1Ref} onOpen={pushSession} />
@@ -1129,7 +1119,8 @@ export function PhoneShell() {
             level keeps drawing the pane that is leaving. */}
         {shownPushed === "notes" ? (
           <NotesPhoneNote onBack={onBack} backRef={surfaceBack2Ref} />
-        ) : shownPushed === "sessions" ? (
+        ) : (
+          shownPushed === "sessions" &&
           phoneSession !== null && (
             <SessionsPhoneBoard
               // Another session is another board: its page starts where the
@@ -1143,8 +1134,6 @@ export function PhoneShell() {
               onPageChange={rememberSessionPage}
             />
           )
-        ) : (
-          <BotsPhoneConversation onBack={onBack} backRef={surfaceBack2Ref} />
         )}
       </StackLevel>
       {/* The always-mounted leading nav drawer (Story 13.3); a portalled Sheet,

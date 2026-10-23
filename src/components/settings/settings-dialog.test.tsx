@@ -74,8 +74,6 @@ vi.mock("@/lib/ipc/client", () => ({
   notesServiceFileNamesSet: vi.fn((names: string[]) => Promise.resolve(names)),
   notesEmbeddingModelGet: vi.fn(() => Promise.resolve(null)),
   notesEmbeddingModelSet: vi.fn(() => Promise.resolve()),
-  botsProvidersList: vi.fn(() => Promise.resolve([])),
-  botsModelsList: vi.fn(() => Promise.resolve([])),
   dockBadgeModeGet: vi.fn(() => Promise.resolve("all")),
   dockBadgeModeSet: vi.fn(() => Promise.resolve()),
   notificationPermissionState: vi.fn(() => Promise.resolve("granted")),
@@ -160,7 +158,16 @@ vi.mock("@/lib/ipc/client", () => ({
     Promise.resolve({ kind: "unsupported", message: "voice is not available in this build" }),
   ),
   voiceWakeGet: vi.fn(() =>
-    Promise.resolve({ enabled: false, phrase: "hey nixie", limits: "limits" }),
+    Promise.resolve({
+      enabled: false,
+      phrase: "hey nixie",
+      limits: "limits",
+      locale: "en-US",
+      localeChosen: null,
+      onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: null,
+    }),
   ),
   voiceHotkeyGet: vi.fn(() =>
     Promise.resolve({
@@ -196,6 +203,27 @@ vi.mock("@/lib/ipc/client", () => ({
   logUploadSet: vi.fn((enabled: boolean) => Promise.resolve(enabled)),
   accountSendLog: vi.fn(),
   voiceEvents: vi.fn(() => Promise.resolve([])),
+  // Settings › Voice (Story 108.3a) mounts on every tier and draws itself
+  // away on `unsupported`; what it reads while it is drawn.
+  voiceWatch: vi.fn(() => Promise.resolve(1)),
+  voiceUnwatch: vi.fn(() => Promise.resolve()),
+  listenVoiceWake: vi.fn(() => Promise.resolve(() => {})),
+  voiceAgentTargets: vi.fn(() => Promise.resolve([])),
+  voiceOldTargetNoticeGet: vi.fn(() => Promise.resolve(null)),
+  voiceOldTargetNoticeDismiss: vi.fn(() => Promise.resolve()),
+  voiceTargetSet: vi.fn(),
+  voiceAuthorize: vi.fn(),
+  voiceStart: vi.fn(),
+  voiceStop: vi.fn(),
+  voiceLocaleSet: vi.fn(),
+  voiceWakeSet: vi.fn(),
+  // Settings › Model providers (Story 108.3a): no provider configured.
+  providersList: vi.fn(() => Promise.resolve([])),
+  providerSave: vi.fn(),
+  providerRemove: vi.fn(),
+  providerProbe: vi.fn(),
+  providerCredentialSourceGet: vi.fn(() => Promise.resolve(null)),
+  providerCredentialSourceSet: vi.fn(),
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
   iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),
@@ -244,12 +272,9 @@ vi.mock("@/lib/ipc/client", () => ({
   notesCaptureImpact: vi.fn(() => Promise.resolve([])),
   notesVaultSettingsSave: vi.fn(),
   capabilities: vi.fn(),
-  // Settings › Agents & bots: the old agent rooms' count (108.2) and Grants.
+  // Settings › Agents & voice: the old agent rooms' count (108.2).
   oldAgentRoomsGet: vi.fn(() => Promise.resolve({ remaining: 0, left: 0, failure: null })),
   oldAgentRoomsLeave: vi.fn(),
-  botsGrantsList: vi.fn(() => Promise.resolve({ grants: [], unknown: [] })),
-  botsBotsList: vi.fn(() => Promise.resolve([])),
-  botsAuditList: vi.fn(() => Promise.resolve([])),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins
@@ -404,8 +429,6 @@ const DESKTOP_CAPABILITIES = {
   sync: false,
   notes: false,
   sessions: false,
-  bots: false,
-  botTools: false,
   overlayTitleBar: false,
   transcription: false,
 };
@@ -1290,6 +1313,7 @@ describe("SettingsDialog", () => {
     expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
     await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
   });
+
   it("shows the old agent rooms the accounts are still in, on every tier, and leaves them (108.2)", async () => {
     vi.mocked(oldAgentRoomsGet).mockResolvedValueOnce({ remaining: 2, left: 0, failure: null });
     vi.mocked(oldAgentRoomsLeave).mockResolvedValueOnce({ remaining: 0, left: 2, failure: null });
@@ -1298,7 +1322,7 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(await screen.findByText(oldAgentRoomsSentence(2))).toBeInTheDocument();
-    showCategory("Agents & bots");
+    showCategory("Agents & voice");
     fireEvent.click(screen.getByRole("button", { name: OLD_AGENT_ROOMS_LEAVE }));
     expect(await screen.findByText(oldAgentRoomsLeftSentence(2))).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: OLD_AGENT_ROOMS_LEAVE })).toBeNull();

@@ -56,7 +56,6 @@ export function columnsUnfolded(): ColumnFold {
     "files-tree": false,
     "chat-list": false,
     "tasks-list": false,
-    "bots-list": false,
   };
 }
 

@@ -398,10 +398,10 @@ describe("AccountSection's settings line (Epic 84, UX-DR118)", () => {
         },
       });
     expect(accountSyncLine(offers(2, 1, 0))).toBe(
-      `${SYNCED} On your other devices: 2 drives, 1 bot provider.`,
+      `${SYNCED} On your other devices: 2 drives, 1 model provider.`,
     );
     expect(accountSyncLine(offers(1, 2, 3))).toBe(
-      `${SYNCED} On your other devices: 1 drive, 2 bot providers, 3 Matrix accounts.`,
+      `${SYNCED} On your other devices: 1 drive, 2 model providers, 3 Matrix accounts.`,
     );
     expect(accountSyncLine(offers(0, 0, 1))).toBe(
       `${SYNCED} On your other devices: 1 Matrix account.`,
@@ -410,7 +410,7 @@ describe("AccountSection's settings line (Epic 84, UX-DR118)", () => {
 });
 
 describe("AccountSection after a restore (Epic 85, UX-DR119)", () => {
-  const RESTORED = "Restored 2 drives, 1 bot provider and your settings from your account.";
+  const RESTORED = "Restored 2 drives, 1 model provider and your settings from your account.";
   const WAITING = "Waiting for /Volumes/Field to restore Field recordings.";
   const WAKE_OFF: VoiceWakeVm = {
     enabled: false,

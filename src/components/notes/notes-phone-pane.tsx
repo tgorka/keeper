@@ -5,9 +5,9 @@
  *
  * The desktop's Notes pane is three columns — scope, list, editor — and a
  * 390px viewport has room for one. So the surface is two stack levels in
- * `PhoneShell`, the Bots shape (Story 62.2): {@link NotesPhoneList} is level 1
- * over the Inbox and {@link NotesPhoneNote} is level 2 over the list, and the
- * shell's own back button, edge-swipe and Escape pop them. The scope column
+ * `PhoneShell`, the list-then-detail shape (Story 62.2): {@link NotesPhoneList}
+ * is level 1 over the Inbox and {@link NotesPhoneNote} is level 2 over the
+ * list, and the shell's own back button, edge-swipe and Escape pop them. The scope column
  * collapses to the vault switcher and shared filter bar; tags, search and the
  * visibility controls retain the desktop semantics with phone-sized targets.
  *
@@ -217,7 +217,7 @@ export function NotesPhoneList({
   // A note that becomes the active target while this level is showing — the
   // palette's New Note, Today's Journal, a wikilink from somewhere — pushes the
   // note level. Only a CHANGE pushes: re-entering Notes with a note still
-  // active from earlier lands on the list, which is the Bots rule too.
+  // active from earlier lands on the list, as every list level does.
   const noteKey = activeNote === null ? null : `${activeNote.vaultId}/${activeNote.noteId}`;
   const seenNoteKey = useRef(noteKey);
   useEffect(() => {

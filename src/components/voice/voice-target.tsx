@@ -1,63 +1,45 @@
 /**
- * Who a spoken turn talks to (Epic 67, Story 67.1, AD-206; AD-384).
+ * Who a spoken turn talks to (Epic 67, Story 67.1, AD-206; AD-384; 108.2).
  *
  * A turn the phrase started finishes in Rust with the screen locked
  * (AD-205), so where it goes cannot be read off the screen — there is
- * none — and is never guessed. It is chosen here: a select of the pinned
- * bots, then the person's agents — every agent of every agents' database
- * this device holds (108.2) — whose unset state is "the pinned bot most
- * recently talked to", the rule `keeper_core::bots::voice_target::resolve`
- * applies when nothing is chosen. The choice is `bots.voice_target` — a bot
- * id, or an agent's `agent:<agent>` — written through `voice_target_set` and
- * read back as
- * `VoiceWakeVm.voiceTarget`, so the desktop's Settings, the desktop pane's
- * voice fold and the phone's Bots sheet — every place {@link BotVoiceWake}
- * renders — show one answer.
+ * none — and is never guessed. It is chosen here: a select of the person's
+ * agents — every agent of every agents' database this device holds. The
+ * choice is `voice.target` — an agent's `agent:<agent>` — written through
+ * `voice_target_set` and read back as `VoiceWakeVm.voiceTarget`; unset, a
+ * spoken turn is refused with `keeper_core::voice::target`'s sentence naming
+ * this control.
  *
- * The bots are read once on mount (`bots_bots_list`), the same read the
- * picker makes, because this control also lives in Settings, where the Bots
- * store may not have been filled. The agents (`voice_agent_targets`) are
- * read on mount and on focus, and again after a growing pause while none is
- * listed or the chosen one is not: keeper may not have opened the agents'
- * databases yet. A chosen agent not (yet) listed still shows as chosen, and
- * is never rewritten here — if it really is gone, Rust refuses the turn with
- * a sentence naming this control. A choice that named one of the agents' old
- * Matrix rooms was cleared at launch, and Rust's one-time notice says so
- * here until it is dismissed (UX-DR-E108-1). With nothing to
- * choose the control is absent (AD-27): the turn's own refusal — "choose a
- * bot to talk to under Bots" — is the sentence that says what to do, and a
+ * The agents (`voice_agent_targets`) are read on mount and on focus, and
+ * again after a growing pause while none is listed or the chosen one is not:
+ * keeper may not have opened the agents' databases yet. A chosen agent not
+ * (yet) listed still shows as chosen, and is never rewritten here — if it
+ * really is gone, Rust refuses the turn with a sentence naming this control.
+ * A choice that named one of the agents' old Matrix rooms was cleared at
+ * launch, and Rust's one-time notice says so here until it is dismissed
+ * (UX-DR-E108-1). With nothing to choose and no notice the control is absent
+ * (AD-27): the turn's own refusal is the sentence that says what to do, and a
  * select with one dead option would say it worse.
- *
- * Each bot option carries the bot's speed (Epic 68, AD-216): the median time
- * to its first token over its last ten answers, `voice_target_speeds`, so
- * choosing a fast bot for voice is a choice made with numbers — "nixie ·
- * first word ~25 s". A bot with fewer than three measured answers shows its
- * name alone; the median is Rust's (`median_first_token`), never computed
- * here, and a read that fails leaves every option nameless of speed rather
- * than absent.
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Label } from "@/components/ui/label";
 import { logFailure } from "@/lib/failure";
-import type { BotVm, VoiceAgentTargetVm, VoiceTargetSpeedVm } from "@/lib/ipc/client";
+import type { VoiceAgentTargetVm } from "@/lib/ipc/client";
 import {
-  botsBotsList,
   voiceAgentTargets,
   voiceOldTargetNoticeDismiss,
   voiceOldTargetNoticeGet,
   voiceTargetSet,
-  voiceTargetSpeeds,
 } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { useVoiceStore, voiceStore } from "@/lib/stores/voice";
 
 /** The control's label. */
 export const VOICE_TARGET_LABEL = "Speak to";
-/** The option for the setting unset: Rust's rule when nothing is chosen. */
-export const VOICE_TARGET_RECENT_LABEL = "Most recently talked to";
+/** The option for the setting unset: a spoken question is refused until one is chosen. */
+export const VOICE_TARGET_UNSET_LABEL = "Nobody yet";
 /** What the choice is for. */
-export const VOICE_TARGET_NOTE =
-  "Where a spoken question goes, whatever is open on the screen. A bot never talked to gets a new conversation.";
+export const VOICE_TARGET_NOTE = "Where a spoken question goes, whatever is open on the screen.";
 /** The group of the person's agents. */
 export const VOICE_TARGET_AGENT_GROUP = "Your agents";
 /** A chosen agent keeper has not listed (yet). */
@@ -73,30 +55,13 @@ const RELIST_FIRST_MS = 5_000;
 const RELIST_MOST_MS = 60_000;
 
 /**
- * The option's words: the name, then — when Rust has a median — the wait
- * for its first word in whole seconds, `~` because it is a median, not a
- * promise. Under a second reads "~1 s" rather than "~0 s": the number says
- * "fast", and zero would say "instant", which nothing measured.
+ * The picker. Renders nothing until the wake facts are read, and nothing at
+ * all with no agent listed, none chosen and no notice to show.
  */
-export function voiceTargetOptionLabel(name: string, firstTokenMedianMs: number | null): string {
-  if (firstTokenMedianMs === null) {
-    return name;
-  }
-  const seconds = Math.max(1, Math.round(firstTokenMedianMs / 1000));
-  return `${name} · first word ~${seconds} s`;
-}
-
-/**
- * The picker. Renders nothing until the wake facts and the bots are read, and
- * nothing at all with no pinned bot, no conversation of the assistant's and
- * none of them chosen.
- */
-export function BotVoiceTarget({ className }: { className?: string } = {}) {
+export function VoiceTarget({ className }: { className?: string } = {}) {
   const wake = useVoiceStore((s) => s.wake);
   const selectId = useId();
-  const [bots, setBots] = useState<BotVm[] | null>(null);
   const [agents, setAgents] = useState<VoiceAgentTargetVm[]>([]);
-  const [speeds, setSpeeds] = useState<VoiceTargetSpeedVm[]>([]);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -119,20 +84,6 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
   useEffect(() => {
     alive.current = true;
     relist();
-    void botsBotsList()
-      .then((read) => {
-        if (alive.current) {
-          setBots(read);
-        }
-      })
-      .catch((raw: unknown) => {
-        logFailure("voice.botsList")(raw);
-        // The list could not be read: no bots to offer, and the turn's own
-        // refusal still says where to go. Settings shows the read's failure itself.
-        if (alive.current) {
-          setBots([]);
-        }
-      });
     void voiceOldTargetNoticeGet()
       .then((read) => {
         if (alive.current) {
@@ -141,14 +92,6 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
       })
       // No notice to show: the choice reads as unset all the same.
       .catch(logFailure("voice.oldTargetNotice"));
-    void voiceTargetSpeeds()
-      .then((read) => {
-        if (alive.current) {
-          setSpeeds(read);
-        }
-      })
-      // No numbers: the names still choose. Nothing to say beside them.
-      .catch(logFailure("voice.targetSpeeds"));
     return () => {
       alive.current = false;
     };
@@ -174,23 +117,15 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
     return () => clearTimeout(timer);
   }, [waiting, relist]);
 
-  if (
-    wake === null ||
-    bots === null ||
-    (bots.length === 0 && agents.length === 0 && !unlisted && notice === null)
-  ) {
+  if (wake === null || (agents.length === 0 && !unlisted && notice === null)) {
     return null;
   }
 
-  // A choice naming a bot that is no longer pinned reads as unset here, the
-  // way Rust treats it at send time — so the select never shows a value its
-  // options do not have. One of the person's agents shows as chosen listed
-  // or not: Rust either finds it or says so.
-  const chosen =
-    stored !== null &&
-    (stored.startsWith(AGENT_TARGET_PREFIX) || bots.some((bot) => bot.id === stored))
-      ? stored
-      : null;
+  // A value naming no agent — a pinned bot's id from before the bots left —
+  // reads as unset here, the way Rust treats it at send time, so the select
+  // never shows a value its options do not have. One of the person's agents
+  // shows as chosen listed or not: Rust either finds it or says so.
+  const chosen = stored?.startsWith(AGENT_TARGET_PREFIX) === true ? stored : null;
 
   const dismissNotice = () => {
     setNotice(null);
@@ -228,15 +163,7 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           onFocus={relist}
           className="h-9 max-w-64 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <option value="">{VOICE_TARGET_RECENT_LABEL}</option>
-          {bots.map((bot) => (
-            <option key={bot.id} value={bot.id}>
-              {voiceTargetOptionLabel(
-                bot.name,
-                speeds.find((speed) => speed.botId === bot.id)?.firstTokenMedianMs ?? null,
-              )}
-            </option>
-          ))}
+          <option value="">{VOICE_TARGET_UNSET_LABEL}</option>
           {agents.length > 0 && (
             <optgroup label={VOICE_TARGET_AGENT_GROUP}>
               {agents.map((agent) => (

@@ -27,7 +27,6 @@ import type { PrimaryView } from "@/lib/stores/primary-view";
 
 /** The full-screen level-1 surfaces the phone stack renders. */
 export type PhoneSurface =
-  | "bots"
   | "settings"
   | "approval"
   | "bridges"
@@ -38,7 +37,7 @@ export type PhoneSurface =
 
 /**
  * The surface a view opens on the phone, or `null` where the phone has none
- * for it. Capability-gated where the desktop is (`bots`, `sync`, `files`,
+ * for it. Capability-gated where the desktop is (`sync`, `files`,
  * `notes`): absent, never a dead level, where the build cannot do the thing.
  * Files rides `sync` exactly as the desktop's nav entry does (Story 66.3,
  * AD-200): where no folder can be synced there is nothing to browse. Notes
@@ -52,8 +51,6 @@ export function phoneSurfaceFor(
   capabilities: CapabilitiesVm,
 ): PhoneSurface | null {
   switch (view) {
-    case "bots":
-      return capabilities.bots ? "bots" : null;
     case "sync":
       return capabilities.sync ? "sync" : null;
     case "files":

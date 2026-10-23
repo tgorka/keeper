@@ -3,25 +3,25 @@
  *
  * What is asserted here that nothing else asserts:
  *
- * 1. **The palette's verb is the shared verb** — `bots-toggle-listening`
+ * 1. **The palette's verb is the shared verb** — `voice-toggle-listening`
  *    dispatches `toggleVoiceListening`, which calls `voice_wake_toggle`
  *    without reading the store first (the palette can open with no pane
  *    mounted), mirrors what Rust stored and re-reads availability.
  * 2. **The control's words are the state** — "Listening off" /
  *    "Listening on · hey nixie" — and it flips through the same verb.
- * 3. **Absent, never disabled** (AD-27) — under `BotVoiceWake`'s rule:
- *    no bots capability, an unanswered probe, an `unsupported` answer, or
+ * 3. **Absent, never disabled** (AD-27) — under `VoiceWake`'s rule:
+ *    an unanswered probe, an `unsupported` answer, or
  *    wake facts not yet read.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { paletteActionHandlers } from "@/components/command-palette/actions";
 import {
-  BotListeningToggle,
   LISTENING_TOGGLE_LABEL,
+  ListeningToggle,
   listeningLabel,
   toggleVoiceListening,
-} from "@/components/bots/bot-listening-toggle";
-import { paletteActionHandlers } from "@/components/command-palette/actions";
+} from "@/components/voice/listening-toggle";
 import type { VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
@@ -57,7 +57,7 @@ beforeEach(() => {
   voiceWakeToggle.mockReset();
   voiceAvailability.mockReset();
   voiceAvailability.mockResolvedValue(null);
-  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
   voiceStore.setState({ state: null, unavailable: null, wake: WAKE_OFF });
 });
 
@@ -65,7 +65,7 @@ describe("toggleVoiceListening", () => {
   it("is the verb the command palette dispatches, and it flips through Rust", async () => {
     voiceWakeToggle.mockResolvedValue(WAKE_ON);
     voiceAvailability.mockResolvedValue(NOT_AUTHORIZED);
-    const handler = paletteActionHandlers["bots-toggle-listening"];
+    const handler = paletteActionHandlers["voice-toggle-listening"];
     expect(handler).toBeTypeOf("function");
 
     await handler(null);
@@ -93,10 +93,10 @@ describe("toggleVoiceListening", () => {
   });
 });
 
-describe("BotListeningToggle", () => {
+describe("ListeningToggle", () => {
   it("says the state and flips it", async () => {
     voiceWakeToggle.mockResolvedValue(WAKE_ON);
-    render(<BotListeningToggle />);
+    render(<ListeningToggle />);
     const button = screen.getByRole("button", { name: LISTENING_TOGGLE_LABEL });
     expect(button).toHaveTextContent("Listening off");
     expect(button).toHaveAttribute("aria-pressed", "false");
@@ -107,35 +107,30 @@ describe("BotListeningToggle", () => {
   });
 
   it("draws the phone's 44 pt height when asked", () => {
-    render(<BotListeningToggle phone />);
+    render(<ListeningToggle phone />);
     expect(screen.getByRole("button", { name: LISTENING_TOGGLE_LABEL })).toHaveClass("h-11");
   });
 
   it("is absent under the wake band's rule", () => {
     voiceStore.setState({ unavailable: { kind: "unsupported", message: "no port" } });
-    const { unmount } = render(<BotListeningToggle />);
+    const { unmount } = render(<ListeningToggle />);
     expect(screen.queryByRole("button")).toBeNull();
     unmount();
 
     voiceStore.setState({ unavailable: undefined });
-    const unanswered = render(<BotListeningToggle />);
+    const unanswered = render(<ListeningToggle />);
     expect(screen.queryByRole("button")).toBeNull();
     unanswered.unmount();
 
     voiceStore.setState({ unavailable: null, wake: null });
-    const unread = render(<BotListeningToggle />);
+    const unread = render(<ListeningToggle />);
     expect(screen.queryByRole("button")).toBeNull();
     unread.unmount();
-
-    voiceStore.setState({ wake: WAKE_OFF });
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: false });
-    render(<BotListeningToggle />);
-    expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("stays, with its sentence beside the switch elsewhere, under every other refusal", () => {
     voiceStore.setState({ unavailable: NOT_AUTHORIZED, wake: WAKE_ON });
-    render(<BotListeningToggle />);
+    render(<ListeningToggle />);
     expect(screen.getByRole("button", { name: LISTENING_TOGGLE_LABEL })).toHaveTextContent(
       listeningLabel(WAKE_ON),
     );

@@ -6,9 +6,9 @@
  * Every voice surface decides whether to exist from the first of these —
  * `voice_availability`, the one runtime answer, never a capability flag —
  * and the wake control draws itself from the second. {@link useVoiceStream}
- * reads both beside the stream for the Bots pane; the Settings sections read
- * them here without a stream, because Settings is a dialog over whatever
- * pane is open and a second `voice_watch` would replace the pane's watcher.
+ * reads both beside the stream; the Settings sections read them here without
+ * a stream, because Settings is a dialog over whatever pane is open and a
+ * second `voice_watch` would replace the pane's watcher.
  *
  * A read that fails leaves the store as it was: `unavailable` stays
  * `undefined` (a question not answered, from which absence is never
@@ -116,8 +116,7 @@ function startMirror(): () => void {
 
 /**
  * Keep the wake VM current while `open` — a surface showing the turn models'
- * line is in view (the Bots sheet, the unfolded voice fold, a Settings
- * section): read it now, and share the one event listener and visibility
+ * line is in view (Settings › Voice): read it now, and share the one event listener and visibility
  * re-read every open surface holds. The last surface to close stops both.
  */
 export function useVoiceWakeMirror(open: boolean): void {

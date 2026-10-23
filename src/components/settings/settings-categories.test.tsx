@@ -70,6 +70,7 @@ describe.each<SettingsLayout>(["rail", "drill"])("SettingsCategories (%s)", (lay
     sections.shortcuts = null;
     sections.capture = null;
     sections["notes-search"] = null;
+    sections["model-providers"] = null;
     render(<SettingsCategories layout={layout} sections={sections} />);
     const titles = rows().map((row) => row.textContent);
     expect(titles).not.toContain("Shortcuts");
@@ -87,6 +88,7 @@ describe.each<SettingsLayout>(["rail", "drill"])("SettingsCategories (%s)", (lay
     const sections = everySection();
     sections.capture = { node: <Late /> };
     sections["notes-search"] = { node: null };
+    sections["model-providers"] = { node: null };
     render(<SettingsCategories layout={layout} sections={sections} />);
     expect(rows().map((row) => row.textContent)).not.toContain("Notes");
 
@@ -160,7 +162,7 @@ describe("SettingsCategories deep links", () => {
     expect(visibleSections()).toContain("account");
 
     act(() => settingsUiStore.getState().revealSection("notes-search", "notes-embedding-model"));
-    expect(visibleSections()).toEqual(["capture", "notes-search"]);
+    expect(visibleSections()).toEqual(["capture", "notes-search", "model-providers"]);
     await act(async () => draw(true));
     expect(screen.getByRole("textbox", { name: "Model" })).toHaveFocus();
   });
@@ -186,7 +188,7 @@ describe("SettingsCategories deep links", () => {
     sections["notes-search"] = { node: <Search /> };
     settingsUiStore.getState().revealSection("notes-search", "notes-embedding-model");
     render(<SettingsCategories layout="drill" sections={sections} />);
-    expect(visibleSections()).toEqual(["capture", "notes-search"]);
+    expect(visibleSections()).toEqual(["capture", "notes-search", "model-providers"]);
     expect(screen.getByRole("button", { name: "Model" })).not.toHaveFocus();
 
     await act(async () => hydrate());

@@ -9,8 +9,7 @@
  *    and speaking; the status line says which in words.
  * 2. **The button sends nothing and speaks nothing (AD-205)** — a turn's
  *    `heard` snapshot is shown as a status and nothing else happens in the
- *    webview: no `botsChatSend`, no `voice_speak` (which no longer exists as
- *    a binding). The send and the speak are Rust's, whether the turn was the
+ *    webview: no `voice_speak` (which no longer exists as a binding). The send and the speak are Rust's, whether the turn was the
  *    button's or the phrase's — one path.
  * 3. **Stop abandons** — pressing while listening or while the answer is
  *    read aloud calls `voice_stop` (the one manual stop, AD-212), and the
@@ -19,15 +18,13 @@
  * 4. **The first press asks, by name, once** — `voice_authorize` precedes
  *    `voice_start`; a granted answer starts; a refusal starts nothing and
  *    renders Rust's sentence with Open Settings.
- * 5. **Absent** where `capabilities.bots` is off, while availability is
- *    unanswered, and on `unsupported`.
+ * 5. **Absent** while availability is unanswered, and on `unsupported`
+ *    (AD-179: no capability flag gates it).
  */
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  BotVoiceMic,
-  BotVoiceStatus,
   micState,
   VOICE_HEARD_STATUS,
   VOICE_LISTENING_STATUS,
@@ -37,7 +34,9 @@ import {
   VOICE_STOP_LISTENING_LABEL,
   VOICE_STOP_SPEAKING_LABEL,
   VOICE_TALK_LABEL,
-} from "@/components/bots/bot-voice-mic";
+  VoiceMic,
+  VoiceStatus,
+} from "@/components/voice/voice-mic";
 import type { VoiceStateVm, VoiceUnavailableVm } from "@/lib/ipc/client";
 import * as client from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -47,7 +46,6 @@ const voiceAuthorize = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceStart = vi.fn<() => Promise<void>>();
 const voiceStop = vi.fn<() => Promise<void>>();
 const iosOpenAppSettings = vi.fn<() => Promise<void>>();
-const botsChatSend = vi.fn<() => Promise<string>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
@@ -56,7 +54,6 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceStart: () => voiceStart(),
     voiceStop: () => voiceStop(),
     iosOpenAppSettings: () => iosOpenAppSettings(),
-    botsChatSend: () => botsChatSend(),
   };
 });
 
@@ -89,12 +86,9 @@ function seed(
   overrides: {
     unavailable?: VoiceUnavailableVm | null | undefined;
     state?: VoiceStateVm | null;
-    bots?: boolean;
   } = {},
 ) {
-  capabilitiesStore
-    .getState()
-    .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: overrides.bots ?? true });
+  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
   voiceStore.setState({
     state: overrides.state ?? IDLE,
     unavailable: "unavailable" in overrides ? overrides.unavailable : null,
@@ -106,8 +100,8 @@ function seed(
 function Surface() {
   return (
     <>
-      <BotVoiceStatus />
-      <BotVoiceMic />
+      <VoiceStatus />
+      <VoiceMic />
     </>
   );
 }
@@ -117,12 +111,10 @@ beforeEach(() => {
   voiceStart.mockReset();
   voiceStop.mockReset();
   iosOpenAppSettings.mockReset();
-  botsChatSend.mockReset();
   voiceAuthorize.mockResolvedValue(null);
   voiceStart.mockResolvedValue();
   voiceStop.mockResolvedValue();
   iosOpenAppSettings.mockResolvedValue();
-  botsChatSend.mockResolvedValue("never");
   seed();
 });
 
@@ -139,7 +131,7 @@ describe("micState", () => {
   });
 });
 
-describe("BotVoiceMic — three states you can read", () => {
+describe("VoiceMic — three states you can read", () => {
   it("is Talk while idle, unpressed, with no status band", () => {
     render(<Surface />);
     const button = screen.getByRole("button", { name: VOICE_TALK_LABEL });
@@ -179,7 +171,7 @@ describe("BotVoiceMic — three states you can read", () => {
   });
 });
 
-describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (AD-205)", () => {
+describe("VoiceMic — the turn is Rust's from the phrase to the last word (AD-205)", () => {
   it("shows a button-started turn's hearing and sending as status, and sends nothing itself", async () => {
     const { rerender } = render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_TALK_LABEL }));
@@ -199,7 +191,6 @@ describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (A
     rerender(<Surface />);
     expect(screen.getByRole("status")).toHaveTextContent(VOICE_SPEAKING_STATUS);
 
-    expect(botsChatSend).not.toHaveBeenCalled();
     // The composer receives nothing: the field is not this control's to fill.
     expect(screen.queryByRole("textbox")).toBeNull();
   });
@@ -212,7 +203,6 @@ describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (A
     rerender(<Surface />);
     expect(screen.getByRole("status")).toHaveTextContent(VOICE_HEARD_STATUS);
     expect(voiceStart).not.toHaveBeenCalled();
-    expect(botsChatSend).not.toHaveBeenCalled();
   });
 
   it("has no way to read an answer aloud from the webview", () => {
@@ -225,7 +215,7 @@ describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (A
     vi.useFakeTimers();
     try {
       const sentAtMs = Date.now() - 4_200;
-      seed({ state: { kind: "sending", answering: false, bot: "nixie", sentAtMs } });
+      seed({ state: { kind: "sending", answering: false, agent: "nixie", sentAtMs } });
       const { rerender } = render(<Surface />);
       expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 4 s");
       act(() => {
@@ -235,7 +225,7 @@ describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (A
       voiceStore.getState().applyState({
         kind: "sending",
         answering: true,
-        bot: "nixie",
+        agent: "nixie",
         sentAtMs,
         firstTokenMs: sentAtMs + 6_300,
       });
@@ -251,7 +241,7 @@ describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (A
   });
 });
 
-describe("BotVoiceMic — stop abandons, and the surface honours the release", () => {
+describe("VoiceMic — stop abandons, and the surface honours the release", () => {
   it("calls voice_stop while listening and renders the idle snapshot that follows", async () => {
     seed({ state: LISTENING_HALF });
     const { rerender } = render(<Surface />);
@@ -286,7 +276,7 @@ describe("BotVoiceMic — stop abandons, and the surface honours the release", (
   });
 });
 
-describe("BotVoiceMic — asks by name, once, on the first press", () => {
+describe("VoiceMic — asks by name, once, on the first press", () => {
   it("asks before it starts, and starts on a grant", async () => {
     const order: string[] = [];
     voiceAuthorize.mockImplementation(async () => {
@@ -331,14 +321,7 @@ describe("BotVoiceMic — asks by name, once, on the first press", () => {
   });
 });
 
-describe("BotVoiceMic — absence", () => {
-  it("renders nothing without the bots capability", () => {
-    seed({ bots: false });
-    render(<Surface />);
-    expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.queryByRole("status")).toBeNull();
-  });
-
+describe("VoiceMic — absence", () => {
   it("renders nothing while availability is unanswered, and on unsupported", () => {
     seed({ unavailable: undefined });
     const { rerender } = render(<Surface />);

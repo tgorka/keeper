@@ -1,20 +1,16 @@
 /**
- * Listening, as one action in every menu that has a Bots section (Epic 68,
- * Story 68.4, AD-218).
+ * Listening, as one action every menu calls (Epic 68, Story 68.4, AD-218).
  *
- * The wake switch lived in three places and no menu: a folded band on the
- * desktop pane, a sheet on the phone, Settings → Bots. This module is the
- * one verb the menus call — the ⌘K palette's `bots-toggle-listening`, the
- * native Bots menu it feeds, the chip beside the metadata chip in the
- * desktop pane header, the button in the phone's Bots list bar — and the
+ * This module is the one verb the menus call — the ⌘K palette's
+ * `voice-toggle-listening`, Settings › Voice, the account view — and the
  * tray calls the same Rust command from Rust. One command,
- * `voice_wake_toggle`, so five surfaces are one setting.
+ * `voice_wake_toggle`, so every surface is one setting.
  *
  * # Nothing here decides
  *
  * Which way the switch flips, and whether switching on asks for the
  * microphone first, is Rust's (`voice_ipc::voice_wake_toggle` carries the
- * rule the pane's switch applied in `BotVoiceWake.save`). The store is
+ * rule the pane's switch applied in `VoiceWake.save`). The store is
  * written from what Rust answered, never from a local "did I click" flag,
  * and availability is read again after the flip — as the locale picker
  * does — so a refusal the port answered on switching on is shown beside the
@@ -22,16 +18,16 @@
  *
  * # Where the control exists at all
  *
- * {@link BotVoiceWake}'s three conditions, and every failing one is an AD-27
- * absence: `capabilities.bots`, `voice_availability` answered, and the answer
- * not `unsupported`; plus the wake facts read (`wake !== null`), because the
- * label *is* the state and a chip with no state would be a chip lying.
+ * {@link VoiceWake}'s conditions, and every failing one is an AD-27 absence:
+ * `voice_availability` answered, and the answer not `unsupported` (AD-179:
+ * voice exists on availability alone); plus the wake facts read
+ * (`wake !== null`), because the label *is* the state and a chip with no
+ * state would be a chip lying.
  */
 
 import { sayFailure } from "@/lib/failure";
 import type { VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceAvailability, voiceWakeToggle } from "@/lib/ipc/client";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useVoiceStore, voiceStore } from "@/lib/stores/voice";
 import { cn } from "@/lib/utils";
 
@@ -50,9 +46,9 @@ export const LISTENING_TOGGLE_LABEL = "Listening for the wake phrase";
  * Flip the switch through Rust and mirror what it stored.
  *
  * Exported because the command palette's entry is the other caller (UX-DR42's
- * one-verb rule, `toggleBotMessageDetails`'s shape). Reads nothing from the
- * store first: the palette can be opened with no Bots pane mounted, so Rust
- * reads the stored switch itself and flips it. Availability is re-read after
+ * one-verb rule). Reads nothing from the store first: the palette can be
+ * opened with no voice control mounted, so Rust reads the stored switch
+ * itself and flips it. Availability is re-read after
  * the write for the reason the module doc gives.
  */
 export async function toggleVoiceListening(): Promise<void> {
@@ -67,12 +63,11 @@ export async function toggleVoiceListening(): Promise<void> {
  * metadata chip's idiom. `phone` draws it at the 44 pt height the phone's
  * bars use; the desktop draws the chip. Absent under the module doc's rule.
  */
-export function BotListeningToggle({ phone = false }: { phone?: boolean } = {}) {
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
+export function ListeningToggle({ phone = false }: { phone?: boolean } = {}) {
   const unavailable = useVoiceStore((s) => s.unavailable);
   const wake = useVoiceStore((s) => s.wake);
 
-  if (!bots || unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
+  if (unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
     return null;
   }
 

@@ -87,32 +87,17 @@
  * switch, present exactly while the snapshot says the microphone is open —
  * for the phrase or for a turn — and announced when it appears. Someone
  * driving glances at it; nobody hovers.
- *
- * # Folded to one line in the desktop pane (Epic 64, Story 64.1, AD-184)
- *
- * Epic 63 gave the Mac a voice, and this block came with it: 210–260 px of
- * switch, box, picker, sentence, note and limits above the transcript the
- * pane exists for. In the Bots pane the block renders through
- * {@link FoldSection} when the host hands in a `fold`, and folded it is ONE
- * line — {@link voiceFoldedLine}: whether listening is armed, the phrase and
- * the language in force, with the refusal's first clause when the port
- * refuses, so "not allowed" is read without unfolding. One click unfolds to
- * the whole block; the host owns where that is remembered. Without a `fold`
- * (Settings → Bots, the phone's sheet) the block is exactly what it was, so
- * folding removes no path to any control.
  */
-import { ChevronDown, ChevronRight, Mic } from "lucide-react";
+import { Mic } from "lucide-react";
 import { useEffect, useId, useState } from "react";
-import { BotVoiceTarget } from "@/components/bots/bot-voice-target";
-import { FoldSection } from "@/components/layout/sidebar-group";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { VoiceTarget } from "@/components/voice/voice-target";
 import { useVoiceWakeMirror } from "@/hooks/use-voice-facts";
 import { logFailure } from "@/lib/failure";
-import type { VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceAuthorize, voiceAvailability, voiceLocaleSet, voiceWakeSet } from "@/lib/ipc/client";
 import { useFailureNotice } from "@/lib/stores/failure-notices";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -172,57 +157,12 @@ export function voiceListeningIn(locale: string): string {
   return `Listens in ${voiceLocaleName(locale)}.`;
 }
 
-/** The folded line while the switch is off. */
-export const VOICE_FOLDED_OFF = "Listening off";
-
-/**
- * A refusal's first clause: Rust's sentences all open with the fact and
- * follow it, after a comma, a dash or a semicolon, with the remedy — and the
- * remedy is what unfolding (or, on the phone, opening the sheet) is for. A
- * sentence with no such break is carried whole.
- */
-export function voiceRefusalClause(message: string): string {
-  const clause = /^(.*?)(?:,|;| —)\s/.exec(message);
-  return clause?.[1] ?? message;
-}
-
-/**
- * The one line the folded block says (AD-184).
- *
- * `Listening for "nixie" · en-US` while the switch is on, `Listening off ·
- * en-US` while it is not — the SETTING, from `VoiceWakeVm`, not the turn's
- * live state, which the status line above the composer already shows. The
- * identifier rather than {@link voiceLocaleName}'s long form, because this is
- * a glance and the unfolded picker spells the name. A refusal contributes
- * {@link voiceRefusalClause}.
- */
-export function voiceFoldedLine(wake: VoiceWakeVm, unavailable: VoiceUnavailableVm | null): string {
-  const armed = wake.enabled ? wakeListeningLabel(wake.phrase) : VOICE_FOLDED_OFF;
-  const parts = [armed, wake.locale];
-  if (unavailable !== null) {
-    parts.push(voiceRefusalClause(unavailable.message));
-  }
-  return parts.join(" · ");
-}
-
-/** The id of the region the pane's fold discloses. Unique in the document. */
-const FOLD_REGION_ID = "bots-voice-wake";
-
 /**
  * The wake phrase band. Absent, or the switch with its chip and sentence.
- * `className` is the host's frame: the phone's sheet draws the pane band by
- * default, and Settings → Bots (Story 63.5) hands in its own row spacing,
- * because the control is one and the frames are two. `fold` is the desktop
- * pane's: given, the block folds to {@link voiceFoldedLine} and the host says
- * whether it is folded and where a toggle is remembered.
+ * `className` is the host's frame: Settings › Voice hands in its own row
+ * spacing.
  */
-export function BotVoiceWake({
-  className,
-  fold,
-}: {
-  className?: string;
-  fold?: { folded: boolean; onToggle: () => void };
-} = {}) {
+export function VoiceWake({ className }: { className?: string } = {}) {
   const unavailable = useVoiceStore((s) => s.unavailable);
   const wake = useVoiceStore((s) => s.wake);
   const state = useVoiceStore((s) => s.state);
@@ -253,13 +193,8 @@ export function BotVoiceWake({
       setStopDraft(heldStop);
     }
   }, [heldStop]);
-  // Kept current only while the block is drawn and unfolded: a folded band
-  // shows no turn models' line, and reads again when it opens.
-  useVoiceWakeMirror(
-    unavailable !== undefined &&
-      unavailable?.kind !== "unsupported" &&
-      (fold === undefined || !fold.folded),
-  );
+  // Kept current only while the block is drawn.
+  useVoiceWakeMirror(unavailable !== undefined && unavailable?.kind !== "unsupported");
 
   if (unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
     return null;
@@ -426,7 +361,7 @@ export function BotVoiceWake({
           <p className="text-muted-foreground text-xs">{VOICE_LOCALE_NOTE}</p>
         </div>
       )}
-      <BotVoiceTarget />
+      <VoiceTarget />
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}
@@ -458,26 +393,6 @@ export function BotVoiceWake({
       <p className="text-muted-foreground text-xs">{wake.limits}</p>
     </>
   );
-
-  if (fold !== undefined) {
-    // The pane's band: `shrink-0` whether folded or not, because the
-    // transcript beside it is the one flexible box (Story 61.14's contract),
-    // and `hidden` on the body takes the block out of the column entirely.
-    return (
-      <FoldSection
-        label={voiceFoldedLine(wake, unavailable)}
-        icon={fold.folded ? ChevronRight : ChevronDown}
-        folded={fold.folded}
-        onToggle={fold.onToggle}
-        id={FOLD_REGION_ID}
-        labelClassName="text-sm"
-        className={cn("shrink-0 border-border border-b px-4 py-1", className)}
-        bodyClassName="flex flex-col gap-2 px-2 pt-1 pb-2"
-      >
-        {rows}
-      </FoldSection>
-    );
-  }
 
   return (
     <section

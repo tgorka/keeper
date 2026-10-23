@@ -48,12 +48,12 @@ export const VOICE_ANSWERING_WORD = "Answering";
 /**
  * The line while the model has said nothing yet (AD-215): whose seconds
  * they are, and how many so far — `Waiting for nixie · 12 s`, or
- * `Waiting · 12 s` when Rust has not named the bot. Whole seconds, never
+ * `Waiting · 12 s` when Rust has not named the agent. Whole seconds, never
  * negative: a clock that ran backwards is not a negative wait.
  */
-export function voiceWaitingLine(bot: string | null | undefined, elapsedMs: number): string {
+export function voiceWaitingLine(agent: string | null | undefined, elapsedMs: number): string {
   const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
-  return bot ? `Waiting for ${bot} · ${seconds} s` : `Waiting · ${seconds} s`;
+  return agent ? `Waiting for ${agent} · ${seconds} s` : `Waiting · ${seconds} s`;
 }
 
 /** After the turn (AD-215): how long the first word took — `first word after 28 s`. */
@@ -77,7 +77,7 @@ export function voiceWaitWord(state: VoiceStateVm | null, nowMs: number): string
   if (state.sentAtMs == null) {
     return null;
   }
-  return voiceWaitingLine(state.bot, nowMs - state.sentAtMs);
+  return voiceWaitingLine(state.agent, nowMs - state.sentAtMs);
 }
 
 /** The after-the-turn line an `idle` snapshot carries, or `null` before a turn has answered. */

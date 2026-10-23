@@ -2258,7 +2258,7 @@ describe("SyncPane on the phone (Story 66.1, AD-198)", () => {
     // its card is absent rather than a Copy that fails.
     capabilitiesStore
       .getState()
-      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true });
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, notes: true });
     await renderPane();
     expect(screen.getByText("tgdrive")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: SYNC_ADD_TITLE })).toBeInTheDocument();

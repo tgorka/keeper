@@ -42,8 +42,8 @@ export const PHONE_BACK_TO_INBOX = `Back to ${PHONE_INBOX_TITLE}`;
 /**
  * The bar itself: the 52px row with the previous level's title on a ≥44pt
  * back button (UX-DR21), and whatever the level puts beside it. `PhoneHeader`
- * is this bar plus the Room's identity block; the view levels Story 62.2 adds
- * (Bots, Settings) wear the bar alone, so it is one definition rather than
+ * is this bar plus the Room's identity block; the view levels (Settings and
+ * the like) wear the bar alone, so it is one definition rather than
  * three copies of the same classes.
  */
 export function PhoneBackBar({
