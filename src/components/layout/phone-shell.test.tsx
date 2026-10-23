@@ -122,13 +122,6 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     syncSubscribeProgress: vi.fn(async () => 1),
     syncUnsubscribeProgress: vi.fn(async () => {}),
     syncGetCredential: vi.fn(async () => null),
-    // The Bots list (Story 62.2), reached by the drawer enumeration below.
-    botsProvidersList: vi.fn(async () => []),
-    botsBotsList: vi.fn(async () => []),
-    botsSessionsList: vi.fn(async () => []),
-    botsSessionsSearch: vi.fn(async () => ({ rows: [], total: 0 })),
-    botsModelsList: vi.fn(async () => []),
-    botsMessageDetailsGet: vi.fn(async () => false),
     // Unanswered (the mock never resolves), so no voice affordance renders (AD-179).
     voiceAvailability: vi.fn(() => pending),
     voiceWakeGet: vi.fn(() => pending),
@@ -1245,8 +1238,6 @@ describe("PhoneShell persistent offline pill (Story 14.6)", () => {
     sync: false,
     notes: false,
     sessions: false,
-    bots: false,
-    botTools: false,
     overlayTitleBar: false,
     transcription: false,
   };
@@ -1490,7 +1481,7 @@ describe("PhoneShell keyboard inset (Story 13.5)", () => {
 describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
   /** The tier a phone hydrates to once its folder links (Epic 66) and that folder has a
    *  sessions zone (98.2): only what the OS refuses is off. */
-  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
+  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, sync: true, sessions: true };
 
   const draft: ApprovalDraftVm = {
     accountId: account.accountId,
@@ -1621,7 +1612,7 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
   });
 
   it("has no Sync row and no Sync level where the folder cannot sync", async () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
     render(<PhoneShell />);
     fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
     const nav = await screen.findByRole("navigation", { name: "Views" });
@@ -1759,7 +1750,7 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
 });
 
 describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
-  const PHONE_WITH_ZONE = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
+  const PHONE_WITH_ZONE = { ...DEFAULT_CAPABILITIES, sync: true, sessions: true };
   const SESSION_ROOM = "!session-room:example.org";
 
   const root: SessionRootVm = {
@@ -1860,7 +1851,7 @@ describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
 describe("PhoneShell on an Android tablet", () => {
   // Android's answer: every `cfg!(desktop)` flag false, the folder flags on;
   // whether the device is a tablet is Rust's fact (`PlatformVm.tablet`).
-  const ANDROID = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true, sessions: true };
+  const ANDROID = { ...DEFAULT_CAPABILITIES, sync: true, notes: true, sessions: true };
   const onDevice = (tablet: boolean) => {
     capabilitiesStore.getState().applySnapshot(ANDROID);
     platformStore.getState().applySnapshot({ urlForm: "localhost", tablet, disclosure: null });

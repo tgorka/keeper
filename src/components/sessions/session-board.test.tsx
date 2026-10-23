@@ -733,7 +733,7 @@ describe("SessionBoard — who works a card and where (UX-DR134)", () => {
   it("keeps the mark and offers no Allow on the phone, where the command is unsupported", () => {
     act(() => {
       capabilitiesStore.setState({
-        capabilities: { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true },
+        capabilities: { ...DEFAULT_CAPABILITIES, sync: true, notes: true },
         hydrated: true,
       });
     });

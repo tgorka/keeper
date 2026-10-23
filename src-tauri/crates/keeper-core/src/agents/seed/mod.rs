@@ -27,7 +27,6 @@ use crate::bots::chat::{effort_refusal, Effort};
 use crate::bots::store::ProviderRow;
 use crate::bots::Bot;
 use crate::bots::ProviderKind;
-use crate::org_account::settings_sync::ProviderRef;
 
 const README: &str = include_str!("zone/README.md");
 const RULES: &str = include_str!("zone/AGENTS.md");
@@ -684,11 +683,14 @@ pub fn bot_choices(providers: &[ProviderRow], bots: &[Bot]) -> Vec<AgentSeedBotV
                 .iter()
                 .find(|row| row.provider.id == bot.provider_id)?;
             Some(AgentSeedBotVm {
-                reference: ProviderRef::new(
+                reference: format!(
+                    "bot:{}:{}#{}",
                     provider.provider.kind.as_registry_str(),
-                    &provider.provider.base_url,
-                )
-                .bot_reference(&bot.target),
+                    crate::org_account::settings_sync::normalize_base_url(
+                        &provider.provider.base_url
+                    ),
+                    bot.target
+                ),
                 name: bot.name.clone(),
                 provider: provider.provider.name.clone(),
                 efforts: crate::bots::quirks::quirks(provider.provider.kind)

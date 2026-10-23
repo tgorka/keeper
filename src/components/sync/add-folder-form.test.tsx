@@ -1849,7 +1849,7 @@ describe("AddFolderForm choosing a home directory (Story 59.8)", () => {
 describe("AddFolderForm on the phone (Story 66.1, AD-199)", () => {
   /** The reduced tier a phone hydrates to once its folder links (Epic 66). */
   function arrangePhone() {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
   }
 
   afterEach(() => {
@@ -1987,7 +1987,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
   });
 
   it("on the phone, turns on nothing the phone does not show, keeps the sessions zone, and needs no folder", async () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
     mockSave.mockResolvedValue(profileVm({ id: "p9" }));
     render(
       <AddFolderForm
@@ -2037,7 +2037,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
 
   it("reports a draft while it still has a created folder to finish, though no field moved", async () => {
     // The phone: no folder to choose, so an untouched offer can be saved as is.
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
     rustOffers({ [driveOffer().remoteUrl]: { account: USE_ACME, forges: [] } });
     accountStore.getState().setVm(accountVm());
     mockSave.mockResolvedValue(profileVm({ id: "p9" }));

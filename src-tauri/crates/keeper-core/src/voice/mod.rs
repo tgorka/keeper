@@ -1,7 +1,7 @@
 //! Voice (Epic 62, Stories 62.4–62.6): a turn you can speak, decided here.
 //!
 //! A **turn** is: the phrase is heard, the microphone opens, what was said
-//! becomes text, the text goes to the bot as an ordinary message, the answer
+//! becomes text, the text goes to the agent as an ordinary message, the answer
 //! streams back, the answer is spoken. The state machine over those steps is
 //! [`turn::advance`]; the phrase that starts it is [`phrase::WakePhrase`]; and
 //! [`Turn`] is the driver the shell holds — it applies events, matches the
@@ -51,6 +51,7 @@ pub mod platform;
 pub mod request;
 pub mod segments;
 pub mod speech;
+pub mod target;
 pub mod timings;
 pub mod turn;
 pub mod turn_models;
@@ -300,7 +301,7 @@ pub trait VoicePort: Send + Sync {
     /// once, not per probe.
     fn locales(&self) -> locale::DeviceLocales;
 
-    /// Record the person's choice of locale (`bots.voice_locale`; `None` is
+    /// Record the person's choice of locale (`voice.locale`; `None` is
     /// "choose for me"). The port hands it to [`locale::choose`] with its
     /// own enumeration before every availability probe and every request,
     /// and builds the recogniser for the answer; it decides nothing itself.
@@ -503,8 +504,8 @@ struct Answer {
 /// One request, stamped by the shell (AD-215).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sent {
-    /// The bot's display name, for "Waiting for nixie".
-    bot: String,
+    /// The agent's display name, for "Waiting for nixie".
+    agent: String,
     /// When the request left, milliseconds since the Unix epoch.
     at_ms: i64,
     /// When the first token came, or `None` while the model is thinking.
@@ -625,13 +626,13 @@ impl Turn {
         self.table_event.as_ref()
     }
 
-    /// The request for what the turn heard has left (AD-215): to `bot`, at
+    /// The request for what the turn heard has left (AD-215): to `agent`, at
     /// `at_ms` on the shell's clock. Only a turn waiting for an answer is
     /// stamped; a typed message leaving while no turn runs is nothing here.
-    pub fn note_sent(&mut self, bot: String, at_ms: i64) {
+    pub fn note_sent(&mut self, agent: String, at_ms: i64) {
         if self.awaiting_send() {
             self.sent = Some(Sent {
-                bot,
+                agent,
                 at_ms,
                 first_token_ms: None,
             });
@@ -919,7 +920,7 @@ impl Turn {
             },
             TurnState::Sending { answering } => VoiceStateVm::Sending {
                 answering: *answering,
-                bot: self.sent.as_ref().map(|sent| sent.bot.clone()),
+                agent: self.sent.as_ref().map(|sent| sent.agent.clone()),
                 sent_at_ms: self.sent.as_ref().map(|sent| sent.at_ms),
                 first_token_ms: self.sent.as_ref().and_then(|sent| sent.first_token_ms),
             },
@@ -1026,7 +1027,7 @@ fn voice_for(
 /// Whether keeper arms the phrase again without being asked (Epic 65,
 /// Story 65.2, AD-190).
 ///
-/// `bots.wake_enabled` is the person's `intent`, persisted as chosen even
+/// `voice.wake_enabled` is the person's `intent`, persisted as chosen even
 /// when the port refused at arming time. A refusal is shown, not saved as
 /// "no" — so when it clears (a grant, a language change, keeper back in
 /// front, the port's own resume) the shell asks this and re-runs the arm.

@@ -1109,7 +1109,7 @@ async fn query_embedding(
     platform: &dyn keeper_core::platform::Platform,
     query: &str,
 ) -> EmbeddingAnswer {
-    use keeper_core::bots::embed;
+    use keeper_core::providers::embed;
     let dir = platform
         .data_dir()
         .map_err(|_| "the settings could not be read")?;

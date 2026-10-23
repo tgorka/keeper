@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(
             face(&VoiceStateVm::Sending {
                 answering: false,
-                bot: None,
+                agent: None,
                 sent_at_ms: None,
                 first_token_ms: None,
             }),

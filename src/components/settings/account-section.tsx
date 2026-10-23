@@ -22,7 +22,7 @@
  * state word of its own.
  *
  * Rename is an inline disclosure on this device's row (a modal over a list
- * hides the rows being compared — the Bots rule). Sign out and Forget are
+ * hides the rows being compared). Sign out and Forget are
  * AlertDialogs, and each names what goes and what stays: signing out keeps the
  * account set up and the repository's files where they are; forgetting
  * deletes this device's copy and never touches the server.
@@ -41,7 +41,6 @@ import { useEffect, useId, useRef, useState } from "react";
 import { DEVICE_CLASS_LABEL, SetupLinkField } from "@/components/account/account-setup-sheet";
 import { AccountShareSheet } from "@/components/account/account-share-sheet";
 import { SignInLink } from "@/components/auth/sign-in-link";
-import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -55,6 +54,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { toggleVoiceListening } from "@/components/voice/listening-toggle";
 import { reportFrontendError } from "@/lib/crash-report";
 import { logFailure, sayFailure } from "@/lib/failure";
 import {
@@ -133,7 +133,7 @@ export function accountSyncLine(vm: OrgAccountVm): string {
   const synced = "Your settings sync with this account.";
   const counts = [
     [vm.offers.drives.length, "drive", "drives"],
-    [vm.offers.providers.length, "bot provider", "bot providers"],
+    [vm.offers.providers.length, "model provider", "model providers"],
     [vm.offers.matrix.length, "Matrix account", "Matrix accounts"],
   ] as const;
   const offered = counts

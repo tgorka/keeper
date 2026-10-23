@@ -485,14 +485,14 @@ function checkNonWebColour(file) {
 }
 
 // ---------------------------------------------------------------------------
-// The bot identity palette (Story 61.7).
+// The identity palette (Story 61.7; an agent's since Story 106.2).
 // ---------------------------------------------------------------------------
 
 /**
  * Where the closed sets live, and why the gate reads three files to check one
  * decision.
  *
- * A bot's identity is a shape, a colour and a mark, and the colour is the only
+ * An agent's identity is a shape, a colour and a mark, and the colour is the only
  * one of the three that can be *wrong* rather than merely unfamiliar: an
  * unreadable ink is unreadable, and `DESIGN.md` records the arithmetic that
  * makes an unconstrained pick indefensible — AA needs L* <= 46.8 on warm paper
@@ -505,8 +505,8 @@ function checkNonWebColour(file) {
  * draw, or one Rust refuses after the picker has offered it:
  *
  *   - the ink hexes, twice each, in `src/index.css`;
- *   - the closed set of names the picker offers, in `bot-identity.tsx`;
- *   - the closed set `keeper-core` will accept, in `bots/identity.rs`.
+ *   - the closed set of names the picker offers, in `components/agents/identity.tsx`;
+ *   - the closed set `keeper-core` will accept, in `hq/identity.rs`.
  */
 const IDENTITY_PALETTE_SOURCE = "src/components/agents/identity.tsx";
 const IDENTITY_PALETTE_RUST = "src-tauri/crates/keeper-core/src/hq/identity.rs";
@@ -517,7 +517,7 @@ export const IDENTITY_INK_PREFIX = "bot-ink-";
  *
  * An identity is drawn as a cell with a MARK inside it, and a mark may be a
  * single letter the user typed — which is text, and text has a text floor. The
- * same ink also sets the bot's name in the picker. Holding the whole palette to
+ * same ink also sets the agent's name in the picker. Holding the whole palette to
  * the text floor is the only way the ink can be used for both without the gate
  * having to know which call site it is looking at.
  */
@@ -525,7 +525,7 @@ export const IDENTITY_PALETTE_FLOOR = 4.5;
 /** The surfaces an identity can be drawn on: pane, card, and the raised row. */
 export const IDENTITY_SURFACES = ["background", "card", "secondary"];
 /**
- * The bound on the palette's size, from the story: fewer than six and two bots
+ * The bound on the palette's size, from the story: fewer than six and two agents
  * collide constantly, more than ten and the names stop being memorable — and an
  * unbounded list is the free picker under another name.
  */
@@ -626,7 +626,7 @@ function checkIdentityPalette() {
         cssFile,
         lineOf(`--${IDENTITY_INK_PREFIX}${finding.name}:`),
         "identity-palette",
-        `--${IDENTITY_INK_PREFIX}${finding.name} on --${finding.surface} (${finding.theme}) is ${finding.ratio.toFixed(2)}:1, needs ${IDENTITY_PALETTE_FLOOR} — a bot's ink is read at text size`,
+        `--${IDENTITY_INK_PREFIX}${finding.name} on --${finding.surface} (${finding.theme}) is ${finding.ratio.toFixed(2)}:1, needs ${IDENTITY_PALETTE_FLOOR} — an identity's ink is read at text size`,
       );
       continue;
     }
@@ -652,7 +652,7 @@ function checkIdentityPalette() {
       join(ROOT, IDENTITY_PALETTE_SOURCE),
       1,
       "identity-palette",
-      `the bot palette is ${finding.name} — it is bounded at ${IDENTITY_PALETTE_BOUNDS.join("-")}, because an unbounded list is the free picker under another name`,
+      `the identity palette is ${finding.name} — it is bounded at ${IDENTITY_PALETTE_BOUNDS.join("-")}, because an unbounded list is the free picker under another name`,
     );
   }
 
@@ -717,7 +717,7 @@ if (import.meta.main) {
 
   if (violations.length === 0) {
     console.log(
-      `check:design — clean (${sources.length} web + ${nonWeb.length} native files, ${TOKENS} arithmetic verified, bot palette measured in both themes)`,
+      `check:design — clean (${sources.length} web + ${nonWeb.length} native files, ${TOKENS} arithmetic verified, identity palette measured in both themes)`,
     );
     process.exit(0);
   }

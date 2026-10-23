@@ -165,7 +165,7 @@ fn remote_host(remote_url: &str) -> Option<String> {
 /// this crate from depending on `keeper-sync` — so adding a profile adds its host
 /// here on the next read, and removing the profile removes it, with no cache to go
 /// stale. `provider_base_urls` is the base URL of every configured AI provider
-/// (`bots::store::provider_base_urls`), read the same way and for the same
+/// (`providers::store::provider_base_urls`), read the same way and for the same
 /// reason: a provider the user added is a destination on the next open, and one
 /// they removed is gone from it.
 ///
@@ -251,7 +251,7 @@ pub fn compute_egress(
     // and derived through the SAME `remote_host` a git remote goes through —
     // not a second reduction that would have to be kept in step with it. A
     // provider's base URL cannot legally carry userinfo (the grammar in
-    // `bots::url` refuses it), so this is belt and braces; belt and braces is
+    // `providers::url` refuses it), so this is belt and braces; belt and braces is
     // exactly what an honesty surface should wear, because the row that leaks a
     // token is the one written by a build where the grammar was looser than
     // this function assumed.
@@ -272,8 +272,8 @@ pub fn compute_egress(
         seen_provider_hosts.push(host.clone());
         endpoints.push(EgressEndpointVm {
             url: host,
-            kind: EgressKind::BotProvider,
-            label: "AI provider".to_owned(),
+            kind: EgressKind::ModelProvider,
+            label: "Notes search provider".to_owned(),
         });
     }
 
@@ -922,7 +922,7 @@ mod tests {
     /// Story 61.1, FR-371: a provider is disclosed as a HOST, and a credential
     /// pasted into its URL cannot reach the screen.
     ///
-    /// The base-URL grammar (`bots::url`) already refuses userinfo, so a row
+    /// The base-URL grammar (`providers::url`) already refuses userinfo, so a row
     /// shaped like this should not exist — which is exactly why the disclosure
     /// is reduced by `remote_host` anyway. The row that leaks a token is the one
     /// written by a build whose grammar was looser than this function assumed,
@@ -936,7 +936,7 @@ mod tests {
             shape(&out),
             vec![
                 (EgressKind::Homeserver, "https://matrix.example.org"),
-                (EgressKind::BotProvider, "gw.example.org"),
+                (EgressKind::ModelProvider, "gw.example.org"),
                 (EgressKind::Update, UPDATE),
             ]
         );
@@ -951,7 +951,7 @@ mod tests {
         }
         assert!(
             !out.iter()
-                .any(|e| e.kind == EgressKind::BotProvider && e.url.contains("/v1")),
+                .any(|e| e.kind == EgressKind::ModelProvider && e.url.contains("/v1")),
             "a provider row is the host and nothing else — not its path"
         );
     }
@@ -975,7 +975,7 @@ mod tests {
 
         assert_eq!(
             out.iter()
-                .filter(|e| e.kind == EgressKind::BotProvider)
+                .filter(|e| e.kind == EgressKind::ModelProvider)
                 .map(|e| e.url.as_str())
                 .collect::<Vec<_>>(),
             vec!["gw.example.org", "localhost"],
@@ -998,7 +998,7 @@ mod tests {
             vec![
                 (EgressKind::Homeserver, "https://matrix.example.org"),
                 (EgressKind::GitRemote, "github.com"),
-                (EgressKind::BotProvider, "127.0.0.1"),
+                (EgressKind::ModelProvider, "127.0.0.1"),
                 (EgressKind::Update, UPDATE),
             ],
             "providers disclose after the sync remotes, and the update endpoint stays last"
@@ -1008,7 +1008,7 @@ mod tests {
         assert!(
             !without_provider
                 .iter()
-                .any(|e| e.kind == EgressKind::BotProvider),
+                .any(|e| e.kind == EgressKind::ModelProvider),
             "removing every provider must remove the kind from the disclosure entirely"
         );
         assert_eq!(
@@ -1024,15 +1024,15 @@ mod tests {
 
     /// An `openai` provider adds no destination the person did not configure
     /// (NFR-121): its stored base URL — port and all, as the grammar keeps it —
-    /// discloses exactly one "AI provider" row for its host, and the rest of
+    /// discloses exactly one "Notes search provider" row for its host, and the rest of
     /// the disclosure does not move.
     #[test]
     fn an_openai_provider_discloses_exactly_its_host_once() {
-        let base = crate::bots::parse_base_url("https://provider.example:8452/")
+        let base = crate::providers::parse_base_url("https://provider.example:8452/")
             .expect("an OpenAI-compatible base URL is a base URL");
-        let provider = crate::bots::Provider {
+        let provider = crate::providers::Provider {
             id: "01JOPENAIPROVIDER0000000000".to_owned(),
-            kind: crate::bots::ProviderKind::OpenAi,
+            kind: crate::providers::ProviderKind::OpenAi,
             name: "CLIProxyAPI".to_owned(),
             base_url: base.normalized,
             created_ms: 1,
@@ -1043,13 +1043,16 @@ mod tests {
 
         let providers: Vec<(&str, &str)> = with
             .iter()
-            .filter(|e| e.kind == EgressKind::BotProvider)
+            .filter(|e| e.kind == EgressKind::ModelProvider)
             .map(|e| (e.url.as_str(), e.label.as_str()))
             .collect();
-        assert_eq!(providers, vec![("provider.example", "AI provider")]);
+        assert_eq!(
+            providers,
+            vec![("provider.example", "Notes search provider")]
+        );
         let rest: Vec<_> = with
             .iter()
-            .filter(|e| e.kind != EgressKind::BotProvider)
+            .filter(|e| e.kind != EgressKind::ModelProvider)
             .cloned()
             .collect();
         assert_eq!(rest, without, "nothing but the provider's row is added");
@@ -1074,7 +1077,7 @@ mod tests {
             EgressKind::Homeserver,
             EgressKind::Beeper,
             EgressKind::GitRemote,
-            EgressKind::BotProvider,
+            EgressKind::ModelProvider,
             EgressKind::Update,
             EgressKind::Telemetry,
             EgressKind::Account,
@@ -1090,7 +1093,7 @@ mod tests {
                 EgressKind::Homeserver => {}
                 EgressKind::Beeper => {}
                 EgressKind::GitRemote => {}
-                EgressKind::BotProvider => {}
+                EgressKind::ModelProvider => {}
                 EgressKind::Update => {}
                 EgressKind::Telemetry => {}
                 EgressKind::Account => {}

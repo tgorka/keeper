@@ -35,8 +35,6 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   sync: false,
   notes: false,
   sessions: false,
-  bots: false,
-  botTools: false,
   overlayTitleBar: false,
 });
 
@@ -71,12 +69,6 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
  * Flags that do not tell the tiers apart, and so are left out of the fold in
  * {@link isReducedCapabilityPlatform}.
  *
- * **`bots` is true on every tier (Epic 62, FR-396)** — a conversation is two
- * tables in `keeper.db`, which every platform opens — so its value says
- * nothing about which build this is. Folding it in would make the phone read
- * as a desktop the moment the pane existed, which would silently drop the
- * "On this iPhone" disclosure, the backup-exclusion line and the offline pill.
- *
  * **`sync` and `notes` are true on the phone too (Epic 66, AD-198, AD-200)**:
  * `keeper-sync` links on iOS and clones, fetches and fast-forwards with its
  * own engine, and a vault is a folder keeper syncs, so a folder on the phone
@@ -87,8 +79,7 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
  * phone; leaving them in the fold would turn the first phone that could sync
  * into a desktop the moment `capabilities()` answered.
  *
- * The drive half of the Bots surface, `botTools`, is `desktop && sync` and
- * stays in the fold. A flag belongs here only when the Rust side does NOT
+ * A flag belongs here only when the Rust side does NOT
  * compute it as `cfg!(desktop)`-shaped — true on both tiers, or true on the
  * phone alone; that is the whole membership rule.
  *
@@ -105,7 +96,6 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
  * offers Reveal or Share by reading the two flags themselves, never the tier.
  */
 const TIER_NEUTRAL_FLAGS: Partial<Record<keyof CapabilitiesVm, true>> = {
-  bots: true,
   sync: true,
   notes: true,
   sessions: true,

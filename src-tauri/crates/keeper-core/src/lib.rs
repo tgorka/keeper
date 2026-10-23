@@ -45,6 +45,7 @@ pub mod org_account;
 pub mod palette;
 pub mod panels;
 pub mod platform;
+pub mod providers;
 pub mod recording;
 pub mod registry;
 pub mod release_check;

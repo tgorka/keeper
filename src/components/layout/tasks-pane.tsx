@@ -170,6 +170,7 @@ import {
   syncTaskRunNow,
   syncTasks,
   syncTasksForget,
+  syncTasksRetiredDismiss,
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -381,6 +382,21 @@ export const TASKS_ROW_TESTID = "task-row";
  */
 export const TASKS_DESCRIPTION_TESTID = "task-description";
 export const TASKS_UNKNOWN_ROW_TESTID = "task-unknown-row";
+
+/** The notice an upgrade leaves about the tasks it removed (Story 108.3a). */
+export const TASKS_RETIRED_TESTID = "tasks-retired";
+/** The control that puts that notice away. */
+export const TASKS_RETIRED_DISMISS_LABEL = "Dismiss";
+
+/**
+ * The notice's sentence: what happened, and to which stored tasks, named by
+ * their descriptions (or ids) as `sync.db` held them (UX-DR-E108-3).
+ */
+export function tasksRetiredSentence(names: readonly string[]): string {
+  const which =
+    names.length === 1 ? "this stored task was" : `these ${names.length} stored tasks were`;
+  return `keeper no longer runs prompts on a schedule, so ${which} removed: ${names.join(", ")}.`;
+}
 export const TASKS_HOST_TESTID = "task-host";
 export const TASKS_REFUSAL_TESTID = "task-refusal";
 /** Where a refusal whose row the listing no longer holds is drawn instead. */
@@ -2468,6 +2484,12 @@ export function TasksPane() {
     void refresh();
   }, [refresh]);
 
+  const dismissRetired = () => {
+    void syncTasksRetiredDismiss()
+      .catch(logFailure("tasks.retiredDismiss"))
+      .finally(() => void refresh());
+  };
+
   useEffect(() => {
     const clock = setInterval(() => setNow(Date.now()), TASKS_CLOCK_TICK_MS);
     return () => clearInterval(clock);
@@ -3285,6 +3307,19 @@ export function TasksPane() {
           {id}: {refusal}
         </p>
       ))}
+      {/* The one notice an upgrade leaves (Story 108.3a, UX-DR-E108-3): the
+          stored tasks keeper removed when it stopped running prompts on a
+          schedule, named once, until put away. */}
+      {listing !== null && listing.retired.length > 0 && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 px-6 pt-4">
+          <p role="status" data-testid={TASKS_RETIRED_TESTID} className="min-w-0 flex-1 text-sm">
+            {tasksRetiredSentence(listing.retired)}
+          </p>
+          <Button type="button" variant="outline" size="sm" onClick={dismissRetired}>
+            {TASKS_RETIRED_DISMISS_LABEL}
+          </Button>
+        </div>
+      )}
 
       <div className="flex min-h-0 min-w-0 flex-1">
         {/* Level 1 — the names. */}

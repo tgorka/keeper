@@ -72,7 +72,7 @@ export const ITEMS: CountNoun = { one: "item", many: "items" };
 export const RUNS: CountNoun = { one: "run", many: "runs" };
 
 /**
- * A bot answer's token noun (Story 61.8, FR-384).
+ * An answer's token noun (Story 61.8, FR-384).
  *
  * Only ever worded from a number an endpoint actually reported: a `usage` block
  * an endpoint omitted arrives as `null` and the caption drops the phrase

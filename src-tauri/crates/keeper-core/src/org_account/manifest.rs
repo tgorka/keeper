@@ -1,9 +1,9 @@
-//! Drives, bot providers and Matrix accounts as offers in the person's config
-//! repository (AD-323).
+//! Drives, model providers and Matrix accounts as offers in the person's
+//! config repository (AD-323).
 //!
 //! ```text
 //! <login>/drives.toml    [[drive]]
-//! <login>/bots.toml      [[provider]] with [[provider.bot]]
+//! <login>/bots.toml      [[provider]]
 //! <login>/matrix.toml    [[account]]
 //! ```
 //!
@@ -30,8 +30,9 @@ pub fn drives_path(login: &str) -> String {
     format!("{login}/drives.toml")
 }
 
-/// `<login>/bots.toml`.
-pub fn bots_path(login: &str) -> String {
+/// `<login>/bots.toml` — the model providers' file, under the name older
+/// devices read (DW-E108-6).
+pub fn providers_path(login: &str) -> String {
     format!("{login}/bots.toml")
 }
 
@@ -101,26 +102,8 @@ pub struct DriveRecord {
     pub extra: Extra,
 }
 
-/// One pinned bot of a provider.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct BotRecord {
-    pub target: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub pin_order: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shape: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub colour: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mark: Option<String>,
-    #[serde(flatten)]
-    pub extra: Extra,
-}
-
-/// One bot provider and its pinned bots.
+/// One model provider. A `[[provider.bot]]` list an older device wrote is an
+/// unknown field to this build and is kept as one.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderRecord {
@@ -133,8 +116,6 @@ pub struct ProviderRecord {
     pub credential: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_timeout_ms: Option<u64>,
-    #[serde(rename = "bot", default, skip_serializing_if = "Vec::is_empty")]
-    pub bots: Vec<BotRecord>,
     #[serde(default)]
     pub devices: Vec<String>,
     #[serde(flatten)]
@@ -281,35 +262,15 @@ impl Record for ProviderRecord {
     }
     fn absorb(&mut self, remote: &Self) {
         overlay(&mut self.extra, &remote.extra);
-        for bot in &mut self.bots {
-            if let Some(theirs) = remote
-                .bots
-                .iter()
-                .find(|theirs| theirs.target == bot.target)
-            {
-                overlay(&mut bot.extra, &theirs.extra);
-            }
-        }
     }
     fn portable(&self) -> Option<Self> {
-        let mut bots = self.bots.clone();
-        bots.sort_by(|a, b| (a.pin_order, &a.target).cmp(&(b.pin_order, &b.target)));
         Some(ProviderRecord {
             base_url: normalize_base_url(&self.base_url),
-            bots,
             ..self.clone()
         })
     }
     fn described(&self) -> Self {
         ProviderRecord {
-            bots: self
-                .bots
-                .iter()
-                .map(|bot| BotRecord {
-                    extra: Extra::new(),
-                    ..bot.clone()
-                })
-                .collect(),
             devices: Vec::new(),
             extra: Extra::new(),
             ..self.clone()
@@ -505,18 +466,13 @@ pub fn offers(
             })
             .collect(),
         providers: missing(remote_providers, mine_providers)
-            .map(|provider| {
-                let mut bots: Vec<&BotRecord> = provider.bots.iter().collect();
-                bots.sort_by_key(|bot| bot.pin_order);
-                ProviderOfferVm {
-                    key: provider.identity().reference(),
-                    kind: provider.kind.clone(),
-                    name: provider.name.clone(),
-                    base_url: provider.base_url.clone(),
-                    credential: provider.credential.clone(),
-                    bots: bots.into_iter().map(|bot| bot.name.clone()).collect(),
-                    devices: provider.devices.clone(),
-                }
+            .map(|provider| ProviderOfferVm {
+                key: provider.identity().reference(),
+                kind: provider.kind.clone(),
+                name: provider.name.clone(),
+                base_url: provider.base_url.clone(),
+                credential: provider.credential.clone(),
+                devices: provider.devices.clone(),
             })
             .collect(),
         matrix: missing(remote_matrix, mine_matrix)
@@ -545,9 +501,9 @@ fn render_toml<T: Serialize>(header: &str, file: &T) -> Result<String, String> {
 const DRIVES_HEADER: &str =
     "# The drives you use, and on which devices. keeper offers each one to your other devices;\n\
 # it never adds one by itself, and no credential is ever written here.\n";
-const BOTS_HEADER: &str =
-    "# Your bot providers and their bots, and on which devices. keeper offers each one to your\n\
-# other devices; it never adds one by itself, and no key is ever written here.\n";
+const PROVIDERS_HEADER: &str =
+    "# Your model providers, and on which devices. keeper offers each one to your other\n\
+# devices; it never adds one by itself, and no key is ever written here.\n";
 const MATRIX_HEADER: &str =
     "# Your Matrix accounts, and on which devices. keeper offers a prefilled sign-in on your\n\
 # other devices; no session or password is ever written here.\n";
@@ -584,22 +540,23 @@ impl DrivesFile {
     }
 }
 
-/// `bots.toml`. An `Err` is a file keeper cannot read; leave it alone.
+/// `bots.toml`, the model providers' file. An `Err` is a file keeper cannot
+/// read; leave it alone.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct BotsFile {
+pub struct ProvidersFile {
     #[serde(rename = "provider", default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderRecord>,
     #[serde(flatten)]
     pub extra: Extra,
 }
 
-impl BotsFile {
+impl ProvidersFile {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         parse_toml(bytes)
     }
 
     pub fn render(&self) -> Result<String, String> {
-        render_toml(BOTS_HEADER, self)
+        render_toml(PROVIDERS_HEADER, self)
     }
 }
 
@@ -814,34 +771,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_bots_come_from_this_device_and_keep_unknown_fields() {
-        let mut theirs = BotRecord {
-            target: "llama3".to_owned(),
-            name: "Llama".to_owned(),
-            ..BotRecord::default()
-        };
-        theirs
-            .extra
-            .insert("voice".to_owned(), toml::Value::String("low".to_owned()));
-        let remote = [ProviderRecord {
+    fn a_provider_comes_from_this_device_and_keeps_unknown_fields() {
+        let mut remote = [ProviderRecord {
             kind: "ollama".to_owned(),
             name: "Home".to_owned(),
             base_url: "http://localhost:11434".to_owned(),
             credential: "own".to_owned(),
-            bots: vec![theirs],
             devices: vec!["studio".to_owned()],
             ..ProviderRecord::default()
         }];
+        remote[0]
+            .extra
+            .insert("voice".to_owned(), toml::Value::String("low".to_owned()));
         let mine = [ProviderRecord {
             kind: "ollama".to_owned(),
             name: "Home Ollama".to_owned(),
             base_url: "HTTP://LocalHost:11434/".to_owned(),
             credential: "own".to_owned(),
-            bots: vec![BotRecord {
-                target: "llama3".to_owned(),
-                name: "Llama 3".to_owned(),
-                ..BotRecord::default()
-            }],
             ..ProviderRecord::default()
         }];
         let merged = merge_providers(&remote, &mine, None, "mac", &[], true);
@@ -849,9 +795,8 @@ mod tests {
         assert_eq!(merged[0].name, "Home Ollama");
         assert_eq!(merged[0].base_url, "http://localhost:11434");
         assert_eq!(merged[0].devices, ["mac", "studio"]);
-        assert_eq!(merged[0].bots[0].name, "Llama 3");
         assert_eq!(
-            merged[0].bots[0].extra.get("voice"),
+            merged[0].extra.get("voice"),
             Some(&toml::Value::String("low".to_owned()))
         );
 
@@ -899,21 +844,19 @@ mod tests {
                     name = \"Ops\"\n\
                     pin_order = 1\n\
                     glyph = \"x\"\n";
-        let parsed = BotsFile::parse(text.as_bytes()).expect("parses");
+        let parsed = ProvidersFile::parse(text.as_bytes()).expect("parses");
         assert_eq!(parsed.extra.get("schema"), Some(&toml::Value::Integer(2)));
         assert_eq!(
             parsed.providers[0].extra.get("rate"),
             Some(&toml::Value::Integer(3))
         );
-        assert_eq!(
-            parsed.providers[0].bots[0].extra.get("glyph"),
-            Some(&toml::Value::String("x".to_owned()))
-        );
+        // An older device's pinned list is an unknown field here, and kept.
+        assert!(parsed.providers[0].extra.contains_key("bot"));
         let rendered = parsed.render().expect("renders");
-        assert!(rendered.starts_with(BOTS_HEADER));
+        assert!(rendered.starts_with(PROVIDERS_HEADER));
         assert!(rendered.contains("[[provider.bot]]"), "{rendered}");
         assert_eq!(
-            BotsFile::parse(rendered.as_bytes()).expect("reparses"),
+            ProvidersFile::parse(rendered.as_bytes()).expect("reparses"),
             parsed
         );
 
@@ -936,7 +879,7 @@ mod tests {
     #[test]
     fn a_nested_unknown_table_is_written_back_in_key_order() {
         let text = "[future]\nz = 1\na = 2\n[future.deep]\nz = 3\nb = 4\n";
-        let rendered = BotsFile::parse(text.as_bytes())
+        let rendered = ProvidersFile::parse(text.as_bytes())
             .expect("parses")
             .render()
             .expect("renders");
@@ -957,20 +900,6 @@ mod tests {
             name: "Home".to_owned(),
             base_url: "http://localhost:11434".to_owned(),
             credential: "account".to_owned(),
-            bots: vec![
-                BotRecord {
-                    target: "b".to_owned(),
-                    name: "Second".to_owned(),
-                    pin_order: 2,
-                    ..BotRecord::default()
-                },
-                BotRecord {
-                    target: "a".to_owned(),
-                    name: "First".to_owned(),
-                    pin_order: 1,
-                    ..BotRecord::default()
-                },
-            ],
             devices: vec!["studio".to_owned()],
             ..ProviderRecord::default()
         }];
@@ -1006,7 +935,6 @@ mod tests {
             offered.providers[0].key,
             "provider:ollama:http://localhost:11434"
         );
-        assert_eq!(offered.providers[0].bots, ["First", "Second"], "pin order");
         let matrix_keys: Vec<&str> = offered.matrix.iter().map(|m| m.key.as_str()).collect();
         assert_eq!(matrix_keys, ["matrix:@tg:acme.dev"]);
 

@@ -23,7 +23,7 @@
 //! `supportsOnDeviceRecognition` (0.41 s for all sixty-three, so the answer
 //! is cached and refreshed only when the person changes the choice), and
 //! hands that list, the system locale and the person's choice
-//! (`bots.voice_locale`, via [`VoicePort::set_locale`]) to
+//! (`voice.locale`, via [`VoicePort::set_locale`]) to
 //! `keeper_core::voice::locale::choose`, which answers the locale to build
 //! the recogniser for or the refusal to show. The port decides nothing
 //! about the choice; it enumerates and obeys. The OS logs
@@ -563,7 +563,7 @@ struct Worker {
     suspended: Option<Instant>,
     /// Fresh requests that failed to start since the last that worked.
     failed_starts: u32,
-    /// The person's choice of locale (`bots.voice_locale`); `None` is
+    /// The person's choice of locale (`voice.locale`); `None` is
     /// "choose for me". Handed to `locale::choose` with `locales`.
     requested: Option<String>,
     /// The enumeration of `supportedLocales()` by on-device support, filled

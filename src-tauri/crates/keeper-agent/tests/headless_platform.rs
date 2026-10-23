@@ -102,7 +102,6 @@ fn the_headless_platforms_answer_every_method() {
     assert_eq!(sync.data_dir().expect("data"), root.path().join("data"));
     assert_eq!(sync.host_label(), "electra");
     assert_eq!(sync.free_space(root.path()), None);
-    assert!(sync.bot_task_runner().is_none());
     assert!(sync.now_ms() > 1_577_836_800_000);
 
     // A keychain round trip lands in a 0600 file of the strict directory.

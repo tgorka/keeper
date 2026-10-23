@@ -5,9 +5,9 @@
  *
  * **Nothing here decides what a command means.** The registry, the resolution
  * order (exact name, then alias, then the first prefix), the refusal sentences,
- * the availability reasons and the escape are Rust's — `keeper_core::bots::
- * commands` for the ⌘9 bot composer, `keeper_core::chat::commands` for chats
- * and agent rooms — reached through each composer's preview IPC. A matcher in
+ * the availability reasons and the escape are Rust's — `keeper_core::chat::
+ * commands` for chats and agent rooms — reached through the composer's preview
+ * IPC. A matcher in
  * this file beside those would be a second opinion about what `/mod` means, and
  * the one that disagrees is always the one the person is looking at.
  * So this module answers three questions a textarea has to answer locally,
@@ -37,9 +37,8 @@
 import type { ArgMode } from "@/lib/ipc/gen/ArgMode";
 
 /**
- * One menu row, as both registries project it (`BotCommandRowVm`,
- * `ChatCommandRowVm`). `warning` is the bot registry's caveat a runnable row may
- * still owe; the chat registry has none.
+ * One menu row, as the registry projects it (`ChatCommandRowVm`). `warning` is
+ * a caveat a runnable row may still owe; the chat registry has none today.
  */
 export interface SlashRow {
   /** The registry name, without the slash. */
@@ -75,7 +74,7 @@ export interface SlashPreview {
 /**
  * The longest draft worth opening the menu for.
  *
- * Mirrors `bots::commands::MAX_COMMAND_CHARS`, which `chat::commands` shares.
+ * Mirrors `chat::commands::MAX_COMMAND_CHARS`.
  * Duplicated as a number rather than fetched because here it is a *bound*, not
  * a rule: it only decides whether the menu asks while you type. What a `/` line
  * means when it is sent is still Rust's — past the bound the messenger's answer
@@ -184,7 +183,7 @@ export function nextIndex(index: number, count: number, action: "up" | "down"): 
  * The draft that replaces the current one when a row is accepted.
  *
  * The name is completed and a space is added for the commands that take an
- * argument, so accepting `/bot` leaves the caret where the bot name goes rather
+ * argument, so accepting `/model` leaves the caret where the model goes rather
  * than one keystroke short of it — the note editor's caret rule
  * (`slash-menu.ts:44-52`) applied to a token instead of to a pair. A command
  * that takes nothing is completed without the space, because a trailing space

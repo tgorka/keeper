@@ -4,7 +4,7 @@
  * Everything asserted here is a fact about a `<textarea>`, not about what a
  * command means: which drafts are candidates at all, which token a dismissal
  * belongs to, and which keystrokes the menu claims. The rules are Rust's and
- * are proven in `keeper-core/tests/bots_commands.rs` and `chat_commands.rs`.
+ * are proven in `keeper-core/tests/chat_commands.rs`.
  */
 import { describe, expect, it } from "vitest";
 import {

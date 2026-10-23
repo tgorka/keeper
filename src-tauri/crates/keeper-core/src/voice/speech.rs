@@ -4,7 +4,7 @@
 //! Recognition and synthesis are different inventories. The Mac this was
 //! measured on recognises four locales on its own, all English, and has 180
 //! synthesiser voices, one of them Polish. So a person listening in English
-//! whose bot answers in Polish *can* hear that answer in Polish — the epic
+//! whose agent answers in Polish *can* hear that answer in Polish — the epic
 //! opened with the same Mac reading it in the default English voice, which
 //! was unintelligible, because nothing chose a voice at all.
 //!
@@ -414,7 +414,7 @@ mod tests {
         }
     }
 
-    /// The case the epic opens with: listening in English, the bot answered
+    /// The case the epic opens with: listening in English, the agent answered
     /// in Polish, the Mac has a Polish voice.
     #[test]
     fn a_polish_answer_with_a_polish_voice_is_spoken_in_polish() {
@@ -453,7 +453,7 @@ mod tests {
         );
     }
 
-    /// A Polish-listening device whose bot answered in English, with an
+    /// A Polish-listening device whose agent answered in English, with an
     /// English voice: English, and the listener's own locale of it is not
     /// in play, so the first English voice in the sorted list.
     #[test]

@@ -2,8 +2,8 @@
  * The slash menu's state, shared by every composer that has one (Story 61.9;
  * the messenger composer since Story 100.5, R385).
  *
- * One state machine for the ⌘9 bot composer and the messenger composer, so
- * the two cannot disagree about what a key does: the preview is asked only
+ * One state machine for every composer with a menu, so no two can disagree
+ * about what a key does: the preview is asked only
  * while the draft could be a command (a keystroke of prose costs nothing), an
  * answer for text the field no longer holds is dropped, Escape dismisses for
  * the token it dismissed and the dismissal is retired the moment the token
@@ -23,8 +23,8 @@
  * name and then running it is one choice. Nothing about the command, the
  * draft or the room is sent.
  *
- * What a line *means* is not here: each composer passes its own Rust preview
- * (`botsCommandPreview`, `chatCommandPreview`) as `resolve`.
+ * What a line *means* is not here: the composer passes its Rust preview
+ * (`chatCommandPreview`) as `resolve`.
  */
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import {

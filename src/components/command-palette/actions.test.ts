@@ -209,7 +209,7 @@ describe("open-search on the phone tier (Story 66.1, DW-111)", () => {
     // An iPhone rotated wide is still an iPhone (Epic 65, AD-189): the tier is
     // the platform's, so the surface follows the capabilities, not the width.
     mockViewport(false);
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
     void dispatchPaletteAction("open-search", null);
     expect(searchSurfaceStore.getState().isOpen).toBe(true);
     expect(searchStore.getState().isOpen).toBe(false);

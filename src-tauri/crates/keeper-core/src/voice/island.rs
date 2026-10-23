@@ -168,7 +168,7 @@ mod tests {
     fn sending(answering: bool) -> VoiceStateVm {
         VoiceStateVm::Sending {
             answering,
-            bot: None,
+            agent: None,
             sent_at_ms: None,
             first_token_ms: None,
         }

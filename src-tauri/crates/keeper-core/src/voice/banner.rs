@@ -77,13 +77,13 @@ pub fn should_post(in_front: bool, word: Word) -> bool {
 }
 
 /// The line under "Thinking" (AD-215): whose time the wait is, counted in
-/// whole seconds from the moment the request left. `bot` is the bot's
+/// whole seconds from the moment the request left. `agent` is the agent's
 /// name, or `None` when the turn has not been told one.
 #[must_use]
-pub fn waiting(bot: Option<&str>, elapsed_ms: i64) -> String {
+pub fn waiting(agent: Option<&str>, elapsed_ms: i64) -> String {
     let seconds = elapsed_ms.max(0) / 1000;
-    match bot {
-        Some(bot) => format!("Waiting for {bot} · {seconds} s"),
+    match agent {
+        Some(agent) => format!("Waiting for {agent} · {seconds} s"),
         None => format!("Waiting · {seconds} s"),
     }
 }

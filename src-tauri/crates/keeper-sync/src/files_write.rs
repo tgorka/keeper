@@ -427,7 +427,7 @@ pub struct WriteScope<'a> {
     /// every home file from every tool writer (AD-362).
     agents_subfolder: Option<String>,
     /// Whether the whole sessions zone is closed to this scope's writes
-    /// (R51) — an agent host's scope, never a person's or a ⌘9 bot's.
+    /// (R51) — an agent host's scope, never a person's.
     sessions_closed: bool,
     /// The first configured subfolder [`native_prefix`] could not place
     /// inside the profile: every write in this scope refuses naming it.

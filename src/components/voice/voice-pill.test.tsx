@@ -85,7 +85,7 @@ describe("VoicePill per state", () => {
     vi.useFakeTimers();
     try {
       const sentAtMs = Date.now() - 11_800;
-      const waiting: VoiceStateVm = { kind: "sending", answering: false, bot: "nixie", sentAtMs };
+      const waiting: VoiceStateVm = { kind: "sending", answering: false, agent: "nixie", sentAtMs };
       const { rerender } = render(<VoicePill state={waiting} />);
       // Mounted mid-wait: the seconds are the true ones, not zero.
       expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 11 s");

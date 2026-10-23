@@ -12,21 +12,16 @@
  *   all-accounts avatar, with a worst-state bridge-health lamp overlaid on it,
  *   shown only for `degraded`/`disconnected` (hidden on `healthy`/`null`).
  * - Trailing: an amber Approval chip shown only when the pending-Draft count is
- *   > 0 (deep-links to the Approval Pane), a Bots button where the capability is
- *   on (Story 63.1, FR-410 — absent, never disabled, where it is off), a
+ *   > 0 (deep-links to the Approval Pane), a
  *   magnifier (opens the merged full-screen Search surface, Story 13.4), and a
  *   compose button.
  *
  * Every tappable target is ≥44pt with an accessible name. No forked sidebar and
- * no bottom tab bar — the drawer carries the nav. The Bots button is the one
- * view the header reaches directly: a conversation with a model is the thing
- * a phone with no Matrix account opens keeper for (AD-180), and the drawer is
- * two taps and a discovery away. It pushes the SAME level 1 the drawer's row
- * does (AD-31: one level visible, no second column, no tab bar).
+ * no bottom tab bar — the drawer carries the nav (AD-31: one level visible,
+ * no second column, no tab bar).
  */
-import { Bot, NotebookPen, Pencil, Search, Users } from "lucide-react";
+import { NotebookPen, Pencil, Search, Users } from "lucide-react";
 import type { Ref } from "react";
-import { BOTS_PANE_TITLE } from "@/components/bots/bots-pane";
 import { ProxyDockSheet } from "@/components/layout/proxy-dock-sheet";
 import { NOTES_PHONE_CAPTURE_LABEL } from "@/components/notes/notes-phone-pane";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -73,9 +68,6 @@ export function PhoneInboxHeader({
   const showHealthDot = bridgeHealth === "degraded" || bridgeHealth === "disconnected";
   // The pending-draft count (Story 7.3): the amber Approval chip shows only > 0.
   const pendingDraftCount = usePendingDraftCount();
-  // The Bots view (Story 63.1): present only where this build can talk to a
-  // model, the same gate the drawer's row and the shell's level read.
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   // Quick capture (Story 66.4): present only where a vault can exist.
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
   // A tablet's shell (story 98.3, UX-DR146) adds the proxy dock as a sheet.
@@ -145,20 +137,6 @@ export function PhoneInboxHeader({
           >
             {pendingDraftCount}
           </button>
-        )}
-        {bots && (
-          <IconHint label={BOTS_PANE_TITLE}>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label={BOTS_PANE_TITLE}
-              onClick={() => primaryViewStore.getState().setView("bots")}
-              className="size-11 shrink-0"
-            >
-              <Bot aria-hidden="true" />
-            </Button>
-          </IconHint>
         )}
         {/* Quick capture (Epic 66, Story 66.4, AD-200): the phone's twin of the
             desktop's hotkey, one tap from the Inbox because a thought arrives

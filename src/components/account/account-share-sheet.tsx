@@ -17,7 +17,7 @@
  * Copy link says when the clipboard refused (or there is none), because the
  * person would otherwise paste whatever was on it before; the link is
  * selectable in one click for copying by hand. "Copied" goes back to "Copy
- * link" after the house's two seconds, as the bot answer's copy button does.
+ * link" after the house's two seconds, as an agent answer's copy button does.
  */
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";

@@ -12,9 +12,7 @@ use super::GIT_ADVICE;
 
 /// `SyncPlatform` over agentd's data directory and its [`SecretMap`].
 ///
-/// `bot_task_runner` keeps the trait's `None`: a `TaskKind::Bot` row on this
-/// host records `NO_BOT_RUNNER_SENTENCE` (AD-224, AD-226, R9). `open_file_state`
-/// keeps the refusing default too: agentd materialises, so it never releases
+/// `open_file_state` keeps the trait's refusing default: agentd materialises, so it never releases
 /// content and never needs the answer.
 #[derive(Debug, Clone)]
 pub struct HeadlessSyncPlatform {

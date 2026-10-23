@@ -182,7 +182,6 @@ function mockViewport(width: number, height: number) {
 describe("useShellLayout on an Android tablet", () => {
   const ANDROID: typeof DEFAULT_CAPABILITIES = {
     ...DEFAULT_CAPABILITIES,
-    bots: true,
     sync: true,
     notes: true,
     sessions: true,

@@ -1,8 +1,8 @@
 /**
  * What the organisation account offers from the person's other devices (Epic
  * 84, AD-323, UX-DR118): the words and small shapes the three surfaces that
- * show offers share — Settings › Sync (drives), Settings › Bots (endpoints)
- * and the add-account screen (Matrix accounts).
+ * show offers share — Settings › Sync (drives), Settings › Model providers
+ * (endpoints) and the add-account screen (Matrix accounts).
  *
  * An offer is a description, never a thing already added: a drive still needs
  * a folder on this device, a Matrix account a sign-in, and an endpoint its key

@@ -503,7 +503,7 @@ describe("SidebarPane notes entry (Story 37.1)", () => {
 
 describe("SidebarPane as the phone drawer (Story 66.1, AD-197, AD-27)", () => {
   /** The tier a phone hydrates to once its folder links (Epic 66). */
-  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
+  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, sync: true };
 
   it("keeps only the rows the phone stack can land, in registry order", () => {
     capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
@@ -523,7 +523,6 @@ describe("SidebarPane as the phone drawer (Story 66.1, AD-197, AD-27)", () => {
       "Bridges",
       "Sync",
       "Files",
-      "Bots",
       "Settings",
     ]);
     expect(

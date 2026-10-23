@@ -33,7 +33,7 @@ device: AccountDeviceVm | null, devices: Array<AccountDeviceVm>, lastSyncedMs: n
  */
 faults: Array<string>, 
 /**
- * Drives, bot providers and Matrix accounts the person uses on their
+ * Drives, model providers and Matrix accounts the person uses on their
  * other devices and not here. Empty without an account.
  */
 offers: AccountOffersVm, 

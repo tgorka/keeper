@@ -29,8 +29,6 @@ const DESKTOP_CAPABILITIES = {
   sync: false,
   notes: false,
   sessions: false,
-  bots: false,
-  botTools: false,
   overlayTitleBar: false,
   transcription: false,
 };

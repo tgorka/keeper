@@ -31,6 +31,7 @@ beforeEach(() => {
   ] as SyncProfileVm[]);
   vi.mocked(syncTasks).mockResolvedValue({
     unknown: [],
+    retired: [],
     tasks: [
       {
         id: "copy",
@@ -65,6 +66,7 @@ describe("Tasks settings", () => {
     vi.mocked(syncTasksLedgerSet).mockResolvedValue({ ...ledger, chosenProfileId: "archive" });
     vi.mocked(syncTasks).mockResolvedValue({
       unknown: [],
+      retired: [],
       tasks: [
         {
           id: "copy",

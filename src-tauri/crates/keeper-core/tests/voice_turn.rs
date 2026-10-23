@@ -158,7 +158,7 @@ fn listening(heard: &str) -> TurnState {
 fn sending_vm(answering: bool) -> VoiceStateVm {
     VoiceStateVm::Sending {
         answering,
-        bot: None,
+        agent: None,
         sent_at_ms: None,
         first_token_ms: None,
     }
@@ -1204,7 +1204,7 @@ fn voice_driver_carries_the_wait_into_the_snapshot() {
         turn.vm(),
         VoiceStateVm::Sending {
             answering: false,
-            bot: Some("nixie".to_owned()),
+            agent: Some("nixie".to_owned()),
             sent_at_ms: Some(1_000),
             first_token_ms: None,
         }
@@ -1219,7 +1219,7 @@ fn voice_driver_carries_the_wait_into_the_snapshot() {
         turn.vm(),
         VoiceStateVm::Sending {
             answering: true,
-            bot: Some("nixie".to_owned()),
+            agent: Some("nixie".to_owned()),
             sent_at_ms: Some(1_000),
             first_token_ms: Some(29_550),
         }

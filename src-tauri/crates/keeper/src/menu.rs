@@ -105,11 +105,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Read through the shell's own capability probe rather than a `cfg!`, because
     // notes needs a usable `git` and that is a runtime fact (AD-41).
     let notes = notes_capability(app);
-    // The bots gate is NOT that probe (Epic 61, FR-384): the pane needs no `git`
-    // and no `sync.db`, only a desktop shell, so it is `cfg!(desktop)` — the same
-    // words `capabilities` uses. This function only ever runs on desktop, which
-    // is exactly why the literal is honest rather than a shortcut. The voice
-    // gate (Epic 68, AD-218) is the port's one answer, as the tray reads it: a
+    // The voice gate (Epic 68, AD-218) is the port's one answer, as the tray reads it: a
     // build whose port is `Unsupported` builds no listening toggle (AD-27). The
     // transcription gate is the probe `capabilities` fills `transcription`
     // from, so "Transcribe a File…" is in the Recording menu only where the
@@ -117,7 +113,6 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     for section in registry_sections(
         crate::macos_version::recording_supported(),
         notes,
-        cfg!(desktop),
         crate::voice_ipc::port_present(),
         crate::transcribe_ipc::transcription_supported(),
     ) {

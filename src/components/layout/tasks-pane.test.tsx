@@ -32,6 +32,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncPacedWork: vi.fn(),
   // The mounted form's own read (Story 58.1): the folder picker.
   syncProfiles: vi.fn(),
+  // The upgrade notice's dismissal (Story 108.3a).
+  syncTasksRetiredDismiss: vi.fn(),
 }));
 
 import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
@@ -109,6 +111,8 @@ import {
   TASKS_PANE_TITLE,
   TASKS_RAIL_LIST_LABEL,
   TASKS_REFUSAL_TESTID,
+  TASKS_RETIRED_DISMISS_LABEL,
+  TASKS_RETIRED_TESTID,
   TASKS_ROW_TESTID,
   TASKS_RUN_NOW_SENTENCE,
   TASKS_SELECTED_TESTID,
@@ -122,6 +126,7 @@ import {
   taskHistoryUnshownText,
   taskOutcomeText,
   tasksForgetConfirmTitle,
+  tasksRetiredSentence,
   tasksSelectionSentence,
 } from "@/components/layout/tasks-pane";
 import {
@@ -153,6 +158,7 @@ import {
   syncTaskSave,
   syncTasks,
   syncTasksForget,
+  syncTasksRetiredDismiss,
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -233,12 +239,9 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,
-    // The eight per-kind fields (Story 72.7). A `sync` row carries every key
-    // and fills none of them: the wire has no conditional keys, so a fixture
-    // that left them out would be a shape no build sends.
-    botId: null,
-    promptSubpath: null,
-    model: null,
+    // The per-kind fields (Story 72.7). A `sync` row carries every key and
+    // fills none of them: the wire has no conditional keys, so a fixture that
+    // left them out would be a shape no build sends.
     copySource: null,
     copyDestination: null,
     copySourceFacts: null,
@@ -256,7 +259,7 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
 }
 
 function listing(over: Partial<TaskListingVm> = {}): TaskListingVm {
-  return { tasks: [task()], unknown: [], ...over };
+  return { tasks: [task()], unknown: [], retired: [], ...over };
 }
 
 function answer(value: TaskListingVm): void {
@@ -378,6 +381,27 @@ afterEach(() => {
 });
 
 describe("the Tasks pane", () => {
+  it("names the stored tasks an upgrade removed until the notice is put away", async () => {
+    answer(listing({ retired: ["Morning digest", "01OLD"] }));
+    vi.mocked(syncTasksRetiredDismiss).mockResolvedValue(undefined);
+    render(<TasksPane />);
+    const notice = await screen.findByTestId(TASKS_RETIRED_TESTID);
+    expect(notice).toHaveTextContent(tasksRetiredSentence(["Morning digest", "01OLD"]));
+    expect(notice).toHaveTextContent("these 2 stored tasks were removed: Morning digest, 01OLD.");
+
+    answer(listing());
+    fireEvent.click(screen.getByRole("button", { name: TASKS_RETIRED_DISMISS_LABEL }));
+    await waitFor(() => expect(screen.queryByTestId(TASKS_RETIRED_TESTID)).toBeNull());
+    expect(syncTasksRetiredDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no notice when nothing was removed", async () => {
+    answer(listing());
+    render(<TasksPane />);
+    await screen.findAllByTestId(TASKS_ROW_TESTID);
+    expect(screen.queryByTestId(TASKS_RETIRED_TESTID)).toBeNull();
+  });
+
   it("names both copy drives and reveals each existing path without claiming machine-wide scope", async () => {
     const source = { path: "/photos/source", drive: "Photos", driveId: "photos", exists: true };
     const destination = {

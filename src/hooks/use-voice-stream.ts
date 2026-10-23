@@ -1,14 +1,14 @@
 /**
  * The voice stream's lifecycle (Epic 62, Story 62.5, FR-405).
  *
- * The SINGLE `voice_watch` subscriber: one channel for the whole Bots
- * surface, mirroring every streamed {@link VoiceStateVm} into
+ * The SINGLE `voice_watch` subscriber: one channel for the voice surface
+ * (Settings › Voice), mirroring every streamed {@link VoiceStateVm} into
  * {@link voiceStore}. The wake chip (62.5) and the talk-mode control (62.6)
  * are projections of that store and open no channel of their own.
  *
- * Mounted where `capabilities.bots` is true and nowhere else; where it is
- * false the effect does nothing at all, because a surface that does not exist
- * must not hold a microphone watcher open. On cleanup — StrictMode
+ * Active only while its host says so (`enabled`, the section's `open`);
+ * otherwise the effect does nothing at all, because a surface that is not
+ * showing must not hold a microphone watcher open. On cleanup — StrictMode
  * double-mount or unmount — the watch is torn down and the last snapshot
  * forgotten (DW-4: no stream outlives its surface), so a chip cannot keep
  * saying "listening" on a pane that is gone. The sink is gated so a late
@@ -39,14 +39,11 @@ import { readVoiceFacts } from "@/hooks/use-voice-facts";
 import { logFailure } from "@/lib/failure";
 import type { VoiceStateVm } from "@/lib/ipc/client";
 import { voiceUnwatch, voiceWatch } from "@/lib/ipc/client";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
-export function useVoiceStream(): void {
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
-
+export function useVoiceStream(enabled: boolean): void {
   useEffect(() => {
-    if (!bots) {
+    if (!enabled) {
       return;
     }
 
@@ -86,5 +83,5 @@ export function useVoiceStream(): void {
       }
       voiceStore.getState().reset();
     };
-  }, [bots]);
+  }, [enabled]);
 }

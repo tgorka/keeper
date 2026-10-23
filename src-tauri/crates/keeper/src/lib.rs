@@ -17,23 +17,9 @@ mod account_restore;
 // providers and Matrix accounts as portable records, and where a pulled
 // setting is written. Every target, like the account itself.
 mod account_settings;
-// The app's side of `keeper_agent`'s ports (AD-367): the stream sinks, the
-// voice turn's hooks and the error mapping on every target; the approval
-// sheet, the notes vault and the sync profiles on desktop, chosen at compile
-// time so a phone's turn is armed with no drive.
+// The app's side of `keeper_agent`'s vault port (AD-367): the sessions
+// board's writes into a notes vault, desktop-only.
 mod agent_ports;
-// The Bots surface's commands that run on every target (Epic 61, Story 61.4;
-// split in Story 62.1). A provider is a URL plus a credential and a
-// conversation two tables in the `keeper.db` every platform already opens;
-// the turn loop itself is `keeper_agent` (AD-367).
-mod bots_ipc;
-// The drive half of the Bots surface (Story 62.1): grants, the audit log, the
-// approval answer, image staging and deliverable paths. Desktop-only: the
-// phone has no drive for a bot to reach. `CapabilitiesVm.botTools` is false
-// where this module is absent, so nothing on a phone calls it — absence
-// rather than a refusing twin (AD-27).
-#[cfg(desktop)]
-mod bots_drive_ipc;
 mod build_identity;
 // The copy engine drives `keeper_sync`, which links on every target since
 // Epic 66 (AD-198); its three commands sit in the shared handler list.
@@ -71,6 +57,8 @@ mod notes_ipc;
 mod notes_vault;
 #[cfg(desktop)]
 mod notes_window;
+// The model providers notes search asks (Story 108.3a): every target.
+mod providers_ipc;
 mod recorder;
 // The `keeper-recording://` asset scheme (Story 42.4). Desktop-only for the same
 // reason `note_protocol` is: it serves the recordings a desktop records into,
@@ -1068,74 +1056,14 @@ pub fn run() {
                 hq_ipc::agent_instances_subscribe,
                 hq_ipc::agent_instances_unsubscribe,
                 hq_ipc::agent_instances_set,
-                // The Bots surface's sync-free half (Epic 61, Story 61.4;
-                // split in Story 62.1), in the shared body for
-                // `config_layers`' reason: `keeper_core::bots` has no desktop
-                // gate — a provider is a URL and a credential, a conversation
-                // is two tables in `keeper.db` — so a phone can hold a
-                // conversation with a Hermes bot. The drive half — grants,
-                // audit, the approval answer, image staging, deliverable
-                // paths — is `bots_drive_ipc` (below, in the desktop splice),
-                // and a phone's turn is armed with no drive
-                // (`agent_ports::turn_env`). `CapabilitiesVm.bots` is true wherever the pane
-                // exists; `CapabilitiesVm.botTools` is what keeps the drive
-                // affordances off a phone.
-                bots_ipc::bots_providers_list,
-                bots_ipc::bots_provider_save,
-                bots_ipc::bots_provider_remove,
-                bots_ipc::bots_provider_probe,
-                bots_ipc::bots_models_list,
-                bots_ipc::bots_bot_probe,
-                bots_ipc::bots_bots_list,
-                bots_ipc::bots_bot_save,
-                bots_ipc::bots_bot_remove,
-                // The pinned-bot identity half (Story 61.7, FR-383).
-                // `bots_bot_identity_save` validates through
-                // `keeper_core::bots::identity` — the closed shape set and the
-                // bounded, contrast-checked palette — and
-                // `bots_bots_reorder` rewrites the whole hand order in one
-                // transaction, refusing anything that is not a permutation of
-                // the bots that exist.
-                bots_ipc::bots_bot_identity_save,
-                bots_ipc::bots_bots_reorder,
-                bots_ipc::bots_sessions_list,
-                bots_ipc::bots_session_open,
-                // The step-level follow of a session another device is
-                // writing (Story 63.7, AD-177): one history read, never a
-                // second SSE against a run this process did not start.
-                bots_ipc::bots_session_follow,
-                // The list, the archive and the continue verb (Story 61.6,
-                // FR-381, FR-382). `bots_sessions_search` is the queried,
-                // scoped, bounded read the list uses; the three writes each
-                // answer with the row as stored, and the delete makes no
-                // remote request because keeper's store is the record
-                // (AD-154).
-                bots_ipc::bots_sessions_search,
-                bots_ipc::bots_session_rename,
-                bots_ipc::bots_session_archive,
-                bots_ipc::bots_session_delete,
-                // The streaming pair, and its cancel. `bots_chat_send` and
-                // `bots_message_retry` each open a `Channel<BotStreamEvent>`
-                // and return a string subscription id; `bots_chat_stop` fires
-                // that answer's cancel handle and is idempotent, so a racing
-                // unmount is not an error. On every target: a turn is one
-                // tool loop over a host the drive port supplies, and a build
-                // with no drive supplies one that refuses.
-                bots_ipc::bots_chat_send,
-                bots_ipc::bots_message_retry,
-                bots_ipc::bots_chat_stop,
-                // The metadata toggle (Story 61.8, FR-384). An ordinary
-                // `settings` row rather than a bots table: it is a preference
-                // about the person, so a `keeper.toml` may set it like any
-                // other, and it is registered here beside the surface it
-                // belongs to rather than in the settings block.
-                bots_ipc::bots_message_details_get,
-                bots_ipc::bots_message_details_set,
-                // The slash-command registry (Story 61.9, FR-385). Stateless
-                // and pure — one `keeper_core::bots::commands` call — and in
-                // the shared literal for the same reason as the rest: the
-                // composer may always ask what a draft is.
-                bots_ipc::bots_command_preview,
+                // The model providers notes search asks (Story 108.3a), in the
+                // shared body: a provider is a URL and a credential behind the
+                // keychain, so a phone's notes search reaches one the same way.
+                providers_ipc::providers_list,
+                providers_ipc::provider_save,
+                providers_ipc::provider_remove,
+                providers_ipc::provider_probe,
+                providers_ipc::provider_models,
                 // 108.2: the agents "Speak to" offers, from the databases.
                 hq_ipc::voice_agent_targets,
                 // Story 100.3 (R383), 108.2: the one default agent, from the
@@ -1153,15 +1081,12 @@ pub fn run() {
                 voice_ipc::voice_start,
                 voice_ipc::voice_stop,
                 voice_ipc::voice_wake_set,
-                // Epic 67 (AD-206): the bot a spoken turn goes to.
+                // Epic 67 (AD-206): where a spoken turn goes.
                 voice_ipc::voice_target_set,
                 // 108.2 (UX-DR-E108-1): an old agent room choice cleared.
                 voice_ipc::voice_old_target_notice_get,
                 voice_ipc::voice_old_target_notice_dismiss,
-                // Epic 68 (AD-216, AD-218): each pinned bot's first-token
-                // median for the picker, and the one listening toggle every
-                // menu with a Bots section calls.
-                voice_ipc::voice_target_speeds,
+                // Epic 68 (AD-218): the one listening toggle every menu calls.
                 voice_ipc::voice_wake_toggle,
                 // Story 62.5: the watcher without a turn, and the persisted phrase.
                 voice_ipc::voice_watch,
@@ -1200,8 +1125,8 @@ pub fn run() {
                 account_ipc::account_offer_add_provider,
                 account_ipc::sync_credential_source_get,
                 account_ipc::sync_credential_source_set,
-                account_ipc::bots_provider_credential_source_get,
-                account_ipc::bots_provider_credential_source_set,
+                account_ipc::provider_credential_source_get,
+                account_ipc::provider_credential_source_set,
                 // Repository sources (Epic 86): every target, like drives.
                 forge_ipc::forges_list,
                 forge_ipc::forge_repos,
@@ -1482,8 +1407,8 @@ pub fn run() {
                 // Tasks verbs, the copy engine, sessions and notes — on every
                 // target since Epic 66 (AD-198): `keeper-sync` links on the
                 // phone. Which of them a phone *renders* is `CapabilitiesVm`
-                // (`sync` true there; `notes`, `sessions`, `botTools` their
-                // own stories'), never the handler list. The commands that need
+                // (`sync` true there; `notes` and `sessions` their own
+                // stories'), never the handler list. The commands that need
                 // a window or a file manager stay in the desktop splice below
                 // with `Unsupported` twins on the phone.
                 sync_ipc::sync_profiles,
@@ -1560,6 +1485,7 @@ pub fn run() {
                 // to name, and iOS is not a task host at all (AD-137: the OS owns the
                 // runtime, `pause_all()` runs on backgrounding).
                 sync_ipc::sync_tasks,
+                sync_ipc::sync_tasks_retired_dismiss,
                 sync_ipc::sync_task_history,
                 sync_ipc::sync_task_run_log,
                 sync_ipc::sync_tasks_ledger,
@@ -1712,45 +1638,6 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = keeper_with_commands!(
         builder,
-        // The drive half of the Bots surface (Story 62.1), spliced in
-        // as desktop `$extra` beside the sync surface it reaches into:
-        // every command here needs `keeper_sync` — a grant names a
-        // synced profile, an audit row records a call into one, a
-        // deliverable path resolves against one, and a pasted image
-        // is an affordance the phone does not offer. `mod
-        // bots_drive_ipc` is itself `#[cfg(desktop)]`, so none of these
-        // has a `#[cfg(not(desktop))]` twin to name; what keeps the
-        // affordances off a phone is `CapabilitiesVm.botTools`, false
-        // there (AD-27's absence rather than a refusing twin). The
-        // sync-free half — providers, bots, conversations, the
-        // streaming pair — is in the shared literal above.
-        //
-        // The answer to a `BotStreamEvent::ApprovalAsked` (Story
-        // 61.10, FR-387): the one direction the channel cannot carry.
-        // Idempotent like `bots_chat_stop`, for the same reason. Here
-        // rather than beside the streaming pair because only a
-        // `DriveToolHost` ever asks.
-        bots_drive_ipc::bots_approval_answer,
-        // The grant and audit half (Story 61.10, FR-386, NFR-47): a
-        // grant decision is `keeper_core::bots::grant` and the audit
-        // rows are `keeper.db`, but a grant is a promise about files
-        // keeper cannot reach from a phone, so the commands live with
-        // the drive rather than compiling into a build that cannot
-        // honour them.
-        bots_drive_ipc::bots_grants_list,
-        bots_drive_ipc::bots_grant_save,
-        bots_drive_ipc::bots_grant_revoke,
-        bots_drive_ipc::bots_audit_list,
-        // An image you can paste, a path you can open (Story 61.12,
-        // FR-392, FR-393). `bots_image_paste` takes its bytes as an
-        // `InvokeBody::Raw` body and never as base64 in a JSON payload
-        // (AD-58), which is why it is a `tauri::ipc::Request` command
-        // and not an argument list; `bots_deliverable_paths` re-reads
-        // the grants on every call, so a reveal control cannot outlive
-        // the permission that justified it.
-        bots_drive_ipc::bots_image_paste,
-        bots_drive_ipc::bots_image_discard,
-        bots_drive_ipc::bots_deliverable_paths,
         // The notes commands that need a window (the quick-capture panel), a
         // file manager or an opener — the rest of notes is in the shared body
         // since Epic 66. Each has an `Unsupported` twin in `ipc` below.

@@ -159,8 +159,8 @@ export function Study() {
       <header id="study-controls" className="ph-no-capture">
         <h1>Synthetic usability study</h1>
         <p>
-          This document contains only invented tasks. Your account, messages, drive, notes, bots and
-          recordings are not loaded here. Never paste private content into this page.
+          This document contains only invented tasks. Your account, messages, drive, notes, agents
+          and recordings are not loaded here. Never paste private content into this page.
         </p>
         <p>
           Start permits PostHog replay and click/movement heatmaps for this session only. Text and
