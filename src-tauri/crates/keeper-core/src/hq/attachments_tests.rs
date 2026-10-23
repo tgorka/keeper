@@ -1078,3 +1078,143 @@ fn every_refusal_code_the_server_sends_reads_as_a_sentence_naming_the_file() {
         "The agents server refused plan.pdf: hq.new_rule: not today."
     );
 }
+
+fn thumbnail_fixture() -> Vec<u8> {
+    include_bytes!("../../../../../dev/fixtures/agent-photo.png").to_vec()
+}
+
+fn thumbnail_dimensions(bytes: &[u8]) -> (u32, u32) {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .expect("PNG format")
+        .into_dimensions()
+        .expect("PNG dimensions")
+}
+
+#[test]
+fn thumbnail_path_scheme_serves_only_staged_snapshots_at_256_and_refuses_traversal() {
+    use crate::asset_url::{compose, UrlForm};
+    use crate::hq::thumbnails;
+    let dir = tempfile::tempdir().expect("directory");
+    let path = dir.path().join("photo.png");
+    std::fs::write(&path, thumbnail_fixture()).expect("image");
+    let staging = Staging::default();
+    let key = AgentSessionRef {
+        database: "alpha".into(),
+        session_id: "dev1.1".into(),
+    };
+    let handle = staging.stage(&key, stage_path(&path).expect("stage path"));
+    // A replaced path cannot change the selected snapshot or escape its allow-set.
+    std::fs::write(&path, b"not the selected file").expect("replace");
+    for form in [UrlForm::Scheme, UrlForm::Localhost] {
+        let prefix = if form == UrlForm::Scheme {
+            "localhost/"
+        } else {
+            ""
+        };
+        let uri = compose(form, SCHEME, &format!("{prefix}{handle}?thumbnail=1"));
+        assert_eq!(
+            thumbnail_dimensions(&thumbnails::staged(&staging, &uri).expect("thumbnail")),
+            (256, 128)
+        );
+        for denied in [
+            "/etc/passwd",
+            "../photo.png",
+            "%2e%2e%2fphoto.png",
+            "notstaged",
+            "foo/bar",
+        ] {
+            assert_eq!(
+                thumbnails::staged(
+                    &staging,
+                    &compose(form, SCHEME, &format!("{prefix}{denied}?thumbnail=1"))
+                ),
+                Err(OpenError::NotHere)
+            );
+        }
+    }
+    staging.release(&key, std::slice::from_ref(&handle));
+    let uri = compose(
+        UrlForm::Scheme,
+        SCHEME,
+        &format!("localhost/{handle}?thumbnail=1"),
+    );
+    assert_eq!(thumbnails::staged(&staging, &uri), Err(OpenError::NotHere));
+}
+
+#[test]
+fn thumbnail_rejects_invalid_and_oversized_images_without_panicking() {
+    use crate::hq::thumbnails::render;
+    assert_eq!(render(b"not an image"), Err(OpenError::NotHere));
+    let mut oversized = thumbnail_fixture();
+    oversized.resize(ATTACHMENT_MAX_BYTES as usize + 1, 0);
+    assert_eq!(render(&oversized), Err(OpenError::NotHere));
+}
+
+#[test]
+fn thumbnail_blob_is_own_person_only_and_cache_only_even_after_restart() {
+    use crate::hq::thumbnails;
+    let dir = tempfile::tempdir().expect("directory");
+    let alpha = open(dir.path());
+    seed_session(&alpha, "dev1.1", 1_000, false);
+    let bytes = thumbnail_fixture();
+    let blob = sha256(&bytes);
+    attach(
+        &alpha,
+        "dev1.1",
+        "look",
+        vec![stage_bytes("photo.png", "image/png", bytes).expect("staged")],
+    )
+    .expect("sent");
+    close(alpha);
+    let mut alpha = open(dir.path());
+    assert_eq!(
+        thumbnail_dimensions(
+            &thumbnails::blob(&alpha, &blob).expect("cached thumbnail after restart")
+        ),
+        (256, 128)
+    );
+    assert!(chips(&alpha, "dev1.1")
+        .values()
+        .flatten()
+        .all(|chip| chip.thumbnail_url.is_some()));
+    alpha.actor = "another-person".into();
+    assert_eq!(thumbnails::blob(&alpha, &blob), Err(OpenError::NotHere));
+    assert!(chips(&alpha, "dev1.1")
+        .values()
+        .flatten()
+        .all(|chip| chip.thumbnail_url.is_none()));
+    alpha.actor = ANA.into();
+    file(dir.path())
+        .execute("UPDATE messages SET role = 'agent'", [])
+        .expect("agent message");
+    assert_eq!(thumbnails::blob(&alpha, &blob), Err(OpenError::NotHere));
+    assert!(chips(&alpha, "dev1.1")
+        .values()
+        .flatten()
+        .all(|chip| chip.thumbnail_url.is_none()));
+    file(dir.path())
+        .execute("UPDATE messages SET role = 'person'", [])
+        .expect("person message");
+    file(dir.path())
+        .execute("DELETE FROM _syncular_blobs", [])
+        .expect("cache miss");
+    assert_eq!(
+        thumbnails::blob(&alpha, &blob),
+        Err(OpenError::NotHere),
+        "a thumbnail cache entry cannot authorize a download or outlive the blob"
+    );
+}
+
+#[test]
+fn thumbnail_cache_miss_never_uses_the_download_port_even_when_online() {
+    let (replica, source) = fake(vec![json!({"mime": "image/png"})], LinkState::Connected);
+    assert_eq!(
+        crate::hq::thumbnails::blob(&source, "missing-photo"),
+        Err(OpenError::NotHere)
+    );
+    assert!(
+        replica.fetched_blobs.lock().expect("downloads").is_empty(),
+        "showing a thumbnail must never attempt to download an uncached image"
+    );
+}

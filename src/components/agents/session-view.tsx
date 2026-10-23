@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
+import { useSessionAttachmentDraft } from "@/components/agents/session-attachment-draft";
 import { SessionAttachments } from "@/components/agents/session-attachments";
 import { SessionControls } from "@/components/agents/session-controls";
 import { SessionInstances } from "@/components/agents/session-instances";
@@ -43,6 +44,7 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** Mount keyed by (database, sessionId): no old page, draft or action can leak across databases. */
 export function SessionView({ target, onBack }: { target: AgentSessionRef; onBack?: () => void }) {
+  const attachmentDraft = useSessionAttachmentDraft(target);
   const [vm, setVm] = useState<AgentSessionViewVm | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Rust's sentence while the session is not on this device yet but may still arrive.
@@ -180,11 +182,14 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     try {
       for (let index = 0; index < pending.length; ) {
         const attachment = pending[index];
-        if (attachment.kind === "path") {
+        if (attachmentDraft.has(attachment.id)) {
+          index += 1;
+          handles.push(await attachmentDraft.stage(attachment));
+        } else if (attachment.kind === "path") {
           const paths: string[] = [];
           while (index < pending.length) {
             const next = pending[index];
-            if (next.kind !== "path") break;
+            if (next.kind !== "path" || attachmentDraft.has(next.id)) break;
             paths.push(next.path);
             index += 1;
           }
@@ -200,9 +205,27 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
       if (handles.length > 0) {
         void agentAttachRelease(target, handles).catch(logFailure("agents.attach.release"));
       }
+      attachmentDraft.consume(
+        pending.map((attachment) => attachment.id),
+        handles,
+        true,
+      );
       throw raw;
     }
-    await agentAttachCommit(target, handles, caption);
+    try {
+      await agentAttachCommit(target, handles, caption);
+    } catch (raw) {
+      attachmentDraft.consume(
+        pending.map((attachment) => attachment.id),
+        handles,
+        true,
+      );
+      throw raw;
+    }
+    attachmentDraft.consume(
+      pending.map((attachment) => attachment.id),
+      handles,
+    );
   }
 
   const pageBack = async () => {
@@ -437,6 +460,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
               onSend={async (body) => {
                 await agentSend(target, body);
               }}
+              attachmentPreview={attachmentDraft.preview}
             />
           </ConversationStoresProvider>
         </div>

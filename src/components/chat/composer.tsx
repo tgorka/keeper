@@ -38,6 +38,7 @@ import { Camera, Image, Paperclip, Plus, X } from "lucide-react";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -140,6 +141,7 @@ interface ComposerProps {
    * Absent → the attach/paste affordances are inert.
    */
   onSendAttachments?: (attachments: PendingAttachment[], caption?: string) => Promise<void>;
+  attachmentPreview?: (attachment: PendingAttachment) => ReactNode;
   /** When `true`, the composer is inert (no room loaded). */
   disabled?: boolean;
   /** The active reply/edit context, or `null`. Drives the banner + Esc routing. */
@@ -262,6 +264,7 @@ export function Composer({
   roomId,
   onSend,
   onSendAttachments,
+  attachmentPreview,
   disabled = false,
   pending = null,
   editPrefill = null,
@@ -1406,6 +1409,7 @@ export function Composer({
               key={attachment.id}
               className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border bg-muted/50 py-1 pr-1 pl-2"
             >
+              {attachmentPreview?.(attachment)}
               <span
                 className="min-w-0 flex-1 break-words text-xs [overflow-wrap:anywhere]"
                 title={chipLabel(attachment)}

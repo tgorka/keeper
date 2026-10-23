@@ -581,6 +581,15 @@ impl Hq {
         attachments::open_blob(&source, blob_id).map_err(sentence)
     }
 
+    /// Resolve a device-only thumbnail request; no network fetch is reachable.
+    pub fn attachment_thumbnail(&self, uri: &str) -> Result<Vec<u8>, HqError> {
+        if let Some((database, blob)) = attachments::parse_blob_url(uri) {
+            super::thumbnails::blob(&self.source(&database)?, &blob).map_err(sentence)
+        } else {
+            super::thumbnails::staged(&self.staging, uri).map_err(sentence)
+        }
+    }
+
     /// The bytes of blobs `database`'s replica caches on this device.
     pub fn blob_cache_bytes(&self, database: &str) -> Result<u64, HqError> {
         self.source(database)?

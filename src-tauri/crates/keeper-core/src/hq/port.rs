@@ -336,6 +336,8 @@ pub trait Replica: Send + Sync {
     ) -> Result<String, ReplicaError>;
     /// A blob's bytes, from the cache or, while the replica syncs, its server.
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError>;
+    /// A locally cached body only. Must never fetch on a miss.
+    fn cached_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError>;
     /// What became of the commit `commit_id`. Answers from the file.
     fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError>;
     /// What is owed, or was refused, of the writes made here to `table`'s
@@ -408,6 +410,8 @@ pub(crate) mod fake {
         pub(crate) joined: AtomicBool,
         /// What [`Replica::upload_refusals`] answers.
         pub(crate) upload_refusals: Mutex<Vec<UploadRefusal>>,
+        /// Downloads attempted through the network-capable blob port.
+        pub(crate) fetched_blobs: Mutex<Vec<String>>,
         state: watch::Sender<ReplicaState>,
     }
 
@@ -473,8 +477,15 @@ pub(crate) mod fake {
         ) -> Result<String, ReplicaError> {
             self.mutate(ops)
         }
-        fn fetch_blob(&self, _: &str) -> Result<Vec<u8>, ReplicaError> {
+        fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+            self.fetched_blobs
+                .lock()
+                .expect("fetched blobs")
+                .push(blob.to_owned());
             Ok(Vec::new())
+        }
+        fn cached_blob(&self, _: &str) -> Result<Vec<u8>, ReplicaError> {
+            Err(ReplicaError::Closed)
         }
         fn delivery(&self, _: &str) -> Result<Delivery, ReplicaError> {
             Ok(Delivery::Unknown)
@@ -565,6 +576,7 @@ pub(crate) mod fake {
                 closed: AtomicBool::new(false),
                 joined: AtomicBool::new(false),
                 upload_refusals: Mutex::new(Vec::new()),
+                fetched_blobs: Mutex::new(Vec::new()),
                 state,
             });
             self.opened

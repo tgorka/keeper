@@ -104,4 +104,26 @@ describe("session attachment chips", () => {
       `${file.url}?retry=1`,
     );
   });
+
+  it("shows only an authorized thumbnail before Open, and retains Open after decode refusal", () => {
+    const own = {
+      ...file,
+      name: "photo.png",
+      mime: "image/png",
+      thumbnailUrl: "keeper-hq-blob://blob/alpha/sha256:abc?thumbnail=1",
+    };
+    render(
+      <SessionAttachments
+        attachments={[own, { ...own, id: "other", name: "other.png", thumbnailUrl: undefined }]}
+      />,
+    );
+    const thumb = screen.getByRole("img", { name: "Thumbnail of photo.png" });
+    expect(thumb).toHaveAttribute("src", own.thumbnailUrl);
+    expect(screen.queryByRole("img", { name: "Thumbnail of other.png" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "photo.png" })).not.toBeInTheDocument();
+    fireEvent.error(thumb);
+    expect(screen.queryByRole("img", { name: "Thumbnail of photo.png" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open photo.png" }));
+    expect(screen.getByRole("img", { name: "photo.png" })).toHaveAttribute("src", own.url);
+  });
 });

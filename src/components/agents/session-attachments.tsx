@@ -1,5 +1,6 @@
 import { FileText, RefreshCw } from "lucide-react";
 import { useId, useRef, useState } from "react";
+import { SessionThumbnail } from "@/components/agents/session-thumbnail";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,10 +13,18 @@ import {
 import type { AgentAttachmentVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
-/** Metadata only until Open: never mount a thumbnail that downloads another member's file. */
+/** Only Rust-authorized own images have a thumbnail; other files wait for Open. */
 export function SessionAttachments({ attachments }: { attachments: AgentAttachmentVm[] }) {
   return (
-    <ul aria-label="Attachments" className="mt-2 grid min-w-0 gap-2 sm:grid-cols-2">
+    <ul
+      aria-label="Attachments"
+      className={cn(
+        "mt-2 grid min-w-0 gap-2",
+        attachments.some((attachment) => attachment.thumbnailUrl)
+          ? "grid-cols-2"
+          : "sm:grid-cols-2",
+      )}
+    >
       {attachments.map((attachment) => (
         <AttachmentChip key={attachment.id} attachment={attachment} />
       ))}
@@ -39,7 +48,15 @@ function AttachmentChip({ attachment }: { attachment: AgentAttachmentVm }) {
             aria-describedby={description}
             className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-lg p-3 text-left hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
           >
-            <FileText aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+            {attachment.thumbnailUrl ? (
+              <SessionThumbnail
+                src={attachment.thumbnailUrl}
+                name={attachment.name}
+                className="h-28 w-28 max-w-[40%]"
+              />
+            ) : (
+              <FileText aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+            )}
             <span className="min-w-0 flex-1">
               <span className="block break-words text-sm [overflow-wrap:anywhere]">
                 {attachment.name}

@@ -660,6 +660,9 @@ impl Replica for Staged {
     fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
         self.inner.fetch_blob(b)
     }
+    fn cached_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
+        self.inner.cached_blob(b)
+    }
     fn delivery(
         &self,
         commit: &str,
