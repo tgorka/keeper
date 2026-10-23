@@ -121,6 +121,12 @@ is safe.
 
 ## D-4 — The endpoint is yours, never keeper's
 
+> **Amended by D-37 (2026-10-20).** The ⌘9 surface below is gone (Story 108.3a). "The endpoint
+> is yours" survives in two places: the agents server's address, which keeper ships none of
+> (`agents.server_url`, `docs/agents.md` § *The agents server and pairing*), and the model provider
+> rows notes search reads (`docs/egress.md` § *A model provider is a destination you typed*). The
+> entry is kept as written.
+
 keeper will talk to a model — a Hermes Agent profile, an Ollama model or any OpenAI-compatible
 endpoint, over the OpenAI-compatible wire, from a surface of its own at ⌘9 — and it will **not**
 decide where that model lives. There is
@@ -1600,6 +1606,11 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
 
 ## D-31 — An agent lives in a drive, and its session's log is the truth
 
+> **Superseded by D-37 for conversations (2026-10-20).** An agent's conversation is a row in a
+> database keeper-hq serves, not a log in a drive, and the agents keeper-hq runs are defined in
+> its image, not in the drives (`docs/agents.md`). The session logs were imported once (Story
+> 108.1); the drives keep them untouched, and nothing writes them. The entry is kept as written.
+
 The owner asked for agents with their own sessions, active and archived, that keep "all the data
 he needs, scripts he needs to use etc logs but also the message history and actions taken - so the
 session can be used after. - also after sync by drive the work can be continued on other device
@@ -1668,6 +1679,11 @@ soul, tools or core memory.
   wraps that writer, and the agents folder flag in `keeper-sync`.
 
 ## D-32 — Matrix is the agents' only live channel; keeper runs no hub and opens no listening socket
+
+> **Superseded by D-37 for agents (2026-10-20).** Agents talk through keeper-hq's databases, not
+> Matrix, and keeper no longer carries the agents' Matrix client (Story 108.2). Matrix stays the
+> messenger's and its bridges'. keeper still runs no hub and opens no listening socket. The entry is
+> kept as written.
 
 The owner wants the agents on the Mac, the iPhone and the Linux server ("I dont want sidecar. I
 want my mac, iphone, sever on linux to use it", 2026-10-01), talking to each other "instead of

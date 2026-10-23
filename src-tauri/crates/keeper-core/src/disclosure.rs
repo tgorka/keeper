@@ -40,7 +40,7 @@ pub enum Device {
 /// line IS [`VoicePlatform::IOS`]'s `limits` (AD-193): the sentence read here
 /// before switching listening on is the sentence shown beside the switch.
 pub const IPHONE_LINES: [&str; 8] = [
-    "keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.",
+    "keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows, and only ids pass through your gateway and Apple, never words); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.",
     "A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.",
     "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
     "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",
@@ -75,7 +75,7 @@ pub fn android(noun: &str) -> Vec<String> {
 /// push status there.
 pub fn android_push_line(noun: &str) -> String {
     format!(
-        "keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this {noun} while keeper runs in the background, read on this {noun} (nothing else shows; the ids of other messages still pass through that server, and this {noun} discards them); once Android has stopped keeper, a push only says that something arrived."
+        "keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this {noun} while keeper runs in the background, read on this {noun} (nothing else shows, and only ids pass through that server, never words); once Android has stopped keeper, a push only says that something arrived."
     )
 }
 

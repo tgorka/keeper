@@ -327,10 +327,8 @@ the phone builds also stamp `crates/keeper/posthog-client.env`, which
 `build.rs` reads when the environment is silent; `install-ios.sh` removes the
 local copy once the rsync has carried it and the Mac's copy once the Rust build
 has read it, by a trap that covers success, failure and interruption, R499).
-keeper-agentd and
-keeper-nse install no such layer and link no exporter crate
-(`check:agentd-lean`, `check:nse-lean`); electra's agent host logs to
-journald only.
+keeper-nse installs no such layer and links no exporter crate
+(`check:nse-lean`). The agents run in keeper-hq, whose logs are its own.
 
 ### Closed events
 
@@ -352,7 +350,7 @@ name or the warning's text (`keeper_core::telemetry::MicLossCause`,
 `telemetry_capture` contract.
 
 **Never sent on purpose:** unredacted text, stack traces, chat messages,
-notes, recordings, bot prompts or answers, an agent line's message or fields,
+notes, recordings, agent conversations, an agent line's message or fields,
 and nothing at all without diagnostics consent. A warning's own words can
 still name a file, folder or device (DW-1512): the redactor is lexical.
 
@@ -366,11 +364,11 @@ ORDER BY timestamp DESC LIMIT 50` with the maintainer's personal key
 
 ## Agents
 
-Agents (`keeper-agent`, `keeper-agentd`, `keeper_core::agents`) send PostHog
-no content: a desktop or phone agent line leaves with its level, target,
-file:line and fingerprint only (R461; `telemetry/tests.rs`
-`agent_target_lines_leave_without_their_message`), and the daemon on a server
-links no exporter at all (`bun run check:agentd-lean`). An agent-host failure
-on the desktop is a `WARN`/`ERROR` line in `keeper.log` and the agent room's
-own status line; the daemon on a server writes its own log beside its
-sessions ([agents.md](agents.md)).
+keeper's agents client (`keeper_core::hq`, `keeper-agent`, `keeper_core::agents`)
+sends PostHog no content: a desktop or phone agent line leaves with its level,
+target, file:line and fingerprint only (R461; `telemetry/tests.rs`
+`agent_target_lines_leave_without_their_message`). A failure of the agents
+client is a `WARN`/`ERROR` line in `keeper.log`, and what the agents server
+refused is said where it happened, in the Agents window or Settings › Agents &
+voice ([agents.md](agents.md)). The agents themselves run in keeper-hq, and
+their logs are keeper-hq's.

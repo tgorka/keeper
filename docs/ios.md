@@ -473,7 +473,7 @@ linked it. The phone build now carries the sync engine, the `sync_*`, `copy_*`,
 schemes. What stays desktop-only, and why:
 
 - The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
-- `bots_drive_ipc` and the drive half of `agent_ports` (the drive half of Bots), `notes_window` (the
+- `agent_ports` (the sessions board's writes into a notes vault), `notes_window` (the
   quick-capture window), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
   `pdf_export` (macOS WebKit). `sessions_root` compiles on the phone since 98.2 (the
   board below); the sessions lifecycle verbs keep their `unsupported` twins.
@@ -732,7 +732,7 @@ Face ID, and the time an action takes from a background launch.
 ## The folder on the phone
 
 Until Epic 66 the phone had no folder, so everything the folder carries — Files, Notes,
-the drive half of Bots — was absent by one construction. This section is what a folder on
+and the sessions board — was absent by one construction. This section is what a folder on
 the phone *is* now (AD-198, AD-199, AD-202; [decisions.md](decisions.md) D-15 and D-16),
 stated with the line that decides each fact, so the next reader checks the code rather
 than this prose.
@@ -776,12 +776,13 @@ The phone reads a drive's sessions zone and moves its cards; it writes no sessio
 - **What it reads.** `sessions_roots`, `sessions_list`, `sessions_rescan`,
   `sessions_detail`, `sessions_tree`, `sessions_refs`, `sessions_search` and its cancel
   run on the phone with no twin. The board is `keeper_agent::sessions::board::detail`,
-  the one projection the Mac shows too; an agent's session carries its room
-  (`SessionDetailVm.room`), where its approval card is decided.
+  the one projection the Mac shows too. An agent's session in a drive may still name the
+  Matrix room it was worked in before Story 108.2; that is one of the agents' old rooms,
+  which keeper no longer opens (`sessions-phone-pane.tsx:49-51`).
 - **What it writes.** `sessions_task_move` only: the moved card's `status:` and
   `order:`, and its neighbours' `order:` when the gap it lands in has collapsed — never
-  `run:`, `assignee:` or a body (`compile_move`). Agents on other hosts commit to the
-  same drive all the time, so the move goes through `Engine::phone_write` (R346): a
+  `run:`, `assignee:` or a body (`compile_move`). Other hosts may commit to the same drive
+  at any time, so the move goes through `Engine::phone_write` (R346): a
   pull-only pass first, so the move is planned over the remote's current bytes; a folder
   that is diverged, busy or failing refuses the move with the engine's own sentence and
   nothing is written; then the move, then one pass that commits and pushes it through the
@@ -809,12 +810,9 @@ The phone reads a drive's sessions zone and moves its cards; it writes no sessio
   *Move to…* (to the end of the column it joins), never by a drag — the picker's own
   *Move to…* entry is choosable and moves nothing, so opening the picker to look and
   tapping *Done* changes no card; a refused move is said in Rust's words, a move whose
-  push did not land says so (`unpushed`) — and *Allow* says to allow on the Mac. Tapping a
-  card of an agent's session opens the session's room on the account whose Agents window
-  holds it — the approval card is decided there, by the Matrix event a Mac would send —
-  and backing out of the room lands on the board again, on the page it was left on. A room
-  no account on the phone is in is said, not opened; a tap before the Agents window has
-  arrived says keeper is still reading the rooms.
+  push did not land says so (`unpushed`) — and *Allow* says to allow on the Mac. The board
+  offers no way into an old agent room, and an agent's approvals are decided in Agents
+  ([agents.md](agents.md)).
 
 ### Fully virtual by default, and why
 
@@ -936,7 +934,7 @@ the second is a problem. Three shapes:
    `a_phone_that_rooted_its_own_history_fetches_one_commit_deep_and_resets`.
 
    **The sessions board meets this more than notes do.** A drive's sessions zone is
-   written by agents on other hosts all day, so a card moved on top of the phone's last
+   written from other hosts often, so a card moved on top of the phone's last
    fast-forward would almost always diverge. That is why a move pulls first and is refused
    — nothing written — when the pull already names a divergence (R346, `Engine::phone_write`).
    What remains is a remote commit landing in the seconds between that pull and the push,
@@ -1042,7 +1040,7 @@ build. These are the same eight points keeper shows in-app under **Settings → 
 folder; the first and seventh by Epic 67, Story 67.4, AD-210, when a spoken turn learned
 to finish with the screen locked):
 
-- keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.
+- keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows, and only ids pass through your gateway and Apple, never words); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
@@ -1059,7 +1057,7 @@ to finish with the screen locked):
 
 On the first item, the canonical in-app wording spells out the sync consequence and its
 two exceptions (`NO_BACKGROUND_SYNC_SENTENCE`,
-`src/components/settings/no-background-sync-disclosure.tsx`): "On iPhone, keeper syncs and notifies about messages only while open. Close it and messages wait on your homeserver until you return — nothing is lost. Two things still reach you while it is closed. With a build signed by your own paid Apple team and a push gateway you run, set in Settings › Notifications, your agents' approval requests and your own agent's answers arrive as notifications, read on this phone. Nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them. And a voice session you left listening keeps listening with keeper behind other apps or the screen locked, and posts what it heard and answered as a local banner from this phone." The app-icon badge
+`src/components/settings/no-background-sync-disclosure.tsx`): "On iPhone, keeper syncs and notifies about messages only while open. Close it and messages wait on your homeserver until you return — nothing is lost. Two things still reach you while it is closed. With a build signed by your own paid Apple team and a push gateway you run, set in Settings › Notifications, your agents' approval requests and your own agent's answers arrive as notifications, read on this phone. Nothing else shows, and only ids pass through your gateway and Apple, never words. And a voice session you left listening keeps listening with keeper behind other apps or the screen locked, and posts what it heard and answered as a local banner from this phone." The app-icon badge
 follows the same honesty: "The app-icon badge is not a live count while keeper is closed; it
 reflects what keeper knew when it was last open."
 
@@ -1097,7 +1095,7 @@ The sessions board: the read verbs and `sessions_task_move` run on the phone wit
 twin, and the Sessions surface (`src/components/sessions/sessions-phone-pane.tsx`) is
 there exactly while `CapabilitiesVm.sessions` is — a folder on the phone with a sessions
 zone ([The sessions board on the phone](#the-sessions-board-on-the-phone-982) above).
-A card's session room is where its approval is decided; "creating and archiving
+An agent's approvals are decided in Agents ([agents.md](agents.md)); "creating and archiving
 sessions stays on your Mac" is every lifecycle verb's `unsupported` twin
 (`crates/keeper/src/sessions_ipc.rs`, DW-410). The bridge runner: `bridges-pane.tsx`
 gates the runner on `bridgeSidecar`, which is `cfg!(desktop)` (`ipc.rs:1430`);
@@ -1111,16 +1109,9 @@ would be true for minutes at a time (DW-238). Screen recording: `recording` is
 `macos_version::recording_supported()` (`ipc.rs:1435`), false off macOS; an audio memo
 on the phone is a different feature (DW-239). The summon hotkey: `hotkey.rs` is
 `#[cfg(desktop)]` (`lib.rs:41-42`) and `globalHotkey` is `cfg!(desktop)` (`ipc.rs:1426`),
-because iOS has no global hotkey. The drive tools: Bots exists on the phone — endpoints
-and bots are added, tested, edited and removed there through the same `keeper-core`
-grammar the desktop uses, and a conversation streams the same way — but the drive half
-(grants, the audit, deliverable paths, image staging) is `bots_drive_ipc` / `agent_ports`,
-still `#[cfg(desktop)]` (`lib.rs:22-29`) and `botTools` still `notes_available`
-(`ipc.rs:1495`). Since Epic 66 that is a choice rather than a linking fact — the phone
-has the folder now — and DW-220 says what would flip it. On the phone those controls are
-absent, not disabled: the pane says once, in its empty state, that the drive tools live
-on your Mac. The scope is Hermes because that is what was asked for; an Ollama or `openai`
-endpoint a phone can reach is the same wire and is neither built for nor blocked (DW-221).
+because iOS has no global hotkey. No agent runs on the phone, as on the Mac: the agents
+run in keeper-hq, and the phone is a client of its databases like any other device
+([agents.md](agents.md)).
 
 The sixth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
 "reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
@@ -1135,7 +1126,7 @@ and says either "keeper X.Y.Z is available — install it from your Mac with
 anything: a dev-signed bundle can only be replaced from the Mac.
 
 The seventh and eighth items are talk mode, Epic 62. keeper turns speech into
-text, sends it to the bot as an ordinary message and speaks the answer; a wake phrase
+text, sends it to an agent as an ordinary message and speaks the answer; a wake phrase
 (`nixie` by default, yours to change) starts a turn hands-free once listening is
 switched on. What iOS forbids is *starting* the microphone from the background, so
 listening is switched on while keeper is in front; what iOS supports is a session that
@@ -1153,7 +1144,7 @@ speak were the webview's, and a webview with the screen locked does not run, so 
 heard the question and waited for somebody to open keeper. Now the turn is Rust's from
 the phrase to the last word, the lock screen shows what it heard, and the stop word ends
 an answer — [A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen)
-below, and [decisions.md](decisions.md) D-17. The stop word is `bots.stop_phrase`,
+below, and [decisions.md](decisions.md) D-17. The stop word is `voice.stop_phrase`,
 "stop" by default, shown beside the wake phrase on both tiers.
 
 The eighth item is, byte for byte, the limits sentence the port shows beside the
@@ -1197,7 +1188,8 @@ rotation is a resize the stack handles, never a tier change.
 
 Measured on the phone rig — `dev/measure-bots.ts --phone` and `--phone-landscape`,
 hesperia's headless Chrome emulating the iPhone 14 Pro Max, 2026-09-05, the Bots
-conversation open (`app-shell.tsx:304-322`; `dev/measure-bots.ts:52-59`; commit `26816fb`):
+conversation open (`app-shell.tsx:304-322`; `dev/measure-bots.ts:52-59`; commit `26816fb` — the
+script and the pane left with the bots in Story 108.3a, so the run is a record of that commit):
 
 | Viewport | Before | After |
 | --- | --- | --- |
@@ -1393,7 +1385,7 @@ port reports no end of the answer while paused; one that ran out as the pause la
 continues. Each utterance the synthesiser reads to its end is reported by its delegate
 (`voice_synthesizer.rs`), and when the answer was an agent's and you stopped it or asked over it,
 the agent is told where you stopped listening before your next question goes in
-([agents.md](agents.md) § *Talking to Nixi*). Every pause leaves one `pause` row in the ring and
+([agents.md](agents.md) § *Talking to an agent*). Every pause leaves one `pause` row in the ring and
 the line `voice pause {…}` in the app log — `decision` (`backchannel_duration`,
 `backchannel_words`, `stop`, `question`, `false_onset`), `onset_ms`, `pause_ms`, `speech_end_ms`,
 `final_words_ms`, `resume_ms` — and every answer read a `voice spoken {"spoken_ms":…}` line, which
@@ -1426,53 +1418,36 @@ the session is `.playAndRecord`, activated while the phrase is armed, and Apple 
 synthesiser "obeys the same rules as other audio" — it had simply never been reached
 from the background (Epic 67, *What was measured*, 2).
 
-**What is Rust's now (AD-205, Story 67.1).** The port's result handler sinks
-`FinalHeard` into `voice_ipc::transition` (`crates/keeper/src/voice_ipc.rs:267`), which
-drives the turn: the phrase match takes `Idle` to `Listening`, the next final transcript
-is `Heard { text }` with `[SendText(text)]` (`keeper-core/src/voice/turn.rs:222-235`).
-`transition` finds the `SendText` in the effects it just drove and spawns
-`bots_ipc::send_spoken(&app, text)` on the runtime with the voice lock released
-(`voice_ipc.rs:278-291`). `send_spoken` (`crates/keeper/src/bots_ipc.rs:1330`) resolves
-the target (`spoken_request` `:1363`, `spoken_target` `:1389`), opens a Rust
-`Channel` whose sink re-emits every `BotStreamEvent` as the app event
-`keeper://bots-spoken-stream` (`SPOKEN_STREAM_EVENT`, `:1312`, `:1341-1354`), and runs
-`open_turn` (`:1224`) — the former body of `bots_chat_send`, so there is one stream code
-path. The driver marks the turn sent at its first byte (`drive` `:1723`, `note_sent`
-`:1738` → `Sending`) and answering at the first token (`note_answer_chunk` `:1760`), and
-the stream's close (`close` `:1881`) hands the whole answer to
-`voice_ipc::answer_complete` (`:1921` → `voice_ipc.rs:300`), a stop to `answer_stopped`
-(`:1922` → `:324`) and a failure to `answer_failed` (`:1923`, `close_failed` `:1943` →
-`:312`). `answer_complete` drives `AnswerDone`, which is `Speaking` with `[Speak(text)]`
-(`turn.rs:238-244`), and `perform` hands the text to the port's synthesiser. No webview
-is anywhere in that loop. The pane observes: `listenSpokenStream`
-(`src/lib/ipc/client.ts:7405`) → `useSpokenStream` (`src/hooks/use-spoken-stream.ts:25`)
-→ the pane's own `onStreamEvent` (`bots-pane.tsx:259`, `bots-phone-pane.tsx:339`), so the
-conversation on screen shows the heard text and the answer as before; `speakIfHeard`,
-the `onHeard` hand-off and the `voice_speak` command are gone, and
-`src/test/voice-capability.test.ts` pins that no voice component sends a message or
-reads an answer aloud. A button-started turn takes the same path — the transcript no
-longer lands in the composer to be checked first (`BotComposer.heard` is gone; the
-status reads "Heard — sending it", `bot-voice-mic.tsx:82`), because Rust cannot know a
-turn's origin once it performs the send and the epic asked for one turn, not two.
+**What is Rust's now (AD-205, Story 67.1; the send re-pointed by Story 108.2).** The port's
+result handler sinks `FinalHeard` into `voice_ipc::transition`, which drives the turn: the phrase
+match takes `Idle` to `Listening`, the next final transcript is `Heard { text }` with
+`[SendText(text)]` (`keeper-core/src/voice/turn.rs`). `transition` finds the `SendText` in the
+effects it just drove and spawns `send_spoken` on the runtime with the voice lock released
+(`crates/keeper/src/voice_ipc.rs:485`). It resolves *Speak to* through
+`keeper_core::voice::target` and hands the text to `hq_ipc::send_spoken`
+(`crates/keeper/src/hq_ipc.rs:918`), which writes it as your message into the agent's main
+conversation through `Hq::spoken_send` and follows the answer as it grows: the turn hears the send
+leave, the first words, each sentence with its end, and the end, or a refusal or failure as its
+sentence. The end drives `AnswerDone`, which is `Speaking` with `[Speak(text)]`, and `perform`
+hands the text to the port's synthesiser. No webview is anywhere in that loop; no `voice*.rs` file
+reaches the network, because the agents' half is `hq_ipc`'s. The webview observes the turn through
+the snapshots it already watches (`src/hooks/use-voice-stream.ts`), and
+`src/test/voice-capability.test.ts` pins that no voice component sends a message or reads an
+answer aloud. A button-started turn takes the same path — the status reads "Heard — sending it"
+(`src/components/voice/voice-mic.tsx:79`) — because Rust cannot know a turn's origin once it
+performs the send, and the epic asked for one turn, not two. What the agent does with the question,
+and how the answer and the heard mark travel, is [agents.md](agents.md) § *Talking to an agent*.
 
-**The voice target (AD-206).** A spoken question goes to `bots.voice_target` — the bot
-picked under "Speak to" in the voice section on both tiers (`bot-voice-target.tsx:29`,
-mounted in `bot-voice-wake.tsx:398`) — and to that bot's newest conversation, or a new
-one; unset, or naming a bot no longer pinned, it goes to the pinned bot most recently
-talked to, in the conversation list's own order; and with neither it is refused
-(`keeper-core/src/bots/voice_target.rs:77-101`) with one sentence, "Nothing to talk to
-yet: choose a bot to talk to under Bots." (`NO_TARGET_SENTENCE`, `:32`), which reaches
-the turn as `Failed { reason }` — beside the switch, on the lock screen as "Listening
-stopped: …", and in the ring as `refused` (`bots_ipc.rs:1337`, `voice_ipc.rs:312-317`).
-The model is the target conversation's last answering model, else the endpoint's first
-listed (`model_for`, `voice_target.rs:110`). Nothing is ever taken from what is open on
-the screen: the picker's note says so ("Where a spoken question goes, whatever is open on
-the screen", `bot-voice-target.tsx:33-34`), and a stream opened by Rust replaces the
-conversation on screen with the target's rather than the other way round.
-Since 91.4 (AD-384) the same key may name one of your assistant's conversations as
-`agent:<room id>` — the phone's Bots sheet lists them under "Speak to" from
-`voice_agent_targets` — and the question then goes into that room as your own message,
-with the answer spoken from the room's edits (`docs/agents.md` § *Talking to Nixi*).
+**The voice target (AD-206; Story 108.2).** A spoken question goes to the agent chosen under
+"Speak to" in the *Voice* section of Settings on both tiers (`src/components/voice/voice-target.tsx:38`),
+stored as `voice.target = agent:<agent>`, and to that agent's main conversation. Unset, or naming
+nothing an older build could name — one of the agents' old Matrix rooms or a ⌘9 bot — it is
+refused with one sentence, "Nothing to talk to yet: choose an agent under Speak to."
+(`NO_TARGET_SENTENCE`, `keeper-core/src/voice/target.rs:31`); an agent no held database names is
+refused with its own sentence. The refusal reaches the turn as `Failed { reason }` — beside the
+switch, on the lock screen as "Listening stopped: …", and in the ring as `refused`. Nothing is
+ever taken from what is open on the screen: the picker's note says so ("Where a spoken question
+goes, whatever is open on the screen", `voice-target.tsx:42`).
 
 **The banner (AD-207, Story 67.2).** `crates/keeper/src/voice_notify.rs` is iOS-only and
 is called from the same fan-out as the island (`voice_ipc.rs:409-412`). On every change of
@@ -1504,7 +1479,7 @@ App ID, nothing the free team lacks — the island (above) stays the richer surf
 it can be signed; this is the one every build has.
 
 **The stop word (AD-208, Story 67.3).** `SpeechDetected` now carries its transcript
-(`turn.rs:108`), and `Turn::apply` matches it against `bots.stop_phrase` while the turn is
+(`turn.rs:108`), and `Turn::apply` matches it against `voice.stop_phrase` while the turn is
 `Speaking` (`voice/mod.rs:462-475`): a match becomes `StopHeard`, a core-only event no
 port ever emits (`turn.rs:109-112`), and `(Speaking, StopHeard)` is `Idle` with
 `[StopSpeaking, ReleaseMicrophone]` (`turn.rs:212-214`); because `StopHeard` counts as
@@ -1521,7 +1496,7 @@ open microphone in someone's car (`:14-18`); "stop" by default (`DEFAULT_STOP_PH
 "okay stop now" match, "stopped" and "nonstop" do not). It is read at boot
 (`voice_ipc.rs:519-540`), validated and stored by the same `voice_wake_set` as the wake
 phrase (`:618-628`), and shown beside it as "Stop word" with its own Save on both tiers
-(`bot-voice-wake.tsx:114-118`, `:350-366`). The ring records the match as `stop_matched`
+(`src/components/voice/voice-wake.tsx`). The ring records the match as `stop_matched`
 with the words that matched (`voice_log.rs:61-65`).
 
 **The echo measure (AD-209, Story 67.3).** The session mode is `voiceChat` explicitly —
@@ -1550,12 +1525,12 @@ anything then. What the read did find is DW-246: a media-services reset mid-utte
 goes through `speech_over` without owing a `Silence` (`:1033-1045`).
 
 **What the run on kalypso must show (AD-210).** Not yet measured as of 2026-09-05; this
-is the prediction the ring is checked against. Phrase armed in keeper, "Speak to" set (or
-a pinned bot already talked to), then the phone locked. Say the phrase and a question;
+is the prediction the ring is checked against. Phrase armed in keeper, "Speak to" set to an
+agent, then the phone locked. Say the phrase and a question;
 keeper posts "Heard: …" on the lock screen within a second, then "Thinking", then
 "Answer: …" as the answer begins to be spoken aloud with the screen still locked; say
 "stop" mid-answer and the speech ends and the phrase works again without opening keeper.
-Afterwards, Settings → Bots → *What the voice port did* must list, newest first, each
+Afterwards, Settings › Agents & voice › *Voice* › *What the voice port did* must list, newest first, each
 with a timestamp:
 
 1. `wake_matched`, then `turn:listening`;
@@ -1585,7 +1560,7 @@ section predicts.
 
 ### Reading what the port did
 
-A phone has no console beside it. Settings → Bots on the phone shows **What the voice
+A phone has no console beside it. Settings › Agents & voice › *Voice* on the phone shows **What the voice
 port did**: the last fifty of a bounded ring of two hundred events the voice port fed —
 `armed` with the phrase, `disarmed`, `refused` with the sentence you were shown,
 `interruption_begun`, `interruption_ended`, `media_reset`, `route_changed` with the
@@ -1596,7 +1571,7 @@ words the tail gate threw away, `notified` with the lock-screen banner's word or
 `cleared` (Epic 67, AD-208, AD-209, AD-207), and the island's own `island:started` /
 `updated` / `ended` / `refused` with the system's refusal as the detail — newest first,
 each with how long ago (Epic 65, Story 65.3, AD-192; `keeper-core/src/voice/events.rs:32-79`,
-`:86-117`; `src/components/settings/bots-section.tsx:186-202`, `:233-301`). It is
+`:86-117`; `src/components/settings/voice-section.tsx:45-60`). It is
 read on open and every 2 s while open, kept in memory only, and neither written nor sent
 (`egress.md`, *The phone's record and the island add no egress*). It is how every story in
 epic 65 is evidenced on hardware: a refusal at arming appears there with its reason; a

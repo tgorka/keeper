@@ -83,7 +83,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
-| `agents` | This folder keeps agents, and where: `{ subfolder }`, default `80-agents`. Needs `sessions` in the same profile; a folder file may set it as `[folder.agents]`. See `docs/agents.md` § *The agents zone*. Since 108.2 it is read and kept but inert, and the form no longer sets it |
+| `agents` | Where this folder kept agents before they moved to keeper-hq: `{ subfolder }`, default `80-agents`; a folder file may set it as `[folder.agents]`. Since Story 108.2 it is read and kept, so a folder file that names it is not refused, and nothing acts on it; the form no longer sets it (DW-E108-2; `docs/agents.md` § *What left keeper with the agents' move*) |
 
 ### State
 
@@ -2347,9 +2347,13 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | `sync` | one full sync pass over the named folder, or over every enabled folder when the task is host-wide — the same `sync --once` body, taking the same per-folder reservation |
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
 | `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
-| `bot` | one question, asked of one bot: the prompt is any markdown file under the named folder, resolved through the same containment every other path uses. Frontmatter and one leading heading are omitted; the remaining text reaches the model verbatim. Existing grants govern every tool call; unattended asks are refused, never approved by the schedule. |
 | `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 7d`, `run_now`) once; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
 | `copy` | one verified local copy job between two absolute paths, using the last successful source mark with a configurable overlap; missing destinations are refilled by default, and deletion is an explicit option; no two-way relationship or journal |
+
+A stored task of kind `bot` — the scheduled prompt the ⌘9 bots ran until Story 108.3a — is not
+a kind this build knows. Opening `sync.db` removes each such row with its run history, names it
+once in a WARN line, and the Tasks list shows one notice until it is dismissed
+(`keeper-sync/src/db.rs:4858-4870`; UX-DR-E108-3).
 
 `sync`, `release` and `verify` reuse the existing implementation rather than gaining a second one,
 which is what makes "a task is not a privileged caller" true rather than
@@ -2476,36 +2480,6 @@ verification body, not another driver for cleanup. The scratch/footprint sweep
 stays daily (**24 hours**, `SWEEP_EVERY_MS`); the release/helper look remains
 hourly. The read-only “Also paced by this host” rows remain scan, scratch sweep,
 and optional notes cadence: nothing is migrated out of that projection.
-
-`bot` reuses the app's own chat path for the same reason, through a port: this
-crate is `keeper-core`-free, so the engine asks the shell to run the turn and
-records what came back. A host with no bot runner — `keeper-syncd` today —
-lists the task, refuses the run with "this host cannot run a bot task; the
-keeper app on the Mac runs it", and leaves the window for the host that has
-one. The app's own task form offers the kind with controls for all three facts
-a row of it carries — a bot, a prompt file and a model — so it is created there
-like every other kind; the CLI can set one too:
-
-```
-keeper-syncd tasks set nightly-digest --kind bot --profile drive \
-  --bot 01M1HDCJBAWFGF19X2ZB0H90VK \
-  --prompt 60-sessions/active/2026-09-05-digest/prompts/10-summarise.md \
-  --schedule '0 7 * * *'
-```
-
-The prompt need not live in a session's `prompts/` folder: AD-244 allows any
-markdown file under the profile, and the path above is one example rather than
-the shape.
-
-```
-keeper-syncd tasks set nightly-digest --kind bot --profile drive \
-  --bot 01M1HDCJBAWFGF19X2ZB0H90VK \
-  --prompt 60-sessions/active/2026-09-05-digest/prompts/10-summarise.md \
-  --schedule '0 7 * * *'
-```
-
-A prompt that is still a pointer (its content not fetched) is refused with what
-to do about it rather than sent as 130 bytes of `oid sha256:…`.
 
 `verify` is the one kind that takes **no per-folder reservation**, and that is
 deliberate rather than an omission: it writes nothing, so there is no second

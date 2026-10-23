@@ -204,7 +204,7 @@ keeper ships no push server and never picks one (D-1, D-4).
 **What you set up (operator actions).**
 
 - A UnifiedPush server that is also a Matrix push gateway, reachable over
-  `https://` by your homeserver and by this device — ntfy (Apache-2.0) is one:
+  `https://` by your agents server and by this device — ntfy (Apache-2.0) is one:
   it answers the Matrix push path on its own address. keeper registers push
   only over `https://`.
 - The distributor app for it on this device — the ntfy app, pointed at that
@@ -228,7 +228,7 @@ keeper ships no push server and never picks one (D-1, D-4).
    anyone who has it can post to this device — so keeper never logs or shows it,
    only its host; it is kept in keeper's data directory as
    `unifiedpush-endpoint`, with the distributor it came from and whether its
-   server answered as a gateway, so a sign-out can remove the pusher.
+   server answered as a gateway, so the old Matrix pusher (DW-E108-1) can still be removed.
 3. keeper asks the endpoint's own server once per endpoint whether it is a
    Matrix push gateway: `GET https://<endpoint host>/_matrix/push/v1/notify`,
    which a gateway answers with `{"unifiedpush":{"gateway":"matrix"}}`
@@ -237,11 +237,11 @@ keeper ships no push server and never picks one (D-1, D-4).
    new endpoint is. This is the one request keeper itself makes to the push
    server — on the iPhone it contacts its gateway never. A redirect is not
    followed. A definite other answer — a 404, something that is not that JSON,
-   a UnifiedPush gateway of another kind — registers nothing (and removes a
-   pusher registered before), and Settings → Notifications says why, naming
-   the host. **No answer** — the server unreachable, or slower than 10
-   seconds — is not an answer: keeper changes nothing, a pusher registered
-   before stays, and it asks again at the next start
+   a UnifiedPush gateway of another kind — gives the agents server no push
+   target (and takes back one given before), and Settings → Notifications says
+   why, naming the host. **No answer** — the server unreachable, or slower than
+   10 seconds — is not an answer: keeper changes nothing, a push target the
+   agents server has from before stays, and it asks again at the next start
    (`unifiedpush::pusher_change`). No other gateway is ever tried.
 4. Before 108.2 keeper registered on every account that held agent session
    rooms an `event_id_only` pusher to that gateway (app
@@ -269,9 +269,9 @@ keeper ships no push server and never picks one (D-1, D-4).
    words ("Open keeper to see what arrived."), and each such push replaces the
    last.
 
-**What is proved where.** On Linux: the pusher, the endpoint's grammar, the
+**What is proved where.** On Linux: the old pusher's identity, the endpoint's grammar, the
 discovery answer and request (against a local HTTPS server), asking once per
-endpoint, an unreachable server keeping the pusher, what a push names, the
+endpoint, an unreachable server changing nothing, what a push names, the
 distributor confirmation and what a notification posts and offers
 (`keeper-core/tests/unifiedpush_android.rs`,
 `unifiedpush_gateway_discovery.rs`). The Kotlin compiled
@@ -280,8 +280,9 @@ before the confirmation was added; the confirmation's Kotlin (the
 distributors' names), the notification intents' data URIs and the status-bar
 icon are checked by inspection, and `push_android.rs` type-checked for
 `aarch64-linux-android`; neither has been linked into an APK or run — CI's
-`android` job is the first build. The device run — the pusher on tuwunel,
-an approval from the lock screen, push latency — is story 98.4 #10, owed until
+`android` job is the first build. The device run — the old pusher's removal
+from tuwunel, an approval from the lock screen through the agents server, push
+latency — is story 98.4 #10, owed until
 its row is in `docs/agents.md` § *Measured*. What is still open: push only
 while keeper runs (DW-1310), registration only when the distributor answers at
 start (DW-1311), no way to switch to another distributor while the confirmed
@@ -374,7 +375,7 @@ tablet"** (on an Android phone the same lines say "phone"):
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own storage: it syncs only when keeper opens, comes back in front or you pull to refresh, and nothing is merged on this tablet — the Mac merges.
 - The sessions board is here: read a session's cards and move one with Move to…, and an agent's approvals are decided in Agents; creating and archiving sessions stays on your Mac.
 - No screen recording and no transcription on this tablet.
-- keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived.
+- keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows, and only ids pass through that server, never words); once Android has stopped keeper, a push only says that something arrived.
 - Voice works from Android 13: speech is recognised on this tablet and never sent to a server, and the answer is read aloud. There are no turn models here, so keeper waits for a pause after you stop. Turn listening on while keeper is in front and it listens while keeper stays in front with the screen on. Switching to another app or turning the screen off stops it, and it starts again whenever keeper is back in front, after a relaunch too. Where this device has no echo canceller, keeper stops listening while it speaks, so saying the stop word over an answer does nothing and the button stops it. It stops when you turn it off. Android shows its microphone indicator the whole time, and listening uses battery.
 - Updates arrive by installing a new build, signed with your own key and sideloaded; Check for updates in About says when a new version is out.
 

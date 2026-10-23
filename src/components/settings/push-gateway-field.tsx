@@ -10,19 +10,19 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 export const PUSH_GATEWAY_LABEL = "Push gateway";
 
 /**
- * What the field is for and who contacts the address (98.1, Q4/Q6; D-1, D-35; R331): the
- * gateway is the person's; keeper registers it with each account that holds agent rooms as
- * a pusher that carries event ids only, and never contacts it; what push brings is an
- * agent's approval request and the person's own agent's answer, read on the phone; and it
- * needs a build signed by the person's paid Apple team. Sentence case, no exclamation marks.
+ * What the field is for and who contacts the address (98.1, Q4/Q6; D-1, D-35; R331; 106.6,
+ * 108.2): the gateway is the person's; keeper hands it to the agents server as this device's
+ * push target, and the agents server sends it ids only — an approval waiting for the person
+ * and their own agent's answer, read on the phone; keeper never contacts it, and no
+ * homeserver is given it any more. It needs a build signed by the person's paid Apple team.
+ * Sentence case, no exclamation marks.
  */
 export const PUSH_GATEWAY_NOTE =
-  "The address of a Matrix push gateway you run. keeper registers it with your homeserver for " +
-  "each account that holds agent rooms, so your agents' approval requests and your own " +
-  "agent's answers reach this phone while keeper is closed, and nothing else shows. Your " +
-  "homeserver sends the gateway the id of every message that would notify, never its words, " +
-  "and keeper never contacts it. Push needs a build signed by your " +
-  "own paid Apple team. Leave it empty for no push.";
+  "The address of a Matrix push gateway you run. keeper gives it to your agents server as " +
+  "this phone's push address, so your agents' approval requests and your own agent's " +
+  "answers reach this phone while keeper is closed, and nothing else shows. The agents " +
+  "server sends the gateway their ids, never their words, and keeper never contacts it. " +
+  "Push needs a build signed by your own paid Apple team. Leave it empty for no push.";
 
 const PUSH_GATEWAY_PLACEHOLDER = "https://push.example.org";
 const PUSH_GATEWAY_SAVE = "Save";
