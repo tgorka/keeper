@@ -4317,7 +4317,7 @@ pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Re
         .map_err(|error| refusal(format!("{}: {error}", record.base_url)))?
         .normalized;
     let provider = Provider {
-        id: keeper_agent::turn::new_id(),
+        id: keeper_agent::sessions::new_id(),
         kind,
         name: record.name.clone(),
         base_url,

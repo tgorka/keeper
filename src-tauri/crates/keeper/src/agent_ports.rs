@@ -8,7 +8,7 @@
 
 #[cfg(desktop)]
 pub(crate) mod drive {
-    use keeper_agent::ports::VaultWriter;
+    use keeper_agent::promote::VaultWriter;
 
     /// A write that lands in a registered notes vault: written durably,
     /// then the reconciler and the dirty mark told, as an edit in the

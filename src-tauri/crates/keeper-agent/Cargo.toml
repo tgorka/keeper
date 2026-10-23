@@ -1,6 +1,6 @@
 [package]
 name = "keeper-agent"
-description = "keeper's one turn loop, drive tool host and task runner, shared by the app and the server (AD-367)"
+description = "keeper's client half of the agents: the sessions runtime, promotion and the surface (AD-367, R-HQ-2)"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -10,100 +10,32 @@ edition.workspace = true
 [lints]
 workspace = true
 
-# AD-367: tauri-free, so both the app and a Linux host link it.
+# AD-367: tauri-free, so it stays a library the app links on every target.
 # `bun run check:agent-tauri-free` asserts it over `cargo tree`.
 [dependencies]
 keeper-core = { path = "../keeper-core" }
 keeper-sync = { path = "../keeper-sync" }
-tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
-# A classic NanoKVM (96.5, AD-409): its WebSocket over keeper's own pinned
-# TLS (rustls through tokio-rustls, the stack reqwest already uses), its
-# URLs, and its JPEG frames decoded to grey (`image`'s `jpeg`, through
-# zune-jpeg) for the region hash.
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-tokio-tungstenite = { workspace = true }
-getrandom = { workspace = true }
-url = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The zone lock's file half: an exclusive lock a second process waits on.
 fs4 = { workspace = true }
 # The caller's clock, handed to a create (AD-56).
 chrono = { workspace = true }
-# An agent's room: the event ids and transaction ids its sends carry.
-matrix-sdk = { workspace = true }
-# BMAD's helpers, ported (AD-396): `bmad_config` and `bmad_party` read the
-# drive's install through them, and print what they print in key order.
-keeper-ported = { path = "../keeper-ported" }
-toml = { workspace = true }
-# A round's helpers run side by side on the turn's thread (R110). The MCP
-# servers a host names for its agents (AD-406): one client per
-# server, over streamable HTTP or, where the host may spawn, a child. The
-# HTTP side is keeper's own bounded client over the workspace's reqwest
-# (`mcp::http`), the child's pipes keeper's own transport with its output
-# read through a bound, so no feature of rmcp's own HTTP, process or pipe
-# layer is built. Every server is listed at once beside the manifest's
-# renewal.
-futures-util = { workspace = true }
-rmcp = { workspace = true, features = ["client", "transport-streamable-http-client"] }
-sse-stream = { workspace = true }
-# A screen server's screenshot, an MCP image block's base64, decoded to
-# grey for a region's difference hash before an action at coordinates is
-# approved and again before it is consumed (96.4).
-image = { workspace = true, features = ["jpeg"] }
-# The JPEG decoder `image` runs, asked directly what a photo's header says
-# its decoding takes — its components and their sampling — before a smaller
-# copy of it is made (R512). Already in Cargo.lock at 0.5.15 through
-# `image`'s `jpeg`, with the same features, so no new crate. MIT OR
-# Apache-2.0 OR Zlib.
-zune-jpeg = "0.5"
-base64 = { workspace = true }
 
-# The text of a PDF a person sends into an agent's room, written beside it
-# (story 101.2, R417). The session worker that does it is not built on a
-# phone (`cfg(phone)`), so neither is the reader.
-[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-pdf-extract = { workspace = true }
-
-# The headless host's process layer: no secret variable and no core dump
-# after start (S-07), `prctl` on Linux; a `run`'s own process group, killed
-# whole at its timeout.
+# The journaled executor's folder handles: `openat`, `renameat` and `fsync`
+# on a held directory, so a plan's steps stay inside the zone it opened.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
-# A `run`'s sandbox on Linux, applied by the trampoline to itself before it
-# execs the program (D-33): landlock for files and TCP, seccomp for sockets
-# and the calls that reach into another process, nix to close what it
-# inherited and to start the checked program by its descriptor
-# (`execveat`, feature `process`).
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = { workspace = true }
-seccompiler = { workspace = true }
-libc = { workspace = true }
-nix = { workspace = true, features = ["process"] }
-
 [dev-dependencies]
 tempfile = { workspace = true }
-# The paced edits are tested on tokio's paused clock.
-tokio = { workspace = true, features = ["test-util"] }
-# A served session's second turn opens no file under log/: counted by inotify.
-notify = { workspace = true }
+tokio = { workspace = true }
 # What a decision path writes to the process log, captured: a rejected
 # value never reaches it.
 tracing-subscriber = { workspace = true }
-# An index that opens and cannot answer, made by renaming its table
-# (drive_search). keeper-core already links it: no new crate.
-rusqlite = { workspace = true }
-# In-test MCP servers, spoken to over a real HTTP port and a real child.
-rmcp = { workspace = true, features = ["server", "elicitation", "transport-io", "transport-streamable-http-server"] }
-axum = { workspace = true }
-# A fake classic NanoKVM checks the login's password as the device would:
-# AES-256-CBC under the published key (96.5 #3). Both in the lock.
-aes = { workspace = true }
-cbc = { workspace = true }
-rcgen = { workspace = true }
+# A session's `agent.toml` names its people and room by Matrix id
+# (`keeper_core::agents::session`, R-HQ-69); the promote tests build them.
+matrix-sdk = { workspace = true }

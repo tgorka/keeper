@@ -477,11 +477,10 @@ schemes. What stays desktop-only, and why:
   quick-capture window), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
   `pdf_export` (macOS WebKit). `sessions_root` compiles on the phone since 98.2 (the
   board below); the sessions lifecycle verbs keep their `unsupported` twins.
-- Inside `keeper-agent`, everything that writes a session's log, an approval or a card's
-  run — `writer`, the session worker in `agent`, `approvals`, `cards` — and every module
-  built on them is `#[cfg(not(phone))]` (`keeper-agent/build.rs` sets `phone` for an iOS
-  or Android target), so a phone code path that names one does not compile.
-  `bun run check:agent-phone` checks that half on any host (98.2, AD-413).
+- `keeper-agent` holds no writer of a session's log, an approval or a card's run: those
+  left keeper with the agents' runtime (108.2, 108.3c), so the phone builds the whole
+  crate — the sessions runtime, promotion and the surface — and the `cfg(phone)` split
+  of 98.2 (AD-413) and its `check:agent-phone` are gone with them.
 - Inside `keeper-sync`, `git/cli.rs` is the one module that spawns a process. On
   iOS every verb on it refuses **before** `Command::new` with one sentence naming
   the phone and the in-process route (`GitEngine::Gix`, `GitCli::phone()`); the
@@ -796,8 +795,8 @@ The phone reads a drive's sessions zone and moves its cards; it writes no sessio
   keeper was closed in between — the declaration lives in memory).
 - **What stays on the Mac.** Creating, archiving, deleting, migrating sessions, the
   space and template editors, file verbs and *Allow* on a card's schedule keep their
-  `unsupported` twins, and `keeper-agent`'s session writer and approvals writer do not
-  exist in its build. A move a crash cut short — neighbours renumbered, the card not yet
+  `unsupported` twins; keeper has no session-log or approvals writer on any target
+  (108.3c). A move a crash cut short — neighbours renumbered, the card not yet
   written — is finished before every sync pass, by the same executor
   (`sessions_root::finish_interrupted_before_pass` → `resume_all`), so no pass commits half
   a move.
