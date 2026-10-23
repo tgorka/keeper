@@ -927,7 +927,9 @@ Recognition never leaves the device (`docs/egress.md`, *Voice adds no egress*).
 **Speak to** lists every agent of every database this device holds
 (`src-tauri/crates/keeper-core/src/hq/spoken.rs:119`) and is stored as `agent:<agent>`
 (`:68`, `:94`). A stored value from before 108.2 named an agent's Matrix room
-(`agent:!room…`). It is read as no choice, once, with a notice (`:110`; UX-DR-E108-1).
+(`agent:!room…`). It is read as no choice, once, with a notice (`:110`; UX-DR-E108-1). With no
+choice the turn is refused with *Nothing to talk to yet: choose an agent under Speak to.*
+(`keeper-core/src/voice/target.rs:31`); nothing is sent to an agent nobody chose.
 
 **Where a spoken question goes** (`hq/spoken.rs:11-19`, `:148`). It goes to the agent's main
 conversation: its newest session that is not archived in any held database, the one launch and the
@@ -950,10 +952,80 @@ claim copies it into `sessions.heard_until` and cuts the answer there in the nex
 It never answers a heard row, and the Agents window draws none (`hq/sessions.rs:597`). A later
 mark supersedes an earlier one, from whichever device.
 
+The device keeps the mark per question, beside the answer it follows: where each sentence handed to
+the synthesiser ends in the answer's text, and how many the synthesiser read to their end, as its
+delegate reports them. A sentence it was cut off in does not count, so the agent is never told you
+heard more than you did. When the answer is stopped — the stop phrase, the mic button, the hotkey,
+the tray (reason `stop`), or a question asked over it (`barge_in`) — the mark is written first, and
+your next question goes in once it is; one not written within 10 s is not waited for, and cuts the
+turns after it (`HEARD_MARK_WAIT`, `hq/spoken.rs:81`). An answer heard to its end, or one a failure
+ended, is marked nowhere. A choice under *Speak to* naming an agent no held database lists is
+refused with *The agent chosen under Speak to is in none of the agents' databases this device
+holds: choose again under Speak to.* (`:85-86`).
+
+- **When you talk over an answer.** The answer pauses, mid-word, the moment you speak — at the
+  voice activity model's onset (three frames, 96 ms) with the account's turn models, at the
+  recogniser's first words without them — and what you said decides: "mhm", "yeah", "okay"
+  (English) or "mhm", "tak", "no", "jasne" (Polish), the whole utterance and nothing else, resume
+  it; with the turn models, wordless speech under 600 ms resumes it too, and an onset that comes to
+  no words under 250 ms resumes it as a false onset. The stop phrase ends the answer. Anything else
+  stops it and is your next question — "no, wait" in English is a question. The list is the one
+  for the language recognition runs in; any other language has "mhm" and "aha". On the Mac this is
+  the same as on the phone ([ios.md](ios.md) § *When you talk over an answer*); a capture without
+  voice processing (an aggregate input, AD-213) hears keeper's own voice, so there the voice
+  activity model does not listen while keeper speaks, and the button, the hotkey and the tray stop
+  the answer.
+- **When your question ends.** Without the account's turn models it ends 1.8 s after the
+  recogniser's last words. With them (Silero VAD and Smart Turn v3.2 from `_models/`, on an
+  Apple-silicon Mac and the iPhone) a finished sentence ends it about a quarter of a second after
+  you stop, and a sentence the model judges unfinished waits for the 1.8 s pause
+  ([ios.md](ios.md) § *How a spoken turn ends*). The audio goes from the tap to the models and
+  nowhere else.
+- **The wake phrase** is the one you set; an agent's name renames nothing.
+
 The shell's `hq_ipc` runs the follow and tells the voice turn each step; no `voice*.rs` file
 reaches the network, which `voice_on_device` checks (`keeper-core/tests/voice_on_device.rs`).
 **Owed on devices:** the voice turn end to end on hesperia and kalypso, against keeper-hq with the
 heard runtime deployed (R-HQ-65).
+
+### Measured: a spoken turn's end
+
+NFR-114's end-of-turn half, per device, over at least twenty spoken questions with the turn
+models present — about half complete sentences, half trailing off — from the app log of the run
+(debug mode on; `KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test voice_timings
+measure_a_device_run -- --ignored --nocapture`): the p95 of `finish_recognition_ms −
+speech_end_ms` over the turns the model ended (≤ 300 ms; `finish_recognition_ms` is when the
+port ran `endAudio`, as it reported it), the p95 of `sent_ms − finish_recognition_ms`
+(≤ 600 ms), and the pause turns sent less than 1.8 s after their speech end
+(none). Each sent text is also compared by hand with what was said: no question may lose its last
+word.
+
+| device | OS | build | date | n | model turns | finish p95 | send p95 | early pauses | last words lost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hesperia | — | — | owed | — | — | — | — | — | — |
+| kalypso | — | — | owed | — | — | — | — | — | — |
+
+Both rows are owed: story 97.2 is done only when they are filled from real runs (97.2 #8).
+
+### Measured: talking over an answer
+
+NFR-114's backchannel half, per device, with the turn models present, over at least twenty
+pauses — "mhm" and "yeah" (English), "no" and "tak" (Polish) during long answers, "stop" and
+"no, wait" mid-answer, and ten minutes of an answer read with nobody speaking — from the app log
+of the run (debug mode on; `KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test
+voice_timings measure_a_pause_run -- --ignored --nocapture`): the p95 of `pause_ms − onset_ms`
+(≤ 150 ms), of `resume_ms − speech_end_ms` over pauses resumed by their duration and of
+`resume_ms − final_words_ms` over pauses resumed by their words (each ≤ 300 ms; `final_words_ms`
+is when the deciding words reached the turn, `resume_ms` when the synthesiser had continued),
+and the false onsets per ten minutes of reading aloud — more than one is reported to the
+coordinator before 97.3 closes.
+
+| device | OS | build | date | n | pause p95 | duration resume p95 | words resume p95 | false onsets / 10 min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hesperia | — | — | owed | — | — | — | — | — |
+| kalypso | — | — | owed | — | — | — | — | — |
+
+Both rows are owed: story 97.3 is done only when they are filled from real runs (97.3 #11).
 
 ## Old agent rooms
 
