@@ -91,7 +91,7 @@ use keeper_core::voice::{
 #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::ipc::{to_ipc_error, AppState};
 

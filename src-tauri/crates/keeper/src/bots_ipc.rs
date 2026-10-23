@@ -851,7 +851,7 @@ pub async fn send_spoken(app: &AppHandle, question: u64, text: String) {
             bot,
             session_id,
             history,
-        }) => spoken_request(&state, bot, session_id, history, &text).await,
+        }) => spoken_request(&state, *bot, session_id, history, &text).await,
         Err(refusal) => Err(refusal),
     };
     let req = match outcome {
@@ -918,7 +918,7 @@ enum SpokenTarget {
     /// A pinned bot, its conversation (none: a new one) and that
     /// conversation's messages.
     Bot {
-        bot: Bot,
+        bot: Box<Bot>,
         session_id: Option<String>,
         history: Vec<session::BotMessage>,
     },
@@ -967,7 +967,7 @@ fn spoken_target(dir: &Path, agents: &[String]) -> Result<SpokenTarget, IpcError
                 None => Vec::new(),
             };
             Ok(SpokenTarget::Bot {
-                bot,
+                bot: Box::new(bot),
                 session_id,
                 history,
             })
@@ -1279,7 +1279,7 @@ mod tests {
                 bot,
                 session_id,
                 history,
-            } => (bot, session_id, history),
+            } => (*bot, session_id, history),
             SpokenTarget::Agent { .. } => panic!("a bot target"),
         };
 
