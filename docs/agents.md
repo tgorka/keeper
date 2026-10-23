@@ -45,7 +45,8 @@ serves (`agents/provider-models.txt`). keeper neither chooses an agent's model n
 an answer names it (*Show details*, below). Nixi is the only agent that holds the Paseo broker, and
 she runs on a flash-tier model. A broker start is T3 and always waits for a person, and outside
 content raises it to T4, so the person stays the check (keeper-hq `review-agent-models.md`,
-rated Medium).
+rated Medium). A broker start (`create_agent` or `send_agent_prompt`) that times out may still
+take effect, so check the broker before asking for it again (DW-E108-14).
 
 On electra, on 2026-10-23, against keeper-hq 60b0da0, Nixi answered on
 `openrouter/z-ai/glm-5.3-flash` (108.3b's acceptance, below). She is the one agent verified there on
@@ -68,9 +69,9 @@ agents' models, not on the build. The rerun, with Nixi in a tgdrive session:
   the approval was consumed once, and the command ran.
 - **An MCP call:** `mcp__paseo__list_agents` returned.
 - **A broker approval:** `create_agent` went pending, was approved, and was consumed once by
-  `nixi.electra`. The Paseo broker then did not answer within 120 s, so keeper-hq ended the call
-  `refused` and Nixi told the person exactly that — a broker-side issue (DW-E108-14), not a
-  keeper-hq one.
+  `nixi.electra`. The broker did not answer within keeper-hq's 120 s deadline, and Nixi told the
+  person the call was refused. The owner's check found that the broker created the agent after
+  keeper-hq's 120 s deadline had passed, and keeper-hq recorded the call as refused (DW-E108-14).
 
 ## What left keeper with the agents' move
 
