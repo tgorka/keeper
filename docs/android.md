@@ -228,7 +228,7 @@ keeper ships no push server and never picks one (D-1, D-4).
    anyone who has it can post to this device — so keeper never logs or shows it,
    only its host; it is kept in keeper's data directory as
    `unifiedpush-endpoint`, with the distributor it came from and whether its
-   server answered as a gateway, so a sign-out can remove the pusher.
+   server answered as a gateway, so the old Matrix pusher (DW-E108-1) can still be removed.
 3. keeper asks the endpoint's own server once per endpoint whether it is a
    Matrix push gateway: `GET https://<endpoint host>/_matrix/push/v1/notify`,
    which a gateway answers with `{"unifiedpush":{"gateway":"matrix"}}`
@@ -237,11 +237,11 @@ keeper ships no push server and never picks one (D-1, D-4).
    new endpoint is. This is the one request keeper itself makes to the push
    server — on the iPhone it contacts its gateway never. A redirect is not
    followed. A definite other answer — a 404, something that is not that JSON,
-   a UnifiedPush gateway of another kind — registers nothing (and removes a
-   pusher registered before), and Settings → Notifications says why, naming
-   the host. **No answer** — the server unreachable, or slower than 10
-   seconds — is not an answer: keeper changes nothing, a pusher registered
-   before stays, and it asks again at the next start
+   a UnifiedPush gateway of another kind — gives the agents server no push
+   target (and takes back one given before), and Settings → Notifications says
+   why, naming the host. **No answer** — the server unreachable, or slower than
+   10 seconds — is not an answer: keeper changes nothing, a push target the
+   agents server has from before stays, and it asks again at the next start
    (`unifiedpush::pusher_change`). No other gateway is ever tried.
 4. Before 108.2 keeper registered on every account that held agent session
    rooms an `event_id_only` pusher to that gateway (app
@@ -269,9 +269,9 @@ keeper ships no push server and never picks one (D-1, D-4).
    words ("Open keeper to see what arrived."), and each such push replaces the
    last.
 
-**What is proved where.** On Linux: the pusher, the endpoint's grammar, the
+**What is proved where.** On Linux: the old pusher's identity, the endpoint's grammar, the
 discovery answer and request (against a local HTTPS server), asking once per
-endpoint, an unreachable server keeping the pusher, what a push names, the
+endpoint, an unreachable server changing nothing, what a push names, the
 distributor confirmation and what a notification posts and offers
 (`keeper-core/tests/unifiedpush_android.rs`,
 `unifiedpush_gateway_discovery.rs`). The Kotlin compiled

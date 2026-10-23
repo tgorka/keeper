@@ -9,16 +9,17 @@
 //! package, in Settings on this device ([`choose_distributor`]); the choice
 //! is kept on this device and a different distributor asks again. The
 //! distributor gives keeper an [`Endpoint`]: a URL on its server that
-//! delivers whatever is posted to it to keeper on this device. A Matrix
-//! homeserver cannot post to that URL itself; it posts to a *Matrix push
-//! gateway*, which forwards to the endpoint. keeper never chooses that
+//! delivers whatever is posted to it to keeper on this device. The agents
+//! server does not post to that URL itself; it posts, in the Matrix Push
+//! Gateway API's shape, to a *Matrix push gateway*, which forwards to the
+//! endpoint. keeper never chooses that
 //! gateway (D-1, D-4): it asks the endpoint's own server whether it is one —
 //! the UnifiedPush convention is a `GET` of [`NOTIFY_PATH`] on the endpoint's
 //! host answering `{"unifiedpush":{"gateway":"matrix"}}` ([`discover_gateway`])
 //! — and when it is, that address, read through [`Gateway::parse`], is the
 //! push target's gateway ([`crate::hq::push::PushTarget::unifiedpush`]).
 //! A definite other answer is refused with a sentence naming the host, and
-//! no pusher is registered; a server keeper cannot reach changes nothing
+//! the agents server gets no push target; a server keeper cannot reach changes nothing
 //! ([`pusher_change`]). So on Android, and only there, keeper itself
 //! contacts the push server: once per endpoint, to ask that one question
 //! ([`known_gateway`]; codemap §3 row 15).
@@ -104,11 +105,11 @@ impl std::fmt::Debug for Endpoint {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EndpointRefusal {
     /// Not a URL with a host.
-    #[error("Your UnifiedPush distributor gave keeper an address that is not a web address, so no pusher is registered.")]
+    #[error("Your UnifiedPush distributor gave keeper an address that is not a web address, so the agents server gets no push address for this device.")]
     NotAnAddress,
     /// A scheme other than `https`: the gateway on the same server would be
     /// reached unencrypted, and keeper registers no such gateway.
-    #[error("Your UnifiedPush distributor's server {host} is reached over {scheme}://; keeper registers push only over https://, so no pusher is registered. Give that server an https:// address in the distributor.")]
+    #[error("Your UnifiedPush distributor's server {host} is reached over {scheme}://; keeper registers push only over https://, so the agents server gets no push address for this device. Give that server an https:// address in the distributor.")]
     NotHttps {
         /// The endpoint's host.
         host: String,
@@ -117,13 +118,13 @@ pub enum EndpointRefusal {
     },
     /// A user name or password in the address, which the homeserver would
     /// keep.
-    #[error("The address your UnifiedPush distributor gave keeper on {host} carries a user name or password; keeper does not hand that to your homeserver, so no pusher is registered.")]
+    #[error("The address your UnifiedPush distributor gave keeper on {host} carries a user name or password; keeper does not hand that to the agents server, so the agents server gets no push address for this device.")]
     Credentials {
         /// The endpoint's host.
         host: String,
     },
     /// Longer than a homeserver keeps.
-    #[error("The address your UnifiedPush distributor gave keeper on {host} is longer than a homeserver keeps (512 bytes), so no pusher is registered.")]
+    #[error("The address your UnifiedPush distributor gave keeper on {host} is longer than a push gateway takes as a pushkey (512 bytes), so the agents server gets no push address for this device.")]
     TooLong {
         /// The endpoint's host.
         host: String,
@@ -192,14 +193,14 @@ pub enum DiscoveryRefusal {
     Endpoint(#[from] EndpointRefusal),
     /// The server could not be reached, or did not answer in time: keeper
     /// does not know, so it changes nothing ([`pusher_change`]).
-    #[error("keeper could not reach {host} to ask whether it is a Matrix push gateway, so it changed nothing: a pusher registered before stays. keeper asks again the next time it opens.")]
+    #[error("keeper could not reach {host} to ask whether it is a Matrix push gateway, so it changed nothing: a push address the agents server has from before stays. keeper asks again the next time it opens.")]
     Unreachable {
         /// The endpoint's host.
         host: String,
     },
     /// The server answered with a status other than 200 (a 404 is a server
     /// with no Matrix gateway; a redirect is not followed).
-    #[error("{host} answered {status} when keeper asked whether it is a Matrix push gateway, so it is not one and no pusher is registered. Use a UnifiedPush server that is also a Matrix gateway (ntfy is).")]
+    #[error("{host} answered {status} when keeper asked whether it is a Matrix push gateway, so it is not one and the agents server gets no push address for this device. Use a UnifiedPush server that is also a Matrix gateway (ntfy is).")]
     Status {
         /// The endpoint's host.
         host: String,
@@ -207,13 +208,13 @@ pub enum DiscoveryRefusal {
         status: u16,
     },
     /// The server answered something that is not the UnifiedPush answer.
-    #[error("{host} did not answer as a Matrix push gateway when keeper asked, so no pusher is registered. Use a UnifiedPush server that is also a Matrix gateway (ntfy is).")]
+    #[error("{host} did not answer as a Matrix push gateway when keeper asked, so the agents server gets no push address for this device. Use a UnifiedPush server that is also a Matrix gateway (ntfy is).")]
     NotMatrix {
         /// The endpoint's host.
         host: String,
     },
     /// The answer is a UnifiedPush gateway of another kind.
-    #[error("{host} says it is a UnifiedPush gateway for {kind}, not for Matrix, so no pusher is registered.")]
+    #[error("{host} says it is a UnifiedPush gateway for {kind}, not for Matrix, so the agents server gets no push address for this device.")]
     OtherGateway {
         /// The endpoint's host.
         host: String,
@@ -544,18 +545,18 @@ impl UnifiedPushStatus {
                 "No UnifiedPush distributor is installed on this {noun}, so nothing reaches it while keeper is closed. Install one — the ntfy app, pointed at a server you run — and open keeper again."
             ),
             UnifiedPushStatus::Asking(asked) => format!(
-                "keeper registers for push on this {noun} only through a UnifiedPush distributor you confirm here. Installed: {}. The one you confirm gives keeper an address on its server; keeper asks that server once whether it is a Matrix push gateway, and your homeserver then sends it the id of every message that would notify on accounts that hold agent rooms, never its words.",
+                "keeper registers for push on this {noun} only through a UnifiedPush distributor you confirm here. Installed: {}. The one you confirm gives keeper an address on its server; keeper asks that server once whether it is a Matrix push gateway, and your agents server then sends it, for this {noun}, the ids of an approval waiting for you and of your own agent's answers, never their words.",
                 asked.iter().map(Distributor::named).collect::<Vec<_>>().join(", ")
             ),
             UnifiedPushStatus::RegistrationFailed => {
-                "Your UnifiedPush distributor refused to register keeper, so no pusher is registered.".to_owned()
+                "Your UnifiedPush distributor refused to register keeper, so the agents server gets no push address for this device.".to_owned()
             }
             UnifiedPushStatus::Unregistered => {
-                "Your UnifiedPush distributor removed keeper's registration, so keeper removed its pusher.".to_owned()
+                "Your UnifiedPush distributor removed keeper's registration, so keeper took its push address back from the agents server.".to_owned()
             }
             UnifiedPushStatus::Refused(why) => why.to_string(),
             UnifiedPushStatus::Registered { host, distributor } => format!(
-                "Push reaches this {noun} through {host}, the server of {}, the UnifiedPush distributor you confirmed; it answers as a Matrix push gateway. Your homeserver sends it the id of every message that would notify on accounts that hold agent rooms, never its words.",
+                "Push reaches this {noun} through {host}, the server of {}, the UnifiedPush distributor you confirmed; it answers as a Matrix push gateway. Your agents server sends it the ids of an approval waiting for you and of your own agent's answers, never their words.",
                 distributor.named()
             ),
         }
