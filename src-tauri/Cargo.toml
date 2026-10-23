@@ -221,14 +221,6 @@ cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 # Cargo.lock; rustls `Apache-2.0 OR ISC OR MIT`, tokio-rustls `MIT OR Apache-2.0`.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-# The classic NanoKVM's HID input over its `/api/ws` WebSocket (96.5): the
-# handshake only, over keeper's own pinned TLS stream — no TLS feature of its
-# own. tokio-tungstenite MIT, tungstenite `MIT OR Apache-2.0`; `cargo deny
-# check` from `src-tauri/` passes with them.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
-# The classic NanoKVM login's IV, drawn from the OS as its reference draws it
-# (`os.urandom`). Already in Cargo.lock at 0.3.4; MIT OR Apache-2.0.
-getrandom = "0.3"
 
 # ---------------------------------------------------------------------------
 # Folder Sync phase (Epics 23–31, AD-40 … AD-53). Consumed by `keeper-sync`
@@ -335,42 +327,12 @@ toml = "0.9"
 # included, stays. Already in Cargo.lock at this version through
 # `proc-macro-crate`, so the tree gains no package. MIT OR Apache-2.0.
 toml_edit = "0.25.12"
-# The headless hosts' process layer (Epic 90, S-07, S-34): `geteuid` for the
-# strict secrets directory, `O_NOFOLLOW` for its files and, on Linux,
-# `prctl(PR_SET_DUMPABLE, 0)`. Already in Cargo.lock at 1.1.4 through
+# `geteuid` and `O_NOFOLLOW` for keeper-sync's strict secrets directory
+# (S-34), and the sessions executor's directory handles in keeper-agent
+# (`openat`, `renameat`, `fsync`). Already in Cargo.lock at 1.1.4 through
 # tempfile and tokio, so the tree gains no package.
 # `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
-# An agent's `run` on Linux (D-33, AD-405): agentd re-executes itself, applies a
-# landlock ruleset and a seccomp filter to itself and then execs the program —
-# no `unsafe`. Linux-only target dependencies of keeper-agent. landlock is
-# `MIT OR Apache-2.0`, seccompiler (Firecracker's) `Apache-2.0 OR BSD-3-Clause`;
-# both pass `cargo deny check`.
-landlock = "0.4"
-seccompiler = "0.5"
-# Syscall numbers and address families for that filter — constants only, no
-# call through it. Already in Cargo.lock; `MIT OR Apache-2.0`.
-libc = "0.2"
-# The trampoline closes every descriptor it inherited but the standard
-# streams before it execs a run's program (R213): `nix::unistd::close` takes a
-# raw number safely, which std and rustix do not, so keeper's code stays free
-# of `unsafe` (R141). No feature: `unistd` is always built. MIT.
-nix = { version = "0.31", default-features = false }
-# An agent's MCP servers (AD-406): keeper is a client only. The streamable HTTP
-# transport rides the workspace's reqwest 0.13 (rmcp's own `reqwest` TLS feature
-# stays off, so rustls is the one TLS stack); the child-process transport is
-# compiled everywhere and refused at use where the host may not spawn.
-# `Apache-2.0`; `cargo deny check licenses bans sources` from `src-tauri/`
-# passes with it (R157). The server half and its HTTP service are
-# keeper-agent's dev-dependencies only, for in-test servers.
-rmcp = { version = "3.5", default-features = false }
-# The event-stream parser rmcp itself uses, under keeper's own bounded MCP HTTP
-# client (every body and event read only up to a bound). Already in Cargo.lock
-# at 0.2.6; `MIT OR Apache-2.0`.
-sse-stream = "0.2"
-# Serves an in-test MCP server's tower service over HTTP. Already in Cargo.lock
-# at 0.8.9; MIT.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 # A self-signed certificate made per test run, for the in-test KVM and MCP
 # servers whose certificate keeper pins (96.5 #3/#4, DW-810): no private key is
 # ever committed. aws-lc-rs, the provider rustls already uses here. MIT OR
@@ -475,15 +437,6 @@ quick-xml = "0.39"
 # reqwest already pulls into `keeper-core`, so the direct edge adds no package
 # to Cargo.lock. MIT OR Apache-2.0 — passes `cargo deny check`.
 flate2 = "1"
-# The text of a PDF a person sends into an agent's room (Epic 101, story
-# 101.2, R417): the agent's host writes it beside the file, so the agent
-# reads it with `drive_read`. Pure Rust over `lopdf` (pdf-extract turns
-# lopdf's default features off: no rayon), MIT, as are its parsers
-# (adobe-cmap-parser, cff-parser, type1-encoding-parser, postscript); its
-# advisory is DW-1450, and CI's deny job is the licence gate. Linked by
-# keeper-agent only, and only off the phone, and run only in the host's PDF
-# reader process (R444/03).
-pdf-extract = "0.12"
 # Wake-phrase normalisation (Epic 62, Story 62.4, FR-404): a phrase a person
 # types is matched against what the recogniser heard case- and
 # diacritic-insensitively, and the diacritic half is NFD decomposition plus
@@ -588,12 +541,3 @@ rustfft = "6.4"
 # directory.
 [patch.crates-io]
 tao = { path = "../tools/tao" }
-
-# SHA-256 at the shipped build's speed in debug and test builds too. keeper
-# hashes a program before it starts it as an MCP server (R225), inside the
-# server's 10 s answer bound (`keeper_agent::mcp::ANSWER_WITHIN`), and the
-# MCP tests start their own test binary as that server — 300 MB on a Mac,
-# which an unoptimised sha2 took ten of those seconds to hash (sampled on
-# hesperia, 2026-10-11). Nothing else of the build changes.
-[profile.dev.package.sha2]
-opt-level = 3
