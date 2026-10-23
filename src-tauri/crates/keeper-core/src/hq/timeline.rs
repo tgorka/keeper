@@ -33,6 +33,8 @@ use crate::hq::sessions::{
     earlier_months, int, is_ask, is_heard, json, mark, month, newest_months, opt_text, page_key,
     previous_month, read, reads_trace, text, truthy, window, Source,
 };
+#[path = "turn_folds.rs"]
+mod turn_folds;
 
 /// The registered `sessionPage` query's operation id, as `syncular/`'s
 /// generated `syncular.queries.ts` names it.
@@ -121,6 +123,60 @@ pub struct AgentMessageVm {
     pub attachments: Vec<AgentAttachmentVm>,
 }
 
+/// Ordered reading column. References resolve against `messages`, `folds`,
+/// and `live`; grouping and ordering are never inferred by the renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum AgentTimelineItemVm {
+    Message { message_id: String },
+    Fold { turn_id: String },
+    LiveAnswer { turn_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AgentTurnStatusVm {
+    Running,
+    Done,
+    Parked,
+    Refused,
+    Interrupted,
+    Waiting,
+}
+
+/// One compact, always-visible outcome above the answer, not a tool card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentTurnFailureVm {
+    pub step_id: String,
+    pub sentence: String,
+}
+
+/// One turn's work, separate from its terminal answer. Lead-ins reference
+/// the original messages so attachments and author identity are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentTurnFoldVm {
+    pub turn_id: String,
+    pub lead_in_ids: Vec<String>,
+    pub reasoning: Option<String>,
+    pub steps: Vec<AgentToolStepVm>,
+    pub failures: Vec<AgentTurnFailureVm>,
+    pub status: AgentTurnStatusVm,
+    pub status_label: String,
+    pub summary: String,
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+}
+
 /// What an opened session shows, whole, every time it changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +195,14 @@ pub struct AgentSessionViewVm {
     pub read_only: bool,
     /// Oldest first.
     pub messages: Vec<AgentMessageVm>,
+    /// 109.13: the ordered projection consumed by the fold renderer. The
+    /// legacy messages/live fields remain until 109.14 switches over.
+    #[serde(default)]
+    #[ts(as = "Option<Vec<AgentTimelineItemVm>>", optional)]
+    pub items: Vec<AgentTimelineItemVm>,
+    #[serde(default)]
+    #[ts(as = "Option<Vec<AgentTurnFoldVm>>", optional)]
+    pub folds: Vec<AgentTurnFoldVm>,
     /// Oldest first; empty for a member who does not read the trace.
     pub approvals: Vec<AgentApprovalVm>,
     /// Earlier messages exist beyond what is shown.
@@ -383,6 +447,21 @@ pub fn view(
         &session.agent_actor,
         &session.title,
     );
+    let live = live::turns(source, session_id, &opened.live, &ended, &extras);
+    let pending: HashSet<String> = if reads_trace {
+        read(
+            source,
+            "SELECT DISTINCT t.turn_id FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
+             WHERE a.session_id = ?1 AND a.state = 'pending' AND a.expires_at_ms > ?2",
+            &[Value::from(session_id), Value::from(now_ms)],
+        )
+        .iter()
+        .filter_map(|row| opt_text(row, "turn_id"))
+        .collect()
+    } else {
+        HashSet::new()
+    };
+    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending);
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -395,6 +474,8 @@ pub fn view(
             archived: session.archived,
             read_only: session.archived,
             messages,
+            items,
+            folds,
             approvals: approvals::of_session(source, session_id, &directory, refusals, now_ms),
             has_earlier,
             loading_earlier,
@@ -402,7 +483,7 @@ pub fn view(
             note,
             reads_trace,
             untrusted: session.untrusted,
-            live: live::turns(source, session_id, &opened.live, &ended, &extras),
+            live,
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,

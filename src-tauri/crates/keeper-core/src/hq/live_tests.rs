@@ -853,3 +853,6 @@ fn a_session_that_read_outside_content_is_marked() {
     }]);
     assert!(w.view(&Opened::default()).untrusted);
 }
+
+#[path = "fold_tests.rs"]
+mod fold_tests;

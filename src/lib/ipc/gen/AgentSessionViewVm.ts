@@ -5,6 +5,8 @@ import type { AgentLiveTurnVm } from "./AgentLiveTurnVm";
 import type { AgentMessageVm } from "./AgentMessageVm";
 import type { AgentSessionAnsweringVm } from "./AgentSessionAnsweringVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
+import type { AgentTimelineItemVm } from "./AgentTimelineItemVm";
+import type { AgentTurnFoldVm } from "./AgentTurnFoldVm";
 import type { AgentViewPrefsVm } from "./AgentViewPrefsVm";
 
 /**
@@ -19,6 +21,11 @@ readOnly: boolean,
  * Oldest first.
  */
 messages: Array<AgentMessageVm>, 
+/**
+ * 109.13: the ordered projection consumed by the fold renderer. The
+ * legacy messages/live fields remain until 109.14 switches over.
+ */
+items?: Array<AgentTimelineItemVm>, folds?: Array<AgentTurnFoldVm>, 
 /**
  * Oldest first; empty for a member who does not read the trace.
  */

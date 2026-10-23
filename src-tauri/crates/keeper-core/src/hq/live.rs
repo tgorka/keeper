@@ -70,6 +70,20 @@ pub enum AgentToolStepStatusVm {
     Started,
     Done,
     Refused,
+    Interrupted,
+    Parked,
+}
+
+impl AgentToolStepStatusVm {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Started => "Started",
+            Self::Done => "Finished",
+            Self::Refused => "Refused",
+            Self::Interrupted => "Interrupted",
+            Self::Parked => "Paused",
+        }
+    }
 }
 
 /// One tool call of a turn, as its `tool_calls` row says (readers only).
@@ -79,6 +93,9 @@ pub enum AgentToolStepStatusVm {
 pub struct AgentToolStepVm {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    #[ts(as = "Option<String>", optional)]
+    pub status_label: String,
     pub status: AgentToolStepStatusVm,
     /// The outcome, or the refusal's sentence, once it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -442,11 +459,14 @@ pub fn extras(
             let status = match text(&row, "status") {
                 "done" => AgentToolStepStatusVm::Done,
                 "refused" => AgentToolStepStatusVm::Refused,
+                "interrupted" => AgentToolStepStatusVm::Interrupted,
+                "parked" => AgentToolStepStatusVm::Parked,
                 _ => AgentToolStepStatusVm::Started,
             };
             steps.entry(turn).or_default().push(AgentToolStepVm {
                 id,
                 name: text(&row, "name").to_owned(),
+                status_label: status.label().to_owned(),
                 status,
                 result: row.get("result").and_then(Value::as_str).map(str::to_owned),
                 started_at_ms: int(&row, "started_at_ms"),

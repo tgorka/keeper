@@ -400,6 +400,18 @@ for each `from_seq` — through a presence leave — until that seq's chunk arri
 with the agent's `messages` row for the turn (`turn_id`) once it holds it.” The frontend renders
 that projection, never folds chunks or presence itself.
 
+The session VM also supplies Rust-authored `items` and `folds` for the per-turn renderer
+cutover (109.14); the current renderer still uses the unchanged `messages` and `live` fields.
+Each turn has one fold containing its earlier agent-message IDs, permitted reasoning and
+tool steps, a summary, reported duration, status label and single-line failures. The final
+answer is a separate reading item immediately after its fold. Tool results arriving after
+the answer update that same fold, never add work below the answer or fabricate a live answer.
+Interrupted work says **Interrupted**. Parked work says **Paused** unless an unexpired pending
+approval actually asks the person, in which case it says **Waiting for you**. Trace access and
+Show thinking still gate the corresponding fold contents; Show details does not gate the
+reported duration used in a summary. Missing or negative durations are absent; a reported zero
+is retained. Grouping, ordering and all these sentences belong to Rust, not the renderer.
+
 Development fixtures: `?sessions=launch&live=stream`, with `&platform=phone` for the phone shell.
 `live=error`, `stopped`, `nonreader`, `no-tools`, `untrusted`, `long`, `refused` and `pinned` cover
 provider error, ended claim, trace exclusion, absent offers, outside-content marker, long strings,
