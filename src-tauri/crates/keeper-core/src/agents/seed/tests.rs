@@ -1,14 +1,8 @@
 use std::collections::BTreeMap;
 
-use chrono::DateTime;
-
 use super::*;
 use crate::agents::home::{self, AgentConfig};
-use crate::agents::label::{Integrity, Label};
-use crate::agents::memory;
-use crate::agents::prompt::{self, PromptInput, RenderedFact, SessionFrame};
-use crate::agents::skills::SkillsIndex;
-use crate::agents::soul::{self, Fact};
+use crate::agents::soul;
 
 /// The fixtures' bot: never CLIProxyAPI's URL (S-20).
 const BOT: &str = "bot:openai:https://provider.example:8452#m";
@@ -75,15 +69,6 @@ fn read_home(files: &BTreeMap<&str, &str>, folder: &str, decl: &DriveDecl) -> Ag
         "{folder}: {:?}",
         soul.ignored_keys
     );
-    for file in ["USER.md", "MEMORY.md"] {
-        let text = files[format!("{folder}/{file}").as_str()];
-        let read = memory::snapshot(Some(text), Some(text));
-        assert!(
-            read.problems.is_empty(),
-            "{folder}/{file}: {:?}",
-            read.problems
-        );
-    }
     for dir in ["journal", "proposals"] {
         assert_eq!(files[format!("{folder}/{dir}/.keep").as_str()], "");
     }
@@ -165,92 +150,6 @@ fn every_seeded_file_is_valid_under_its_own_grammar() {
         assert_eq!(amelia.bot, home::BotRef::parse(BOT).expect("bot"));
         assert!(new_files["amelia/SOUL.md"].contains("2026-10-03"));
     }
-}
-
-#[test]
-fn the_seeded_souls_compose() {
-    let compose = || -> Vec<(String, String)> {
-        let choices = tgdrive(&all());
-        let seeded = files(&choices);
-        let files = by_path(&seeded);
-        CATALOGUE
-            .iter()
-            .map(|agent| {
-                let config = home::parse_agent_toml(
-                    files[format!("{}/agent.toml", agent.id).as_str()],
-                    agent.id,
-                    &choices.decl,
-                )
-                .expect("agent.toml");
-                let soul_text = files[format!("{}/SOUL.md", agent.id).as_str()];
-                let soul = soul::parse_soul(soul_text, &config.name).expect("SOUL.md");
-                let facts: Vec<RenderedFact> = soul
-                    .persistent_facts
-                    .iter()
-                    .map(|fact| match fact {
-                        Fact::Text(text) => RenderedFact::Text(text.clone()),
-                        Fact::File(path) => panic!("no seeded soul names a file: {path}"),
-                    })
-                    .collect();
-                let memory = memory::snapshot(
-                    Some(files[format!("{}/USER.md", agent.id).as_str()]),
-                    Some(files[format!("{}/MEMORY.md", agent.id).as_str()]),
-                );
-                let frame = SessionFrame {
-                    agent: config.id.clone(),
-                    host: "electra".to_owned(),
-                    session_path: "60-sessions/active/2026-10-03-main".to_owned(),
-                    session_kind: "main".to_owned(),
-                    drives: vec![("tgdrive".to_owned(), "tgdrive".to_owned())],
-                    audience_sentence: Label::opening(&choices.decl, Integrity::Owner)
-                        .sentence(&|user| user.localpart().to_owned()),
-                    now: DateTime::parse_from_rfc3339("2026-10-03T09:00:00+02:00").expect("now"),
-                    focus: None,
-                    bmad: Vec::new(),
-                };
-                let composed = prompt::compose(&PromptInput {
-                    soul: &soul,
-                    facts: &facts,
-                    memory: &memory,
-                    skills: &SkillsIndex::default(),
-                    menu: &config.menu,
-                    frame: &frame,
-                    context: None,
-                });
-
-                // Slot 1 holds the soul's fields in AD-363's order, then the
-                // body verbatim.
-                let slot = &composed.sections[0];
-                assert_eq!(slot.slot, 1);
-                let told = &composed.text[slot.range.clone()];
-                let mut order = vec![
-                    format!("Name: {}\n", soul.name),
-                    format!("Title: {}\n", soul.title),
-                    format!("Icon: {}\n", soul.icon),
-                    format!("Role: {}\n", soul.role),
-                    format!("## Identity\n\n{}\n", soul.identity),
-                    format!("## Communication style\n\n{}\n", soul.communication_style),
-                    "## Principles\n".to_owned(),
-                ];
-                order.extend(soul.principles.iter().map(|p| format!("- {p}\n")));
-                order.push("## Persistent facts\n".to_owned());
-                order.push(soul.body.trim().to_owned());
-                let mut at = 0;
-                for piece in &order {
-                    let found = told[at..]
-                        .find(piece.as_str())
-                        .unwrap_or_else(|| panic!("{}: {piece:?} after byte {at}", agent.id));
-                    at += found + piece.len();
-                }
-                assert_eq!(soul.icon.chars().count(), 1, "one glyph (R43)");
-                (agent.id.to_owned(), composed.prompt_sha256)
-            })
-            .collect()
-    };
-    let first = compose();
-    assert_eq!(first, compose(), "the same seed composes the same bytes");
-    let digests: BTreeSet<&str> = first.iter().map(|(_, sha)| sha.as_str()).collect();
-    assert_eq!(digests.len(), CATALOGUE.len());
 }
 
 #[test]

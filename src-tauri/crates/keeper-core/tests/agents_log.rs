@@ -1,7 +1,8 @@
 //! An agent session's log over real files (story 89.5, AD-365, AD-366,
 //! NFR-116, NFR-117): the chunk writer's torn tail, rotation, blobs and
-//! symlink refusal; the reader's merge and epoch fence; replay against a real
-//! tool loop on a real socket; and the `.keeper/` index with the logs gone.
+//! symlink refusal; the reader's merge and epoch fence; a real tool loop on a
+//! real socket logged with no secret in it; and the `.keeper/` index with the
+//! logs gone.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -13,7 +14,6 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::{hydrate_blob, read_session, ClaimConflict};
-use keeper_core::agents::log::replay::{replay, COMPACT_HEADING};
 use keeper_core::agents::log::writer::{rotate_at, ChunkWriter};
 use keeper_core::agents::log::{
     AssistantBody, ChunkName, ClaimAction, ClaimBody, CompactBody, ErrorBody, HostSlug, LineBody,
@@ -23,7 +23,7 @@ use keeper_core::agents::log::{
 use keeper_core::agents::redact::redact_secrets;
 use keeper_core::agents::session::SessionKind;
 use keeper_core::bots::chat::{
-    build_body, cancellation, ChatEvent, ChatMessage, ChatOptions, ChatRequest, Role,
+    cancellation, ChatEvent, ChatMessage, ChatOptions, ChatRequest, Role,
 };
 use keeper_core::bots::error::BotsError;
 use keeper_core::bots::grant::GrantMode;
@@ -385,9 +385,8 @@ fn a_body_over_16_kib_becomes_a_blob_written_before_its_line() {
     );
 
     let log = read_session(session);
+    assert!(log.problems.is_empty(), "{:?}", log.problems);
     let hydrated = hydrate_blob(session, &sha).expect("hydrate");
-    let replayed = replay(&log, &|name| hydrate_blob(session, name)).expect("replay");
-    assert_eq!(replayed.messages.len(), 2);
     assert_eq!(hydrated["call_id"], "call_1");
 
     // A blob that was changed no longer matches its name.
@@ -579,7 +578,7 @@ fn a_superseded_epochs_late_lines_are_dropped() {
 }
 
 #[test]
-fn a_double_acquire_at_one_epoch_is_a_conflict_and_replay_refuses() {
+fn a_double_acquire_at_one_epoch_is_a_conflict() {
     let scratch = Scratch::new();
     let session = &scratch.0;
     let mut electra = ChunkWriter::open(session, &host("electra"), ROTATE, day()).expect("e");
@@ -606,8 +605,6 @@ fn a_double_acquire_at_one_epoch_is_a_conflict_and_replay_refuses() {
         .problems
         .iter()
         .any(|p| p.sentence.contains("conflicted")));
-    let refusal = replay(&log, &|name| hydrate_blob(session, name)).expect_err("refused");
-    assert!(refusal.sentence().contains("two truths"));
 
     let calm = Scratch::new();
     let mut only = ChunkWriter::open(&calm.0, &host("electra"), ROTATE, day()).expect("e");
@@ -619,71 +616,7 @@ fn a_double_acquire_at_one_epoch_is_a_conflict_and_replay_refuses() {
 }
 
 // ---------------------------------------------------------------------------
-// Compaction
-// ---------------------------------------------------------------------------
-
-#[test]
-fn compact_replaces_the_lines_through_it_with_one_summary() {
-    let scratch = Scratch::new();
-    let session = &scratch.0;
-    let mut writer = ChunkWriter::open(session, &host("electra"), ROTATE, day()).expect("open");
-    writer
-        .append(&user_line("electra", 1, at(0), 1, "first"))
-        .expect("w");
-    let answer = line(
-        "electra",
-        1,
-        at(1),
-        2,
-        LineBody::Assistant(AssistantBody {
-            bot: None,
-            effort: None,
-            text: "first answer".into(),
-            model: "m".into(),
-            finish: "stop".into(),
-            usage: Usage::default(),
-            ttft_ms: None,
-            duration_ms: 1,
-            anchor_event: None,
-        }),
-    );
-    writer.append(&answer).expect("w");
-    writer
-        .append(&user_line("electra", 1, at(2), 3, "second"))
-        .expect("w");
-    writer
-        .append(&line(
-            "electra",
-            1,
-            at(3),
-            4,
-            LineBody::Compact(CompactBody {
-                summary: "They asked one thing and got an answer.".into(),
-                replaces_through: answer.id,
-            }),
-        ))
-        .expect("w");
-    let replayed = replay(&read_session(session), &|n| hydrate_blob(session, n)).expect("replay");
-    assert_eq!(replayed.messages.len(), 2);
-    assert_eq!(replayed.messages[0].role, Role::System);
-    let body = build_body(
-        ProviderKind::Ollama,
-        &ChatRequest {
-            model: "m".into(),
-            messages: replayed.messages,
-            ..ChatRequest::default()
-        },
-    )
-    .expect("body");
-    assert_eq!(
-        body["messages"][0]["content"],
-        format!("{COMPACT_HEADING}\n\nThey asked one thing and got an answer.")
-    );
-    assert_eq!(body["messages"][1]["content"], "second");
-}
-
-// ---------------------------------------------------------------------------
-// Replay against a real tool loop (FR-774)
+// A real tool loop, logged (FR-774)
 // ---------------------------------------------------------------------------
 
 type Script = Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync + 'static>;
@@ -884,8 +817,8 @@ impl Logging {
 }
 
 /// Run one real tool loop against the stub, logging every step through a
-/// `ChunkWriter`; return what the stub received last and what replay builds.
-async fn logged_turn(session: &Path, secret: Option<&str>) -> (String, String) {
+/// `ChunkWriter`; return what the stub received last.
+async fn logged_turn(session: &Path, secret: Option<&str>) -> String {
     // With a secret, the model echoes it into a tool call's arguments too.
     let b_path = match secret {
         Some(secret) => format!("notes/b-{secret}.md"),
@@ -1036,51 +969,27 @@ async fn logged_turn(session: &Path, secret: Option<&str>) -> (String, String) {
 
     let bodies = server.bodies();
     assert_eq!(bodies.len(), 3);
-    let last = bodies[2].clone();
-
-    // A fresh read of the files, as another host would do it.
     let log = read_session(session);
     assert!(log.problems.is_empty(), "{:?}", log.problems);
-    let replayed = replay(&log, &|name| hydrate_blob(session, name)).expect("replay");
-    assert!(replayed.last_open.is_some());
-    let mut messages = vec![ChatMessage::text(Role::System, SYSTEM)];
-    messages.extend(replayed.messages);
-    let rebuilt = build_body(
-        ProviderKind::Ollama,
-        &ChatRequest {
-            messages,
-            ..turn_request()
-        },
-    )
-    .expect("body");
-    (last, serde_json::to_string(&rebuilt).expect("json"))
+    bodies[2].clone()
 }
 
 #[tokio::test]
-async fn replay_reproduces_the_request_body_byte_for_byte() {
+async fn a_secret_never_reaches_the_log() {
     let scratch = Scratch::new();
-    let (sent, replayed) = logged_turn(&scratch.0, None).await;
+    let secret = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+    let sent = logged_turn(&scratch.0, Some(secret)).await;
+    assert!(sent.contains(secret), "the model saw it");
     assert!(
         sent.contains("\"tool_calls\""),
-        "the last request replays tool calls"
+        "the last request carries tool calls"
     );
     assert!(sent.contains("\"role\":\"tool\""));
     assert!(
         sent.contains("outside this grant"),
         "the refusal is in the trace"
     );
-    assert_eq!(replayed, sent);
-}
-
-#[tokio::test]
-async fn a_secret_never_reaches_the_log_and_replay_differs_exactly_at_it() {
-    let scratch = Scratch::new();
-    let secret = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
-    let (sent, replayed) = logged_turn(&scratch.0, Some(secret)).await;
-    assert!(sent.contains(secret), "the model saw it");
-    let marker = redact_secrets(secret).text;
-    assert_ne!(marker, secret);
-    assert_eq!(replayed, sent.replace(secret, &marker));
+    assert_ne!(redact_secrets(secret).text, secret);
     assert!(
         sent.contains(&format!("notes/b-{secret}.md")),
         "echoed in arguments"
@@ -1683,204 +1592,4 @@ fn a_refresh_reads_a_bounded_amount_of_log() {
     }
     let row = index.session(FIXTURE_SESSION).expect("q").expect("row");
     assert_eq!(row.lines, first.lines + 20, "the rest on the next opens");
-}
-
-/// R-18: a person's attachments, a peer's question and a relayed answer are
-/// in the message the turn sends (`message_for` of the line as written) and
-/// in the message a replay rebuilds, the same bytes both ways; an answer
-/// reads as the answer to its ask (R99), never as a question of its own.
-#[test]
-fn attachments_and_a_peer_question_replay_as_they_were_sent() {
-    use keeper_core::agents::log::replay::message_for;
-    use keeper_core::agents::log::{Attachment, PeerAnswer, PeerAsk, PeerBody};
-
-    let scratch = Scratch::new();
-    let session = &scratch.0;
-    let mut writer = ChunkWriter::open(session, &host("electra"), ROTATE, day()).expect("open");
-    let asked = line(
-        "electra",
-        0,
-        at(0),
-        1,
-        LineBody::User(UserBody {
-            sender: user("@tgorka:h"),
-            text: "Compare these.".to_owned(),
-            attachments: vec![
-                Attachment {
-                    drive: "tgdrive".to_owned(),
-                    path: "notes/a.md".to_owned(),
-                },
-                Attachment {
-                    drive: "tgdrive".to_owned(),
-                    path: "notes/b.md".to_owned(),
-                },
-            ],
-        }),
-    );
-    let peer = line(
-        "electra",
-        0,
-        at(1),
-        2,
-        LineBody::Peer(PeerBody {
-            sender: user("@tola:h"),
-            text: "Here is the plan.".to_owned(),
-            ask: Some(PeerAsk {
-                id: "q1".to_owned(),
-                question: "Ship on Friday?".to_owned(),
-                room: "!steward:h".try_into().expect("room"),
-                label: Label {
-                    readers: Readers::Only([user("@tgorka:h")].into()),
-                    integrity: Integrity::Owner,
-                    local_only: false,
-                },
-            }),
-            answers: None,
-            artifacts: Some(vec![
-                "tgdrive/60-sessions/active/x/artifacts/plan.md".to_owned()
-            ]),
-        }),
-    );
-    let answered = line(
-        "electra",
-        0,
-        at(2),
-        3,
-        LineBody::Peer(PeerBody {
-            sender: user("@nixi:h"),
-            text: "1".to_owned(),
-            ask: None,
-            answers: Some(PeerAnswer {
-                id: "q0".to_owned(),
-                choice: Some("Continue".to_owned()),
-            }),
-            artifacts: None,
-        }),
-    );
-    let sent: Vec<String> = [&asked, &peer, &answered]
-        .into_iter()
-        .map(|line| {
-            let receipt = writer.append(line).expect("append");
-            format!("{:?}", message_for(&receipt.line).expect("a message"))
-        })
-        .collect();
-    writer.sync().expect("sync");
-
-    let replayed =
-        replay(&read_session(session), &|sha| hydrate_blob(session, sha)).expect("replay");
-    let replayed: Vec<String> = replayed.messages.iter().map(|m| format!("{m:?}")).collect();
-    assert_eq!(replayed, sent);
-    assert!(
-        sent[0].contains("Attached files:\\n- tgdrive:notes/a.md\\n- tgdrive:notes/b.md"),
-        "{}",
-        sent[0]
-    );
-    assert!(
-        sent[1].contains(
-            "From @tola:h:\\nHere is the plan.\\n\\nFiles handed over:\\n- tgdrive/60-sessions/active/x/artifacts/plan.md\\n\\nQuestion q1: Ship on Friday?"
-        ),
-        "{}",
-        sent[1]
-    );
-    assert!(
-        sent[2].contains("From @nixi:h, relaying the answer to your question q0:\\n1\\n\\nIt picks the choice Continue."),
-        "{}",
-        sent[2]
-    );
-    assert!(!sent[2].contains("Question q0"), "{}", sent[2]);
-}
-
-/// 94.4 acceptance 5, the reader's half: a helper's own steps — its
-/// model's rounds, its calls and their results, under its `tool_call` — are
-/// in the log and out of the replay. The session's messages are its own
-/// model's, the helper's result among them, even where a step's call id is
-/// the helper call's own.
-#[test]
-fn helper_steps_are_in_the_log_and_out_of_the_replay() {
-    let scratch = Scratch::new();
-    let session = &scratch.0;
-    let mut writer = ChunkWriter::open(session, &host("electra"), ROTATE, day()).expect("open");
-    let mut seq = 0u64;
-    let mut next = |parent: Option<Ulid>, body: LineBody| {
-        seq += 1;
-        let mut written = line("electra", 1, at(seq as i64), seq, body);
-        written.parent = parent;
-        writer.append(&written).expect("append");
-        written.id
-    };
-    let assistant = |text: &str, finish: &str, tokens: u32| {
-        LineBody::Assistant(AssistantBody {
-            bot: None,
-            effort: None,
-            text: text.to_owned(),
-            model: "m".to_owned(),
-            finish: finish.to_owned(),
-            usage: Usage {
-                prompt: Some(tokens),
-                completion: Some(0),
-            },
-            ttft_ms: None,
-            duration_ms: 0,
-            anchor_event: None,
-        })
-    };
-    let call = |id: &str, tool: &str| {
-        LineBody::ToolCall(ToolCallBody {
-            call_id: id.to_owned(),
-            tool: tool.to_owned(),
-            args: "{}".to_owned(),
-            tier: 0,
-            grant_id: None,
-        })
-    };
-    let result = |id: &str, content: &str| {
-        LineBody::ToolResult(ToolResultBody {
-            call_id: id.to_owned(),
-            outcome: ToolOutcomeWord::Ok,
-            content: content.to_owned(),
-            truncated: None,
-            label: tg_label(),
-            paseo: None,
-            effect: None,
-        })
-    };
-    next(
-        None,
-        LineBody::User(UserBody {
-            sender: user("@tgorka:h"),
-            text: "review it".to_owned(),
-            attachments: Vec::new(),
-        }),
-    );
-    let round = next(None, assistant("", "tool_calls", 10));
-    let helper = next(Some(round), call("c1", "helper"));
-    let answered = next(
-        Some(helper),
-        result("c1", "The helper answered: one finding."),
-    );
-    next(Some(helper), assistant("", "tool_calls", 1500));
-    let step = next(Some(helper), call("c1", "drive_read"));
-    next(Some(step), result("c1", "the file the helper read"));
-    next(Some(helper), assistant("one finding", "stop", 1500));
-    next(Some(answered), assistant("done.", "stop", 20));
-    writer.sync().expect("sync");
-
-    let log = read_session(session);
-    assert_eq!(log.lines.len(), 9, "every step is in the log");
-    let replayed = replay(&log, &|name| hydrate_blob(session, name)).expect("replay");
-    let shown = format!("{:?}", replayed.messages);
-    assert_eq!(replayed.messages.len(), 4, "{shown}");
-    let calls: Vec<&str> = replayed.messages[1]
-        .tool_calls
-        .iter()
-        .map(|call| call.name.as_str())
-        .collect();
-    assert_eq!(calls, ["helper"]);
-    assert_eq!(replayed.messages[2].tool_call_id.as_deref(), Some("c1"));
-    assert!(
-        shown.contains("The helper answered: one finding."),
-        "{shown}"
-    );
-    assert!(!shown.contains("the file the helper read"), "{shown}");
-    assert!(!shown.contains("drive_read"), "{shown}");
 }

@@ -5,12 +5,11 @@
 //! rebuild the model's context from it, tool calls and results included. One
 //! JSON object per line, keys in the documented order
 //! (`v, id, parent, ts, host, epoch, claim, kind, matrix_event, body`) so a
-//! log reads in a text editor. [`writer::ChunkWriter`] writes it,
-//! [`reader::read_session`] merges it, [`replay::replay`] turns it back into
-//! the messages the model saw.
+//! log reads in a text editor. [`writer::ChunkWriter`] writes it and
+//! [`reader::read_session`] merges it. The replay that turned it back into
+//! the messages the model saw served the Matrix host and left in 108.3c.
 
 pub mod reader;
-pub mod replay;
 pub mod writer;
 
 use std::fmt;

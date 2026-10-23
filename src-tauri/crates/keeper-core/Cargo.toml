@@ -110,8 +110,10 @@ chacha20poly1305 = { workspace = true }
 # `check:core-sync-free` stay green. MIT OR Apache-2.0.
 unicode-normalization = { workspace = true }
 # Upstream code rewritten in Rust (Epic 89, AD-396): BMAD's customization
-# merge feeds `agents::soul::soul_from_bmad`, agentskills' validator feeds
-# `agents::skills`. A pure path crate — no network, no runtime, no tauri.
+# merge feeds `agents::soul::soul_from_bmad`, the memlog name feeds
+# `sessions::files`, the NanoKVM login feeds `agents::kvm` and the smart-turn
+# features feed `voice::end_of_turn`. A pure path crate — no network, no
+# runtime, no tauri.
 keeper-ported = { path = "../keeper-ported" }
 # OpenAI-compatible streaming, the provider quirks and the tool loop (AD-431),
 # re-exported at their old `bots::*` paths. An open crate with no keeper
