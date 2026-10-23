@@ -252,7 +252,7 @@ safe binding. Current inventory:
   `SFSpeechRecognizer` (`authorizationStatus`, `requestAuthorization:`, `initWithLocale:`,
   `supportsOnDeviceRecognition`, `isAvailable`, `supportedLocales` — enumerated once and
   cached (0.41 s for 63 locales on hesperia), refreshed when the person changes
-  `bots.voice_locale`, so the recogniser is built for a locale that runs on this Mac
+  `voice.locale`, so the recogniser is built for a locale that runs on this Mac
   rather than for the system locale (Epic 63; `localeWithLocaleIdentifier:` and
   `currentLocale` are safe bindings), `recognitionTaskWithRequest:resultHandler:`),
   `SFSpeechAudioBufferRecognitionRequest` (`setRequiresOnDeviceRecognition:` — always
@@ -292,7 +292,7 @@ safe binding. Current inventory:
 - Voice selection and on-device language detection, both ports (Epic 64, Story 64.2,
   FR-429–FR-432, AD-182, AD-183, AD-188): `AVSpeechSynthesisVoice` (`speechVoices` —
   enumerated once and cached beside the locales, refreshed when the person changes
-  `bots.voice_locale`; 180 voices on hesperia, one Polish — `language`, `name`, and
+  `voice.locale`; 180 voices on hesperia, one Polish — `language`, `name`, and
   `voiceWithLanguage:`, whose `nil` is refused as `VoiceUnavailable::NoVoice` naming the
   language and the platform's voice-download page, never a fall-through to the default
   voice), `AVSpeechUtterance setVoice:` (set on every utterance; no utterance is spoken

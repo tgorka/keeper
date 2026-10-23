@@ -245,8 +245,8 @@ repository is where it lives, as DW-341 records for the transcription models (a
 - **When they load:** only for an account, from a complete turn group whose marker the clone
   names now — the same facts the line below is computed from. Forgetting the account unloads
   them; with the server unreachable, models already here keep working.
-- **What voice shows:** one line under the voice switch (Settings › Bots, the Bots pane's voice
-  fold and the phone's Bots sheet) — *Turn models ready*, *Turn models missing:
+- **What voice shows:** one line under the voice switch (Settings › Agents & voice › *Voice*, on
+  the Mac and the phone) — *Turn models ready*, *Turn models missing:
   `silero-vad/model.onnx` — keeper waits 1.8 s after you stop*, or a refusal; without an account
   there are no turn models, and the line says so. The line moves by itself: keeper tells the
   window when a fetch starts and ends, when the models load at launch, when a synced model pick
