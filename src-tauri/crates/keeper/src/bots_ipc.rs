@@ -936,11 +936,7 @@ async fn spoken_target_now(state: &AppState) -> Result<SpokenTarget, IpcError> {
         .as_deref()
         .and_then(keeper_core::hq::spoken::target_agent)
     {
-        Some(_) => crate::hq_ipc::voice_agent_targets()
-            .await?
-            .into_iter()
-            .map(|target| target.agent)
-            .collect(),
+        Some(_) => crate::hq_ipc::spoken_agents().await?,
         None => Vec::new(),
     };
     spoken_target(&dir, &agents)

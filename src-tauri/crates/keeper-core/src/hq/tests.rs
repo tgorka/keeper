@@ -1572,3 +1572,48 @@ async fn a_spoken_question_to_an_agent_of_one_database_opens_its_conversation_th
     assert_eq!(sessions[0]["agent_actor"], Value::from("nixie"));
     assert_eq!(sessions[0]["id"], Value::from(ask.key.session_id.clone()));
 }
+
+/// After #570 a relaunch opens the replicas on disk before anything is
+/// listed. A spoken turn meanwhile is told keeper is still opening them —
+/// retriable — never that its agent is gone (choose again) nor written
+/// anywhere; once open, the same question goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spoken_question_while_the_replicas_open_is_arriving_then_goes() {
+    let world = World::new();
+    paired_holding_alpha(&world);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, held) = std::sync::mpsc::channel();
+    let opener = Arc::new(HeldOpener {
+        database: "alpha",
+        entered: Arc::clone(&entered),
+        release: Mutex::new(Some(held)),
+    });
+    let hq = real_hq(&world, opener);
+    let starting = {
+        let hq = Arc::clone(&hq);
+        tokio::spawn(async move { hq.start().await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("alpha's open begins");
+    let agents = hq.spoken_agents();
+    let early = hq.spoken_send("nixie", "What is on today?");
+    release.send(()).expect("releases");
+    starting.await.expect("joins").expect("starts");
+    assert!(matches!(&agents, Err(HqError::Arriving(_))), "{agents:?}");
+    assert!(matches!(&early, Err(HqError::Arriving(_))), "{early:?}");
+
+    assert_eq!(hq.spoken_agents().expect("listed"), ["nixie"]);
+    let ask = hq.spoken_send("nixie", "What is on today?").expect("asked");
+    assert_eq!(ask.key.database, "alpha");
+    let source = hq.source("alpha").expect("alpha");
+    let written = source
+        .replica
+        .query("SELECT body FROM messages", &[])
+        .expect("reads");
+    assert_eq!(
+        written.len(),
+        1,
+        "the question once, after the open: {written:?}"
+    );
+}

@@ -554,15 +554,34 @@ impl Hq {
         Ok(targets(&self.choices()?))
     }
 
+    /// The agents a spoken turn may go to, by actor id, as the turn is sent.
+    /// While the replicas on disk are not open yet nothing is listed, but an
+    /// agent chosen under *Speak to* is not gone: the turn is told keeper is
+    /// still opening them ([`Hq::not_open`]) rather than to choose again.
+    pub fn spoken_agents(&self) -> Result<Vec<String>, HqError> {
+        if let Some(refusal) = self.not_open() {
+            return Err(refusal);
+        }
+        Ok(self
+            .choices()?
+            .into_iter()
+            .map(|choice| choice.agent_actor)
+            .collect())
+    }
+
     /// Write what the voice turn heard into `agent`'s main conversation
     /// ([`main_session`]) as the person's own message, and answer where it
-    /// went. Refused, with [`AGENT_GONE_SENTENCE`], when no held database
+    /// went. Refused while the replicas on disk are not open yet
+    /// ([`Hq::not_open`]), with [`AGENT_GONE_SENTENCE`] when no held database
     /// names the agent, and with [`unchosen_sentence`] — writing nothing —
     /// when the agent has no conversation yet and several databases, none
     /// chosen; an empty question is never written.
     pub fn spoken_send(&self, agent: &str, body: &str) -> Result<SpokenAsk, HqError> {
         if body.trim().is_empty() {
             return Err(HqError::Sentence("Nothing was heard to send.".to_owned()));
+        }
+        if let Some(refusal) = self.not_open() {
+            return Err(refusal);
         }
         let sources = self.sources();
         let last = sessions::last_choices(&self.data_dir()?);

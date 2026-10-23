@@ -878,6 +878,12 @@ pub async fn voice_agent_targets() -> Result<Vec<VoiceAgentTargetVm>, IpcError> 
     blocking(|hq| hq.voice_agent_targets()).await
 }
 
+/// The agents a spoken turn may go to, by actor id — refused while the
+/// replicas on disk are still opening (`Hq::spoken_agents`).
+pub(crate) async fn spoken_agents() -> Result<Vec<String>, IpcError> {
+    blocking(|hq| hq.spoken_agents()).await
+}
+
 /// The send and then the following of the answer to the voice turn's
 /// current question, when it went to one of the person's agents: only that
 /// question's is ever kept ([`FollowSlot`]).
