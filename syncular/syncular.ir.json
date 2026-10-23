@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "schemaVersions": [
     {
       "version": 1,
@@ -18,6 +18,12 @@
       "version": 3,
       "migrations": [
         "0003_agent_profile_tools"
+      ]
+    },
+    {
+      "version": 4,
+      "migrations": [
+        "0004_grants_settings_drives"
       ]
     }
   ],
@@ -224,6 +230,31 @@
         },
         {
           "name": "tools",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "models",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "default_model",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "efforts",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "default_effort",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "drives",
           "type": "json",
           "nullable": true
         }
@@ -579,6 +610,135 @@
         },
         {
           "name": "session_tool_switches_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "session_settings",
+      "primaryKey": "session_id",
+      "columns": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "model",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "effort",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        }
+      ],
+      "references": [
+        {
+          "column": "session_id",
+          "parentTable": "sessions",
+          "onDelete": "CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_session_settings_session_id_ref",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "session_settings_session_id",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "session_drives",
+      "primaryKey": "session_id",
+      "columns": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "drives",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "session:{session}",
+          "variable": "session",
+          "column": "session_id"
+        }
+      ],
+      "references": [
+        {
+          "column": "session_id",
+          "parentTable": "sessions",
+          "onDelete": "CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_session_drives_session_id_ref",
+          "columns": [
+            "session_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "session_drives_session_id",
           "columns": [
             "session_id"
           ],
@@ -1121,6 +1281,11 @@
           "name": "author_client",
           "type": "string",
           "nullable": false
+        },
+        {
+          "name": "grant_id",
+          "type": "string",
+          "nullable": true
         }
       ],
       "scopes": [
@@ -1214,6 +1379,96 @@
           "pattern": "actor:{actor}",
           "variable": "actor",
           "column": "person_actor"
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "standing_grants",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "pair_key",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "person_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "agent_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "tool",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "args_match",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "max_tier",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "expires_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "revoked_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "granted_by_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "pair:{pair}",
+          "variable": "pair",
+          "column": "pair_key"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "standing_grants_pair",
+          "columns": [
+            "pair_key",
+            "created_at_ms",
+            "id"
+          ],
+          "unique": false
         }
       ],
       "extensions": {}
@@ -1415,6 +1670,36 @@
       ]
     },
     {
+      "name": "sessionSettings",
+      "table": "session_settings",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sessionDrives",
+      "table": "session_drives",
+      "scopes": [
+        {
+          "variable": "session",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "sessionId"
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "sessionTurnChunks",
       "table": "turn_chunks",
       "scopes": [
@@ -1514,6 +1799,21 @@
             {
               "kind": "parameter",
               "name": "actorId"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "standingGrants",
+      "table": "standing_grants",
+      "scopes": [
+        {
+          "variable": "pair",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "pairKey"
             }
           ]
         }

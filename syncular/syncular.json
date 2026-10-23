@@ -12,7 +12,8 @@
   "schemaVersions": [
     { "version": 1, "through": "0001_initial" },
     { "version": 2, "through": "0002_session_trust" },
-    { "version": 3, "through": "0003_agent_profile_tools" }
+    { "version": 3, "through": "0003_agent_profile_tools" },
+    { "version": 4, "through": "0004_grants_settings_drives" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -35,6 +36,14 @@
       "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
     },
     {
+      "name": "session_settings",
+      "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
+    },
+    {
+      "name": "session_drives",
+      "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
+    },
+    {
       "name": "turn_chunks",
       "scopes": [{ "pattern": "session:{session}", "column": "session_id" }]
     },
@@ -49,6 +58,10 @@
     {
       "name": "instance_prefs",
       "scopes": [{ "pattern": "actor:{actor}", "column": "person_actor" }]
+    },
+    {
+      "name": "standing_grants",
+      "scopes": [{ "pattern": "pair:{pair}", "column": "pair_key" }]
     },
     {
       "name": "agent_memory",
@@ -84,6 +97,16 @@
       "scopes": { "session": ["{sessionId}"] }
     },
     {
+      "name": "sessionSettings",
+      "table": "session_settings",
+      "scopes": { "session": ["{sessionId}"] }
+    },
+    {
+      "name": "sessionDrives",
+      "table": "session_drives",
+      "scopes": { "session": ["{sessionId}"] }
+    },
+    {
       "name": "sessionTurnChunks",
       "table": "turn_chunks",
       "scopes": { "session": ["{sessionId}"] }
@@ -101,6 +124,11 @@
       "name": "instancePrefs",
       "table": "instance_prefs",
       "scopes": { "actor": ["{actorId}"] }
+    },
+    {
+      "name": "standingGrants",
+      "table": "standing_grants",
+      "scopes": { "pair": ["{pairKey}"] }
     },
     {
       "name": "agentMemoryOwn",

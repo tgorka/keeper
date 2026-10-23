@@ -12,6 +12,10 @@
     {
       "name": "0003_agent_profile_tools",
       "sha256": "cfbe97c7f13cf5b4f3bb7c12f776a71914c5d96f14bfc6b1cdedad2c1f1558d0"
+    },
+    {
+      "name": "0004_grants_settings_drives",
+      "sha256": "0a17f0ca7e06afc7888ccb85f443e9dcb2e4f248f5c00b15c123bd77d38bbbfb"
     }
   ],
   "head": {
@@ -176,6 +180,31 @@
             "name": "tools",
             "type": "json",
             "nullable": true
+          },
+          {
+            "name": "models",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "default_model",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "efforts",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "default_effort",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "drives",
+            "type": "json",
+            "nullable": true
           }
         ]
       },
@@ -262,6 +291,11 @@
             "name": "author_client",
             "type": "string",
             "nullable": false
+          },
+          {
+            "name": "grant_id",
+            "type": "string",
+            "nullable": true
           }
         ]
       },
@@ -587,6 +621,37 @@
         ]
       },
       {
+        "name": "session_drives",
+        "primaryKey": "session_id",
+        "columns": [
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "drives",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
         "name": "session_members",
         "primaryKey": "id",
         "columns": [
@@ -629,6 +694,42 @@
             "name": "read_until",
             "type": "integer",
             "nullable": true
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "session_settings",
+        "primaryKey": "session_id",
+        "columns": [
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "model",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "effort",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
           },
           {
             "name": "author_actor",
@@ -756,6 +857,77 @@
             "name": "trust",
             "type": "string",
             "nullable": true
+          }
+        ]
+      },
+      {
+        "name": "standing_grants",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "pair_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "person_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "agent_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "tool",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "args_match",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "max_tier",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "expires_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "revoked_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "granted_by_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
           }
         ]
       },
