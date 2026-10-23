@@ -921,7 +921,7 @@ Stories 108.2 and 108.3a (AD-384, AD-411; R-HQ-68). **Settings › Agents & voic
 the wake switch, the wake phrase, the stop phrase, the listening language and *Speak to*, under the
 `voice.*` keys (`voice.wake_enabled`, `voice.wake_phrase`, `voice.stop_phrase`, `voice.locale`,
 `voice.target`). A value an older build wrote under the matching `bots.*` key is read under its
-`voice.*` key, and a value already under the new key wins (`registry.rs:203-211`, `:223-233`).
+`voice.*` key, and a value already under the new key wins (`keeper-core/src/registry.rs:203-211`, `:223-233`).
 Recognition never leaves the device (`docs/egress.md`, *Voice adds no egress*).
 
 **Speak to** lists every agent of every database this device holds
@@ -1033,12 +1033,12 @@ Story 108.2 (FR-863; UX-DR-E108-2). Before 108.2 an agent's conversation was a M
 person's accounts are still in those rooms. keeper hides them from every room list, and from
 notifications, by their create type: `dev.keeper.agent.session` for a session room,
 `dev.keeper.agent.control` for a principal's control room
-(`src-tauri/crates/keeper-core/src/old_agent_rooms.rs:21-31`; `notify.rs:596`). Only the room's
+(`src-tauri/crates/keeper-core/src/old_agent_rooms.rs:21-31`; `keeper-core/src/notify.rs:596`). Only the room's
 type is looked at; no agent event is read or sent.
 
 **Settings › Agents & voice › Old agent rooms** says how many such rooms the accounts are still in,
 and **Leave old agent rooms** leaves all of them. Only the person's own membership changes
-(`account.rs:4418`). The section is absent when there is no old room left. The agents' own Matrix
+(`keeper-core/src/account.rs:4418`). The section is absent when there is no old room left. The agents' own Matrix
 users, their devices and their rooms on the homeserver are the operator's to clean up
 (DW-E108-8).
 
@@ -1048,7 +1048,7 @@ left behind (`src-tauri/crates/keeper-core/src/agents_cleanup.rs:1-26`, `:37-50`
 agent copy's keychain items and its store under `<data_dir>/agents/`; and the setting
 `agents.claims_lease`. Each step is idempotent and logs a WARN line if it fails. Nothing touches a
 drive. The ⌘9 bots' tables are dropped once, the first time a 108.3a build opens `keeper.db`
-(`registry.rs:184`, `:188-201`), all but `bot_providers`, which notes search keeps; stored bot
+(`keeper-core/src/registry.rs:184`, `:188-201`), all but `bot_providers`, which notes search keeps; stored bot
 tasks leave `sync.db`, each named once in a WARN line, and Tasks shows one notice
 (`keeper-sync/src/db.rs:4858-4870`; UX-DR-E108-3). The phone's Matrix pusher is removed by its
 own path for one more release (DW-E108-1). **Owed:** the messenger smoke and a live *Leave old
