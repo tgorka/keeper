@@ -188,6 +188,18 @@ session from anywhere — a row, a tapped notification — ends New session (one
 kept in the webview's store until New session opens again, where it is back in the composer.
 **Cancel** (or Escape on a phone) and a created session drop it; a relaunch does too.
 
+**Slash commands.** In an open session, type `/` to see the commands Rust offers, type more to
+filter, and press Enter to run the selected command. Unknown or unavailable commands are refused,
+never sent as prose; `//` sends a literal leading slash. `/clean` and `/new [title]` open a fresh,
+empty session with the same agent and database, keeping the old conversation in the list. They
+neither clear history nor create an empty prompt. `/rename <title>` changes its title; `/archive`
+keeps its history and makes it read-only. `/people` opens People, `/tools` opens the existing tool
+switches when that agent offers tools, and `/help` opens the command list. `/context` shows the
+current agent, database and trust details; token occupancy is not reported on this build.
+`/model`, `/effort` and `/drives` are not offered until their backend operations exist. `/stop`
+writes a person control row naming each unfinished turn; a compatible runtime cancels only the
+named running turn and keeps the output already received. With no unfinished turn it refuses.
+
 **With no server address set** (`agents.server_url` blank, or cleared after pairing) keeper
 contacts no agents server. A device that was paired keeps the databases of the server it last
 synced with (`hq/last-server.json`, its base URL and nothing else; the pairing stays in the

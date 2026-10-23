@@ -72,8 +72,18 @@ function Mark({ mark }: { mark: string }) {
   );
 }
 
-export function SessionPeople({ target }: { target: AgentSessionRef }) {
-  const [open, setOpen] = useState(false);
+export function SessionPeople({
+  target,
+  open: controlled,
+  onOpenChange,
+}: {
+  target: AgentSessionRef;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const [ownOpen, setOwnOpen] = useState(false);
+  const open = controlled ?? ownOpen;
+  const setOpen = onOpenChange ?? setOwnOpen;
   const { phone } = useShellLayout();
   return (
     <Sheet open={open} onOpenChange={setOpen}>

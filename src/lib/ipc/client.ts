@@ -9,6 +9,7 @@
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { AgentCommandResultVm } from "./gen/AgentCommandResultVm";
 import type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
@@ -4113,6 +4114,20 @@ export async function agentInstancesSet(agentActor: string, order: string[]): Pr
 
 export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {
   await invoke<void>("agent_send", { ...target, body });
+}
+
+export async function agentCommandPreview(
+  target: AgentSessionRef,
+  draft: string,
+): Promise<ChatCommandPreviewVm> {
+  return await invoke<ChatCommandPreviewVm>("agent_command_preview", { ...target, draft });
+}
+
+export async function agentCommand(
+  target: AgentSessionRef,
+  draft: string,
+): Promise<AgentCommandResultVm> {
+  return await invoke<AgentCommandResultVm>("agent_command", { ...target, draft });
 }
 
 /**
