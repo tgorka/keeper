@@ -47,8 +47,10 @@ she runs on a flash-tier model. A broker start is T3 and always waits for a pers
 content raises it to T4, so the person stays the check (keeper-hq `review-agent-models.md`,
 rated Medium).
 
-<!-- 108.3b-acceptance: these models answering on electra after the 60b0da0 deploy -->
-*Pending the electra acceptance rerun:* whether the deployed agents answer on these models.
+On electra, on 2026-10-23, against keeper-hq 60b0da0, Nixi answered on
+`openrouter/z-ai/glm-5.3-flash` (108.3b's acceptance, below). She is the one agent verified there on
+these models: the other agents on the new models have not been run one by one, and that run (D8)
+is still owed.
 
 **The runtime.** keeper-hq's `hq-agent` holds the turn loop, the tool host, approvals, MCP, the
 sandboxed `run`, memory and the agent's half of attachments (108.3b). keeper's `keeper-agent`
@@ -57,10 +59,18 @@ keeps only the client halves: the drive's sessions runtime, *Promote*, the surfa
 some `keeper_core::agents` decision modules and the tool policy in `keeper_core::bots`, because
 keeper-hq imports them at a pinned revision. keeper itself runs no turn with them (AGENTS.md).
 
-<!-- 108.3b-acceptance: a turn, an approval, an MCP call and an attachment from keeper-hq's own build on electra -->
-*Pending the electra acceptance rerun:* keeper-hq's own-copy build serving a turn, an approval, an
-MCP call and an attachment on electra. The first run, on fdf5255, failed all four on the agents'
-models, not on the build; R-HQ-72 is the fix being rerun.
+**keeper-hq's own build on electra** (108.3b acceptance 3, met on 2026-10-23 against keeper-hq
+60b0da0 with the R-HQ-72 models). The first run, on fdf5255, had failed all four checks on the
+agents' models, not on the build. The rerun, with Nixi in a tgdrive session:
+
+- **A turn:** Nixi answered.
+- **A file:** a text file was read through `run` (`cat`) after a T2 approval: the person approved,
+  the approval was consumed once, and the command ran.
+- **An MCP call:** `mcp__paseo__list_agents` returned.
+- **A broker approval:** `create_agent` went pending, was approved, and was consumed once by
+  `nixi.electra`. The Paseo broker then did not answer within 120 s, so keeper-hq ended the call
+  `refused` and Nixi told the person exactly that — a broker-side issue (DW-E108-14), not a
+  keeper-hq one.
 
 ## What left keeper with the agents' move
 
