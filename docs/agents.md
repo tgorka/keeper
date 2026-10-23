@@ -62,16 +62,20 @@ keeper-hq imports them at a pinned revision. keeper itself runs no turn with the
 
 **keeper-hq's own build on electra** (108.3b acceptance 3, met on 2026-10-23 against keeper-hq
 60b0da0 with the R-HQ-72 models). The first run, on fdf5255, had failed all four checks on the
-agents' models, not on the build. The rerun, with Nixi in a tgdrive session:
+agents' models, not on the build. The rerun, with Nixi in a tgdrive session, was checked by the
+owner against the rows in `tgdrive`:
 
 - **A turn:** Nixi answered.
 - **A file:** a text file was read through `run` (`cat`) after a T2 approval: the person approved,
-  the approval was consumed once, and the command ran.
-- **An MCP call:** `mcp__paseo__list_agents` returned.
-- **A broker approval:** `create_agent` went pending, was approved, and was consumed once by
-  `nixi.electra`. The broker did not answer within keeper-hq's 120 s deadline, and Nixi told the
-  person the call was refused. The owner's check found that the broker created the agent after
-  keeper-hq's 120 s deadline had passed, and keeper-hq recorded the call as refused (DW-E108-14).
+  the approval was consumed once by `nixi.electra`, and the call's row is `done`.
+- **An MCP call:** `mcp__paseo__list_agents` returned; its row is `done`.
+- **A broker approval:** `mcp__paseo__create_agent` went pending at T3, was approved, and was
+  consumed once by `nixi.electra`. The broker did not answer within keeper-hq's 120 s deadline,
+  and Nixi told the person the call was refused. The broker created the agent after keeper-hq's
+  120 s deadline had passed, and keeper-hq recorded the call as refused (DW-E108-14).
+
+Nixi's container logged no error or refusal over the run, and the device the run paired as was
+revoked afterwards.
 
 ## What left keeper with the agents' move
 
