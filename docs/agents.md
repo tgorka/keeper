@@ -1084,8 +1084,14 @@ on the server only, as an alias of that actor; it is not part of keeper's contra
   not see it.
 - The drives were only read. Their session files and their agents' homes stay untouched, and an
   agent's drive memory was not imported (DW-E108-4).
-- Rows of one message, or approvals, written in the same millisecond keep the log's order only
-  within one writer (DW-E108-10, DW-E108-11).
+- **Order.** Three different limits (keeper-hq `agent/crates/hq-import/src/plan.rs` at
+  60b0da0):
+  - a message's attachments keep the order they were attached in, whoever wrote the log
+    (their ids carry the attachment's index);
+  - rows written in the same millisecond keep the log's order only when one writer, in one run,
+    wrote them; across writers or a restarted writer that order is not promised (DW-E108-10);
+  - imported approvals whose timestamps tie have no promised order at all, whoever wrote them:
+    each approval's id is derived from its own record (DW-E108-11).
 
 **Owed:** the imported sessions of both databases in the Agents window on hesperia (R-HQ-65), and
 NFR-127 there (below).
