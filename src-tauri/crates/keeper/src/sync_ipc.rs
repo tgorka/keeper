@@ -4599,9 +4599,9 @@ pub async fn sync_export_pdf(
         // different call — so the honest answer here is that this is not built
         // yet, named as such.
         let _ = (&app, &state, &id, &subpath);
-        return Err(open_failure(
+        Err(open_failure(
             "exporting a PDF is macOS-only for now: it renders through the webview".to_owned(),
-        ));
+        ))
     }
     #[cfg(target_os = "macos")]
     {

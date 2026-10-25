@@ -38,6 +38,7 @@
 //! worth one of them on the path to the first window, so it lands a moment
 //! after the rest. A log line is not less useful for arriving second.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// What the build says about itself, without asking the system anything.
