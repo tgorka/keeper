@@ -30,12 +30,19 @@ import "@codemirror/language";
 import "@codemirror/state";
 import "@/components/notes/editor/indent-keymap";
 import "@/components/notes/editor/live-preview";
-// Note mode's mount awaits three more chunks, and `settle()` drains microtasks
-// rather than frames — so they are warmed here for `raw-rendered-view.test.tsx`'s
-// reason: a cold `import()` would not have resolved by the time it returns.
+// Warm the editor dependencies to keep these tests cheap. Readiness still comes
+// from waiting for the mounted view, never from a fixed microtask count.
 import "@/components/notes/editor/writing-tools";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, type RenderResult, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  type RenderResult,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { useRef, useState } from "react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TextFileVm } from "@/lib/ipc/client";
@@ -281,11 +288,9 @@ beforeEach(() => {
 });
 
 /**
- * Drain the microtasks the live pane's mount rides on, and nothing else.
- *
- * Deliberately not `waitFor`, which advances timers: a frame starts CodeMirror's
- * measure pass, and `raw-rendered-view.test.tsx` records why that is a trade
- * about jsdom rather than about the feature.
+ * Flush synchronous mock responses and their React updates, not lazy imports.
+ * Editor mounts must separately await `waitFor(paneView)`. Timer-driven
+ * CodeMirror measurements are safe under this file's `withRangeRects` shim.
  */
 async function settle(): Promise<void> {
   await act(async () => {
@@ -867,6 +872,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     );
     render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
     await settle();
+    await waitFor(paneView);
 
     expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
@@ -891,6 +897,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     syncReadFrontmatter.mockRejectedValue(new Error("keeper will not read that here"));
     render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
     await settle();
+    await waitFor(paneView);
 
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
     expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
@@ -909,6 +916,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     const disk = { text: BLOCK + BODY };
     render(<LiveFrame initial={BLOCK + BODY} disk={disk} sets={sets} reads={reads} />);
     await settle();
+    await waitFor(paneView);
     expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
 
     const view = paneView();
@@ -955,6 +963,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     const reads: string[] = [];
     render(<LiveFrame initial={BLOCK + BODY} disk={disk} sets={sets} reads={reads} />);
     await settle();
+    await waitFor(paneView);
     expect(paneView().state.doc.toString()).toBe(BODY);
 
     disk.text = LANDED + BODY;
@@ -963,6 +972,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     fireEvent.change(status, { target: { value: "done" } });
     fireEvent.blur(status);
     await settle();
+    await waitFor(paneView);
 
     // Once. A splice AND a re-read would be the file read twice for one property.
     expect(reads).toEqual([LANDED + BODY]);
@@ -983,6 +993,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     const reads: string[] = [];
     const view = render(<LiveFrame initial={BLOCK + BODY} disk={disk} sets={sets} reads={reads} />);
     await settle();
+    await waitFor(paneView);
     expect(paneView().state.doc.toString()).toBe(BODY);
 
     // The other file, with a block of its own.
@@ -1014,6 +1025,7 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     syncReadFrontmatter.mockResolvedValue(BLOCK);
     render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
     await settle();
+    await waitFor(paneView);
     expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
     expect(paneView().state.doc.toString()).toBe(BODY);
 
@@ -1061,6 +1073,7 @@ describe("the properties fold", () => {
     syncReadFrontmatter.mockResolvedValue(BLOCK);
     render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
     await settle();
+    await waitFor(paneView);
 
     // Open on arrival, with no cookie and no press: the grid is there and the
     // pane holds his document rather than his document with its own metadata
