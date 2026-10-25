@@ -1326,9 +1326,15 @@ fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose()
             "{draft}"
         );
     }
-    assert!(
-        matches!(preview("//stop", false).verdict, ChatCommandVerdictVm::Text { text } if text == "/stop")
-    );
+    // These verdicts also govern attachment captions: only an explicit escape
+    // turns a command-looking caption into text, including unknown commands.
+    for caption in ["/stop", "/unknown", "/model unavailable"] {
+        let escaped = format!("/{caption}");
+        assert!(
+            matches!(preview(&escaped, false).verdict, ChatCommandVerdictVm::Text { text } if text == caption),
+            "escaped caption {escaped} must retain exactly one leading slash"
+        );
+    }
     assert_eq!(preview("/ren", false).rows[0].name, "rename");
     assert!(
         matches!(preview("/stop", false).verdict, ChatCommandVerdictVm::Command { name, args: None } if name == "stop")

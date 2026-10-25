@@ -201,6 +201,104 @@ it("runs a session slash command without an emote transport and never sends it a
   await waitFor(() => expect(field).toHaveValue(""));
 });
 
+describe("session slash commands with queued attachments", () => {
+  const file = {
+    id: "queued",
+    kind: "path" as const,
+    path: "/tmp/report.txt",
+    filename: "report.txt",
+  };
+
+  function mountCaption(answer: ChatCommandPreviewVm, session = true) {
+    const onSend = vi.fn(async () => {});
+    const onSendAttachments = vi.fn(async () => {});
+    const onCommand = vi.fn(async () => ({ tone: "done" as const, message: "Stop requested." }));
+    const resolveCommand = vi.fn(async () => answer);
+    render(
+      <Composer
+        transport={session ? "session" : "matrix"}
+        accountId="alpha"
+        roomId="caption-command"
+        onSend={onSend}
+        onSendEmote={session ? undefined : vi.fn(async () => {})}
+        onSendAttachments={onSendAttachments}
+        onCommand={onCommand}
+        resolveCommand={resolveCommand}
+      />,
+    );
+    act(() => attachmentsStore.getState().add(file));
+    return {
+      field: screen.getByLabelText<HTMLTextAreaElement>("Message"),
+      onSend,
+      onSendAttachments,
+      onCommand,
+      resolveCommand,
+    };
+  }
+
+  it("runs stop without uploading or consuming the queued file", async () => {
+    const { field, onSend, onSendAttachments, onCommand } = mountCaption(
+      preview("/stop", { verdict: { kind: "command", name: "stop", args: null } }),
+    );
+    type(field, "/stop");
+    key(field);
+    await waitFor(() => expect(field).toHaveValue(""));
+    expect(onCommand).toHaveBeenCalledWith({ name: "stop", args: null });
+    expect(onSendAttachments).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(attachmentsStore.getState().pending).toEqual([file]);
+    expect(screen.getByText("report.txt")).toBeInTheDocument();
+  });
+
+  it.each([
+    "/unknown",
+    "/model unavailable",
+  ])("refuses %s without sending its queued file", async (line) => {
+    const { field, onSend, onSendAttachments, onCommand } = mountCaption(
+      preview(line, { verdict: { kind: "refusal", message: "Command unavailable." } }),
+    );
+    type(field, line);
+    key(field);
+    expect(await screen.findByText("Command unavailable.")).toBeInTheDocument();
+    expect(onSendAttachments).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onCommand).not.toHaveBeenCalled();
+    expect(field).toHaveValue(line);
+    expect(attachmentsStore.getState().pending).toEqual([file]);
+  });
+
+  it.each([
+    "/stop",
+    "/unknown",
+    "/model unavailable",
+  ])("sends escaped %s as the literal attachment caption", async (caption) => {
+    const line = `/${caption}`;
+    const { field, onSend, onSendAttachments, onCommand } = mountCaption(
+      preview(line, { verdict: { kind: "text", text: caption } }),
+    );
+    type(field, line);
+    key(field);
+    await waitFor(() => expect(onSendAttachments).toHaveBeenCalledWith([file], caption));
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onCommand).not.toHaveBeenCalled();
+    await waitFor(() => expect(field).toHaveValue(""));
+    expect(attachmentsStore.getState().pending).toEqual([]);
+  });
+
+  it("preserves messenger slash captions without command resolution", async () => {
+    const { field, onSend, onSendAttachments, onCommand, resolveCommand } = mountCaption(
+      preview("/stop", { verdict: { kind: "command", name: "stop", args: null } }),
+      false,
+    );
+    type(field, "/stop");
+    key(field);
+    await waitFor(() => expect(onSendAttachments).toHaveBeenCalledWith([file], "/stop"));
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onCommand).not.toHaveBeenCalled();
+    expect(resolveCommand).not.toHaveBeenCalled();
+  });
+});
+
 describe("Composer slash menu", () => {
   it("opens over a leading slash with Rust's rows, and asks nothing about prose", async () => {
     const { field, resolveCommand } = mount(MENU);

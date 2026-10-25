@@ -190,7 +190,11 @@ kept in the webview's store until New session opens again, where it is back in t
 
 **Slash commands.** In an open session, type `/` to see the commands Rust offers, type more to
 filter, and press Enter to run the selected command. Unknown or unavailable commands are refused,
-never sent as prose; `//` sends a literal leading slash. `/clean` and `/new [title]` open a fresh,
+never sent as prose. Queued attachments do not disable commands: `/stop` runs without uploading
+the files and leaves them queued; a refusal keeps both the files and the draft. A command that
+leaves the session discards its unsent tray, just like navigating away. To send a literal leading
+slash as an attachment caption, double it: `//stop` sends the caption `/stop`, not a command.
+The same `//` escape applies without attachments. `/clean` and `/new [title]` open a fresh,
 empty session with the same agent and database, keeping the old conversation in the list. They
 neither clear history nor create an empty prompt. `/rename <title>` changes its title; `/archive`
 keeps its history and makes it read-only. `/people` opens People, `/tools` opens the existing tool
