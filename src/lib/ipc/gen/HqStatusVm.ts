@@ -2,6 +2,7 @@
 import type { HqDatabaseVm } from "./HqDatabaseVm";
 import type { HqDeviceVm } from "./HqDeviceVm";
 import type { HqPhase } from "./HqPhase";
+import type { HqSignInVm } from "./HqSignInVm";
 import type { HqThisDeviceVm } from "./HqThisDeviceVm";
 
 /**
@@ -29,4 +30,8 @@ devices: Array<HqDeviceVm>,
  * A pairing link opened on this device and not yet confirmed: the
  * server's host it would pair with.
  */
-offer: string | null, };
+offer: string | null, 
+/**
+ * Whether this device gets its credential by signing in (109.6).
+ */
+signIn: HqSignInVm, };

@@ -1,10 +1,12 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ADD_DEVICE,
   AGENTS_SERVER_LABEL,
   AGENTS_SERVER_SAVE,
   AgentsServerSection,
   FORGET_SERVER,
+  NEW_DEVICES_TITLE,
   OFFER_PAIR,
   PAIR_CODE_LABEL,
   PAIR_REDEEM,
@@ -12,6 +14,7 @@ import {
 import {
   type HqStatusVm,
   hqDeviceRevoke,
+  hqEnrolments,
   hqPairOfferAccept,
   hqPairRedeem,
   hqServerSet,
@@ -28,6 +31,7 @@ vi.mock("@/lib/ipc/client", () => ({
   hqPairOfferAccept: vi.fn(),
   hqPairOfferDismiss: vi.fn(() => Promise.resolve()),
   hqDeviceRevoke: vi.fn(),
+  hqEnrolments: vi.fn(() => Promise.resolve([])),
 }));
 vi.mock("@/components/settings/config-source-section", () => ({
   FileControlled: () => null,
@@ -42,6 +46,7 @@ const NO_SERVER: HqStatusVm = {
   waitingHere: 0,
   devices: [],
   offer: null,
+  signIn: { state: "unavailable", sentence: null },
 };
 
 let push: (status: HqStatusVm) => void = () => {};
@@ -126,6 +131,7 @@ describe("AgentsServerSection (UX-DR-E106-1)", () => {
         kalypso,
       ],
       offer: null,
+      signIn: { state: "unavailable", sentence: null },
     };
     vi.mocked(hqStatusSubscribe).mockImplementation((onStatus) => {
       push = onStatus;
@@ -173,5 +179,77 @@ describe("AgentsServerSection (UX-DR-E106-1)", () => {
     });
     render(<AgentsServerSection open />);
     expect(await screen.findByRole("button", { name: FORGET_SERVER })).toBeInTheDocument();
+  });
+
+  describe("sign-in enrolment (109.6)", () => {
+    const NOT_CONNECTED: HqStatusVm = {
+      ...NO_SERVER,
+      server: "https://agents.example.org",
+      phase: "notPaired",
+      sentence: "This device is not connected to agents.example.org yet.",
+    };
+
+    it("asks no code of a person who can sign in, and tells them how", async () => {
+      vi.mocked(hqStatusSubscribe).mockImplementation((onStatus) => {
+        push = onStatus;
+        onStatus({
+          ...NOT_CONNECTED,
+          signIn: {
+            state: "signedOut",
+            sentence: "Sign in to your account under Account, and keeper connects this device.",
+          },
+        });
+        return Promise.resolve("sub-1");
+      });
+      render(<AgentsServerSection open />);
+      expect(await screen.findByText(/Sign in to your account under Account/)).toBeInTheDocument();
+      expect(screen.queryByLabelText(PAIR_CODE_LABEL)).toBeNull();
+      // A sign-in the server refuses: the code is the way in again.
+      act(() =>
+        push({
+          ...NOT_CONNECTED,
+          signIn: { state: "refused", sentence: "agents.example.org trusts a different sign-in." },
+        }),
+      );
+      expect(await screen.findByLabelText(PAIR_CODE_LABEL)).toBeInTheDocument();
+    });
+
+    it("shows a signed-in device the new devices of the person, and no Add a device", async () => {
+      vi.mocked(hqEnrolments).mockResolvedValue([
+        { clientId: "ana.k", sentence: "New device signed in: keeper on kalypso.", atMs: 2 },
+      ]);
+      vi.mocked(hqStatusSubscribe).mockImplementation((onStatus) => {
+        push = onStatus;
+        onStatus({
+          ...NOT_CONNECTED,
+          phase: "paired",
+          sentence: "Paired with agents.example.org.",
+          device: { clientId: "ana.1", name: "keeper" },
+          signIn: { state: "enrolled", sentence: "Signed in." },
+        });
+        return Promise.resolve("sub-1");
+      });
+      render(<AgentsServerSection open />);
+      const notices = await screen.findByRole("list", { name: NEW_DEVICES_TITLE });
+      expect(notices).toHaveTextContent("New device signed in: keeper on kalypso.");
+      expect(screen.queryByRole("button", { name: ADD_DEVICE })).toBeNull();
+    });
+
+    it("keeps Add a device for a paired device that cannot sign in", async () => {
+      vi.mocked(hqEnrolments).mockResolvedValue([]);
+      vi.mocked(hqStatusSubscribe).mockImplementation((onStatus) => {
+        onStatus({
+          ...NOT_CONNECTED,
+          phase: "paired",
+          sentence: "Paired with agents.example.org.",
+          device: { clientId: "ana.1", name: "keeper" },
+        });
+        return Promise.resolve("sub-1");
+      });
+      render(<AgentsServerSection open />);
+      expect(await screen.findByRole("button", { name: ADD_DEVICE })).toBeInTheDocument();
+      expect(hqEnrolments).toHaveBeenCalled();
+      expect(screen.queryByRole("list", { name: NEW_DEVICES_TITLE })).toBeNull();
+    });
   });
 });

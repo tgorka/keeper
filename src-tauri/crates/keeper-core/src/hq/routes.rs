@@ -1,11 +1,15 @@
 //! The server's routes outside syncular's own protocol: at the root,
 //! discovery (`GET /databases`), pairing (`POST /pair/start`,
-//! `POST /pair/redeem`), revocation (`POST /clients/{id}/revoke`) and this
-//! device's push target (`PUT`/`DELETE /clients/self/push-target`); in a
-//! database's mount, the one item a push names
-//! (`GET /<database>/push/item/{kind}/{id}`). Each request carries the
-//! device's token as a bearer credential and nothing else of it; no response
-//! body is ever logged, because a redeem's body is the token.
+//! `POST /pair/redeem`), sign-in enrolment (`GET /auth/config`,
+//! `POST /devices/enroll`, `POST /clients/self/attest`,
+//! `GET /clients/self/enrolments`), revocation (`POST /clients/{id}/revoke`)
+//! and this device's push target (`PUT`/`DELETE /clients/self/push-target`);
+//! in a database's mount, the one item a push names
+//! (`GET /<database>/push/item/{kind}/{id}`). Each request carries one
+//! credential as a bearer and nothing else of it — the device's token, a
+//! pairing code, or at the enrol and attest routes alone the account's
+//! sign-in token (S-ID-1), never in a URL (S-ID-2); no response body is ever
+//! logged, because a redeem's or an enrolment's body is the token.
 
 use serde::Deserialize;
 use std::future::Future;
@@ -29,6 +33,10 @@ pub enum RouteError {
     /// 403 with the server's code.
     #[error("the server refused: {0}")]
     Forbidden(String),
+    /// A sign-in route's refusal (400, 401, 403, 404, 409 or 503) with the
+    /// server's code: which one decides what keeper does next.
+    #[error("the server refused ({status}): {code}")]
+    Refused { status: u16, code: String },
     /// Connection, TLS or timeout: nothing was decided.
     #[error("the server could not be reached: {0}")]
     Unreachable(String),
@@ -68,6 +76,77 @@ pub struct Issued {
     pub expires_at_ms: i64,
 }
 
+/// What `GET /auth/config` names: the sign-in the server takes at its enrol
+/// and attest routes (109.5). keeper compares it with its own account before
+/// any token leaves the device (S-ID-2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    pub issuer: String,
+    pub client_id: String,
+    /// The scopes a token must have been asked with to carry the server's
+    /// audience and role.
+    pub scopes: Vec<String>,
+}
+
+/// An enrolment's answer: a device token (shown once), what it opens, and
+/// whether it adopted the device token sent with it (same client id).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Enrolled {
+    pub token: String,
+    pub discovery: Discovery,
+    pub adopted: bool,
+}
+
+impl std::fmt::Debug for Enrolled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enrolled")
+            .field("token", &"<redacted>")
+            .field("discovery", &self.discovery)
+            .field("adopted", &self.adopted)
+            .finish()
+    }
+}
+
+/// An attestation's answer, on the server's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attested {
+    pub attested_at_ms: i64,
+    pub lapses_at_ms: i64,
+}
+
+/// How a device came to hold its credential, as a notice names it (S-ID-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EnrolmentKind {
+    /// A new device, by signing in.
+    Enrolled,
+    /// A paired device, signed in and kept under its client id.
+    Adopted,
+    /// A device that redeemed a pairing code.
+    Paired,
+}
+
+/// One "new device" notice of the person's, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Enrolment {
+    pub client_id: String,
+    pub name: String,
+    pub host: Option<String>,
+    pub kind: EnrolmentKind,
+    pub at_ms: i64,
+    /// The notice is this device's own.
+    #[serde(rename = "self")]
+    pub this_device: bool,
+}
+
+#[derive(Deserialize)]
+struct EnrolmentsBody {
+    enrolments: Vec<Enrolment>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DatabaseRow {
@@ -89,6 +168,16 @@ struct RedeemBody {
     actor_id: String,
     client_id: String,
     databases: Vec<DatabaseRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrolBody {
+    token: String,
+    actor_id: String,
+    client_id: String,
+    databases: Vec<DatabaseRow>,
+    adopted: bool,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +278,34 @@ pub trait Routes: Send + Sync {
         token: &'a str,
         pushed: &'a PushedItem,
     ) -> Answer<'a, Vec<u8>>;
+    /// `GET /auth/config`, unauthenticated: the sign-in the server trusts.
+    fn auth_config<'a>(&'a self, server: &'a ServerUrl) -> Answer<'a, AuthConfig>;
+    /// `POST /devices/enroll`: the account's sign-in token is the bearer,
+    /// once; `device_token` is a paired device's own, sent so the server
+    /// adopts it (same client id, new token) rather than minting a device.
+    fn enroll<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        sign_in_token: &'a str,
+        name: &'a str,
+        host: &'a str,
+        device_token: Option<&'a str>,
+    ) -> Answer<'a, Enrolled>;
+    /// `POST /clients/self/attest`: a fresh sign-in token keeps the device
+    /// the sign-in enrolled from lapsing.
+    fn attest<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        sign_in_token: &'a str,
+        device_token: &'a str,
+    ) -> Answer<'a, Attested>;
+    /// `GET /clients/self/enrolments`: the person's newest "new device"
+    /// notices, by the device token.
+    fn enrolments<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+    ) -> Answer<'a, Vec<Enrolment>>;
 }
 
 /// The root routes over HTTP, with no redirect followed.
@@ -254,6 +371,41 @@ impl Routes for HttpRoutes {
     ) -> Answer<'a, ()> {
         Box::pin(revoke(&self.http, server, token, client_id))
     }
+    fn auth_config<'a>(&'a self, server: &'a ServerUrl) -> Answer<'a, AuthConfig> {
+        Box::pin(auth_config(&self.http, server))
+    }
+    fn enroll<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        sign_in_token: &'a str,
+        name: &'a str,
+        host: &'a str,
+        device_token: Option<&'a str>,
+    ) -> Answer<'a, Enrolled> {
+        Box::pin(enroll(
+            &self.http,
+            server,
+            sign_in_token,
+            name,
+            host,
+            device_token,
+        ))
+    }
+    fn attest<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        sign_in_token: &'a str,
+        device_token: &'a str,
+    ) -> Answer<'a, Attested> {
+        Box::pin(attest(&self.http, server, sign_in_token, device_token))
+    }
+    fn enrolments<'a>(
+        &'a self,
+        server: &'a ServerUrl,
+        token: &'a str,
+    ) -> Answer<'a, Vec<Enrolment>> {
+        Box::pin(enrolments(&self.http, server, token))
+    }
 }
 
 async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, RouteError> {
@@ -308,13 +460,7 @@ async fn redeem(
     name: &str,
     host: &str,
 ) -> Result<Redeemed, RouteError> {
-    // Match pairing.ts: a trimmed, non-empty host of at most 200 UTF-16 code units.
-    let host = host.trim();
-    if host.is_empty() || host.encode_utf16().count() > 200 {
-        return Err(RouteError::Unexpected(
-            "this device has no valid host name".to_owned(),
-        ));
-    }
+    let host = checked_host(host)?;
     let response = send(
         http.post(server.route("/pair/redeem"))
             .bearer_auth(code.as_str())
@@ -329,6 +475,112 @@ async fn redeem(
         token: found.token,
         discovery: discovery_of(found.actor_id, found.client_id, found.databases)?,
     })
+}
+
+/// This device's host as the server's naming rule takes it (`device-name.ts`,
+/// for pairing and enrolment alike): trimmed, non-empty, at most 200 UTF-16
+/// code units.
+fn checked_host(host: &str) -> Result<&str, RouteError> {
+    let host = host.trim();
+    if host.is_empty() || host.encode_utf16().count() > 200 {
+        return Err(RouteError::Unexpected(
+            "this device has no valid host name".to_owned(),
+        ));
+    }
+    Ok(host)
+}
+
+/// A sign-in route's request: a success, or the server's refusal with its
+/// code ([`RouteError::Refused`]) — an old server without the route answers
+/// 404 too, and is told apart from nothing else.
+async fn send_signin(request: reqwest::RequestBuilder) -> Result<reqwest::Response, RouteError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| RouteError::Unreachable(error.without_url().to_string()))?;
+    let status = response.status().as_u16();
+    match status {
+        200..=299 => Ok(response),
+        400 | 401 | 403 | 404 | 409 | 503 => {
+            let code = response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| body["error"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("http-{status}"));
+            Err(RouteError::Refused { status, code })
+        }
+        other => Err(RouteError::Unexpected(format!("HTTP {other}"))),
+    }
+}
+
+/// `GET /auth/config`: no credential goes with it.
+async fn auth_config(http: &reqwest::Client, server: &ServerUrl) -> Result<AuthConfig, RouteError> {
+    let response = send_signin(http.get(server.route("/auth/config"))).await?;
+    body(response).await
+}
+
+/// `POST /devices/enroll` with the sign-in token as the bearer and the
+/// device token, when there is one, in the body (never a URL, S-ID-2).
+async fn enroll(
+    http: &reqwest::Client,
+    server: &ServerUrl,
+    sign_in_token: &str,
+    name: &str,
+    host: &str,
+    device_token: Option<&str>,
+) -> Result<Enrolled, RouteError> {
+    let host = checked_host(host)?;
+    let mut request = serde_json::json!({ "name": name, "host": host });
+    if let Some(device_token) = device_token {
+        request["deviceToken"] = device_token.into();
+    }
+    let response = send_signin(
+        http.post(server.route("/devices/enroll"))
+            .bearer_auth(sign_in_token)
+            .json(&request),
+    )
+    .await?;
+    let found: EnrolBody = body(response).await?;
+    if found.token.is_empty() {
+        return Err(RouteError::Unexpected("an empty token".to_owned()));
+    }
+    Ok(Enrolled {
+        token: found.token,
+        discovery: discovery_of(found.actor_id, found.client_id, found.databases)?,
+        adopted: found.adopted,
+    })
+}
+
+/// `POST /clients/self/attest` with the sign-in token as the bearer.
+async fn attest(
+    http: &reqwest::Client,
+    server: &ServerUrl,
+    sign_in_token: &str,
+    device_token: &str,
+) -> Result<Attested, RouteError> {
+    let response = send_signin(
+        http.post(server.route("/clients/self/attest"))
+            .bearer_auth(sign_in_token)
+            .json(&serde_json::json!({ "deviceToken": device_token })),
+    )
+    .await?;
+    body(response).await
+}
+
+/// `GET /clients/self/enrolments` with the device token.
+async fn enrolments(
+    http: &reqwest::Client,
+    server: &ServerUrl,
+    token: &str,
+) -> Result<Vec<Enrolment>, RouteError> {
+    let response = send_signin(
+        http.get(server.route("/clients/self/enrolments"))
+            .bearer_auth(token),
+    )
+    .await?;
+    let found: EnrolmentsBody = body(response).await?;
+    Ok(found.enrolments)
 }
 
 /// `POST /pair/start`: a code another device of this person can redeem.

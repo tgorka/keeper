@@ -91,6 +91,34 @@ impl Routes for FakeRoutes {
     ) -> Answer<'a, Vec<u8>> {
         Box::pin(async { Err(RouteError::Unreachable("unused".to_owned())) })
     }
+    fn auth_config<'a>(&'a self, _: &'a ServerUrl) -> Answer<'a, routes::AuthConfig> {
+        Box::pin(async { Err(RouteError::Unreachable("unused".to_owned())) })
+    }
+    fn enroll<'a>(
+        &'a self,
+        _: &'a ServerUrl,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
+        _: Option<&'a str>,
+    ) -> Answer<'a, routes::Enrolled> {
+        Box::pin(async { Err(RouteError::Unreachable("unused".to_owned())) })
+    }
+    fn attest<'a>(
+        &'a self,
+        _: &'a ServerUrl,
+        _: &'a str,
+        _: &'a str,
+    ) -> Answer<'a, routes::Attested> {
+        Box::pin(async { Err(RouteError::Unreachable("unused".to_owned())) })
+    }
+    fn enrolments<'a>(
+        &'a self,
+        _: &'a ServerUrl,
+        _: &'a str,
+    ) -> Answer<'a, Vec<routes::Enrolment>> {
+        Box::pin(async { Err(RouteError::Unreachable("unused".to_owned())) })
+    }
 }
 
 struct World {
@@ -113,6 +141,7 @@ impl World {
             Arc::clone(&self.platform) as Arc<dyn Platform>,
             Arc::clone(&self.opener) as Arc<dyn Opener>,
             Arc::clone(&self.routes) as Arc<dyn Routes>,
+            Arc::new(signin::NoAccount),
             "keeper on test".to_owned(),
             || "test".to_owned(),
         )
@@ -131,6 +160,7 @@ impl World {
             actor_id: "ana".to_owned(),
             client_id: "ana.1".to_owned(),
             name: "keeper on test".to_owned(),
+            bound: None,
         };
         self.platform
             .keychain_set(
@@ -190,6 +220,7 @@ async fn pairing_registers_the_host_not_the_display_name() {
             Arc::clone(&world.platform) as Arc<dyn Platform>,
             Arc::clone(&world.opener) as Arc<dyn Opener>,
             Arc::new(routes::HttpRoutes::new()),
+            Arc::new(signin::NoAccount),
             "My keeper".to_owned(),
             move || lock(&provided_host).clone(),
         );
@@ -827,6 +858,7 @@ async fn staged_session(
         Arc::clone(&world.platform) as Arc<dyn Platform>,
         Arc::clone(&opener) as Arc<dyn Opener>,
         Arc::clone(&world.routes) as Arc<dyn Routes>,
+        Arc::new(signin::NoAccount),
         "keeper on test".to_owned(),
         || "test".to_owned(),
     );
@@ -1251,6 +1283,7 @@ fn real_hq(world: &World, opener: Arc<dyn Opener>) -> Arc<Hq> {
         Arc::clone(&world.platform) as Arc<dyn Platform>,
         opener,
         Arc::clone(&world.routes) as Arc<dyn Routes>,
+        Arc::new(signin::NoAccount),
         "keeper on test".to_owned(),
         || "test".to_owned(),
     )
@@ -1515,6 +1548,7 @@ async fn spoken_world(world: &World, databases: &[&str]) -> (Arc<Hq>, Arc<LocalO
         Arc::clone(&world.platform) as Arc<dyn Platform>,
         Arc::clone(&opener) as Arc<dyn Opener>,
         Arc::clone(&world.routes) as Arc<dyn Routes>,
+        Arc::new(signin::NoAccount),
         "keeper on test".to_owned(),
         || "test".to_owned(),
     );

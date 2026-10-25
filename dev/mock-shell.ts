@@ -5893,7 +5893,10 @@ function mockCancelHeld(payload: Record<string, unknown>): HeldRestoreVm | Promi
  * opens on: absent — no server; `connected` — paired, both databases connected; `notopen` —
  * one database no longer open to this device; `removed` — this device was removed;
  * `notpaired` — an address and no pairing; `offer` — a scanned pairing QR waits for the
- * person to confirm it.
+ * person to confirm it. Sign-in enrolment (109.6): `signedout` — the server trusts the
+ * account and nobody is signed in; `enrolling` — signing this device in, which lands signed in
+ * after two seconds; `enrolled` — signed in, with other devices' "new device" notices;
+ * `signinrefused` — the server trusts another sign-in, so a code is the way in.
  */
 const hqParam = new URLSearchParams(window.location.search).get("hq");
 const HQ_SERVER = "https://agents.example.org";
@@ -5926,6 +5929,12 @@ let hqDevices: HqStatusVm["devices"] = [
   },
 ];
 const HQ_NOT_PAIRED = `This device is not paired with ${HQ_HOST}. Type the code a paired device shows under Add a device.`;
+const HQ_NOT_CONNECTED = `This device is not connected to ${HQ_HOST} yet.`;
+const HQ_SIGN_IN_UNAVAILABLE: HqStatusVm["signIn"] = { state: "unavailable", sentence: null };
+const HQ_ENROLLED: HqStatusVm["signIn"] = {
+  state: "enrolled",
+  sentence: `Signed in: ${HQ_HOST} knows this device by your account.`,
+};
 const hqNone: HqStatusVm = {
   server: null,
   phase: "noServer",
@@ -5936,8 +5945,12 @@ const hqNone: HqStatusVm = {
   waitingHere: 2,
   devices: [],
   offer: null,
+  signIn: HQ_SIGN_IN_UNAVAILABLE,
 };
-function hqPairedStatus(beta: HqStatusVm["databases"][number]["state"]): HqStatusVm {
+function hqPairedStatus(
+  beta: HqStatusVm["databases"][number]["state"],
+  signIn: HqStatusVm["signIn"] = HQ_SIGN_IN_UNAVAILABLE,
+): HqStatusVm {
   return {
     server: HQ_SERVER,
     phase: "paired",
@@ -5947,8 +5960,32 @@ function hqPairedStatus(beta: HqStatusVm["databases"][number]["state"]): HqStatu
     waitingHere: 0,
     devices: hqDevices,
     offer: null,
+    signIn,
   };
 }
+function hqNotConnected(signIn: HqStatusVm["signIn"]): HqStatusVm {
+  return {
+    ...hqNone,
+    server: HQ_SERVER,
+    phase: "notPaired",
+    sentence: HQ_NOT_CONNECTED,
+    waitingHere: 0,
+    signIn,
+  };
+}
+/** Another device's notices (`hq_enrolments`), newest first; this device's own are not listed. */
+const HQ_ENROLMENTS = [
+  {
+    clientId: "ana.5e6f7a8b",
+    sentence: "New device signed in: keeper on kalypso.",
+    atMs: Date.UTC(2026, 9, 25, 9, 12),
+  },
+  {
+    clientId: "ana.9f8e7d6c",
+    sentence: "keeper on hesperia signed in and kept its place.",
+    atMs: Date.UTC(2026, 9, 24, 18, 3),
+  },
+];
 function hqFixture(): HqStatusVm {
   switch (hqParam) {
     case "connected":
@@ -5965,6 +6002,7 @@ function hqFixture(): HqStatusVm {
         waitingHere: 0,
         devices: [],
         offer: null,
+        signIn: HQ_SIGN_IN_UNAVAILABLE,
       };
     case "notpaired":
       return {
@@ -5976,6 +6014,27 @@ function hqFixture(): HqStatusVm {
       };
     case "offer":
       return { ...hqNone, offer: HQ_HOST };
+    case "signedout":
+      return hqNotConnected({
+        state: "signedOut",
+        sentence: `Sign in to your account under Account, and keeper connects this device to ${HQ_HOST}. There is no code to type.`,
+      });
+    case "enrolling":
+      // Lands signed in two seconds after Settings first subscribes (`hq_status_subscribe`).
+      return hqNotConnected({
+        state: "enrolling",
+        sentence: `Signing this device in to ${HQ_HOST}…`,
+      });
+    case "enrolled":
+      return hqPairedStatus("connected", HQ_ENROLLED);
+    case "signinrefused":
+      return {
+        ...hqNotConnected({
+          state: "refused",
+          sentence: `${HQ_HOST} trusts a different sign-in than your account's, so keeper sent it nothing. Pair this device with a code.`,
+        }),
+        sentence: HQ_NOT_PAIRED,
+      };
     // ?hq=cleared — paired once, then the address cleared (A106-01): the last server's
     // databases stay listed and written to, and what is written waits in each one.
     case "cleared":
@@ -6010,6 +6069,7 @@ function hqClearedWrite(database: string): void {
   hqPublish(hqCleared(waiting));
 }
 let hqStatus: HqStatusVm = hqFixture();
+let hqEnrollStarted = false;
 const hqWatchers = new Map<string, MockChannel<HqStatusVm>>();
 function hqPublish(next: HqStatusVm): HqStatusVm {
   hqStatus = next;
@@ -7275,6 +7335,10 @@ const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> 
     const channel = payload.channel as MockChannel<HqStatusVm>;
     hqWatchers.set(id, channel);
     channel.onmessage?.(hqStatus);
+    if (hqParam === "enrolling" && hqStatus.signIn.state === "enrolling" && !hqEnrollStarted) {
+      hqEnrollStarted = true;
+      setTimeout(() => hqPublish(hqPairedStatus("connected", HQ_ENROLLED)), 2000);
+    }
     return id;
   },
   hq_status_unsubscribe: (payload) => {
@@ -7338,6 +7402,12 @@ const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> 
       device.clientId === payload.clientId ? { ...device, revoked: true } : device,
     );
     return hqPublish({ ...hqStatus, devices: hqDevices });
+  },
+  hq_enrolments: () => {
+    if (hqStatus.phase !== "paired") {
+      hqRefuse("This device is not paired with an agents server.");
+    }
+    return hqStatus.signIn.state === "enrolled" ? HQ_ENROLMENTS : [];
   },
 };
 

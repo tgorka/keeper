@@ -20,10 +20,11 @@ use keeper_core::hq::sessions::{
     diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
     AgentSessionsOp,
 };
+use keeper_core::hq::signin::OrgAccount;
 use keeper_core::hq::spoken::{FollowSlot, SpokenStep};
 use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::timeline::AgentSessionViewVm;
-use keeper_core::hq::vm::{HqPairCodeVm, HqStatusVm};
+use keeper_core::hq::vm::{HqEnrolmentVm, HqPairCodeVm, HqStatusVm};
 use keeper_core::hq::{Hq, HqError};
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceAgentTargetVm};
 use tauri::async_runtime::JoinHandle;
@@ -93,10 +94,18 @@ pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
     }
     let platform = Arc::clone(&app.state::<crate::ipc::AppState>().platform);
     crate::install_settings_layers(platform.as_ref());
+    // The account's sign-in enrols this device (109.6); core decides when
+    // and to which server, the shell only names the account and its client.
+    let sign_in = Arc::new(OrgAccount::new(
+        Arc::clone(&platform),
+        crate::account_ipc::descriptor,
+        || crate::account_ipc::http().cloned(),
+    ));
     let hq = Hq::new(
         platform,
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
+        sign_in,
         "keeper".to_owned(),
         crate::account_ipc::device_host,
     );
@@ -298,6 +307,13 @@ pub fn hq_pair_offer_dismiss() -> Result<(), IpcError> {
 #[tauri::command]
 pub async fn hq_device_revoke(client_id: String) -> Result<HqStatusVm, IpcError> {
     hq()?.revoke(&client_id).await.map_err(error)
+}
+
+/// The person's newest "new device" notices from their other devices
+/// (S-ID-8): signed in, adopted, or paired with a code.
+#[tauri::command]
+pub async fn hq_enrolments() -> Result<Vec<HqEnrolmentVm>, IpcError> {
+    hq()?.enrolments().await.map_err(error)
 }
 
 /// Run a blocking core call off the async workers.

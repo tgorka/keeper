@@ -146,6 +146,35 @@ app does not currently hold. Apple must grant that entitlement for assigned-name
 `iPhone` differs from `hesperia`, but two iPhones would share it; the actual kalypso enrollment
 and T4 decision still require the physical-device check.
 
+**Signing in** (Story 109.6; Q109-01 … Q109-06 a, S-ID-1 … S-ID-9; the server half is keeper-hq's
+109.5). A device whose person is signed in to the organisation account gets its credential by
+signing in, with no code (`keeper-core/src/hq/signin.rs`):
+
+- **When.** With `agents.server_url` set and the account signed in, keeper enrols on its own after
+  every start, every settings change and every sign-in (`Hq::consider_sign_in`). A device with no
+  credential gets a new one. A paired device sends its own token in the body, so the server
+  *adopts* it: the same client id, a new token, its host bound now (Q109-04 a). A device whose
+  sign-in lapsed or was suspended (S-ID-9: the server refuses its token) signs in again the same
+  way, silently, keeping its client id.
+- **To whom.** The account's access token leaves the device only after the server's
+  unauthenticated `GET /auth/config` names the account's own issuer and client, exactly, and no
+  scope the account's sign-in does not ask for (S-ID-2, `signin::trusts`). It goes only to
+  `POST /devices/enroll` and `POST /clients/self/attest`, as a bearer, never in a URL (S-ID-1).
+  Each presentation mints a new token (`oidc::minted_access_token`): the server spends its `jti`
+  and refuses one issued more than five minutes before. Neither token is ever logged.
+- **What is kept.** The device token goes to the keychain item a pairing's lives in
+  (`agents-server/<base URL>`), replacing it, with when it was last attested.
+- **Attestation** (Q109-03 a). A credential that came from a sign-in is re-attested six days into
+  the server's seven-day window (`signin::Bound::due_at_ms`), with a freshly minted token. A
+  signed-out account does not attest; the credential lapses, and the next sign-in adopts it back.
+- **Settings.** For a person keeper can sign in for, *Agents server* shows no code field and no
+  **Add a device**: it says how this device stands with signing in, and lists **New devices** —
+  the server's notices of the person's other devices signing in, being adopted or pairing
+  (`GET /clients/self/enrolments`, S-ID-8), this device's own left out.
+- **Pairing stays** for anyone keeper cannot sign in for: no account, a server without sign-in
+  (`/auth/config` answers 404), or a refusal (another issuer or client, a person the server does
+  not list). 109.7 retires it.
+
 **Discovery.** At every start, and after pairing, `GET /databases` says whom the token was issued
 to and which databases it opens (`hq/routes.rs:289-295`). The device holds one replica per server,
 database and person under the data directory, at `hq/servers/<server>/<database>/<actor>.sqlite`,

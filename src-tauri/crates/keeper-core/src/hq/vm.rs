@@ -85,6 +85,60 @@ pub struct HqStatusVm {
     /// A pairing link opened on this device and not yet confirmed: the
     /// server's host it would pair with.
     pub offer: Option<String>,
+    /// Whether this device gets its credential by signing in (109.6).
+    pub sign_in: HqSignInVm,
+}
+
+/// Where this device stands with signing in to the agents server (109.6,
+/// Q109-01 a): the account's sign-in exchanged once for the device's
+/// credential, with no code to type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum HqSignInState {
+    /// No account is set up, no server is set, or the server offers no
+    /// sign-in: a pairing code is the way in.
+    Unavailable,
+    /// The account is set up and the server trusts its sign-in, but nobody
+    /// is signed in: signing in connects this device.
+    SignedOut,
+    /// keeper is checking the server and signing this device in now.
+    Enrolling,
+    /// This device's credential comes from the account's sign-in.
+    Enrolled,
+    /// Signing in did not work; the sentence says why. A pairing code still
+    /// works.
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HqSignInVm {
+    pub state: HqSignInState,
+    /// The line Settings shows under the server, when there is one.
+    pub sentence: Option<String>,
+}
+
+impl HqSignInVm {
+    pub fn unavailable() -> HqSignInVm {
+        HqSignInVm {
+            state: HqSignInState::Unavailable,
+            sentence: None,
+        }
+    }
+}
+
+/// One "new device" notice (S-ID-8): another of the person's devices that
+/// signed in, was adopted by a sign-in, or redeemed a pairing code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HqEnrolmentVm {
+    pub client_id: String,
+    pub sentence: String,
+    #[ts(type = "number")]
+    pub at_ms: i64,
 }
 
 /// One of the person's devices, read from a database's `clients` rows.
@@ -121,6 +175,15 @@ fn waiting_clause(waiting: u32) -> String {
         1 => " 1 change waits on this device.".to_owned(),
         n => format!(" {n} changes wait on this device."),
     }
+}
+
+/// The server row's line while a device without a credential gets one by
+/// signing in rather than by a code (109.6).
+pub fn not_connected_sentence(host: &str, waiting_here: u32) -> String {
+    format!(
+        "This device is not connected to {host} yet.{}",
+        waiting_clause(waiting_here)
+    )
 }
 
 /// A database's state and line from its replica's link and outbox, whether

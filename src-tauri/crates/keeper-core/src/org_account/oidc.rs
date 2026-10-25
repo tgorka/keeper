@@ -1464,12 +1464,36 @@ pub async fn access_token(
     http: &reqwest::Client,
     d: &AccountDescriptor,
 ) -> Result<String, AccountError> {
+    access_token_or_minted(platform, http, d, false).await
+}
+
+/// A newly minted access token: always refreshed, never the stored one or
+/// one another caller received. For a server that takes a token once, as a
+/// fresh proof of sign-in, and spends its `jti` (the agents server's
+/// enrolment and attestation, 109.6): a token reused there is a replay.
+/// Concurrent callers each get their own, one after the other.
+pub async fn minted_access_token(
+    platform: &dyn Platform,
+    http: &reqwest::Client,
+    d: &AccountDescriptor,
+) -> Result<String, AccountError> {
+    access_token_or_minted(platform, http, d, true).await
+}
+
+async fn access_token_or_minted(
+    platform: &dyn Platform,
+    http: &reqwest::Client,
+    d: &AccountDescriptor,
+    mint: bool,
+) -> Result<String, AccountError> {
     let needs_sign_in =
         || AccountError::NeedsSignIn("Sign in again to keep your settings in sync.".to_owned());
-    if let Some(session) = load_bound_session(platform, d)? {
-        if still_fresh(session.access_expires_ms) {
-            session.check_roles(d)?;
-            return Ok(session.access_token);
+    if !mint {
+        if let Some(session) = load_bound_session(platform, d)? {
+            if still_fresh(session.access_expires_ms) {
+                session.check_roles(d)?;
+                return Ok(session.access_token);
+            }
         }
     }
     let lock = refresh_lock(&session_key(&d.id));
@@ -1477,7 +1501,7 @@ pub async fn access_token(
     // Re-read under the lock: the caller before us may have just refreshed.
     let mut session = load_bound_session(platform, d)?.ok_or_else(needs_sign_in)?;
     session.check_roles(d)?;
-    if still_fresh(session.access_expires_ms) {
+    if !mint && still_fresh(session.access_expires_ms) {
         return Ok(session.access_token);
     }
     let refresh = session.refresh_token.clone().ok_or_else(needs_sign_in)?;
@@ -3235,6 +3259,35 @@ mod tests {
             1,
             "two refreshes would replay a rotated token"
         );
+    }
+
+    #[tokio::test]
+    async fn a_minted_token_is_always_a_new_refresh_even_for_concurrent_callers() {
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = account(&fake, "minted", None);
+        seed_session(&p, &d, Vec::new(), now_ms() + 3_600_000);
+        let client = http();
+
+        // The stored token is fresh: the ordinary call takes it as it is.
+        assert_eq!(
+            access_token(&p, &client, &d).await.expect("cached"),
+            "access-1"
+        );
+        assert_eq!(fake.refreshes(), 0);
+        assert_eq!(
+            minted_access_token(&p, &client, &d).await.expect("minted"),
+            "access-2"
+        );
+        assert_eq!(fake.refreshes(), 1, "a fresh stored token is not reused");
+        // The one just minted is fresh too, and still not handed out again.
+        let (a, b) = tokio::join!(
+            minted_access_token(&p, &client, &d),
+            minted_access_token(&p, &client, &d)
+        );
+        a.expect("first");
+        b.expect("second");
+        assert_eq!(fake.refreshes(), 3, "each caller gets its own refresh");
     }
 
     #[tokio::test]
