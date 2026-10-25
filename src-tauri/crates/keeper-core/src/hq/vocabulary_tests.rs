@@ -67,3 +67,22 @@ fn efforts_are_distinct_and_known_by_name() {
     assert!(is_effort("low") && is_effort("xhigh"));
     assert!(!is_effort("") && !is_effort("max") && !is_effort("LOW"));
 }
+
+/// The key is the contract's: every example reproduces, among them two
+/// pairs whose ids joined by `/` alone would read the same.
+#[test]
+fn every_person_agent_example_has_the_key_the_contract_names() {
+    let examples = person_agent_examples();
+    assert!(examples.len() >= 3);
+    for example in examples {
+        assert_eq!(
+            person_agent_key(&example.person, &example.agent),
+            example.key,
+            "{} / {}",
+            example.person,
+            example.agent
+        );
+    }
+    let keys: HashSet<_> = examples.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys.len(), examples.len());
+}

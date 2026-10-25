@@ -1393,7 +1393,7 @@
           "nullable": false
         },
         {
-          "name": "pair_key",
+          "name": "person_agent_key",
           "type": "string",
           "nullable": false
         },
@@ -1406,6 +1406,11 @@
           "name": "agent_actor",
           "type": "string",
           "nullable": false
+        },
+        {
+          "name": "session_id",
+          "type": "string",
+          "nullable": true
         },
         {
           "name": "tool",
@@ -1455,16 +1460,16 @@
       ],
       "scopes": [
         {
-          "pattern": "pair:{pair}",
-          "variable": "pair",
-          "column": "pair_key"
+          "pattern": "person_agent:{person_agent}",
+          "variable": "person_agent",
+          "column": "person_agent_key"
         }
       ],
       "indexes": [
         {
-          "name": "standing_grants_pair",
+          "name": "standing_grants_person_agent",
           "columns": [
-            "pair_key",
+            "person_agent_key",
             "created_at_ms",
             "id"
           ],
@@ -1809,11 +1814,11 @@
       "table": "standing_grants",
       "scopes": [
         {
-          "variable": "pair",
+          "variable": "person_agent",
           "values": [
             {
               "kind": "parameter",
-              "name": "pairKey"
+              "name": "personAgentKey"
             }
           ]
         }

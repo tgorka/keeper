@@ -223,5 +223,29 @@
         "handle": "sturdy-snail-wobbles"
       }
     ]
+  },
+  "personAgentKey": {
+    "examples": [
+      {
+        "person": "tgorka",
+        "agent": "nixi",
+        "key": "6:tgorka/nixi"
+      },
+      {
+        "person": "tgorka",
+        "agent": "a/b",
+        "key": "6:tgorka/a/b"
+      },
+      {
+        "person": "tgorka/a",
+        "agent": "b",
+        "key": "8:tgorka/a/b"
+      },
+      {
+        "person": "zoë",
+        "agent": "nixi",
+        "key": "4:zoë/nixi"
+      }
+    ]
   }
 }

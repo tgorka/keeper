@@ -19,7 +19,7 @@ keeper ships no server URL).
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
 | `limits.json` | the bounds both sides read: `attachmentMaxBytes`, the most bytes one attachment's blob may have (26,214,400); hand-written, never generated |
-| `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover) and `handle` (the word lists a session's handle is made of, with examples); hand-written, never generated |
+| `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 
 Everything generated comes from `@syncular/typegen` 0.32.1 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -55,15 +55,16 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `actor` | an actor id | itself | itself | `instance_prefs` |
 | `agent` | an agent's actor id | the agents of this database that serve the person | itself | `agent_memory` |
 | `family` | a family name | the families of this database that serve the person | its own family | `agent_memory` |
-| `pair` | `<person_actor>/<agent_actor>` | `<itself>/<agent>` for each agent of this database that serves the person | `<person>/<itself>` for each person of this database it serves | `standing_grants` |
+| `person_agent` | a person-agent key (*Ids*) | the key of (itself, agent) for each agent of this database that serves the person | the key of (person, itself) for each person of this database it serves | `standing_grants` |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
 `trace`. `turn_chunks` carry text only.
 
-A `pair` value names one person and one agent, so a person reads only the standing grants they
-wrote, and an agent instance only those written about its own agent: neither reads a grant another
-person wrote about the same agent, or one the same person wrote about another agent.
+A `person_agent` value names one person and one agent, and no other pair has it, so a person
+reads only the standing grants they wrote, and an agent instance only those written about its own
+agent: neither reads a grant another person wrote about the same agent, or one the same person
+wrote about another agent.
 
 ## Ids
 
@@ -78,7 +79,14 @@ Every id a client creates can be minted offline:
   `<session_id>/<actor_id>`, `instance_prefs.id` is `<person_actor>/<agent_actor>`, `claims`,
   `session_tool_switches`, `session_settings` and `session_drives` are keyed by `session_id`,
   `agent_profiles.id` is the instance's client id;
-- `actors` and `clients` are written by the server's own service client, never by a device.
+- `actors` and `clients` are written by the server's own service client, never by a device;
+- an actor id never contains `/` or `:`, so `<session_id>/<actor_id>` and every key below split
+  one way only; a server refuses a directory naming such an actor;
+- a **person-agent key** (`standing_grants.person_agent_key`, the `person_agent` scope) is
+  `<n>:<person_actor>/<agent_actor>`, `n` the number of UTF-8 bytes of `person_actor` in decimal
+  without leading zeros: `6:tgorka/nixi`. The length decides where the person ends, so two
+  different (person, agent) pairs never share a key, whatever the ids hold; `vocabulary.json`'s
+  `personAgentKey.examples` holds keys every implementation must reproduce.
 
 ## Page keys
 
@@ -184,8 +192,10 @@ last wrote it. Times are UTC milliseconds since the epoch.
   requests: `agentMemoryOwn` (`agent` alone) receives one agent's rows, and `agentMemoryFamily`
   (`family` alone) receives every row of a family, its peers' included. A subscription requesting
   both would receive only the rows of that agent in that family.
-- **`standing_grants`** (schema 4) — one person's standing "always allow" for one agent:
-  `pair_key` (`<person_actor>/<agent_actor>`), `person_actor`, `agent_actor`, `tool` (a tool
+- **`standing_grants`** (schema 4) — one person's "always allow" for one agent:
+  `person_agent_key` (the person-agent key of the two, *Ids*), `person_actor`, `agent_actor`,
+  `session_id` (absent: a standing grant, for every session of this database the two share; set:
+  "This session only", the grant applies in that one session and nowhere else), `tool` (a tool
   name as `tool_calls.name` records it), `args_match` (the argument scope, below), `max_tier` (the
   highest tier it covers, one of `vocabulary.json`'s `grantTiers`), `expires_at_ms` (absent: until
   revoked), `revoked_at_ms`, `granted_by_client` (the device it was granted from), `created_at_ms`.
@@ -193,7 +203,8 @@ last wrote it. Times are UTC milliseconds since the epoch.
   argument scope, in a session of this database, under V8 below; every use is still its own
   approval row, with its own digest, consumed once. `args_match` is a JSON object: for `run`,
   `{"program": …}` with the program as the call landed it (its `argv[0]`), and optionally
-  `"arg"`, its first argument; for every other tool, `{}`.
+  `"arg"`, its first argument; for every other tool, `{}`. A grant never covers a call that
+  writes a drive (*V15*).
 
 Declared references, enforced by the server at commit: `clients` and `agent_profiles` need their
 actor; `claims`, `session_tool_switches`, `session_settings`, `session_drives`, `turn_chunks` and
@@ -285,10 +296,12 @@ rule broken refuses the whole commit.
    by a standing grant: then its `grant_id` names a `standing_grants` row of this database which,
    in the commit's candidate state, is not revoked and not expired by the server's clock; whose
    `agent_actor` is the session's agent; whose `person_actor` is named in `approvers` and is a
-   person or owner member of the session whose `reads_trace` holds; whose `tool` is the approval's
-   tool call's `name` and whose `args_match` holds of that call's `args`; and whose `max_tier` is
-   not below the approval's `tier`. The tier is one of `grantTiers`, never `T4`, and the session is
-   not `untrusted`. Its `decided_by_actor` is the grant's `person_actor`, its `decided_by_client`
+   person or owner member of the session whose `reads_trace` holds; whose `session_id` is absent
+   or is the approval's session, which is then open and not archived; whose `tool` is the
+   approval's tool call's `name` and whose `args_match` holds of that call's `args`; and whose
+   `max_tier` is not below the approval's `tier`. The tier is one of `grantTiers`, never `T4`, the
+   session is not `untrusted`, and the call writes no drive: a grant never decides a drive write,
+   whatever its tier, the session's trust or the spelling of its tool's name. Its `decided_by_actor` is the grant's `person_actor`, its `decided_by_client`
    the grant's `granted_by_client`, and it is consumed as any approved row is. `grant_id` never
    changes.
 9. **V9 — preferences.** `instance_prefs.person_actor` is the commit's actor.
@@ -310,12 +323,18 @@ rule broken refuses the whole commit.
 14. V14 is not a client's rule: a server's own import of older records uses the number.
 15. **V15 — standing grants.** `standing_grants` is written only by a person, never by an agent:
     `person_actor` is the commit's actor, `agent_actor` an agent of this database that serves
-    them, and `pair_key` `<person_actor>/<agent_actor>`. A grant is inserted with
+    them, and `person_agent_key` the person-agent key of the two. A grant is inserted with
     `granted_by_client` the commit's client, no `revoked_at_ms`, a `created_at_ms` the server's
-    clock accepts, an `expires_at_ms` absent or later, a `max_tier` among `grantTiers`, a `tool`
-    other than `delegate`, and an `args_match` of the tool's shape (*Tables* above). After that
-    the one change is its revocation: its person sets `revoked_at_ms`, once, from any of their
-    devices, and nothing else moves. A grant is never deleted, so every approval that names one
+    clock accepts, an `expires_at_ms` absent or later, a `max_tier` among `grantTiers`, and an
+    `args_match` of the tool's shape (*Tables* above). Its `tool` is one the server knows writes no
+    drive — an allow-list of tools, never a refusal of names — and never `delegate`: a grant never
+    covers a drive write, whatever its tier, the session's trust or how its tool's name is
+    spelled. A `session_id` names a session of this database, open and not archived, whose
+    `agent_actor` is the grant's agent and in which the grant's person is a person or owner member.
+    After that the one change is its revocation: its person sets `revoked_at_ms`, once, from any of
+    their devices, and nothing else moves — `session_id` never changes. A session-bound grant ends
+    with its session: when the session is archived or deleted the server revokes it
+    (`revoked_at_ms`), so a session archived and brought back does not bring the grant back. A grant is never deleted, so every approval that names one
     can still be read beside it. No write widens a grant: a wider one is a new grant.
 16. **V16 — session settings.** `session_settings` is written only by a person who is a member of
     the session (role `owner` or `person`), never by an agent; its session is a session of this

@@ -9,7 +9,10 @@
 //!   time;
 //! - [`handle`]: a session's handle, three words drawn from the file's lists
 //!   by the SHA-256 of the session id (the contract's *Session handles*).
-//!   A handle is display only: never a key, a scope value or a lookup path.
+//!   A handle is display only: never a key, a scope value or a lookup path;
+//! - [`person_agent_key`]: the key of one person's standing grants about one
+//!   agent (`standing_grants.person_agent_key`, the `person_agent` scope),
+//!   checked against the file's `personAgentKey.examples`.
 
 use std::sync::LazyLock;
 
@@ -25,6 +28,22 @@ struct Vocabulary {
     efforts: Vec<String>,
     grant_tiers: Vec<String>,
     handle: HandleWords,
+    person_agent_key: PersonAgentWords,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonAgentWords {
+    examples: Vec<PersonAgentExample>,
+}
+
+/// A person, an agent, and the person-agent key the contract says they have.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonAgentExample {
+    pub person: String,
+    pub agent: String,
+    pub key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +89,22 @@ pub fn handle_examples() -> &'static [HandleExample] {
     PARSED
         .as_ref()
         .map_or(&[], |v| v.handle.examples.as_slice())
+}
+
+/// The contract's examples: each (person, agent) with its person-agent key.
+pub fn person_agent_examples() -> &'static [PersonAgentExample] {
+    PARSED
+        .as_ref()
+        .map_or(&[], |v| v.person_agent_key.examples.as_slice())
+}
+
+/// The person-agent key of `person` and `agent`: `<n>:<person>/<agent>`, `n`
+/// the UTF-8 byte length of `person` in decimal. The length says where the
+/// person ends, so no two (person, agent) pairs share a key, whatever the ids
+/// hold — `tgorka` with `a/b` is `6:tgorka/a/b`, `tgorka/a` with `b` is
+/// `8:tgorka/a/b`.
+pub fn person_agent_key(person: &str, agent: &str) -> String {
+    format!("{}:{person}/{agent}", person.len())
 }
 
 /// The word `digest[at..at + 2]` picks from `words`: a big-endian unsigned

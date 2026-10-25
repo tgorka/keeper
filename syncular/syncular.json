@@ -61,7 +61,7 @@
     },
     {
       "name": "standing_grants",
-      "scopes": [{ "pattern": "pair:{pair}", "column": "pair_key" }]
+      "scopes": [{ "pattern": "person_agent:{person_agent}", "column": "person_agent_key" }]
     },
     {
       "name": "agent_memory",
@@ -128,7 +128,7 @@
     {
       "name": "standingGrants",
       "table": "standing_grants",
-      "scopes": { "pair": ["{pairKey}"] }
+      "scopes": { "person_agent": ["{personAgentKey}"] }
     },
     {
       "name": "agentMemoryOwn",

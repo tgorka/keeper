@@ -15,7 +15,7 @@
     },
     {
       "name": "0004_grants_settings_drives",
-      "sha256": "0a17f0ca7e06afc7888ccb85f443e9dcb2e4f248f5c00b15c123bd77d38bbbfb"
+      "sha256": "5d82cb2d4c59120f429537ba3fc16040050418f3ab6fccf9991f60d3987d06c2"
     }
   ],
   "head": {
@@ -870,7 +870,7 @@
             "nullable": false
           },
           {
-            "name": "pair_key",
+            "name": "person_agent_key",
             "type": "string",
             "nullable": false
           },
@@ -883,6 +883,11 @@
             "name": "agent_actor",
             "type": "string",
             "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": true
           },
           {
             "name": "tool",

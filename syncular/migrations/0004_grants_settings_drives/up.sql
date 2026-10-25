@@ -42,13 +42,17 @@ CREATE TABLE session_drives (
 
 CREATE INDEX session_drives_session_id ON session_drives (session_id);
 
--- pair: one person's standing decisions about one agent, `<person_actor>/<agent_actor>`.
+-- person_agent: one person's standing decisions about one agent, keyed by the contract's
+-- person-agent key (`<UTF-8 bytes of person_actor>:<person_actor>/<agent_actor>`), which no two
+-- (person, agent) pairs share. `session_id` absent: the grant stands in every session of the two;
+-- set: it applies only in that session ("This session only").
 
 CREATE TABLE standing_grants (
   id TEXT PRIMARY KEY,
-  pair_key TEXT NOT NULL,
+  person_agent_key TEXT NOT NULL,
   person_actor TEXT NOT NULL,
   agent_actor TEXT NOT NULL,
+  session_id TEXT,
   tool TEXT NOT NULL,
   args_match JSON NOT NULL,
   max_tier TEXT NOT NULL,
@@ -60,4 +64,4 @@ CREATE TABLE standing_grants (
   author_client TEXT NOT NULL
 );
 
-CREATE INDEX standing_grants_pair ON standing_grants (pair_key, created_at_ms, id);
+CREATE INDEX standing_grants_person_agent ON standing_grants (person_agent_key, created_at_ms, id);
