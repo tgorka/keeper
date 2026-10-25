@@ -41,6 +41,8 @@ percent-encoding = { workspace = true }
 # MIME parsing (media send caption/type) + path→mime guessing (Story 3.7, FR-13).
 mime = { workspace = true }
 mime_guess = { workspace = true }
+# Bounded local attachment thumbnail decoding; PNG output, raster input only.
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 # HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
 reqwest = { workspace = true }
 # The organisation account's OIDC client (Epic 82, AD-310). See the workspace
@@ -158,9 +160,6 @@ tokio-rustls = { workspace = true }
 # cache's lock: the `EventCacheStore` trait and its in-memory store, which
 # `matrix-sdk` does not re-export. Already in the tree through it.
 matrix-sdk-base = "0.19"
-# The region difference hash's bounds are proved over real screenshots of
-# the Mac (PNG fixtures, 96.4 #5); the hash itself takes grey bytes.
-image = { workspace = true }
 # The container move's tests (Epic 98) move real directories; already in the
 # graph through keeper-sync.
 tempfile = { workspace = true }

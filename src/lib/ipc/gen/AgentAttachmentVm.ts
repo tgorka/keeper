@@ -18,4 +18,8 @@ sentence?: string,
  * Opens it: the `keeper-hq-blob://` URL, in this build's spelling. The
  * first request downloads it; nothing is downloaded before.
  */
-url: string, };
+url: string, 
+/**
+ * A device-only thumbnail of the current person's image; never downloads.
+ */
+thumbnailUrl?: string, };

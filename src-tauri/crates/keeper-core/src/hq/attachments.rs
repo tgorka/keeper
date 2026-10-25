@@ -233,6 +233,17 @@ impl Staging {
     }
 }
 
+impl Staging {
+    pub(super) fn thumbnail(&self, handle: &str) -> Result<Vec<u8>, OpenError> {
+        let files = self.files();
+        let (_, file) = files.get(handle).ok_or(OpenError::NotHere)?;
+        if !super::thumbnails::supported(file.mime()) {
+            return Err(OpenError::NotHere);
+        }
+        super::thumbnails::render(&file.bytes)
+    }
+}
+
 /// A file's name as an attachment carries it: its last path segment, so a
 /// name never names a folder.
 fn file_name(raw: &str) -> String {
@@ -495,10 +506,16 @@ pub struct AgentAttachmentVm {
     /// Opens it: the `keeper-hq-blob://` URL, in this build's spelling. The
     /// first request downloads it; nothing is downloaded before.
     pub url: String,
+    /// A device-only thumbnail of the current person's image; never downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub thumbnail_url: Option<String>,
 }
 
-const ATTACHMENTS: &str = "SELECT id, message_id, blob_ref, name, mime, size, author_client, \
-     _sync_version AS version FROM attachments WHERE session_id = ?1 ORDER BY created_at_ms, id";
+const ATTACHMENTS: &str = "SELECT a.id, a.message_id, a.blob_ref, a.name, a.mime, a.size, a.author_client, \
+     a._sync_version AS version, m.author_actor AS message_author, m.role AS message_role \
+     FROM attachments a LEFT JOIN messages m ON m.id = a.message_id AND m.session_id = a.session_id \
+     WHERE a.session_id = ?1 ORDER BY a.created_at_ms, a.id";
 
 fn blob_id_of(blob_ref: &Value) -> Option<String> {
     let parsed = match blob_ref {
@@ -527,6 +544,10 @@ fn chip(
         state,
         sentence,
         url: blob_url(&source.database, &blob_id),
+        thumbnail_url: (super::thumbnails::supported(text(row, "mime"))
+            && text(row, "message_author") == source.actor
+            && text(row, "message_role") == "person")
+            .then(|| format!("{}?thumbnail=1", blob_url(&source.database, &blob_id))),
     })
 }
 

@@ -5,6 +5,8 @@
 //! replica cache, downloading it on the first open, and answers as the
 //! `keeper-media://` handler does — 200, 206 for a `Range`, 416 for one that
 //! cannot be met, 404 for anything it will not serve.
+//! `thumbnail=1` instead serves a bounded PNG from a staged snapshot or an
+//! authorized own-person image already in the cache; it never downloads.
 //!
 //! A fifth handler rather than a wider `keeper-media://`, which resolves
 //! against the Matrix media cache: the two caches, their owners and their
@@ -17,6 +19,7 @@
 //! | is this URL well formed, which database and blob | `keeper_core::hq::attachments::parse_blob_url` |
 //! | does an attachment this replica holds name it; its bytes, cached or downloaded | `Hq::open_blob` (`attachments::open_blob`) |
 //! | which `Content-Type` it may be served as (never one that runs) | `attachments::served_mime` |
+//! | thumbnail routing, authorization and bounded decoding | `hq::thumbnails`, `Hq::attachment_thumbnail` |
 //! | `Range`, statuses | `crate::media_protocol` |
 //!
 //! Every refusal is one 404; why is in the log, never the blob id.
@@ -39,18 +42,30 @@ pub fn handle<R: Runtime>(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let Some((database, blob_id)) = parse_blob_url(&uri) else {
-        tracing::debug!("keeper-hq-blob: unresolvable URL");
+    let thumbnail = keeper_core::hq::thumbnails::requested(&uri);
+    let parsed = parse_blob_url(&uri);
+    if !thumbnail && parsed.is_none() {
         responder.respond(media_protocol::not_found());
         return;
-    };
+    }
     let Some(hq) = crate::hq_ipc::service() else {
         tracing::debug!("keeper-hq-blob: the agents server is not started yet");
         responder.respond(media_protocol::not_found());
         return;
     };
-    // A download waits on the replica's owner thread: off the webview's.
+    // Replica reads and image decoding stay off the webview's thread.
     tauri::async_runtime::spawn_blocking(move || {
+        if thumbnail {
+            let response = match hq.attachment_thumbnail(&uri) {
+                Ok(bytes) => nosniff(media_protocol::full_response(bytes, "image/png")),
+                Err(_) => media_protocol::not_found(),
+            };
+            responder.respond(response);
+            return;
+        }
+        let Some((database, blob_id)) = parsed else {
+            return;
+        };
         let response = match hq.open_blob(&database, &blob_id) {
             Ok(opened) => nosniff(match range.as_deref() {
                 Some(range) => media_protocol::partial_or_full(opened.bytes, opened.mime, range),

@@ -57,6 +57,7 @@ pub mod server;
 pub mod sessions;
 pub mod spoken;
 pub mod syncular;
+pub mod thumbnails;
 pub mod timeline;
 pub mod vm;
 pub mod vocabulary;

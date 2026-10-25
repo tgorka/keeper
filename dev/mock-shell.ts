@@ -45,7 +45,7 @@
  */
 
 import { emit } from "@tauri-apps/api/event";
-import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+import { mockConvertFileSrc, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { IDLE_RECORDING_STATUS } from "@/hooks/use-recording-session";
 import { remoteOnSourceHost } from "@/lib/forge-repos";
 import type {
@@ -162,6 +162,8 @@ import { platformStore } from "@/lib/stores/platform";
 // docs rather than holding a third copy.
 import ANDROID_DOC from "../docs/android.md?raw";
 import IOS_DOC from "../docs/ios.md?raw";
+import photoFixture from "./fixtures/agent-photo.png";
+import photoThumbnail from "./fixtures/agent-photo-thumbnail.png";
 // Nixi's picture (story 100.4): an SVG from her home, served by Vite here as
 // keeper-file:// serves it in the app — an `<img>` source, never inlined. The
 // other agents have none and keep their letter.
@@ -6238,7 +6240,10 @@ function mockChip(
         }
       : {}),
     ...(state === "blocked" ? { sentence: mockBlocked(name, "another file") } : {}),
-    url: URL.createObjectURL(new Blob([body], { type: mime })),
+    url: mime.startsWith("image/")
+      ? photoFixture
+      : URL.createObjectURL(new Blob([body], { type: mime })),
+    ...(/^image\/(png|jpeg|gif|webp)$/.test(mime) ? { thumbnailUrl: photoThumbnail } : {}),
   };
 }
 if (attachmentsScenario === "chips") {
@@ -6601,7 +6606,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         mockChip(
           `att-${++sessionSerial}-${index}`,
           path.split(/[\\/]/).pop() || "attachment",
-          "application/octet-stream",
+          /\.(png|jpe?g|gif|webp)$/i.test(path) ? "image/png" : "application/octet-stream",
           4096,
           "uploading",
         ),
@@ -7406,7 +7411,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const options = payload.options;
     return options && typeof options === "object" && "directory" in options && options.directory
       ? "/Users/tgorka/Documents"
-      : "/Volumes/merope/tgdrive/meeting.mov";
+      : attachmentsScenario === "chips"
+        ? "/fixtures/agent-photo.png"
+        : "/Volumes/merope/tgdrive/meeting.mov";
   },
   // tgdrive before its last upload stops (`UPLOAD_STOPS_AT`): the push is held
   // while the upload moves, so the card reads as syncing and offers nothing.
@@ -9322,6 +9329,19 @@ export function installMockShell(): void {
   // reads the window's label from the shell's metadata; without it opening any
   // room throws before the timeline draws.
   mockWindows("main");
+  mockConvertFileSrc("linux");
+  // mockWindows/mockConvertFileSrc installed this in-process Tauri boundary above.
+  const mockWindow = window as unknown as {
+    __TAURI_INTERNALS__: {
+      convertFileSrc: (path: string, protocol?: string) => string;
+    };
+  };
+  const internals = mockWindow.__TAURI_INTERNALS__;
+  const convert = internals.convertFileSrc;
+  internals.convertFileSrc = (path, protocol) =>
+    protocol === "keeper-hq-blob" && mockStaged.has(path)
+      ? photoThumbnail
+      : convert(path, protocol);
   // What the shell's initialization script writes before the bundle runs
   // (`ipc::platform_plugin`): applied here, before the app mounts.
   platformStore.getState().applySnapshot(MOCK_PLATFORM_FACTS);

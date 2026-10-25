@@ -806,6 +806,7 @@ enum Command {
     Supersede(Vec<String>, String, Reply<()>),
     Commit(Vec<BlobBody>, Vec<Mutation>, Reply<String>),
     Fetch(String, Reply<Vec<u8>>),
+    CachedBlob(String, Reply<Vec<u8>>),
     CacheBytes(Reply<u64>),
     SyncNow,
     /// A socket frame arrived.
@@ -1139,6 +1140,14 @@ impl Owner {
                     .map_err(|(code, message)| ReplicaError::Client(format!("{code}: {message}")));
                 let _ = reply.send(fetched);
                 self.enforce_cache();
+            }
+            Command::CachedBlob(blob, reply) => {
+                let bytes = self.cache.bodies.query_row(
+                    "SELECT bytes FROM _syncular_blobs WHERE blob_id = ?1 AND byte_length <= ?2 AND length(bytes) <= ?2",
+                    rusqlite::params![blob, super::attachments::ATTACHMENT_MAX_BYTES],
+                    |row| row.get::<_, Vec<u8>>(0),
+                ).map_err(|error| ReplicaError::Client(error.to_string()));
+                let _ = reply.send(bytes);
             }
             Command::CacheBytes(reply) => {
                 let bytes = self
@@ -1763,6 +1772,10 @@ impl Replica for SyncularReplica {
 
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
         self.ask(|reply| Command::Fetch(blob.to_owned(), reply))
+    }
+
+    fn cached_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+        self.ask(|reply| Command::CachedBlob(blob.to_owned(), reply))
     }
 
     fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError> {

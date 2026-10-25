@@ -712,8 +712,9 @@ the session, type and name in headers (`agent_attach_bytes`).
 
 **One Send, one message** (R1071C-02). Neither call writes anything: each reads and checks its
 files and stages them in the process under handles it returns (`attachments::Staging`), never in
-the replica, so nothing staged can reach the server. The composer's Send stages its whole
-selection — paths and pastes in any mix — then hands every handle with the caption to
+the replica, so nothing staged can reach the server. An image preview stages its snapshot
+on selection; Send reuses that handle and stages the remaining paths and pastes, then hands
+every handle with the caption to
 `agent_attach_commit`, which takes them all and commits them as **one** message, its text the
 caption, once; a handle no longer staged refuses the whole Send and commits nothing. Handles are
 spent by the commit, released by `agent_attach_release` when the composer drops them, and
@@ -815,6 +816,24 @@ Cards use one column on a phone and two where space permits. The text field sits
 own row above the attachment toolbar and Send, leaving room to type at 320 px. An
 enqueue-time refusal appears under the composer, with the draft and unsent selections kept.
 No progress percentage, resend promise, or successful upload is invented in TypeScript.
+
+**Own-image thumbnails (109.15, Q109-14 a).** The composer shows a 64 px removable
+preview; a person's own sent images use a two-column grid and open the existing full-image
+dialog on activation. Rust alone supplies `thumbnailUrl` after joining the attachment to
+that person's `person` message. Another member's or an agent's images remain file chips.
+`keeper-hq-blob` requests with `thumbnail=1` render PNGs with a maximum 256 px long edge,
+from the staged snapshot or the already-cached blob only: a missing cached body never starts
+a download. The handler checks ownership before consulting its bounded 64-entry memory cache.
+PNG, JPEG, GIF and WebP are decoded with dimension, pixel-allocation and attachment-byte
+limits. EXIF rotation and mirroring are applied before scaling. One bounded decoder reads
+dimensions and pixels; compressed PNG ICC profiles over 8 MiB are refused by a streaming
+preflight (the PNG decoder otherwise silently ignores profile-limit errors).
+Unsupported raw formats (including HEIC), invalid images and missing bytes retain an
+openable file chip. The existing photo-picker normalization can first convert HEIC to JPEG
+when the webview can decode it; this is not a native HEIC thumbnail decoder.
+Removing a selection releases its stage, even if staging finishes late;
+Send consumes that same snapshot, and a failed Send restages retained selections for retry.
+
 
 **Opening.** A chip's URL is `keeper-hq-blob://blob/<database>/<blobId>` (on Android and Windows,
 `http://keeper-hq-blob.localhost/…`). The handler serves only a blob an `attachments` row of that
