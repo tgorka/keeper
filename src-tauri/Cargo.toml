@@ -429,7 +429,7 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 # colleague cannot be turned into gigabytes of text by parsing it. That is
 # load-bearing rather than incidental, so `keeper_core::document` has a test
 # that fails if a future version starts expanding them.
-quick-xml = "0.39"
+quick-xml = "0.42"
 # Inflating a PDF's compressed object streams (Story 45.8). A PDF 1.5+ writer
 # packs the page tree into `/Type /ObjStm` streams, so a page count read only
 # from the uncompressed body is `None` for most documents a person actually
