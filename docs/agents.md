@@ -1126,6 +1126,24 @@ on the server only, as an alias of that actor; it is not part of keeper's contra
 **Owed:** the imported sessions of both databases in the Agents window on hesperia (R-HQ-65), and
 NFR-127 there (below).
 
+## A session's model and effort (109.17)
+
+`Hq::session_settings` reads `session_settings` and returns the saved nullable model and
+effort, the union of the session agent's published model/effort choices, and each instance's
+defaults separately (`AgentSessionSettingsVm`, `AgentSettingsDefaultVm`). Another agent's
+profiles never supply choices. No shared default is invented when instances disagree.
+
+`Hq::set_session_settings` replaces both choices together for a person member (`owner` or
+`person`); `None` resets a choice to the definition default. Off-list choices and nonmembers
+are refused locally; the server remains authoritative. Settings coverage is held for archived
+sessions too. Until that coverage is complete, reading or writing returns `HqError::Arriving`
+rather than mistaking missing rows for defaults.
+
+Choices affect subsequent turns, not a turn already running. An answer records the model
+actually used and its effort; when a selected model is no longer offered, it falls back to the
+definition default and records why. This story adds the core read/write API and picker inputs
+only: no shell command, picker or other UI is exposed yet.
+
 ## Measured
 
 The agents' three latency targets (keeper-hq `ARCHITECTURE-KEEPER-HQ.md`, the NFR table) and what

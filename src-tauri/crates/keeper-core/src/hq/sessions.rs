@@ -8,8 +8,9 @@
 //! row is always local; an active session keeps its newest month and the
 //! current one of `messages` (and, for a reader, of `approvals` and
 //! `tool_calls`) and its streamed chunks; an opened session widens month by
-//! month as the person scrolls back; an archived one holds nothing, so
-//! archiving evicts its rows (the client keeps rows the outbox still holds).
+//! month as the person scrolls back; archiving evicts these windowed rows
+//! (the client keeps rows the outbox still holds). Session settings remain
+//! subscribed for every member session, including archived sessions.
 //!
 //! A session is named by `(database, session id)` everywhere: two sessions
 //! with the same id in the two databases are two rows.
@@ -327,12 +328,13 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 /// The windows a replica holds, each along one scope variable. Every held
 /// session's members are held beside its row, so the People sheet reads
 /// who else is in it.
-pub const WINDOWS: [(&str, &str); 10] = [
+pub const WINDOWS: [(&str, &str); 11] = [
     ("sessions", "session"),
     ("session_members", "session"),
     ("turn_chunks", "session"),
     ("claims", "session"),
     ("session_tool_switches", "session"),
+    ("session_settings", "session"),
     ("attachments", "session"),
     ("messages", "page"),
     ("approvals", "trace"),
@@ -409,13 +411,13 @@ pub fn reads_trace(source: &Source, session_id: &str) -> bool {
     .is_some_and(|row| truthy(row, "reads_trace"))
 }
 
-/// Each window's units for one database: every session row and its members;
+/// Each window's units for one database: every session row, its members and settings;
 /// for each active session its streamed chunks, its claim, its tool switches
 /// and its attachments' rows (never their bytes), and
 /// its newest months (widened by `widen` for an opened one); its trace
 /// months only where the person reads the trace, and their thinking only
-/// while `reasoning` is shown. Of an archived one nothing — but its
-/// attachments' rows while it is opened (in `widen`): its messages come
+/// while `reasoning` is shown. An archived session keeps its session, member
+/// and settings rows, plus its attachments' rows while opened (in `widen`): its messages come
 /// through the server's `sessionPage`, and its files' names, sizes and the
 /// right to open them come with these rows, which go again when it closes.
 pub fn plan(
@@ -456,6 +458,7 @@ pub fn plan(
     let sessions: Vec<String> = sessions.into_iter().collect();
     vec![
         ("sessions", sessions.clone()),
+        ("session_settings", sessions.clone()),
         ("session_members", sessions),
         ("turn_chunks", turns.clone()),
         ("claims", turns.clone()),
