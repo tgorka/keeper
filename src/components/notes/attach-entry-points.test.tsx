@@ -93,6 +93,7 @@ vi.mock("@/lib/ipc/client", () => ({
     notesBodyWrite(v, n, text, rev),
   notesBufferReport: vi.fn(async () => {}),
   notesBacklinks: vi.fn(async () => []),
+  notesTemplateUpdatePreview: vi.fn(async () => null),
   notesEmbedPaths: (v: string, targets: string[]) => notesEmbedPaths(v, targets),
   notesGallery: (v: string, folder: string, scope?: string) => notesGallery(v, folder, scope),
 }));
