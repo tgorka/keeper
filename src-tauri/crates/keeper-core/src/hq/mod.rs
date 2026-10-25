@@ -56,6 +56,7 @@ pub mod routes;
 pub mod send;
 pub mod server;
 pub mod sessions;
+pub mod settings;
 pub mod spoken;
 pub mod syncular;
 pub mod thumbnails;
