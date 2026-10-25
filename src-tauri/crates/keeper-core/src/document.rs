@@ -675,12 +675,12 @@ fn read_part<R: io::Read + io::Seek>(
 /// rename, so matching on the qualified name would work for Word's output and
 /// fail for a conforming producer that spells the prefixes differently.
 fn local(name: quick_xml::name::QName<'_>) -> Vec<u8> {
-    name.local_name().as_ref().to_vec()
+    name.local_name().as_ref().as_bytes().to_vec()
 }
 
 /// The text of a text event, never expanding an entity it does not recognise.
 ///
-/// Two steps, and the second is the load-bearing one.
+/// The parser supplies UTF-8; entity resolution is the load-bearing step.
 /// [`quick_xml::escape::unescape`] resolves the five XML built-ins and *errors*
 /// on anything else — there is a `unescape_with` taking a resolver for callers
 /// who want DTD entities, and this deliberately does not use it. On that error
@@ -688,13 +688,8 @@ fn local(name: quick_xml::name::QName<'_>) -> Vec<u8> {
 /// it is what the file says, and is unambiguously better than either expanding
 /// it or dropping the paragraph.
 fn text_of(event: &quick_xml::events::BytesText<'_>) -> String {
-    let Ok(decoded) = event.decode() else {
-        return String::from_utf8_lossy(event.as_ref()).into_owned();
-    };
-    quick_xml::escape::unescape(&decoded).map_or_else(
-        |_| decoded.clone().into_owned(),
-        std::borrow::Cow::into_owned,
-    )
+    quick_xml::escape::unescape(event)
+        .map_or_else(|_| event.to_string(), std::borrow::Cow::into_owned)
 }
 
 /// Whether an OOXML boolean toggle attribute is on.
@@ -706,7 +701,9 @@ fn text_of(event: &quick_xml::events::BytesText<'_>) -> String {
 fn toggle_on(event: &quick_xml::events::BytesStart<'_>) -> bool {
     for attribute in event.attributes().flatten() {
         if local(attribute.key) == b"val" {
-            let value = attribute.unescape_value().unwrap_or_default();
+            let value = attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .unwrap_or_default();
             return !matches!(value.as_ref(), "0" | "false" | "off");
         }
     }
@@ -901,7 +898,7 @@ fn attribute_value(event: &quick_xml::events::BytesStart<'_>, want: &[u8]) -> Op
         (local(attribute.key) == want)
             .then(|| {
                 attribute
-                    .unescape_value()
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                     .ok()
                     .map(std::borrow::Cow::into_owned)
             })

@@ -52,8 +52,25 @@ yanked = "warn"
 # openidconnect (4.0.1) still pins p256/p384 0.13 -> crypto-bigint 0.5.
 # OIDC verifies provider signatures using public EC inputs; no EC private-key
 # signing or key agreement. Re-audit this exception before adding either.
+# Other waivers reviewed 2026-10-25; removal criteria and dependency owners are
+# recorded in docs/constraints-and-limitations.md, "RustSec waivers and maintenance follow-ups".
+# No blanket severity or unmaintained suppression: new advisories still fail.
 ignore = [
   { id = "RUSTSEC-2026-0387", reason = "EC signature verification on public inputs only via openidconnect; no secret-integer use; https://github.com/tgorka/keeper/issues/576" },
+  { id = "RUSTSEC-2023-0071", reason = "WAIVER 2026-10-25: rsa 0.9.10 has no upstream fix. Production openidconnect verifies public-key signatures only; keeper's private-key signing is cfg(test). Revisit before adding RSA private-key operations." },
+  { id = "RUSTSEC-2026-0367", reason = "WAIVER 2026-10-25: zip 4 is required by tauri-plugin-updater. keeper-core reads bounded OOXML parts without extraction; updater ZIP extraction is Windows-only and receives signature-verified releases. Unix SUID/SGID extraction is not reached. Remove when updater supports zip >=9." },
+  { id = "RUSTSEC-2026-0368", reason = "WAIVER 2026-10-25: keeper-core never extracts ZIP entries. Windows updater does extract, but only release archives verified by its configured minisign key; a malicious signed release remains a trusted-publisher risk. Updater requires zip ^4; remove when it supports zip >=9." },
+  { id = "RUSTSEC-2026-0369", reason = "WAIVER 2026-10-25: keeper-core never extracts ZIP entries; updater extraction is Windows-only, not the affected Unix permission path, and accepts signature-verified releases. Updater requires zip ^4; remove when it supports zip >=9." },
+  { id = "RUSTSEC-2026-0319", reason = "WAIVER / FOLLOW-UP 2026-10-25: anymap2 is pulled by matrix-sdk 0.19.1. Track the SDK's migration to a maintained map; do not replace SDK internals in this lockfile lane." },
+  { id = "RUSTSEC-2024-0370", reason = "WAIVER / FOLLOW-UP 2026-10-25: proc-macro-error is pulled by glib-macros and gtk3-macros in Tauri's Linux GTK3 stack. Track an upstream GTK/Tauri migration; no crate substitution in this lane." },
+  { id = "RUSTSEC-2025-0081", reason = "WAIVER / FOLLOW-UP 2026-10-25: unic-char-property is pulled through unic-ucd-ident -> urlpattern -> tauri-utils. Track urlpattern's Unicode dependency migration." },
+  { id = "RUSTSEC-2025-0075", reason = "WAIVER / FOLLOW-UP 2026-10-25: unic-char-range is pulled through unic-ucd-ident -> urlpattern -> tauri-utils. Track urlpattern's Unicode dependency migration." },
+  { id = "RUSTSEC-2025-0080", reason = "WAIVER / FOLLOW-UP 2026-10-25: unic-common is pulled through unic-ucd-version -> unic-ucd-ident -> urlpattern -> tauri-utils. Track urlpattern's Unicode dependency migration." },
+  { id = "RUSTSEC-2025-0100", reason = "WAIVER / FOLLOW-UP 2026-10-25: unic-ucd-ident is pulled by urlpattern in tauri-utils. Track urlpattern's Unicode dependency migration." },
+  { id = "RUSTSEC-2025-0098", reason = "WAIVER / FOLLOW-UP 2026-10-25: unic-ucd-version is pulled through unic-ucd-ident -> urlpattern -> tauri-utils. Track urlpattern's Unicode dependency migration." },
+  { id = "RUSTSEC-2026-0371", reason = "WAIVER / FOLLOW-UP 2026-10-25: zbus_names is pulled by zbus/zbus_macros through notify-rust and tauri-plugin-opener. Track their migration to zbus 6, which incorporates these APIs." },
+  { id = "RUSTSEC-2026-0370", reason = "WAIVER / FOLLOW-UP 2026-10-25: zvariant is pulled by zbus/zbus_macros/zbus_names through notify-rust and tauri-plugin-opener. Track their migration to zbus 6; no D-Bus stack replacement here." },
+  { id = "RUSTSEC-2026-0372", reason = "WAIVER / FOLLOW-UP 2026-10-25: zvariant_derive is pulled by zvariant in the zbus 5 stack through notify-rust and tauri-plugin-opener. Track their migration to zbus 6." },
 ]
 
 [sources]
