@@ -403,9 +403,13 @@ that projection, never folds chunks or presence itself.
 The session VM also supplies Rust-authored `items` and `folds` for the per-turn renderer
 cutover (109.14); the current renderer still uses the unchanged `messages` and `live` fields.
 Each turn has one fold containing its earlier agent-message IDs, permitted reasoning and
-tool steps, a summary, reported duration, status label and single-line failures. The final
-answer is a separate reading item immediately after its fold. Tool results arriving after
-the answer update that same fold, never add work below the answer or fabricate a live answer.
+tool steps, a summary, reported duration, status label and single-line failures. A persisted
+terminal answer is identified by the runtime Closed row's `metadata.finish` key, including
+an explicitly null finish reason; a committed lead-in does not end the live answer. The final
+answer is a separate reading item immediately after its fold, at the answer's own position
+after any intervening person messages. Historical tool-only folds stay at their earliest
+recorded work time, before later messages and answers, without fabricating a live answer.
+Tool results arriving after the answer update that same fold, never add work below it.
 Interrupted work says **Interrupted**. Parked work says **Paused** unless an unexpired pending
 approval actually asks the person, in which case it says **Waiting for you**. Trace access and
 Show thinking still gate the corresponding fold contents; Show details does not gate the

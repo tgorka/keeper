@@ -422,7 +422,7 @@ pub fn view(
     let extras = live::extras(source, session_id, reads_trace, opened.prefs.show_reasoning);
     let ended: HashSet<String> = rows
         .iter()
-        .filter(|row| text(row, "role") == "agent")
+        .filter(|row| text(row, "role") == "agent" && live::is_terminal(&json(row, "metadata")))
         .filter_map(|row| opt_text(row, "turn_id"))
         .collect();
     let mut messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
@@ -462,6 +462,7 @@ pub fn view(
         HashSet::new()
     };
     let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending);
+    let live = live.into_iter().map(|(_, turn)| turn).collect();
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),

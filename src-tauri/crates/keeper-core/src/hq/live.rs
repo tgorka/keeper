@@ -517,15 +517,22 @@ pub fn ended_thinking(extras: &Extras, turn_id: &str) -> Option<String> {
     Some(thinking(Some(rows), &Tails::default())).filter(|text| !text.is_empty())
 }
 
-/// The turns of `session_id` still being written — any turn with chunks
-/// or a tail and no agent message naming it in `ended` — oldest first.
-pub fn turns(
+/// Runtime Closed rows always include `finish`, even when the provider
+/// reported no finish reason. A persisted lead-in has no such marker.
+pub(super) fn is_terminal(metadata: &Value) -> bool {
+    metadata.get("finish").is_some()
+}
+
+/// The turns of `session_id` still being written, with their first chunk's
+/// time (unknown for presence-only turns), oldest first. Only a terminal
+/// agent row suppresses a turn through `ended`.
+pub(super) fn turns(
     source: &Source,
     session_id: &str,
     live: &Live,
     ended: &HashSet<String>,
     extras: &Extras,
-) -> Vec<AgentLiveTurnVm> {
+) -> Vec<(i64, AgentLiveTurnVm)> {
     struct Chunks {
         pieces: Vec<(i64, String)>,
         author: Option<String>,
@@ -570,7 +577,7 @@ pub fn turns(
     ids.sort_unstable();
     let empty = Tails::default();
     ids.into_iter()
-        .map(|(_, id)| {
+        .map(|(at, id)| {
             let turn = live.turns.get(id);
             let held = chunks.get(id);
             let text = fold(
@@ -588,14 +595,17 @@ pub fn turns(
                     )
                 })
                 .filter(|text| !text.is_empty());
-            AgentLiveTurnVm {
-                turn_id: id.to_owned(),
-                text,
-                tool: turn.and_then(|turn| turn.tool.clone()),
-                reasoning,
-                steps: extras.steps.get(id).cloned().unwrap_or_default(),
-                stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
-            }
+            (
+                at,
+                AgentLiveTurnVm {
+                    turn_id: id.to_owned(),
+                    text,
+                    tool: turn.and_then(|turn| turn.tool.clone()),
+                    reasoning,
+                    steps: extras.steps.get(id).cloned().unwrap_or_default(),
+                    stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
+                },
+            )
         })
         .collect()
 }

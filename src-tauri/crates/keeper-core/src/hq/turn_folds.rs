@@ -11,14 +11,14 @@ use super::{
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentToolStepStatusVm as Step, AgentToolStepVm, Extras,
 };
-use crate::hq::sessions::{json, text};
+use crate::hq::sessions::{int, json, text};
 
 /// All steps stay with their turn, even when committed after its answer.
 /// The legacy message projection is untouched until the renderer cutover.
 pub(super) fn project(
     rows: &[Map<String, Value>],
     messages: &[AgentMessageVm],
-    live: &[AgentLiveTurnVm],
+    live: &[(i64, AgentLiveTurnVm)],
     extras: &Extras,
     pending: &HashSet<String>,
 ) -> (Vec<Item>, Vec<AgentTurnFoldVm>) {
@@ -26,6 +26,11 @@ pub(super) fn project(
     let mut answers = HashMap::new();
     let mut lead_ins: HashMap<&str, Vec<String>> = HashMap::new();
     let mut metadata = HashMap::new();
+    let mut work_at = HashMap::new();
+    let active_by_turn: HashMap<_, _> = live
+        .iter()
+        .map(|(_, turn)| (turn.turn_id.as_str(), turn))
+        .collect();
     for row in rows.iter().filter(|row| text(row, "role") == "agent") {
         let turn = text(row, "turn_id");
         if turn.is_empty() {
@@ -33,44 +38,89 @@ pub(super) fn project(
         }
         let id = text(row, "id");
         by_message.insert(id, turn);
-        if let Some(previous) = answers.insert(turn, id) {
-            lead_ins.entry(turn).or_default().push(previous.to_owned());
+        let details = json(row, "metadata");
+        if live::is_terminal(&details) {
+            answers.insert(turn, id);
+            metadata.insert(turn, details);
+        } else {
+            lead_ins.entry(turn).or_default().push(id.to_owned());
         }
-        metadata.insert(turn, json(row, "metadata"));
+        let at = int(row, "created_at_ms").unwrap_or(i64::MAX);
+        let first = work_at.entry(turn).or_insert(at);
+        *first = (*first).min(at);
     }
-    // A tool result can arrive without any answer chunks. It is work, not
-    // evidence of a live answer; keep the legacy live projection unchanged.
-    let mut tool_turns: Vec<_> = extras
-        .steps
+    // Work without an answer has its own historical position, never a
+    // fabricated live answer or an append-only slot below newer answers.
+    for (id, steps) in &extras.steps {
+        let at = steps
+            .iter()
+            .filter_map(|step| step.started_at_ms)
+            .min()
+            .unwrap_or(i64::MAX);
+        let first = work_at.entry(id.as_str()).or_insert(at);
+        *first = (*first).min(at);
+    }
+    enum Reading<'a> {
+        Message(&'a AgentMessageVm),
+        Work(&'a str),
+        Live(&'a AgentLiveTurnVm),
+    }
+    let mut reading: Vec<_> = messages
         .iter()
-        .filter(|(id, _)| {
-            !answers.contains_key(id.as_str()) && !live.iter().any(|turn| turn.turn_id == **id)
+        .filter(|message| {
+            by_message
+                .get(message.id.as_str())
+                .is_none_or(|turn| answers.get(turn).copied() == Some(message.id.as_str()))
         })
-        .map(|(id, steps)| {
+        .map(|message| {
             (
-                steps
-                    .iter()
-                    .filter_map(|step| step.started_at_ms)
-                    .min()
-                    .unwrap_or(i64::MAX),
-                id.as_str(),
+                message.created_at_ms,
+                message.id.as_str(),
+                Reading::Message(message),
             )
         })
+        .chain(work_at.into_iter().filter_map(|(id, at)| {
+            (!answers.contains_key(id) && !active_by_turn.contains_key(id)).then_some((
+                at,
+                id,
+                Reading::Work(id),
+            ))
+        }))
+        .chain(
+            live.iter()
+                .map(|(at, turn)| (*at, turn.turn_id.as_str(), Reading::Live(turn))),
+        )
         .collect();
-    tool_turns.sort_unstable();
+    reading.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let mut items = Vec::new();
     let mut folds = Vec::new();
-    let mut shown = HashSet::new();
-    let turns = messages
-        .iter()
-        .filter_map(|message| by_message.get(message.id.as_str()).copied())
-        .chain(live.iter().map(|turn| turn.turn_id.as_str()))
-        .chain(tool_turns.iter().map(|(_, id)| *id));
-    for id in turns {
-        if !shown.insert(id) {
-            continue;
+    for (_, _, entry) in reading {
+        let (id, answer) = match entry {
+            Reading::Message(message) => {
+                let answer = Item::Message {
+                    message_id: message.id.clone(),
+                };
+                let Some(id) = by_message.get(message.id.as_str()) else {
+                    items.push(answer);
+                    continue;
+                };
+                (*id, Some(answer))
+            }
+            Reading::Work(id) => (id, None),
+            Reading::Live(turn) => (
+                turn.turn_id.as_str(),
+                Some(Item::LiveAnswer {
+                    turn_id: turn.turn_id.clone(),
+                }),
+            ),
+        };
+        items.push(Item::Fold {
+            turn_id: id.to_owned(),
+        });
+        if let Some(answer) = answer {
+            items.push(answer);
         }
-        let active = live.iter().find(|turn| turn.turn_id == id);
+        let active = active_by_turn.get(id).copied();
         let steps = extras.steps.get(id).cloned().unwrap_or_default();
         let details = metadata.get(id).and_then(live::details);
         let interrupted = active.is_some_and(|turn| turn.stopped)
@@ -140,41 +190,6 @@ pub(super) fn project(
             status_label: label.to_owned(),
             summary,
             duration_ms,
-        });
-    }
-    // Fold then terminal answer, never a work item below the answer.
-    let mut emitted = HashSet::new();
-    for message in messages {
-        if let Some(id) = by_message.get(message.id.as_str()) {
-            if emitted.insert(*id) {
-                items.push(Item::Fold {
-                    turn_id: (*id).to_owned(),
-                });
-                if let Some(answer) = answers.get(id) {
-                    items.push(Item::Message {
-                        message_id: (*answer).to_owned(),
-                    });
-                }
-            }
-        } else {
-            items.push(Item::Message {
-                message_id: message.id.clone(),
-            });
-        }
-    }
-    for turn in live {
-        if emitted.insert(turn.turn_id.as_str()) {
-            items.push(Item::Fold {
-                turn_id: turn.turn_id.clone(),
-            });
-            items.push(Item::LiveAnswer {
-                turn_id: turn.turn_id.clone(),
-            });
-        }
-    }
-    for (_, id) in tool_turns {
-        items.push(Item::Fold {
-            turn_id: id.to_owned(),
         });
     }
     (items, folds)
