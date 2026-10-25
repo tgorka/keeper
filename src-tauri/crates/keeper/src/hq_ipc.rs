@@ -612,6 +612,16 @@ pub async fn agent_session_new(
     blocking(move |hq| hq.new_session(&database, &agent_actor, &body)).await
 }
 
+/// Rename the title without changing the session id.
+#[tauri::command]
+pub async fn agent_session_rename(
+    database: String,
+    session_id: String,
+    title: String,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.rename_session(&session(database, session_id), &title)).await
+}
+
 /// Archive a session: its messages leave this device.
 #[tauri::command]
 pub async fn agent_session_archive(database: String, session_id: String) -> Result<(), IpcError> {

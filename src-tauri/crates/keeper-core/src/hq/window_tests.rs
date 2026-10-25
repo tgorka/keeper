@@ -158,6 +158,97 @@ fn now() -> i64 {
 }
 
 #[test]
+fn colliding_handles_append_session_numbers_without_changing_ids() {
+    let w = world();
+    for id in ["dev1.242", "dev1.752"] {
+        w.alpha
+            .replica
+            .mutate(session(id, NIXIE, now(), false, None))
+            .expect("session");
+    }
+    let rows = sessions::rows(&w.alpha, now());
+    for (id, expected) in [
+        ("dev1.242", "mighty-toucan-skips-242"),
+        ("dev1.752", "mighty-toucan-skips-752"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == id)
+            .expect("same id");
+        assert_eq!(row.handle, expected);
+    }
+}
+
+#[test]
+fn names_use_published_handles_and_rename_preserves_identity() {
+    let w = world();
+    for example in crate::hq::vocabulary::handle_examples() {
+        w.alpha
+            .replica
+            .mutate(session(&example.session_id, NIXIE, now(), false, None))
+            .expect("session");
+        sessions::rename(&w.alpha, &example.session_id, "hej").expect("rename");
+        let rows = sessions::rows(&w.alpha, now());
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == example.session_id)
+            .expect("same id");
+        assert_eq!(row.title, "hej");
+        assert_eq!(row.display_name, "nixie · hej");
+        assert_eq!(row.handle, example.handle);
+        assert!(!row.archived);
+        for blank in ["", " \t "] {
+            sessions::rename(&w.alpha, &example.session_id, blank).expect("blank title");
+            let view = timeline::view(
+                &w.alpha,
+                &example.session_id,
+                &Opened::default(),
+                &HashMap::new(),
+                now(),
+            )
+            .expect("view")
+            .0;
+            assert_eq!(view.display_name, format!("nixie · {}", example.handle));
+            assert_eq!(view.handle, example.handle);
+            assert_eq!(view.session_id, example.session_id);
+        }
+    }
+}
+
+#[test]
+fn names_include_only_agent_members_primary_first() {
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("dev1.1", STEWARD, now(), false, None))
+        .expect("session");
+    w.alpha
+        .replica
+        .mutate(vec![
+            actor("zed", "agent", "Zed", "/zed"),
+            actor("aaa", "agent", "Aaa", "/aaa"),
+        ])
+        .expect("agents");
+    for member in ["zed", STEWARD, NIXIE, "aaa"] {
+        w.alpha
+            .replica
+            .mutate(vec![upsert(
+                "session_members",
+                json!({
+                    "id": format!("dev1.1/{member}"), "session_id": "dev1.1", "actor_id": member,
+                    "role": "member", "reads_trace": true, "added_by_actor": ANA,
+                    "added_at_ms": 1, "read_until": null, "author_actor": ANA, "author_client": "dev1"
+                }),
+            )])
+            .expect("member");
+    }
+    assert_eq!(
+        sessions::rows(&w.alpha, now())[0].display_name,
+        "steward,aaa,nixie,zed · about dev1.1"
+    );
+}
+
+#[test]
 fn both_databases_list_together_each_row_labelled_and_attention_is_rusts() {
     let w = world();
     let t = now() - 60_000;

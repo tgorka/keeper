@@ -46,6 +46,8 @@ it("shares a list channel across docks but keeps the window's selection and each
     database: "beta",
     sessionId: "same.1",
     title: "Beta work",
+    displayName: "assistant · Beta work",
+    handle: "jolly-pigeon-squeaks",
     agentActor: "assistant",
     agentName: "Assistant",
     agentMark: "A",

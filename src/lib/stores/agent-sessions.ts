@@ -25,7 +25,7 @@ interface AgentSessionsState {
   error: string | null;
   selected: AgentSessionRef | null;
   /** The open session Rust's list dropped (left, or removed by its owner), until another opens. */
-  gone: { database: string; sessionId: string; title: string } | null;
+  gone: { database: string; sessionId: string; displayName: string } | null;
   newSession: AgentDefaultSessionVm | null;
   /** New session is open because the person asked for it. */
   creating: boolean;
@@ -89,7 +89,11 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
           loaded: true,
           error: null,
           selected: null,
-          gone: { database: dropped.database, sessionId: dropped.sessionId, title: dropped.title },
+          gone: {
+            database: dropped.database,
+            sessionId: dropped.sessionId,
+            displayName: dropped.displayName,
+          },
         };
       }
       // A refused leave (R-HQ-40) brings the session back: the note would no longer be true.

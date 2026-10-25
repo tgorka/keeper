@@ -172,6 +172,19 @@ database; identical session ids in two databases remain separate conversations. 
 agent, last activity and Rust's attention state. **Active**, **Archived** and **All** change only
 which rows are shown, never their order or the underlying subscription.
 
+Rust derives each name as `<agents> · <title>`, with the primary agent first and other agent
+members in actor-id order. Person members do not enter the name. The word handle comes from
+the immutable session id and the shared Syncular vocabulary; a collision within a database
+appends the session number. It is a display label, not another identity or storage key. A blank
+title uses the handle. Renaming changes only the title, never the session id or handle.
+
+Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
+menu: **Rename**, **Copy id**, **Copy name**, **Details**, and **Archive** (or **Unarchive**).
+Rename edits inline; Save commits and Cancel/Escape leaves the title unchanged. Clipboard and
+write refusals stay visible beside the row. Details includes the database, immutable id,
+creation time, reported trust and known instances; a known host is labelled `<agent>@<host>`.
+Pin, Mark unread, Drives and Model are absent because this surface has no operation for them.
+
 Opening a session shows its newest visible page. **Earlier messages**, or scrolling to the top,
 asks Rust to widen the history window. **Archive session** keeps the list row and marks the
 session archived; **Unarchive session** continues it. An archived read-only page has no composer.

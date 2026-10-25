@@ -6074,13 +6074,25 @@ const sessionRows: AgentSessionRowVm[] =
         {
           database: "alpha",
           sessionId: "device.1",
+          displayName:
+            sessionScenario === "names"
+              ? "nixi · plan"
+              : sessionScenario === "long"
+                ? `assistant · Release-${"long-title-".repeat(30)}`
+                : "assistant · Plan the next release",
+          handle: "jolly-pigeon-squeaks",
+          createdAtMs: 1700000000000,
+          trust: "native",
+          instances: [sessionScenario === "names" ? "nixi@electra" : "assistant@electra"],
           title:
-            sessionScenario === "long"
-              ? `Release-${"long-title-".repeat(30)}`
-              : "Plan the next release",
-          agentActor: "assistant",
-          agentName: "Assistant",
-          agentMark: "A",
+            sessionScenario === "names"
+              ? "plan"
+              : sessionScenario === "long"
+                ? `Release-${"long-title-".repeat(30)}`
+                : "Plan the next release",
+          agentActor: sessionScenario === "names" ? "nixi" : "assistant",
+          agentName: sessionScenario === "names" ? "Nixi" : "Assistant",
+          agentMark: sessionScenario === "names" ? "N" : "A",
           archived: false,
           lastActivityMs: Date.now(),
           attention: "needsYou",
@@ -6088,6 +6100,11 @@ const sessionRows: AgentSessionRowVm[] =
         {
           database: "beta",
           sessionId: "device.1",
+          displayName: "assistant · Review the research notes",
+          handle: "jolly-pigeon-squeaks",
+          createdAtMs: 1700000000000,
+          trust: "native",
+          instances: ["assistant@electra"],
           title: "Review the research notes",
           agentActor: "assistant",
           agentName: "Assistant",
@@ -6099,6 +6116,11 @@ const sessionRows: AgentSessionRowVm[] =
         {
           database: "alpha",
           sessionId: "device.2",
+          displayName: "assistant · Archive — one thousand messages",
+          handle: "calm-weasel-scribbles",
+          createdAtMs: 1700000000000,
+          trust: "native",
+          instances: ["assistant@electra"],
           title: "Archive — one thousand messages",
           agentActor: "assistant",
           agentName: "Assistant",
@@ -6829,6 +6851,20 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     for (const handle of (payload.handles as string[]) ?? []) mockStaged.delete(handle);
     return null;
   },
+  agent_session_rename: (payload) => {
+    const vm = mockSession(payload);
+    vm.title = String(payload.title);
+    vm.displayName = `${vm.agentActor} · ${vm.title.trim() || vm.handle}`;
+    const row = sessionRows.find(
+      (row) => row.database === vm.database && row.sessionId === vm.sessionId,
+    );
+    if (row) {
+      row.title = vm.title;
+      row.displayName = vm.displayName;
+    }
+    publishSessions();
+    return null;
+  },
   agent_session_archive: (payload) => {
     const vm = mockSession(payload);
     vm.archived = true;
@@ -6876,6 +6912,11 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       database: String(payload.database),
       sessionId: `device.${++sessionSerial + 10}`,
       title: String(payload.body).split("\n")[0],
+      displayName: `${choice.agentActor} · ${String(payload.body).split("\n")[0]}`,
+      handle: "sturdy-snail-wobbles",
+      createdAtMs: Date.now(),
+      trust: "native",
+      instances: [],
       agentActor: choice.agentActor,
       agentName: choice.agentName,
       agentMark: choice.agentMark,
@@ -9443,6 +9484,11 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         database: target.database,
         sessionId: target.sessionId,
         title: "Arrived after the tap",
+        displayName: "researcher · Arrived after the tap",
+        handle: "lucky-salmon-sprints",
+        createdAtMs: Date.now(),
+        trust: "native",
+        instances: [],
         agentActor: "researcher",
         agentName: "Researcher",
         agentMark: "R",

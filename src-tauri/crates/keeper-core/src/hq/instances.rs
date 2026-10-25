@@ -243,7 +243,12 @@ pub fn instances_of(source: &Source, agent: &str) -> Vec<Instance> {
         found.insert(
             id.clone(),
             Instance {
-                label: opt_text(&row, "name").unwrap_or_else(|| id.clone()),
+                label: opt_text(&row, "host")
+                    .filter(|host| !host.is_empty())
+                    .map_or_else(
+                        || opt_text(&row, "name").unwrap_or_else(|| id.clone()),
+                        |host| format!("{agent}@{host}"),
+                    ),
                 host: opt_text(&row, "host"),
                 client_id: id,
                 ..Instance::default()

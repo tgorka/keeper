@@ -129,6 +129,8 @@ pub struct AgentSessionViewVm {
     pub database: String,
     pub session_id: String,
     pub title: String,
+    pub display_name: String,
+    pub handle: String,
     pub agent_actor: String,
     pub agent_name: String,
     pub agent_mark: String,
@@ -376,11 +378,18 @@ pub fn view(
         &opened.live,
         now_ms,
     );
+    let (display_name, handle) = crate::hq::sessions::SessionNames::read(source).presentation(
+        session_id,
+        &session.agent_actor,
+        &session.title,
+    );
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
             session_id: session_id.to_owned(),
             title: session.title,
+            display_name,
+            handle,
             agent_mark: mark(&agent_name),
             agent_name,
             archived: session.archived,

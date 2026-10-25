@@ -73,6 +73,11 @@ const row = (database: string, archived = false) => ({
   database,
   sessionId: "same.1",
   title: `${database} session`,
+  displayName: `assistant · ${database} session`,
+  handle: "jolly-pigeon-squeaks",
+  createdAtMs: 1780000000000,
+  trust: "trusted",
+  instances: [],
   agentActor: "assistant",
   agentName: "Assistant",
   agentMark: "A",
@@ -132,7 +137,9 @@ async function list() {
   );
 }
 async function open(database: string, patch: Partial<AgentSessionViewVm> = {}) {
-  fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${database} session`) }));
+  fireEvent.click(
+    screen.getByRole("button", { name: new RegExp(`^${row(database).displayName},`) }),
+  );
   await waitFor(() => expect(mock.views.has(database)).toBe(true));
   act(() => mock.views.get(database)?.(view(database, patch)));
 }
@@ -180,15 +187,17 @@ describe("database Agents window", () => {
     await waitFor(() =>
       expect(mock.archive).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }),
     );
-    expect(screen.getByRole("button", { name: /^beta session/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^assistant · beta session,/ })).toBeInTheDocument();
     act(() => {
       mock.list?.({ ops: [{ op: "set", index: 1, row: row("beta", true) }], total: 3 });
       mock.views.get("beta")?.(view("beta", { archived: true, readOnly: true }));
     });
-    expect(screen.queryByRole("button", { name: /^beta session/ })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^assistant · beta session,/ }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByRole("textbox", { name: "Message" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Archived" }));
-    expect(screen.getByRole("button", { name: /^beta session/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^assistant · beta session,/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Unarchive session" }));
     await waitFor(() =>
       expect(mock.unarchive).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }),
@@ -236,11 +245,11 @@ describe("database Agents window", () => {
     mock.phone = true;
     draw();
     await list();
-    screen.getByRole("button", { name: /^beta session/ }).focus();
+    screen.getByRole("button", { name: /^assistant · beta session,/ }).focus();
     await open("beta");
     expect(screen.getByRole("button", { name: "Back to sessions" })).toHaveFocus();
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    expect(screen.getByRole("button", { name: /^beta session/ })).toHaveFocus();
+    expect(screen.getByRole("button", { name: /^assistant · beta session,/ })).toHaveFocus();
     expect(screen.queryByRole("textbox", { name: "Message" })).not.toBeInTheDocument();
   });
   it("widens history once requested without replacing a database's address", async () => {
@@ -458,7 +467,7 @@ it("keeps phone Back focused when loading the last earlier page removes its cont
   act(() => mock.views.get("beta")?.(view("beta", { hasEarlier: false })));
   expect(screen.getByRole("button", { name: "Back to sessions" })).toHaveFocus();
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-  expect(screen.getByRole("button", { name: /^beta session/ })).toHaveFocus();
+  expect(screen.getByRole("button", { name: /^assistant · beta session,/ })).toHaveFocus();
 });
 
 describe("live answer controls", () => {

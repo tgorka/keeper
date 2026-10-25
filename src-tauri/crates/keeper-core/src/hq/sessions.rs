@@ -74,6 +74,12 @@ pub struct AgentSessionRowVm {
     pub database: String,
     pub session_id: String,
     pub title: String,
+    pub display_name: String,
+    pub handle: String,
+    #[ts(type = "number")]
+    pub created_at_ms: i64,
+    pub trust: String,
+    pub instances: Vec<String>,
     pub agent_actor: String,
     /// The agent's name from the database's directory; its id until the
     /// directory arrives.
@@ -478,13 +484,70 @@ pub fn plan(
 // The list
 // ---------------------------------------------------------------------------
 
+/// Display-only identities, read and hashed once per database projection.
+pub struct SessionNames {
+    members: HashMap<String, Vec<String>>,
+    handles: HashMap<String, String>,
+}
+
+impl SessionNames {
+    pub fn read(source: &Source) -> Self {
+        let mut members: HashMap<String, Vec<String>> = HashMap::new();
+        for row in read(source,
+            "SELECT m.session_id, m.actor_id FROM session_members m JOIN actors a ON a.id = m.actor_id \
+             WHERE a.kind = 'agent' ORDER BY m.actor_id", &[]) {
+            members.entry(text(&row, "session_id").to_owned()).or_default()
+                .push(text(&row, "actor_id").to_owned());
+        }
+        let mut handles = HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for row in read(source, "SELECT id FROM sessions", &[]) {
+            let id = text(&row, "id");
+            let handle = super::vocabulary::handle(id).unwrap_or_else(|| id.to_owned());
+            *counts.entry(handle.clone()).or_default() += 1;
+            handles.insert(id.to_owned(), handle);
+        }
+        for (id, handle) in &mut handles {
+            if counts.get(handle).copied().unwrap_or(0) > 1 {
+                *handle = format!("{handle}-{}", id.rsplit('.').next().unwrap_or(id));
+            }
+        }
+        Self { members, handles }
+    }
+
+    pub fn presentation(&self, id: &str, agent: &str, title: &str) -> (String, String) {
+        let mut agents = vec![agent];
+        if let Some(members) = self.members.get(id) {
+            agents.extend(
+                members
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|member| *member != agent),
+            );
+        }
+        let handle = self
+            .handles
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_owned());
+        let suffix = if title.trim().is_empty() {
+            &handle
+        } else {
+            title
+        };
+        (format!("{} · {suffix}", agents.join(",")), handle)
+    }
+}
+
 /// One database's rows of the list.
 pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
     let names = directory(source);
+    let mut instances: HashMap<String, Vec<String>> = HashMap::new();
+    let identities = SessionNames::read(source);
     let sessions = read(
         source,
         "SELECT s.id AS id, s.title AS title, s.status AS status, s.agent_actor AS agent_actor, \
-         s.archived AS archived, s.last_activity_ms AS last_activity_ms, \
+         s.archived AS archived, s.last_activity_ms AS last_activity_ms, s.created_at_ms AS created_at_ms, s.trust AS trust, \
          m.read_until AS read_until \
          FROM session_members m JOIN sessions s ON s.id = m.session_id \
          WHERE m.actor_id = ?1",
@@ -538,10 +601,25 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
             } else {
                 None
             };
+            let (display_name, handle) = identities.presentation(&id, &agent, text(row, "title"));
+            let instance_labels = instances
+                .entry(agent.clone())
+                .or_insert_with(|| {
+                    super::instances::instances_of(source, &agent)
+                        .into_iter()
+                        .map(|instance| instance.label)
+                        .collect()
+                })
+                .clone();
             Some(AgentSessionRowVm {
                 database: source.database.clone(),
                 session_id: id,
                 title: text(row, "title").to_owned(),
+                display_name,
+                handle,
+                created_at_ms: int(row, "created_at_ms").unwrap_or(0),
+                trust: opt_text(row, "trust").unwrap_or_else(|| "Not reported".to_owned()),
+                instances: instance_labels,
                 agent_mark: mark(&agent_name),
                 agent_name,
                 agent_actor: agent,
@@ -957,6 +1035,20 @@ pub fn create_with_first(
     Ok(id)
 }
 
+/// Rename changes only the mutable title, preserving session identity.
+pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), ReplicaError> {
+    source.replica.mutate(vec![RowOp::Patch {
+        table: "sessions".to_owned(),
+        values: authored(
+            source,
+            object(serde_json::json!({ "id": session_id, "title": title })),
+        ),
+        base_version: None,
+    }])?;
+    source.replica.sync_now();
+    Ok(())
+}
+
 /// Set a session's `archived` flag. The window follows from the row.
 pub fn set_archived(source: &Source, session_id: &str, archived: bool) -> Result<(), ReplicaError> {
     source.replica.mutate(vec![RowOp::Patch {
@@ -1121,6 +1213,11 @@ mod tests {
             database: db.to_owned(),
             session_id: id.to_owned(),
             title: id.to_owned(),
+            display_name: format!("nixie · {id}"),
+            handle: id.to_owned(),
+            created_at_ms: at,
+            trust: "native".to_owned(),
+            instances: Vec::new(),
             agent_actor: "nixie".to_owned(),
             agent_name: "Nixie".to_owned(),
             agent_mark: "N".to_owned(),

@@ -4203,6 +4203,10 @@ export async function agentSessionNew(
   return await invoke<AgentSessionRef>("agent_session_new", { database, agentActor, body });
 }
 
+export async function agentSessionRename(target: AgentSessionRef, title: string): Promise<void> {
+  await invoke<void>("agent_session_rename", { ...target, title });
+}
+
 export async function agentSessionArchive(target: AgentSessionRef): Promise<void> {
   await invoke<void>("agent_session_archive", { ...target });
 }

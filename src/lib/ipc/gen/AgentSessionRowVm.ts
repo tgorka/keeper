@@ -8,7 +8,7 @@ export type AgentSessionRowVm = {
 /**
  * The database the session lives in: the row's label.
  */
-database: string, sessionId: string, title: string, agentActor: string, 
+database: string, sessionId: string, title: string, displayName: string, handle: string, createdAtMs: number, trust: string, instances: Array<string>, agentActor: string, 
 /**
  * The agent's name from the database's directory; its id until the
  * directory arrives.
