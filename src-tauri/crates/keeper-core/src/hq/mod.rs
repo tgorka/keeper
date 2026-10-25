@@ -272,10 +272,6 @@ pub struct Hq {
     sign_in: Arc<dyn signin::SignIn>,
     device_name: String,
     device_host: Box<dyn Fn() -> String + Send + Sync>,
-    /// The sign-in enrolment running now, if any. Not one of a
-    /// configuration's tasks: one that keeps its credential restarts the
-    /// service itself.
-    sign_in_task: Mutex<Option<JoinHandle<()>>>,
     /// Serialises every change of configuration. Never held across a request
     /// to the server; reads never take it.
     lifecycle: tokio::sync::Mutex<()>,
@@ -385,7 +381,6 @@ impl Hq {
             sign_in,
             device_name,
             device_host: Box::new(device_host),
-            sign_in_task: Mutex::default(),
             lifecycle: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner::default()),
             contacts: Arc::default(),
@@ -559,9 +554,6 @@ impl Hq {
     /// ending, or a test's restart.
     pub async fn shutdown(&self) {
         let _lifecycle = self.lifecycle.lock().await;
-        if let Some(task) = lock(&self.sign_in_task).take() {
-            task.abort();
-        }
         let retired = {
             let mut inner = lock(&self.inner);
             inner.generation += 1;
@@ -574,6 +566,9 @@ impl Hq {
         for task in inner.tasks.drain(..) {
             task.abort();
         }
+        // The sign-in attempt of the configuration retired here sends
+        // nothing more (R1096-02); one already sent keeps what it is answered.
+        inner.sign_in.cancel();
         inner.discovering = false;
         let mut replicas: Vec<Arc<dyn Replica>> =
             inner.dbs.drain(..).map(|db| db.replica).collect();

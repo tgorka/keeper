@@ -3682,9 +3682,11 @@ impl LiveSignIn {
             .collect();
         LiveSignIn {
             account: keeper_core::hq::signin::AccountSignIn {
+                account: "hq-live".to_owned(),
                 issuer: env("KEEPER_HQ_LIVE_SIGNIN_ISSUER"),
                 client_id: env("KEEPER_HQ_LIVE_SIGNIN_CLIENT"),
                 scopes,
+                signed_in_at: Some(1),
             },
             refresh_file: PathBuf::from(env("KEEPER_HQ_LIVE_SIGNIN_REFRESH_FILE")),
             minted: Mutex::new(Vec::new()),
@@ -3747,8 +3749,14 @@ impl keeper_core::hq::signin::SignIn for LiveSignIn {
     fn account(&self) -> keeper_core::hq::signin::AccountState {
         keeper_core::hq::signin::AccountState::SignedIn(self.account.clone())
     }
-    fn fresh_token(&self) -> keeper_core::hq::signin::TokenAnswer<'_> {
+    fn fresh_token<'a>(
+        &'a self,
+        account: &'a keeper_core::hq::signin::AccountSignIn,
+    ) -> keeper_core::hq::signin::TokenAnswer<'a> {
         Box::pin(async move {
+            if *account != self.account {
+                return Err(keeper_core::hq::signin::TokenError::Changed);
+            }
             self.mint()
                 .await
                 .map_err(keeper_core::hq::signin::TokenError::Unavailable)

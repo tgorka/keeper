@@ -23,10 +23,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 use crate::hq::databases::Authorization;
 use crate::hq::routes::{AuthConfig, Enrolled, EnrolmentKind, RouteError};
@@ -48,13 +50,36 @@ const ATTEST_TICK: Duration = Duration::from_secs(60 * 60);
 /// The wait before an attestation that could not be made is tried again.
 const ATTEST_RETRY: Duration = Duration::from_secs(10 * 60);
 
-/// The account a sign-in token would come from, as its descriptor names it.
+/// The account a sign-in token would come from, as its descriptor names it,
+/// and which sign-in of it. One attempt holds one of these from the first
+/// check to the request it sends: the token is minted from exactly this
+/// account, and an attempt whose account moved on sends nothing (R1096-01).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSignIn {
+    /// The descriptor's `id`: another account with the same issuer is
+    /// another account.
+    pub account: String,
     pub issuer: String,
     pub client_id: String,
     /// Every scope the account's sign-in asks for.
     pub scopes: Vec<String>,
+    /// When the person last signed in, as the provider stated it (the ID
+    /// token's `auth_time`): a new sign-in is a new attempt even when the
+    /// account is the same (R1096-03). `None` signed out, or unstated.
+    pub signed_in_at: Option<i64>,
+}
+
+impl AccountSignIn {
+    /// The same account, whichever sign-in of it.
+    fn same_account(&self, other: &AccountSignIn) -> bool {
+        AccountSignIn {
+            signed_in_at: None,
+            ..self.clone()
+        } == AccountSignIn {
+            signed_in_at: None,
+            ..other.clone()
+        }
+    }
 }
 
 /// Whether this device has an account, and whether someone is signed in.
@@ -74,6 +99,10 @@ pub enum TokenError {
     /// The sign-in server could not be asked now.
     #[error("{0}")]
     Unavailable(String),
+    /// The account configured now is not the one asked for: nothing was
+    /// minted.
+    #[error("the account changed")]
+    Changed,
 }
 
 /// A sign-in token, as a future the caller can drop.
@@ -85,10 +114,12 @@ pub trait SignIn: Send + Sync {
     /// The account and whether it is signed in; reads the keychain, never
     /// the network.
     fn account(&self) -> AccountState;
-    /// An access token minted for this call alone: the server spends its
-    /// `jti` and refuses one issued more than five minutes before it
-    /// arrives (S-ID-3), so a token is never presented twice.
-    fn fresh_token(&self) -> TokenAnswer<'_>;
+    /// An access token of `account` — the one whose issuer, client and
+    /// scopes the server was checked against, or [`TokenError::Changed`] —
+    /// minted for this call alone: the server spends its `jti` and refuses
+    /// one issued more than five minutes before it arrives (S-ID-3), so a
+    /// token is never presented twice.
+    fn fresh_token<'a>(&'a self, account: &'a AccountSignIn) -> TokenAnswer<'a>;
 }
 
 /// No account: every device pairs.
@@ -98,12 +129,8 @@ impl SignIn for NoAccount {
     fn account(&self) -> AccountState {
         AccountState::NoAccount
     }
-    fn fresh_token(&self) -> TokenAnswer<'_> {
-        Box::pin(async {
-            Err(TokenError::NeedsSignIn(
-                "No account is set up on this device.".to_owned(),
-            ))
-        })
+    fn fresh_token<'a>(&'a self, _: &'a AccountSignIn) -> TokenAnswer<'a> {
+        Box::pin(async { Err(TokenError::Changed) })
     }
 }
 
@@ -134,8 +161,9 @@ impl OrgAccount {
     }
 }
 
-fn account_of(d: &AccountDescriptor) -> AccountSignIn {
+fn account_of(d: &AccountDescriptor, signed_in_at: Option<i64>) -> AccountSignIn {
     AccountSignIn {
+        account: d.id.clone(),
         issuer: d.auth.issuer.clone(),
         client_id: d.auth.client_id.clone(),
         scopes: d
@@ -145,7 +173,21 @@ fn account_of(d: &AccountDescriptor) -> AccountSignIn {
             .chain(&d.auth.extra_scopes)
             .cloned()
             .collect(),
+        signed_in_at,
     }
+}
+
+/// A claim of a stored token's payload: our own, read back from the keychain.
+fn claim(jwt: &str, name: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let part = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(part.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get(name)?
+        .as_i64()
 }
 
 impl SignIn for OrgAccount {
@@ -153,21 +195,38 @@ impl SignIn for OrgAccount {
         let Some(d) = (self.descriptor)() else {
             return AccountState::NoAccount;
         };
-        match session::identity(self.platform.as_ref(), &d) {
-            Ok(Some(_)) => AccountState::SignedIn(account_of(&d)),
-            Ok(None) => AccountState::SignedOut(account_of(&d)),
+        let session =
+            session::load_bound_session(self.platform.as_ref(), &d).and_then(
+                |session| match session {
+                    Some(session) => session.check_roles(&d).map(|()| Some(session)),
+                    None => Ok(None),
+                },
+            );
+        match session {
+            // A refresh keeps the original `auth_time` (OIDC Core §12.2,
+            // checked in `oidc::refreshed_roles`); only a sign-in moves it.
+            // Without one, the ID token's own `iat` stands in.
+            Ok(Some(session)) => AccountState::SignedIn(account_of(
+                &d,
+                claim(&session.id_token, "auth_time").or_else(|| claim(&session.id_token, "iat")),
+            )),
+            Ok(None) => AccountState::SignedOut(account_of(&d, None)),
             Err(error) => {
                 tracing::debug!(%error, "the account's session cannot sign this device in to the agents server");
-                AccountState::SignedOut(account_of(&d))
+                AccountState::SignedOut(account_of(&d, None))
             }
         }
     }
 
-    fn fresh_token(&self) -> TokenAnswer<'_> {
+    fn fresh_token<'a>(&'a self, account: &'a AccountSignIn) -> TokenAnswer<'a> {
         Box::pin(async move {
-            let d = (self.descriptor)().ok_or_else(|| {
-                TokenError::NeedsSignIn("No account is set up on this device.".to_owned())
-            })?;
+            // Minted from the very descriptor the server was checked
+            // against, or not at all: its issuer is the one the session is
+            // bound to and the token endpoint is asked of (R1096-01).
+            let d = (self.descriptor)().ok_or(TokenError::Changed)?;
+            if !account_of(&d, None).same_account(account) {
+                return Err(TokenError::Changed);
+            }
             let http = (self.http)().map_err(TokenError::Unavailable)?;
             oidc::minted_access_token(self.platform.as_ref(), &http, &d)
                 .await
@@ -266,14 +325,40 @@ pub(crate) enum Outcome {
     Failed(String),
 }
 
-/// Sign-in enrolment's state for one configuration: reset by every restart.
+/// The sign-in attempt running for a configuration.
+#[derive(Debug)]
+pub(crate) struct Running {
+    handle: JoinHandle<()>,
+    /// The account it was started for.
+    account: AccountState,
+    /// Set, under the service's lock, the moment its enrolment request is
+    /// sent: from then on the attempt is never cancelled, and it keeps what
+    /// the server answers, because the server may already have issued a
+    /// device or rotated the old token (R1096-02).
+    committed: Arc<AtomicBool>,
+}
+
+/// Sign-in enrolment's state for one configuration: reset by every restart,
+/// which cancels the attempt running for the configuration it replaces.
 #[derive(Debug, Default)]
 pub(crate) struct SignInMemo {
-    /// An attempt is running.
-    pub busy: bool,
+    pub running: Option<Running>,
     pub outcome: Option<Outcome>,
-    /// The account the outcome was reached for: another one tries again.
+    /// The account, and which sign-in of it, the outcome was reached for:
+    /// another one tries again.
     pub tried: Option<AccountState>,
+}
+
+impl SignInMemo {
+    /// Cancel the running attempt unless its request is already sent; a
+    /// sent one finishes on its own and finds itself replaced.
+    pub(crate) fn cancel(&mut self) {
+        if let Some(running) = self.running.take() {
+            if !running.committed.load(Ordering::SeqCst) {
+                running.handle.abort();
+            }
+        }
+    }
 }
 
 /// What an attempt asks of the server.
@@ -284,6 +369,17 @@ enum Ask {
     /// A paired device's credential, or one the server stopped taking:
     /// adopted under the same client id.
     Adopt,
+}
+
+/// What an attempt ended in.
+enum Attempted {
+    /// An outcome to remember for this account.
+    Done(Outcome),
+    /// A credential was kept (the restart that follows reads it).
+    Kept,
+    /// The account moved on before anything was sent: nothing to remember,
+    /// and the account as it is now is considered again.
+    Superseded,
 }
 
 /// What an attestation ended in.
@@ -333,7 +429,7 @@ impl Hq {
                 format!("Signed in: {host} knows this device by your account."),
             );
         }
-        if inner.sign_in.busy {
+        if inner.sign_in.running.is_some() {
             return vm(
                 HqSignInState::Enrolling,
                 format!("Signing this device in to {host}…"),
@@ -356,110 +452,170 @@ impl Hq {
 
     /// Enrol, adopt or sign in again if this configuration wants it and the
     /// account allows it; a no-op otherwise. Never waits: the attempt runs
-    /// on its own, and a credential it stores restarts the service.
+    /// on its own, and a credential it keeps restarts the service. An
+    /// attempt running for another account — another one, or another
+    /// sign-in of it — is cancelled first, unless its request is sent.
     pub(super) fn consider_sign_in(&self) {
         let account = self.sign_in.account();
-        let (generation, server, pairing, ask) = {
-            let mut inner = lock(&self.inner);
-            let Some(server) = inner.server.clone() else {
-                return;
-            };
-            if inner.sign_in.busy {
-                return;
-            }
-            let ask = match &inner.pairing {
-                None => Ask::New,
-                Some(pairing) if pairing.bound.is_none() || inner.authorization.removed => {
-                    Ask::Adopt
-                }
-                // Signed in already: attestation keeps it.
-                Some(_) => return,
-            };
-            if account == AccountState::NoAccount {
-                let changed = inner.sign_in.outcome.take().is_some();
-                inner.sign_in.tried = None;
-                drop(inner);
-                if changed {
-                    self.publish();
-                }
-                return;
-            }
-            let settled = matches!(
-                inner.sign_in.outcome,
-                Some(Outcome::NotOffered | Outcome::SignedOut | Outcome::Refused(_))
-            );
-            if settled && inner.sign_in.tried.as_ref() == Some(&account) {
-                return;
-            }
-            inner.sign_in.busy = true;
-            (inner.generation, server, inner.pairing.clone(), ask)
+        let mut inner = lock(&self.inner);
+        let Some(server) = inner.server.clone() else {
+            return;
         };
-        self.publish();
+        if let Some(running) = &inner.sign_in.running {
+            if running.account == account || running.committed.load(Ordering::SeqCst) {
+                return;
+            }
+            inner.sign_in.cancel();
+        }
+        let ask = match &inner.pairing {
+            None => Ask::New,
+            Some(pairing) if pairing.bound.is_none() || inner.authorization.removed => Ask::Adopt,
+            // Signed in already: attestation keeps it.
+            Some(_) => return,
+        };
+        if account == AccountState::NoAccount {
+            let changed = inner.sign_in.outcome.take().is_some();
+            inner.sign_in.tried = None;
+            drop(inner);
+            if changed {
+                self.publish();
+            }
+            return;
+        }
+        let settled = matches!(
+            inner.sign_in.outcome,
+            Some(Outcome::NotOffered | Outcome::SignedOut | Outcome::Refused(_))
+        );
+        if settled && inner.sign_in.tried.as_ref() == Some(&account) {
+            return;
+        }
+        let generation = inner.generation;
+        let pairing = inner.pairing.clone();
+        let committed = Arc::new(AtomicBool::new(false));
         let me = self.me.clone();
-        let task = tokio::spawn(async move {
+        let (mine, started) = (Arc::clone(&committed), account.clone());
+        // Spawned and recorded under the lock, so the attempt finds itself
+        // running when it first takes it.
+        let handle = tokio::spawn(async move {
             let Some(hq) = me.upgrade() else { return };
-            let outcome = hq
-                .sign_in_attempt(generation, &server, pairing, ask, &account)
+            let attempted = hq
+                .sign_in_attempt(generation, &server, pairing, ask, &started, &mine)
                 .await;
             let mut inner = lock(&hq.inner);
-            if inner.generation != generation {
-                // A restart replaced this configuration — the one an
-                // enrolment that kept its credential ran itself among them.
+            let current = inner.generation == generation
+                && inner
+                    .sign_in
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| Arc::ptr_eq(&running.committed, &mine));
+            if !current {
+                // A restart or another account replaced it — or the restart
+                // its own kept credential ran.
                 return;
             }
-            inner.sign_in.busy = false;
-            inner.sign_in.outcome = outcome;
-            inner.sign_in.tried = Some(account);
+            inner.sign_in.running = None;
+            let again = match attempted {
+                Attempted::Done(outcome) => {
+                    inner.sign_in.outcome = Some(outcome);
+                    inner.sign_in.tried = Some(started);
+                    false
+                }
+                Attempted::Kept => false,
+                Attempted::Superseded => {
+                    inner.sign_in.outcome = None;
+                    inner.sign_in.tried = None;
+                    true
+                }
+            };
             drop(inner);
             hq.publish();
+            if again {
+                hq.consider_sign_in();
+            }
         });
-        // The last attempt has finished: a new one starts only when none is busy.
-        *lock(&self.sign_in_task) = Some(task);
+        inner.sign_in.running = Some(Running {
+            handle,
+            account,
+            committed,
+        });
+        drop(inner);
+        self.publish();
+    }
+
+    /// Whether the attempt holding `committed` may send its request now:
+    /// its configuration is the current one, it is still the running
+    /// attempt, and the account is still the one it was started for. If so,
+    /// it is marked sent, under the same lock a restart cancels under.
+    fn commit(&self, generation: u64, account: &AccountState, committed: &Arc<AtomicBool>) -> bool {
+        let now = self.sign_in.account();
+        let inner = lock(&self.inner);
+        let current = inner.generation == generation
+            && inner
+                .sign_in
+                .running
+                .as_ref()
+                .is_some_and(|running| Arc::ptr_eq(&running.committed, committed));
+        if !current || now != *account {
+            return false;
+        }
+        committed.store(true, Ordering::SeqCst);
+        true
     }
 
     /// One attempt: the server's sign-in checked against the account, a
-    /// fresh token, the enrolment, the credential kept. `None` once a
-    /// credential is kept (the restart that follows reads it).
+    /// token minted from that same account, the enrolment, the credential
+    /// kept.
     async fn sign_in_attempt(
         &self,
         generation: u64,
         server: &ServerUrl,
         pairing: Option<Pairing>,
         ask: Ask,
-        account: &AccountState,
-    ) -> Option<Outcome> {
+        state: &AccountState,
+        committed: &Arc<AtomicBool>,
+    ) -> Attempted {
         let host = server.host().to_owned();
         let answer = {
             let _contact = self.contacts.hold(server);
             let config = match self.routes.auth_config(server).await {
                 Ok(config) => config,
-                Err(RouteError::Refused { status: 404, .. }) => return Some(Outcome::NotOffered),
-                Err(error) => return Some(Outcome::Failed(route_sentence(server, &error))),
-            };
-            match account {
-                AccountState::NoAccount => return Some(Outcome::NotOffered),
-                AccountState::SignedOut(account) | AccountState::SignedIn(account) => {
-                    if let Err(mistrust) = trusts(&config, account) {
-                        tracing::warn!(
-                            ?mistrust,
-                            "the agents server trusts another sign-in; nothing was sent to it"
-                        );
-                        return Some(Outcome::Refused(mistrust_sentence(&host, &mistrust)));
-                    }
+                Err(RouteError::Refused { status: 404, .. }) => {
+                    return Attempted::Done(Outcome::NotOffered)
                 }
+                Err(error) => {
+                    return Attempted::Done(Outcome::Failed(route_sentence(server, &error)))
+                }
+            };
+            let account = match state {
+                AccountState::NoAccount => return Attempted::Done(Outcome::NotOffered),
+                AccountState::SignedOut(account) | AccountState::SignedIn(account) => account,
+            };
+            if let Err(mistrust) = trusts(&config, account) {
+                tracing::warn!(
+                    ?mistrust,
+                    "the agents server trusts another sign-in; nothing was sent to it"
+                );
+                return Attempted::Done(Outcome::Refused(mistrust_sentence(&host, &mistrust)));
             }
-            if matches!(account, AccountState::SignedOut(_)) {
-                return Some(Outcome::SignedOut);
+            if matches!(state, AccountState::SignedOut(_)) {
+                return Attempted::Done(Outcome::SignedOut);
             }
-            let token = match self.sign_in.fresh_token().await {
+            let token = match self.sign_in.fresh_token(account).await {
                 Ok(token) => token,
-                Err(TokenError::NeedsSignIn(_)) => return Some(Outcome::SignedOut),
+                Err(TokenError::NeedsSignIn(_)) => return Attempted::Done(Outcome::SignedOut),
                 Err(TokenError::Unavailable(why)) => {
-                    return Some(Outcome::Failed(format!(
+                    return Attempted::Done(Outcome::Failed(format!(
                         "keeper could not reach your account's sign-in: {why}"
                     )))
                 }
+                Err(TokenError::Changed) => return Attempted::Superseded,
             };
+            if !self.commit(generation, state, committed) {
+                tracing::info!(
+                    "the account or the server changed while signing in; nothing was sent"
+                );
+                return Attempted::Superseded;
+            }
             let device_token = match ask {
                 Ask::New => None,
                 Ask::Adopt => pairing.as_ref().map(|pairing| pairing.token.as_str()),
@@ -480,7 +636,7 @@ impl Hq {
             Ok(enrolled) => enrolled,
             Err(RouteError::Refused { code, status }) => {
                 tracing::info!(%code, status, "the agents server refused to sign this device in");
-                return Some(match code.as_str() {
+                return Attempted::Done(match code.as_str() {
                     "hq.signin_disabled" => Outcome::NotOffered,
                     "hq.device_unknown" => Outcome::Refused(format!(
                         "{host} no longer knows this device, so signing in cannot keep it. \
@@ -497,33 +653,24 @@ impl Hq {
                     _ => Outcome::Failed(format!("{host} refused the sign-in: {code}.")),
                 });
             }
-            Err(error) => return Some(Outcome::Failed(route_sentence(server, &error))),
+            Err(error) => return Attempted::Done(Outcome::Failed(route_sentence(server, &error))),
         };
-        match self.keep_enrolled(generation, server, enrolled).await {
-            Ok(()) => None,
+        match self.keep_enrolled(server, enrolled).await {
+            Ok(()) => Attempted::Kept,
             Err(error) => {
                 tracing::warn!(%error, "the agents server's credential could not be kept");
-                Some(Outcome::Failed(error.to_string()))
+                Attempted::Done(Outcome::Failed(error.to_string()))
             }
         }
     }
 
-    /// Keep what an enrolment answered — in the keychain item a pairing's
-    /// token lives in, replacing it — and restart on it.
-    async fn keep_enrolled(
-        &self,
-        generation: u64,
-        server: &ServerUrl,
-        enrolled: Enrolled,
-    ) -> Result<(), HqError> {
+    /// Keep what an enrolment answered — in the keychain item of the server
+    /// it was sent to, where a pairing's token lives, replacing it — and
+    /// restart on it if that server is still the one set. A sent request is
+    /// never thrown away: the server may already have issued the device or
+    /// rotated the old token (R1096-02).
+    async fn keep_enrolled(&self, server: &ServerUrl, enrolled: Enrolled) -> Result<(), HqError> {
         let _lifecycle = self.lifecycle.lock().await;
-        if lock(&self.inner).generation != generation {
-            return Err(HqError::Sentence(
-                "The agents server changed while this device was signing in, so nothing was \
-                 saved."
-                    .to_owned(),
-            ));
-        }
         let data_dir = self.data_dir()?;
         let record = Pairing {
             token: enrolled.token,
@@ -539,13 +686,23 @@ impl Hq {
             open: enrolled.discovery.databases.clone(),
         }
         .save(&data_dir, server)?;
-        lock(&self.inner).refusals.clear();
         tracing::info!(
             adopted = enrolled.adopted,
             databases = enrolled.discovery.databases.len(),
             "this device signed in to its agents server"
         );
-        self.restart().await
+        let set = {
+            let mut inner = lock(&self.inner);
+            let set = inner.server.as_ref() == Some(server);
+            if set {
+                inner.refusals.clear();
+            }
+            set
+        };
+        if set {
+            self.restart().await?;
+        }
+        Ok(())
     }
 
     /// Keep a credential that came from a sign-in attested: wake when it is
@@ -574,7 +731,8 @@ impl Hq {
     }
 
     async fn attest(&self, generation: u64) -> Attest {
-        let account = match self.sign_in.account() {
+        let state = self.sign_in.account();
+        let account = match &state {
             AccountState::SignedIn(account) => account,
             // Signing in again is the person's to do; until then the
             // credential may lapse, and the next sign-in adopts it back.
@@ -599,20 +757,29 @@ impl Hq {
                     return Attest::Later;
                 }
             };
-            if let Err(mistrust) = trusts(&config, &account) {
+            if let Err(mistrust) = trusts(&config, account) {
                 tracing::warn!(
                     ?mistrust,
                     "the agents server trusts another sign-in; nothing was sent to it"
                 );
                 return Attest::Later;
             }
-            let token = match self.sign_in.fresh_token().await {
+            let token = match self.sign_in.fresh_token(account).await {
                 Ok(token) => token,
                 Err(error) => {
                     tracing::info!(%error, "no sign-in token to attest with; attesting later");
                     return Attest::Later;
                 }
             };
+            // The account the server was checked against is still the one
+            // signed in, and the configuration is still this one (R1096-01).
+            if self.sign_in.account() != state {
+                tracing::info!("the account changed while attesting; nothing was sent");
+                return Attest::Later;
+            }
+            if lock(&self.inner).generation != generation {
+                return Attest::Stop;
+            }
             self.routes.attest(&server, &token, &pairing.token).await
         };
         match answer {
@@ -642,17 +809,35 @@ impl Hq {
                 self.forget_bound(generation, &server, &pairing).await;
                 Attest::Stop
             }
-            // The server stopped taking the credential: discovery says how,
-            // and a lapse or a suspension signs in again from there.
-            Err(RouteError::Refused { status: 401, .. }) => {
+            // The device token itself is unknown: revoked, or rotated by
+            // another adoption. Discovery marks it removed, and a sign-in
+            // adopts it back where the server still can (R1096-04).
+            Err(RouteError::Refused { status: 401, code }) if code == "hq.device_unknown" => {
+                tracing::warn!(%code, "the agents server no longer knows this device's credential; attesting stops");
                 let mut inner = lock(&self.inner);
                 if inner.generation == generation {
                     self.schedule_discovery(&mut inner, Duration::ZERO);
                 }
                 Attest::Stop
             }
+            // The person or the app is not one the server takes: retrying
+            // would mint a token every ten minutes for the same answer. The
+            // credential lapses, and the sign-in after it says why.
+            Err(RouteError::Refused { status: 403, code }) => {
+                tracing::warn!(%code, "the agents server refused this sign-in's attestation; attesting stops");
+                Attest::Stop
+            }
+            // Any other refusal judged the sign-in token, not the device
+            // (`hq.signin.stale`, `.replayed`, …), or nothing was decided:
+            // ask again whether the device is known, and attest again later.
             Err(error) => {
                 tracing::info!(%error, "the attestation did not go through; attesting later");
+                if matches!(error, RouteError::Refused { status: 401, .. }) {
+                    let mut inner = lock(&self.inner);
+                    if inner.generation == generation {
+                        self.schedule_discovery(&mut inner, Duration::ZERO);
+                    }
+                }
                 Attest::Later
             }
         }
@@ -742,10 +927,90 @@ mod tests {
 
     fn account() -> AccountSignIn {
         AccountSignIn {
+            account: "acme".to_owned(),
             issuer: "https://id.example.org".to_owned(),
             client_id: "keeper".to_owned(),
             scopes: vec!["openid".to_owned(), "urn:x:aud".to_owned()],
+            signed_in_at: Some(1),
         }
+    }
+
+    /// The account the descriptor provider names now, swappable.
+    fn org(
+        p: &Arc<crate::forges::testing::FakePlatform>,
+        now: &Arc<std::sync::Mutex<AccountDescriptor>>,
+    ) -> OrgAccount {
+        let now = Arc::clone(now);
+        OrgAccount::new(
+            Arc::clone(p) as Arc<dyn Platform>,
+            move || Some(now.lock().expect("descriptor").clone()),
+            || Ok(crate::forges::testing::http()),
+        )
+    }
+
+    #[tokio::test]
+    async fn org_account_mints_only_for_the_account_the_server_was_checked_against() {
+        let p = Arc::new(crate::forges::testing::FakePlatform::default());
+        let d = crate::forges::testing::signed_in_account(&p, "");
+        let now = Arc::new(std::sync::Mutex::new(d.clone()));
+        let org = org(&p, &now);
+        let AccountState::SignedIn(checked) = org.account() else {
+            panic!("signed in");
+        };
+        // Same account: it goes on to mint (here: no refresh token, so the
+        // sign-in is no longer good — but it was the right account to ask).
+        assert!(matches!(
+            org.fresh_token(&checked).await,
+            Err(TokenError::NeedsSignIn(_))
+        ));
+        // Another issuer is configured meanwhile: nothing is minted at all.
+        let mut other = d.clone();
+        other.auth.issuer = "https://id.elsewhere.dev".to_owned();
+        *now.lock().expect("descriptor") = other;
+        assert_eq!(org.fresh_token(&checked).await, Err(TokenError::Changed));
+        // So is another account with the same issuer.
+        let mut renamed = d;
+        renamed.id = "other".to_owned();
+        *now.lock().expect("descriptor") = renamed;
+        assert_eq!(org.fresh_token(&checked).await, Err(TokenError::Changed));
+    }
+
+    #[test]
+    fn a_new_sign_in_moves_the_account_state_and_a_refresh_does_not() {
+        use crate::org_account::session::{load_session, store_session};
+        use base64::Engine as _;
+        let p = Arc::new(crate::forges::testing::FakePlatform::default());
+        let d = crate::forges::testing::signed_in_account(&p, "");
+        let now = Arc::new(std::sync::Mutex::new(d.clone()));
+        let org = org(&p, &now);
+        let id_token = |claims: serde_json::Value| {
+            let b64 = |v: &serde_json::Value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+            };
+            format!(
+                "{}.{}.sig",
+                b64(&serde_json::json!({"alg": "RS256"})),
+                b64(&claims)
+            )
+        };
+        let signed_in_as = |claims: serde_json::Value| {
+            let mut session = load_session(p.as_ref(), &d.id)
+                .expect("reads")
+                .expect("session");
+            session.id_token = id_token(claims);
+            store_session(p.as_ref(), &d.id, &session).expect("stores");
+            match org.account() {
+                AccountState::SignedIn(account) => account.signed_in_at,
+                other => panic!("{other:?}"),
+            }
+        };
+        let first = signed_in_as(serde_json::json!({"auth_time": 100, "iat": 100}));
+        // A refresh: a new ID token, the same `auth_time`.
+        let refreshed = signed_in_as(serde_json::json!({"auth_time": 100, "iat": 5000}));
+        let again = signed_in_as(serde_json::json!({"auth_time": 9000, "iat": 9000}));
+        assert_eq!(first, Some(100));
+        assert_eq!(refreshed, first, "a refresh is the same sign-in");
+        assert_eq!(again, Some(9000), "a new sign-in is a new state");
     }
 
     fn config(issuer: &str, client: &str, scopes: &[&str]) -> AuthConfig {
