@@ -4146,7 +4146,10 @@ function recordSend(kind: string, payload: Record<string, unknown>): null {
   return null;
 }
 
-function mockChatCommandPreview(payload: Record<string, unknown>): ChatCommandPreviewVm {
+function mockChatCommandPreview(
+  payload: Record<string, unknown>,
+  offered?: ChatCommandRowVm[],
+): ChatCommandPreviewVm {
   const draft = String(payload.draft ?? "");
   const replying = payload.replying === true;
   const readonly = new URLSearchParams(window.location.search).get("slash") === "readonly";
@@ -4206,8 +4209,9 @@ function mockChatCommandPreview(payload: Record<string, unknown>): ChatCommandPr
     null,
     null,
   ];
-  const registry: ChatCommandRowVm[] = [...chatSet, help].map(
-    ([name, aliases, description, args, argHint, reason]) => ({
+  const registry: ChatCommandRowVm[] =
+    offered ??
+    [...chatSet, help].map(([name, aliases, description, args, argHint, reason]) => ({
       name,
       aliases,
       description,
@@ -4215,8 +4219,7 @@ function mockChatCommandPreview(payload: Record<string, unknown>): ChatCommandPr
       argHint,
       available: reason === null,
       reason,
-    }),
-  );
+    }));
   const line = draft.startsWith("/") && !draft.startsWith("//") && !draft.includes("\n");
   if (line && new TextEncoder().encode(draft).length > 512) {
     return {
@@ -6574,6 +6577,73 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     vm.hasEarlier = false;
     publishSessions();
     return null;
+  },
+  // Viewing aid only: production parsing and capability decisions are Rust's.
+  // Reuse the existing mock preview engine, not a second mock parser.
+  agent_command_preview: (payload) => {
+    const vm = mockSession(payload);
+    const rows: ChatCommandRowVm[] = [
+      ["clean", "Start fresh; keep this conversation.", "none", null],
+      ["new", "Start a new conversation.", "optionalRest", "title"],
+      ["rename", "Rename this conversation.", "required", "title"],
+      ["stop", "Stop the running turn.", "none", null],
+      ...(vm.tools.length ? [["tools", "Open tool switches.", "none", null]] : []),
+      ["context", "Open context details.", "none", null],
+      ["people", "Open this session's people.", "none", null],
+      ["archive", "Archive this conversation.", "none", null],
+      ["help", "List commands.", "none", null],
+    ].map(([name, description, args, argHint]) => ({
+      name: name as string,
+      description: description as string,
+      args: args as ChatCommandRowVm["args"],
+      argHint: argHint ?? null,
+      aliases: [],
+      available: true,
+      reason: null,
+    }));
+    return mockChatCommandPreview(payload, rows);
+  },
+  agent_command: (payload) => {
+    const preview = sessionHandlers.agent_command_preview(payload) as ChatCommandPreviewVm;
+    if (preview.verdict.kind !== "command") hqRefuse("Choose a command first.");
+    if (preview.verdict.kind !== "command") return null;
+    const { name, args } = preview.verdict;
+    const vm = mockSession(payload);
+    const result = {
+      session: null as { database: string; sessionId: string } | null,
+      surface: null as string | null,
+      message: "",
+    };
+    if (name === "clean" || name === "new") {
+      result.session = sessionHandlers.agent_session_new({
+        database: vm.database,
+        agentActor: vm.agentActor,
+        body: "",
+      }) as { database: string; sessionId: string };
+      const fresh = mockSession(result.session);
+      fresh.messages = [];
+      fresh.title = args ?? "New conversation";
+      const row = sessionRows.find(
+        (row) => row.database === fresh.database && row.sessionId === fresh.sessionId,
+      );
+      if (row) row.title = fresh.title;
+      publishSessions();
+    } else if (name === "rename") {
+      vm.title = args ?? vm.title;
+      const row = sessionRows.find(
+        (row) => row.database === vm.database && row.sessionId === vm.sessionId,
+      );
+      if (row) row.title = vm.title;
+      publishSessions();
+    } else if (name === "archive") {
+      sessionHandlers.agent_session_archive(payload);
+    } else if (name === "stop") {
+      if (!vm.live.length) hqRefuse("There is no running turn to stop.");
+      vm.live = [];
+      result.message = "Stop requested.";
+      publishSessions();
+    } else result.surface = name;
+    return result;
   },
   agent_send: (payload) => {
     if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");

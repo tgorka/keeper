@@ -25,6 +25,8 @@ import {
   agentAttachCommit,
   agentAttachPath,
   agentAttachRelease,
+  agentCommand,
+  agentCommandPreview,
   agentSend,
   agentSessionArchive,
   agentSessionClose,
@@ -47,6 +49,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const attachmentDraft = useSessionAttachmentDraft(target);
   const [vm, setVm] = useState<AgentSessionViewVm | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [peopleOpen, setPeopleOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [contextOpen, setContextOpen] = useState(false);
   // Rust's sentence while the session is not on this device yet but may still arrive.
   const [arriving, setArriving] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -293,7 +298,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             )}
           </p>
         </div>
-        {vm && <SessionPeople target={target} />}
+        {vm && <SessionPeople target={target} open={peopleOpen} onOpenChange={setPeopleOpen} />}
         {vm && (
           <Button
             variant="ghost"
@@ -308,7 +313,29 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         )}
       </header>
       {vm?.answering && <SessionInstances answering={vm.answering} agentName={vm.agentName} />}
-      {vm && <SessionControls vm={vm} />}
+      {vm && <SessionControls vm={vm} toolsOpen={toolsOpen} onToolsOpenChange={setToolsOpen} />}
+      {vm && contextOpen && (
+        <section aria-label="Conversation context" className="shrink-0 border-b px-3 py-2 text-sm">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="font-medium">Conversation context</h3>
+            <Button variant="ghost" onClick={() => setContextOpen(false)}>
+              Close context
+            </Button>
+          </div>
+          <p>
+            {vm.agentName} · {vm.database}
+          </p>
+          <p>
+            {vm.untrusted
+              ? "Outside content has been read in this conversation."
+              : "No outside content has been marked in this conversation."}
+          </p>
+          <p className="text-muted-foreground">
+            Context usage is not reported by this runtime. Show details displays the usage it
+            reports for each answer.
+          </p>
+        </section>
+      )}
       {error && (
         <div
           role="alert"
@@ -457,6 +484,25 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
               roomId={sessionId}
               disabled={!vm?.complete}
               onSendAttachments={attach}
+              resolveCommand={(draft) => agentCommandPreview(target, draft)}
+              onCommand={async ({ name, args }) => {
+                try {
+                  const result = await agentCommand(
+                    target,
+                    `/${name}${args === null ? "" : ` ${args}`}`,
+                  );
+                  if (result.session) agentSessionsStore.getState().select(result.session);
+                  if (result.surface === "people") setPeopleOpen(true);
+                  if (result.surface === "tools") setToolsOpen(true);
+                  if (result.surface === "context") setContextOpen(true);
+                  return result.message ? { tone: "done", message: result.message } : null;
+                } catch (raw) {
+                  return {
+                    tone: "failed",
+                    message: syncErrorMessage(raw, "keeper could not run this command."),
+                  };
+                }
+              }}
               onSend={async (body) => {
                 await agentSend(target, body);
               }}

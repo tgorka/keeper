@@ -477,6 +477,28 @@ pub async fn agent_send(
     blocking(move |hq| hq.send(&session(database, session_id), &body)).await
 }
 
+/// Rust decides both menu rows and how Enter interprets an agents draft.
+#[tauri::command]
+pub fn agent_command_preview(
+    database: String,
+    session_id: String,
+    draft: String,
+) -> Result<keeper_core::vm::ChatCommandPreviewVm, IpcError> {
+    hq()?
+        .command_preview(&session(database, session_id), &draft)
+        .map_err(error)
+}
+
+/// Revalidate and execute an agents command against the current replica.
+#[tauri::command]
+pub async fn agent_command(
+    database: String,
+    session_id: String,
+    draft: String,
+) -> Result<keeper_core::hq::commands::AgentCommandResultVm, IpcError> {
+    blocking(move |hq| hq.command(&session(database, session_id), &draft)).await
+}
+
 /// Stage the files at `paths` (the paperclip, drag-and-drop) for a message
 /// of a session: Rust reads each file, so no bytes cross IPC. A handle for
 /// each, in order; a file over the contract's bound, or one keeper cannot

@@ -243,7 +243,9 @@ describe("TaskForm creation and new kinds", () => {
     expect(
       alert.compareDocumentPosition(screen.getByLabelText("Id")) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+    await waitFor(() =>
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ block: "nearest" }),
+    );
     expect(saved).not.toHaveBeenCalled();
   });
 

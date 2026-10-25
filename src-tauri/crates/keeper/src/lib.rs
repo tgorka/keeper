@@ -1021,6 +1021,8 @@ pub fn run() {
                 hq_ipc::agent_session_close,
                 hq_ipc::agent_session_page_back,
                 hq_ipc::agent_send,
+                hq_ipc::agent_command_preview,
+                hq_ipc::agent_command,
                 hq_ipc::agent_attach_path,
                 hq_ipc::agent_attach_bytes,
                 hq_ipc::agent_attach_commit,

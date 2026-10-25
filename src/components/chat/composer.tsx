@@ -30,8 +30,8 @@
  * `keeper_core::chat::commands`' answer through {@link chatCommandPreview}: text,
  * an action (`/me`), an act on the room, or a refusal shown here with the draft
  * kept. A line with no leading slash is sent without asking, so prose costs no
- * round trip. Commands are off while editing (the text is that message's body)
- * and while attachments are pending (the text is their caption).
+ * round trip. Commands are off while editing (the text is that message's body).
+ * Pending messenger attachments use raw captions; session captions still ask Rust.
  */
 import { type DialogFilter, open } from "@tauri-apps/plugin-dialog";
 import { Camera, Image, Paperclip, Plus, X } from "lucide-react";
@@ -815,7 +815,10 @@ export function Composer({
     const body = message?.body ?? draft.trim();
     const trayAttachments = tray.getState().pending;
     const dispatchAttachments =
-      message === undefined && onSendAttachments != null && !wasEdit && trayAttachments.length > 0;
+      (message === undefined || (transport === "session" && !message.emote)) &&
+      onSendAttachments != null &&
+      !wasEdit &&
+      trayAttachments.length > 0;
     if (
       (body.length === 0 && !dispatchAttachments) ||
       disabled ||
@@ -919,10 +922,13 @@ export function Composer({
     }
   }
 
-  // Slash commands (Story 100.5) — off while editing (the text is that
-  // message's body) and while attachments wait (the text is their caption).
+  // An edit is existing message text. Messenger attachments retain raw captions;
+  // session attachments never bypass Rust's command/refusal/escaped-text verdict.
   const commandsEnabled =
-    onCommand != null && onSendEmote != null && pending?.mode !== "edit" && !hasAttachments;
+    onCommand != null &&
+    (onSendEmote != null || (transport === "session" && resolveCommand != null)) &&
+    pending?.mode !== "edit" &&
+    (transport === "session" || !hasAttachments);
   const replying = pending?.mode === "reply";
   const resolve = useCallback(
     (line: string) =>
@@ -1091,7 +1097,10 @@ export function Composer({
   // The mid-text `/` (Story 101.3, R418): wherever the composer has a slash
   // menu, except over a whole-line command, which is that menu's.
   const inlineEnabled =
-    onCommand != null && onSendEmote != null && !(commandsEnabled && isCommandLine(draft));
+    transport !== "session" &&
+    onCommand != null &&
+    onSendEmote != null &&
+    !(commandsEnabled && isCommandLine(draft));
   const resolveInlineHere = useCallback(
     (before: string, after: string) =>
       resolveInline != null

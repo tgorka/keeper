@@ -1218,3 +1218,168 @@ fn a_lock_screen_decision_never_approves_t4_and_says_why_it_was_not_sent() {
         Err("This device does not hold alpha yet.".to_owned())
     );
 }
+
+#[test]
+fn agent_commands_keep_history_and_create_no_phantom_prompt() {
+    use crate::hq::commands::{run, AgentCommandSurface};
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("old", NIXIE, now(), false, None))
+        .expect("session");
+    w.alpha
+        .replica
+        .mutate(vec![message(
+            "m1",
+            "old",
+            "person",
+            now(),
+            None,
+            Value::Null,
+        )])
+        .expect("history");
+    for draft in ["/clean", "/new", "/new A fresh title"] {
+        let next = run(&w.alpha, "old", draft)
+            .expect("fresh session")
+            .session
+            .expect("navigation");
+        assert_eq!(next.database, "alpha");
+        assert_ne!(next.session_id, "old");
+        let row = timeline::session_row(&w.alpha, &next.session_id).expect("new row");
+        assert_eq!(row.agent_actor, NIXIE);
+        if draft.contains("A fresh") {
+            assert_eq!(row.title, "A fresh title");
+        }
+        assert!(
+            sessions::read(
+                &w.alpha,
+                "SELECT id FROM messages WHERE session_id = ?1",
+                &[next.session_id.into()]
+            )
+            .is_empty(),
+            "fresh context must not dispatch a fake message"
+        );
+        assert!(
+            !timeline::session_row(&w.alpha, "old")
+                .expect("old preserved")
+                .archived
+        );
+        assert_eq!(
+            sessions::read(&w.alpha, "SELECT body FROM messages WHERE id = 'm1'", &[])[0]["body"],
+            "body of m1"
+        );
+    }
+    assert!(run(&w.alpha, "old", "/rename").is_err());
+    run(&w.alpha, "old", "/rename New title").expect("rename");
+    assert_eq!(
+        timeline::session_row(&w.alpha, "old").expect("row").title,
+        "New title"
+    );
+    for (draft, surface) in [
+        ("/people", AgentCommandSurface::People),
+        ("/context", AgentCommandSurface::Context),
+        ("/help", AgentCommandSurface::Help),
+    ] {
+        assert_eq!(
+            run(&w.alpha, "old", draft).expect("open").surface,
+            Some(surface)
+        );
+    }
+    assert!(
+        run(&w.alpha, "old", "/stop").is_err(),
+        "no turn means no control row"
+    );
+    run(&w.alpha, "old", "/archive").expect("archive");
+    assert!(
+        timeline::session_row(&w.alpha, "old")
+            .expect("preserved")
+            .archived
+    );
+    assert!(run(&w.alpha, "old", "/rename archived").is_err());
+}
+
+#[test]
+fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose() {
+    use crate::hq::commands::preview;
+    use crate::vm::ChatCommandVerdictVm;
+    let names = |tools| {
+        preview("/", tools)
+            .rows
+            .into_iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(false),
+        ["clean", "new", "rename", "stop", "context", "people", "archive", "help"]
+    );
+    assert!(names(true).contains(&"tools".to_owned()));
+    for draft in [
+        "/unknown",
+        "/model some-model",
+        "/effort high",
+        "/drives",
+        "/tools",
+    ] {
+        assert!(
+            matches!(
+                preview(draft, false).verdict,
+                ChatCommandVerdictVm::Refusal { .. }
+            ),
+            "{draft}"
+        );
+    }
+    // These verdicts also govern attachment captions: only an explicit escape
+    // turns a command-looking caption into text, including unknown commands.
+    for caption in ["/stop", "/unknown", "/model unavailable"] {
+        let escaped = format!("/{caption}");
+        assert!(
+            matches!(preview(&escaped, false).verdict, ChatCommandVerdictVm::Text { text } if text == caption),
+            "escaped caption {escaped} must retain exactly one leading slash"
+        );
+    }
+    assert_eq!(preview("/ren", false).rows[0].name, "rename");
+    assert!(
+        matches!(preview("/stop", false).verdict, ChatCommandVerdictVm::Command { name, args: None } if name == "stop")
+    );
+}
+
+#[test]
+fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface() {
+    use crate::hq::commands::{run, AgentCommandSurface};
+    let w = world();
+    let t = now();
+    w.alpha
+        .replica
+        .mutate(session("s", NIXIE, t, false, None))
+        .expect("session");
+    let chunk = |id: &str| {
+        upsert(
+            "turn_chunks",
+            json!({"id":format!("chunk-{id}"), "session_id":"s", "turn_id":id, "seq":0, "text":"", "created_at_ms":t, "author_actor":NIXIE,"author_client":"nixie.box"}),
+        )
+    };
+    w.alpha
+        .replica
+        .mutate(vec![
+            chunk("live"),
+            chunk("done"),
+            message("answer", "s", "agent", t, Some("done"), Value::Null),
+        ])
+        .expect("turns");
+    run(&w.alpha, "s", "/stop").expect("stop");
+    let controls = sessions::read(
+        &w.alpha,
+        "SELECT metadata, role FROM messages WHERE session_id = 's' AND role = 'person'",
+        &[],
+    );
+    assert_eq!(controls.len(), 1);
+    let metadata: Value =
+        serde_json::from_str(controls[0]["metadata"].as_str().expect("json string")).expect("json");
+    assert_eq!(metadata, json!({"kind":"stop","turn":"live"}));
+    w.alpha.replica.mutate(vec![upsert("agent_profiles", json!({"id":"nixie.box", "actor_id":NIXIE, "name":"Nixie", "description":"", "avatar_blob":null, "definition_hash":"h", "image_digest":"d", "started_at_ms":t, "dir":"alpha", "tools":"[\"read\"]", "author_actor":NIXIE, "author_client":"nixie.box"}))]).expect("tools");
+    assert_eq!(
+        run(&w.alpha, "s", "/tools").expect("tools").surface,
+        Some(AgentCommandSurface::Tools)
+    );
+}
