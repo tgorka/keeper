@@ -48,6 +48,13 @@ deny = [
 
 [advisories]
 yanked = "warn"
+# 2026-10-25: waiver, not a fix; only >=0.7.6 is patched, and the latest
+# openidconnect (4.0.1) still pins p256/p384 0.13 -> crypto-bigint 0.5.
+# OIDC verifies provider signatures using public EC inputs; no EC private-key
+# signing or key agreement. Re-audit this exception before adding either.
+ignore = [
+  { id = "RUSTSEC-2026-0387", reason = "EC signature verification on public inputs only via openidconnect; no secret-integer use; https://github.com/tgorka/keeper/issues/576" },
+]
 
 [sources]
 unknown-registry = "deny"
