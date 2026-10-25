@@ -810,7 +810,10 @@ that person's `person` message. Another member's or an agent's images remain fil
 from the staged snapshot or the already-cached blob only: a missing cached body never starts
 a download. The handler checks ownership before consulting its bounded 64-entry memory cache.
 PNG, JPEG, GIF and WebP are decoded with dimension, pixel-allocation and attachment-byte
-limits; unsupported raw formats (including HEIC), invalid images and missing bytes retain an
+limits. EXIF rotation and mirroring are applied before scaling. One bounded decoder reads
+dimensions and pixels; compressed PNG ICC profiles over 8 MiB are refused by a streaming
+preflight (the PNG decoder otherwise silently ignores profile-limit errors).
+Unsupported raw formats (including HEIC), invalid images and missing bytes retain an
 openable file chip. The existing photo-picker normalization can first convert HEIC to JPEG
 when the webview can decode it; this is not a native HEIC thumbnail decoder.
 Removing a selection releases its stage, even if staging finishes late;
