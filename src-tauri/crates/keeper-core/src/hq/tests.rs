@@ -43,6 +43,7 @@ impl Routes for FakeRoutes {
         server: &'a ServerUrl,
         _: &'a PairingCode,
         _: &'a str,
+        _: &'a str,
     ) -> Answer<'a, Redeemed> {
         lock(&self.redeemed).push(server.as_str().to_owned());
         let gate = lock(&self.redeem_gate).take();
@@ -113,6 +114,7 @@ impl World {
             Arc::clone(&self.opener) as Arc<dyn Opener>,
             Arc::clone(&self.routes) as Arc<dyn Routes>,
             "keeper on test".to_owned(),
+            || "test".to_owned(),
         )
     }
 
@@ -158,6 +160,69 @@ impl World {
             .iter()
             .filter(|r| r.spec.database == database)
             .count()
+    }
+}
+
+#[tokio::test]
+async fn pairing_registers_the_host_not_the_display_name() {
+    use crate::forges::testing::{serve, Reply};
+    for (host, offered) in [("hesperia", false), ("kalypso", true)] {
+        let server = serve(move |request| {
+            if request.path == "/pair/redeem" {
+                if request.json()["host"] != host || request.json()["name"] != "My keeper" {
+                    return Reply::json(400, r#"{"error":"hq.device_host"}"#);
+                }
+                Reply::json(
+                    200,
+                    r#"{"token":"device-token","actorId":"ana","clientId":"ana.1","databases":[]}"#,
+                )
+            } else {
+                Reply::json(
+                    200,
+                    r#"{"actorId":"ana","clientId":"ana.1","databases":[]}"#,
+                )
+            }
+        });
+        let world = World::new();
+        let live_host = Arc::new(Mutex::new(String::new()));
+        let provided_host = Arc::clone(&live_host);
+        let hq = Hq::new(
+            Arc::clone(&world.platform) as Arc<dyn Platform>,
+            Arc::clone(&world.opener) as Arc<dyn Opener>,
+            Arc::new(routes::HttpRoutes::new()),
+            "My keeper".to_owned(),
+            move || lock(&provided_host).clone(),
+        );
+        hq.start().await.expect("starts");
+        hq.set_server(&server.base).await.expect("sets server");
+        assert!(matches!(
+            hq.pair_redeem("0123456789ABCDEFGHJKMNPQ").await,
+            Err(HqError::Sentence(_))
+        ));
+        assert!(lock(&hq.inner).pairing.is_none());
+        *lock(&live_host) = host.to_owned();
+        if offered {
+            let link = format!(
+                "keeper://agents/pair?server={}&code=0123456789ABCDEFGHJKMNPQ",
+                server.base
+            );
+            hq.offer_link(&link).expect("offers pairing");
+            hq.accept_offer()
+                .await
+                .expect("pairs from link with the OS host");
+        } else {
+            hq.pair_redeem("0123456789ABCDEFGHJKMNPQ")
+                .await
+                .expect("pairs with the OS host");
+        }
+        assert_eq!(
+            lock(&hq.inner)
+                .pairing
+                .as_ref()
+                .expect("paired credential")
+                .client_id,
+            "ana.1"
+        );
     }
 }
 
@@ -760,6 +825,7 @@ async fn staged_session(
         Arc::clone(&opener) as Arc<dyn Opener>,
         Arc::clone(&world.routes) as Arc<dyn Routes>,
         "keeper on test".to_owned(),
+        || "test".to_owned(),
     );
     hq.start().await.expect("starts");
     let staged = lock(&opener.0).clone().expect("alpha opened");
@@ -1183,6 +1249,7 @@ fn real_hq(world: &World, opener: Arc<dyn Opener>) -> Arc<Hq> {
         opener,
         Arc::clone(&world.routes) as Arc<dyn Routes>,
         "keeper on test".to_owned(),
+        || "test".to_owned(),
     )
 }
 
@@ -1446,6 +1513,7 @@ async fn spoken_world(world: &World, databases: &[&str]) -> (Arc<Hq>, Arc<LocalO
         Arc::clone(&opener) as Arc<dyn Opener>,
         Arc::clone(&world.routes) as Arc<dyn Routes>,
         "keeper on test".to_owned(),
+        || "test".to_owned(),
     );
     hq.start().await.expect("starts");
     for database in databases {

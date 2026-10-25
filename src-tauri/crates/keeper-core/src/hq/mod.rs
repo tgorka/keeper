@@ -255,6 +255,7 @@ pub struct Hq {
     opener: Arc<dyn Opener>,
     routes: Arc<dyn Routes>,
     device_name: String,
+    device_host: Box<dyn Fn() -> String + Send + Sync>,
     /// Serialises every change of configuration. Never held across a request
     /// to the server; reads never take it.
     lifecycle: tokio::sync::Mutex<()>,
@@ -340,11 +341,13 @@ async fn retire(retired: Retired) {
 impl Hq {
     /// A service with nothing open yet; [`Hq::start`] reads the setting.
     /// `device_name` is how the person's other devices will list this one.
+    /// `device_host` reads the OS host at redemption, after any late platform setup.
     pub fn new(
         platform: Arc<dyn Platform>,
         opener: Arc<dyn Opener>,
         routes: Arc<dyn Routes>,
         device_name: String,
+        device_host: impl Fn() -> String + Send + Sync + 'static,
     ) -> Arc<Hq> {
         let (status, _) = watch::channel(no_server());
         let (changes, _) = watch::channel(0);
@@ -354,6 +357,7 @@ impl Hq {
             opener,
             routes,
             device_name,
+            device_host: Box::new(device_host),
             lifecycle: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner::default()),
             contacts: Arc::default(),
@@ -1053,10 +1057,11 @@ impl Hq {
 
     async fn redeem(&self, server: ServerUrl, code: PairingCode) -> Result<HqStatusVm, HqError> {
         let generation = lock(&self.inner).generation;
+        let host = (self.device_host)();
         let redeemed = {
             let _contact = self.contacts.hold(&server);
             self.routes
-                .redeem(&server, &code, &self.device_name)
+                .redeem(&server, &code, &self.device_name, &host)
                 .await
                 .map_err(|error| match error {
                     RouteError::Unauthorized => HqError::Sentence(

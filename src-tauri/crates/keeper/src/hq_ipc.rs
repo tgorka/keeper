@@ -97,7 +97,8 @@ pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
         platform,
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
-        format!("keeper on {}", keeper_core::config::read_host_label()),
+        "keeper".to_owned(),
+        crate::account_ipc::device_host,
     );
     if HQ.set(Arc::clone(&hq)).is_err() {
         return HQ.get().map_or(hq, Arc::clone);

@@ -524,6 +524,7 @@ impl RepoFiles for WorktreeFiles<'_> {
 struct IosDevice {
     class: DeviceClass,
     model: String,
+    name: String,
 }
 
 /// Read once on the main thread at setup: `UIDevice` is main-thread-only and
@@ -551,7 +552,27 @@ pub fn init_device() {
     let _ = IOS_DEVICE.set(IosDevice {
         class,
         model: device.model().to_string(),
+        name: device.name().to_string(),
     });
+}
+
+/// The OS device name, not a random model suffix or an account credential.
+/// iOS may expose only the generic model name without Apple's name entitlement.
+#[cfg(target_os = "ios")]
+pub fn device_host() -> String {
+    IOS_DEVICE
+        .get()
+        .map_or_else(String::new, |device| device.name.clone())
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn device_host() -> String {
+    let host = keeper_core::config::read_host_label();
+    if host == "unknown-host" {
+        String::new()
+    } else {
+        host
+    }
 }
 
 /// `desktop` on macOS, Linux and Windows; on iOS `tablet` for an iPad idiom,

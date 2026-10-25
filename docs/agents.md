@@ -131,6 +131,21 @@ in the platform keychain, under `agents-server/<base URL>` (`hq/mod.rs:88`), and
 never in `keeper.db`, a settings file, a view model or a log line. How a person's first device
 gets its code is the server's business; keeper only redeems one.
 
+Pairing sends the operating-system host separately from the device's display name: the short
+hostname on desktop, or `UIDevice.name` on iOS (Story 109.1). An unavailable, empty or oversized
+host refuses enrollment locally; keeper never substitutes a model name or random account-device
+identifier. The host is read when redeeming, not when the service singleton is constructed: a
+notification's background launch may precede UIKit device-name initialization. A later attempt
+uses the now-known name without restarting keeper. The display name is simply `keeper`, never
+parsed as host identity. The server binds the host to the new credential. T4 decisions must come
+from a known host different from the claim holder's; an approval commit cannot override it.
+Existing hostless credentials cannot decide T4: re-pair them, or adopt a host through the
+sign-in enrollment introduced by Stories 109.5/109.6. On iOS 16+, `UIDevice.name` returns generic
+`iPhone` without `com.apple.developer.device-information.user-assigned-device-name`, which the
+app does not currently hold. Apple must grant that entitlement for assigned-name access. Generic
+`iPhone` differs from `hesperia`, but two iPhones would share it; the actual kalypso enrollment
+and T4 decision still require the physical-device check.
+
 **Discovery.** At every start, and after pairing, `GET /databases` says whom the token was issued
 to and which databases it opens (`hq/routes.rs:289-295`). The device holds one replica per server,
 database and person under the data directory, at `hq/servers/<server>/<database>/<actor>.sqlite`,

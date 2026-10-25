@@ -156,12 +156,13 @@ pub trait Routes: Send + Sync {
     /// `GET /databases`: whom the token was issued to and what it opens.
     fn discover<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Discovery>;
     /// `POST /pair/redeem`: the code is the credential; `name` is how the
-    /// person's other devices list this one.
+    /// person's other devices list this one; `host` binds its T4 identity.
     fn redeem<'a>(
         &'a self,
         server: &'a ServerUrl,
         code: &'a PairingCode,
         name: &'a str,
+        host: &'a str,
     ) -> Answer<'a, Redeemed>;
     /// `POST /pair/start`: a code another device of this person can redeem.
     fn start<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Issued>;
@@ -238,8 +239,9 @@ impl Routes for HttpRoutes {
         server: &'a ServerUrl,
         code: &'a PairingCode,
         name: &'a str,
+        host: &'a str,
     ) -> Answer<'a, Redeemed> {
-        Box::pin(redeem(&self.http, server, code, name))
+        Box::pin(redeem(&self.http, server, code, name, host))
     }
     fn start<'a>(&'a self, server: &'a ServerUrl, token: &'a str) -> Answer<'a, Issued> {
         Box::pin(start(&self.http, server, token))
@@ -298,17 +300,25 @@ async fn discover(
 }
 
 /// `POST /pair/redeem`: the code is the credential; `name` is how the
-/// person's other devices list this one.
+/// person's other devices list this one; `host` is bound at enrollment.
 async fn redeem(
     http: &reqwest::Client,
     server: &ServerUrl,
     code: &PairingCode,
     name: &str,
+    host: &str,
 ) -> Result<Redeemed, RouteError> {
+    // Match pairing.ts: a trimmed, non-empty host of at most 200 UTF-16 code units.
+    let host = host.trim();
+    if host.is_empty() || host.encode_utf16().count() > 200 {
+        return Err(RouteError::Unexpected(
+            "this device has no valid host name".to_owned(),
+        ));
+    }
     let response = send(
         http.post(server.route("/pair/redeem"))
             .bearer_auth(code.as_str())
-            .json(&serde_json::json!({ "name": name })),
+            .json(&serde_json::json!({ "name": name, "host": host })),
     )
     .await?;
     let found: RedeemBody = body(response).await?;
@@ -399,6 +409,30 @@ async fn push_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_invalid_host_is_refused_before_redeeming_a_code() {
+        let server = ServerUrl::parse("http://127.0.0.1:1")
+            .expect("url")
+            .expect("server");
+        let code = crate::hq::pairing::parse("0123456789ABCDEFGHJKMNPQ")
+            .expect("code")
+            .code;
+        for host in [
+            String::new(),
+            "  ".to_owned(),
+            "x".repeat(201),
+            "😀".repeat(101),
+        ] {
+            assert!(
+                matches!(
+                    redeem(&reqwest::Client::new(), &server, &code, "keeper", &host).await,
+                    Err(RouteError::Unexpected(_))
+                ),
+                "invalid host must be refused locally"
+            );
+        }
+    }
 
     #[test]
     fn a_database_name_is_safe_in_a_path_and_a_url() {
