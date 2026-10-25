@@ -519,11 +519,13 @@ const ROW_REFUSED: &str =
      json_each(o.operations_json) op \
      WHERE o.resolution = 'active' AND o.status IN ('conflict', 'rejected') \
      AND json_extract(op.value, '$.table') = ?1 AND json_extract(op.value, '$.rowId') = ?2 \
+     AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(json_extract(op.value, '$.values')) field WHERE field.key = ?3)) \
      GROUP BY o.seq ORDER BY o.seq DESC";
 
 /// Whether a commit in the outbox writes one row.
 const ROW_PENDING: &str = "SELECT 1 AS pending FROM _syncular_outbox o, json_each(o.ops_json) op \
      WHERE json_extract(op.value, '$.table') = ?1 AND json_extract(op.value, '$.rowId') = ?2 \
+     AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(json_extract(op.value, '$.values')) field WHERE field.key = ?3)) \
      LIMIT 1";
 
 /// The standing refusals of commits written here that wrote a row of one
@@ -1811,8 +1813,17 @@ impl Replica for SyncularReplica {
         })
     }
 
-    fn row_writes(&self, table: &str, row_id: &str) -> Result<RowWrites, ReplicaError> {
-        let params = [Value::from(table), Value::from(row_id)];
+    fn row_writes(
+        &self,
+        table: &str,
+        row_id: &str,
+        field: Option<&str>,
+    ) -> Result<RowWrites, ReplicaError> {
+        let params = [
+            Value::from(table),
+            Value::from(row_id),
+            field.map(Value::from).unwrap_or(Value::Null),
+        ];
         let pending = !self.query(ROW_PENDING, &params)?.is_empty();
         let mut refused = Vec::new();
         for row in self.query(ROW_REFUSED, &params)? {
@@ -2445,7 +2456,7 @@ pub(crate) mod tests {
         let replica = SyncularReplica::open(spec.clone()).expect("opens");
         assert_eq!(
             replica
-                .row_writes("instance_prefs", "ana/nixie")
+                .row_writes("instance_prefs", "ana/nixie", None)
                 .expect("reads"),
             RowWrites::default(),
             "never written"
@@ -2454,12 +2465,12 @@ pub(crate) mod tests {
             .mutate(vec![prefs_row("ana/nixie")])
             .expect("commits");
         let owed = replica
-            .row_writes("instance_prefs", "ana/nixie")
+            .row_writes("instance_prefs", "ana/nixie", None)
             .expect("reads");
         assert!(owed.pending && owed.refused.is_empty());
         assert_eq!(
             replica
-                .row_writes("instance_prefs", "kuba/nixie")
+                .row_writes("instance_prefs", "kuba/nixie", None)
                 .expect("reads"),
             RowWrites::default(),
             "another person's row"
@@ -2472,7 +2483,7 @@ pub(crate) mod tests {
         let again = SyncularReplica::open(spec.clone()).expect("reopens");
         assert!(
             again
-                .row_writes("instance_prefs", "ana/nixie")
+                .row_writes("instance_prefs", "ana/nixie", None)
                 .expect("reads")
                 .pending,
             "the outbox survived"
@@ -2480,7 +2491,7 @@ pub(crate) mod tests {
         journal_refusal(&spec.path, "c-old", "ana/nixie", "hq.v9.person_actor");
         journal_refusal(&spec.path, "c-other", "kuba/nixie", "hq.v9.person_actor");
         let writes = again
-            .row_writes("instance_prefs", "ana/nixie")
+            .row_writes("instance_prefs", "ana/nixie", None)
             .expect("reads");
         assert_eq!(writes.refused.len(), 1);
         assert_eq!(writes.refused[0].commit_id, "c-old");
@@ -2490,7 +2501,7 @@ pub(crate) mod tests {
             .supersede(vec!["c-old".to_owned()], &written)
             .expect("supersedes");
         assert!(again
-            .row_writes("instance_prefs", "ana/nixie")
+            .row_writes("instance_prefs", "ana/nixie", None)
             .expect("reads")
             .refused
             .is_empty());
@@ -2499,12 +2510,12 @@ pub(crate) mod tests {
         drop(again);
         let third = SyncularReplica::open(spec).expect("reopens");
         let writes = third
-            .row_writes("instance_prefs", "ana/nixie")
+            .row_writes("instance_prefs", "ana/nixie", None)
             .expect("reads");
         assert!(writes.refused.is_empty(), "set aside across a restart");
         assert_eq!(
             third
-                .row_writes("instance_prefs", "kuba/nixie")
+                .row_writes("instance_prefs", "kuba/nixie", None)
                 .expect("reads")
                 .refused
                 .len(),

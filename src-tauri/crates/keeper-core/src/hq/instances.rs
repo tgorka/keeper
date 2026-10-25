@@ -336,7 +336,7 @@ impl Shared {
     pub fn read(source: &Source, agent: &str, online: Online) -> Shared {
         let writes = source
             .replica
-            .row_writes(PREFS, &prefs_id(&source.actor, agent))
+            .row_writes(PREFS, &prefs_id(&source.actor, agent), None)
             .unwrap_or_else(|error| {
                 tracing::debug!(database = %source.database, %error, "the choice's delivery could not be read");
                 RowWrites::default()
@@ -828,7 +828,7 @@ pub fn set_order(
         let row_id = prefs_id(&source.actor, agent);
         let standing: Vec<String> = source
             .replica
-            .row_writes(PREFS, &row_id)
+            .row_writes(PREFS, &row_id, None)
             .map(|writes| {
                 writes
                     .refused

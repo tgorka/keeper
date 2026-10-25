@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import { SessionRowMenu } from "@/components/agents/session-row-menu";
 import type * as Ipc from "@/lib/ipc/client";
@@ -13,6 +13,7 @@ const row: AgentSessionRowVm = {
   database: "alpha",
   sessionId: "device.1",
   title: "plan",
+  titleWrite: { state: "confirmed" },
   displayName: "nixi · plan",
   handle: "jolly-pigeon-squeaks",
   createdAtMs: 1700000000000,
@@ -49,4 +50,69 @@ it("retains the proposed title after a refused rename and permits a successful r
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(screen.queryByRole("textbox")).not.toBeInTheDocument());
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("shows a later server refusal after local success and recovers the proposal on a fresh mount", async () => {
+  rename.mockResolvedValue(undefined);
+  const view = (session: AgentSessionRowVm) => (
+    <ul>
+      <li>
+        <SessionRowMenu row={session}>
+          <button type="button">{session.displayName}</button>
+        </SessionRowMenu>
+      </li>
+    </ul>
+  );
+  const mounted = render(view(row));
+  fireEvent.contextMenu(screen.getByRole("button", { name: row.displayName }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Rename…" }));
+  fireEvent.change(await screen.findByRole("textbox", { name: "Session title" }), {
+    target: { value: "hej" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(screen.queryByRole("textbox")).not.toBeInTheDocument());
+  const pending: AgentSessionRowVm = {
+    ...row,
+    title: "hej",
+    displayName: "nixi · hej",
+    titleWrite: { state: "pending" },
+  };
+  mounted.rerender(view(pending));
+  expect(screen.getByRole("status")).toHaveTextContent("waiting for the server");
+  const refused: AgentSessionRowVm = {
+    ...row,
+    titleWrite: {
+      state: "refused",
+      title: "hej",
+      sentence: "The server refused this rename: you are no longer a member of this chat.",
+    },
+  };
+  mounted.rerender(view(refused));
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "The server refused this rename: you are no longer a member of this chat.",
+  );
+  expect(screen.getByRole("button", { name: "Retry rename" })).toBeVisible();
+  mounted.unmount();
+  const reopened = render(view(refused));
+  fireEvent.contextMenu(screen.getByRole("button", { name: row.displayName }));
+  const menu = await screen.findByRole("menu");
+  expect(
+    within(menu).getByText(
+      refused.titleWrite.state === "refused" ? refused.titleWrite.sentence : "",
+    ),
+  ).toBeVisible();
+  fireEvent.click(within(menu).getByRole("menuitem", { name: "Retry rename…" }));
+  expect(await screen.findByRole("textbox", { name: "Session title" })).toHaveValue("hej");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Retry rename" }));
+  expect(await screen.findByRole("textbox", { name: "Session title" })).toHaveValue("hej");
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(screen.queryByRole("textbox")).not.toBeInTheDocument());
+  reopened.rerender(view(pending));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByRole("status")).toHaveTextContent("waiting for the server");
+  reopened.rerender(view({ ...pending, titleWrite: { state: "confirmed" } }));
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry rename" })).not.toBeInTheDocument();
 });

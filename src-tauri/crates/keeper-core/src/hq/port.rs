@@ -341,8 +341,14 @@ pub trait Replica: Send + Sync {
     /// What became of the commit `commit_id`. Answers from the file.
     fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError>;
     /// What is owed, or was refused, of the writes made here to `table`'s
-    /// row `row_id`. Answers from the file.
-    fn row_writes(&self, table: &str, row_id: &str) -> Result<RowWrites, ReplicaError>;
+    /// row `row_id`, optionally restricted to operations writing `field`.
+    /// Answers from the file.
+    fn row_writes(
+        &self,
+        table: &str,
+        row_id: &str,
+        field: Option<&str>,
+    ) -> Result<RowWrites, ReplicaError>;
     /// The standing refusals of commits written here that wrote a row of
     /// `table`, newest first, with what each wrote. Answers from the file.
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError>;
@@ -490,7 +496,7 @@ pub(crate) mod fake {
         fn delivery(&self, _: &str) -> Result<Delivery, ReplicaError> {
             Ok(Delivery::Unknown)
         }
-        fn row_writes(&self, _: &str, _: &str) -> Result<RowWrites, ReplicaError> {
+        fn row_writes(&self, _: &str, _: &str, _: Option<&str>) -> Result<RowWrites, ReplicaError> {
             Ok(RowWrites::default())
         }
         fn refused_commits(&self, _: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {

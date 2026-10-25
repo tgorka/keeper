@@ -76,6 +76,7 @@ function row(sessionId: string): AgentSessionRowVm {
     database: "beta",
     sessionId,
     title: `about ${sessionId}`,
+    titleWrite: { state: "confirmed" },
     displayName: `researcher · about ${sessionId}`,
     handle: "jolly-pigeon-squeaks",
     createdAtMs: 1780000000000,

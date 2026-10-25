@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use crate::hq::port::{Replica, ReplicaError, RowOp, WindowBase};
+use crate::hq::port::{
+    RefusedCommit, Rejection, Replica, ReplicaError, RowOp, WindowBase, CONFLICT,
+};
 
 /// A session's state in the Agents list; a session in none of them carries
 /// none.
@@ -65,6 +67,26 @@ pub struct AgentSessionRef {
     pub session_id: String,
 }
 
+/// What became of the renames written on this device, read from the
+/// replica's outbox and outcome journal — the same per-row delivery the
+/// instance choice reads ([`crate::hq::port::Replica::row_writes`]) — never
+/// inferred from the rename call returning: that only says the outbox took
+/// it. The session's own creation is not a rename.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "state", rename_all = "camelCase")]
+#[ts(export)]
+pub enum AgentSessionTitleWriteVm {
+    /// No rename written here waits or stands refused.
+    Confirmed,
+    /// A rename written here waits in the outbox for the server.
+    Pending,
+    /// The server refused the newest rename written here: the title it
+    /// proposed, for a retry, and why, as the person reads it.
+    Refused { title: String, sentence: String },
+    /// The replica could not say.
+    Unknown,
+}
+
 /// One row of the Agents window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +96,7 @@ pub struct AgentSessionRowVm {
     pub database: String,
     pub session_id: String,
     pub title: String,
+    pub title_write: AgentSessionTitleWriteVm,
     pub display_name: String,
     pub handle: String,
     #[ts(type = "number")]
@@ -539,11 +562,77 @@ impl SessionNames {
     }
 }
 
+/// The one column only a session's creation writes: a write carrying it is
+/// the session arriving, not a rename.
+const CREATED: &str = "created_at_ms";
+
+/// A refused rename, by the server's code, matched exactly.
+fn rename_refusal(rejection: &Rejection) -> String {
+    match rejection.code.as_str() {
+        "hq.v3.not_member" => {
+            "The server refused this rename: you are no longer a member of this chat.".to_owned()
+        }
+        CONFLICT => {
+            "The server refused this rename: another device changed this chat first.".to_owned()
+        }
+        _ => format!("The server refused this rename: {rejection}."),
+    }
+}
+
+/// What became of the renames of session `id` written here.
+fn title_write(source: &Source, id: &str, refused: &[RefusedCommit]) -> AgentSessionTitleWriteVm {
+    let read = |field| {
+        source
+            .replica
+            .row_writes("sessions", id, Some(field))
+            .map_err(|error| {
+                tracing::debug!(database = %source.database, %error, "the rename's delivery could not be read");
+            })
+    };
+    let (Ok(titles), Ok(creation)) = (read("title"), read(CREATED)) else {
+        return AgentSessionTitleWriteVm::Unknown;
+    };
+    // Newest first: the first refused rename is the one to show.
+    for refusal in &titles.refused {
+        let Some(values) = refused
+            .iter()
+            .find(|commit| commit.commit_id == refusal.commit_id)
+            .and_then(|commit| {
+                commit.rows.iter().find_map(|(table, values)| {
+                    (table == "sessions" && values.get("id").and_then(Value::as_str) == Some(id))
+                        .then_some(values)
+                })
+            })
+        else {
+            // Refused between the two reads, or journalled without its row.
+            return AgentSessionTitleWriteVm::Unknown;
+        };
+        if values.contains_key(CREATED) {
+            continue;
+        }
+        let Some(title) = values.get("title").and_then(Value::as_str) else {
+            return AgentSessionTitleWriteVm::Unknown;
+        };
+        return AgentSessionTitleWriteVm::Refused {
+            title: title.to_owned(),
+            sentence: rename_refusal(&refusal.rejection),
+        };
+    }
+    // While the creation itself waits, every title write waiting is the
+    // creation's or rides behind it: the chat, not a rename, is owed.
+    if titles.pending && !creation.pending {
+        AgentSessionTitleWriteVm::Pending
+    } else {
+        AgentSessionTitleWriteVm::Confirmed
+    }
+}
+
 /// One database's rows of the list.
 pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
     let names = directory(source);
     let mut instances: HashMap<String, Vec<String>> = HashMap::new();
     let identities = SessionNames::read(source);
+    let refused_titles = source.replica.refused_commits("sessions");
     let sessions = read(
         source,
         "SELECT s.id AS id, s.title AS title, s.status AS status, s.agent_actor AS agent_actor, \
@@ -613,6 +702,10 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
                 .clone();
             Some(AgentSessionRowVm {
                 database: source.database.clone(),
+                title_write: match &refused_titles {
+                    Ok(refused) => title_write(source, &id, refused),
+                    Err(_) => AgentSessionTitleWriteVm::Unknown,
+                },
                 session_id: id,
                 title: text(row, "title").to_owned(),
                 display_name,
@@ -1037,7 +1130,14 @@ pub fn create_with_first(
 
 /// Rename changes only the mutable title, preserving session identity.
 pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), ReplicaError> {
-    source.replica.mutate(vec![RowOp::Patch {
+    let standing = source
+        .replica
+        .row_writes("sessions", session_id, Some("title"))?
+        .refused
+        .into_iter()
+        .map(|refusal| refusal.commit_id)
+        .collect();
+    let commit = source.replica.mutate(vec![RowOp::Patch {
         table: "sessions".to_owned(),
         values: authored(
             source,
@@ -1045,6 +1145,7 @@ pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), Repl
         ),
         base_version: None,
     }])?;
+    source.replica.supersede(standing, &commit)?;
     source.replica.sync_now();
     Ok(())
 }
@@ -1213,6 +1314,7 @@ mod tests {
             database: db.to_owned(),
             session_id: id.to_owned(),
             title: id.to_owned(),
+            title_write: AgentSessionTitleWriteVm::Confirmed,
             display_name: format!("nixie · {id}"),
             handle: id.to_owned(),
             created_at_ms: at,

@@ -6020,6 +6020,10 @@ function hqRefuse(message: string): never {
   throw { code: "internal", message, accountId: null, retriable: false };
 }
 const sessionScenario = new URLSearchParams(location.search).get("sessions");
+// ?sessions=names&rename=refused: IPC succeeds locally, then a server
+// refusal arrives; the next rename is accepted after its pending state.
+const renameScenario = new URLSearchParams(location.search).get("rename");
+const renameAttempts = new Map<string, number>();
 // ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused|pinned
 const liveScenario = new URLSearchParams(location.search).get("live");
 /**
@@ -6074,6 +6078,7 @@ const sessionRows: AgentSessionRowVm[] =
         {
           database: "alpha",
           sessionId: "device.1",
+          titleWrite: { state: "confirmed" },
           displayName:
             sessionScenario === "names"
               ? "nixi · plan"
@@ -6100,6 +6105,7 @@ const sessionRows: AgentSessionRowVm[] =
         {
           database: "beta",
           sessionId: "device.1",
+          titleWrite: { state: "confirmed" },
           displayName: "assistant · Review the research notes",
           handle: "jolly-pigeon-squeaks",
           createdAtMs: 1700000000000,
@@ -6116,6 +6122,7 @@ const sessionRows: AgentSessionRowVm[] =
         {
           database: "alpha",
           sessionId: "device.2",
+          titleWrite: { state: "confirmed" },
           displayName: "assistant · Archive — one thousand messages",
           handle: "calm-weasel-scribbles",
           createdAtMs: 1700000000000,
@@ -6853,6 +6860,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   },
   agent_session_rename: (payload) => {
     const vm = mockSession(payload);
+    const previous = { title: vm.title, displayName: vm.displayName };
     vm.title = String(payload.title);
     vm.displayName = `${vm.agentActor} · ${vm.title.trim() || vm.handle}`;
     const row = sessionRows.find(
@@ -6861,6 +6869,28 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (row) {
       row.title = vm.title;
       row.displayName = vm.displayName;
+      row.titleWrite = { state: renameScenario === "refused" ? "pending" : "confirmed" };
+      if (renameScenario === "refused") {
+        const key = JSON.stringify([row.database, row.sessionId]);
+        const attempt = (renameAttempts.get(key) ?? 0) + 1;
+        renameAttempts.set(key, attempt);
+        const title = row.title;
+        window.setTimeout(() => {
+          if (renameAttempts.get(key) !== attempt) return;
+          if (attempt === 1) {
+            Object.assign(vm, previous);
+            Object.assign(row, previous);
+            row.titleWrite = {
+              state: "refused",
+              title,
+              sentence: "The server refused this rename: you are no longer a member of this chat.",
+            };
+          } else {
+            row.titleWrite = { state: "confirmed" };
+          }
+          publishSessions();
+        }, 1200);
+      }
     }
     publishSessions();
     return null;
@@ -6912,6 +6942,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       database: String(payload.database),
       sessionId: `device.${++sessionSerial + 10}`,
       title: String(payload.body).split("\n")[0],
+      titleWrite: { state: "confirmed" },
       displayName: `${choice.agentActor} · ${String(payload.body).split("\n")[0]}`,
       handle: "sturdy-snail-wobbles",
       createdAtMs: Date.now(),
@@ -9484,6 +9515,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         database: target.database,
         sessionId: target.sessionId,
         title: "Arrived after the tap",
+        titleWrite: { state: "confirmed" },
         displayName: "researcher · Arrived after the tap",
         handle: "lucky-salmon-sprints",
         createdAtMs: Date.now(),

@@ -157,6 +157,203 @@ fn now() -> i64 {
     sessions::now_ms()
 }
 
+/// Settle queued commits as a round would, at the replica file rather than
+/// through a live server: each keeps its real commit id and operations. A
+/// refused commit leaves the outbox with its refusal journalled; an accepted
+/// one also lands in the server's copy (`_syncular_base_<table>`), so the
+/// row outlives a restart. `title` picks the commits writing that title;
+/// `None` settles every queued commit.
+fn journal_session_writes(path: &std::path::Path, title: Option<&str>, refused: bool) {
+    use syncular_client::api::{CommitOperation, CommitOperationOutcome, RejectionRecord};
+    let mut conn = rusqlite::Connection::open(path).expect("opens outcome fixture");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("timeout");
+    let queued: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT commit_id, ops_json FROM _syncular_outbox WHERE ?1 IS NULL OR EXISTS \
+             (SELECT 1 FROM json_each(ops_json) op WHERE json_extract(op.value, '$.table') = \
+             'sessions' AND json_extract(op.value, '$.values.title') = ?1) ORDER BY seq",
+        )
+        .expect("outbox")
+        .query_map([title], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("queued writes")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert!(
+        !queued.is_empty(),
+        "the fixture must settle a real local commit"
+    );
+    let tx = conn.transaction().expect("transaction");
+    for (commit, operations) in queued {
+        let ops: Vec<CommitOperation> = serde_json::from_str(&operations).expect("wire operations");
+        let results: Vec<_> = (0..ops.len())
+            .map(|index| {
+                let op_index = i32::try_from(index).expect("small fixture");
+                if refused {
+                    CommitOperationOutcome::Error {
+                        rejection: RejectionRecord {
+                            client_commit_id: commit.clone(),
+                            op_index,
+                            code: "hq.v3.not_member".to_owned(),
+                            message: "You are no longer a member of this chat.".to_owned(),
+                            retryable: false,
+                            details: None,
+                            operation: None,
+                        },
+                    }
+                } else {
+                    CommitOperationOutcome::Applied { op_index }
+                }
+            })
+            .collect();
+        tx.execute(
+            "INSERT INTO _syncular_commit_outcomes(client_commit_id, status, recorded_at_ms, \
+             results_json, operations_json) VALUES (?1, ?2, 1, ?3, ?4)",
+            rusqlite::params![
+                commit,
+                if refused { "rejected" } else { "applied" },
+                serde_json::to_string(&results).expect("results"),
+                serde_json::to_string(&ops).expect("operations")
+            ],
+        )
+        .expect("records server outcome");
+        if !refused {
+            for op in &ops {
+                let (base, visible) = (format!("_syncular_base_{}", op.table), &op.table);
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {base} SELECT * FROM {visible} WHERE id = ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM {base} WHERE id = ?1)"
+                    ),
+                    [&op.row_id],
+                )
+                .expect("server copy of a created row");
+                for column in op.values.iter().flat_map(|values| values.keys()) {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {base} SET \"{column}\" = (SELECT \"{column}\" FROM {visible} \
+                             WHERE id = ?1) WHERE id = ?1"
+                        ),
+                        [&op.row_id],
+                    )
+                    .expect("server copy of a written column");
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM _syncular_outbox WHERE commit_id = ?1",
+            [&commit],
+        )
+        .expect("settles outbox");
+    }
+    tx.commit().expect("durable outcome");
+}
+
+#[test]
+fn a_later_refused_rename_survives_restart_and_an_accepted_retry_clears_it() {
+    use sessions::AgentSessionTitleWriteVm as Write;
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("dev1.1", NIXIE, 1, false, None))
+        .expect("session");
+    w.alpha
+        .replica
+        .mutate(session("dev1.2", NIXIE, 2, false, None))
+        .expect("other session");
+    let path = w._dir.path().join("alpha.sqlite");
+    let vm = || {
+        sessions::rows(&w.alpha, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("row")
+    };
+    assert_eq!(
+        vm().title_write,
+        Write::Confirmed,
+        "a chat whose creation waits has no rename waiting"
+    );
+    journal_session_writes(&path, None, false);
+    assert_eq!(vm().title_write, Write::Confirmed);
+    sessions::rename(&w.alpha, "dev1.1", "proposed after local success").expect("queued offline");
+    assert_eq!(
+        vm().title_write,
+        Write::Pending,
+        "local success is not server acceptance"
+    );
+    sessions::set_archived(&w.alpha, "dev1.1", true).expect("unrelated pending write");
+    journal_session_writes(&path, Some("proposed after local success"), true);
+    let expected = Write::Refused {
+        title: "proposed after local success".to_owned(),
+        sentence: "The server refused this rename: you are no longer a member of this chat."
+            .to_owned(),
+    };
+    assert_eq!(
+        vm().title_write,
+        expected,
+        "a later server refusal must reach the row VM: {:?}; {:?}",
+        w.alpha
+            .replica
+            .row_writes("sessions", "dev1.1", Some("title")),
+        w.alpha.replica.refused_commits("sessions")
+    );
+    assert_eq!(
+        sessions::rows(&w.alpha, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.2")
+            .expect("other row")
+            .title_write,
+        Write::Confirmed,
+        "another chat is unaffected"
+    );
+    w.alpha.replica.close();
+    w.alpha.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    let after_restart = || {
+        sessions::rows(&source, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("reopened row")
+    };
+    assert_eq!(
+        after_restart().title_write,
+        expected,
+        "the file, not editor memory, retains the proposal"
+    );
+    sessions::rename(&source, "dev1.1", "proposed after local success").expect("retry queued");
+    assert_eq!(
+        after_restart().title_write,
+        Write::Pending,
+        "retry supersedes the standing refusal"
+    );
+    journal_session_writes(&path, Some("proposed after local success"), false);
+    assert_eq!(
+        after_restart().title_write,
+        Write::Confirmed,
+        "accepted retry clears refusal even while the archive write still waits"
+    );
+    assert!(
+        source
+            .replica
+            .row_writes("sessions", "dev1.1", None)
+            .expect("all writes")
+            .pending,
+        "archive pending must not be reported as a pending rename"
+    );
+    source.replica.close();
+    source.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    assert_eq!(
+        sessions::rows(&source, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("row after acceptance")
+            .title_write,
+        Write::Confirmed,
+        "the supersession and confirmation survive another restart"
+    );
+}
+
 #[test]
 fn colliding_handles_append_session_numbers_without_changing_ids() {
     let w = world();
@@ -773,8 +970,9 @@ impl crate::hq::port::Replica for Staged {
         &self,
         table: &str,
         row_id: &str,
+        field: Option<&str>,
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
-        self.inner.row_writes(table, row_id)
+        self.inner.row_writes(table, row_id, field)
     }
     fn refused_commits(
         &self,

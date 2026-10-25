@@ -73,6 +73,7 @@ const row = (database: string, archived = false) => ({
   database,
   sessionId: "same.1",
   title: `${database} session`,
+  titleWrite: { state: "confirmed" as const },
   displayName: `assistant · ${database} session`,
   handle: "jolly-pigeon-squeaks",
   createdAtMs: 1780000000000,

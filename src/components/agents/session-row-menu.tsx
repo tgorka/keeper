@@ -1,4 +1,5 @@
-import { type ReactElement, useRef, useState } from "react";
+import type { ReactElement } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -9,12 +10,8 @@ import {
 } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import {
-  type AgentSessionRowVm,
-  agentSessionArchive,
-  agentSessionRename,
-  agentSessionUnarchive,
-} from "@/lib/ipc/client";
+import type { AgentSessionRowVm } from "@/lib/ipc/client";
+import { agentSessionArchive, agentSessionRename, agentSessionUnarchive } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 export function SessionRowMenu({
@@ -31,6 +28,16 @@ export function SessionRowMenu({
   const [notice, setNotice] = useState<string | null>(null);
   const [details, setDetails] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const refused = row.titleWrite.state === "refused" ? row.titleWrite : null;
+  useEffect(() => {
+    if (editing) input.current?.focus();
+  }, [editing]);
+  const beginEditing = () => {
+    setTitle(refused?.title ?? row.title);
+    setError(null);
+    setNotice(null);
+    setEditing(true);
+  };
   const finishEditing = () => {
     const item = input.current?.closest("li");
     setEditing(false);
@@ -102,22 +109,22 @@ export function SessionRowMenu({
           )}
         </ContextMenuTrigger>
         <ContextMenuContent
-          className="w-52 [&_[role=menuitem]]:min-h-11"
+          className="w-52 max-w-(--radix-context-menu-content-available-width) [&_[role=menuitem]]:min-h-11"
+          collisionPadding={8}
           onCloseAutoFocus={(event) => {
             if (editing) {
               event.preventDefault();
               input.current?.focus();
-              input.current?.select();
             }
           }}
         >
-          <ContextMenuItem
-            onSelect={() => {
-              setTitle(row.title);
-              setEditing(true);
-            }}
-          >
-            Rename…
+          {refused && (
+            <p className="px-2 py-1 text-destructive text-xs [overflow-wrap:anywhere]">
+              {refused.sentence}
+            </p>
+          )}
+          <ContextMenuItem onSelect={beginEditing}>
+            {refused ? "Retry rename…" : "Rename…"}
           </ContextMenuItem>
           <ContextMenuItem onSelect={() => void copy(row.sessionId)}>Copy id</ContextMenuItem>
           <ContextMenuItem onSelect={() => void copy(row.displayName)}>Copy name</ContextMenuItem>
@@ -132,6 +139,32 @@ export function SessionRowMenu({
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
+      {refused && (
+        <div className="min-w-0 px-3 pb-3 text-destructive text-sm [overflow-wrap:anywhere]">
+          <p role="alert">{refused.sentence}</p>
+          {!editing && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="min-h-11"
+              onClick={beginEditing}
+            >
+              Retry rename
+            </Button>
+          )}
+        </div>
+      )}
+      {row.titleWrite.state === "pending" && (
+        <p role="status" className="px-3 pb-3 text-muted-foreground text-xs">
+          Rename saved on this device; waiting for the server.
+        </p>
+      )}
+      {row.titleWrite.state === "unknown" && (
+        <p role="status" className="px-3 pb-3 text-muted-foreground text-xs">
+          Rename delivery is unavailable.
+        </p>
+      )}
       {error && (
         <p role="alert" className="break-words p-3 text-destructive text-sm">
           {error}

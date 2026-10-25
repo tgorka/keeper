@@ -738,8 +738,9 @@ impl Replica for Staged {
         &self,
         table: &str,
         row_id: &str,
+        field: Option<&str>,
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
-        self.inner.row_writes(table, row_id)
+        self.inner.row_writes(table, row_id, field)
     }
     fn refused_commits(
         &self,
