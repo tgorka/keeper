@@ -65,6 +65,46 @@ risk sections.
 - **E-mail, AI-bot client, terminal client** are future-phase items tracked in the PRD's
   post-MVP section, not storied yet.
 
+## RustSec waivers and maintenance follow-ups
+
+Reviewed **2026-10-25**. `src-tauri/deny.toml` lists individual, dated waivers;
+these are accepted limitations, not patched vulnerabilities. Run `cargo deny check`
+from `src-tauri/` after changing the dependency graph. New advisory IDs still fail.
+
+- **RSA / RUSTSEC-2023-0071:** `keeper-core -> openidconnect 4.0.1 -> rsa 0.9.10`.
+  No patched upstream release exists. Production verifies ID-token signatures using
+  public keys; it does not perform RSA private-key operations. The direct `rsa`
+  dependency and `CoreRsaPrivateSigningKey` generate/sign fixtures under `cfg(test)`.
+  Follow-up: upgrade `openidconnect` when it adopts a fixed RSA implementation;
+  reassess before introducing private-key signing/decryption in production.
+- **ZIP / RUSTSEC-2026-0367, -0368, -0369:** `keeper-core` and
+  `keeper -> tauri-plugin-updater 2.10.1` require `zip 4.6.1`; fixes require 9.0.0.
+  The document reader only reads named, size-bounded OOXML parts, never extracts
+  entries or applies archive permissions. The updater's ZIP extraction is Windows-only:
+  the Unix SUID/SGID and permission-setting paths are not used. Its download path
+  verifies the configured minisign signature before installation, so untrusted
+  archive bytes cannot reach it through keeper's update flow. The extraction API
+  remains reachable for signed Windows releases; compromise of the trusted release
+  publisher is a residual risk, not a claim that the dependency is fixed.
+  Follow-up: upgrade `tauri-plugin-updater` when it supports `zip >=9`, then upgrade
+  keeper's direct ZIP dependency and remove all three waivers.
+
+No unmaintained crate is replaced in this lane. Each follow-up upgrades or replaces
+the dependency that owns it, rather than substituting an incompatible transitive crate:
+
+| Advisory | Unmaintained crate | Pulled by | Follow-up |
+| --- | --- | --- | --- |
+| RUSTSEC-2026-0319 | `anymap2` | `matrix-sdk 0.19.1` | Upgrade Matrix SDK when it replaces the map implementation. |
+| RUSTSEC-2024-0370 | `proc-macro-error` | `glib-macros`, `gtk3-macros`, through Tauri's Linux GTK3 stack | Upgrade Tauri/GTK when their macros replace this dependency. |
+| RUSTSEC-2025-0081 | `unic-char-property` | `unic-ucd-ident -> urlpattern -> tauri-utils` | Upgrade `urlpattern` through Tauri when its Unicode implementation is replaced. |
+| RUSTSEC-2025-0075 | `unic-char-range` | `unic-char-property` / `unic-ucd-ident -> urlpattern -> tauri-utils` | Upgrade `urlpattern` through Tauri when its Unicode implementation is replaced. |
+| RUSTSEC-2025-0080 | `unic-common` | `unic-ucd-version -> unic-ucd-ident -> urlpattern -> tauri-utils` | Upgrade `urlpattern` through Tauri when its Unicode implementation is replaced. |
+| RUSTSEC-2025-0100 | `unic-ucd-ident` | `urlpattern -> tauri-utils` | Upgrade `urlpattern` through Tauri when its Unicode implementation is replaced. |
+| RUSTSEC-2025-0098 | `unic-ucd-version` | `unic-ucd-ident -> urlpattern -> tauri-utils` | Upgrade `urlpattern` through Tauri when its Unicode implementation is replaced. |
+| RUSTSEC-2026-0371 | `zbus_names` | `zbus` / `zbus_macros`, through `notify-rust` and `tauri-plugin-opener` | Upgrade those parents to their zbus 6 integration (names moved into zbus). |
+| RUSTSEC-2026-0370 | `zvariant` | `zbus` / `zbus_macros` / `zbus_names`, through `notify-rust` and `tauri-plugin-opener` | Upgrade those parents to their zbus 6 integration (wire format moved into zbus). |
+| RUSTSEC-2026-0372 | `zvariant_derive` | `zvariant`, through the same zbus 5 parents | Upgrade those parents to their zbus 6 integration (derives moved into zbus). |
+
 ## Linux desktop (verified 2026-08-02 on Ubuntu 26.04 + XFCE/ayatana)
 
 keeper builds and runs on `x86_64-unknown-linux-gnu` and was exercised end to end against a
