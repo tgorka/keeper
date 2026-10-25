@@ -5,6 +5,7 @@ import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
 import { useSessionAttachmentDraft } from "@/components/agents/session-attachment-draft";
 import { SessionAttachments } from "@/components/agents/session-attachments";
+import { SessionContext } from "@/components/agents/session-context";
 import { SessionControls } from "@/components/agents/session-controls";
 import { SessionInstances } from "@/components/agents/session-instances";
 import { SessionPeople } from "@/components/agents/session-people";
@@ -507,6 +508,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 await agentSend(target, body);
               }}
               attachmentPreview={attachmentDraft.preview}
+              sendAccessory={vm?.context ? <SessionContext context={vm.context} /> : undefined}
             />
           </ConversationStoresProvider>
         </div>

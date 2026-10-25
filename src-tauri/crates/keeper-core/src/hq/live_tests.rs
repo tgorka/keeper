@@ -511,6 +511,53 @@ const SHOW_ALL: AgentViewPrefsVm = AgentViewPrefsVm {
 };
 
 #[test]
+fn answer_context_survives_replica_projection_only_for_trace_readers() {
+    for reader in [true, false] {
+        let w = world(reader);
+        let parts: Vec<_> = [
+            "persona",
+            "memory",
+            "tools",
+            "mcp",
+            "history",
+            "attachments",
+            "tool_results",
+        ]
+        .into_iter()
+        .map(|part| json!({"part": part, "tokens": 10, "estimated": true}))
+        .collect();
+        let mut metadata = json!({"context": {"used": 70, "window": 200, "parts": parts},
+            "usage": {"prompt_tokens": 9000}});
+        w.put(vec![w.answer("answer", metadata.clone())]);
+        let view = w.view(&opened(AgentViewPrefsVm::default(), &[], &[]));
+        assert_eq!(view.context.as_ref().map(|c| c.used), reader.then_some(70));
+        assert_eq!(
+            view.context.as_ref().and_then(|c| c.percent.as_deref()),
+            reader.then_some("35%")
+        );
+        metadata["context"]["window"] = Value::Null;
+        w.put(vec![w.answer("answer", metadata.clone())]);
+        let unknown = w.view(&opened(AgentViewPrefsVm::default(), &[], &[]));
+        if reader {
+            assert_eq!(
+                unknown.context.expect("unknown window").summary,
+                "used ≈ 70 tokens"
+            );
+        } else {
+            assert!(unknown.context.is_none());
+        }
+        metadata["context"]["parts"][0]["tokens"] = json!(71);
+        w.put(vec![w.answer("answer", metadata)]);
+        assert!(w.view(&opened(SHOW_ALL, &[], &[])).context.is_none());
+        w.put(vec![w.answer(
+            "old answer",
+            json!({"usage": {"prompt_tokens": 9000}}),
+        )]);
+        assert!(w.view(&opened(SHOW_ALL, &[], &[])).context.is_none());
+    }
+}
+
+#[test]
 fn a_late_opener_sees_everything_so_far_and_the_final_row_replaces_it_byte_for_byte() {
     let w = world(true);
     w.put(vec![

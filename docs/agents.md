@@ -264,6 +264,24 @@ first token, duration, finish reason and error. Missing measurements have no lab
 filled with zero. A reported zero remains a real measurement. Answer markdown renders inert text:
 model-written HTML does not become HTML, and model-written links do not navigate.
 
+**Context window** beside Send opens a side **Details** panel. A trace reader sees the latest
+answer's last-round occupancy (`metadata.context.used`), not the accumulated billing usage in
+`metadata.usage`. The labelled ring and its tooltip show used/window and the rounded percentage;
+an unknown model window shows **used ≈ N tokens**, with no window percentage or ring. Tab from
+the message field to the context button, then Enter to open Details; Escape closes it and returns
+focus. Its seven expandable parts are system and persona, memory, built-in tools, MCP tools,
+history, attachments and this turn's tool results. Counts and shares are estimates, marked **≈**.
+Rust validates and calculates the view, independently of the Show details preference. A person
+without trace access receives no context view. Missing or old metadata omits the control rather
+than inventing zero; malformed counts, duplicate/missing categories or parts above the used count
+are refused with a tracing warning. Over-window occupancy keeps its real percentage label while
+the ring and accessible meter stop at 100%.
+
+For the context viewing aid, `?sessions=launch` opens alpha with 48000/200000 tokens (24%); beta,
+**Review the research notes**, has the same used count and an unknown window. Their source answer
+metadata deliberately carries different cumulative usage (125000 input tokens). These are mock
+projections, not evidence of a running model or the packaged app.
+
 **Tools** contains only tools the answering instance offers, from its definition and container.
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
 unknown or absent offered-tools list renders no Tools control, and neither does a session that
