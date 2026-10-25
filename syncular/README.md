@@ -19,6 +19,7 @@ keeper ships no server URL).
 | `syncular.generated.ts` | `schema`, a `ServerSchema`, and the row types (generated) |
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
 | `limits.json` | the bounds both sides read: `attachmentMaxBytes`, the most bytes one attachment's blob may have (26,214,400); hand-written, never generated |
+| `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
 
 Everything generated comes from `@syncular/typegen` 0.32.1 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -47,17 +48,23 @@ request a single variable alone, so a wildcard would be a public read of every t
 | variable | value | granted to a person | granted to an agent instance | tables |
 | --- | --- | --- | --- | --- |
 | `dir` | the name of the database the server serves | when the person belongs to it | when the instance subscribes to it | `actors`, `clients`, `agent_profiles` |
-| `session` | a session id | the sessions the actor is a member of, and the next 16 unused ids of each of the actor's clients | the same | `sessions`, `session_members`, `claims`, `session_tool_switches`, `turn_chunks`, `attachments` |
+| `session` | a session id | the sessions the actor is a member of, and the next 16 unused ids of each of the actor's clients | the same | `sessions`, `session_members`, `claims`, `session_tool_switches`, `session_settings`, `session_drives`, `turn_chunks`, `attachments` |
 | `member` | an actor id | itself | itself | `session_members` |
 | `page` | a page key | for each granted session, the months from its creation to now | the same | `messages` |
 | `trace` | a page key | as `page`, only for sessions where the person's membership has `reads_trace` | as `page`, for the sessions the agent is a member of | `reasoning`, `tool_calls`, `approvals` |
 | `actor` | an actor id | itself | itself | `instance_prefs` |
 | `agent` | an agent's actor id | the agents of this database that serve the person | itself | `agent_memory` |
 | `family` | a family name | the families of this database that serve the person | its own family | `agent_memory` |
+| `person_agent` | a person-agent key (*Ids*) | the key of (itself, agent) for each agent of this database that serves the person | the key of (person, itself) for each person of this database it serves | `standing_grants` |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
 `trace`. `turn_chunks` carry text only.
+
+A `person_agent` value names one person and one agent, and no other pair has it, so a person
+reads only the standing grants they wrote, and an agent instance only those written about its own
+agent: neither reads a grant another person wrote about the same agent, or one the same person
+wrote about another agent.
 
 ## Ids
 
@@ -66,13 +73,20 @@ Every id a client creates can be minted offline:
 - a session id is `<clientId>.<n>`, `n` a decimal integer the client counts up; the server grants
   each client its next 16 unused ids, so a device creates a session and its first message in one
   commit without a round trip;
-- a row of `messages`, `turn_chunks`, `reasoning`, `tool_calls`, `approvals`, `attachments` or
-  `agent_memory`, and a turn id, is a ULID;
+- a row of `messages`, `turn_chunks`, `reasoning`, `tool_calls`, `approvals`, `attachments`,
+  `agent_memory` or `standing_grants`, and a turn id, is a ULID;
 - a row there is at most one of is keyed by what it belongs to: `session_members.id` is
-  `<session_id>/<actor_id>`, `instance_prefs.id` is `<person_actor>/<agent_actor>`, `claims` and
-  `session_tool_switches` are keyed by `session_id`, `agent_profiles.id` is the instance's client
-  id;
-- `actors` and `clients` are written by the server's own service client, never by a device.
+  `<session_id>/<actor_id>`, `instance_prefs.id` is `<person_actor>/<agent_actor>`, `claims`,
+  `session_tool_switches`, `session_settings` and `session_drives` are keyed by `session_id`,
+  `agent_profiles.id` is the instance's client id;
+- `actors` and `clients` are written by the server's own service client, never by a device;
+- an actor id never contains `/` or `:`, so `<session_id>/<actor_id>` and every key below split
+  one way only; a server refuses a directory naming such an actor;
+- a **person-agent key** (`standing_grants.person_agent_key`, the `person_agent` scope) is
+  `<n>:<person_actor>/<agent_actor>`, `n` the number of UTF-8 bytes of `person_actor` in decimal
+  without leading zeros: `6:tgorka/nixi`. The length decides where the person ends, so two
+  different (person, agent) pairs never share a key, whatever the ids hold; `vocabulary.json`'s
+  `personAgentKey.examples` holds keys every implementation must reproduce.
 
 ## Page keys
 
@@ -118,7 +132,13 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `description`, `avatar_blob`, `definition_hash`, `image_digest`, `started_at_ms`, `dir`, `tools`
   (schema 3: a JSON array of the tool names the instance offers — its definition's tools less
   those its container withholds — written when it starts; absent until an instance says, and a
-  client then offers no tool switch).
+  client then offers no tool switch), and from schema 4 what a person may pick for a session of
+  it: `models` (a JSON array of model ids, its definition's ceiling) and `default_model` (the one
+  it uses when nobody picked), `efforts` (a JSON array of the reasoning efforts it can send, each
+  one of `vocabulary.json`'s `efforts`) and `default_effort` (the one it sends when nobody picked;
+  absent when it sends none), and `drives` (a JSON array of the drive names it can read: its
+  definition's ceiling less what its container does not mount). Each is absent until an instance
+  says, and a client then offers no picker for it.
 - **`sessions`** — `title`, `status`, `agent_actor`, `created_by_actor`, `created_by_client`,
   `preferred_client` (the instance the person asked for), `parent_session` (a delegated child's
   parent), `invite` (a JSON array of actor ids), `archived`, `heard_until` (the claim holder's mark
@@ -133,6 +153,14 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `holder_client`, `epoch`, `renewed_at_ms`, `released`.
 - **`session_tool_switches`** — one row per session: `tools_off`, a JSON array of the tool names a
   person switched off for it, and `updated_at_ms`. There is no column that switches a tool on.
+- **`session_settings`** (schema 4) — one row per session: `model` and `effort`, what a person
+  picked for the session's next turns, each absent for the agent's default, and `updated_at_ms`.
+  The pick holds from the next turn until it is changed; a model the agent no longer offers falls
+  back to its default, and the answer's `metadata` says so.
+- **`session_drives`** (schema 4) — one row per session: `drives`, a JSON array of the drive names
+  a person ticked for the session's agent to read, and `updated_at_ms`. No row, or an empty array,
+  is no drive: none is ticked until a person ticks it. It can only name drives the agent offers
+  (`agent_profiles.drives`), and it grants reading, never writing.
 - **`turn_chunks`** — the committed text of a streaming answer: `session_id`, `turn_id`, `seq`,
   `text`; deleted when the turn's message is written.
 - **`attachments`** — `session_id`, `message_id`, `blob_ref` (a syncular blob: canonical BlobRef JSON
@@ -152,7 +180,9 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `result`, `result_blob`, `started_at_ms`, `ended_at_ms`.
 - **`approvals`** — `session_id`, `page_key`, `tool_call_id`, `tier`, `binding_digest`, `summary`,
   `approvers` (a JSON array of actor ids), `state` (`pending` | `approved` | `denied` | `consumed`
-  | `expired`), `decided_by_actor`, `decided_by_client`, `consumed_by_client`, `expires_at_ms`.
+  | `expired`), `decided_by_actor`, `decided_by_client`, `consumed_by_client`, `expires_at_ms`,
+  `grant_id` (schema 4: the standing grant that decided an approval born `approved`; absent on
+  every approval a person decides).
 - **`instance_prefs`** — one person's choice of instance for one agent: `person_actor`,
   `agent_actor`, `default_client`, `fallback` (a JSON array of client ids, in order),
   `updated_at_ms`.
@@ -162,10 +192,33 @@ last wrote it. Times are UTC milliseconds since the epoch.
   requests: `agentMemoryOwn` (`agent` alone) receives one agent's rows, and `agentMemoryFamily`
   (`family` alone) receives every row of a family, its peers' included. A subscription requesting
   both would receive only the rows of that agent in that family.
+- **`standing_grants`** (schema 4) — one person's "always allow" for one agent:
+  `person_agent_key` (the person-agent key of the two, *Ids*), `person_actor`, `agent_actor`,
+  `session_id` (absent: a standing grant, for every session of this database the two share; set:
+  "This session only", the grant applies in that one session and nowhere else), `tool` (a tool
+  name as `tool_calls.name` records it), `args_match` (the argument scope, below), `max_tier` (the
+  highest tier it covers, one of `vocabulary.json`'s `grantTiers`), `expires_at_ms` (absent: until
+  revoked), `revoked_at_ms`, `granted_by_client` (the device it was granted from), `created_at_ms`.
+  It stands in for that person's decision on a later approval of the same agent, tool and
+  argument scope, in a session of this database, under V8 below; every use is still its own
+  approval row, with its own digest, consumed once. `args_match` is a JSON object: for `run`,
+  `{"program": …}` with the program as the call landed it (its `argv[0]`), and optionally
+  `"arg"`, its first argument; for every other tool, `{}`. A grant never covers a call that
+  writes a drive (*V15*).
 
 Declared references, enforced by the server at commit: `clients` and `agent_profiles` need their
-actor; `claims`, `session_tool_switches`, `turn_chunks` and `attachments` need their session and go
-with it; an approval needs its tool call.
+actor; `claims`, `session_tool_switches`, `session_settings`, `session_drives`, `turn_chunks` and
+`attachments` need their session and go with it; an approval needs its tool call.
+
+## Session handles
+
+A session's handle is a name a person can say, such as `noble-hedgehog-struts`: three words drawn
+from `vocabulary.json`'s `handle` lists by the SHA-256 of the session id's UTF-8 bytes. Bytes 0–1,
+2–3 and 4–5 of the digest, each read as a big-endian unsigned 16-bit number modulo its list's
+length, pick the adjective, the noun and the verb, joined by `-`. `handle.examples` holds session
+ids with the handle each must give, so every implementation can check itself. A handle is display
+only: it is a pure function of the id, never a key, a scope value or a lookup path, and two
+sessions may share one, which a client tells apart by the session number.
 
 ## The live answer
 
@@ -195,15 +248,18 @@ A row validator sees the commit's actor; the whole-commit validator also sees it
 every operation of the commit. These rules hold against a client that does not follow them. A
 validator is the server's own code and appears in no generated file, so this list is the
 contract. "The service client" is the server writing on its own behalf; "the registry" is the
-server's own list of people, agents and the databases of each. A rule broken refuses the whole
-commit.
+server's own list of people, agents and the databases of each, and of who may read each drive. A
+rule broken refuses the whole commit.
 
 1. **V1 — authorship.** `author_actor` is the commit's actor and `author_client` is the commit's
    client, on every row written. The server also refuses a commit whose client is not the client
    the caller's credential was issued to.
 2. **V2 — the directory.** `actors` and `clients` are written only by the service client. An
    `agent_profiles` row is written only by the instance it describes: its `id` is the commit's
-   client and its `actor_id` the commit's actor.
+   client and its `actor_id` the commit's actor. Its `models`, `efforts` and `drives` are each
+   absent or a JSON array of distinct non-empty strings, every effort one of `vocabulary.json`'s
+   `efforts`; `default_model` is absent or one of `models`, and `default_effort` absent or one of
+   `efforts`.
 3. **V3 — sessions.** A new session's id starts with the commit's client id followed by `.`.
    `agent_actor`, `created_by_actor`, `created_by_client` and `parent_session` never change. A
    session is inserted only by a person, or by an instance of an agent the registry lets start work;
@@ -236,6 +292,18 @@ commit.
    `approved` becomes `consumed` only by the claim holder, with `consumed_by_client` the commit's;
    a decision on a tier-4 approval comes only from a client whose host is not the claim holder's
    host. A consumption carries the version it read, so a second consumer conflicts.
+   A new approval is `pending`, with no decision and no `grant_id`, unless it is born `approved`
+   by a standing grant: then its `grant_id` names a `standing_grants` row of this database which,
+   in the commit's candidate state, is not revoked and not expired by the server's clock; whose
+   `agent_actor` is the session's agent; whose `person_actor` is named in `approvers` and is a
+   person or owner member of the session whose `reads_trace` holds; whose `session_id` is absent
+   or is the approval's session, which is then open and not archived; whose `tool` is the
+   approval's tool call's `name` and whose `args_match` holds of that call's `args`; and whose
+   `max_tier` is not below the approval's `tier`. The tier is one of `grantTiers`, never `T4`, the
+   session is not `untrusted`, and the call writes no drive: a grant never decides a drive write,
+   whatever its tier, the session's trust or the spelling of its tool's name. Its `decided_by_actor` is the grant's `person_actor`, its `decided_by_client`
+   the grant's `granted_by_client`, and it is consumed as any approved row is. `grant_id` never
+   changes.
 9. **V9 — preferences.** `instance_prefs.person_actor` is the commit's actor.
 10. **V10 — memory.** An agent instance writes only rows whose `agent_actor` is its actor and
     whose `family` is its family, and only `journal`, `proposal` and `family` entries; `user` and
@@ -252,6 +320,37 @@ commit.
 13. **V13 — trust.** `sessions.trust` is absent, `trusted` or `untrusted`, and only rises: a write
     that lowers it is refused. It is raised only by the client holding the session's claim or by a
     person who is a member of the session.
+14. V14 is not a client's rule: a server's own import of older records uses the number.
+15. **V15 — standing grants.** `standing_grants` is written only by a person, never by an agent:
+    `person_actor` is the commit's actor, `agent_actor` an agent of this database that serves
+    them, and `person_agent_key` the person-agent key of the two. A grant is inserted with
+    `granted_by_client` the commit's client, no `revoked_at_ms`, a `created_at_ms` the server's
+    clock accepts, an `expires_at_ms` absent or later, a `max_tier` among `grantTiers`, and an
+    `args_match` of the tool's shape (*Tables* above). Its `tool` is one the server knows writes no
+    drive — an allow-list of tools, never a refusal of names — and never `delegate`: a grant never
+    covers a drive write, whatever its tier, the session's trust or how its tool's name is
+    spelled. A `session_id` names a session of this database, open and not archived, whose
+    `agent_actor` is the grant's agent and in which the grant's person is a person or owner member.
+    After that the one change is its revocation: its person sets `revoked_at_ms`, once, from any of
+    their devices, and nothing else moves — `session_id` never changes. A session-bound grant ends
+    with its session: when the session is archived or deleted the server revokes it
+    (`revoked_at_ms`), so a session archived and brought back does not bring the grant back. A grant is never deleted, so every approval that names one
+    can still be read beside it. No write widens a grant: a wider one is a new grant.
+16. **V16 — session settings.** `session_settings` is written only by a person who is a member of
+    the session (role `owner` or `person`), never by an agent; its session is a session of this
+    database and never changes. `model` is absent or one of the `models` an `agent_profiles` row
+    of the session's agent offers; `effort` is absent or one of `vocabulary.json`'s `efforts` and
+    one of the `efforts` such a row offers.
+17. **V17 — session drives.** `session_drives` is written only by a person who is a member of the
+    session (role `owner` or `person`), never by an agent; its session is a session of this
+    database and never changes. `drives` is a JSON array of distinct drive names, each one an
+    `agent_profiles` row of the session's agent offers, and each readable by every person of this
+    database: a drive is ticked in a database only when everyone who reads that database may read
+    the drive.
+
+A server that does not enforce one of these rules yet refuses every write the rule governs: a
+table it does not serve under its rule is written by nobody, and an approval naming a grant is
+refused while grants are.
 
 An attachment's `size` is at most `limits.json`'s `attachmentMaxBytes` (26,214,400) bytes, and so is
 its blob; its message is in the same session. A client refuses a larger file before it uploads

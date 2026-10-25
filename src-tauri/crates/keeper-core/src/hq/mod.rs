@@ -59,6 +59,7 @@ pub mod spoken;
 pub mod syncular;
 pub mod timeline;
 pub mod vm;
+pub mod vocabulary;
 pub mod window;
 
 use std::collections::HashMap;
