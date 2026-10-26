@@ -6600,22 +6600,40 @@ function startLiveFixture(vm: AgentSessionViewVm) {
     if (tick === 4) {
       turn.tool = "web_search";
       turn.steps = [
-        { id: "tool-live", name: "web_search", status: "started", startedAtMs: Date.now() },
+        {
+          id: "tool-live",
+          name: "web_search",
+          status: "started",
+          statusLabel: "Started",
+          startedAtMs: Date.now(),
+        },
       ];
     }
-    if (tick === 24) {
+    if (tick === 24 && liveScenario !== "stopped") {
       delete turn.tool;
       turn.steps[0] = {
         ...turn.steps[0],
         status: "done",
+        statusLabel: "Finished",
         result: "Found the release checklist. No files changed.",
         endedAtMs: Date.now(),
       };
     }
     if (tick === 90) {
       clearInterval(timer);
-      if (liveScenario === "stopped") turn.stopped = true;
-      else {
+      if (liveScenario === "stopped") {
+        // keeper-hq's `end_cut`: a call still running when its instance
+        // stopped ends `interrupted`, and Rust names it.
+        delete turn.tool;
+        turn.steps[0] = {
+          ...turn.steps[0],
+          status: "interrupted",
+          statusLabel: "Interrupted",
+          result: "The agent restarted while this call ran; it may have had its effect.",
+          endedAtMs: Date.now(),
+        };
+        turn.stopped = true;
+      } else {
         vm.messages.push({
           id: `final-${vm.database}`,
           role: "agent",

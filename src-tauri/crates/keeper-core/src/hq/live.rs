@@ -72,9 +72,28 @@ pub enum AgentToolStepStatusVm {
     Refused,
     Interrupted,
     Parked,
+    /// keeper-hq's importer (`hq-import` `plan.rs`): the tool ran and failed.
+    Failed,
+    /// A status word keeper does not know. Never taken for running work.
+    Unknown,
 }
 
 impl AgentToolStepStatusVm {
+    /// The `tool_calls.status` word as keeper-hq writes it: `sink.rs`
+    /// (`started`, `done`, `refused`, `parked`, `interrupted`), `worker.rs`
+    /// `end_cut`, `approvals.rs`, and the importer's `failed`.
+    pub fn of(word: &str) -> Self {
+        match word {
+            "started" => Self::Started,
+            "done" => Self::Done,
+            "refused" => Self::Refused,
+            "interrupted" => Self::Interrupted,
+            "parked" => Self::Parked,
+            "failed" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Started => "Started",
@@ -82,6 +101,8 @@ impl AgentToolStepStatusVm {
             Self::Refused => "Refused",
             Self::Interrupted => "Interrupted",
             Self::Parked => "Paused",
+            Self::Failed => "Failed",
+            Self::Unknown => "Unknown status",
         }
     }
 }
@@ -93,8 +114,7 @@ impl AgentToolStepStatusVm {
 pub struct AgentToolStepVm {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    #[ts(as = "Option<String>", optional)]
+    /// Rust's words for the status; the renderer shows them as they are.
     pub status_label: String,
     pub status: AgentToolStepStatusVm,
     /// The outcome, or the refusal's sentence, once it ended.
@@ -456,17 +476,19 @@ pub fn extras(
             let (Some(id), Some(turn)) = (opt_text(&row, "id"), opt_text(&row, "turn_id")) else {
                 continue;
             };
-            let status = match text(&row, "status") {
-                "done" => AgentToolStepStatusVm::Done,
-                "refused" => AgentToolStepStatusVm::Refused,
-                "interrupted" => AgentToolStepStatusVm::Interrupted,
-                "parked" => AgentToolStepStatusVm::Parked,
-                _ => AgentToolStepStatusVm::Started,
+            let word = text(&row, "status");
+            let status = AgentToolStepStatusVm::of(word);
+            let status_label = match status {
+                AgentToolStepStatusVm::Unknown if !word.trim().is_empty() => {
+                    let word: Vec<&str> = word.split_whitespace().collect();
+                    format!("{} \"{}\"", status.label(), word.join(" "))
+                }
+                _ => status.label().to_owned(),
             };
             steps.entry(turn).or_default().push(AgentToolStepVm {
                 id,
                 name: text(&row, "name").to_owned(),
-                status_label: status.label().to_owned(),
+                status_label,
                 status,
                 result: row.get("result").and_then(Value::as_str).map(str::to_owned),
                 started_at_ms: int(&row, "started_at_ms"),

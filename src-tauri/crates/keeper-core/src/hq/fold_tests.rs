@@ -940,3 +940,100 @@ fn a_cut_row_and_a_late_close_of_one_turn_both_stay_in_items() {
     );
     assert_items_account_for_legacy(&view);
 }
+
+/// A `tool_calls` row as keeper-hq's importer writes it (`hq-import`
+/// `plan.rs`): first `interrupted`, then its result's outcome word.
+fn imported_call(w: &World, id: &str, turn: &str, status: &str, result: &str) -> RowOp {
+    upsert(
+        "tool_calls",
+        json!({"id": id, "session_id": "dev1.1", "page_key": w.page(), "turn_id": turn,
+               "name": "run", "args": "{\"argv\":[\"make\"]}", "status": status,
+               "result": result, "result_blob": null, "started_at_ms": w.at + 10,
+               "ended_at_ms": w.at + 20, "created_at_ms": w.at + 10,
+               "author_actor": "alpha", "author_client": "import"}),
+    )
+}
+
+#[test]
+fn an_imported_failed_tool_call_reads_failed_and_never_working() {
+    let w = world(true);
+    w.put(vec![
+        imported_call(&w, "c1", TURN, "failed", "exit status 1"),
+        // The importer's terminal answer (`plan.rs`): its own metadata shape.
+        w.answer(
+            "The build failed.",
+            json!({"model": "m", "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                   "total_tokens": 15}, "ttft_ms": 300, "duration_ms": 4000,
+                   "finish": "stop", "tool_calls": 1, "rounds": 2}),
+        ),
+        // An imported turn whose answer had no text: work only.
+        imported_call(&w, "c2", "t-tools", "failed", "no such file"),
+    ]);
+    let view = w.view(&Opened::default());
+    let answered = view.folds.iter().find(|f| f.turn_id == TURN).expect("t1");
+    assert_eq!(state(answered), (json!("done"), "Finished"));
+    assert_eq!(
+        (
+            serde_json::to_value(answered.steps[0].status).expect("status"),
+            answered.steps[0].status_label.as_str()
+        ),
+        (json!("failed"), "Failed")
+    );
+    assert_eq!(answered.summary, "Worked for 4 s · ran 1 command");
+    assert_eq!(
+        answered
+            .failures
+            .iter()
+            .map(|f| f.sentence.as_str())
+            .collect::<Vec<_>>(),
+        ["run · Failed: exit status 1"]
+    );
+    let tools = view
+        .folds
+        .iter()
+        .find(|f| f.turn_id == "t-tools")
+        .expect("work-only turn");
+    assert_eq!(state(tools), (json!("failed"), "Failed"));
+    assert!(view.live.is_empty());
+}
+
+#[test]
+fn an_unknown_step_status_never_outranks_the_close() {
+    let w = world(true);
+    w.put(vec![
+        imported_call(&w, "c1", TURN, "frobbed\nlater", "whatever happened"),
+        w.answer("Done.", json!({"finish": "stop", "duration_ms": 2000})),
+    ]);
+    let view = w.view(&Opened::default());
+    let fold = &view.folds[0];
+    assert_eq!(
+        state(fold),
+        (json!("done"), "Finished"),
+        "the close decides, never Working"
+    );
+    assert_eq!(
+        fold.steps[0].status_label, "Unknown status \"frobbed later\"",
+        "Rust names what it did not understand, on one line"
+    );
+    assert_eq!(
+        fold.failures
+            .iter()
+            .map(|f| f.sentence.as_str())
+            .collect::<Vec<_>>(),
+        ["run · Unknown status \"frobbed later\": whatever happened"]
+    );
+    assert!(
+        fold.summary.starts_with("Worked for 2 s"),
+        "{}",
+        fold.summary
+    );
+    // Every close, not just a normal one, still decides.
+    w.put(vec![w.answer(
+        "Stopped.",
+        json!({"finish": "cancelled", "error": STOPPED_REASON}),
+    )]);
+    assert_eq!(
+        state(&w.view(&Opened::default()).folds[0]),
+        (json!("stopped"), "Stopped")
+    );
+}

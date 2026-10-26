@@ -340,7 +340,9 @@ not evidence for that target.
 ## Live answers, thinking and details
 
 An open answer grows as its text arrives. Its current tool is named below the text. Tool-call
-disclosures show a reader when a call starts, when it finishes or is refused, and its result.
+disclosures show a reader each call's status in Rust's own words (`statusLabel`: Started,
+Finished, Refused, Interrupted, Paused, Failed, or `Unknown status "<word>"` for a word keeper does
+not know) and its result; the renderer maps no status itself.
 The transcript scrolls inside its own viewport: a growing answer does not move the composer or
 replace an unsent draft. Scrolling back stops following the newest text until you return to the
 bottom. If the claim ends without a final message, the retained text says **The answer stopped.**
@@ -401,7 +403,8 @@ with the agent's `messages` row for the turn (`turn_id`) once it holds it.” Th
 that projection, never folds chunks or presence itself.
 
 The session VM also supplies Rust-authored `items` and `folds` for the per-turn renderer
-cutover (109.14); the current renderer still uses the unchanged `messages` and `live` fields.
+cutover (109.14); the current renderer still draws `messages` and `live`, whose tool steps carry
+the same Rust status labels.
 Each turn has one fold containing its earlier agent-message IDs, permitted reasoning and
 tool steps, a summary, reported duration, status label and single-line failures. A persisted
 terminal answer is identified by the runtime Closed row's `metadata.finish` key, including
@@ -419,8 +422,11 @@ arriving after the answer update that same fold, never add work below it.
 The status reads each runtime close explicitly: `cancelled` (a person's Stop) says
 **Stopped**, as does a person's stop row naming a turn that has not closed yet; `cut` (the
 instance restarted mid-turn) and interrupted work say **Interrupted**; `failed` (a broken
-stream or a provider error) says **Failed**; only `content_filter`, or tool-only work that
-ended refused, says **Refused**. `stop`, `length`, `tool_calls`, a null reason or a provider's
+stream or a provider error) says **Failed**, as does work-only history whose tool call failed
+(the importer's `failed` step); only `content_filter`, or tool-only work that ended refused,
+says **Refused**. A tool step whose status word keeper does not know is never running work: the
+turn reads by its close, and the step keeps one failure line naming the word.
+`stop`, `length`, `tool_calls`, a null reason or a provider's
 own word is an ordinary close. Parked work says **Paused** unless an unexpired pending
 approval actually asks the person, in which case it says **Waiting for you**. Trace access and
 Show thinking still gate the corresponding fold contents; Show details does not gate the

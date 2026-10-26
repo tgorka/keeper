@@ -187,7 +187,11 @@ pub(super) fn project(
             || active.is_some_and(|turn| turn.stopped)
             || steps.iter().any(|step| step.status == Step::Interrupted);
         let waiting = pending.contains(id);
+        // Only a step the runtime says started is running work; an unknown
+        // status word never is, so it can never outrank the turn's close.
         let running = active.is_some() || steps.iter().any(|step| step.status == Step::Started);
+        let failed = close == Some(Close::Failed)
+            || (close.is_none() && steps.iter().any(|step| step.status == Step::Failed));
         let refused = close == Some(Close::Refused)
             || (close.is_none() && steps.iter().any(|step| step.status == Step::Refused));
         let (status, label) = if stopped {
@@ -200,22 +204,29 @@ pub(super) fn project(
             (Status::Interrupted, "Interrupted")
         } else if running {
             (Status::Running, "Working")
-        } else if close == Some(Close::Failed) {
+        } else if failed {
             (Status::Failed, "Failed")
         } else if refused {
             (Status::Refused, "Refused")
         } else {
             (Status::Done, "Finished")
         };
+        // A step that was refused, interrupted or failed, or whose status
+        // keeper does not know, keeps one always-visible line in Rust's words.
         let mut failures: Vec<AgentTurnFailureVm> = steps
             .iter()
-            .filter(|step| matches!(step.status, Step::Refused | Step::Interrupted))
+            .filter(|step| {
+                matches!(
+                    step.status,
+                    Step::Refused | Step::Interrupted | Step::Failed | Step::Unknown
+                )
+            })
             .map(|step| AgentTurnFailureVm {
                 step_id: step.id.clone(),
                 sentence: format!(
                     "{} · {}{}",
                     step.name,
-                    step.status.label(),
+                    step.status_label,
                     step.result
                         .as_ref()
                         .map(|result| format!(": {}", one_line(result)))

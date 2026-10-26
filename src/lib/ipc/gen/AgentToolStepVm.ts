@@ -4,7 +4,11 @@ import type { AgentToolStepStatusVm } from "./AgentToolStepStatusVm";
 /**
  * One tool call of a turn, as its `tool_calls` row says (readers only).
  */
-export type AgentToolStepVm = { id: string, name: string, statusLabel?: string, status: AgentToolStepStatusVm, 
+export type AgentToolStepVm = { id: string, name: string, 
+/**
+ * Rust's words for the status; the renderer shows them as they are.
+ */
+statusLabel: string, status: AgentToolStepStatusVm, 
 /**
  * The outcome, or the refusal's sentence, once it ended.
  */

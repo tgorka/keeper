@@ -57,12 +57,7 @@ export function SessionTrace({
             <li key={step.id} className="min-w-0">
               <details className="rounded-md border border-border">
                 <summary className="min-h-11 cursor-pointer break-all px-3 py-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                  {step.name} ·{" "}
-                  {step.status === "started"
-                    ? "Started"
-                    : step.status === "done"
-                      ? "Finished"
-                      : "Refused"}
+                  {step.name} · {step.statusLabel}
                 </summary>
                 <div className="space-y-1 px-3 pb-3 text-xs">
                   {step.startedAtMs !== undefined && (
