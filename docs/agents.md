@@ -303,7 +303,9 @@ stays behind, and the new session's drive control shows what came across. `/new`
 title; `/archive` keeps its history and makes it read-only. `/people` opens People, `/tools` opens
 the existing tool switches when that agent offers tools, and `/help` opens the command list.
 `/context` opens the same context **Details** panel as the ring beside Send (below).
-`/model`, `/effort` and `/drives` are not offered until their backend operations exist. `/stop`
+Each of `/model`, `/effort` and `/drives` is offered when that choice exists for you here: `/model`
+when the agent offers models, `/effort` when it offers efforts (it lists only those), and `/drives`
+when you have the session's drive control (below). `/stop`
 writes a person control row naming each unfinished turn; a compatible runtime cancels only the
 named running turn and keeps the output already received. With no unfinished turn it refuses.
 
