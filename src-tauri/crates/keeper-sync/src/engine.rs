@@ -38087,9 +38087,9 @@ mod tests {
     /// counts are never held back by an offline backoff — with a live watcher
     /// that `ensure_watcher` keeps.
     ///
-    /// The watcher is the poll backend: it needs no inotify instance, so the
-    /// fixture is live on a host whose per-user instances are spent, and its
-    /// 30 s re-stat never fires inside a test that runs on the fake clock.
+    /// The watcher is the poll backend, so the fixture is live on a host whose
+    /// per-user inotify instances are spent — and it is quiet, see
+    /// [`arm_poll_watcher`].
     async fn published_fixture(
         engine: &Engine,
         platform: &TestPlatform,
@@ -38112,9 +38112,23 @@ mod tests {
     }
 
     /// A live watcher on the poll backend, recorded the way `ensure_watcher`
-    /// records one so it is kept.
+    /// records one so it is kept, and quiet: what it reports goes nowhere.
+    ///
+    /// The fixtures it serves are folders nobody touches, but keeper itself
+    /// writes `.git`, and the bare `.git` node is a wake (`fold_watch_events`).
+    /// The poll backend was trusted to stay silent because its re-stat is 30 s
+    /// away, and its first pass is not: the poll loop starts on its own thread
+    /// unordered with `watch()`. On a loaded host that pass ran after the first
+    /// tick had rewritten the index, and when `sync_once`'s last write to `.git`
+    /// and the tick's straddled a second (the backend compares whole-second
+    /// mtimes), it reported `.git` modified — a wake, and a remote poll a tick
+    /// early. That is how
+    /// `a_quiet_live_watcher_folder_asks_the_remote_every_remote_poll` and
+    /// `a_pull_running_in_another_engine_covers_the_paced_poll` failed in CI
+    /// (DW-E109-21). What a wake does is other tests' subject; these count the
+    /// clock, so no thread may speak into the engine behind their back.
     fn arm_poll_watcher(engine: &Engine, p: &SyncProfile) {
-        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (reports, _discarded) = tokio::sync::mpsc::unbounded_channel();
         let watcher = FolderWatcher::start(
             &p.local_path,
             WatchConfig {
@@ -38122,9 +38136,10 @@ mod tests {
                 rescan_interval_ms: 0,
                 force_poll: true,
             },
-            tx,
+            reports,
         )
         .expect("a poll watcher arms over a real directory");
+        let (_nobody, events) = tokio::sync::mpsc::unbounded_channel();
         Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
     }
 

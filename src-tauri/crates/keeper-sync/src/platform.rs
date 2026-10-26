@@ -151,7 +151,8 @@ const PROC_ROOT: &str = "/proc";
 /// into a refusal: a target that cannot be stat'ed, a `proc_root` that cannot
 /// be read or has no resolvable `self`, a dirent that cannot be enumerated
 /// (in `<proc_root>` *or* inside a `<pid>/fd`), a `<pid>` that cannot be
-/// entered, a descriptor whose `stat` fails for any reason but "it is gone",
+/// entered, a descriptor whose `stat` fails for any reason but "it is gone" —
+/// or, when the `stat` is refused, whose table still reads when asked again —
 /// and any `read_dir` error that is neither "gone" nor "not yours".
 ///
 /// The discipline is applied at every level on purpose. A partially enumerated
@@ -160,6 +161,21 @@ const PROC_ROOT: &str = "/proc";
 /// is the one direction AD-125 forbids.
 #[cfg(target_os = "linux")]
 fn open_file_state_under_proc(proc_root: &Path, path: &Path) -> OpenFileState {
+    open_file_state_under_proc_with(proc_root, path, |descriptor| std::fs::metadata(descriptor))
+}
+
+/// [`open_file_state_under_proc`] with the descriptor `stat` passed in.
+///
+/// A fixture root can stage every state a process can be in except one: a
+/// process that leaves *between* the listing of its table and the `stat` of an
+/// entry in it. The `stat` is the one call made inside that window, so passing
+/// it in is what lets a test stand in the window.
+#[cfg(target_os = "linux")]
+fn open_file_state_under_proc_with(
+    proc_root: &Path,
+    path: &Path,
+    stat_descriptor: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> OpenFileState {
     use std::os::unix::fs::MetadataExt as _;
 
     // `metadata` and not `symlink_metadata`: whoever has this file open opened
@@ -190,7 +206,7 @@ fn open_file_state_under_proc(proc_root: &Path, path: &Path) -> OpenFileState {
 
     let mut own_seen = false;
 
-    for entry in processes {
+    'processes: for entry in processes {
         // A `/proc` this process cannot enumerate is a blind spot, not an empty
         // machine.
         let Ok(entry) = entry else {
@@ -217,11 +233,34 @@ fn open_file_state_under_proc(proc_root: &Path, path: &Path) -> OpenFileState {
                     let Ok(fd) = fd else {
                         return OpenFileState::Unknown;
                     };
-                    let open = match std::fs::metadata(fd.path()) {
+                    let open = match stat_descriptor(&fd.path()) {
                         Ok(open) => open,
                         // A descriptor that vanished between the `read_dir` and
                         // the `stat` is a descriptor that holds nothing.
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        // A table that listed a moment ago and now refuses one
+                        // of its entries: procfs answers EACCES, not ENOENT,
+                        // for a process caught exiting or mid-`exec`, because
+                        // the magic link checks ptrace access to a task that is
+                        // being torn down. Measured under process churn (a
+                        // parallel build): about one walk in a hundred met
+                        // such a process, and a release refused as
+                        // `OpenUnknown` a file nothing held (DW-E109-21).
+                        //
+                        // So ask the table again, and give the process the
+                        // answer the walk would have given it had it arrived a
+                        // moment later: gone, or not ours, holds nothing this
+                        // walk can claim to see. A table that still reads has
+                        // refused a descriptor for some other reason, and that
+                        // descriptor was never compared.
+                        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                            match std::fs::read_dir(entry.path().join("fd")) {
+                                Err(again) if !unreadable_table_blinds(&entry.path(), &again) => {
+                                    continue 'processes;
+                                }
+                                _ => return OpenFileState::Unknown,
+                            }
+                        }
                         // Anything else — ESTALE off a network mount, EIO —
                         // means this descriptor was never compared, so the
                         // walk cannot claim it did not match.
@@ -235,36 +274,11 @@ fn open_file_state_under_proc(proc_root: &Path, path: &Path) -> OpenFileState {
                     own_seen = true;
                 }
             }
-            Err(err) => match err.kind() {
-                // The process exited while the walk was running. It holds
-                // nothing, so it changes no answer.
-                std::io::ErrorKind::NotFound => {}
-                std::io::ErrorKind::PermissionDenied => {
-                    // Another uid's descriptor table: `<pid>/fd` is `0500`.
-                    // This is the one documented narrowing of `Closed`, and the
-                    // scan continues rather than refusing — see this function's
-                    // doc for why demanding completeness answers `Unknown`
-                    // everywhere.
-                    //
-                    // But a process keeper cannot even IDENTIFY is a different
-                    // thing and a real blind spot: `hidepid=1` makes `<pid>`
-                    // itself unenterable, and then its `stat` file — which is
-                    // world-readable on every ordinary Linux — cannot be read
-                    // either. That distinguishes "somebody else's process" from
-                    // "a process hidden from us", and only the second one is
-                    // grounds to stop claiming anything.
-                    if std::fs::metadata(entry.path().join("stat"))
-                        .err()
-                        .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
-                    {
-                        return OpenFileState::Unknown;
-                    }
+            Err(err) => {
+                if unreadable_table_blinds(&entry.path(), &err) {
+                    return OpenFileState::Unknown;
                 }
-                // Anything else — a procfs that answered EIO, an `/proc`
-                // replaced by something that is not one — is unclassified, and
-                // an unclassified failure may not read as "nobody has it open".
-                _ => return OpenFileState::Unknown,
-            },
+            }
         }
     }
 
@@ -275,6 +289,35 @@ fn open_file_state_under_proc(proc_root: &Path, path: &Path) -> OpenFileState {
         // descriptor table did not read: this walk never established that it
         // can see anything, so it claims nothing.
         OpenFileState::Unknown
+    }
+}
+
+/// Whether a `<pid>` whose descriptor table would not open leaves the walk
+/// blind — `false` when the process holds nothing the walk could claim to see.
+#[cfg(target_os = "linux")]
+fn unreadable_table_blinds(pid_dir: &Path, err: &std::io::Error) -> bool {
+    match err.kind() {
+        // The process exited while the walk was running. It holds nothing, so
+        // it changes no answer.
+        std::io::ErrorKind::NotFound => false,
+        // Another uid's descriptor table: `<pid>/fd` is `0500`. This is the one
+        // documented narrowing of `Closed`, and the scan continues rather than
+        // refusing — see [`open_file_state_under_proc`] for why demanding
+        // completeness answers `Unknown` everywhere.
+        //
+        // But a process keeper cannot even IDENTIFY is a different thing and a
+        // real blind spot: `hidepid=1` makes `<pid>` itself unenterable, and
+        // then its `stat` file — which is world-readable on every ordinary
+        // Linux — cannot be read either. That distinguishes "somebody else's
+        // process" from "a process hidden from us", and only the second one is
+        // grounds to stop claiming anything.
+        std::io::ErrorKind::PermissionDenied => std::fs::metadata(pid_dir.join("stat"))
+            .err()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied),
+        // Anything else — a procfs that answered EIO, an `/proc` replaced by
+        // something that is not one — is unclassified, and an unclassified
+        // failure may not read as "nobody has it open".
+        _ => true,
     }
 }
 
@@ -1134,6 +1177,209 @@ mod tests {
             OpenFileState::Unknown,
             "a process whose very existence keeper cannot confirm is a blind spot, \
              not a process that holds nothing"
+        );
+    }
+
+    /// A process that exits between the listing of its descriptor table and
+    /// the `stat` of an entry in it holds nothing, and the walk still answers.
+    ///
+    /// procfs refuses that `stat` with `EACCES`, not `ENOENT`: the magic link
+    /// checks ptrace access to a task being torn down. Under process churn about one
+    /// walk in a hundred met such a process and answered `Unknown`, which is
+    /// how `a_descriptor_this_test_holds_makes_the_answer_open` and
+    /// `with_nothing_holding_it_the_release_actually_happens` failed under
+    /// load, and how a real release was refused as `OpenUnknown` for a file
+    /// nothing held. The stand-in `stat` is that moment: the process's
+    /// directory goes, and the descriptor is refused.
+    ///
+    /// Fails for a walk that answers `Unknown` on every refused descriptor.
+    /// The opposite bug — a refused descriptor on a table that still reads,
+    /// skipped as if it held nothing — is
+    /// `a_refused_descriptor_on_a_table_that_still_reads_refuses`'s.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_process_that_exits_while_its_table_is_read_holds_nothing() {
+        let work = tempfile::tempdir().expect("temp dir");
+        let file = work.path().join("clip.mp4");
+        std::fs::write(&file, b"content").expect("write");
+
+        let root = answerable_proc_root(&work.path().join("proc"));
+        let leaving = root.join("1234");
+        std::fs::create_dir_all(leaving.join("fd")).expect("the leaving pid directory");
+        std::fs::write(leaving.join("stat"), "1234 (leaving) R 1 1 1 0\n").expect("write stat");
+        let descriptor = leaving.join("fd").join("3");
+        std::fs::write(&descriptor, b"").expect("descriptor 3");
+
+        let observed = open_file_state_under_proc_with(&root, &file, |path| {
+            if path == descriptor {
+                std::fs::remove_dir_all(&leaving).expect("the process exits");
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            std::fs::metadata(path)
+        });
+        assert!(
+            !leaving.exists(),
+            "the stand-in stat was asked about the leaving process"
+        );
+        assert_eq!(
+            observed,
+            OpenFileState::Closed,
+            "a process that is gone holds nothing, however procfs spelled its going"
+        );
+    }
+
+    /// A descriptor refused while its table still reads was never compared, so
+    /// the walk refuses — even though every other table answered.
+    ///
+    /// The guard on the other side of
+    /// `a_process_that_exits_while_its_table_is_read_holds_nothing`: asking the
+    /// table again may only clear a process whose table no longer reads. Fails
+    /// for a walk that skips every process with a refused descriptor, which
+    /// reports `Closed` past a descriptor that may be the very opener (AD-125).
+    /// The refused descriptor is another process's on purpose: this process's
+    /// own table skipped would answer `Unknown` through the `own_seen` gate,
+    /// and `a_descriptor_table_that_cannot_be_read_through_refuses` passes
+    /// against that bug for exactly that reason.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_refused_descriptor_on_a_table_that_still_reads_refuses() {
+        let work = tempfile::tempdir().expect("temp dir");
+        let file = work.path().join("clip.mp4");
+        std::fs::write(&file, b"content").expect("write");
+
+        let root = answerable_proc_root(&work.path().join("proc"));
+        let staying = root.join("1234");
+        std::fs::create_dir_all(staying.join("fd")).expect("the staying pid directory");
+        std::fs::write(staying.join("stat"), "1234 (staying) S 1 1 1 0\n").expect("write stat");
+        let descriptor = staying.join("fd").join("3");
+        std::fs::write(&descriptor, b"").expect("descriptor 3");
+        assert_eq!(
+            open_file_state_under_proc(&root, &file),
+            OpenFileState::Closed,
+            "the root answers when nothing is refused, so the refusal below is \
+             the only thing the second answer can be attributed to"
+        );
+
+        let observed = open_file_state_under_proc_with(&root, &file, |path| {
+            if path == descriptor {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            std::fs::metadata(path)
+        });
+        assert_eq!(
+            observed,
+            OpenFileState::Unknown,
+            "a descriptor the walk could not compare is not a descriptor that did not match"
+        );
+    }
+
+    /// A refused descriptor whose process then cannot even be identified — the
+    /// `hidepid=1` shape, arriving inside the window — refuses.
+    ///
+    /// Asking the table again clears a process only through
+    /// `unreadable_table_blinds`, the rule the walk applies to every unreadable
+    /// table; this is that rule's blind answer, reached through the new arm.
+    /// Fails for a re-ask that skips every process whose table no longer reads
+    /// without asking whether it can be identified (RSF-02, mutant M3): that
+    /// walk reports `Closed` over a process keeper knows nothing about.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_refused_descriptor_whose_process_then_hides_refuses() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = tempfile::tempdir().expect("temp dir");
+        let file = work.path().join("clip.mp4");
+        std::fs::write(&file, b"content").expect("write");
+
+        // uid 0 ignores the DAC check, so a mode-000 directory hides nothing on
+        // a root runner and there is nothing falsifiable here.
+        let probe = work.path().join("mode-probe");
+        std::fs::create_dir(&probe).expect("probe dir");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000))
+            .expect("lock the probe");
+        let is_root = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock the probe");
+        if is_root {
+            return;
+        }
+
+        let root = answerable_proc_root(&work.path().join("proc"));
+        let hiding = root.join("1234");
+        std::fs::create_dir_all(hiding.join("fd")).expect("the hiding pid directory");
+        std::fs::write(hiding.join("stat"), "1234 (hiding) S 1 1 1 0\n").expect("write stat");
+        let descriptor = hiding.join("fd").join("3");
+        std::fs::write(&descriptor, b"").expect("descriptor 3");
+        assert_eq!(
+            open_file_state_under_proc(&root, &file),
+            OpenFileState::Closed,
+            "the root answers when nothing is refused or hidden"
+        );
+
+        let observed = open_file_state_under_proc_with(&root, &file, |path| {
+            if path == descriptor {
+                std::fs::set_permissions(&hiding, std::fs::Permissions::from_mode(0o000))
+                    .expect("hide the pid directory");
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            std::fs::metadata(path)
+        });
+        // Restore before asserting, or a failing run leaks a mode-000 directory
+        // that `TempDir::drop` cannot remove.
+        std::fs::set_permissions(&hiding, std::fs::Permissions::from_mode(0o700))
+            .expect("restore the mode so the temp directory can be removed");
+        assert_eq!(
+            observed,
+            OpenFileState::Unknown,
+            "a process whose very existence keeper cannot confirm is a blind spot, \
+             not a process that holds nothing"
+        );
+    }
+
+    /// A refused descriptor whose table then fails for an unclassified reason
+    /// refuses.
+    ///
+    /// The stand-in is `ENOTDIR` — `<pid>/fd` replaced by a regular file — for
+    /// the same reason `a_descriptor_table_that_cannot_be_read_through_refuses`
+    /// uses it: an `EIO` off procfs cannot be staged in a temp directory, and
+    /// both land in the same arm, "neither gone nor not yours". Fails for a
+    /// re-ask that skips every process whose table no longer reads (RSF-02,
+    /// mutant M3).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_refused_descriptor_whose_table_then_fails_unclassified_refuses() {
+        let work = tempfile::tempdir().expect("temp dir");
+        let file = work.path().join("clip.mp4");
+        std::fs::write(&file, b"content").expect("write");
+
+        let root = answerable_proc_root(&work.path().join("proc"));
+        let failing = root.join("1234");
+        std::fs::create_dir_all(failing.join("fd")).expect("the failing pid directory");
+        std::fs::write(failing.join("stat"), "1234 (failing) S 1 1 1 0\n").expect("write stat");
+        let descriptor = failing.join("fd").join("3");
+        std::fs::write(&descriptor, b"").expect("descriptor 3");
+        assert_eq!(
+            open_file_state_under_proc(&root, &file),
+            OpenFileState::Closed,
+            "the root answers when nothing fails"
+        );
+
+        let observed = open_file_state_under_proc_with(&root, &file, |path| {
+            if path == descriptor {
+                std::fs::remove_dir_all(failing.join("fd")).expect("drop the table");
+                std::fs::write(failing.join("fd"), b"not a directory").expect("fd as a file");
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            std::fs::metadata(path)
+        });
+        assert!(
+            failing.join("fd").is_file(),
+            "the stand-in stat was asked about the failing process"
+        );
+        assert_eq!(
+            observed,
+            OpenFileState::Unknown,
+            "an unclassified failure to read a descriptor table is not an empty one"
         );
     }
 }
