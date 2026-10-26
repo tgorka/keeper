@@ -240,8 +240,10 @@ title uses the handle. Renaming changes only the title, never the session id or 
 
 Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
 menu: **Rename**, **Copy id**, **Copy name**, **Details**, **Drives…** (only where you may
-choose the session's drives; it opens the session and its Drives menu, see § Live answers) and
-**Archive** (or **Unarchive**).
+choose the session's drives; it opens the session and its Drives menu, see § Live answers),
+**Model…** (only where you may change the session's model and its agent offers more than one,
+`AgentSessionRowVm.choosesModel`; it opens the session and the composer's model picker, the same
+picker `/model` writes through) and **Archive** (or **Unarchive**).
 Rename edits inline with the current title selected, so typing replaces it; Save queues the title
 on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
 local enqueue, not server acceptance: the row says it is waiting until the server settles the
@@ -270,7 +272,8 @@ row waits, the server refuses the first rename 1.2 s later, and a retry is accep
 its save.
 Details includes the database, immutable id, creation time, reported trust and known instances;
 a known host is labelled `<agent>@<host>`.
-Pin, Mark unread, Drives and Model are absent because this surface has no operation for them.
+Pin and Mark unread are absent: this surface has no operation for them, and whether to build them
+waits for the owner's decision (A109-05).
 
 Opening a session shows its newest visible page. **Earlier messages**, or scrolling to the top,
 asks Rust to widen the history window. **Archive session** keeps the list row and marks the

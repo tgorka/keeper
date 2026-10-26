@@ -26,6 +26,7 @@ const row: AgentSessionRowVm = {
   archived: false,
   lastActivityMs: 1700000000000,
   choosesDrives: false,
+  choosesModel: false,
 };
 beforeEach(() => rename.mockReset());
 
@@ -172,4 +173,28 @@ it("offers Drives… only where Rust says this person has the control, and opens
   const target = { database: "alpha", sessionId: "device.1" };
   expect(selected).toEqual(target);
   expect(drivesFor).toEqual(target);
+});
+
+it("offers Model… only where Rust says there is a model to choose, and opens that session's picker", async () => {
+  const draw = (model: boolean) =>
+    render(
+      <SessionRowMenu row={{ ...row, choosesModel: model }}>
+        <button type="button">{`${row.displayName} ${model}`}</button>
+      </SessionRowMenu>,
+    );
+  draw(false);
+  fireEvent.contextMenu(screen.getByRole("button", { name: `${row.displayName} false` }));
+  await screen.findByRole("menuitem", { name: "Rename…" });
+  expect(screen.queryByRole("menuitem", { name: "Model…" })).toBeNull();
+  fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+
+  draw(true);
+  fireEvent.contextMenu(screen.getByRole("button", { name: `${row.displayName} true` }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Model…" }));
+  const { selected, modelFor, drivesFor } = agentSessionsStore.getState();
+  const target = { database: "alpha", sessionId: "device.1" };
+  expect(selected).toEqual(target);
+  expect(modelFor).toEqual(target);
+  expect(drivesFor).toBeNull();
 });

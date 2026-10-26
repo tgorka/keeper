@@ -89,6 +89,7 @@ function row(sessionId: string): AgentSessionRowVm {
     archived: false,
     lastActivityMs: 1780000000000,
     choosesDrives: false,
+    choosesModel: false,
   };
 }
 

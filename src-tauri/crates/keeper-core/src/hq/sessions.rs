@@ -123,6 +123,10 @@ pub struct AgentSessionRowVm {
     /// [`crate::hq::drives::may_choose`] and an agent that says what it
     /// reads): the row's menu offers Drives….
     pub chooses_drives: bool,
+    /// This person may change the session's model, and its agent offers
+    /// more than one ([`crate::hq::settings::agents_choosing_model`]): the
+    /// row's menu offers Model… (A109-05), which opens the composer's picker.
+    pub chooses_model: bool,
 }
 
 impl AgentSessionRowVm {
@@ -657,6 +661,7 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
     }
     let needs = needs_you(source, now_ms);
     let saying = super::drives::agents_saying(source);
+    let choosing = super::settings::agents_choosing_model(source);
     let working: HashSet<String> = read(source, "SELECT DISTINCT session_id FROM turn_chunks", &[])
         .iter()
         .filter_map(|row| opt_text(row, "session_id"))
@@ -711,6 +716,9 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
                         .collect()
                 })
                 .clone();
+            // The drive control and the model picker are a person member's
+            // of a live session alike.
+            let may_choose = super::drives::may_choose(text(row, "role"), truthy(row, "archived"));
             Some(AgentSessionRowVm {
                 database: source.database.clone(),
                 title_write: match &refused_titles {
@@ -726,10 +734,8 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
                 instances: instance_labels,
                 agent_mark: mark(&agent_name),
                 agent_name,
-                chooses_drives: super::drives::may_choose(
-                    text(row, "role"),
-                    truthy(row, "archived"),
-                ) && saying.contains(&agent),
+                chooses_drives: may_choose && saying.contains(&agent),
+                chooses_model: may_choose && choosing.contains(&agent),
                 agent_actor: agent,
                 archived: truthy(row, "archived"),
                 last_activity_ms: int(row, "last_activity_ms").unwrap_or(0),
@@ -1440,6 +1446,7 @@ mod tests {
             last_activity_ms: at,
             attention: None,
             chooses_drives: false,
+            chooses_model: false,
         }
     }
 

@@ -36,19 +36,26 @@ import { cn } from "@/lib/utils";
  * decision — what is offered, which is current, which is a default, whether there is an effort menu
  * at all, what a running turn or a refusal means — is Rust's (`AgentSessionPickerVm`). Only the
  * search text, the stars (a lens, in a cookie) and the order they give are this component's; what a
- * change wrote is remembered as this device's last pick for `agent` (Q109-16 b).
+ * change wrote is remembered as this device's last pick for `agent` (Q109-16 b). The model popover
+ * may be held by the view (`modelsOpen`), so the list's right-click "Model…" opens this same picker.
  */
 export function SessionSettingsPicker({
   target,
   agent,
   picker,
+  modelsOpen: heldOpen,
+  onModelsOpenChange,
 }: {
   target: AgentSessionRef;
   agent: string;
   picker: AgentSessionPickerVm;
+  modelsOpen?: boolean;
+  onModelsOpenChange?: (open: boolean) => void;
 }) {
   const favorites = useModelFavorites();
-  const [modelsOpen, setModelsOpen] = useState(false);
+  const [ownOpen, setOwnOpen] = useState(false);
+  const modelsOpen = heldOpen ?? ownOpen;
+  const setModelsOpen = onModelsOpenChange ?? setOwnOpen;
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const writing = useRef(false);

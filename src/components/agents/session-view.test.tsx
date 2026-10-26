@@ -567,6 +567,39 @@ describe("session header drives", () => {
   });
 });
 
+describe("Model… from the list (A109-05)", () => {
+  const withModels: AgentSessionViewVm = {
+    ...vm,
+    settings: {
+      models: [
+        { id: "alpha-large", current: false, default: false },
+        { id: "beta-small", current: true, default: true },
+      ],
+      efforts: [],
+      modelLabel: "beta-small",
+      resettable: false,
+      write: { state: "confirmed" },
+    },
+  };
+
+  it("opens the composer's model picker when the list's right-click menu asked for it", async () => {
+    agentSessionsStore.getState().openModel({ database: "beta", sessionId: "same.1" });
+    await draw(withModels);
+    const picker = await screen.findByRole("dialog", { name: "Choose a model" });
+    expect(within(picker).getByRole("option", { name: "beta-small, in use, default" }));
+    expect(agentSessionsStore.getState().modelFor).toBeNull();
+  });
+
+  it("drops a Model request its first view answers without a picker", async () => {
+    agentSessionsStore.getState().openModel({ database: "beta", sessionId: "same.1" });
+    await draw();
+    expect(agentSessionsStore.getState().modelFor).toBeNull();
+    act(() => mock.view?.(withModels));
+    expect(screen.getByRole("button", { name: "Model: beta-small" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
 describe("the approval banner", () => {
   const waiting = (id: string, digest: string) => ({
     id,

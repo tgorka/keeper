@@ -6279,6 +6279,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentMark: sessionScenario === "names" ? "N" : "A",
           archived: false,
           choosesDrives: drivesScenario !== "nonmember",
+          choosesModel: true,
           lastActivityMs: Date.now(),
           attention: "needsYou",
         },
@@ -6297,6 +6298,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentMark: "A",
           archived: false,
           choosesDrives: drivesScenario !== "nonmember",
+          choosesModel: true,
           lastActivityMs: Date.now() - 3600000,
           attention: "needsYou",
         },
@@ -6315,6 +6317,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentMark: "A",
           archived: true,
           choosesDrives: false,
+          choosesModel: false,
           lastActivityMs: Date.now() - 86400000,
         },
       ];
@@ -8050,6 +8053,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       agentMark: choice.agentMark,
       archived: false,
       choosesDrives: false,
+      choosesModel: true,
       lastActivityMs: Date.now(),
     };
     sessionRows.unshift(row);
@@ -8194,6 +8198,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       archived: false,
       lastActivityMs: now,
       choosesDrives: true,
+      choosesModel: true,
     };
     const key = JSON.stringify([row.database, row.sessionId]);
     const thread: AgentSessionViewVm = {
@@ -10838,6 +10843,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         agentMark: "R",
         archived: false,
         choosesDrives: false,
+        choosesModel: true,
         lastActivityMs: Date.now(),
       };
       sessionRows.unshift(row);
