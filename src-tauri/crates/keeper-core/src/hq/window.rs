@@ -603,12 +603,15 @@ impl Hq {
     }
 
     /// Open a session with `agent` in `database` and write its first
-    /// message; the database is remembered as the person's choice.
+    /// message; the database is remembered as the person's choice. `pick`
+    /// is this device's last model and effort for `agent`: what it still
+    /// offers starts the session's settings (Q109-16 b).
     pub fn new_session(
         &self,
         database: &str,
         agent: &str,
         body: &str,
+        pick: Option<&crate::hq::settings::AgentSettingsPick>,
     ) -> Result<AgentSessionRef, HqError> {
         if body.trim().is_empty() {
             return Err(HqError::Sentence("Write something first.".to_owned()));
@@ -625,7 +628,7 @@ impl Hq {
             )));
         }
         let source = self.source(database)?;
-        let session_id = sessions::create(&source, agent, body).map_err(sentence)?;
+        let session_id = sessions::create(&source, agent, body, pick).map_err(sentence)?;
         sessions::remember_choice(&self.data_dir()?, agent, database);
         self.touch();
         Ok(AgentSessionRef {

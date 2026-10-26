@@ -1248,7 +1248,7 @@ async fn agents_window_archive_and_an_archived_session_opens_within_a_second() {
         let a = Arc::clone(&a);
         let (database, agent) = (database.clone(), agent.clone());
         tokio::task::spawn_blocking(move || {
-            a.new_session(&database, &agent, "the first of a thousand")
+            a.new_session(&database, &agent, "the first of a thousand", None)
         })
         .await
         .expect("joins")
@@ -1483,7 +1483,7 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
     let key: AgentSessionRef = {
         let a = Arc::clone(&a);
         let (database, agent) = (database.clone(), agent.clone());
-        tokio::task::spawn_blocking(move || a.new_session(&database, &agent, "long: tell me"))
+        tokio::task::spawn_blocking(move || a.new_session(&database, &agent, "long: tell me", None))
             .await
             .expect("joins")
             .expect("a new session")
@@ -1963,10 +1963,12 @@ async fn an_answer_whose_instance_was_killed_says_it_stopped() {
     .await;
     let key = {
         let a = Arc::clone(&a);
-        tokio::task::spawn_blocking(move || a.new_session(&database, &agent, "cut: a long one"))
-            .await
-            .expect("joins")
-            .expect("a new session")
+        tokio::task::spawn_blocking(move || {
+            a.new_session(&database, &agent, "cut: a long one", None)
+        })
+        .await
+        .expect("joins")
+        .expect("a new session")
     };
     a.open_session(&key).expect("opens");
     let view_of = |hq: &Arc<Hq>| {
@@ -2154,7 +2156,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     let new_session = |db: String, agent: String, body: &'static str| {
         let a = Arc::clone(&a);
         async move {
-            tokio::task::spawn_blocking(move || a.new_session(&db, &agent, body))
+            tokio::task::spawn_blocking(move || a.new_session(&db, &agent, body, None))
                 .await
                 .expect("joins")
                 .expect("a new session")
@@ -2783,7 +2785,7 @@ async fn two_instances_answer_by_the_persons_choice_and_who_is_online() {
         let key = {
             let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
             tokio::task::spawn_blocking(move || {
-                mac.new_session(&database, &agent, "who answers this one?")
+                mac.new_session(&database, &agent, "who answers this one?", None)
             })
             .await
             .expect("joins")
@@ -2830,10 +2832,12 @@ async fn two_instances_answer_by_the_persons_choice_and_who_is_online() {
     let database = databases[0].clone();
     let other = {
         let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
-        tokio::task::spawn_blocking(move || mac.new_session(&database, &agent, "and this one?"))
-            .await
-            .expect("joins")
-            .expect("a new session")
+        tokio::task::spawn_blocking(move || {
+            mac.new_session(&database, &agent, "and this one?", None)
+        })
+        .await
+        .expect("joins")
+        .expect("a new session")
     };
     mac.open_session(&other).expect("opens");
     let ((holder, sentence), took) = {
@@ -3078,7 +3082,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     .await;
     let key = {
         let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
-        off(move || mac.new_session(&database, &agent, "files for you")).await
+        off(move || mac.new_session(&database, &agent, "files for you", None)).await
     }
     .expect("a new session");
     wait_status(
@@ -3559,7 +3563,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     // Every other write of that replica goes on: a new session.
     let after = {
         let (skipper, database, agent) = (Arc::clone(&skipper), database.clone(), agent.clone());
-        off(move || skipper.new_session(&database, &agent, "after the refusal")).await
+        off(move || skipper.new_session(&database, &agent, "after the refusal", None)).await
     }
     .expect("a new session");
     until(

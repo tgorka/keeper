@@ -5,8 +5,10 @@ import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentApprovalVm, AgentSessionsBatch, AgentSessionViewVm } from "@/lib/ipc/client";
+import { AGENT_PICKS_COOKIE, agentPicksCookie } from "@/lib/stores/agent-picks";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import { agentViewPrefsWriteStore } from "@/lib/stores/agent-view-prefs";
+import { persistFold } from "@/lib/stores/fold-cookie";
 
 const mock = vi.hoisted(() => ({
   list: null as ((batch: AgentSessionsBatch) => void) | null,
@@ -284,7 +286,7 @@ it("requires the database choice for a multi-database agent before sending the f
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() =>
-    expect(mock.create).toHaveBeenCalledWith("beta", "assistant", "Begin in beta"),
+    expect(mock.create).toHaveBeenCalledWith("beta", "assistant", "Begin in beta", null),
   );
   expect(agentSessionsStore.getState().selected).toEqual({ database: "beta", sessionId: "new.1" });
 });
@@ -306,8 +308,42 @@ it("uses Rust's sole database without a picker", async () => {
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() =>
-    expect(mock.create).toHaveBeenCalledWith("beta", "researcher", "Research this"),
+    expect(mock.create).toHaveBeenCalledWith("beta", "researcher", "Research this", null),
   );
+});
+
+it("hands this device's last pick for that agent, and only that agent's, to a new session", async () => {
+  // Rust decides what of it the agent still offers (`settings::initial`).
+  persistFold(
+    agentPicksCookie({
+      researcher: { model: "deep-model", effort: "high" },
+      assistant: { model: "other-model", effort: null },
+    }),
+  );
+  try {
+    agentSessionsStore.setState({
+      newSession: {
+        agentActor: "researcher",
+        agentName: "Researcher",
+        database: "beta",
+        sessionId: null,
+      },
+    });
+    draw();
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled());
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "Research this" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(mock.create).toHaveBeenCalledWith("beta", "researcher", "Research this", {
+        model: "deep-model",
+        effort: "high",
+      }),
+    );
+  } finally {
+    persistFold(`${AGENT_PICKS_COOKIE}=; path=/; max-age=0`);
+  }
 });
 
 it("binds approval to the shown action and keeps the server's refusal visible", async () => {

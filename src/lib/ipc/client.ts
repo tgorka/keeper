@@ -10,6 +10,9 @@ import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AgentCommandResultVm } from "./gen/AgentCommandResultVm";
+import type { AgentSettingsChange } from "./gen/AgentSettingsChange";
+import type { AgentSettingsChangedVm } from "./gen/AgentSettingsChangedVm";
+import type { AgentSettingsPick } from "./gen/AgentSettingsPick";
 import type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
@@ -356,6 +359,7 @@ export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 export type { AgentDirectoryPersonVm } from "./gen/AgentDirectoryPersonVm";
+export type { AgentEffortOptionVm } from "./gen/AgentEffortOptionVm";
 export type { AgentInstancePresenceVm } from "./gen/AgentInstancePresenceVm";
 export type { AgentInstanceStateVm } from "./gen/AgentInstanceStateVm";
 export type { AgentInstancesDatabaseVm } from "./gen/AgentInstancesDatabaseVm";
@@ -368,6 +372,7 @@ export type { AgentMessageDetailsVm } from "./gen/AgentMessageDetailsVm";
 export type { AgentMessageVm } from "./gen/AgentMessageVm";
 export type { AgentModelBotVm } from "./gen/AgentModelBotVm";
 export type { AgentModelLineVm } from "./gen/AgentModelLineVm";
+export type { AgentModelOptionVm } from "./gen/AgentModelOptionVm";
 export type { AgentModelReq } from "./gen/AgentModelReq";
 export type { AgentModelVm } from "./gen/AgentModelVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
@@ -382,11 +387,16 @@ export type { AgentSessionAnsweringVm } from "./gen/AgentSessionAnsweringVm";
 export type { AgentSessionDrivesVm } from "./gen/AgentSessionDrivesVm";
 export type { AgentSessionDriveVm } from "./gen/AgentSessionDriveVm";
 export type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
+export type { AgentSessionPickerVm } from "./gen/AgentSessionPickerVm";
 export type { AgentSessionRef } from "./gen/AgentSessionRef";
 export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
 export type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
 export type { AgentSessionToolVm } from "./gen/AgentSessionToolVm";
 export type { AgentSessionViewVm } from "./gen/AgentSessionViewVm";
+export type { AgentSettingsChange } from "./gen/AgentSettingsChange";
+export type { AgentSettingsChangedVm } from "./gen/AgentSettingsChangedVm";
+export type { AgentSettingsPick } from "./gen/AgentSettingsPick";
+export type { AgentSettingsWriteVm } from "./gen/AgentSettingsWriteVm";
 export type { AgentTimelineItemVm } from "./gen/AgentTimelineItemVm";
 export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
 export type { AgentTurnFailureVm } from "./gen/AgentTurnFailureVm";
@@ -4070,6 +4080,22 @@ export async function agentSessionDriveSet(
   await invoke("agent_session_drive_set", { ...target, drive, tick });
 }
 
+/**
+ * Change a session's model or effort, or reset both to the agent's defaults (109.18). Resolves to
+ * what was written (this device's last pick for the agent from now on) and the sentence a change
+ * made while a turn runs owes the person. A later refusal by the server arrives with the session's
+ * view (`settings.write`), not here.
+ */
+export async function agentSessionSettingsChange(
+  target: AgentSessionRef,
+  change: AgentSettingsChange,
+): Promise<AgentSettingsChangedVm> {
+  return await invoke<AgentSettingsChangedVm>("agent_session_settings_change", {
+    ...target,
+    change,
+  });
+}
+
 /** A session's People sheet: its members and the people of its database the owner may add. */
 export async function agentSessionMembersSubscribe(
   target: AgentSessionRef,
@@ -4142,11 +4168,13 @@ export async function agentCommandPreview(
   return await invoke<ChatCommandPreviewVm>("agent_command_preview", { ...target, draft });
 }
 
+/** `pick` is this device's last model and effort for the session's agent: `/new` and `/clean` start with it. */
 export async function agentCommand(
   target: AgentSessionRef,
   draft: string,
+  pick: AgentSettingsPick | null,
 ): Promise<AgentCommandResultVm> {
-  return await invoke<AgentCommandResultVm>("agent_command", { ...target, draft });
+  return await invoke<AgentCommandResultVm>("agent_command", { ...target, draft, pick });
 }
 
 /**
@@ -4214,12 +4242,14 @@ export async function agentAttachRelease(
   await invoke<void>("agent_attach_release", { ...target, handles });
 }
 
+/** `pick` is this device's last model and effort for the agent; Rust writes what it still offers. */
 export async function agentSessionNew(
   database: string,
   agentActor: string,
   body: string,
+  pick: AgentSettingsPick | null,
 ): Promise<AgentSessionRef> {
-  return await invoke<AgentSessionRef>("agent_session_new", { database, agentActor, body });
+  return await invoke<AgentSessionRef>("agent_session_new", { database, agentActor, body, pick });
 }
 
 export async function agentSessionRename(target: AgentSessionRef, title: string): Promise<void> {

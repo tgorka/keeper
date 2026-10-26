@@ -1327,7 +1327,7 @@ async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and
         [("nixie", Some("alpha"))]
     );
     let key = hq
-        .new_session("alpha", "nixie", "plan the week")
+        .new_session("alpha", "nixie", "plan the week", None)
         .expect("a new session with no server");
     assert_eq!(key.database, "alpha");
     hq.send(&key, "and then the weekend").expect("a message");
@@ -1384,7 +1384,7 @@ async fn a_device_never_paired_offers_no_agent_and_asks_nothing() {
     hq.start().await.expect("starts");
     assert!(hq.choices().expect("choices").is_empty());
     assert!(matches!(
-        hq.new_session("local", "nixie", "hello"),
+        hq.new_session("local", "nixie", "hello", None),
         Err(HqError::Sentence(_))
     ));
     assert_eq!(world.routes.discovered.load(Ordering::SeqCst), 0);
@@ -1477,7 +1477,7 @@ async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens(
     })
     .await;
     let key = first
-        .new_session("alpha", "nixie", "plan the week")
+        .new_session("alpha", "nixie", "plan the week", None)
         .expect("a session");
     first.shutdown().await;
 

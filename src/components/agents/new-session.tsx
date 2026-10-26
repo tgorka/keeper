@@ -16,6 +16,7 @@ import {
   agentSessionNew,
   agentsChoices,
 } from "@/lib/ipc/client";
+import { lastAgentPick } from "@/lib/stores/agent-picks";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import {
   ConversationStoresProvider,
@@ -172,7 +173,12 @@ export function NewSession({
             }}
             onSend={async (body) => {
               if (!choice || !database) return;
-              const target = await agentSessionNew(database, choice.agentActor, body);
+              const target = await agentSessionNew(
+                database,
+                choice.agentActor,
+                body,
+                lastAgentPick(choice.agentActor),
+              );
               agentSessionsStore.getState().keepNewDraft(null);
               onCreated(target);
             }}

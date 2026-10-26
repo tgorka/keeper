@@ -1042,6 +1042,7 @@ pub fn run() {
                 hq_ipc::agent_view_prefs_set,
                 hq_ipc::agent_session_tool_set,
                 hq_ipc::agent_session_drive_set,
+                hq_ipc::agent_session_settings_change,
                 // A session's people: who is in it, adding, the reader
                 // flag, removing, leaving.
                 hq_ipc::agent_session_members_subscribe,

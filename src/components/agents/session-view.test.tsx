@@ -146,6 +146,7 @@ describe("session context details", () => {
       expect(mock.command).toHaveBeenCalledWith(
         { database: "beta", sessionId: "same.1" },
         "/context",
+        null,
       ),
     );
     return await screen.findByRole("dialog", { name: "Details" });

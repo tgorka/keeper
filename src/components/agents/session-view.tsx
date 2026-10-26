@@ -10,6 +10,7 @@ import { SessionControls } from "@/components/agents/session-controls";
 import { SessionDrives } from "@/components/agents/session-drives";
 import { SessionInstances } from "@/components/agents/session-instances";
 import { SessionPeople } from "@/components/agents/session-people";
+import { SessionSettingsPicker } from "@/components/agents/session-settings-picker";
 import {
   SessionAnswerDetails,
   SessionLiveTurn,
@@ -38,6 +39,7 @@ import {
   hqStatusSubscribe,
   hqStatusUnsubscribe,
 } from "@/lib/ipc/client";
+import { lastAgentPick, rememberAgentPick } from "@/lib/stores/agent-picks";
 import { agentSessionsStore, useAgentSessionsStore } from "@/lib/stores/agent-sessions";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import {
@@ -498,7 +500,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                     const result = await agentCommand(
                       target,
                       `/${name}${args === null ? "" : ` ${args}`}`,
+                      vm ? lastAgentPick(vm.agentActor) : null,
                     );
+                    if (result.pick && vm) rememberAgentPick(vm.agentActor, result.pick);
                     if (result.session) agentSessionsStore.getState().select(result.session);
                     if (result.surface === "people") setPeopleOpen(true);
                     if (result.surface === "tools") setToolsOpen(true);
@@ -522,6 +526,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
               />
             </ConversationStoresProvider>
           </SessionContext>
+          {vm?.settings && (
+            <SessionSettingsPicker target={target} agent={vm.agentActor} picker={vm.settings} />
+          )}
         </div>
       )}
     </section>

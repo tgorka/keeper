@@ -1076,10 +1076,17 @@ pub(crate) fn person_message(
 static CREATING: Mutex<()> = Mutex::new(());
 
 /// Create a session with `agent` in `source`'s database and its first
-/// message, in one commit, offline if need be (the server grants each
-/// client its next session ids).
-pub fn create(source: &Source, agent: &str, body: &str) -> Result<String, ReplicaError> {
-    create_with_first(source, agent, body, &ulid::Ulid::new().to_string())
+/// message, offline if need be (the server grants each client its next
+/// session ids). `pick` is this device's last choice of model and effort for
+/// `agent`: what the agent still offers of it starts the session's settings
+/// (Q109-16 b). See [`create_with_first`] for the commits it writes.
+pub fn create(
+    source: &Source,
+    agent: &str,
+    body: &str,
+    pick: Option<&crate::hq::settings::AgentSettingsPick>,
+) -> Result<String, ReplicaError> {
+    create_with_first(source, agent, body, &ulid::Ulid::new().to_string(), pick)
 }
 
 /// [`create`], its first message's id `first` — what a spoken question's
@@ -1089,6 +1096,7 @@ pub fn create_with_first(
     agent: &str,
     body: &str,
     first: &str,
+    pick: Option<&crate::hq::settings::AgentSettingsPick>,
 ) -> Result<String, ReplicaError> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let at = now_ms();
@@ -1132,11 +1140,36 @@ pub fn create_with_first(
         ),
         base_version: None,
     };
-    let mut ops = vec![session, member];
-    if !body.is_empty() {
-        ops.push(person_message(source, &id, first, body, at));
+    let settings = pick
+        .map(|pick| crate::hq::settings::initial(source, agent, &id, pick, at))
+        .transpose()?
+        .flatten();
+    let message = (!body.is_empty()).then(|| person_message(source, &id, first, body, at));
+    match settings {
+        // Nothing of a pick to write: one commit, as a creation always was.
+        None => {
+            let mut ops = vec![session, member];
+            ops.extend(message);
+            source.replica.mutate(ops)?;
+        }
+        // Three commits, in this order (R10918-07). The pick's settings row
+        // is its own commit: V16 judges it against the server's offers, which
+        // this device may not hold yet (written offline, or behind a
+        // republish), and a refusal rolls back only the commit it is in —
+        // never the conversation or its first message. The refusal then shows
+        // on the new session's picker (`settings::write_state`). The server
+        // applies a client's commits in order, so the settings commit is
+        // applied before the message, and the runtime starts no turn before
+        // it holds the session's settings (keeper-hq `worker.rs`,
+        // `start_turn`): the first turn uses the pick.
+        Some(row) => {
+            source.replica.mutate(vec![session, member])?;
+            source.replica.mutate(vec![row])?;
+            if let Some(message) = message {
+                source.replica.mutate(vec![message])?;
+            }
+        }
     }
-    source.replica.mutate(ops)?;
     source.replica.sync_now();
     Ok(id)
 }
