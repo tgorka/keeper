@@ -25,10 +25,14 @@ readOnly: boolean,
  */
 messages: Array<AgentMessageVm>, 
 /**
- * 109.13: the ordered projection consumed by the fold renderer. The
- * legacy messages/live fields remain until 109.14 switches over.
+ * The reading column, in order (109.13): what the window draws. Its
+ * entries name `messages`, `folds` and `live`.
  */
-items?: Array<AgentTimelineItemVm>, folds?: Array<AgentTurnFoldVm>, 
+items: Array<AgentTimelineItemVm>, 
+/**
+ * One per turn, in the order the column names them.
+ */
+folds: Array<AgentTurnFoldVm>, 
 /**
  * Oldest first; empty for a member who does not read the trace. The
  * requests that wait for this person are in `banner`, not here.
@@ -64,7 +68,8 @@ readsTrace: boolean,
  */
 untrusted: boolean, 
 /**
- * The answers still being written, oldest first.
+ * The answers still being written, oldest first; each one's work is its
+ * turn's fold.
  */
 live: Array<AgentLiveTurnVm>, 
 /**

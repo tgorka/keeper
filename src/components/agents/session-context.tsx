@@ -21,13 +21,14 @@ type ContextVm = NonNullable<AgentSessionViewVm["context"]>;
  */
 export function SessionContext({
   context,
-  showDetails,
+  verbose,
   open,
   onOpenChange,
   children,
 }: {
   context: ContextVm | undefined;
-  showDetails: boolean;
+  /** The verbose view mode: the one in which Rust sends an answer's details. */
+  verbose: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Where the ring lives: it must render inside this panel's root to be its trigger. */
@@ -63,9 +64,9 @@ export function SessionContext({
             <ContextBreakdown context={context} />
           ) : (
             <p className="text-muted-foreground text-sm">
-              {showDetails
+              {verbose
                 ? "The latest answer has no context window measurement."
-                : "The context window is one of an answer's details. Turn on Show details to see it."}
+                : "The context window is one of an answer's details. Choose the Verbose view to see it."}
             </p>
           )}
         </section>

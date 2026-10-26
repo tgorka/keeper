@@ -134,7 +134,7 @@ impl Hq {
             let plan = sessions::plan(
                 &sessions::held(&source),
                 &widen,
-                self.view_prefs().show_reasoning,
+                self.view_prefs().view_mode.shows_thinking(),
                 now,
             )
             .into_iter()
@@ -365,8 +365,7 @@ impl Hq {
     fn read_view_prefs(&self) -> Result<AgentViewPrefsVm, HqError> {
         let data_dir = self.data_dir()?;
         Ok(AgentViewPrefsVm {
-            show_reasoning: crate::registry::get_agents_show_reasoning(&data_dir)?,
-            show_details: crate::registry::get_agents_show_details(&data_dir)?,
+            view_mode: crate::registry::get_agents_view_mode(&data_dir)?,
         })
     }
 
@@ -396,11 +395,8 @@ impl Hq {
     pub fn set_view_prefs(&self, patch: AgentViewPrefsPatch) -> Result<AgentViewPrefsVm, HqError> {
         let data_dir = self.data_dir()?;
         let mut held = lock(&self.prefs);
-        if let Some(shown) = patch.show_reasoning {
-            crate::registry::set_agents_show_reasoning(&data_dir, shown)?;
-        }
-        if let Some(shown) = patch.show_details {
-            crate::registry::set_agents_show_details(&data_dir, shown)?;
+        if let Some(mode) = patch.view_mode {
+            crate::registry::set_agents_view_mode(&data_dir, mode)?;
         }
         let prefs = self.read_view_prefs()?;
         let moved = held.replace(prefs) != Some(prefs);

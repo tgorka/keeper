@@ -8,9 +8,7 @@ use super::{
     AgentMessageVm, AgentTimelineItemVm as Item, AgentTurnFailureVm, AgentTurnFoldVm,
     AgentTurnStatusVm as Status,
 };
-use crate::hq::live::{
-    self, AgentLiveTurnVm, AgentToolStepStatusVm as Step, AgentToolStepVm, Extras,
-};
+use crate::hq::live::{self, AgentToolStepStatusVm as Step, AgentToolStepVm, Extras, LiveTurn};
 use crate::hq::sessions::{int, is_ask, json, text};
 
 /// How the runtime closed a turn, by its Closed row's `metadata.finish`.
@@ -44,13 +42,12 @@ impl Close {
 }
 
 /// All steps stay with their turn, even when committed after its answer.
-/// The legacy message projection is untouched until the renderer cutover.
 /// `live` is oldest first; `stopping` holds the turns a person's stop row
 /// names.
 pub(super) fn project(
     rows: &[Map<String, Value>],
     messages: &[AgentMessageVm],
-    live: &[AgentLiveTurnVm],
+    live: &[LiveTurn],
     extras: &Extras,
     pending: &HashSet<String>,
     stopping: &HashSet<String>,
@@ -65,7 +62,7 @@ pub(super) fn project(
     let mut work_at = HashMap::new();
     let active_by_turn: HashMap<_, _> = live
         .iter()
-        .map(|turn| (turn.turn_id.as_str(), turn))
+        .map(|turn| (turn.vm.turn_id.as_str(), turn))
         .collect();
     for row in rows.iter().filter(|row| text(row, "role") == "agent") {
         let turn = text(row, "turn_id");
@@ -110,7 +107,7 @@ pub(super) fn project(
     enum Reading<'a> {
         Message(&'a AgentMessageVm),
         Work(&'a str),
-        Live(&'a AgentLiveTurnVm),
+        Live(&'a LiveTurn),
     }
     let mut reading: Vec<_> = messages
         .iter()
@@ -135,7 +132,7 @@ pub(super) fn project(
     // written when the turn ends, after everything written so far.
     reading.extend(
         live.iter()
-            .map(|turn| (i64::MAX, turn.turn_id.as_str(), Reading::Live(turn))),
+            .map(|turn| (i64::MAX, turn.vm.turn_id.as_str(), Reading::Live(turn))),
     );
     let mut items = Vec::new();
     let mut folds = Vec::new();
@@ -159,9 +156,9 @@ pub(super) fn project(
             }
             Reading::Work(id) => (id, None),
             Reading::Live(turn) => (
-                turn.turn_id.as_str(),
+                turn.vm.turn_id.as_str(),
                 Some(Item::LiveAnswer {
-                    turn_id: turn.turn_id.clone(),
+                    turn_id: turn.vm.turn_id.clone(),
                 }),
             ),
         };
@@ -184,12 +181,15 @@ pub(super) fn project(
         // its close does (a stop that lost the race to a normal close).
         let stopped = close.map_or_else(|| stopping.contains(id), |c| c == Close::Stopped);
         let interrupted = close == Some(Close::Interrupted)
-            || active.is_some_and(|turn| turn.stopped)
+            || active.is_some_and(|turn| turn.vm.stopped)
             || steps.iter().any(|step| step.status == Step::Interrupted);
         let waiting = pending.contains(id);
-        // Only a step the runtime says started is running work; an unknown
-        // status word never is, so it can never outrank the turn's close.
-        let running = active.is_some() || steps.iter().any(|step| step.status == Step::Started);
+        // Only a step the runtime says started is running work, and only
+        // until the turn closes: the close decides a closed turn, even over
+        // a step its row still calls started. An unknown status word is
+        // never running work.
+        let running = active.is_some()
+            || (close.is_none() && steps.iter().any(|step| step.status == Step::Started));
         let failed = close == Some(Close::Failed)
             || (close.is_none() && steps.iter().any(|step| step.status == Step::Failed));
         let refused = close == Some(Close::Refused)
@@ -296,6 +296,8 @@ fn summary(
         Status::Interrupted => "Interrupted".to_owned(),
         Status::Stopped => "Stopped".to_owned(),
         Status::Failed => "Failed".to_owned(),
+        // The fold line is the turn's one visible status: a refusal says so.
+        Status::Refused => "Refused".to_owned(),
         Status::Running => match tool.or_else(|| {
             steps
                 .iter()

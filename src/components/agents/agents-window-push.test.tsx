@@ -103,7 +103,9 @@ function view(sessionId: string): AgentSessionViewVm {
     untrusted: false,
     live: [],
     tools: [],
-    prefs: { showReasoning: false, showDetails: false },
+    prefs: { viewMode: "normal" },
+    items: [{ kind: "message", messageId: "m1" }],
+    folds: [],
     messages: [
       {
         id: "m1",

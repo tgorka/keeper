@@ -1134,10 +1134,7 @@ pub fn watch_settings() {
         if key == "voice.wake_enabled" {
             wake_chosen();
         }
-        if matches!(
-            key,
-            "agents.server_url" | "agents.show_reasoning" | "agents.show_details"
-        ) {
+        if matches!(key, "agents.server_url" | "agents.view_mode") {
             crate::hq_ipc::reconcile();
         }
         if settings_sync::synced_file(key).is_some() {

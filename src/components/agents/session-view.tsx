@@ -11,17 +11,14 @@ import { SessionDrives } from "@/components/agents/session-drives";
 import { SessionInstances } from "@/components/agents/session-instances";
 import { SessionPeople } from "@/components/agents/session-people";
 import { SessionSettingsPicker } from "@/components/agents/session-settings-picker";
-import {
-  SessionAnswerDetails,
-  SessionLiveTurn,
-  SessionTrace,
-} from "@/components/agents/session-turn";
+import { SessionAnswerDetails, SessionLiveTurn, TurnFold } from "@/components/agents/session-turn";
 import { announcedElsewhere, announcedRejection, Composer } from "@/components/chat/composer";
 import { Button } from "@/components/ui/button";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { logFailure } from "@/lib/failure";
 import { formatMessageTime } from "@/lib/format-time";
 import {
+  type AgentMessageVm,
   type AgentSessionRef,
   type AgentSessionViewVm,
   agentAttachBytes,
@@ -334,6 +331,66 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     }
   };
 
+  const messages = new Map(vm?.messages.map((message) => [message.id, message]));
+  const folds = new Map(vm?.folds.map((fold) => [fold.turnId, fold]));
+  const live = new Map(vm?.live.map((turn) => [turn.turnId, turn]));
+
+  function renderMessage(message: AgentMessageVm) {
+    return (
+      <li key={message.id} className="min-w-0">
+        <div className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs">
+          <span className="font-medium">{message.authorName}</span>
+          <span className="text-muted-foreground">{formatMessageTime(message.createdAtMs)}</span>
+          {message.state && <span className="text-muted-foreground">{message.state}</span>}
+        </div>
+        {message.role === "agent" ? (
+          <AgentAnswer body={message.body} />
+        ) : (
+          <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
+            {message.body}
+          </p>
+        )}
+        {!!message.attachments?.length && <SessionAttachments attachments={message.attachments} />}
+        {message.details && <SessionAnswerDetails details={message.details} />}
+        {message.ask && (
+          <fieldset className="mt-2 flex min-w-0 flex-wrap gap-2" aria-label="Question options">
+            {message.ask.open ? (
+              <>
+                {message.ask.options.map((option) => (
+                  <Button
+                    key={option}
+                    variant="outline"
+                    size="sm"
+                    className="h-auto min-h-11 max-w-full whitespace-normal break-words text-left [overflow-wrap:anywhere]"
+                    disabled={busy || vm?.readOnly}
+                    onClick={async () => {
+                      setBusy(true);
+                      setError(null);
+                      try {
+                        await fromUnderBanner(() => agentSend(target, option, declines));
+                      } catch (raw) {
+                        setError(syncErrorMessage(raw, "keeper could not send your answer."));
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                  >
+                    {option}
+                  </Button>
+                ))}
+                <span className="w-full text-muted-foreground text-xs">
+                  Choose an option or type your answer below.
+                </span>
+              </>
+            ) : (
+              <span className="text-muted-foreground text-xs">Answered</span>
+            )}
+          </fieldset>
+        )}
+      </li>
+    );
+  }
+
   return (
     <section
       aria-label="Agent session"
@@ -446,75 +503,44 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             Loading messages…
           </p>
         )}
-        {vm?.complete && vm.messages.length === 0 && vm.live.length === 0 && (
+        {vm?.complete && vm.items.length === 0 && (
           <p className="text-muted-foreground text-sm">No messages in this session yet.</p>
         )}
-        <ol aria-label="Messages" className="mx-auto flex w-full max-w-3xl flex-col gap-5">
-          {vm?.messages.map((message) => (
-            <li key={message.id} className="min-w-0">
-              <div className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs">
-                <span className="font-medium">{message.authorName}</span>
-                <span className="text-muted-foreground">
-                  {formatMessageTime(message.createdAtMs)}
-                </span>
-                {message.state && <span className="text-muted-foreground">{message.state}</span>}
-              </div>
-              {message.role === "agent" ? (
-                <AgentAnswer body={message.body} />
-              ) : (
-                <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
-                  {message.body}
-                </p>
-              )}
-              {!!message.attachments?.length && (
-                <SessionAttachments attachments={message.attachments} />
-              )}
-              <SessionTrace reasoning={message.reasoning} steps={message.steps} />
-              {message.details && <SessionAnswerDetails details={message.details} />}
-              {message.ask && (
-                <fieldset
-                  className="mt-2 flex min-w-0 flex-wrap gap-2"
-                  aria-label="Question options"
-                >
-                  {message.ask.open ? (
-                    <>
-                      {message.ask.options.map((option) => (
-                        <Button
-                          key={option}
-                          variant="outline"
-                          size="sm"
-                          className="h-auto min-h-11 max-w-full whitespace-normal break-words text-left [overflow-wrap:anywhere]"
-                          disabled={busy || vm?.readOnly}
-                          onClick={async () => {
-                            setBusy(true);
-                            setError(null);
-                            try {
-                              await fromUnderBanner(() => agentSend(target, option, declines));
-                            } catch (raw) {
-                              setError(syncErrorMessage(raw, "keeper could not send your answer."));
-                            } finally {
-                              setBusy(false);
-                            }
-                          }}
-                        >
-                          {option}
-                        </Button>
-                      ))}
-                      <span className="w-full text-muted-foreground text-xs">
-                        Choose an option or type your answer below.
-                      </span>
-                    </>
-                  ) : (
-                    <span className="text-muted-foreground text-xs">Answered</span>
-                  )}
-                </fieldset>
-              )}
-            </li>
-          ))}
-          {vm?.live.map((turn) => (
-            <SessionLiveTurn key={turn.turnId} turn={turn} agentName={vm.agentName} />
-          ))}
-        </ol>
+        {vm && (
+          <ol aria-label="Messages" className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+            {vm.items.map((item) => {
+              // Rust's reading column, in its order: each entry names what it draws.
+              if (item.kind === "message") {
+                const message = messages.get(item.messageId);
+                return message && renderMessage(message);
+              }
+              if (item.kind === "fold") {
+                const fold = folds.get(item.turnId);
+                return (
+                  fold && (
+                    <TurnFold
+                      key={`fold:${item.turnId}`}
+                      fold={fold}
+                      leadIns={fold.leadInIds.flatMap((id) => messages.get(id) ?? [])}
+                      agentName={vm.agentName}
+                      verbose={vm.prefs.viewMode === "verbose"}
+                    />
+                  )
+                );
+              }
+              const turn = live.get(item.turnId);
+              return (
+                turn && (
+                  <SessionLiveTurn
+                    key={`live:${item.turnId}`}
+                    turn={turn}
+                    agentName={vm.agentName}
+                  />
+                )
+              );
+            })}
+          </ol>
+        )}
         {!!vm?.approvals.length && (
           <section
             aria-label="Session approvals"
@@ -565,7 +591,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         <div data-slot="agent-session-composer" className="shrink-0 border-border border-t p-3">
           <SessionContext
             context={vm?.context}
-            showDetails={vm?.prefs.showDetails ?? false}
+            verbose={vm?.prefs.viewMode === "verbose"}
             open={contextOpen}
             onOpenChange={setContextOpen}
           >

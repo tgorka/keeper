@@ -55,7 +55,7 @@ fn screenshot_turn_folds_once_with_late_searches_and_a_separate_answer_last() {
             json!({"duration_ms": 14000, "finish": "stop"}),
         ),
     ]);
-    let before = w.view(&opened(SHOW_ALL, &[], &[]));
+    let before = w.view(&opened(VERBOSE, &[], &[]));
     w.put(vec![
         call(
             &w,
@@ -74,7 +74,7 @@ fn screenshot_turn_folds_once_with_late_searches_and_a_separate_answer_last() {
             Some("later result"),
         ),
     ]);
-    let view = w.view(&opened(SHOW_ALL, &[], &[]));
+    let view = w.view(&opened(VERBOSE, &[], &[]));
     assert_eq!(
         view.items,
         vec![
@@ -238,7 +238,7 @@ fn fold_trace_and_reasoning_respect_membership_and_reasoning_preference() {
             w.reasoning("r1", 1, true, "private thought"),
             w.answer("public answer", json!({})),
         ]);
-        let on = w.view(&opened(SHOW_ALL, &[], &[]));
+        let on = w.view(&opened(VERBOSE, &[], &[]));
         let fold = &on.folds[0];
         assert_eq!(
             fold.reasoning.as_deref(),
@@ -1036,4 +1036,42 @@ fn an_unknown_step_status_never_outranks_the_close() {
         state(&w.view(&Opened::default()).folds[0]),
         (json!("stopped"), "Stopped")
     );
+}
+
+/// 109.13's review note, fixed for 109.14: a turn that closed decides its
+/// own status even when a call's row still says `started` — never
+/// "Working" under a finished answer. Without a close, the same row is
+/// running work.
+#[test]
+fn a_closed_turn_with_a_started_step_reads_by_its_close() {
+    let w = world(true);
+    w.put(vec![imported_call(&w, "c1", TURN, "started", "")]);
+    let open = w.view(&Opened::default());
+    assert_eq!(state(&open.folds[0]), (json!("running"), "Working"));
+    w.put(vec![w.answer(
+        "Done.",
+        json!({"finish": "stop", "duration_ms": 2000}),
+    )]);
+    let closed = w.view(&Opened::default());
+    let fold = &closed.folds[0];
+    assert_eq!(
+        state(fold),
+        (json!("done"), "Finished"),
+        "the close decides, never Working"
+    );
+    assert_eq!(fold.summary, "Worked for 2 s · ran 1 command");
+}
+
+/// The fold line is the one status a collapsed turn shows: a refused turn
+/// says so in its summary rather than "Worked".
+#[test]
+fn a_refused_turn_says_refused_on_its_fold_line() {
+    let w = world(true);
+    w.put(vec![
+        imported_call(&w, "c1", TURN, "done", "ok"),
+        w.answer("", json!({"finish": "content_filter", "duration_ms": 1000})),
+    ]);
+    let fold = &w.view(&Opened::default()).folds[0];
+    assert_eq!(state(fold), (json!("refused"), "Refused"));
+    assert_eq!(fold.summary, "Refused · ran 1 command");
 }

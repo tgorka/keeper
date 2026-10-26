@@ -42,16 +42,59 @@ const STALE_MS: i64 = 120_000;
 /// so an answer whose instance stopped says so with nothing else changing.
 pub const RECHECK: Duration = Duration::from_secs(2);
 
+/// How a person reads agents' turns (Story 109.14, Q109-13 a; Claude
+/// desktop's transcript modes). What Rust sends follows it: thinking only in
+/// `Thinking` and `Verbose`, and only to a reader of the trace; an answer's
+/// details only in `Verbose`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AgentViewModeVm {
+    /// Each turn's work folded into one line above its answer.
+    #[default]
+    Normal,
+    /// Folded, plus the agent's thinking.
+    Thinking,
+    /// Every turn's work open, the thinking, and each answer's details.
+    Verbose,
+}
+
+impl AgentViewModeVm {
+    /// The `agents.view_mode` word; a word keeper does not know is `Normal`.
+    pub fn of(word: &str) -> Self {
+        match word {
+            "thinking" => Self::Thinking,
+            "verbose" => Self::Verbose,
+            _ => Self::Normal,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Thinking => "thinking",
+            Self::Verbose => "verbose",
+        }
+    }
+
+    /// The agent's thinking is sent (to a reader of the trace).
+    pub fn shows_thinking(self) -> bool {
+        matches!(self, Self::Thinking | Self::Verbose)
+    }
+
+    /// An answer's model, tokens and timings are sent.
+    pub fn shows_details(self) -> bool {
+        self == Self::Verbose
+    }
+}
+
 /// What this viewer chose to see — a person's settings, the same on every
 /// device (R-HQ-31), a settings file winning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AgentViewPrefsVm {
-    /// The agent's thinking, where the person reads the trace.
-    pub show_reasoning: bool,
-    /// An answer's model, tokens and timings.
-    pub show_details: bool,
+    pub view_mode: AgentViewModeVm,
 }
 
 /// A change of [`AgentViewPrefsVm`]: only what is present is written.
@@ -59,8 +102,7 @@ pub struct AgentViewPrefsVm {
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct AgentViewPrefsPatch {
-    pub show_reasoning: Option<bool>,
-    pub show_details: Option<bool>,
+    pub view_mode: Option<AgentViewModeVm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -129,7 +171,8 @@ pub struct AgentToolStepVm {
     pub ended_at_ms: Option<i64>,
 }
 
-/// A turn still being written.
+/// A turn still being written: its answer so far. Its work, thinking and
+/// current tool are its fold's ([`crate::hq::timeline::AgentTurnFoldVm`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -137,20 +180,20 @@ pub struct AgentLiveTurnVm {
     pub turn_id: String,
     /// What is written so far: always a prefix of the answer.
     pub text: String,
-    /// The tool being called now, by name (the session's tail carries it to
-    /// every member).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub tool: Option<String>,
-    /// The thinking so far, for a reader who chose to see it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub reasoning: Option<String>,
-    /// Its tool calls; empty for a member who does not read the trace.
-    pub steps: Vec<AgentToolStepVm>,
     /// The instance writing it stopped without ending it: what is shown is
     /// all there will be.
     pub stopped: bool,
+}
+
+/// A turn still being written, with what its fold reads of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTurn {
+    pub vm: AgentLiveTurnVm,
+    /// The tool being called now, by name (the session's tail carries it to
+    /// every member).
+    pub tool: Option<String>,
+    /// The thinking so far, for a reader who chose to see it.
+    pub reasoning: Option<String>,
 }
 
 /// What an answer's provider reported. A value it did not report is
@@ -458,12 +501,15 @@ pub struct Extras {
     pub thinking: bool,
 }
 
+/// `mode` decides whether any thinking is read: only in
+/// [`AgentViewModeVm::shows_thinking`], and only for a reader.
 pub fn extras(
     source: &Source,
     session_id: &str,
     reads_trace: bool,
-    show_reasoning: bool,
+    mode: AgentViewModeVm,
 ) -> Extras {
+    let show_reasoning = mode.shows_thinking();
     let mut steps: HashMap<String, Vec<AgentToolStepVm>> = HashMap::new();
     let mut reasoning: HashMap<String, Vec<(i64, bool, String)>> = HashMap::new();
     if reads_trace {
@@ -554,7 +600,7 @@ pub(super) fn turns(
     live: &Live,
     ended: &HashSet<String>,
     extras: &Extras,
-) -> Vec<AgentLiveTurnVm> {
+) -> Vec<LiveTurn> {
     struct Chunks {
         pieces: Vec<(i64, String)>,
         author: Option<String>,
@@ -617,13 +663,14 @@ pub(super) fn turns(
                     )
                 })
                 .filter(|text| !text.is_empty());
-            AgentLiveTurnVm {
-                turn_id: id.to_owned(),
-                text,
+            LiveTurn {
+                vm: AgentLiveTurnVm {
+                    turn_id: id.to_owned(),
+                    text,
+                    stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
+                },
                 tool: turn.and_then(|turn| turn.tool.clone()),
                 reasoning,
-                steps: extras.steps.get(id).cloned().unwrap_or_default(),
-                stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
             }
         })
         .collect()

@@ -1,9 +1,29 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { type AgentSessionViewVm, agentSessionToolSet } from "@/lib/ipc/client";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import {
+  type AgentSessionViewVm,
+  type AgentViewModeVm,
+  agentSessionToolSet,
+} from "@/lib/ipc/client";
 import { setAgentViewPrefs, useAgentViewPrefsWrite } from "@/lib/stores/agent-view-prefs";
 import { syncErrorMessage } from "@/lib/stores/sync";
+
+/** Claude desktop's transcript modes (Q109-13 a); Rust decides what each one sends. */
+const VIEW_MODES: { mode: AgentViewModeVm; label: string; hint: string }[] = [
+  {
+    mode: "normal",
+    label: "Normal",
+    hint: "Each turn's work folded into one line above its answer",
+  },
+  { mode: "thinking", label: "Thinking", hint: "Folded work, plus the agent's thinking" },
+  {
+    mode: "verbose",
+    label: "Verbose",
+    hint: "Every turn's work open, the thinking, and each answer's details",
+  },
+];
 
 export function SessionControls({
   vm,
@@ -14,8 +34,8 @@ export function SessionControls({
   toolsOpen?: boolean;
   onToolsOpenChange?: (open: boolean) => void;
 }) {
-  // The switches show the preferences as Rust resolves them now, carried with
-  // the view: switched on another device or in a settings file, they follow.
+  // The view mode shows the preference as Rust resolves it now, carried with
+  // the view: changed on another device or in a settings file, it follows.
   const { prefs } = vm;
   const write = useAgentViewPrefsWrite();
   const [ownToolsOpen, setOwnToolsOpen] = useState(false);
@@ -31,30 +51,32 @@ export function SessionControls({
   const tools = vm.readOnly ? [] : vm.tools;
   // Never the `disabled` attribute while a write is in flight: it would drop
   // keyboard focus to the page. A click then is ignored instead (the write
-  // store ignores a preference click too).
+  // store ignores a preference click while one is in flight).
   return (
     <div className="shrink-0 border-border border-b px-3 py-1">
       <fieldset className="flex flex-wrap items-center gap-1" aria-label="Answer preferences">
-        {vm.readsTrace && (
-          <Button
-            variant={prefs.showReasoning ? "secondary" : "ghost"}
-            className="min-h-11"
-            aria-pressed={prefs.showReasoning}
-            aria-busy={write.busy}
-            onClick={() => void setAgentViewPrefs({ showReasoning: !prefs.showReasoning })}
-          >
-            Show thinking
-          </Button>
-        )}
-        <Button
-          variant={prefs.showDetails ? "secondary" : "ghost"}
-          className="min-h-11"
-          aria-pressed={prefs.showDetails}
+        <ToggleGroup
+          type="single"
+          aria-label="View"
+          value={prefs.viewMode}
           aria-busy={write.busy}
-          onClick={() => void setAgentViewPrefs({ showDetails: !prefs.showDetails })}
+          onValueChange={(next) => {
+            // Radix answers "" when the pressed item is pressed again: the mode stays.
+            const mode = VIEW_MODES.find((option) => option.mode === next)?.mode;
+            if (mode && mode !== prefs.viewMode) void setAgentViewPrefs({ viewMode: mode });
+          }}
         >
-          Show details
-        </Button>
+          {VIEW_MODES.map((option) => (
+            <ToggleGroupItem
+              key={option.mode}
+              value={option.mode}
+              className="min-h-11 px-3"
+              title={option.hint}
+            >
+              {option.label}
+            </ToggleGroupItem>
+          ))}
+        </ToggleGroup>
         {tools.length > 0 && (
           <Button
             variant="ghost"

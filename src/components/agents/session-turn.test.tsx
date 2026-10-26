@@ -1,9 +1,128 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { SessionTrace } from "@/components/agents/session-turn";
-import type { AgentToolStepVm } from "@/lib/ipc/client";
+import { TurnFold, TurnSteps } from "@/components/agents/session-turn";
+import type { AgentMessageVm, AgentToolStepVm, AgentTurnFoldVm } from "@/lib/ipc/client";
 
-describe("SessionTrace", () => {
+const lead: AgentMessageVm = {
+  id: "lead",
+  role: "agent",
+  authorActor: "assistant",
+  authorName: "Assistant",
+  body: "Checking — one minute.",
+  createdAtMs: 1780000000000,
+};
+
+function fold(patch: Partial<AgentTurnFoldVm> = {}): AgentTurnFoldVm {
+  return {
+    turnId: "t1",
+    leadInIds: ["lead"],
+    reasoning: null,
+    steps: [
+      { id: "s1", name: "run", status: "done", statusLabel: "Finished", result: "ok" },
+      { id: "s2", name: "web_search", status: "refused", statusLabel: "Refused", result: "No." },
+    ],
+    failures: [{ stepId: "s2", sentence: "web_search · Refused: No." }],
+    status: "done",
+    statusLabel: "Finished",
+    summary: "Worked for 14 s · ran 1 command, searched the web 1 time",
+    durationMs: 14000,
+    ...patch,
+  };
+}
+
+function draw(vm: AgentTurnFoldVm, verbose = false) {
+  return render(
+    <ol>
+      <TurnFold fold={vm} leadIns={[lead]} agentName="Assistant" verbose={verbose} />
+    </ol>,
+  );
+}
+
+describe("TurnFold", () => {
+  it("is one line until opened, with each refusal a line of its own and never a card", () => {
+    draw(fold());
+    const line = screen.getByRole("button", {
+      name: "Worked for 14 s · ran 1 command, searched the web 1 time",
+    });
+    expect(line).toHaveAttribute("aria-expanded", "false");
+    // Folded: the lead-in and the calls are not drawn at all.
+    expect(screen.queryByText("Checking — one minute.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Tool calls" })).not.toBeInTheDocument();
+    // The refusal stays visible, as one plain line: no disclosure, no card.
+    const refusal = screen.getByText("web_search · Refused: No.");
+    expect(refusal).toBeVisible();
+    const row = refusal.closest("li");
+    expect(row).toHaveAttribute("data-slot", "turn-failure");
+    expect(refusal.closest("details")).toBeNull();
+    expect(row?.className).not.toMatch(/\bborder\b|\brounded/);
+
+    fireEvent.click(line);
+    expect(line).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Checking — one minute.")).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Tool calls" })).toBeInTheDocument();
+  });
+
+  it("opens by default in the verbose mode, and a person's own toggle wins until the mode changes", () => {
+    const { rerender } = draw(fold(), true);
+    const line = screen.getByRole("button", { expanded: true });
+    fireEvent.click(line);
+    expect(line).toHaveAttribute("aria-expanded", "false");
+    rerender(
+      <ol>
+        <TurnFold fold={fold()} leadIns={[lead]} agentName="Assistant" verbose={false} />
+      </ol>,
+    );
+    expect(screen.getByRole("button", { expanded: false })).toBeInTheDocument();
+    rerender(
+      <ol>
+        <TurnFold fold={fold()} leadIns={[lead]} agentName="Assistant" verbose={true} />
+      </ol>,
+    );
+    expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
+  });
+
+  it("draws the thinking Rust sent, and none when it sent none", () => {
+    const { rerender } = draw(fold({ reasoning: "Compare two sources." }));
+    expect(screen.getByRole("region", { name: "Thinking" })).toHaveTextContent(
+      "Compare two sources.",
+    );
+    rerender(
+      <ol>
+        <TurnFold fold={fold()} leadIns={[lead]} agentName="Assistant" verbose={false} />
+      </ol>,
+    );
+    expect(screen.queryByRole("region", { name: "Thinking" })).not.toBeInTheDocument();
+  });
+
+  it("announces a running turn's live line", () => {
+    draw(
+      fold({
+        status: "running",
+        statusLabel: "Working",
+        summary: "Searching the web… · 3 steps",
+        failures: [],
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Searching the web… · 3 steps");
+  });
+
+  it("is a plain line, not a control, when there is nothing to open", () => {
+    render(
+      <ol>
+        <TurnFold
+          fold={fold({ leadInIds: [], steps: [], failures: [], summary: "Worked for 14 s" })}
+          leadIns={[]}
+          agentName="Assistant"
+          verbose={true}
+        />
+      </ol>,
+    );
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByText("Worked for 14 s")).toBeInTheDocument();
+  });
+});
+
+describe("TurnSteps", () => {
   // Rust names every step status (keeper-core `live.rs`); the renderer maps none.
   it("shows each step's status in Rust's own words, never a local guess", () => {
     const steps: AgentToolStepVm[] = [
@@ -13,11 +132,32 @@ describe("SessionTrace", () => {
       { id: "c4", name: "run", status: "unknown", statusLabel: 'Unknown status "frobbed"' },
       { id: "c5", name: "read_file", status: "refused", statusLabel: "Refused" },
     ];
-    render(<SessionTrace steps={steps} />);
+    render(<TurnSteps steps={steps} />);
     expect(screen.getByText("web_search · Interrupted")).toBeInTheDocument();
     expect(screen.getByText("web_search · Paused")).toBeInTheDocument();
     expect(screen.getByText("run · Failed")).toBeInTheDocument();
     expect(screen.getByText('run · Unknown status "frobbed"')).toBeInTheDocument();
     expect(screen.getAllByText(/· Refused$/)).toHaveLength(1);
+  });
+
+  // 109.13's review note: the end caption said "Finished" for every ending.
+  it("captions how a call ended in Rust's word, never Finished for an interruption", () => {
+    render(
+      <TurnSteps
+        steps={[
+          {
+            id: "c1",
+            name: "web_search",
+            status: "interrupted",
+            statusLabel: "Interrupted",
+            startedAtMs: 1780000000000,
+            endedAtMs: 1780000001000,
+          },
+        ]}
+      />,
+    );
+    const call = screen.getByRole("listitem");
+    expect(within(call).getByText(/^Interrupted \d/)).toBeInTheDocument();
+    expect(within(call).queryByText(/^Finished/)).not.toBeInTheDocument();
   });
 });

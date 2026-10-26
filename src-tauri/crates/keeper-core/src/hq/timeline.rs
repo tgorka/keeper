@@ -27,7 +27,7 @@ use crate::hq::drives::AgentSessionDrivesVm;
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentMessageDetailsVm, AgentSessionToolVm, AgentToolStepVm,
-    AgentViewPrefsVm, Extras, Live,
+    AgentViewPrefsVm, Live,
 };
 use crate::hq::port::ReplicaError;
 use crate::hq::sessions::{
@@ -106,18 +106,11 @@ pub struct AgentMessageVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub ask: Option<AgentSessionAskVm>,
-    /// An agent answer's details, when this viewer shows them.
+    /// An agent answer's details, in the `verbose` view mode only. Its
+    /// turn's thinking and tool calls are the turn's fold's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub details: Option<AgentMessageDetailsVm>,
-    /// An agent answer's thinking, for a reader who shows it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub reasoning: Option<String>,
-    /// An agent answer's tool calls, for a reader.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub steps: Option<Vec<AgentToolStepVm>>,
     /// The files attached to it, in the order they were attached.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<AgentAttachmentVm>>", optional)]
@@ -238,13 +231,10 @@ pub struct AgentSessionViewVm {
     pub read_only: bool,
     /// Oldest first.
     pub messages: Vec<AgentMessageVm>,
-    /// 109.13: the ordered projection consumed by the fold renderer. The
-    /// legacy messages/live fields remain until 109.14 switches over.
-    #[serde(default)]
-    #[ts(as = "Option<Vec<AgentTimelineItemVm>>", optional)]
+    /// The reading column, in order (109.13): what the window draws. Its
+    /// entries name `messages`, `folds` and `live`.
     pub items: Vec<AgentTimelineItemVm>,
-    #[serde(default)]
-    #[ts(as = "Option<Vec<AgentTurnFoldVm>>", optional)]
+    /// One per turn, in the order the column names them.
     pub folds: Vec<AgentTurnFoldVm>,
     /// Oldest first; empty for a member who does not read the trace. The
     /// requests that wait for this person are in `banner`, not here.
@@ -268,7 +258,8 @@ pub struct AgentSessionViewVm {
     pub reads_trace: bool,
     /// The session has read outside content (`sessions.trust`, D-34).
     pub untrusted: bool,
-    /// The answers still being written, oldest first.
+    /// The answers still being written, oldest first; each one's work is its
+    /// turn's fold.
     pub live: Vec<AgentLiveTurnVm>,
     /// The tools the agent offers here and whether each is on; empty while
     /// no instance has said what it offers.
@@ -482,13 +473,13 @@ pub fn view(
     rows.retain(|row| text(row, "role") != "person" || !is_heard(&json(row, "metadata")));
     let taken = taken(source, session_id, &rows);
     let reads_trace = reads_trace(source, session_id);
-    let extras = live::extras(source, session_id, reads_trace, opened.prefs.show_reasoning);
+    let extras = live::extras(source, session_id, reads_trace, opened.prefs.view_mode);
     let ended: HashSet<String> = rows
         .iter()
         .filter(|row| text(row, "role") == "agent" && live::is_terminal(&json(row, "metadata")))
         .filter_map(|row| opt_text(row, "turn_id"))
         .collect();
-    let mut messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
+    let mut messages = messages(source, &mut rows, &directory, &taken, opened.prefs);
     let mut chips = attachments::chips(source, session_id);
     for message in &mut messages {
         message.attachments = chips.remove(&message.id).unwrap_or_default();
@@ -529,6 +520,7 @@ pub fn view(
     };
     let stopping = stopping(source, session_id, &rows);
     let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
+    let live = live.into_iter().map(|turn| turn.vm).collect();
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -555,7 +547,7 @@ pub fn view(
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,
-            context: super::context::latest(&rows, opened.prefs.show_details),
+            context: super::context::latest(&rows, opened.prefs.view_mode.shows_details()),
             drives: None,
             settings: if session.archived {
                 None
@@ -627,7 +619,6 @@ fn messages(
     rows: &mut [Map<String, Value>],
     directory: &HashMap<String, String>,
     taken: &HashSet<String>,
-    extras: &Extras,
     prefs: AgentViewPrefsVm,
 ) -> Vec<AgentMessageVm> {
     let last_person = rows.iter().rposition(|row| text(row, "role") == "person");
@@ -654,8 +645,6 @@ fn messages(
                 });
             let metadata = json(row, "metadata");
             let answer = role == AgentMessageRoleVm::Agent;
-            let turn = opt_text(row, "turn_id").filter(|_| answer);
-            let turn = turn.as_deref();
             let ask = (role == AgentMessageRoleVm::Agent && is_ask(&metadata)).then(|| {
                 AgentSessionAskVm {
                     options: metadata
@@ -683,13 +672,9 @@ fn messages(
                 created_at_ms: int(row, "created_at_ms").unwrap_or(0),
                 state,
                 ask,
-                details: (answer && prefs.show_details)
+                details: (answer && prefs.view_mode.shows_details())
                     .then(|| live::details(&metadata))
                     .flatten(),
-                reasoning: turn
-                    .filter(|_| extras.thinking)
-                    .and_then(|turn| live::ended_thinking(extras, turn)),
-                steps: turn.and_then(|turn| extras.steps.get(turn).cloned()),
                 attachments: Vec::new(),
             })
         })
@@ -724,8 +709,6 @@ fn refused(
             state: Some(AgentMessageStateVm::Refused),
             ask: None,
             details: None,
-            reasoning: None,
-            steps: None,
             attachments: refused.attachments,
         };
         let at = messages.partition_point(|shown| {

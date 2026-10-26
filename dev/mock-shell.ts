@@ -72,6 +72,10 @@ import type {
   AgentSessionViewVm,
   AgentSettingsChange,
   AgentSettingsPick,
+  AgentTimelineItemVm,
+  AgentToolStepVm,
+  AgentTurnFoldVm,
+  AgentViewPrefsVm,
   AutoUpdateRestartVm,
   AutoUpdateVm,
   BotModelVm,
@@ -6093,6 +6097,10 @@ const renameScenario = new URLSearchParams(location.search).get("rename");
 const renameAttempts = new Map<string, number>();
 // ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused|pinned
 const liveScenario = new URLSearchParams(location.search).get("live");
+// ?sessions=launch&turns=all — alpha's device.1 carries one turn of every fold state (109.14):
+// tool-only interrupted work, a person's stop, an imported failed step, and the screenshot's
+// turn (a lead-in, a run, three searches with one refused, then the answer).
+const turnsScenario = new URLSearchParams(location.search).get("turns");
 /**
  * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
  * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
@@ -6154,14 +6162,14 @@ function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm |
   };
 }
 /**
- * The answer preferences survive a reload in `sessionStorage`, as the capture
+ * The view mode survives a reload in `sessionStorage`, as the capture
  * sources do, read on first use rather than at import.
  */
 const AGENT_VIEW_PREFS_KEY = "keeper.mock-shell.agentViewPrefs";
-let agentViewPrefs: { showReasoning: boolean; showDetails: boolean } | null = null;
-function viewPrefs(): { showReasoning: boolean; showDetails: boolean } {
+let agentViewPrefs: AgentViewPrefsVm | null = null;
+function viewPrefs(): AgentViewPrefsVm {
   if (agentViewPrefs) return agentViewPrefs;
-  const shipped = { showReasoning: false, showDetails: false };
+  const shipped: AgentViewPrefsVm = { viewMode: "normal" };
   let read = shipped;
   try {
     const stored = sessionStorage.getItem(AGENT_VIEW_PREFS_KEY);
@@ -6173,11 +6181,53 @@ function viewPrefs(): { showReasoning: boolean; showDetails: boolean } {
   return read;
 }
 /**
- * The preferences as they hold: what was chosen, with `live=pinned` standing in
- * for a settings file that keeps Show details off whatever is chosen.
+ * The preference as it holds: what was chosen, with `live=pinned` standing in
+ * for a settings file that keeps the view mode at `normal` whatever is chosen.
  */
-function heldViewPrefs(): { showReasoning: boolean; showDetails: boolean } {
-  return liveScenario === "pinned" ? { ...viewPrefs(), showDetails: false } : { ...viewPrefs() };
+function heldViewPrefs(): AgentViewPrefsVm {
+  return liveScenario === "pinned" ? { viewMode: "normal" } : { ...viewPrefs() };
+}
+/**
+ * Rust's fold of one turn, as the mock's source keeps it: everything a reader is sent, the
+ * sentence a member who does not read the trace is sent instead, the answer it sits above, and
+ * where tool-only work reads. `sessionViewerVm` projects it as `timeline.rs` does.
+ */
+type MockFold = AgentTurnFoldVm & { publicSummary: string; answerId?: string; atMs: number };
+const sessionFolds = new Map<string, MockFold[]>();
+function mockFoldsOf(vm: AgentSessionViewVm): MockFold[] {
+  const key = JSON.stringify([vm.database, vm.sessionId]);
+  let folds = sessionFolds.get(key);
+  if (!folds) {
+    folds = [];
+    sessionFolds.set(key, folds);
+  }
+  return folds;
+}
+function mockStep(
+  id: string,
+  name: string,
+  status: AgentToolStepVm["status"],
+  result: string | undefined,
+  at: number,
+): AgentToolStepVm {
+  const label: Record<AgentToolStepVm["status"], string> = {
+    started: "Started",
+    done: "Finished",
+    refused: "Refused",
+    interrupted: "Interrupted",
+    parked: "Paused",
+    failed: "Failed",
+    unknown: "Unknown status",
+  };
+  return {
+    id,
+    name,
+    status,
+    statusLabel: label[status],
+    startedAtMs: at,
+    ...(status === "started" ? {} : { endedAtMs: at + 1500 }),
+    ...(result === undefined ? {} : { result }),
+  };
 }
 const sessionChoices: AgentChoiceVm[] = [
   {
@@ -6587,7 +6637,9 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           row.database === "alpha" &&
           row.sessionId === "device.1"),
       live: [],
-      prefs: { showReasoning: false, showDetails: false },
+      items: [],
+      folds: [],
+      prefs: { viewMode: "normal" },
       drives: mockDrives(row.database, row.archived),
       tools:
         liveScenario === "no-tools"
@@ -6694,9 +6746,9 @@ const contextAnswers: Record<
   },
 };
 /** Viewing aid mirroring Rust's context projection; never used by the app. */
-function mockContext(vm: AgentSessionViewVm, showDetails: boolean): AgentSessionViewVm["context"] {
+function mockContext(vm: AgentSessionViewVm, verbose: boolean): AgentSessionViewVm["context"] {
   const answer = contextAnswers[vm.database];
-  if (!showDetails || !answer || !vm.messages.some((message) => message.id === answer.id)) return;
+  if (!verbose || !answer || !vm.messages.some((message) => message.id === answer.id)) return;
   const context = answer.metadata.context;
   const known = context.window !== null;
   return {
@@ -6751,6 +6803,198 @@ function mockContext(vm: AgentSessionViewVm, showDetails: boolean): AgentSession
       },
     ],
   };
+}
+
+// Every answered turn has its fold (109.13), even one with no work to show.
+for (const vm of sessionViews.values()) {
+  mockFoldsOf(vm).push({
+    turnId: `turn-${vm.database}-1000`,
+    answerId: "message-1000",
+    atMs: vm.messages.find((m) => m.id === "message-1000")?.createdAtMs ?? 0,
+    leadInIds: [],
+    reasoning: "Group the checks before the review so nothing is skipped.",
+    steps: [],
+    failures: [],
+    status: "done",
+    statusLabel: "Finished",
+    summary: "Worked for 3 s",
+    publicSummary: "Worked for 3 s",
+    durationMs: 3000,
+  });
+}
+if (turnsScenario === "all") {
+  const vm = sessionViews.get(JSON.stringify(["alpha", "device.1"]));
+  if (vm) {
+    const t0 = (vm.messages[vm.messages.length - 1]?.createdAtMs ?? Date.now()) + 1000;
+    const person = (id: string, at: number, body: string) =>
+      vm.messages.push({
+        id,
+        role: "person",
+        authorActor: "ana",
+        authorName: "Ana",
+        body,
+        createdAtMs: at,
+        state: "taken",
+      });
+    const agent = (
+      id: string,
+      at: number,
+      body: string,
+      details?: AgentSessionViewVm["messages"][number]["details"],
+    ) =>
+      vm.messages.push({
+        id,
+        role: "agent",
+        authorActor: "assistant",
+        authorName: "Assistant",
+        body,
+        createdAtMs: at,
+        ...(details ? { details } : {}),
+      });
+    const folds = mockFoldsOf(vm);
+    // Tool-only work the instance's restart cut: no answer, read at its own time.
+    person("turns-p1", t0, "Find last year's release notes.");
+    folds.push({
+      turnId: "turn-interrupted",
+      atMs: t0 + 10,
+      leadInIds: [],
+      reasoning: null,
+      steps: [
+        mockStep(
+          "ti-1",
+          "web_search",
+          "interrupted",
+          "The agent restarted while this call ran; it may have had its effect.",
+          t0 + 10,
+        ),
+      ],
+      failures: [
+        {
+          stepId: "ti-1",
+          sentence:
+            "web_search · Interrupted: The agent restarted while this call ran; it may have had its effect.",
+        },
+      ],
+      status: "interrupted",
+      statusLabel: "Interrupted",
+      summary: "Interrupted · searched the web 1 time",
+      publicSummary: "Interrupted",
+      durationMs: null,
+    });
+    // A person's Stop: the close is `cancelled` and its error is the stop's sentence.
+    person("turns-p2", t0 + 1000, "Write the full changelog.");
+    agent(
+      "turns-a2",
+      t0 + 4000,
+      "Here is the changelog so far: the release checklist and the review notes.",
+      {
+        model: "example-model",
+        durationMs: 3000,
+        finish: "cancelled",
+        error: "Stopped. What had arrived is kept.",
+      },
+    );
+    folds.push({
+      turnId: "turn-stopped",
+      answerId: "turns-a2",
+      atMs: t0 + 1100,
+      leadInIds: [],
+      reasoning: null,
+      steps: [mockStep("ts-1", "run", "done", "git log --oneline v0.10..HEAD", t0 + 1100)],
+      failures: [{ stepId: "", sentence: "Stopped. What had arrived is kept." }],
+      status: "stopped",
+      statusLabel: "Stopped",
+      summary: "Stopped · ran 1 command",
+      publicSummary: "Stopped",
+      durationMs: 3000,
+    });
+    // An imported turn whose tool call failed (`hq-import`'s `failed`): the close decides.
+    person("turns-p3", t0 + 5000, "Run the test suite.");
+    agent("turns-a3", t0 + 7000, "The tests could not run: the command failed.", {
+      model: "example-model",
+      durationMs: 2000,
+      finish: "stop",
+    });
+    folds.push({
+      turnId: "turn-imported",
+      answerId: "turns-a3",
+      atMs: t0 + 5100,
+      leadInIds: [],
+      reasoning: null,
+      steps: [mockStep("tf-1", "run", "failed", "exit status 1", t0 + 5100)],
+      failures: [{ stepId: "tf-1", sentence: "run · Failed: exit status 1" }],
+      status: "done",
+      statusLabel: "Finished",
+      summary: "Worked for 2 s · ran 1 command",
+      publicSummary: "Worked for 2 s",
+      durationMs: 2000,
+    });
+    // The screenshot's turn (Q109-13): a lead-in, a run, three searches (one refused), the answer.
+    const at = t0 + 10000;
+    person("turns-p4", at, "What will the weather be in Kraków tomorrow?");
+    agent("turns-lead", at + 1000, "Checking — one minute.");
+    const forecast = Array.from(
+      { length: 40 },
+      (_, hour) => `${String(hour % 24).padStart(2, "0")}:00  ${8 + (hour % 7)} °C  light wind`,
+    ).join("\n");
+    agent(
+      "turns-answer",
+      at + 15000,
+      "Tomorrow in Kraków: **cloudy in the morning, sunny from noon**, 9–14 °C, light wind. No rain is expected.",
+      {
+        model: "example-model",
+        promptTokens: 2400,
+        completionTokens: 120,
+        totalTokens: 2520,
+        ttftMs: 640,
+        durationMs: 14000,
+        finish: "stop",
+      },
+    );
+    folds.push({
+      turnId: "turn-weather",
+      answerId: "turns-answer",
+      atMs: at + 1000,
+      leadInIds: ["turns-lead"],
+      reasoning:
+        "The person wants tomorrow's forecast for Kraków. Search two forecast sources and compare them; one command to read the hourly table.",
+      steps: [
+        mockStep("tw-1", "run", "done", forecast, at + 1200),
+        mockStep(
+          "tw-2",
+          "web_search",
+          "done",
+          "yr.no: Kraków, tomorrow — 9–14 °C, cloudy then sunny.",
+          at + 3000,
+        ),
+        mockStep(
+          "tw-3",
+          "web_search",
+          "done",
+          "meteo.pl: Kraków — no precipitation, wind 2–4 m/s.",
+          at + 6000,
+        ),
+        mockStep(
+          "tw-4",
+          "web_search",
+          "refused",
+          "This turn has used the two web searches it may make.",
+          at + 9000,
+        ),
+      ],
+      failures: [
+        {
+          stepId: "tw-4",
+          sentence: "web_search · Refused: This turn has used the two web searches it may make.",
+        },
+      ],
+      status: "done",
+      statusLabel: "Finished",
+      summary: "Worked for 14 s · ran 1 command, searched the web 3 times",
+      publicSummary: "Worked for 14 s",
+      durationMs: 14000,
+    });
+  }
 }
 
 // ?sessions=launch&attachments=chips — the chip in every state (UX-DR-E107-1), in alpha's
@@ -6963,16 +7207,64 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
     write: held.refused ? { state: "refused", sentence: held.refused } : { state: "confirmed" },
   };
 }
-/** The mock's source retains rows; only the reader's selected projection crosses IPC. */
+/**
+ * The mock's source retains rows; only the viewer's projection crosses IPC, as `timeline.rs`
+ * draws it: a turn's fold just above its answer (lead-ins inside it), tool-only work at its own
+ * time, a streaming answer last. Thinking only in the thinking and verbose modes and only to a
+ * reader; steps and their failure lines only to a reader; details only in verbose.
+ */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   const prefs = heldViewPrefs();
+  const reader = vm.readsTrace;
+  const thinking = reader && prefs.viewMode !== "normal";
+  const source = mockFoldsOf(vm);
+  const leadIns = new Set(source.flatMap((fold) => fold.leadInIds));
+  const byAnswer = new Map(
+    source.flatMap((fold) => (fold.answerId ? [[fold.answerId, fold] as const] : [])),
+  );
+  const streaming = new Set(vm.live.map((turn) => turn.turnId));
+  const loose = source
+    .filter((fold) => !fold.answerId && !streaming.has(fold.turnId))
+    .sort((a, b) => a.atMs - b.atMs);
+  const items: AgentTimelineItemVm[] = [];
+  let next = 0;
+  for (const message of vm.messages) {
+    while (next < loose.length && loose[next].atMs < message.createdAtMs)
+      items.push({ kind: "fold", turnId: loose[next++].turnId });
+    if (leadIns.has(message.id)) continue;
+    const fold = byAnswer.get(message.id);
+    if (fold) items.push({ kind: "fold", turnId: fold.turnId });
+    items.push({ kind: "message", messageId: message.id });
+  }
+  while (next < loose.length) items.push({ kind: "fold", turnId: loose[next++].turnId });
+  for (const turn of vm.live) {
+    if (source.some((fold) => fold.turnId === turn.turnId))
+      items.push({ kind: "fold", turnId: turn.turnId });
+    items.push({ kind: "liveAnswer", turnId: turn.turnId });
+  }
+  const folds = items.flatMap((item) => {
+    const fold = item.kind === "fold" && source.find((f) => f.turnId === item.turnId);
+    if (!fold) return [];
+    const { publicSummary, answerId: _answer, atMs: _at, ...vmFold } = fold;
+    return [
+      {
+        ...vmFold,
+        reasoning: thinking ? vmFold.reasoning : null,
+        steps: reader ? vmFold.steps.map((step) => ({ ...step })) : [],
+        failures: reader ? [...vmFold.failures] : vmFold.failures.filter((f) => f.stepId === ""),
+        summary: reader ? vmFold.summary : publicSummary,
+      },
+    ];
+  });
   // `timeline::banner`: what a message would decline sits above the composer.
-  const cards = vm.readsTrace ? vm.approvals.map(mockApproval) : [];
+  const cards = reader ? vm.approvals.map(mockApproval) : [];
   const waiting = cards.filter((card) => card.declinedBySend);
   return {
     ...vm,
     prefs,
-    context: mockContext(vm, prefs.showDetails),
+    context: mockContext(vm, prefs.viewMode === "verbose"),
+    items,
+    folds,
     approvals: cards.filter((card) => !card.declinedBySend),
     ...(waiting.length > 0
       ? {
@@ -6990,17 +7282,11 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
       : {}),
     settings: mockPicker(vm),
-    messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
+    messages: vm.messages.map(({ details, ...message }) => ({
       ...message,
-      ...(prefs.showDetails && details ? { details } : {}),
-      ...(vm.readsTrace && prefs.showReasoning && reasoning ? { reasoning } : {}),
-      ...(vm.readsTrace && steps ? { steps } : {}),
+      ...(prefs.viewMode === "verbose" && details ? { details } : {}),
     })),
-    live: vm.live.map(({ reasoning, steps, ...turn }) => ({
-      ...turn,
-      ...(vm.readsTrace && prefs.showReasoning && reasoning ? { reasoning } : {}),
-      steps: vm.readsTrace ? steps.map((step) => ({ ...step })) : [],
-    })),
+    live: vm.live.map((turn) => ({ ...turn })),
   };
 }
 
@@ -7010,13 +7296,23 @@ function startLiveFixture(vm: AgentSessionViewVm) {
   if (!liveScenario || vm.archived || startedLiveFixtures.has(key)) return;
   startedLiveFixtures.add(key);
   vm.approvals = [];
-  const turn: AgentSessionViewVm["live"][number] = {
-    turnId: `live-${vm.database}`,
-    text: "",
-    steps: [],
-    stopped: false,
-  };
+  const turnId = `live-${vm.database}`;
+  const turn: AgentSessionViewVm["live"][number] = { turnId, text: "", stopped: false };
   vm.live = [turn];
+  const fold: MockFold = {
+    turnId,
+    atMs: Date.now(),
+    leadInIds: [],
+    reasoning: null,
+    steps: [],
+    failures: [],
+    status: "running",
+    statusLabel: "Working",
+    summary: "Working…",
+    publicSummary: "Working…",
+    durationMs: null,
+  };
+  mockFoldsOf(vm).push(fold);
   const text =
     "## Release checks\n\nStart with the acceptance checks, then review the changes with Ana and Ben.\n\n" +
     Array.from(
@@ -7030,56 +7326,60 @@ function startLiveFixture(vm: AgentSessionViewVm) {
   const timer = setInterval(() => {
     tick += 1;
     turn.text = text.slice(0, Math.ceil((text.length * Math.min(tick, 90)) / 90));
-    turn.reasoning = "I will separate the acceptance checks from the release notes.".slice(
+    fold.reasoning = "I will separate the acceptance checks from the release notes.".slice(
       0,
       tick * 3,
     );
     if (tick === 4) {
-      turn.tool = "web_search";
-      turn.steps = [
-        {
-          id: "tool-live",
-          name: "web_search",
-          status: "started",
-          statusLabel: "Started",
-          startedAtMs: Date.now(),
-        },
-      ];
+      fold.steps = [mockStep("tool-live", "web_search", "started", undefined, Date.now())];
+      fold.summary = "Searching the web… · 1 step";
+      fold.publicSummary = "Searching the web…";
     }
     if (tick === 24 && liveScenario !== "stopped") {
-      delete turn.tool;
-      turn.steps[0] = {
-        ...turn.steps[0],
-        status: "done",
-        statusLabel: "Finished",
-        result: "Found the release checklist. No files changed.",
-        endedAtMs: Date.now(),
-      };
+      fold.steps = [
+        mockStep(
+          "tool-live",
+          "web_search",
+          "done",
+          "Found the release checklist. No files changed.",
+          fold.steps[0]?.startedAtMs ?? Date.now(),
+        ),
+      ];
+      fold.summary = "Working… · 1 step";
+      fold.publicSummary = "Working…";
     }
     if (tick === 90) {
       clearInterval(timer);
       if (liveScenario === "stopped") {
         // keeper-hq's `end_cut`: a call still running when its instance
         // stopped ends `interrupted`, and Rust names it.
-        delete turn.tool;
-        turn.steps[0] = {
-          ...turn.steps[0],
+        const result = "The agent restarted while this call ran; it may have had its effect.";
+        fold.steps = [
+          mockStep(
+            "tool-live",
+            "web_search",
+            "interrupted",
+            result,
+            fold.steps[0]?.startedAtMs ?? Date.now(),
+          ),
+        ];
+        Object.assign(fold, {
           status: "interrupted",
           statusLabel: "Interrupted",
-          result: "The agent restarted while this call ran; it may have had its effect.",
-          endedAtMs: Date.now(),
-        };
+          summary: "Interrupted · searched the web 1 time",
+          publicSummary: "Interrupted",
+          failures: [{ stepId: "tool-live", sentence: `web_search · Interrupted: ${result}` }],
+        });
         turn.stopped = true;
       } else {
+        const id = `final-${vm.database}`;
         vm.messages.push({
-          id: `final-${vm.database}`,
+          id,
           role: "agent",
           authorActor: "assistant",
           authorName: "Assistant",
           body: turn.text,
           createdAtMs: Date.now(),
-          reasoning: turn.reasoning,
-          steps: turn.steps,
           details: {
             model: "example-model",
             promptTokens: 120,
@@ -7090,6 +7390,18 @@ function startLiveFixture(vm: AgentSessionViewVm) {
             finish: liveScenario === "error" ? "error" : "stop",
             ...(liveScenario === "error" ? { error: "The provider stopped responding." } : {}),
           },
+        });
+        Object.assign(fold, {
+          answerId: id,
+          status: "done",
+          statusLabel: "Finished",
+          summary: "Worked for 18 s · searched the web 1 time",
+          publicSummary: "Worked for 18 s",
+          durationMs: 18000,
+          failures:
+            liveScenario === "error"
+              ? [{ stepId: "", sentence: "The provider stopped responding." }]
+              : [],
         });
         vm.live = [];
       }
@@ -7121,12 +7433,8 @@ function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
 const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   agent_view_prefs_set: (payload) => {
     if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
-    const patch = payload.patch as { showReasoning: boolean | null; showDetails: boolean | null };
-    const held = viewPrefs();
-    agentViewPrefs = {
-      showReasoning: patch.showReasoning ?? held.showReasoning,
-      showDetails: patch.showDetails ?? held.showDetails,
-    };
+    const patch = payload.patch as { viewMode: AgentViewPrefsVm["viewMode"] | null };
+    agentViewPrefs = { viewMode: patch.viewMode ?? viewPrefs().viewMode };
     try {
       sessionStorage.setItem(AGENT_VIEW_PREFS_KEY, JSON.stringify(agentViewPrefs));
     } catch {
@@ -7510,7 +7818,18 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     } else if (name === "stop") {
       if (!vm.live.length) hqRefuse("There is no running turn to stop.");
       mockDecline(vm, payload.declines);
-      vm.live = [];
+      // A person's stop row names the turn: its fold says so until the close lands.
+      for (const turn of vm.live) {
+        const fold = mockFoldsOf(vm).find((f) => f.turnId === turn.turnId);
+        if (fold)
+          Object.assign(fold, {
+            status: "stopped",
+            statusLabel: "Stopped",
+            summary: "Stopped",
+            publicSummary: "Stopped",
+          });
+        turn.stopped = true;
+      }
       result.message = "Stop requested.";
       publishSessions();
     } else result.surface = name;
@@ -7695,7 +8014,9 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       untrusted: false,
       live: [],
       tools: [],
-      prefs: { showReasoning: false, showDetails: false },
+      items: [],
+      folds: [],
+      prefs: { viewMode: "normal" },
       approvals: [],
       messages: [
         {
@@ -10284,7 +10605,9 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         untrusted: false,
         live: [],
         tools: [],
-        prefs: { showReasoning: false, showDetails: false },
+        items: [],
+        folds: [],
+        prefs: { viewMode: "normal" },
         approvals: [],
         messages: [
           {

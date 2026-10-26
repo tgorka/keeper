@@ -251,3 +251,84 @@ fn a_fresh_install_opens_with_nothing_to_retire() {
         owned(&[("upgrade.bots_retired", "1")])
     );
 }
+
+/// Story 109.14: the two answer switches an older build stored become one
+/// `agents.view_mode`, so the choice a person made carries over — details on
+/// reads `verbose`; otherwise thinking on reads `thinking`; otherwise
+/// `normal` — and neither old key is left behind. Every combination, and a
+/// key held alone.
+#[test]
+fn the_answer_switches_become_one_view_mode_for_every_combination() {
+    use keeper_core::hq::live::AgentViewModeVm::{self, Normal, Thinking, Verbose};
+    /// The rows an older build stored, the mode they read as, its stored word.
+    type Case = (
+        &'static [(&'static str, &'static str)],
+        AgentViewModeVm,
+        &'static str,
+    );
+    let cases: [Case; 8] = [
+        (
+            &[("agents.show_reasoning", "0"), ("agents.show_details", "0")],
+            Normal,
+            "normal",
+        ),
+        (
+            &[("agents.show_reasoning", "1"), ("agents.show_details", "0")],
+            Thinking,
+            "thinking",
+        ),
+        (
+            &[("agents.show_reasoning", "0"), ("agents.show_details", "1")],
+            Verbose,
+            "verbose",
+        ),
+        (
+            &[("agents.show_reasoning", "1"), ("agents.show_details", "1")],
+            Verbose,
+            "verbose",
+        ),
+        (&[("agents.show_reasoning", "1")], Thinking, "thinking"),
+        (&[("agents.show_details", "1")], Verbose, "verbose"),
+        (&[("agents.show_reasoning", "0")], Normal, "normal"),
+        (&[("agents.show_details", "0")], Normal, "normal"),
+    ];
+    for (pairs, mode, word) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        legacy_database(dir.path(), pairs);
+        assert_eq!(
+            registry::get_agents_view_mode(dir.path()).expect("read"),
+            mode,
+            "{pairs:?}"
+        );
+        assert_eq!(
+            settings(dir.path()),
+            owned(&[("agents.view_mode", word), ("upgrade.bots_retired", "1")]),
+            "{pairs:?}: the old keys are gone, the mode is stored"
+        );
+    }
+}
+
+/// A view mode already stored wins over switches an older build left beside
+/// it; a store holding neither stays as it is.
+#[test]
+fn a_stored_view_mode_wins_over_the_old_switches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    legacy_database(
+        dir.path(),
+        &[
+            ("agents.view_mode", "thinking"),
+            ("agents.show_details", "1"),
+        ],
+    );
+    assert_eq!(
+        registry::get_agents_view_mode(dir.path()).expect("read"),
+        keeper_core::hq::live::AgentViewModeVm::Thinking
+    );
+    assert_eq!(
+        settings(dir.path()),
+        owned(&[
+            ("agents.view_mode", "thinking"),
+            ("upgrade.bots_retired", "1")
+        ])
+    );
+}

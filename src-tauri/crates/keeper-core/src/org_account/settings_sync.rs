@@ -129,8 +129,8 @@ pub struct Values {
     /// Top-level items other than `[settings]`, kept verbatim for the same
     /// reason.
     pub other: toml::Table,
-    /// The file as read still spells a key Story 108.3a retired
-    /// ([`registry::retire_bot_keys`]). It reads as the current keys, and a
+    /// The file as read still spells a key a later build retired
+    /// ([`registry::retire_keys`]). It reads as the current keys, and a
     /// merge never reproduces this flag, so the file differs from what the
     /// merge would write and is rewritten once under the new names.
     pub legacy: bool,
@@ -150,10 +150,8 @@ impl Values {
             Some(toml::Value::Table(table)) => {
                 let mut flat = Vec::with_capacity(table.len());
                 flatten("", table, &mut flat);
-                parsed.legacy = flat
-                    .iter()
-                    .any(|(key, _)| registry::is_retired_bot_key(key));
-                let flat = registry::retire_bot_keys(flat, |value| value.as_str());
+                parsed.legacy = flat.iter().any(|(key, _)| registry::is_retired_key(key));
+                let flat = registry::retire_keys(flat);
                 for (key, value) in flat {
                     let stored = keys::spec(&key)
                         .filter(|_| synced_file(&key) == Some(file))
@@ -206,11 +204,9 @@ impl Values {
         serde_json::from_str::<BTreeMap<String, String>>(raw)
             .ok()
             .map(|values| Values {
-                values: registry::retire_bot_keys(values.into_iter().collect(), |value| {
-                    Some(value)
-                })
-                .into_iter()
-                .collect(),
+                values: registry::retire_keys(values.into_iter().collect())
+                    .into_iter()
+                    .collect(),
                 ..Values::default()
             })
     }
@@ -2270,5 +2266,55 @@ mod tests {
         );
         assert!(!again.changed, "the second sync writes nothing");
         assert!(again.apply.is_empty());
+    }
+
+    /// Story 109.14: a synced file and a stored base an older device wrote
+    /// read the two answer switches as the one view mode they choose —
+    /// details on reads `verbose`; otherwise thinking on reads `thinking`;
+    /// otherwise `normal` — and the file is marked to be rewritten under the
+    /// new key. A view mode the same file already holds wins.
+    #[test]
+    fn an_older_devices_answer_switches_read_as_one_view_mode() {
+        for (reasoning, details, mode) in [
+            (false, false, "normal"),
+            (true, false, "thinking"),
+            (false, true, "verbose"),
+            (true, true, "verbose"),
+        ] {
+            let text = format!(
+                "[settings]\n\"agents.show_reasoning\" = {reasoning}\n\
+                 \"agents.show_details\" = {details}\n\"recording.codec\" = \"hevc\"\n"
+            );
+            let parsed = Values::parse(text.as_bytes(), SyncedFile::Shared).expect("parses");
+            assert!(parsed.legacy, "{reasoning}/{details}");
+            assert_eq!(
+                parsed.values,
+                values(&[("agents.view_mode", mode), ("recording.codec", "hevc")]).values,
+                "{reasoning}/{details}"
+            );
+            assert!(parsed.preserved.is_empty(), "{:?}", parsed.preserved);
+            let rendered = parsed.render().expect("renders");
+            assert!(!rendered.contains("agents.show_"), "{rendered}");
+
+            let flag = |on: bool| if on { "1" } else { "0" };
+            let base = Values::from_base_json(&format!(
+                r#"{{"agents.show_reasoning":"{}","agents.show_details":"{}"}}"#,
+                flag(reasoning),
+                flag(details)
+            ))
+            .expect("base");
+            assert_eq!(
+                base.values,
+                values(&[("agents.view_mode", mode)]).values,
+                "base {reasoning}/{details}"
+            );
+        }
+        let text =
+            "[settings]\n\"agents.view_mode\" = \"thinking\"\n\"agents.show_details\" = true\n";
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Shared).expect("parses");
+        assert_eq!(
+            parsed.values,
+            values(&[("agents.view_mode", "thinking")]).values
+        );
     }
 }

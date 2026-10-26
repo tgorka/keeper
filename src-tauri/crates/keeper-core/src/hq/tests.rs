@@ -497,20 +497,21 @@ async fn a_changed_setting_is_followed_and_an_unchanged_one_restarts_nothing() {
     );
 }
 
-/// The view preferences are a person's settings: switched in a settings
-/// file or synced from another device, they reach the open views on the
-/// next reconcile.
+/// The view mode is a person's setting: switched in a settings file or
+/// synced from another device, it reaches the open views on the next
+/// reconcile.
 #[tokio::test]
 async fn a_view_preference_switched_elsewhere_is_followed() {
     let world = World::new();
     let hq = world.hq();
     hq.start().await.expect("starts");
-    assert!(!hq.view_prefs().show_reasoning);
+    assert_eq!(hq.view_prefs().view_mode, live::AgentViewModeVm::Normal);
     let mut changes = hq.changes();
     changes.borrow_and_update();
-    crate::registry::set_agents_show_reasoning(&world.data_dir(), true).expect("stores");
+    crate::registry::set_agents_view_mode(&world.data_dir(), live::AgentViewModeVm::Thinking)
+        .expect("stores");
     hq.reconcile().await.expect("reconciles");
-    assert!(hq.view_prefs().show_reasoning);
+    assert_eq!(hq.view_prefs().view_mode, live::AgentViewModeVm::Thinking);
     assert!(changes.has_changed().expect("open"), "the views read again");
 }
 
@@ -1040,34 +1041,25 @@ async fn an_older_view_never_forgets_a_turn_a_newer_stream_saw() {
     );
 }
 
-/// R1063-09: a settings file that sets a view preference keeps it. Asking
-/// for the other value — thinking on where the file says off, details off
-/// where it says on — answers what holds, keeps it and draws by it.
+/// R1063-09: a settings file that sets the view mode keeps it. Asking for
+/// another — verbose where the file says normal — answers what holds,
+/// keeps it and draws by it.
 #[tokio::test]
 async fn a_view_preference_a_settings_file_sets_stays_as_the_file_says() {
-    let layers = crate::config::install_for_test(crate::config::layers_from(&[
-        (
-            "agents.show_reasoning",
-            "0",
-            crate::config::LayerTier::UserGlobal,
-        ),
-        (
-            "agents.show_details",
-            "1",
-            crate::config::LayerTier::UserGlobal,
-        ),
-    ]));
+    let layers = crate::config::install_for_test(crate::config::layers_from(&[(
+        "agents.view_mode",
+        "normal",
+        crate::config::LayerTier::UserGlobal,
+    )]));
     let world = World::new();
     let (hq, staged, key) = staged_session(&world, true, &[""]).await;
     *lock(&staged.others) = Vec::new();
     let held = live::AgentViewPrefsVm {
-        show_reasoning: false,
-        show_details: true,
+        view_mode: live::AgentViewModeVm::Normal,
     };
     let answered = hq
         .set_view_prefs(live::AgentViewPrefsPatch {
-            show_reasoning: Some(true),
-            show_details: Some(false),
+            view_mode: Some(live::AgentViewModeVm::Verbose),
         })
         .expect("writes");
     assert_eq!(
@@ -1078,8 +1070,8 @@ async fn a_view_preference_a_settings_file_sets_stays_as_the_file_says() {
     let view = hq.session_view(&key).expect("view");
     assert_eq!(view.prefs, held, "the switches show what holds");
     assert!(view.reads_trace);
-    assert_eq!(
-        view.live[0].reasoning, None,
+    assert!(
+        view.folds.iter().all(|fold| fold.reasoning.is_none()),
         "no thinking the file keeps off"
     );
     // Without the file the written choice holds.
@@ -1088,8 +1080,7 @@ async fn a_view_preference_a_settings_file_sets_stays_as_the_file_says() {
     assert_eq!(
         hq.view_prefs(),
         live::AgentViewPrefsVm {
-            show_reasoning: true,
-            show_details: false,
+            view_mode: live::AgentViewModeVm::Verbose,
         }
     );
 }
