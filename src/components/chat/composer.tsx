@@ -247,6 +247,21 @@ export const DRAFT_NOT_SAVED =
  */
 export const FILE_READ_TIMEOUT_MS = 60_000;
 
+/**
+ * Marks a send rejection whose sentence the parent already announced (an agents session says a
+ * refused send in its approval banner): the composer still shows it beside the draft, hidden from
+ * assistive technology, so it is announced once (R10911-13).
+ */
+export function announcedRejection(raw: unknown): unknown {
+  if (raw instanceof Error) return { message: raw.message, announced: true };
+  return typeof raw === "object" && raw !== null ? { ...raw, announced: true } : raw;
+}
+
+/** Whether `raw` is a rejection {@link announcedRejection} marked. */
+export function announcedElsewhere(raw: unknown): boolean {
+  return typeof raw === "object" && raw !== null && "announced" in raw && raw.announced === true;
+}
+
 /** A pasted or picked batch still being read: its tray chip and the way to drop it. */
 interface ReadingBatch {
   id: number;
@@ -292,7 +307,9 @@ export function Composer({
   // edited (`SendError::TargetNotFound | NotEditable`). Telling that user to check
   // their connection and try again would be a lie: no retry can ever succeed, so
   // the two cases get distinct copy (AD-21 honesty, Story 3.4).
-  const [error, setError] = useState<"retriable" | "terminal" | { message: string } | null>(null);
+  const [error, setError] = useState<
+    "retriable" | "terminal" | { message: string; announced?: boolean } | null
+  >(null);
   // The `account\0room` whose last draft save failed, or `null`: says
   // DRAFT_NOT_SAVED under that chat's composer until a save there succeeds.
   const [unsavedDraft, setUnsavedDraft] = useState<string | null>(null);
@@ -906,7 +923,12 @@ export function Composer({
       const err = raw as IpcError | null | undefined;
       setError(
         transport === "session"
-          ? { message: syncErrorMessage(raw, "keeper could not send this message.") }
+          ? {
+              message: syncErrorMessage(raw, "keeper could not send this message."),
+              // The parent already said it where it belongs (the agents' approval banner):
+              // shown here beside the draft, announced once.
+              announced: announcedElsewhere(raw),
+            }
           : err?.retriable === false
             ? "terminal"
             : "retriable",
@@ -1706,7 +1728,11 @@ export function Composer({
           </p>
         ))}
       {error !== null && (
-        <p role="alert" className="text-destructive text-xs">
+        <p
+          role={typeof error === "object" && error.announced ? undefined : "alert"}
+          aria-hidden={typeof error === "object" && error.announced ? true : undefined}
+          className="text-destructive text-xs"
+        >
           {typeof error === "object"
             ? error.message
             : error === "terminal"

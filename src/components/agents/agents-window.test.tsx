@@ -221,6 +221,7 @@ describe("database Agents window", () => {
     expect(mock.send).toHaveBeenCalledWith(
       { database: "alpha", sessionId: "same.1" },
       "Keep these words",
+      [],
     );
     for (const state of ["waiting", "sent", "taken"] as const) {
       act(() =>
@@ -366,11 +367,13 @@ it("binds approval to the shown action and keeps the server's refusal visible", 
         state: "pending",
         canDecide: true,
         sentence: "Waiting for you",
+        actions: ["allowOnce", "deny"],
+        declinedBySend: true,
       },
     ],
   });
   expect(screen.getByLabelText("Exact action")).toHaveTextContent("notes/a.md");
-  fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
+  fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
   await waitFor(() =>
     expect(screen.getByRole("alert")).toHaveTextContent("Decide from another host."),
   );
@@ -380,7 +383,7 @@ it("binds approval to the shown action and keeps the server's refusal visible", 
     "digest-beta",
     true,
   );
-  expect(screen.getByRole("button", { name: "Approve once" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled();
 });
 
 it("sends an ask answer through its database and waits for Rust to close its options", async () => {
@@ -404,7 +407,11 @@ it("sends an ask answer through its database and waits for Rust to close its opt
   );
   fireEvent.click(screen.getByRole("button", { name: "Research" }));
   await waitFor(() =>
-    expect(mock.send).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, "Research"),
+    expect(mock.send).toHaveBeenCalledWith(
+      { database: "beta", sessionId: "same.1" },
+      "Research",
+      [],
+    ),
   );
   expect(screen.getByRole("button", { name: "Research" })).toBeInTheDocument();
   act(() =>
@@ -446,16 +453,25 @@ it("reenables the same approval after Rust rejects a queued decision", async () 
     state: "pending",
     canDecide: true,
     sentence: "Waiting for you",
+    actions: ["allowOnce", "deny"],
+    declinedBySend: true,
   };
   const { rerender } = render(<DatabaseApprovalCard approval={approval} />);
-  fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
+  fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
   await waitFor(() => expect(mock.decide).toHaveBeenCalledTimes(1));
   rerender(
     <DatabaseApprovalCard
-      approval={{ ...approval, state: "approved", canDecide: false, sentence: "Queued locally" }}
+      approval={{
+        ...approval,
+        state: "approved",
+        canDecide: false,
+        sentence: "Queued locally",
+        actions: [],
+        declinedBySend: false,
+      }}
     />,
   );
-  expect(screen.queryByRole("button", { name: "Approve once" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Allow once" })).not.toBeInTheDocument();
   rerender(
     <DatabaseApprovalCard
       approval={{
@@ -465,7 +481,7 @@ it("reenables the same approval after Rust rejects a queued decision", async () 
       }}
     />,
   );
-  await waitFor(() => expect(screen.getByRole("button", { name: "Approve once" })).toBeEnabled());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled());
   expect(screen.getByRole("alert")).toHaveTextContent("Decision rejected: review it again.");
 });
 

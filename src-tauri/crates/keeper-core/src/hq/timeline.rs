@@ -184,6 +184,42 @@ pub struct AgentTurnFoldVm {
     pub duration_ms: Option<i64>,
 }
 
+/// The requests a message sent now would decline, held above the composer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentApprovalBannerVm {
+    /// Oldest first.
+    pub approvals: Vec<AgentApprovalVm>,
+    /// What sending a message does to them, in plain words.
+    pub sentence: String,
+}
+
+/// The banner over `approvals`' requests a message would decline, and the
+/// rest, for the reading column.
+pub fn banner(
+    approvals: Vec<AgentApprovalVm>,
+) -> (Option<AgentApprovalBannerVm>, Vec<AgentApprovalVm>) {
+    let (waiting, rest): (Vec<_>, Vec<_>) = approvals
+        .into_iter()
+        .partition(|approval| approval.declined_by_send);
+    let banner = (!waiting.is_empty()).then(|| AgentApprovalBannerVm {
+        sentence: if waiting.len() == 1 {
+            "Sending a message declines this request, even a message that says yes. Use Allow \
+             to let it run."
+                .to_owned()
+        } else {
+            format!(
+                "Sending a message declines these {} requests, even a message that says yes. \
+                 Use Allow to let one run.",
+                waiting.len()
+            )
+        },
+        approvals: waiting,
+    });
+    (banner, rest)
+}
+
 /// What an opened session shows, whole, every time it changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -210,8 +246,14 @@ pub struct AgentSessionViewVm {
     #[serde(default)]
     #[ts(as = "Option<Vec<AgentTurnFoldVm>>", optional)]
     pub folds: Vec<AgentTurnFoldVm>,
-    /// Oldest first; empty for a member who does not read the trace.
+    /// Oldest first; empty for a member who does not read the trace. The
+    /// requests that wait for this person are in `banner`, not here.
     pub approvals: Vec<AgentApprovalVm>,
+    /// The requests waiting for this person, above the composer and out of
+    /// the reading column (Q109-12 a); absent while none waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub banner: Option<AgentApprovalBannerVm>,
     /// Earlier messages exist beyond what is shown.
     pub has_earlier: bool,
     /// An earlier page is on its way.
@@ -455,6 +497,9 @@ pub fn view(
         refused(source, session_id, &directory, &mut messages);
     }
     let newest_ms = messages.last().map(|m| m.created_at_ms);
+    let (banner, approvals) = banner(approvals::of_session(
+        source, session_id, &directory, refusals, now_ms,
+    ));
     let answering = instances::answering(
         source,
         session_id,
@@ -498,7 +543,8 @@ pub fn view(
             messages,
             items,
             folds,
-            approvals: approvals::of_session(source, session_id, &directory, refusals, now_ms),
+            approvals,
+            banner,
             has_earlier,
             loading_earlier,
             complete,

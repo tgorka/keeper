@@ -16,6 +16,7 @@ const mock = vi.hoisted(() => ({
   commit: vi.fn(),
   releaseHandles: vi.fn(),
   send: vi.fn(),
+  decide: vi.fn(),
   picker: vi.fn(),
   preview: vi.fn(),
   command: vi.fn(),
@@ -42,6 +43,7 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentAttachCommit: mock.commit,
   agentAttachRelease: mock.releaseHandles,
   agentSend: mock.send,
+  agentSessionApprovalDecide: mock.decide,
   agentCommandPreview: mock.preview,
   agentCommand: mock.command,
 }));
@@ -147,6 +149,7 @@ describe("session context details", () => {
         { database: "beta", sessionId: "same.1" },
         "/context",
         null,
+        [],
       ),
     );
     return await screen.findByRole("dialog", { name: "Details" });
@@ -203,6 +206,7 @@ describe("session composer attachments", () => {
         { database: "beta", sessionId: "same.1" },
         ["h1", "h2"],
         "Read both files",
+        [],
       ),
     );
     expect(mock.path).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, [
@@ -262,6 +266,7 @@ describe("session composer attachments", () => {
       { database: "beta", sessionId: "same.1" },
       ["h1", "h2", "h3"],
       "Compare these two files",
+      [],
     );
     expect(mock.send).not.toHaveBeenCalled();
     expect(mock.releaseHandles).not.toHaveBeenCalled();
@@ -297,6 +302,7 @@ describe("session composer attachments", () => {
       { database: "beta", sessionId: "same.1" },
       ["h2", "h3"],
       "Review these",
+      [],
     );
     expect(mock.send).not.toHaveBeenCalled();
   });
@@ -356,6 +362,7 @@ describe("session composer attachments", () => {
       { database: "beta", sessionId: "same.1" },
       ["h1"],
       "Explain these prices",
+      [],
     );
     expect(mock.send).not.toHaveBeenCalled();
   });
@@ -377,6 +384,7 @@ describe("session composer attachments", () => {
       { database: "beta", sessionId: "same.1" },
       ["h1", "h2"],
       undefined,
+      [],
     );
   });
 
@@ -387,7 +395,7 @@ describe("session composer attachments", () => {
     expect(screen.queryByRole("list", { name: "Files being read" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(mock.send).toHaveBeenCalledOnce());
-    expect(mock.send).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, text);
+    expect(mock.send).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, text, []);
     expect(mock.bytes).not.toHaveBeenCalled();
     expect(mock.commit).not.toHaveBeenCalled();
   }
@@ -440,6 +448,7 @@ describe("session composer attachments", () => {
       { database: "beta", sessionId: "same.1" },
       ["h1"],
       "Only the kept file",
+      [],
     );
     expect(mock.send).not.toHaveBeenCalled();
   });
@@ -543,5 +552,121 @@ describe("session header drives", () => {
       sessionId: "same.1",
     });
     agentSessionsStore.getState().drivesShown();
+  });
+});
+
+describe("the approval banner", () => {
+  const waiting = (id: string, digest: string) => ({
+    id,
+    database: "beta",
+    sessionId: "same.1",
+    toolName: "run",
+    tier: "T2",
+    summary: `Run ${id}`,
+    action: '{"argv":["ls"]}',
+    bindingDigest: digest,
+    expiresAtMs: 1800000000000,
+    createdAtMs: 1780000000000,
+    state: "pending" as const,
+    canDecide: true,
+    sentence: "Waiting for you.",
+    actions: ["allowOnce" as const, "deny" as const],
+    declinedBySend: true,
+  });
+  const banner = {
+    approvals: [waiting("a1", "d1"), waiting("a2", "d2")],
+    sentence: "Sending a message declines these 2 requests, even a message that says yes.",
+  };
+
+  it("sends the requests it showed, at their digests, with the message", async () => {
+    await draw();
+    act(() => mock.view?.({ ...vm, banner }));
+    expect(
+      screen.getByRole("complementary", { name: "Waiting for your decision" }),
+    ).toHaveTextContent("declines these 2 requests");
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "yes" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(mock.send).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }, "yes", [
+        { id: "a1", bindingDigest: "d1" },
+        { id: "a2", bindingDigest: "d2" },
+      ]),
+    );
+  });
+
+  it("moves focus to a decided card's place in the reading column, else to the next request", async () => {
+    mock.decide.mockResolvedValue({ state: "sent", sentence: "Approved." });
+    await draw();
+    act(() => mock.view?.({ ...vm, banner }));
+    const region = () => screen.getByRole("complementary", { name: "Waiting for your decision" });
+    const a1 = within(region()).getByRole("article", { name: "Approval: Run a1" });
+    fireEvent.click(within(a1).getByRole("button", { name: "Allow once" }));
+    await waitFor(() => expect(mock.decide).toHaveBeenCalledTimes(1));
+    // Rust's next view moves a1 to the reading column, approved.
+    const decided = { ...waiting("a1", "d1"), state: "approved" as const, canDecide: false };
+    act(() =>
+      mock.view?.({
+        ...vm,
+        approvals: [{ ...decided, actions: [], declinedBySend: false }],
+        banner: { ...banner, approvals: [waiting("a2", "d2")] },
+      }),
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("article", { name: "Approval: Run a1" }),
+      ),
+    );
+    // a2 decided, and Rust's view has it nowhere: focus goes to the next request, else the
+    // composer — never the body.
+    const a2 = within(region()).getByRole("article", { name: "Approval: Run a2" });
+    fireEvent.click(within(a2).getByRole("button", { name: "Deny" }));
+    await waitFor(() => expect(mock.decide).toHaveBeenCalledTimes(2));
+    act(() => mock.view?.({ ...vm, banner: undefined }));
+    await waitFor(() => expect(document.activeElement).not.toBe(document.body));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Message" }));
+  });
+
+  it("drops the refused-send alert once the banner's requests change", async () => {
+    const said =
+      "keeper could not decline “Run a1” on this device, so your message was not sent; the request still waits for you (disk full).";
+    mock.send.mockRejectedValueOnce({ message: said });
+    await draw();
+    act(() => mock.view?.({ ...vm, banner }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "yes" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    const region = () => screen.getByRole("complementary", { name: "Waiting for your decision" });
+    await waitFor(() => expect(within(region()).getByRole("alert")).toHaveTextContent(said));
+    // The same banner drawn again keeps it: nothing it names has changed.
+    act(() => mock.view?.({ ...vm, banner: { ...banner } }));
+    expect(within(region()).getByRole("alert")).toHaveTextContent(said);
+    // a1 is decided elsewhere: the banner holds a2 alone, and the sentence about a1 goes.
+    act(() => mock.view?.({ ...vm, banner: { ...banner, approvals: [waiting("a2", "d2")] } }));
+    expect(within(region()).queryByRole("alert")).toBeNull();
+  });
+
+  it("says in the banner that a refused send left its requests waiting, and keeps the draft", async () => {
+    const said =
+      "keeper could not decline “Run a1” on this device, so your message was not sent; the request still waits for you (disk full).";
+    mock.send.mockRejectedValueOnce({ message: said });
+    await draw();
+    act(() => mock.view?.({ ...vm, banner }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "yes" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    const region = screen.getByRole("complementary", { name: "Waiting for your decision" });
+    await waitFor(() => expect(within(region).getByRole("alert")).toHaveTextContent(said));
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("yes");
+    // Announced once: the composer shows the sentence beside the draft, hidden from readers.
+    expect(screen.getAllByRole("alert").filter((alert) => alert.textContent === said)).toHaveLength(
+      1,
+    );
+    const copies = screen.getAllByText(said);
+    expect(copies).toHaveLength(2);
+    expect(copies.filter((copy) => copy.getAttribute("aria-hidden") === "true")).toHaveLength(1);
   });
 });

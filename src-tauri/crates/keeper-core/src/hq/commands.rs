@@ -6,6 +6,7 @@ use ts_rs::TS;
 
 use crate::bots::chat::Effort;
 use crate::chat::commands::{self, ArgMode, CommandSpec, Context, Place, Resolution, RoomKind};
+use crate::hq::approvals::{self, Decisions, ShownApprovalVm};
 use crate::hq::port::RowOp;
 use crate::hq::sessions::{self, AgentSessionRef, Source};
 use crate::hq::settings::{self, AgentSettingsChange, AgentSettingsPick};
@@ -208,11 +209,17 @@ pub struct AgentCommandResultVm {
 /// Execute against the same replica used by the session's ordinary controls.
 /// `pick` is this device's last model and effort for the session's agent: a
 /// fresh session (`/new`, `/clean`) starts with what the agent still offers.
+/// `/stop` declines the requests the banner showed (`shown`) that still wait
+/// for this person, before it writes the stop (R10911-07): a stopped turn's
+/// request has nothing left to decide. No other command declines anything —
+/// none of them steers the agent's turn.
 pub fn run(
     source: &Source,
+    decisions: &Decisions,
     sid: &str,
     draft: &str,
     pick: Option<&AgentSettingsPick>,
+    shown: &[ShownApprovalVm],
 ) -> Result<AgentCommandResultVm, String> {
     let session =
         timeline::session_row(source, sid).ok_or("This conversation is not on this device.")?;
@@ -285,6 +292,7 @@ pub fn run(
                 return Err("There is no running turn to stop.".to_owned());
             }
             let at = sessions::now_ms();
+            approvals::decline_pending(source, decisions, sid, shown, at)?;
             let ops = turns
                 .iter()
                 .map(|turn| {
@@ -334,15 +342,25 @@ impl Hq {
         ))
     }
 
+    /// Run a slash command; `shown` is what the banner showed, which only
+    /// `/stop` declines.
     pub fn command(
         &self,
         key: &AgentSessionRef,
         draft: &str,
         pick: Option<&AgentSettingsPick>,
+        shown: &[ShownApprovalVm],
     ) -> Result<AgentCommandResultVm, HqError> {
         let source = self.source(&key.database)?;
-        let result = run(&source, &key.session_id, draft, pick).map_err(HqError::Sentence)?;
+        let result = run(
+            &source,
+            self.decisions()?,
+            &key.session_id,
+            draft,
+            pick,
+            shown,
+        );
         self.touch();
-        Ok(result)
+        result.map_err(HqError::Sentence)
     }
 }

@@ -124,6 +124,13 @@ pub enum AttachError {
     Archived,
     #[error("{0}")]
     Replica(#[from] ReplicaError),
+    /// A request the banner showed could not be declined on this device;
+    /// nothing was written (R10911-06).
+    #[error("{0}")]
+    Declines(String),
+    /// The message could not be written after the requests it declines were.
+    #[error("Your message was not written ({0}); the requests it declines stay declined.")]
+    AfterDeclines(ReplicaError),
     /// A handle the composer named is no longer staged here.
     #[error("A file of this message is no longer ready to send. Attach it again.")]
     Released,
@@ -372,9 +379,11 @@ fn ordered_ids(count: usize) -> impl Iterator<Item = String> {
 /// id.
 pub fn attach(
     source: &Source,
+    decisions: &crate::hq::approvals::Decisions,
     session_id: &str,
     caption: &str,
     files: Vec<StagedFile>,
+    shown: &[crate::hq::approvals::ShownApprovalVm],
 ) -> Result<String, AttachError> {
     if files.is_empty() {
         return Err(AttachError::Nothing);
@@ -384,6 +393,10 @@ pub fn attach(
         return Err(AttachError::Archived);
     }
     let at = now_ms();
+    // A message, files and all, declines what its banner showed (Q109-12 a),
+    // as a text message does.
+    let declined = crate::hq::approvals::decline_pending(source, decisions, session_id, shown, at)
+        .map_err(AttachError::Declines)?;
     let message_id = ulid::Ulid::new().to_string();
     let body = if caption.trim().is_empty() {
         ""
@@ -421,7 +434,13 @@ pub fn attach(
         });
     }
     ops.push(activity(source, session_id, at));
-    source.replica.commit_with_blobs(blobs, ops)?;
+    source
+        .replica
+        .commit_with_blobs(blobs, ops)
+        .map_err(|error| match declined.is_empty() {
+            true => AttachError::Replica(error),
+            false => AttachError::AfterDeclines(error),
+        })?;
     source.replica.sync_now();
     Ok(message_id)
 }

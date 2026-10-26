@@ -12,6 +12,8 @@ vi.mock("@/lib/ipc/client", () => ({
   // Settings › Agents › Answers from (106.5): never answers here, so the section stays absent.
   agentInstancesSubscribe: vi.fn(() => new Promise(() => {})),
   agentInstancesUnsubscribe: vi.fn(() => Promise.resolve()),
+  agentGrantsSubscribe: vi.fn(() => new Promise(() => {})),
+  agentGrantsUnsubscribe: vi.fn(() => Promise.resolve()),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   // The About sub-block's background-update plan and its writer.
   autoUpdateGet: vi.fn(() =>

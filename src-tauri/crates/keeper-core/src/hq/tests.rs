@@ -773,6 +773,16 @@ impl Replica for Staged {
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
         self.inner.row_writes(table, row_id, field)
     }
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+        self.inner.revoked_units(table)
+    }
+    fn granted(
+        &self,
+        table: &str,
+        variable: &str,
+    ) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+        self.inner.granted(table, variable)
+    }
     fn refused_commits(
         &self,
         table: &str,
@@ -1330,7 +1340,8 @@ async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and
         .new_session("alpha", "nixie", "plan the week", None)
         .expect("a new session with no server");
     assert_eq!(key.database, "alpha");
-    hq.send(&key, "and then the weekend").expect("a message");
+    hq.send(&key, "and then the weekend", &[])
+        .expect("a message");
     let status = status_until(&hq, "both writes wait", |s| s.waiting_here == before + 2).await;
     assert_eq!(status.databases[0].waiting, before + 2);
     assert!(

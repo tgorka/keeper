@@ -60,6 +60,8 @@ import type {
   AgentAttachmentVm,
   AgentChoiceVm,
   AgentEffortOptionVm,
+  AgentGrantOfferVm,
+  AgentGrantsVm,
   AgentInstancesVm,
   AgentSessionAnsweringVm,
   AgentSessionDrivesVm,
@@ -6291,8 +6293,282 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
         state: "pending",
         canDecide: true,
         sentence: "Waiting for you",
+        actions: [],
+        declinedBySend: false,
+      },
+      // 109.11: a trusted T2 `run` — the one that offers *Always allow …* — and a T4 Paseo
+      // start, which never does (another device decides it every time).
+      {
+        id: "approval-2",
+        database: "alpha",
+        sessionId: "device.1",
+        toolName: "run",
+        tier: "T2",
+        summary: "List the changed files",
+        bindingDigest: "sha256:fixture-git-status",
+        action: JSON.stringify({ argv: ["git", "status", "--porcelain"] }, null, 2),
+        expiresAtMs: Date.now() + 3600000,
+        createdAtMs: Date.now() + 1,
+        state: "pending",
+        canDecide: true,
+        sentence: "Waiting for you.",
+        actions: [],
+        declinedBySend: false,
+      },
+      {
+        id: "approval-3",
+        database: "alpha",
+        sessionId: "device.1",
+        toolName: "mcp__paseo__create_agent",
+        tier: "T4",
+        summary: "Start a coding agent on the release branch",
+        bindingDigest: "sha256:fixture-paseo-start",
+        action: JSON.stringify({ title: "release", prompt: "Prepare the release notes" }, null, 2),
+        expiresAtMs: Date.now() + 3600000,
+        createdAtMs: Date.now() + 2,
+        state: "pending",
+        canDecide: true,
+        sentence: "Waiting for you.",
+        actions: [],
+        declinedBySend: false,
       },
     ];
+
+/**
+ * ?grants=refused|untrusted|unserved|decline-fails (109.11). `refused`: the server refuses every
+ * grant write, as `hq.v15.agent` would (`grants::refused_because`), and the list starts with one
+ * it refused; `untrusted`: alpha's device.1 has read outside content, so no card there offers a
+ * grant; `unserved`: Ana is invited into alpha's device.1 but its agent does not serve her, so no
+ * card offers one (R10911-02); `decline-fails`: writing a denial fails on this device, so a send
+ * from under the banner is refused (R10911-06).
+ *
+ * `window.__keeperMockLateApproval()` lands a new request in alpha's device.1 without drawing it,
+ * as a request synced after the banner was drawn: a send then leaves it pending (R10911-01).
+ */
+const grantsScenario = new URLSearchParams(location.search).get("grants");
+/** `keeper_core::hq::grants::GRANTABLE_TOOLS` and `vocabulary.json`'s `grantTiers`. */
+const MOCK_GRANTABLE = ["run", "mcp__paseo__create_agent", "mcp__paseo__send_agent_prompt"];
+const MOCK_REVOKE_NOTE =
+  "Revoking a grant stops its new uses. Approvals it has already issued still run.";
+/** `grants::offer`, for the mock's fixtures: the same gates, the same sentences. */
+function mockOffer(row: AgentApprovalVm, vm: AgentSessionViewVm): AgentGrantOfferVm | undefined {
+  if (!row.canDecide || !["T2", "T3"].includes(row.tier) || vm.untrusted || vm.archived)
+    return undefined;
+  if (grantsScenario === "unserved" && vm.database === "alpha" && vm.sessionId === "device.1")
+    return undefined;
+  if (!MOCK_GRANTABLE.includes(row.toolName)) return undefined;
+  const db = row.database;
+  const who = vm.agentName;
+  let scopes: AgentGrantOfferVm["scopes"];
+  if (row.toolName === "run") {
+    const argv: string[] = JSON.parse(row.action ?? "{}").argv ?? [];
+    const [program, arg] = argv;
+    if (!program) return undefined;
+    // `Scope::any_code`: an interpreter alone or with an eval flag runs any code.
+    const interpreter = /^(sh|bash|zsh|python[0-9.]*|node|perl|ruby)$/.test(
+      program?.split("/").pop() ?? "",
+    );
+    const anyCode = (flag: string | undefined) =>
+      interpreter && (flag === undefined || ["-c", "-e", "--eval"].includes(flag))
+        ? ` That is any code: ${program?.split("/").pop()} runs whatever program text it is given.`
+        : "";
+    const scope = (
+      id: string,
+      covers: string,
+      whatever: string,
+      label: string,
+      flag: string | undefined,
+    ) => ({
+      id,
+      label,
+      standing: `${who} may run “${covers} …” in every session you share with it in ${db}, without asking — ${whatever}.${anyCode(flag)}`,
+      session: `${who} may run “${covers} …” in this session, without asking — ${whatever}.${anyCode(flag)}`,
+    });
+    scopes = [
+      ...(arg === undefined
+        ? []
+        : [
+            scope(
+              "programArg",
+              `${program} ${arg}`,
+              `whatever follows “${arg}”`,
+              `“${program} ${arg} …”`,
+              arg,
+            ),
+          ]),
+      scope("program", program, "whatever arguments follow", `“${program} …”`, undefined),
+    ];
+  } else {
+    scopes = [
+      {
+        id: "any",
+        label: `${row.toolName}, any arguments`,
+        standing: `${who} may call ${row.toolName} in every session you share with it in ${db}, without asking — whatever its arguments.`,
+        session: `${who} may call ${row.toolName} in this session, without asking — whatever its arguments.`,
+      },
+    ];
+  }
+  return {
+    agentName: who,
+    tool: row.toolName,
+    tier: row.tier,
+    scopes,
+    expiries: [
+      { label: "Until you revoke it" },
+      { days: 1, label: "For a day" },
+      { days: 7, label: "For a week" },
+      { days: 30, label: "For 30 days" },
+    ],
+    never:
+      "It never applies in a session that has read outside content, at T4, or to another agent, database or program. Each use is still its own approval, recorded under the grant.",
+    revokeNote: MOCK_REVOKE_NOTE,
+  };
+}
+/** The card as Rust draws it: its actions, its offer, and whether a message declines it. */
+function mockApproval(row: AgentApprovalVm): AgentApprovalVm {
+  const vm = sessionViews.get(JSON.stringify([row.database, row.sessionId]));
+  const grant = vm ? mockOffer(row, vm) : undefined;
+  return {
+    ...row,
+    ...(grant ? { grant } : {}),
+    actions: row.canDecide
+      ? ["allowOnce", ...(grant ? (["alwaysAllow", "sessionOnly"] as const) : []), "deny"]
+      : [],
+    declinedBySend: row.state === "pending" && row.canDecide && !vm?.archived,
+  };
+}
+/**
+ * `approvals::decline_pending`: a message declines what its banner showed (`declines`, each at
+ * its shown digest) that still waits for its sender — nothing that arrived since.
+ */
+function mockDecline(vm: AgentSessionViewVm, declines: unknown) {
+  const shown = Array.isArray(declines)
+    ? (declines as { id: string; bindingDigest: string }[])
+    : [];
+  for (const row of sessionApprovals) {
+    if (row.database !== vm.database || row.sessionId !== vm.sessionId) continue;
+    if (!shown.some((s) => s.id === row.id && s.bindingDigest === row.bindingDigest)) continue;
+    if (!mockApproval(row).declinedBySend) continue;
+    if (grantsScenario === "decline-fails")
+      hqRefuse(
+        `keeper could not decline “${row.summary}” on this device, so your message was not sent; the request still waits for you (database or disk is full).`,
+      );
+    delete row.refused;
+    row.state = "denied";
+    row.canDecide = false;
+    row.sentence = "Denied by Ana.";
+  }
+}
+const mockGrants: AgentGrantsVm["grants"] = ["empty", "loading", "error"].includes(
+  sessionScenario ?? "",
+)
+  ? []
+  : [
+      {
+        id: "grant-1",
+        database: "alpha",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "run",
+        scope: "Run “ls …”, whatever arguments follow",
+        createdAtMs: Date.now() - 86_400_000,
+        state: "active",
+        sentence: "Always allowed in every session with Assistant in alpha.",
+        canRevoke: true,
+      },
+      {
+        id: "grant-2",
+        database: "alpha",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "mcp__paseo__send_agent_prompt",
+        scope: "Call mcp__paseo__send_agent_prompt, whatever its arguments",
+        session: "Release planning",
+        expiresAtMs: Date.now() + 6 * 86_400_000,
+        createdAtMs: Date.now() - 3_600_000,
+        state: "active",
+        sentence: "Allowed in “Release planning” only.",
+        canRevoke: true,
+      },
+      {
+        id: "grant-3",
+        database: "beta",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "run",
+        scope:
+          "Run “python3 -c …”, whatever follows “-c”. That is any code: python3 runs whatever program text it is given.",
+        createdAtMs: Date.now() - 7 * 86_400_000,
+        state: "revoked",
+        sentence: "Revoked.",
+        canRevoke: false,
+      },
+      // A session-bound grant whose session was archived: ended with it (R10911-03).
+      {
+        id: "grant-ended",
+        database: "beta",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "run",
+        scope: "Run “git log …”, whatever follows “log”",
+        session: "Archive — one thousand messages",
+        createdAtMs: Date.now() - 2 * 86_400_000,
+        state: "ended",
+        sentence: "Ended with its session; it stays ended if the session is reopened.",
+        canRevoke: false,
+      },
+      // Expires 20 s after the page opens: the list reads Expired then, with no row changing
+      // (R10911-05).
+      {
+        id: "grant-soon",
+        database: "alpha",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "run",
+        scope: "Run “npm test …”, whatever follows “test”",
+        expiresAtMs: Date.now() + 20_000,
+        createdAtMs: Date.now() - 600_000,
+        state: "active",
+        sentence: "Always allowed in every session with Assistant in alpha.",
+        canRevoke: true,
+      },
+      ...(grantsScenario === "refused"
+        ? [
+            {
+              id: "grant-refused",
+              database: "beta",
+              agentActor: "assistant",
+              agentName: "Assistant",
+              tool: "run",
+              scope: "Run “make …”, whatever arguments follow",
+              createdAtMs: Date.now() - 60_000,
+              state: "refused" as const,
+              sentence:
+                "The server refused this grant: that agent does not serve you in this database.",
+              canRevoke: false,
+            },
+          ]
+        : []),
+    ];
+const grantWatchers = new Map<string, MockChannel<AgentGrantsVm>>();
+// `grants::next_expiry` wakes the views at the soonest expiry; the mock flips it there.
+for (const grant of mockGrants) {
+  const at = grant.expiresAtMs;
+  if (at === undefined || grant.state !== "active" || at - Date.now() > 3_600_000) continue;
+  setTimeout(
+    () => {
+      grant.state = "expired";
+      grant.sentence = "Expired.";
+      grant.canRevoke = false;
+      publishGrants();
+    },
+    Math.max(0, at - Date.now()),
+  );
+}
+function publishGrants() {
+  for (const channel of grantWatchers.values())
+    channel.onmessage?.({ grants: [...mockGrants], note: MOCK_REVOKE_NOTE });
+}
 const approvalWatchers = new Map<string, MockChannel<AgentApprovalVm[]>>();
 const sessionViews = new Map<string, AgentSessionViewVm>(
   sessionRows.map((row) => [
@@ -6304,7 +6580,12 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
       loadingEarlier: false,
       complete: true,
       readsTrace: liveScenario !== "nonreader",
-      untrusted: liveScenario === "untrusted" || liveScenario === "stream",
+      untrusted:
+        liveScenario === "untrusted" ||
+        liveScenario === "stream" ||
+        (grantsScenario === "untrusted" &&
+          row.database === "alpha" &&
+          row.sessionId === "device.1"),
       live: [],
       prefs: { showReasoning: false, showDetails: false },
       drives: mockDrives(row.database, row.archived),
@@ -6685,11 +6966,25 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
 /** The mock's source retains rows; only the reader's selected projection crosses IPC. */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   const prefs = heldViewPrefs();
+  // `timeline::banner`: what a message would decline sits above the composer.
+  const cards = vm.readsTrace ? vm.approvals.map(mockApproval) : [];
+  const waiting = cards.filter((card) => card.declinedBySend);
   return {
     ...vm,
     prefs,
     context: mockContext(vm, prefs.showDetails),
-    approvals: vm.readsTrace ? vm.approvals : [],
+    approvals: cards.filter((card) => !card.declinedBySend),
+    ...(waiting.length > 0
+      ? {
+          banner: {
+            approvals: waiting,
+            sentence:
+              waiting.length === 1
+                ? "Sending a message declines this request, even a message that says yes. Use Allow to let it run."
+                : `Sending a message declines these ${waiting.length} requests, even a message that says yes. Use Allow to let one run.`,
+          },
+        }
+      : {}),
     tools: vm.tools.map((tool) => ({ ...tool })),
     ...(vm.drives
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
@@ -6809,7 +7104,8 @@ const sessionViewWatchers = new Map<
 >();
 function publishSessions() {
   for (const channel of approvalWatchers.values())
-    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide));
+    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide).map(mockApproval));
+  publishGrants();
   for (const channel of sessionListWatchers.values())
     channel.onmessage?.({ ops: [{ op: "reset", rows: sessionRows }], total: sessionRows.length });
   for (const { key, channel } of sessionViewWatchers.values()) {
@@ -6936,11 +7232,102 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     const id = `session-approvals-${++sessionSerial}`;
     const channel = payload.channel as MockChannel<AgentApprovalVm[]>;
     approvalWatchers.set(id, channel);
-    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide));
+    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide).map(mockApproval));
     return id;
   },
   agent_approvals_unsubscribe: (payload) => {
     approvalWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_approval_always_allow: (payload) => {
+    const row = sessionApprovals.find(
+      (row) =>
+        row.database === payload.database &&
+        row.sessionId === payload.sessionId &&
+        row.id === payload.approvalId,
+    );
+    if (!row?.canDecide) return hqRefuse("This request was already decided.");
+    if (row.bindingDigest !== payload.bindingDigest)
+      return hqRefuse("This request changed since it was shown; look at it again before deciding.");
+    const offer = mockApproval(row).grant;
+    const scope = offer?.scopes.find((scope) => scope.id === payload.scope);
+    if (!offer || !scope) return hqRefuse("This request does not offer that scope.");
+    const sessionOnly = payload.sessionOnly === true;
+    const days = typeof payload.expiresInDays === "number" ? payload.expiresInDays : undefined;
+    const vm = mockSession(payload);
+    const grant: AgentGrantsVm["grants"][number] = {
+      id: `grant-${++sessionSerial}`,
+      database: row.database,
+      agentActor: vm.agentActor,
+      agentName: vm.agentName,
+      tool: row.toolName,
+      // `grants::scope_sentence`: what it covers, then what follows that it does not look at.
+      scope:
+        row.toolName === "run"
+          ? `Run ${scope.label}, ${scope.standing.split(" — ")[1]?.replace(/\.$/, "")}`
+          : `Call ${row.toolName}, whatever its arguments`,
+      ...(sessionOnly ? { session: vm.title } : {}),
+      ...(days === undefined ? {} : { expiresAtMs: Date.now() + days * 86_400_000 }),
+      createdAtMs: Date.now(),
+      state: "waiting",
+      sentence: `Written here; it takes effect once ${row.database} has it.`,
+      canRevoke: true,
+    };
+    mockGrants.unshift(grant);
+    if (grantsScenario === "refused") {
+      // The grant and the decision are one commit: the server refuses both.
+      grant.state = "refused";
+      grant.canRevoke = false;
+      grant.sentence =
+        "The server refused this grant: that agent does not serve you in this database.";
+      row.refused = "that agent does not serve you in this database.";
+      row.sentence = `The server refused your decision: ${row.refused}`;
+      publishSessions();
+      return hqRefuse(row.sentence);
+    }
+    delete row.refused;
+    row.state = "approved";
+    row.canDecide = false;
+    row.sentence = "Approved by Ana.";
+    publishSessions();
+    setTimeout(() => {
+      grant.state = "active";
+      grant.sentence = sessionOnly
+        ? `Allowed in “${vm.title}” only.`
+        : `Always allowed in every session with ${vm.agentName} in ${row.database}.`;
+      publishGrants();
+    }, 600);
+    return {
+      state: "sent",
+      sentence: sessionOnly
+        ? "Allowed, and allowed for the rest of this session."
+        : "Allowed, and always allowed from now on.",
+    };
+  },
+  agent_grants_subscribe: (payload) => {
+    const id = `grants-${++sessionSerial}`;
+    grantWatchers.set(id, payload.channel as MockChannel<AgentGrantsVm>);
+    publishGrants();
+    return id;
+  },
+  agent_grants_unsubscribe: (payload) => {
+    grantWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_grant_revoke: (payload) => {
+    const grant = mockGrants.find(
+      (grant) => grant.database === payload.database && grant.id === payload.grantId,
+    );
+    if (!grant) return hqRefuse("This grant is not on this device.");
+    if (!grant.canRevoke) return hqRefuse("This grant is already revoked.");
+    grant.state = "revoked";
+    grant.canRevoke = false;
+    grant.sentence = `Revoking; it stops once ${grant.database} has it.`;
+    publishGrants();
+    setTimeout(() => {
+      grant.sentence = "Revoked.";
+      publishGrants();
+    }, 600);
     return null;
   },
   agent_session_approval_decide: (payload) => {
@@ -7122,6 +7509,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       result.pick = changed.pick;
     } else if (name === "stop") {
       if (!vm.live.length) hqRefuse("There is no running turn to stop.");
+      mockDecline(vm, payload.declines);
       vm.live = [];
       result.message = "Stop requested.";
       publishSessions();
@@ -7131,6 +7519,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   agent_send: (payload) => {
     if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
     const vm = mockSession(payload);
+    mockDecline(vm, payload.declines);
     for (const message of vm.messages) if (message.ask) message.ask.open = false;
     const message = {
       id: `local-${++sessionSerial}`,
@@ -7186,6 +7575,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (chips.length === 0) hqRefuse("Choose a file to attach.");
     if (chips.some((chip) => chip === undefined))
       hqRefuse("A file of this message is no longer ready to send. Attach it again.");
+    mockDecline(vm, payload.declines);
     mockAttach(
       vm,
       String(payload.caption ?? ""),
@@ -9965,5 +10355,29 @@ export function installMockShell(): void {
   // (`ipc::platform_plugin`): applied here, before the app mounts.
   platformStore.getState().applySnapshot(MOCK_PLATFORM_FACTS);
   (window as unknown as { __keeperMockPushTap: typeof pushTap }).__keeperMockPushTap = pushTap;
+  // R10911-01: a request that lands after the banner was drawn — not published, so the banner
+  // does not show it until something else changes.
+  const lateApproval = () => {
+    sessionApprovals.push({
+      id: `approval-late-${++sessionSerial}`,
+      database: "alpha",
+      sessionId: "device.1",
+      toolName: "run",
+      tier: "T2",
+      summary: "Delete the build folder",
+      bindingDigest: "sha256:fixture-late",
+      action: JSON.stringify({ argv: ["rm", "-r", "build"] }, null, 2),
+      expiresAtMs: Date.now() + 3600000,
+      createdAtMs: Date.now(),
+      state: "pending",
+      canDecide: true,
+      sentence: "Waiting for you.",
+      actions: [],
+      declinedBySend: false,
+    });
+  };
+  (
+    window as unknown as { __keeperMockLateApproval: typeof lateApproval }
+  ).__keeperMockLateApproval = lateApproval;
   document.documentElement.dataset.mockShell = "on";
 }

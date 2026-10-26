@@ -1055,6 +1055,11 @@ pub fn run() {
                 hq_ipc::agent_instances_subscribe,
                 hq_ipc::agent_instances_unsubscribe,
                 hq_ipc::agent_instances_set,
+                // Always allow (109.11): a card's grant, the grants list, revoke.
+                hq_ipc::agent_approval_always_allow,
+                hq_ipc::agent_grants_subscribe,
+                hq_ipc::agent_grants_unsubscribe,
+                hq_ipc::agent_grant_revoke,
                 // The model providers notes search asks (Story 108.3a), in the
                 // shared body: a provider is a URL and a credential behind the
                 // keychain, so a phone's notes search reaches one the same way.

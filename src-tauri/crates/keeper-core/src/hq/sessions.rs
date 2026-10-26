@@ -363,7 +363,7 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 /// The windows a replica holds, each along one scope variable. Every held
 /// session's members are held beside its row, so the People sheet reads
 /// who else is in it.
-pub const WINDOWS: [(&str, &str); 12] = [
+pub const WINDOWS: [(&str, &str); 13] = [
     ("sessions", "session"),
     ("session_members", "session"),
     ("turn_chunks", "session"),
@@ -376,6 +376,8 @@ pub const WINDOWS: [(&str, &str); 12] = [
     ("approvals", "trace"),
     ("reasoning", "trace"),
     ("tool_calls", "trace"),
+    // One person's grants about one agent ([`crate::hq::grants::units`]).
+    ("standing_grants", "person_agent"),
 ];
 
 pub fn window(table: &str) -> WindowBase {

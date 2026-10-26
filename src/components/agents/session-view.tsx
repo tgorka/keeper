@@ -16,7 +16,7 @@ import {
   SessionLiveTurn,
   SessionTrace,
 } from "@/components/agents/session-turn";
-import { Composer } from "@/components/chat/composer";
+import { announcedElsewhere, announcedRejection, Composer } from "@/components/chat/composer";
 import { Button } from "@/components/ui/button";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { logFailure } from "@/lib/failure";
@@ -60,6 +60,11 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   // Rust's sentence while the session is not on this device yet but may still arrive.
   const [arriving, setArriving] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // A send from under the banner that failed: said in the banner too, since its requests
+  // may still wait (R10911-06).
+  const [bannerFailure, setBannerFailure] = useState<string | null>(null);
+  // A request decided from the banner: once Rust moves it out, focus follows it (R10911-12).
+  const [decidedFromBanner, setDecidedFromBanner] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [stores] = useState(createConversationStores);
   const viewport = useRef<HTMLDivElement>(null);
@@ -194,6 +199,56 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     };
   }, [vm?.complete, vm?.readOnly, stores]);
 
+  // A decision taken in the banner moves its card to the reading column when Rust's next view
+  // has it. Focus goes to that card, else to the next request still in the banner, else to the
+  // composer — never to the page's body.
+  useEffect(() => {
+    if (decidedFromBanner === null || !vm) return;
+    if (vm.banner?.approvals.some((approval) => approval.id === decidedFromBanner)) return;
+    setDecidedFromBanner(null);
+    const moved = viewport.current?.querySelector<HTMLElement>(
+      `[data-approval-id="${CSS.escape(decidedFromBanner)}"]`,
+    );
+    const next = document.querySelector<HTMLElement>(
+      '[data-slot="agent-approval-banner"] [data-approval-id] button',
+    );
+    if (moved) moved.focus();
+    else if (next) next.focus();
+    else stores.composer.getState().requestFocus();
+  }, [vm, decidedFromBanner, stores]);
+  // An answer that never moves the card (refused, then decided elsewhere) stops waiting for it.
+  useEffect(() => {
+    if (decidedFromBanner === null) return;
+    const giveUp = setTimeout(() => setDecidedFromBanner(null), 10_000);
+    return () => clearTimeout(giveUp);
+  }, [decidedFromBanner]);
+
+  // What the banner shows now: a message (or `/stop`) sent from under it declines exactly these,
+  // at these digests, and nothing that arrives later (Q109-12 a, R10911-01).
+  const declines = (vm?.banner?.approvals ?? []).map(({ id, bindingDigest }) => ({
+    id,
+    bindingDigest,
+  }));
+  // A refused send names a request that still waits; once the banner's requests change (one is
+  // decided, another arrives), that sentence may be false, so it goes (R10911-16).
+  const shownKey = JSON.stringify(declines);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the banner's requests changing is the trigger
+  useEffect(() => {
+    setBannerFailure(null);
+  }, [shownKey]);
+  /** Run a write that declines what the banner shows, saying in the banner if it failed. */
+  async function fromUnderBanner<T>(write: () => Promise<T>): Promise<T> {
+    setBannerFailure(null);
+    try {
+      return await write();
+    } catch (raw) {
+      if (declines.length === 0) throw raw;
+      setBannerFailure(syncErrorMessage(raw, "keeper could not send your message."));
+      // Said in the banner; the composer keeps the draft and shows it unannounced.
+      throw announcedRejection(raw);
+    }
+  }
+
   async function attach(pending: PendingAttachment[], caption?: string) {
     // Rust stages every selection under a handle (paths in one call per run of
     // them, each paste or photo as its raw body), then one commit writes them
@@ -234,7 +289,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
       throw raw;
     }
     try {
-      await agentAttachCommit(target, handles, caption);
+      await fromUnderBanner(() => agentAttachCommit(target, handles, caption, declines));
     } catch (raw) {
       attachmentDraft.consume(
         pending.map((attachment) => attachment.id),
@@ -434,7 +489,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                             setBusy(true);
                             setError(null);
                             try {
-                              await agentSend(target, option);
+                              await fromUnderBanner(() => agentSend(target, option, declines));
                             } catch (raw) {
                               setError(syncErrorMessage(raw, "keeper could not send your answer."));
                             } finally {
@@ -475,6 +530,33 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         )}
       </div>
       {vm && !vm.readOnly && <SessionQuestionsPanel messages={vm.messages} />}
+      {vm?.banner && !vm.readOnly && (
+        // Q109-12 a: what waits for this person sits above the composer, out of the
+        // reading column, and says what a message would do to it.
+        <aside
+          aria-label="Waiting for your decision"
+          data-slot="agent-approval-banner"
+          className="max-h-[45dvh] shrink-0 overflow-y-auto border-border border-t bg-muted/30 px-3 py-2"
+        >
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+            <p role="note" className="text-sm [overflow-wrap:anywhere]">
+              {vm.banner.sentence}
+            </p>
+            {bannerFailure && (
+              <p role="alert" className="text-destructive text-sm [overflow-wrap:anywhere]">
+                {bannerFailure}
+              </p>
+            )}
+            {vm.banner.approvals.map((approval) => (
+              <DatabaseApprovalCard
+                key={JSON.stringify([approval.id, approval.bindingDigest])}
+                approval={approval}
+                onDecided={(decided) => setDecidedFromBanner(decided.id)}
+              />
+            ))}
+          </div>
+        </aside>
+      )}
       {vm?.readOnly ? (
         <p className="border-border border-t px-4 py-3 text-muted-foreground text-sm">
           This archived session is read-only. Unarchive it to continue.
@@ -497,11 +579,13 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 resolveCommand={(draft) => agentCommandPreview(target, draft)}
                 onCommand={async ({ name, args }) => {
                   try {
-                    const result = await agentCommand(
-                      target,
-                      `/${name}${args === null ? "" : ` ${args}`}`,
-                      vm ? lastAgentPick(vm.agentActor) : null,
-                    );
+                    const line = `/${name}${args === null ? "" : ` ${args}`}`;
+                    const pick = vm ? lastAgentPick(vm.agentActor) : null;
+                    // Only `/stop` declines what the banner shows (R10911-07).
+                    const result =
+                      name === "stop"
+                        ? await fromUnderBanner(() => agentCommand(target, line, pick, declines))
+                        : await agentCommand(target, line, pick, []);
                     if (result.pick && vm) rememberAgentPick(vm.agentActor, result.pick);
                     if (result.session) agentSessionsStore.getState().select(result.session);
                     if (result.surface === "people") setPeopleOpen(true);
@@ -510,6 +594,8 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                     if (result.surface === "context") setContextOpen(true);
                     return result.message ? { tone: "done", message: result.message } : null;
                   } catch (raw) {
+                    // A refused `/stop` from under the banner is said there, once.
+                    if (announcedElsewhere(raw)) return null;
                     return {
                       tone: "failed",
                       message: syncErrorMessage(raw, "keeper could not run this command."),
@@ -517,7 +603,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                   }
                 }}
                 onSend={async (body) => {
-                  await agentSend(target, body);
+                  await fromUnderBanner(() => agentSend(target, body, declines));
                 }}
                 attachmentPreview={attachmentDraft.preview}
                 sendAccessory={

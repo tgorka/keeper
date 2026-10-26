@@ -49,6 +49,7 @@ pub mod context;
 pub mod databases;
 pub mod default_agent;
 pub mod drives;
+pub mod grants;
 pub mod identity;
 pub mod instances;
 pub mod live;
@@ -290,6 +291,9 @@ pub struct Hq {
     views: Mutex<HashMap<sessions::AgentSessionRef, timeline::Opened>>,
     /// The units each replica's windows were last set to.
     windows: Mutex<HashMap<(String, &'static str), Vec<String>>>,
+    /// When each database's revoked grants units were last asked for again
+    /// ([`grants::reask_revoked`]); emptied when the replicas restart.
+    grants_asked: Mutex<HashMap<String, std::time::Instant>>,
     /// The files the composers staged, not sent yet ([`attachments::Staging`]).
     staging: attachments::Staging,
     window_task: Mutex<Option<JoinHandle<()>>>,
@@ -396,6 +400,7 @@ impl Hq {
             live: watch::channel(0).0,
             views: Mutex::default(),
             windows: Mutex::default(),
+            grants_asked: Mutex::default(),
             staging: attachments::Staging::default(),
             window_task: Mutex::default(),
             decisions: std::sync::OnceLock::new(),
@@ -592,6 +597,8 @@ impl Hq {
     /// again through the status — even when it reads the same.
     async fn restart(&self) -> Result<(), HqError> {
         lock(&self.inner).local_open = LocalOpen::Opening;
+        // A new link asks again for every grants unit the server refused.
+        lock(&self.grants_asked).clear();
         let reopened = self.reopen().await;
         if let Err(error) = &reopened {
             lock(&self.inner).local_open = LocalOpen::Failed(error.to_string());

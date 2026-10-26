@@ -352,6 +352,17 @@ pub trait Replica: Send + Sync {
     /// The standing refusals of commits written here that wrote a row of
     /// `table`, newest first, with what each wrote. Answers from the file.
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError>;
+    /// The values of `variable` the server granted this replica's active
+    /// subscriptions of `table` on their last pull (their effective scopes):
+    /// what it allows, never what was only asked for. A unit asked for and
+    /// not granted (revoked), or not pulled yet, is absent. Answers from the
+    /// file.
+    fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError>;
+    /// The units of `table`'s window whose subscription the server revoked.
+    /// syncular-client never asks the server for such a unit again while it
+    /// stays in the window; taking it out and putting it back
+    /// ([`Replica::set_window`]) subscribes it afresh. Answers from the file.
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError>;
     /// The server's standing refusals of uploads of blobs commits written
     /// here reference, each resolved ([`UploadRefusal`]). Answers from what
     /// the replica kept beside its file, never the network.
@@ -508,6 +519,12 @@ pub(crate) mod fake {
         }
         fn row_writes(&self, _: &str, _: &str, _: Option<&str>) -> Result<RowWrites, ReplicaError> {
             Ok(RowWrites::default())
+        }
+        fn granted(&self, _: &str, _: &str) -> Result<Vec<String>, ReplicaError> {
+            Ok(Vec::new())
+        }
+        fn revoked_units(&self, _: &str) -> Result<Vec<String>, ReplicaError> {
+            Ok(Vec::new())
         }
         fn refused_commits(&self, _: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
             Ok(Vec::new())
