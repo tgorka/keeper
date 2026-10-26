@@ -233,6 +233,11 @@ enum Verdict {
     NotOffered,
     /// The agent offers it, and these people read this database but not it.
     Audience(Vec<String>),
+    /// Ticked, its readers unknown here, and the standing server refusal of
+    /// a selection written here names it by the audience rule: it fails as
+    /// surely as one keeper judged, until a newer selection sets that
+    /// refusal aside (R10923-08).
+    Refused,
 }
 
 /// One drive of a session as keeper judges it.
@@ -245,7 +250,10 @@ struct Judged {
 impl Judged {
     /// It cannot be (or stay) in a selection the server takes.
     fn fails(&self) -> bool {
-        matches!(self.verdict, Verdict::NotOffered | Verdict::Audience(_))
+        matches!(
+            self.verdict,
+            Verdict::NotOffered | Verdict::Audience(_) | Verdict::Refused
+        )
     }
 
     /// Why it cannot be ticked; `None` when it may be, and for a ticked
@@ -254,7 +262,7 @@ impl Judged {
         let name = &self.name;
         match &self.verdict {
             _ if self.ticked => None,
-            Verdict::Allowed | Verdict::Unknown => None,
+            Verdict::Allowed | Verdict::Unknown | Verdict::Refused => None,
             Verdict::NotOffered => Some(format!("{agent} does not offer {name}.")),
             Verdict::Audience(outside) => Some(format!(
                 "{} but cannot read {name}, so it cannot be ticked here.",
@@ -303,12 +311,17 @@ impl<'a> Stale<'a> {
             clauses.push(format!("{agent} no longer offers {them}"));
         }
         for drive in &self.0 {
-            if let Verdict::Audience(outside) = &drive.verdict {
-                let it = if alone { "it" } else { drive.name.as_str() };
-                clauses.push(format!(
+            let it = if alone { "it" } else { drive.name.as_str() };
+            match &drive.verdict {
+                Verdict::Audience(outside) => clauses.push(format!(
                     "{} but cannot read {it}",
                     readers(outside, database)
-                ));
+                )),
+                Verdict::Refused => clauses.push(format!(
+                    "the server refused {it} because not everyone who reads {database} may \
+                     read it"
+                )),
+                _ => {}
             }
         }
         clauses.join("; ")
@@ -431,7 +444,7 @@ fn culprits<'a>(code: &str, proposed: &[String], judged: &'a [Judged]) -> Vec<&'
         AUDIENCE => {
             let known = of(|v| matches!(v, Verdict::Audience(_)));
             if known.is_empty() {
-                of(|v| *v == Verdict::Unknown)
+                of(|v| matches!(v, Verdict::Unknown | Verdict::Refused))
             } else {
                 known
             }
@@ -477,14 +490,27 @@ fn delivery(source: &Source, session_id: &str) -> (bool, Option<Refused>) {
     (pending, Some((newest.rejection, proposed)))
 }
 
+/// What [`judge`] answers: every drive keeper knows of in the session,
+/// judged; the agent's name; whether a selection written here waits; and the
+/// newest standing refusal of one.
+struct Judgement {
+    judged: Vec<Judged>,
+    agent: String,
+    pending: bool,
+    refusal: Option<Refused>,
+}
+
 /// Every drive keeper knows of in the session, judged, and the agent's
-/// name; `None` where this person has no control (see [`view`]).
+/// name; `None` where this person has no control (see [`view`]). A ticked
+/// drive keeper cannot judge that the standing refusal names is
+/// [`Verdict::Refused`]: without that, it and a drive keeper knows fails
+/// would each hold the other's untick back (R10923-08).
 fn judge(
     source: &Source,
     session_id: &str,
     session: &SessionRow,
     sources: &[Source],
-) -> Option<(Vec<Judged>, String)> {
+) -> Option<Judgement> {
     if !person_member(source, session_id, session) {
         return None;
     }
@@ -500,7 +526,7 @@ fn judge(
     known.extend(audiences.databases().cloned());
     known.extend(offered.iter().cloned());
     known.extend(ticked.iter().cloned());
-    let judged = known
+    let mut judged: Vec<Judged> = known
         .into_iter()
         .map(|name| Judged {
             verdict: if offered.contains(&name) {
@@ -512,7 +538,24 @@ fn judge(
             name,
         })
         .collect();
-    Some((judged, agent))
+    let (pending, refusal) = delivery(source, session_id);
+    if let Some((rejection, Some(proposed))) = &refusal {
+        let named: Vec<String> = culprits(&rejection.code, proposed, &judged)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for drive in &mut judged {
+            if drive.ticked && drive.verdict == Verdict::Unknown && named.contains(&drive.name) {
+                drive.verdict = Verdict::Refused;
+            }
+        }
+    }
+    Some(Judgement {
+        judged,
+        agent,
+        pending,
+        refusal,
+    })
 }
 
 /// The session's drives for this person, or `None` when there is no
@@ -525,7 +568,12 @@ pub fn view(
     session: &SessionRow,
     sources: &[Source],
 ) -> Option<AgentSessionDrivesVm> {
-    let (judged, agent) = judge(source, session_id, session, sources)?;
+    let Judgement {
+        judged,
+        agent,
+        pending,
+        refusal,
+    } = judge(source, session_id, session, sources)?;
     let database = source.database.as_str();
     let stale = Stale::of(&judged);
     let held_back = stale.sentence(&agent, database);
@@ -542,7 +590,6 @@ pub fn view(
             refused: None,
         })
         .collect();
-    let (pending, refusal) = delivery(source, session_id);
     let mut refused = None;
     if let Some((rejection, proposed)) = refusal {
         let culprits = culprits(
@@ -601,9 +648,10 @@ pub fn set(
 ) -> Result<(), DriveRefused> {
     let session = timeline::session_row(source, session_id)
         .ok_or_else(|| DriveRefused("This conversation is not on this device.".to_owned()))?;
-    let (judged, agent) = judge(source, session_id, &session, sources).ok_or_else(|| {
-        DriveRefused("Only a person in this chat may choose the drives it reads.".to_owned())
-    })?;
+    let Judgement { judged, agent, .. } =
+        judge(source, session_id, &session, sources).ok_or_else(|| {
+            DriveRefused("Only a person in this chat may choose the drives it reads.".to_owned())
+        })?;
     let database = source.database.as_str();
     let (mut drives, version) = ticked(source, session_id);
     if drives.iter().any(|ticked| ticked == drive) == tick {

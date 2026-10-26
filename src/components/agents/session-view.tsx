@@ -64,15 +64,17 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const backButton = useRef<HTMLButtonElement>(null);
   const { phone } = useShellLayout();
   const { database, sessionId } = target;
-  // Drives… in the list's right-click menu asks for this view's menu; it opens once Rust's view
-  // says this person has the control, and only for this session.
+  // Drives… in the list's right-click menu asks for this view's menu. Rust's first view of this
+  // session answers it: with drives the menu opens; without (the role or the agent's profile
+  // changed since the row was drawn) the request is dropped, so it never opens later on its own.
   const drivesFor = useAgentSessionsStore((state) => state.drivesFor);
+  const viewed = vm !== null;
   const hasDrives = vm?.drives !== undefined;
   useEffect(() => {
-    if (!hasDrives || drivesFor?.database !== database || drivesFor.sessionId !== sessionId) return;
-    setDrivesOpen(true);
+    if (!viewed || drivesFor?.database !== database || drivesFor.sessionId !== sessionId) return;
+    if (hasDrives) setDrivesOpen(true);
     agentSessionsStore.getState().drivesShown();
-  }, [hasDrives, drivesFor, database, sessionId]);
+  }, [viewed, hasDrives, drivesFor, database, sessionId]);
   const pinned = useRef(true);
   const previousHeight = useRef<number | null>(null);
 

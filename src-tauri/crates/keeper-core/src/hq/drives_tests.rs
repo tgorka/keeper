@@ -650,3 +650,62 @@ fn unticking_either_of_two_drives_failing_for_different_reasons_unticks_both() {
         assert_eq!(stored(&alpha).as_deref(), Some("[]"));
     }
 }
+
+/// R10923-08: a ticked drive whose readers this device cannot see, which the
+/// server refused by the audience rule, beside a drive keeper knows fails.
+/// Counted as failing only by keeper's own judgement, each untick was refused
+/// — the one here, the other by the server. A drive a standing refusal names
+/// fails too, so unticking either writes a selection without both.
+#[test]
+fn a_ticked_drive_the_server_refused_goes_with_one_keeper_knows_fails() {
+    for clicked in ["alpha", "beta"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // This device holds alpha only: who reads beta it cannot know.
+        let alpha = open(dir.path(), "alpha");
+        seed(&alpha, Some("owner"), false);
+        put(
+            &alpha,
+            vec![profile("nixie.box", AGENT, Some(&["alpha", "beta"]))],
+        );
+        let sources = [alpha.clone()];
+        set(&alpha, SESSION, "alpha", true, &sources, 5).expect("ticks alpha");
+        set(&alpha, SESSION, "beta", true, &sources, 6).expect("beta: the server decides");
+        // The instance stops publishing alpha; unticking it wrote ["beta"],
+        // which the server refused for beta.
+        put(&alpha, vec![profile("nixie.box", AGENT, Some(&["beta"]))]);
+        journal_refusal(
+            &dir.path().join("alpha.sqlite"),
+            "c-beta",
+            &["beta"],
+            "hq.v17.audience",
+        );
+
+        let vm = drives_vm(&alpha, &sources).expect("control");
+        let said = "Untick alpha and beta to change the other drives: Nixie no longer offers \
+                    alpha; the server refused beta because not everyone who reads alpha may \
+                    read it. Unticking either unticks both.";
+        for name in ["alpha", "beta"] {
+            let drive = vm.drives.iter().find(|d| d.name == name).expect(name);
+            assert_eq!(drive.reason.as_deref(), Some(said), "{name}");
+        }
+        assert_eq!(
+            vm.drives
+                .iter()
+                .find(|d| d.name == "beta")
+                .expect("beta")
+                .refused
+                .as_deref(),
+            Some("The server refused beta: not everyone who reads alpha may read it.")
+        );
+
+        set(&alpha, SESSION, clicked, false, &sources, 7).expect("the way out");
+        assert_eq!(
+            stored(&alpha).as_deref(),
+            Some("[]"),
+            "unticking {clicked} writes a selection without both"
+        );
+        // The refusal is set aside: beta is the server's to decide again.
+        set(&alpha, SESSION, "beta", true, &sources, 8).expect("then a healthy change");
+        assert_eq!(stored(&alpha).as_deref(), Some(r#"["beta"]"#));
+    }
+}

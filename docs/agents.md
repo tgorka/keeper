@@ -420,21 +420,23 @@ chips say so before the person acts (**Untick delta and gamma to change the othe
 longer offers them. Unticking either unticks both.**). Every other change is refused here, naming
 them all (**Untick delta and gamma first: Nixie no longer offers them.**). Unticking one alone would
 leave a selection V17 still refuses for the other, so nothing could ever change (R10923-06). A
-server refusal (`hq.v17.audience`, `hq.v17.not_offered`, …) is hung on the drives of the refused
-selection keeper knows fail that way (for the audience rule, failing those, the ones whose readers
-it cannot see), never on the drive that was clicked; it reaches the drive's row and the line under
-the chips — inside the menu while it is open, where a screen reader still hears it — read from the
-replica's per-row outcome record, until the next selection sets it aside. The menu always says, and
-the header repeats once a tick takes the selection from none to one, what D-34's accepted risk
-allows (R-HQ-79): once a drive is ticked the agent may read it and send what it reads to the web
-without asking, even after the chat has read outside content. Only a person member (`owner` or
-`person`) of a session that is not archived gets the control, `/drives` and **Drives…** in the
-Agents list's right-click menu, which opens the session and its menu; anyone else sees none of them,
-and an agent that has not said what it reads gets no control. Fixtures: the default mock offers
-`alpha` and `gamma`, refuses `beta` by the audience rule and `omega` as another agent's, and its
-fake server refuses a tick of `gamma` a moment later; `?drives=nonmember` draws no control;
-`?drives=stale` ticks `alpha` and a `delta` and `gamma` the agent no longer offers; `/drives` opens
-the menu.
+ticked drive whose readers this device cannot see counts as failing too once a standing server
+refusal names it, until a newer selection sets that refusal aside: beside a drive keeper knows
+fails, each would otherwise hold the other's untick back (R10923-08). A server refusal
+(`hq.v17.audience`, `hq.v17.not_offered`, …) is hung on the drives of the refused selection keeper
+knows fail that way (for the audience rule, failing those, the ones whose readers it cannot see),
+never on the drive that was clicked; it reaches the drive's row and the line under the chips —
+inside the menu while it is open, where a screen reader still hears it — read from the replica's
+per-row outcome record, until the next selection sets it aside. The menu always says, and the header
+repeats once a tick takes the selection from none to one, what D-34's accepted risk allows
+(R-HQ-79): once a drive is ticked the agent may read it and send what it reads to the web without
+asking, even after the chat has read outside content. Only a person member (`owner` or `person`) of
+a session that is not archived gets the control, `/drives` and **Drives…** in the Agents list's
+right-click menu, which opens the session and its menu; anyone else sees none of them, and an agent
+that has not said what it reads gets no control. Fixtures: the default mock offers `alpha` and
+`gamma`, refuses `beta` by the audience rule and `omega` as another agent's, and its fake server
+refuses a tick of `gamma` a moment later; `?drives=nonmember` draws no control; `?drives=stale`
+ticks `alpha` and a `delta` and `gamma` the agent no longer offers; `/drives` opens the menu.
 
 The viewer rule is Rust's: “A viewer renders a turn that is still being written as the turn's
 `turn_chunks` contiguous from seq 0, followed by the latest `text` it has seen on
