@@ -519,8 +519,11 @@ export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { HqDatabaseState } from "./gen/HqDatabaseState";
 export type { HqDatabaseVm } from "./gen/HqDatabaseVm";
 export type { HqDeviceVm } from "./gen/HqDeviceVm";
+export type { HqEnrolmentVm } from "./gen/HqEnrolmentVm";
 export type { HqPairCodeVm } from "./gen/HqPairCodeVm";
 export type { HqPhase } from "./gen/HqPhase";
+export type { HqSignInState } from "./gen/HqSignInState";
+export type { HqSignInVm } from "./gen/HqSignInVm";
 export type { HqStatusVm } from "./gen/HqStatusVm";
 export type { HqThisDeviceVm } from "./gen/HqThisDeviceVm";
 export type { InboxBatch } from "./gen/InboxBatch";
@@ -842,6 +845,7 @@ import type { ForgeReposVm } from "./gen/ForgeReposVm";
 import type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 import type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 import type { HotkeyVm } from "./gen/HotkeyVm";
+import type { HqEnrolmentVm } from "./gen/HqEnrolmentVm";
 import type { HqPairCodeVm } from "./gen/HqPairCodeVm";
 import type { HqStatusVm } from "./gen/HqStatusVm";
 import type { InboxBatch } from "./gen/InboxBatch";
@@ -4262,6 +4266,14 @@ export async function hqPairRedeem(code: string): Promise<HqStatusVm> {
  */
 export async function hqDeviceRevoke(clientId: string): Promise<HqStatusVm> {
   return await invoke<HqStatusVm>("hq_device_revoke", { clientId });
+}
+
+/**
+ * The person's newest "new device" notices from their other devices: signed in, adopted by a
+ * sign-in, or paired with a code. Each sentence is Rust's.
+ */
+export async function hqEnrolments(): Promise<HqEnrolmentVm[]> {
+  return await invoke<HqEnrolmentVm[]>("hq_enrolments");
 }
 
 /** Pair with the server of the link a scanned QR opened (`HqStatusVm.offer`). */

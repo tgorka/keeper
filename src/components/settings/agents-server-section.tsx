@@ -4,6 +4,11 @@
  * person's *Devices*, each with *Remove*, and the confirmation of a pairing link a scanned QR
  * opened.
  *
+ * Sign-in enrolment (109.6): a person whose account keeper can sign in with gets no code field
+ * and no *Add a device* — the device connects by signing in — and sees *New devices*, the
+ * server's notices of their other devices signing in or pairing (S-ID-8). The code field stays
+ * for anyone keeper cannot sign in for (no account, a server without sign-in, a refusal).
+ *
  * Every sentence but the copy is Rust's (`HqStatusVm`, the commands' refusals): whether an
  * address is one keeper contacts, which databases this device holds and how each stands,
  * whether the device was removed, and the devices — which follow the server's replicated
@@ -17,9 +22,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { logFailure } from "@/lib/failure";
 import {
+  type HqEnrolmentVm,
   type HqPairCodeVm,
   type HqStatusVm,
   hqDeviceRevoke,
+  hqEnrolments,
   hqPairOfferAccept,
   hqPairOfferDismiss,
   hqPairRedeem,
@@ -34,7 +41,8 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 export const AGENTS_SERVER_TITLE = "Agents server";
 export const AGENTS_SERVER_NOTE =
   "The server your agents' conversations sync through. keeper has none of its own: set the " +
-  "address of the one you run, and pair this device with a code from one that is paired.";
+  "address of the one you run. Signed in to your account, this device connects by itself; " +
+  "without a sign-in, pair it with a code from a device that is connected.";
 export const AGENTS_SERVER_LABEL = "Server address";
 export const AGENTS_SERVER_SAVE = "Save";
 export const PAIR_CODE_LABEL = "Pairing code";
@@ -50,6 +58,7 @@ export const REMOVED_DEVICE = "Removed";
 export const FORGET_SERVER = "Remove this server's copies";
 export const OFFER_PAIR = "Pair this device";
 export const OFFER_DISMISS = "Not now";
+export const NEW_DEVICES_TITLE = "New devices";
 const PLACEHOLDER = "https://agents.example.org";
 const READ_FAILED = "Could not read the agents server's status.";
 const QR_ALT = "QR code of the pairing code";
@@ -69,6 +78,7 @@ export function AgentsServerSection({ open }: { open: boolean }) {
   const [busy, setBusy] = useState(false);
   const [alert, setAlert] = useState<string | null>(null);
   const [pairCode, setPairCode] = useState<HqPairCodeVm | null>(null);
+  const [notices, setNotices] = useState<HqEnrolmentVm[]>([]);
 
   useEffect(() => {
     if (!open) {
@@ -99,6 +109,28 @@ export function AgentsServerSection({ open }: { open: boolean }) {
   }, [open]);
 
   const paired = status?.phase === "paired";
+  const signIn = status?.signIn.state ?? "unavailable";
+  // A code is the way in only for someone keeper cannot sign in for.
+  const byCode = signIn === "unavailable" || signIn === "refused";
+  // A new device in the directory is a new notice: read them again when the list moves.
+  const devicesKey = status?.devices.map((device) => device.clientId).join(",") ?? "";
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: devicesKey is the request to read the notices again
+  useEffect(() => {
+    if (!open || !paired) {
+      setNotices([]);
+      return;
+    }
+    let cancelled = false;
+    void hqEnrolments()
+      .then((next) => {
+        if (!cancelled) setNotices(next);
+      })
+      .catch(logFailure("hq.enrolments"));
+    return () => {
+      cancelled = true;
+    };
+  }, [open, paired, devicesKey]);
 
   const run = useCallback(<T,>(scope: string, call: () => Promise<T>, then: (value: T) => void) => {
     setBusy(true);
@@ -167,6 +199,14 @@ export function AgentsServerSection({ open }: { open: boolean }) {
         <p role="status" className="[overflow-wrap:anywhere]">
           {status.sentence}
         </p>
+        {status.signIn.sentence !== null && (
+          <p
+            data-sign-in={status.signIn.state}
+            className="text-muted-foreground [overflow-wrap:anywhere]"
+          >
+            {status.signIn.sentence}
+          </p>
+        )}
       </div>
 
       {status.databases.length > 0 && (
@@ -213,7 +253,7 @@ export function AgentsServerSection({ open }: { open: boolean }) {
         </fieldset>
       )}
 
-      {(status.phase === "notPaired" || status.phase === "noServer") && (
+      {(status.phase === "notPaired" || status.phase === "noServer") && byCode && (
         <form
           className="flex min-w-0 flex-col gap-2"
           onSubmit={(event) => {
@@ -253,7 +293,7 @@ export function AgentsServerSection({ open }: { open: boolean }) {
         </p>
       )}
 
-      {paired && (
+      {paired && byCode && (
         <div className="flex min-w-0 flex-col gap-2">
           <Button
             type="button"
@@ -307,6 +347,26 @@ export function AgentsServerSection({ open }: { open: boolean }) {
                     {REMOVE_DEVICE}
                   </Button>
                 )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {notices.length > 0 && (
+        <div className="flex min-w-0 flex-col gap-2">
+          <h4 className="font-medium">{NEW_DEVICES_TITLE}</h4>
+          <ul aria-label={NEW_DEVICES_TITLE} className="flex min-w-0 flex-col gap-1">
+            {notices.map((notice) => (
+              <li
+                key={`${notice.clientId}-${notice.atMs}`}
+                className="min-w-0 [overflow-wrap:anywhere]"
+              >
+                {notice.sentence}
+                <span className="text-muted-foreground">
+                  {" "}
+                  · {new Date(notice.atMs).toLocaleString()}
+                </span>
               </li>
             ))}
           </ul>

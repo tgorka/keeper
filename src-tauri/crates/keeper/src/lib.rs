@@ -1013,6 +1013,7 @@ pub fn run() {
                 hq_ipc::hq_pair_offer_accept,
                 hq_ipc::hq_pair_offer_dismiss,
                 hq_ipc::hq_device_revoke,
+                hq_ipc::hq_enrolments,
                 // The Agents window on the replicas: the list, an open
                 // session, writing, archiving, approvals.
                 hq_ipc::agents_sessions_subscribe,

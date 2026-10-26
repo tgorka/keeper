@@ -146,6 +146,66 @@ app does not currently hold. Apple must grant that entitlement for assigned-name
 `iPhone` differs from `hesperia`, but two iPhones would share it; the actual kalypso enrollment
 and T4 decision still require the physical-device check.
 
+**Signing in** (Story 109.6; Q109-01 … Q109-06 a, S-ID-1 … S-ID-9; the server half is keeper-hq's
+109.5). A device whose person is signed in to the organisation account gets its credential by
+signing in, with no code (`keeper-core/src/hq/signin.rs`):
+
+- **When.** With `agents.server_url` set and the account signed in, keeper enrols on its own after
+  every start, every settings change and every sign-in (`Hq::consider_sign_in`). A device with no
+  credential gets a new one. A paired device sends its own token in the body, so the server
+  *adopts* it: the same client id, a new token, its host bound now (Q109-04 a). A device whose
+  sign-in lapsed or was suspended (S-ID-9: the server refuses its token) signs in again the same
+  way, silently, keeping its client id. An outcome is remembered per account *and* per sign-in of
+  it: keeper's own mark, minted by every interactive sign-in and kept by every refresh
+  (`StoredSession::sign_in`), never the provider's `auth_time` (a refresh may drop it, and a
+  sign-in completed from the provider's own session may repeat it). A sign-in that could not be
+  refreshed is tried again as soon as the person signs in anew, and a device the server no longer
+  knows (`hq.device_unknown`) is never replaced by a new client id on its own. An account that
+  moves under three attempts in a row before any could send waits for the next change of the
+  account or the setting, so it is never a loop against the provider and the server.
+- **One attempt, one account, one server.** An attempt holds the account it checked — its id,
+  issuer, client, scopes and sign-in — and the token is minted from that very account
+  (`OrgAccount::fresh_token` refuses another one, `TokenError::Changed`). Before the request is
+  sent the attempt checks, under the service's lock, that its configuration is still the current
+  one and the account still the one it checked; otherwise it sends nothing and the account as it
+  is now is considered afresh. A server change, a cleared address or another account cancels the
+  running attempt. One whose request is already sent is not cancelled: it keeps what the server
+  answers under that server's keychain item, because the server may already have issued the
+  device or rotated the old token, and restarts onto it only if that server is still set. It
+  replaces only what it started from — no credential, or the token it adopted: if the item moved
+  on meanwhile (a Forget, or a newer attempt that kept its own), the late answer is discarded and
+  its device revoked with its own token (`POST /clients/{id}/revoke`), so no credential is left
+  that nothing holds.
+- **To whom.** The account's access token leaves the device only after the server's
+  unauthenticated `GET /auth/config` names the account's own issuer and client, exactly, and no
+  scope the account's sign-in does not ask for (S-ID-2, `signin::trusts`). It goes only to
+  `POST /devices/enroll` and `POST /clients/self/attest`, as a bearer, never in a URL (S-ID-1).
+  Each presentation mints a new token (`oidc::minted_access_token`): the server spends its `jti`
+  and refuses one issued more than five minutes before. Neither token is ever logged.
+- **What is kept.** The device token goes to the keychain item a pairing's lives in
+  (`agents-server/<base URL>`), replacing it, with when it was last attested.
+- **Attestation** (Q109-03 a). A credential that came from a sign-in is re-attested six days into
+  the server's seven-day window (`signin::Bound::due_at_ms`), with a freshly minted token. A
+  signed-out account does not attest; the credential lapses, and the next sign-in adopts it back.
+  Attesting stops only on an answer about the device itself: the server no longer knows it (401
+  `hq.device_unknown`: discovery then marks it removed), it never came from a sign-in (409
+  `hq.attest.not_enrolled`: an enrolment adopts it), or it is another person's (403
+  `hq.attest.other_person`). Anything else — a refused sign-in token (`hq.signin.stale`,
+  `.replayed`, …), a person, app or role an administrator can restore (`hq.not_a_person`,
+  `hq.signin.client`, `hq.signin.role`), a 403 that is not keeper-hq's (a proxy's page), an
+  unreachable server — is tried again after ten minutes, doubling at each one in a row up to six
+  hours, and back to ten minutes after a success; a 401 also asks the server again whether the
+  device is known. Every wait is kept on the wall clock and slept at most an hour at a time, so a
+  computer that slept through it attests at its next wake. Settings says why under the
+  signed-in line until an attestation goes through.
+- **Settings.** For a person keeper can sign in for, *Agents server* shows no code field and no
+  **Add a device**: it says how this device stands with signing in, and lists **New devices** —
+  the server's notices of the person's other devices signing in, being adopted or pairing
+  (`GET /clients/self/enrolments`, S-ID-8), this device's own left out.
+- **Pairing stays** for anyone keeper cannot sign in for: no account, a server without sign-in
+  (`/auth/config` answers 404), or a refusal (another issuer or client, a person the server does
+  not list). 109.7 retires it.
+
 **Discovery.** At every start, and after pairing, `GET /databases` says whom the token was issued
 to and which databases it opens (`hq/routes.rs:289-295`). The device holds one replica per server,
 database and person under the data directory, at `hq/servers/<server>/<database>/<actor>.sqlite`,

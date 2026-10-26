@@ -78,6 +78,13 @@ pub(crate) struct StoredSession {
     pub display_name: String,
     pub email: Option<String>,
     pub roles: Vec<String>,
+    /// keeper's own mark of the interactive sign-in this session came from:
+    /// minted by every sign-in, never by a refresh, which keeps it. What
+    /// "the person signed in again" means to the agents server's enrolment
+    /// (109.6, R1096-05/-06), whatever the provider's `auth_time` does.
+    /// Absent in a session stored before it existed: one sign-in like any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<String>,
 }
 
 impl StoredSession {

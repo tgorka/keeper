@@ -2,15 +2,17 @@
 //! keeper as a client of the syncular server the person runs.
 //!
 //! keeper ships no server address (D-4). The person sets `agents.server_url`
-//! to the server's base URL; a device pairs by redeeming a code another of
-//! their devices shows, typed or opened from its QR ([`pairing`]); the token
-//! it receives lives in the platform keychain and nowhere else — never in
-//! `keeper.db`, a settings file, a view model or a log line. `GET /databases`
-//! says which databases the token opens, and the device holds one replica of
-//! each ([`databases`]), each with its own socket at `<base>/<database>/…` and
-//! its own owner thread ([`syncular`]). With no address, or no pairing,
-//! everything written waits in a local replica's outbox and keeper makes no
-//! request to any agents server.
+//! to the server's base URL; a device whose person is signed in to the
+//! account gets its credential by signing in ([`signin`], 109.6), and any
+//! other device pairs by redeeming a code another of their devices shows,
+//! typed or opened from its QR ([`pairing`]); the token it receives lives in
+//! the platform keychain and nowhere else — never in `keeper.db`, a settings
+//! file, a view model or a log line. `GET /databases` says which databases
+//! the token opens, and the device holds one replica of each ([`databases`]),
+//! each with its own socket at `<base>/<database>/…` and its own owner thread
+//! ([`syncular`]). With no address, or no credential, everything written
+//! waits in a local replica's outbox and keeper makes no request to any
+//! agents server.
 //!
 //! One lifecycle owns every request: [`Hq`] follows the effective
 //! `agents.server_url` ([`Hq::reconcile`], called whenever a setting or a
@@ -58,6 +60,7 @@ pub mod send;
 pub mod server;
 pub mod sessions;
 pub mod settings;
+pub mod signin;
 pub mod spoken;
 pub mod syncular;
 pub mod thumbnails;
@@ -85,7 +88,8 @@ use crate::hq::port::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaStat
 use crate::hq::routes::{RouteError, Routes};
 use crate::hq::server::ServerUrl;
 use crate::hq::vm::{
-    database_vm, phase_sentence, HqDeviceVm, HqPairCodeVm, HqPhase, HqStatusVm, HqThisDeviceVm,
+    database_vm, not_connected_sentence, phase_sentence, HqDeviceVm, HqPairCodeVm, HqPhase,
+    HqSignInState, HqSignInVm, HqStatusVm, HqThisDeviceVm,
 };
 use crate::platform::{exclude_from_backup_best_effort, Platform};
 
@@ -137,14 +141,18 @@ struct Pairing {
     actor_id: String,
     client_id: String,
     name: String,
+    /// Set when the credential came from a sign-in (109.6): when it was
+    /// last attested. A pairing's has none, and a sign-in adopts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound: Option<signin::Bound>,
 }
 
 impl std::fmt::Debug for Pairing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pairing")
             .field("token", &"<redacted>")
-            .field("actor_id", &self.actor_id)
             .field("client_id", &self.client_id)
+            .field("bound", &self.bound)
             .finish()
     }
 }
@@ -245,6 +253,8 @@ struct Inner {
     /// What the server last took: its base URL, this device's client id and
     /// the target.
     push_told: Option<(String, String, Option<push::PushTarget>)>,
+    /// Sign-in enrolment on this configuration ([`signin`]).
+    sign_in: signin::SignInMemo,
 }
 
 /// What a reconfiguration takes out of service.
@@ -259,6 +269,11 @@ pub struct Hq {
     platform: Arc<dyn Platform>,
     opener: Arc<dyn Opener>,
     routes: Arc<dyn Routes>,
+    /// The account's sign-in, which enrols this device ([`signin`]).
+    sign_in: Arc<dyn signin::SignIn>,
+    /// How far tests moved the attestation timers' wall clock on.
+    #[cfg(test)]
+    wall_offset: std::sync::atomic::AtomicI64,
     device_name: String,
     device_host: Box<dyn Fn() -> String + Send + Sync>,
     /// Serialises every change of configuration. Never held across a request
@@ -299,6 +314,7 @@ fn no_server() -> HqStatusVm {
         waiting_here: 0,
         devices: Vec::new(),
         offer: None,
+        sign_in: HqSignInVm::unavailable(),
     }
 }
 
@@ -309,7 +325,9 @@ fn keychain_key(server: &ServerUrl) -> String {
 fn route_sentence(server: &ServerUrl, error: &RouteError) -> String {
     match error {
         RouteError::Unauthorized => "The server does not know this device.".to_owned(),
-        RouteError::Forbidden(code) => format!("{} refused: {code}.", server.host()),
+        RouteError::Forbidden(code) | RouteError::Refused { code, .. } => {
+            format!("{} refused: {code}.", server.host())
+        }
         RouteError::Unreachable(why) => format!("keeper could not reach {}: {why}", server.host()),
         RouteError::Unexpected(why) => {
             format!(
@@ -345,12 +363,15 @@ async fn retire(retired: Retired) {
 
 impl Hq {
     /// A service with nothing open yet; [`Hq::start`] reads the setting.
+    /// `sign_in` is the account whose sign-in enrols this device.
     /// `device_name` is how the person's other devices will list this one.
-    /// `device_host` reads the OS host at redemption, after any late platform setup.
+    /// `device_host` reads the OS host at redemption and at enrolment, after
+    /// any late platform setup.
     pub fn new(
         platform: Arc<dyn Platform>,
         opener: Arc<dyn Opener>,
         routes: Arc<dyn Routes>,
+        sign_in: Arc<dyn signin::SignIn>,
         device_name: String,
         device_host: impl Fn() -> String + Send + Sync + 'static,
     ) -> Arc<Hq> {
@@ -361,6 +382,9 @@ impl Hq {
             platform,
             opener,
             routes,
+            sign_in,
+            #[cfg(test)]
+            wall_offset: std::sync::atomic::AtomicI64::new(0),
             device_name,
             device_host: Box::new(device_host),
             lifecycle: tokio::sync::Mutex::new(()),
@@ -523,6 +547,9 @@ impl Hq {
             }
         };
         if unchanged {
+            // An account signed in or out, or another account set up: a
+            // device that can sign in now does.
+            self.consider_sign_in();
             return Ok(());
         }
         tracing::info!("the agents server setting changed; following it");
@@ -545,6 +572,9 @@ impl Hq {
         for task in inner.tasks.drain(..) {
             task.abort();
         }
+        // The sign-in attempt of the configuration retired here sends
+        // nothing more (R1096-02); one already sent keeps what it is answered.
+        inner.sign_in.cancel();
         inner.discovering = false;
         let mut replicas: Vec<Arc<dyn Replica>> =
             inner.dbs.drain(..).map(|db| db.replica).collect();
@@ -567,6 +597,9 @@ impl Hq {
         }
         self.publish();
         self.status.send_modify(|_| {});
+        if reopened.is_ok() {
+            self.consider_sign_in();
+        }
         reopened
     }
 
@@ -610,6 +643,7 @@ impl Hq {
             inner.address_refused = address_refused;
             inner.pairing = pairing.clone();
             inner.authorization = authorization.clone();
+            inner.sign_in = signin::SignInMemo::default();
             (retired, inner.generation)
         };
         // Every old request ends before the new configuration is published.
@@ -675,6 +709,14 @@ impl Hq {
             // with no address nothing is asked at all.
             if server.is_some() && pairing.is_some() && !authorization.removed {
                 self.schedule_discovery(&mut inner, Duration::ZERO);
+            }
+            // A credential that came from a sign-in stays attested.
+            if let (Some(_), Some(bound), false) = (
+                &server,
+                pairing.as_ref().and_then(|pairing| pairing.bound),
+                authorization.removed,
+            ) {
+                self.schedule_attest(&mut inner, bound);
             }
             inner.local_open = LocalOpen::Open;
         }
@@ -948,7 +990,11 @@ impl Hq {
         };
         drop(stale_contact);
         self.publish();
-        if !authorization.removed {
+        if authorization.removed {
+            // A lapsed or suspended sign-in is refused like a removed device:
+            // signed in, the device signs in again, keeping its client id.
+            self.consider_sign_in();
+        } else {
             self.tell_push_target();
         }
         Ok(())
@@ -990,10 +1036,20 @@ impl Hq {
             // even with the last server's replicas held.
             let paired = inner.server.as_ref().and(inner.pairing.as_ref());
             let linkable = inner.server.is_some();
+            let sign_in = Self::sign_in_vm(&inner);
+            let sentence = match (phase, sign_in.state, host) {
+                // No code to type: signing in connects it.
+                (
+                    HqPhase::NotPaired,
+                    HqSignInState::SignedOut | HqSignInState::Enrolling,
+                    Some(host),
+                ) => not_connected_sentence(host, waiting_here),
+                _ => phase_sentence(phase, host, waiting_here),
+            };
             let status = HqStatusVm {
                 server: inner.server.as_ref().map(|s| s.as_str().to_owned()),
                 phase,
-                sentence: phase_sentence(phase, host, waiting_here),
+                sentence,
                 device: paired.map(|pairing| HqThisDeviceVm {
                     client_id: pairing.client_id.clone(),
                     name: pairing.name.clone(),
@@ -1013,6 +1069,7 @@ impl Hq {
                     .offer
                     .as_ref()
                     .map(|(server, _)| server.host().to_owned()),
+                sign_in,
             };
             let replicas: Vec<Arc<dyn Replica>> =
                 inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
@@ -1091,6 +1148,7 @@ impl Hq {
             actor_id: redeemed.discovery.actor_id,
             client_id: redeemed.discovery.client_id,
             name: self.device_name.clone(),
+            bound: None,
         };
         let stored = serde_json::to_string(&record).map_err(sentence)?;
         self.platform
@@ -1285,6 +1343,8 @@ fn devices(replicas: &[Arc<dyn Replica>], actor: &str, me: &str) -> Vec<HqDevice
     devices
 }
 
+#[cfg(test)]
+mod signin_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

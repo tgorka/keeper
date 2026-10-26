@@ -74,6 +74,7 @@ async fn cold_start(data_dir: &Path) -> Option<String> {
         phone as Arc<dyn Platform>,
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
+        Arc::new(keeper_core::hq::signin::NoAccount),
         format!("keeper on {HOST}"),
         || HOST.to_owned(),
     );

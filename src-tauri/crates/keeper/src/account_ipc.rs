@@ -3190,6 +3190,9 @@ async fn sign_in_and_sync(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegis
         .attempt();
     update(|inner| inner.attempt = Some(attempt));
     drop(gate);
+    // Signed in now, the agents server may take this device by its sign-in
+    // (109.6) — whether or not the settings sync went through.
+    crate::hq_ipc::reconcile();
     resync_if_dirty();
     current_vm()
 }

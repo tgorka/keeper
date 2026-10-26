@@ -24,6 +24,10 @@
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
 //! ```
 //!
+//! The sign-in case (109.6) needs a server with sign-in configured and the
+//! account's refresh token instead of the operator's token; its own docs
+//! (`sign_in_enrols_adopts_announces_and_attests`) name its variables.
+//!
 //! The operator's token is used only for the person's first pairing code, as
 //! an operator pairs a person's first device. Each device runs behind a local
 //! TCP relay, so the test can cut one device off the server and see every
@@ -542,6 +546,7 @@ fn hq(device: &Arc<Device>, name: &str) -> Arc<Hq> {
         Arc::clone(device) as Arc<dyn Platform>,
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
+        Arc::new(keeper_core::hq::signin::NoAccount),
         name.to_owned(),
         move || host.clone(),
     )
@@ -3656,4 +3661,268 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     );
     mac.shutdown().await;
     phone.shutdown().await;
+}
+
+/// The account's sign-in for the live enrolment case: a refresh token of
+/// keeper's app, read from a mode-600 file and rotated back into it, each
+/// access token minted for one presentation and remembered for the log
+/// search. Never printed.
+struct LiveSignIn {
+    account: keeper_core::hq::signin::AccountSignIn,
+    refresh_file: PathBuf,
+    minted: Mutex<Vec<String>>,
+    http: reqwest::Client,
+}
+
+impl LiveSignIn {
+    fn from_env() -> LiveSignIn {
+        let scopes = env("KEEPER_HQ_LIVE_SIGNIN_SCOPES")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        LiveSignIn {
+            account: keeper_core::hq::signin::AccountSignIn {
+                account: "hq-live".to_owned(),
+                issuer: env("KEEPER_HQ_LIVE_SIGNIN_ISSUER"),
+                client_id: env("KEEPER_HQ_LIVE_SIGNIN_CLIENT"),
+                scopes,
+                sign_in: Some("hq-live".to_owned()),
+            },
+            refresh_file: PathBuf::from(env("KEEPER_HQ_LIVE_SIGNIN_REFRESH_FILE")),
+            minted: Mutex::new(Vec::new()),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn mint(&self) -> Result<String, String> {
+        let discovery: Value = self
+            .http
+            .get(format!(
+                "{}/.well-known/openid-configuration",
+                self.account.issuer
+            ))
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        let endpoint = discovery["token_endpoint"]
+            .as_str()
+            .ok_or("no token endpoint")?
+            .to_owned();
+        let refresh = std::fs::read_to_string(&self.refresh_file)
+            .map_err(|e| e.to_string())?
+            .trim()
+            .to_owned();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("refresh_token", &refresh)
+            .append_pair("client_id", &self.account.client_id)
+            .finish();
+        let answer: Value = self
+            .http
+            .post(endpoint)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form)
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?
+            .error_for_status()
+            .map_err(|e| format!("the refresh was refused: {}", e.without_url()))?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(rotated) = answer["refresh_token"].as_str() {
+            std::fs::write(&self.refresh_file, rotated).map_err(|e| e.to_string())?;
+        }
+        let token = answer["access_token"]
+            .as_str()
+            .ok_or("no access token")?
+            .to_owned();
+        self.minted.lock().expect("minted").push(token.clone());
+        Ok(token)
+    }
+}
+
+impl keeper_core::hq::signin::SignIn for LiveSignIn {
+    fn account(&self) -> keeper_core::hq::signin::AccountState {
+        keeper_core::hq::signin::AccountState::SignedIn(self.account.clone())
+    }
+    fn fresh_token<'a>(
+        &'a self,
+        account: &'a keeper_core::hq::signin::AccountSignIn,
+    ) -> keeper_core::hq::signin::TokenAnswer<'a> {
+        Box::pin(async move {
+            if *account != self.account {
+                return Err(keeper_core::hq::signin::TokenError::Changed);
+            }
+            self.mint()
+                .await
+                .map_err(keeper_core::hq::signin::TokenError::Unavailable)
+        })
+    }
+}
+
+fn signed_in_hq(device: &Arc<Device>, sign_in: &Arc<LiveSignIn>, host: &str) -> Arc<Hq> {
+    let host = host.to_owned();
+    Hq::new(
+        Arc::clone(device) as Arc<dyn Platform>,
+        Arc::new(SyncularOpener),
+        Arc::new(HttpRoutes::new()),
+        Arc::clone(sign_in) as Arc<dyn keeper_core::hq::signin::SignIn>,
+        "keeper".to_owned(),
+        move || host.clone(),
+    )
+}
+
+/// The one agents-server item in a device's keychain, as JSON.
+fn credential(device: &Arc<Device>) -> (String, Value) {
+    let keychain = device.keychain.lock().expect("keychain");
+    let (key, raw) = keychain
+        .iter()
+        .find(|(key, _)| key.starts_with("agents-server/"))
+        .expect("a credential");
+    (key.clone(), serde_json::from_str(raw).expect("json"))
+}
+
+/// 109.6 against 109.5: a device signs in with no code, a paired device is
+/// adopted under its client id, the person's other device is told, and a
+/// due attestation goes through. Needs a server with `KEEPER_HQ_OIDC_*` set
+/// and the person's `oidcSubject` in its registry, and the account's
+/// refresh token (see the module docs):
+///
+/// ```sh
+/// KEEPER_HQ_LIVE_URL=https://<host>:<port> \
+/// KEEPER_HQ_LIVE_DATABASES=<the person's databases, comma-separated> \
+/// KEEPER_HQ_LIVE_SIGNIN_ISSUER=<the account's issuer, exactly as /auth/config names it> \
+/// KEEPER_HQ_LIVE_SIGNIN_CLIENT=<keeper's app client id> \
+/// KEEPER_HQ_LIVE_SIGNIN_SCOPES="<the account's scopes, space-separated>" \
+/// KEEPER_HQ_LIVE_SIGNIN_REFRESH_FILE=<a mode-600 file holding a refresh token of keeper's app> \
+/// cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live \
+///   -- --ignored --nocapture sign_in_enrols
+/// ```
+///
+/// It leaves two revoked devices and their notices on the server, and the
+/// refresh file holds the rotated refresh token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an agents server with sign-in (109.5) and the account's refresh token; see the docs"]
+async fn sign_in_enrols_adopts_announces_and_attests() {
+    let log = Captured::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.clone())
+            .finish(),
+    )
+    .expect("the only subscriber");
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let dbs = env("KEEPER_HQ_LIVE_DATABASES").split(',').count();
+    let sign_in = Arc::new(LiveSignIn::from_env());
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let within = Duration::from_secs(30);
+    let connected = |s: &HqStatusVm| {
+        s.phase == HqPhase::Paired
+            && s.sign_in.state == keeper_core::hq::vm::HqSignInState::Enrolled
+            && s.databases.len() == dbs
+            && s.databases
+                .iter()
+                .all(|db| db.state == HqDatabaseState::Connected)
+    };
+
+    // A signs in: no code, no operator.
+    let platform_a = device(&scratch.path().join("a"));
+    let a = signed_in_hq(&platform_a, &sign_in, "hq-live-a");
+    a.start().await.expect("starts");
+    a.set_server(&server).await.expect("stores the address");
+    let status = wait_status(&a, "a signs in and connects", connected, within).await;
+    let a_client = status.device.expect("a").client_id;
+    let (_, a_kept) = credential(&platform_a);
+    assert!(
+        a_kept["bound"]["attestedAtMs"].is_i64(),
+        "a sign-in's credential"
+    );
+
+    // B pairs with a code A shows, then signs in and is adopted.
+    let platform_b = device(&scratch.path().join("b"));
+    let paired_b = hq(&platform_b, "hq-live-b");
+    paired_b.start().await.expect("starts");
+    paired_b.set_server(&server).await.expect("stores");
+    let code = a.pair_start().await.expect("a shows a code").code;
+    paired_b.pair_redeem(&code).await.expect("b redeems");
+    let b_client = wait_status(&paired_b, "b pairs", |s| s.phase == HqPhase::Paired, within)
+        .await
+        .device
+        .expect("b")
+        .client_id;
+    let (_, b_paired) = credential(&platform_b);
+    paired_b.shutdown().await;
+    drop(paired_b);
+    let b = signed_in_hq(&platform_b, &sign_in, "hq-live-b");
+    b.start().await.expect("starts");
+    let status = wait_status(&b, "b is adopted", connected, within).await;
+    assert_eq!(
+        status.device.expect("b").client_id,
+        b_client,
+        "same client id"
+    );
+    let (_, b_kept) = credential(&platform_b);
+    assert_ne!(b_kept["token"], b_paired["token"], "the token is rotated");
+
+    // A is told, with B's host; its own notice is not shown to it.
+    let notices = a.enrolments().await.expect("notices");
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.client_id == b_client && n.sentence.contains("hq-live-b")),
+        "{notices:#?}"
+    );
+    assert!(notices.iter().all(|n| n.client_id != a_client));
+
+    // A's attestation falls due: the restarted service attests at once.
+    let (key, mut aged) = credential(&platform_a);
+    let old = chrono::Utc::now().timestamp_millis() - 13 * 24 * 60 * 60 * 1000 / 2;
+    aged["bound"]["attestedAtMs"] = old.into();
+    a.shutdown().await;
+    drop(a);
+    platform_a
+        .keychain_set(&key, &aged.to_string())
+        .expect("ages");
+    let a = signed_in_hq(&platform_a, &sign_in, "hq-live-a");
+    a.start().await.expect("starts");
+    let deadline = Instant::now() + within;
+    loop {
+        let (_, kept) = credential(&platform_a);
+        if kept["bound"]["attestedAtMs"]
+            .as_i64()
+            .is_some_and(|at| at > old)
+        {
+            assert_eq!(kept["token"], aged["token"], "attesting keeps the token");
+            break;
+        }
+        assert!(Instant::now() < deadline, "a attests");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    wait_status(&a, "a stays connected", connected, within).await;
+
+    // Cleanup: the person removes both devices.
+    a.revoke(&b_client).await.expect("removes b");
+    a.revoke(&a_client).await.expect("removes a");
+    b.shutdown().await;
+    a.shutdown().await;
+
+    let logged = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+    let mut secrets: Vec<String> = sign_in.minted.lock().expect("minted").clone();
+    for kept in [&a_kept, &b_paired, &b_kept, &aged] {
+        secrets.push(kept["token"].as_str().expect("token").to_owned());
+    }
+    for secret in &secrets {
+        assert!(!logged.contains(secret.as_str()), "a token was logged");
+    }
+    println!(
+        "sign-in live case: {} tokens minted, {} log bytes searched",
+        secrets.len() - 4,
+        logged.len()
+    );
 }
