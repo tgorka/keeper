@@ -428,3 +428,108 @@ fn a_refusal_without_a_drive_of_its_own_is_said_for_the_selection() {
     );
     assert!(vm.drives.iter().all(|d| d.refused.is_none()));
 }
+
+/// R10923-01: V17 checks every drive of the selection, so a drive ticked
+/// before the agent stopped offering it would make every other change a
+/// refused write — and the refusal used to be hung on the drive clicked.
+#[test]
+fn a_ticked_drive_that_stopped_being_offered_holds_the_others_back_until_it_is_unticked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("owner"), false);
+    put(
+        &alpha,
+        vec![profile("nixie.box", AGENT, Some(&["alpha", "gamma"]))],
+    );
+    let sources = [alpha.clone()];
+    set(&alpha, SESSION, "alpha", true, &sources, 5).expect("ticks alpha");
+    set(&alpha, SESSION, "gamma", true, &sources, 6).expect("ticks gamma");
+    // The instance stops publishing gamma.
+    put(&alpha, vec![profile("nixie.box", AGENT, Some(&["alpha"]))]);
+
+    let vm = drives_vm(&alpha, &sources).expect("control");
+    let gamma = &vm.drives[0];
+    assert_eq!(
+        gamma.name, "gamma",
+        "the drive holding the others back comes first"
+    );
+    assert!(gamma.ticked);
+    assert_eq!(
+        gamma.reason.as_deref(),
+        Some("Nixie no longer offers gamma. Untick it to change the other drives.")
+    );
+
+    let refused = set(&alpha, SESSION, "alpha", false, &sources, 7).expect_err("held back");
+    assert_eq!(refused.0, "Untick gamma first: Nixie no longer offers it.");
+    assert_eq!(
+        stored(&alpha).as_deref(),
+        Some(r#"["alpha","gamma"]"#),
+        "nothing V17 must refuse is written"
+    );
+
+    set(&alpha, SESSION, "gamma", false, &sources, 8).expect("unticking it is always allowed");
+    assert_eq!(stored(&alpha).as_deref(), Some(r#"["alpha"]"#));
+    set(&alpha, SESSION, "alpha", false, &sources, 9).expect("then the others change");
+    assert_eq!(stored(&alpha).as_deref(), Some("[]"));
+}
+
+#[test]
+fn a_ticked_drive_the_audience_rule_now_refuses_is_named_in_the_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    let beta = open(dir.path(), "beta");
+    seed(&alpha, Some("owner"), false);
+    seed(&beta, Some("owner"), false);
+    let offers = Some(&["alpha", "beta"][..]);
+    put(&alpha, vec![profile("nixie.box", AGENT, offers)]);
+    put(&beta, vec![profile("nixie.box", AGENT, offers)]);
+    let sources = [alpha.clone(), beta.clone()];
+    set(&beta, SESSION, "alpha", true, &sources, 5).expect("ticks alpha");
+    // Cy joins beta and not alpha.
+    put(&beta, vec![actor("cy", "person", "Cy", "beta")]);
+
+    let refused = set(&beta, SESSION, "beta", true, &sources, 6).expect_err("held back");
+    assert_eq!(
+        refused.0,
+        "Untick alpha first: Cy reads beta but cannot read it."
+    );
+    assert_eq!(stored(&beta).as_deref(), Some(r#"["alpha"]"#));
+    set(&beta, SESSION, "alpha", false, &sources, 7).expect("the way out");
+    assert_eq!(stored(&beta).as_deref(), Some("[]"));
+}
+
+/// R10923-01's other half: the server names no drive, so its refusal is hung
+/// on the drive keeper knows fails, never on the one the person clicked.
+#[test]
+fn a_server_refusal_is_hung_on_the_drive_that_fails_not_the_one_clicked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("owner"), false);
+    put(
+        &alpha,
+        vec![profile("nixie.box", AGENT, Some(&["alpha", "gamma"]))],
+    );
+    let sources = [alpha.clone()];
+    set(&alpha, SESSION, "alpha", true, &sources, 5).expect("ticks alpha");
+    set(&alpha, SESSION, "gamma", true, &sources, 6).expect("ticks gamma");
+    put(&alpha, vec![profile("nixie.box", AGENT, Some(&["alpha"]))]);
+    // Another device unticked alpha while gamma was still ticked; refused.
+    journal_refusal(
+        &dir.path().join("alpha.sqlite"),
+        "c-other",
+        &["gamma"],
+        "hq.v17.not_offered",
+    );
+    let vm = drives_vm(&alpha, &sources).expect("control");
+    let by = |name: &str| vm.drives.iter().find(|d| d.name == name).expect(name);
+    assert_eq!(
+        by("gamma").refused.as_deref(),
+        Some("The server refused gamma: Nixie does not offer it.")
+    );
+    assert_eq!(
+        by("alpha").refused,
+        None,
+        "alpha was clicked; it is not what failed"
+    );
+    assert_eq!(vm.refused, by("gamma").refused);
+}

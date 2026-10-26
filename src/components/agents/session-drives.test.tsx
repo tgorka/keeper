@@ -145,4 +145,38 @@ describe("SessionDrives", () => {
     );
     expect(screen.queryByRole("note", { hidden: true })).toBeNull();
   });
+
+  it("announces a refusal inside the open menu, where a screen reader still is", () => {
+    const refused = "The server refused gamma: not everyone who reads alpha may read it.";
+    const vm = drives({ refused });
+    const view = render(<Harness vm={vm} />);
+    // Not `hidden: true`: the alert is in the accessibility tree while the menu is open.
+    expect(within(screen.getByRole("menu")).getByRole("alert")).toHaveTextContent(refused);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    view.rerender(<Harness vm={vm} />);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent(refused);
+  });
+
+  it("marks a ticked drive that stopped being allowed and unticks it from its chip", async () => {
+    const reason = "Nixie no longer offers gamma. Untick it to change the other drives.";
+    render(
+      <Harness
+        vm={drives({
+          drives: [
+            { name: "gamma", ticked: true, reason },
+            { name: "alpha", ticked: true },
+          ],
+        })}
+      />,
+    );
+    expect(item("gamma")).not.toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByText(reason, { selector: "p" })).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Untick gamma" }));
+    });
+    expect(mock.set).toHaveBeenCalledWith(target, "gamma", false);
+    expect(screen.queryByRole("button", { name: "Untick alpha" })).toBeNull();
+  });
 });

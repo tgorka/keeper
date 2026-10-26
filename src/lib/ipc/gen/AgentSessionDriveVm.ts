@@ -3,7 +3,8 @@
 /**
  * One drive of the menu: ticked (`ticked`), offered (`reason` absent), or
  * not allowed (`reason` says why). A ticked drive with a reason was ticked
- * before it stopped being allowed: it may be unticked, never ticked again.
+ * before it stopped being allowed: it holds every other change back (V17
+ * checks the whole selection), and unticking it is always allowed.
  */
 export type AgentSessionDriveVm = { name: string, ticked: boolean, 
 /**

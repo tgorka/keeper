@@ -1,4 +1,4 @@
-import { ChevronDown, HardDrive } from "lucide-react";
+import { ChevronDown, HardDrive, X } from "lucide-react";
 import { useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,7 +22,8 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  * Rust answers who may change it — this renders only what it is given, so for anyone but a
  * person member there is no `drives` and nothing is drawn. What ticking allows (D-34's accepted
  * risk, R-HQ-79) is Rust's sentence, shown in the menu where every tick happens and again under
- * the chips when a tick takes the selection from none to one.
+ * the chips when a tick takes the selection from none to one. A ticked drive Rust gives a reason
+ * stopped being allowed and holds every other change back: its chip says so and unticks it.
  */
 export function SessionDrives({
   target,
@@ -43,6 +44,7 @@ export function SessionDrives({
   const writing = useRef(false);
   const warningId = useId();
   const ticked = drives.drives.filter((drive) => drive.ticked);
+  const failing = ticked.filter((drive) => drive.reason !== undefined);
 
   const change = async (name: string, tick: boolean) => {
     // Never the `disabled` attribute while a write is in flight: it would drop keyboard focus
@@ -89,6 +91,17 @@ export function SessionDrives({
             >
               {drives.warning}
             </p>
+            {/* Radix hides everything outside an open menu from assistive technology, and the
+                menu stays open across ticks: a refusal arriving meanwhile is said in here. */}
+            {open && alert && (
+              <p
+                role="alert"
+                data-slot="session-drives-menu-alert"
+                className="px-2 pb-2 text-destructive text-xs [overflow-wrap:anywhere]"
+              >
+                {alert}
+              </p>
+            )}
             <DropdownMenuSeparator />
             {drives.drives.map((drive) => {
               const blocked = !drive.ticked && drive.reason !== undefined;
@@ -135,14 +148,36 @@ export function SessionDrives({
           {ticked.length === 0 ? (
             <li className="text-muted-foreground text-xs">No drive ticked</li>
           ) : (
-            ticked.map((drive) => (
-              <li
-                key={drive.name}
-                className="max-w-full break-all rounded-full border border-border bg-secondary px-2 py-0.5 text-secondary-foreground text-xs"
-              >
-                {drive.name}
-              </li>
-            ))
+            ticked.map((drive) =>
+              drive.reason ? (
+                // Ticked before it stopped being allowed: it holds every other change back,
+                // so its chip says so and unticks it in one step.
+                <li
+                  key={drive.name}
+                  data-failing="true"
+                  className="flex max-w-full items-center gap-1 rounded-full border border-destructive py-0.5 pr-0.5 pl-2 text-destructive text-xs"
+                >
+                  <span className="break-all">{drive.name}</span>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-6 rounded-full"
+                    aria-label={`Untick ${drive.name}`}
+                    aria-busy={busy === drive.name}
+                    onClick={() => void change(drive.name, false)}
+                  >
+                    <X aria-hidden="true" />
+                  </Button>
+                </li>
+              ) : (
+                <li
+                  key={drive.name}
+                  className="max-w-full break-all rounded-full border border-border bg-secondary px-2 py-0.5 text-secondary-foreground text-xs"
+                >
+                  {drive.name}
+                </li>
+              ),
+            )
           )}
           {drives.pending && (
             <li className="text-muted-foreground text-xs" aria-live="polite">
@@ -151,6 +186,11 @@ export function SessionDrives({
           )}
         </ul>
       </div>
+      {failing.map((drive) => (
+        <p key={drive.name} className="pt-1 text-destructive text-xs [overflow-wrap:anywhere]">
+          {drive.reason}
+        </p>
+      ))}
       {firstTick && ticked.length > 0 && (
         <div
           role="note"
@@ -163,7 +203,7 @@ export function SessionDrives({
           </Button>
         </div>
       )}
-      {alert && (
+      {!open && alert && (
         <p role="alert" className="pt-1 text-destructive text-xs [overflow-wrap:anywhere]">
           {alert}
         </p>

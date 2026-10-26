@@ -6093,7 +6093,9 @@ const liveScenario = new URLSearchParams(location.search).get("live");
  * device holds (Ben reads alpha, not beta), `omega` is another agent's. Who reads `gamma` this
  * device cannot know, so a tick of it is written and the fake server refuses it a moment later
  * (`hq.v17.audience`), as the real one would. `?drives=nonmember`: the person is no person member
- * of any session, so Rust answers no `drives` and no control is drawn.
+ * of any session, so Rust answers no `drives` and no control is drawn. `?drives=stale`: `alpha`
+ * and `gamma` are ticked and the agent no longer offers `gamma` (R10923-01): every change but
+ * unticking `gamma` is refused here, naming it, as Rust's `drives::set` refuses it.
  */
 const drivesScenario = new URLSearchParams(location.search).get("drives");
 /** keeper-core's `drives::WARNING`, word for word. */
@@ -6103,6 +6105,25 @@ const DRIVES_WARNING =
   "Text it read on the web or in a drive can lead it to do that.";
 function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm | undefined {
   if (archived || drivesScenario === "nonmember") return undefined;
+  if (drivesScenario === "stale" && database === "alpha")
+    return {
+      drives: [
+        {
+          name: "gamma",
+          ticked: true,
+          reason: "Assistant no longer offers gamma. Untick it to change the other drives.",
+        },
+        { name: "alpha", ticked: true },
+        {
+          name: "beta",
+          ticked: false,
+          reason: "Ben reads alpha but cannot read beta, so it cannot be ticked here.",
+        },
+        { name: "omega", ticked: false, reason: "Assistant does not offer omega." },
+      ],
+      warning: DRIVES_WARNING,
+      pending: false,
+    };
   return {
     drives:
       database === "alpha"
@@ -6757,10 +6778,19 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     const tick = payload.tick === true;
     if (drive.ticked === tick) return null;
     if (tick && drive.reason) hqRefuse(drive.reason);
+    // keeper-core's rule: a ticked drive that stopped being allowed holds every other change back.
+    const unticking = !tick && drive.reason !== undefined;
+    const stale = drives.drives.find((row) => row.ticked && row.reason && row !== drive);
+    if (!unticking && stale) hqRefuse(`Untick ${stale.name} first: Assistant no longer offers it.`);
     // A selection written sets the earlier refusals aside.
     for (const row of drives.drives) delete row.refused;
     delete drives.refused;
     drive.ticked = tick;
+    if (!tick && drive.reason) {
+      // Unticked, it is no longer the agent's to read: listed as not offered, after the others.
+      drive.reason = `Assistant does not offer ${drive.name}.`;
+      drives.drives.sort((a, b) => Number(!!a.reason) - Number(!!b.reason));
+    }
     drives.pending = true;
     publishSessions();
     setTimeout(() => {
@@ -6878,6 +6908,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       ["rename", "Rename this conversation.", "required", "title"],
       ["stop", "Stop the running turn.", "none", null],
       ...(vm.tools.length ? [["tools", "Open tool switches.", "none", null]] : []),
+      ...(vm.drives ? [["drives", "Choose the drives this session may read.", "none", null]] : []),
       ["context", "Open context details.", "none", null],
       ["people", "Open this session's people.", "none", null],
       ["archive", "Archive this conversation.", "none", null],
