@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use crate::hq::port::{Rejection, RowOp, CONFLICT};
+use crate::hq::port::{Rejection, ReplicaError, RowOp, CONFLICT};
 use crate::hq::sessions::{
     self, authored, int, json, names, object, opt_text, read, text, AgentSessionRef, Source,
 };
@@ -702,6 +702,53 @@ pub fn set(
         .replica
         .mutate_superseding(vec![row], earlier)
         .map_err(|error| DriveRefused(error.to_string()))?;
+    source.replica.sync_now();
+    Ok(())
+}
+
+/// `/clean`'s carry-over (Q109-17 b: a fresh session with "the same agent,
+/// database and drives"; A109-06): the drives ticked in `from` that this
+/// person may still tick there — the menu's own judgement, so a drive the
+/// agent no longer offers, the audience rule now refuses, or the server
+/// refused is left behind — written as `to`'s selection, in the old row's
+/// order. Nothing ticked carries nothing: no row is written, and the new
+/// session has no drive, as one made any other way.
+///
+/// The selection is its own commit, after the session's: V17 would take it
+/// in the session's commit (the server reads that commit's own rows, as it
+/// does for a first message), but it judges the selection against offers
+/// and readers this device may hold stale, and a refusal rolls back only
+/// the commit it is in — never the conversation. The refusal then shows on
+/// the new session's drive control, as the pick's settings row does
+/// (`sessions::create_with_first`, R10918-07).
+pub fn carry(
+    source: &Source,
+    from: &str,
+    session: &SessionRow,
+    to: &str,
+    sources: &[Source],
+    now_ms: i64,
+) -> Result<(), ReplicaError> {
+    let Some(Judgement { judged, .. }) = judge(source, from, session, sources) else {
+        return Ok(());
+    };
+    let (ticked, _) = ticked(source, from);
+    let carried: Vec<String> = ticked
+        .into_iter()
+        .filter(|name| {
+            judged
+                .iter()
+                .any(|drive| &drive.name == name && !drive.fails())
+        })
+        .collect();
+    if carried.is_empty() {
+        return Ok(());
+    }
+    source.replica.mutate(vec![RowOp::Upsert {
+        table: TABLE.to_owned(),
+        values: authored(source, selection(to, &carried, now_ms)),
+        base_version: None,
+    }])?;
     source.replica.sync_now();
     Ok(())
 }

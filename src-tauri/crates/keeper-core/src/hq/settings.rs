@@ -581,7 +581,7 @@ mod tests {
         let decisions = crate::hq::approvals::Decisions::load(
             std::env::temp_dir().join(format!("keeper-settings-{}.json", ulid::Ulid::new())),
         );
-        crate::hq::commands::run(source, &decisions, sid, draft, pick, &[])
+        crate::hq::commands::run(source, &[], &decisions, sid, draft, pick, &[])
     }
 
     fn fixture(complete: bool) -> (tempfile::TempDir, Source) {

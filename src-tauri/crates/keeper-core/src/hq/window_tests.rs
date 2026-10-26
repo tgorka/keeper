@@ -435,7 +435,7 @@ fn the_newest_title_write_decides_and_an_older_refusal_never_outranks_it() {
     // `/rename` is a rename like the menu's: it sets the older one aside too.
     sessions::rename(&source, "dev1.1", "AAA").expect("menu rename queued");
     let decisions = approvals::Decisions::load(w._dir.path().join("decisions.json"));
-    crate::hq::commands::run(&source, &decisions, "dev1.1", "/rename BBB", None, &[])
+    crate::hq::commands::run(&source, &[], &decisions, "dev1.1", "/rename BBB", None, &[])
         .expect("/rename queued");
     journal_session_writes(&path, Some("AAA"), true);
     let vm = row(&source);
@@ -559,7 +559,7 @@ fn command(
     draft: &str,
 ) -> Result<crate::hq::commands::AgentCommandResultVm, String> {
     let decisions = approvals::Decisions::load(w._dir.path().join("decisions.json"));
-    crate::hq::commands::run(&w.alpha, &decisions, session, draft, None, &[])
+    crate::hq::commands::run(&w.alpha, &[], &decisions, session, draft, None, &[])
 }
 
 #[test]

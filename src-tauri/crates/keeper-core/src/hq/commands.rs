@@ -209,12 +209,16 @@ pub struct AgentCommandResultVm {
 /// Execute against the same replica used by the session's ordinary controls.
 /// `pick` is this device's last model and effort for the session's agent: a
 /// fresh session (`/new`, `/clean`) starts with what the agent still offers.
+/// `/clean` also carries the drives ticked here that this person may still
+/// tick (Q109-17 b, A109-06; `sources`, every database this device holds,
+/// are for who reads each drive); `/new` starts with none (Q109-20 b).
 /// `/stop` declines the requests the banner showed (`shown`) that still wait
 /// for this person, before it writes the stop (R10911-07): a stopped turn's
 /// request has nothing left to decide. No other command declines anything —
 /// none of them steers the agent's turn.
 pub fn run(
     source: &Source,
+    sources: &[Source],
     decisions: &Decisions,
     sid: &str,
     draft: &str,
@@ -243,6 +247,10 @@ pub fn run(
             // Empty body creates no message and therefore no phantom model turn.
             let id = sessions::create(source, &session.agent_actor, "", pick)
                 .map_err(|e| e.to_string())?;
+            if name == "clean" {
+                drives::carry(source, sid, &session, &id, sources, sessions::now_ms())
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(title) = args {
                 sessions::rename(source, &id, &title).map_err(|e| e.to_string())?;
             }
@@ -354,6 +362,7 @@ impl Hq {
         let source = self.source(&key.database)?;
         let result = run(
             &source,
+            &self.sources(),
             self.decisions()?,
             &key.session_id,
             draft,

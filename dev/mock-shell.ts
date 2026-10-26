@@ -7795,11 +7795,35 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       }) as { database: string; sessionId: string };
       const fresh = mockSession(result.session);
       fresh.messages = [];
+      // Rust's `drives::carry` (A109-06): `/clean` ticks the old session's drives that may still
+      // be ticked; one ticked with a reason (no longer allowed) stays behind. `/new` ticks none.
+      // A fresh session ticks nothing; a drive no longer offered is listed as such.
+      const offered = vm.drives && mockDrives(fresh.database, false);
+      const base = offered && {
+        ...offered,
+        drives: offered.drives.map(({ name, ticked, reason }) =>
+          ticked && reason
+            ? { name, ticked: false, reason: `Assistant does not offer ${name}.` }
+            : { name, ticked: false, ...(reason ? { reason } : {}) },
+        ),
+      };
+      if (name === "clean" && vm.drives && base) {
+        const carried = vm.drives.drives.filter((d) => d.ticked && !d.reason).map((d) => d.name);
+        fresh.drives = {
+          ...base,
+          drives: base.drives.map((d) =>
+            carried.includes(d.name) ? { name: d.name, ticked: true } : d,
+          ),
+        };
+      } else if (base) fresh.drives = base;
       fresh.title = args ?? "New conversation";
       const row = sessionRows.find(
         (row) => row.database === fresh.database && row.sessionId === fresh.sessionId,
       );
-      if (row) row.title = fresh.title;
+      if (row) {
+        row.title = fresh.title;
+        row.choosesDrives = fresh.drives !== undefined;
+      }
       publishSessions();
     } else if (name === "rename") {
       vm.title = args ?? vm.title;

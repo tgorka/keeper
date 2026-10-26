@@ -295,11 +295,14 @@ the files and leaves them queued; a refusal keeps both the files and the draft. 
 leaves the session discards its unsent tray, just like navigating away. To send a literal leading
 slash as an attachment caption, double it: `//stop` sends the caption `/stop`, not a command.
 The same `//` escape applies without attachments. `/clean` and `/new [title]` open a fresh,
-empty session with the same agent and database, keeping the old conversation in the list. They
-neither clear history nor create an empty prompt. `/rename <title>` changes its title; `/archive`
-keeps its history and makes it read-only. `/people` opens People, `/tools` opens the existing tool
-switches when that agent offers tools, and `/help` opens the command list. `/context` opens the
-same context **Details** panel as the ring beside Send (below).
+empty session with the same agent and database, keeping the old conversation in the list.
+`/clean` also ticks the old session's drives that you may still tick (Q109-17 b, "same agent,
+database and drives"): a drive the agent no longer offers, or one the audience rule now refuses,
+stays behind, and the new session's drive control shows what came across. `/new` ticks none
+(Q109-20 b). They neither clear history nor create an empty prompt. `/rename <title>` changes its
+title; `/archive` keeps its history and makes it read-only. `/people` opens People, `/tools` opens
+the existing tool switches when that agent offers tools, and `/help` opens the command list.
+`/context` opens the same context **Details** panel as the ring beside Send (below).
 `/model`, `/effort` and `/drives` are not offered until their backend operations exist. `/stop`
 writes a person control row naming each unfinished turn; a compatible runtime cancels only the
 named running turn and keeps the output already received. With no unfinished turn it refuses.

@@ -597,6 +597,7 @@ fn stop_declines_what_the_banner_showed_and_other_commands_do_not() {
     request(&w, "late", "dev1.1", "run", "T2", git_status(), &["zoë"]);
     crate::hq::commands::run(
         &w.alpha,
+        &[],
         &w.decisions,
         "dev1.1",
         "/rename Plans",
@@ -618,8 +619,16 @@ fn stop_declines_what_the_banner_showed_and_other_commands_do_not() {
                    "author_client": "nixi.box"}),
         )])
         .expect("a running turn");
-    crate::hq::commands::run(&w.alpha, &w.decisions, "dev1.1", "/stop", None, &banner)
-        .expect("stop");
+    crate::hq::commands::run(
+        &w.alpha,
+        &[],
+        &w.decisions,
+        "dev1.1",
+        "/stop",
+        None,
+        &banner,
+    )
+    .expect("stop");
     assert_eq!(
         card(&w, "dev1.1", "mine").state,
         AgentApprovalStateVm::Denied
