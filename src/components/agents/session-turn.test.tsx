@@ -94,16 +94,39 @@ describe("TurnFold", () => {
     expect(screen.queryByRole("region", { name: "Thinking" })).not.toBeInTheDocument();
   });
 
-  it("announces a running turn's live line", () => {
-    draw(
-      fold({
-        status: "running",
-        statusLabel: "Working",
-        summary: "Searching the web… · 3 steps",
-        failures: [],
-      }),
+  // R10914-01: Chromium names a button holding a live region "" — so the
+  // name is given outright, and the status sits beside the button, once.
+  // Asserted on the DOM, not through jsdom's name computation, which names
+  // that button where Chromium does not.
+  it("names a running fold's button outright and announces its line from beside it", () => {
+    const summary = "Searching the web… · 3 steps";
+    const { container, rerender } = draw(
+      fold({ status: "running", statusLabel: "Working", summary, failures: [] }),
     );
-    expect(screen.getByRole("status")).toHaveTextContent("Searching the web… · 3 steps");
+    const button = container.querySelector('[data-slot="turn-fold"] > button');
+    expect(button).toHaveAttribute("aria-label", summary);
+    expect(button?.querySelector('[role="status"]')).toBeNull();
+    const statuses = container.querySelectorAll('[role="status"]');
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]).toHaveTextContent(summary);
+    expect(button?.contains(statuses[0])).toBe(false);
+
+    // Ended: the same stable name, Rust's new sentence, and no live region left.
+    rerender(
+      <ol>
+        <TurnFold
+          fold={fold({ summary: "Worked for 14 s · searched the web 3 times" })}
+          leadIns={[lead]}
+          agentName="Assistant"
+          verbose={false}
+        />
+      </ol>,
+    );
+    expect(container.querySelector('[data-slot="turn-fold"] > button')).toHaveAttribute(
+      "aria-label",
+      "Worked for 14 s · searched the web 3 times",
+    );
+    expect(container.querySelector('[role="status"]')).toBeNull();
   });
 
   it("is a plain line, not a control, when there is nothing to open", () => {

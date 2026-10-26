@@ -461,7 +461,7 @@ pub const KEYS: &[KeySpec] = &[
         settable: Settable::AnyLayer,
         shape: Shape::Choice(&["normal", "thinking", "verbose"]),
         default: "normal",
-        summary: "How an agent's turns read. `normal`: each turn's work folds into one line above its answer. `thinking`: the same, plus the agent's thinking. `verbose`: every turn's work open, the thinking, and each answer's details — model, tokens, time to first token, duration, finish. Thinking and tool results reach this device only in a session whose trace you may read; this setting never widens that. Replaces `agents.show_reasoning` and `agents.show_details`: a file or device still holding them reads as `verbose` when details were on, otherwise `thinking` when thinking was on, otherwise `normal`.",
+        summary: "How an agent's turns read. `normal`: each turn's work folds into one line above its answer. `thinking`: the same, plus the agent's thinking. `verbose`: every turn's work open, the thinking, and each answer's details — model, tokens, time to first token, duration, finish. Thinking and tool results reach this device only in a session whose trace you may read; this setting never widens that. Replaces `agents.show_reasoning` and `agents.show_details`: a file or device still holding them reads as `verbose` when details were on, otherwise `thinking` when thinking was on, otherwise `normal` — so a `keeper.toml` that pinned only one of them now pins the whole mode; rewrite it as one `agents.view_mode` line. A device older than this key loses both switches once a newer device rewrites the synced file.",
         example: "\"thinking\"",
     },
     // ---- bots ------------------------------------------------------------

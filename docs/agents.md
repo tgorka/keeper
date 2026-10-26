@@ -442,6 +442,18 @@ and `agents.show_details` read as one mode: details on is `verbose`; otherwise t
 `thinking`; otherwise `normal` (in `keeper.db`, in every `keeper.toml` layer, and in the synced
 settings file and its base, which is rewritten once under the new key).
 
+- **A `keeper.toml` that pinned one old switch now pins the whole mode.** A layer holding only
+  `"agents.show_details" = false` pins `agents.view_mode = "normal"`, and one holding only
+  `"agents.show_reasoning" = true` pins `"thinking"`: the switch the file left open is no longer
+  the person's to choose, and the View control stays as the file says. Whoever owns such a file
+  should rewrite it as the one `agents.view_mode` line it means (R10914-02).
+- **Devices on different versions, while any of them is older than 109.14.** The first newer
+  device to sync rewrites the synced settings file under `agents.view_mode`; an older device then
+  finds its two switches gone from the file and turns both off, and keeps the newer key without
+  reading it. A switch turned on afterwards on the older device is dropped again by the next newer
+  device to sync, so it never reaches the newer devices. Update every device to read the mode
+  everywhere (R10914-03).
+
 Rust decides what each mode sends, and a mode never widens who reads what. Thinking reaches the view
 only in the Thinking and Verbose modes and only for a person who can read the session's trace; it
 remains readable after the answer finishes. A person without trace access receives no reasoning or
@@ -454,8 +466,8 @@ HTML, and model-written links do not navigate.
 
 **Context window** beside Send opens a side **Details** panel; `/context` opens the same panel. It
 shows the latest answer's last-round occupancy (`metadata.context.used`), not the accumulated
-billing usage in `metadata.usage`. Like the rest of an answer's details it follows **Show
-details**, for any member, trace reader or not: `metadata.context` is in every member's replica,
+billing usage in `metadata.usage`. Like the rest of an answer's details it follows the **Verbose**
+view mode, for any member, trace reader or not: `metadata.context` is in every member's replica,
 so the setting decides only what is drawn. The labelled ring and its tooltip show used/window and
 the rounded percentage; an unknown model window shows **used ≈ N tokens**, with no window
 percentage or ring. Tab from the message field to the context button, then Enter to open Details;

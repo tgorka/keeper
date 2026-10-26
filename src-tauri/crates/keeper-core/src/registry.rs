@@ -4158,6 +4158,25 @@ mod tests {
     use super::*;
     use crate::send::MessageKind;
 
+    /// R10914-06: a mode the same source holds wins over the old switches in
+    /// any order — not only because today's callers sort `agents.show_*`
+    /// before `agents.view_mode`.
+    #[test]
+    fn a_held_view_mode_wins_over_the_old_switches_in_either_order() {
+        let mode_first = vec![
+            ("agents.view_mode".to_owned(), "normal".to_owned()),
+            ("agents.show_details".to_owned(), "1".to_owned()),
+        ];
+        let mode_last: Vec<_> = mode_first.iter().rev().cloned().collect();
+        for entries in [mode_first, mode_last] {
+            assert_eq!(
+                retire_keys(entries.clone()),
+                vec![("agents.view_mode".to_owned(), "normal".to_owned())],
+                "{entries:?}"
+            );
+        }
+    }
+
     #[test]
     fn service_file_names_default_corrupt_and_normalized_round_trip() {
         let dir = temp_dir();
