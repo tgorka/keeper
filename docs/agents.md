@@ -198,8 +198,8 @@ The same `//` escape applies without attachments. `/clean` and `/new [title]` op
 empty session with the same agent and database, keeping the old conversation in the list. They
 neither clear history nor create an empty prompt. `/rename <title>` changes its title; `/archive`
 keeps its history and makes it read-only. `/people` opens People, `/tools` opens the existing tool
-switches when that agent offers tools, and `/help` opens the command list. `/context` shows the
-current agent, database and trust details; token occupancy is not reported on this build.
+switches when that agent offers tools, and `/help` opens the command list. `/context` opens the
+same context **Details** panel as the ring beside Send (below).
 `/model`, `/effort` and `/drives` are not offered until their backend operations exist. `/stop`
 writes a person control row naming each unfinished turn; a compatible runtime cancels only the
 named running turn and keeps the output already received. With no unfinished turn it refuses.
@@ -263,6 +263,30 @@ to the session, not its arguments or result. These are server/Rust boundaries, n
 first token, duration, finish reason and error. Missing measurements have no label and are never
 filled with zero. A reported zero remains a real measurement. Answer markdown renders inert text:
 model-written HTML does not become HTML, and model-written links do not navigate.
+
+**Context window** beside Send opens a side **Details** panel; `/context` opens the same panel. It
+shows the latest answer's last-round occupancy (`metadata.context.used`), not the accumulated
+billing usage in `metadata.usage`. Like the rest of an answer's details it follows **Show
+details**, for any member, trace reader or not: `metadata.context` is in every member's replica,
+so the setting decides only what is drawn. The labelled ring and its tooltip show used/window and
+the rounded percentage; an unknown model window shows **used ≈ N tokens**, with no window
+percentage or ring. Tab from the message field to the context button, then Enter to open Details;
+Escape closes it and returns focus to whatever opened it. Its seven expandable parts are system
+and persona, memory, built-in tools, MCP tools, history, attachments and this turn's tool results;
+parts a newer runtime adds that this build does not name are summed into one **Other** row, so
+they never hide the meter. Counts and shares are estimates, marked **≈**; the total is always
+`used`. Missing or old metadata omits the ring rather than inventing zero, and `/context` then
+says the latest answer has no measurement (or that Show details is off). Malformed counts, a
+missing or repeated known part, or parts above the used count are refused, with one tracing
+warning per answer. A turn stopped or refused before its first measured round has no context, and
+the meter does not fall back to an older answer. Over-window occupancy keeps its real percentage
+label while the ring and accessible meter stop at 100%.
+
+For the context viewing aid, `?sessions=launch` opens alpha with 48000/200000 tokens (24%); beta,
+**Review the research notes**, has the same used count and an unknown window. Their source answer
+metadata deliberately carries different cumulative usage (125000 input tokens). These are mock
+projections, not evidence of a running model or the packaged app. The mock ships with Show details
+off, so turn it on to see the ring.
 
 **Tools** contains only tools the answering instance offers, from its definition and container.
 Switching off narrows that set; switching on restores an offered tool and never adds one. An

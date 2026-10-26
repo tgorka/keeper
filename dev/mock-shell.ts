@@ -6200,6 +6200,120 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
   ]),
 );
 
+// Raw answer metadata stays in the mock source, not the renderer's IPC VM.
+const contextAnswers: Record<
+  string,
+  {
+    id: string;
+    metadata: {
+      context: {
+        used: number;
+        window: number | null;
+        parts: { part: string; tokens: number; estimated: boolean }[];
+      };
+      usage: { prompt_tokens: number; completion_tokens: number };
+    };
+  }
+> = {
+  alpha: {
+    id: "message-1000",
+    metadata: {
+      context: {
+        used: 48000,
+        window: 200000,
+        parts: [
+          { part: "persona", tokens: 8000, estimated: true },
+          { part: "memory", tokens: 2000, estimated: true },
+          { part: "tools", tokens: 4000, estimated: true },
+          { part: "mcp", tokens: 6000, estimated: true },
+          { part: "history", tokens: 18000, estimated: true },
+          { part: "attachments", tokens: 5000, estimated: true },
+          { part: "tool_results", tokens: 5000, estimated: true },
+        ],
+      },
+      usage: { prompt_tokens: 125000, completion_tokens: 1200 },
+    },
+  },
+  beta: {
+    id: "message-1000",
+    metadata: {
+      context: {
+        used: 48000,
+        window: null,
+        parts: [
+          { part: "persona", tokens: 8000, estimated: true },
+          { part: "memory", tokens: 2000, estimated: true },
+          { part: "tools", tokens: 4000, estimated: true },
+          { part: "mcp", tokens: 6000, estimated: true },
+          { part: "history", tokens: 18000, estimated: true },
+          { part: "attachments", tokens: 5000, estimated: true },
+          { part: "tool_results", tokens: 5000, estimated: true },
+        ],
+      },
+      usage: { prompt_tokens: 125000, completion_tokens: 1200 },
+    },
+  },
+};
+/** Viewing aid mirroring Rust's context projection; never used by the app. */
+function mockContext(vm: AgentSessionViewVm, showDetails: boolean): AgentSessionViewVm["context"] {
+  const answer = contextAnswers[vm.database];
+  if (!showDetails || !answer || !vm.messages.some((message) => message.id === answer.id)) return;
+  const context = answer.metadata.context;
+  const known = context.window !== null;
+  return {
+    used: context.used,
+    window: context.window,
+    percent: known ? "24%" : null,
+    meterPercent: known ? 24 : null,
+    ringBackground: known ? "conic-gradient(currentColor 86deg, var(--muted) 0deg)" : null,
+    summary: known ? "24% · used ≈ 48000 / 200000 tokens" : "used ≈ 48000 tokens",
+    parts: [
+      {
+        label: "System and persona",
+        description: "System instructions, SOUL.md and USER.md.",
+        tokens: "≈ 8000 tokens",
+        share: "≈ 17% of used context",
+      },
+      {
+        label: "Memory",
+        description: "Memory included in this prompt.",
+        tokens: "≈ 2000 tokens",
+        share: "≈ 4% of used context",
+      },
+      {
+        label: "Built-in tools",
+        description: "Built-in tool definitions offered to the model.",
+        tokens: "≈ 4000 tokens",
+        share: "≈ 8% of used context",
+      },
+      {
+        label: "MCP tools",
+        description: "MCP tool definitions offered to the model.",
+        tokens: "≈ 6000 tokens",
+        share: "≈ 13% of used context",
+      },
+      {
+        label: "History",
+        description: "Conversation history and the current question.",
+        tokens: "≈ 18000 tokens",
+        share: "≈ 38% of used context",
+      },
+      {
+        label: "Attachments",
+        description: "Attachments included in this turn.",
+        tokens: "≈ 5000 tokens",
+        share: "≈ 10% of used context",
+      },
+      {
+        label: "This turn's tool results",
+        description: "Tool calls and results included in this turn.",
+        tokens: "≈ 5000 tokens",
+        share: "≈ 10% of used context",
+      },
+    ],
+  };
+}
+
 // ?sessions=launch&attachments=chips — the chip in every state (UX-DR-E107-1), in alpha's
 // device.1: a message whose files are uploading, waiting, sent and refused, and a message the
 // server refused whole because it refused one file's upload — that file `refused`, the other
@@ -6347,6 +6461,7 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   return {
     ...vm,
     prefs,
+    context: mockContext(vm, prefs.showDetails),
     approvals: vm.readsTrace ? vm.approvals : [],
     tools: vm.tools.map((tool) => ({ ...tool })),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({

@@ -168,6 +168,10 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub answering: Option<AgentSessionAnsweringVm>,
+    /// Last answer's context occupancy; follows Show details, for any member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub context: Option<super::context::AgentContextVm>,
 }
 
 /// The pages of an archived session read so far through the server.
@@ -393,6 +397,7 @@ pub fn view(
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,
+            context: super::context::latest(&rows, opened.prefs.show_details),
             agent_actor: session.agent_actor,
         },
         newest_ms,

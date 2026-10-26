@@ -510,6 +510,63 @@ const SHOW_ALL: AgentViewPrefsVm = AgentViewPrefsVm {
     show_details: true,
 };
 
+/// The meter follows Show details, like the rest of an answer's details, for any member
+/// (R10921-02): `metadata.context` is in every member's replica, so trace access gates nothing.
+#[test]
+fn answer_context_survives_replica_projection_with_show_details_for_any_member() {
+    let details_only = AgentViewPrefsVm {
+        show_reasoning: false,
+        show_details: true,
+    };
+    let reasoning_only = AgentViewPrefsVm {
+        show_reasoning: true,
+        show_details: false,
+    };
+    for reader in [true, false] {
+        let w = world(reader);
+        let parts: Vec<_> = [
+            "persona",
+            "memory",
+            "tools",
+            "mcp",
+            "history",
+            "attachments",
+            "tool_results",
+        ]
+        .into_iter()
+        .map(|part| json!({"part": part, "tokens": 10, "estimated": true}))
+        .collect();
+        let mut metadata = json!({"context": {"used": 70, "window": 200, "parts": parts},
+            "usage": {"prompt_tokens": 9000}});
+        w.put(vec![w.answer("answer", metadata.clone())]);
+        let view = w.view(&opened(details_only, &[], &[]));
+        assert_eq!(view.context.as_ref().map(|c| c.used), Some(70), "{reader}");
+        assert_eq!(
+            view.context.as_ref().and_then(|c| c.percent.as_deref()),
+            Some("35%")
+        );
+        assert!(
+            w.view(&opened(reasoning_only, &[], &[])).context.is_none(),
+            "details off hides the meter, reader {reader}"
+        );
+        metadata["context"]["window"] = Value::Null;
+        w.put(vec![w.answer("answer", metadata.clone())]);
+        let unknown = w.view(&opened(details_only, &[], &[]));
+        assert_eq!(
+            unknown.context.expect("unknown window").summary,
+            "used ≈ 70 tokens"
+        );
+        metadata["context"]["parts"][0]["tokens"] = json!(71);
+        w.put(vec![w.answer("answer", metadata)]);
+        assert!(w.view(&opened(SHOW_ALL, &[], &[])).context.is_none());
+        w.put(vec![w.answer(
+            "old answer",
+            json!({"usage": {"prompt_tokens": 9000}}),
+        )]);
+        assert!(w.view(&opened(SHOW_ALL, &[], &[])).context.is_none());
+    }
+}
+
 #[test]
 fn a_late_opener_sees_everything_so_far_and_the_final_row_replaces_it_byte_for_byte() {
     let w = world(true);

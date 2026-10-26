@@ -142,6 +142,8 @@ interface ComposerProps {
    */
   onSendAttachments?: (attachments: PendingAttachment[], caption?: string) => Promise<void>;
   attachmentPreview?: (attachment: PendingAttachment) => ReactNode;
+  /** Session-owned controls beside Send; no protocol state lives in the composer. */
+  sendAccessory?: ReactNode;
   /** When `true`, the composer is inert (no room loaded). */
   disabled?: boolean;
   /** The active reply/edit context, or `null`. Drives the banner + Esc routing. */
@@ -265,6 +267,7 @@ export function Composer({
   onSend,
   onSendAttachments,
   attachmentPreview,
+  sendAccessory,
   disabled = false,
   pending = null,
   editPrefill = null,
@@ -1646,18 +1649,24 @@ export function Composer({
           )}
           data-incognito={incognitoEffective ? "true" : undefined}
         />
-        <Button
-          type="button"
-          onClick={submit}
-          disabled={!canSend}
-          aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
-          // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
-          // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
-          // default button size.
-          className={cn(phone && "h-11 min-w-11", transport === "session" && "ml-auto")}
-        >
-          {pending?.mode === "edit" ? "Save" : "Send"}
-        </Button>
+        <div className={sendAccessory ? "ml-auto flex min-w-0 items-center gap-2" : "contents"}>
+          {sendAccessory}
+          <Button
+            type="button"
+            onClick={submit}
+            disabled={!canSend}
+            aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
+            // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
+            // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
+            // default button size.
+            className={cn(
+              phone && "h-11 min-w-11",
+              transport === "session" && !sendAccessory && "ml-auto",
+            )}
+          >
+            {pending?.mode === "edit" ? "Save" : "Send"}
+          </Button>
+        </div>
       </div>
       {reading.length > 0 && (
         <p role="status" className="text-muted-foreground text-xs">

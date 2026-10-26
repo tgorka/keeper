@@ -43,6 +43,7 @@ pub mod approvals;
 pub mod attachments;
 pub mod blob_cache;
 pub mod commands;
+pub mod context;
 pub mod databases;
 pub mod default_agent;
 pub mod identity;

@@ -16,6 +16,8 @@ const mock = vi.hoisted(() => ({
   releaseHandles: vi.fn(),
   send: vi.fn(),
   picker: vi.fn(),
+  preview: vi.fn(),
+  command: vi.fn(),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mock.picker }));
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -39,6 +41,8 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentAttachCommit: mock.commit,
   agentAttachRelease: mock.releaseHandles,
   agentSend: mock.send,
+  agentCommandPreview: mock.preview,
+  agentCommand: mock.command,
 }));
 const vm: AgentSessionViewVm = {
   agentMark: "A",
@@ -60,14 +64,14 @@ const vm: AgentSessionViewVm = {
   approvals: [],
   prefs: { showReasoning: false, showDetails: false },
 };
-async function draw() {
+async function draw(shown: AgentSessionViewVm = vm) {
   const result = render(
     <TooltipProvider>
       <SessionView target={{ database: "beta", sessionId: "same.1" }} />
     </TooltipProvider>,
   );
   await waitFor(() => expect(mock.view).not.toBeNull());
-  act(() => mock.view?.(vm));
+  act(() => mock.view?.(shown));
   await waitFor(() => expect(mock.drop).not.toBeNull());
   return result;
 }
@@ -105,6 +109,80 @@ beforeEach(() => {
   mock.releaseHandles.mockReset().mockResolvedValue(undefined);
   mock.send.mockReset().mockResolvedValue(undefined);
   mock.picker.mockReset().mockResolvedValue(["/tmp/plan.pdf", "/tmp/prices.csv"]);
+  mock.preview.mockReset().mockImplementation(async (_target, draft: string) => ({
+    draft,
+    verdict: { kind: "command", name: "context", args: null },
+    rows: [],
+    escapeHint: "",
+  }));
+  mock.command.mockReset().mockResolvedValue({ session: null, surface: "context", message: "" });
+});
+
+describe("session context details", () => {
+  const context: NonNullable<AgentSessionViewVm["context"]> = {
+    used: 48000,
+    window: 200000,
+    percent: "24%",
+    meterPercent: 24,
+    ringBackground: "conic-gradient(currentColor 86deg, var(--muted) 0deg)",
+    summary: "24% · used ≈ 48000 / 200000 tokens",
+    parts: [
+      {
+        label: "History",
+        description: "Conversation history and the current question.",
+        tokens: "≈ 48000 tokens",
+        share: "≈ 100% of used context",
+      },
+    ],
+  };
+  async function runContextCommand() {
+    const field = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(field, { target: { value: "/context" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    await waitFor(() =>
+      expect(mock.command).toHaveBeenCalledWith(
+        { database: "beta", sessionId: "same.1" },
+        "/context",
+      ),
+    );
+    return await screen.findByRole("dialog", { name: "Details" });
+  }
+
+  it("/context opens the same Details dialog the ring opens", async () => {
+    await draw({ ...vm, context, prefs: { showReasoning: false, showDetails: true } });
+    const ring = screen.getByRole("button", { name: `Context details: ${context.summary}` });
+    fireEvent.click(ring);
+    const viaRing = await screen.findByRole("dialog", { name: "Details" });
+    expect(within(viaRing).getByText("History")).toBeInTheDocument();
+    fireEvent.keyDown(viaRing, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    const viaCommand = await runContextCommand();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    // One Sheet root: the ring controls this very dialog, whichever way it was opened.
+    expect(viaCommand.id).toBe(viaRing.id);
+    expect(ring).toHaveAttribute("aria-controls", viaCommand.id);
+    expect(ring).toHaveAttribute("aria-expanded", "true");
+    expect(within(viaCommand).getByText(context.summary)).toBeInTheDocument();
+    expect(within(viaCommand).getByText("History")).toBeInTheDocument();
+    expect(screen.queryByText(/not reported by this runtime/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Conversation context" })).not.toBeInTheDocument();
+  });
+
+  it("/context without a measurement opens Details saying why, never pointing at usage", async () => {
+    await draw();
+    expect(screen.queryByRole("button", { name: /^Context details/ })).not.toBeInTheDocument();
+    const hidden = await runContextCommand();
+    expect(hidden).toHaveTextContent("Turn on Show details to see it.");
+    expect(hidden).not.toHaveTextContent(/usage/i);
+    fireEvent.keyDown(hidden, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    act(() => mock.view?.({ ...vm, prefs: { showReasoning: false, showDetails: true } }));
+    const missing = await runContextCommand();
+    expect(missing).toHaveTextContent("The latest answer has no context window measurement.");
+    expect(missing).not.toHaveTextContent(/usage/i);
+  });
 });
 
 describe("session composer attachments", () => {
