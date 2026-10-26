@@ -168,7 +168,7 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub answering: Option<AgentSessionAnsweringVm>,
-    /// Last answer's context occupancy, visible only to trace readers.
+    /// Last answer's context occupancy; follows Show details, for any member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub context: Option<super::context::AgentContextVm>,

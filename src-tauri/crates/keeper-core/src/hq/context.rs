@@ -262,6 +262,7 @@ mod tests {
             "nameless",
             "unknown estimated",
             "unknown overflow",
+            "unknown malformed",
         ] {
             let mut value = metadata(json!(300));
             let parts = value["parts"].as_array_mut().expect("parts");
@@ -276,6 +277,10 @@ mod tests {
                 "nameless" => parts.push(json!({"tokens": 0, "estimated": true})),
                 "unknown estimated" => parts.push(extra("skills", 0, false)),
                 "unknown overflow" => parts.push(extra("skills", 1, true)),
+                // A malformed unknown part refuses the whole context, never a silent skip.
+                "unknown malformed" => {
+                    parts.push(json!({"part": "skills", "tokens": -1, "estimated": true}))
+                }
                 _ => value["window"] = json!(0),
             }
             assert!(latest(&rows(value), true).is_none(), "{field}");

@@ -69,6 +69,6 @@ prefs: AgentViewPrefsVm,
  */
 answering?: AgentSessionAnsweringVm, 
 /**
- * Last answer's context occupancy, visible only to trace readers.
+ * Last answer's context occupancy; follows Show details, for any member.
  */
 context?: AgentContextVm, };
