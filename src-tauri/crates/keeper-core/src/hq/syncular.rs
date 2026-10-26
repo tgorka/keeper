@@ -805,7 +805,8 @@ fn refusal_of(
 type Reply<T> = SyncSender<Result<T, ReplicaError>>;
 
 enum Command {
-    Mutate(Vec<Mutation>, Reply<String>),
+    /// Commit, then set the refusals of the earlier commits aside by it.
+    Mutate(Vec<Mutation>, Vec<String>, Reply<String>),
     Subscribe(Subscription, Reply<()>),
     SetWindow(WindowBase, Vec<String>, Reply<()>),
     WindowState(WindowBase, Reply<WindowState>),
@@ -815,7 +816,6 @@ enum Command {
         reply: Reply<()>,
     },
     Presence(String, Reply<Vec<Peer>>),
-    Supersede(Vec<String>, String, Reply<()>),
     Commit(Vec<BlobBody>, Vec<Mutation>, Reply<String>),
     Fetch(String, Reply<Vec<u8>>),
     CachedBlob(String, Reply<Vec<u8>>),
@@ -1065,11 +1065,21 @@ impl Owner {
     /// One command; `false` to stop.
     fn handle(&mut self, command: Command) -> bool {
         match command {
-            Command::Mutate(ops, reply) => {
+            Command::Mutate(ops, earlier, reply) => {
                 let outcome = self.client.mutate(ops).map_err(|error| {
                     ReplicaError::Client(format!("{}: {}", error.code, error.message))
                 });
-                self.dirty |= outcome.is_ok();
+                if let Ok(commit) = &outcome {
+                    self.dirty = true;
+                    // Before the reply, so before any round can journal
+                    // a refusal of theirs beside this commit.
+                    if !earlier.is_empty() {
+                        if let Err(error) = self.supersede(earlier, commit) {
+                            tracing::warn!(database = %self.database, %error, "an earlier write's refusal was not set aside");
+                        }
+                        self.prune_refusals();
+                    }
+                }
                 let _ = reply.send(outcome);
             }
             Command::Subscribe(subscription, reply) => {
@@ -1127,10 +1137,6 @@ impl Owner {
                     })
                     .collect();
                 let _ = reply.send(Ok(peers));
-            }
-            Command::Supersede(commits, replacement, reply) => {
-                let _ = reply.send(self.supersede(commits, &replacement));
-                self.prune_refusals();
             }
             Command::Commit(blobs, ops, reply) => {
                 let outcome = self.commit_with_blobs(&blobs, ops);
@@ -1829,8 +1835,7 @@ fn command_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaErro
 
 impl Replica for SyncularReplica {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
-        let ops = ops.into_iter().map(mutation).collect();
-        self.ask(|reply| Command::Mutate(ops, reply))
+        self.mutate_superseding(ops, Vec::new())
     }
 
     fn query_covered(
@@ -2027,12 +2032,13 @@ impl Replica for SyncularReplica {
         self.ask(Command::CacheBytes)
     }
 
-    fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError> {
-        if commit_ids.is_empty() {
-            return Ok(());
-        }
-        let replacement = replacement.to_owned();
-        self.ask(|reply| Command::Supersede(commit_ids, replacement, reply))
+    fn mutate_superseding(
+        &self,
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, ReplicaError> {
+        let ops = ops.into_iter().map(mutation).collect();
+        self.ask(|reply| Command::Mutate(ops, earlier, reply))
     }
 
     fn remote_query(
@@ -2639,7 +2645,7 @@ pub(crate) mod tests {
         assert_eq!(writes.refused[0].rejection.code, "hq.v9.person_actor");
         // Written again: the refusal is set aside, durably.
         again
-            .supersede(vec!["c-old".to_owned()], &written)
+            .mutate_superseding(vec![prefs_row("ana/nixie")], vec!["c-old".to_owned()])
             .expect("supersedes");
         assert!(again
             .row_writes("instance_prefs", "ana/nixie", None)
@@ -2663,6 +2669,63 @@ pub(crate) mod tests {
             1,
             "another row's refusal stands"
         );
+    }
+
+    /// R10916-05: the step that writes a commit sets the earlier ones aside
+    /// before it ends. The owner may run a round right after any step, and
+    /// that round may journal the refusal of an earlier commit still on the
+    /// wire; it must find that commit already set aside, never stand it
+    /// beside the newer write for a round.
+    #[test]
+    fn the_step_that_writes_a_commit_sets_the_earlier_ones_aside_before_any_round() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("alpha.sqlite"));
+        let (wake, _woken) = mpsc::channel();
+        let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(false)), wake).expect("opens");
+        let older: String = ask(&mut owner, |reply| {
+            Command::Mutate(vec![mutation(prefs_row("ana/nixie"))], Vec::new(), reply)
+        });
+        let newer: String = ask(&mut owner, |reply| {
+            Command::Mutate(
+                vec![mutation(prefs_row("ana/nixie"))],
+                vec![older.clone()],
+                reply,
+            )
+        });
+        // Nothing else has run on the owner: what the readers consult, and
+        // the file beside the replica, already hold the set-aside.
+        assert_eq!(
+            owner.superseded_waiting.lock().expect("held").get(&older),
+            Some(&newer),
+            "the older commit is not set aside when its step ends"
+        );
+        assert_eq!(
+            owner
+                .cache
+                .log
+                .superseded_waiting()
+                .expect("side file")
+                .get(&older),
+            Some(&newer)
+        );
+        // The next round: the older commit is refused and leaves the outbox.
+        journal_refusal(&spec.path, &older, "ana/nixie", "hq.v3.not_member");
+        rusqlite::Connection::open(&spec.path)
+            .expect("opens")
+            .execute(
+                "DELETE FROM _syncular_outbox WHERE commit_id = ?1",
+                [&older],
+            )
+            .expect("leaves the outbox");
+        owner.settle_superseded();
+        let outcome = owner
+            .client
+            .commit_outcome(&older)
+            .expect("reads")
+            .expect("journalled");
+        assert!(!stands(&outcome), "the older refusal stands: {outcome:?}");
+        assert!(owner.superseded_waiting.lock().expect("held").is_empty());
+        owner.stop();
     }
 
     #[test]
@@ -3216,7 +3279,7 @@ pub(crate) mod tests {
         let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(true)), wake).expect("opens");
         bootstrapped(&spec.path);
         let waiting: String = ask(&mut owner, |reply| {
-            Command::Mutate(vec![mutation(message("m-1"))], reply)
+            Command::Mutate(vec![mutation(message("m-1"))], Vec::new(), reply)
         });
         let refusal = |commit: &str| UploadRefusal {
             commit_id: commit.to_owned(),

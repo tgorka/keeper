@@ -189,13 +189,16 @@ delivery the instance choice reads, so it survives a restart. A later refusal st
 beside the row and in its menu in plain words (`hq.v3.not_member`: "you are no longer a member of
 this chat"; a conflict: "another device changed this chat first"; any other code is quoted).
 **Retry rename** reopens the refused proposed title; retrying supersedes the old refusal, and
-acceptance clears the waiting state. Only the newest title write counts: a rename sets aside every
-earlier title write of the row, including one still waiting, so if an older rename is refused
-after a newer one was written, that refusal never stands — the row follows the newer one, and
-Retry never offers the older title. The set-aside of a waiting write is kept beside the replica
-(`<replica>.blob-access.sqlite`) until its outcome arrives. The chat's own creation is not a
-rename and is never set aside by one: while it waits, a rename queued behind it shows no rename
-state, and neither does its own refusal. An unrelated archive write is not a pending
+acceptance clears the waiting state. Only the newest title write counts: a rename — from the menu
+or `/rename`, which take the same path — sets aside every earlier title write of the row,
+including one still waiting, so if an older rename is refused after a newer one was written, that
+refusal never stands — the row follows the newer one, and Retry never offers the older title. The
+set-aside is made in the same step of the replica's owner that writes the new title, before any
+sync round can settle the older one. The set-aside of a waiting write is kept beside the replica
+(`<replica>.blob-access.sqlite`) until its outcome arrives. If that record cannot be written, the
+rename still reports success (the title was queued) and the failure is logged. The chat's own
+creation is not a rename and is never set aside by one: while it waits, a rename queued behind it
+shows no rename state, and neither does its own refusal. An unrelated archive write is not a pending
 rename. If delivery cannot be read, the row says it is unavailable rather than claiming
 confirmation. Clipboard refusals also stay visible beside the row. Archive/Unarchive still
 reports only the local write; its later refusal is not surfaced on the row yet.

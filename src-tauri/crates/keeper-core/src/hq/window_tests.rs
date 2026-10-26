@@ -432,6 +432,31 @@ fn the_newest_title_write_decides_and_an_older_refusal_never_outranks_it() {
     assert_eq!(row(&source).title_write, Write::Pending);
     journal_session_writes(&path, Some("DDD"), false);
     assert_eq!(row(&source).title_write, Write::Confirmed);
+    // `/rename` is a rename like the menu's: it sets the older one aside too.
+    sessions::rename(&source, "dev1.1", "AAA").expect("menu rename queued");
+    crate::hq::commands::run(&source, "dev1.1", "/rename BBB").expect("/rename queued");
+    journal_session_writes(&path, Some("AAA"), true);
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Pending),
+        "an older menu rename's refusal must not outrank a newer /rename"
+    );
+    journal_session_writes(&path, Some("BBB"), false);
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed)
+    );
+    source.replica.close();
+    source.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed),
+        "the /rename's set-aside survives a restart"
+    );
 }
 
 #[test]
@@ -958,13 +983,20 @@ impl Staged {
 
 impl crate::hq::port::Replica for Staged {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, crate::hq::port::ReplicaError> {
+        self.mutate_superseding(ops, Vec::new())
+    }
+    fn mutate_superseding(
+        &self,
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, crate::hq::port::ReplicaError> {
         let mut held = self.held.lock().expect("held");
         while *held {
             held = self.released.wait(held).expect("held");
         }
         drop(held);
         self.written.lock().expect("written").push(ops.clone());
-        let commit = self.inner.mutate(ops)?;
+        let commit = self.inner.mutate_superseding(ops, earlier)?;
         self.commits.lock().expect("commits").push(commit.clone());
         Ok(commit)
     }
@@ -1065,13 +1097,6 @@ impl crate::hq::port::Replica for Staged {
     }
     fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
         self.inner.blob_cache_bytes()
-    }
-    fn supersede(
-        &self,
-        commits: Vec<String>,
-        replacement: &str,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
-        self.inner.supersede(commits, replacement)
     }
     fn remote_query(
         &self,

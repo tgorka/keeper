@@ -6,7 +6,7 @@ use ts_rs::TS;
 
 use crate::chat::commands::{self, ArgMode, CommandSpec, Context, Place, Resolution, RoomKind};
 use crate::hq::port::RowOp;
-use crate::hq::sessions::{self, authored, object, AgentSessionRef, Source};
+use crate::hq::sessions::{self, AgentSessionRef, Source};
 use crate::hq::{live, timeline, Hq, HqError};
 use crate::vm::{ChatCommandPreviewVm, ChatCommandRowVm, ChatCommandVerdictVm};
 
@@ -185,14 +185,15 @@ pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResult
             let id =
                 sessions::create(source, &session.agent_actor, "").map_err(|e| e.to_string())?;
             if let Some(title) = args {
-                rename(source, &id, &title)?;
+                sessions::rename(source, &id, &title).map_err(|e| e.to_string())?;
             }
             result.session = Some(AgentSessionRef {
                 database: source.database.clone(),
                 session_id: id,
             });
         }
-        "rename" => rename(source, sid, args.as_deref().unwrap_or_default())?,
+        "rename" => sessions::rename(source, sid, args.as_deref().unwrap_or_default())
+            .map_err(|e| e.to_string())?,
         "archive" => sessions::set_archived(source, sid, true).map_err(|e| e.to_string())?,
         "stop" => {
             let turns = source.replica.query("SELECT DISTINCT turn_id AS id FROM turn_chunks WHERE session_id = ?1 AND turn_id NOT IN (SELECT turn_id FROM messages WHERE session_id = ?1 AND role = 'agent' AND turn_id IS NOT NULL)", &[sid.into()]).map_err(|e| e.to_string())?;
@@ -231,19 +232,6 @@ pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResult
         _ => unreachable!("every offered agent command has an operation"),
     }
     Ok(result)
-}
-
-fn rename(source: &Source, sid: &str, title: &str) -> Result<(), String> {
-    source
-        .replica
-        .mutate(vec![RowOp::Patch {
-            table: "sessions".to_owned(),
-            values: authored(source, object(json!({"id": sid, "title": title}))),
-            base_version: None,
-        }])
-        .map_err(|e| e.to_string())?;
-    source.replica.sync_now();
-    Ok(())
 }
 
 impl Hq {

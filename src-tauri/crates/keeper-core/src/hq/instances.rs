@@ -852,13 +852,8 @@ pub fn set_order(
             ),
             base_version: None,
         };
-        match source.replica.mutate(vec![row]) {
-            Ok(commit) => {
-                if let Err(error) = source.replica.supersede(standing, &commit) {
-                    tracing::debug!(database = %source.database, %error, "an earlier refusal of the choice was not set aside");
-                }
-                source.replica.sync_now();
-            }
+        match source.replica.mutate_superseding(vec![row], standing) {
+            Ok(_) => source.replica.sync_now(),
             Err(error) => failed.push(format!("{}: {error}", source.database)),
         }
     }

@@ -359,11 +359,19 @@ pub trait Replica: Send + Sync {
     /// The bytes of blob bodies the replica caches, as its client reports
     /// them (`blob_cache_bytes_approx`).
     fn blob_cache_bytes(&self) -> Result<u64, ReplicaError>;
-    /// Set the refusals of `commit_ids` aside: `replacement`, written since,
-    /// writes their row again. A commit still waiting in the outbox is set
-    /// aside in advance: should the server refuse it, that refusal never
-    /// stands. Durable, like the refusals.
-    fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError>;
+    /// [`Replica::mutate`], and set the refusals of `earlier` aside by the
+    /// new commit, which writes their row again, in the same step of the
+    /// replica's owner: no round runs between the two, so no refusal of
+    /// theirs can surface beside the new commit. A commit still waiting in
+    /// the outbox is set aside in advance: should the server refuse it, that
+    /// refusal never stands. Durable, like the refusals. Once the commit is
+    /// written its id is the answer; a set-aside that fails after it is
+    /// logged, since the write itself was made.
+    fn mutate_superseding(
+        &self,
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, ReplicaError>;
     /// Run the server's registered query `operation_id` with `params`: rows
     /// read on the server, never kept in the replica. Not on the owner
     /// thread, so it never waits behind a round; refused while the replica
@@ -513,8 +521,12 @@ pub(crate) mod fake {
         fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
             Ok(0)
         }
-        fn supersede(&self, _: Vec<String>, _: &str) -> Result<(), ReplicaError> {
-            Ok(())
+        fn mutate_superseding(
+            &self,
+            ops: Vec<RowOp>,
+            _: Vec<String>,
+        ) -> Result<String, ReplicaError> {
+            self.mutate(ops)
         }
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Err(ReplicaError::NotSyncing)

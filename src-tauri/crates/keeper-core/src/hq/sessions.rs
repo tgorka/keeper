@@ -1133,8 +1133,10 @@ pub fn create_with_first(
 /// Rename changes only the mutable title, preserving session identity. The
 /// newest title write decides the row's rename state: every earlier title
 /// write of this row — refused, or still waiting and so not refused yet — is
-/// set aside by this one. The chat's own creation is not a rename and is
-/// never set aside by one.
+/// set aside by this one, in the same step of the replica's owner that
+/// writes it ([`Replica::mutate_superseding`]). The chat's own creation is
+/// not a rename and is never set aside by one. The one title writer: the
+/// menu and `/rename` both come here.
 pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), ReplicaError> {
     let titles = source
         .replica
@@ -1159,15 +1161,17 @@ pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), Repl
         .chain(titles.pending)
         .filter(|commit| !created.contains(commit))
         .collect();
-    let commit = source.replica.mutate(vec![RowOp::Patch {
-        table: "sessions".to_owned(),
-        values: authored(
-            source,
-            object(serde_json::json!({ "id": session_id, "title": title })),
-        ),
-        base_version: None,
-    }])?;
-    source.replica.supersede(earlier, &commit)?;
+    source.replica.mutate_superseding(
+        vec![RowOp::Patch {
+            table: "sessions".to_owned(),
+            values: authored(
+                source,
+                object(serde_json::json!({ "id": session_id, "title": title })),
+            ),
+            base_version: None,
+        }],
+        earlier,
+    )?;
     source.replica.sync_now();
     Ok(())
 }
