@@ -260,6 +260,7 @@ pub fn signed_in_account(
         display_name: "tgorka".to_owned(),
         email: None,
         roles: Vec::new(),
+        sign_in: Some("seeded".to_owned()),
     };
     store_session(p, &d.id, &session).expect("seed session");
     d

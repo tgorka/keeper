@@ -47,8 +47,16 @@ pub const ATTEST_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// a computer asleep does not advance a monotonic sleep.
 const ATTEST_TICK: Duration = Duration::from_secs(60 * 60);
 
-/// The wait before an attestation that could not be made is tried again.
+/// The first wait before an attestation that could not be made is tried
+/// again; it doubles at each refusal in a row, up to [`ATTEST_RETRY_MAX`].
 const ATTEST_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// The longest wait between attestations that keep being refused.
+const ATTEST_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Attempts in a row superseded before anything was sent, before keeper
+/// stops re-trying on its own (R1096-05).
+const SUPERSEDED_LIMIT: u32 = 3;
 
 /// The account a sign-in token would come from, as its descriptor names it,
 /// and which sign-in of it. One attempt holds one of these from the first
@@ -63,20 +71,23 @@ pub struct AccountSignIn {
     pub client_id: String,
     /// Every scope the account's sign-in asks for.
     pub scopes: Vec<String>,
-    /// When the person last signed in, as the provider stated it (the ID
-    /// token's `auth_time`): a new sign-in is a new attempt even when the
-    /// account is the same (R1096-03). `None` signed out, or unstated.
-    pub signed_in_at: Option<i64>,
+    /// Which interactive sign-in of it: keeper's own mark, minted by every
+    /// sign-in and kept by every refresh (`StoredSession::sign_in`). A new
+    /// sign-in is a new attempt even when the account is the same
+    /// (R1096-03), and a refresh is not (R1096-05); the provider's
+    /// `auth_time` decides neither (R1096-06). `None` signed out, or a
+    /// session stored before the mark existed.
+    pub sign_in: Option<String>,
 }
 
 impl AccountSignIn {
     /// The same account, whichever sign-in of it.
     fn same_account(&self, other: &AccountSignIn) -> bool {
         AccountSignIn {
-            signed_in_at: None,
+            sign_in: None,
             ..self.clone()
         } == AccountSignIn {
-            signed_in_at: None,
+            sign_in: None,
             ..other.clone()
         }
     }
@@ -161,7 +172,7 @@ impl OrgAccount {
     }
 }
 
-fn account_of(d: &AccountDescriptor, signed_in_at: Option<i64>) -> AccountSignIn {
+fn account_of(d: &AccountDescriptor, sign_in: Option<String>) -> AccountSignIn {
     AccountSignIn {
         account: d.id.clone(),
         issuer: d.auth.issuer.clone(),
@@ -173,21 +184,8 @@ fn account_of(d: &AccountDescriptor, signed_in_at: Option<i64>) -> AccountSignIn
             .chain(&d.auth.extra_scopes)
             .cloned()
             .collect(),
-        signed_in_at,
+        sign_in,
     }
-}
-
-/// A claim of a stored token's payload: our own, read back from the keychain.
-fn claim(jwt: &str, name: &str) -> Option<i64> {
-    use base64::Engine as _;
-    let part = jwt.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(part.trim_end_matches('='))
-        .ok()?;
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()?
-        .get(name)?
-        .as_i64()
 }
 
 impl SignIn for OrgAccount {
@@ -203,13 +201,7 @@ impl SignIn for OrgAccount {
                 },
             );
         match session {
-            // A refresh keeps the original `auth_time` (OIDC Core §12.2,
-            // checked in `oidc::refreshed_roles`); only a sign-in moves it.
-            // Without one, the ID token's own `iat` stands in.
-            Ok(Some(session)) => AccountState::SignedIn(account_of(
-                &d,
-                claim(&session.id_token, "auth_time").or_else(|| claim(&session.id_token, "iat")),
-            )),
+            Ok(Some(session)) => AccountState::SignedIn(account_of(&d, session.sign_in)),
             Ok(None) => AccountState::SignedOut(account_of(&d, None)),
             Err(error) => {
                 tracing::debug!(%error, "the account's session cannot sign this device in to the agents server");
@@ -347,6 +339,12 @@ pub(crate) struct SignInMemo {
     /// The account, and which sign-in of it, the outcome was reached for:
     /// another one tries again.
     pub tried: Option<AccountState>,
+    /// Attempts in a row the account moved under before they could send:
+    /// past [`SUPERSEDED_LIMIT`] the next waits for a reconcile, so a state
+    /// that keeps moving is never a hot loop against two servers (R1096-05).
+    pub superseded: u32,
+    /// Why the last attestation was refused, for Settings (R1096-08).
+    pub attest_problem: Option<String>,
 }
 
 impl SignInMemo {
@@ -426,7 +424,12 @@ impl Hq {
         if bound && !inner.authorization.removed {
             return vm(
                 HqSignInState::Enrolled,
-                format!("Signed in: {host} knows this device by your account."),
+                match &inner.sign_in.attest_problem {
+                    Some(problem) => {
+                        format!("Signed in: {host} knows this device by your account. {problem}")
+                    }
+                    None => format!("Signed in: {host} knows this device by your account."),
+                },
             );
         }
         if inner.sign_in.running.is_some() {
@@ -516,15 +519,33 @@ impl Hq {
             inner.sign_in.running = None;
             let again = match attempted {
                 Attempted::Done(outcome) => {
+                    inner.sign_in.superseded = 0;
                     inner.sign_in.outcome = Some(outcome);
                     inner.sign_in.tried = Some(started);
                     false
                 }
-                Attempted::Kept => false,
+                Attempted::Kept => {
+                    inner.sign_in.superseded = 0;
+                    false
+                }
                 Attempted::Superseded => {
-                    inner.sign_in.outcome = None;
+                    inner.sign_in.superseded += 1;
                     inner.sign_in.tried = None;
-                    true
+                    if inner.sign_in.superseded >= SUPERSEDED_LIMIT {
+                        tracing::warn!(
+                            attempts = inner.sign_in.superseded,
+                            "the account kept changing under the agents server's sign-in; waiting for the next change"
+                        );
+                        inner.sign_in.outcome = Some(Outcome::Failed(
+                            "Your account kept changing while keeper signed this device in; it \
+                             tries again when your account or this setting next changes."
+                                .to_owned(),
+                        ));
+                        false
+                    } else {
+                        inner.sign_in.outcome = None;
+                        true
+                    }
                 }
             };
             drop(inner);
@@ -655,7 +676,12 @@ impl Hq {
             }
             Err(error) => return Attempted::Done(Outcome::Failed(route_sentence(server, &error))),
         };
-        match self.keep_enrolled(server, enrolled).await {
+        // What the attempt started from: no credential, or the one it adopted.
+        let started_from = match ask {
+            Ask::New => None,
+            Ask::Adopt => pairing.as_ref().map(|pairing| pairing.token.clone()),
+        };
+        match self.keep_enrolled(server, enrolled, started_from).await {
             Ok(()) => Attempted::Kept,
             Err(error) => {
                 tracing::warn!(%error, "the agents server's credential could not be kept");
@@ -667,10 +693,45 @@ impl Hq {
     /// Keep what an enrolment answered — in the keychain item of the server
     /// it was sent to, where a pairing's token lives, replacing it — and
     /// restart on it if that server is still the one set. A sent request is
-    /// never thrown away: the server may already have issued the device or
-    /// rotated the old token (R1096-02).
-    async fn keep_enrolled(&self, server: &ServerUrl, enrolled: Enrolled) -> Result<(), HqError> {
-        let _lifecycle = self.lifecycle.lock().await;
+    /// not thrown away for a configuration that changed (R1096-02): the
+    /// server may already have issued the device or rotated the old token.
+    ///
+    /// It replaces only what the attempt started from — no credential, or
+    /// the token it adopted (`started_from`). If the item moved on meanwhile
+    /// (a Forget, or a newer attempt that kept its own), the answer is
+    /// discarded and its device is revoked with its own token, so the person
+    /// is left with no credential nothing holds (R1096-07).
+    async fn keep_enrolled(
+        &self,
+        server: &ServerUrl,
+        enrolled: Enrolled,
+        started_from: Option<String>,
+    ) -> Result<(), HqError> {
+        let lifecycle = self.lifecycle.lock().await;
+        let key = keychain_key(server);
+        let now: Option<String> = match self.platform.keychain_get(&key)? {
+            Some(stored) => serde_json::from_str::<Pairing>(&stored)
+                .ok()
+                .map(|pairing| pairing.token),
+            None => None,
+        };
+        if now != started_from {
+            drop(lifecycle);
+            tracing::warn!(
+                adopted = enrolled.adopted,
+                "the agents server answered a sign-in this device has moved on from; revoking its device"
+            );
+            let revoked = {
+                let _contact = self.contacts.hold(server);
+                self.routes
+                    .revoke(server, &enrolled.token, &enrolled.discovery.client_id)
+                    .await
+            };
+            if let Err(error) = revoked {
+                tracing::warn!(%error, "the discarded device could not be revoked");
+            }
+            return Ok(());
+        }
         let data_dir = self.data_dir()?;
         let record = Pairing {
             token: enrolled.token,
@@ -680,7 +741,7 @@ impl Hq {
             bound: Some(Bound::now()),
         };
         let stored = serde_json::to_string(&record).map_err(json_sentence)?;
-        self.platform.keychain_set(&keychain_key(server), &stored)?;
+        self.platform.keychain_set(&key, &stored)?;
         Authorization {
             removed: false,
             open: enrolled.discovery.databases.clone(),
@@ -706,13 +767,17 @@ impl Hq {
     }
 
     /// Keep a credential that came from a sign-in attested: wake when it is
-    /// due ([`Bound::due_at_ms`]), attest, wait for the next. Held with the
-    /// configuration's tasks, so a restart plans it again.
+    /// due ([`Bound::due_at_ms`]), attest, wait for the next. One refused or
+    /// failed is tried again after [`ATTEST_RETRY`], doubling at each one in
+    /// a row up to [`ATTEST_RETRY_MAX`], so a refusal that stands mints a
+    /// token a few times a day, not every ten minutes (R1096-08). Held with
+    /// the configuration's tasks, so a restart plans it again.
     pub(super) fn schedule_attest(&self, inner: &mut Inner, bound: Bound) {
         let generation = inner.generation;
         let me = self.me.clone();
         inner.tasks.push(tokio::spawn(async move {
             let mut bound = bound;
+            let mut retry = ATTEST_RETRY;
             loop {
                 let wait = bound.due_at_ms().saturating_sub(now_ms());
                 if wait > 0 {
@@ -722,12 +787,36 @@ impl Hq {
                 }
                 let Some(hq) = me.upgrade() else { return };
                 match hq.attest(generation).await {
-                    Attest::Kept(next) => bound = next,
-                    Attest::Later => tokio::time::sleep(ATTEST_RETRY).await,
+                    Attest::Kept(next) => {
+                        bound = next;
+                        retry = ATTEST_RETRY;
+                    }
+                    Attest::Later => {
+                        drop(hq);
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(ATTEST_RETRY_MAX);
+                    }
                     Attest::Stop => return,
                 }
             }
         }));
+    }
+
+    /// Say in Settings why this configuration's attestation is refused, or
+    /// that it is not any more.
+    fn note_attest(&self, generation: u64, problem: Option<String>) {
+        let changed = {
+            let mut inner = lock(&self.inner);
+            if inner.generation != generation || inner.sign_in.attest_problem == problem {
+                false
+            } else {
+                inner.sign_in.attest_problem = problem;
+                true
+            }
+        };
+        if changed {
+            self.publish();
+        }
     }
 
     async fn attest(&self, generation: u64) -> Attest {
@@ -795,6 +884,7 @@ impl Hq {
                 {
                     Ok(true) => {
                         tracing::info!("this device's sign-in was attested to its agents server");
+                        self.note_attest(generation, None);
                         Attest::Kept(bound)
                     }
                     Ok(false) => Attest::Stop,
@@ -820,23 +910,44 @@ impl Hq {
                 }
                 Attest::Stop
             }
-            // The person or the app is not one the server takes: retrying
-            // would mint a token every ten minutes for the same answer. The
+            // The credential is another person's sign-in: the one refusal
+            // that names this device, so asking again cannot change it. The
             // credential lapses, and the sign-in after it says why.
-            Err(RouteError::Refused { status: 403, code }) => {
-                tracing::warn!(%code, "the agents server refused this sign-in's attestation; attesting stops");
+            Err(RouteError::Refused { status: 403, code }) if code == "hq.attest.other_person" => {
+                tracing::warn!(%code, "the agents server says this device is another person's; attesting stops");
+                self.note_attest(
+                    generation,
+                    Some(format!(
+                        "{} says this device was signed in by someone else, so keeper cannot \
+                         renew it with your sign-in. It stops working when that sign-in lapses.",
+                        server.host()
+                    )),
+                );
                 Attest::Stop
             }
-            // Any other refusal judged the sign-in token, not the device
-            // (`hq.signin.stale`, `.replayed`, …), or nothing was decided:
-            // ask again whether the device is known, and attest again later.
+            // Every other refusal — of the sign-in token (`hq.signin.stale`,
+            // `.replayed`, …), of the person, app or role an administrator can
+            // restore (`hq.not_a_person`, `hq.signin.role`, …), or a 403 that
+            // is not keeper-hq's at all (a proxy page) — or nothing decided:
+            // after a growing wait, ask again. A 401 also asks the server
+            // again whether the device is known.
             Err(error) => {
                 tracing::info!(%error, "the attestation did not go through; attesting later");
-                if matches!(error, RouteError::Refused { status: 401, .. }) {
-                    let mut inner = lock(&self.inner);
-                    if inner.generation == generation {
-                        self.schedule_discovery(&mut inner, Duration::ZERO);
+                if let RouteError::Refused { status, code } = &error {
+                    if *status == 401 {
+                        let mut inner = lock(&self.inner);
+                        if inner.generation == generation {
+                            self.schedule_discovery(&mut inner, Duration::ZERO);
+                        }
                     }
+                    self.note_attest(
+                        generation,
+                        Some(format!(
+                            "{} refused to renew this device's sign-in ({code}); keeper asks \
+                             again later.",
+                            server.host()
+                        )),
+                    );
                 }
                 Attest::Later
             }
@@ -931,7 +1042,7 @@ mod tests {
             issuer: "https://id.example.org".to_owned(),
             client_id: "keeper".to_owned(),
             scopes: vec!["openid".to_owned(), "urn:x:aud".to_owned()],
-            signed_in_at: Some(1),
+            sign_in: Some("first".to_owned()),
         }
     }
 
@@ -973,44 +1084,6 @@ mod tests {
         renamed.id = "other".to_owned();
         *now.lock().expect("descriptor") = renamed;
         assert_eq!(org.fresh_token(&checked).await, Err(TokenError::Changed));
-    }
-
-    #[test]
-    fn a_new_sign_in_moves_the_account_state_and_a_refresh_does_not() {
-        use crate::org_account::session::{load_session, store_session};
-        use base64::Engine as _;
-        let p = Arc::new(crate::forges::testing::FakePlatform::default());
-        let d = crate::forges::testing::signed_in_account(&p, "");
-        let now = Arc::new(std::sync::Mutex::new(d.clone()));
-        let org = org(&p, &now);
-        let id_token = |claims: serde_json::Value| {
-            let b64 = |v: &serde_json::Value| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
-            };
-            format!(
-                "{}.{}.sig",
-                b64(&serde_json::json!({"alg": "RS256"})),
-                b64(&claims)
-            )
-        };
-        let signed_in_as = |claims: serde_json::Value| {
-            let mut session = load_session(p.as_ref(), &d.id)
-                .expect("reads")
-                .expect("session");
-            session.id_token = id_token(claims);
-            store_session(p.as_ref(), &d.id, &session).expect("stores");
-            match org.account() {
-                AccountState::SignedIn(account) => account.signed_in_at,
-                other => panic!("{other:?}"),
-            }
-        };
-        let first = signed_in_as(serde_json::json!({"auth_time": 100, "iat": 100}));
-        // A refresh: a new ID token, the same `auth_time`.
-        let refreshed = signed_in_as(serde_json::json!({"auth_time": 100, "iat": 5000}));
-        let again = signed_in_as(serde_json::json!({"auth_time": 9000, "iat": 9000}));
-        assert_eq!(first, Some(100));
-        assert_eq!(refreshed, first, "a refresh is the same sign-in");
-        assert_eq!(again, Some(9000), "a new sign-in is a new state");
     }
 
     fn config(issuer: &str, client: &str, scopes: &[&str]) -> AuthConfig {

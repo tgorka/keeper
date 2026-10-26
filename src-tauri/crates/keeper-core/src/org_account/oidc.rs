@@ -1083,6 +1083,7 @@ async fn sign_in_within(
         email: string_claim(&claims, "email"),
         login,
         roles,
+        sign_in: Some(ulid::Ulid::new().to_string()),
     };
     {
         let lock = refresh_lock(&session_key(&d.id));
@@ -2023,8 +2024,13 @@ mod tests {
 
     fn merged(mut base: serde_json::Value, patch: &serde_json::Value) -> serde_json::Value {
         if let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) {
+            // A `null` drops the claim: the provider did not send it.
             for (key, value) in patch {
-                base.insert(key.clone(), value.clone());
+                if value.is_null() {
+                    base.remove(key);
+                } else {
+                    base.insert(key.clone(), value.clone());
+                }
             }
         }
         base
@@ -2662,6 +2668,7 @@ mod tests {
             display_name: "tgorka".to_owned(),
             email: None,
             roles,
+            sign_in: Some("seeded".to_owned()),
         };
         store_session(p, &d.id, &session).expect("seed session");
     }
@@ -3288,6 +3295,170 @@ mod tests {
         a.expect("first");
         b.expect("second");
         assert_eq!(fake.refreshes(), 3, "each caller gets its own refresh");
+    }
+
+    // ---- the agents server's sign-in (109.6, R1096-05/-06) -----------------
+
+    /// The agents server's sign-in view of `p`'s account, as keeper runs it.
+    fn org(p: &Arc<FakePlatform>, d: &AccountDescriptor) -> crate::hq::signin::OrgAccount {
+        let d = d.clone();
+        crate::hq::signin::OrgAccount::new(
+            Arc::clone(p) as Arc<dyn Platform>,
+            move || Some(d.clone()),
+            || Ok(http()),
+        )
+    }
+
+    fn sign_in_mark(org: &crate::hq::signin::OrgAccount) -> Option<String> {
+        use crate::hq::signin::{AccountState, SignIn};
+        match org.account() {
+            AccountState::SignedIn(account) => account.sign_in,
+            other => panic!("not signed in: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_sign_in_is_a_new_agents_sign_in_though_auth_time_is_the_same() {
+        // The fake provider states `auth_time` 1000 at every sign-in, as an
+        // identity provider completing it from its own live session may.
+        let fake = start_fake(Behaviour::default());
+        let p = Arc::new(FakePlatform::new(&fake, Browser::Honest));
+        let d = account(&fake, "again", None);
+        let org = org(&p, &d);
+
+        sign_in_at_fake(&p, &d).await.expect("signs in");
+        let first = sign_in_mark(&org);
+        sign_in_at_fake(&p, &d).await.expect("signs in again");
+        let second = sign_in_mark(&org);
+
+        assert!(first.is_some());
+        assert_ne!(first, second, "a new interactive sign-in");
+    }
+
+    /// An agents server that takes any sign-in of `d`'s account and records
+    /// the sign-in tokens it is given at enrolment and attestation.
+    fn agents_server(d: &AccountDescriptor) -> crate::forges::testing::Fake {
+        use crate::forges::testing::{serve, Reply};
+        let config = serde_json::json!({
+            "issuer": d.auth.issuer,
+            "clientId": d.auth.client_id,
+            "scopes": ["openid"],
+        })
+        .to_string();
+        serve(move |seen| match seen.path.as_str() {
+            "/auth/config" => Reply::json(200, &config),
+            "/devices/enroll" => Reply::json(
+                200,
+                r#"{"token":"device-token-1","clientId":"ana.1","actorId":"ana","databases":[{"name":"alpha"}],"adopted":false}"#,
+            ),
+            "/databases" => Reply::json(
+                200,
+                r#"{"actorId":"ana","clientId":"ana.1","databases":[{"name":"alpha"}]}"#,
+            ),
+            "/clients/self/attest" => Reply::json(
+                200,
+                r#"{"clientId":"ana.1","attestedAtMs":1,"lapsesAtMs":604800001}"#,
+            ),
+            _ => Reply::json(404, "{}"),
+        })
+    }
+
+    fn agents_hq(p: &Arc<FakePlatform>, d: &AccountDescriptor) -> Arc<crate::hq::Hq> {
+        crate::hq::Hq::new(
+            Arc::clone(p) as Arc<dyn Platform>,
+            Arc::new(crate::hq::port::fake::FakeOpener::default()),
+            Arc::new(crate::hq::routes::HttpRoutes::new()),
+            Arc::new(org(p, d)),
+            "keeper".to_owned(),
+            || "hesperia".to_owned(),
+        )
+    }
+
+    fn asked(server: &crate::forges::testing::Fake, path: &str) -> Vec<String> {
+        server
+            .requests()
+            .into_iter()
+            .filter(|seen| seen.path == path)
+            .map(|seen| seen.header("authorization").unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_auth_time_neither_moves_the_agents_sign_in_nor_spins_enrolment() {
+        let fake = start_fake(Behaviour {
+            // A refreshed ID token without `auth_time` (OIDC Core §2 makes it
+            // optional unless asked for).
+            refresh_claims: Some(serde_json::json!({ "auth_time": null })),
+            ..Behaviour::default()
+        });
+        let p = Arc::new(FakePlatform::new(&fake, Browser::Honest));
+        let d = account(&fake, "no-auth-time", None);
+        seed_session(&p, &d, Vec::new(), now_ms() + 3_600_000);
+        let before = sign_in_mark(&org(&p, &d));
+        let agents = agents_server(&d);
+        let hq = agents_hq(&p, &d);
+        hq.start().await.expect("starts");
+        hq.set_server(&agents.base).await.expect("sets");
+        for _ in 0..100 {
+            if !asked(&agents, "/devices/enroll").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(asked(&agents, "/devices/enroll"), ["Bearer access-2"]);
+        assert_eq!(fake.refreshes(), 1, "one mint, no loop");
+        assert_eq!(asked(&agents, "/auth/config").len(), 1);
+        assert_eq!(
+            sign_in_mark(&org(&p, &d)),
+            before,
+            "a refresh is the same sign-in"
+        );
+        hq.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_auth_time_still_lets_the_attestation_go() {
+        let fake = start_fake(Behaviour {
+            refresh_claims: Some(serde_json::json!({ "auth_time": null })),
+            ..Behaviour::default()
+        });
+        let p = Arc::new(FakePlatform::new(&fake, Browser::Honest));
+        let d = account(&fake, "attest-no-auth-time", None);
+        seed_session(&p, &d, Vec::new(), now_ms() + 3_600_000);
+        let agents = agents_server(&d);
+        let server = crate::hq::server::ServerUrl::parse(&agents.base)
+            .expect("parses")
+            .expect("an address");
+        crate::registry::set_agents_server_url(&p.data_dir().expect("dir"), Some(&server))
+            .expect("stores");
+        let day = 24 * 60 * 60 * 1000;
+        // Signed in six and a half days ago: the attestation is due.
+        p.keychain_set(
+            &format!("agents-server/{}", server.as_str()),
+            &serde_json::json!({
+                "token": "device-token-a",
+                "actorId": "ana",
+                "clientId": "ana.1",
+                "name": "keeper",
+                "bound": { "attestedAtMs": now_ms() - 13 * day / 2, "windowMs": 7 * day },
+            })
+            .to_string(),
+        )
+        .expect("keychain");
+        let hq = agents_hq(&p, &d);
+        hq.start().await.expect("starts");
+        for _ in 0..100 {
+            if !asked(&agents, "/clients/self/attest").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(asked(&agents, "/clients/self/attest"), ["Bearer access-2"]);
+        assert_eq!(fake.refreshes(), 1);
+        hq.shutdown().await;
     }
 
     #[tokio::test]

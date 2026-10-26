@@ -24,8 +24,8 @@ struct Account {
     id: &'static str,
     issuer: &'static str,
     signed_in: bool,
-    /// The sign-in's `auth_time`: a new sign-in moves it.
-    signed_in_at: i64,
+    /// keeper's sign-in marker: a new interactive sign-in moves it.
+    sign_in: u32,
 }
 
 /// The account: which one, signed in or not, and every token it minted. A
@@ -35,6 +35,9 @@ struct FakeSignIn {
     minted: AtomicUsize,
     /// The next mint answers that the sign-in is no longer good.
     refuse_next: AtomicBool,
+    /// Every mint moves the account's sign-in marker: an account state that
+    /// never holds still (R1096-05's provider, whatever the cause).
+    moves_on_mint: AtomicBool,
     /// The next mint waits, after its account check, until notified.
     hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// A held mint was dropped before it finished: its attempt was cancelled.
@@ -48,10 +51,11 @@ impl FakeSignIn {
                 id: "acme",
                 issuer: ISSUER,
                 signed_in,
-                signed_in_at: 1,
+                sign_in: 1,
             }),
             minted: AtomicUsize::new(0),
             refuse_next: AtomicBool::new(false),
+            moves_on_mint: AtomicBool::new(false),
             hold: Mutex::new(None),
             dropped: Arc::new(AtomicBool::new(false)),
         })
@@ -87,7 +91,7 @@ fn snapshot(account: &Account) -> AccountSignIn {
         issuer: account.issuer.to_owned(),
         client_id: CLIENT.to_owned(),
         scopes: SCOPES.iter().map(|s| (*s).to_owned()).collect(),
-        signed_in_at: account.signed_in.then_some(account.signed_in_at),
+        sign_in: account.signed_in.then(|| account.sign_in.to_string()),
     }
 }
 
@@ -127,6 +131,9 @@ impl SignIn for FakeSignIn {
                 return Err(TokenError::NeedsSignIn("sign in again".to_owned()));
             }
             let n = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.moves_on_mint.load(Ordering::SeqCst) {
+                lock(&self.now).sign_in += 1;
+            }
             Ok(format!("signin-token-{n}"))
         })
     }
@@ -147,8 +154,11 @@ struct Server {
     devices: Vec<Device>,
     spent: Vec<String>,
     minted: usize,
-    /// Refusals `/clients/self/attest` answers first, in order.
-    attest_refusals: Vec<(u16, &'static str)>,
+    /// Refusals `/clients/self/attest` answers first, in order: the status
+    /// and the body as sent.
+    attest_refusals: Vec<(u16, String)>,
+    /// Every revocation: the client revoked and the bearer that asked.
+    revoked: Vec<(String, String)>,
     /// Held requests: `"before <path>"` waits before answering anything,
     /// `"after <path>"` after the server acted on it. A held request goes
     /// on when its sender sends or is dropped.
@@ -240,8 +250,8 @@ fn answer(server: &mut Server, seen: &Seen) -> Reply {
         }
         ("POST", "/clients/self/attest") => {
             if !server.attest_refusals.is_empty() {
-                let (status, code) = server.attest_refusals.remove(0);
-                return Reply::json(status, &format!(r#"{{"error":"{code}"}}"#));
+                let (status, body) = server.attest_refusals.remove(0);
+                return Reply::json(status, &body);
             }
             let token = seen.json()["deviceToken"].as_str().unwrap_or("").to_owned();
             match server.devices.iter().find(|d| d.token == token) {
@@ -266,8 +276,26 @@ fn answer(server: &mut Server, seen: &Seen) -> Reply {
                 {"clientId":"ana.k","name":"keeper","host":"kalypso","kind":"enrolled","atMs":2,"self":false},
                 {"clientId":"ana.1","name":"keeper","host":"hesperia","kind":"adopted","atMs":1,"self":true}]}"#,
         ),
+        ("POST", path) if path.starts_with("/clients/") && path.ends_with("/revoke") => {
+            let client = path
+                .trim_start_matches("/clients/")
+                .trim_end_matches("/revoke")
+                .to_owned();
+            let token = bearer(seen);
+            if !server.devices.iter().any(|d| d.token == token) {
+                return Reply::json(401, r#"{"error":"sync.auth_required"}"#);
+            }
+            server.revoked.push((client.clone(), token));
+            server.devices.retain(|d| d.client != client);
+            Reply::json(200, &format!(r#"{{"clientId":"{client}"}}"#))
+        }
         _ => Reply::json(404, r#"{"error":"not found"}"#),
     }
+}
+
+/// keeper-hq's refusal body for `code`.
+fn refusal(status: u16, code: &str) -> (u16, String) {
+    (status, format!(r#"{{"error":"{code}"}}"#))
 }
 
 struct World {
@@ -820,7 +848,7 @@ async fn a_new_sign_in_after_a_refused_refresh_enrols() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(world.asked("/auth/config").len(), 1);
     // The person signs in again: same account, a new sign-in.
-    world.sign_in.set(|account| account.signed_in_at = 2);
+    world.sign_in.set(|account| account.sign_in = 2);
     hq.reconcile().await.expect("reconciles");
     status_until(&hq, "enrolled", enrolled).await;
     assert_eq!(world.asked("/devices/enroll").len(), 1);
@@ -839,7 +867,7 @@ async fn past_the_retry() {
 async fn an_attestation_refused_for_its_sign_in_token_is_tried_again() {
     let world = World::new(true);
     world.holds("device-token-a", "ana.1", Some(due()), false);
-    lock(&world.state).attest_refusals = vec![(401, "hq.signin.stale")];
+    lock(&world.state).attest_refusals = vec![refusal(401, "hq.signin.stale")];
     let hq = world.hq();
     hq.start().await.expect("starts");
     world.until_asked("/clients/self/attest", 1).await;
@@ -871,11 +899,202 @@ async fn an_attestation_refused_for_its_sign_in_token_is_tried_again() {
 async fn an_attestation_answered_device_unknown_stops() {
     let world = World::new(true);
     world.holds("device-token-a", "ana.1", Some(due()), false);
-    lock(&world.state).attest_refusals = vec![(401, "hq.device_unknown")];
+    lock(&world.state).attest_refusals = vec![refusal(401, "hq.device_unknown")];
     let hq = world.hq();
     hq.start().await.expect("starts");
     world.until_asked("/clients/self/attest", 1).await;
     world.until_asked("/databases", 2).await;
+    past_the_retry().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(world.asked("/clients/self/attest").len(), 1);
+}
+
+// ---- R1096-05: an account state that keeps moving is no hot loop ----------
+
+#[tokio::test]
+async fn an_account_state_that_moves_with_every_mint_is_tried_a_bounded_number_of_times() {
+    let world = World::new(true);
+    world.sign_in.moves_on_mint.store(true, Ordering::SeqCst);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    hq.set_server(&world.fake.base).await.expect("sets");
+    let status = status_until(&hq, "it stops trying", |s| {
+        s.sign_in.state == HqSignInState::Refused
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        status
+            .sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|s| s.contains("kept changing")),
+        "{status:#?}"
+    );
+    assert_eq!(
+        world.sign_in.minted.load(Ordering::SeqCst),
+        3,
+        "three attempts, then a wait"
+    );
+    assert_eq!(world.asked("/auth/config").len(), 3);
+    assert!(world.asked("/devices/enroll").is_empty());
+}
+
+// ---- R1096-07: a late answer never undoes what came after it --------------
+
+#[tokio::test]
+async fn an_adoption_answered_after_forget_is_discarded_and_its_device_revoked() {
+    let world = World::new(true);
+    world.holds(PAIRED_TOKEN, "ana.1", None, false);
+    let release = world.hold("after", "/devices/enroll");
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    world.until_asked("/devices/enroll", 1).await;
+    // Forget: the pairing goes, and the device signs in afresh.
+    hq.forget().await.expect("forgets");
+    let status = status_until(&hq, "a new device", enrolled).await;
+    let fresh = status.device.expect("device").client_id;
+    assert_eq!(fresh, "ana.new2");
+    // The adoption's answer arrives late.
+    drop(release);
+    let mut revoked = Vec::new();
+    for _ in 0..100 {
+        revoked = lock(&world.state).revoked.clone();
+        if !revoked.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        revoked,
+        [("ana.1".to_owned(), "device-token-1".to_owned())],
+        "the orphan revoked with its own token"
+    );
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.new2", "what came after stays");
+    assert_eq!(kept.token, "device-token-2");
+    assert_eq!(
+        hq.status()
+            .borrow()
+            .device
+            .as_ref()
+            .expect("device")
+            .client_id,
+        "ana.new2"
+    );
+}
+
+#[tokio::test]
+async fn an_enrolment_answered_after_a_newer_one_kept_its_own_is_discarded() {
+    let world = World::new(true);
+    let release = world.hold("after", "/devices/enroll");
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    hq.set_server(&world.fake.base).await.expect("sets");
+    world.until_asked("/devices/enroll", 1).await;
+    // The same server set again: a newer attempt enrols and keeps its own.
+    hq.set_server("").await.expect("clears");
+    hq.set_server(&world.fake.base).await.expect("sets again");
+    status_until(&hq, "the newer device", enrolled).await;
+    drop(release);
+    let mut revoked = Vec::new();
+    for _ in 0..100 {
+        revoked = lock(&world.state).revoked.clone();
+        if !revoked.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        revoked,
+        [("ana.new1".to_owned(), "device-token-1".to_owned())]
+    );
+    assert_eq!(world.kept().expect("kept").client_id, "ana.new2");
+}
+
+// ---- R1096-08: only the device's own refusal stops attesting --------------
+
+fn sentence(hq: &Hq) -> String {
+    hq.status()
+        .borrow()
+        .sign_in
+        .sentence
+        .clone()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_403_that_is_not_about_the_device_is_retried_on_a_growing_wait_and_said() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(due()), false);
+    lock(&world.state).attest_refusals = vec![
+        // A reverse proxy's page, not keeper-hq's answer.
+        (403, "<html>Forbidden</html>".to_owned()),
+        // A role an administrator can restore.
+        refusal(403, "hq.signin.role"),
+    ];
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "the proxy's refusal said", |s| {
+        s.sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|s| s.contains("(http-403)"))
+    })
+    .await;
+    assert_eq!(hq.status().borrow().sign_in.state, HqSignInState::Enrolled);
+    // Ten minutes on: asked again.
+    past_the_retry().await;
+    status_until(&hq, "the role refusal said", |s| {
+        s.sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|s| s.contains("hq.signin.role"))
+    })
+    .await;
+    assert_eq!(world.asked("/clients/self/attest").len(), 2);
+    // Twenty minutes now: ten more is not enough.
+    past_the_retry().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        world.asked("/clients/self/attest").len(),
+        2,
+        "the wait grew"
+    );
+    past_the_retry().await;
+    status_until(&hq, "renewed", |s| {
+        !s.sign_in
+            .sentence
+            .as_deref()
+            .unwrap_or("")
+            .contains("refused")
+    })
+    .await;
+    assert_eq!(world.asked("/clients/self/attest").len(), 3);
+    assert_eq!(
+        sentence(&hq),
+        format!(
+            "Signed in: {} knows this device by your account.",
+            world.server().host()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_403_naming_another_persons_device_stops_attesting_and_is_said() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(due()), false);
+    lock(&world.state).attest_refusals = vec![refusal(403, "hq.attest.other_person")];
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "said", |s| {
+        s.sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|s| s.contains("signed in by someone else"))
+    })
+    .await;
+    past_the_retry().await;
     past_the_retry().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(world.asked("/clients/self/attest").len(), 1);

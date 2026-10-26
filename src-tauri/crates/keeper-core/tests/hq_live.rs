@@ -3686,7 +3686,7 @@ impl LiveSignIn {
                 issuer: env("KEEPER_HQ_LIVE_SIGNIN_ISSUER"),
                 client_id: env("KEEPER_HQ_LIVE_SIGNIN_CLIENT"),
                 scopes,
-                signed_in_at: Some(1),
+                sign_in: Some("hq-live".to_owned()),
             },
             refresh_file: PathBuf::from(env("KEEPER_HQ_LIVE_SIGNIN_REFRESH_FILE")),
             minted: Mutex::new(Vec::new()),

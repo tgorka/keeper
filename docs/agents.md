@@ -156,9 +156,13 @@ signing in, with no code (`keeper-core/src/hq/signin.rs`):
   *adopts* it: the same client id, a new token, its host bound now (Q109-04 a). A device whose
   sign-in lapsed or was suspended (S-ID-9: the server refuses its token) signs in again the same
   way, silently, keeping its client id. An outcome is remembered per account *and* per sign-in of
-  it (the ID token's `auth_time`): a sign-in that could not be refreshed is tried again as soon as
-  the person signs in anew, and a device the server no longer knows (`hq.device_unknown`) is never
-  replaced by a new client id on its own.
+  it: keeper's own mark, minted by every interactive sign-in and kept by every refresh
+  (`StoredSession::sign_in`), never the provider's `auth_time` (a refresh may drop it, and a
+  sign-in completed from the provider's own session may repeat it). A sign-in that could not be
+  refreshed is tried again as soon as the person signs in anew, and a device the server no longer
+  knows (`hq.device_unknown`) is never replaced by a new client id on its own. An account that
+  moves under three attempts in a row before any could send waits for the next change of the
+  account or the setting, so it is never a loop against the provider and the server.
 - **One attempt, one account, one server.** An attempt holds the account it checked — its id,
   issuer, client, scopes and sign-in — and the token is minted from that very account
   (`OrgAccount::fresh_token` refuses another one, `TokenError::Changed`). Before the request is
@@ -167,7 +171,11 @@ signing in, with no code (`keeper-core/src/hq/signin.rs`):
   is now is considered afresh. A server change, a cleared address or another account cancels the
   running attempt. One whose request is already sent is not cancelled: it keeps what the server
   answers under that server's keychain item, because the server may already have issued the
-  device or rotated the old token, and restarts onto it only if that server is still set.
+  device or rotated the old token, and restarts onto it only if that server is still set. It
+  replaces only what it started from — no credential, or the token it adopted: if the item moved
+  on meanwhile (a Forget, or a newer attempt that kept its own), the late answer is discarded and
+  its device revoked with its own token (`POST /clients/{id}/revoke`), so no credential is left
+  that nothing holds.
 - **To whom.** The account's access token leaves the device only after the server's
   unauthenticated `GET /auth/config` names the account's own issuer and client, exactly, and no
   scope the account's sign-in does not ask for (S-ID-2, `signin::trusts`). It goes only to
@@ -179,12 +187,15 @@ signing in, with no code (`keeper-core/src/hq/signin.rs`):
 - **Attestation** (Q109-03 a). A credential that came from a sign-in is re-attested six days into
   the server's seven-day window (`signin::Bound::due_at_ms`), with a freshly minted token. A
   signed-out account does not attest; the credential lapses, and the next sign-in adopts it back.
-  A refusal of the sign-in token (`hq.signin.stale`, `.replayed`, …), an unreachable server or a
-  race is tried again ten minutes later, after asking the server again whether the device is
-  known. Attesting stops only when the server no longer knows the device (401
-  `hq.device_unknown`: discovery then marks it removed), when it never came from a sign-in (409
-  `hq.attest.not_enrolled`: an enrolment adopts it), or on a 403 (the person or the app is not one
-  the server takes; the sign-in after the lapse says why).
+  Attesting stops only on an answer about the device itself: the server no longer knows it (401
+  `hq.device_unknown`: discovery then marks it removed), it never came from a sign-in (409
+  `hq.attest.not_enrolled`: an enrolment adopts it), or it is another person's (403
+  `hq.attest.other_person`). Anything else — a refused sign-in token (`hq.signin.stale`,
+  `.replayed`, …), a person, app or role an administrator can restore (`hq.not_a_person`,
+  `hq.signin.client`, `hq.signin.role`), a 403 that is not keeper-hq's (a proxy's page), an
+  unreachable server — is tried again after ten minutes, doubling at each one in a row up to six
+  hours; a 401 also asks the server again whether the device is known. Settings says why under the
+  signed-in line until an attestation goes through.
 - **Settings.** For a person keeper can sign in for, *Agents server* shows no code field and no
   **Add a device**: it says how this device stands with signing in, and lists **New devices** —
   the server's notices of the person's other devices signing in, being adopted or pairing
