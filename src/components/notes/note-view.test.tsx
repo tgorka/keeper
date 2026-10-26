@@ -3,7 +3,9 @@
  * `NoteEditor`: what each one draws, that only Note and Source take a caret,
  * and that the choice outlives the editor it was made in.
  */
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { forceParsing } from "@codemirror/language";
+import { EditorView } from "@codemirror/view";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
 import { settleNoteEditorBoot } from "@/test/note-editor-boot";
@@ -64,6 +66,15 @@ async function mounted(): Promise<void> {
   render(<NoteEditor vaultId="v1" noteId="note-7" />);
   await settleNoteEditorBoot();
   await waitFor(() => expect(editorContent()?.textContent).toContain("ship"));
+  // With its parse finished, as CodeMirror's background parse finishes it. The
+  // first parse stops at a 20 ms budget that a busy host overruns even on this
+  // short note, and what Note draws is only settled once the tree is whole.
+  const view = EditorView.findFromDOM(editorContent() as HTMLElement);
+  expect(view, "no EditorView behind the note").not.toBeNull();
+  act(() => {
+    const parsed = view as EditorView;
+    forceParsing(parsed, parsed.state.doc.length, Number.POSITIVE_INFINITY);
+  });
 }
 
 function editorContent(): HTMLElement | null {

@@ -17,7 +17,7 @@
 
 import { undo, undoDepth } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { ensureSyntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, forceParsing, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -37,7 +37,7 @@ vi.mock("@/components/notes/editor/media-block-host", () => ({
 
 /** What the note editor builds, minus the editing extensions: the grammar and
  *  the decoration layer, which is the pair DW-165 lives in. */
-function realState(doc: string): EditorState {
+function assembly(doc: string): EditorState {
   return EditorState.create({
     doc,
     extensions: [
@@ -45,6 +45,28 @@ function realState(doc: string): EditorState {
       livePreview({ vaultId: "vault-1", assetUrl: (rel) => rel, onOpenLink: () => {} }),
     ],
   });
+}
+
+/** The assembly as the editor holds it once its parse has reached the end. The
+ *  first parse stops at a 20 ms budget that a busy host overruns even on these
+ *  few lines, and its background finish is not something these tests wait for;
+ *  so it is finished here, and handed on the way the background parser does: a
+ *  transaction that changes neither the text nor the selection. */
+function realState(doc: string): EditorState {
+  const state = assembly(doc);
+  ensureSyntaxTree(state, state.doc.length, Number.POSITIVE_INFINITY);
+  return state.update({}).state;
+}
+
+/** Finish a mounted preview's parse, as the background parser finishes it. The
+ *  mount returns once the view is built, which on a busy host is before the
+ *  first parse has reached the end of even a short document. */
+function parsed(host: HTMLElement): void {
+  const content = host.querySelector<HTMLElement>(".cm-content");
+  const view = content === null ? null : EditorView.findFromDOM(content);
+  expect(view, "no EditorView is mounted in that host").not.toBeNull();
+  const mounted = view as EditorView;
+  forceParsing(mounted, mounted.state.doc.length, Number.POSITIVE_INFINITY);
 }
 
 const MERMAID = "intro\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter\n";
@@ -112,6 +134,53 @@ describe("DW-165, fixed", () => {
   });
 });
 
+/**
+ * CodeMirror's first parse stops at a 20 ms budget and the rest lands later, in
+ * a transaction that changes neither the text nor the selection. A long note, or
+ * a busy machine, stops it short; a clock that leaps on every read during
+ * creation stops it short on every run.
+ */
+describe("a parse that finishes after the view is built", () => {
+  it("draws the diagram when the parse reaches the fence after the view is built", () => {
+    // The mermaid layer's half: the fence is drawn when the tree reaches it.
+    const start = Date.now();
+    let reads = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => start + 50 * reads++);
+    const state = assembly(MERMAID);
+    clock.mockRestore();
+    const view = new EditorView({ parent: document.createElement("div"), state });
+    // The arrangement, asserted: the fence is past where the first parse stopped.
+    expect(syntaxTreeAvailable(view.state, view.state.doc.length)).toBe(false);
+    expect(view.contentDOM.querySelector(".cm-mermaid-block")).toBeNull();
+
+    // The rest of the parse, as the background parser delivers it: no edit, no caret.
+    expect(forceParsing(view, view.state.doc.length, Number.POSITIVE_INFINITY)).toBe(true);
+
+    expect(view.contentDOM.querySelector(".cm-mermaid-block")).not.toBeNull();
+    expect(view.contentDOM.textContent).not.toContain("graph TD;");
+    view.destroy();
+  });
+
+  it("draws the text's marks when the parse reaches them after the view is built", () => {
+    // The renderer's half of the same late parse: what lies past where the first
+    // parse stopped is undecorated until the rest of the tree arrives, and then
+    // it is drawn, with no edit, no caret move and no scroll.
+    const start = Date.now();
+    let reads = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => start + 50 * reads++);
+    const state = assembly("# Title\n\nsome *emphasis*\n");
+    clock.mockRestore();
+    const view = new EditorView({ parent: document.createElement("div"), state });
+    expect(syntaxTreeAvailable(view.state, view.state.doc.length)).toBe(false);
+    expect(view.contentDOM.querySelector(".cm-lp-em")).toBeNull();
+
+    expect(forceParsing(view, view.state.doc.length, Number.POSITIVE_INFINITY)).toBe(true);
+
+    expect(view.contentDOM.querySelector(".cm-lp-em")?.textContent).toBe("emphasis");
+    view.destroy();
+  });
+});
+
 describe("mermaidFenceLine", () => {
   it("finds the fence with the same grammar the renderer reads", () => {
     expect(mermaidFenceLine(realState(MERMAID), ensureSyntaxTree)).toBe(3);
@@ -139,6 +208,7 @@ describe("mountMarkdownPreview", () => {
     });
 
     expect(preview.failure).toBeNull();
+    parsed(host);
     // The decoration layer's own classes, so this is the renderer and not a
     // second one that happens to produce similar HTML.
     expect(host.querySelector(".cm-lp-h1")).not.toBeNull();
@@ -180,6 +250,7 @@ describe("mountMarkdownPreview", () => {
     const preview = await mountMarkdownPreview(host, MERMAID, { vaultId: "vault-1" });
 
     expect(preview.failure).toBeNull();
+    parsed(host);
     expect(host.querySelector(".cm-mermaid-block")).not.toBeNull();
     preview.destroy();
   });
@@ -258,6 +329,7 @@ describe("mountMarkdownPreview, editable", () => {
     });
 
     expect(preview.failure).toBeNull();
+    parsed(host);
     expect(host.querySelector('[contenteditable="true"]')).not.toBeNull();
     expect(viewIn(host).state.readOnly).toBe(false);
     expect(host.querySelector(".cm-content")?.getAttribute("aria-label")).toBe("Note of log.md");

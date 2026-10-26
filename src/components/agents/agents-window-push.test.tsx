@@ -16,6 +16,7 @@ import type {
   HqStatusVm,
   PushOpenVm,
 } from "@/lib/ipc/client";
+import { hqStatusUnsubscribe } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 
 const mock = vi.hoisted(() => ({
@@ -184,7 +185,10 @@ describe("a tapped notification in the Agents window", () => {
     await waitFor(() =>
       expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Half a thought"),
     );
-    expect(screen.getByRole("combobox", { name: "Agent" })).toHaveTextContent("Researcher");
+    // The picker renders once the agents are read again, a commit after the words.
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Agent" })).toHaveTextContent("Researcher"),
+    );
 
     // Cancel is the person leaving them.
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -246,6 +250,9 @@ describe("a tapped notification in the Agents window", () => {
     act(() => mock.status?.({} as HqStatusVm));
     expect(await screen.findByRole("alert")).toHaveTextContent("beta is not open to this device");
     expect(mock.open).toHaveBeenCalledTimes(2);
+    // The wait ends when its status subscription does, in the refusal's effect
+    // cleanup, which React runs after the alert is on screen.
+    await waitFor(() => expect(hqStatusUnsubscribe).toHaveBeenCalledWith("status"));
     // A refusal is not waited on: the status moving asks nothing more.
     act(() => mock.status?.({} as HqStatusVm));
     act(() => mock.list?.({ ops: [{ op: "reset", rows: [row(HELD.sessionId)] }], total: 1 }));

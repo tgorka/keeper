@@ -1746,8 +1746,15 @@ export function livePreview(options: LivePreviewOptions): Extension {
 
       update(update: ViewUpdate): void {
         // Selection changes matter as much as document changes here: moving the
-        // caret is what reveals and re-hides a line's source.
-        if (update.docChanged || update.selectionSet || update.viewportChanged) {
+        // caret is what reveals and re-hides a line's source. And the tree: the
+        // first parse stops at its time budget, and the rest arrives in an update
+        // that changes nothing else, so text past where it stopped would stay raw.
+        if (
+          update.docChanged ||
+          update.selectionSet ||
+          update.viewportChanged ||
+          syntaxTree(update.startState) !== syntaxTree(update.state)
+        ) {
           this.decorations = buildDecorations(update.view, options);
         }
       }

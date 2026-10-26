@@ -810,6 +810,10 @@ describe("FilesPane keyboard navigation", () => {
         .getAllByRole("treeitem")
         .map((row) => row.getAttribute("tabindex"));
 
+    // Both profile rows first: the tree is on screen a commit before its rows,
+    // and the claim is about the rows (see `focusFirstRowOfTwo`).
+    await screen.findByRole("treeitem", { name: "Vault" });
+    await screen.findByRole("treeitem", { name: "Field" });
     // Tab reaches the tree once; the arrows move inside it. Two hundred files
     // must not be two hundred Tab presses.
     expect(rows()).toEqual(["0", "-1"]);
@@ -3554,6 +3558,46 @@ describe("FilesPane — the tree stays where you left it", () => {
     expect(asked.filter((call) => call === "01VAULT:Notes")).toHaveLength(1);
   });
 
+  it("keeps the tree when Refresh answers between the failed list's render and its effects", async () => {
+    // The restore is a passive effect, and React 19 yields to the host between a
+    // commit and its passive effects. A Refresh pressed while the first call is
+    // still out can be answered in that gap: the failed call's empty list is on
+    // screen and its restore has not run yet. That restore must judge the list it
+    // rendered with, not the answer that came after it, or it reads every
+    // remembered profile as deleted and forgets the tree.
+    vaultTree();
+    // The project's TypeScript lib predates `Promise.withResolvers`.
+    let fail: (error: Error) => void = () => {};
+    let answer: (list: SyncProfileVm[]) => void = () => {};
+    syncProfiles
+      .mockReturnValueOnce(
+        new Promise<SyncProfileVm[]>((_, reject) => {
+          fail = reject;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<SyncProfileVm[]>((resolve) => {
+          answer = resolve;
+        }),
+      );
+    remembered([nodeKey("01VAULT", "")]);
+    render(<FilesPane />);
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    // A DOM mutation's observers run as a microtask once the commit's task ends,
+    // which is before the host gives React its next task for the passive effects.
+    const gap = new MutationObserver(() => {
+      if (!document.body.textContent?.includes(FILES_NO_PROFILES_SENTENCE)) return;
+      gap.disconnect();
+      answer([profile({ id: "01VAULT", name: "Vault" })]);
+    });
+    gap.observe(document.body, { childList: true, subtree: true, characterData: true });
+    fail(new Error("the sync engine is not running"));
+
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+    expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")]));
+  });
+
   it("still re-reads on every later Refresh, because Refresh means ask again", async () => {
     // The other half, and the reason the skip lives in the restore rather than
     // in `load`: a cache check inside `load` would make Refresh a no-op, which
@@ -3666,6 +3710,9 @@ describe("FilesPane — the tree is a column", () => {
     ]);
     render(<FilesPane />);
     const tree = await screen.findByRole("tree", { name: FILES_TREE_LABEL });
+    // Both rows, not just the tree: the tree is on screen a commit before them.
+    await screen.findByRole("treeitem", { name: "Vault" });
+    await screen.findByRole("treeitem", { name: "Field" });
     expect(within(tree).getAllByRole("treeitem")).toHaveLength(2);
 
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));

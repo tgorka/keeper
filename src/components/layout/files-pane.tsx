@@ -1286,14 +1286,20 @@ export function FilesPane() {
    * sync engine could not be reached has not been deleted at all, and dropping
    * someone's expansion over a call that failed would be a worse defect than
    * the one the restore exists to fix. Empty-because-broken forgets nothing.
+   *
+   * State, set in the same update as `setProfiles`, and never a ref. The restore
+   * below runs as a passive effect, which can run after a later answer has
+   * landed: a ref read there would pair the failed first call's empty list with
+   * a Refresh's `true`, and forget every remembered folder as "deleted". As
+   * state, each restore effect sees the `answered` of its own render.
    */
-  const answered = useRef(false);
+  const [answered, setAnswered] = useState(false);
   useEffect(() => {
     let live = true;
     syncProfiles()
       .then((list) => {
         if (live) {
-          answered.current = true;
+          setAnswered(true);
           setProfiles(list);
         }
       })
@@ -1396,7 +1402,7 @@ export function FilesPane() {
    */
   const restored = useRef(false);
   useEffect(() => {
-    if (restored.current || profiles === null || !answered.current) {
+    if (restored.current || profiles === null || !answered) {
       return;
     }
     restored.current = true;
@@ -1412,7 +1418,7 @@ export function FilesPane() {
         load(profileId, nodeKeySubpath(key));
       }
     }
-  }, [profiles, load]);
+  }, [profiles, answered, load]);
 
   const toggle = useCallback(
     (profileId: string, subpath: string) => {
@@ -1436,7 +1442,7 @@ export function FilesPane() {
   const refresh = useCallback(() => {
     syncProfiles()
       .then((list) => {
-        answered.current = true;
+        setAnswered(true);
         setProfiles(list);
       })
       .catch(logFailure("files.refreshProfiles"));
