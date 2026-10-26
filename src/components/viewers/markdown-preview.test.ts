@@ -17,7 +17,7 @@
 
 import { undo, undoDepth } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { ensureSyntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, forceParsing, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -37,7 +37,7 @@ vi.mock("@/components/notes/editor/media-block-host", () => ({
 
 /** What the note editor builds, minus the editing extensions: the grammar and
  *  the decoration layer, which is the pair DW-165 lives in. */
-function realState(doc: string): EditorState {
+function assembly(doc: string): EditorState {
   return EditorState.create({
     doc,
     extensions: [
@@ -45,6 +45,10 @@ function realState(doc: string): EditorState {
       livePreview({ vaultId: "vault-1", assetUrl: (rel) => rel, onOpenLink: () => {} }),
     ],
   });
+}
+
+function realState(doc: string): EditorState {
+  return assembly(doc);
 }
 
 const MERMAID = "intro\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter\n";
@@ -108,6 +112,34 @@ describe("DW-165, fixed", () => {
       }),
     });
     expect(view.contentDOM).not.toBeNull();
+    view.destroy();
+  });
+});
+
+/**
+ * CodeMirror's first parse stops at a 20 ms budget and the rest lands later, in
+ * a transaction that changes neither the text nor the selection. A long note, or
+ * a busy machine, stops it short; a clock that leaps on every read during
+ * creation stops it short on every run.
+ */
+describe("a parse that finishes after the view is built", () => {
+  it("draws the diagram when the parse reaches the fence after the view is built", () => {
+    // The mermaid layer's half: the fence is drawn when the tree reaches it.
+    const start = Date.now();
+    let reads = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => start + 50 * reads++);
+    const state = assembly(MERMAID);
+    clock.mockRestore();
+    const view = new EditorView({ parent: document.createElement("div"), state });
+    // The arrangement, asserted: the fence is past where the first parse stopped.
+    expect(syntaxTreeAvailable(view.state, view.state.doc.length)).toBe(false);
+    expect(view.contentDOM.querySelector(".cm-mermaid-block")).toBeNull();
+
+    // The rest of the parse, as the background parser delivers it: no edit, no caret.
+    expect(forceParsing(view, view.state.doc.length, Number.POSITIVE_INFINITY)).toBe(true);
+
+    expect(view.contentDOM.querySelector(".cm-mermaid-block")).not.toBeNull();
+    expect(view.contentDOM.textContent).not.toContain("graph TD;");
     view.destroy();
   });
 });

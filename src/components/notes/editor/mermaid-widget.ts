@@ -254,10 +254,16 @@ export function mermaidLayer(): Extension {
       return { fences, decorations: paint(fences, state) };
     },
     update(value, transaction) {
-      if (!transaction.docChanged && transaction.selection === undefined) {
+      // The tree as well as the text: the first parse stops at its time budget
+      // and the rest arrives later in a transaction that changes neither, so a
+      // fence past where it stopped would otherwise stay source until an edit.
+      const rescan =
+        transaction.docChanged ||
+        syntaxTree(transaction.startState) !== syntaxTree(transaction.state);
+      if (!rescan && transaction.selection === undefined) {
         return value;
       }
-      const fences = transaction.docChanged ? mermaidFences(transaction.state) : value.fences;
+      const fences = rescan ? mermaidFences(transaction.state) : value.fences;
       return { fences, decorations: paint(fences, transaction.state) };
     },
     provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
