@@ -15,6 +15,7 @@
  * the note came out blank.
  */
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { fireEvent } from "@testing-library/dom";
@@ -49,6 +50,11 @@ afterEach(() => {
  * about *source*, not about the render, and would pass for a renderer that did
  * nothing at all. Every document below therefore ends with a spare line, and
  * the caret goes there.
+ *
+ * And with the parse finished. CodeMirror's first parse stops at a 20 ms budget
+ * that a busy host overruns even on these few lines, and the rest is a
+ * background parse no test here waits for; it is finished here, and handed to
+ * the view the way that parse hands it over.
  */
 function render(doc: string): EditorView {
   const parent = document.createElement("div");
@@ -64,6 +70,7 @@ function render(doc: string): EditorView {
       ],
     }),
   });
+  forceParsing(view, view.state.doc.length, Number.POSITIVE_INFINITY);
   view.dispatch({ selection: { anchor: view.state.doc.length } });
   views.push(view);
   return view;
