@@ -31,7 +31,7 @@
 //! - **The risk is said where a drive is ticked** ([`WARNING`]; D-34's
 //!   accepted risk, R-HQ-79).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -132,17 +132,32 @@ fn people(source: &Source) -> BTreeSet<String> {
     .collect()
 }
 
-/// This person may change the session's drives: a person member (`owner`
-/// or `person`) of a session that is not archived (V17).
+/// The one rule for who has the drive control, wherever it is drawn — the
+/// session header, `/drives`, the list's right-click menu: a person member
+/// (`owner` or `person`, as V17 requires) of a session that is not archived.
+pub(crate) fn may_choose(role: &str, archived: bool) -> bool {
+    !archived && matches!(role, "owner" | "person")
+}
+
+/// This person may change the session's drives ([`may_choose`]).
 fn person_member(source: &Source, session_id: &str, session: &SessionRow) -> bool {
-    !session.archived
-        && read(
-            source,
-            "SELECT role FROM session_members WHERE session_id = ?1 AND actor_id = ?2",
-            &[Value::from(session_id), Value::from(source.actor.as_str())],
-        )
-        .first()
-        .is_some_and(|row| matches!(text(row, "role"), "owner" | "person"))
+    let role = read(
+        source,
+        "SELECT role FROM session_members WHERE session_id = ?1 AND actor_id = ?2",
+        &[Value::from(session_id), Value::from(source.actor.as_str())],
+    );
+    role.first()
+        .is_some_and(|row| may_choose(text(row, "role"), session.archived))
+}
+
+/// The agents of `source`'s database that say what drives they read: an
+/// agent none of whose instances says has no drive control anywhere.
+pub(crate) fn agents_saying(source: &Source) -> HashSet<String> {
+    read(source, "SELECT actor_id, drives FROM agent_profiles", &[])
+        .iter()
+        .filter(|row| json(row, "drives").is_array())
+        .filter_map(|row| opt_text(row, "actor_id"))
+        .collect()
 }
 
 /// The drives the agent offers — every name any of its `agent_profiles`
@@ -432,15 +447,16 @@ type Refused = (Rejection, Option<Vec<String>>);
 /// Whether a selection written here waits for the server, and its newest
 /// standing refusal.
 fn delivery(source: &Source, session_id: &str) -> (bool, Option<Refused>) {
-    let writes = match source.replica.row_writes(TABLE, session_id) {
+    let writes = match source.replica.row_writes(TABLE, session_id, None) {
         Ok(writes) => writes,
         Err(error) => {
             tracing::debug!(database = %source.database, %error, "the drives' delivery could not be read");
             return (false, None);
         }
     };
+    let pending = !writes.pending.is_empty();
     let Some(newest) = writes.refused.into_iter().next() else {
-        return (writes.pending, None);
+        return (pending, None);
     };
     let proposed = source
         .replica
@@ -458,7 +474,7 @@ fn delivery(source: &Source, session_id: &str) -> (bool, Option<Refused>) {
                 .then(|| names(&values, "drives"))
             })
         });
-    (writes.pending, Some((newest.rejection, proposed)))
+    (pending, Some((newest.rejection, proposed)))
 }
 
 /// Every drive keeper knows of in the session, judged, and the agent's
@@ -614,25 +630,30 @@ pub fn set(
     } else {
         drives.retain(|ticked| ticked != drive);
     }
-    let standing: Vec<String> = source
+    // The newest selection decides: every earlier one of this row — refused,
+    // or still waiting and so not refused yet — is set aside by this write,
+    // in the same step of the replica's owner (as a rename is, 109.16).
+    let earlier: Vec<String> = source
         .replica
-        .row_writes(TABLE, session_id)
-        .map(|writes| writes.refused.into_iter().map(|r| r.commit_id).collect())
+        .row_writes(TABLE, session_id, None)
+        .map(|writes| {
+            writes
+                .refused
+                .into_iter()
+                .map(|r| r.commit_id)
+                .chain(writes.pending)
+                .collect()
+        })
         .unwrap_or_default();
     let row = RowOp::Upsert {
         table: TABLE.to_owned(),
         values: authored(source, selection(session_id, &drives, now_ms)),
         base_version: version.filter(|v| *v > 0),
     };
-    let commit = source
+    source
         .replica
-        .mutate(vec![row])
+        .mutate_superseding(vec![row], earlier)
         .map_err(|error| DriveRefused(error.to_string()))?;
-    if !standing.is_empty() {
-        if let Err(error) = source.replica.supersede(standing, &commit) {
-            tracing::debug!(database = %source.database, %error, "earlier drive refusals were not set aside");
-        }
-    }
     source.replica.sync_now();
     Ok(())
 }

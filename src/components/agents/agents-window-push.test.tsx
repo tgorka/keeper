@@ -88,6 +88,7 @@ function row(sessionId: string): AgentSessionRowVm {
     agentMark: "R",
     archived: false,
     lastActivityMs: 1780000000000,
+    choosesDrives: false,
   };
 }
 

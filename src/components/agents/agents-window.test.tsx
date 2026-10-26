@@ -84,6 +84,7 @@ const row = (database: string, archived = false) => ({
   agentMark: "A",
   archived,
   lastActivityMs: 1780000000000,
+  choosesDrives: false,
   attention: "working" as const,
 });
 function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentSessionViewVm {

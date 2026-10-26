@@ -12,6 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Input } from "@/components/ui/input";
 import type { AgentSessionRowVm } from "@/lib/ipc/client";
 import { agentSessionArchive, agentSessionRename, agentSessionUnarchive } from "@/lib/ipc/client";
+import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 // The editor opens with the current title selected, so typing replaces it and
@@ -136,6 +137,11 @@ export function SessionRowMenu({
           <ContextMenuItem onSelect={() => void copy(row.sessionId)}>Copy id</ContextMenuItem>
           <ContextMenuItem onSelect={() => void copy(row.displayName)}>Copy name</ContextMenuItem>
           <ContextMenuItem onSelect={() => setDetails(true)}>Details</ContextMenuItem>
+          {row.choosesDrives && (
+            <ContextMenuItem onSelect={() => agentSessionsStore.getState().openDrives(row)}>
+              Drives…
+            </ContextMenuItem>
+          )}
           <ContextMenuSeparator />
           <ContextMenuItem
             onSelect={() =>

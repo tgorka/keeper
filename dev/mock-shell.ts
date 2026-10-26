@@ -6220,6 +6220,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentName: sessionScenario === "names" ? "Nixi" : "Assistant",
           agentMark: sessionScenario === "names" ? "N" : "A",
           archived: false,
+          choosesDrives: drivesScenario !== "nonmember",
           lastActivityMs: Date.now(),
           attention: "needsYou",
         },
@@ -6237,6 +6238,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentName: "Assistant",
           agentMark: "A",
           archived: false,
+          choosesDrives: drivesScenario !== "nonmember",
           lastActivityMs: Date.now() - 3600000,
           attention: "needsYou",
         },
@@ -6254,6 +6256,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentName: "Assistant",
           agentMark: "A",
           archived: true,
+          choosesDrives: false,
           lastActivityMs: Date.now() - 86400000,
         },
       ];
@@ -7140,6 +7143,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       agentName: choice.agentName,
       agentMark: choice.agentMark,
       archived: false,
+      choosesDrives: false,
       lastActivityMs: Date.now(),
     };
     sessionRows.unshift(row);
@@ -9723,6 +9727,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         agentName: "Researcher",
         agentMark: "R",
         archived: false,
+        choosesDrives: false,
         lastActivityMs: Date.now(),
       };
       sessionRows.unshift(row);

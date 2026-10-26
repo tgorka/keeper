@@ -41,6 +41,15 @@ interface AgentSessionsState {
    * whatever opened it, and keeps {@link newDraft}.
    */
   select: (target: AgentSessionRef | null) => void;
+  /**
+   * A session whose Drives menu was asked for from the list's right-click menu (109.23): the
+   * session opens and its view opens the menu once Rust's view carries the drives.
+   */
+  drivesFor: AgentSessionRef | null;
+  /** Open `target` and ask its view for its Drives menu. */
+  openDrives: (target: AgentSessionRef) => void;
+  /** The view opened the menu it was asked for. */
+  drivesShown: () => void;
   startNew: () => void;
   keepNewDraft: (draft: NewSessionDraft | null) => void;
 }
@@ -55,6 +64,7 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
   newSession: null,
   creating: false,
   newDraft: null,
+  drivesFor: null,
   apply: (batch) =>
     set((state) => {
       let rows = [...state.rows];
@@ -106,7 +116,13 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
       }
       return { rows, loaded: true, error: null };
     }),
-  select: (selected) => set({ selected, gone: null, newSession: null, creating: false }),
+  select: (selected) =>
+    set({ selected, gone: null, newSession: null, creating: false, drivesFor: null }),
+  openDrives: (target) => {
+    const selected = { database: target.database, sessionId: target.sessionId };
+    set({ selected, gone: null, newSession: null, creating: false, drivesFor: selected });
+  },
+  drivesShown: () => set({ drivesFor: null }),
   startNew: () => set({ selected: null, gone: null, newSession: null, creating: true }),
   keepNewDraft: (newDraft) => set({ newDraft }),
 }));

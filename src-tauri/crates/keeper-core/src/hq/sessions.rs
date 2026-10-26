@@ -119,6 +119,10 @@ pub struct AgentSessionRowVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attention: Option<AgentAttentionVm>,
+    /// This person has the session's drive control (109.23,
+    /// [`crate::hq::drives::may_choose`] and an agent that says what it
+    /// reads): the row's menu offers Drives….
+    pub chooses_drives: bool,
 }
 
 impl AgentSessionRowVm {
@@ -641,7 +645,7 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
         source,
         "SELECT s.id AS id, s.title AS title, s.status AS status, s.agent_actor AS agent_actor, \
          s.archived AS archived, s.last_activity_ms AS last_activity_ms, s.created_at_ms AS created_at_ms, s.trust AS trust, \
-         m.read_until AS read_until \
+         m.read_until AS read_until, m.role AS role \
          FROM session_members m JOIN sessions s ON s.id = m.session_id \
          WHERE m.actor_id = ?1",
         &[Value::from(source.actor.as_str())],
@@ -650,6 +654,7 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
         return Vec::new();
     }
     let needs = needs_you(source, now_ms);
+    let saying = super::drives::agents_saying(source);
     let working: HashSet<String> = read(source, "SELECT DISTINCT session_id FROM turn_chunks", &[])
         .iter()
         .filter_map(|row| opt_text(row, "session_id"))
@@ -719,6 +724,10 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
                 instances: instance_labels,
                 agent_mark: mark(&agent_name),
                 agent_name,
+                chooses_drives: super::drives::may_choose(
+                    text(row, "role"),
+                    truthy(row, "archived"),
+                ) && saying.contains(&agent),
                 agent_actor: agent,
                 archived: truthy(row, "archived"),
                 last_activity_ms: int(row, "last_activity_ms").unwrap_or(0),
@@ -1355,6 +1364,7 @@ mod tests {
             archived: false,
             last_activity_ms: at,
             attention: None,
+            chooses_drives: false,
         }
     }
 

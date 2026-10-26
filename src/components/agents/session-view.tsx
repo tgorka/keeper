@@ -38,7 +38,7 @@ import {
   hqStatusSubscribe,
   hqStatusUnsubscribe,
 } from "@/lib/ipc/client";
-import { agentSessionsStore } from "@/lib/stores/agent-sessions";
+import { agentSessionsStore, useAgentSessionsStore } from "@/lib/stores/agent-sessions";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import {
   ConversationStoresProvider,
@@ -64,6 +64,15 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const backButton = useRef<HTMLButtonElement>(null);
   const { phone } = useShellLayout();
   const { database, sessionId } = target;
+  // Drives… in the list's right-click menu asks for this view's menu; it opens once Rust's view
+  // says this person has the control, and only for this session.
+  const drivesFor = useAgentSessionsStore((state) => state.drivesFor);
+  const hasDrives = vm?.drives !== undefined;
+  useEffect(() => {
+    if (!hasDrives || drivesFor?.database !== database || drivesFor.sessionId !== sessionId) return;
+    setDrivesOpen(true);
+    agentSessionsStore.getState().drivesShown();
+  }, [hasDrives, drivesFor, database, sessionId]);
   const pinned = useRef(true);
   const previousHeight = useRef<number | null>(null);
 

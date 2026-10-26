@@ -211,6 +211,12 @@ fn only_a_person_member_of_a_live_session_has_the_control() {
             "role {role:?}, archived {archived}: control {shown:?}"
         );
         assert_eq!(available(&alpha, SESSION, &row(&alpha)), has);
+        // The list's right-click menu offers Drives… on the same rule.
+        let listed = sessions::rows(&alpha, sessions::now_ms())
+            .into_iter()
+            .find(|r| r.session_id == SESSION)
+            .is_some_and(|r| r.chooses_drives);
+        assert_eq!(listed, has, "row menu: role {role:?}, archived {archived}");
         let written = set(&alpha, SESSION, "alpha", true, &sources(&alpha), 5);
         assert_eq!(written.is_ok(), has, "role {role:?}, archived {archived}");
         if !has {
@@ -232,8 +238,18 @@ fn an_agent_that_has_not_said_what_it_reads_gets_no_control() {
         None,
         "an instance older than the column"
     );
+    let in_list = |a: &Source| {
+        sessions::rows(a, sessions::now_ms())
+            .into_iter()
+            .any(|r| r.session_id == SESSION && r.chooses_drives)
+    };
+    assert!(!in_list(&alpha), "no Drives… in the row menu either");
     put(&alpha, vec![profile("nixie.new", AGENT, Some(&[]))]);
     let vm = drives_vm(&alpha, &sources).expect("an empty list is said");
+    assert!(
+        in_list(&alpha),
+        "said, even empty: the row menu offers Drives…"
+    );
     assert_eq!(
         menu(&vm),
         [("alpha".to_owned(), false, false)],

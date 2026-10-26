@@ -23,4 +23,10 @@ agentMark: string, archived: boolean, lastActivityMs: number,
  * Needs you, failed, working or done since the person last read it;
  * absent for a session in none of them.
  */
-attention?: AgentAttentionVm, };
+attention?: AgentAttentionVm, 
+/**
+ * This person has the session's drive control (109.23,
+ * [`crate::hq::drives::may_choose`] and an agent that says what it
+ * reads): the row's menu offers Drives….
+ */
+choosesDrives: boolean, };

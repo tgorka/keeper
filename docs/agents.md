@@ -239,7 +239,9 @@ appends the session number. It is a display label, not another identity or stora
 title uses the handle. Renaming changes only the title, never the session id or handle.
 
 Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
-menu: **Rename**, **Copy id**, **Copy name**, **Details**, and **Archive** (or **Unarchive**).
+menu: **Rename**, **Copy id**, **Copy name**, **Details**, **Drives…** (only where you may
+choose the session's drives; it opens the session and its Drives menu, see § Live answers) and
+**Archive** (or **Unarchive**).
 Rename edits inline with the current title selected, so typing replaces it; Save queues the title
 on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
 local enqueue, not server acceptance: the row says it is waiting until the server settles the
@@ -426,7 +428,8 @@ replica's per-row outcome record, until the next selection sets it aside. The me
 the header repeats once a tick takes the selection from none to one, what D-34's accepted risk
 allows (R-HQ-79): once a drive is ticked the agent may read it and send what it reads to the web
 without asking, even after the chat has read outside content. Only a person member (`owner` or
-`person`) of a session that is not archived gets the control or `/drives`; anyone else sees none,
+`person`) of a session that is not archived gets the control, `/drives` and **Drives…** in the
+Agents list's right-click menu, which opens the session and its menu; anyone else sees none of them,
 and an agent that has not said what it reads gets no control. Fixtures: the default mock offers
 `alpha` and `gamma`, refuses `beta` by the audience rule and `omega` as another agent's, and its
 fake server refuses a tick of `gamma` a moment later; `?drives=nonmember` draws no control;
