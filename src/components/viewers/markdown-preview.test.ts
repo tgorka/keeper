@@ -142,6 +142,25 @@ describe("a parse that finishes after the view is built", () => {
     expect(view.contentDOM.textContent).not.toContain("graph TD;");
     view.destroy();
   });
+
+  it("draws the text's marks when the parse reaches them after the view is built", () => {
+    // The renderer's half of the same late parse: what lies past where the first
+    // parse stopped is undecorated until the rest of the tree arrives, and then
+    // it is drawn, with no edit, no caret move and no scroll.
+    const start = Date.now();
+    let reads = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => start + 50 * reads++);
+    const state = assembly("# Title\n\nsome *emphasis*\n");
+    clock.mockRestore();
+    const view = new EditorView({ parent: document.createElement("div"), state });
+    expect(syntaxTreeAvailable(view.state, view.state.doc.length)).toBe(false);
+    expect(view.contentDOM.querySelector(".cm-lp-em")).toBeNull();
+
+    expect(forceParsing(view, view.state.doc.length, Number.POSITIVE_INFINITY)).toBe(true);
+
+    expect(view.contentDOM.querySelector(".cm-lp-em")?.textContent).toBe("emphasis");
+    view.destroy();
+  });
 });
 
 describe("mermaidFenceLine", () => {
