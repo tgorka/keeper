@@ -154,9 +154,11 @@ struct Server {
     devices: Vec<Device>,
     spent: Vec<String>,
     minted: usize,
-    /// Refusals `/clients/self/attest` answers first, in order: the status
-    /// and the body as sent.
+    /// What `/clients/self/attest` answers first, in order: the status and
+    /// the body as sent, or a 200 for the ordinary answer.
     attest_refusals: Vec<(u16, String)>,
+    /// The attestation window the server states; a week unless set.
+    attest_window_ms: Option<i64>,
     /// Every revocation: the client revoked and the bearer that asked.
     revoked: Vec<(String, String)>,
     /// Held requests: `"before <path>"` waits before answering anything,
@@ -251,13 +253,19 @@ fn answer(server: &mut Server, seen: &Seen) -> Reply {
         ("POST", "/clients/self/attest") => {
             if !server.attest_refusals.is_empty() {
                 let (status, body) = server.attest_refusals.remove(0);
-                return Reply::json(status, &body);
+                if status != 200 {
+                    return Reply::json(status, &body);
+                }
             }
             let token = seen.json()["deviceToken"].as_str().unwrap_or("").to_owned();
+            let window = server.attest_window_ms.unwrap_or(604_800_000);
             match server.devices.iter().find(|d| d.token == token) {
                 Some(d) if d.bound => Reply::json(
                     200,
-                    r#"{"clientId":"x","attestedAtMs":1000,"lapsesAtMs":604801000}"#,
+                    &format!(
+                        r#"{{"clientId":"x","attestedAtMs":1000,"lapsesAtMs":{}}}"#,
+                        1000 + window
+                    ),
                 ),
                 Some(_) => Reply::json(409, r#"{"error":"hq.attest.not_enrolled"}"#),
                 None => Reply::json(401, r#"{"error":"hq.device_unknown"}"#),
@@ -856,11 +864,34 @@ async fn a_new_sign_in_after_a_refused_refresh_enrols() {
 
 // ---- R1096-04: a refused sign-in proof is retried; a gone device is not ---
 
-/// Let the ten-minute retry pass on tokio's clock, then go on in real time.
-async fn past_the_retry() {
+/// `wall` passes on the wall clock and `awake` on tokio's — less when the
+/// computer slept — then the test goes on in real time.
+async fn pass(hq: &Hq, wall: Duration, awake: Duration) {
+    hq.advance_wall(wall);
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(601)).await;
+    tokio::time::advance(awake).await;
     tokio::time::resume();
+}
+
+/// Let the ten-minute retry pass, awake.
+async fn past_the_retry(hq: &Hq) {
+    let ten = Duration::from_secs(601);
+    pass(hq, ten, ten).await;
+}
+
+/// Start `world`'s service with the first attestation's answer held until
+/// the start-up discovery has been applied, so the rediscovery a refusal
+/// asks for is never folded into the start-up one (R1096-10).
+async fn start_after_discovery(world: &World) -> Arc<Hq> {
+    let release = world.hold("before", "/clients/self/attest");
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "the start-up discovery applied", |s| {
+        !s.databases.is_empty()
+    })
+    .await;
+    drop(release);
+    hq
 }
 
 #[tokio::test]
@@ -868,12 +899,11 @@ async fn an_attestation_refused_for_its_sign_in_token_is_tried_again() {
     let world = World::new(true);
     world.holds("device-token-a", "ana.1", Some(due()), false);
     lock(&world.state).attest_refusals = vec![refusal(401, "hq.signin.stale")];
-    let hq = world.hq();
-    hq.start().await.expect("starts");
+    let hq = start_after_discovery(&world).await;
     world.until_asked("/clients/self/attest", 1).await;
     // The device itself is asked about again, and is still known.
     world.until_asked("/databases", 2).await;
-    past_the_retry().await;
+    past_the_retry(&hq).await;
     world.until_asked("/clients/self/attest", 2).await;
     for _ in 0..100 {
         if world
@@ -900,11 +930,10 @@ async fn an_attestation_answered_device_unknown_stops() {
     let world = World::new(true);
     world.holds("device-token-a", "ana.1", Some(due()), false);
     lock(&world.state).attest_refusals = vec![refusal(401, "hq.device_unknown")];
-    let hq = world.hq();
-    hq.start().await.expect("starts");
+    let hq = start_after_discovery(&world).await;
     world.until_asked("/clients/self/attest", 1).await;
     world.until_asked("/databases", 2).await;
-    past_the_retry().await;
+    past_the_retry(&hq).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(world.asked("/clients/self/attest").len(), 1);
 }
@@ -1044,7 +1073,7 @@ async fn a_403_that_is_not_about_the_device_is_retried_on_a_growing_wait_and_sai
     .await;
     assert_eq!(hq.status().borrow().sign_in.state, HqSignInState::Enrolled);
     // Ten minutes on: asked again.
-    past_the_retry().await;
+    past_the_retry(&hq).await;
     status_until(&hq, "the role refusal said", |s| {
         s.sign_in
             .sentence
@@ -1054,14 +1083,14 @@ async fn a_403_that_is_not_about_the_device_is_retried_on_a_growing_wait_and_sai
     .await;
     assert_eq!(world.asked("/clients/self/attest").len(), 2);
     // Twenty minutes now: ten more is not enough.
-    past_the_retry().await;
+    past_the_retry(&hq).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         world.asked("/clients/self/attest").len(),
         2,
         "the wait grew"
     );
-    past_the_retry().await;
+    past_the_retry(&hq).await;
     status_until(&hq, "renewed", |s| {
         !s.sign_in
             .sentence
@@ -1094,8 +1123,78 @@ async fn a_403_naming_another_persons_device_stops_attesting_and_is_said() {
             .is_some_and(|s| s.contains("signed in by someone else"))
     })
     .await;
-    past_the_retry().await;
-    past_the_retry().await;
+    past_the_retry(&hq).await;
+    past_the_retry(&hq).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(world.asked("/clients/self/attest").len(), 1);
+}
+
+// ---- R1096-09: the backoff is a schedule on the wall clock ----------------
+
+/// Wait for the `n`th attestation, refused with `code`, to be said.
+async fn refused_attestation(world: &World, hq: &Hq, n: usize, code: &str) {
+    world.until_asked("/clients/self/attest", n).await;
+    status_until(hq, code, |s| {
+        s.sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|s| s.contains(code))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_long_retry_is_not_slept_through_while_the_computer_sleeps() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(due()), false);
+    // Consecutive codes differ, so each refusal is seen on its own.
+    lock(&world.state).attest_refusals = [
+        "hq.signin.role",
+        "hq.signin.client",
+        "hq.not_a_person",
+        "hq.signin.role",
+    ]
+    .into_iter()
+    .map(|code| refusal(403, code))
+    .collect();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    refused_attestation(&world, &hq, 1, "hq.signin.role").await;
+    let minutes = |m: u64| Duration::from_secs(m * 60 + 1);
+    pass(&hq, minutes(10), minutes(10)).await;
+    refused_attestation(&world, &hq, 2, "hq.signin.client").await;
+    pass(&hq, minutes(20), minutes(20)).await;
+    refused_attestation(&world, &hq, 3, "hq.not_a_person").await;
+    pass(&hq, minutes(40), minutes(40)).await;
+    refused_attestation(&world, &hq, 4, "hq.signin.role").await;
+    // The next wait is 80 minutes. The computer sleeps through them, awake
+    // for only one hour of it: the attestation still goes at the next wake.
+    pass(&hq, minutes(80), minutes(60)).await;
+    world.until_asked("/clients/self/attest", 5).await;
+}
+
+#[tokio::test]
+async fn a_success_starts_the_retry_schedule_over() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(due()), false);
+    {
+        let mut server = lock(&world.state);
+        // Refused, renewed, refused again.
+        server.attest_refusals = vec![
+            refusal(403, "hq.signin.role"),
+            (200, String::new()),
+            refusal(403, "hq.signin.client"),
+        ];
+        // A window of 0.7 s: the renewal falls due again at once.
+        server.attest_window_ms = Some(700);
+    }
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    refused_attestation(&world, &hq, 1, "hq.signin.role").await;
+    past_the_retry(&hq).await;
+    world.until_asked("/clients/self/attest", 2).await;
+    refused_attestation(&world, &hq, 3, "hq.signin.client").await;
+    // Ten minutes again, not the twenty that came after the first refusal.
+    past_the_retry(&hq).await;
+    world.until_asked("/clients/self/attest", 4).await;
 }

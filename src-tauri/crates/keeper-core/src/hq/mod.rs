@@ -270,6 +270,9 @@ pub struct Hq {
     routes: Arc<dyn Routes>,
     /// The account's sign-in, which enrols this device ([`signin`]).
     sign_in: Arc<dyn signin::SignIn>,
+    /// How far tests moved the attestation timers' wall clock on.
+    #[cfg(test)]
+    wall_offset: std::sync::atomic::AtomicI64,
     device_name: String,
     device_host: Box<dyn Fn() -> String + Send + Sync>,
     /// Serialises every change of configuration. Never held across a request
@@ -379,6 +382,8 @@ impl Hq {
             opener,
             routes,
             sign_in,
+            #[cfg(test)]
+            wall_offset: std::sync::atomic::AtomicI64::new(0),
             device_name,
             device_host: Box::new(device_host),
             lifecycle: tokio::sync::Mutex::new(()),

@@ -194,7 +194,9 @@ signing in, with no code (`keeper-core/src/hq/signin.rs`):
   `.replayed`, …), a person, app or role an administrator can restore (`hq.not_a_person`,
   `hq.signin.client`, `hq.signin.role`), a 403 that is not keeper-hq's (a proxy's page), an
   unreachable server — is tried again after ten minutes, doubling at each one in a row up to six
-  hours; a 401 also asks the server again whether the device is known. Settings says why under the
+  hours, and back to ten minutes after a success; a 401 also asks the server again whether the
+  device is known. Every wait is kept on the wall clock and slept at most an hour at a time, so a
+  computer that slept through it attests at its next wake. Settings says why under the
   signed-in line until an attestation goes through.
 - **Settings.** For a person keeper can sign in for, *Agents server* shows no code field and no
   **Add a device**: it says how this device stands with signing in, and lists **New devices** —

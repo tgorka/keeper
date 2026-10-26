@@ -24,7 +24,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -286,13 +286,6 @@ pub(crate) struct Bound {
 }
 
 impl Bound {
-    pub(crate) fn now() -> Bound {
-        Bound {
-            attested_at_ms: now_ms(),
-            window_ms: ATTEST_WINDOW_MS,
-        }
-    }
-
     /// When keeper attests again: six sevenths into the window — six days
     /// of seven — so a day's slack outlasts a skewed clock or an offline
     /// evening, and no sooner, so a launch is not an attestation.
@@ -388,6 +381,25 @@ enum Attest {
     Later,
     /// The configuration or the credential moved on.
     Stop,
+}
+
+/// Sleep until `hq`'s wall clock reads `at_ms`, never more than
+/// [`ATTEST_TICK`] at a time: a monotonic sleep stops while the computer
+/// sleeps, so each wake reads the wall clock again. `false` once the service
+/// is gone.
+async fn sleep_until_wall(hq: &Weak<Hq>, at_ms: i64) -> bool {
+    loop {
+        let Some(service) = hq.upgrade() else {
+            return false;
+        };
+        let wait = at_ms.saturating_sub(service.wall_ms());
+        drop(service);
+        if wait <= 0 {
+            return true;
+        }
+        let wait = Duration::from_millis(u64::try_from(wait).unwrap_or(u64::MAX));
+        tokio::time::sleep(wait.min(ATTEST_TICK)).await;
+    }
 }
 
 fn notice_sentence(name: &str, host: Option<&str>, kind: EnrolmentKind) -> String {
@@ -738,7 +750,10 @@ impl Hq {
             actor_id: enrolled.discovery.actor_id,
             client_id: enrolled.discovery.client_id,
             name: self.device_name.clone(),
-            bound: Some(Bound::now()),
+            bound: Some(Bound {
+                attested_at_ms: self.wall_ms(),
+                window_ms: ATTEST_WINDOW_MS,
+            }),
         };
         let stored = serde_json::to_string(&record).map_err(json_sentence)?;
         self.platform.keychain_set(&key, &stored)?;
@@ -766,12 +781,33 @@ impl Hq {
         Ok(())
     }
 
+    /// The wall clock the attestation timers read, ms since the epoch. Tests
+    /// move it on as a computer asleep would ([`Hq::advance_wall`]).
+    pub(super) fn wall_ms(&self) -> i64 {
+        #[cfg(test)]
+        let offset = self.wall_offset.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let offset = 0;
+        now_ms().saturating_add(offset)
+    }
+
+    /// As if the computer slept through `by`: the wall clock moves on, the
+    /// monotonic one does not.
+    #[cfg(test)]
+    pub(super) fn advance_wall(&self, by: Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        self.wall_offset.fetch_add(by, Ordering::SeqCst);
+    }
+
     /// Keep a credential that came from a sign-in attested: wake when it is
     /// due ([`Bound::due_at_ms`]), attest, wait for the next. One refused or
     /// failed is tried again after [`ATTEST_RETRY`], doubling at each one in
     /// a row up to [`ATTEST_RETRY_MAX`], so a refusal that stands mints a
-    /// token a few times a day, not every ten minutes (R1096-08). Held with
-    /// the configuration's tasks, so a restart plans it again.
+    /// token a few times a day, not every ten minutes (R1096-08); a success
+    /// starts the schedule over. Every wait is measured on the wall clock
+    /// ([`sleep_until_wall`]), so a computer that slept does not sleep through
+    /// it (R1096-09). Held with the configuration's tasks, so a restart plans
+    /// it again.
     pub(super) fn schedule_attest(&self, inner: &mut Inner, bound: Bound) {
         let generation = inner.generation;
         let me = self.me.clone();
@@ -779,11 +815,8 @@ impl Hq {
             let mut bound = bound;
             let mut retry = ATTEST_RETRY;
             loop {
-                let wait = bound.due_at_ms().saturating_sub(now_ms());
-                if wait > 0 {
-                    let wait = Duration::from_millis(u64::try_from(wait).unwrap_or(u64::MAX));
-                    tokio::time::sleep(wait.min(ATTEST_TICK)).await;
-                    continue;
+                if !sleep_until_wall(&me, bound.due_at_ms()).await {
+                    return;
                 }
                 let Some(hq) = me.upgrade() else { return };
                 match hq.attest(generation).await {
@@ -792,8 +825,12 @@ impl Hq {
                         retry = ATTEST_RETRY;
                     }
                     Attest::Later => {
+                        let retry_ms = i64::try_from(retry.as_millis()).unwrap_or(i64::MAX);
+                        let retry_at = hq.wall_ms().saturating_add(retry_ms);
                         drop(hq);
-                        tokio::time::sleep(retry).await;
+                        if !sleep_until_wall(&me, retry_at).await {
+                            return;
+                        }
                         retry = (retry * 2).min(ATTEST_RETRY_MAX);
                     }
                     Attest::Stop => return,
@@ -875,7 +912,7 @@ impl Hq {
             Ok(attested) => {
                 let window = attested.lapses_at_ms - attested.attested_at_ms;
                 let bound = Bound {
-                    attested_at_ms: now_ms(),
+                    attested_at_ms: self.wall_ms(),
                     window_ms: if window > 0 { window } else { ATTEST_WINDOW_MS },
                 };
                 match self
