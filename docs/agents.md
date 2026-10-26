@@ -42,7 +42,7 @@ operator's CLIProxyAPI router (R-HQ-72):
 
 keeper-hq's definitions guard refuses any model outside its checked-in list of the ids the router
 serves (`agents/provider-models.txt`). keeper neither chooses an agent's model nor shows it before
-an answer names it (*Show details*, below). Nixi is the only agent that holds the Paseo broker, and
+an answer names it (the *Verbose* view, below). Nixi is the only agent that holds the Paseo broker, and
 she runs on a flash-tier model. A broker start is T3 and always waits for a person, and outside
 content raises it to T4, so the person stays the check (keeper-hq `review-agent-models.md`,
 rated Medium). A broker start (`create_agent` or `send_agent_prompt`) that times out may still
@@ -400,37 +400,74 @@ with `arriveAfterMs` a session that reaches the list only then. The installed ma
 archived-session ≤1 s tailnet target still require the native/device gates; mock page timing is
 not evidence for that target.
 
-## Live answers, thinking and details
+## Live answers, the turn fold and view modes
 
-An open answer grows as its text arrives. Its current tool is named below the text. Tool-call
-disclosures show a reader each call's status in Rust's own words (`statusLabel`: Started,
-Finished, Refused, Interrupted, Paused, Failed, or `Unknown status "<word>"` for a word keeper does
-not know) and its result; the renderer maps no status itself.
-The transcript scrolls inside its own viewport: a growing answer does not move the composer or
-replace an unsent draft. Scrolling back stops following the newest text until you return to the
-bottom. If the claim ends without a final message, the retained text says **The answer stopped.**
+**The answer last (109.14, Q109-13 a).** The window draws Rust's reading column (`items`) in its
+order and nothing else: a person's message, each turn's **fold**, the turn's answer below it, an
+agent's question where it was asked, an answer still being written last. A message the column does
+not name is not drawn — a lead-in ("Checking — one minute.") lives inside its turn's fold.
 
-**Show thinking** and **Show details** start off and are your preferences on every device
-(`agents.show_reasoning`, `agents.show_details`, user-global, settable in a settings file).
-Changing one writes only that preference. The switches show the preferences as they hold now,
-carried with the open session's view: a change synced from another device or a settings file
-reaches open sessions and their switches too. A settings file that sets one keeps it — the
-switch stays as the file says and **Saved, but a settings file keeps this preference as it is.**
-appears beside it.
-Thinking is offered only to a person who can read the session's trace, and reasoning enters the
-view only while that preference is on. It remains readable after the answer finishes. A person
-without trace access receives no reasoning or tool-result rows; the current tool's name is public
-to the session, not its arguments or result. These are server/Rust boundaries, not CSS hiding.
+- **While a turn runs** its fold is one live line, Rust's sentence: "Searching the web… · 3 steps".
+- **When it ends** everything but the answer — lead-ins, thinking, tool calls — is one line above
+  the answer: "Worked for 14 s · ran 1 command, searched the web 3 times", or the status a turn
+  ended in ("Interrupted · …", "Stopped · …", "Refused · …", "Failed · …").
+- **Refusals and failures** stay one plain line each under the fold line, folded or not: never a
+  card, never behind a disclosure.
+- **Opened**, a fold shows its lead-ins and its tool calls in a scroll area of at most
+  `min(24rem, 40vh)`; each call is its own disclosure with its status in Rust's words
+  (`statusLabel`: Started, Finished, Refused, Interrupted, Paused, Failed, or
+  `Unknown status "<word>"`), how it ended ("Interrupted 12:03", never "Finished" for every
+  ending) and its result in a `max-h-64` scroll area. The renderer groups, orders and words nothing.
 
-**Show details** reveals the final answer's model, reported input/output/total tokens, time to
-first token, duration, finish reason and error. Missing measurements have no label and are never
-filled with zero. A reported zero remains a real measurement. Answer markdown renders inert text:
-model-written HTML does not become HTML, and model-written links do not navigate.
+An open answer grows as its text arrives. The transcript scrolls inside its own viewport: a growing
+answer does not move the composer or replace an unsent draft. Scrolling back stops following the
+newest text until you return to the bottom. If the claim ends without a final message, the retained
+text says **The answer stopped.**
+
+**View modes** — **Normal**, **Thinking** and **Verbose**, Claude desktop's transcript modes —
+replace *Show thinking* and *Show details*. Normal is the default.
+
+| Mode | Folds | Thinking | Answer details |
+|---|---|---|---|
+| Normal | closed | not sent | not sent |
+| Thinking | closed | sent, shown under the fold line | not sent |
+| Verbose | open | sent | sent: model, input/output/total tokens, time to first token, duration, finish, error |
+
+The mode is your preference on every device (`agents.view_mode`, user-global, settable in a
+settings file). The control shows it as it holds now, carried with the open session's view: a
+change synced from another device or a settings file reaches open sessions too. A settings file
+that sets it keeps it — the control stays as the file says and **Saved, but a settings file keeps
+this preference as it is.** appears beside it. An older device's or file's `agents.show_reasoning`
+and `agents.show_details` read as one mode: details on is `verbose`; otherwise thinking on is
+`thinking`; otherwise `normal` (in `keeper.db`, in every `keeper.toml` layer, and in the synced
+settings file and its base, which is rewritten once under the new key).
+
+- **A `keeper.toml` that pinned one old switch now pins the whole mode.** A layer holding only
+  `"agents.show_details" = false` pins `agents.view_mode = "normal"`, and one holding only
+  `"agents.show_reasoning" = true` pins `"thinking"`: the switch the file left open is no longer
+  the person's to choose, and the View control stays as the file says. Whoever owns such a file
+  should rewrite it as the one `agents.view_mode` line it means (R10914-02).
+- **Devices on different versions, while any of them is older than 109.14.** The first newer
+  device to sync rewrites the synced settings file under `agents.view_mode`; an older device then
+  finds its two switches gone from the file and turns both off, and keeps the newer key without
+  reading it. A switch turned on afterwards on the older device is dropped again by the next newer
+  device to sync, so it never reaches the newer devices. Update every device to read the mode
+  everywhere (R10914-03).
+
+Rust decides what each mode sends, and a mode never widens who reads what. Thinking reaches the view
+only in the Thinking and Verbose modes and only for a person who can read the session's trace; it
+remains readable after the answer finishes. A person without trace access receives no reasoning or
+tool-result rows and their folds carry no steps — their fold line counts no calls ("Worked for
+14 s"), and only a close's own error stays a failure line; the current tool's name is public to the
+session ("Searching the web…"), not its arguments or result. These are server/Rust boundaries, not
+CSS hiding. Missing measurements have no label and are never filled with zero; a reported zero
+remains a real measurement. Answer markdown renders inert text: model-written HTML does not become
+HTML, and model-written links do not navigate.
 
 **Context window** beside Send opens a side **Details** panel; `/context` opens the same panel. It
 shows the latest answer's last-round occupancy (`metadata.context.used`), not the accumulated
-billing usage in `metadata.usage`. Like the rest of an answer's details it follows **Show
-details**, for any member, trace reader or not: `metadata.context` is in every member's replica,
+billing usage in `metadata.usage`. Like the rest of an answer's details it follows the **Verbose**
+view mode, for any member, trace reader or not: `metadata.context` is in every member's replica,
 so the setting decides only what is drawn. The labelled ring and its tooltip show used/window and
 the rounded percentage; an unknown model window shows **used ≈ N tokens**, with no window
 percentage or ring. Tab from the message field to the context button, then Enter to open Details;
@@ -439,7 +476,7 @@ and persona, memory, built-in tools, MCP tools, history, attachments and this tu
 parts a newer runtime adds that this build does not name are summed into one **Other** row, so
 they never hide the meter. Counts and shares are estimates, marked **≈**; the total is always
 `used`. Missing or old metadata omits the ring rather than inventing zero, and `/context` then
-says the latest answer has no measurement (or that Show details is off). Malformed counts, a
+says the latest answer has no measurement (or that the view mode is not Verbose). Malformed counts, a
 missing or repeated known part, or parts above the used count are refused, with one tracing
 warning per answer. A turn stopped or refused before its first measured round has no context, and
 the meter does not fall back to an older answer. Over-window occupancy keeps its real percentage
@@ -448,8 +485,8 @@ label while the ring and accessible meter stop at 100%.
 For the context viewing aid, `?sessions=launch` opens alpha with 48000/200000 tokens (24%); beta,
 **Review the research notes**, has the same used count and an unknown window. Their source answer
 metadata deliberately carries different cumulative usage (125000 input tokens). These are mock
-projections, not evidence of a running model or the packaged app. The mock ships with Show details
-off, so turn it on to see the ring.
+projections, not evidence of a running model or the packaged app. The mock ships in the Normal view
+mode, so choose Verbose to see the ring.
 
 **Tools** contains only tools the answering instance offers, from its definition and container.
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
@@ -506,9 +543,9 @@ for each `from_seq` — through a presence leave — until that seq's chunk arri
 with the agent's `messages` row for the turn (`turn_id`) once it holds it.” The frontend renders
 that projection, never folds chunks or presence itself.
 
-The session VM also supplies Rust-authored `items` and `folds` for the per-turn renderer
-cutover (109.14); the current renderer still draws `messages` and `live`, whose tool steps carry
-the same Rust status labels.
+The session VM's `items` and `folds` are what the window draws (109.13, drawn since 109.14):
+`messages` holds the bodies the column names, and `live` the text of answers still being written;
+neither carries a turn's thinking or tool calls any more — those are the fold's alone.
 Each turn has one fold containing its earlier agent-message IDs, permitted reasoning and
 tool steps, a summary, reported duration, status label and single-line failures. A persisted
 terminal answer is identified by the runtime Closed row's `metadata.finish` key, including
@@ -529,19 +566,23 @@ instance restarted mid-turn) and interrupted work say **Interrupted**; `failed` 
 stream or a provider error) says **Failed**, as does work-only history whose tool call failed
 (the importer's `failed` step); only `content_filter`, or tool-only work that ended refused,
 says **Refused**. A tool step whose status word keeper does not know is never running work: the
-turn reads by its close, and the step keeps one failure line naming the word.
+turn reads by its close, and the step keeps one failure line naming the word. A closed turn
+reads by its close even while a call's row still says `started` (109.14).
 `stop`, `length`, `tool_calls`, a null reason or a provider's
 own word is an ordinary close. Parked work says **Paused** unless an unexpired pending
 approval actually asks the person, in which case it says **Waiting for you**. Trace access and
-Show thinking still gate the corresponding fold contents; Show details does not gate the
-reported duration used in a summary. Missing or negative durations are absent; a reported zero
+the view mode still gate the corresponding fold contents; the mode does not gate the reported
+duration used in a summary. Missing or negative durations are absent; a reported zero
 is retained. Grouping, ordering and all these sentences belong to Rust, not the renderer.
 
 Development fixtures: `?sessions=launch&live=stream`, with `&platform=phone` for the phone shell.
 `live=error`, `stopped`, `nonreader`, `no-tools`, `untrusted`, `long`, `refused` and `pinned` cover
 provider error, ended claim, trace exclusion, absent offers, outside-content marker, long strings,
-refused preference/tool writes and a settings file keeping Show details off. Timed mock deltas
-are UI evidence only, not a server or latency proof.
+refused preference/tool writes and a settings file keeping the view mode at Normal.
+`&turns=all` adds to alpha's `device.1` one turn of every fold state: tool-only work cut by a
+restart, a person's stop, an imported failed call, and the screenshot's turn (a lead-in, a run,
+three searches with one refused, then the answer). Timed mock deltas are UI evidence only, not a
+server or latency proof.
 
 ### Measured: live-answer presentation
 
@@ -577,15 +618,16 @@ Nixie client stood in for R-HQ-30's runtime half and wrote only an `agent_profil
   step 25 ms, each step a prefix of the final 1,090 bytes, the last equal to the final row. A
   second device that paired and opened mid-answer showed at once at least what the first had
   shown by then (98/98, 118/118, 146/146, 274/274 bytes), then the same final row byte for byte.
-  With *Show details* on, the final row showed model, 50/240/290 tokens, time to first token
-  27–33 ms and duration about 7.1 s. With *Show thinking* on, the thinking streamed and stayed.
+  With *Show details* on (now the Verbose mode), the final row showed model, 50/240/290 tokens,
+  time to first token 27–33 ms and duration about 7.1 s. With *Show thinking* on (now the Thinking
+  mode), the thinking streamed and stayed.
 - **Model to viewer** (three runs, 544 steps): from the stub emitting a token to keeper-core's
   session view first showing that length, p50 3.6 ms, p95 21.5 ms, p99 256 ms, max 556 ms. The
   outliers fall while the second device pairs in the same process. This is one host over
   loopback and includes the instance's work, so it is **not** NFR-124's figure: the tailnet
   publish-to-receive p95 (electra → hesperia) is still owed.
 - **Non-reader:** a person invited when the session opened saw the answer grow and the same
-  final row, was shown no thinking or tool step with *Show thinking* on, and held no
+  final row, was shown no thinking or tool step with *Show thinking* on (now Thinking), and held no
   `reasoning` or `tool_calls` row for the session.
 - **Tool switches:** both offered tools were listed on. `journal_append` switched off on the
   owner's device showed off on the guest's, and the next turn offered the model only
@@ -1398,7 +1440,7 @@ on the server only, as an alias of that actor; it is not part of keeper's contra
 
 **Its limits:**
 
-- **No reasoning.** Imported sessions carry no thinking: *Show thinking* has nothing to show
+- **No reasoning.** Imported sessions carry no thinking: the *Thinking* view mode has nothing to show
   there.
 - An answer carries the model, usage, time to first token and duration where the log recorded
   them, and nothing invented where it did not.

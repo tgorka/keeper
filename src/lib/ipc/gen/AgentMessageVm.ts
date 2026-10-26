@@ -4,7 +4,6 @@ import type { AgentMessageDetailsVm } from "./AgentMessageDetailsVm";
 import type { AgentMessageRoleVm } from "./AgentMessageRoleVm";
 import type { AgentMessageStateVm } from "./AgentMessageStateVm";
 import type { AgentSessionAskVm } from "./AgentSessionAskVm";
-import type { AgentToolStepVm } from "./AgentToolStepVm";
 
 export type AgentMessageVm = { id: string, role: AgentMessageRoleVm, authorActor: string, authorName: string, body: string, createdAtMs: number, 
 /**
@@ -12,17 +11,10 @@ export type AgentMessageVm = { id: string, role: AgentMessageRoleVm, authorActor
  */
 state?: AgentMessageStateVm, ask?: AgentSessionAskVm, 
 /**
- * An agent answer's details, when this viewer shows them.
+ * An agent answer's details, in the `verbose` view mode only. Its
+ * turn's thinking and tool calls are the turn's fold's.
  */
 details?: AgentMessageDetailsVm, 
-/**
- * An agent answer's thinking, for a reader who shows it.
- */
-reasoning?: string, 
-/**
- * An agent answer's tool calls, for a reader.
- */
-steps?: Array<AgentToolStepVm>, 
 /**
  * The files attached to it, in the order they were attached.
  */

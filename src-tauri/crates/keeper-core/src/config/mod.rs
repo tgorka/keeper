@@ -616,12 +616,17 @@ pub fn parse_layer_file(
                     ));
                     continue;
                 }
-                // A pin an older build accepted under a `bots.*` voice key
-                // reads as its `voice.*` key (Story 108.3a), then meets the
-                // new key's rules like any other line.
-                let flat = crate::registry::retire_bot_keys(flatten_settings("", table), |raw| {
-                    raw.as_str()
-                });
+                // A pin an older build accepted under a retired key reads
+                // as the key it lives under now (a `bots.*` voice key as its
+                // `voice.*` key, Story 108.3a; the two answer switches as
+                // `agents.view_mode`, Story 109.14), then meets the new key's
+                // rules like any other line.
+                let flat = crate::registry::retire_keys(
+                    flatten_settings("", table)
+                        .into_iter()
+                        .map(|(key, raw)| (key, raw.clone()))
+                        .collect(),
+                );
                 for (key, raw) in flat {
                     let key = &key;
                     if let Err(reason) = keys::layer_may_set(key, tier.machine_scoped()) {
@@ -633,7 +638,7 @@ pub fn parse_layer_file(
                         ));
                         continue;
                     }
-                    let text = match setting_text(key, raw) {
+                    let text = match setting_text(key, &raw) {
                         Ok(text) => text,
                         Err(message) => {
                             file.faults.push(fault(
@@ -1434,6 +1439,59 @@ mod tests {
             vec![LayerFaultKind::KeyRefused],
             "{:?}",
             layers.faults
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Story 109.14: a `keeper.toml` that pinned the two answer switches pins
+    /// the one view mode they choose — details on reads `verbose`; otherwise
+    /// thinking on reads `thinking`; otherwise `normal` — with no fault and no
+    /// old key left; a `agents.view_mode` line beside them in the same file
+    /// wins.
+    #[test]
+    fn a_layer_pinning_the_answer_switches_pins_their_view_mode() {
+        let cases = [
+            ("false", "false", "normal"),
+            ("true", "false", "thinking"),
+            ("false", "true", "verbose"),
+            ("true", "true", "verbose"),
+        ];
+        for (reasoning, details, mode) in cases {
+            let home = temp_dir();
+            write(
+                &keeper_dir(&home).join("keeper.toml"),
+                &format!(
+                    "[settings]\n\"agents.show_reasoning\" = {reasoning}\n\
+                     \"agents.show_details\" = {details}\n"
+                ),
+            );
+            let layers = load_app_layers(&home, "testbox");
+            assert!(layers.faults.is_empty(), "faults: {:?}", layers.faults);
+            assert_eq!(
+                value(&layers, "agents.view_mode").as_deref(),
+                Some(mode),
+                "{reasoning}/{details}"
+            );
+            assert!(
+                layers
+                    .overrides
+                    .keys()
+                    .all(|key| !key.starts_with("agents.show_")),
+                "{:?}",
+                layers.overrides.keys().collect::<Vec<_>>()
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+        let home = temp_dir();
+        write(
+            &keeper_dir(&home).join("keeper.toml"),
+            "[settings]\n\"agents.view_mode\" = \"normal\"\n\"agents.show_details\" = true\n",
+        );
+        let layers = load_app_layers(&home, "testbox");
+        assert!(layers.faults.is_empty(), "faults: {:?}", layers.faults);
+        assert_eq!(
+            value(&layers, "agents.view_mode").as_deref(),
+            Some("normal")
         );
         let _ = std::fs::remove_dir_all(&home);
     }

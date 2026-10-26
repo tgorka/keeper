@@ -1,9 +1,18 @@
+import { Ban, ChevronDown, ChevronRight } from "lucide-react";
+import { useId, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
+import { SessionAttachments } from "@/components/agents/session-attachments";
 import { countLabel, TOKENS } from "@/lib/count-label";
-import type { AgentLiveTurnVm, AgentMessageDetailsVm, AgentToolStepVm } from "@/lib/ipc/client";
+import type {
+  AgentLiveTurnVm,
+  AgentMessageDetailsVm,
+  AgentMessageVm,
+  AgentToolStepVm,
+  AgentTurnFoldVm,
+} from "@/lib/ipc/client";
 
 /** No live region around token text: announce the state, not the whole answer per delta.
- * Rust sends a turn's thinking and steps only to a reader who may see them. */
+ * The turn's work and thinking are its fold's, drawn above this. */
 export function SessionLiveTurn({ turn, agentName }: { turn: AgentLiveTurnVm; agentName: string }) {
   return (
     <li className="min-w-0" aria-label={`Answer from ${agentName}`}>
@@ -16,12 +25,6 @@ export function SessionLiveTurn({ turn, agentName }: { turn: AgentLiveTurnVm; ag
         )}
       </div>
       <AgentAnswer body={turn.text} />
-      {turn.tool && (
-        <p role="status" className="mt-2 break-all text-muted-foreground text-xs">
-          Calling: {turn.tool}
-        </p>
-      )}
-      <SessionTrace reasoning={turn.reasoning} steps={turn.steps} />
       {turn.stopped && (
         <p
           role="status"
@@ -34,50 +37,165 @@ export function SessionLiveTurn({ turn, agentName }: { turn: AgentLiveTurnVm; ag
   );
 }
 
-export function SessionTrace({
-  reasoning,
-  steps,
+/**
+ * One turn's work, folded into one line above its answer (Q109-13 a): Rust's
+ * summary sentence, then each refusal or failure as one line of its own, the
+ * thinking where Rust sent it, and — opened — the lead-ins and tool calls in a
+ * bounded scroll area. Opened by default only in the verbose view mode; the
+ * answer is never inside it. Rust decides every word and what a viewer who
+ * does not read the trace receives (no thinking, no steps).
+ */
+export function TurnFold({
+  fold,
+  leadIns,
+  agentName,
+  verbose,
 }: {
-  reasoning?: string;
-  steps?: AgentToolStepVm[];
+  fold: AgentTurnFoldVm;
+  leadIns: AgentMessageVm[];
+  agentName: string;
+  verbose: boolean;
 }) {
+  // A person's own toggle lasts until the view mode changes; a change
+  // forgets it, set during render rather than after a paint.
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  const [mode, setMode] = useState(verbose);
+  if (mode !== verbose) {
+    setMode(verbose);
+    setToggled(null);
+  }
+  const bodyId = useId();
+  const hasBody = leadIns.length > 0 || fold.steps.length > 0;
+  const open = hasBody && (toggled ?? verbose);
+  const running = fold.status === "running";
+  const summary = (
+    <span className="min-w-0 break-words [overflow-wrap:anywhere]">{fold.summary}</span>
+  );
   return (
-    <>
-      {reasoning && (
-        <section aria-label="Thinking" className="mt-3 min-w-0 border-border border-l-2 pl-3">
-          <h3 className="mb-1 font-medium text-muted-foreground text-xs">Thinking</h3>
-          <p className="whitespace-pre-wrap break-words text-muted-foreground text-sm [overflow-wrap:anywhere]">
-            {reasoning}
-          </p>
-        </section>
+    <li
+      className="min-w-0"
+      data-slot="turn-fold"
+      data-status={fold.status}
+      aria-label={`Work of ${agentName}`}
+    >
+      {hasBody ? (
+        // The name is Rust's sentence, given outright: a live region inside a
+        // button leaves Chromium computing an empty name (R10914-01).
+        <button
+          type="button"
+          className="flex min-h-11 w-full min-w-0 items-center gap-1 rounded-md px-1 text-left text-muted-foreground text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={fold.summary}
+          aria-expanded={open}
+          aria-controls={bodyId}
+          onClick={() => setToggled(!open)}
+        >
+          {open ? (
+            <ChevronDown aria-hidden="true" className="size-4 shrink-0" />
+          ) : (
+            <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
+          )}
+          {summary}
+        </button>
+      ) : (
+        // While running, the status below says this line; read once, not twice.
+        <p
+          aria-hidden={running || undefined}
+          className="flex min-h-11 min-w-0 items-center text-muted-foreground text-xs"
+        >
+          {summary}
+        </p>
       )}
-      {!!steps?.length && (
-        <ul aria-label="Tool calls" className="mt-2 flex min-w-0 flex-col gap-1">
-          {steps.map((step) => (
-            <li key={step.id} className="min-w-0">
-              <details className="rounded-md border border-border">
-                <summary className="min-h-11 cursor-pointer break-all px-3 py-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                  {step.name} · {step.statusLabel}
-                </summary>
-                <div className="space-y-1 px-3 pb-3 text-xs">
-                  {step.startedAtMs !== undefined && (
-                    <p>Started {new Date(step.startedAtMs).toLocaleTimeString()}</p>
-                  )}
-                  {step.endedAtMs !== undefined && (
-                    <p>Finished {new Date(step.endedAtMs).toLocaleTimeString()}</p>
-                  )}
-                  {step.result !== undefined && (
-                    <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono">
-                      {step.result}
-                    </pre>
-                  )}
-                </div>
-              </details>
+      {/* A running turn's line is announced from this one element, beside the
+          line and never in a button, at the same place whether or not the turn
+          has anything to open yet: its first step updates the text a screen
+          reader is already watching rather than replacing the region (R10914-07). */}
+      {running && (
+        <span role="status" className="sr-only">
+          {fold.summary}
+        </span>
+      )}
+      {fold.failures.length > 0 && (
+        <ul aria-label="Refusals and failures" className="flex min-w-0 flex-col gap-1">
+          {fold.failures.map((failure, index) => (
+            <li
+              // A close's error has no step; its place among the failures is its identity.
+              key={failure.stepId || `close-${index}`}
+              data-slot="turn-failure"
+              className="flex min-w-0 items-start gap-1.5 text-muted-foreground text-xs"
+            >
+              <Ban aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
+              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                {failure.sentence}
+              </span>
             </li>
           ))}
         </ul>
       )}
-    </>
+      {fold.reasoning && (
+        <section
+          aria-label="Thinking"
+          className="mt-2 max-h-64 min-w-0 overflow-y-auto overscroll-contain border-border border-l-2 pl-3"
+        >
+          <h3 className="mb-1 font-medium text-muted-foreground text-xs">Thinking</h3>
+          <p className="whitespace-pre-wrap break-words text-muted-foreground text-sm [overflow-wrap:anywhere]">
+            {fold.reasoning}
+          </p>
+        </section>
+      )}
+      {open && (
+        <div
+          id={bodyId}
+          data-slot="turn-fold-body"
+          className="mt-1 flex max-h-[min(24rem,40vh)] min-w-0 flex-col gap-3 overflow-y-auto overscroll-contain rounded-md border border-border p-3"
+        >
+          {leadIns.map((message) => (
+            <div key={message.id} className="min-w-0 text-muted-foreground">
+              <AgentAnswer body={message.body} />
+              {!!message.attachments?.length && (
+                <SessionAttachments attachments={message.attachments} />
+              )}
+            </div>
+          ))}
+          {fold.steps.length > 0 && <TurnSteps steps={fold.steps} />}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** Each call behind its own disclosure, its result bounded on its own. */
+export function TurnSteps({ steps }: { steps: AgentToolStepVm[] }) {
+  return (
+    <ul aria-label="Tool calls" className="flex min-w-0 flex-col gap-1">
+      {steps.map((step) => (
+        <li key={step.id} className="min-w-0">
+          <details className="rounded-md border border-border">
+            <summary className="min-h-11 cursor-pointer break-all px-3 py-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              {step.name} · {step.statusLabel}
+            </summary>
+            <div className="space-y-1 px-3 pb-3 text-xs">
+              {step.startedAtMs !== undefined && (
+                <p>Started {new Date(step.startedAtMs).toLocaleTimeString()}</p>
+              )}
+              {step.endedAtMs !== undefined && (
+                // How it ended, in Rust's word: "Interrupted 12:03", never "Finished".
+                <p>
+                  {step.statusLabel} {new Date(step.endedAtMs).toLocaleTimeString()}
+                </p>
+              )}
+              {step.result !== undefined && (
+                <pre
+                  data-slot="step-result"
+                  className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono"
+                >
+                  {step.result}
+                </pre>
+              )}
+            </div>
+          </details>
+        </li>
+      ))}
+    </ul>
   );
 }
 

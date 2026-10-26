@@ -410,6 +410,7 @@ export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
 export type { AgentTurnFailureVm } from "./gen/AgentTurnFailureVm";
 export type { AgentTurnFoldVm } from "./gen/AgentTurnFoldVm";
 export type { AgentTurnStatusVm } from "./gen/AgentTurnStatusVm";
+export type { AgentViewModeVm } from "./gen/AgentViewModeVm";
 export type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
 export type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
@@ -4106,10 +4107,7 @@ export async function agentViewPrefsSet(
   patch: Partial<AgentViewPrefsVm>,
 ): Promise<AgentViewPrefsVm> {
   return await invoke("agent_view_prefs_set", {
-    patch: {
-      showReasoning: patch.showReasoning ?? null,
-      showDetails: patch.showDetails ?? null,
-    },
+    patch: { viewMode: patch.viewMode ?? null },
   });
 }
 

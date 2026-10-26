@@ -174,8 +174,8 @@ pub fn decide_pushed(
 
 /// The effective settings may have changed (a setting written, a settings
 /// layer installed or cleared, a settings file pulled): follow
-/// `agents.server_url` if it moved, and the view preferences
-/// (`agents.show_reasoning`, `agents.show_details`). Before [`init`] there is
+/// `agents.server_url` if it moved, and the view preference
+/// (`agents.view_mode`). Before [`init`] there is
 /// nothing to follow.
 pub fn reconcile() {
     let Some(hq) = HQ.get().cloned() else {

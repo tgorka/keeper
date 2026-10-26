@@ -15,6 +15,7 @@ use rusqlite::Connection;
 
 use crate::capture::Placement;
 use crate::error::{CoreError, PlatformError};
+use crate::hq::live::AgentViewModeVm;
 use crate::vm::DockBadgeMode;
 
 /// Resolve the `keeper.db` path under a data directory.
@@ -182,6 +183,7 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
     ensure_provider_column(&conn)?;
     ensure_incognito_column(&conn)?;
     retire_bots(&conn)?;
+    retire_view_flags(&conn)?;
     Ok(conn)
 }
 
@@ -211,8 +213,12 @@ pub const RETIRED_VOICE_KEYS: [(&str, &str); 5] = [
 ];
 
 /// The setting the bots surface kept that nothing reads any more: an agent's
-/// answer details are `agents.show_details`.
+/// answer details are `agents.view_mode`'s `verbose`.
 pub const RETIRED_BOT_SETTING: &str = "bots.message_details";
+
+/// The two answer switches Story 109.14 folded into [`AGENTS_VIEW_MODE_KEY`]
+/// (Q109-13 a, R-HQ-76): *Show thinking*, then *Show details*.
+pub const RETIRED_VIEW_FLAGS: [&str; 2] = ["agents.show_reasoning", "agents.show_details"];
 
 /// Whether `key` is one Story 108.3a retired: a `bots.*` voice key or
 /// [`RETIRED_BOT_SETTING`].
@@ -220,26 +226,104 @@ pub fn is_retired_bot_key(key: &str) -> bool {
     key == RETIRED_BOT_SETTING || RETIRED_VOICE_KEYS.iter().any(|(old, _)| *old == key)
 }
 
-/// Settings an older build wrote, read under the keys voice has now (Story
-/// 108.3a): each `bots.*` voice key becomes its `voice.*` key unless the same
-/// source already holds that one, `bots.voice_target` only when it names an
-/// agent room, and `bots.message_details` is dropped — the moves
-/// [`retire_bots`] makes in `keeper.db` once, for every other place a value
-/// can live: a `keeper.toml` layer, a synced settings file and its base.
-/// `text` reads an entry's value as a string, where it is one.
+/// Whether `key` is one a later build retired: [`is_retired_bot_key`], or one
+/// of [`RETIRED_VIEW_FLAGS`].
+pub fn is_retired_key(key: &str) -> bool {
+    is_retired_bot_key(key) || RETIRED_VIEW_FLAGS.contains(&key)
+}
+
+/// The view mode one source's retired switches choose: details on gives
+/// `verbose`; otherwise thinking on gives `thinking`; otherwise `normal`. A
+/// switch the source does not hold, or holds in no boolean spelling, is off.
+pub fn view_mode_of_flags(reasoning: Option<bool>, details: Option<bool>) -> AgentViewModeVm {
+    if details == Some(true) {
+        AgentViewModeVm::Verbose
+    } else if reasoning == Some(true) {
+        AgentViewModeVm::Thinking
+    } else {
+        AgentViewModeVm::Normal
+    }
+}
+
+/// A settings value as one of the places a retired key can live spells it:
+/// a TOML file's value, or a stored string (a synced file's base).
+pub trait RetiredValue: Sized {
+    /// The value as a string, where it is one.
+    fn text(&self) -> Option<&str>;
+    /// The value as a boolean switch, in a file's or the store's spelling.
+    fn flag(&self) -> Option<bool>;
+    /// A stored word in this place's spelling.
+    fn word(word: &str) -> Self;
+}
+
+impl RetiredValue for toml::Value {
+    fn text(&self) -> Option<&str> {
+        self.as_str()
+    }
+    fn flag(&self) -> Option<bool> {
+        match self {
+            toml::Value::Boolean(on) => Some(*on),
+            toml::Value::String(raw) => raw.flag(),
+            _ => None,
+        }
+    }
+    fn word(word: &str) -> Self {
+        toml::Value::String(word.to_owned())
+    }
+}
+
+impl RetiredValue for String {
+    fn text(&self) -> Option<&str> {
+        Some(self)
+    }
+    fn flag(&self) -> Option<bool> {
+        match self.as_str() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
+    }
+    fn word(word: &str) -> Self {
+        word.to_owned()
+    }
+}
+
+/// Settings an older build wrote, read under the keys they live under now —
+/// the moves [`retire_bots`] and [`retire_view_flags`] make in `keeper.db`,
+/// for every other place a value can live: a `keeper.toml` layer, a synced
+/// settings file and its base.
 ///
-/// What the renamed key is then allowed to do is the new key's rule: a layer
-/// still may not arm the microphone, because `voice.wake_enabled` is refused
-/// from files exactly as `bots.wake_enabled` was.
-pub fn retire_bot_keys<V>(
-    entries: Vec<(String, V)>,
-    text: impl Fn(&V) -> Option<&str>,
-) -> Vec<(String, V)> {
+/// Story 108.3a: each `bots.*` voice key becomes its `voice.*` key unless the
+/// same source already holds that one, `bots.voice_target` only when it names
+/// an agent room, and `bots.message_details` is dropped. What the renamed key
+/// is then allowed to do is the new key's rule: a layer still may not arm the
+/// microphone, because `voice.wake_enabled` is refused from files exactly as
+/// `bots.wake_enabled` was.
+///
+/// Story 109.14: `agents.show_reasoning` and `agents.show_details` become one
+/// `agents.view_mode` ([`view_mode_of_flags`]) where the first of them stood,
+/// unless the same source already holds `agents.view_mode`.
+pub fn retire_keys<V: RetiredValue>(entries: Vec<(String, V)>) -> Vec<(String, V)> {
     let present: std::collections::BTreeSet<String> =
         entries.iter().map(|(key, _)| key.clone()).collect();
+    let flag = |name: &str| {
+        entries
+            .iter()
+            .find(|(key, _)| key == name)
+            .and_then(|(_, value)| value.flag())
+    };
+    let mode = view_mode_of_flags(flag(RETIRED_VIEW_FLAGS[0]), flag(RETIRED_VIEW_FLAGS[1]));
+    let mut mode_held = present.contains(AGENTS_VIEW_MODE_KEY);
     entries
         .into_iter()
         .filter_map(|(key, value)| {
+            if RETIRED_VIEW_FLAGS.contains(&key.as_str()) {
+                if mode_held {
+                    return None;
+                }
+                mode_held = true;
+                return Some((AGENTS_VIEW_MODE_KEY.to_owned(), V::word(mode.word())));
+            }
             if key == RETIRED_BOT_SETTING {
                 return None;
             }
@@ -257,7 +341,7 @@ pub fn retire_bot_keys<V>(
             // Matrix rooms, which `clear_old_voice_target` then clears with
             // its notice (108.2); a pinned bot's id names nothing now.
             if new == VOICE_TARGET_KEY
-                && !text(&value).is_some_and(|value| {
+                && !value.text().is_some_and(|value| {
                     value
                         .trim()
                         .starts_with(crate::hq::spoken::AGENT_TARGET_PREFIX)
@@ -334,6 +418,53 @@ fn retire_bots(conn: &Connection) -> Result<(), CoreError> {
     )
     .map_err(|e| err("marker", e))?;
     tx.commit().map_err(|e| err("transaction", e))
+}
+
+/// Fold the two answer switches an older build kept in `keeper.db` into
+/// `agents.view_mode` (Story 109.14, [`view_mode_of_flags`]); a mode already
+/// stored wins. Nothing writes the old keys any more, so this does nothing
+/// once they are gone and needs no marker.
+fn retire_view_flags(conn: &Connection) -> Result<(), CoreError> {
+    let err = |e: rusqlite::Error| {
+        CoreError::Internal(format!("could not retire the answer switches: {e}"))
+    };
+    let mut held = [None, None];
+    {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM settings WHERE key IN (?1, ?2)")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![RETIRED_VIEW_FLAGS[0], RETIRED_VIEW_FLAGS[1]],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(err)?;
+        for row in rows {
+            let (key, value) = row.map_err(err)?;
+            if let Some(at) = RETIRED_VIEW_FLAGS.iter().position(|old| *old == key) {
+                held[at] = Some(value);
+            }
+        }
+    }
+    if held.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    let [reasoning, details] = held.map(|value| value.as_ref().and_then(RetiredValue::flag));
+    let tx = conn.unchecked_transaction().map_err(err)?;
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+        rusqlite::params![
+            AGENTS_VIEW_MODE_KEY,
+            view_mode_of_flags(reasoning, details).word()
+        ],
+    )
+    .map_err(err)?;
+    tx.execute(
+        "DELETE FROM settings WHERE key IN (?1, ?2)",
+        rusqlite::params![RETIRED_VIEW_FLAGS[0], RETIRED_VIEW_FLAGS[1]],
+    )
+    .map_err(err)?;
+    tx.commit().map_err(err)
 }
 
 /// Read a single settings value by key, or `None` when unset.
@@ -1398,36 +1529,22 @@ pub fn set_agents_server_url(
     )
 }
 
-/// Whether an agent's thinking is shown; `"1"`/`"0"`, absent = off. A
-/// person's preference, the same on every device; who may read the thinking
-/// at all is the session's reader flag, not this key.
-const AGENTS_SHOW_REASONING_KEY: &str = "agents.show_reasoning";
+/// How an agent's turns read (Story 109.14, Q109-13 a): `normal`,
+/// `thinking` or `verbose`, absent = `normal`. A person's preference, the
+/// same on every device; who may read thinking and tool results at all is the
+/// session's reader flag, not this key.
+pub const AGENTS_VIEW_MODE_KEY: &str = "agents.view_mode";
 
-/// Whether an agent answer's details are shown; `"1"`/`"0"`, absent = off.
-const AGENTS_SHOW_DETAILS_KEY: &str = "agents.show_details";
-
-pub fn get_agents_show_reasoning(data_dir: &Path) -> Result<bool, CoreError> {
-    Ok(get_setting(data_dir, AGENTS_SHOW_REASONING_KEY)?.as_deref() == Some("1"))
+/// A stored word keeper does not know reads as `normal`.
+pub fn get_agents_view_mode(data_dir: &Path) -> Result<AgentViewModeVm, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_VIEW_MODE_KEY)?
+        .as_deref()
+        .map(AgentViewModeVm::of)
+        .unwrap_or_default())
 }
 
-pub fn set_agents_show_reasoning(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
-    set_setting(
-        data_dir,
-        AGENTS_SHOW_REASONING_KEY,
-        if shown { "1" } else { "0" },
-    )
-}
-
-pub fn get_agents_show_details(data_dir: &Path) -> Result<bool, CoreError> {
-    Ok(get_setting(data_dir, AGENTS_SHOW_DETAILS_KEY)?.as_deref() == Some("1"))
-}
-
-pub fn set_agents_show_details(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
-    set_setting(
-        data_dir,
-        AGENTS_SHOW_DETAILS_KEY,
-        if shown { "1" } else { "0" },
-    )
+pub fn set_agents_view_mode(data_dir: &Path, mode: AgentViewModeVm) -> Result<(), CoreError> {
+    set_setting(data_dir, AGENTS_VIEW_MODE_KEY, mode.word())
 }
 
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
@@ -4040,6 +4157,25 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
 mod tests {
     use super::*;
     use crate::send::MessageKind;
+
+    /// R10914-06: a mode the same source holds wins over the old switches in
+    /// any order — not only because today's callers sort `agents.show_*`
+    /// before `agents.view_mode`.
+    #[test]
+    fn a_held_view_mode_wins_over_the_old_switches_in_either_order() {
+        let mode_first = vec![
+            ("agents.view_mode".to_owned(), "normal".to_owned()),
+            ("agents.show_details".to_owned(), "1".to_owned()),
+        ];
+        let mode_last: Vec<_> = mode_first.iter().rev().cloned().collect();
+        for entries in [mode_first, mode_last] {
+            assert_eq!(
+                retire_keys(entries.clone()),
+                vec![("agents.view_mode".to_owned(), "normal".to_owned())],
+                "{entries:?}"
+            );
+        }
+    }
 
     #[test]
     fn service_file_names_default_corrupt_and_normalized_round_trip() {

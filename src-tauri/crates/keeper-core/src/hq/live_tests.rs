@@ -511,23 +511,28 @@ fn opened(prefs: AgentViewPrefsVm, session: &[Peer], trace: &[Peer]) -> Opened {
     opened
 }
 
-const SHOW_ALL: AgentViewPrefsVm = AgentViewPrefsVm {
-    show_reasoning: true,
-    show_details: true,
+const VERBOSE: AgentViewPrefsVm = AgentViewPrefsVm {
+    view_mode: AgentViewModeVm::Verbose,
 };
 
-/// The meter follows Show details, like the rest of an answer's details, for any member
+const THINKING: AgentViewPrefsVm = AgentViewPrefsVm {
+    view_mode: AgentViewModeVm::Thinking,
+};
+
+/// The fold of [`TURN`]: where a turn's work, thinking and current tool are read.
+fn turn_fold(view: &timeline::AgentSessionViewVm) -> &timeline::AgentTurnFoldVm {
+    view.folds
+        .iter()
+        .find(|fold| fold.turn_id == TURN)
+        .expect("the turn's fold")
+}
+
+/// The meter follows the Verbose view mode, like the rest of an answer's details, for any member
 /// (R10921-02): `metadata.context` is in every member's replica, so trace access gates nothing.
 #[test]
-fn answer_context_survives_replica_projection_with_show_details_for_any_member() {
-    let details_only = AgentViewPrefsVm {
-        show_reasoning: false,
-        show_details: true,
-    };
-    let reasoning_only = AgentViewPrefsVm {
-        show_reasoning: true,
-        show_details: false,
-    };
+fn answer_context_survives_replica_projection_in_the_verbose_mode_for_any_member() {
+    let details_only = VERBOSE;
+    let reasoning_only = THINKING;
     for reader in [true, false] {
         let w = world(reader);
         let parts: Vec<_> = [
@@ -553,7 +558,7 @@ fn answer_context_survives_replica_projection_with_show_details_for_any_member()
         );
         assert!(
             w.view(&opened(reasoning_only, &[], &[])).context.is_none(),
-            "details off hides the meter, reader {reader}"
+            "the thinking mode hides the meter, reader {reader}"
         );
         metadata["context"]["window"] = Value::Null;
         w.put(vec![w.answer("answer", metadata.clone())]);
@@ -564,12 +569,12 @@ fn answer_context_survives_replica_projection_with_show_details_for_any_member()
         );
         metadata["context"]["parts"][0]["tokens"] = json!(71);
         w.put(vec![w.answer("answer", metadata)]);
-        assert!(w.view(&opened(SHOW_ALL, &[], &[])).context.is_none());
+        assert!(w.view(&opened(VERBOSE, &[], &[])).context.is_none());
         w.put(vec![w.answer(
             "old answer",
             json!({"usage": {"prompt_tokens": 9000}}),
         )]);
-        assert!(w.view(&opened(SHOW_ALL, &[], &[])).context.is_none());
+        assert!(w.view(&opened(VERBOSE, &[], &[])).context.is_none());
     }
 }
 
@@ -590,8 +595,12 @@ fn a_late_opener_sees_everything_so_far_and_the_final_row_replaces_it_byte_for_b
     assert_eq!(view.live.len(), 1);
     let turn = &view.live[0];
     assert_eq!(
-        (turn.text.as_str(), turn.tool.as_deref(), turn.stopped),
-        ("Ahoj, ana i ben", Some("web_search"), false)
+        (
+            turn.text.as_str(),
+            turn.stopped,
+            turn_fold(&view).summary.as_str()
+        ),
+        ("Ahoj, ana i ben", false, "Searching the web…")
     );
     // The end: one commit writes the message and deletes the chunks.
     w.put(vec![
@@ -632,7 +641,12 @@ fn details_show_what_the_provider_reported_and_nothing_it_did_not() {
     )]);
     let hidden = w.view(&opened(AgentViewPrefsVm::default(), &[], &[]));
     assert_eq!(hidden.messages[0].details, None, "off by default");
-    let shown = w.view(&opened(SHOW_ALL, &[], &[]));
+    let thinking = w.view(&opened(THINKING, &[], &[]));
+    assert_eq!(
+        thinking.messages[0].details, None,
+        "the thinking mode sends none"
+    );
+    let shown = w.view(&opened(VERBOSE, &[], &[]));
     assert_eq!(
         shown.messages[0].details,
         Some(AgentMessageDetailsVm {
@@ -670,12 +684,21 @@ fn thinking_streams_only_for_a_reader_who_shows_it_and_stays_after_the_end() {
     let off = w.view(&opened(AgentViewPrefsVm::default(), &[], &trace));
     assert!(off.reads_trace);
     assert_eq!(
-        off.live[0].reasoning, None,
-        "Show thinking is off by default"
+        turn_fold(&off).reasoning,
+        None,
+        "the normal mode, the default, sends no thinking"
     );
-    assert_eq!(off.live[0].steps[0].status, AgentToolStepStatusVm::Started);
-    let on = w.view(&opened(SHOW_ALL, &[], &trace));
-    assert_eq!(on.live[0].reasoning.as_deref(), Some("think harder"));
+    assert_eq!(
+        turn_fold(&off).steps[0].status,
+        AgentToolStepStatusVm::Started
+    );
+    let on = w.view(&opened(THINKING, &[], &trace));
+    assert_eq!(turn_fold(&on).reasoning.as_deref(), Some("think harder"));
+    let verbose = w.view(&opened(VERBOSE, &[], &trace));
+    assert_eq!(
+        turn_fold(&verbose).reasoning.as_deref(),
+        Some("think harder")
+    );
 
     w.put(vec![
         w.tool_call("done", Some("3 results")),
@@ -692,10 +715,9 @@ fn thinking_streams_only_for_a_reader_who_shows_it_and_stays_after_the_end() {
         },
         w.reasoning("r-all", 0, true, "think harder"),
     ]);
-    let ended = w.view(&opened(SHOW_ALL, &[], &[]));
-    let answer = ended.messages.last().expect("the answer");
-    assert_eq!(answer.reasoning.as_deref(), Some("think harder"));
-    let step = &answer.steps.as_ref().expect("steps")[0];
+    let ended = w.view(&opened(THINKING, &[], &[]));
+    assert_eq!(turn_fold(&ended).reasoning.as_deref(), Some("think harder"));
+    let step = &turn_fold(&ended).steps[0];
     assert_eq!(
         (
             step.status,
@@ -705,10 +727,7 @@ fn thinking_streams_only_for_a_reader_who_shows_it_and_stays_after_the_end() {
         (AgentToolStepStatusVm::Done, Some("3 results"), true)
     );
     let hidden = w.view(&opened(AgentViewPrefsVm::default(), &[], &[]));
-    assert_eq!(
-        hidden.messages.last().and_then(|m| m.reasoning.clone()),
-        None
-    );
+    assert_eq!(turn_fold(&hidden).reasoning, None);
 }
 
 #[test]
@@ -727,12 +746,11 @@ fn a_member_who_does_not_read_the_trace_is_shown_none_of_it() {
         client_id: INSTANCE.to_owned(),
         doc: json!({"turn": TURN, "from_seq": 2, "reasoning": "more secret"}),
     }];
-    let view = w.view(&opened(SHOW_ALL, &[], &trace));
+    let view = w.view(&opened(VERBOSE, &[], &trace));
     assert!(!view.reads_trace);
-    let turn = &view.live[0];
-    assert_eq!(turn.text, "text");
-    assert_eq!(turn.reasoning, None);
-    assert!(turn.steps.is_empty());
+    assert_eq!(view.live[0].text, "text");
+    assert_eq!(turn_fold(&view).reasoning, None);
+    assert!(turn_fold(&view).steps.is_empty());
 }
 
 #[test]

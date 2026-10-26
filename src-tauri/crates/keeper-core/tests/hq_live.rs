@@ -1453,7 +1453,7 @@ async fn agents_window_archive_and_an_archived_session_opens_within_a_second() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a running agents server and an agent instance; see the module docs"]
 async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
-    use keeper_core::hq::live::AgentViewPrefsPatch;
+    use keeper_core::hq::live::{AgentViewModeVm, AgentViewPrefsPatch};
     use keeper_core::hq::sessions::AgentSessionRef;
     use keeper_core::hq::timeline::{AgentMessageRoleVm, AgentSessionViewVm};
 
@@ -1476,8 +1476,7 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
     )
     .await;
     a.set_view_prefs(AgentViewPrefsPatch {
-        show_reasoning: Some(true),
-        show_details: Some(true),
+        view_mode: Some(AgentViewModeVm::Verbose),
     })
     .expect("prefs");
     let key: AgentSessionRef = {
@@ -1569,7 +1568,10 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
                 shown.push((started.elapsed().as_millis(), turn.text.clone()));
                 received.push((chrono::Utc::now().timestamp_millis(), turn.text.len()));
             }
-            reasoning_seen |= turn.reasoning.as_ref().is_some_and(|r| !r.is_empty());
+            reasoning_seen |= view
+                .folds
+                .iter()
+                .any(|fold| fold.reasoning.as_ref().is_some_and(|r| !r.is_empty()));
         }
         if shown.len() >= 5 {
             if let Some(start) = late.take() {
@@ -1634,7 +1636,10 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
         reasoning_seen,
         "a reader showing the thinking saw it stream"
     );
-    assert!(answer.reasoning.is_some(), "and kept it after the end");
+    assert!(
+        final_view.folds.iter().any(|fold| fold.reasoning.is_some()),
+        "and kept it after the end"
+    );
     println!("PASS the thinking streamed beside the answer and stayed after it");
 
     let b = late_task.expect("b started").await.expect("b joins");
@@ -1672,7 +1677,7 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
 /// A member who does not read the trace, and a session's tool switches,
 /// against a real agent instance. The invited person sees the answer grow
 /// but is shown no thinking and no tool step, and holds no reasoning or
-/// tool-call row, even with *Show thinking* on; the owner, a reader, sees
+/// tool-call row, even in the Verbose view mode; the owner, a reader, sees
 /// the thinking. The tools the agent says it offers are listed on; one
 /// switched off reaches the other member and is not offered to the model
 /// on the next turn, and switched back on it is again. Needs
@@ -1683,7 +1688,7 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a running agents server and an agent instance; see the module docs"]
 async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered() {
-    use keeper_core::hq::live::AgentViewPrefsPatch;
+    use keeper_core::hq::live::{AgentViewModeVm, AgentViewPrefsPatch};
     use keeper_core::hq::sessions::AgentSessionRef;
     use keeper_core::hq::timeline::{AgentMessageRoleVm, AgentMessageVm, AgentSessionViewVm};
 
@@ -1716,8 +1721,7 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
     .await;
     for hq in [&a, &k] {
         hq.set_view_prefs(AgentViewPrefsPatch {
-            show_reasoning: Some(true),
-            show_details: Some(true),
+            view_mode: Some(AgentViewModeVm::Verbose),
         })
         .expect("prefs");
     }
@@ -1774,7 +1778,7 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
     let mut changes = a.changes();
     let mut tails = a.live_changes();
     let started = Instant::now();
-    let a_answer = loop {
+    let (a_answer, a_folds) = loop {
         assert!(
             started.elapsed() < Duration::from_secs(180),
             "no answer in 3 minutes"
@@ -1787,17 +1791,17 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
             va.reads_trace && !vk.reads_trace,
             "the owner reads the trace, the guest does not"
         );
-        a_thinking |= va.live.iter().any(|t| t.reasoning.is_some());
+        a_thinking |= va.folds.iter().any(|f| f.reasoning.is_some());
         k_text |= vk.live.iter().any(|t| !t.text.is_empty());
         assert!(
-            vk.live
+            vk.folds
                 .iter()
-                .all(|t| t.reasoning.is_none() && t.steps.is_empty()),
+                .all(|f| f.reasoning.is_none() && f.steps.is_empty()),
             "the guest was shown {:?}",
-            vk.live
+            vk.folds
         );
         if let (true, Some(answer)) = (va.live.is_empty() && a_thinking, answer_of(&va)) {
-            break answer;
+            break (answer, va.folds);
         }
         tokio::select! {
             _ = changes.changed() => {}
@@ -1806,15 +1810,15 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
         }
     };
     assert!(
-        a_answer.reasoning.is_some(),
+        a_folds.iter().any(|fold| fold.reasoning.is_some()),
         "the owner keeps the thinking after the end"
     );
     assert!(k_text, "the guest saw the answer while it was written");
     let deadline = Instant::now() + Duration::from_secs(30);
-    let k_answer = loop {
+    let (k_answer, k_folds) = loop {
         let view = view_of(&k).await.expect("k's view");
         if let (true, Some(m)) = (view.live.is_empty(), answer_of(&view)) {
-            break m;
+            break (m, view.folds);
         }
         assert!(
             Instant::now() < deadline,
@@ -1824,8 +1828,10 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
     };
     assert_eq!(k_answer.body, a_answer.body, "the same final row on both");
     assert!(
-        k_answer.reasoning.is_none() && k_answer.steps.is_none(),
-        "{k_answer:?}"
+        k_folds
+            .iter()
+            .all(|fold| fold.reasoning.is_none() && fold.steps.is_empty()),
+        "{k_folds:?}"
     );
     let rk = k.replica(&database).expect("k holds it");
     for table in ["reasoning", "tool_calls"] {
@@ -2097,7 +2103,7 @@ async fn count(replica: &Arc<dyn Replica>, table: &str, session: &str) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a running agents server and an agent instance in each database; see the module docs"]
 async fn many_people_in_one_session_by_the_owner_and_the_server() {
-    use keeper_core::hq::live::AgentViewPrefsPatch;
+    use keeper_core::hq::live::{AgentViewModeVm, AgentViewPrefsPatch};
     use keeper_core::hq::port::Delivery;
 
     let server = env("KEEPER_HQ_LIVE_URL");
@@ -2133,8 +2139,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     )
     .await;
     k.set_view_prefs(AgentViewPrefsPatch {
-        show_reasoning: Some(true),
-        show_details: None,
+        view_mode: Some(AgentViewModeVm::Thinking),
     })
     .expect("prefs");
     let owner_client = a
@@ -2480,7 +2485,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     assert_eq!(count(&rk, "tool_calls", &key.session_id).await, 0);
     assert_eq!(count(&rk, "approvals", &key.session_id).await, 0);
     let view = k.session_view(&key).expect("k's view");
-    assert!(view.messages.iter().all(|m| m.reasoning.is_none()));
+    assert!(view.folds.iter().all(|f| f.reasoning.is_none()));
     println!("PASS withdrawn: the guest's replica holds no reasoning, tool call or approval of the session, and still the answers ({} messages)", view.messages.len());
 
     // 4: the owner removes the guest: the session leaves their device.

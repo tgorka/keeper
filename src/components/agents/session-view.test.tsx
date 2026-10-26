@@ -66,8 +66,10 @@ const vm: AgentSessionViewVm = {
   live: [],
   tools: [],
   messages: [],
+  items: [],
+  folds: [],
   approvals: [],
-  prefs: { showReasoning: false, showDetails: false },
+  prefs: { viewMode: "normal" },
 };
 async function draw(shown: AgentSessionViewVm = vm) {
   const result = render(
@@ -156,7 +158,7 @@ describe("session context details", () => {
   }
 
   it("/context opens the same Details dialog the ring opens", async () => {
-    await draw({ ...vm, context, prefs: { showReasoning: false, showDetails: true } });
+    await draw({ ...vm, context, prefs: { viewMode: "verbose" } });
     const ring = screen.getByRole("button", { name: `Context details: ${context.summary}` });
     fireEvent.click(ring);
     const viaRing = await screen.findByRole("dialog", { name: "Details" });
@@ -180,12 +182,12 @@ describe("session context details", () => {
     await draw();
     expect(screen.queryByRole("button", { name: /^Context details/ })).not.toBeInTheDocument();
     const hidden = await runContextCommand();
-    expect(hidden).toHaveTextContent("Turn on Show details to see it.");
+    expect(hidden).toHaveTextContent("Choose the Verbose view to see it.");
     expect(hidden).not.toHaveTextContent(/usage/i);
     fireEvent.keyDown(hidden, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 
-    act(() => mock.view?.({ ...vm, prefs: { showReasoning: false, showDetails: true } }));
+    act(() => mock.view?.({ ...vm, prefs: { viewMode: "verbose" } }));
     const missing = await runContextCommand();
     expect(missing).toHaveTextContent("The latest answer has no context window measurement.");
     expect(missing).not.toHaveTextContent(/usage/i);
@@ -668,5 +670,87 @@ describe("the approval banner", () => {
     const copies = screen.getAllByText(said);
     expect(copies).toHaveLength(2);
     expect(copies.filter((copy) => copy.getAttribute("aria-hidden") === "true")).toHaveLength(1);
+  });
+});
+
+describe("the reading column (109.14)", () => {
+  const person: Ipc.AgentMessageVm = {
+    id: "p1",
+    role: "person",
+    authorActor: "ana",
+    authorName: "Ana",
+    body: "What will the weather be tomorrow?",
+    createdAtMs: 1780000000000,
+  };
+  const lead: Ipc.AgentMessageVm = {
+    id: "lead",
+    role: "agent",
+    authorActor: "assistant",
+    authorName: "Assistant",
+    body: "Checking — one minute.",
+    createdAtMs: 1780000001000,
+  };
+  const answer: Ipc.AgentMessageVm = {
+    id: "answer",
+    role: "agent",
+    authorActor: "assistant",
+    authorName: "Assistant",
+    body: "Cloudy, then sunny.",
+    createdAtMs: 1780000015000,
+  };
+  const turn: Ipc.AgentTurnFoldVm = {
+    turnId: "t1",
+    leadInIds: ["lead"],
+    reasoning: null,
+    steps: [{ id: "s1", name: "web_search", status: "done", statusLabel: "Finished" }],
+    failures: [{ stepId: "s2", sentence: "web_search · Refused: no more searches" }],
+    status: "done",
+    statusLabel: "Finished",
+    summary: "Worked for 14 s · searched the web 2 times",
+    durationMs: 14000,
+  };
+  const screenshot: AgentSessionViewVm = {
+    ...vm,
+    messages: [person, lead, answer],
+    items: [
+      { kind: "message", messageId: "p1" },
+      { kind: "fold", turnId: "t1" },
+      { kind: "message", messageId: "answer" },
+    ],
+    folds: [turn],
+  };
+
+  it("draws Rust's column in its order: the fold line above the answer, the answer last and outside it", async () => {
+    await draw();
+    act(() => mock.view?.(screenshot));
+    const column = screen.getByRole("list", { name: "Messages" });
+    const rows = Array.from(column.children);
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toHaveTextContent(person.body);
+    expect(rows[1]).toHaveAttribute("data-slot", "turn-fold");
+    expect(rows[2]).toHaveTextContent(answer.body);
+    // The answer is its own row, never inside the fold, opened or not.
+    fireEvent.click(within(rows[1] as HTMLElement).getByRole("button"));
+    expect(within(rows[1] as HTMLElement).queryByText(answer.body)).not.toBeInTheDocument();
+    expect(within(rows[1] as HTMLElement).getByText(lead.body)).toBeInTheDocument();
+  });
+
+  it("never draws a message the column does not name: a lead-in lives in its fold only", async () => {
+    await draw();
+    act(() => mock.view?.(screenshot));
+    // Folded, the lead-in is nowhere: a renderer that walked `messages`
+    // itself would draw it as a row of its own.
+    expect(screen.queryByText(lead.body)).not.toBeInTheDocument();
+    expect(screen.getAllByText(answer.body)).toHaveLength(1);
+  });
+
+  it("opens every fold in the verbose mode", async () => {
+    await draw();
+    act(() => mock.view?.({ ...screenshot, prefs: { viewMode: "verbose" } }));
+    expect(screen.getByRole("button", { name: turn.summary })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText(lead.body)).toBeInTheDocument();
   });
 });

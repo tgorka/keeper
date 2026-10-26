@@ -323,7 +323,7 @@ fn shown_to(ben: &Source) -> (usize, usize, usize) {
         sessions::now_ms(),
     )
     .expect("view");
-    let steps = view.live.iter().map(|turn| turn.steps.len()).sum();
+    let steps = view.folds.iter().map(|fold| fold.steps.len()).sum();
     let waiting = approvals::waiting(
         std::slice::from_ref(ben),
         &HashMap::new(),
@@ -397,7 +397,7 @@ fn a_withdrawn_or_removed_reader_is_shown_no_approval_and_cannot_decide() {
     )
     .expect("the session row is still here");
     assert!(view.approvals.is_empty() && !view.reads_trace);
-    assert!(view.live.iter().all(|turn| turn.steps.is_empty()));
+    assert!(view.folds.iter().all(|fold| fold.steps.is_empty()));
     assert!(approvals::waiting(
         std::slice::from_ref(&ben),
         &HashMap::new(),

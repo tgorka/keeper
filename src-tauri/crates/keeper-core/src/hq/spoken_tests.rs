@@ -8,9 +8,6 @@ fn turn(turn_id: &str, text: &str, stopped: bool) -> AgentLiveTurnVm {
     AgentLiveTurnVm {
         turn_id: turn_id.to_owned(),
         text: text.to_owned(),
-        tool: None,
-        reasoning: None,
-        steps: Vec::new(),
         stopped,
     }
 }

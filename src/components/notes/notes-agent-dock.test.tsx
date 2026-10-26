@@ -60,8 +60,10 @@ it("shares a list channel across docks but keeps the window's selection and each
     untrusted: false,
     live: [],
     tools: [],
-    prefs: { showReasoning: false, showDetails: false },
+    prefs: { viewMode: "normal" },
     approvals: [],
+    items: [{ kind: "message", messageId: "m" }],
+    folds: [],
     messages: [
       {
         id: "m",
