@@ -1308,8 +1308,11 @@ export function FilesPane() {
         // The profile list failing is the whole surface failing; an empty list
         // is the honest rendering, and the Sync pane is where that failure is
         // diagnosed. This pane does not grow a second sync-health readout.
+        // Unless a Refresh has answered first (RLF-01): its list is newer than
+        // this failure, and replacing it would draw "no folders" over a real one
+        // and hand the restore an empty list to forget every folder against.
         if (live) {
-          setProfiles([]);
+          setProfiles((current) => current ?? []);
         }
       });
     return () => {

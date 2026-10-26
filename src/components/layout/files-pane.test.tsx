@@ -3598,6 +3598,77 @@ describe("FilesPane — the tree stays where you left it", () => {
     expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")]));
   });
 
+  /**
+   * RLF-01: the first profile call's failure arriving AFTER the Refresh behind
+   * it has answered. The failure is older news than the answer, so it must not
+   * replace the list Rust gave — not in the batch they share, and not later.
+   */
+  function slowFirstCall(): {
+    fail: (error: Error) => void;
+    answer: (list: SyncProfileVm[]) => void;
+  } {
+    const calls = { fail: (_: Error) => {}, answer: (_: SyncProfileVm[]) => {} };
+    syncProfiles
+      .mockReturnValueOnce(
+        new Promise<SyncProfileVm[]>((_, reject) => {
+          calls.fail = reject;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<SyncProfileVm[]>((resolve) => {
+          calls.answer = resolve;
+        }),
+      );
+    return calls;
+  }
+
+  /** Every promise callback already queued has run: a macrotask comes after all
+   *  of them. A barrier, not a delay — nothing here waits on a duration. */
+  const drained = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  it("keeps Refresh's list when the first call fails after it in the same task", async () => {
+    vaultTree();
+    const calls = slowFirstCall();
+    remembered([nodeKey("01VAULT", "")]);
+    render(<FilesPane />);
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    // Refresh answers, then the first call fails, and React renders them together.
+    await act(async () => {
+      calls.answer([profile({ id: "01VAULT", name: "Vault" })]);
+      calls.fail(new Error("the sync engine is not running"));
+      await drained();
+    });
+
+    // Nothing forgotten: the expansion outlives the stale failure...
+    expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")]));
+    // ...and the tree is drawn from Rust's list.
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+  });
+
+  it("keeps Refresh's list when the first call fails after it in a later task", async () => {
+    vaultTree();
+    const calls = slowFirstCall();
+    remembered([nodeKey("01VAULT", "")]);
+    render(<FilesPane />);
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+    await act(async () => {
+      calls.answer([profile({ id: "01VAULT", name: "Vault" })]);
+      await drained();
+    });
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+
+    await act(async () => {
+      calls.fail(new Error("the sync engine is not running"));
+      await drained();
+    });
+
+    // Not "No folders are set up yet" over a list Rust has just given.
+    expect(screen.queryByText(FILES_NO_PROFILES_SENTENCE)).toBeNull();
+    expect(screen.getByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+    expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")]));
+  });
+
   it("still re-reads on every later Refresh, because Refresh means ask again", async () => {
     // The other half, and the reason the skip lives in the restore rather than
     // in `load`: a cache check inside `load` would make Refresh a no-op, which
