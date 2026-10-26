@@ -6093,9 +6093,10 @@ const liveScenario = new URLSearchParams(location.search).get("live");
  * device holds (Ben reads alpha, not beta), `omega` is another agent's. Who reads `gamma` this
  * device cannot know, so a tick of it is written and the fake server refuses it a moment later
  * (`hq.v17.audience`), as the real one would. `?drives=nonmember`: the person is no person member
- * of any session, so Rust answers no `drives` and no control is drawn. `?drives=stale`: `alpha`
- * and `gamma` are ticked and the agent no longer offers `gamma` (R10923-01): every change but
- * unticking `gamma` is refused here, naming it, as Rust's `drives::set` refuses it.
+ * of any session, so Rust answers no `drives` and no control is drawn. `?drives=stale`: `alpha`,
+ * `delta` and `gamma` are ticked and the agent no longer offers `delta` or `gamma` (R10923-01,
+ * R10923-06): unticking either unticks both in one write, and every other change is refused here,
+ * naming both, as Rust's `drives::set` does.
  */
 const drivesScenario = new URLSearchParams(location.search).get("drives");
 /** keeper-core's `drives::WARNING`, word for word. */
@@ -6103,16 +6104,17 @@ const DRIVES_WARNING =
   "Once you tick a drive, the agent may read it and send what it reads to the web, in a search " +
   "or a page it fetches, without asking you, even after this chat has read outside content. " +
   "Text it read on the web or in a drive can lead it to do that.";
+/** keeper-core's `Stale::sentence` for the `stale` fixture's two drives. */
+const STALE_SENTENCE =
+  "Untick delta and gamma to change the other drives: Assistant no longer offers them. " +
+  "Unticking either unticks both.";
 function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm | undefined {
   if (archived || drivesScenario === "nonmember") return undefined;
   if (drivesScenario === "stale" && database === "alpha")
     return {
       drives: [
-        {
-          name: "gamma",
-          ticked: true,
-          reason: "Assistant no longer offers gamma. Untick it to change the other drives.",
-        },
+        { name: "delta", ticked: true, reason: STALE_SENTENCE },
+        { name: "gamma", ticked: true, reason: STALE_SENTENCE },
         { name: "alpha", ticked: true },
         {
           name: "beta",
@@ -6778,17 +6780,26 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     const tick = payload.tick === true;
     if (drive.ticked === tick) return null;
     if (tick && drive.reason) hqRefuse(drive.reason);
-    // keeper-core's rule: a ticked drive that stopped being allowed holds every other change back.
-    const unticking = !tick && drive.reason !== undefined;
-    const stale = drives.drives.find((row) => row.ticked && row.reason && row !== drive);
-    if (!unticking && stale) hqRefuse(`Untick ${stale.name} first: Assistant no longer offers it.`);
+    // keeper-core's rule: ticked drives that stopped being allowed go together. Unticking one
+    // unticks all of them; anything else is refused, naming them.
+    const stale = drives.drives.filter((row) => row.ticked && row.reason);
+    const unticking = !tick && stale.includes(drive);
+    if (!unticking && stale.length)
+      hqRefuse(
+        `Untick ${stale.map((row) => row.name).join(" and ")} first: Assistant no longer offers ${
+          stale.length === 1 ? "it" : "them"
+        }.`,
+      );
     // A selection written sets the earlier refusals aside.
     for (const row of drives.drives) delete row.refused;
     delete drives.refused;
     drive.ticked = tick;
-    if (!tick && drive.reason) {
-      // Unticked, it is no longer the agent's to read: listed as not offered, after the others.
-      drive.reason = `Assistant does not offer ${drive.name}.`;
+    if (unticking) {
+      // Unticked, they are no longer the agent's to read: listed as not offered, after the others.
+      for (const row of stale) {
+        row.ticked = false;
+        row.reason = `Assistant does not offer ${row.name}.`;
+      }
       drives.drives.sort((a, b) => Number(!!a.reason) - Number(!!b.reason));
     }
     drives.pending = true;

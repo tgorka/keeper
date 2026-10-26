@@ -397,36 +397,41 @@ consequential actions still need a person.
 
 **Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
 menu of check items. No drive is ticked until a person ticks one — not even the session's own
-database. The menu lists every drive the agent offers (`agent_profiles.drives`, any instance of
-it, as the server reads the ceiling), then the drives keeper knows of that it may not read here,
-each with Rust's reason: another agent's drive ("Nixie does not offer omega."), or one the
-audience rule refuses — drive D in database S only when everyone who reads S reads D (D-34), read
-from the directories of the databases this device holds ("Ben reads alpha but cannot read beta").
-A drive whose readers this device cannot see (the person is not in that database) is offered and
-the server decides. keeper reads readers from the `actors` rows the server's directory sync writes, and that
+database. The menu lists every drive the agent offers (`agent_profiles.drives`, any instance of it,
+as the server reads the ceiling), then the drives keeper knows of that it may not read here, each
+with Rust's reason: another agent's drive ("Nixie does not offer omega."), or one the audience rule
+refuses — drive D in database S only when everyone who reads S reads D (D-34), read from the
+directories of the databases this device holds ("Ben reads alpha but cannot read beta"). A drive
+whose readers this device cannot see (the person is not in that database) is offered and the server
+decides. keeper reads readers from the `actors` rows the server's directory sync writes, and that
 sync only ever adds rows: a person the registry no longer lists in a database still counts as its
 reader here (R10923-02). keeper may then show a drive as not allowed that the server would accept;
 the other direction is benign, since the server refuses and the refusal is shown. Only the server
-can close this, by removing departed people from `actors`. Ticking writes the session's `session_drives` row; unticking the last drive
-writes `[]`, never a delete, because syncular refuses any later write to a deleted id. A tick
-waits for the server (**Waiting for the server…**). V17 checks every drive of the selection and
-names none, so a ticked drive that stopped being allowed (its agent no longer offers it, or the
-audience rule now refuses it) would make every other change a refused write: keeper marks its chip,
-which unticks it in one step, and refuses any other change here with **Untick gamma first: Nixie
-no longer offers it.** Unticking that drive is always allowed. A server refusal (`hq.v17.audience`,
-`hq.v17.not_offered`, …) is hung on the drives of the refused selection keeper knows fail that way
-(for the audience rule, failing those, the ones whose readers it cannot see), never on the drive
-that was clicked; it reaches the drive's row and the line under the chips — inside the menu while
-it is open, where a screen reader still hears it — read from the replica's per-row outcome record,
-until the next selection sets it aside. The menu always says,
-and the header repeats once a tick takes the selection from none to one, what D-34's accepted risk
+can close this, by removing departed people from `actors`. Ticking writes the session's
+`session_drives` row; unticking the last drive writes `[]`, never a delete, because syncular refuses
+any later write to a deleted id. A tick waits for the server (**Waiting for the server…**). V17
+checks every drive of the selection and names none, so a ticked drive that stopped being allowed
+(its agent no longer offers it, or the audience rule now refuses it) would make every other change a
+refused write. Such drives go together: unticking any of them — in the menu or with its chip's
+button — unticks all of them in one write, which V17 takes, and the menu and the line under the
+chips say so before the person acts (**Untick delta and gamma to change the other drives: Nixie no
+longer offers them. Unticking either unticks both.**). Every other change is refused here, naming
+them all (**Untick delta and gamma first: Nixie no longer offers them.**). Unticking one alone would
+leave a selection V17 still refuses for the other, so nothing could ever change (R10923-06). A
+server refusal (`hq.v17.audience`, `hq.v17.not_offered`, …) is hung on the drives of the refused
+selection keeper knows fail that way (for the audience rule, failing those, the ones whose readers
+it cannot see), never on the drive that was clicked; it reaches the drive's row and the line under
+the chips — inside the menu while it is open, where a screen reader still hears it — read from the
+replica's per-row outcome record, until the next selection sets it aside. The menu always says, and
+the header repeats once a tick takes the selection from none to one, what D-34's accepted risk
 allows (R-HQ-79): once a drive is ticked the agent may read it and send what it reads to the web
 without asking, even after the chat has read outside content. Only a person member (`owner` or
 `person`) of a session that is not archived gets the control or `/drives`; anyone else sees none,
 and an agent that has not said what it reads gets no control. Fixtures: the default mock offers
 `alpha` and `gamma`, refuses `beta` by the audience rule and `omega` as another agent's, and its
 fake server refuses a tick of `gamma` a moment later; `?drives=nonmember` draws no control;
-`?drives=stale` ticks `alpha` and a `gamma` the agent no longer offers; `/drives` opens the menu.
+`?drives=stale` ticks `alpha` and a `delta` and `gamma` the agent no longer offers; `/drives` opens
+the menu.
 
 The viewer rule is Rust's: “A viewer renders a turn that is still being written as the turn's
 `turn_chunks` contiguous from seq 0, followed by the latest `text` it has seen on

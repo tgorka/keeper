@@ -179,4 +179,32 @@ describe("SessionDrives", () => {
     expect(mock.set).toHaveBeenCalledWith(target, "gamma", false);
     expect(screen.queryByRole("button", { name: "Untick alpha" })).toBeNull();
   });
+
+  it("says once, on every failing chip, that unticking either unticks both", async () => {
+    const reason =
+      "Untick delta and gamma to change the other drives: Nixie no longer offers them. " +
+      "Unticking either unticks both.";
+    render(
+      <Harness
+        vm={drives({
+          drives: [
+            { name: "delta", ticked: true, reason },
+            { name: "gamma", ticked: true, reason },
+            { name: "alpha", ticked: true },
+          ],
+        })}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(screen.getAllByText(reason, { selector: "p" })).toHaveLength(1);
+    for (const name of ["delta", "gamma"])
+      expect(screen.getByRole("button", { name: `Untick ${name}` })).toHaveAccessibleDescription(
+        reason,
+      );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Untick delta" }));
+    });
+    // Rust's `set` unticks every failing drive in that one write.
+    expect(mock.set).toHaveBeenCalledWith(target, "delta", false);
+  });
 });

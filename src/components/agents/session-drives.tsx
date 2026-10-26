@@ -23,7 +23,8 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  * person member there is no `drives` and nothing is drawn. What ticking allows (D-34's accepted
  * risk, R-HQ-79) is Rust's sentence, shown in the menu where every tick happens and again under
  * the chips when a tick takes the selection from none to one. A ticked drive Rust gives a reason
- * stopped being allowed and holds every other change back: its chip says so and unticks it.
+ * stopped being allowed and holds every other change back: its chip says so, and its button
+ * unticks every such drive at once (Rust's `set`), as the sentence under the chips says.
  */
 export function SessionDrives({
   target,
@@ -43,6 +44,7 @@ export function SessionDrives({
   const [busy, setBusy] = useState<string | null>(null);
   const writing = useRef(false);
   const warningId = useId();
+  const staleId = useId();
   const ticked = drives.drives.filter((drive) => drive.ticked);
   const failing = ticked.filter((drive) => drive.reason !== undefined);
 
@@ -163,6 +165,7 @@ export function SessionDrives({
                     size="icon-xs"
                     className="size-6 rounded-full"
                     aria-label={`Untick ${drive.name}`}
+                    aria-describedby={staleId}
                     aria-busy={busy === drive.name}
                     onClick={() => void change(drive.name, false)}
                   >
@@ -186,11 +189,12 @@ export function SessionDrives({
           )}
         </ul>
       </div>
-      {failing.map((drive) => (
-        <p key={drive.name} className="pt-1 text-destructive text-xs [overflow-wrap:anywhere]">
-          {drive.reason}
+      {failing[0] && (
+        // One sentence for all of them: Rust's, the same on each failing drive.
+        <p id={staleId} className="pt-1 text-destructive text-xs [overflow-wrap:anywhere]">
+          {failing[0].reason}
         </p>
-      ))}
+      )}
       {firstTick && ticked.length > 0 && (
         <div
           role="note"

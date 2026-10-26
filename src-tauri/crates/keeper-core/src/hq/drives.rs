@@ -57,7 +57,7 @@ pub const WARNING: &str = "Once you tick a drive, the agent may read it and send
 /// One drive of the menu: ticked (`ticked`), offered (`reason` absent), or
 /// not allowed (`reason` says why). A ticked drive with a reason was ticked
 /// before it stopped being allowed: it holds every other change back (V17
-/// checks the whole selection), and unticking it is always allowed.
+/// checks the whole selection), and unticking it unticks every such drive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -233,37 +233,95 @@ impl Judged {
         matches!(self.verdict, Verdict::NotOffered | Verdict::Audience(_))
     }
 
-    /// Why it cannot be ticked, or — ticked already — why it holds every
-    /// other change back until it is unticked; `None` when it may be ticked.
+    /// Why it cannot be ticked; `None` when it may be, and for a ticked
+    /// drive, whose reason is the selection's ([`Stale`]).
     fn reason(&self, agent: &str, database: &str) -> Option<String> {
         let name = &self.name;
-        match (&self.verdict, self.ticked) {
-            (Verdict::Allowed | Verdict::Unknown, _) => None,
-            (Verdict::NotOffered, false) => Some(format!("{agent} does not offer {name}.")),
-            (Verdict::NotOffered, true) => Some(format!(
-                "{agent} no longer offers {name}. Untick it to change the other drives."
-            )),
-            (Verdict::Audience(outside), false) => Some(format!(
+        match &self.verdict {
+            _ if self.ticked => None,
+            Verdict::Allowed | Verdict::Unknown => None,
+            Verdict::NotOffered => Some(format!("{agent} does not offer {name}.")),
+            Verdict::Audience(outside) => Some(format!(
                 "{} but cannot read {name}, so it cannot be ticked here.",
-                readers(outside, database)
-            )),
-            (Verdict::Audience(outside), true) => Some(format!(
-                "{} but cannot read {name}. Untick it to change the other drives.",
                 readers(outside, database)
             )),
         }
     }
+}
 
-    /// Why a selection still holding this drive is refused here.
-    fn untick_first(&self, agent: &str, database: &str) -> String {
-        let name = &self.name;
-        match &self.verdict {
-            Verdict::Audience(outside) => format!(
-                "Untick {name} first: {} but cannot read it.",
-                readers(outside, database)
-            ),
-            _ => format!("Untick {name} first: {agent} no longer offers it."),
+/// The ticked drives that stopped being allowed. V17 checks every drive of
+/// a selection, so while one stays ticked every write is refused: they go
+/// together — unticking any of them unticks all of them in one write — and
+/// nothing else changes until they are gone (R10923-01, R10923-06).
+struct Stale<'a>(Vec<&'a Judged>);
+
+impl<'a> Stale<'a> {
+    fn of(judged: &'a [Judged]) -> Stale<'a> {
+        Stale(judged.iter().filter(|d| d.ticked && d.fails()).collect())
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.0.iter().any(|d| d.name == name)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.0.iter().map(|d| d.name.clone()).collect()
+    }
+
+    /// Why they fail: "Nixie no longer offers them", "Nixie no longer
+    /// offers gamma; Ben reads alpha but cannot read beta".
+    fn why(&self, agent: &str, database: &str) -> String {
+        let alone = self.0.len() == 1;
+        let not_offered: Vec<String> = self
+            .0
+            .iter()
+            .filter(|d| d.verdict == Verdict::NotOffered)
+            .map(|d| d.name.clone())
+            .collect();
+        let mut clauses = Vec::new();
+        if !not_offered.is_empty() {
+            let them = if not_offered.len() == self.0.len() {
+                if alone { "it" } else { "them" }.to_owned()
+            } else {
+                listed(&not_offered)
+            };
+            clauses.push(format!("{agent} no longer offers {them}"));
         }
+        for drive in &self.0 {
+            if let Verdict::Audience(outside) = &drive.verdict {
+                let it = if alone { "it" } else { drive.name.as_str() };
+                clauses.push(format!(
+                    "{} but cannot read {it}",
+                    readers(outside, database)
+                ));
+            }
+        }
+        clauses.join("; ")
+    }
+
+    /// What each of them says, in the menu and under the chips, before the
+    /// person acts; `None` when there are none.
+    fn sentence(&self, agent: &str, database: &str) -> Option<String> {
+        let names = listed(&self.names());
+        let together = match self.0.len() {
+            0 => return None,
+            1 => "",
+            2 => " Unticking either unticks both.",
+            _ => " Unticking one unticks them all.",
+        };
+        Some(format!(
+            "Untick {names} to change the other drives: {}.{together}",
+            self.why(agent, database)
+        ))
+    }
+
+    /// Why any other change is refused here.
+    fn untick_first(&self, agent: &str, database: &str) -> String {
+        format!(
+            "Untick {} first: {}.",
+            listed(&self.names()),
+            self.why(agent, database)
+        )
     }
 }
 
@@ -453,12 +511,18 @@ pub fn view(
 ) -> Option<AgentSessionDrivesVm> {
     let (judged, agent) = judge(source, session_id, session, sources)?;
     let database = source.database.as_str();
+    let stale = Stale::of(&judged);
+    let held_back = stale.sentence(&agent, database);
     let mut drives: Vec<AgentSessionDriveVm> = judged
         .iter()
         .map(|drive| AgentSessionDriveVm {
             name: drive.name.clone(),
             ticked: drive.ticked,
-            reason: drive.reason(&agent, database),
+            reason: if stale.contains(&drive.name) {
+                held_back.clone()
+            } else {
+                drive.reason(&agent, database)
+            },
             refused: None,
         })
         .collect();
@@ -507,10 +571,10 @@ pub struct DriveRefused(pub String);
 
 /// Tick `drive` for the session's agent to read, or untick it. Written on
 /// the version read, so two devices ticking at once conflict rather than
-/// overwrite; unticking the last drive writes `[]`, never a delete. While a
-/// ticked drive keeper knows fails stays in the selection, every change but
-/// unticking it is refused here, naming it. A selection written sets aside
-/// the refusals of the ones before it.
+/// overwrite; unticking the last drive writes `[]`, never a delete. Ticked
+/// drives keeper knows fail ([`Stale`]) go together: unticking any of them
+/// unticks all of them, and every other change is refused here, naming
+/// them. A selection written sets aside the refusals of the ones before it.
 pub fn set(
     source: &Source,
     session_id: &str,
@@ -529,7 +593,15 @@ pub fn set(
     if drives.iter().any(|ticked| ticked == drive) == tick {
         return Ok(());
     }
-    if tick {
+    let stale = Stale::of(&judged);
+    if !tick && stale.contains(drive) {
+        // The way out: every drive that stopped being allowed goes in this
+        // one write, so what is written is a selection V17 takes.
+        drives.retain(|ticked| !stale.contains(ticked));
+    } else if !stale.0.is_empty() {
+        // Anything else would be refused for them: say so here, naming them.
+        return Err(DriveRefused(stale.untick_first(&agent, database)));
+    } else if tick {
         let Some(target) = judged.iter().find(|row| row.name == drive) else {
             return Err(DriveRefused(format!(
                 "{drive} is not a drive this chat's agent offers."
@@ -541,18 +613,6 @@ pub fn set(
         drives.push(drive.to_owned());
     } else {
         drives.retain(|ticked| ticked != drive);
-    }
-    // V17 checks every drive of the selection: one ticked before it stopped
-    // being allowed would refuse this change too. Unticking such a drive is
-    // always written — the way out — and anything else waits until it is.
-    let unticking_failing = !tick && judged.iter().any(|row| row.name == drive && row.fails());
-    if !unticking_failing {
-        if let Some(stale) = judged
-            .iter()
-            .find(|row| row.fails() && drives.contains(&row.name))
-        {
-            return Err(DriveRefused(stale.untick_first(&agent, database)));
-        }
     }
     let standing: Vec<String> = source
         .replica

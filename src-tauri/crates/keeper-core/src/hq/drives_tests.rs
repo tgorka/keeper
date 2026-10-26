@@ -456,7 +456,7 @@ fn a_ticked_drive_that_stopped_being_offered_holds_the_others_back_until_it_is_u
     assert!(gamma.ticked);
     assert_eq!(
         gamma.reason.as_deref(),
-        Some("Nixie no longer offers gamma. Untick it to change the other drives.")
+        Some("Untick gamma to change the other drives: Nixie no longer offers it.")
     );
 
     let refused = set(&alpha, SESSION, "alpha", false, &sources, 7).expect_err("held back");
@@ -532,4 +532,105 @@ fn a_server_refusal_is_hung_on_the_drive_that_fails_not_the_one_clicked() {
         "alpha was clicked; it is not what failed"
     );
     assert_eq!(vm.refused, by("gamma").refused);
+}
+
+/// R10923-06: two ticked drives that stopped being offered. Unticking one
+/// alone would write a selection V17 still refuses for the other, so each
+/// untick was refused for the other and nothing could change: unticking
+/// either unticks both, in one write.
+#[test]
+fn unticking_either_of_two_drives_no_longer_offered_unticks_both() {
+    for clicked in ["gamma", "delta"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = open(dir.path(), "alpha");
+        seed(&alpha, Some("owner"), false);
+        put(
+            &alpha,
+            vec![profile(
+                "nixie.box",
+                AGENT,
+                Some(&["alpha", "gamma", "delta"]),
+            )],
+        );
+        let sources = [alpha.clone()];
+        for drive in ["alpha", "gamma", "delta"] {
+            set(&alpha, SESSION, drive, true, &sources, 5).expect("ticks");
+        }
+        put(&alpha, vec![profile("nixie.box", AGENT, Some(&["alpha"]))]);
+
+        let vm = drives_vm(&alpha, &sources).expect("control");
+        let said = "Untick delta and gamma to change the other drives: Nixie no longer offers \
+                    them. Unticking either unticks both.";
+        for name in ["gamma", "delta"] {
+            let drive = vm.drives.iter().find(|d| d.name == name).expect(name);
+            assert_eq!(
+                drive.reason.as_deref(),
+                Some(said),
+                "{name} says so before acting"
+            );
+        }
+        let refused = set(&alpha, SESSION, "alpha", false, &sources, 6).expect_err("held back");
+        assert_eq!(
+            refused.0,
+            "Untick delta and gamma first: Nixie no longer offers them."
+        );
+        assert_eq!(
+            stored(&alpha).as_deref(),
+            Some(r#"["alpha","gamma","delta"]"#)
+        );
+
+        set(&alpha, SESSION, clicked, false, &sources, 7).expect("the way out");
+        assert_eq!(
+            stored(&alpha).as_deref(),
+            Some(r#"["alpha"]"#),
+            "unticking {clicked} unticks both in one write V17 takes"
+        );
+        set(&alpha, SESSION, "alpha", false, &sources, 8).expect("then a healthy change");
+        assert_eq!(stored(&alpha).as_deref(), Some("[]"));
+    }
+}
+
+/// R10923-06 with two causes: one drive no longer offered, one the audience
+/// rule now refuses.
+#[test]
+fn unticking_either_of_two_drives_failing_for_different_reasons_unticks_both() {
+    for clicked in ["beta", "gamma"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alpha = open(dir.path(), "alpha");
+        let beta = open(dir.path(), "beta");
+        seed(&alpha, Some("owner"), false);
+        seed(&beta, Some("owner"), false);
+        let offers = Some(&["alpha", "beta", "gamma"][..]);
+        put(&alpha, vec![profile("nixie.box", AGENT, offers)]);
+        put(&beta, vec![profile("nixie.box", AGENT, offers)]);
+        let sources = [alpha.clone(), beta.clone()];
+        for drive in ["alpha", "beta", "gamma"] {
+            set(&alpha, SESSION, drive, true, &sources, 5).expect("ticks");
+        }
+        // Ben joins alpha and not beta; the instance stops publishing gamma.
+        put(
+            &alpha,
+            vec![
+                actor("ben", "person", "Ben", "alpha"),
+                profile("nixie.box", AGENT, Some(&["alpha", "beta"])),
+            ],
+        );
+
+        let vm = drives_vm(&alpha, &sources).expect("control");
+        let said = "Untick beta and gamma to change the other drives: Nixie no longer offers \
+                    gamma; Ben reads alpha but cannot read beta. Unticking either unticks both.";
+        assert_eq!(vm.drives[0].reason.as_deref(), Some(said));
+        assert_eq!(vm.drives[1].reason.as_deref(), Some(said));
+        let refused = set(&alpha, SESSION, "alpha", false, &sources, 6).expect_err("held back");
+        assert_eq!(
+            refused.0,
+            "Untick beta and gamma first: Nixie no longer offers gamma; Ben reads alpha but \
+             cannot read beta."
+        );
+
+        set(&alpha, SESSION, clicked, false, &sources, 7).expect("the way out");
+        assert_eq!(stored(&alpha).as_deref(), Some(r#"["alpha"]"#), "{clicked}");
+        set(&alpha, SESSION, "alpha", false, &sources, 8).expect("then a healthy change");
+        assert_eq!(stored(&alpha).as_deref(), Some("[]"));
+    }
 }
