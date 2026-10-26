@@ -49,6 +49,8 @@ const vm: AgentSessionViewVm = {
   database: "beta",
   sessionId: "same.1",
   title: "Research",
+  displayName: "assistant · Research",
+  handle: "jolly-pigeon-squeaks",
   agentActor: "assistant",
   agentName: "Assistant",
   readOnly: false,

@@ -769,8 +769,9 @@ impl Replica for Staged {
         &self,
         table: &str,
         row_id: &str,
+        field: Option<&str>,
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
-        self.inner.row_writes(table, row_id)
+        self.inner.row_writes(table, row_id, field)
     }
     fn refused_commits(
         &self,
@@ -784,12 +785,12 @@ impl Replica for Staged {
     fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
         self.inner.blob_cache_bytes()
     }
-    fn supersede(
+    fn mutate_superseding(
         &self,
-        commits: Vec<String>,
-        replacement: &str,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
-        self.inner.supersede(commits, replacement)
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, crate::hq::port::ReplicaError> {
+        self.inner.mutate_superseding(ops, earlier)
     }
     fn remote_query(
         &self,

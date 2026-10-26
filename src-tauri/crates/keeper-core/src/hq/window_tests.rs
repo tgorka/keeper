@@ -157,6 +157,399 @@ fn now() -> i64 {
     sessions::now_ms()
 }
 
+/// Settle queued commits as a round would, at the replica file rather than
+/// through a live server: each keeps its real commit id. A refused commit
+/// leaves the outbox with its refusal and operations journalled; an accepted
+/// one is journalled without its operations, as syncular journals one, and
+/// lands in the server's copy (`_syncular_base_<table>`), so the row
+/// outlives a restart. `title` picks the commits writing that title; `None`
+/// settles every queued commit.
+fn journal_session_writes(path: &std::path::Path, title: Option<&str>, refused: bool) {
+    use syncular_client::api::{CommitOperation, CommitOperationOutcome, RejectionRecord};
+    let mut conn = rusqlite::Connection::open(path).expect("opens outcome fixture");
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("timeout");
+    let queued: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT commit_id, ops_json FROM _syncular_outbox WHERE ?1 IS NULL OR EXISTS \
+             (SELECT 1 FROM json_each(ops_json) op WHERE json_extract(op.value, '$.table') = \
+             'sessions' AND json_extract(op.value, '$.values.title') = ?1) ORDER BY seq",
+        )
+        .expect("outbox")
+        .query_map([title], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("queued writes")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert!(
+        !queued.is_empty(),
+        "the fixture must settle a real local commit"
+    );
+    let tx = conn.transaction().expect("transaction");
+    for (commit, operations) in queued {
+        let ops: Vec<CommitOperation> = serde_json::from_str(&operations).expect("wire operations");
+        let results: Vec<_> = (0..ops.len())
+            .map(|index| {
+                let op_index = i32::try_from(index).expect("small fixture");
+                if refused {
+                    CommitOperationOutcome::Error {
+                        rejection: RejectionRecord {
+                            client_commit_id: commit.clone(),
+                            op_index,
+                            code: "hq.v3.not_member".to_owned(),
+                            message: "You are no longer a member of this chat.".to_owned(),
+                            retryable: false,
+                            details: None,
+                            operation: None,
+                        },
+                    }
+                } else {
+                    CommitOperationOutcome::Applied { op_index }
+                }
+            })
+            .collect();
+        tx.execute(
+            "INSERT INTO _syncular_commit_outcomes(client_commit_id, status, recorded_at_ms, \
+             results_json, operations_json) VALUES (?1, ?2, 1, ?3, ?4)",
+            rusqlite::params![
+                commit,
+                if refused { "rejected" } else { "applied" },
+                serde_json::to_string(&results).expect("results"),
+                refused.then(|| serde_json::to_string(&ops).expect("operations"))
+            ],
+        )
+        .expect("records server outcome");
+        if !refused {
+            for op in &ops {
+                let (base, visible) = (format!("_syncular_base_{}", op.table), &op.table);
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {base} SELECT * FROM {visible} WHERE id = ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM {base} WHERE id = ?1)"
+                    ),
+                    [&op.row_id],
+                )
+                .expect("server copy of a created row");
+                for column in op.values.iter().flat_map(|values| values.keys()) {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {base} SET \"{column}\" = (SELECT \"{column}\" FROM {visible} \
+                             WHERE id = ?1) WHERE id = ?1"
+                        ),
+                        [&op.row_id],
+                    )
+                    .expect("server copy of a written column");
+                }
+            }
+        }
+        tx.execute(
+            "DELETE FROM _syncular_outbox WHERE commit_id = ?1",
+            [&commit],
+        )
+        .expect("settles outbox");
+    }
+    tx.commit().expect("durable outcome");
+}
+
+#[test]
+fn a_later_refused_rename_survives_restart_and_an_accepted_retry_clears_it() {
+    use sessions::AgentSessionTitleWriteVm as Write;
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("dev1.1", NIXIE, 1, false, None))
+        .expect("session");
+    w.alpha
+        .replica
+        .mutate(session("dev1.2", NIXIE, 2, false, None))
+        .expect("other session");
+    let path = w._dir.path().join("alpha.sqlite");
+    let vm = || {
+        sessions::rows(&w.alpha, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("row")
+    };
+    assert_eq!(
+        vm().title_write,
+        Write::Confirmed,
+        "a chat whose creation waits has no rename waiting"
+    );
+    journal_session_writes(&path, None, false);
+    assert_eq!(vm().title_write, Write::Confirmed);
+    sessions::rename(&w.alpha, "dev1.1", "proposed after local success").expect("queued offline");
+    assert_eq!(
+        vm().title_write,
+        Write::Pending,
+        "local success is not server acceptance"
+    );
+    sessions::set_archived(&w.alpha, "dev1.1", true).expect("unrelated pending write");
+    journal_session_writes(&path, Some("proposed after local success"), true);
+    let expected = Write::Refused {
+        title: "proposed after local success".to_owned(),
+        sentence: "The server refused this rename: you are no longer a member of this chat."
+            .to_owned(),
+    };
+    assert_eq!(
+        vm().title_write,
+        expected,
+        "a later server refusal must reach the row VM: {:?}; {:?}",
+        w.alpha
+            .replica
+            .row_writes("sessions", "dev1.1", Some("title")),
+        w.alpha.replica.refused_commits("sessions")
+    );
+    assert_eq!(
+        sessions::rows(&w.alpha, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.2")
+            .expect("other row")
+            .title_write,
+        Write::Confirmed,
+        "another chat is unaffected"
+    );
+    w.alpha.replica.close();
+    w.alpha.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    let after_restart = || {
+        sessions::rows(&source, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("reopened row")
+    };
+    assert_eq!(
+        after_restart().title_write,
+        expected,
+        "the file, not editor memory, retains the proposal"
+    );
+    sessions::rename(&source, "dev1.1", "proposed after local success").expect("retry queued");
+    assert_eq!(
+        after_restart().title_write,
+        Write::Pending,
+        "retry supersedes the standing refusal"
+    );
+    journal_session_writes(&path, Some("proposed after local success"), false);
+    assert_eq!(
+        after_restart().title_write,
+        Write::Confirmed,
+        "accepted retry clears refusal even while the archive write still waits"
+    );
+    assert!(
+        !source
+            .replica
+            .row_writes("sessions", "dev1.1", None)
+            .expect("all writes")
+            .pending
+            .is_empty(),
+        "archive pending must not be reported as a pending rename"
+    );
+    source.replica.close();
+    source.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    assert_eq!(
+        sessions::rows(&source, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("row after acceptance")
+            .title_write,
+        Write::Confirmed,
+        "the supersession and confirmation survive another restart"
+    );
+}
+
+#[test]
+fn the_newest_title_write_decides_and_an_older_refusal_never_outranks_it() {
+    use sessions::AgentSessionTitleWriteVm as Write;
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("dev1.1", NIXIE, 1, false, None))
+        .expect("session");
+    let path = w._dir.path().join("alpha.sqlite");
+    journal_session_writes(&path, None, false);
+    let row = |source: &Source| {
+        sessions::rows(source, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("row")
+    };
+    let refused = |title: &str| Write::Refused {
+        title: title.to_owned(),
+        sentence: "The server refused this rename: you are no longer a member of this chat."
+            .to_owned(),
+    };
+    // Two renames inside one round trip: AAA still waits when BBB is written.
+    sessions::rename(&w.alpha, "dev1.1", "AAA").expect("first rename queued");
+    sessions::rename(&w.alpha, "dev1.1", "BBB").expect("second rename queued");
+    assert_eq!(row(&w.alpha).title_write, Write::Pending);
+    journal_session_writes(&path, Some("AAA"), true);
+    let vm = row(&w.alpha);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Pending),
+        "the older refusal must not hide the newer rename that still waits"
+    );
+    journal_session_writes(&path, Some("BBB"), false);
+    let vm = row(&w.alpha);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed),
+        "the newer rename was accepted: the older refusal is moot"
+    );
+    w.alpha.replica.close();
+    w.alpha.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed),
+        "set aside across a restart, not only in this process"
+    );
+    assert!(
+        source
+            .replica
+            .row_writes("sessions", "dev1.1", Some("title"))
+            .expect("title writes")
+            .refused
+            .is_empty(),
+        "the refusal is resolved in the outcome journal itself"
+    );
+    // Both refused: the newest decides, and Retry offers only its title.
+    sessions::rename(&source, "dev1.1", "CCC").expect("third rename queued");
+    sessions::rename(&source, "dev1.1", "DDD").expect("fourth rename queued");
+    journal_session_writes(&path, Some("CCC"), true);
+    journal_session_writes(&path, Some("DDD"), true);
+    assert_eq!(row(&source).title_write, refused("DDD"));
+    source.replica.close();
+    source.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    assert_eq!(
+        row(&source).title_write,
+        refused("DDD"),
+        "the older refusal stays set aside after a restart"
+    );
+    // Retrying the newest sets it aside too; nothing older resurfaces.
+    sessions::rename(&source, "dev1.1", "DDD").expect("retry queued");
+    assert_eq!(row(&source).title_write, Write::Pending);
+    journal_session_writes(&path, Some("DDD"), false);
+    assert_eq!(row(&source).title_write, Write::Confirmed);
+    // `/rename` is a rename like the menu's: it sets the older one aside too.
+    sessions::rename(&source, "dev1.1", "AAA").expect("menu rename queued");
+    crate::hq::commands::run(&source, "dev1.1", "/rename BBB").expect("/rename queued");
+    journal_session_writes(&path, Some("AAA"), true);
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Pending),
+        "an older menu rename's refusal must not outrank a newer /rename"
+    );
+    journal_session_writes(&path, Some("BBB"), false);
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed)
+    );
+    source.replica.close();
+    source.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed),
+        "the /rename's set-aside survives a restart"
+    );
+}
+
+#[test]
+fn colliding_handles_append_session_numbers_without_changing_ids() {
+    let w = world();
+    for id in ["dev1.242", "dev1.752"] {
+        w.alpha
+            .replica
+            .mutate(session(id, NIXIE, now(), false, None))
+            .expect("session");
+    }
+    let rows = sessions::rows(&w.alpha, now());
+    for (id, expected) in [
+        ("dev1.242", "mighty-toucan-skips-242"),
+        ("dev1.752", "mighty-toucan-skips-752"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == id)
+            .expect("same id");
+        assert_eq!(row.handle, expected);
+    }
+}
+
+#[test]
+fn names_use_published_handles_and_rename_preserves_identity() {
+    let w = world();
+    for example in crate::hq::vocabulary::handle_examples() {
+        w.alpha
+            .replica
+            .mutate(session(&example.session_id, NIXIE, now(), false, None))
+            .expect("session");
+        sessions::rename(&w.alpha, &example.session_id, "hej").expect("rename");
+        let rows = sessions::rows(&w.alpha, now());
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == example.session_id)
+            .expect("same id");
+        assert_eq!(row.title, "hej");
+        assert_eq!(row.display_name, "nixie · hej");
+        assert_eq!(row.handle, example.handle);
+        assert!(!row.archived);
+        for blank in ["", " \t "] {
+            sessions::rename(&w.alpha, &example.session_id, blank).expect("blank title");
+            let view = timeline::view(
+                &w.alpha,
+                &example.session_id,
+                &Opened::default(),
+                &HashMap::new(),
+                now(),
+            )
+            .expect("view")
+            .0;
+            assert_eq!(view.display_name, format!("nixie · {}", example.handle));
+            assert_eq!(view.handle, example.handle);
+            assert_eq!(view.session_id, example.session_id);
+        }
+    }
+}
+
+#[test]
+fn names_include_only_agent_members_primary_first() {
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("dev1.1", STEWARD, now(), false, None))
+        .expect("session");
+    w.alpha
+        .replica
+        .mutate(vec![
+            actor("zed", "agent", "Zed", "/zed"),
+            actor("aaa", "agent", "Aaa", "/aaa"),
+        ])
+        .expect("agents");
+    for member in ["zed", STEWARD, NIXIE, "aaa"] {
+        w.alpha
+            .replica
+            .mutate(vec![upsert(
+                "session_members",
+                json!({
+                    "id": format!("dev1.1/{member}"), "session_id": "dev1.1", "actor_id": member,
+                    "role": "member", "reads_trace": true, "added_by_actor": ANA,
+                    "added_at_ms": 1, "read_until": null, "author_actor": ANA, "author_client": "dev1"
+                }),
+            )])
+            .expect("member");
+    }
+    assert_eq!(
+        sessions::rows(&w.alpha, now())[0].display_name,
+        "steward,aaa,nixie,zed · about dev1.1"
+    );
+}
+
 #[test]
 fn both_databases_list_together_each_row_labelled_and_attention_is_rusts() {
     let w = world();
@@ -590,13 +983,20 @@ impl Staged {
 
 impl crate::hq::port::Replica for Staged {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, crate::hq::port::ReplicaError> {
+        self.mutate_superseding(ops, Vec::new())
+    }
+    fn mutate_superseding(
+        &self,
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, crate::hq::port::ReplicaError> {
         let mut held = self.held.lock().expect("held");
         while *held {
             held = self.released.wait(held).expect("held");
         }
         drop(held);
         self.written.lock().expect("written").push(ops.clone());
-        let commit = self.inner.mutate(ops)?;
+        let commit = self.inner.mutate_superseding(ops, earlier)?;
         self.commits.lock().expect("commits").push(commit.clone());
         Ok(commit)
     }
@@ -682,8 +1082,9 @@ impl crate::hq::port::Replica for Staged {
         &self,
         table: &str,
         row_id: &str,
+        field: Option<&str>,
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
-        self.inner.row_writes(table, row_id)
+        self.inner.row_writes(table, row_id, field)
     }
     fn refused_commits(
         &self,
@@ -696,13 +1097,6 @@ impl crate::hq::port::Replica for Staged {
     }
     fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
         self.inner.blob_cache_bytes()
-    }
-    fn supersede(
-        &self,
-        commits: Vec<String>,
-        replacement: &str,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
-        self.inner.supersede(commits, replacement)
     }
     fn remote_query(
         &self,

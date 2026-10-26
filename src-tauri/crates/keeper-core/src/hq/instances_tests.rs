@@ -9,8 +9,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::{
-    agent_view, answering_vm, list, online, set_order, AgentInstancePresenceVm, Instance, Online,
-    Prefs, Shared,
+    agent_view, answering_vm, instances_of, list, online, set_order, AgentInstancePresenceVm,
+    Instance, Online, Prefs, Shared,
 };
 use crate::hq::live::{Claim, Live, LEASE};
 use crate::hq::port::{Refusal, Rejection, ReplicaSpec, RowOp, RowWrites};
@@ -136,6 +136,28 @@ fn present(clients: &[&str]) -> Online {
 
 fn nobody(_: &Source) -> Online {
     Some(HashSet::new())
+}
+
+#[test]
+fn instance_label_uses_agent_and_host_not_client_nickname() {
+    let (_dir, sources) = world();
+    sources[0]
+        .replica
+        .mutate(vec![upsert(
+            "clients",
+            server(json!({
+                "id": A, "actor_id": NIXIE, "kind": "instance", "name": "desk nickname",
+                "host": "electra", "created_at_ms": 1, "revoked_at_ms": null, "dir": "alpha"
+            })),
+        )])
+        .expect("client");
+    let instances = instances_of(&sources[0], NIXIE);
+    let instance = instances
+        .iter()
+        .find(|instance| instance.client_id == A)
+        .expect("instance");
+    assert_eq!(instance.label, "nixie@electra");
+    assert_eq!(instance.client_id, A);
 }
 
 #[test]
@@ -658,7 +680,7 @@ fn shared(database: &str, order: Option<&[&str]>, writes: RowWrites) -> Shared {
 
 fn waiting() -> RowWrites {
     RowWrites {
-        pending: true,
+        pending: vec!["c-waiting".to_owned()],
         refused: Vec::new(),
     }
 }
@@ -698,7 +720,7 @@ fn a_choice_one_database_took_and_another_still_waits_for_is_not_shown_as_agreem
                 "beta",
                 Some(&[A, B]),
                 RowWrites {
-                    pending: false,
+                    pending: Vec::new(),
                     refused: vec![Refusal {
                         commit_id: "c-1".to_owned(),
                         rejection: Rejection::new("hq.v9.person_actor", "not yours"),

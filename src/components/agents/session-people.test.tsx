@@ -223,6 +223,12 @@ describe("a session that leaves the list", () => {
     database: "alpha",
     sessionId,
     title: `about ${sessionId}`,
+    titleWrite: { state: "confirmed" as const },
+    displayName: `nixie · about ${sessionId}`,
+    handle: "jolly-pigeon-squeaks",
+    createdAtMs: 1780000000000,
+    trust: "native",
+    instances: [],
     agentActor: "nixie",
     agentName: "Nixie",
     agentMark: "N",
@@ -239,7 +245,7 @@ describe("a session that leaves the list", () => {
     store.apply({ ops: [{ op: "remove", index: 0 }], total: 0 });
     expect(agentSessionsStore.getState()).toMatchObject({
       selected: null,
-      gone: { database: "alpha", sessionId: "s.1", title: "about s.1" },
+      gone: { database: "alpha", sessionId: "s.1", displayName: "nixie · about s.1" },
     });
     // A session just created is selected before the list holds it: not dropped.
     store.select({ database: "alpha", sessionId: "new.1" });

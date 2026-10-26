@@ -214,8 +214,8 @@ pub struct Refusal {
 /// outlives a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RowWrites {
-    /// A commit writing the row waits in the outbox.
-    pub pending: bool,
+    /// The commits writing the row that wait in the outbox, oldest first.
+    pub pending: Vec<String>,
     /// The standing refusals of commits that wrote it, newest first.
     pub refused: Vec<Refusal>,
 }
@@ -341,8 +341,14 @@ pub trait Replica: Send + Sync {
     /// What became of the commit `commit_id`. Answers from the file.
     fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError>;
     /// What is owed, or was refused, of the writes made here to `table`'s
-    /// row `row_id`. Answers from the file.
-    fn row_writes(&self, table: &str, row_id: &str) -> Result<RowWrites, ReplicaError>;
+    /// row `row_id`, optionally restricted to operations writing `field`.
+    /// Answers from the file.
+    fn row_writes(
+        &self,
+        table: &str,
+        row_id: &str,
+        field: Option<&str>,
+    ) -> Result<RowWrites, ReplicaError>;
     /// The standing refusals of commits written here that wrote a row of
     /// `table`, newest first, with what each wrote. Answers from the file.
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError>;
@@ -353,9 +359,19 @@ pub trait Replica: Send + Sync {
     /// The bytes of blob bodies the replica caches, as its client reports
     /// them (`blob_cache_bytes_approx`).
     fn blob_cache_bytes(&self) -> Result<u64, ReplicaError>;
-    /// Set the standing refusals `commit_ids` aside: `replacement`, written
-    /// since, writes their row again. Durable, like the refusals.
-    fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError>;
+    /// [`Replica::mutate`], and set the refusals of `earlier` aside by the
+    /// new commit, which writes their row again, in the same step of the
+    /// replica's owner: no round runs between the two, so no refusal of
+    /// theirs can surface beside the new commit. A commit still waiting in
+    /// the outbox is set aside in advance: should the server refuse it, that
+    /// refusal never stands. Durable, like the refusals. Once the commit is
+    /// written its id is the answer; a set-aside that fails after it is
+    /// logged, since the write itself was made.
+    fn mutate_superseding(
+        &self,
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, ReplicaError>;
     /// Run the server's registered query `operation_id` with `params`: rows
     /// read on the server, never kept in the replica. Not on the owner
     /// thread, so it never waits behind a round; refused while the replica
@@ -490,7 +506,7 @@ pub(crate) mod fake {
         fn delivery(&self, _: &str) -> Result<Delivery, ReplicaError> {
             Ok(Delivery::Unknown)
         }
-        fn row_writes(&self, _: &str, _: &str) -> Result<RowWrites, ReplicaError> {
+        fn row_writes(&self, _: &str, _: &str, _: Option<&str>) -> Result<RowWrites, ReplicaError> {
             Ok(RowWrites::default())
         }
         fn refused_commits(&self, _: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
@@ -505,8 +521,12 @@ pub(crate) mod fake {
         fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
             Ok(0)
         }
-        fn supersede(&self, _: Vec<String>, _: &str) -> Result<(), ReplicaError> {
-            Ok(())
+        fn mutate_superseding(
+            &self,
+            ops: Vec<RowOp>,
+            _: Vec<String>,
+        ) -> Result<String, ReplicaError> {
+            self.mutate(ops)
         }
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Err(ReplicaError::NotSyncing)

@@ -232,6 +232,44 @@ database; identical session ids in two databases remain separate conversations. 
 agent, last activity and Rust's attention state. **Active**, **Archived** and **All** change only
 which rows are shown, never their order or the underlying subscription.
 
+Rust derives each name as `<agents> · <title>`, with the primary agent first and other agent
+members in actor-id order. Person members do not enter the name. The word handle comes from
+the immutable session id and the shared Syncular vocabulary; a collision within a database
+appends the session number. It is a display label, not another identity or storage key. A blank
+title uses the handle. Renaming changes only the title, never the session id or handle.
+
+Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
+menu: **Rename**, **Copy id**, **Copy name**, **Details**, and **Archive** (or **Unarchive**).
+Rename edits inline with the current title selected, so typing replaces it; Save queues the title
+on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
+local enqueue, not server acceptance: the row says it is waiting until the server settles the
+write. The state comes from the replica's outbox and
+outcome journal (`Replica::row_writes`, restricted to writes of `title`), the same per-row
+delivery the instance choice reads, so it survives a restart. A later refusal stays visible
+beside the row and in its menu in plain words (`hq.v3.not_member`: "you are no longer a member of
+this chat"; a conflict: "another device changed this chat first"; any other code is quoted).
+**Retry rename** reopens the refused proposed title; retrying supersedes the old refusal, and
+acceptance clears the waiting state. Only the newest title write counts: a rename — from the menu
+or `/rename`, which take the same path — sets aside every earlier title write of the row,
+including one still waiting, so if an older rename is refused after a newer one was written, that
+refusal never stands — the row follows the newer one, and Retry never offers the older title. The
+set-aside is made in the same step of the replica's owner that writes the new title, before any
+sync round can settle the older one. The set-aside of a waiting write is kept beside the replica
+(`<replica>.blob-access.sqlite`) until its outcome arrives. If that record cannot be written, the
+rename still reports success (the title was queued), the failure is logged, and the set-aside still
+holds in memory until keeper restarts. The chat's own creation is not a rename and is never set
+aside by one: while it waits, a rename queued behind it shows no rename state, and neither does its
+own refusal. An unrelated archive write is not a pending
+rename. If delivery cannot be read, the row says it is unavailable rather than claiming
+confirmation. Clipboard refusals also stay visible beside the row. Archive/Unarchive still
+reports only the local write; its later refusal is not surfaced on the row yet.
+Development fixture: `?sessions=names&rename=refused` — the editor closes on the local save, the
+row waits, the server refuses the first rename 1.2 s later, and a retry is accepted 1.2 s after
+its save.
+Details includes the database, immutable id, creation time, reported trust and known instances;
+a known host is labelled `<agent>@<host>`.
+Pin, Mark unread, Drives and Model are absent because this surface has no operation for them.
+
 Opening a session shows its newest visible page. **Earlier messages**, or scrolling to the top,
 asks Rust to widen the history window. **Archive session** keeps the list row and marks the
 session archived; **Unarchive session** continues it. An archived read-only page has no composer.

@@ -243,7 +243,12 @@ pub fn instances_of(source: &Source, agent: &str) -> Vec<Instance> {
         found.insert(
             id.clone(),
             Instance {
-                label: opt_text(&row, "name").unwrap_or_else(|| id.clone()),
+                label: opt_text(&row, "host")
+                    .filter(|host| !host.is_empty())
+                    .map_or_else(
+                        || opt_text(&row, "name").unwrap_or_else(|| id.clone()),
+                        |host| format!("{agent}@{host}"),
+                    ),
                 host: opt_text(&row, "host"),
                 client_id: id,
                 ..Instance::default()
@@ -331,7 +336,7 @@ impl Shared {
     pub fn read(source: &Source, agent: &str, online: Online) -> Shared {
         let writes = source
             .replica
-            .row_writes(PREFS, &prefs_id(&source.actor, agent))
+            .row_writes(PREFS, &prefs_id(&source.actor, agent), None)
             .unwrap_or_else(|error| {
                 tracing::debug!(database = %source.database, %error, "the choice's delivery could not be read");
                 RowWrites::default()
@@ -639,7 +644,7 @@ fn per_database(
             .refused
             .first()
             .map(|refusal| refusal.rejection.to_string());
-        let pending = db.writes.pending;
+        let pending = !db.writes.pending.is_empty();
         if !expected.is_empty() && row != expected {
             differs = true;
         }
@@ -823,7 +828,7 @@ pub fn set_order(
         let row_id = prefs_id(&source.actor, agent);
         let standing: Vec<String> = source
             .replica
-            .row_writes(PREFS, &row_id)
+            .row_writes(PREFS, &row_id, None)
             .map(|writes| {
                 writes
                     .refused
@@ -847,13 +852,8 @@ pub fn set_order(
             ),
             base_version: None,
         };
-        match source.replica.mutate(vec![row]) {
-            Ok(commit) => {
-                if let Err(error) = source.replica.supersede(standing, &commit) {
-                    tracing::debug!(database = %source.database, %error, "an earlier refusal of the choice was not set aside");
-                }
-                source.replica.sync_now();
-            }
+        match source.replica.mutate_superseding(vec![row], standing) {
+            Ok(_) => source.replica.sync_now(),
             Err(error) => failed.push(format!("{}: {error}", source.database)),
         }
     }

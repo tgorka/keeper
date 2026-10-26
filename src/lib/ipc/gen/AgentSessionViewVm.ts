@@ -10,7 +10,7 @@ import type { AgentViewPrefsVm } from "./AgentViewPrefsVm";
 /**
  * What an opened session shows, whole, every time it changes.
  */
-export type AgentSessionViewVm = { database: string, sessionId: string, title: string, agentActor: string, agentName: string, agentMark: string, archived: boolean, 
+export type AgentSessionViewVm = { database: string, sessionId: string, title: string, displayName: string, handle: string, agentActor: string, agentName: string, agentMark: string, archived: boolean, 
 /**
  * Read through the server, not held here: nothing can be written.
  */

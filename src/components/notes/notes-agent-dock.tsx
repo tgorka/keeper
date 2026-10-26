@@ -116,7 +116,7 @@ export function DockBody() {
                 key={JSON.stringify([row.database, row.sessionId])}
                 value={JSON.stringify([row.database, row.sessionId])}
               >
-                {row.title} · {row.database}
+                {row.displayName} · {row.database}
                 {row.archived ? " · Archived" : ""}
               </SelectItem>
             ))}

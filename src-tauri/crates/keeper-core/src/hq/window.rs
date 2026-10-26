@@ -630,6 +630,13 @@ impl Hq {
         })
     }
 
+    pub fn rename_session(&self, key: &AgentSessionRef, title: &str) -> Result<(), HqError> {
+        let source = self.source(&key.database)?;
+        sessions::rename(&source, &key.session_id, title).map_err(sentence)?;
+        self.touch();
+        Ok(())
+    }
+
     /// Archive or unarchive a session; its window follows.
     pub fn set_archived(&self, key: &AgentSessionRef, archived: bool) -> Result<(), HqError> {
         let source = self.source(&key.database)?;

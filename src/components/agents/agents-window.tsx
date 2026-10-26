@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { AgentAttentionMark, agentAttentionLabel } from "@/components/agents/agent-attention";
 import { DatabaseDecisionsPanel } from "@/components/agents/decisions-panel";
 import { NewSession } from "@/components/agents/new-session";
+import { SessionRowMenu } from "@/components/agents/session-row-menu";
 import { SessionView } from "@/components/agents/session-view";
 import { Button } from "@/components/ui/button";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -141,7 +142,8 @@ export function AgentsWindow() {
                 role="status"
                 className="p-3 text-muted-foreground text-sm [overflow-wrap:anywhere]"
               >
-                You are no longer in “{gone.title}” ({gone.database}); it has left this device.
+                You are no longer in “{gone.displayName}” ({gone.database}); it has left this
+                device.
               </p>
             )}
             {!loaded && !error && (
@@ -159,52 +161,54 @@ export function AgentsWindow() {
             <ul aria-label="Sessions" className="flex flex-col">
               {visible.map((row) => (
                 <li key={JSON.stringify([row.database, row.sessionId])}>
-                  <button
-                    ref={(button) => {
-                      const key = JSON.stringify([row.database, row.sessionId]);
-                      if (button) rowButtons.current.set(key, button);
-                      else rowButtons.current.delete(key);
-                    }}
-                    type="button"
-                    aria-label={`${row.title}, ${row.agentName}, ${row.database}, ${formatRoomTimestamp(row.lastActivityMs)}${row.archived ? ", archived" : ""}${agentAttentionLabel(row.attention)}`}
-                    aria-current={
-                      selected?.database === row.database && selected.sessionId === row.sessionId
-                        ? "true"
-                        : undefined
-                    }
-                    className={cn(
-                      "flex w-full min-w-0 flex-col gap-1 border-border border-b px-3 py-3 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                      selected?.database === row.database &&
-                        selected.sessionId === row.sessionId &&
-                        "bg-accent",
-                    )}
-                    onClick={() => {
-                      origin.current = JSON.stringify([row.database, row.sessionId]);
-                      agentSessionsStore
-                        .getState()
-                        .select({ database: row.database, sessionId: row.sessionId });
-                    }}
-                  >
-                    <span className="flex w-full min-w-0 items-baseline gap-2">
-                      <span
-                        className="min-w-0 flex-1 truncate font-medium text-sm"
-                        title={row.title}
-                      >
-                        {row.title}
+                  <SessionRowMenu row={row}>
+                    <button
+                      ref={(button) => {
+                        const key = JSON.stringify([row.database, row.sessionId]);
+                        if (button) rowButtons.current.set(key, button);
+                        else rowButtons.current.delete(key);
+                      }}
+                      type="button"
+                      aria-label={`${row.displayName}, ${row.handle}, ${row.database}, ${formatRoomTimestamp(row.lastActivityMs)}${row.archived ? ", archived" : ""}${agentAttentionLabel(row.attention)}`}
+                      aria-current={
+                        selected?.database === row.database && selected.sessionId === row.sessionId
+                          ? "true"
+                          : undefined
+                      }
+                      className={cn(
+                        "flex w-full min-w-0 flex-col gap-1 border-border border-b px-3 py-3 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                        selected?.database === row.database &&
+                          selected.sessionId === row.sessionId &&
+                          "bg-accent",
+                      )}
+                      onClick={() => {
+                        origin.current = JSON.stringify([row.database, row.sessionId]);
+                        agentSessionsStore
+                          .getState()
+                          .select({ database: row.database, sessionId: row.sessionId });
+                      }}
+                    >
+                      <span className="flex w-full min-w-0 items-baseline gap-2">
+                        <span
+                          className="min-w-0 flex-1 truncate font-medium text-sm"
+                          title={row.displayName}
+                        >
+                          {row.displayName}
+                        </span>
+                        <span className="shrink-0 text-muted-foreground text-xs">
+                          {formatRoomTimestamp(row.lastActivityMs)}
+                        </span>
                       </span>
-                      <span className="shrink-0 text-muted-foreground text-xs">
-                        {formatRoomTimestamp(row.lastActivityMs)}
+                      <span className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground text-xs">
+                        <span className="truncate">{row.handle}</span>
+                        <span className="break-all rounded-sm bg-muted px-1.5 py-0.5">
+                          {row.database}
+                        </span>
+                        {row.archived && <span>Archived</span>}
                       </span>
-                    </span>
-                    <span className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground text-xs">
-                      <span className="truncate">{row.agentName}</span>
-                      <span className="break-all rounded-sm bg-muted px-1.5 py-0.5">
-                        {row.database}
-                      </span>
-                      {row.archived && <span>Archived</span>}
-                    </span>
-                    {row.attention && <AgentAttentionMark state={row.attention} />}
-                  </button>
+                      {row.attention && <AgentAttentionMark state={row.attention} />}
+                    </button>
+                  </SessionRowMenu>
                 </li>
               ))}
             </ul>

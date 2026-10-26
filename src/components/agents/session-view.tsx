@@ -284,11 +284,12 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           </Button>
         )}
         <div className="min-w-0 flex-1">
-          <h2 className="truncate font-semibold text-title" title={vm?.title}>
-            {vm?.title ?? "Opening session…"}
+          <h2 className="truncate font-semibold text-title" title={vm?.displayName}>
+            {vm?.displayName ?? "Opening session…"}
           </h2>
           <p className="flex min-w-0 flex-wrap gap-x-2 text-muted-foreground text-xs">
             <span className="break-all">{database}</span>
+            <span>{vm?.handle}</span>
             {vm && <span className="break-all">{vm.agentName}</span>}
             {vm?.archived && <span>Archived</span>}
             {vm?.untrusted && (
