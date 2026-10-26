@@ -329,7 +329,9 @@ fn shown_to(ben: &Source) -> (usize, usize, usize) {
         &HashMap::new(),
         sessions::now_ms(),
     );
-    (view.approvals.len(), steps, waiting.len())
+    // A request waiting for him sits in the banner (Q109-12 a); either place shows it.
+    let banner = view.banner.map_or(0, |banner| banner.approvals.len());
+    (view.approvals.len() + banner, steps, waiting.len())
 }
 
 /// R1064K-01: withdrawing Ben's reader flag, then removing him, leaves the

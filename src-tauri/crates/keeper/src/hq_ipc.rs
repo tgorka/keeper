@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
-use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
+use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm, ShownApprovalVm};
 use keeper_core::hq::default_agent::DefaultAgentVm;
+use keeper_core::hq::grants::{AgentGrantsVm, AlwaysAllow};
 use keeper_core::hq::instances::AgentInstancesVm;
 use keeper_core::hq::live::{AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::members::AgentSessionMembersVm;
@@ -515,8 +516,9 @@ pub async fn agent_send(
     database: String,
     session_id: String,
     body: String,
+    declines: Vec<ShownApprovalVm>,
 ) -> Result<(), IpcError> {
-    blocking(move |hq| hq.send(&session(database, session_id), &body)).await
+    blocking(move |hq| hq.send(&session(database, session_id), &body, &declines)).await
 }
 
 /// Rust decides both menu rows and how Enter interprets an agents draft.
@@ -538,8 +540,17 @@ pub async fn agent_command(
     session_id: String,
     draft: String,
     pick: Option<keeper_core::hq::settings::AgentSettingsPick>,
+    declines: Vec<ShownApprovalVm>,
 ) -> Result<keeper_core::hq::commands::AgentCommandResultVm, IpcError> {
-    blocking(move |hq| hq.command(&session(database, session_id), &draft, pick.as_ref())).await
+    blocking(move |hq| {
+        hq.command(
+            &session(database, session_id),
+            &draft,
+            pick.as_ref(),
+            &declines,
+        )
+    })
+    .await
 }
 
 /// Stage the files at `paths` (the paperclip, drag-and-drop) for a message
@@ -623,12 +634,14 @@ pub async fn agent_attach_commit(
     session_id: String,
     handles: Vec<String>,
     caption: Option<String>,
+    declines: Vec<ShownApprovalVm>,
 ) -> Result<(), IpcError> {
     blocking(move |hq| {
         hq.commit_attachments(
             &session(database, session_id),
             &handles,
             caption.as_deref().unwrap_or(""),
+            &declines,
         )
     })
     .await
@@ -748,6 +761,84 @@ pub async fn agent_session_approval_decide(
         )
     })
     .await
+}
+
+/// A card's *Always allow …* or *This session only* (109.11): the request
+/// approved and the grant it offers written, the scope named by its id —
+/// Rust derives it again from the request's own call and decides whether it
+/// is offered at all.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn agent_approval_always_allow(
+    database: String,
+    session_id: String,
+    approval_id: String,
+    binding_digest: String,
+    scope: String,
+    session_only: bool,
+    expires_in_days: Option<u32>,
+) -> Result<AgentDecisionOutcomeVm, IpcError> {
+    blocking(move |hq| {
+        hq.always_allow(
+            &database,
+            &AlwaysAllow {
+                session_id,
+                approval_id,
+                binding_digest,
+                scope,
+                session_only,
+                expires_in_days,
+            },
+        )
+    })
+    .await
+}
+
+/// Stream Settings › Agents › *Always allowed* at once, then on every
+/// change.
+#[tauri::command]
+pub fn agent_grants_subscribe(channel: Channel<AgentGrantsVm>) -> Result<String, IpcError> {
+    let hq = Arc::clone(hq()?);
+    // A grant made on another device about an agent that only started
+    // serving this person lists once the server is asked again.
+    hq.recheck_grants();
+    let mut changes = hq.changes();
+    let start = move |id: String| {
+        tauri::async_runtime::spawn(async move {
+            let mut shown: Option<AgentGrantsVm> = None;
+            loop {
+                let read = Arc::clone(&hq);
+                let Ok(grants) = tauri::async_runtime::spawn_blocking(move || read.grants()).await
+                else {
+                    return;
+                };
+                if shown.as_ref() != Some(&grants) {
+                    if channel.send(grants.clone()).is_err() {
+                        end(&id);
+                        return;
+                    }
+                    shown = Some(grants);
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    Ok(keep(None, start))
+}
+
+/// End an [`agent_grants_subscribe`] stream.
+#[tauri::command]
+pub fn agent_grants_unsubscribe(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// Revoke one of this person's grants: new uses stop; approvals it already
+/// issued still run.
+#[tauri::command]
+pub async fn agent_grant_revoke(database: String, grant_id: String) -> Result<(), IpcError> {
+    blocking(move |hq| hq.revoke_grant(&database, &grant_id)).await
 }
 
 /// Stream a session's People sheet — its members and who the owner may

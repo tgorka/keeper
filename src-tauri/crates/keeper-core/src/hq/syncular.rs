@@ -548,6 +548,23 @@ const TABLE_REFUSED: &str =
      WHERE json_extract(op.value, '$.table') = ?1) \
      ORDER BY o.seq DESC";
 
+/// The values of one scope variable the server granted the active
+/// subscriptions of one table on their last pull: syncular-client keeps each
+/// subscription's status and effective scopes in `_syncular_subscriptions`.
+const GRANTED: &str = "SELECT DISTINCT v.value AS value FROM _syncular_subscriptions s, \
+     json_each(json_extract(s.state_json, '$.effectiveScopes.' || ?2)) v \
+     WHERE s.tbl = ?1 AND json_extract(s.state_json, '$.status') = 'active' \
+     AND json_extract(s.state_json, '$.cursor') >= 0 \
+     ORDER BY v.value";
+
+/// The window units of one table whose subscription the server revoked:
+/// syncular-client keeps the unit registered (`_syncular_windows`) and never
+/// pulls it again.
+const REVOKED_UNITS: &str = "SELECT w.unit AS unit FROM _syncular_windows w \
+     JOIN _syncular_subscriptions s ON s.id = w.sub_id \
+     WHERE s.tbl = ?1 AND json_extract(s.state_json, '$.status') = 'revoked' \
+     ORDER BY w.unit";
+
 /// The bodies the client caches, with whether the outbox pins each: staged
 /// for upload, or referenced by a commit the server has not taken.
 const CACHED_BODIES: &str = "SELECT b.blob_id, b.byte_length, b.created_at_ms, \
@@ -1984,6 +2001,22 @@ impl Replica for SyncularReplica {
             }
         }
         Ok(RowWrites { pending, refused })
+    }
+
+    fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError> {
+        Ok(self
+            .query(GRANTED, &[Value::from(table), Value::from(variable)])?
+            .into_iter()
+            .filter_map(|row| row.get("value").and_then(Value::as_str).map(str::to_owned))
+            .collect())
+    }
+
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError> {
+        Ok(self
+            .query(REVOKED_UNITS, &[Value::from(table)])?
+            .into_iter()
+            .filter_map(|row| row.get("unit").and_then(Value::as_str).map(str::to_owned))
+            .collect())
     }
 
     fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {

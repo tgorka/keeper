@@ -327,6 +327,67 @@ an open selector consumes Escape before the screen does. The Notes dock and tabl
 sheet use the same list mirror with independent selections, and launch opens Rust's local
 default session.
 
+**Always allow (109.11, Q109-09 b, Q109-10 a, Q109-12 a).** A card's actions are Rust's
+(`AgentApprovalVm.actions`): *Allow once* and *Deny* as buttons, and every action in its `…`
+menu — *Always allow …* and *This session only* only where `hq::grants::offer` offers a grant.
+It offers one for a T2 or T3 request of a tool on the server's allow-list (`run`,
+`mcp__paseo__create_agent`, `mcp__paseo__send_agent_prompt`) in an open session that has not
+read outside content, and only to a person the session's agent serves in that database — keeper
+reads that from the `person_agent` keys the server granted its grants window
+(`Replica::granted`), as V15 decides it (`hq.v15.agent`). syncular-client never pulls a unit
+the server revoked again, so keeper asks again for revoked grants units itself
+(`grants::reask_revoked`: out of the window and back in): once after the replicas start, at most
+hourly after, and when the person opens a session or Settings › Always allowed (at most once a
+minute). An agent that starts serving the person then gets its offer, and the grants made about
+it on another device list here; never at T4, in an untrusted session,
+for `delegate`, a drive tool, any other tool or an invited member the agent does not serve, where
+the menu leaves it out rather than disabling it. The confirm says how broad the
+grant is in Rust's words: a `run` grant covers every call whose program (and first argument, if
+it names one) matches, whatever follows; a Paseo grant covers every call of that exact tool,
+whatever its arguments. The sentence adds that this is any code for an interpreter named alone,
+with any option first (`bash -lc`, `sh -ec`, `python3 -c`, `node -e` …) or an eval subcommand
+(`deno eval`), for a program whose first argument is program text (`awk`), and for a wrapper
+that runs whatever program follows it (`env`, `sudo`, `ssh`, `nice`, `timeout`, `xargs` …). The
+confirm returns focus to the card's `…` menu when it closes; a decision taken in the banner moves
+focus to the card's new place in the reading column, else to the next request in the banner,
+else to the composer. The scope is derived again in Rust from the request's own call; the
+grant row (`standing_grants`, keyed by `vocabulary::person_agent_key`, the server's
+`personAgentKey`) and the approval go in one commit, so a refused grant leaves the request
+waiting with the server's words. Settings › Agents › *Always allowed* lists every grant the
+person made — agent, scope, database, its session if bound, expiry, state — with *Revoke*.
+Revoking stops new uses, not approvals already issued, and the section says so. A grant bound to
+a session reads *Ended* once its session's row here is archived, and stays ended if the session is
+reopened; a session merely absent from the device (left, removed, not arrived yet) leaves the
+grant as it was, with Revoke. A grant reads *Expired* when its expiry passes: the views wake at
+the soonest one (`grants::next_expiry`). A refused grant or revocation is read back from the replica's per-row outcome record.
+
+The requests waiting for this person sit in a banner above the composer (`AgentSessionViewVm
+.banner`), out of the reading column. **Sending a message declines them** — each its own denial,
+written before the message (`approvals::decline_pending`) — and the banner says so, including
+that a message saying yes still declines. The webview sends back the `(id, digest)` pairs its
+banner showed, and Rust declines only those still waiting at that digest: a request that arrived
+after the banner was drawn stays pending. A text message, a message with files, an ask option and
+`/stop` decline; no other slash command does, nor a spoken question (it is sent with no banner
+shown). A denial that cannot be written on the device stops the message, and the banner says
+which request still waits; the composer keeps the draft and shows the same sentence hidden from
+assistive technology, so it is announced once. Mock shell: `?sessions=launch` draws a trusted T2
+`run` (grants offered) and a T4 Paseo start (none); `&grants=untrusted` makes that session
+untrusted; `&grants=refused` has the server refuse every grant write; `&grants=unserved` makes
+the session's agent one that does not serve the person; `&grants=decline-fails` fails every denial
+write; `window.__keeperMockLateApproval()` lands a request without drawing it. The grants list
+holds an ended grant and one that expires 20 s after the page opens.
+
+**Always allow: known limits.**
+
+- The "any code" line does not yet know Windows forms (`powershell.exe -c`, `python.exe -c`,
+  `cmd /c`), package runners (`npx`, `bunx`, `uvx`, `uv run`, `pipx run`) or programs that can
+  exec (`find -exec`, GNU `sed`'s `e`); for those the breadth sentence ("whatever arguments
+  follow") stays literally true (R10911-17).
+- Revoked grants units are asked for again at most hourly, inside a window pass (a change or an
+  expiry wakes one), so an idle device can wait longer; and if the second window write of a
+  re-ask fails, the unit stays out of the window until the units change or keeper restarts — no
+  offer and no rows meanwhile (R10911-18).
+
 Conversations agents had before they moved to the database are archived sessions of their
 database (*Imported history*, below). Instance selection is **Answers from** (below); message and
 attention state remain Rust-owned throughout.

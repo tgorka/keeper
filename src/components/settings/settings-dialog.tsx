@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import { AlwaysAllowedSection } from "@/components/agents/always-allowed-section";
 import { CaptureSettingsSection } from "@/components/notes/capture-settings";
 import { SearchSettingsSection } from "@/components/notes/search-settings";
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
@@ -277,6 +278,10 @@ export function SettingsBody({
     // databases, so a phone chooses the same way — and absent while no held
     // database lists an instance (AD-27).
     "agent-instances": { node: <AgentInstancesSection open={open} /> },
+    // 109.11 (Q109-09 b): what this person always allows, and revoke. On every
+    // tier and behind no capability — a grant is a row in their databases —
+    // and absent while they hold none (AD-27).
+    "always-allowed": { node: <AlwaysAllowedSection open={open} /> },
     // 108.2 (UX-DR-E108-2): the agents' old Matrix rooms the accounts are
     // still in, and the one action that leaves them. On every tier and behind
     // no capability — a phone's accounts are in them too — and absent once

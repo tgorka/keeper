@@ -14,6 +14,12 @@
 //! whose tool call is not on this device cannot be approved here, and a
 //! decision names the binding digest it was shown, so a request that changed
 //! since is refused rather than approved blind.
+//!
+//! A card offers its actions in one menu (109.11, Q109-09 b): *Allow once*,
+//! *Always allow …* and *This session only* where [`crate::hq::grants`]
+//! offers a standing grant, and *Deny*. Sending a message in a session
+//! declines every request there that waits for this person (Q109-12 a,
+//! [`decline_pending`]) — the safe direction, and the card says so.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
+use crate::hq::grants::{self, AgentGrantOfferVm, SessionFacts};
 use crate::hq::port::{Delivery, LinkState, Rejection, RowOp};
 use crate::hq::sessions::{
     authored, int, names, object, opt_text, read, reads_trace, text, Source,
@@ -43,6 +50,21 @@ pub enum AgentApprovalStateVm {
     Consumed,
     /// Nobody decided before it expired.
     Expired,
+}
+
+/// One action of an approval card's menu, in the menu's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AgentApprovalActionVm {
+    /// Approve this request, this once.
+    AllowOnce,
+    /// Approve it and write a standing grant for every session the person
+    /// shares with the agent in this database (`grant` says what it covers).
+    AlwaysAllow,
+    /// Approve it and write a grant bound to this session alone.
+    SessionOnly,
+    Deny,
 }
 
 /// One approval of a session.
@@ -83,6 +105,18 @@ pub struct AgentApprovalVm {
     pub refused: Option<String>,
     /// Rust's line for it.
     pub sentence: String,
+    /// What this person may do with it here, in the card menu's order;
+    /// empty where they decide nothing.
+    pub actions: Vec<AgentApprovalActionVm>,
+    /// What *Always allow …* and *This session only* would grant. Absent
+    /// wherever neither is offered: at T4, in an untrusted session, for
+    /// `delegate`, a drive tool or any tool off the allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub grant: Option<AgentGrantOfferVm>,
+    /// It waits for this person, so a message they send in its session
+    /// declines it (Q109-12 a): what the banner above the composer holds.
+    pub declined_by_send: bool,
 }
 
 /// How a decision went.
@@ -107,7 +141,7 @@ pub struct AgentDecisionOutcomeVm {
 const SELECT: &str = "SELECT a.id AS id, a.session_id AS session_id, a.tier AS tier, \
      a.binding_digest AS binding_digest, a.summary AS summary, a.approvers AS approvers, \
      a.state AS state, a.decided_by_actor AS decided_by_actor, a.decided_by_client AS decided_by_client, a.expires_at_ms AS expires_at_ms, \
-     a.created_at_ms AS created_at_ms, a._sync_version AS version, \
+     a.created_at_ms AS created_at_ms, a.grant_id AS grant_id, a._sync_version AS version, \
      t.id AS call_id, t.name AS tool_name, t.args AS args \
      FROM approvals a LEFT JOIN tool_calls t ON t.id = a.tool_call_id";
 
@@ -142,6 +176,7 @@ pub type Refusals = HashMap<(String, String), String>;
 fn vm(
     source: &Source,
     row: &Map<String, Value>,
+    session: Option<&SessionFacts>,
     directory: &HashMap<String, String>,
     refusals: &Refusals,
     now_ms: i64,
@@ -176,6 +211,12 @@ fn vm(
         .filter(|_| refused.is_none())
         .map(|actor| name(&actor));
     let can_decide = state == AgentApprovalStateVm::Pending && mine && action.is_some();
+    // A grant's own decision names the grant's person (V8 as amended): the
+    // card says it came from their standing grant, not a click.
+    let by = |verb: &str| match (decided_by.as_deref(), opt_text(row, "grant_id")) {
+        (Some(who), Some(_)) => format!("{verb} by {who}'s standing grant"),
+        (who, _) => format!("{verb} by {}", who.unwrap_or("someone")),
+    };
     let sentence = match state {
         AgentApprovalStateVm::Pending if refused.is_some() => format!(
             "The server refused your decision: {}",
@@ -194,25 +235,42 @@ fn vm(
                 .to_owned()
         }
         AgentApprovalStateVm::Pending => "Waiting for you.".to_owned(),
-        AgentApprovalStateVm::Approved => format!(
-            "Approved by {}.",
-            decided_by.as_deref().unwrap_or("someone")
-        ),
-        AgentApprovalStateVm::Denied => {
-            format!("Denied by {}.", decided_by.as_deref().unwrap_or("someone"))
-        }
-        AgentApprovalStateVm::Consumed => format!(
-            "Approved by {}; the agent has run it.",
-            decided_by.as_deref().unwrap_or("someone")
-        ),
+        AgentApprovalStateVm::Approved => format!("{}.", by("Approved")),
+        AgentApprovalStateVm::Denied => format!("{}.", by("Denied")),
+        AgentApprovalStateVm::Consumed => format!("{}; the agent has run it.", by("Approved")),
         AgentApprovalStateVm::Expired => "Expired before anyone decided.".to_owned(),
     };
+    let tool_name = text(row, "tool_name").to_owned();
+    let tier = text(row, "tier").to_owned();
+    let grant = match session {
+        Some(session) if can_decide => grants::offer(
+            &tier,
+            &tool_name,
+            &crate::hq::sessions::json(row, "args"),
+            session,
+            &name(&session.agent_actor),
+            &source.database,
+        ),
+        _ => None,
+    };
+    let mut actions = Vec::new();
+    if can_decide {
+        actions.push(AgentApprovalActionVm::AllowOnce);
+        if grant.is_some() {
+            actions.push(AgentApprovalActionVm::AlwaysAllow);
+            actions.push(AgentApprovalActionVm::SessionOnly);
+        }
+        actions.push(AgentApprovalActionVm::Deny);
+    }
+    let declined_by_send = state == AgentApprovalStateVm::Pending
+        && mine
+        && session.is_some_and(|session| !session.archived);
     Some(AgentApprovalVm {
         id,
         database: source.database.clone(),
         session_id: text(row, "session_id").to_owned(),
-        tool_name: text(row, "tool_name").to_owned(),
-        tier: text(row, "tier").to_owned(),
+        tool_name,
+        tier,
         summary: text(row, "summary").to_owned(),
         binding_digest: text(row, "binding_digest").to_owned(),
         action,
@@ -223,6 +281,9 @@ fn vm(
         can_decide,
         refused,
         sentence,
+        actions,
+        grant,
+        declined_by_send,
     })
 }
 
@@ -238,13 +299,14 @@ pub fn of_session(
     if !reads_trace(source, session_id) {
         return Vec::new();
     }
+    let session = grants::session_facts(source, session_id);
     read(
         source,
         &format!("{SELECT} WHERE a.session_id = ?1 ORDER BY a.created_at_ms, a.id"),
         &[Value::from(session_id)],
     )
     .iter()
-    .filter_map(|row| vm(source, row, directory, refusals, now_ms))
+    .filter_map(|row| vm(source, row, session.as_ref(), directory, refusals, now_ms))
     .collect()
 }
 
@@ -260,6 +322,7 @@ pub fn waiting(sources: &[Source], refusals: &Refusals, now_ms: i64) -> Vec<Agen
             .filter(|membership| membership.reads_trace)
             .map(|membership| membership.id)
             .collect();
+        let mut facts: HashMap<String, Option<SessionFacts>> = HashMap::new();
         all.extend(
             read(
                 source,
@@ -268,7 +331,13 @@ pub fn waiting(sources: &[Source], refusals: &Refusals, now_ms: i64) -> Vec<Agen
             )
             .iter()
             .filter(|row| reading.contains(text(row, "session_id")))
-            .filter_map(|row| vm(source, row, &directory, refusals, now_ms))
+            .filter_map(|row| {
+                let id = text(row, "session_id");
+                let session = facts
+                    .entry(id.to_owned())
+                    .or_insert_with(|| grants::session_facts(source, id));
+                vm(source, row, session.as_ref(), &directory, refusals, now_ms)
+            })
             .filter(|approval| approval.can_decide),
         );
     }
@@ -439,6 +508,9 @@ pub fn refused_because(rejection: &Rejection) -> String {
              are not yours to decide."
                 .to_owned()
         }
+        // *Always allow …* writes its grant in the decision's commit, so the
+        // grant's refusal is the decision's.
+        code if code.starts_with("hq.v15.") => grants::refused_because(rejection),
         _ if rejection.message.is_empty() => rejection.code.clone(),
         _ => rejection.message.clone(),
     }
@@ -463,6 +535,39 @@ pub fn decide(
     approve: bool,
     now_ms: i64,
 ) -> Result<AgentDecisionOutcomeVm, Refusal> {
+    let row = decidable(
+        source,
+        decisions,
+        session_id,
+        approval_id,
+        binding_digest,
+        approve,
+        now_ms,
+    )?;
+    let op = decision_op(source, approval_id, approve, int(&row, "version"));
+    settle(
+        source,
+        decisions,
+        vec![op],
+        approval_id,
+        Vec::new(),
+        if approve { "Approved." } else { "Denied." },
+    )
+}
+
+/// The request `approval_id` of `session_id` as this person may decide it
+/// now — on the digest they were shown, while it waits for them, and to
+/// approve only with its exact call here — or keeper's refusal, before
+/// anything is written.
+pub(crate) fn decidable(
+    source: &Source,
+    decisions: &Decisions,
+    session_id: &str,
+    approval_id: &str,
+    binding_digest: &str,
+    approve: bool,
+    now_ms: i64,
+) -> Result<Map<String, Value>, Refusal> {
     // A member who does not read the trace holds no request to decide, even
     // where its row is still here (withdrawn, removed, or pinned by the
     // outbox).
@@ -474,12 +579,12 @@ pub fn decide(
         &format!("{SELECT} WHERE a.id = ?1 AND a.session_id = ?2"),
         &[Value::from(approval_id), Value::from(session_id)],
     );
-    let Some(row) = rows.first() else {
+    let Some(row) = rows.into_iter().next() else {
         return Err(Refusal(
             "This request is not on this device any more.".to_owned(),
         ));
     };
-    if text(row, "binding_digest") != binding_digest {
+    if text(&row, "binding_digest") != binding_digest {
         return Err(Refusal(
             "This request changed since it was shown; look at it again before deciding.".to_owned(),
         ));
@@ -487,7 +592,7 @@ pub fn decide(
     let refused_here = decisions
         .refusals(std::slice::from_ref(source))
         .contains_key(&(source.database.clone(), approval_id.to_owned()));
-    match state_of(row, now_ms) {
+    match state_of(&row, now_ms) {
         AgentApprovalStateVm::Pending => {}
         AgentApprovalStateVm::Approved | AgentApprovalStateVm::Denied if refused_here => {}
         AgentApprovalStateVm::Expired => {
@@ -497,23 +602,33 @@ pub fn decide(
         }
         _ => return Err(Refusal("This request was already decided.".to_owned())),
     }
-    if !names(row, "approvers").contains(&source.actor) {
+    if !names(&row, "approvers").contains(&source.actor) {
         return Err(Refusal("This request is not yours to decide.".to_owned()));
     }
-    if approve && action(row).is_none() {
+    if approve && action(&row).is_none() {
         return Err(Refusal(
             "keeper does not hold this request's action yet, so it cannot be approved here."
                 .to_owned(),
         ));
     }
+    Ok(row)
+}
+
+/// Commit `ops` — a decision on `approval_id`, and whatever goes in its
+/// commit — record it in `decisions`, set the standing refusals `supersede`
+/// names aside, and wait up to [`DECISION_WAIT`] for the server: `sent`
+/// once it took it, waiting on this device, or refused with its sentence.
+pub(crate) fn settle(
+    source: &Source,
+    decisions: &Decisions,
+    ops: Vec<RowOp>,
+    approval_id: &str,
+    supersede: Vec<String>,
+    sent: &str,
+) -> Result<AgentDecisionOutcomeVm, Refusal> {
     let commit = source
         .replica
-        .mutate(vec![decision_op(
-            source,
-            approval_id,
-            approve,
-            int(row, "version"),
-        )])
+        .mutate_superseding(ops, supersede)
         .map_err(|error| Refusal(error.to_string()))?;
     decisions.record(&commit, &source.database, approval_id);
     source.replica.sync_now();
@@ -528,7 +643,7 @@ pub fn decide(
             Ok(Delivery::Applied) => {
                 return Ok(AgentDecisionOutcomeVm {
                     state: AgentDecisionStateVm::Sent,
-                    sentence: if approve { "Approved." } else { "Denied." }.to_owned(),
+                    sentence: sent.to_owned(),
                 })
             }
             Ok(Delivery::Refused(rejection)) => {
@@ -550,6 +665,76 @@ pub fn decide(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// One request as the banner showed it: what a message sent from under that
+/// banner declines (Q109-12 a, R10911-01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ShownApprovalVm {
+    pub id: String,
+    pub binding_digest: String,
+}
+
+/// Decline the requests of `session_id` the banner showed — `shown`, each
+/// at the digest it was shown with — that still wait for this person, as a
+/// message sent from under that banner does (Q109-12 a). A request that
+/// arrived after the banner was drawn, or changed since, is left alone: the
+/// person was never told the message declines it. Each denial is the card's
+/// own decision ([`decision_op`]) in its own commit, so a refusal of one (a
+/// tier-4 host, a race) neither refuses the others nor the message, and is
+/// recorded in `decisions`, so a refusal reaches its card. Written before
+/// the message, never waited for. The ids declined; or, when one could not
+/// be written on this device, the sentence saying which still waits — the
+/// message must then not be sent (R10911-06).
+pub fn decline_pending(
+    source: &Source,
+    decisions: &Decisions,
+    session_id: &str,
+    shown: &[ShownApprovalVm],
+    now_ms: i64,
+) -> Result<Vec<String>, String> {
+    if shown.is_empty() || !reads_trace(source, session_id) {
+        return Ok(Vec::new());
+    }
+    let rows = read(
+        source,
+        &format!("{SELECT} WHERE a.session_id = ?1 ORDER BY a.created_at_ms, a.id"),
+        &[Value::from(session_id)],
+    );
+    let refusals = decisions.refusals(std::slice::from_ref(source));
+    let directory = HashMap::new();
+    let session = grants::session_facts(source, session_id);
+    let mut declined = Vec::new();
+    for row in &rows {
+        let Some(approval) = vm(source, row, session.as_ref(), &directory, &refusals, now_ms)
+        else {
+            continue;
+        };
+        let was_shown = shown
+            .iter()
+            .any(|s| s.id == approval.id && s.binding_digest == approval.binding_digest);
+        if !was_shown || !approval.declined_by_send {
+            continue;
+        }
+        let op = decision_op(source, &approval.id, false, int(row, "version"));
+        match source.replica.mutate(vec![op]) {
+            Ok(commit) => {
+                decisions.record(&commit, &source.database, &approval.id);
+                declined.push(approval.id);
+            }
+            Err(error) => {
+                tracing::warn!(database = %source.database, %error, "a request a message declines could not be declined");
+                return Err(format!(
+                    "keeper could not decline “{}” on this device, so your message was not \
+                     sent; the request still waits for you ({error}).",
+                    approval.summary
+                ));
+            }
+        }
+    }
+    Ok(declined)
 }
 
 /// keeper's refusal of *Approve once* from a notification on a request the

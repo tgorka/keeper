@@ -571,6 +571,19 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    /// A slash command as the composer runs it, from under an empty banner.
+    fn run(
+        source: &Source,
+        sid: &str,
+        draft: &str,
+        pick: Option<&AgentSettingsPick>,
+    ) -> Result<crate::hq::commands::AgentCommandResultVm, String> {
+        let decisions = crate::hq::approvals::Decisions::load(
+            std::env::temp_dir().join(format!("keeper-settings-{}.json", ulid::Ulid::new())),
+        );
+        crate::hq::commands::run(source, &decisions, sid, draft, pick, &[])
+    }
+
     fn fixture(complete: bool) -> (tempfile::TempDir, Source) {
         fixture_with(complete, true)
     }
@@ -926,7 +939,7 @@ mod tests {
             &crate::hq::timeline::session_row(&source, "dev1.1").expect("session"),
         );
         assert!(offers.models && offers.efforts.is_empty());
-        assert!(crate::hq::commands::run(&source, "dev1.1", "/effort high", None).is_err());
+        assert!(run(&source, "dev1.1", "/effort high", None).is_err());
         assert!(matches!(
             change(
                 &source,
@@ -1159,7 +1172,6 @@ mod tests {
 
     #[test]
     fn model_and_effort_commands_write_what_the_pickers_write() {
-        use crate::hq::commands::run;
         let (_dir, source) = fixture(true);
         assert_eq!(
             run(&source, "dev1.1", "/model alternate", None)
@@ -1215,7 +1227,6 @@ mod tests {
 
     #[test]
     fn effort_takes_only_offered_levels_by_the_menus_word_or_the_contracts() {
-        use crate::hq::commands::run;
         let (_dir, source) = fixture(true);
         // Offered: medium and high. Neither low nor xhigh is listed or taken.
         for word in ["low", "xhigh", "extra high", "loud"] {

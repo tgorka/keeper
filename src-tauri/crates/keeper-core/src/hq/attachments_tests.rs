@@ -18,6 +18,14 @@ use crate::hq::timeline::{self, AgentMessageStateVm, Opened};
 
 const ANA: &str = "ana";
 
+/// The decisions a message declines with; these sessions hold no request,
+/// so nothing is ever written to it.
+fn decisions() -> crate::hq::approvals::Decisions {
+    crate::hq::approvals::Decisions::load(
+        std::env::temp_dir().join(format!("keeper-attach-{}.json", ulid::Ulid::new())),
+    )
+}
+
 fn spec(dir: &Path) -> ReplicaSpec {
     ReplicaSpec {
         database: "alpha".to_owned(),
@@ -163,7 +171,15 @@ fn attaching_stages_each_blob_and_commits_the_message_and_its_rows_in_one_commit
         stage_path(&csv).expect("stages"),
         stage_bytes("folder/../paste.png", "image/png", b"\x89PNG-ish".to_vec()).expect("stages"),
     ];
-    let message = attach(&alpha, "dev1.1", "what is the price of tea?", files).expect("attaches");
+    let message = attach(
+        &alpha,
+        &decisions(),
+        "dev1.1",
+        "what is the price of tea?",
+        files,
+        &[],
+    )
+    .expect("attaches");
     assert_eq!(
         outbox(dir.path()),
         before + 1,
@@ -266,7 +282,7 @@ fn a_messages_chips_keep_the_order_the_files_were_attached_in() {
                     .expect("stages")
             })
             .collect();
-        let message = attach(&alpha, &session, "", files).expect("attaches");
+        let message = attach(&alpha, &decisions(), &session, "", files, &[]).expect("attaches");
         let (view, _) = timeline::view(
             &alpha,
             &session,
@@ -293,15 +309,15 @@ fn nothing_attached_an_archived_or_unknown_session_is_refused_and_writes_nothing
     let before = outbox(dir.path());
     let file = || vec![stage_bytes("a.txt", "", b"a".to_vec()).expect("stages")];
     assert_eq!(
-        attach(&alpha, "dev1.1", "", Vec::new()),
+        attach(&alpha, &decisions(), "dev1.1", "", Vec::new(), &[]),
         Err(AttachError::Nothing)
     );
     assert_eq!(
-        attach(&alpha, "dev1.1", "", file()),
+        attach(&alpha, &decisions(), "dev1.1", "", file(), &[]),
         Err(AttachError::Archived)
     );
     assert_eq!(
-        attach(&alpha, "dev1.9", "", file()),
+        attach(&alpha, &decisions(), "dev1.9", "", file(), &[]),
         Err(AttachError::Unknown)
     );
     assert_eq!(outbox(dir.path()), before);
@@ -388,7 +404,8 @@ fn a_mixed_selection_staged_under_handles_is_one_message_with_its_caption_once()
     let files = staging
         .take(&chat, &handles)
         .expect("every handle is staged");
-    let message = attach(&alpha, "dev1.1", "compare these", files).expect("attaches");
+    let message =
+        attach(&alpha, &decisions(), "dev1.1", "compare these", files, &[]).expect("attaches");
     assert_eq!(outbox(dir.path()), before + 1, "one commit");
     assert_eq!(
         messages_saying(&alpha, "dev1.1", "compare these"),
@@ -431,7 +448,15 @@ fn several_pasted_files_sent_once_are_one_message() {
         })
         .collect();
     let files = staging.take(&chat, &handles).expect("staged");
-    let message = attach(&alpha, "dev1.1", "Compare these files", files).expect("attaches");
+    let message = attach(
+        &alpha,
+        &decisions(),
+        "dev1.1",
+        "Compare these files",
+        files,
+        &[],
+    )
+    .expect("attaches");
     assert_eq!(outbox(dir.path()), before + 1);
     assert_eq!(
         attached_to(&alpha, &message),
@@ -515,8 +540,8 @@ fn offline_a_staged_blob_survives_a_relaunch_pinned_and_the_same_bytes_are_one_u
     let bytes = b"%PDF-1.7 the report".to_vec();
     let report =
         || vec![stage_bytes("report.pdf", "application/pdf", bytes.clone()).expect("stages")];
-    attach(&alpha, "dev1.1", "", report()).expect("attaches");
-    attach(&alpha, "dev1.1", "again", report()).expect("attaches twice");
+    attach(&alpha, &decisions(), "dev1.1", "", report(), &[]).expect("attaches");
+    attach(&alpha, &decisions(), "dev1.1", "again", report(), &[]).expect("attaches twice");
     let waiting = outbox(dir.path());
     assert_eq!(waiting, 3, "the session and both messages");
     close(alpha);
@@ -562,9 +587,11 @@ fn only_a_blob_an_attachment_names_opens_and_only_as_a_type_that_cannot_run() {
     let page = b"<script>alert(1)</script>".to_vec();
     attach(
         &alpha,
+        &decisions(),
         "dev1.1",
         "",
         vec![stage_bytes("page.html", "text/html", page.clone()).expect("stages")],
+        &[],
     )
     .expect("attaches");
     let opened = open_blob(&alpha, &sha256(&page)).expect("opens");
@@ -799,9 +826,11 @@ fn a_message_whose_files_the_server_refused_stays_shown_refused_with_the_reason(
     );
     let later = attach(
         &alpha,
+        &decisions(),
         "dev1.1",
         "",
         vec![stage_bytes("b.txt", "", b"b".to_vec()).expect("stages")],
+        &[],
     )
     .expect("attaches");
     let (view, _) = timeline::view(
@@ -960,19 +989,23 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
     // session's message after them.
     attach(
         &alpha,
+        &decisions(),
         "dev1.1",
         "two files",
         vec![
             stage_bytes("huge.zip", "application/zip", huge.clone()).expect("stages"),
             stage_bytes("tiny.csv", "text/csv", tiny.clone()).expect("stages"),
         ],
+        &[],
     )
     .expect("attaches");
     attach(
         &alpha,
+        &decisions(),
         "dev1.2",
         "elsewhere",
         vec![stage_bytes("note.txt", "text/plain", note.clone()).expect("stages")],
+        &[],
     )
     .expect("attaches");
     let refused_at = || {
@@ -1161,9 +1194,11 @@ fn thumbnail_blob_is_own_person_only_and_cache_only_even_after_restart() {
     let blob = sha256(&bytes);
     attach(
         &alpha,
+        &decisions(),
         "dev1.1",
         "look",
         vec![stage_bytes("photo.png", "image/png", bytes).expect("staged")],
+        &[],
     )
     .expect("sent");
     close(alpha);

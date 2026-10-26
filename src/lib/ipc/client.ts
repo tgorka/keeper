@@ -349,6 +349,8 @@ export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
+export type { AgentApprovalActionVm } from "./gen/AgentApprovalActionVm";
+export type { AgentApprovalBannerVm } from "./gen/AgentApprovalBannerVm";
 export type { AgentApprovalVm } from "./gen/AgentApprovalVm";
 export type { AgentAttachmentStateVm } from "./gen/AgentAttachmentStateVm";
 export type { AgentAttachmentVm } from "./gen/AgentAttachmentVm";
@@ -360,6 +362,12 @@ export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 export type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 export type { AgentDirectoryPersonVm } from "./gen/AgentDirectoryPersonVm";
 export type { AgentEffortOptionVm } from "./gen/AgentEffortOptionVm";
+export type { AgentGrantExpiryVm } from "./gen/AgentGrantExpiryVm";
+export type { AgentGrantOfferVm } from "./gen/AgentGrantOfferVm";
+export type { AgentGrantScopeVm } from "./gen/AgentGrantScopeVm";
+export type { AgentGrantStateVm } from "./gen/AgentGrantStateVm";
+export type { AgentGrantsVm } from "./gen/AgentGrantsVm";
+export type { AgentGrantVm } from "./gen/AgentGrantVm";
 export type { AgentInstancePresenceVm } from "./gen/AgentInstancePresenceVm";
 export type { AgentInstanceStateVm } from "./gen/AgentInstanceStateVm";
 export type { AgentInstancesDatabaseVm } from "./gen/AgentInstancesDatabaseVm";
@@ -739,6 +747,7 @@ export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
+export type { ShownApprovalVm } from "./gen/ShownApprovalVm";
 export type { SignInLinkVm } from "./gen/SignInLinkVm";
 export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
@@ -820,6 +829,7 @@ import type { AgentApprovalVm } from "./gen/AgentApprovalVm";
 import type { AgentChoiceVm } from "./gen/AgentChoiceVm";
 import type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 import type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
+import type { AgentGrantsVm } from "./gen/AgentGrantsVm";
 import type { AgentInstancesVm } from "./gen/AgentInstancesVm";
 import type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 import type { AgentSessionRef } from "./gen/AgentSessionRef";
@@ -961,6 +971,7 @@ import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
 import type { SessionTaskMoveVm } from "./gen/SessionTaskMoveVm";
 import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
+import type { ShownApprovalVm } from "./gen/ShownApprovalVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
@@ -4016,6 +4027,45 @@ export async function agentSessionApprovalDecide(
   });
 }
 
+/**
+ * A card's *Always allow …* (`sessionOnly` false) or *This session only*: the request approved
+ * and the grant written. `scope` is one of the offer's scope ids; Rust derives the scope again
+ * from the request and refuses one it does not offer. `expiresInDays` is one of the offer's
+ * expiries, or null for "until revoked".
+ */
+export async function agentApprovalAlwaysAllow(
+  target: AgentSessionRef,
+  approvalId: string,
+  bindingDigest: string,
+  scope: string,
+  sessionOnly: boolean,
+  expiresInDays: number | null,
+): Promise<AgentDecisionOutcomeVm> {
+  return await invoke<AgentDecisionOutcomeVm>("agent_approval_always_allow", {
+    ...target,
+    approvalId,
+    bindingDigest,
+    scope,
+    sessionOnly,
+    expiresInDays,
+  });
+}
+
+export async function agentGrantsSubscribe(
+  onGrants: (grants: AgentGrantsVm) => void,
+): Promise<string> {
+  return await subscribeWithStringId<AgentGrantsVm>("agent_grants_subscribe", onGrants);
+}
+
+export async function agentGrantsUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("agent_grants_unsubscribe", { subscriptionId });
+}
+
+/** Revoke a grant: new uses stop; approvals it already issued still run. */
+export async function agentGrantRevoke(database: string, grantId: string): Promise<void> {
+  await invoke<void>("agent_grant_revoke", { database, grantId });
+}
+
 export async function agentApprovalsSubscribe(
   onRows: (rows: AgentApprovalVm[]) => void,
 ): Promise<string> {
@@ -4157,8 +4207,16 @@ export async function agentInstancesSet(agentActor: string, order: string[]): Pr
   await invoke<void>("agent_instances_set", { agentActor, order });
 }
 
-export async function agentSend(target: AgentSessionRef, body: string): Promise<void> {
-  await invoke<void>("agent_send", { ...target, body });
+/**
+ * Write a person's message. `declines` is what the approval banner showed when it was sent: Rust
+ * declines those requests that still wait at the shown digest, and nothing newer (Q109-12 a).
+ */
+export async function agentSend(
+  target: AgentSessionRef,
+  body: string,
+  declines: ShownApprovalVm[],
+): Promise<void> {
+  await invoke<void>("agent_send", { ...target, body, declines });
 }
 
 export async function agentCommandPreview(
@@ -4168,13 +4226,18 @@ export async function agentCommandPreview(
   return await invoke<ChatCommandPreviewVm>("agent_command_preview", { ...target, draft });
 }
 
-/** `pick` is this device's last model and effort for the session's agent: `/new` and `/clean` start with it. */
+/**
+ * Run a slash command. `pick` is this device's last model and effort for the session's agent:
+ * `/new` and `/clean` start with it. `declines` is what the banner showed, which only `/stop`
+ * declines.
+ */
 export async function agentCommand(
   target: AgentSessionRef,
   draft: string,
   pick: AgentSettingsPick | null,
+  declines: ShownApprovalVm[],
 ): Promise<AgentCommandResultVm> {
-  return await invoke<AgentCommandResultVm>("agent_command", { ...target, draft, pick });
+  return await invoke<AgentCommandResultVm>("agent_command", { ...target, draft, pick, declines });
 }
 
 /**
@@ -4229,9 +4292,15 @@ export async function agentAttachBytes(
 export async function agentAttachCommit(
   target: AgentSessionRef,
   handles: string[],
-  caption?: string,
+  caption: string | undefined,
+  declines: ShownApprovalVm[],
 ): Promise<void> {
-  await invoke<void>("agent_attach_commit", { ...target, handles, caption: caption ?? null });
+  await invoke<void>("agent_attach_commit", {
+    ...target,
+    handles,
+    caption: caption ?? null,
+    declines,
+  });
 }
 
 /** Let go of staged files the composer will not send. */

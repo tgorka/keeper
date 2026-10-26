@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions};
+use crate::hq::approvals::{
+    self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions, ShownApprovalVm,
+};
 use crate::hq::attachments::{self, OpenedBlob};
 use crate::hq::drives;
 use crate::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
@@ -21,6 +23,12 @@ use crate::hq::sessions::{
 use crate::hq::timeline::{self, AgentSessionViewVm, Opened};
 use crate::hq::vm::{phase_sentence, HqPhase};
 use crate::hq::{lock, sentence, Hq, HqError, LocalOpen};
+
+/// How often the grants units the server revoked are asked for again.
+pub const GRANTS_REASK_EVERY: Duration = Duration::from_secs(3600);
+
+/// The shortest wait between two asks [`Hq::recheck_grants`] causes.
+pub const GRANTS_RECHECK_AFTER: Duration = Duration::from_secs(60);
 
 /// Every archive fetch's token, so an answer for a view that has moved on
 /// is told apart from the one it waits for.
@@ -128,7 +136,12 @@ impl Hq {
                 &widen,
                 self.view_prefs().show_reasoning,
                 now,
-            );
+            )
+            .into_iter()
+            .chain(std::iter::once((
+                crate::hq::grants::TABLE,
+                crate::hq::grants::units(&source),
+            )));
             for (table, units) in plan {
                 let key = (source.database.clone(), table);
                 if lock(&self.windows).get(&key) == Some(&units) {
@@ -143,12 +156,47 @@ impl Hq {
                     }
                 }
             }
+            self.reask_grants_if_due(&source);
         }
     }
 
+    /// Ask the server again for `source`'s revoked grants units
+    /// ([`crate::hq::grants::reask_revoked`]) once after the replicas
+    /// (re)start, then at most every [`GRANTS_REASK_EVERY`], or sooner when
+    /// [`Hq::recheck_grants`] asks: whether an agent serves the person is the
+    /// server's registry, which no synced row reflects, so only the server's
+    /// own answer can turn it true again.
+    fn reask_grants_if_due(&self, source: &Source) {
+        let due = {
+            let mut asked = lock(&self.grants_asked);
+            let due = asked
+                .get(&source.database)
+                .is_none_or(|at| at.elapsed() >= GRANTS_REASK_EVERY);
+            if due {
+                asked.insert(source.database.clone(), std::time::Instant::now());
+            }
+            due
+        };
+        if !due {
+            return;
+        }
+        if let Err(error) = crate::hq::grants::reask_revoked(source) {
+            tracing::debug!(database = %source.database, %error, "the revoked grants units could not be asked for again");
+        }
+    }
+
+    /// Ask the server again soon for the grants units it revoked, as the
+    /// person looks at what grants decide: Settings › Always allowed, an
+    /// opened session. Not more than once a [`GRANTS_RECHECK_AFTER`] per
+    /// database.
+    pub fn recheck_grants(&self) {
+        lock(&self.grants_asked).retain(|_, at| at.elapsed() < GRANTS_RECHECK_AFTER);
+        self.touch();
+    }
+
     /// Start following the replicas with their windows, once; and wake
-    /// every view when the next pending approval expires, since nothing in
-    /// the replica changes then.
+    /// every view when the next pending approval or grant expires, since
+    /// nothing in the replica changes then.
     pub(crate) fn follow_windows(&self) {
         let mut task = lock(&self.window_task);
         if task.is_some() {
@@ -161,7 +209,16 @@ impl Hq {
                 let Some(hq) = me.upgrade() else { return };
                 let done = tokio::task::spawn_blocking(move || {
                     hq.reconcile_windows();
-                    approvals::next_expiry(&hq.sources(), sessions::now_ms())
+                    let (sources, now) = (hq.sources(), sessions::now_ms());
+                    // A request or a grant expiring changes what is shown
+                    // with no row changing.
+                    [
+                        approvals::next_expiry(&sources, now),
+                        crate::hq::grants::next_expiry(&sources, now),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
                 })
                 .await;
                 let next = match done {
@@ -384,6 +441,9 @@ impl Hq {
     /// replicas are opening, or its database syncs — and a sentence once
     /// nothing will: no server, a removed device, a database not open to it.
     pub fn open_session(&self, key: &AgentSessionRef) -> Result<(), HqError> {
+        // Its cards may offer a grant: whether the agent serves the person
+        // now is asked of the server again (R10911-10).
+        self.recheck_grants();
         let held = self.source(&key.database).ok().and_then(|source| {
             timeline::session_row(&source, &key.session_id).map(|session| (source, session))
         });
@@ -516,10 +576,18 @@ impl Hq {
         Ok(())
     }
 
-    /// Write a person's message into a session.
-    pub fn send(&self, key: &AgentSessionRef, body: &str) -> Result<(), HqError> {
+    /// Write a person's message into a session; it declines the requests its
+    /// banner showed (`shown`) that still wait for them (Q109-12 a).
+    pub fn send(
+        &self,
+        key: &AgentSessionRef,
+        body: &str,
+        shown: &[ShownApprovalVm],
+    ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
-        send::send(&source, &key.session_id, body).map_err(sentence)
+        let sent = send::send(&source, self.decisions()?, &key.session_id, body, shown);
+        self.touch();
+        sent.map_err(sentence)
     }
 
     /// Stage the files at `paths` for a message of a session: every file
@@ -565,10 +633,20 @@ impl Hq {
         key: &AgentSessionRef,
         handles: &[String],
         caption: &str,
+        shown: &[ShownApprovalVm],
     ) -> Result<(), HqError> {
         let files = self.staging.take(key, handles).map_err(sentence)?;
         let source = self.source(&key.database)?;
-        attachments::attach(&source, &key.session_id, caption, files).map_err(sentence)?;
+        let attached = attachments::attach(
+            &source,
+            self.decisions()?,
+            &key.session_id,
+            caption,
+            files,
+            shown,
+        );
+        self.touch();
+        attached.map_err(sentence)?;
         self.touch();
         Ok(())
     }

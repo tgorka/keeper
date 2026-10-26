@@ -434,7 +434,9 @@ fn the_newest_title_write_decides_and_an_older_refusal_never_outranks_it() {
     assert_eq!(row(&source).title_write, Write::Confirmed);
     // `/rename` is a rename like the menu's: it sets the older one aside too.
     sessions::rename(&source, "dev1.1", "AAA").expect("menu rename queued");
-    crate::hq::commands::run(&source, "dev1.1", "/rename BBB", None).expect("/rename queued");
+    let decisions = approvals::Decisions::load(w._dir.path().join("decisions.json"));
+    crate::hq::commands::run(&source, &decisions, "dev1.1", "/rename BBB", None, &[])
+        .expect("/rename queued");
     journal_session_writes(&path, Some("AAA"), true);
     let vm = row(&source);
     assert_eq!(
@@ -548,6 +550,16 @@ fn names_include_only_agent_members_primary_first() {
         sessions::rows(&w.alpha, now())[0].display_name,
         "steward,aaa,nixie,zed · about dev1.1"
     );
+}
+
+/// A slash command as the composer runs it, from under an empty banner.
+fn command(
+    w: &World,
+    session: &str,
+    draft: &str,
+) -> Result<crate::hq::commands::AgentCommandResultVm, String> {
+    let decisions = approvals::Decisions::load(w._dir.path().join("decisions.json"));
+    crate::hq::commands::run(&w.alpha, &decisions, session, draft, None, &[])
 }
 
 #[test]
@@ -675,7 +687,14 @@ fn a_message_is_waiting_until_the_server_has_it_and_an_ask_closes_on_an_answer()
         (vec!["go".to_owned(), "stop".to_owned()], true)
     );
 
-    crate::hq::send::send(&w.alpha, "dev1.1", "go").expect("sent");
+    crate::hq::send::send(
+        &w.alpha,
+        &approvals::Decisions::load(w._dir.path().join("decisions.json")),
+        "dev1.1",
+        "go",
+        &[],
+    )
+    .expect("sent");
     let (view, newest) = timeline::view(
         &w.alpha,
         "dev1.1",
@@ -707,7 +726,14 @@ fn an_archived_session_takes_no_message_and_is_read_through_the_server() {
         .mutate(session("dev1.1", NIXIE, t, true, None))
         .expect("seed");
     assert_eq!(
-        crate::hq::send::send(&w.alpha, "dev1.1", "hi").map_err(|e| e.to_string()),
+        crate::hq::send::send(
+            &w.alpha,
+            &approvals::Decisions::load(w._dir.path().join("decisions.json")),
+            "dev1.1",
+            "hi",
+            &[],
+        )
+        .map_err(|e| e.to_string()),
         Err("This conversation is archived; unarchive it to write in it.".to_owned())
     );
     // No server: the remote read is refused with the database's sentence.
@@ -946,6 +972,9 @@ pub(super) struct Staged {
     /// Answers `remote_command` (operation, request id, params) in place
     /// of a server.
     pub(super) server: std::sync::Mutex<Option<ServerCommand>>,
+    /// A local write whose first row is of this table fails, as a full
+    /// disk would fail it.
+    pub(super) failing: std::sync::Mutex<Option<String>>,
 }
 
 /// A stand-in server's answer to one command.
@@ -963,6 +992,7 @@ impl Staged {
             written: std::sync::Mutex::new(Vec::new()),
             commits: std::sync::Mutex::new(Vec::new()),
             server: std::sync::Mutex::new(None),
+            failing: std::sync::Mutex::new(None),
         });
         let wrapped = Source {
             replica: Arc::clone(&staged) as Arc<dyn crate::hq::port::Replica>,
@@ -995,6 +1025,16 @@ impl crate::hq::port::Replica for Staged {
             held = self.released.wait(held).expect("held");
         }
         drop(held);
+        let first = ops.first().map(|op| match op {
+            RowOp::Upsert { table, .. }
+            | RowOp::Patch { table, .. }
+            | RowOp::Delete { table, .. } => table.clone(),
+        });
+        if first.is_some() && *self.failing.lock().expect("failing") == first {
+            return Err(crate::hq::port::ReplicaError::Client(
+                "database or disk is full".to_owned(),
+            ));
+        }
         self.written.lock().expect("written").push(ops.clone());
         let commit = self.inner.mutate_superseding(ops, earlier)?;
         self.commits.lock().expect("commits").push(commit.clone());
@@ -1085,6 +1125,16 @@ impl crate::hq::port::Replica for Staged {
         field: Option<&str>,
     ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
         self.inner.row_writes(table, row_id, field)
+    }
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+        self.inner.revoked_units(table)
+    }
+    fn granted(
+        &self,
+        table: &str,
+        variable: &str,
+    ) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+        self.inner.granted(table, variable)
     }
     fn refused_commits(
         &self,
@@ -1615,7 +1665,7 @@ fn a_lock_screen_decision_never_approves_t4_and_says_why_it_was_not_sent() {
 
 #[test]
 fn agent_commands_keep_history_and_create_no_phantom_prompt() {
-    use crate::hq::commands::{run, AgentCommandSurface};
+    use crate::hq::commands::AgentCommandSurface;
     let w = world();
     w.alpha
         .replica
@@ -1633,7 +1683,7 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
         )])
         .expect("history");
     for draft in ["/clean", "/new", "/new A fresh title"] {
-        let next = run(&w.alpha, "old", draft, None)
+        let next = command(&w, "old", draft)
             .expect("fresh session")
             .session
             .expect("navigation");
@@ -1663,8 +1713,8 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
             "body of m1"
         );
     }
-    assert!(run(&w.alpha, "old", "/rename", None).is_err());
-    run(&w.alpha, "old", "/rename New title", None).expect("rename");
+    assert!(command(&w, "old", "/rename").is_err());
+    command(&w, "old", "/rename New title").expect("rename");
     assert_eq!(
         timeline::session_row(&w.alpha, "old").expect("row").title,
         "New title"
@@ -1675,21 +1725,21 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
         ("/help", AgentCommandSurface::Help),
     ] {
         assert_eq!(
-            run(&w.alpha, "old", draft, None).expect("open").surface,
+            command(&w, "old", draft).expect("open").surface,
             Some(surface)
         );
     }
     assert!(
-        run(&w.alpha, "old", "/stop", None).is_err(),
+        command(&w, "old", "/stop").is_err(),
         "no turn means no control row"
     );
-    run(&w.alpha, "old", "/archive", None).expect("archive");
+    command(&w, "old", "/archive").expect("archive");
     assert!(
         timeline::session_row(&w.alpha, "old")
             .expect("preserved")
             .archived
     );
-    assert!(run(&w.alpha, "old", "/rename archived", None).is_err());
+    assert!(command(&w, "old", "/rename archived").is_err());
 }
 
 #[test]
@@ -1785,7 +1835,7 @@ fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose()
 
 #[test]
 fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface() {
-    use crate::hq::commands::{run, AgentCommandSurface};
+    use crate::hq::commands::AgentCommandSurface;
     let w = world();
     let t = now();
     w.alpha
@@ -1806,7 +1856,7 @@ fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface(
             message("answer", "s", "agent", t, Some("done"), Value::Null),
         ])
         .expect("turns");
-    run(&w.alpha, "s", "/stop", None).expect("stop");
+    command(&w, "s", "/stop").expect("stop");
     let controls = sessions::read(
         &w.alpha,
         "SELECT metadata, role FROM messages WHERE session_id = 's' AND role = 'person'",
@@ -1818,7 +1868,7 @@ fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface(
     assert_eq!(metadata, json!({"kind":"stop","turn":"live"}));
     w.alpha.replica.mutate(vec![upsert("agent_profiles", json!({"id":"nixie.box", "actor_id":NIXIE, "name":"Nixie", "description":"", "avatar_blob":null, "definition_hash":"h", "image_digest":"d", "started_at_ms":t, "dir":"alpha", "tools":"[\"read\"]", "author_actor":NIXIE, "author_client":"nixie.box"}))]).expect("tools");
     assert_eq!(
-        run(&w.alpha, "s", "/tools", None).expect("tools").surface,
+        command(&w, "s", "/tools").expect("tools").surface,
         Some(AgentCommandSurface::Tools)
     );
 }
