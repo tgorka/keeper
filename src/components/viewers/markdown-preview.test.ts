@@ -47,8 +47,26 @@ function assembly(doc: string): EditorState {
   });
 }
 
+/** The assembly as the editor holds it once its parse has reached the end. The
+ *  first parse stops at a 20 ms budget that a busy host overruns even on these
+ *  few lines, and its background finish is not something these tests wait for;
+ *  so it is finished here, and handed on the way the background parser does: a
+ *  transaction that changes neither the text nor the selection. */
 function realState(doc: string): EditorState {
-  return assembly(doc);
+  const state = assembly(doc);
+  ensureSyntaxTree(state, state.doc.length, Number.POSITIVE_INFINITY);
+  return state.update({}).state;
+}
+
+/** Finish a mounted preview's parse, as the background parser finishes it. The
+ *  mount returns once the view is built, which on a busy host is before the
+ *  first parse has reached the end of even a short document. */
+function parsed(host: HTMLElement): void {
+  const content = host.querySelector<HTMLElement>(".cm-content");
+  const view = content === null ? null : EditorView.findFromDOM(content);
+  expect(view, "no EditorView is mounted in that host").not.toBeNull();
+  const mounted = view as EditorView;
+  forceParsing(mounted, mounted.state.doc.length, Number.POSITIVE_INFINITY);
 }
 
 const MERMAID = "intro\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter\n";
@@ -190,6 +208,7 @@ describe("mountMarkdownPreview", () => {
     });
 
     expect(preview.failure).toBeNull();
+    parsed(host);
     // The decoration layer's own classes, so this is the renderer and not a
     // second one that happens to produce similar HTML.
     expect(host.querySelector(".cm-lp-h1")).not.toBeNull();
@@ -231,6 +250,7 @@ describe("mountMarkdownPreview", () => {
     const preview = await mountMarkdownPreview(host, MERMAID, { vaultId: "vault-1" });
 
     expect(preview.failure).toBeNull();
+    parsed(host);
     expect(host.querySelector(".cm-mermaid-block")).not.toBeNull();
     preview.destroy();
   });
@@ -309,6 +329,7 @@ describe("mountMarkdownPreview, editable", () => {
     });
 
     expect(preview.failure).toBeNull();
+    parsed(host);
     expect(host.querySelector('[contenteditable="true"]')).not.toBeNull();
     expect(viewIn(host).state.readOnly).toBe(false);
     expect(host.querySelector(".cm-content")?.getAttribute("aria-label")).toBe("Note of log.md");
