@@ -180,16 +180,22 @@ title uses the handle. Renaming changes only the title, never the session id or 
 
 Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
 menu: **Rename**, **Copy id**, **Copy name**, **Details**, and **Archive** (or **Unarchive**).
-Rename edits inline; Save queues the title on this device, including offline, and Cancel/Escape
-leaves it unchanged. Closing the editor means local enqueue, not server acceptance: the row says
-it is waiting until the server settles the write. The state comes from the replica's outbox and
+Rename edits inline with the current title selected, so typing replaces it; Save queues the title
+on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
+local enqueue, not server acceptance: the row says it is waiting until the server settles the
+write. The state comes from the replica's outbox and
 outcome journal (`Replica::row_writes`, restricted to writes of `title`), the same per-row
 delivery the instance choice reads, so it survives a restart. A later refusal stays visible
 beside the row and in its menu in plain words (`hq.v3.not_member`: "you are no longer a member of
 this chat"; a conflict: "another device changed this chat first"; any other code is quoted).
 **Retry rename** reopens the refused proposed title; retrying supersedes the old refusal, and
-acceptance clears the waiting state. The chat's own creation is not a rename: while it waits, or
-if it is refused, the row shows no rename state. An unrelated archive write is not a pending
+acceptance clears the waiting state. Only the newest title write counts: a rename sets aside every
+earlier title write of the row, including one still waiting, so if an older rename is refused
+after a newer one was written, that refusal never stands — the row follows the newer one, and
+Retry never offers the older title. The set-aside of a waiting write is kept beside the replica
+(`<replica>.blob-access.sqlite`) until its outcome arrives. The chat's own creation is not a
+rename and is never set aside by one: while it waits, a rename queued behind it shows no rename
+state, and neither does its own refusal. An unrelated archive write is not a pending
 rename. If delivery cannot be read, the row says it is unavailable rather than claiming
 confirmation. Clipboard refusals also stay visible beside the row. Archive/Unarchive still
 reports only the local write; its later refusal is not surfaced on the row yet.

@@ -52,6 +52,38 @@ it("retains the proposed title after a refused rename and permits a successful r
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
+// Typing as a browser does: the keys replace whatever is selected, or go in at
+// the caret when nothing is.
+function type(field: HTMLInputElement, text: string) {
+  const start = field.selectionStart ?? field.value.length;
+  const end = field.selectionEnd ?? field.value.length;
+  fireEvent.change(field, {
+    target: { value: field.value.slice(0, start) + text + field.value.slice(end) },
+  });
+}
+
+it("saves exactly the title typed into a freshly opened rename editor", async () => {
+  rename.mockResolvedValue(undefined);
+  render(
+    <ul>
+      <li>
+        <SessionRowMenu row={row}>
+          <button type="button">{row.displayName}</button>
+        </SessionRowMenu>
+      </li>
+    </ul>,
+  );
+  fireEvent.contextMenu(screen.getByRole("button", { name: row.displayName }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Rename…" }));
+  const editor = await screen.findByRole<HTMLInputElement>("textbox", { name: "Session title" });
+  await waitFor(() => expect(editor).toHaveFocus());
+  expect(editor).toHaveValue("plan");
+  type(editor, "hej");
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(rename).toHaveBeenCalledTimes(1));
+  expect(rename).toHaveBeenCalledWith(row, "hej");
+});
+
 it("shows a later server refusal after local success and recovers the proposal on a fresh mount", async () => {
   rename.mockResolvedValue(undefined);
   const view = (session: AgentSessionRowVm) => (

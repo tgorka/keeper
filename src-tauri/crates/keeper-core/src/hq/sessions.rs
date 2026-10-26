@@ -76,7 +76,9 @@ pub struct AgentSessionRef {
 #[serde(tag = "state", rename_all = "camelCase")]
 #[ts(export)]
 pub enum AgentSessionTitleWriteVm {
-    /// No rename written here waits or stands refused.
+    /// No rename written here stands refused, and none waits on its own:
+    /// while the chat's creation still waits, a rename queued behind it is
+    /// owed with the chat and reads as confirmed.
     Confirmed,
     /// A rename written here waits in the outbox for the server.
     Pending,
@@ -620,7 +622,7 @@ fn title_write(source: &Source, id: &str, refused: &[RefusedCommit]) -> AgentSes
     }
     // While the creation itself waits, every title write waiting is the
     // creation's or rides behind it: the chat, not a rename, is owed.
-    if titles.pending && !creation.pending {
+    if !titles.pending.is_empty() && creation.pending.is_empty() {
         AgentSessionTitleWriteVm::Pending
     } else {
         AgentSessionTitleWriteVm::Confirmed
@@ -1128,14 +1130,34 @@ pub fn create_with_first(
     Ok(id)
 }
 
-/// Rename changes only the mutable title, preserving session identity.
+/// Rename changes only the mutable title, preserving session identity. The
+/// newest title write decides the row's rename state: every earlier title
+/// write of this row — refused, or still waiting and so not refused yet — is
+/// set aside by this one. The chat's own creation is not a rename and is
+/// never set aside by one.
 pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), ReplicaError> {
-    let standing = source
+    let titles = source
         .replica
-        .row_writes("sessions", session_id, Some("title"))?
+        .row_writes("sessions", session_id, Some("title"))?;
+    let creation = source
+        .replica
+        .row_writes("sessions", session_id, Some(CREATED))?;
+    let created: Vec<String> = creation
+        .pending
+        .into_iter()
+        .chain(
+            creation
+                .refused
+                .into_iter()
+                .map(|refusal| refusal.commit_id),
+        )
+        .collect();
+    let earlier: Vec<String> = titles
         .refused
         .into_iter()
         .map(|refusal| refusal.commit_id)
+        .chain(titles.pending)
+        .filter(|commit| !created.contains(commit))
         .collect();
     let commit = source.replica.mutate(vec![RowOp::Patch {
         table: "sessions".to_owned(),
@@ -1145,7 +1167,7 @@ pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), Repl
         ),
         base_version: None,
     }])?;
-    source.replica.supersede(standing, &commit)?;
+    source.replica.supersede(earlier, &commit)?;
     source.replica.sync_now();
     Ok(())
 }

@@ -24,6 +24,7 @@
 //! pins — through a third connection on the same file, used only on the
 //! owner thread, after an upload, an open and a round.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -33,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use syncular_client::api::{
-    ClientDiagnosticsRequest, CommitDelivery, CommitOperationOutcome, CommitOutcomeResolution,
-    CommitOutcomeStatus, ResolveCommitOutcomeInput, WindowCoverage,
+    ClientDiagnosticsRequest, CommitDelivery, CommitOperationOutcome, CommitOutcome,
+    CommitOutcomeResolution, CommitOutcomeStatus, ResolveCommitOutcomeInput, WindowCoverage,
 };
 use syncular_client::native_transport::{HostTransport, Inbound};
 use syncular_client::{
@@ -511,6 +512,15 @@ impl PresenceGate {
     }
 }
 
+/// Whether `outcome` is a refusal nothing has set aside yet.
+fn stands(outcome: &CommitOutcome) -> bool {
+    outcome.resolution == CommitOutcomeResolution::Active
+        && matches!(
+            outcome.status,
+            CommitOutcomeStatus::Conflict | CommitOutcomeStatus::Rejected
+        )
+}
+
 /// The standing refusals of commits written here that wrote one row, newest
 /// first: the replica's outcome journal keeps a refused commit's operations
 /// until it is resolved.
@@ -522,11 +532,11 @@ const ROW_REFUSED: &str =
      AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(json_extract(op.value, '$.values')) field WHERE field.key = ?3)) \
      GROUP BY o.seq ORDER BY o.seq DESC";
 
-/// Whether a commit in the outbox writes one row.
-const ROW_PENDING: &str = "SELECT 1 AS pending FROM _syncular_outbox o, json_each(o.ops_json) op \
+/// The commits in the outbox that write one row, oldest first.
+const ROW_PENDING: &str = "SELECT o.commit_id AS commit_id FROM _syncular_outbox o, json_each(o.ops_json) op \
      WHERE json_extract(op.value, '$.table') = ?1 AND json_extract(op.value, '$.rowId') = ?2 \
      AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(json_extract(op.value, '$.values')) field WHERE field.key = ?3)) \
-     LIMIT 1";
+     GROUP BY o.seq ORDER BY o.seq";
 
 /// The standing refusals of commits written here that wrote a row of one
 /// table, newest first, with every operation each wrote.
@@ -880,6 +890,11 @@ struct Owner {
     /// The server's standing refusals of uploads, as kept beside the
     /// replica, shared with the replica's readers.
     upload_refusals: Arc<Mutex<Vec<UploadRefusal>>>,
+    /// Waiting commits set aside in advance, by their replacements, as kept
+    /// beside the replica, shared with the replica's readers: a refusal of
+    /// one does not stand even before [`Owner::settle_superseded`] resolves
+    /// it in the outcome journal.
+    superseded_waiting: Arc<Mutex<HashMap<String, String>>>,
     /// A commit failed and putting back what it staged failed too: its
     /// record waits beside the replica, and with it blobs queued for upload
     /// that no message names. While it is `Some`, no round runs; each wake
@@ -910,6 +925,9 @@ impl Owner {
         })?;
         let refusals = cache.standing_refusals().map_err(|error| {
             ReplicaError::Client(format!("the replica's upload refusals: {error}"))
+        })?;
+        let superseded_waiting = cache.log.superseded_waiting().map_err(|error| {
+            ReplicaError::Client(format!("the replica's superseded commits: {error}"))
         })?;
         let (config, origin) = match &spec.link {
             Some(link) => {
@@ -962,7 +980,7 @@ impl Owner {
             presence: 0,
             presence_known: false,
         });
-        Ok(Owner {
+        let mut owner = Owner {
             database: spec.database.clone(),
             client,
             transport,
@@ -978,8 +996,12 @@ impl Owner {
             cache_max: BLOB_CACHE_MAX_BYTES,
             cache,
             upload_refusals: Arc::new(Mutex::new(refusals)),
+            superseded_waiting: Arc::new(Mutex::new(superseded_waiting)),
             settle: None,
-        })
+        };
+        // An outcome may have arrived before the last process ended.
+        owner.settle_superseded();
+        Ok(owner)
     }
 
     /// Whether this owner may touch the network now.
@@ -1107,20 +1129,7 @@ impl Owner {
                 let _ = reply.send(Ok(peers));
             }
             Command::Supersede(commits, replacement, reply) => {
-                let mut outcome = Ok(());
-                for commit in commits {
-                    let resolved = self
-                        .client
-                        .resolve_commit_outcome(ResolveCommitOutcomeInput {
-                            client_commit_id: commit,
-                            resolution: CommitOutcomeResolution::Superseded,
-                            replacement_client_commit_id: Some(replacement.clone()),
-                        });
-                    if let Err(error) = resolved {
-                        outcome = Err(ReplicaError::Client(error));
-                    }
-                }
-                let _ = reply.send(outcome);
+                let _ = reply.send(self.supersede(commits, &replacement));
                 self.prune_refusals();
             }
             Command::Commit(blobs, ops, reply) => {
@@ -1485,11 +1494,118 @@ impl Owner {
                 }
             }
         }
+        self.settle_superseded();
         self.absorb_changes();
         // An outcome may have made an upload refusal moot.
         self.prune_refusals();
         // A commit the server took no longer pins its blobs.
         self.enforce_cache();
+    }
+
+    /// Set the refusals of `commits` aside by `replacement`: those standing
+    /// in the outcome journal now, those still waiting in advance, kept
+    /// beside the replica until their outcome arrives
+    /// ([`Self::settle_superseded`]). A commit the server took, or whose
+    /// refusal is already resolved, needs nothing.
+    fn supersede(&mut self, commits: Vec<String>, replacement: &str) -> Result<(), ReplicaError> {
+        let mut outcome = Ok(());
+        let mut waiting = Vec::new();
+        for commit in commits {
+            match self.client.commit_outcome(&commit) {
+                Ok(Some(known)) if stands(&known) => {
+                    if let Err(error) = self.resolve_superseded(commit, replacement) {
+                        outcome = Err(error);
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => waiting.push(commit),
+                Err(error) => outcome = Err(ReplicaError::Client(error)),
+            }
+        }
+        if waiting.is_empty() {
+            return outcome;
+        }
+        self.cache
+            .log
+            .supersede_waiting(&waiting, replacement)
+            .map_err(|error| {
+                ReplicaError::Client(format!("the replica's superseded commits: {error}"))
+            })?;
+        let mut held = self
+            .superseded_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for commit in waiting {
+            held.insert(commit, replacement.to_owned());
+        }
+        outcome
+    }
+
+    fn resolve_superseded(
+        &mut self,
+        commit: String,
+        replacement: &str,
+    ) -> Result<(), ReplicaError> {
+        self.client
+            .resolve_commit_outcome(ResolveCommitOutcomeInput {
+                client_commit_id: commit,
+                resolution: CommitOutcomeResolution::Superseded,
+                replacement_client_commit_id: Some(replacement.to_owned()),
+            })
+            .map(|_| ())
+            .map_err(ReplicaError::Client)
+    }
+
+    /// Resolve every commit set aside in advance whose outcome has arrived:
+    /// a refusal is set aside in the outcome journal, an acceptance needs
+    /// nothing; either way, and for a commit gone from the outbox with no
+    /// outcome, its record goes. Nothing to do while none is held.
+    fn settle_superseded(&mut self) {
+        let held: Vec<(String, String)> = self
+            .superseded_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(commit, replacement)| (commit.clone(), replacement.clone()))
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let waiting = self.client.pending_commit_ids();
+        let mut settled = Vec::new();
+        for (commit, replacement) in held {
+            let refused = match self.client.commit_outcome(&commit) {
+                Ok(Some(known)) => stands(&known),
+                Ok(None) if waiting.contains(&commit) => continue,
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::debug!(database = %self.database, %error, "a superseded commit's outcome was not read");
+                    continue;
+                }
+            };
+            if refused {
+                if let Err(error) = self.resolve_superseded(commit.clone(), &replacement) {
+                    tracing::debug!(database = %self.database, %error, "a superseded refusal was not set aside");
+                    continue;
+                }
+            }
+            settled.push(commit);
+        }
+        if settled.is_empty() {
+            return;
+        }
+        if let Err(error) = self.cache.log.drop_superseded_waiting(&settled) {
+            // Kept beside the replica: the next settle finds them resolved.
+            tracing::debug!(database = %self.database, %error, "settled superseded commits were not dropped");
+            return;
+        }
+        let mut held = self
+            .superseded_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for commit in &settled {
+            held.remove(commit);
+        }
     }
 
     /// Drop the upload refusals that no longer stand — their commit neither
@@ -1604,6 +1720,7 @@ pub struct SyncularReplica {
     state: watch::Receiver<ReplicaState>,
     remote: Option<Remote>,
     upload_refusals: Arc<Mutex<Vec<UploadRefusal>>>,
+    superseded_waiting: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl SyncularReplica {
@@ -1639,6 +1756,7 @@ impl SyncularReplica {
                     let _ = ready.send(Ok((
                         owner.state.subscribe(),
                         Arc::clone(&owner.upload_refusals),
+                        Arc::clone(&owner.superseded_waiting),
                     )));
                     owner.run(inbox);
                 }
@@ -1647,7 +1765,8 @@ impl SyncularReplica {
                 }
             })
             .map_err(|error| ReplicaError::Client(format!("owner thread: {error}")))?;
-        let (state, upload_refusals) = opened.recv().map_err(|_| ReplicaError::Closed)??;
+        let (state, upload_refusals, superseded_waiting) =
+            opened.recv().map_err(|_| ReplicaError::Closed)??;
         Ok(SyncularReplica {
             commands,
             gate,
@@ -1656,6 +1775,7 @@ impl SyncularReplica {
             state,
             remote,
             upload_refusals,
+            superseded_waiting,
         })
     }
 
@@ -1665,6 +1785,15 @@ impl SyncularReplica {
             .send(command(reply))
             .map_err(|_| ReplicaError::Closed)?;
         answer.recv().map_err(|_| ReplicaError::Closed)?
+    }
+
+    /// Whether `commit_id` was set aside in advance: its refusal, should one
+    /// arrive, never stands.
+    fn superseded_in_advance(&self, commit_id: &str) -> bool {
+        self.superseded_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(commit_id)
     }
 }
 
@@ -1824,12 +1953,20 @@ impl Replica for SyncularReplica {
             Value::from(row_id),
             field.map(Value::from).unwrap_or(Value::Null),
         ];
-        let pending = !self.query(ROW_PENDING, &params)?.is_empty();
+        let pending = self
+            .query(ROW_PENDING, &params)?
+            .iter()
+            .filter_map(|row| row.get("commit_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
         let mut refused = Vec::new();
         for row in self.query(ROW_REFUSED, &params)? {
             let Some(commit_id) = row.get("commit_id").and_then(Value::as_str) else {
                 continue;
             };
+            if self.superseded_in_advance(commit_id) {
+                continue;
+            }
             if let Delivery::Refused(rejection) = self.delivery(commit_id)? {
                 refused.push(Refusal {
                     commit_id: commit_id.to_owned(),
@@ -1846,6 +1983,9 @@ impl Replica for SyncularReplica {
             let Some(commit_id) = row.get("commit_id").and_then(Value::as_str) else {
                 continue;
             };
+            if self.superseded_in_advance(commit_id) {
+                continue;
+            }
             let Delivery::Refused(rejection) = self.delivery(commit_id)? else {
                 continue;
             };
@@ -2467,7 +2607,7 @@ pub(crate) mod tests {
         let owed = replica
             .row_writes("instance_prefs", "ana/nixie", None)
             .expect("reads");
-        assert!(owed.pending && owed.refused.is_empty());
+        assert!(owed.pending == std::slice::from_ref(&written) && owed.refused.is_empty());
         assert_eq!(
             replica
                 .row_writes("instance_prefs", "kuba/nixie", None)
@@ -2481,11 +2621,12 @@ pub(crate) mod tests {
 
         // A new process: nothing of the last one but the file.
         let again = SyncularReplica::open(spec.clone()).expect("reopens");
-        assert!(
+        assert_eq!(
             again
                 .row_writes("instance_prefs", "ana/nixie", None)
                 .expect("reads")
                 .pending,
+            std::slice::from_ref(&written),
             "the outbox survived"
         );
         journal_refusal(&spec.path, "c-old", "ana/nixie", "hq.v9.person_actor");

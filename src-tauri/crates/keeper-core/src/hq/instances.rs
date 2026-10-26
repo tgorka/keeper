@@ -644,7 +644,7 @@ fn per_database(
             .refused
             .first()
             .map(|refusal| refusal.rejection.to_string());
-        let pending = db.writes.pending;
+        let pending = !db.writes.pending.is_empty();
         if !expected.is_empty() && row != expected {
             differs = true;
         }

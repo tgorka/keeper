@@ -680,7 +680,7 @@ fn shared(database: &str, order: Option<&[&str]>, writes: RowWrites) -> Shared {
 
 fn waiting() -> RowWrites {
     RowWrites {
-        pending: true,
+        pending: vec!["c-waiting".to_owned()],
         refused: Vec::new(),
     }
 }
@@ -720,7 +720,7 @@ fn a_choice_one_database_took_and_another_still_waits_for_is_not_shown_as_agreem
                 "beta",
                 Some(&[A, B]),
                 RowWrites {
-                    pending: false,
+                    pending: Vec::new(),
                     refused: vec![Refusal {
                         commit_id: "c-1".to_owned(),
                         rejection: Rejection::new("hq.v9.person_actor", "not yours"),

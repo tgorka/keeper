@@ -14,6 +14,13 @@ import type { AgentSessionRowVm } from "@/lib/ipc/client";
 import { agentSessionArchive, agentSessionRename, agentSessionUnarchive } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
+// The editor opens with the current title selected, so typing replaces it and
+// an arrow key edits it in place.
+function focusEditor(field: HTMLInputElement | null) {
+  field?.focus();
+  field?.select();
+}
+
 export function SessionRowMenu({
   row,
   children,
@@ -30,7 +37,7 @@ export function SessionRowMenu({
   const input = useRef<HTMLInputElement>(null);
   const refused = row.titleWrite.state === "refused" ? row.titleWrite : null;
   useEffect(() => {
-    if (editing) input.current?.focus();
+    if (editing) focusEditor(input.current);
   }, [editing]);
   const beginEditing = () => {
     setTitle(refused?.title ?? row.title);
@@ -114,7 +121,7 @@ export function SessionRowMenu({
           onCloseAutoFocus={(event) => {
             if (editing) {
               event.preventDefault();
-              input.current?.focus();
+              focusEditor(input.current);
             }
           }}
         >

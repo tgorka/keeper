@@ -158,11 +158,12 @@ fn now() -> i64 {
 }
 
 /// Settle queued commits as a round would, at the replica file rather than
-/// through a live server: each keeps its real commit id and operations. A
-/// refused commit leaves the outbox with its refusal journalled; an accepted
-/// one also lands in the server's copy (`_syncular_base_<table>`), so the
-/// row outlives a restart. `title` picks the commits writing that title;
-/// `None` settles every queued commit.
+/// through a live server: each keeps its real commit id. A refused commit
+/// leaves the outbox with its refusal and operations journalled; an accepted
+/// one is journalled without its operations, as syncular journals one, and
+/// lands in the server's copy (`_syncular_base_<table>`), so the row
+/// outlives a restart. `title` picks the commits writing that title; `None`
+/// settles every queued commit.
 fn journal_session_writes(path: &std::path::Path, title: Option<&str>, refused: bool) {
     use syncular_client::api::{CommitOperation, CommitOperationOutcome, RejectionRecord};
     let mut conn = rusqlite::Connection::open(path).expect("opens outcome fixture");
@@ -213,7 +214,7 @@ fn journal_session_writes(path: &std::path::Path, title: Option<&str>, refused: 
                 commit,
                 if refused { "rejected" } else { "applied" },
                 serde_json::to_string(&results).expect("results"),
-                serde_json::to_string(&ops).expect("operations")
+                refused.then(|| serde_json::to_string(&ops).expect("operations"))
             ],
         )
         .expect("records server outcome");
@@ -333,11 +334,12 @@ fn a_later_refused_rename_survives_restart_and_an_accepted_retry_clears_it() {
         "accepted retry clears refusal even while the archive write still waits"
     );
     assert!(
-        source
+        !source
             .replica
             .row_writes("sessions", "dev1.1", None)
             .expect("all writes")
-            .pending,
+            .pending
+            .is_empty(),
         "archive pending must not be reported as a pending rename"
     );
     source.replica.close();
@@ -352,6 +354,84 @@ fn a_later_refused_rename_survives_restart_and_an_accepted_retry_clears_it() {
         Write::Confirmed,
         "the supersession and confirmation survive another restart"
     );
+}
+
+#[test]
+fn the_newest_title_write_decides_and_an_older_refusal_never_outranks_it() {
+    use sessions::AgentSessionTitleWriteVm as Write;
+    let w = world();
+    w.alpha
+        .replica
+        .mutate(session("dev1.1", NIXIE, 1, false, None))
+        .expect("session");
+    let path = w._dir.path().join("alpha.sqlite");
+    journal_session_writes(&path, None, false);
+    let row = |source: &Source| {
+        sessions::rows(source, now())
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("row")
+    };
+    let refused = |title: &str| Write::Refused {
+        title: title.to_owned(),
+        sentence: "The server refused this rename: you are no longer a member of this chat."
+            .to_owned(),
+    };
+    // Two renames inside one round trip: AAA still waits when BBB is written.
+    sessions::rename(&w.alpha, "dev1.1", "AAA").expect("first rename queued");
+    sessions::rename(&w.alpha, "dev1.1", "BBB").expect("second rename queued");
+    assert_eq!(row(&w.alpha).title_write, Write::Pending);
+    journal_session_writes(&path, Some("AAA"), true);
+    let vm = row(&w.alpha);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Pending),
+        "the older refusal must not hide the newer rename that still waits"
+    );
+    journal_session_writes(&path, Some("BBB"), false);
+    let vm = row(&w.alpha);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed),
+        "the newer rename was accepted: the older refusal is moot"
+    );
+    w.alpha.replica.close();
+    w.alpha.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    let vm = row(&source);
+    assert_eq!(
+        (vm.title.as_str(), &vm.title_write),
+        ("BBB", &Write::Confirmed),
+        "set aside across a restart, not only in this process"
+    );
+    assert!(
+        source
+            .replica
+            .row_writes("sessions", "dev1.1", Some("title"))
+            .expect("title writes")
+            .refused
+            .is_empty(),
+        "the refusal is resolved in the outcome journal itself"
+    );
+    // Both refused: the newest decides, and Retry offers only its title.
+    sessions::rename(&source, "dev1.1", "CCC").expect("third rename queued");
+    sessions::rename(&source, "dev1.1", "DDD").expect("fourth rename queued");
+    journal_session_writes(&path, Some("CCC"), true);
+    journal_session_writes(&path, Some("DDD"), true);
+    assert_eq!(row(&source).title_write, refused("DDD"));
+    source.replica.close();
+    source.replica.join();
+    let source = open(w._dir.path(), "alpha");
+    assert_eq!(
+        row(&source).title_write,
+        refused("DDD"),
+        "the older refusal stays set aside after a restart"
+    );
+    // Retrying the newest sets it aside too; nothing older resurfaces.
+    sessions::rename(&source, "dev1.1", "DDD").expect("retry queued");
+    assert_eq!(row(&source).title_write, Write::Pending);
+    journal_session_writes(&path, Some("DDD"), false);
+    assert_eq!(row(&source).title_write, Write::Confirmed);
 }
 
 #[test]

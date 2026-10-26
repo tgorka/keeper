@@ -214,8 +214,8 @@ pub struct Refusal {
 /// outlives a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RowWrites {
-    /// A commit writing the row waits in the outbox.
-    pub pending: bool,
+    /// The commits writing the row that wait in the outbox, oldest first.
+    pub pending: Vec<String>,
     /// The standing refusals of commits that wrote it, newest first.
     pub refused: Vec<Refusal>,
 }
@@ -359,8 +359,10 @@ pub trait Replica: Send + Sync {
     /// The bytes of blob bodies the replica caches, as its client reports
     /// them (`blob_cache_bytes_approx`).
     fn blob_cache_bytes(&self) -> Result<u64, ReplicaError>;
-    /// Set the standing refusals `commit_ids` aside: `replacement`, written
-    /// since, writes their row again. Durable, like the refusals.
+    /// Set the refusals of `commit_ids` aside: `replacement`, written since,
+    /// writes their row again. A commit still waiting in the outbox is set
+    /// aside in advance: should the server refuse it, that refusal never
+    /// stands. Durable, like the refusals.
     fn supersede(&self, commit_ids: Vec<String>, replacement: &str) -> Result<(), ReplicaError>;
     /// Run the server's registered query `operation_id` with `params`: rows
     /// read on the server, never kept in the replica. Not on the owner

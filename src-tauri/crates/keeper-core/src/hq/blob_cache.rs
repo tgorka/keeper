@@ -87,13 +87,14 @@ pub struct StagedBlob {
     pub queued: bool,
 }
 
-/// When each blob of one replica was last used on this device, and the
-/// server's refusals of blob uploads: keeper's own file beside the replica
-/// (`<replica>.blob-access.sqlite`), never inside the client's, so a schema
-/// change there cannot take it and nothing here is mistaken for a synced
-/// table. Losing it costs the order (a body with no record counts from when
-/// it was cached), the reason a refused file shows, and the record of a
-/// commit a crash cut short.
+/// When each blob of one replica was last used on this device, the server's
+/// refusals of blob uploads, and the waiting commits set aside in advance:
+/// keeper's own file beside the replica (`<replica>.blob-access.sqlite`),
+/// never inside the client's, so a schema change there cannot take it and
+/// nothing here is mistaken for a synced table. Losing it costs the order (a
+/// body with no record counts from when it was cached), the reason a refused
+/// file shows, the record of a commit a crash cut short, and a set-aside
+/// commit's refusal, which then stands until a later write sets it aside.
 pub struct AccessLog {
     conn: Connection,
 }
@@ -116,7 +117,9 @@ impl AccessLog {
                at_ms INTEGER NOT NULL,
                PRIMARY KEY (commit_id, blob_id));
              CREATE TABLE IF NOT EXISTS unfinished_commit (
-               blob_id TEXT PRIMARY KEY, body INTEGER NOT NULL, queued INTEGER NOT NULL);",
+               blob_id TEXT PRIMARY KEY, body INTEGER NOT NULL, queued INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS superseded_waiting (
+               commit_id TEXT PRIMARY KEY, replacement TEXT NOT NULL);",
         )?;
         Ok(AccessLog { conn })
     }
@@ -237,6 +240,45 @@ impl AccessLog {
         let mut statement = self.conn.prepare("DELETE FROM used WHERE blob_id = ?1")?;
         for blob_id in blob_ids {
             statement.execute(params![blob_id])?;
+        }
+        Ok(())
+    }
+
+    /// `commit_ids`, still waiting in the outbox, are set aside by
+    /// `replacement` in advance: a refusal arriving for one never stands.
+    /// A later replacement of the same commit replaces the earlier.
+    pub fn supersede_waiting(
+        &self,
+        commit_ids: &[String],
+        replacement: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        for commit_id in commit_ids {
+            tx.execute(
+                "INSERT INTO superseded_waiting (commit_id, replacement) VALUES (?1, ?2) \
+                 ON CONFLICT(commit_id) DO UPDATE SET replacement = excluded.replacement",
+                params![commit_id, replacement],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Every commit set aside in advance, with its replacement.
+    pub fn superseded_waiting(&self) -> Result<HashMap<String, String>, rusqlite::Error> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT commit_id, replacement FROM superseded_waiting")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// The outcomes of `commit_ids` are settled: their records go.
+    pub fn drop_superseded_waiting(&self, commit_ids: &[String]) -> Result<(), rusqlite::Error> {
+        let mut statement = self
+            .conn
+            .prepare("DELETE FROM superseded_waiting WHERE commit_id = ?1")?;
+        for commit_id in commit_ids {
+            statement.execute(params![commit_id])?;
         }
         Ok(())
     }
