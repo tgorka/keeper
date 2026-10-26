@@ -716,6 +716,24 @@ pub fn tools(source: &Source, session_id: &str, agent_actor: &str) -> Vec<AgentS
         .collect()
 }
 
+/// The turns of a session that streamed and have no answer yet: what a
+/// stop names, and why a model or effort change waits for the next answer.
+pub fn running_turns(
+    source: &Source,
+    session_id: &str,
+) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+    Ok(source
+        .replica
+        .query(
+            "SELECT DISTINCT turn_id AS id FROM turn_chunks WHERE session_id = ?1 AND turn_id NOT IN \
+             (SELECT turn_id FROM messages WHERE session_id = ?1 AND role = 'agent' AND turn_id IS NOT NULL)",
+            &[Value::from(session_id)],
+        )?
+        .iter()
+        .filter_map(|row| opt_text(row, "id"))
+        .collect())
+}
+
 /// Why a switch was not written, as the person reads it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]

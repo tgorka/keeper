@@ -5,6 +5,7 @@ import type { AgentLiveTurnVm } from "./AgentLiveTurnVm";
 import type { AgentMessageVm } from "./AgentMessageVm";
 import type { AgentSessionAnsweringVm } from "./AgentSessionAnsweringVm";
 import type { AgentSessionDrivesVm } from "./AgentSessionDrivesVm";
+import type { AgentSessionPickerVm } from "./AgentSessionPickerVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
 import type { AgentTimelineItemVm } from "./AgentTimelineItemVm";
 import type { AgentTurnFoldVm } from "./AgentTurnFoldVm";
@@ -87,4 +88,10 @@ context?: AgentContextVm,
  * window fills it from every database this device holds
  * ([`crate::hq::drives::view`]).
  */
-drives?: AgentSessionDrivesVm, };
+drives?: AgentSessionDrivesVm, 
+/**
+ * The composer's model and effort pickers (109.18): absent for an
+ * archived session, while its settings are still arriving, and for a
+ * reader who may not change them.
+ */
+settings?: AgentSessionPickerVm, };

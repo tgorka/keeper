@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ts_rs::TS;
 
+use crate::bots::chat::Effort;
 use crate::chat::commands::{self, ArgMode, CommandSpec, Context, Place, Resolution, RoomKind};
 use crate::hq::port::RowOp;
 use crate::hq::sessions::{self, AgentSessionRef, Source};
+use crate::hq::settings::{self, AgentSettingsChange, AgentSettingsPick};
 use crate::hq::{drives, live, timeline, Hq, HqError};
 use crate::vm::{ChatCommandPreviewVm, ChatCommandRowVm, ChatCommandVerdictVm};
 
@@ -49,13 +51,13 @@ const REGISTRY: &[CommandSpec] = &[
     ),
     spec(
         "model",
-        "Choose the model for the next turn.",
+        "Choose the model from the next answer on.",
         ArgMode::Required,
         Some("model id"),
     ),
     spec(
         "effort",
-        "Choose the reasoning effort for the next turn.",
+        "Choose the reasoning effort from the next answer on.",
         ArgMode::Required,
         Some("level"),
     ),
@@ -102,25 +104,54 @@ fn context() -> Context {
     }
 }
 
-// 109.18 attaches its operation here when its backend exists: no
-// model/effort picker exists on this base. `/drives` (109.23) is offered
-// only to whoever has the drive control.
-fn registry(has_tools: bool, has_drives: bool) -> Vec<CommandSpec> {
+/// What a session offers, so a command without its operation is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Offers {
+    /// The agent offers tools here.
+    pub tools: bool,
+    /// This person has the session's drive control (109.23).
+    pub drives: bool,
+    /// The person may choose among the agent's models.
+    pub models: bool,
+    /// The efforts the agent offers, lowest first: `/effort` lists these
+    /// and only these, and is absent without them.
+    pub efforts: Vec<Effort>,
+}
+
+impl Offers {
+    /// What `sid` offers this reader now. The model and effort choices
+    /// exist only where the pickers do (109.18); `/drives` only for whoever
+    /// has the drive control (109.23).
+    pub fn of(source: &Source, sid: &str, session: &timeline::SessionRow) -> Offers {
+        let picker = settings::picker(source, sid).ok();
+        Offers {
+            tools: !live::tools(source, sid, &session.agent_actor).is_empty(),
+            drives: drives::available(source, sid, session),
+            models: picker.as_ref().is_some_and(|p| !p.models.is_empty()),
+            efforts: picker
+                .map(|p| p.efforts.into_iter().map(|e| e.effort).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn registry(offers: &Offers) -> Vec<CommandSpec> {
     REGISTRY
         .iter()
         .copied()
         .filter(|s| match s.name {
-            "model" | "effort" => false,
-            "tools" => has_tools,
-            "drives" => has_drives,
+            "tools" => offers.tools,
+            "drives" => offers.drives,
+            "model" => offers.models,
+            "effort" => !offers.efforts.is_empty(),
             _ => true,
         })
         .collect()
 }
 
 /// Menu and verdict are one Rust answer, like the messenger's.
-pub fn preview(draft: &str, has_tools: bool, has_drives: bool) -> ChatCommandPreviewVm {
-    let registry = registry(has_tools, has_drives);
+pub fn preview(draft: &str, offers: &Offers) -> ChatCommandPreviewVm {
+    let registry = registry(offers);
     let ctx = context();
     let verdict = match commands::resolve_in(&registry, draft, &ctx) {
         Resolution::Text(text) => ChatCommandVerdictVm::Text { text },
@@ -136,7 +167,14 @@ pub fn preview(draft: &str, has_tools: bool, has_drives: bool) -> ChatCommandPre
         verdict,
         rows: commands::menu_in(&registry, draft, &ctx)
             .into_iter()
-            .map(|s| ChatCommandRowVm::compose(s, &ctx))
+            .map(|s| {
+                let mut row = ChatCommandRowVm::compose(s, &ctx);
+                // The levels this agent takes, in the words its menu shows.
+                if row.name == "effort" {
+                    row.arg_hint = Some(settings::effort_hint(&offers.efforts));
+                }
+                row
+            })
             .collect(),
         escape_hint: commands::ESCAPE_HINT.to_owned(),
     }
@@ -162,19 +200,26 @@ pub struct AgentCommandResultVm {
     pub session: Option<AgentSessionRef>,
     pub surface: Option<AgentCommandSurface>,
     pub message: String,
+    /// After `/model` or `/effort`: the session's choice, which this device
+    /// keeps as its last pick for the agent, as the pickers' change does.
+    pub pick: Option<AgentSettingsPick>,
 }
 
 /// Execute against the same replica used by the session's ordinary controls.
-pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResultVm, String> {
+/// `pick` is this device's last model and effort for the session's agent: a
+/// fresh session (`/new`, `/clean`) starts with what the agent still offers.
+pub fn run(
+    source: &Source,
+    sid: &str,
+    draft: &str,
+    pick: Option<&AgentSettingsPick>,
+) -> Result<AgentCommandResultVm, String> {
     let session =
         timeline::session_row(source, sid).ok_or("This conversation is not on this device.")?;
     if session.archived {
         return Err("Unarchive this conversation first.".to_owned());
     }
-    let registry = registry(
-        !live::tools(source, sid, &session.agent_actor).is_empty(),
-        drives::available(source, sid, &session),
-    );
+    let registry = registry(&Offers::of(source, sid, &session));
     let (name, args) = match commands::resolve_in(&registry, draft, &context()) {
         Resolution::Command { name, args } => (name, args),
         Resolution::Refusal { message, .. } => return Err(message),
@@ -184,12 +229,13 @@ pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResult
         session: None,
         surface: None,
         message: String::new(),
+        pick: None,
     };
     match name {
         "clean" | "new" => {
             // Empty body creates no message and therefore no phantom model turn.
-            let id =
-                sessions::create(source, &session.agent_actor, "").map_err(|e| e.to_string())?;
+            let id = sessions::create(source, &session.agent_actor, "", pick)
+                .map_err(|e| e.to_string())?;
             if let Some(title) = args {
                 sessions::rename(source, &id, &title).map_err(|e| e.to_string())?;
             }
@@ -201,15 +247,46 @@ pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResult
         "rename" => sessions::rename(source, sid, args.as_deref().unwrap_or_default())
             .map_err(|e| e.to_string())?,
         "archive" => sessions::set_archived(source, sid, true).map_err(|e| e.to_string())?,
+        "model" | "effort" => {
+            let arg = args.unwrap_or_default();
+            let arg = arg.trim();
+            let what = if name == "model" {
+                AgentSettingsChange::Model {
+                    model: arg.to_owned(),
+                }
+            } else {
+                AgentSettingsChange::Effort {
+                    effort: settings::effort_named(source, sid, arg).map_err(|e| e.to_string())?,
+                }
+            };
+            let changed = settings::change(source, sid, what, sessions::now_ms())
+                .map_err(|e| e.to_string())?;
+            let done = if name == "model" {
+                format!("The model is now {arg}.")
+            } else {
+                format!(
+                    "The effort is now {}.",
+                    changed
+                        .pick
+                        .effort
+                        .map(settings::effort_word)
+                        .unwrap_or_default()
+                )
+            };
+            result.message = match changed.note {
+                Some(note) => format!("{done} {note}"),
+                None => done,
+            };
+            result.pick = Some(changed.pick);
+        }
         "stop" => {
-            let turns = source.replica.query("SELECT DISTINCT turn_id AS id FROM turn_chunks WHERE session_id = ?1 AND turn_id NOT IN (SELECT turn_id FROM messages WHERE session_id = ?1 AND role = 'agent' AND turn_id IS NOT NULL)", &[sid.into()]).map_err(|e| e.to_string())?;
+            let turns = live::running_turns(source, sid).map_err(|e| e.to_string())?;
             if turns.is_empty() {
                 return Err("There is no running turn to stop.".to_owned());
             }
             let at = sessions::now_ms();
             let ops = turns
                 .iter()
-                .filter_map(|turn| turn.get("id").and_then(serde_json::Value::as_str))
                 .map(|turn| {
                     let mut row = sessions::person_message(
                         source,
@@ -253,8 +330,7 @@ impl Hq {
         })?;
         Ok(preview(
             draft,
-            !live::tools(&source, &key.session_id, &session.agent_actor).is_empty(),
-            drives::available(&source, &key.session_id, &session),
+            &Offers::of(&source, &key.session_id, &session),
         ))
     }
 
@@ -262,9 +338,10 @@ impl Hq {
         &self,
         key: &AgentSessionRef,
         draft: &str,
+        pick: Option<&AgentSettingsPick>,
     ) -> Result<AgentCommandResultVm, HqError> {
         let source = self.source(&key.database)?;
-        let result = run(&source, &key.session_id, draft).map_err(HqError::Sentence)?;
+        let result = run(&source, &key.session_id, draft, pick).map_err(HqError::Sentence)?;
         self.touch();
         Ok(result)
     }

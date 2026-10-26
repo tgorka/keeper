@@ -1359,23 +1359,81 @@ on the server only, as an alias of that actor; it is not part of keeper's contra
 **Owed:** the imported sessions of both databases in the Agents window on hesperia (R-HQ-65), and
 NFR-127 there (below).
 
-## A session's model and effort (109.17)
+## A session's model and effort (109.17, 109.18)
 
-`Hq::session_settings` reads `session_settings` and returns the saved nullable model and
-effort, the union of the session agent's published model/effort choices, and each instance's
-defaults separately (`AgentSessionSettingsVm`, `AgentSettingsDefaultVm`). Another agent's
-profiles never supply choices. No shared default is invented when instances disagree.
+keeper-core reads `session_settings` with the saved nullable model and effort, the union of the
+session agent's published model/effort choices, and each instance's defaults separately
+(`AgentSessionSettingsVm`, `AgentSettingsDefaultVm`). Another agent's profiles never supply
+choices. No shared default is invented when instances disagree.
 
-`Hq::set_session_settings` replaces both choices together for a person member (`owner` or
-`person`); `None` resets a choice to the definition default. Off-list choices and nonmembers
-are refused locally; the server remains authoritative. Settings coverage is held for archived
-sessions too. Until that coverage is complete, reading or writing returns `HqError::Arriving`
-rather than mistaking missing rows for defaults.
+`Hq::change_session_settings` writes one `AgentSettingsChange` for a person member (`owner` or
+`person`): a model (the saved effort kept), an effort (the saved model kept), or `reset`, which
+writes **null for both**. A saved half the agent no longer offers is written back as null rather
+than refusing the other change, because the runtime already answers with the default for it.
+Off-list choices and nonmembers are refused locally with the offered choices named; the server
+remains authoritative. Settings coverage is held for archived sessions too. Until that coverage
+is complete, reading or writing returns `HqError::Arriving` rather than mistaking missing rows for
+defaults.
 
 Choices affect subsequent turns, not a turn already running. An answer records the model
 actually used and its effort; when a selected model is no longer offered, it falls back to the
-definition default and records why. This story adds the core read/write API and picker inputs
-only: no shell command, picker or other UI is exposed yet.
+definition default and records why in `metadata.model_fallback`.
+
+**The pickers (109.18).** The session view carries `AgentSessionViewVm.settings`
+(`AgentSessionPickerVm`), absent for an archived session, while the settings arrive, and for a
+reader who may not change them. Rust decides every part of it:
+
+- `models` lists only the offered models, each `current` (the saved choice, or the instances'
+  defaults while no offered choice is saved) and `default`; a saved model the agent dropped is
+  never listed.
+- `efforts` lists only the offered efforts with the same flags. Nothing offered — Nixi as
+  shipped, whose effort is withheld — leaves `efforts` empty and `effortLabel` absent: the effort
+  menu and `/effort` are **absent**, not disabled.
+- `resettable`: a choice is saved, so Reset has something to write back to null.
+- `running`: a turn streamed and has no answer yet; a change then answers "This answer keeps its
+  model and effort; your change applies from the next answer." (also the return of the change).
+- `fallback`: the newest answer's `metadata.model_fallback`, shown beside the picker.
+- `write`: the row's per-row outcome (`Replica::row_writes`, as the instance choice reads it):
+  `pending`, or `refused` with the server's V16 code in plain words. A new change supersedes a
+  standing refusal.
+
+The composer footer (`session-settings-picker.tsx`) is t3code's shape: a model popover with a
+search box, starred models first and a "Default" badge; an effort menu with a "Default" badge;
+Reset. An agent with nothing to choose draws no group at all. Stars are a lens, not a setting:
+they live in the `keeper_model_favorites` cookie like the other remembered views (no settings
+row, no IPC write), device-wide, and only order Rust's offers — a starred model the agent does
+not offer is never listed. Enter and Space on a star star it; they never reach the list, which
+would take Enter as choosing the highlighted model.
+
+`/model <id>` and `/effort <level>` (109.19's registry) run the same change and appear only when
+the pickers would offer the matching choice. `/effort` lists only the agent's offered levels, in
+the menu's words, and takes either the menu's word (`extra high`) or the contract's (`xhigh`); a
+level the agent does not offer is refused with the offered ones named.
+
+**The last pick for new sessions (Q109-16 b, ruled per device).** Every change answers what it
+wrote (`AgentSettingsChangedVm.pick`; `/model` and `/effort` answer it in
+`AgentCommandResultVm.pick`), and this device keeps it per agent in the `keeper_agent_picks`
+cookie (`src/lib/stores/agent-picks.ts`); a reset forgets the agent. When this device opens a new
+session with that agent — the New session composer, `/new` or `/clean` — it hands the pick to
+Rust, which writes the halves the agent still offers (`settings::initial`). A dropped half is left
+to the agent's default; nothing offered, or no pick, writes no settings row. Nothing new is drawn.
+
+A creation with a pick to write is three commits, in order: the session and its membership; the
+settings row; the first message (`sessions::create_with_first`, R10918-07). Without one it stays a
+single commit, as before. V16 judges the pick
+against the server's offers, which this device may not hold yet (a session created offline, or a
+replica behind a republished definition), and a refusal rolls back only its own commit: the
+conversation and the person's first words stand, the turn runs on the agent's defaults, and the
+refusal shows on the new session's picker. The server applies a client's commits in order and the
+runtime starts no turn before its subscription to the session's settings has caught up
+(keeper-hq `worker.rs`, `start_turn`), so an accepted pick reaches the first turn.
+A spoken question (`hq::spoken`) opens its session in Rust alone, so it starts with the agent's
+defaults.
+
+Mock shell: `?sessions=launch&settings=nixi|refused|fallback` (with `&live=stream` for a running
+turn).
+
+**Owed:** the pickers on kalypso (iOS).
 
 ## Measured
 

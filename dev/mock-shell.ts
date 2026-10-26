@@ -59,13 +59,17 @@ import type {
   AgentApprovalVm,
   AgentAttachmentVm,
   AgentChoiceVm,
+  AgentEffortOptionVm,
   AgentInstancesVm,
   AgentSessionAnsweringVm,
   AgentSessionDrivesVm,
   AgentSessionMembersVm,
+  AgentSessionPickerVm,
   AgentSessionRowVm,
   AgentSessionsBatch,
   AgentSessionViewVm,
+  AgentSettingsChange,
+  AgentSettingsPick,
   AutoUpdateRestartVm,
   AutoUpdateVm,
   BotModelVm,
@@ -6609,6 +6613,75 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
   }, 900);
 }
 
+// ?sessions=launch&settings=nixi|refused|fallback — the composer's model and effort pickers
+// (109.18). Absent: an agent that offers several models and efforts. `nixi` offers models and no
+// effort (her effort is withheld), so the effort menu is absent. `refused` has the server refuse
+// each change a moment after it was written, through the row's outcome. `fallback` puts
+// `metadata.model_fallback` on the newest answer. Viewing aid only: Rust's `picker_of` decides.
+const settingsScenario = new URLSearchParams(location.search).get("settings");
+const MOCK_MODELS = ["claude-opus-5-5", "gpt-6-astra", "glm-5.3-flash", "qwen-4-coder"];
+const MOCK_EFFORTS: AgentEffortOptionVm["effort"][] =
+  settingsScenario === "nixi" ? [] : ["low", "medium", "high", "xhigh"];
+const MOCK_EFFORT_LABELS: Record<AgentEffortOptionVm["effort"], string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+};
+/** Rust's `settings::effort_hint`: the offered levels in the menu's words, `a, b or c`. */
+function mockEffortWords(): string {
+  const words = MOCK_EFFORTS.map((e) => MOCK_EFFORT_LABELS[e].toLowerCase());
+  return words.length > 1
+    ? `${words.slice(0, -1).join(", ")} or ${words[words.length - 1]}`
+    : (words[0] ?? "");
+}
+const mockSettings = new Map<
+  string,
+  { model: string | null; effort: AgentEffortOptionVm["effort"] | null; refused: string | null }
+>();
+function mockSettingsOf(vm: AgentSessionViewVm) {
+  const key = JSON.stringify([vm.database, vm.sessionId]);
+  let held = mockSettings.get(key);
+  if (!held) {
+    held = { model: null, effort: null, refused: null };
+    mockSettings.set(key, held);
+  }
+  return held;
+}
+function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
+  if (vm.archived) return undefined;
+  const held = mockSettingsOf(vm);
+  const defaultModel = "glm-5.3-flash";
+  const defaultEffort = settingsScenario === "nixi" ? null : "medium";
+  const model = held.model ?? defaultModel;
+  const effort = held.effort ?? defaultEffort;
+  return {
+    models: MOCK_MODELS.map((id) => ({
+      id,
+      current: id === model,
+      default: id === defaultModel,
+    })),
+    efforts: MOCK_EFFORTS.map((option) => ({
+      effort: option,
+      label: MOCK_EFFORT_LABELS[option],
+      current: option === effort,
+      default: option === defaultEffort,
+    })),
+    modelLabel: model,
+    ...(MOCK_EFFORTS.length && effort ? { effortLabel: MOCK_EFFORT_LABELS[effort] } : {}),
+    resettable: held.model !== null || held.effort !== null,
+    ...(vm.live.length
+      ? {
+          running:
+            "This answer keeps its model and effort; your change applies from the next answer.",
+        }
+      : {}),
+    ...(settingsScenario === "fallback"
+      ? { fallback: "claude-opus-4-8 is no longer offered; using glm-5.3-flash instead." }
+      : {}),
+    write: held.refused ? { state: "refused", sentence: held.refused } : { state: "confirmed" },
+  };
+}
 /** The mock's source retains rows; only the reader's selected projection crosses IPC. */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   const prefs = heldViewPrefs();
@@ -6621,6 +6694,7 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     ...(vm.drives
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
       : {}),
+    settings: mockPicker(vm),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
       ...message,
       ...(prefs.showDetails && details ? { details } : {}),
@@ -6818,6 +6892,46 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     }, 1500);
     return null;
   },
+  agent_session_settings_change: (payload) => {
+    const vm = mockSession(payload);
+    if (vm.readOnly) hqRefuse("Unarchive this conversation first.");
+    const change = payload.change as AgentSettingsChange;
+    const held = mockSettingsOf(vm);
+    const before = { model: held.model, effort: held.effort };
+    if (change.kind === "model") {
+      if (!MOCK_MODELS.includes(change.model))
+        hqRefuse(`${change.model} is not offered here; choose ${MOCK_MODELS.join(", ")}.`);
+      held.model = change.model;
+    } else if (change.kind === "effort") {
+      if (!MOCK_EFFORTS.includes(change.effort))
+        hqRefuse(
+          MOCK_EFFORTS.length
+            ? `${change.effort} is not offered here; choose ${mockEffortWords()}.`
+            : "This conversation's agent offers no effort choice.",
+        );
+      held.effort = change.effort;
+    } else {
+      held.model = null;
+      held.effort = null;
+    }
+    // A new write sets an earlier refusal aside, as Rust's `supersede` does.
+    held.refused = null;
+    publishSessions();
+    if (settingsScenario === "refused" && change.kind !== "reset")
+      setTimeout(() => {
+        held.model = before.model;
+        held.effort = before.effort;
+        held.refused =
+          "The server refused your model and effort change: the agent does not offer that model.";
+        publishSessions();
+      }, 600);
+    return {
+      note: vm.live.length
+        ? "This answer keeps its model and effort; your change applies from the next answer."
+        : null,
+      pick: { model: held.model, effort: held.effort },
+    };
+  },
   agent_approvals_subscribe: (payload) => {
     const id = `session-approvals-${++sessionSerial}`;
     const channel = payload.channel as MockChannel<AgentApprovalVm[]>;
@@ -6920,6 +7034,19 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       ["clean", "Start fresh; keep this conversation.", "none", null],
       ["new", "Start a new conversation.", "optionalRest", "title"],
       ["rename", "Rename this conversation.", "required", "title"],
+      ...(vm.archived
+        ? []
+        : [["model", "Choose the model from the next answer on.", "required", "model id"]]),
+      ...(vm.archived || !MOCK_EFFORTS.length
+        ? []
+        : [
+            [
+              "effort",
+              "Choose the reasoning effort from the next answer on.",
+              "required",
+              mockEffortWords(),
+            ],
+          ]),
       ["stop", "Stop the running turn.", "none", null],
       ...(vm.tools.length ? [["tools", "Open tool switches.", "none", null]] : []),
       ...(vm.drives ? [["drives", "Choose the drives this session may read.", "none", null]] : []),
@@ -6948,12 +7075,14 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       session: null as { database: string; sessionId: string } | null,
       surface: null as string | null,
       message: "",
+      pick: null as AgentSettingsPick | null,
     };
     if (name === "clean" || name === "new") {
       result.session = sessionHandlers.agent_session_new({
         database: vm.database,
         agentActor: vm.agentActor,
         body: "",
+        pick: payload.pick,
       }) as { database: string; sessionId: string };
       const fresh = mockSession(result.session);
       fresh.messages = [];
@@ -6972,6 +7101,25 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       publishSessions();
     } else if (name === "archive") {
       sessionHandlers.agent_session_archive(payload);
+    } else if (name === "model" || name === "effort") {
+      const arg = (args ?? "").trim();
+      const said = arg.split(/\s+/).join(" ").toLowerCase();
+      let change: AgentSettingsChange = { kind: "model", model: arg };
+      let done = `The model is now ${arg}.`;
+      if (name === "effort") {
+        // Rust's `effort_named`: the menu's label or the contract's word, offered levels only.
+        const effort =
+          MOCK_EFFORTS.find((e) => e === said || MOCK_EFFORT_LABELS[e].toLowerCase() === said) ??
+          hqRefuse(`${arg} is not offered here; choose ${mockEffortWords()}.`);
+        change = { kind: "effort", effort };
+        done = `The effort is now ${MOCK_EFFORT_LABELS[effort].toLowerCase()}.`;
+      }
+      const changed = sessionHandlers.agent_session_settings_change({ ...payload, change }) as {
+        note: string | null;
+        pick: AgentSettingsPick;
+      };
+      result.message = changed.note ? `${done} ${changed.note}` : done;
+      result.pick = changed.pick;
     } else if (name === "stop") {
       if (!vm.live.length) hqRefuse("There is no running turn to stop.");
       vm.live = [];
@@ -7171,6 +7319,11 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         },
       ],
     });
+    // Rust's `settings::initial`: the device's last pick, only what the agent still offers.
+    const pick = payload.pick as AgentSettingsPick | null;
+    const seeded = mockSettingsOf(mockSession(row));
+    seeded.model = pick?.model && MOCK_MODELS.includes(pick.model) ? pick.model : null;
+    seeded.effort = pick?.effort && MOCK_EFFORTS.includes(pick.effort) ? pick.effort : null;
     publishSessions();
     hqClearedWrite(row.database);
     return { database: row.database, sessionId: row.sessionId };

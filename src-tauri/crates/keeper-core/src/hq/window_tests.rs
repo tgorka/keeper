@@ -434,7 +434,7 @@ fn the_newest_title_write_decides_and_an_older_refusal_never_outranks_it() {
     assert_eq!(row(&source).title_write, Write::Confirmed);
     // `/rename` is a rename like the menu's: it sets the older one aside too.
     sessions::rename(&source, "dev1.1", "AAA").expect("menu rename queued");
-    crate::hq::commands::run(&source, "dev1.1", "/rename BBB").expect("/rename queued");
+    crate::hq::commands::run(&source, "dev1.1", "/rename BBB", None).expect("/rename queued");
     journal_session_writes(&path, Some("AAA"), true);
     let vm = row(&source);
     assert_eq!(
@@ -796,8 +796,8 @@ fn archiving_shrinks_the_windows_and_an_outbox_pinned_row_survives() {
 fn a_new_session_takes_the_next_id_and_its_database_is_the_only_one_or_the_last_chosen() {
     let w = world();
     let sources = [w.alpha.clone(), w.beta.clone()];
-    let first = sessions::create(&w.alpha, NIXIE, "plan the week\nthen more").expect("first");
-    let second = sessions::create(&w.alpha, NIXIE, "again").expect("second");
+    let first = sessions::create(&w.alpha, NIXIE, "plan the week\nthen more", None).expect("first");
+    let second = sessions::create(&w.alpha, NIXIE, "again", None).expect("second");
     assert_eq!((first.as_str(), second.as_str()), ("dev1.1", "dev1.2"));
     let row = timeline::session_row(&w.alpha, &first).expect("row");
     assert_eq!(
@@ -1141,7 +1141,7 @@ fn sessions_created_at_once_never_share_an_id() {
             .map(|n| {
                 let alpha = w.alpha.clone();
                 scope.spawn(move || {
-                    sessions::create(&alpha, NIXIE, &format!("hello {n}")).expect("created")
+                    sessions::create(&alpha, NIXIE, &format!("hello {n}"), None).expect("created")
                 })
             })
             .collect();
@@ -1633,7 +1633,7 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
         )])
         .expect("history");
     for draft in ["/clean", "/new", "/new A fresh title"] {
-        let next = run(&w.alpha, "old", draft)
+        let next = run(&w.alpha, "old", draft, None)
             .expect("fresh session")
             .session
             .expect("navigation");
@@ -1663,8 +1663,8 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
             "body of m1"
         );
     }
-    assert!(run(&w.alpha, "old", "/rename").is_err());
-    run(&w.alpha, "old", "/rename New title").expect("rename");
+    assert!(run(&w.alpha, "old", "/rename", None).is_err());
+    run(&w.alpha, "old", "/rename New title", None).expect("rename");
     assert_eq!(
         timeline::session_row(&w.alpha, "old").expect("row").title,
         "New title"
@@ -1675,41 +1675,73 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
         ("/help", AgentCommandSurface::Help),
     ] {
         assert_eq!(
-            run(&w.alpha, "old", draft).expect("open").surface,
+            run(&w.alpha, "old", draft, None).expect("open").surface,
             Some(surface)
         );
     }
     assert!(
-        run(&w.alpha, "old", "/stop").is_err(),
+        run(&w.alpha, "old", "/stop", None).is_err(),
         "no turn means no control row"
     );
-    run(&w.alpha, "old", "/archive").expect("archive");
+    run(&w.alpha, "old", "/archive", None).expect("archive");
     assert!(
         timeline::session_row(&w.alpha, "old")
             .expect("preserved")
             .archived
     );
-    assert!(run(&w.alpha, "old", "/rename archived").is_err());
+    assert!(run(&w.alpha, "old", "/rename archived", None).is_err());
 }
 
 #[test]
 fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose() {
-    use crate::hq::commands::preview;
+    use crate::bots::chat::Effort;
+    use crate::hq::commands::{preview, Offers};
     use crate::vm::ChatCommandVerdictVm;
-    let names = |tools, drives| {
-        preview("/", tools, drives)
+    let none = Offers::default();
+    let names = |offers: Offers| {
+        preview("/", &offers)
             .rows
             .into_iter()
             .map(|r| r.name)
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        names(false, false),
+        names(none.clone()),
         ["clean", "new", "rename", "stop", "context", "people", "archive", "help"]
     );
-    assert!(names(true, false).contains(&"tools".to_owned()));
+    assert!(names(Offers {
+        tools: true,
+        ..none.clone()
+    })
+    .contains(&"tools".to_owned()));
+    // A choice exists only where the agent offers it (109.18): Nixi offers
+    // models but no effort, so `/effort` is absent, not refused later.
+    let models_only = names(Offers {
+        models: true,
+        ..none.clone()
+    });
+    assert!(models_only.contains(&"model".to_owned()));
+    assert!(!models_only.contains(&"effort".to_owned()));
+    // `/effort` names only the levels offered, in the menu's words.
+    let effort = preview(
+        "/eff",
+        &Offers {
+            efforts: vec![Effort::Medium, Effort::Xhigh],
+            ..none.clone()
+        },
+    )
+    .rows
+    .into_iter()
+    .find(|r| r.name == "effort")
+    .expect("/effort offered");
+    assert_eq!(effort.arg_hint.as_deref(), Some("medium or extra high"));
     // `/drives` only for whoever has the drive control (109.23).
-    assert!(names(false, true).contains(&"drives".to_owned()));
+    assert!(names(Offers {
+        drives: true,
+        ..none.clone()
+    })
+    .contains(&"drives".to_owned()));
+    let none = &none;
     for draft in [
         "/unknown",
         "/model some-model",
@@ -1719,7 +1751,7 @@ fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose()
     ] {
         assert!(
             matches!(
-                preview(draft, false, false).verdict,
+                preview(draft, none).verdict,
                 ChatCommandVerdictVm::Refusal { .. }
             ),
             "{draft}"
@@ -1730,17 +1762,24 @@ fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose()
     for caption in ["/stop", "/unknown", "/model unavailable"] {
         let escaped = format!("/{caption}");
         assert!(
-            matches!(preview(&escaped, false, false).verdict, ChatCommandVerdictVm::Text { text } if text == caption),
+            matches!(preview(&escaped, none).verdict, ChatCommandVerdictVm::Text { text } if text == caption),
             "escaped caption {escaped} must retain exactly one leading slash"
         );
     }
-    assert_eq!(preview("/ren", false, false).rows[0].name, "rename");
+    assert_eq!(preview("/ren", none).rows[0].name, "rename");
     assert!(matches!(
-        preview("/drives", false, true).verdict,
+        preview(
+            "/drives",
+            &Offers {
+                drives: true,
+                ..none.clone()
+            }
+        )
+        .verdict,
         ChatCommandVerdictVm::Command { name, args: None } if name == "drives"
     ));
     assert!(
-        matches!(preview("/stop", false, false).verdict, ChatCommandVerdictVm::Command { name, args: None } if name == "stop")
+        matches!(preview("/stop", none).verdict, ChatCommandVerdictVm::Command { name, args: None } if name == "stop")
     );
 }
 
@@ -1767,7 +1806,7 @@ fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface(
             message("answer", "s", "agent", t, Some("done"), Value::Null),
         ])
         .expect("turns");
-    run(&w.alpha, "s", "/stop").expect("stop");
+    run(&w.alpha, "s", "/stop", None).expect("stop");
     let controls = sessions::read(
         &w.alpha,
         "SELECT metadata, role FROM messages WHERE session_id = 's' AND role = 'person'",
@@ -1779,7 +1818,7 @@ fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface(
     assert_eq!(metadata, json!({"kind":"stop","turn":"live"}));
     w.alpha.replica.mutate(vec![upsert("agent_profiles", json!({"id":"nixie.box", "actor_id":NIXIE, "name":"Nixie", "description":"", "avatar_blob":null, "definition_hash":"h", "image_digest":"d", "started_at_ms":t, "dir":"alpha", "tools":"[\"read\"]", "author_actor":NIXIE, "author_client":"nixie.box"}))]).expect("tools");
     assert_eq!(
-        run(&w.alpha, "s", "/tools").expect("tools").surface,
+        run(&w.alpha, "s", "/tools", None).expect("tools").surface,
         Some(AgentCommandSurface::Tools)
     );
 }

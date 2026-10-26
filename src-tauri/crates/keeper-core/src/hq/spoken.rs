@@ -615,7 +615,7 @@ impl Hq {
             }
             MainSession::New { database } => {
                 let source = self.source(&database)?;
-                let session_id = sessions::create_with_first(&source, agent, body, &question)
+                let session_id = sessions::create_with_first(&source, agent, body, &question, None)
                     .map_err(|error| HqError::Sentence(error.to_string()))?;
                 AgentSessionRef {
                     database,

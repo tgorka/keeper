@@ -253,6 +253,12 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub drives: Option<AgentSessionDrivesVm>,
+    /// The composer's model and effort pickers (109.18): absent for an
+    /// archived session, while its settings are still arriving, and for a
+    /// reader who may not change them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub settings: Option<crate::hq::settings::AgentSessionPickerVm>,
 }
 
 /// The pages of an archived session read so far through the server.
@@ -505,6 +511,15 @@ pub fn view(
             answering,
             context: super::context::latest(&rows, opened.prefs.show_details),
             drives: None,
+            settings: if session.archived {
+                None
+            } else {
+                crate::hq::settings::picker(source, session_id)
+                    .map_err(|error| {
+                        tracing::debug!(database = %source.database, %error, "the session's pickers are not shown");
+                    })
+                    .ok()
+            },
             agent_actor: session.agent_actor,
         },
         newest_ms,

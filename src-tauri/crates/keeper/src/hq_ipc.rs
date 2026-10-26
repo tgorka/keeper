@@ -487,6 +487,20 @@ pub async fn agent_session_drive_set(
     blocking(move |hq| hq.set_session_drive(&session(database, session_id), &drive, tick)).await
 }
 
+/// Change a session's model or effort, or reset both to the agent's
+/// defaults (109.18). Answers what was written (the device's last pick for
+/// the agent) and the sentence a change made while a turn runs owes the
+/// person; a later server refusal arrives with the session's view
+/// (`AgentSessionViewVm.settings.write`).
+#[tauri::command]
+pub async fn agent_session_settings_change(
+    database: String,
+    session_id: String,
+    change: keeper_core::hq::settings::AgentSettingsChange,
+) -> Result<keeper_core::hq::settings::AgentSettingsChangedVm, IpcError> {
+    blocking(move |hq| hq.change_session_settings(&session(database, session_id), change)).await
+}
+
 /// The person scrolled to the top of an open session: earlier messages.
 #[tauri::command]
 pub fn agent_session_page_back(database: String, session_id: String) -> Result<(), IpcError> {
@@ -523,8 +537,9 @@ pub async fn agent_command(
     database: String,
     session_id: String,
     draft: String,
+    pick: Option<keeper_core::hq::settings::AgentSettingsPick>,
 ) -> Result<keeper_core::hq::commands::AgentCommandResultVm, IpcError> {
-    blocking(move |hq| hq.command(&session(database, session_id), &draft)).await
+    blocking(move |hq| hq.command(&session(database, session_id), &draft, pick.as_ref())).await
 }
 
 /// Stage the files at `paths` (the paperclip, drag-and-drop) for a message
@@ -630,14 +645,16 @@ pub fn agent_attach_release(
     Ok(())
 }
 
-/// Open a session with an agent in one database, with its first message.
+/// Open a session with an agent in one database, with its first message;
+/// `pick` is this device's last model and effort for the agent (109.18).
 #[tauri::command]
 pub async fn agent_session_new(
     database: String,
     agent_actor: String,
     body: String,
+    pick: Option<keeper_core::hq::settings::AgentSettingsPick>,
 ) -> Result<AgentSessionRef, IpcError> {
-    blocking(move |hq| hq.new_session(&database, &agent_actor, &body)).await
+    blocking(move |hq| hq.new_session(&database, &agent_actor, &body, pick.as_ref())).await
 }
 
 /// Rename the title without changing the session id.
