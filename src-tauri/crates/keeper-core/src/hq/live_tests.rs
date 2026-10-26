@@ -454,7 +454,13 @@ impl World {
                    "author_actor": "alpha", "author_client": INSTANCE}),
         )
     }
-    fn answer(&self, body: &str, metadata: Value) -> RowOp {
+    fn answer(&self, body: &str, mut metadata: Value) -> RowOp {
+        // Closed always writes the finish key, including an unreported reason.
+        metadata
+            .as_object_mut()
+            .expect("metadata object")
+            .entry("finish")
+            .or_insert(Value::Null);
         upsert(
             "messages",
             json!({"id": "m-final", "session_id": "dev1.1", "page_key": self.page(),
@@ -853,3 +859,6 @@ fn a_session_that_read_outside_content_is_marked() {
     }]);
     assert!(w.view(&Opened::default()).untrusted);
 }
+
+#[path = "fold_tests.rs"]
+mod fold_tests;

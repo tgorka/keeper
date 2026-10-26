@@ -33,6 +33,8 @@ use crate::hq::sessions::{
     earlier_months, int, is_ask, is_heard, json, mark, month, newest_months, opt_text, page_key,
     previous_month, read, reads_trace, text, truthy, window, Source,
 };
+#[path = "turn_folds.rs"]
+mod turn_folds;
 
 /// The registered `sessionPage` query's operation id, as `syncular/`'s
 /// generated `syncular.queries.ts` names it.
@@ -121,6 +123,66 @@ pub struct AgentMessageVm {
     pub attachments: Vec<AgentAttachmentVm>,
 }
 
+/// Ordered reading column. References resolve against `messages`, `folds`,
+/// and `live`; grouping and ordering are never inferred by the renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum AgentTimelineItemVm {
+    Message { message_id: String },
+    Fold { turn_id: String },
+    LiveAnswer { turn_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AgentTurnStatusVm {
+    Running,
+    Done,
+    Parked,
+    /// The provider refused to answer, or tool-only work ended refused.
+    /// Never a stop, an interruption or a failure.
+    Refused,
+    Interrupted,
+    Waiting,
+    /// A person's Stop (109.19): asked for, or the turn closed `cancelled`.
+    Stopped,
+    /// The stream broke or the provider/runtime failed (`finish: failed`).
+    Failed,
+}
+
+/// One compact, always-visible outcome above the answer, not a tool card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentTurnFailureVm {
+    pub step_id: String,
+    pub sentence: String,
+}
+
+/// One turn's work, separate from its terminal answer. Lead-ins reference
+/// the original messages so attachments and author identity are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentTurnFoldVm {
+    pub turn_id: String,
+    pub lead_in_ids: Vec<String>,
+    pub reasoning: Option<String>,
+    pub steps: Vec<AgentToolStepVm>,
+    pub failures: Vec<AgentTurnFailureVm>,
+    pub status: AgentTurnStatusVm,
+    pub status_label: String,
+    pub summary: String,
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+}
+
 /// What an opened session shows, whole, every time it changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +201,14 @@ pub struct AgentSessionViewVm {
     pub read_only: bool,
     /// Oldest first.
     pub messages: Vec<AgentMessageVm>,
+    /// 109.13: the ordered projection consumed by the fold renderer. The
+    /// legacy messages/live fields remain until 109.14 switches over.
+    #[serde(default)]
+    #[ts(as = "Option<Vec<AgentTimelineItemVm>>", optional)]
+    pub items: Vec<AgentTimelineItemVm>,
+    #[serde(default)]
+    #[ts(as = "Option<Vec<AgentTurnFoldVm>>", optional)]
+    pub folds: Vec<AgentTurnFoldVm>,
     /// Oldest first; empty for a member who does not read the trace.
     pub approvals: Vec<AgentApprovalVm>,
     /// Earlier messages exist beyond what is shown.
@@ -358,7 +428,7 @@ pub fn view(
     let extras = live::extras(source, session_id, reads_trace, opened.prefs.show_reasoning);
     let ended: HashSet<String> = rows
         .iter()
-        .filter(|row| text(row, "role") == "agent")
+        .filter(|row| text(row, "role") == "agent" && live::is_terminal(&json(row, "metadata")))
         .filter_map(|row| opt_text(row, "turn_id"))
         .collect();
     let mut messages = messages(source, &mut rows, &directory, &taken, &extras, opened.prefs);
@@ -383,6 +453,22 @@ pub fn view(
         &session.agent_actor,
         &session.title,
     );
+    let live = live::turns(source, session_id, &opened.live, &ended, &extras);
+    let pending: HashSet<String> = if reads_trace {
+        read(
+            source,
+            "SELECT DISTINCT t.turn_id FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
+             WHERE a.session_id = ?1 AND a.state = 'pending' AND a.expires_at_ms > ?2",
+            &[Value::from(session_id), Value::from(now_ms)],
+        )
+        .iter()
+        .filter_map(|row| opt_text(row, "turn_id"))
+        .collect()
+    } else {
+        HashSet::new()
+    };
+    let stopping = stopping(source, session_id, &rows);
+    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -395,6 +481,8 @@ pub fn view(
             archived: session.archived,
             read_only: session.archived,
             messages,
+            items,
+            folds,
             approvals: approvals::of_session(source, session_id, &directory, refusals, now_ms),
             has_earlier,
             loading_earlier,
@@ -402,7 +490,7 @@ pub fn view(
             note,
             reads_trace,
             untrusted: session.untrusted,
-            live: live::turns(source, session_id, &opened.live, &ended, &extras),
+            live,
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,
@@ -411,6 +499,36 @@ pub fn view(
         },
         newest_ms,
     ))
+}
+
+/// The turns a person asked to stop (109.19), as the runtime's
+/// `stop::targets` reads a stop row: `metadata.kind = "stop"` naming the
+/// turn, written by one of the session's members whose directory kind is
+/// `person`. A row in a person's role written by anyone else stops nothing.
+fn stopping(source: &Source, session_id: &str, rows: &[Map<String, Value>]) -> HashSet<String> {
+    let people: HashSet<String> = read(
+        source,
+        "SELECT m.actor_id FROM session_members m JOIN actors a ON a.id = m.actor_id \
+         WHERE m.session_id = ?1 AND a.kind = 'person'",
+        &[Value::from(session_id)],
+    )
+    .iter()
+    .filter_map(|row| opt_text(row, "actor_id"))
+    .collect();
+    rows.iter()
+        .filter(|row| text(row, "role") == "person" && people.contains(text(row, "author_actor")))
+        .filter_map(|row| {
+            let metadata = json(row, "metadata");
+            (metadata.get("kind").and_then(Value::as_str) == Some("stop"))
+                .then(|| {
+                    metadata
+                        .get("turn")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .collect()
 }
 
 /// The person's messages a turn names: by an agent message or a streamed

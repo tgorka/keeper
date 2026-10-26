@@ -70,6 +70,41 @@ pub enum AgentToolStepStatusVm {
     Started,
     Done,
     Refused,
+    Interrupted,
+    Parked,
+    /// keeper-hq's importer (`hq-import` `plan.rs`): the tool ran and failed.
+    Failed,
+    /// A status word keeper does not know. Never taken for running work.
+    Unknown,
+}
+
+impl AgentToolStepStatusVm {
+    /// The `tool_calls.status` word as keeper-hq writes it: `sink.rs`
+    /// (`started`, `done`, `refused`, `parked`, `interrupted`), `worker.rs`
+    /// `end_cut`, `approvals.rs`, and the importer's `failed`.
+    pub fn of(word: &str) -> Self {
+        match word {
+            "started" => Self::Started,
+            "done" => Self::Done,
+            "refused" => Self::Refused,
+            "interrupted" => Self::Interrupted,
+            "parked" => Self::Parked,
+            "failed" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Started => "Started",
+            Self::Done => "Finished",
+            Self::Refused => "Refused",
+            Self::Interrupted => "Interrupted",
+            Self::Parked => "Paused",
+            Self::Failed => "Failed",
+            Self::Unknown => "Unknown status",
+        }
+    }
 }
 
 /// One tool call of a turn, as its `tool_calls` row says (readers only).
@@ -79,6 +114,8 @@ pub enum AgentToolStepStatusVm {
 pub struct AgentToolStepVm {
     pub id: String,
     pub name: String,
+    /// Rust's words for the status; the renderer shows them as they are.
+    pub status_label: String,
     pub status: AgentToolStepStatusVm,
     /// The outcome, or the refusal's sentence, once it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -439,14 +476,19 @@ pub fn extras(
             let (Some(id), Some(turn)) = (opt_text(&row, "id"), opt_text(&row, "turn_id")) else {
                 continue;
             };
-            let status = match text(&row, "status") {
-                "done" => AgentToolStepStatusVm::Done,
-                "refused" => AgentToolStepStatusVm::Refused,
-                _ => AgentToolStepStatusVm::Started,
+            let word = text(&row, "status");
+            let status = AgentToolStepStatusVm::of(word);
+            let status_label = match status {
+                AgentToolStepStatusVm::Unknown if !word.trim().is_empty() => {
+                    let word: Vec<&str> = word.split_whitespace().collect();
+                    format!("{} \"{}\"", status.label(), word.join(" "))
+                }
+                _ => status.label().to_owned(),
             };
             steps.entry(turn).or_default().push(AgentToolStepVm {
                 id,
                 name: text(&row, "name").to_owned(),
+                status_label,
                 status,
                 result: row.get("result").and_then(Value::as_str).map(str::to_owned),
                 started_at_ms: int(&row, "started_at_ms"),
@@ -497,9 +539,16 @@ pub fn ended_thinking(extras: &Extras, turn_id: &str) -> Option<String> {
     Some(thinking(Some(rows), &Tails::default())).filter(|text| !text.is_empty())
 }
 
-/// The turns of `session_id` still being written — any turn with chunks
-/// or a tail and no agent message naming it in `ended` — oldest first.
-pub fn turns(
+/// Runtime Closed rows always include `finish`, even when the provider
+/// reported no finish reason. A persisted lead-in has no such marker.
+pub(super) fn is_terminal(metadata: &Value) -> bool {
+    metadata.get("finish").is_some()
+}
+
+/// The turns of `session_id` still being written, oldest first chunk
+/// first (presence-only turns, with no chunk yet, last). Only a terminal
+/// agent row suppresses a turn through `ended`.
+pub(super) fn turns(
     source: &Source,
     session_id: &str,
     live: &Live,

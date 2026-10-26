@@ -778,7 +778,7 @@ describe("live answer controls", () => {
       turnId: "t1",
       text: "Kept text",
       tool: "read_file",
-      steps: [{ id: "c1", name: "read_file", status: "started" as const }],
+      steps: [{ id: "c1", name: "read_file", status: "started" as const, statusLabel: "Started" }],
       stopped: false,
     };
     await open("alpha", { untrusted: true, live: [turn] });
@@ -795,7 +795,13 @@ describe("live answer controls", () => {
               turnId: turn.turnId,
               stopped: true,
               steps: [
-                { id: "c1", name: "read_file", status: "refused", result: "Not allowed here" },
+                {
+                  id: "c1",
+                  name: "read_file",
+                  status: "refused",
+                  statusLabel: "Refused",
+                  result: "Not allowed here",
+                },
               ],
             },
           ],
