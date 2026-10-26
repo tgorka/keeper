@@ -405,12 +405,23 @@ cutover (109.14); the current renderer still uses the unchanged `messages` and `
 Each turn has one fold containing its earlier agent-message IDs, permitted reasoning and
 tool steps, a summary, reported duration, status label and single-line failures. A persisted
 terminal answer is identified by the runtime Closed row's `metadata.finish` key, including
-an explicitly null finish reason; a committed lead-in does not end the live answer. The final
-answer is a separate reading item immediately after its fold, at the answer's own position
-after any intervening person messages. Historical tool-only folds stay at their earliest
-recorded work time, before later messages and answers, without fabricating a live answer.
-Tool results arriving after the answer update that same fold, never add work below it.
-Interrupted work says **Interrupted**. Parked work says **Paused** unless an unexpired pending
+an explicitly null finish reason; a committed lead-in does not end the live answer. An agent's
+ask (`metadata.kind = "ask"`) is a question to the person: always a reading item where it was
+asked, never a lead-in, an answer or a fold. The final answer is a separate reading item
+immediately after its fold, at the answer's own position after any intervening person
+messages. A streaming answer is read where its Closed row will land — after everything already
+written — so a person message sent mid-stream sits above it before and after it finishes. A
+second finished row of one turn (a kill-cut row, then a late close) stays a reading item at its
+own position; the turn keeps one fold, its last close decides the status, and every close's
+error stays a failure line. Historical tool-only folds stay at their earliest recorded work
+time, before later messages and answers, without fabricating a live answer. Tool results
+arriving after the answer update that same fold, never add work below it.
+The status reads each runtime close explicitly: `cancelled` (a person's Stop) says
+**Stopped**, as does a person's stop row naming a turn that has not closed yet; `cut` (the
+instance restarted mid-turn) and interrupted work say **Interrupted**; `failed` (a broken
+stream or a provider error) says **Failed**; only `content_filter`, or tool-only work that
+ended refused, says **Refused**. `stop`, `length`, `tool_calls`, a null reason or a provider's
+own word is an ordinary close. Parked work says **Paused** unless an unexpired pending
 approval actually asks the person, in which case it says **Waiting for you**. Trace access and
 Show thinking still gate the corresponding fold contents; Show details does not gate the
 reported duration used in a summary. Missing or negative durations are absent; a reported zero

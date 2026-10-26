@@ -145,9 +145,15 @@ pub enum AgentTurnStatusVm {
     Running,
     Done,
     Parked,
+    /// The provider refused to answer, or tool-only work ended refused.
+    /// Never a stop, an interruption or a failure.
     Refused,
     Interrupted,
     Waiting,
+    /// A person's Stop (109.19): asked for, or the turn closed `cancelled`.
+    Stopped,
+    /// The stream broke or the provider/runtime failed (`finish: failed`).
+    Failed,
 }
 
 /// One compact, always-visible outcome above the answer, not a tool card.
@@ -461,8 +467,8 @@ pub fn view(
     } else {
         HashSet::new()
     };
-    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending);
-    let live = live.into_iter().map(|(_, turn)| turn).collect();
+    let stopping = stopping(source, session_id, &rows);
+    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -493,6 +499,36 @@ pub fn view(
         },
         newest_ms,
     ))
+}
+
+/// The turns a person asked to stop (109.19), as the runtime's
+/// `stop::targets` reads a stop row: `metadata.kind = "stop"` naming the
+/// turn, written by one of the session's members whose directory kind is
+/// `person`. A row in a person's role written by anyone else stops nothing.
+fn stopping(source: &Source, session_id: &str, rows: &[Map<String, Value>]) -> HashSet<String> {
+    let people: HashSet<String> = read(
+        source,
+        "SELECT m.actor_id FROM session_members m JOIN actors a ON a.id = m.actor_id \
+         WHERE m.session_id = ?1 AND a.kind = 'person'",
+        &[Value::from(session_id)],
+    )
+    .iter()
+    .filter_map(|row| opt_text(row, "actor_id"))
+    .collect();
+    rows.iter()
+        .filter(|row| text(row, "role") == "person" && people.contains(text(row, "author_actor")))
+        .filter_map(|row| {
+            let metadata = json(row, "metadata");
+            (metadata.get("kind").and_then(Value::as_str) == Some("stop"))
+                .then(|| {
+                    metadata
+                        .get("turn")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .collect()
 }
 
 /// The person's messages a turn names: by an agent message or a streamed

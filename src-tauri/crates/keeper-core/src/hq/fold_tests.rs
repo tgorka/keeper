@@ -306,20 +306,21 @@ fn distinct_turns_keep_their_work_and_person_messages_without_a_global_fold() {
 }
 
 #[test]
-fn provider_refusal_remains_a_single_line_without_inventing_duration() {
+fn provider_failure_remains_a_single_line_without_inventing_duration() {
     let w = world(true);
+    // keeper-hq `served.rs` `Ending::Error`: `finish: failed` and the error.
     w.put(vec![w.answer(
         "I cannot do that.",
-        json!({"error": "Provider refused\n  the request", "finish": "refused", "duration_ms": -1}),
+        json!({"error": "Provider answered\n  HTTP 500", "finish": "failed", "duration_ms": -1}),
     )]);
     let view = w.view(&Opened::default());
     assert_eq!(
         (view.folds[0].status, view.folds[0].status_label.as_str()),
-        (Status::Refused, "Refused")
+        (Status::Failed, "Failed")
     );
     assert_eq!(
         view.folds[0].failures[0].sentence,
-        "Provider refused the request"
+        "Provider answered HTTP 500"
     );
     assert_eq!(view.folds[0].duration_ms, None);
     assert_eq!(
@@ -564,7 +565,7 @@ fn committed_lead_in_keeps_the_live_answer_until_a_terminal_row_replaces_it() {
 }
 
 #[test]
-fn live_answers_and_tool_only_work_use_their_recorded_chronological_positions() {
+fn live_answers_sit_below_later_tool_only_work_and_person_rows_like_their_close_will() {
     let w = world(true);
     w.put(vec![
         w.chunk(0, "Earlier streamed answer"),
@@ -590,19 +591,352 @@ fn live_answers_and_tool_only_work_use_their_recorded_chronological_positions() 
         view.items,
         [
             Item::Fold {
-                turn_id: TURN.into()
-            },
-            Item::LiveAnswer {
-                turn_id: TURN.into()
-            },
-            Item::Fold {
                 turn_id: "t2".into()
             },
             Item::Message {
                 message_id: "later-person".into()
             },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::LiveAnswer {
+                turn_id: TURN.into()
+            },
         ],
-        "a live answer's first chunk is not moved below later work or person rows"
+        "a live answer is read where its Closed row will be: after what is already written"
     );
     assert_eq!(view.live[0].text, "Earlier streamed answer");
+}
+
+/// keeper-hq `served.rs`: what a stopped answer's row and pane carry.
+const STOPPED_REASON: &str = "Stopped. What had arrived is kept.";
+/// keeper-hq `served.rs`: what an answer whose stream broke carries.
+const BROKE_REASON: &str = "The answer stopped before it finished.";
+/// keeper-hq `worker.rs` `cut_sentence()`: the kill-cut row's error.
+const CUT_SENTENCE: &str =
+    "My answer was cut off when the agent restarted. Ask again if you still need it.";
+
+/// A fold's status as the wire spells it, and its label.
+fn state(fold: &timeline::AgentTurnFoldVm) -> (Value, &str) {
+    (
+        serde_json::to_value(fold.status).expect("status"),
+        fold.status_label.as_str(),
+    )
+}
+
+/// Every legacy message is read exactly once, as an item or as a fold's
+/// lead-in; every live turn has one live answer; `folds` is in item order.
+fn assert_items_account_for_legacy(view: &timeline::AgentSessionViewVm) {
+    let mut read: Vec<&str> = view
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Message { message_id } => Some(message_id.as_str()),
+            _ => None,
+        })
+        .chain(
+            view.folds
+                .iter()
+                .flat_map(|fold| fold.lead_in_ids.iter().map(String::as_str)),
+        )
+        .collect();
+    read.sort_unstable();
+    let mut legacy: Vec<&str> = view.messages.iter().map(|m| m.id.as_str()).collect();
+    legacy.sort_unstable();
+    assert_eq!(read, legacy, "each legacy message is read exactly once");
+    let live: Vec<&str> = view
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::LiveAnswer { turn_id } => Some(turn_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        live,
+        view.live
+            .iter()
+            .map(|t| t.turn_id.as_str())
+            .collect::<Vec<_>>()
+    );
+    let folded: Vec<&str> = view
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fold { turn_id } => Some(turn_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        folded,
+        view.folds
+            .iter()
+            .map(|f| f.turn_id.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn person_actor(id: &str) -> RowOp {
+    upsert(
+        "actors",
+        json!({"id": id, "kind": "person", "display_name": id, "family": null,
+               "dir": "alpha", "created_at_ms": 1, "author_actor": "server",
+               "author_client": "server"}),
+    )
+}
+
+#[test]
+fn an_ask_is_a_reading_item_at_its_place_and_never_folded() {
+    let w = world(true);
+    // keeper-hq `ask.rs` `row()`: a turn of its own (its id), no `finish`.
+    let ask = json!({"kind": "ask", "options": ["Celsius", "Fahrenheit"]});
+    w.put(vec![
+        recorded_message(&w, "p1", None, "Weather in Kraków?", 0, json!({})),
+        recorded_message(&w, "lead", Some(TURN), "Checking", 5, json!({})),
+        recorded_message(&w, "ask1", Some("ask1"), "Which unit?", 10, ask),
+        w.answer("18 C", json!({"finish": "stop"})),
+    ]);
+    let view = w.view(&Opened::default());
+    assert_eq!(
+        view.items,
+        [
+            Item::Message {
+                message_id: "p1".into()
+            },
+            Item::Message {
+                message_id: "ask1".into()
+            },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::Message {
+                message_id: "m-final".into()
+            },
+        ],
+        "the question to the person is read where it was asked"
+    );
+    assert_eq!(
+        view.folds
+            .iter()
+            .map(|f| (f.turn_id.as_str(), f.lead_in_ids.clone()))
+            .collect::<Vec<_>>(),
+        [(TURN, vec!["lead".to_owned()])],
+        "an ask is neither a fold of its own nor anyone's lead-in"
+    );
+    let legacy = view.messages.iter().find(|m| m.id == "ask1").expect("ask");
+    assert!(
+        legacy.ask.is_some(),
+        "legacy messages keep the ask's options"
+    );
+    assert_items_account_for_legacy(&view);
+}
+
+#[test]
+fn a_persons_stop_reads_stopped_while_it_lands_and_after_the_turn_closes() {
+    let w = world(true);
+    w.put(vec![
+        person_actor("ana"),
+        w.chunk(0, ""),
+        w.chunk(1, "The temperature is"),
+    ]);
+    let docs = [session_doc(2, " 18")];
+    let opened = opened(AgentViewPrefsVm::default(), &docs, &[]);
+    assert_eq!(
+        state(&w.view(&opened).folds[0]),
+        (json!("running"), "Working")
+    );
+    // A row in a person's role written by an agent is no person's stop:
+    // the runtime's `stop::targets` ignores it, so keeper does too.
+    w.put(vec![upsert(
+        "messages",
+        json!({"id": "agent-stop", "session_id": "dev1.1", "page_key": w.page(),
+               "turn_id": null, "role": "person", "body": "Stopped this turn.",
+               "body_blob": null, "metadata": json!({"kind": "stop", "turn": TURN}).to_string(),
+               "created_at_ms": w.at + 40, "author_actor": "alpha",
+               "author_client": INSTANCE}),
+    )]);
+    assert_eq!(
+        state(&w.view(&opened).folds[0]),
+        (json!("running"), "Working")
+    );
+    // keeper `hq/commands.rs` `/stop`: the person's stop row names the turn.
+    w.put(vec![recorded_message(
+        &w,
+        "stop",
+        None,
+        "Stopped this turn.",
+        50,
+        json!({"kind": "stop", "turn": TURN}),
+    )]);
+    let landing = w.view(&opened);
+    assert_eq!(
+        state(&landing.folds[0]),
+        (json!("stopped"), "Stopped"),
+        "the stop is landing: not Working, not Refused"
+    );
+    assert_eq!(
+        landing.items.last(),
+        Some(&Item::LiveAnswer {
+            turn_id: TURN.into()
+        }),
+        "what had arrived stays shown"
+    );
+    // keeper-hq `served.rs` `close()` for `Ending::Stopped`, through
+    // `sink.rs` `closed()`.
+    w.put(vec![w.answer(
+        "The temperature is 18",
+        json!({"model": "m", "effort": null, "model_fallback": null,
+               "usage": {"prompt_tokens": null, "completion_tokens": null, "total_tokens": null},
+               "ttft_ms": 400, "duration_ms": 3000, "finish": "cancelled", "tool_calls": 0,
+               "error": STOPPED_REASON}),
+    )]);
+    let ended = w.view(&opened);
+    assert_eq!(state(&ended.folds[0]), (json!("stopped"), "Stopped"));
+    assert!(
+        ended.folds[0].summary.starts_with("Stopped"),
+        "{}",
+        ended.folds[0].summary
+    );
+    assert!(ended.live.is_empty());
+    // A stop that lost the race to an ordinary close: the close decides.
+    w.put(vec![w.answer(
+        "The temperature is 18 C.",
+        json!({"finish": "stop"}),
+    )]);
+    assert_eq!(
+        state(&w.view(&opened).folds[0]),
+        (json!("done"), "Finished")
+    );
+}
+
+#[test]
+fn each_runtime_close_reads_its_own_status_and_only_a_refusal_reads_refused() {
+    let w = world(true);
+    for (metadata, expected) in [
+        (json!({"finish": "stop"}), (json!("done"), "Finished")),
+        (json!({"finish": "length"}), (json!("done"), "Finished")),
+        (json!({"finish": "tool_calls"}), (json!("done"), "Finished")),
+        (json!({"finish": null}), (json!("done"), "Finished")),
+        (
+            json!({"finish": "cancelled", "error": STOPPED_REASON}),
+            (json!("stopped"), "Stopped"),
+        ),
+        (
+            json!({"finish": "cut", "error": CUT_SENTENCE}),
+            (json!("interrupted"), "Interrupted"),
+        ),
+        (
+            json!({"finish": "failed", "error": BROKE_REASON}),
+            (json!("failed"), "Failed"),
+        ),
+        (
+            json!({"finish": "failed", "error": "provider answered HTTP 500"}),
+            (json!("failed"), "Failed"),
+        ),
+        (
+            json!({"finish": "content_filter"}),
+            (json!("refused"), "Refused"),
+        ),
+    ] {
+        w.put(vec![w.answer("partial", metadata.clone())]);
+        let view = w.view(&Opened::default());
+        assert_eq!(state(&view.folds[0]), expected, "{metadata}");
+    }
+}
+
+#[test]
+fn a_person_message_sent_mid_stream_never_moves_the_answer() {
+    let w = world(true);
+    // Production shape: the lead-in streams as the first chunks.
+    w.put(vec![
+        w.chunk(0, ""),
+        w.chunk(1, "Checking — one minute. "),
+        recorded_message(&w, "steer", None, "Use Celsius", 50, json!({})),
+    ]);
+    let docs = [session_doc(2, "The temperature is")];
+    let opened = opened(AgentViewPrefsVm::default(), &docs, &[]);
+    let streaming = w.view(&opened);
+    assert_eq!(
+        streaming.items,
+        [
+            Item::Message {
+                message_id: "steer".into()
+            },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::LiveAnswer {
+                turn_id: TURN.into()
+            },
+        ],
+        "the streaming answer sits where it will sit once finished"
+    );
+    w.put(vec![w.answer(
+        "Checking — one minute. The temperature is 18 C.",
+        json!({"finish": "stop"}),
+    )]);
+    let finished = w.view(&opened);
+    assert_eq!(
+        finished.items,
+        [
+            Item::Message {
+                message_id: "steer".into()
+            },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::Message {
+                message_id: "m-final".into()
+            },
+        ]
+    );
+    assert_items_account_for_legacy(&streaming);
+    assert_items_account_for_legacy(&finished);
+}
+
+#[test]
+fn a_cut_row_and_a_late_close_of_one_turn_both_stay_in_items() {
+    let w = world(true);
+    w.put(vec![
+        recorded_message(&w, "p1", None, "Weather?", 0, json!({})),
+        // keeper-hq `worker.rs` `end_cut`.
+        recorded_message(
+            &w,
+            "cut",
+            Some(TURN),
+            "Checking",
+            10,
+            json!({"finish": "cut", "error": CUT_SENTENCE}),
+        ),
+        w.answer("18 C", json!({"finish": "stop"})),
+    ]);
+    let view = w.view(&Opened::default());
+    assert_eq!(
+        view.items,
+        [
+            Item::Message {
+                message_id: "p1".into()
+            },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::Message {
+                message_id: "cut".into()
+            },
+            Item::Message {
+                message_id: "m-final".into()
+            },
+        ],
+        "neither finished answer disappears"
+    );
+    assert_eq!(view.folds.len(), 1, "still one fold for the turn");
+    assert!(view.folds[0].lead_in_ids.is_empty());
+    assert!(
+        view.folds[0]
+            .failures
+            .iter()
+            .any(|f| f.sentence == CUT_SENTENCE),
+        "the cut row's sentence stays visible"
+    );
+    assert_items_account_for_legacy(&view);
 }

@@ -523,8 +523,8 @@ pub(super) fn is_terminal(metadata: &Value) -> bool {
     metadata.get("finish").is_some()
 }
 
-/// The turns of `session_id` still being written, with their first chunk's
-/// time (unknown for presence-only turns), oldest first. Only a terminal
+/// The turns of `session_id` still being written, oldest first chunk
+/// first (presence-only turns, with no chunk yet, last). Only a terminal
 /// agent row suppresses a turn through `ended`.
 pub(super) fn turns(
     source: &Source,
@@ -532,7 +532,7 @@ pub(super) fn turns(
     live: &Live,
     ended: &HashSet<String>,
     extras: &Extras,
-) -> Vec<(i64, AgentLiveTurnVm)> {
+) -> Vec<AgentLiveTurnVm> {
     struct Chunks {
         pieces: Vec<(i64, String)>,
         author: Option<String>,
@@ -577,7 +577,7 @@ pub(super) fn turns(
     ids.sort_unstable();
     let empty = Tails::default();
     ids.into_iter()
-        .map(|(at, id)| {
+        .map(|(_, id)| {
             let turn = live.turns.get(id);
             let held = chunks.get(id);
             let text = fold(
@@ -595,17 +595,14 @@ pub(super) fn turns(
                     )
                 })
                 .filter(|text| !text.is_empty());
-            (
-                at,
-                AgentLiveTurnVm {
-                    turn_id: id.to_owned(),
-                    text,
-                    tool: turn.and_then(|turn| turn.tool.clone()),
-                    reasoning,
-                    steps: extras.steps.get(id).cloned().unwrap_or_default(),
-                    stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
-                },
-            )
+            AgentLiveTurnVm {
+                turn_id: id.to_owned(),
+                text,
+                tool: turn.and_then(|turn| turn.tool.clone()),
+                reasoning,
+                steps: extras.steps.get(id).cloned().unwrap_or_default(),
+                stopped: live.stopped(id, held.and_then(|c| c.author.as_deref())),
+            }
         })
         .collect()
 }

@@ -11,41 +11,87 @@ use super::{
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentToolStepStatusVm as Step, AgentToolStepVm, Extras,
 };
-use crate::hq::sessions::{int, json, text};
+use crate::hq::sessions::{int, is_ask, json, text};
+
+/// How the runtime closed a turn, by its Closed row's `metadata.finish`.
+/// Every word keeper-hq writes is named; any other word is a provider's
+/// own finish reason, an ordinary close.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Close {
+    /// `stop`, `length`, `tool_calls`, an unreported (null) reason, or a
+    /// provider's own word.
+    Normal,
+    /// `cancelled`: a person's Stop (109.19), `served.rs` `Ending::Stopped`.
+    Stopped,
+    /// `cut`: the instance restarted mid-turn, `worker.rs` `end_cut`.
+    Interrupted,
+    /// `failed`: a broken stream or a provider/runtime error.
+    Failed,
+    /// `content_filter`: the provider refused to answer.
+    Refused,
+}
+
+impl Close {
+    fn of(finish: Option<&str>) -> Self {
+        match finish {
+            Some("cancelled") => Self::Stopped,
+            Some("cut") => Self::Interrupted,
+            Some("failed") => Self::Failed,
+            Some("content_filter") => Self::Refused,
+            _ => Self::Normal,
+        }
+    }
+}
 
 /// All steps stay with their turn, even when committed after its answer.
 /// The legacy message projection is untouched until the renderer cutover.
+/// `live` is oldest first; `stopping` holds the turns a person's stop row
+/// names.
 pub(super) fn project(
     rows: &[Map<String, Value>],
     messages: &[AgentMessageVm],
-    live: &[(i64, AgentLiveTurnVm)],
+    live: &[AgentLiveTurnVm],
     extras: &Extras,
     pending: &HashSet<String>,
+    stopping: &HashSet<String>,
 ) -> (Vec<Item>, Vec<AgentTurnFoldVm>) {
-    let mut by_message = HashMap::new();
-    let mut answers = HashMap::new();
+    // A terminal row's turn, by message id; the turn's last close, which
+    // decides its status; every close's error, so none disappears.
+    let mut answers: HashMap<&str, &str> = HashMap::new();
+    let mut last_close: HashMap<&str, (i64, &str, Value)> = HashMap::new();
+    let mut errors: HashMap<&str, Vec<String>> = HashMap::new();
     let mut lead_ins: HashMap<&str, Vec<String>> = HashMap::new();
-    let mut metadata = HashMap::new();
+    let mut hidden = HashSet::new();
     let mut work_at = HashMap::new();
     let active_by_turn: HashMap<_, _> = live
         .iter()
-        .map(|(_, turn)| (turn.turn_id.as_str(), turn))
+        .map(|turn| (turn.turn_id.as_str(), turn))
         .collect();
     for row in rows.iter().filter(|row| text(row, "role") == "agent") {
         let turn = text(row, "turn_id");
-        if turn.is_empty() {
+        let details = json(row, "metadata");
+        // An ask is a question to the person (R-HQ-28): always read where
+        // it was asked, never a lead-in, never an answer, never work.
+        if turn.is_empty() || is_ask(&details) {
             continue;
         }
         let id = text(row, "id");
-        by_message.insert(id, turn);
-        let details = json(row, "metadata");
+        let at = int(row, "created_at_ms").unwrap_or(i64::MAX);
         if live::is_terminal(&details) {
-            answers.insert(turn, id);
-            metadata.insert(turn, details);
+            answers.insert(id, turn);
+            if let Some(error) = live::details(&details).and_then(|d| d.error) {
+                errors.entry(turn).or_default().push(one_line(&error));
+            }
+            let later = last_close
+                .get(turn)
+                .is_none_or(|(when, which, _)| (at, id) > (*when, *which));
+            if later {
+                last_close.insert(turn, (at, id, details));
+            }
         } else {
+            hidden.insert(id);
             lead_ins.entry(turn).or_default().push(id.to_owned());
         }
-        let at = int(row, "created_at_ms").unwrap_or(i64::MAX);
         let first = work_at.entry(turn).or_insert(at);
         *first = (*first).min(at);
     }
@@ -60,6 +106,7 @@ pub(super) fn project(
         let first = work_at.entry(id.as_str()).or_insert(at);
         *first = (*first).min(at);
     }
+    let answered: HashSet<&str> = answers.values().copied().collect();
     enum Reading<'a> {
         Message(&'a AgentMessageVm),
         Work(&'a str),
@@ -67,11 +114,7 @@ pub(super) fn project(
     }
     let mut reading: Vec<_> = messages
         .iter()
-        .filter(|message| {
-            by_message
-                .get(message.id.as_str())
-                .is_none_or(|turn| answers.get(turn).copied() == Some(message.id.as_str()))
-        })
+        .filter(|message| !hidden.contains(message.id.as_str()))
         .map(|message| {
             (
                 message.created_at_ms,
@@ -80,31 +123,39 @@ pub(super) fn project(
             )
         })
         .chain(work_at.into_iter().filter_map(|(id, at)| {
-            (!answers.contains_key(id) && !active_by_turn.contains_key(id)).then_some((
+            (!answered.contains(id) && !active_by_turn.contains_key(id)).then_some((
                 at,
                 id,
                 Reading::Work(id),
             ))
         }))
-        .chain(
-            live.iter()
-                .map(|(at, turn)| (*at, turn.turn_id.as_str(), Reading::Live(turn))),
-        )
         .collect();
     reading.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    // A streaming answer sits where its Closed row will: that row is
+    // written when the turn ends, after everything written so far.
+    reading.extend(
+        live.iter()
+            .map(|turn| (i64::MAX, turn.turn_id.as_str(), Reading::Live(turn))),
+    );
     let mut items = Vec::new();
     let mut folds = Vec::new();
+    let mut folded = HashSet::new();
     for (_, _, entry) in reading {
         let (id, answer) = match entry {
             Reading::Message(message) => {
                 let answer = Item::Message {
                     message_id: message.id.clone(),
                 };
-                let Some(id) = by_message.get(message.id.as_str()) else {
-                    items.push(answer);
-                    continue;
-                };
-                (*id, Some(answer))
+                // The turn's first finished answer opens its one fold; a
+                // later one (a kill-cut row, then a late close) is read
+                // where it was written.
+                match answers.get(message.id.as_str()) {
+                    Some(turn) if !folded.contains(turn) => (*turn, Some(answer)),
+                    _ => {
+                        items.push(answer);
+                        continue;
+                    }
+                }
             }
             Reading::Work(id) => (id, None),
             Reading::Live(turn) => (
@@ -114,6 +165,7 @@ pub(super) fn project(
                 }),
             ),
         };
+        folded.insert(id);
         items.push(Item::Fold {
             turn_id: id.to_owned(),
         });
@@ -122,18 +174,25 @@ pub(super) fn project(
         }
         let active = active_by_turn.get(id).copied();
         let steps = extras.steps.get(id).cloned().unwrap_or_default();
-        let details = metadata.get(id).and_then(live::details);
-        let interrupted = active.is_some_and(|turn| turn.stopped)
-            || steps.iter().any(|step| step.status == Step::Interrupted)
-            || details.as_ref().and_then(|d| d.finish.as_deref()) == Some("interrupted");
+        let details = last_close
+            .get(id)
+            .and_then(|(_, _, metadata)| live::details(metadata));
+        let close = last_close
+            .contains_key(id)
+            .then(|| Close::of(details.as_ref().and_then(|d| d.finish.as_deref())));
+        // A person's stop decides while it lands; once the turn has closed,
+        // its close does (a stop that lost the race to a normal close).
+        let stopped = close.map_or_else(|| stopping.contains(id), |c| c == Close::Stopped);
+        let interrupted = close == Some(Close::Interrupted)
+            || active.is_some_and(|turn| turn.stopped)
+            || steps.iter().any(|step| step.status == Step::Interrupted);
         let waiting = pending.contains(id);
         let running = active.is_some() || steps.iter().any(|step| step.status == Step::Started);
-        let refused = (!answers.contains_key(id)
-            && steps.iter().any(|step| step.status == Step::Refused))
-            || details
-                .as_ref()
-                .is_some_and(|d| d.error.is_some() || d.finish.as_deref() == Some("refused"));
-        let (status, label) = if waiting {
+        let refused = close == Some(Close::Refused)
+            || (close.is_none() && steps.iter().any(|step| step.status == Step::Refused));
+        let (status, label) = if stopped {
+            (Status::Stopped, "Stopped")
+        } else if waiting {
             (Status::Waiting, "Waiting for you")
         } else if steps.iter().any(|step| step.status == Step::Parked) {
             (Status::Parked, "Paused")
@@ -141,6 +200,8 @@ pub(super) fn project(
             (Status::Interrupted, "Interrupted")
         } else if running {
             (Status::Running, "Working")
+        } else if close == Some(Close::Failed) {
+            (Status::Failed, "Failed")
         } else if refused {
             (Status::Refused, "Refused")
         } else {
@@ -162,12 +223,16 @@ pub(super) fn project(
                 ),
             })
             .collect();
-        if let Some(error) = details.as_ref().and_then(|d| d.error.as_deref()) {
-            failures.push(AgentTurnFailureVm {
-                step_id: String::new(),
-                sentence: one_line(error),
-            });
-        }
+        failures.extend(
+            errors
+                .remove(id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|sentence| AgentTurnFailureVm {
+                    step_id: String::new(),
+                    sentence,
+                }),
+        );
         let duration_ms = details
             .as_ref()
             .and_then(|d| d.duration_ms)
@@ -218,6 +283,8 @@ fn summary(
         Status::Waiting => "Waiting for you".to_owned(),
         Status::Parked => "Paused".to_owned(),
         Status::Interrupted => "Interrupted".to_owned(),
+        Status::Stopped => "Stopped".to_owned(),
+        Status::Failed => "Failed".to_owned(),
         Status::Running => match tool.or_else(|| {
             steps
                 .iter()
