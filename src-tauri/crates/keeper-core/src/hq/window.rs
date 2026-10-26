@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions};
 use crate::hq::attachments::{self, OpenedBlob};
+use crate::hq::drives;
 use crate::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
 use crate::hq::send;
 use crate::hq::sessions::{
@@ -255,8 +256,11 @@ impl Hq {
             }
         };
         let refusals = self.refusals();
-        let view = view_now(&source, &key.session_id, &opened, &refusals, now_ms)
+        let mut view = view_now(&source, &key.session_id, &opened, &refusals, now_ms)
             .map_err(HqError::Sentence)?;
+        if let Some(session) = timeline::session_row(&source, &key.session_id) {
+            view.drives = drives::view(&source, &key.session_id, &session, &self.sources());
+        }
         if let Some(held) = lock(&self.views).get_mut(key) {
             held.live.settle(&opened.live, &view.live);
         }

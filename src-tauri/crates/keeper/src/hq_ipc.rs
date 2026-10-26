@@ -475,6 +475,18 @@ pub async fn agent_session_tool_set(
     blocking(move |hq| hq.set_session_tool(&session(database, session_id), &name, on)).await
 }
 
+/// Tick a drive for the session's agent to read, or untick it; keeper-core
+/// decides whether this person may and writes `[]`, never a delete.
+#[tauri::command]
+pub async fn agent_session_drive_set(
+    database: String,
+    session_id: String,
+    drive: String,
+    tick: bool,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.set_session_drive(&session(database, session_id), &drive, tick)).await
+}
+
 /// The person scrolled to the top of an open session: earlier messages.
 #[tauri::command]
 pub fn agent_session_page_back(database: String, session_id: String) -> Result<(), IpcError> {

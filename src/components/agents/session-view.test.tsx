@@ -490,3 +490,23 @@ describe("session composer attachments", () => {
     expect(mock.release).toHaveBeenCalledOnce();
   });
 });
+
+describe("session header drives", () => {
+  it("draws the drive control only where Rust sends the selection (a person member)", async () => {
+    await draw();
+    // The base view carries no `drives`: anyone but a person member sees no control.
+    expect(screen.queryByRole("button", { name: "Drives" })).toBeNull();
+    act(() =>
+      mock.view?.({
+        ...vm,
+        drives: {
+          drives: [{ name: "beta", ticked: true }],
+          warning: "Once you tick a drive…",
+          pending: false,
+        },
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Drives" })).toBeInTheDocument();
+    expect(within(screen.getByRole("list", { name: "Drives ticked" })).getByText("beta"));
+  });
+});

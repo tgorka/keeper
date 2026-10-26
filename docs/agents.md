@@ -395,6 +395,27 @@ cannot be changed here (archived). Changes wait for Rust's view; a
 refusal is visible beside the controls. **Untrusted** marks a session that has read outside content;
 consequential actions still need a person.
 
+**Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
+menu of check items. No drive is ticked until a person ticks one — not even the session's own
+database. The menu lists every drive the agent offers (`agent_profiles.drives`, any instance of
+it, as the server reads the ceiling), then the drives keeper knows of that it may not read here,
+each with Rust's reason: another agent's drive ("Nixie does not offer omega."), or one the
+audience rule refuses — drive D in database S only when everyone who reads S reads D (D-34), read
+from the directories of the databases this device holds ("Ben reads alpha but cannot read beta").
+A drive whose readers this device cannot see (the person is not in that database) is offered and
+the server decides. Ticking writes the session's `session_drives` row; unticking the last drive
+writes `[]`, never a delete, because syncular refuses any later write to a deleted id. A tick
+waits for the server (**Waiting for the server…**), and a refusal (`hq.v17.audience`,
+`hq.v17.not_offered`, …) reaches the drive's row and the line under the chips, read from the
+replica's per-row outcome record, until the next selection sets it aside. The menu always says,
+and the header repeats once a tick takes the selection from none to one, what D-34's accepted risk
+allows (R-HQ-79): once a drive is ticked the agent may read it and send what it reads to the web
+without asking, even after the chat has read outside content. Only a person member (`owner` or
+`person`) of a session that is not archived gets the control or `/drives`; anyone else sees none,
+and an agent that has not said what it reads gets no control. Fixtures: the default mock offers
+`alpha` and `gamma`, refuses `beta` by the audience rule and `omega` as another agent's, and its
+fake server refuses a tick of `gamma` a moment later; `?drives=nonmember` draws no control.
+
 The viewer rule is Rust's: “A viewer renders a turn that is still being written as the turn's
 `turn_chunks` contiguous from seq 0, followed by the latest `text` it has seen on
 `session:{session_id}` whose `from_seq` is the seq after the last of them; it keeps the latest tail

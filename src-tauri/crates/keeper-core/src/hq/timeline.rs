@@ -23,6 +23,7 @@ use ts_rs::TS;
 
 use crate::hq::approvals::{self, AgentApprovalVm};
 use crate::hq::attachments::{self, AgentAttachmentVm};
+use crate::hq::drives::AgentSessionDrivesVm;
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentMessageDetailsVm, AgentSessionToolVm, AgentToolStepVm,
@@ -244,6 +245,14 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub context: Option<super::context::AgentContextVm>,
+    /// The drives the agent may read here and this person's ticks; absent
+    /// where this person has no control for them (not a person member, an
+    /// archived session, an agent that has not said what it reads). The
+    /// window fills it from every database this device holds
+    /// ([`crate::hq::drives::view`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub drives: Option<AgentSessionDrivesVm>,
 }
 
 /// The pages of an archived session read so far through the server.
@@ -495,6 +504,7 @@ pub fn view(
             prefs: opened.prefs,
             answering,
             context: super::context::latest(&rows, opened.prefs.show_details),
+            drives: None,
             agent_actor: session.agent_actor,
         },
         newest_ms,

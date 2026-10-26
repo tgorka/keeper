@@ -359,13 +359,14 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 /// The windows a replica holds, each along one scope variable. Every held
 /// session's members are held beside its row, so the People sheet reads
 /// who else is in it.
-pub const WINDOWS: [(&str, &str); 11] = [
+pub const WINDOWS: [(&str, &str); 12] = [
     ("sessions", "session"),
     ("session_members", "session"),
     ("turn_chunks", "session"),
     ("claims", "session"),
     ("session_tool_switches", "session"),
     ("session_settings", "session"),
+    ("session_drives", "session"),
     ("attachments", "session"),
     ("messages", "page"),
     ("approvals", "trace"),
@@ -443,8 +444,8 @@ pub fn reads_trace(source: &Source, session_id: &str) -> bool {
 }
 
 /// Each window's units for one database: every session row, its members and settings;
-/// for each active session its streamed chunks, its claim, its tool switches
-/// and its attachments' rows (never their bytes), and
+/// for each active session its streamed chunks, its claim, its tool switches,
+/// its drives and its attachments' rows (never their bytes), and
 /// its newest months (widened by `widen` for an opened one); its trace
 /// months only where the person reads the trace, and their thinking only
 /// while `reasoning` is shown. An archived session keeps its session, member
@@ -493,7 +494,8 @@ pub fn plan(
         ("session_members", sessions),
         ("turn_chunks", turns.clone()),
         ("claims", turns.clone()),
-        ("session_tool_switches", turns),
+        ("session_tool_switches", turns.clone()),
+        ("session_drives", turns),
         ("attachments", files.into_iter().collect()),
         ("messages", pages.into_iter().collect()),
         ("approvals", trace.clone()),
@@ -1282,6 +1284,7 @@ mod tests {
         assert_eq!(shown["turn_chunks"], vec!["c.1", "c.3"]);
         assert_eq!(shown["claims"], vec!["c.1", "c.3"]);
         assert_eq!(shown["session_tool_switches"], vec!["c.1", "c.3"]);
+        assert_eq!(shown["session_drives"], vec!["c.1", "c.3"]);
         // An active session's attachments' rows (never their bytes), not an
         // archived one's.
         assert_eq!(shown["attachments"], vec!["c.1", "c.3"]);

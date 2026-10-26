@@ -48,6 +48,7 @@ pub mod commands;
 pub mod context;
 pub mod databases;
 pub mod default_agent;
+pub mod drives;
 pub mod identity;
 pub mod instances;
 pub mod live;

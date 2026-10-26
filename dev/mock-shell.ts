@@ -61,6 +61,7 @@ import type {
   AgentChoiceVm,
   AgentInstancesVm,
   AgentSessionAnsweringVm,
+  AgentSessionDrivesVm,
   AgentSessionMembersVm,
   AgentSessionRowVm,
   AgentSessionsBatch,
@@ -6087,6 +6088,43 @@ const renameAttempts = new Map<string, number>();
 // ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused|pinned
 const liveScenario = new URLSearchParams(location.search).get("live");
 /**
+ * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
+ * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
+ * device holds (Ben reads alpha, not beta), `omega` is another agent's. Who reads `gamma` this
+ * device cannot know, so a tick of it is written and the fake server refuses it a moment later
+ * (`hq.v17.audience`), as the real one would. `?drives=nonmember`: the person is no person member
+ * of any session, so Rust answers no `drives` and no control is drawn.
+ */
+const drivesScenario = new URLSearchParams(location.search).get("drives");
+/** keeper-core's `drives::WARNING`, word for word. */
+const DRIVES_WARNING =
+  "Once you tick a drive, the agent may read it and send what it reads to the web, in a search " +
+  "or a page it fetches, without asking you, even after this chat has read outside content. " +
+  "Text it read on the web or in a drive can lead it to do that.";
+function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm | undefined {
+  if (archived || drivesScenario === "nonmember") return undefined;
+  return {
+    drives:
+      database === "alpha"
+        ? [
+            { name: "alpha", ticked: false },
+            { name: "gamma", ticked: false },
+            {
+              name: "beta",
+              ticked: false,
+              reason: "Ben reads alpha but cannot read beta, so it cannot be ticked here.",
+            },
+            { name: "omega", ticked: false, reason: "Assistant does not offer omega." },
+          ]
+        : [
+            { name: "alpha", ticked: false },
+            { name: "beta", ticked: false },
+          ],
+    warning: DRIVES_WARNING,
+    pending: false,
+  };
+}
+/**
  * The answer preferences survive a reload in `sessionStorage`, as the capture
  * sources do, read on first use rather than at import.
  */
@@ -6239,6 +6277,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
       untrusted: liveScenario === "untrusted" || liveScenario === "stream",
       live: [],
       prefs: { showReasoning: false, showDetails: false },
+      drives: mockDrives(row.database, row.archived),
       tools:
         liveScenario === "no-tools"
           ? []
@@ -6553,6 +6592,9 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     context: mockContext(vm, prefs.showDetails),
     approvals: vm.readsTrace ? vm.approvals : [],
     tools: vm.tools.map((tool) => ({ ...tool })),
+    ...(vm.drives
+      ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
+      : {}),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
       ...message,
       ...(prefs.showDetails && details ? { details } : {}),
@@ -6704,6 +6746,32 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (liveScenario === "refused") hqRefuse("This device cannot change the session's tools.");
     tool.on = payload.on === true;
     publishSessions();
+    return null;
+  },
+  agent_session_drive_set: (payload) => {
+    const vm = mockSession(payload);
+    const drives = vm.drives;
+    if (!drives) hqRefuse("Only a person in this chat may choose the drives it reads.");
+    const drive = drives.drives.find((row) => row.name === payload.drive);
+    if (!drive) hqRefuse(`${String(payload.drive)} is not a drive this chat's agent offers.`);
+    const tick = payload.tick === true;
+    if (drive.ticked === tick) return null;
+    if (tick && drive.reason) hqRefuse(drive.reason);
+    // A selection written sets the earlier refusals aside.
+    for (const row of drives.drives) delete row.refused;
+    delete drives.refused;
+    drive.ticked = tick;
+    drives.pending = true;
+    publishSessions();
+    setTimeout(() => {
+      drives.pending = false;
+      if (tick && drive.name === "gamma") {
+        drive.ticked = false;
+        drive.refused = `The server refused gamma: not everyone who reads ${vm.database} may read it.`;
+        drives.refused = drive.refused;
+      }
+      publishSessions();
+    }, 1500);
     return null;
   },
   agent_approvals_subscribe: (payload) => {
