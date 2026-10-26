@@ -1,4 +1,7 @@
 //! Last-answer occupancy, independent of cumulative billing usage (Q109-19).
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
@@ -38,7 +41,12 @@ const PARTS: [(&str, &str, &str); 7] = [
         "Tool calls and results included in this turn.",
     ),
 ];
+/// One row for parts a newer runtime emits that this build does not name (R10921-05).
+const OTHER: (&str, &str) = ("Other", "Parts this version of keeper does not name yet.");
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
+/// Answer ids whose malformed context was already logged. The view is recomputed on every
+/// replica change, so without this one bad answer would warn for as long as it is the latest.
+static REFUSED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -67,12 +75,13 @@ pub struct AgentContextVm {
     pub parts: Vec<AgentContextPartVm>,
 }
 
-/// Never fall back to an older answer (or billing usage) when the latest lacks context.
-pub fn latest(rows: &[Map<String, Value>], reader: bool) -> Option<AgentContextVm> {
-    if !reader {
+/// Shown with the rest of an answer's details, to any member (R10921-02). Never falls back to
+/// an older answer (or billing usage) when the latest lacks context.
+pub fn latest(rows: &[Map<String, Value>], show_details: bool) -> Option<AgentContextVm> {
+    if !show_details {
         return None;
     }
-    let metadata = rows
+    let (row, metadata) = rows
         .iter()
         .rev()
         .filter(|row| row.get("role").and_then(Value::as_str) == Some("agent"))
@@ -81,14 +90,23 @@ pub fn latest(rows: &[Map<String, Value>], reader: bool) -> Option<AgentContextV
             metadata
                 .get("kind")
                 .is_none_or(Value::is_null)
-                .then_some(metadata)
+                .then_some((row, metadata))
         })?;
     let context = metadata.get("context")?;
     let result = parse(context);
-    if result.is_none() {
+    if result.is_none() && first_refusal(row.get("id").and_then(Value::as_str)) {
         tracing::warn!("hq: refusing malformed answer context metadata");
     }
     result
+}
+
+/// True the first time an answer id is refused; an answer without an id always counts.
+fn first_refusal(id: Option<&str>) -> bool {
+    let Some(id) = id else { return true };
+    REFUSED
+        .lock()
+        .map(|mut seen| seen.insert(id.to_owned()))
+        .unwrap_or(true)
 }
 
 fn number(value: &Value) -> Option<u64> {
@@ -102,37 +120,51 @@ fn rounded(n: u64, total: u64) -> u128 {
     (u128::from(n) * 100 + u128::from(total) / 2) / u128::from(total)
 }
 
+fn part(label: &str, description: &str, tokens: u64, used: u64) -> AgentContextPartVm {
+    AgentContextPartVm {
+        label: label.into(),
+        description: description.into(),
+        tokens: format!("≈ {tokens} tokens"),
+        share: format!("≈ {}% of used context", rounded(tokens, used)),
+    }
+}
+
 fn parse(context: &Value) -> Option<AgentContextVm> {
     let used = number(context.get("used")?)?;
     let window = match context.get("window")? {
         Value::Null => None,
         value => Some(number(value).filter(|n| *n > 0)?),
     };
-    let raw = context.get("parts")?.as_array()?;
-    if raw.len() != PARTS.len() {
+    let mut known = [None; PARTS.len()];
+    let mut other = None;
+    let mut sum = 0u64;
+    for raw in context.get("parts")?.as_array()? {
+        let key = raw.get("part")?.as_str()?;
+        if raw.get("estimated")?.as_bool() != Some(true) {
+            return None;
+        }
+        let tokens = number(raw.get("tokens")?)?;
+        sum = sum.checked_add(tokens)?;
+        match PARTS.iter().position(|(name, _, _)| *name == key) {
+            // A known part named twice cannot be apportioned.
+            Some(i) => {
+                if known[i].replace(tokens).is_some() {
+                    return None;
+                }
+            }
+            None => other = Some(other.unwrap_or(0u64).checked_add(tokens)?),
+        }
+    }
+    if sum > used {
         return None;
     }
-    let mut sum = 0u64;
-    let mut parts = Vec::with_capacity(PARTS.len());
-    for (key, label, description) in PARTS {
-        let mut matches = raw
-            .iter()
-            .filter(|part| part.get("part").and_then(Value::as_str) == Some(key));
-        let part = matches.next()?;
-        if matches.next().is_some() || part.get("estimated")?.as_bool() != Some(true) {
-            return None;
-        }
-        let tokens = number(part.get("tokens")?)?;
-        sum = sum.checked_add(tokens)?;
-        if sum > used {
-            return None;
-        }
-        parts.push(AgentContextPartVm {
-            label: label.into(),
-            description: description.into(),
-            tokens: format!("≈ {tokens} tokens"),
-            share: format!("≈ {}% of used context", rounded(tokens, used)),
-        });
+    let mut parts = PARTS
+        .iter()
+        .zip(known)
+        .map(|((_, label, description), tokens)| Some(part(label, description, tokens?, used)))
+        .collect::<Option<Vec<_>>>()?;
+    if let Some(tokens) = other {
+        parts.push(part(OTHER.0, OTHER.1, tokens, used));
     }
     let percent = window.map(|window| rounded(used, window));
     let meter_percent = percent.map(|n| n.min(100) as u32);
@@ -161,6 +193,9 @@ fn parse(context: &Value) -> Option<AgentContextVm> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn metadata(window: Value) -> Value {
         json!({"used": 101, "window": window, "parts": PARTS.iter().enumerate().map(|(i, (part, _, _))|
@@ -189,7 +224,7 @@ mod tests {
         assert_eq!(vm.summary, "used ≈ 101 tokens");
     }
     #[test]
-    fn missing_old_or_nonreader_metadata_never_shows_a_zero_meter() {
+    fn missing_old_or_hidden_details_never_show_a_zero_meter() {
         assert!(latest(&rows(metadata(json!(300))), false).is_none());
         let mut rows = rows(metadata(json!(300)));
         rows.push(
@@ -217,19 +252,83 @@ mod tests {
             value["parts"][0]["tokens"] = bad;
             assert!(latest(&rows(value), true).is_none());
         }
-        for field in ["overflow", "duplicate", "estimated", "missing", "window"] {
+        let extra = |part: &str, tokens: u64, estimated: bool| json!({"part": part, "tokens": tokens, "estimated": estimated});
+        for field in [
+            "overflow",
+            "duplicate",
+            "estimated",
+            "missing",
+            "window",
+            "nameless",
+            "unknown estimated",
+            "unknown overflow",
+        ] {
             let mut value = metadata(json!(300));
+            let parts = value["parts"].as_array_mut().expect("parts");
             match field {
-                "overflow" => value["parts"][0]["tokens"] = json!(102),
-                "duplicate" => value["parts"][1]["part"] = json!("persona"),
-                "estimated" => value["parts"][0]["estimated"] = json!(false),
+                "overflow" => parts[0]["tokens"] = json!(102),
+                // Every known part present, one of them twice: only the duplicate guard refuses.
+                "duplicate" => parts.push(extra("persona", 0, true)),
+                "estimated" => parts[0]["estimated"] = json!(false),
                 "missing" => {
-                    value["parts"].as_array_mut().expect("parts").pop();
+                    parts.pop();
                 }
+                "nameless" => parts.push(json!({"tokens": 0, "estimated": true})),
+                "unknown estimated" => parts.push(extra("skills", 0, false)),
+                "unknown overflow" => parts.push(extra("skills", 1, true)),
                 _ => value["window"] = json!(0),
             }
             assert!(latest(&rows(value), true).is_none(), "{field}");
         }
+    }
+    #[test]
+    fn unknown_new_parts_become_one_other_row_and_keep_the_meter() {
+        let mut value = metadata(json!(300));
+        value["used"] = json!(126);
+        for (part, tokens) in [("skills", 20), ("cache", 5)] {
+            value["parts"]
+                .as_array_mut()
+                .expect("parts")
+                .push(json!({"part": part, "tokens": tokens, "estimated": true}));
+        }
+        let vm = latest(&rows(value), true).expect("context");
+        assert_eq!(vm.summary, "42% · used ≈ 126 / 300 tokens");
+        assert_eq!(vm.parts.len(), PARTS.len() + 1);
+        assert_eq!(vm.parts[0].label, "System and persona");
+        let other = vm.parts.last().expect("other");
+        assert_eq!(other.label, "Other");
+        assert_eq!(other.tokens, "≈ 25 tokens");
+        assert_eq!(other.share, "≈ 20% of used context");
+        assert!(vm.parts.iter().all(|part| part.tokens.starts_with("≈ ")));
+        let known = latest(&rows(metadata(json!(300))), true).expect("known only");
+        assert!(known.parts.iter().all(|part| part.label != "Other"));
+    }
+    struct Count(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn a_malformed_answer_is_logged_once_per_answer_id() {
+        let mut bad = metadata(json!(300));
+        bad["used"] = json!(-1);
+        let answer = |id: &str| {
+            let mut rows = rows(bad.clone());
+            rows[0].insert("id".into(), json!(id));
+            rows
+        };
+        let (first, second) = (answer("refused-once-a"), answer("refused-once-b"));
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(warnings.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                assert!(latest(&first, true).is_none());
+            }
+            assert!(latest(&second, true).is_none());
+            assert!(latest(&first, true).is_none());
+        });
+        assert_eq!(warnings.load(Ordering::SeqCst), 2);
     }
     #[test]
     fn zero_and_over_window_counts_are_honest_and_bounded() {

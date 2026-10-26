@@ -397,7 +397,7 @@ pub fn view(
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,
-            context: super::context::latest(&rows, reads_trace),
+            context: super::context::latest(&rows, opened.prefs.show_details),
             agent_actor: session.agent_actor,
         },
         newest_ms,

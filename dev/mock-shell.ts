@@ -6255,9 +6255,9 @@ const contextAnswers: Record<
   },
 };
 /** Viewing aid mirroring Rust's context projection; never used by the app. */
-function mockContext(vm: AgentSessionViewVm): AgentSessionViewVm["context"] {
+function mockContext(vm: AgentSessionViewVm, showDetails: boolean): AgentSessionViewVm["context"] {
   const answer = contextAnswers[vm.database];
-  if (!vm.readsTrace || !answer || !vm.messages.some((message) => message.id === answer.id)) return;
+  if (!showDetails || !answer || !vm.messages.some((message) => message.id === answer.id)) return;
   const context = answer.metadata.context;
   const known = context.window !== null;
   return {
@@ -6461,7 +6461,7 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   return {
     ...vm,
     prefs,
-    context: mockContext(vm),
+    context: mockContext(vm, prefs.showDetails),
     approvals: vm.readsTrace ? vm.approvals : [],
     tools: vm.tools.map((tool) => ({ ...tool })),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
