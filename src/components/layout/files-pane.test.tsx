@@ -810,6 +810,10 @@ describe("FilesPane keyboard navigation", () => {
         .getAllByRole("treeitem")
         .map((row) => row.getAttribute("tabindex"));
 
+    // Both profile rows first: the tree is on screen a commit before its rows,
+    // and the claim is about the rows (see `focusFirstRowOfTwo`).
+    await screen.findByRole("treeitem", { name: "Vault" });
+    await screen.findByRole("treeitem", { name: "Field" });
     // Tab reaches the tree once; the arrows move inside it. Two hundred files
     // must not be two hundred Tab presses.
     expect(rows()).toEqual(["0", "-1"]);
@@ -3706,6 +3710,9 @@ describe("FilesPane — the tree is a column", () => {
     ]);
     render(<FilesPane />);
     const tree = await screen.findByRole("tree", { name: FILES_TREE_LABEL });
+    // Both rows, not just the tree: the tree is on screen a commit before them.
+    await screen.findByRole("treeitem", { name: "Vault" });
+    await screen.findByRole("treeitem", { name: "Field" });
     expect(within(tree).getAllByRole("treeitem")).toHaveLength(2);
 
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
