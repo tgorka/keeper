@@ -129,6 +129,76 @@ describe("TurnFold", () => {
     expect(container.querySelector('[role="status"]')).toBeNull();
   });
 
+  // R10914-08: a running turn with nothing to open yet still announces its line.
+  it("announces a running fold's line while there is nothing to open yet", () => {
+    const { container } = render(
+      <ol>
+        <TurnFold
+          fold={fold({
+            status: "running",
+            statusLabel: "Working",
+            summary: "Working…",
+            leadInIds: [],
+            steps: [],
+            failures: [],
+          })}
+          leadIns={[]}
+          agentName="Assistant"
+          verbose={false}
+        />
+      </ol>,
+    );
+    const statuses = container.querySelectorAll('[role="status"]');
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]).toHaveTextContent("Working…");
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  // R10914-07: the first step updates the region a screen reader already
+  // watches; a region replaced at that moment is one it never announces.
+  it("keeps one status element across a running turn's first step, updating its text", () => {
+    const running = {
+      status: "running" as const,
+      statusLabel: "Working",
+      failures: [],
+      leadInIds: [],
+    };
+    const { container, rerender } = render(
+      <ol>
+        <TurnFold
+          fold={fold({ ...running, summary: "Working…", steps: [] })}
+          leadIns={[]}
+          agentName="Assistant"
+          verbose={false}
+        />
+      </ol>,
+    );
+    const before = container.querySelector('[role="status"]');
+    expect(before).toHaveTextContent("Working…");
+    rerender(
+      <ol>
+        <TurnFold
+          fold={fold({
+            ...running,
+            summary: "Searching the web… · 1 step",
+            steps: [{ id: "s1", name: "web_search", status: "started", statusLabel: "Started" }],
+          })}
+          leadIns={[]}
+          agentName="Assistant"
+          verbose={false}
+        />
+      </ol>,
+    );
+    const after = container.querySelectorAll('[role="status"]');
+    expect(after).toHaveLength(1);
+    expect(after[0]).toBe(before);
+    expect(after[0]).toHaveTextContent("Searching the web… · 1 step");
+    expect(container.querySelector("button")).toHaveAttribute(
+      "aria-label",
+      "Searching the web… · 1 step",
+    );
+  });
+
   it("is a plain line, not a control, when there is nothing to open", () => {
     render(
       <ol>

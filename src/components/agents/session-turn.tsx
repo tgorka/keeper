@@ -79,38 +79,40 @@ export function TurnFold({
       aria-label={`Work of ${agentName}`}
     >
       {hasBody ? (
-        <>
-          {/* The name is Rust's sentence, given outright: a live region inside a
-              button leaves Chromium computing an empty name (R10914-01). */}
-          <button
-            type="button"
-            className="flex min-h-11 w-full min-w-0 items-center gap-1 rounded-md px-1 text-left text-muted-foreground text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label={fold.summary}
-            aria-expanded={open}
-            aria-controls={bodyId}
-            onClick={() => setToggled(!open)}
-          >
-            {open ? (
-              <ChevronDown aria-hidden="true" className="size-4 shrink-0" />
-            ) : (
-              <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
-            )}
-            {summary}
-          </button>
-          {/* A running turn's line is announced from beside the button, once. */}
-          {running && (
-            <span role="status" className="sr-only">
-              {fold.summary}
-            </span>
+        // The name is Rust's sentence, given outright: a live region inside a
+        // button leaves Chromium computing an empty name (R10914-01).
+        <button
+          type="button"
+          className="flex min-h-11 w-full min-w-0 items-center gap-1 rounded-md px-1 text-left text-muted-foreground text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={fold.summary}
+          aria-expanded={open}
+          aria-controls={bodyId}
+          onClick={() => setToggled(!open)}
+        >
+          {open ? (
+            <ChevronDown aria-hidden="true" className="size-4 shrink-0" />
+          ) : (
+            <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
           )}
-        </>
+          {summary}
+        </button>
       ) : (
+        // While running, the status below says this line; read once, not twice.
         <p
-          role={running ? "status" : undefined}
+          aria-hidden={running || undefined}
           className="flex min-h-11 min-w-0 items-center text-muted-foreground text-xs"
         >
           {summary}
         </p>
+      )}
+      {/* A running turn's line is announced from this one element, beside the
+          line and never in a button, at the same place whether or not the turn
+          has anything to open yet: its first step updates the text a screen
+          reader is already watching rather than replacing the region (R10914-07). */}
+      {running && (
+        <span role="status" className="sr-only">
+          {fold.summary}
+        </span>
       )}
       {fold.failures.length > 0 && (
         <ul aria-label="Refusals and failures" className="flex min-w-0 flex-col gap-1">
