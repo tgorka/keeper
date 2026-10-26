@@ -196,9 +196,10 @@ refusal never stands — the row follows the newer one, and Retry never offers t
 set-aside is made in the same step of the replica's owner that writes the new title, before any
 sync round can settle the older one. The set-aside of a waiting write is kept beside the replica
 (`<replica>.blob-access.sqlite`) until its outcome arrives. If that record cannot be written, the
-rename still reports success (the title was queued) and the failure is logged. The chat's own
-creation is not a rename and is never set aside by one: while it waits, a rename queued behind it
-shows no rename state, and neither does its own refusal. An unrelated archive write is not a pending
+rename still reports success (the title was queued), the failure is logged, and the set-aside still
+holds in memory until keeper restarts. The chat's own creation is not a rename and is never set
+aside by one: while it waits, a rename queued behind it shows no rename state, and neither does its
+own refusal. An unrelated archive write is not a pending
 rename. If delivery cannot be read, the row says it is unavailable rather than claiming
 confirmation. Clipboard refusals also stay visible beside the row. Archive/Unarchive still
 reports only the local write; its later refusal is not surfaced on the row yet.

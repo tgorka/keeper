@@ -1512,7 +1512,10 @@ impl Owner {
     /// in the outcome journal now, those still waiting in advance, kept
     /// beside the replica until their outcome arrives
     /// ([`Self::settle_superseded`]). A commit the server took, or whose
-    /// refusal is already resolved, needs nothing.
+    /// refusal is already resolved, needs nothing. A waiting commit is held
+    /// in memory first, which is what the readers and the settle act on, so
+    /// a failed write beside the replica loses the set-aside only across a
+    /// restart.
     fn supersede(&mut self, commits: Vec<String>, replacement: &str) -> Result<(), ReplicaError> {
         let mut outcome = Ok(());
         let mut waiting = Vec::new();
@@ -1531,19 +1534,20 @@ impl Owner {
         if waiting.is_empty() {
             return outcome;
         }
+        self.superseded_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                waiting
+                    .iter()
+                    .map(|commit| (commit.clone(), replacement.to_owned())),
+            );
         self.cache
             .log
             .supersede_waiting(&waiting, replacement)
             .map_err(|error| {
                 ReplicaError::Client(format!("the replica's superseded commits: {error}"))
             })?;
-        let mut held = self
-            .superseded_waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        for commit in waiting {
-            held.insert(commit, replacement.to_owned());
-        }
         outcome
     }
 
@@ -2709,14 +2713,7 @@ pub(crate) mod tests {
             Some(&newer)
         );
         // The next round: the older commit is refused and leaves the outbox.
-        journal_refusal(&spec.path, &older, "ana/nixie", "hq.v3.not_member");
-        rusqlite::Connection::open(&spec.path)
-            .expect("opens")
-            .execute(
-                "DELETE FROM _syncular_outbox WHERE commit_id = ?1",
-                [&older],
-            )
-            .expect("leaves the outbox");
+        refused_by_a_round(&spec.path, &older);
         owner.settle_superseded();
         let outcome = owner
             .client
@@ -2726,6 +2723,114 @@ pub(crate) mod tests {
         assert!(!stands(&outcome), "the older refusal stands: {outcome:?}");
         assert!(owner.superseded_waiting.lock().expect("held").is_empty());
         owner.stop();
+    }
+
+    /// What a round does to waiting commit `commit` of `instance_prefs` row
+    /// `ana/nixie` that the server refuses: journals the refusal, and the
+    /// commit leaves the outbox.
+    fn refused_by_a_round(path: &std::path::Path, commit: &str) {
+        journal_refusal(path, commit, "ana/nixie", "hq.v3.not_member");
+        rusqlite::Connection::open(path)
+            .expect("opens")
+            .execute(
+                "DELETE FROM _syncular_outbox WHERE commit_id = ?1",
+                [commit],
+            )
+            .expect("leaves the outbox");
+    }
+
+    /// The owner may run a round after any command, so
+    /// [`Replica::mutate_superseding`] must hand it the commit and its
+    /// set-aside as one: here the owner is driven a command at a time, and a
+    /// round after the first finds the older commit already set aside.
+    #[test]
+    fn the_replica_hands_its_owner_a_commit_and_its_set_aside_as_one_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("alpha.sqlite"));
+        let (wake, _woken) = mpsc::channel();
+        let mut owner = Owner::open(&spec, Arc::new(AtomicBool::new(false)), wake).expect("opens");
+        let older: String = ask(&mut owner, |reply| {
+            Command::Mutate(vec![mutation(prefs_row("ana/nixie"))], Vec::new(), reply)
+        });
+        // The replica's half, over a channel whose owner is this test.
+        let (commands, inbox) = mpsc::channel();
+        let replica = Arc::new(SyncularReplica {
+            commands,
+            gate: Arc::new(AtomicBool::new(true)),
+            thread: Mutex::new(None),
+            reader: Mutex::new(FileQuerySnapshotReader::new(
+                spec.path.to_str().expect("UTF-8 path"),
+            )),
+            state: owner.state.subscribe(),
+            remote: None,
+            upload_refusals: Arc::clone(&owner.upload_refusals),
+            superseded_waiting: Arc::clone(&owner.superseded_waiting),
+        });
+        let writer = {
+            let (replica, older) = (Arc::clone(&replica), older.clone());
+            std::thread::spawn(move || {
+                replica.mutate_superseding(vec![prefs_row("ana/nixie")], vec![older])
+            })
+        };
+        let first = inbox
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a command");
+        assert!(owner.handle(first));
+        refused_by_a_round(&spec.path, &older);
+        let refused = replica
+            .row_writes("instance_prefs", "ana/nixie", None)
+            .expect("reads")
+            .refused;
+        // Whatever else the writer asks, it is answered.
+        while !writer.is_finished() {
+            if let Ok(command) = inbox.recv_timeout(Duration::from_millis(50)) {
+                assert!(owner.handle(command));
+            }
+        }
+        writer.join().expect("writer").expect("written");
+        assert!(
+            refused.is_empty(),
+            "a round after the replica's first command found the older refusal standing: {refused:?}"
+        );
+        owner.stop();
+    }
+
+    /// R10916-06: a set-aside the file beside the replica refuses still
+    /// holds for the running replica; only a restart loses it.
+    #[test]
+    fn a_set_aside_the_side_file_refuses_still_holds_in_this_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = local(dir.path().join("alpha.sqlite"));
+        let replica = SyncularReplica::open(spec.clone()).expect("opens");
+        let older = replica
+            .mutate(vec![prefs_row("ana/nixie")])
+            .expect("commits");
+        let side = rusqlite::Connection::open(AccessLog::beside(&spec.path)).expect("side file");
+        side.execute_batch(
+            "CREATE TRIGGER refuse_set_aside BEFORE INSERT ON superseded_waiting \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )
+        .expect("arms the failure");
+        replica
+            .mutate_superseding(vec![prefs_row("ana/nixie")], vec![older.clone()])
+            .expect("the write itself is made");
+        let kept: i64 = side
+            .query_row("SELECT count(*) FROM superseded_waiting", [], |row| {
+                row.get(0)
+            })
+            .expect("counts");
+        assert_eq!(kept, 0, "the side-file write did not fail");
+        refused_by_a_round(&spec.path, &older);
+        let refused = replica
+            .row_writes("instance_prefs", "ana/nixie", None)
+            .expect("reads")
+            .refused;
+        assert!(
+            refused.is_empty(),
+            "the older refusal surfaced in the same process: {refused:?}"
+        );
+        replica.close();
+        replica.join();
     }
 
     #[test]
