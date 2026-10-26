@@ -2058,8 +2058,9 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
 
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
     expect(await screen.findByText(/disk full/)).toBeInTheDocument();
-    // Replacing this form now would lose the folder p9 it must finish.
-    expect(onPristineChange).toHaveBeenLastCalledWith(false);
+    // Replacing this form now would lose the folder p9 it must finish. The form reports that
+    // from an effect, which may run after the refusal's text is already on screen.
+    await waitFor(() => expect(onPristineChange).toHaveBeenLastCalledWith(false));
   });
 });
 
