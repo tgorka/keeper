@@ -5,6 +5,7 @@ import { FILE_READ_TIMEOUT_MS } from "@/components/chat/composer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentSessionViewVm } from "@/lib/ipc/client";
+import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 
 const mock = vi.hoisted(() => ({
   view: null as ((vm: AgentSessionViewVm) => void) | null,
@@ -488,5 +489,58 @@ describe("session composer attachments", () => {
     expect(within(tray).queryByRole("button", { name: "Remove first.md" })).not.toBeInTheDocument();
     unmount();
     expect(mock.release).toHaveBeenCalledOnce();
+  });
+});
+
+describe("session header drives", () => {
+  it("draws the drive control only where Rust sends the selection (a person member)", async () => {
+    await draw();
+    // The base view carries no `drives`: anyone but a person member sees no control.
+    expect(screen.queryByRole("button", { name: "Drives" })).toBeNull();
+    act(() =>
+      mock.view?.({
+        ...vm,
+        drives: {
+          drives: [{ name: "beta", ticked: true }],
+          warning: "Once you tick a drive…",
+          pending: false,
+        },
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Drives" })).toBeInTheDocument();
+    expect(within(screen.getByRole("list", { name: "Drives ticked" })).getByText("beta"));
+  });
+
+  const withDrives: AgentSessionViewVm = {
+    ...vm,
+    drives: { drives: [{ name: "beta", ticked: false }], warning: "Once…", pending: false },
+  };
+
+  it("opens its Drives menu when the list's right-click menu asked for it", async () => {
+    agentSessionsStore.getState().openDrives({ database: "beta", sessionId: "same.1" });
+    await draw(withDrives);
+    expect(await screen.findByRole("menu", { name: "Drives" })).toBeInTheDocument();
+    expect(agentSessionsStore.getState().drivesFor).toBeNull();
+  });
+
+  it("drops a Drives request its first view answers without drives (R10923-09)", async () => {
+    agentSessionsStore.getState().openDrives({ database: "beta", sessionId: "same.1" });
+    await draw();
+    expect(agentSessionsStore.getState().drivesFor).toBeNull();
+    // The person's role comes back later: the menu does not open on its own.
+    act(() => mock.view?.(withDrives));
+    expect(screen.getByRole("button", { name: "Drives" })).toBeInTheDocument();
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("ignores a Drives request for another session", async () => {
+    agentSessionsStore.getState().openDrives({ database: "alpha", sessionId: "same.1" });
+    await draw(withDrives);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(agentSessionsStore.getState().drivesFor).toEqual({
+      database: "alpha",
+      sessionId: "same.1",
+    });
+    agentSessionsStore.getState().drivesShown();
   });
 });

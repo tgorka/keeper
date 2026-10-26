@@ -7,6 +7,7 @@ import { useSessionAttachmentDraft } from "@/components/agents/session-attachmen
 import { SessionAttachments } from "@/components/agents/session-attachments";
 import { SessionContext, SessionContextTrigger } from "@/components/agents/session-context";
 import { SessionControls } from "@/components/agents/session-controls";
+import { SessionDrives } from "@/components/agents/session-drives";
 import { SessionInstances } from "@/components/agents/session-instances";
 import { SessionPeople } from "@/components/agents/session-people";
 import {
@@ -37,7 +38,7 @@ import {
   hqStatusSubscribe,
   hqStatusUnsubscribe,
 } from "@/lib/ipc/client";
-import { agentSessionsStore } from "@/lib/stores/agent-sessions";
+import { agentSessionsStore, useAgentSessionsStore } from "@/lib/stores/agent-sessions";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import {
   ConversationStoresProvider,
@@ -52,6 +53,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const [error, setError] = useState<string | null>(null);
   const [peopleOpen, setPeopleOpen] = useState(false);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [drivesOpen, setDrivesOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   // Rust's sentence while the session is not on this device yet but may still arrive.
   const [arriving, setArriving] = useState<string | null>(null);
@@ -62,6 +64,17 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const backButton = useRef<HTMLButtonElement>(null);
   const { phone } = useShellLayout();
   const { database, sessionId } = target;
+  // Drives… in the list's right-click menu asks for this view's menu. Rust's first view of this
+  // session answers it: with drives the menu opens; without (the role or the agent's profile
+  // changed since the row was drawn) the request is dropped, so it never opens later on its own.
+  const drivesFor = useAgentSessionsStore((state) => state.drivesFor);
+  const viewed = vm !== null;
+  const hasDrives = vm?.drives !== undefined;
+  useEffect(() => {
+    if (!viewed || drivesFor?.database !== database || drivesFor.sessionId !== sessionId) return;
+    if (hasDrives) setDrivesOpen(true);
+    agentSessionsStore.getState().drivesShown();
+  }, [viewed, hasDrives, drivesFor, database, sessionId]);
   const pinned = useRef(true);
   const previousHeight = useRef<number | null>(null);
 
@@ -299,6 +312,15 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
               </span>
             )}
           </p>
+          {vm?.drives && (
+            <SessionDrives
+              target={target}
+              agentName={vm.agentName}
+              drives={vm.drives}
+              open={drivesOpen}
+              onOpenChange={setDrivesOpen}
+            />
+          )}
         </div>
         {vm && <SessionPeople target={target} open={peopleOpen} onOpenChange={setPeopleOpen} />}
         {vm && (
@@ -480,6 +502,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                     if (result.session) agentSessionsStore.getState().select(result.session);
                     if (result.surface === "people") setPeopleOpen(true);
                     if (result.surface === "tools") setToolsOpen(true);
+                    if (result.surface === "drives") setDrivesOpen(true);
                     if (result.surface === "context") setContextOpen(true);
                     return result.message ? { tone: "done", message: result.message } : null;
                   } catch (raw) {

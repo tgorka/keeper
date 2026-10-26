@@ -7,7 +7,7 @@ use ts_rs::TS;
 use crate::chat::commands::{self, ArgMode, CommandSpec, Context, Place, Resolution, RoomKind};
 use crate::hq::port::RowOp;
 use crate::hq::sessions::{self, AgentSessionRef, Source};
-use crate::hq::{live, timeline, Hq, HqError};
+use crate::hq::{drives, live, timeline, Hq, HqError};
 use crate::vm::{ChatCommandPreviewVm, ChatCommandRowVm, ChatCommandVerdictVm};
 
 const fn spec(
@@ -102,23 +102,25 @@ fn context() -> Context {
     }
 }
 
-// 109.18 and 109.23 attach their operation here when their backend exists.
-// Neither a model/effort picker nor a drive selection exists on this base.
-fn registry(has_tools: bool) -> Vec<CommandSpec> {
+// 109.18 attaches its operation here when its backend exists: no
+// model/effort picker exists on this base. `/drives` (109.23) is offered
+// only to whoever has the drive control.
+fn registry(has_tools: bool, has_drives: bool) -> Vec<CommandSpec> {
     REGISTRY
         .iter()
         .copied()
         .filter(|s| match s.name {
-            "model" | "effort" | "drives" => false,
+            "model" | "effort" => false,
             "tools" => has_tools,
+            "drives" => has_drives,
             _ => true,
         })
         .collect()
 }
 
 /// Menu and verdict are one Rust answer, like the messenger's.
-pub fn preview(draft: &str, has_tools: bool) -> ChatCommandPreviewVm {
-    let registry = registry(has_tools);
+pub fn preview(draft: &str, has_tools: bool, has_drives: bool) -> ChatCommandPreviewVm {
+    let registry = registry(has_tools, has_drives);
     let ctx = context();
     let verdict = match commands::resolve_in(&registry, draft, &ctx) {
         Resolution::Text(text) => ChatCommandVerdictVm::Text { text },
@@ -146,6 +148,7 @@ pub fn preview(draft: &str, has_tools: bool) -> ChatCommandPreviewVm {
 #[ts(export)]
 pub enum AgentCommandSurface {
     Tools,
+    Drives,
     Context,
     People,
     Help,
@@ -168,7 +171,10 @@ pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResult
     if session.archived {
         return Err("Unarchive this conversation first.".to_owned());
     }
-    let registry = registry(!live::tools(source, sid, &session.agent_actor).is_empty());
+    let registry = registry(
+        !live::tools(source, sid, &session.agent_actor).is_empty(),
+        drives::available(source, sid, &session),
+    );
     let (name, args) = match commands::resolve_in(&registry, draft, &context()) {
         Resolution::Command { name, args } => (name, args),
         Resolution::Refusal { message, .. } => return Err(message),
@@ -226,6 +232,7 @@ pub fn run(source: &Source, sid: &str, draft: &str) -> Result<AgentCommandResult
             result.message = "Stop requested.".to_owned();
         }
         "tools" => result.surface = Some(AgentCommandSurface::Tools),
+        "drives" => result.surface = Some(AgentCommandSurface::Drives),
         "context" => result.surface = Some(AgentCommandSurface::Context),
         "people" => result.surface = Some(AgentCommandSurface::People),
         "help" => result.surface = Some(AgentCommandSurface::Help),
@@ -247,6 +254,7 @@ impl Hq {
         Ok(preview(
             draft,
             !live::tools(&source, &key.session_id, &session.agent_actor).is_empty(),
+            drives::available(&source, &key.session_id, &session),
         ))
     }
 

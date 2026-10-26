@@ -119,6 +119,10 @@ pub struct AgentSessionRowVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attention: Option<AgentAttentionVm>,
+    /// This person has the session's drive control (109.23,
+    /// [`crate::hq::drives::may_choose`] and an agent that says what it
+    /// reads): the row's menu offers Drives….
+    pub chooses_drives: bool,
 }
 
 impl AgentSessionRowVm {
@@ -359,13 +363,14 @@ pub fn earlier_months(created_ms: i64, last_activity_ms: i64, widen: u32) -> Vec
 /// The windows a replica holds, each along one scope variable. Every held
 /// session's members are held beside its row, so the People sheet reads
 /// who else is in it.
-pub const WINDOWS: [(&str, &str); 11] = [
+pub const WINDOWS: [(&str, &str); 12] = [
     ("sessions", "session"),
     ("session_members", "session"),
     ("turn_chunks", "session"),
     ("claims", "session"),
     ("session_tool_switches", "session"),
     ("session_settings", "session"),
+    ("session_drives", "session"),
     ("attachments", "session"),
     ("messages", "page"),
     ("approvals", "trace"),
@@ -443,8 +448,8 @@ pub fn reads_trace(source: &Source, session_id: &str) -> bool {
 }
 
 /// Each window's units for one database: every session row, its members and settings;
-/// for each active session its streamed chunks, its claim, its tool switches
-/// and its attachments' rows (never their bytes), and
+/// for each active session its streamed chunks, its claim, its tool switches,
+/// its drives and its attachments' rows (never their bytes), and
 /// its newest months (widened by `widen` for an opened one); its trace
 /// months only where the person reads the trace, and their thinking only
 /// while `reasoning` is shown. An archived session keeps its session, member
@@ -493,7 +498,8 @@ pub fn plan(
         ("session_members", sessions),
         ("turn_chunks", turns.clone()),
         ("claims", turns.clone()),
-        ("session_tool_switches", turns),
+        ("session_tool_switches", turns.clone()),
+        ("session_drives", turns),
         ("attachments", files.into_iter().collect()),
         ("messages", pages.into_iter().collect()),
         ("approvals", trace.clone()),
@@ -639,7 +645,7 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
         source,
         "SELECT s.id AS id, s.title AS title, s.status AS status, s.agent_actor AS agent_actor, \
          s.archived AS archived, s.last_activity_ms AS last_activity_ms, s.created_at_ms AS created_at_ms, s.trust AS trust, \
-         m.read_until AS read_until \
+         m.read_until AS read_until, m.role AS role \
          FROM session_members m JOIN sessions s ON s.id = m.session_id \
          WHERE m.actor_id = ?1",
         &[Value::from(source.actor.as_str())],
@@ -648,6 +654,7 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
         return Vec::new();
     }
     let needs = needs_you(source, now_ms);
+    let saying = super::drives::agents_saying(source);
     let working: HashSet<String> = read(source, "SELECT DISTINCT session_id FROM turn_chunks", &[])
         .iter()
         .filter_map(|row| opt_text(row, "session_id"))
@@ -717,6 +724,10 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
                 instances: instance_labels,
                 agent_mark: mark(&agent_name),
                 agent_name,
+                chooses_drives: super::drives::may_choose(
+                    text(row, "role"),
+                    truthy(row, "archived"),
+                ) && saying.contains(&agent),
                 agent_actor: agent,
                 archived: truthy(row, "archived"),
                 last_activity_ms: int(row, "last_activity_ms").unwrap_or(0),
@@ -1282,6 +1293,7 @@ mod tests {
         assert_eq!(shown["turn_chunks"], vec!["c.1", "c.3"]);
         assert_eq!(shown["claims"], vec!["c.1", "c.3"]);
         assert_eq!(shown["session_tool_switches"], vec!["c.1", "c.3"]);
+        assert_eq!(shown["session_drives"], vec!["c.1", "c.3"]);
         // An active session's attachments' rows (never their bytes), not an
         // archived one's.
         assert_eq!(shown["attachments"], vec!["c.1", "c.3"]);
@@ -1352,6 +1364,7 @@ mod tests {
             archived: false,
             last_activity_ms: at,
             attention: None,
+            chooses_drives: false,
         }
     }
 

@@ -3,6 +3,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { SessionRowMenu } from "@/components/agents/session-row-menu";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentSessionRowVm } from "@/lib/ipc/client";
+import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 
 const rename = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/ipc/client", async (original) => ({
@@ -24,6 +25,7 @@ const row: AgentSessionRowVm = {
   agentMark: "N",
   archived: false,
   lastActivityMs: 1700000000000,
+  choosesDrives: false,
 };
 beforeEach(() => rename.mockReset());
 
@@ -147,4 +149,27 @@ it("shows a later server refusal after local success and recovers the proposal o
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Retry rename" })).not.toBeInTheDocument();
+});
+
+it("offers Drives… only where Rust says this person has the control, and opens that session's", async () => {
+  const draw = (drives: boolean) =>
+    render(
+      <SessionRowMenu row={{ ...row, choosesDrives: drives }}>
+        <button type="button">{`${row.displayName} ${drives}`}</button>
+      </SessionRowMenu>,
+    );
+  draw(false);
+  fireEvent.contextMenu(screen.getByRole("button", { name: `${row.displayName} false` }));
+  await screen.findByRole("menuitem", { name: "Rename…" });
+  expect(screen.queryByRole("menuitem", { name: "Drives…" })).toBeNull();
+  fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+
+  draw(true);
+  fireEvent.contextMenu(screen.getByRole("button", { name: `${row.displayName} true` }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Drives…" }));
+  const { selected, drivesFor } = agentSessionsStore.getState();
+  const target = { database: "alpha", sessionId: "device.1" };
+  expect(selected).toEqual(target);
+  expect(drivesFor).toEqual(target);
 });

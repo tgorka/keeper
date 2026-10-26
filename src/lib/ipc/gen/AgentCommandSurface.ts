@@ -3,4 +3,4 @@
 /**
  * A local surface to reveal; the operation, not command text, crosses IPC.
  */
-export type AgentCommandSurface = "tools" | "context" | "people" | "help";
+export type AgentCommandSurface = "tools" | "drives" | "context" | "people" | "help";

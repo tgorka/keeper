@@ -1037,9 +1037,11 @@ pub fn run() {
                 hq_ipc::agent_approvals_subscribe,
                 hq_ipc::agent_approvals_unsubscribe,
                 hq_ipc::agent_session_approval_decide,
-                // What a viewer chose to see, and a session's tool switches.
+                // What a viewer chose to see, a session's tool switches
+                // and the drives its agent may read.
                 hq_ipc::agent_view_prefs_set,
                 hq_ipc::agent_session_tool_set,
+                hq_ipc::agent_session_drive_set,
                 // A session's people: who is in it, adding, the reader
                 // flag, removing, leaving.
                 hq_ipc::agent_session_members_subscribe,

@@ -61,6 +61,7 @@ import type {
   AgentChoiceVm,
   AgentInstancesVm,
   AgentSessionAnsweringVm,
+  AgentSessionDrivesVm,
   AgentSessionMembersVm,
   AgentSessionRowVm,
   AgentSessionsBatch,
@@ -6087,6 +6088,66 @@ const renameAttempts = new Map<string, number>();
 // ?sessions=launch&live=stream|error|stopped|nonreader|no-tools|untrusted|long|refused|pinned
 const liveScenario = new URLSearchParams(location.search).get("live");
 /**
+ * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
+ * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
+ * device holds (Ben reads alpha, not beta), `omega` is another agent's. Who reads `gamma` this
+ * device cannot know, so a tick of it is written and the fake server refuses it a moment later
+ * (`hq.v17.audience`), as the real one would. `?drives=nonmember`: the person is no person member
+ * of any session, so Rust answers no `drives` and no control is drawn. `?drives=stale`: `alpha`,
+ * `delta` and `gamma` are ticked and the agent no longer offers `delta` or `gamma` (R10923-01,
+ * R10923-06): unticking either unticks both in one write, and every other change is refused here,
+ * naming both, as Rust's `drives::set` does.
+ */
+const drivesScenario = new URLSearchParams(location.search).get("drives");
+/** keeper-core's `drives::WARNING`, word for word. */
+const DRIVES_WARNING =
+  "Once you tick a drive, the agent may read it and send what it reads to the web, in a search " +
+  "or a page it fetches, without asking you, even after this chat has read outside content. " +
+  "Text it read on the web or in a drive can lead it to do that.";
+/** keeper-core's `Stale::sentence` for the `stale` fixture's two drives. */
+const STALE_SENTENCE =
+  "Untick delta and gamma to change the other drives: Assistant no longer offers them. " +
+  "Unticking either unticks both.";
+function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm | undefined {
+  if (archived || drivesScenario === "nonmember") return undefined;
+  if (drivesScenario === "stale" && database === "alpha")
+    return {
+      drives: [
+        { name: "delta", ticked: true, reason: STALE_SENTENCE },
+        { name: "gamma", ticked: true, reason: STALE_SENTENCE },
+        { name: "alpha", ticked: true },
+        {
+          name: "beta",
+          ticked: false,
+          reason: "Ben reads alpha but cannot read beta, so it cannot be ticked here.",
+        },
+        { name: "omega", ticked: false, reason: "Assistant does not offer omega." },
+      ],
+      warning: DRIVES_WARNING,
+      pending: false,
+    };
+  return {
+    drives:
+      database === "alpha"
+        ? [
+            { name: "alpha", ticked: false },
+            { name: "gamma", ticked: false },
+            {
+              name: "beta",
+              ticked: false,
+              reason: "Ben reads alpha but cannot read beta, so it cannot be ticked here.",
+            },
+            { name: "omega", ticked: false, reason: "Assistant does not offer omega." },
+          ]
+        : [
+            { name: "alpha", ticked: false },
+            { name: "beta", ticked: false },
+          ],
+    warning: DRIVES_WARNING,
+    pending: false,
+  };
+}
+/**
  * The answer preferences survive a reload in `sessionStorage`, as the capture
  * sources do, read on first use rather than at import.
  */
@@ -6159,6 +6220,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentName: sessionScenario === "names" ? "Nixi" : "Assistant",
           agentMark: sessionScenario === "names" ? "N" : "A",
           archived: false,
+          choosesDrives: drivesScenario !== "nonmember",
           lastActivityMs: Date.now(),
           attention: "needsYou",
         },
@@ -6176,6 +6238,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentName: "Assistant",
           agentMark: "A",
           archived: false,
+          choosesDrives: drivesScenario !== "nonmember",
           lastActivityMs: Date.now() - 3600000,
           attention: "needsYou",
         },
@@ -6193,6 +6256,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentName: "Assistant",
           agentMark: "A",
           archived: true,
+          choosesDrives: false,
           lastActivityMs: Date.now() - 86400000,
         },
       ];
@@ -6239,6 +6303,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
       untrusted: liveScenario === "untrusted" || liveScenario === "stream",
       live: [],
       prefs: { showReasoning: false, showDetails: false },
+      drives: mockDrives(row.database, row.archived),
       tools:
         liveScenario === "no-tools"
           ? []
@@ -6553,6 +6618,9 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     context: mockContext(vm, prefs.showDetails),
     approvals: vm.readsTrace ? vm.approvals : [],
     tools: vm.tools.map((tool) => ({ ...tool })),
+    ...(vm.drives
+      ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
+      : {}),
     messages: vm.messages.map(({ details, reasoning, steps, ...message }) => ({
       ...message,
       ...(prefs.showDetails && details ? { details } : {}),
@@ -6706,6 +6774,50 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     publishSessions();
     return null;
   },
+  agent_session_drive_set: (payload) => {
+    const vm = mockSession(payload);
+    const drives = vm.drives;
+    if (!drives) hqRefuse("Only a person in this chat may choose the drives it reads.");
+    const drive = drives.drives.find((row) => row.name === payload.drive);
+    if (!drive) hqRefuse(`${String(payload.drive)} is not a drive this chat's agent offers.`);
+    const tick = payload.tick === true;
+    if (drive.ticked === tick) return null;
+    if (tick && drive.reason) hqRefuse(drive.reason);
+    // keeper-core's rule: ticked drives that stopped being allowed go together. Unticking one
+    // unticks all of them; anything else is refused, naming them.
+    const stale = drives.drives.filter((row) => row.ticked && row.reason);
+    const unticking = !tick && stale.includes(drive);
+    if (!unticking && stale.length)
+      hqRefuse(
+        `Untick ${stale.map((row) => row.name).join(" and ")} first: Assistant no longer offers ${
+          stale.length === 1 ? "it" : "them"
+        }.`,
+      );
+    // A selection written sets the earlier refusals aside.
+    for (const row of drives.drives) delete row.refused;
+    delete drives.refused;
+    drive.ticked = tick;
+    if (unticking) {
+      // Unticked, they are no longer the agent's to read: listed as not offered, after the others.
+      for (const row of stale) {
+        row.ticked = false;
+        row.reason = `Assistant does not offer ${row.name}.`;
+      }
+      drives.drives.sort((a, b) => Number(!!a.reason) - Number(!!b.reason));
+    }
+    drives.pending = true;
+    publishSessions();
+    setTimeout(() => {
+      drives.pending = false;
+      if (tick && drive.name === "gamma") {
+        drive.ticked = false;
+        drive.refused = `The server refused gamma: not everyone who reads ${vm.database} may read it.`;
+        drives.refused = drive.refused;
+      }
+      publishSessions();
+    }, 1500);
+    return null;
+  },
   agent_approvals_subscribe: (payload) => {
     const id = `session-approvals-${++sessionSerial}`;
     const channel = payload.channel as MockChannel<AgentApprovalVm[]>;
@@ -6810,6 +6922,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       ["rename", "Rename this conversation.", "required", "title"],
       ["stop", "Stop the running turn.", "none", null],
       ...(vm.tools.length ? [["tools", "Open tool switches.", "none", null]] : []),
+      ...(vm.drives ? [["drives", "Choose the drives this session may read.", "none", null]] : []),
       ["context", "Open context details.", "none", null],
       ["people", "Open this session's people.", "none", null],
       ["archive", "Archive this conversation.", "none", null],
@@ -7030,6 +7143,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       agentName: choice.agentName,
       agentMark: choice.agentMark,
       archived: false,
+      choosesDrives: false,
       lastActivityMs: Date.now(),
     };
     sessionRows.unshift(row);
@@ -9613,6 +9727,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         agentName: "Researcher",
         agentMark: "R",
         archived: false,
+        choosesDrives: false,
         lastActivityMs: Date.now(),
       };
       sessionRows.unshift(row);

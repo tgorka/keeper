@@ -4,6 +4,7 @@ import type { AgentContextVm } from "./AgentContextVm";
 import type { AgentLiveTurnVm } from "./AgentLiveTurnVm";
 import type { AgentMessageVm } from "./AgentMessageVm";
 import type { AgentSessionAnsweringVm } from "./AgentSessionAnsweringVm";
+import type { AgentSessionDrivesVm } from "./AgentSessionDrivesVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
 import type { AgentTimelineItemVm } from "./AgentTimelineItemVm";
 import type { AgentTurnFoldVm } from "./AgentTurnFoldVm";
@@ -78,4 +79,12 @@ answering?: AgentSessionAnsweringVm,
 /**
  * Last answer's context occupancy; follows Show details, for any member.
  */
-context?: AgentContextVm, };
+context?: AgentContextVm, 
+/**
+ * The drives the agent may read here and this person's ticks; absent
+ * where this person has no control for them (not a person member, an
+ * archived session, an agent that has not said what it reads). The
+ * window fills it from every database this device holds
+ * ([`crate::hq::drives::view`]).
+ */
+drives?: AgentSessionDrivesVm, };

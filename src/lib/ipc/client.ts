@@ -379,6 +379,8 @@ export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentSessionAnsweringVm } from "./gen/AgentSessionAnsweringVm";
+export type { AgentSessionDrivesVm } from "./gen/AgentSessionDrivesVm";
+export type { AgentSessionDriveVm } from "./gen/AgentSessionDriveVm";
 export type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 export type { AgentSessionRef } from "./gen/AgentSessionRef";
 export type { AgentSessionRowVm } from "./gen/AgentSessionRowVm";
@@ -4057,6 +4059,15 @@ export async function agentSessionToolSet(
   on: boolean,
 ): Promise<void> {
   await invoke("agent_session_tool_set", { ...target, name, on });
+}
+
+/** Tick a drive for the session's agent to read, or untick it (109.23); Rust decides. */
+export async function agentSessionDriveSet(
+  target: AgentSessionRef,
+  drive: string,
+  tick: boolean,
+): Promise<void> {
+  await invoke("agent_session_drive_set", { ...target, drive, tick });
 }
 
 /** A session's People sheet: its members and the people of its database the owner may add. */

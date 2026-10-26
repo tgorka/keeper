@@ -234,6 +234,7 @@ describe("a session that leaves the list", () => {
     agentMark: "N",
     archived: false,
     lastActivityMs: 1,
+    choosesDrives: false,
   });
 
   it("is closed with a note when Rust's list drops the open one, and only then", () => {

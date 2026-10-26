@@ -1696,18 +1696,20 @@ fn agent_commands_keep_history_and_create_no_phantom_prompt() {
 fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose() {
     use crate::hq::commands::preview;
     use crate::vm::ChatCommandVerdictVm;
-    let names = |tools| {
-        preview("/", tools)
+    let names = |tools, drives| {
+        preview("/", tools, drives)
             .rows
             .into_iter()
             .map(|r| r.name)
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        names(false),
+        names(false, false),
         ["clean", "new", "rename", "stop", "context", "people", "archive", "help"]
     );
-    assert!(names(true).contains(&"tools".to_owned()));
+    assert!(names(true, false).contains(&"tools".to_owned()));
+    // `/drives` only for whoever has the drive control (109.23).
+    assert!(names(false, true).contains(&"drives".to_owned()));
     for draft in [
         "/unknown",
         "/model some-model",
@@ -1717,7 +1719,7 @@ fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose()
     ] {
         assert!(
             matches!(
-                preview(draft, false).verdict,
+                preview(draft, false, false).verdict,
                 ChatCommandVerdictVm::Refusal { .. }
             ),
             "{draft}"
@@ -1728,13 +1730,17 @@ fn agent_commands_filter_capabilities_and_never_send_unknown_commands_as_prose()
     for caption in ["/stop", "/unknown", "/model unavailable"] {
         let escaped = format!("/{caption}");
         assert!(
-            matches!(preview(&escaped, false).verdict, ChatCommandVerdictVm::Text { text } if text == caption),
+            matches!(preview(&escaped, false, false).verdict, ChatCommandVerdictVm::Text { text } if text == caption),
             "escaped caption {escaped} must retain exactly one leading slash"
         );
     }
-    assert_eq!(preview("/ren", false).rows[0].name, "rename");
+    assert_eq!(preview("/ren", false, false).rows[0].name, "rename");
+    assert!(matches!(
+        preview("/drives", false, true).verdict,
+        ChatCommandVerdictVm::Command { name, args: None } if name == "drives"
+    ));
     assert!(
-        matches!(preview("/stop", false).verdict, ChatCommandVerdictVm::Command { name, args: None } if name == "stop")
+        matches!(preview("/stop", false, false).verdict, ChatCommandVerdictVm::Command { name, args: None } if name == "stop")
     );
 }
 
