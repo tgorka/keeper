@@ -380,6 +380,9 @@ describe("session composer attachments", () => {
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Timed caption");
     expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
     await lateReadAddsNothingAndTextSends(() => held.finish(0), "Timed caption");
+    // The composer drops a paste while a send is in flight, and the send is in flight until
+    // its field is spent — `agentSend` being called is not the send being over.
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue(""));
     // A later paste that reads retires the timed-out batch's sentence.
     paste("next.csv");
     await screen.findByRole("button", { name: "Remove next.csv" });
