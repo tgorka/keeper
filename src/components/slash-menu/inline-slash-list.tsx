@@ -17,7 +17,14 @@ const KIND_ICON: Record<ChatInlineKindVm, typeof AtSign> = {
   shrug: Smile,
 };
 
-export function InlineSlashList({ menu }: { menu: InlineSlashState }) {
+export function InlineSlashList({
+  menu,
+  label = INLINE_MENU_LABEL,
+}: {
+  menu: InlineSlashState;
+  /** The menu's accessible name: the mid-text menu's unless a composer names its own. */
+  label?: string;
+}) {
   const listRef = useRef<HTMLDivElement>(null);
   const { setIds, open, rows } = menu;
   useLayoutEffect(() => {
@@ -53,7 +60,7 @@ export function InlineSlashList({ menu }: { menu: InlineSlashState }) {
         }}
         className="bg-transparent"
       >
-        <CommandList ref={listRef} label={INLINE_MENU_LABEL} className="max-h-64 p-1">
+        <CommandList ref={listRef} label={label} className="max-h-64 p-1">
           {rows.map((row) => {
             const Icon = KIND_ICON[row.kind];
             const key = row.key;

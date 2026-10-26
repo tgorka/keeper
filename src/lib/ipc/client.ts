@@ -355,6 +355,7 @@ export type { AgentApprovalVm } from "./gen/AgentApprovalVm";
 export type { AgentAttachmentStateVm } from "./gen/AgentAttachmentStateVm";
 export type { AgentAttachmentVm } from "./gen/AgentAttachmentVm";
 export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
+export type { AgentChildSessionVm } from "./gen/AgentChildSessionVm";
 export type { AgentChoiceVm } from "./gen/AgentChoiceVm";
 export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
@@ -4215,6 +4216,28 @@ export async function agentSend(
   declines: ShownApprovalVm[],
 ): Promise<void> {
   await invoke<void>("agent_send", { ...target, body, declines });
+}
+
+/**
+ * The composer's line (109.24): `@<handle> …` starts that agent's thread from this
+ * session, as Rust decides; any other line is a message, as {@link agentSend}. Either
+ * declines first what the banner showed (`declines`, Q109-12 a).
+ */
+export async function agentSendLine(
+  target: AgentSessionRef,
+  line: string,
+  declines: ShownApprovalVm[],
+): Promise<void> {
+  await invoke<void>("agent_send_line", { ...target, line, declines });
+}
+
+/** What an `@` at the start of a session's draft offers (109.24). */
+export async function agentMentionPreview(
+  target: AgentSessionRef,
+  before: string,
+  after: string,
+): Promise<ChatInlinePreviewVm> {
+  return await invoke<ChatInlinePreviewVm>("agent_mention_preview", { ...target, before, after });
 }
 
 export async function agentCommandPreview(

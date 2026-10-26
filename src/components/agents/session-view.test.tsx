@@ -4,7 +4,7 @@ import { SessionView } from "@/components/agents/session-view";
 import { FILE_READ_TIMEOUT_MS } from "@/components/chat/composer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
-import type { AgentSessionViewVm } from "@/lib/ipc/client";
+import type { AgentChildSessionVm, AgentSessionViewVm } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 
 const mock = vi.hoisted(() => ({
@@ -46,6 +46,16 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentSessionApprovalDecide: mock.decide,
   agentCommandPreview: mock.preview,
   agentCommand: mock.command,
+  // The composer's line goes out through Rust's mention-aware send (109.24),
+  // declining what the banner showed as `agentSend` does.
+  agentSendLine: mock.send,
+  agentMentionPreview: vi.fn(async (_target: unknown, before: string, after: string) => ({
+    before,
+    after,
+    token: null,
+    rows: [],
+    note: null,
+  })),
 }));
 const vm: AgentSessionViewVm = {
   agentMark: "A",
@@ -474,7 +484,7 @@ describe("session composer attachments", () => {
     expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
     await lateReadAddsNothingAndTextSends(() => held.finish(0), "Timed caption");
     // The composer drops a paste while a send is in flight, and the send is in flight until
-    // its field is spent — `agentSend` being called is not the send being over.
+    // its field is spent — `agentSendLine` being called is not the send being over.
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue(""));
     // A later paste that reads retires the timed-out batch's sentence.
     paste("next.csv");
@@ -752,5 +762,96 @@ describe("the reading column (109.14)", () => {
       "true",
     );
     expect(screen.getByText(lead.body)).toBeInTheDocument();
+  });
+});
+
+/** A thread started here (109.24) whose newest turn ran tools: as if Rust had sent steps. */
+const RUNNING_CHILD: AgentChildSessionVm = {
+  threadId: "line-1",
+  sessionId: "same.7",
+  agentActor: "tola-grey",
+  agentName: "Tola Grey",
+  agentMark: "T",
+  createdAtMs: 1,
+  archived: false,
+  truncated: false,
+  prompt: {
+    id: "line-1",
+    role: "person",
+    authorActor: "ana",
+    authorName: "Ana",
+    body: "@tola-grey check the notes",
+    createdAtMs: 1,
+    state: "taken",
+  },
+  items: [
+    { kind: "fold", turnId: "line-1" },
+    { kind: "liveAnswer", turnId: "line-1" },
+  ],
+  folds: [
+    {
+      turnId: "line-1",
+      leadInIds: [],
+      reasoning: null,
+      steps: [
+        {
+          id: "s1",
+          name: "web_search",
+          status: "started",
+          statusLabel: "Started",
+          startedAtMs: 2,
+        },
+      ],
+      failures: [],
+      status: "running",
+      statusLabel: "Working",
+      summary: "Searching the web… · 1 step",
+      durationMs: null,
+    },
+  ],
+  messages: [],
+  live: [{ turnId: "line-1", text: "The notes say ship on Friday.", stopped: false }],
+};
+
+describe("a thread started here, inline (109.24)", () => {
+  it("never opens its fold, even in Verbose: the answer is drawn and nothing expands", async () => {
+    await draw({
+      ...vm,
+      prefs: { viewMode: "verbose" },
+      children: [RUNNING_CHILD],
+      items: [{ kind: "child", threadId: "line-1" }],
+    });
+    const thread = screen.getByRole("region", { name: "Thread with Tola Grey" });
+    expect(within(thread).getByText("The notes say ship on Friday.")).toBeInTheDocument();
+    expect(within(thread).getByText("Searching the web… · 1 step")).toBeInTheDocument();
+    expect(within(thread).queryByRole("button", { expanded: true })).toBeNull();
+    expect(within(thread).queryByRole("button", { expanded: false })).toBeNull();
+    expect(within(thread).queryByText("web_search")).toBeNull();
+  });
+
+  it("leaves the parent one live region while a thread runs: its own answer's", async () => {
+    await draw({
+      ...vm,
+      children: [RUNNING_CHILD],
+      live: [{ turnId: "own", text: "Working on it", stopped: false }],
+      items: [
+        { kind: "child", threadId: "line-1" },
+        { kind: "liveAnswer", turnId: "own" },
+      ],
+    });
+    const column = screen.getByRole("list", { name: "Messages" });
+    const live = column.querySelectorAll('[role="status"], [role="alert"], [aria-live]');
+    expect(live).toHaveLength(1);
+    expect(
+      within(screen.getByRole("region", { name: "Thread with Tola Grey" })).queryByRole("status"),
+    ).toBeNull();
+    // Whose work the inline line is, in its accessible text.
+    expect(
+      within(screen.getByRole("region", { name: "Thread with Tola Grey" })).getByText(
+        (_, node) =>
+          node?.getAttribute("data-slot") === "inline-fold" &&
+          node.textContent === "Tola Grey: Searching the web… · 1 step",
+      ),
+    ).toBeInTheDocument();
   });
 });

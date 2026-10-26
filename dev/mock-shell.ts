@@ -58,11 +58,13 @@ import type {
   AccountVm,
   AgentApprovalVm,
   AgentAttachmentVm,
+  AgentChildSessionVm,
   AgentChoiceVm,
   AgentEffortOptionVm,
   AgentGrantOfferVm,
   AgentGrantsVm,
   AgentInstancesVm,
+  AgentMessageVm,
   AgentSessionAnsweringVm,
   AgentSessionDrivesVm,
   AgentSessionMembersVm,
@@ -7242,6 +7244,18 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
       items.push({ kind: "fold", turnId: turn.turnId });
     items.push({ kind: "liveAnswer", turnId: turn.turnId });
   }
+  // `mention::place` (109.24): each thread started here before the first message written
+  // after it, above that message's fold.
+  for (const child of vm.children ?? []) {
+    let at = items.findIndex((item) =>
+      item.kind === "message"
+        ? (vm.messages.find((m) => m.id === item.messageId)?.createdAtMs ?? 0) > child.createdAtMs
+        : item.kind === "liveAnswer",
+    );
+    if (at === -1) at = items.length;
+    else if (at > 0 && items[at - 1].kind === "fold") at -= 1;
+    items.splice(at, 0, { kind: "child", threadId: child.threadId });
+  }
   const folds = items.flatMap((item) => {
     const fold = item.kind === "fold" && source.find((f) => f.turnId === item.turnId);
     if (!fold) return [];
@@ -7945,6 +7959,17 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   },
   agent_session_archive: (payload) => {
     const vm = mockSession(payload);
+    // 109.24: an archived thread is drawn in its parent as archived, nothing more.
+    for (const parent of sessionViews.values())
+      for (const child of parent.children ?? [])
+        if (parent.database === vm.database && child.sessionId === vm.sessionId)
+          Object.assign(child, {
+            archived: true,
+            truncated: false,
+            prompt: undefined,
+            items: [],
+            messages: [],
+          });
     vm.archived = true;
     vm.readOnly = true;
     const row = sessionRows.find(
@@ -8039,7 +8064,204 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     hqClearedWrite(row.database);
     return { database: row.database, sessionId: row.sessionId };
   },
+  // 109.24: an `@` line (Rust's `hq::mention`). alpha's directory holds the assistant
+  // (device.1's own agent), Tola Grey — who answers her thread — and Mason, whose
+  // thread the mock server refuses as V11 would after he left alpha's directory;
+  // the researcher is beta's. Any other handle is unknown. Viewing aid only.
+  agent_mention_preview: (payload) => {
+    const vm = mockSession(payload);
+    const before = String(payload.before);
+    const after = String(payload.after);
+    const token = before.trimStart();
+    const query = token.slice(1).toLowerCase();
+    const answer: ChatInlinePreviewVm = { before, after, token: null, rows: [], note: null };
+    if (!token.startsWith("@") || /\s/.test(query) || (after !== "" && !/^\s/.test(after)))
+      return answer;
+    answer.token = token;
+    answer.rows = mockMentionAgents(vm.database)
+      .filter((agent) => agent.id !== vm.agentActor)
+      .filter(
+        (agent) =>
+          agent.id.startsWith(query) ||
+          agent.name
+            .toLowerCase()
+            .split(/\s+/)
+            .some((word) => word.startsWith(query)),
+      )
+      .map((agent) => ({
+        kind: "mention",
+        key: agent.id,
+        label: `@${agent.id}`,
+        detail: agent.name,
+        insert: `@${agent.id}`,
+      }));
+    return answer;
+  },
+  agent_send_line: (payload) => {
+    const line = String(payload.line);
+    const parsed = /^\s*@(\S+)(.*)$/s.exec(line);
+    const handle = parsed?.[1].replace(/[,:;.!?]+$/, "");
+    if (!parsed || !handle) return sessionHandlers.agent_send({ ...payload, body: line });
+    const vm = mockSession(payload);
+    const agent = mockMentionAgents(vm.database).find((agent) => agent.id === handle.toLowerCase());
+    if (!agent) {
+      const elsewhere = ["alpha", "beta"]
+        .filter((db) => db !== vm.database)
+        .flatMap((db) => mockMentionAgents(db).map((other) => ({ db, other })))
+        .find(({ other }) => other.id === handle.toLowerCase());
+      return hqRefuse(
+        elsewhere
+          ? `${elsewhere.other.name} is an agent of ${elsewhere.db}, not ${vm.database}: a conversation brings in only agents of its own database.`
+          : `No agent of ${vm.database} is called @${handle}.`,
+      );
+    }
+    if (agent.id === vm.agentActor)
+      return hqRefuse(
+        `${agent.name} already answers this conversation; write without @${agent.id}.`,
+      );
+    if (parsed[2].trim() === "")
+      return hqRefuse(`Write something for ${agent.name} after @${agent.id}.`);
+    // Q109-12 a (R10924K-10): past its local checks, a mention declines what the
+    // banner showed, as any message does.
+    mockDecline(vm, payload.declines);
+    const now = Date.now();
+    const sessionId = `device.${++sessionSerial + 10}`;
+    const prompt: AgentMessageVm = {
+      id: `local-${sessionSerial}`,
+      role: "person",
+      authorActor: "ana",
+      authorName: "Ana",
+      body: line,
+      createdAtMs: now,
+      state: "waiting",
+    };
+    // The parent's copy of the line, cut as Rust cuts it (`MAX_INLINE_ANSWER`).
+    const cutLine = line.length > 1200;
+    const inlinePrompt = cutLine ? { ...prompt, body: `${line.slice(0, 1200)}…` } : prompt;
+    const child: AgentChildSessionVm = {
+      threadId: prompt.id,
+      sessionId,
+      archived: false,
+      truncated: cutLine,
+      agentActor: agent.id,
+      agentName: agent.name,
+      agentMark: agent.name[0],
+      createdAtMs: now,
+      prompt: inlinePrompt,
+      items: [],
+      folds: [],
+      messages: [],
+      live: [],
+    };
+    vm.children = [...(vm.children ?? []), child];
+    const row: AgentSessionRowVm = {
+      database: vm.database,
+      sessionId,
+      title: parsed[2].trim().split("\n")[0],
+      titleWrite: { state: "confirmed" },
+      displayName: `${agent.name} · ${parsed[2].trim().split("\n")[0]}`,
+      handle: "quiet-heron-listens",
+      createdAtMs: now,
+      trust: "native",
+      instances: [],
+      agentActor: agent.id,
+      agentName: agent.name,
+      agentMark: agent.name[0],
+      archived: false,
+      lastActivityMs: now,
+      choosesDrives: true,
+    };
+    const key = JSON.stringify([row.database, row.sessionId]);
+    const thread: AgentSessionViewVm = {
+      ...row,
+      readOnly: false,
+      complete: true,
+      hasEarlier: false,
+      loadingEarlier: false,
+      readsTrace: true,
+      untrusted: false,
+      live: [],
+      tools: [],
+      prefs: { viewMode: "normal" },
+      items: [],
+      folds: [],
+      approvals: [],
+      messages: [prompt],
+    };
+    sessionRows.unshift(row);
+    sessionViews.set(key, thread);
+    publishSessions();
+    setTimeout(() => {
+      if (agent.id === "mason") {
+        // Refused whole: the thread never existed; the line stays on the parent.
+        sessionRows.splice(sessionRows.indexOf(row), 1);
+        sessionViews.delete(key);
+        prompt.state = "refused";
+        inlinePrompt.state = "refused";
+        child.refusal = `The agents server refused to bring ${agent.name} in: ${agent.name} is not an agent of ${vm.database}. Nothing was sent to ${agent.name}.`;
+        publishSessions();
+        return;
+      }
+      prompt.state = "taken";
+      inlinePrompt.state = "taken";
+      // A line with "brief" is answered below the cut: the parent shows it whole
+      // in a box that may still overflow on a phone (R10924K-06).
+      const brief = line.includes("brief");
+      const answer: AgentMessageVm = {
+        id: `answer-${sessionId}`,
+        role: "agent",
+        authorActor: agent.id,
+        authorName: agent.name,
+        // Long, as Rust cuts it for the parent (`MAX_INLINE_ANSWER`); the thread has it whole.
+        body: brief
+          ? `Ship on Friday. ${"Each check has an owner and the evidence it needs. ".repeat(20)}`.slice(
+              0,
+              1100,
+            )
+          : `The research notes agree: ship the release on Friday, after the acceptance checks. ${"Each check is listed with its owner and the evidence it needs before the release goes out. ".repeat(14)}`
+              .slice(0, 1200)
+              .concat("…"),
+        createdAtMs: Date.now(),
+      };
+      child.items = [
+        { kind: "fold", turnId: prompt.id },
+        { kind: "message", messageId: answer.id },
+      ];
+      child.folds = [
+        {
+          turnId: prompt.id,
+          leadInIds: [],
+          reasoning: null,
+          steps: [],
+          failures: [],
+          status: "done",
+          statusLabel: "Finished",
+          summary: "Answered in 2 s",
+          durationMs: 2000,
+        },
+      ];
+      child.messages = [answer];
+      child.truncated = cutLine || !brief;
+      thread.messages = [prompt, answer];
+      publishSessions();
+    }, 1200);
+    return null;
+  },
 };
+
+/** The agents of a mock database's directory, for the `@` menu. */
+function mockMentionAgents(database: string): { id: string; name: string }[] {
+  return database === "alpha"
+    ? [
+        { id: "assistant", name: "Assistant" },
+        { id: "mason", name: "Mason" },
+        { id: "tola-grey", name: "Tola Grey" },
+      ]
+    : [
+        { id: "assistant", name: "Assistant" },
+        { id: "researcher", name: "Researcher" },
+      ];
+}
 
 // ?sessions=launch&people=member|refused|offline|long — a session's People sheet.
 const peopleScenario = new URLSearchParams(location.search).get("people");

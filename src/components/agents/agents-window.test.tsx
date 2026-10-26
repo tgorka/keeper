@@ -39,6 +39,15 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   }),
   agentSessionClose: mock.close,
   agentSend: mock.send,
+  // The composer's line (109.24); an ask's option still answers through agentSend.
+  agentSendLine: mock.send,
+  agentMentionPreview: vi.fn(async (_target: unknown, before: string, after: string) => ({
+    before,
+    after,
+    token: null,
+    rows: [],
+    note: null,
+  })),
   agentSessionArchive: mock.archive,
   agentSessionUnarchive: mock.unarchive,
   agentSessionPageBack: mock.page,

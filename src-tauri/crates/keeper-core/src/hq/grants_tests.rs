@@ -1209,3 +1209,96 @@ fn a_grants_unit_revoked_once_is_asked_again_so_service_that_began_shows() {
     assert_eq!(laptop.agent_name, "Tola");
     assert!(laptop.can_revoke);
 }
+
+/// 109.24 (R10924K-10, Q109-12 a): a mention declines what the banner showed,
+/// as any message does — after its local checks, so a mention refused here
+/// declines nothing — and the denials are written before the thread.
+#[test]
+fn a_mention_declines_what_the_banner_showed_before_its_thread() {
+    let w = world("zoë");
+    session(&w, "dev1.1", None, false);
+    request(&w, "mine", "dev1.1", "run", "T2", git_status(), &["zoë"]);
+    let shown = shown(&w, "dev1.1");
+    assert_eq!(shown.len(), 1, "the banner shows the request");
+    let sources = [w.alpha.clone()];
+    let send = |line: &str| {
+        crate::hq::mention::send_line(&sources, &w.alpha, &w.decisions, "dev1.1", line, &shown)
+    };
+    // Refused here: nothing declined, nothing written.
+    for line in ["@nobody hi", "@nixi hi", "@tola"] {
+        send(line).expect_err("refused here");
+    }
+    assert_eq!(
+        card(&w, "dev1.1", "mine").state,
+        AgentApprovalStateVm::Pending
+    );
+    let conn = rusqlite::Connection::open(w.dir.path().join("alpha.sqlite")).expect("opens");
+    let last: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM _syncular_outbox",
+            [],
+            |row| row.get(0),
+        )
+        .expect("seq");
+    send("@tola look at the logs").expect("started");
+    let declined = card(&w, "dev1.1", "mine");
+    assert_eq!(declined.state, AgentApprovalStateVm::Denied);
+    assert_eq!(declined.decided_by.as_deref(), Some("Zoë"));
+    // The denial is its own commit, before the thread's one commit.
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(ops_json, '$[0].table') FROM _syncular_outbox \
+             WHERE seq > ?1 ORDER BY seq",
+        )
+        .expect("outbox");
+    let tables: Vec<String> = stmt
+        .query_map([last], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("tables");
+    assert_eq!(tables, vec!["approvals", "sessions"]);
+}
+
+/// 109.24 (R10924K-12, Q109-12 a): the composer's every line goes through
+/// `mention::send_line`; a plain one declines what the banner showed, as
+/// 109.11's send does — the denial, then the message.
+#[test]
+fn a_plain_line_from_the_composer_declines_what_the_banner_showed() {
+    let w = world("zoë");
+    session(&w, "dev1.1", None, false);
+    request(&w, "mine", "dev1.1", "run", "T2", git_status(), &["zoë"]);
+    let shown = shown(&w, "dev1.1");
+    assert_eq!(shown.len(), 1, "the banner shows the request");
+    let conn = rusqlite::Connection::open(w.dir.path().join("alpha.sqlite")).expect("opens");
+    let last: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM _syncular_outbox",
+            [],
+            |row| row.get(0),
+        )
+        .expect("seq");
+    crate::hq::mention::send_line(
+        std::slice::from_ref(&w.alpha),
+        &w.alpha,
+        &w.decisions,
+        "dev1.1",
+        "yes, do it",
+        &shown,
+    )
+    .expect("sent");
+    let declined = card(&w, "dev1.1", "mine");
+    assert_eq!(declined.state, AgentApprovalStateVm::Denied);
+    assert_eq!(declined.decided_by.as_deref(), Some("Zoë"));
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(ops_json, '$[0].table') FROM _syncular_outbox \
+             WHERE seq > ?1 ORDER BY seq",
+        )
+        .expect("outbox");
+    let tables: Vec<String> = stmt
+        .query_map([last], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("tables");
+    assert_eq!(tables, vec!["approvals", "messages"]);
+}

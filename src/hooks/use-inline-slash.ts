@@ -55,6 +55,8 @@ export function useInlineSlash({
   resolve,
   onInsert,
   reportAs,
+  candidate: isCandidate = inlineCandidate,
+  failureSentence = INLINE_PREVIEW_FAILED,
 }: {
   /** The composer's draft. */
   draft: string;
@@ -68,6 +70,14 @@ export function useInlineSlash({
   onInsert: (draft: string, caret: number) => void;
   /** The `keeper.log` source a failed preview is written under. */
   reportAs: string;
+  /**
+   * Whether the caret could be at a token worth asking about; the mid-text `/`'s
+   * {@link inlineCandidate} unless a composer's other token (109.24's leading `@`)
+   * says otherwise. Must be referentially stable.
+   */
+  candidate?: (before: string, after: string) => boolean;
+  /** What is said under the field while the preview cannot be asked. */
+  failureSentence?: string;
 }): InlineSlashState {
   const [preview, setPreview] = useState<ChatInlinePreviewVm | null>(null);
   const [highlight, setHighlight] = useState(0);
@@ -77,7 +87,7 @@ export function useInlineSlash({
   const reported = useRef(false);
   const before = caret === null ? "" : draft.slice(0, caret);
   const after = caret === null ? "" : draft.slice(caret);
-  const candidate = enabled && caret !== null && inlineCandidate(before, after);
+  const candidate = enabled && caret !== null && isCandidate(before, after);
 
   useEffect(() => {
     if (!candidate) {
@@ -186,7 +196,7 @@ export function useInlineSlash({
       "aria-controls": drawn ? ids.list : undefined,
       "aria-activedescendant": drawn && active !== undefined ? ids.options[active.key] : undefined,
     },
-    failure: failed ? INLINE_PREVIEW_FAILED : null,
+    failure: failed ? failureSentence : null,
     note: open && shown !== null ? shown.note : null,
   };
 }

@@ -521,6 +521,33 @@ pub async fn agent_send(
     blocking(move |hq| hq.send(&session(database, session_id), &body, &declines)).await
 }
 
+/// The composer's line (109.24): `@<handle> …` starts that agent's thread
+/// from this session; any other line is a message, as [`agent_send`]. Either
+/// declines first what the banner showed (`declines`, Q109-12 a).
+#[tauri::command]
+pub async fn agent_send_line(
+    database: String,
+    session_id: String,
+    line: String,
+    declines: Vec<ShownApprovalVm>,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.send_line(&session(database, session_id), &line, &declines)).await
+}
+
+/// What an `@` at the start of a session's draft offers (109.24): Rust's
+/// rows, the same shape as the mid-text menu's.
+#[tauri::command]
+pub fn agent_mention_preview(
+    database: String,
+    session_id: String,
+    before: String,
+    after: String,
+) -> Result<keeper_core::vm::ChatInlinePreviewVm, IpcError> {
+    hq()?
+        .mention_preview(&session(database, session_id), &before, &after)
+        .map_err(error)
+}
+
 /// Rust decides both menu rows and how Enter interprets an agents draft.
 #[tauri::command]
 pub fn agent_command_preview(
