@@ -61,7 +61,7 @@ fn row(source: &Source, session: &str) -> Result<Option<Map<String, Value>>, HqE
 /// What `agent` offers in `source`'s database: the union of its published
 /// profiles, and each instance's defaults. `models` keeps the order the
 /// profiles name them in (the agent definition's, which is the owner's:
-/// R-HQ-83), first naming wins; it is never sorted, so the picker lists
+/// R-HQ-86), first naming wins; it is never sorted, so the picker lists
 /// Anthropic opus, sonnet, haiku as offered rather than alphabetically.
 #[derive(Default)]
 struct Offered {
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!((reset.model, reset.effort), (None, None));
     }
 
-    /// The owner's order (R-HQ-83, field report 2026-10-27): the picker lists
+    /// The owner's order (R-HQ-86, field report 2026-10-27): the picker lists
     /// the models as the agent's profile offers them, Anthropic opus, sonnet,
     /// haiku and OpenAI astra, sol, terra, luna, and its provider groups in
     /// the order the list first names them; never alphabetically (which put
@@ -1045,7 +1045,7 @@ mod tests {
             "gpt-6-astra",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
-            "gpt-6-luna",
+            "gpt-6.1-luna",
             "openrouter/z-ai/glm-5.3-flash",
             "openrouter/qwen/qwen3.7-flash",
         ];
@@ -1073,6 +1073,39 @@ mod tests {
             }
         }
         assert_eq!(groups, ["Anthropic", "OpenAI", "Z.ai", "Qwen"]);
+    }
+
+    /// Two instances of one agent naming the same models in different orders:
+    /// the first profile (by id) to name a model fixes its place, and a later
+    /// profile only appends models nobody named yet (R63-02).
+    #[test]
+    fn a_model_named_by_two_profiles_keeps_its_first_place() {
+        let (_dir, source) = fixture(true);
+        let seed = |id: &str, models: &[&str]| RowOp::Upsert {
+            table: "agent_profiles".to_owned(),
+            values: authored(
+                &source,
+                object(
+                    json!({"id":id, "actor_id":"tola", "name":"tola", "description":"", "definition_hash":"h", "image_digest":"d", "started_at_ms":1, "dir":"alpha", "models":serde_json::to_string(models).expect("models"), "efforts":"[]", "default_model":models[0], "default_effort":null}),
+                ),
+            ),
+            base_version: None,
+        };
+        source
+            .replica
+            .mutate(vec![
+                seed("tola.a", &["claude-opus-5-5", "claude-sonnet-5-5"]),
+                seed(
+                    "tola.b",
+                    &["claude-sonnet-5-5", "gpt-6-astra", "claude-opus-5-5"],
+                ),
+            ])
+            .expect("seed");
+        let offered = offered(&source, "tola").expect("offers");
+        assert_eq!(
+            offered.models,
+            ["claude-opus-5-5", "claude-sonnet-5-5", "gpt-6-astra"]
+        );
     }
 
     #[test]
