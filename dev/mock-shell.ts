@@ -7285,11 +7285,16 @@ const settingsScenario = new URLSearchParams(location.search).get("settings");
 const singleModel = settingsScenario === "single" || ownerReport;
 const MOCK_MODELS = singleModel
   ? ["openrouter/z-ai/glm-5.3-flash"]
-  : // The five ids every agent offers at keeper-hq main c60ab1b (`agents/*/agent.toml`).
+  : // The ids every agent offers at keeper-hq hq/offer-luna-order (`agents/*/agent.toml`), in
+    // their order, which Rust's `settings::offered` keeps (R-HQ-83: the owner's order).
     [
       "claude-opus-5-5",
       "claude-sonnet-5-5",
       "claude-haiku-5-5",
+      "gpt-6-astra",
+      "gpt-6.1-sol",
+      "gpt-6.1-terra",
+      "gpt-6-luna",
       "openrouter/z-ai/glm-5.3-flash",
       "openrouter/qwen/qwen3.7-flash",
     ];
@@ -7300,6 +7305,10 @@ const MOCK_PROVIDERS: Record<string, string> = {
   "claude-opus-5-5": "Anthropic",
   "claude-sonnet-5-5": "Anthropic",
   "claude-haiku-5-5": "Anthropic",
+  "gpt-6-astra": "OpenAI",
+  "gpt-6.1-sol": "OpenAI",
+  "gpt-6.1-terra": "OpenAI",
+  "gpt-6-luna": "OpenAI",
   "openrouter/z-ai/glm-5.3-flash": "Z.ai",
   "openrouter/qwen/qwen3.7-flash": "Qwen",
 };
