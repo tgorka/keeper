@@ -32,6 +32,7 @@ const STATE_LABEL = {
   revoked: "Revoked",
   ended: "Ended",
   expired: "Expired",
+  inactive: "Inactive",
   refused: "Refused",
 } as const;
 

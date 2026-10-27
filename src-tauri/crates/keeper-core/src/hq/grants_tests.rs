@@ -1030,6 +1030,74 @@ fn an_expired_grant_reads_expired_and_offers_no_revoke() {
     assert!(!grant.can_revoke);
 }
 
+/// RG-08: a grant made on a device signed out since decides nothing
+/// (`hq.v8.grant_credential`), so it reads Inactive — never Active — and
+/// stays revocable; one from a device still signed in stays Active.
+#[test]
+fn a_grant_made_on_a_signed_out_device_reads_inactive_and_stays_revocable() {
+    let w = world("zoë");
+    let key = crate::hq::vocabulary::person_agent_key("zoë", NIXI);
+    let grant = |id: &str, device: &str| {
+        upsert(
+            TABLE,
+            json!({"id": id, "person_agent_key": key, "person_actor": "zoë",
+                   "agent_actor": NIXI, "session_id": null, "tool": "run",
+                   "args_match": "{\"program\":\"make\"}", "max_tier": "T2",
+                   "expires_at_ms": null, "revoked_at_ms": null, "granted_by_client": device,
+                   "created_at_ms": now() - 1_000, "author_actor": "zoë",
+                   "author_client": device}),
+        )
+    };
+    let device = |id: &str, name: &str, revoked: Option<i64>| {
+        upsert(
+            "clients",
+            json!({"id": id, "actor_id": "zoë", "kind": "device", "name": name, "host": null,
+                   "created_at_ms": 1, "revoked_at_ms": revoked, "dir": "alpha",
+                   "author_actor": "server", "author_client": "server"}),
+        )
+    };
+    w.alpha
+        .replica
+        .mutate(vec![
+            device("dev2", "laptop", Some(now() - 500)),
+            device("dev3", "phone", None),
+            grant("from-laptop", "dev2"),
+            grant("from-phone", "dev3"),
+        ])
+        .expect("written");
+    settle(&w, None);
+    let listed = list(std::slice::from_ref(&w.alpha), now());
+    let of = |id: &str| {
+        listed
+            .grants
+            .iter()
+            .find(|grant| grant.id == id)
+            .expect(id)
+            .clone()
+    };
+    let laptop = of("from-laptop");
+    assert_eq!(
+        (laptop.state, laptop.sentence.as_str()),
+        (
+            AgentGrantStateVm::Inactive,
+            "Inactive: made on “laptop”, a device that was signed out, so it decides nothing. \
+             Revoke it to clear it."
+        )
+    );
+    assert!(laptop.can_revoke, "the person can still clear it");
+    assert_eq!(of("from-phone").state, AgentGrantStateVm::Active);
+
+    revoke(&w.alpha, "from-laptop", now()).expect("revocable");
+    let after = list(std::slice::from_ref(&w.alpha), now());
+    let laptop = after
+        .grants
+        .iter()
+        .find(|grant| grant.id == "from-laptop")
+        .expect("listed");
+    assert_eq!(laptop.state, AgentGrantStateVm::Revoked);
+    assert!(!laptop.can_revoke);
+}
+
 /// A grant bound to a session ends with the session's archive, before the
 /// server's revocation (R3) reaches this device: it never reads live, and
 /// offers no revoke.

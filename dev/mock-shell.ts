@@ -6572,6 +6572,20 @@ const mockGrants: AgentGrantsVm["grants"] = ["empty", "loading", "error"].includ
         sentence: "Ended with its session; it stays ended if the session is reopened.",
         canRevoke: false,
       },
+      // Made on a device signed out since: it decides nothing, and stays revocable (RG-08).
+      {
+        id: "grant-signed-out",
+        database: "alpha",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "run",
+        scope: "Run “cargo check …”, whatever follows “check”",
+        createdAtMs: Date.now() - 3 * 86_400_000,
+        state: "inactive",
+        sentence:
+          "Inactive: made on “laptop”, a device that was signed out, so it decides nothing. Revoke it to clear it.",
+        canRevoke: true,
+      },
       // Expires 20 s after the page opens: the list reads Expired then, with no row changing
       // (R10911-05).
       {

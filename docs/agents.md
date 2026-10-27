@@ -367,7 +367,11 @@ Revoking stops new uses, not approvals already issued, and the section says so. 
 a session reads *Ended* once its session's row here is archived, and stays ended if the session is
 reopened; a session merely absent from the device (left, removed, not arrived yet) leaves the
 grant as it was, with Revoke. A grant reads *Expired* when its expiry passes: the views wake at
-the soonest one (`grants::next_expiry`). A refused grant or revocation is read back from the replica's per-row outcome record.
+the soonest one (`grants::next_expiry`). A grant made on a device that has since been signed out
+(its `clients` row, joined on `granted_by_client`, has `revoked_at_ms`) reads *Inactive*: "made on
+“<device>”, a device that was signed out, so it decides nothing" — the server refuses every
+approval it would make (`hq.v8.grant_credential`) — and keeps *Revoke* so the person can clear it
+(RG-08). A refused grant or revocation is read back from the replica's per-row outcome record.
 
 The requests waiting for this person sit in a banner above the composer (`AgentSessionViewVm
 .banner`), out of the reading column. **Sending a message declines them** — each its own denial,
@@ -383,7 +387,8 @@ assistive technology, so it is announced once. Mock shell: `?sessions=launch` dr
 untrusted; `&grants=refused` has the server refuse every grant write; `&grants=unserved` makes
 the session's agent one that does not serve the person; `&grants=decline-fails` fails every denial
 write; `window.__keeperMockLateApproval()` lands a request without drawing it. The grants list
-holds an ended grant and one that expires 20 s after the page opens.
+holds an ended grant, an inactive one made on a signed-out device, and one that expires 20 s
+after the page opens.
 
 **Always allow: known limits.**
 
@@ -395,6 +400,10 @@ holds an ended grant and one that expires 20 s after the page opens.
   expiry wakes one), so an idle device can wait longer; and if the second window write of a
   re-ask fails, the unit stays out of the window until the units change or keeper restarts — no
   offer and no rows meanwhile (R10911-18).
+- A grant made on a device that is suspended or whose attestation lapsed reads *Active*, though
+  the server refuses it as it does one from a signed-out device. The directory keeper syncs carries
+  only `clients.revoked_at_ms`; showing those states (and that such a grant decides again once the
+  device signs in) waits for keeper-hq to sync them, ideally as a server-computed flag (RG-08).
 
 Conversations agents had before they moved to the database are archived sessions of their
 database (*Imported history*, below). Instance selection is **Answers from** (below); message and
