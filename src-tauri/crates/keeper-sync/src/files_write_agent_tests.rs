@@ -185,6 +185,20 @@ fn an_lfs_path_is_refused_by_its_attributes_and_by_its_pointer() {
 }
 
 #[test]
+fn a_pointer_only_in_the_index_is_refused_too() {
+    let dir = drive();
+    let root = dir.path();
+    // Committed as a pointer, its content materialized on this disk.
+    write(root, "notes/pointer.md", "the real text\n");
+    assert_eq!(
+        check(root, "notes/pointer.md", AgentTarget::Existing),
+        Err(WriteRefusal::LfsRouted {
+            subpath: "notes/pointer.md".to_owned()
+        })
+    );
+}
+
+#[test]
 fn a_pointer_only_on_the_disk_is_refused_too() {
     let dir = drive();
     let root = dir.path();
