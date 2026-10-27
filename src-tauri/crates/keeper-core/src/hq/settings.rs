@@ -59,10 +59,13 @@ fn row(source: &Source, session: &str) -> Result<Option<Map<String, Value>>, HqE
 }
 
 /// What `agent` offers in `source`'s database: the union of its published
-/// profiles, and each instance's defaults.
+/// profiles, and each instance's defaults. `models` keeps the order the
+/// profiles name them in (the agent definition's, which is the owner's:
+/// R-HQ-86), first naming wins; it is never sorted, so the picker lists
+/// Anthropic opus, sonnet, haiku as offered rather than alphabetically.
 #[derive(Default)]
 struct Offered {
-    models: BTreeSet<String>,
+    models: Vec<String>,
     efforts: BTreeSet<Effort>,
     defaults: Vec<AgentSettingsDefaultVm>,
 }
@@ -73,12 +76,16 @@ fn offered(source: &Source, agent: &str) -> Result<Offered, ReplicaError> {
         &[agent.into()],
     )?;
     let mut offered = Offered {
-        models: BTreeSet::new(),
+        models: Vec::new(),
         efforts: BTreeSet::new(),
         defaults: Vec::new(),
     };
     for profile in profiles {
-        offered.models.extend(names(&profile, "models"));
+        for model in names(&profile, "models") {
+            if !offered.models.contains(&model) {
+                offered.models.push(model);
+            }
+        }
         offered.efforts.extend(
             names(&profile, "efforts")
                 .iter()
@@ -131,7 +138,7 @@ fn settings_of(offered: Offered, saved: Option<&Map<String, Value>>) -> AgentSes
         effort: saved
             .and_then(|r| opt_text(r, "effort"))
             .and_then(|s| Effort::parse(&s)),
-        models: offered.models.into_iter().collect(),
+        models: offered.models,
         efforts: offered.efforts.into_iter().collect(),
         defaults: offered.defaults,
         chosen_at_ms: saved.and_then(|r| int(r, "updated_at_ms")),
@@ -997,7 +1004,9 @@ mod tests {
     fn choices_union_only_matching_profiles_and_preserve_each_default() {
         let (_dir, source) = fixture(true);
         let choices = view(&source, "dev1.1").expect("choices");
-        assert_eq!(choices.models, ["alternate", "primary", "second"]);
+        // The profiles' order, first naming wins (nixi.one names primary, alternate;
+        // nixi.two adds second): never sorted.
+        assert_eq!(choices.models, ["primary", "alternate", "second"]);
         assert_eq!(choices.efforts, [Effort::Medium, Effort::High]);
         assert_eq!(
             choices
@@ -1019,6 +1028,84 @@ mod tests {
         set(&source, "dev1.1", None, None, 11).expect("reset");
         let reset = view(&source, "dev1.1").expect("reset view");
         assert_eq!((reset.model, reset.effort), (None, None));
+    }
+
+    /// The owner's order (R-HQ-86, field report 2026-10-27): the picker lists
+    /// the models as the agent's profile offers them, Anthropic opus, sonnet,
+    /// haiku and OpenAI astra, sol, terra, luna, and its provider groups in
+    /// the order the list first names them; never alphabetically (which put
+    /// Haiku first, and luna before sol and terra).
+    #[test]
+    fn the_picker_lists_models_in_the_order_the_agent_offers_them() {
+        let (_dir, source) = fixture(true);
+        let owners = [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.1-luna",
+            "openrouter/z-ai/glm-5.3-flash",
+            "openrouter/qwen/qwen3.7-flash",
+        ];
+        source
+            .replica
+            .mutate(vec![RowOp::Upsert {
+                table: "agent_profiles".to_owned(),
+                values: authored(
+                    &source,
+                    object(
+                        json!({"id":"tola.one", "actor_id":"tola", "name":"tola", "description":"", "definition_hash":"h", "image_digest":"d", "started_at_ms":1, "dir":"alpha", "models":serde_json::to_string(&owners).expect("models"), "efforts":"[]", "default_model":"claude-opus-5-5", "default_effort":null}),
+                    ),
+                ),
+                base_version: None,
+            }])
+            .expect("seed");
+        let settings = settings_of(offered(&source, "tola").expect("offers"), None);
+        let picker = picker_of(&settings, None, None, AgentSettingsWriteVm::Confirmed);
+        let ids: Vec<&str> = picker.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, owners);
+        let mut groups: Vec<&str> = Vec::new();
+        for model in &picker.models {
+            if !groups.contains(&model.provider.as_str()) {
+                groups.push(&model.provider);
+            }
+        }
+        assert_eq!(groups, ["Anthropic", "OpenAI", "Z.ai", "Qwen"]);
+    }
+
+    /// Two instances of one agent naming the same models in different orders:
+    /// the first profile (by id) to name a model fixes its place, and a later
+    /// profile only appends models nobody named yet (R63-02).
+    #[test]
+    fn a_model_named_by_two_profiles_keeps_its_first_place() {
+        let (_dir, source) = fixture(true);
+        let seed = |id: &str, models: &[&str]| RowOp::Upsert {
+            table: "agent_profiles".to_owned(),
+            values: authored(
+                &source,
+                object(
+                    json!({"id":id, "actor_id":"tola", "name":"tola", "description":"", "definition_hash":"h", "image_digest":"d", "started_at_ms":1, "dir":"alpha", "models":serde_json::to_string(models).expect("models"), "efforts":"[]", "default_model":models[0], "default_effort":null}),
+                ),
+            ),
+            base_version: None,
+        };
+        source
+            .replica
+            .mutate(vec![
+                seed("tola.a", &["claude-opus-5-5", "claude-sonnet-5-5"]),
+                seed(
+                    "tola.b",
+                    &["claude-sonnet-5-5", "gpt-6-astra", "claude-opus-5-5"],
+                ),
+            ])
+            .expect("seed");
+        let offered = offered(&source, "tola").expect("offers");
+        assert_eq!(
+            offered.models,
+            ["claude-opus-5-5", "claude-sonnet-5-5", "gpt-6-astra"]
+        );
     }
 
     #[test]
@@ -1341,7 +1428,7 @@ mod tests {
             6,
         );
         assert!(
-            matches!(&refused, Err(HqError::Sentence(s)) if s.contains("alternate, primary or second")),
+            matches!(&refused, Err(HqError::Sentence(s)) if s.contains("primary, alternate or second")),
             "{refused:?}"
         );
         assert_eq!(stored(&source), (Value::Null, json!("high")));
@@ -1653,7 +1740,7 @@ mod tests {
         );
         assert_eq!(stored(&source), (json!("alternate"), json!("high")));
         assert!(run(&source, "dev1.1", "/model foreign", None)
-            .is_err_and(|e| e.contains("choose alternate, primary or second")));
+            .is_err_and(|e| e.contains("choose primary, alternate or second")));
         assert!(run(&source, "dev1.1", "/effort low", None)
             .is_err_and(|e| e.contains("choose medium or high")));
         assert!(run(&source, "dev1.1", "/effort loud", None).is_err());
