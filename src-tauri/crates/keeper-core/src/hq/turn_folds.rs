@@ -64,6 +64,14 @@ pub(super) fn project(
         .iter()
         .map(|turn| (turn.vm.turn_id.as_str(), turn))
         .collect();
+    // A close with nothing to read — the 0-byte `finish = "tool_calls"` row a
+    // turn writes before a parked call (owner report 2026-10-27, `.9`) — is
+    // never a bubble of its own: its turn is read as its fold, at its work.
+    let blank: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.body.trim().is_empty() && m.attachments.is_empty())
+        .map(|m| m.id.as_str())
+        .collect();
     for row in rows.iter().filter(|row| text(row, "role") == "agent") {
         let turn = text(row, "turn_id");
         let details = json(row, "metadata");
@@ -75,7 +83,11 @@ pub(super) fn project(
         let id = text(row, "id");
         let at = int(row, "created_at_ms").unwrap_or(i64::MAX);
         if live::is_terminal(&details) {
-            answers.insert(id, turn);
+            if blank.contains(id) {
+                hidden.insert(id);
+            } else {
+                answers.insert(id, turn);
+            }
             if let Some(error) = live::details(&details).and_then(|d| d.error) {
                 errors.entry(turn).or_default().push(one_line(&error));
             }
@@ -87,7 +99,10 @@ pub(super) fn project(
             }
         } else {
             hidden.insert(id);
-            lead_ins.entry(turn).or_default().push(id.to_owned());
+            // A blank lead-in has nothing to read inside the fold either.
+            if !blank.contains(id) {
+                lead_ins.entry(turn).or_default().push(id.to_owned());
+            }
         }
         let first = work_at.entry(turn).or_insert(at);
         *first = (*first).min(at);

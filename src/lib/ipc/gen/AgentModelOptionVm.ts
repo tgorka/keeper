@@ -5,6 +5,12 @@
  */
 export type AgentModelOptionVm = { id: string, 
 /**
+ * The group the picker lists it under (t3.chat's provider groups, owner
+ * ruling 2026-10-27): read from the id alone ([`provider_of`]), since
+ * the contract publishes model ids and nothing about them.
+ */
+provider: string, 
+/**
  * The next answer uses it: the saved choice, or a default while none
  * that is still offered is saved.
  */

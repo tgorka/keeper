@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionSettingsPicker } from "@/components/agents/session-settings-picker";
 import type * as Ipc from "@/lib/ipc/client";
@@ -23,9 +24,9 @@ const target = { database: "alpha", sessionId: "s.1" };
 function picker(patch: Partial<AgentSessionPickerVm> = {}): AgentSessionPickerVm {
   return {
     models: [
-      { id: "alpha-large", current: false, default: false },
-      { id: "beta-small", current: true, default: true },
-      { id: "gamma-fast", current: false, default: false },
+      { id: "alpha-large", provider: "Alpha", current: false, default: false },
+      { id: "beta-small", provider: "Beta", current: true, default: true },
+      { id: "gamma-fast", provider: "Alpha", current: false, default: false },
     ],
     efforts: [
       { effort: "medium", label: "Medium", current: true, default: true },
@@ -37,6 +38,26 @@ function picker(patch: Partial<AgentSessionPickerVm> = {}): AgentSessionPickerVm
     write: { state: "confirmed" },
     ...patch,
   };
+}
+
+/** The bar's chips as `settings::footer` reads them from this picker. */
+function Picker(
+  props: Omit<ComponentProps<typeof SessionSettingsPicker>, "footer" | "picker"> & {
+    picker: AgentSessionPickerVm;
+  },
+) {
+  const { picker: p } = props;
+  return (
+    <SessionSettingsPicker
+      {...props}
+      footer={{
+        model: p.modelLabel,
+        effort: p.effortLabel ?? "Default",
+        choosesModel: p.models.length > 1,
+        choosesEffort: p.efforts.length > 1,
+      }}
+    />
+  );
 }
 
 function openModels() {
@@ -56,7 +77,7 @@ beforeEach(() => {
 describe("the model and effort pickers", () => {
   it("has no effort menu at all when the agent offers no effort (Nixi)", () => {
     render(
-      <SessionSettingsPicker
+      <Picker
         target={target}
         agent="nixi"
         picker={picker({ efforts: [], effortLabel: undefined })}
@@ -64,25 +85,30 @@ describe("the model and effort pickers", () => {
     );
     expect(screen.getByRole("button", { name: "Model: beta-small" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Effort/ })).toBeNull();
+    // Still named, as a chip that opens nothing (owner ruling 2026-10-27).
+    expect(screen.getByText("Default")).toBeInTheDocument();
   });
 
   it("lists only offered models, starred ones first, and never a starred model not offered", () => {
     persistFold(modelFavoritesCookie(["gamma-fast", "foreign-model"]));
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker()} />);
+    render(<Picker target={target} agent="nixi" picker={picker()} />);
     const dialog = openModels();
     const options = within(dialog).getAllByRole("option");
-    // Starred first; the model in use and the agent's default say so in the option's name.
+    // Starred first, then Rust's provider groups; the model in use and the agent's default say
+    // so in the option's name.
     expect(options.map((option) => option.getAttribute("aria-label"))).toEqual([
       "gamma-fast",
       "alpha-large",
       "beta-small, in use, default",
     ]);
+    expect(within(dialog).getByRole("group", { name: "Alpha" })).toHaveTextContent("alpha-large");
+    expect(within(dialog).getByRole("group", { name: "Beta" })).toHaveTextContent("beta-small");
     expect(within(dialog).queryByText("foreign-model")).toBeNull();
     expect(within(options[2]).getByText("Default")).toBeInTheDocument();
   });
 
   it("searches and picks with the keyboard, writing the model from the next answer", async () => {
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker()} />);
+    render(<Picker target={target} agent="nixi" picker={picker()} />);
     const dialog = openModels();
     const search = within(dialog).getByRole("combobox", { name: "Search models" });
     fireEvent.change(search, { target: { value: "gamma" } });
@@ -94,7 +120,7 @@ describe("the model and effort pickers", () => {
   });
 
   it("starring a model keeps the popover open and writes nothing", () => {
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker()} />);
+    render(<Picker target={target} agent="nixi" picker={picker()} />);
     const dialog = openModels();
     fireEvent.click(
       within(dialog).getByRole("button", { name: "Star alpha-large as a favourite" }),
@@ -105,7 +131,7 @@ describe("the model and effort pickers", () => {
   });
 
   it("offers only the agent's efforts with the default's badge, and writes the one picked", async () => {
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker()} />);
+    render(<Picker target={target} agent="nixi" picker={picker()} />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Effort: Medium" }), {
       button: 0,
       ctrlKey: false,
@@ -120,13 +146,9 @@ describe("the model and effort pickers", () => {
   });
 
   it("resets through Rust's reset, shown only when a choice is saved", async () => {
-    const { rerender } = render(
-      <SessionSettingsPicker target={target} agent="nixi" picker={picker()} />,
-    );
+    const { rerender } = render(<Picker target={target} agent="nixi" picker={picker()} />);
     expect(screen.queryByRole("button", { name: /Reset/ })).toBeNull();
-    rerender(
-      <SessionSettingsPicker target={target} agent="nixi" picker={picker({ resettable: true })} />,
-    );
+    rerender(<Picker target={target} agent="nixi" picker={picker({ resettable: true })} />);
     fireEvent.click(
       screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
     );
@@ -137,7 +159,7 @@ describe("the model and effort pickers", () => {
     const running =
       "This answer keeps its model and effort; your change applies from the next answer.";
     mock.change.mockResolvedValue({ note: running, pick: { model: "alpha-large", effort: null } });
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker({ running })} />);
+    render(<Picker target={target} agent="nixi" picker={picker({ running })} />);
     fireEvent.click(screen.getByRole("button", { name: /^Model: / }));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText(running)).toBeInTheDocument();
@@ -147,7 +169,7 @@ describe("the model and effort pickers", () => {
 
   it("shows the newest answer's fallback by the picker", () => {
     const fallback = "gone-model is no longer offered; using beta-small instead.";
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker({ fallback })} />);
+    render(<Picker target={target} agent="nixi" picker={picker({ fallback })} />);
     expect(screen.getByRole("status")).toHaveTextContent(fallback);
   });
 
@@ -155,7 +177,7 @@ describe("the model and effort pickers", () => {
     const sentence =
       "The server refused your model and effort change: the agent does not offer that model.";
     render(
-      <SessionSettingsPicker
+      <Picker
         target={target}
         agent="nixi"
         picker={picker({ write: { state: "refused", sentence } })}
@@ -170,13 +192,13 @@ describe("the model and effort pickers", () => {
       message: "gamma-fast is not offered here; choose alpha-large or beta-small.",
       accountId: null,
     });
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker()} />);
+    render(<Picker target={target} agent="nixi" picker={picker()} />);
     fireEvent.click(within(openModels()).getAllByRole("option")[0]);
     expect(await screen.findByRole("alert")).toHaveTextContent("is not offered here");
   });
 
   it("Enter or Space on a star stars it and never chooses a model (R10918-01)", async () => {
-    render(<SessionSettingsPicker target={target} agent="nixi" picker={picker()} />);
+    render(<Picker target={target} agent="nixi" picker={picker()} />);
     const dialog = openModels();
     fireEvent.keyDown(
       within(dialog).getByRole("button", { name: "Star alpha-large as a favourite" }),
@@ -206,23 +228,44 @@ describe("the model and effort pickers", () => {
     expect(screen.getByRole("dialog")).toBe(dialog);
   });
 
-  it("draws no empty group for an agent with nothing to choose", () => {
+  it("names model and effort as read-only chips where there is nothing to choose", () => {
     render(
-      <SessionSettingsPicker
+      <Picker
         target={target}
         agent="nixi"
-        picker={picker({ models: [], efforts: [], effortLabel: undefined, resettable: true })}
+        picker={picker({
+          models: [{ id: "beta-small", provider: "Beta", current: true, default: true }],
+          efforts: [],
+          effortLabel: undefined,
+          resettable: true,
+        })}
       />,
     );
-    expect(screen.queryByRole("group", { name: "Model and effort" })).toBeNull();
-    expect(screen.queryByRole("button")).toBeNull();
+    const bar = screen.getByRole("group", { name: "Model and effort" });
+    expect(within(bar).getByText("beta-small")).toBeInTheDocument();
+    expect(within(bar).getByText("Default")).toBeInTheDocument();
+    // Only Reset, for the saved choice: neither chip opens anything.
+    expect(
+      within(bar)
+        .getAllByRole("button")
+        .map((b) => b.textContent),
+    ).toEqual(["Reset"]);
+  });
+
+  it("says which model failed and the way back, above everything else", () => {
+    const failed =
+      "The last answer failed on gamma-fast: provider answered 429. Choose another model, or Reset to the agent's default.";
+    render(<Picker target={target} agent="nixi" picker={picker({ failed, resettable: true })} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(failed);
+    expect(screen.getByRole("button", { name: "Model: beta-small" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps what a change wrote as this device's last pick for the agent, and forgets it on reset", async () => {
     mock.change.mockResolvedValue({ note: null, pick: { model: "gamma-fast", effort: "high" } });
-    render(
-      <SessionSettingsPicker target={target} agent="nixi" picker={picker({ resettable: true })} />,
-    );
+    render(<Picker target={target} agent="nixi" picker={picker({ resettable: true })} />);
     fireEvent.click(within(openModels()).getAllByRole("option")[0]);
     await waitFor(() =>
       expect(lastAgentPick("nixi")).toEqual({ model: "gamma-fast", effort: "high" }),

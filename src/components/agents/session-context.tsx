@@ -1,4 +1,4 @@
-import { CircleHelp } from "lucide-react";
+import { Gauge } from "lucide-react";
 import { type ReactNode, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,26 +12,25 @@ import {
 import { HoverHint } from "@/components/ui/tooltip";
 import type { AgentSessionViewVm } from "@/lib/ipc/client";
 
-type ContextVm = NonNullable<AgentSessionViewVm["context"]>;
+type ContextVm = AgentSessionViewVm["context"];
 
 /**
- * The one Details panel for the session's context window. The ring beside Send and `/context`
- * both open it; `session-view.tsx` holds whether it is open. All counts, rounding and ring
- * geometry come from keeper-core.
+ * The one Details panel for the session's context window. The context reading in the composer's
+ * bar and `/context` both open it; `session-view.tsx` holds whether it is open. All counts,
+ * rounding, labels and ring geometry come from keeper-core, which sends the context in every view
+ * mode and says when it is unknown (owner ruling 2026-10-27).
  */
 export function SessionContext({
   context,
-  verbose,
   open,
   onOpenChange,
   children,
 }: {
+  /** Absent until the session's first view arrives. */
   context: ContextVm | undefined;
-  /** The verbose view mode: the one in which Rust sends an answer's details. */
-  verbose: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Where the ring lives: it must render inside this panel's root to be its trigger. */
+  /** Where the reading lives: it must render inside this panel's root to be its trigger. */
   children: ReactNode;
 }) {
   // Focus returns to whatever opened the panel: the ring, or the message field `/context` ran in.
@@ -60,33 +59,31 @@ export function SessionContext({
           <SheetDescription>Context window · latest answer</SheetDescription>
         </SheetHeader>
         <section aria-label="Context breakdown" className="min-w-0 space-y-4 px-4 pb-6">
-          {context ? (
-            <ContextBreakdown context={context} />
-          ) : (
-            <p className="text-muted-foreground text-sm">
-              {verbose
-                ? "The latest answer has no context window measurement."
-                : "The context window is one of an answer's details. Choose the Verbose view to see it."}
-            </p>
-          )}
+          {context && <ContextBreakdown context={context} />}
         </section>
       </SheetContent>
     </Sheet>
   );
 }
 
-/** The ring beside Send; render it inside `SessionContext`. */
+/**
+ * The bar's context reading (t3.chat's `5.3k / 1M`): a ring and Rust's compact label, always
+ * drawn — an empty ring and `—` until an answer has measured it. Render it inside
+ * `SessionContext`.
+ */
 export function SessionContextTrigger({ context }: { context: ContextVm }) {
   return (
     <HoverHint label="Context window" detail={context.summary}>
       <SheetTrigger asChild>
         <Button
           variant="ghost"
-          className="min-h-11 shrink-0 gap-2 px-2 text-muted-foreground"
+          size="sm"
+          data-slot="agent-context-reading"
+          className="min-h-11 shrink-0 gap-1.5 px-2 text-muted-foreground"
           aria-label={`Context details: ${context.summary}`}
         >
-          {context.ringBackground && context.meterPercent !== null ? (
-            <span className="flex size-5 items-center justify-center">
+          <span className="flex size-4 items-center justify-center">
+            {context.meterPercent !== null && (
               <meter
                 aria-label="Context window occupancy"
                 min={0}
@@ -95,18 +92,17 @@ export function SessionContextTrigger({ context }: { context: ContextVm }) {
                 aria-valuetext={context.summary}
                 className="sr-only"
               />
-              <span
-                aria-hidden="true"
-                className="flex size-5 items-center justify-center rounded-full text-primary"
-                style={{ background: context.ringBackground }}
-              >
-                <span className="size-3.5 rounded-full bg-background" />
-              </span>
+            )}
+            <span
+              aria-hidden="true"
+              data-slot="agent-context-ring"
+              className="flex size-4 items-center justify-center rounded-full text-primary"
+              style={{ background: context.ringBackground }}
+            >
+              <span className="size-2.5 rounded-full bg-background" />
             </span>
-          ) : (
-            <CircleHelp className="size-4" aria-hidden="true" />
-          )}
-          <span className="text-xs">{context.percent ?? context.summary}</span>
+          </span>
+          <span className="text-xs tabular-nums">{context.label}</span>
         </Button>
       </SheetTrigger>
     </HoverHint>
@@ -114,6 +110,14 @@ export function SessionContextTrigger({ context }: { context: ContextVm }) {
 }
 
 function ContextBreakdown({ context }: { context: ContextVm }) {
+  if (context.used === null) {
+    return (
+      <p className="flex items-start gap-2 text-muted-foreground text-sm">
+        <Gauge aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+        <span>{context.summary}</span>
+      </p>
+    );
+  }
   return (
     <>
       <p className="break-words font-medium text-sm">{context.summary}</p>

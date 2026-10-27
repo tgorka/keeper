@@ -268,6 +268,12 @@ pub fn banner(
     (banner, rest)
 }
 
+/// Why an untrusted session's commands ask (D-34): it read a web page, a
+/// broker's answer or other outside content, so every consequential action
+/// waits for a person (owner ruling 2026-10-27).
+pub const UNTRUSTED: &str =
+    "This chat read outside content, such as a web page, so its commands need your approval.";
+
 /// What an opened session shows, whole, every time it changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -321,8 +327,11 @@ pub struct AgentSessionViewVm {
     pub note: Option<String>,
     /// This person may read the session's thinking and tool results.
     pub reads_trace: bool,
-    /// The session has read outside content (`sessions.trust`, D-34).
-    pub untrusted: bool,
+    /// The session has read outside content (`sessions.trust`, D-34): why its
+    /// commands ask, in one plain sentence ([`UNTRUSTED`]); absent while trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub untrusted: Option<String>,
     /// The answers still being written, oldest first; each one's work is its
     /// turn's fold.
     pub live: Vec<AgentLiveTurnVm>,
@@ -339,10 +348,12 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub answering: Option<AgentSessionAnsweringVm>,
-    /// Last answer's context occupancy; follows Show details, for any member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub context: Option<super::context::AgentContextVm>,
+    /// Last answer's context occupancy, for any member in every view mode,
+    /// unknown before the first measured answer (owner ruling 2026-10-27).
+    pub context: super::context::AgentContextVm,
+    /// The model and effort the next answer uses, always: the composer's bar
+    /// draws them as chips (owner ruling 2026-10-27).
+    pub footer: crate::hq::settings::AgentSessionFooterVm,
     /// The drives the agent may read here and this person's ticks; absent
     /// where this person has no control for them (not a person member, an
     /// archived session, an agent that has not said what it reads). The
@@ -608,6 +619,15 @@ pub fn view(
         None => (Vec::new(), 0),
     };
     mention::place(&mut items, &messages, &children);
+    let settings = if session.archived {
+        None
+    } else {
+        crate::hq::settings::picker(source, session_id)
+            .map_err(|error| {
+                tracing::debug!(database = %source.database, %error, "the session's pickers are not shown");
+            })
+            .ok()
+    };
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -631,22 +651,20 @@ pub fn view(
             complete,
             note,
             reads_trace,
-            untrusted: session.untrusted,
+            untrusted: session.untrusted.then(|| UNTRUSTED.to_owned()),
             live,
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,
-            context: super::context::latest(&rows, opened.prefs.view_mode.shows_details()),
+            context: super::context::latest(&rows),
             drives: None,
-            settings: if session.archived {
-                None
-            } else {
-                crate::hq::settings::picker(source, session_id)
-                    .map_err(|error| {
-                        tracing::debug!(database = %source.database, %error, "the session's pickers are not shown");
-                    })
-                    .ok()
-            },
+            footer: crate::hq::settings::footer(
+                source,
+                session_id,
+                &session.agent_actor,
+                settings.as_ref(),
+            ),
+            settings,
             agent_actor: session.agent_actor,
         },
         newest_ms,

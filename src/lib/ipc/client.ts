@@ -395,6 +395,7 @@ export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentSessionAnsweringVm } from "./gen/AgentSessionAnsweringVm";
 export type { AgentSessionDrivesVm } from "./gen/AgentSessionDrivesVm";
 export type { AgentSessionDriveVm } from "./gen/AgentSessionDriveVm";
+export type { AgentSessionFooterVm } from "./gen/AgentSessionFooterVm";
 export type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 export type { AgentSessionPickerVm } from "./gen/AgentSessionPickerVm";
 export type { AgentSessionRef } from "./gen/AgentSessionRef";

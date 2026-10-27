@@ -527,14 +527,17 @@ fn turn_fold(view: &timeline::AgentSessionViewVm) -> &timeline::AgentTurnFoldVm 
         .expect("the turn's fold")
 }
 
-/// The meter follows the Verbose view mode, like the rest of an answer's details, for any member
-/// (R10921-02): `metadata.context` is in every member's replica, so trace access gates nothing.
+/// The meter is in the bar in every view mode, for any member (owner ruling 2026-10-27,
+/// superseding R10921-02's Verbose-only rule): `metadata.context` is in every member's replica,
+/// so neither the view mode nor trace access gates it. Before any answer it reads unknown.
 #[test]
-fn answer_context_survives_replica_projection_in_the_verbose_mode_for_any_member() {
-    let details_only = VERBOSE;
-    let reasoning_only = THINKING;
+fn answer_context_survives_replica_projection_in_every_view_mode_for_any_member() {
     for reader in [true, false] {
         let w = world(reader);
+        let before = w
+            .view(&opened(AgentViewPrefsVm::default(), &[], &[]))
+            .context;
+        assert_eq!((before.used, before.label.as_str()), (None, "—"));
         let parts: Vec<_> = [
             "persona",
             "memory",
@@ -550,31 +553,24 @@ fn answer_context_survives_replica_projection_in_the_verbose_mode_for_any_member
         let mut metadata = json!({"context": {"used": 70, "window": 200, "parts": parts},
             "usage": {"prompt_tokens": 9000}});
         w.put(vec![w.answer("answer", metadata.clone())]);
-        let view = w.view(&opened(details_only, &[], &[]));
-        assert_eq!(view.context.as_ref().map(|c| c.used), Some(70), "{reader}");
-        assert_eq!(
-            view.context.as_ref().and_then(|c| c.percent.as_deref()),
-            Some("35%")
-        );
-        assert!(
-            w.view(&opened(reasoning_only, &[], &[])).context.is_none(),
-            "the thinking mode hides the meter, reader {reader}"
-        );
+        for prefs in [AgentViewPrefsVm::default(), THINKING, VERBOSE] {
+            let view = w.view(&opened(prefs, &[], &[]));
+            assert_eq!(view.context.used, Some(70), "{reader} {prefs:?}");
+            assert_eq!(view.context.percent.as_deref(), Some("35%"));
+            assert_eq!(view.context.label, "70 / 200");
+        }
         metadata["context"]["window"] = Value::Null;
         w.put(vec![w.answer("answer", metadata.clone())]);
-        let unknown = w.view(&opened(details_only, &[], &[]));
-        assert_eq!(
-            unknown.context.expect("unknown window").summary,
-            "used ≈ 70 tokens"
-        );
+        let unknown = w.view(&opened(AgentViewPrefsVm::default(), &[], &[]));
+        assert_eq!(unknown.context.summary, "used ≈ 70 tokens");
         metadata["context"]["parts"][0]["tokens"] = json!(71);
         w.put(vec![w.answer("answer", metadata)]);
-        assert!(w.view(&opened(VERBOSE, &[], &[])).context.is_none());
+        assert!(w.view(&opened(VERBOSE, &[], &[])).context.used.is_none());
         w.put(vec![w.answer(
             "old answer",
             json!({"usage": {"prompt_tokens": 9000}}),
         )]);
-        assert!(w.view(&opened(VERBOSE, &[], &[])).context.is_none());
+        assert!(w.view(&opened(VERBOSE, &[], &[])).context.used.is_none());
     }
 }
 
@@ -867,15 +863,18 @@ fn a_session_offers_only_what_the_agent_offers_and_a_switch_only_narrows() {
 }
 
 #[test]
-fn a_session_that_read_outside_content_is_marked() {
+fn a_session_that_read_outside_content_is_marked_and_says_why() {
     let w = world(true);
-    assert!(!w.view(&Opened::default()).untrusted);
+    assert_eq!(w.view(&Opened::default()).untrusted, None);
     w.put(vec![RowOp::Patch {
         table: "sessions".to_owned(),
         values: object(json!({"id": "dev1.1", "trust": "untrusted"})),
         base_version: None,
     }]);
-    assert!(w.view(&Opened::default()).untrusted);
+    assert_eq!(
+        w.view(&Opened::default()).untrusted.as_deref(),
+        Some(timeline::UNTRUSTED)
+    );
 }
 
 #[path = "fold_tests.rs"]

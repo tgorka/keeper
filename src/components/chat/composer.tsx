@@ -149,6 +149,11 @@ interface ComposerProps {
   attachmentPreview?: (attachment: PendingAttachment) => ReactNode;
   /** Session-owned controls beside Send; no protocol state lives in the composer. */
   sendAccessory?: ReactNode;
+  /**
+   * Session-owned controls at the start of the bar under the message field (t3.chat's model and
+   * effort, owner ruling 2026-10-27), before the attach controls.
+   */
+  barStart?: ReactNode;
   /** When `true`, the composer is inert (no room loaded). */
   disabled?: boolean;
   /** The active reply/edit context, or `null`. Drives the banner + Esc routing. */
@@ -294,6 +299,7 @@ export function Composer({
   onSendAttachments,
   attachmentPreview,
   sendAccessory,
+  barStart,
   disabled = false,
   pending = null,
   editPrefill = null,
@@ -1549,6 +1555,7 @@ export function Composer({
         <SlashMenuList menu={menu} />
         <InlineSlashList menu={inline} />
         <InlineSlashList menu={mention} label={MENTION_MENU_LABEL} />
+        {barStart}
         {attachEnabled && pending?.mode !== "edit" && (
           <IconHint label="Attach file">
             <Button

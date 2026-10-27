@@ -429,7 +429,10 @@ not evidence for that target.
 **The answer last (109.14, Q109-13 a).** The window draws Rust's reading column (`items`) in its
 order and nothing else: a person's message, each turn's **fold**, the turn's answer below it, an
 agent's question where it was asked, an answer still being written last. A message the column does
-not name is not drawn — a lead-in ("Checking — one minute.") lives inside its turn's fold.
+not name is not drawn — a lead-in ("Checking — one minute.") lives inside its turn's fold. A row
+with nothing to read — the 0-byte `finish = "tool_calls"` close a turn writes before a parked
+call (owner report 2026-10-27, `.9`), or a blank lead-in — is never a bubble: the turn is read as
+its fold, at its work, and a blank lead-in is not listed inside the fold either.
 
 - **While a turn runs** its fold is one live line, Rust's sentence: "Searching the web… · 3 steps".
 - **When it ends** everything but the answer — lead-ins, thinking, tool calls — is one line above
@@ -488,36 +491,46 @@ CSS hiding. Missing measurements have no label and are never filled with zero; a
 remains a real measurement. Answer markdown renders inert text: model-written HTML does not become
 HTML, and model-written links do not navigate.
 
-**Context window** beside Send opens a side **Details** panel; `/context` opens the same panel. It
-shows the latest answer's last-round occupancy (`metadata.context.used`), not the accumulated
-billing usage in `metadata.usage`. Like the rest of an answer's details it follows the **Verbose**
-view mode, for any member, trace reader or not: `metadata.context` is in every member's replica,
-so the setting decides only what is drawn. The labelled ring and its tooltip show used/window and
-the rounded percentage; an unknown model window shows **used ≈ N tokens**, with no window
-percentage or ring. Tab from the message field to the context button, then Enter to open Details;
-Escape closes it and returns focus to whatever opened it. Its seven expandable parts are system
-and persona, memory, built-in tools, MCP tools, history, attachments and this turn's tool results;
-parts a newer runtime adds that this build does not name are summed into one **Other** row, so
-they never hide the meter. Counts and shares are estimates, marked **≈**; the total is always
-`used`. Missing or old metadata omits the ring rather than inventing zero, and `/context` then
-says the latest answer has no measurement (or that the view mode is not Verbose). Malformed counts, a
-missing or repeated known part, or parts above the used count are refused, with one tracing
-warning per answer. A turn stopped or refused before its first measured round has no context, and
-the meter does not fall back to an older answer. Over-window occupancy keeps its real percentage
-label while the ring and accessible meter stop at 100%.
+**The composer's bar** (R-HQ-85, owner ruling 2026-10-27, t3.chat's shape; it supersedes R10921-02
+where that hid the ring) sits under the message field and is always drawn: the model and the
+effort (`AgentSessionFooterVm`: the session's choice while the agent still offers it, else the
+agent's default, else "Default"), the attach controls, an **Untrusted** marker when the session
+read outside content, and the context reading beside Send. The model and effort are chips that
+open 109.18's pickers only where Rust says there is an alternative to choose
+(`choosesModel`/`choosesEffort`: more than one offered, and this person may change them); a
+reader who may not, or an agent with one offer, sees read-only chips.
 
-For the context viewing aid, `?sessions=launch` opens alpha with 48000/200000 tokens (24%); beta,
-**Review the research notes**, has the same used count and an unknown window. Their source answer
-metadata deliberately carries different cumulative usage (125000 input tokens). These are mock
-projections, not evidence of a running model or the packaged app. The mock ships in the Normal view
-mode, so choose Verbose to see the ring.
+**Context** beside Send is a ring and Rust's compact label (`5.3k / 1M`), in every view mode and
+for any member: `metadata.context` is in every member's replica. Before any answer measured it, or
+when the latest answer did not, the ring is empty, the label reads **—** and its tooltip and
+Details say why ("Context unknown: …") — never an older answer's count and never a meter claiming
+zero. It opens a side **Details** panel; `/context` opens the same panel. It shows the latest
+answer's last-round occupancy (`metadata.context.used`), not the accumulated billing usage in
+`metadata.usage`. The ring's tooltip shows used/window and the rounded percentage; an unknown model
+window shows **used ≈ N tokens** and the label names the count alone. Tab to the context button,
+then Enter to open Details; Escape closes it and returns focus to whatever opened it. Its seven
+expandable parts are system and persona, memory, built-in tools, MCP tools, history, attachments
+and this turn's tool results; parts a newer runtime adds that this build does not name are summed
+into one **Other** row, so they never hide the meter. Counts and shares are estimates, marked
+**≈**; the total is always `used`. Malformed counts, a missing or repeated known part, or parts
+above the used count are refused (read as unknown), with one tracing warning per answer.
+Over-window occupancy keeps its real percentage while the ring and accessible meter stop at 100%.
+
+For the context viewing aid, `?sessions=launch` opens alpha with 48000/200000 tokens (24%,
+`48k / 200k`); beta, **Review the research notes**, has the same used count and an unknown window.
+A new session reads **—**. `?sessions=launch&owner=report` is the owner's report of 2026-10-27 on
+alpha (Nixi's `.6`, `.9`, `.11`): untrusted, one T3 `run` waiting in the banner, a 0-byte
+`finish = "tool_calls"` close that draws no bubble, one model and no effort (read-only chips), and
+`5.3k / 1M`. These are mock projections, not evidence of a running model or the packaged app.
 
 **Tools** contains only tools the answering instance offers, from its definition and container.
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
 unknown or absent offered-tools list renders no Tools control, and neither does a session that
 cannot be changed here (archived). Changes wait for Rust's view; a
-refusal is visible beside the controls. **Untrusted** marks a session that has read outside content;
-consequential actions still need a person.
+refusal is visible beside the controls. **Untrusted** in the composer's bar marks a session that has
+read outside content (D-34: a web page, a broker's answer); a tap opens Rust's sentence, "This chat
+read outside content, such as a web page, so its commands need your approval.", and the approval
+banner says the same above the requests it holds.
 
 **Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
 menu of check items. No drive is ticked until a person ticks one — not even the session's own
@@ -1583,13 +1596,23 @@ reader who may not change them. Rust decides every part of it:
   `pending`, or `refused` with the server's V16 code in plain words. A new change supersedes a
   standing refusal.
 
-The composer footer (`session-settings-picker.tsx`) is t3code's shape: a model popover with a
-search box, starred models first and a "Default" badge; an effort menu with a "Default" badge;
-Reset. An agent with nothing to choose draws no group at all. Stars are a lens, not a setting:
+The composer's bar (`session-settings-picker.tsx`) is t3.chat's shape (R-HQ-85): a model button
+naming the current model, opening a popover with a search box, starred models first, then the
+offered models grouped by provider (`AgentModelOptionVm.provider`, Rust's reading of the id —
+`openrouter/…` by its route, else the family the name starts with) and a "Default" badge; an effort
+chip with a "Default" badge in its menu; Reset. Where there is nothing to choose they are read-only
+chips, never absent. Capability badges are not drawn: the contract publishes model ids only
+(DW-E109-39). Stars are a lens, not a setting:
 they live in the `keeper_model_favorites` cookie like the other remembered views (no settings
 row, no IPC write), device-wide, and only order Rust's offers — a starred model the agent does
 not offer is never listed. Enter and Space on a star star it; they never reach the list, which
 would take Enter as choosing the highlighted model.
+
+- `failed`: the newest answer failed (`finish = "failed"`) on a model this agent offers an
+  alternative to — a model answering 429 for days, R-HQ-85 — so the picker says which model, why,
+  and the way back ("Choose another model, or Reset to the agent's default."). A person's stop
+  (`cancelled`) or a restart (`cut`) is no failure of the model. Nothing marks a model unavailable
+  ahead of time: keeper-hq publishes no availability (DW-E109-38).
 
 `/model <id>` and `/effort <level>` (109.19's registry) run the same change and appear only when
 the pickers would offer the matching choice. `/effort` lists only the agent's offered levels, in

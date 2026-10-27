@@ -7,6 +7,7 @@ import type { AgentLiveTurnVm } from "./AgentLiveTurnVm";
 import type { AgentMessageVm } from "./AgentMessageVm";
 import type { AgentSessionAnsweringVm } from "./AgentSessionAnsweringVm";
 import type { AgentSessionDrivesVm } from "./AgentSessionDrivesVm";
+import type { AgentSessionFooterVm } from "./AgentSessionFooterVm";
 import type { AgentSessionPickerVm } from "./AgentSessionPickerVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
 import type { AgentTimelineItemVm } from "./AgentTimelineItemVm";
@@ -75,9 +76,10 @@ note?: string,
  */
 readsTrace: boolean, 
 /**
- * The session has read outside content (`sessions.trust`, D-34).
+ * The session has read outside content (`sessions.trust`, D-34): why its
+ * commands ask, in one plain sentence ([`UNTRUSTED`]); absent while trusted.
  */
-untrusted: boolean, 
+untrusted?: string, 
 /**
  * The answers still being written, oldest first; each one's work is its
  * turn's fold.
@@ -101,9 +103,15 @@ prefs: AgentViewPrefsVm,
  */
 answering?: AgentSessionAnsweringVm, 
 /**
- * Last answer's context occupancy; follows Show details, for any member.
+ * Last answer's context occupancy, for any member in every view mode,
+ * unknown before the first measured answer (owner ruling 2026-10-27).
  */
-context?: AgentContextVm, 
+context: AgentContextVm, 
+/**
+ * The model and effort the next answer uses, always: the composer's bar
+ * draws them as chips (owner ruling 2026-10-27).
+ */
+footer: AgentSessionFooterVm, 
 /**
  * The drives the agent may read here and this person's ticks; absent
  * where this person has no control for them (not a person member, an

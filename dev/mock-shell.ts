@@ -6104,6 +6104,35 @@ const liveScenario = new URLSearchParams(location.search).get("live");
 // turn (a lead-in, a run, three searches with one refused, then the answer).
 const turnsScenario = new URLSearchParams(location.search).get("turns");
 /**
+ * ?sessions=launch&owner=report — the owner's report of 2026-10-27 on alpha's device.1, as Nixi's
+ * `.6`, `.9` and `.11`: the session read the web (untrusted), one T3 `run` waits for Ana, the turn
+ * that parked on it closed with a 0-byte `finish = "tool_calls"` row (never its own bubble), the
+ * agent offers one model and no effort (read-only chips), and the latest answer measured 5347 of a
+ * 1,048,576-token window.
+ */
+const ownerReport = new URLSearchParams(location.search).get("owner") === "report";
+/** `timeline::UNTRUSTED`. */
+const MOCK_UNTRUSTED =
+  "This chat read outside content, such as a web page, so its commands need your approval.";
+/** `context::NOT_MEASURED`, before `sessionViewerVm` projects the real reading. */
+const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
+  used: null,
+  window: null,
+  label: "—",
+  percent: null,
+  meterPercent: null,
+  ringBackground: "conic-gradient(currentColor 0deg, var(--muted) 0deg)",
+  summary: "Context unknown: no answer has measured it yet.",
+  parts: [],
+};
+/** Overwritten by `sessionViewerVm` from the mock's picker, as `settings::footer` is. */
+const MOCK_FOOTER_SEED: AgentSessionViewVm["footer"] = {
+  model: "Default",
+  effort: "Default",
+  choosesModel: false,
+  choosesEffort: false,
+};
+/**
  * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
  * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
  * device holds (Ben reads alpha, not beta), `omega` is another agent's. Who reads `gamma` this
@@ -6364,6 +6393,24 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
         action: JSON.stringify({ argv: ["git", "status", "--porcelain"] }, null, 2),
         expiresAtMs: Date.now() + 3600000,
         createdAtMs: Date.now() + 1,
+        state: "pending",
+        canDecide: true,
+        sentence: "Waiting for you.",
+        actions: [],
+        declinedBySend: false,
+      },
+      // `.6`: a T3 `run` in a session that read the web, parked since 07:33:16Z.
+      {
+        id: "approval-run",
+        database: "alpha",
+        sessionId: "device.1",
+        toolName: "run",
+        tier: "T3",
+        summary: "Run git log in the repository",
+        bindingDigest: "sha256:fixture-owner-run",
+        action: JSON.stringify({ argv: ["git", "log", "--oneline", "-5"] }, null, 2),
+        expiresAtMs: Date.now() + 3600000,
+        createdAtMs: Date.now() + 3,
         state: "pending",
         canDecide: true,
         sentence: "Waiting for you.",
@@ -6652,9 +6699,13 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
       untrusted:
         liveScenario === "untrusted" ||
         liveScenario === "stream" ||
-        (grantsScenario === "untrusted" &&
+        ((grantsScenario === "untrusted" || ownerReport) &&
           row.database === "alpha" &&
-          row.sessionId === "device.1"),
+          row.sessionId === "device.1")
+          ? MOCK_UNTRUSTED
+          : undefined,
+      context: MOCK_UNMEASURED,
+      footer: MOCK_FOOTER_SEED,
       live: [],
       items: [],
       folds: [],
@@ -6667,7 +6718,12 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
               { name: "web_search", on: true },
               { name: "read_file", on: false },
             ],
-      approvals: row.database === "alpha" && row.sessionId === "device.1" ? sessionApprovals : [],
+      approvals:
+        row.database === "alpha" && row.sessionId === "device.1"
+          ? ownerReport
+            ? sessionApprovals.filter((approval) => approval.id === "approval-run")
+            : sessionApprovals
+          : [],
       messages: [
         {
           id: "message-999",
@@ -6764,63 +6820,74 @@ const contextAnswers: Record<
     },
   },
 };
-/** Viewing aid mirroring Rust's context projection; never used by the app. */
-function mockContext(vm: AgentSessionViewVm, verbose: boolean): AgentSessionViewVm["context"] {
-  const answer = contextAnswers[vm.database];
-  if (!verbose || !answer || !vm.messages.some((message) => message.id === answer.id)) return;
-  const context = answer.metadata.context;
-  const known = context.window !== null;
-  return {
-    used: context.used,
-    window: context.window,
-    percent: known ? "24%" : null,
-    meterPercent: known ? 24 : null,
-    ringBackground: known ? "conic-gradient(currentColor 86deg, var(--muted) 0deg)" : null,
-    summary: known ? "24% · used ≈ 48000 / 200000 tokens" : "used ≈ 48000 tokens",
+if (ownerReport) {
+  // `.11`: 5347 of a 1,048,576-token window, apportioned as the runtime does.
+  contextAnswers.alpha.metadata.context = {
+    used: 5347,
+    window: 1048576,
     parts: [
-      {
-        label: "System and persona",
-        description: "System instructions, SOUL.md and USER.md.",
-        tokens: "≈ 8000 tokens",
-        share: "≈ 17% of used context",
-      },
-      {
-        label: "Memory",
-        description: "Memory included in this prompt.",
-        tokens: "≈ 2000 tokens",
-        share: "≈ 4% of used context",
-      },
-      {
-        label: "Built-in tools",
-        description: "Built-in tool definitions offered to the model.",
-        tokens: "≈ 4000 tokens",
-        share: "≈ 8% of used context",
-      },
-      {
-        label: "MCP tools",
-        description: "MCP tool definitions offered to the model.",
-        tokens: "≈ 6000 tokens",
-        share: "≈ 13% of used context",
-      },
-      {
-        label: "History",
-        description: "Conversation history and the current question.",
-        tokens: "≈ 18000 tokens",
-        share: "≈ 38% of used context",
-      },
-      {
-        label: "Attachments",
-        description: "Attachments included in this turn.",
-        tokens: "≈ 5000 tokens",
-        share: "≈ 10% of used context",
-      },
-      {
-        label: "This turn's tool results",
-        description: "Tool calls and results included in this turn.",
-        tokens: "≈ 5000 tokens",
-        share: "≈ 10% of used context",
-      },
+      { part: "persona", tokens: 2100, estimated: true },
+      { part: "memory", tokens: 300, estimated: true },
+      { part: "tools", tokens: 1500, estimated: true },
+      { part: "mcp", tokens: 0, estimated: true },
+      { part: "history", tokens: 1447, estimated: true },
+      { part: "attachments", tokens: 0, estimated: true },
+      { part: "tool_results", tokens: 0, estimated: true },
     ],
+  };
+}
+const MOCK_PART_LABELS: Record<string, [string, string]> = {
+  persona: ["System and persona", "System instructions, SOUL.md and USER.md."],
+  memory: ["Memory", "Memory included in this prompt."],
+  tools: ["Built-in tools", "Built-in tool definitions offered to the model."],
+  mcp: ["MCP tools", "MCP tool definitions offered to the model."],
+  history: ["History", "Conversation history and the current question."],
+  attachments: ["Attachments", "Attachments included in this turn."],
+  tool_results: ["This turn's tool results", "Tool calls and results included in this turn."],
+};
+/** `context::compact`. */
+function mockCompact(n: number): string {
+  if (n < 1000) return String(n);
+  const [unit, suffix] = Math.round(n / 1000) < 1000 ? [1000, "k"] : [1_000_000, "M"];
+  const tenths = Math.round((n * 10) / unit);
+  if (tenths >= 1000) return `${Math.round(n / unit)}${suffix}`;
+  return `${tenths % 10 === 0 ? tenths / 10 : (tenths / 10).toFixed(1)}${suffix}`;
+}
+/**
+ * Viewing aid mirroring Rust's `context::latest`; never used by the app. In every view mode
+ * (owner ruling 2026-10-27), unknown until an answer measured it.
+ */
+function mockContext(vm: AgentSessionViewVm): AgentSessionViewVm["context"] {
+  const answer = contextAnswers[vm.database];
+  const newest = [...vm.messages].reverse().find((m) => m.role === "agent" && !m.ask);
+  if (!newest) return MOCK_UNMEASURED;
+  // A blank close before a parked call carries the turn's measurement too, as `.11`'s did.
+  const measured = answer && (newest.id === answer.id || (ownerReport && newest.body === ""));
+  if (!measured)
+    return {
+      ...MOCK_UNMEASURED,
+      summary: "Context unknown: the latest answer did not measure it.",
+    };
+  const { used, window, parts } = answer.metadata.context;
+  const percent = window === null ? null : Math.round((used * 100) / window);
+  const meter = percent === null ? null : Math.min(percent, 100);
+  return {
+    used,
+    window,
+    label: window === null ? mockCompact(used) : `${mockCompact(used)} / ${mockCompact(window)}`,
+    percent: percent === null ? null : `${percent}%`,
+    meterPercent: meter,
+    ringBackground: `conic-gradient(currentColor ${Math.floor(((meter ?? 0) * 360) / 100)}deg, var(--muted) 0deg)`,
+    summary:
+      percent === null
+        ? `used ≈ ${used} tokens`
+        : `${percent}% · used ≈ ${used} / ${window} tokens`,
+    parts: parts.map(({ part, tokens }) => ({
+      label: MOCK_PART_LABELS[part]?.[0] ?? "Other",
+      description: MOCK_PART_LABELS[part]?.[1] ?? "Parts this version of keeper does not name yet.",
+      tokens: `≈ ${tokens} tokens`,
+      share: `≈ ${used === 0 ? 0 : Math.round((tokens * 100) / used)}% of used context`,
+    })),
   };
 }
 
@@ -6840,6 +6907,44 @@ for (const vm of sessionViews.values()) {
     publicSummary: "Worked for 3 s",
     durationMs: 3000,
   });
+}
+if (ownerReport) {
+  const vm = sessionViews.get(JSON.stringify(["alpha", "device.1"]));
+  if (vm) {
+    vm.agentName = "Nixi";
+    const at = (vm.messages[vm.messages.length - 1]?.createdAtMs ?? Date.now()) + 1000;
+    vm.messages.push({
+      id: "owner-ask",
+      role: "person",
+      authorActor: "ana",
+      authorName: "Ana",
+      body: "What changed in the repo today?",
+      createdAtMs: at,
+      state: "taken",
+    });
+    // `.9`: the 0-byte `finish = "tool_calls"` row the turn wrote before it parked.
+    vm.messages.push({
+      id: "owner-blank-close",
+      role: "agent",
+      authorActor: "assistant",
+      authorName: "Nixi",
+      body: "",
+      createdAtMs: at + 1000,
+    });
+    mockFoldsOf(vm).push({
+      turnId: "turn-owner",
+      atMs: at + 500,
+      leadInIds: [],
+      reasoning: null,
+      steps: [mockStep("owner-run", "run", "parked", undefined, at + 600)],
+      failures: [],
+      status: "waiting",
+      statusLabel: "Waiting for you",
+      summary: "Waiting for you · run",
+      publicSummary: "Waiting for you",
+      durationMs: null,
+    });
+  }
 }
 if (turnsScenario === "all") {
   const vm = sessionViews.get(JSON.stringify(["alpha", "device.1"]));
@@ -7162,10 +7267,22 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
 // effort (her effort is withheld), so the effort menu is absent. `refused` has the server refuse
 // each change a moment after it was written, through the row's outcome. `fallback` puts
 // `metadata.model_fallback` on the newest answer. Viewing aid only: Rust's `picker_of` decides.
+// ?settings=single (or ?owner=report): one model and no effort, so the bar's chips are read-only.
+// ?settings=failed: the newest answer failed on the model in use (a 429 for days, R-HQ-85).
 const settingsScenario = new URLSearchParams(location.search).get("settings");
-const MOCK_MODELS = ["claude-opus-5-5", "gpt-6-astra", "glm-5.3-flash", "qwen-4-coder"];
+const singleModel = settingsScenario === "single" || ownerReport;
+const MOCK_MODELS = singleModel
+  ? ["glm-5.3-flash"]
+  : ["claude-opus-5-5", "gpt-6-astra", "glm-5.3-flash", "qwen-4-coder"];
+/** `settings::provider_of`. */
+const MOCK_PROVIDERS: Record<string, string> = {
+  "claude-opus-5-5": "Anthropic",
+  "gpt-6-astra": "OpenAI",
+  "glm-5.3-flash": "Z.ai",
+  "qwen-4-coder": "Qwen",
+};
 const MOCK_EFFORTS: AgentEffortOptionVm["effort"][] =
-  settingsScenario === "nixi" ? [] : ["low", "medium", "high", "xhigh"];
+  settingsScenario === "nixi" || singleModel ? [] : ["low", "medium", "high", "xhigh"];
 const MOCK_EFFORT_LABELS: Record<AgentEffortOptionVm["effort"], string> = {
   low: "Low",
   medium: "Medium",
@@ -7196,12 +7313,13 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
   if (vm.archived) return undefined;
   const held = mockSettingsOf(vm);
   const defaultModel = "glm-5.3-flash";
-  const defaultEffort = settingsScenario === "nixi" ? null : "medium";
+  const defaultEffort = settingsScenario === "nixi" || singleModel ? null : "medium";
   const model = held.model ?? defaultModel;
   const effort = held.effort ?? defaultEffort;
   return {
     models: MOCK_MODELS.map((id) => ({
       id,
+      provider: MOCK_PROVIDERS[id] ?? "Other",
       current: id === model,
       default: id === defaultModel,
     })),
@@ -7222,6 +7340,11 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
       : {}),
     ...(settingsScenario === "fallback"
       ? { fallback: "claude-opus-4-8 is no longer offered; using glm-5.3-flash instead." }
+      : {}),
+    ...(settingsScenario === "failed"
+      ? {
+          failed: `The last answer failed on ${model}: provider answered 429: usage limit reached. Choose another model${held.model !== null || held.effort !== null ? ", or Reset to the agent's default" : ""}.`,
+        }
       : {}),
     write: held.refused ? { state: "refused", sentence: held.refused } : { state: "confirmed" },
   };
@@ -7251,6 +7374,8 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     while (next < loose.length && loose[next].atMs < message.createdAtMs)
       items.push({ kind: "fold", turnId: loose[next++].turnId });
     if (leadIns.has(message.id)) continue;
+    // `turn_folds::project`: a close with nothing to read is never a bubble of its own (.9).
+    if (message.role === "agent" && !message.body.trim() && !message.attachments?.length) continue;
     const fold = byAnswer.get(message.id);
     if (fold) items.push({ kind: "fold", turnId: fold.turnId });
     items.push({ kind: "message", messageId: message.id });
@@ -7289,11 +7414,12 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
   });
   // `timeline::banner`: what a message would decline sits above the composer.
   const cards = reader ? vm.approvals.map(mockApproval) : [];
+  const picker = mockPicker(vm);
   const waiting = cards.filter((card) => card.declinedBySend);
   return {
     ...vm,
     prefs,
-    context: mockContext(vm, prefs.viewMode === "verbose"),
+    context: mockContext(vm),
     items,
     folds,
     approvals: cards.filter((card) => !card.declinedBySend),
@@ -7312,7 +7438,14 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     ...(vm.drives
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
       : {}),
-    settings: mockPicker(vm),
+    settings: picker,
+    // `settings::footer`: always the labels; the chips open only where there is a choice.
+    footer: {
+      model: picker?.modelLabel ?? "glm-5.3-flash",
+      effort: picker?.effortLabel ?? "Default",
+      choosesModel: (picker?.models.length ?? 0) > 1,
+      choosesEffort: (picker?.efforts.length ?? 0) > 1,
+    },
     messages: vm.messages.map(({ details, ...message }) => ({
       ...message,
       ...(prefs.viewMode === "verbose" && details ? { details } : {}),
@@ -8078,7 +8211,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       hasEarlier: false,
       loadingEarlier: false,
       readsTrace: true,
-      untrusted: false,
+      context: MOCK_UNMEASURED,
+      footer: MOCK_FOOTER_SEED,
       live: [],
       tools: [],
       items: [],
@@ -8222,7 +8356,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       hasEarlier: false,
       loadingEarlier: false,
       readsTrace: true,
-      untrusted: false,
+      context: MOCK_UNMEASURED,
+      footer: MOCK_FOOTER_SEED,
       live: [],
       tools: [],
       prefs: { viewMode: "normal" },
@@ -10868,7 +11003,8 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         hasEarlier: false,
         loadingEarlier: false,
         readsTrace: true,
-        untrusted: false,
+        context: MOCK_UNMEASURED,
+        footer: MOCK_FOOTER_SEED,
         live: [],
         tools: [],
         items: [],
