@@ -117,7 +117,14 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
       summary: "Context unknown: no answer has measured it yet.",
       parts: [],
     },
-    footer: { model: "Default", effort: "Default", choosesModel: false, choosesEffort: false },
+    footer: {
+      model: "Default",
+      effort: "Default",
+      shortModel: "Default",
+      compact: "Default · Default",
+      choosesModel: false,
+      choosesEffort: false,
+    },
     live: [],
     tools: [],
     prefs: { viewMode: "normal" },
@@ -881,8 +888,10 @@ describe("live answer controls", () => {
       { kind: "liveAnswer", turnId: "t1" },
     ];
     await open("alpha", {
-      untrusted:
-        "This chat read outside content, such as a web page, so its commands need your approval.",
+      untrusted: {
+        sentence:
+          "This chat read outside content, such as a web page, so its commands need your approval.",
+      },
       live: [turn],
       items: column,
       folds: [
@@ -894,8 +903,8 @@ describe("live answer controls", () => {
         }),
       ],
     });
-    // Said in words, not in a `title` touch and most screen readers never reach: the bar's
-    // marker names the reason and opens it on a tap.
+    // Said in words, not in a `title` touch and most screen readers never reach: the header's
+    // chip names the reason and opens it on a tap.
     const marker = screen.getByRole("button", { name: /^Untrusted: .*need your approval/ });
     fireEvent.click(marker);
     expect(await screen.findByRole("dialog", { name: "Why commands ask" })).toHaveTextContent(

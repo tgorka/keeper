@@ -90,12 +90,22 @@ const vm: AgentSessionViewVm = {
     summary: "Context unknown: no answer has measured it yet.",
     parts: [],
   },
-  footer: { model: "beta-small", effort: "Default", choosesModel: false, choosesEffort: false },
+  footer: {
+    model: "beta-small",
+    effort: "Default",
+    shortModel: "beta-small",
+    compact: "beta-small · Default",
+    choosesModel: false,
+    choosesEffort: false,
+  },
 };
-async function draw(shown: AgentSessionViewVm = vm) {
+async function draw(
+  shown: AgentSessionViewVm = vm,
+  onSession?: (session: { database: string; sessionId: string }) => void,
+) {
   const result = render(
     <TooltipProvider>
-      <SessionView target={{ database: "beta", sessionId: "same.1" }} />
+      <SessionView target={{ database: "beta", sessionId: "same.1" }} onSession={onSession} />
     </TooltipProvider>,
   );
   await waitFor(() => expect(mock.view).not.toBeNull());
@@ -226,7 +236,13 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
   it("opens the pickers from the same chips where Rust says there is a choice", async () => {
     await draw({
       ...vm,
-      footer: { model: "beta-small", effort: "Medium", choosesModel: true, choosesEffort: true },
+      footer: {
+        ...vm.footer,
+        effort: "Medium",
+        compact: "beta-small · Medium",
+        choosesModel: true,
+        choosesEffort: true,
+      },
       settings: {
         models: [
           { id: "alpha-large", provider: "Other", current: false, default: false },
@@ -247,7 +263,7 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
     expect(await screen.findByRole("dialog", { name: "Choose a model" })).toBeInTheDocument();
   });
 
-  it("keeps the reading and the untrusted marker on an archived session (R598-03)", async () => {
+  it("keeps the reading on an archived session, and its untrusted chip offers no fresh chat (R598-03)", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";
     render(
@@ -262,7 +278,8 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
         ...vm,
         archived: true,
         readOnly: true,
-        untrusted: why,
+        // Rust leaves the way out off where `/clean` refuses.
+        untrusted: { sentence: why },
         context: {
           ...vm.context,
           label: "5.3k / 1M",
@@ -274,52 +291,118 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
     const bar = screen.getByRole("group", { name: "Model and effort" });
     expect(within(bar).getByText("beta-small")).toBeInTheDocument();
     expect(within(bar).queryByRole("button", { name: /^Model:/ })).toBeNull();
-    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole("banner")).getByRole("button", { name: `Untrusted: ${why}` }),
+    );
+    const why_ = await screen.findByRole("dialog", { name: "Why commands ask" });
+    expect(why_).toHaveTextContent(why);
+    expect(within(why_).queryByRole("button")).toBeNull();
     expect(
       screen.getByRole("button", { name: "Context details: 1% · used ≈ 5347 / 1048576 tokens" }),
     ).toHaveTextContent("5.3k / 1M");
   });
 
-  it("marks an untrusted session in the bar and says why in the banner", async () => {
+  it("marks an untrusted session in the header, says why in the banner, and offers a fresh chat", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";
-    await draw({
-      ...vm,
-      untrusted: why,
-      banner: {
-        sentence: "Sending a message declines this request, even a message that says yes.",
-        approvals: [
-          {
-            id: "a6",
-            database: "beta",
-            sessionId: "same.1",
-            toolName: "run",
-            tier: "T3",
-            summary: "Run git log",
-            action: '{"argv":["git","log"]}',
-            bindingDigest: "d6",
-            expiresAtMs: 1800000000000,
-            createdAtMs: 1780000000000,
-            state: "pending",
-            canDecide: true,
-            sentence: "Waiting for you.",
-            actions: ["allowOnce", "deny"],
-            declinedBySend: true,
-          },
-        ],
+    const fresh = "Start a fresh chat: starts trusted, keeps drives";
+    const next = { database: "beta", sessionId: "same.2" };
+    mock.command.mockResolvedValue({ session: next, surface: null, message: "" });
+    const onSession = vi.fn();
+    await draw(
+      {
+        ...vm,
+        untrusted: { sentence: why, freshChat: fresh },
+        banner: {
+          sentence: "Sending a message declines this request, even a message that says yes.",
+          approvals: [
+            {
+              id: "a6",
+              database: "beta",
+              sessionId: "same.1",
+              toolName: "run",
+              tier: "T3",
+              summary: "Run git log",
+              action: '{"argv":["git","log"]}',
+              bindingDigest: "d6",
+              expiresAtMs: 1800000000000,
+              createdAtMs: 1780000000000,
+              state: "pending",
+              canDecide: true,
+              sentence: "Waiting for you.",
+              actions: ["allowOnce", "deny"],
+              declinedBySend: true,
+            },
+          ],
+        },
       },
+      onSession,
+    );
+    // A session-state chip on the header's meta line, not a control in the composer's bar.
+    const chip = within(screen.getByRole("banner")).getByRole("button", {
+      name: `Untrusted: ${why}`,
     });
-    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("group", { name: "Model and effort" })).queryByRole("button", {
+        name: /Untrusted/,
+      }),
+    ).toBeNull();
     expect(
       screen.getByRole("complementary", { name: "Waiting for your decision" }),
     ).toHaveTextContent(why);
+    fireEvent.click(chip);
+    const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
+    expect(popover).toHaveTextContent(why);
+    fireEvent.click(within(popover).getByRole("button", { name: fresh }));
+    // `/clean` through the composer's command path; it declines nothing the banner shows.
+    await waitFor(() =>
+      expect(mock.command).toHaveBeenCalledWith(
+        { database: "beta", sessionId: "same.1" },
+        "/clean",
+        null,
+        [],
+      ),
+    );
+    // The host that holds its own choice (the Notes Assistant dock) moves to the fresh chat.
+    await waitFor(() => expect(onSession).toHaveBeenCalledWith(next));
+    expect(agentSessionsStore.getState().selected).toEqual(next);
+  });
+
+  it("says why a fresh chat could not start, in the chip's popover", async () => {
+    const why =
+      "This chat read outside content, such as a web page, so its commands need your approval.";
+    const fresh = "Start a fresh chat: starts trusted, keeps drives";
+    mock.command.mockRejectedValue({
+      code: "internal",
+      message: "Unarchive this conversation first.",
+      accountId: null,
+    });
+    await draw({ ...vm, untrusted: { sentence: why, freshChat: fresh } });
+    fireEvent.click(
+      within(screen.getByRole("banner")).getByRole("button", { name: `Untrusted: ${why}` }),
+    );
+    const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
+    fireEvent.click(within(popover).getByRole("button", { name: fresh }));
+    expect(await within(popover).findByRole("alert")).toHaveTextContent(
+      "Unarchive this conversation first.",
+    );
   });
 });
 
 describe("session composer attachments", () => {
   it("sends a picked batch with one caption into its own database, without a second text message", async () => {
     await draw();
-    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    // Attach, camera and photo share the bar's one `+` menu (FooterOneRow).
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Attach" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(
+      within(await screen.findByRole("menu"))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Attach file", "Choose photo"]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Attach file" }));
     await screen.findByRole("button", { name: "Remove plan.pdf" });
     fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
       target: { value: "Read both files" },

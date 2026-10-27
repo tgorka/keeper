@@ -34,7 +34,7 @@
  * Pending messenger attachments use raw captions; session captions still ask Rust.
  */
 import { type DialogFilter, open } from "@tauri-apps/plugin-dialog";
-import { Camera, Image, Paperclip, Plus, X } from "lucide-react";
+import { ArrowUp, Camera, Image, Paperclip, Plus, X } from "lucide-react";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
@@ -56,6 +56,12 @@ import { InlineSlashList } from "@/components/slash-menu/inline-slash-list";
 import { isCommandLine, type SlashRow } from "@/components/slash-menu/slash-menu";
 import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
 import { useInlineSlash } from "@/hooks/use-inline-slash";
@@ -1220,6 +1226,22 @@ export function Composer({
     }
   }
 
+  /** The camera is offered where the phone's capture input or this webview's camera exists. */
+  const canTakePhoto = phone || typeof navigator.mediaDevices?.getUserMedia === "function";
+  function takePhoto() {
+    if (phone) captureInput.current?.click();
+    else setCameraOpen(true);
+  }
+  function choosePhoto() {
+    if (phone) photoInput.current?.click();
+    // A path the host sends as it is: a HEIC chosen here reaches the agent with its host's note
+    // that its format can't be shown to the model (R444/05).
+    else
+      void pickFiles([
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "heic"] },
+      ]);
+  }
+
   /**
    * Stop holding Send for batch `id`. Returns whether it was still pending: `false` means it was
    * already cancelled, timed out or landed, and whatever its read comes to is no longer wanted.
@@ -1549,7 +1571,10 @@ export function Composer({
       <div
         className={cn(
           "relative flex min-w-0 items-end gap-2",
-          transport === "session" && "flex-wrap",
+          // The session bar holds one row under the field at any width (FooterOneRow): its
+          // controls read the bar's own width (`@container`), never the viewport's, because the
+          // same bar sits in the 280px Notes Assistant panel and in a full window.
+          transport === "session" && "@container/bar flex-wrap items-center",
         )}
       >
         <SlashMenuList menu={menu} />
@@ -1557,62 +1582,86 @@ export function Composer({
         <InlineSlashList menu={mention} label={MENTION_MENU_LABEL} />
         {barStart}
         {attachEnabled && pending?.mode !== "edit" && (
-          <IconHint label="Attach file">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Attach file"
-              disabled={disabled}
-              onClick={() => void pickFiles()}
-              // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
-              // presenting the same native picker; desktop keeps the 36px paperclip.
-              className={cn(phone && "size-11")}
-            >
-              {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
-            </Button>
-          </IconHint>
-        )}
-        {attachEnabled && pending?.mode !== "edit" && (
           <>
-            {(phone || typeof navigator.mediaDevices?.getUserMedia === "function") && (
-              <IconHint label="Take photo">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label="Take photo"
-                  className={cn(phone && "size-11")}
-                  onClick={() => (phone ? captureInput.current?.click() : setCameraOpen(true))}
-                >
-                  <Camera aria-hidden="true" />
-                </Button>
-              </IconHint>
+            {transport === "session" ? (
+              // One 36px `+` (≥44pt on the phone) holds attach, camera and photo, so the bar
+              // keeps one row in the Notes Assistant panel; no action is dropped (AD-260).
+              <DropdownMenu>
+                <IconHint label="Attach">
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Attach"
+                      className={cn("shrink-0", phone && "size-11")}
+                    >
+                      <Plus aria-hidden="true" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </IconHint>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem className="min-h-11" onSelect={() => void pickFiles()}>
+                    <Paperclip aria-hidden="true" />
+                    Attach file
+                  </DropdownMenuItem>
+                  {canTakePhoto && (
+                    <DropdownMenuItem className="min-h-11" onSelect={takePhoto}>
+                      <Camera aria-hidden="true" />
+                      Take photo
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem className="min-h-11" onSelect={choosePhoto}>
+                    <Image aria-hidden="true" />
+                    Choose photo
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <>
+                <IconHint label="Attach file">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Attach file"
+                    disabled={disabled}
+                    onClick={() => void pickFiles()}
+                    // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
+                    // presenting the same native picker; desktop keeps the 36px paperclip.
+                    className={cn(phone && "size-11")}
+                  >
+                    {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
+                  </Button>
+                </IconHint>
+                {canTakePhoto && (
+                  <IconHint label="Take photo">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Take photo"
+                      className={cn(phone && "size-11")}
+                      onClick={takePhoto}
+                    >
+                      <Camera aria-hidden="true" />
+                    </Button>
+                  </IconHint>
+                )}
+                <IconHint label="Choose photo">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Choose photo"
+                    className={cn(phone && "size-11")}
+                    onClick={choosePhoto}
+                  >
+                    <Image aria-hidden="true" />
+                  </Button>
+                </IconHint>
+              </>
             )}
-            <IconHint label="Choose photo">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Choose photo"
-                className={cn(phone && "size-11")}
-                onClick={() =>
-                  phone
-                    ? photoInput.current?.click()
-                    : // A path the host sends as it is: a HEIC chosen here
-                      // reaches the agent with its host's note that its
-                      // format can't be shown to the model (R444/05).
-                      void pickFiles([
-                        {
-                          name: "Images",
-                          extensions: ["png", "jpg", "jpeg", "webp", "gif", "heic"],
-                        },
-                      ])
-                }
-              >
-                <Image aria-hidden="true" />
-              </Button>
-            </IconHint>
             {phone && (
               <>
                 <input
@@ -1713,7 +1762,11 @@ export function Composer({
           )}
           data-incognito={incognitoEffective ? "true" : undefined}
         />
-        <div className={sendAccessory ? "ml-auto flex min-w-0 items-center gap-2" : "contents"}>
+        <div
+          className={
+            sendAccessory ? "ml-auto flex min-w-0 shrink-0 items-center gap-2" : "contents"
+          }
+        >
           {sendAccessory}
           <Button
             type="button"
@@ -1722,13 +1775,25 @@ export function Composer({
             aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
             // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
             // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
-            // default button size.
+            // default button size. A session bar under 24rem draws Send as a
+            // 36px icon (≥44pt on the phone) so it keeps one row.
             className={cn(
               phone && "h-11 min-w-11",
               transport === "session" && !sendAccessory && "ml-auto",
+              transport === "session" &&
+                (phone ? "@max-[24rem]/bar:px-0" : "@max-[24rem]/bar:size-9 @max-[24rem]/bar:px-0"),
             )}
           >
-            {pending?.mode === "edit" ? "Save" : "Send"}
+            {transport === "session" && pending?.mode !== "edit" ? (
+              <>
+                <span className="@max-[24rem]/bar:hidden">Send</span>
+                <ArrowUp aria-hidden="true" className="hidden @max-[24rem]/bar:block" />
+              </>
+            ) : pending?.mode === "edit" ? (
+              "Save"
+            ) : (
+              "Send"
+            )}
           </Button>
         </div>
       </div>

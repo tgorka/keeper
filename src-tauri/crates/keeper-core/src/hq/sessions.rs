@@ -103,6 +103,8 @@ pub struct AgentSessionRowVm {
     pub handle: String,
     #[ts(type = "number")]
     pub created_at_ms: i64,
+    /// `sessions.trust` as the Details dialog says it: "Trusted" for a session
+    /// with no mark (or `trusted`), "Untrusted" once it read outside content.
     pub trust: String,
     pub instances: Vec<String>,
     pub agent_actor: String,
@@ -741,7 +743,7 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
                 display_name,
                 handle,
                 created_at_ms: int(row, "created_at_ms").unwrap_or(0),
-                trust: opt_text(row, "trust").unwrap_or_else(|| "Not reported".to_owned()),
+                trust: trust_label(opt_text(row, "trust").as_deref()),
                 instances: instance_labels,
                 agent_mark: mark(&agent_name),
                 agent_name,
@@ -754,6 +756,17 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
             })
         })
         .collect()
+}
+
+/// `sessions.trust` in the Details dialog's words. No mark is trusted
+/// (`commit-validator.ts`: a row without `trust` counts as trusted); a value
+/// this build does not know is shown as it is.
+fn trust_label(trust: Option<&str>) -> String {
+    match trust {
+        None | Some("trusted") => "Trusted".to_owned(),
+        Some("untrusted") => "Untrusted".to_owned(),
+        Some(other) => other.to_owned(),
+    }
 }
 
 /// The sessions where something waits for this person: an approval naming

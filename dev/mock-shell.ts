@@ -6114,6 +6114,8 @@ const ownerReport = new URLSearchParams(location.search).get("owner") === "repor
 /** `timeline::UNTRUSTED`. */
 const MOCK_UNTRUSTED =
   "This chat read outside content, such as a web page, so its commands need your approval.";
+/** `timeline::FRESH_CHAT`: the chip's `/clean`, absent on an archived session. */
+const MOCK_FRESH_CHAT = "Start a fresh chat: starts trusted, keeps drives";
 /** `context::NOT_MEASURED`, before `sessionViewerVm` projects the real reading. */
 const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
   used: null,
@@ -6129,9 +6131,28 @@ const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
 const MOCK_FOOTER_SEED: AgentSessionViewVm["footer"] = {
   model: "Default",
   effort: "Default",
+  shortModel: "Default",
+  compact: "Default · Default",
   choosesModel: false,
   choosesEffort: false,
 };
+/** `settings::footer_of`: the chip's words are the model's own name; the fold adds the effort. */
+function mockFooter(
+  model: string,
+  effort: string,
+  choosesModel: boolean,
+  choosesEffort: boolean,
+): AgentSessionViewVm["footer"] {
+  const shortModel = model.split("/").filter(Boolean).pop() ?? model;
+  return {
+    model,
+    effort,
+    shortModel,
+    compact: `${shortModel} · ${effort}`,
+    choosesModel,
+    choosesEffort,
+  };
+}
 /**
  * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
  * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
@@ -6705,7 +6726,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           row.sessionId === "device.1") ||
         // An archived chat that read the web keeps its marker (R598-03).
         (ownerReport && row.archived)
-          ? MOCK_UNTRUSTED
+          ? { sentence: MOCK_UNTRUSTED }
           : undefined,
       context: MOCK_UNMEASURED,
       footer: MOCK_FOOTER_SEED,
@@ -7483,13 +7504,22 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
       : {}),
     settings: picker,
+    // `timeline::AgentUntrustedVm::of`: the way out only where `/clean` runs.
+    ...(vm.untrusted
+      ? {
+          untrusted: {
+            sentence: vm.untrusted.sentence,
+            ...(vm.archived ? {} : { freshChat: MOCK_FRESH_CHAT }),
+          },
+        }
+      : {}),
     // `settings::footer`: always the labels; the chips open only where there is a choice.
-    footer: {
-      model: picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
-      effort: picker?.effortLabel ?? "Default",
-      choosesModel: (picker?.models.length ?? 0) > 1,
-      choosesEffort: (picker?.efforts.length ?? 0) > 1,
-    },
+    footer: mockFooter(
+      picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
+      picker?.effortLabel ?? "Default",
+      (picker?.models.length ?? 0) > 1,
+      (picker?.efforts.length ?? 0) > 1,
+    ),
     messages: vm.messages.map(({ details, ...message }) => ({
       ...message,
       ...(prefs.viewMode === "verbose" && details ? { details } : {}),

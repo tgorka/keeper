@@ -158,6 +158,14 @@ pub struct AgentSessionFooterVm {
     pub model: String,
     /// The same for effort.
     pub effort: String,
+    /// What the model chip says: `model` without its router and maker
+    /// (`openrouter/z-ai/glm-5.3-flash` → `glm-5.3-flash`), so the bar holds
+    /// one row in the Notes Assistant panel. `model` stays the whole id.
+    pub short_model: String,
+    /// The model chip at the panel's 280px minimum, where the effort folds
+    /// into it (`glm-5.3-flash · Default`): the documented exception to
+    /// R-HQ-85's separate effort chip.
+    pub compact: String,
     /// The model chip opens the picker: more than one model to choose.
     pub chooses_model: bool,
     /// The effort chip opens its menu: more than one effort to choose.
@@ -206,12 +214,25 @@ fn footer_of(
     picker: Option<&AgentSessionPickerVm>,
 ) -> AgentSessionFooterVm {
     let (model, effort) = labels(settings);
+    let short = short_model(&model).to_owned();
     AgentSessionFooterVm {
+        compact: format!("{short} · {effort}"),
+        short_model: short,
         model,
         effort,
         chooses_model: picker.is_some_and(|p| p.models.len() > 1),
         chooses_effort: picker.is_some_and(|p| p.efforts.len() > 1),
     }
+}
+
+/// A model id's own name: its last path segment, without the router and the
+/// maker (`openrouter/z-ai/glm-5.3-flash` → `glm-5.3-flash`); an id with no
+/// segment is itself.
+fn short_model(model: &str) -> &str {
+    model
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(model)
 }
 
 impl Hq {
@@ -1517,6 +1538,8 @@ mod tests {
             AgentSessionFooterVm {
                 model: "Default".to_owned(),
                 effort: "Default".to_owned(),
+                short_model: "Default".to_owned(),
+                compact: "Default · Default".to_owned(),
                 chooses_model: true,
                 chooses_effort: true,
             }
@@ -1534,6 +1557,8 @@ mod tests {
             AgentSessionFooterVm {
                 model: "alternate".to_owned(),
                 effort: "High".to_owned(),
+                short_model: "alternate".to_owned(),
+                compact: "alternate · High".to_owned(),
                 chooses_model: false,
                 chooses_effort: false,
             }
@@ -1581,6 +1606,22 @@ mod tests {
             ),
             ("alternate", false)
         );
+    }
+
+    /// FooterOneRow: the chip names the model by its own name, never the router's or the
+    /// maker's path, so the bar holds one row at the Notes Assistant's 360px default; the
+    /// whole id stays in `model` (the context reading and the accessible name read it). At
+    /// the 280px minimum the effort folds into the chip's words.
+    #[test]
+    fn the_chip_names_the_model_by_its_own_name_and_folds_the_effort_at_the_minimum() {
+        let routed = settings(None, None, &[(Some("openrouter/z-ai/glm-5.3-flash"), None)]);
+        let footer = footer_of(&routed, None);
+        assert_eq!(footer.model, "openrouter/z-ai/glm-5.3-flash");
+        assert_eq!(footer.short_model, "glm-5.3-flash");
+        assert_eq!(footer.compact, "glm-5.3-flash · Default");
+        assert_eq!(short_model("claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(short_model("maker/model/"), "model");
+        assert_eq!(short_model("/"), "/");
     }
 
     /// Owner ruling 2026-10-27: a model that answers 429 for days fails the turn; the picker

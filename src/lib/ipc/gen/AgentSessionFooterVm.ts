@@ -17,6 +17,18 @@ model: string,
  */
 effort: string, 
 /**
+ * What the model chip says: `model` without its router and maker
+ * (`openrouter/z-ai/glm-5.3-flash` → `glm-5.3-flash`), so the bar holds
+ * one row in the Notes Assistant panel. `model` stays the whole id.
+ */
+shortModel: string, 
+/**
+ * The model chip at the panel's 280px minimum, where the effort folds
+ * into it (`glm-5.3-flash · Default`): the documented exception to
+ * R-HQ-85's separate effort chip.
+ */
+compact: string, 
+/**
  * The model chip opens the picker: more than one model to choose.
  */
 choosesModel: boolean, 

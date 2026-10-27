@@ -1,4 +1,4 @@
-import { Brain, ChevronDown, Info, ShieldAlert, Star } from "lucide-react";
+import { Brain, ChevronDown, Info, RotateCcw, Star } from "lucide-react";
 import { type ReactNode, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,9 +13,11 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -33,29 +35,57 @@ import { toggleModelFavorite, useModelFavorites } from "@/lib/stores/model-favor
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
+/**
+ * The bar's widths, read from the composer bar's own `@container/bar` (FooterOneRow), never the
+ * viewport. Under 24rem (where the context is the ring alone) the chips tighten: less padding and
+ * a smaller chevron on the model, none on the effort menu. Under 19rem — the Notes Assistant's 280px minimum is a 255px bar —
+ * the effort folds into the model chip's words: the documented exception to R-HQ-85's separate
+ * effort chip (docs/agents.md).
+ */
+const NARROW_TIGHT = "@max-[24rem]/bar:px-2";
+const NARROW_HIDDEN = "@max-[24rem]/bar:hidden";
+const FOLDED_HIDDEN = "@max-[19rem]/bar:hidden";
+const FOLDED_SHOWN = "hidden @max-[19rem]/bar:block";
+const FOLDED_SR_ONLY = "@max-[19rem]/bar:sr-only";
+
 /** A chip in the composer's bar that opens nothing: the agent offers no alternative. */
 function ReadOnlyChip({
   name,
   value,
   hint,
   icon,
+  className,
 }: {
   name: string;
-  value: string;
+  value: ReactNode;
   hint: string;
   icon?: ReactNode;
+  className?: string;
 }) {
   return (
     <HoverHint label={name} detail={hint}>
       <span
         data-slot="agent-readonly-chip"
-        className="inline-flex min-h-11 max-w-full items-center gap-1 rounded-md px-2 text-muted-foreground text-xs [overflow-wrap:anywhere]"
+        className={cn(
+          "inline-flex min-h-11 min-w-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-muted-foreground text-xs",
+          className,
+        )}
       >
         {icon}
         <span className="sr-only">{name}: </span>
         {value}
       </span>
     </HoverHint>
+  );
+}
+
+/** The model chip's words: the model's own name, with the effort folded in at the minimum. */
+function ModelWords({ footer }: { footer: AgentSessionFooterVm }) {
+  return (
+    <>
+      <span className={cn("min-w-0 truncate", FOLDED_HIDDEN)}>{footer.shortModel}</span>
+      <span className={cn("min-w-0 truncate", FOLDED_SHOWN)}>{footer.compact}</span>
+    </>
   );
 }
 
@@ -70,15 +100,16 @@ function ReadOnlyChip({
  * popover may be held by the view (`modelsOpen`), so the list's right-click "Model…" opens this
  * same picker.
  *
- * It renders as `display: contents` inside the composer's wrapping bar: the controls sit in the
- * bar's row, the sentences on full-width lines after it.
+ * It renders as `display: contents` inside the composer's bar, which holds one row
+ * (FooterOneRow): the group never forces a wrap (its basis is 0, it grows up to its content and
+ * the model's name truncates), Reset lives in the model popover and the effort menu, and the
+ * sentences sit on full-width lines after the row.
  */
 export function SessionSettingsPicker({
   target,
   agent,
   footer,
   picker,
-  untrusted,
   modelsOpen: heldOpen,
   onModelsOpenChange,
 }: {
@@ -87,8 +118,6 @@ export function SessionSettingsPicker({
   footer: AgentSessionFooterVm;
   /** Absent where this person may not change them, or while they are still arriving. */
   picker?: AgentSessionPickerVm;
-  /** Rust's sentence while the session is untrusted: a marker in the bar says it. */
-  untrusted?: string;
   modelsOpen?: boolean;
   onModelsOpenChange?: (open: boolean) => void;
 }) {
@@ -99,8 +128,6 @@ export function SessionSettingsPicker({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const writing = useRef(false);
-  const modelButton = useRef<HTMLButtonElement>(null);
-  const effortButton = useRef<HTMLButtonElement>(null);
   const group = useRef<HTMLFieldSetElement>(null);
 
   async function apply(change: AgentSettingsChange) {
@@ -228,26 +255,41 @@ export function SessionSettingsPicker({
       </p>,
     );
   }
+  const reset = (
+    <>
+      <RotateCcw aria-hidden="true" />
+      Reset to the agent's defaults
+    </>
+  );
+  // Neither chip opens anything, yet a choice is saved: Reset stays in the bar (AD-260).
+  const resetInBar =
+    picker?.resettable && !(picker && (footer.choosesModel || footer.choosesEffort));
+  if (write?.state === "pending") {
+    notes.push(
+      <p key="pending" role="status" className="text-muted-foreground text-xs">
+        Waiting to sync.
+      </p>,
+    );
+  }
   return (
     <div data-slot="agent-session-settings" className="contents">
       <fieldset
         ref={group}
         tabIndex={-1}
         aria-label="Model and effort"
-        className="flex min-w-0 max-w-full flex-wrap items-center gap-0.5 text-xs"
+        className="flex min-w-0 max-w-max flex-1 basis-0 items-center gap-0.5 text-xs"
       >
         {picker && footer.choosesModel ? (
           <Popover open={modelsOpen} onOpenChange={setModelsOpen}>
             <PopoverTrigger asChild>
               <Button
-                ref={modelButton}
                 variant="ghost"
                 size="sm"
-                className="h-auto min-h-11 max-w-full justify-start whitespace-normal break-all"
+                className={cn("min-h-11 min-w-0 shrink justify-start", NARROW_TIGHT)}
                 aria-label={`Model: ${footer.model}`}
               >
-                <span className="min-w-0">{footer.model}</span>
-                <ChevronDown aria-hidden="true" />
+                <ModelWords footer={footer} />
+                <ChevronDown aria-hidden="true" className="size-4 @max-[24rem]/bar:size-3" />
               </Button>
             </PopoverTrigger>
             <PopoverContent
@@ -273,29 +315,45 @@ export function SessionSettingsPicker({
                     {picker.running}
                   </p>
                 )}
+                {picker.resettable && (
+                  <div className="border-t p-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="min-h-11 w-full justify-start"
+                      aria-label="Reset model and effort to the agent's defaults"
+                      onClick={() => {
+                        setModelsOpen(false);
+                        void apply({ kind: "reset" });
+                      }}
+                    >
+                      {reset}
+                    </Button>
+                  </div>
+                )}
               </Command>
             </PopoverContent>
           </Popover>
         ) : (
           <ReadOnlyChip
             name="Model"
-            value={footer.model}
+            value={<ModelWords footer={footer} />}
             hint="The next answer uses this model; there is no other to choose here."
+            className="shrink"
           />
         )}
         {picker && footer.choosesEffort ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
-                ref={effortButton}
                 variant="ghost"
                 size="sm"
-                className="min-h-11"
+                className={cn("min-h-11 shrink-0", NARROW_TIGHT)}
                 aria-label={`Effort: ${footer.effort}`}
               >
                 <Brain aria-hidden="true" />
-                {footer.effort}
-                <ChevronDown aria-hidden="true" />
+                <span className={FOLDED_SR_ONLY}>{footer.effort}</span>
+                <ChevronDown aria-hidden="true" className={NARROW_HIDDEN} />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="max-w-[calc(100vw-1.5rem)]">
@@ -323,6 +381,18 @@ export function SessionSettingsPicker({
                   {picker.running}
                 </p>
               )}
+              {picker.resettable && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="min-h-11"
+                    aria-label="Reset model and effort to the agent's defaults"
+                    onSelect={() => void apply({ kind: "reset" })}
+                  >
+                    {reset}
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         ) : (
@@ -331,51 +401,24 @@ export function SessionSettingsPicker({
             icon={<Brain aria-hidden="true" className="size-3.5 shrink-0" />}
             value={footer.effort}
             hint="The next answer uses this effort; there is no other to choose here."
+            // Folded into the model chip's words at the minimum; still read aloud here.
+            className={cn("shrink-0", FOLDED_SR_ONLY)}
           />
         )}
-        {picker?.resettable && (
+        {resetInBar && (
           <Button
             variant="ghost"
             size="sm"
-            className="min-h-11"
+            className="min-h-11 shrink-0"
             aria-label="Reset model and effort to the agent's defaults"
             onClick={() => {
-              // Reset removes itself; keep keyboard focus in the bar: on the model's picker, else
-              // the effort's, else the group itself when both are read-only chips (R598-06).
-              (modelButton.current ?? effortButton.current ?? group.current)?.focus();
+              // Reset removes itself; keep keyboard focus in the bar, on the group (R598-06).
+              group.current?.focus();
               void apply({ kind: "reset" });
             }}
           >
             Reset
           </Button>
-        )}
-        {write?.state === "pending" && (
-          <span role="status" className="px-1 text-muted-foreground">
-            Waiting to sync.
-          </span>
-        )}
-        {untrusted && (
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                variant="ghost"
-                size="sm"
-                data-slot="agent-untrusted-marker"
-                className="min-h-11 gap-1 px-2 text-held"
-              >
-                <ShieldAlert aria-hidden="true" className="size-3.5" />
-                Untrusted
-                <span className="sr-only">: {untrusted}</span>
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent
-              align="start"
-              aria-label="Why commands ask"
-              className="w-[min(20rem,calc(100vw-1.5rem))] text-sm"
-            >
-              {untrusted}
-            </PopoverContent>
-          </Popover>
         )}
       </fieldset>
       {notes.length > 0 && <div className="order-last flex basis-full flex-col gap-1">{notes}</div>}

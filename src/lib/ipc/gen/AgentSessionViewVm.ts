@@ -12,6 +12,7 @@ import type { AgentSessionPickerVm } from "./AgentSessionPickerVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
 import type { AgentTimelineItemVm } from "./AgentTimelineItemVm";
 import type { AgentTurnFoldVm } from "./AgentTurnFoldVm";
+import type { AgentUntrustedVm } from "./AgentUntrustedVm";
 import type { AgentViewPrefsVm } from "./AgentViewPrefsVm";
 
 /**
@@ -77,9 +78,9 @@ note?: string,
 readsTrace: boolean, 
 /**
  * The session has read outside content (`sessions.trust`, D-34): why its
- * commands ask, in one plain sentence ([`UNTRUSTED`]); absent while trusted.
+ * commands ask, and the way out; absent while trusted.
  */
-untrusted?: string, 
+untrusted?: AgentUntrustedVm, 
 /**
  * The answers still being written, oldest first; each one's work is its
  * turn's fold.

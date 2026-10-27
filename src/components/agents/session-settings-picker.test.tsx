@@ -53,6 +53,8 @@ function Picker(
       footer={{
         model: p.modelLabel,
         effort: p.effortLabel ?? "Default",
+        shortModel: p.modelLabel,
+        compact: `${p.modelLabel} · ${p.effortLabel ?? "Default"}`,
         choosesModel: p.models.length > 1,
         choosesEffort: p.efforts.length > 1,
       }}
@@ -145,12 +147,32 @@ describe("the model and effort pickers", () => {
     );
   });
 
-  it("resets through Rust's reset, shown only when a choice is saved", async () => {
+  it("resets through Rust's reset from the model popover and the effort menu, never from the bar (FooterOneRow)", async () => {
     const { rerender } = render(<Picker target={target} agent="nixi" picker={picker()} />);
-    expect(screen.queryByRole("button", { name: /Reset/ })).toBeNull();
+    expect(within(openModels()).queryByRole("button", { name: /Reset/ })).toBeNull();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     rerender(<Picker target={target} agent="nixi" picker={picker({ resettable: true })} />);
+    // The bar holds one row: Reset is not a control of its own there.
+    expect(
+      within(screen.getByRole("group", { name: "Model and effort" })).queryByRole("button", {
+        name: /Reset/,
+      }),
+    ).toBeNull();
     fireEvent.click(
-      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+      within(openModels()).getByRole("button", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
+    );
+    await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
+    mock.change.mockClear();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Effort: Medium" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(
+      within(await screen.findByRole("menu")).getByRole("menuitem", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
     );
     await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
   });
@@ -252,7 +274,7 @@ describe("the model and effort pickers", () => {
     ).toEqual(["Reset"]);
   });
 
-  it("Reset keeps focus in the bar when the model is a read-only chip (R598-06)", async () => {
+  it("resets from the effort menu when the model is a read-only chip", async () => {
     render(
       <Picker
         target={target}
@@ -263,10 +285,16 @@ describe("the model and effort pickers", () => {
         })}
       />,
     );
+    expect(screen.queryByRole("button", { name: /Reset/ })).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Effort: Medium" }), {
+      button: 0,
+      ctrlKey: false,
+    });
     fireEvent.click(
-      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+      within(await screen.findByRole("menu")).getByRole("menuitem", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
     );
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Effort: Medium" }));
     await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
   });
 
@@ -295,9 +323,11 @@ describe("the model and effort pickers", () => {
       "The last answer failed on gamma-fast: provider answered 429. Choose another model, or Reset to the agent's default.";
     render(<Picker target={target} agent="nixi" picker={picker({ failed, resettable: true })} />);
     expect(screen.getByRole("alert")).toHaveTextContent(failed);
-    expect(screen.getByRole("button", { name: "Model: beta-small" })).toBeInTheDocument();
+    // The way back the sentence names is where it says: Reset, in the model's popover.
     expect(
-      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+      within(openModels()).getByRole("button", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
     ).toBeInTheDocument();
   });
 
@@ -311,7 +341,9 @@ describe("the model and effort pickers", () => {
     expect(lastAgentPick("other-agent")).toBeNull();
     mock.change.mockResolvedValue({ note: null, pick: { model: null, effort: null } });
     fireEvent.click(
-      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+      within(openModels()).getByRole("button", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
     );
     await waitFor(() => expect(lastAgentPick("nixi")).toBeNull());
   });

@@ -157,7 +157,13 @@ export function DockBody() {
           }}
         />
       ) : chosen ? (
-        <SessionView key={JSON.stringify([chosen.database, chosen.sessionId])} target={chosen} />
+        <SessionView
+          key={JSON.stringify([chosen.database, chosen.sessionId])}
+          target={chosen}
+          // `/clean` and `/new` (and the Untrusted chip's fresh chat) move the dock to the
+          // session they started; the dock's choice is its own, not the Agents window's.
+          onSession={setChosen}
+        />
       ) : (
         loaded && (
           <p className="p-3 text-muted-foreground text-sm">

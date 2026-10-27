@@ -278,6 +278,34 @@ pub fn banner(
 pub const UNTRUSTED: &str =
     "This chat read outside content, such as a web page, so its commands need your approval.";
 
+/// The honest way out of an untrusted chat: `/clean` starts a fresh one with
+/// the same agent, which starts trusted and keeps the drives (Q109-17 b),
+/// while the mark on this one never lowers (D-34, V13).
+pub const FRESH_CHAT: &str = "Start a fresh chat: starts trusted, keeps drives";
+
+/// A session that read outside content, as its header's chip says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentUntrustedVm {
+    /// Why its commands ask ([`UNTRUSTED`]).
+    pub sentence: String,
+    /// The words of the action that runs `/clean` ([`FRESH_CHAT`]); absent
+    /// on an archived session, where `/clean` refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fresh_chat: Option<String>,
+}
+
+impl AgentUntrustedVm {
+    fn of(archived: bool) -> Self {
+        Self {
+            sentence: UNTRUSTED.to_owned(),
+            fresh_chat: (!archived).then(|| FRESH_CHAT.to_owned()),
+        }
+    }
+}
+
 /// What an opened session shows, whole, every time it changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -332,10 +360,10 @@ pub struct AgentSessionViewVm {
     /// This person may read the session's thinking and tool results.
     pub reads_trace: bool,
     /// The session has read outside content (`sessions.trust`, D-34): why its
-    /// commands ask, in one plain sentence ([`UNTRUSTED`]); absent while trusted.
+    /// commands ask, and the way out; absent while trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub untrusted: Option<String>,
+    pub untrusted: Option<AgentUntrustedVm>,
     /// The answers still being written, oldest first; each one's work is its
     /// turn's fold.
     pub live: Vec<AgentLiveTurnVm>,
@@ -655,7 +683,9 @@ pub fn view(
             complete,
             note,
             reads_trace,
-            untrusted: session.untrusted.then(|| UNTRUSTED.to_owned()),
+            untrusted: session
+                .untrusted
+                .then(|| AgentUntrustedVm::of(session.archived)),
             live,
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,

@@ -68,8 +68,9 @@ export function SessionContext({
 
 /**
  * The bar's context reading (t3.chat's `5.3k / 1M`): a ring and Rust's compact label, always
- * drawn — an empty ring and `—` until an answer has measured it. Render it inside
- * `SessionContext`.
+ * drawn — an empty ring and `—` until an answer has measured it. Below 24rem of the
+ * composer's bar (`@container/bar`, FooterOneRow) it is the ring alone; the label stays in its
+ * accessible name, tooltip and Details. Render it inside `SessionContext`.
  */
 export function SessionContextTrigger({ context }: { context: ContextVm }) {
   return (
@@ -102,7 +103,7 @@ export function SessionContextTrigger({ context }: { context: ContextVm }) {
               <span className="size-2.5 rounded-full bg-background" />
             </span>
           </span>
-          <span className="text-xs tabular-nums">{context.label}</span>
+          <span className="text-xs tabular-nums @max-[24rem]/bar:hidden">{context.label}</span>
         </Button>
       </SheetTrigger>
     </HoverHint>
