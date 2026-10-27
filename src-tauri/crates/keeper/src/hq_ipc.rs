@@ -113,6 +113,9 @@ pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
     if HQ.set(Arc::clone(&hq)).is_err() {
         return HQ.get().map_or(hq, Arc::clone);
     }
+    // An approved drive write is committed into this device's own checkout
+    // as the person (109.27).
+    hq.set_drive_writes(Arc::new(crate::hq_apply::ShellDriveWrites::app()));
     let started = Arc::clone(&hq);
     let pending = PUSH_TARGET
         .lock()

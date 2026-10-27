@@ -300,6 +300,10 @@ pub struct Hq {
     window_task: Mutex<Option<JoinHandle<()>>>,
     /// Decisions whose outcome the server still owes ([`approvals::Decisions`]).
     decisions: std::sync::OnceLock<approvals::Decisions>,
+    /// This device's drive writes (109.27, [`approvals::write::Writes`]).
+    writes: approvals::write::Writes,
+    /// A carrying-on of drive writes is running ([`Hq::carry_on_writes`]).
+    carrying: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// What this viewer chose to see ([`live::AgentViewPrefsVm`]), once read.
     prefs: Mutex<Option<live::AgentViewPrefsVm>>,
     /// Ticks when only a presence document moved: the open sessions read
@@ -405,6 +409,8 @@ impl Hq {
             staging: attachments::Staging::default(),
             window_task: Mutex::default(),
             decisions: std::sync::OnceLock::new(),
+            writes: approvals::write::Writes::default(),
+            carrying: std::sync::Arc::default(),
             prefs: Mutex::default(),
             push_turn: tokio::sync::Mutex::new(()),
         })

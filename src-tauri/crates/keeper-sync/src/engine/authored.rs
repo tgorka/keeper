@@ -273,6 +273,45 @@ impl Engine {
         .map_err(|error| SyncError::Config(format!("a commit request was cut off: {error}")))?
     }
 
+    /// The commit on the folder's branch that carried out `approval` — the
+    /// one whose trailers hold `Approval-Record: <approval>` — made at or
+    /// after `since_secs`, or `None` (109.27, contract § 5.3). Under the
+    /// profile's lane, waited for as [`Self::commit_paths`] waits, and only
+    /// once a record a kill left is settled: a commit that was published is
+    /// finished first, so it is found; one that never was is dropped, so it
+    /// is not. What a device asks after it was stopped between taking an
+    /// approval and saying what became of it.
+    pub async fn approval_commit(
+        self: &Arc<Self>,
+        profile_id: &str,
+        approval: &str,
+        since_secs: i64,
+    ) -> Result<Option<String>> {
+        let engine = Arc::clone(self);
+        let (profile_id, approval) = (profile_id.to_owned(), approval.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let Some(profile) = engine.with_db(|conn| db::get_profile(conn, &profile_id))? else {
+                return Err(SyncError::Config(format!(
+                    "no such sync profile: {profile_id}"
+                )));
+            };
+            let waited = std::time::Instant::now();
+            let _reservation = loop {
+                if let Some(reservation) = engine.reserve(&profile.id) {
+                    break reservation;
+                }
+                if waited.elapsed() >= COMMIT_LANE_WAIT {
+                    return Err(SyncError::Busy(profile.name.clone()));
+                }
+                std::thread::sleep(COMMIT_LANE_POLL);
+            };
+            engine.settle_commit_paths(&profile)?;
+            git::history::carrying(&profile.local_path, &approval, since_secs)
+        })
+        .await
+        .map_err(|error| SyncError::Config(format!("a history read was cut off: {error}")))?
+    }
+
     fn commit_paths_blocking(
         &self,
         profile_id: &str,

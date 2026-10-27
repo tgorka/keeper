@@ -17,6 +17,7 @@
 import type { LucideIcon } from "lucide-react";
 import { Ellipsis, OctagonAlert, Shield, ShieldAlert } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
+import { DriveWritePreview } from "@/components/agents/drive-write-preview";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -233,6 +234,7 @@ export function DatabaseApprovalCard({
         <span className="break-all text-muted-foreground text-xs">{approval.database}</span>
       </div>
       <p className="break-words text-sm">{approval.summary}</p>
+      {approval.write && <DriveWritePreview write={approval.write} />}
       {approval.action !== undefined && (
         <figure aria-label="Exact action">
           <pre className="my-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-muted p-2 text-xs [overflow-wrap:anywhere]">
