@@ -496,8 +496,9 @@ fn a_server_refusal_stays_on_the_persons_line_in_plain_words() {
     );
     let prompt = shown.prompt.as_ref().expect("the person's line");
     assert_eq!(
-        (prompt.body.as_str(), prompt.state),
-        (line, Some(AgentMessageStateVm::Refused))
+        (prompt.body.as_str(), prompt.state, prompt.mine),
+        (line, Some(AgentMessageStateVm::Refused), true),
+        "a refused line is this replica's own, so it stays the person's bubble"
     );
     assert!(shown.created_at_ms >= w.at);
     assert_eq!(

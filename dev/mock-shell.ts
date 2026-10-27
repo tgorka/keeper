@@ -8385,7 +8385,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       title: parsed[2].trim().split("\n")[0],
       titleWrite: { state: "confirmed" },
       displayName: `${agent.name} · ${parsed[2].trim().split("\n")[0]}`,
-      handle: "quiet-heron-listens",
+      handle: "quiet-heron",
       createdAtMs: now,
       trust: "native",
       instances: [],

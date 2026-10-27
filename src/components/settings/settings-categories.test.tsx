@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  REVEAL_SETTLE_LIMIT_MS,
+  REVEAL_SETTLE_QUIET_MS,
   SETTINGS_BACK_LABEL,
   SETTINGS_CATEGORIES_LABEL,
   SettingsCategories,
@@ -220,6 +222,126 @@ describe("SettingsCategories deep links", () => {
     fireEvent.click(screen.getByRole("button", { name: "Notes" }));
     expect(screen.getByRole("button", { name: "Model" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Model" })).not.toHaveFocus();
+  });
+});
+
+describe("SettingsCategories deep links whose sections above fill in late", () => {
+  // jsdom lays nothing out, so the test plays the browser: a ResizeObserver
+  // it fires by hand for an element that grew, and a scrollIntoView that
+  // records which element was scrolled to.
+  let observers: { callback: ResizeObserverCallback; targets: Set<Element> }[];
+  let scrolled: Element[];
+  let grow: (on: boolean) => void;
+
+  /** Default agent, the first section of Agents & voice, drawn after its read answers. */
+  function DefaultAgent() {
+    const [on, setOn] = useState(false);
+    grow = setOn;
+    return <p>{on ? "section:default-agent, now three cards tall" : "section:default-agent"}</p>;
+  }
+
+  /** Default agent grows, and the browser tells whoever watches it. */
+  async function growAbove() {
+    await act(async () => grow(true));
+    const above = document.querySelector('[data-settings-section="default-agent"]');
+    act(() => {
+      for (const { callback, targets } of observers) {
+        if (above && targets.has(above)) {
+          callback([], {} as ResizeObserver);
+        }
+      }
+    });
+  }
+
+  const scrolledToAlwaysAllowed = () =>
+    scrolled.filter((element) => element.getAttribute("data-settings-section") === "always-allowed")
+      .length;
+
+  function renderAlwaysAllowed() {
+    const sections = everySection();
+    sections["default-agent"] = { node: <DefaultAgent /> };
+    settingsUiStore.getState().revealSection("always-allowed");
+    render(<SettingsCategories layout="rail" sections={sections} />);
+    expect(visibleSections()).toContain("always-allowed");
+    expect(scrolledToAlwaysAllowed()).toBe(1);
+  }
+
+  beforeEach(() => {
+    observers = [];
+    scrolled = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        private readonly entry: (typeof observers)[number];
+        constructor(callback: ResizeObserverCallback) {
+          this.entry = { callback, targets: new Set() };
+          observers.push(this.entry);
+        }
+        observe(target: Element) {
+          this.entry.targets.add(target);
+        }
+        unobserve(target: Element) {
+          this.entry.targets.delete(target);
+        }
+        disconnect() {
+          this.entry.targets.clear();
+        }
+      },
+    );
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (this: Element) {
+      scrolled.push(this);
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("scrolls back to the revealed section when a section above it grows after the first scroll", async () => {
+    renderAlwaysAllowed();
+    await growAbove();
+    expect(scrolledToAlwaysAllowed()).toBe(2);
+  });
+
+  it.each([
+    ["scrolls", () => fireEvent.wheel(document.body)],
+    ["clicks", () => fireEvent.pointerDown(document.body)],
+    ["types", () => fireEvent.keyDown(document.body, { key: "ArrowDown" })],
+  ])("lets go the moment the person %s", async (_, person) => {
+    renderAlwaysAllowed();
+    person();
+    await growAbove();
+    expect(scrolledToAlwaysAllowed()).toBe(1);
+  });
+
+  it("lets go once the layout has been still for the quiet window", async () => {
+    vi.useFakeTimers();
+    renderAlwaysAllowed();
+    act(() => vi.advanceTimersByTime(REVEAL_SETTLE_QUIET_MS - 1));
+    await growAbove();
+    expect(scrolledToAlwaysAllowed()).toBe(2);
+
+    // A growth restarts the quiet window; a full one without any ends it.
+    act(() => vi.advanceTimersByTime(REVEAL_SETTLE_QUIET_MS));
+    await growAbove();
+    expect(scrolledToAlwaysAllowed()).toBe(2);
+  });
+
+  it("lets go at the limit even while the sections above keep moving", async () => {
+    vi.useFakeTimers();
+    renderAlwaysAllowed();
+    let held = 1;
+    for (let at = 500; at < REVEAL_SETTLE_LIMIT_MS; at += 500) {
+      act(() => vi.advanceTimersByTime(500));
+      await growAbove();
+      held += 1;
+      expect(scrolledToAlwaysAllowed()).toBe(held);
+    }
+    act(() => vi.advanceTimersByTime(500));
+    await growAbove();
+    expect(scrolledToAlwaysAllowed()).toBe(held);
   });
 });
 
