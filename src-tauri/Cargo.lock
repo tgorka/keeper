@@ -4662,6 +4662,7 @@ dependencies = [
 name = "keeper-llm"
 version = "0.10.6"
 dependencies = [
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",

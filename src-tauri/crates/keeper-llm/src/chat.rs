@@ -27,7 +27,7 @@
 //! stopped. The same line is also the retry boundary (see [`stream_chat`]), so
 //! the two rules are one rule.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::header::HeaderValue;
 use serde_json::{json, Map, Value};
@@ -1099,6 +1099,27 @@ impl Default for ChatOptions {
     }
 }
 
+/// The longest `Retry-After` a request waits out before its one retry.
+///
+/// Thirty seconds, because the two things that send the header want very
+/// different answers. A concurrency or per-minute rate limit — Hermes'
+/// rejection (research §2.8), a provider's RPM window — asks for seconds, and
+/// a turn the person is watching can absorb that: it is a quarter of the
+/// [`crate::http::READ_TIMEOUT`] silence the same turn already tolerates. A
+/// spent quota asks for hours or days — CLIProxyAPI's `model_cooldown` sends
+/// the seconds until the reset, `427327` on 2026-10-26 (R58-01) — and no
+/// person waits that out in front of a silent turn. Past the bound the request
+/// fails at once with [`BotsError::RetryAfterTooLong`], which names the model
+/// and when it comes back, so the person can pick another one now.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// A parsed `Retry-After`: how long from now, and when that is.
+struct RetryAfter {
+    wait: Duration,
+    /// `None` only when now plus the header's seconds overflows the clock.
+    at: Option<SystemTime>,
+}
+
 /// A failed attempt, and the two facts the retry decision needs.
 struct AttemptFailure {
     error: BotsError,
@@ -1107,7 +1128,7 @@ struct AttemptFailure {
     /// The completion so far, when there is one worth keeping.
     partial: Option<ChatOutcome>,
     /// `Retry-After`, where the endpoint sent one.
-    retry_after: Option<Duration>,
+    retry_after: Option<RetryAfter>,
 }
 
 /// Send one chat completion and drive its stream to a [`ChatOutcome`].
@@ -1117,7 +1138,9 @@ struct AttemptFailure {
 /// A request is sent again only when **all** of these hold: it produced no
 /// stream byte, its failure is a connect failure / 429 / 5xx, and an attempt
 /// remains. `Retry-After` is honoured where the endpoint sends one — Hermes
-/// sends it on its concurrency rejection (research §2.8).
+/// sends it on its concurrency rejection (research §2.8) — up to
+/// [`MAX_RETRY_AFTER`]. A 429 or 5xx asking for longer is not retried at all:
+/// it fails at once as [`BotsError::RetryAfterTooLong`].
 ///
 /// A partially-streamed completion is **never** retried, for three reasons
 /// that are all somebody else's scar tissue (research §7.3): Chat Completions
@@ -1160,12 +1183,18 @@ pub async fn stream_chat(
             Err(failure) => failure,
         };
 
+        if let Some(refusal) = too_long_to_wait(&failure, &request.model) {
+            return Err(refusal);
+        }
+
         let may_retry =
             !failure.saw_stream_bytes && failure.error.is_retryable() && attempt + 1 < attempts;
 
         if may_retry {
             let wait = failure
                 .retry_after
+                .as_ref()
+                .map(|after| after.wait)
                 .unwrap_or_else(|| backoff(options.retry_backoff, attempt));
             tracing::warn!(
                 attempt = attempt + 1,
@@ -1202,6 +1231,35 @@ pub async fn stream_chat(
     // Unreachable: the loop either returns or continues, and `attempts >= 1`.
     Err(BotsError::Protocol {
         detail: "the request was never attempted".to_owned(),
+    })
+}
+
+/// The refusal for a 429 / 5xx whose `Retry-After` is past
+/// [`MAX_RETRY_AFTER`], or `None` when the failure may be handled as usual.
+///
+/// Decided before the retry rule and regardless of attempts left: a request
+/// that may not be retried still owes the person the model and the wait
+/// rather than a bare status line.
+fn too_long_to_wait(failure: &AttemptFailure, model: &str) -> Option<BotsError> {
+    let after = failure.retry_after.as_ref()?;
+    if after.wait <= MAX_RETRY_AFTER || !failure.error.is_retryable() {
+        return None;
+    }
+    let BotsError::Status {
+        status,
+        endpoint,
+        detail,
+    } = &failure.error
+    else {
+        return None;
+    };
+    Some(BotsError::RetryAfterTooLong {
+        model: model.to_owned(),
+        status: *status,
+        endpoint: endpoint.clone(),
+        wait_secs: after.wait.as_secs(),
+        until: after.at.map(httpdate::fmt_http_date),
+        detail: detail.clone(),
     })
 }
 
@@ -1478,17 +1536,29 @@ async fn attempt_stream(
     Ok(outcome)
 }
 
-/// `Retry-After`, in the delta-seconds form both back ends use.
-fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
-    response
+/// `Retry-After`, in either form RFC 9110 §10.2.3 allows: delta-seconds
+/// (what both back ends send) or an HTTP date. A date already past is a wait
+/// of zero.
+fn parse_retry_after(response: &reqwest::Response) -> Option<RetryAfter> {
+    let value = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+        .trim();
+    let now = SystemTime::now();
+    if let Ok(secs) = value.parse::<u64>() {
+        let wait = Duration::from_secs(secs);
+        return Some(RetryAfter {
+            wait,
+            at: now.checked_add(wait),
+        });
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(RetryAfter {
+        wait: at.duration_since(now).unwrap_or(Duration::ZERO),
+        at: Some(at),
+    })
 }
 
 /// Read at most [`MAX_ERROR_BODY_BYTES`] of a failing response.
