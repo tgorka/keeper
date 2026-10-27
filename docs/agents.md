@@ -380,9 +380,12 @@ that a message saying yes still declines. The webview sends back the `(id, diges
 banner showed, and Rust declines only those still waiting at that digest: a request that arrived
 after the banner was drawn stays pending. A T4 request this device cannot decide — it is on the
 host the agent runs on, or either host is unknown, which V8 refuses for a denial too
-(`hq.v8.t4_other_host`) — is not declined: it stays in the reading column, and the banner adds
-"1 request needs a decision from another device; a message here leaves it waiting"
-(DW-E109-27). A text message, a message with files, an ask option and
+(`hq.v8.t4_other_host`) — is not declined and offers no decision: its card says "Needs a decision
+from another device." with no *Allow once* or *Deny*, it stays in the reading column (and out of
+the decisions panel), and the banner adds "1 request needs a decision from another device; a
+message here leaves it waiting" (DW-E109-27, R109T-02). When the host of the instance holding the
+session is the unknown one, no device can decide it yet, and both say so instead: "Can't be decided
+until the agent's host is known." (R109T-04; `approvals::Undecidable`). A text message, a message with files, an ask option and
 `/stop` decline; no other slash command does, nor a spoken question (it is sent with no banner
 shown). A denial that cannot be written on the device stops the message, and the banner says
 which request still waits; the composer keeps the draft and shows the same sentence hidden from

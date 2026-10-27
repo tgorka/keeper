@@ -289,6 +289,8 @@ fn always_allow_is_left_out_where_no_grant_could_apply() {
     let w = world("zoë");
     session(&w, "dev1.1", None, false);
     session(&w, "dev1.2", Some("untrusted"), false);
+    // On another host than the agent's, so the T4 request is decidable here.
+    hosts(&w, "dev1.1", Some("laptop"), Some("electra"));
     let paseo = json!({"title": "x"});
     request(
         &w,
@@ -528,17 +530,25 @@ fn sending_a_message_declines_what_waits_for_the_sender() {
     assert_eq!(outbox_ops(&w), vec!["approvals", "approvals", "messages"]);
 }
 
-/// DW-E109-27: V8 refuses a T4 decision — a denial too — from the host the
-/// agent runs on, or when a host is unknown. A message there leaves such a
-/// request waiting, out of the banner, and the banner says how many need
-/// another device.
+/// DW-E109-27, R109T-02, R109T-04: V8 refuses a T4 decision — a denial
+/// too — from the host the agent runs on, or when a host is unknown. Such a
+/// card offers no decision and says why; a message leaves it waiting, out of
+/// the banner; and the banner says how many wait, and for what.
 #[test]
-fn a_t4_request_this_device_cannot_decide_is_not_declined_and_waits_for_another_device() {
-    for (mine, holder) in [
-        (Some("electra"), Some("electra")),
-        (None, Some("electra")),
-        (Some("laptop"), None),
+fn a_t4_request_this_device_cannot_decide_offers_no_decision_and_is_not_declined() {
+    let another = "Needs a decision from another device.";
+    let unknown = "Can't be decided until the agent's host is known.";
+    let another_line =
+        "1 request needs a decision from another device; a message here leaves it waiting.";
+    let unknown_line = "1 request can't be decided until the agent's host is known; a message \
+                        here leaves it waiting.";
+    for (mine, holder, card_says, banner_says) in [
+        (Some("electra"), Some("electra"), another, another_line),
+        (None, Some("electra"), another, another_line),
+        (Some("laptop"), None, unknown, unknown_line),
+        (None, None, unknown, unknown_line),
     ] {
+        let case = format!("{mine:?}/{holder:?}");
         let w = world("zoë");
         session(&w, "dev1.1", None, false);
         hosts(&w, "dev1.1", mine, holder);
@@ -564,22 +574,32 @@ fn a_t4_request_this_device_cannot_decide_is_not_declined_and_waits_for_another_
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
             ["mine"],
-            "{mine:?}/{holder:?}"
+            "{case}"
         );
         assert_eq!(
             banner.sentence,
-            "Sending a message declines this request, even a message that says yes. Use Allow \
-             to let it run. 1 request needs a decision from another device; a message here \
-             leaves it waiting."
+            format!(
+                "Sending a message declines this request, even a message that says yes. Use \
+                 Allow to let it run. {banner_says}"
+            ),
+            "{case}"
         );
-        assert_eq!(
-            before
-                .approvals
-                .iter()
-                .map(|a| a.id.as_str())
-                .collect::<Vec<_>>(),
-            ["t4"],
-            "in the reading column"
+        let [t4] = before.approvals.as_slice() else {
+            panic!("{case}: the T4 request alone in the reading column");
+        };
+        assert_eq!(t4.id, "t4");
+        assert_eq!(t4.sentence, card_says, "{case}");
+        assert!(!t4.can_decide, "{case}");
+        assert!(t4.actions.is_empty(), "{case}: no Allow once, no Deny");
+        assert!(
+            !crate::hq::approvals::waiting(
+                std::slice::from_ref(&w.alpha),
+                &Default::default(),
+                now()
+            )
+            .iter()
+            .any(|a| a.id == "t4"),
+            "{case}: not in the decisions panel"
         );
 
         // Even shown, a message declines only what this device may decide.
@@ -600,11 +620,19 @@ fn a_t4_request_this_device_cannot_decide_is_not_declined_and_waits_for_another_
         assert_eq!(outbox_ops(&w), vec!["approvals", "messages"]);
         let after = view().banner.expect("still said");
         assert!(after.approvals.is_empty());
-        assert_eq!(
-            after.sentence,
-            "1 request needs a decision from another device; a message here leaves it waiting."
-        );
+        assert_eq!(after.sentence, banner_says, "{case}");
     }
+
+    // On another host than the agent's, the same request is this device's
+    // to decide.
+    let w = world("zoë");
+    session(&w, "dev1.1", None, false);
+    hosts(&w, "dev1.1", Some("laptop"), Some("electra"));
+    request(&w, "t4", "dev1.1", "delegate", "T4", json!({}), &["zoë"]);
+    let t4 = card(&w, "dev1.1", "t4");
+    assert_eq!(t4.sentence, "Waiting for you.");
+    assert!(t4.can_decide && t4.declined_by_send);
+    assert_eq!(t4.actions, [Action::AllowOnce, Action::Deny]);
 }
 
 /// What the session's banner shows now, as the webview sends it back with a

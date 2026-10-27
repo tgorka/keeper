@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
-use crate::hq::approvals::{self, AgentApprovalVm};
+use crate::hq::approvals::{self, AgentApprovalVm, Undecidable};
 use crate::hq::attachments::{self, AgentAttachmentVm};
 use crate::hq::drives::AgentSessionDrivesVm;
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
@@ -205,16 +205,23 @@ pub struct AgentApprovalBannerVm {
 
 /// The banner over `approvals`' requests a message would decline, and the
 /// rest, for the reading column. A T4 request this device cannot decide
-/// waits for another of the person's devices: a message does not decline
-/// it, so it stays in the reading column and the banner says, in one more
-/// sentence, how many wait that way (DW-E109-27).
+/// waits for another of the person's devices, or for the agent's host to be
+/// known: a message does not decline it, so it stays in the reading column
+/// and the banner says, in one more sentence each, how many wait that way
+/// (DW-E109-27, R109T-04).
 pub fn banner(
     approvals: Vec<AgentApprovalVm>,
 ) -> (Option<AgentApprovalBannerVm>, Vec<AgentApprovalVm>) {
-    let elsewhere = approvals
-        .iter()
-        .filter(|approval| approval.needs_another_device)
-        .count();
+    let count = |why: Undecidable| {
+        approvals
+            .iter()
+            .filter(|approval| approval.undecidable == Some(why))
+            .count()
+    };
+    let (elsewhere, unknown) = (
+        count(Undecidable::AnotherDevice),
+        count(Undecidable::HostUnknown),
+    );
     let (waiting, rest): (Vec<_>, Vec<_>) = approvals
         .into_iter()
         .partition(|approval| approval.declined_by_send);
@@ -241,7 +248,19 @@ pub fn banner(
              waiting."
         )),
     };
-    let sentence: Vec<String> = declines.into_iter().chain(another).collect();
+    let host = match unknown {
+        0 => None,
+        1 => Some(
+            "1 request can't be decided until the agent's host is known; a message here leaves \
+             it waiting."
+                .to_owned(),
+        ),
+        n => Some(format!(
+            "{n} requests can't be decided until the agent's host is known; a message here \
+             leaves them waiting."
+        )),
+    };
+    let sentence: Vec<String> = declines.into_iter().chain(another).chain(host).collect();
     let banner = (!sentence.is_empty()).then(|| AgentApprovalBannerVm {
         sentence: sentence.join(" "),
         approvals: waiting,

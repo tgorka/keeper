@@ -823,6 +823,32 @@ fn clean_leaves_behind_a_drive_this_person_may_no_longer_tick() {
     let fresh = command(&beta, &sources, "/clean");
     assert_eq!(stored_in(&beta, &fresh).as_deref(), Some(r#"["beta"]"#));
 
+    // The server already refused it (R109T-01): this device holds alpha only,
+    // so who reads beta it cannot know, and the standing refusal of the
+    // selection names beta by the audience rule.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("owner"), false);
+    put(
+        &alpha,
+        vec![profile("nixie.box", AGENT, Some(&["alpha", "beta"]))],
+    );
+    let only = [alpha.clone()];
+    set(&alpha, SESSION, "alpha", true, &only, 5).expect("ticks alpha");
+    set(&alpha, SESSION, "beta", true, &only, 6).expect("beta: the server decides");
+    journal_refusal(
+        &dir.path().join("alpha.sqlite"),
+        "c-beta",
+        &["alpha", "beta"],
+        "hq.v17.audience",
+    );
+    let fresh = command(&alpha, &only, "/clean");
+    assert_eq!(
+        stored_in(&alpha, &fresh).as_deref(),
+        Some(r#"["alpha"]"#),
+        "a drive the server refused would have the whole carried selection refused"
+    );
+
     // Every ticked drive left behind: no selection at all.
     put(&beta, vec![profile("nixie.box", AGENT, Some(&[]))]);
     let fresh = command(&beta, &sources, "/clean");

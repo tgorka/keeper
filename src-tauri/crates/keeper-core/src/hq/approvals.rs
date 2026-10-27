@@ -117,13 +117,36 @@ pub struct AgentApprovalVm {
     /// It waits for this person, so a message they send in its session
     /// declines it (Q109-12 a): what the banner above the composer holds.
     pub declined_by_send: bool,
-    /// It waits for this person, but at T4 this device cannot decide it —
-    /// it is on the host the agent runs on, or a host the server cannot
-    /// tell (V8 `hq.v8.t4_other_host`) — so a message leaves it waiting for
-    /// another of their devices (DW-E109-27). The banner counts these.
+    /// It waits for this person, but at T4 this device cannot decide it
+    /// (V8 `hq.v8.t4_other_host`, [`undecidable_here`]): the card offers no
+    /// decision and says why, and a message leaves it waiting (DW-E109-27,
+    /// R109T-02). The banner counts these.
     #[serde(skip)]
     #[ts(skip)]
-    pub needs_another_device: bool,
+    pub undecidable: Option<Undecidable>,
+}
+
+/// Why a T4 request waiting for this person cannot be decided on this
+/// device: what V8's `hq.v8.t4_other_host` refuses, as this replica reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undecidable {
+    /// This device is on the host the agent runs on, or its own host is not
+    /// recorded: another of the person's devices may decide it.
+    AnotherDevice,
+    /// The host of the instance holding the session's claim is not known
+    /// (or nothing holds it): no device can decide it until it is
+    /// (R109T-04).
+    HostUnknown,
+}
+
+impl Undecidable {
+    /// The card's sentence for it.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Undecidable::AnotherDevice => "Needs a decision from another device.",
+            Undecidable::HostUnknown => "Can't be decided until the agent's host is known.",
+        }
+    }
 }
 
 /// How a decision went.
@@ -193,12 +216,13 @@ fn host_of(source: &Source, client: &str) -> Option<String> {
 }
 
 /// V8's tier-4 rule as this device can read it (`hq.v8.t4_other_host`): a
-/// T4 decision is taken only from a device on another host than the claim
-/// holder's, and refused when either host is unknown. `false` for any other
-/// tier.
-fn decided_elsewhere(source: &Source, session_id: &str, tier: &str) -> bool {
+/// T4 decision — an approval or a denial — is taken only from a device on
+/// another host than the claim holder's, and refused when either host is
+/// unknown. `None` where this device may decide, and for any other tier.
+/// The one predicate the card and the banner share.
+fn undecidable_here(source: &Source, session_id: &str, tier: &str) -> Option<Undecidable> {
     if tier != "T4" {
-        return false;
+        return None;
     }
     let holder = read(
         source,
@@ -209,8 +233,9 @@ fn decided_elsewhere(source: &Source, session_id: &str, tier: &str) -> bool {
     .and_then(|row| opt_text(row, "holder_client"))
     .and_then(|client| host_of(source, &client));
     match (host_of(source, &source.client), holder) {
-        (Some(mine), Some(holder)) => mine == holder,
-        _ => true,
+        (_, None) => Some(Undecidable::HostUnknown),
+        (Some(mine), Some(holder)) if mine != holder => None,
+        _ => Some(Undecidable::AnotherDevice),
     }
 }
 
@@ -251,7 +276,14 @@ fn vm(
     let decided_by = opt_text(row, "decided_by_actor")
         .filter(|_| refused.is_none())
         .map(|actor| name(&actor));
-    let can_decide = state == AgentApprovalStateVm::Pending && mine && action.is_some();
+    let tier = text(row, "tier").to_owned();
+    // A T4 request this device cannot decide offers no decision here: the
+    // server would refuse either (R109T-02).
+    let undecidable = (state == AgentApprovalStateVm::Pending && mine)
+        .then(|| undecidable_here(source, text(row, "session_id"), &tier))
+        .flatten();
+    let can_decide =
+        state == AgentApprovalStateVm::Pending && mine && action.is_some() && undecidable.is_none();
     // A grant's own decision names the grant's person (V8 as amended): the
     // card says it came from their standing grant, not a click.
     let by = |verb: &str| match (decided_by.as_deref(), opt_text(row, "grant_id")) {
@@ -271,6 +303,10 @@ fn vm(
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        AgentApprovalStateVm::Pending if undecidable.is_some() => undecidable
+            .map(Undecidable::sentence)
+            .unwrap_or_default()
+            .to_owned(),
         AgentApprovalStateVm::Pending if action.is_none() => {
             "keeper does not hold this request's action yet, so it cannot be approved here."
                 .to_owned()
@@ -282,7 +318,6 @@ fn vm(
         AgentApprovalStateVm::Expired => "Expired before anyone decided.".to_owned(),
     };
     let tool_name = text(row, "tool_name").to_owned();
-    let tier = text(row, "tier").to_owned();
     let grant = match session {
         Some(session) if can_decide => grants::offer(
             &tier,
@@ -308,9 +343,8 @@ fn vm(
         && session.is_some_and(|session| !session.archived);
     // A denial from here would be refused like an approval (V8 checks the
     // host of any T4 decision), so a message must not claim to decline it.
-    let needs_another_device =
-        waits_for_me && decided_elsewhere(source, text(row, "session_id"), &tier);
-    let declined_by_send = waits_for_me && !needs_another_device;
+    let undecidable = undecidable.filter(|_| waits_for_me);
+    let declined_by_send = waits_for_me && undecidable.is_none();
     Some(AgentApprovalVm {
         id,
         database: source.database.clone(),
@@ -330,7 +364,7 @@ fn vm(
         actions,
         grant,
         declined_by_send,
-        needs_another_device,
+        undecidable,
     })
 }
 
