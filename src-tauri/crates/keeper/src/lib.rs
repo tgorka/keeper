@@ -38,6 +38,8 @@ mod forge_ipc;
 #[cfg(desktop)]
 mod hotkey;
 // The agents server (Epic 106): every target, so the phone pairs too.
+// An approved drive write is carried out on every target (109.27).
+mod hq_apply;
 mod hq_blob_protocol;
 mod hq_ipc;
 mod ipc;

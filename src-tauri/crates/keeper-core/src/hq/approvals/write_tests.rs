@@ -1,0 +1,1089 @@
+//! A `drive_write` approval on the deciding device (109.27, contract §§ 5, 8)
+//! over a real on-disk replica whose server is a stand-in — it takes every
+//! commit, or refuses the ones a test names, or says nothing until told —
+//! and a fake drive: the card's gating, the order of the decision, the
+//! consume, the commit and the `applied` message, and recovery.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Map, Value};
+
+use super::*;
+use crate::hq::approvals::{self, AgentApprovalActionVm, AgentApprovalStateVm, Decisions};
+use crate::hq::port::{
+    Covered, Delivery, DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget,
+    DriveWrites, Peer, RefusedCommit, Rejection, Replica, ReplicaError, ReplicaSpec, ReplicaState,
+    RowOp, RowWrites, Subscription, UploadRefusal, WindowBase, WindowState,
+};
+use crate::hq::sessions::{self, object, Source};
+use crate::hq::syncular::SyncularReplica;
+
+const ANA: &str = "ana";
+const NIXI: &str = "nixi";
+const SESSION: &str = "s.1";
+const APPROVAL: &str = "01JAPPR0000000000000000000";
+const CALL_ID: &str = "01JCALL0000000000000000000";
+const TURN: &str = "01JTURN0000000000000000000";
+const PATH: &str = "10-notes/inbox.md";
+/// "- [ ] milk\n" and "- [x] milk\n" (contract § 4.3).
+const BEFORE: &str = "- [ ] milk\n";
+const BEFORE_BLOB: &str = "28571bedbb9cdd80fe3b7a4b691ebed6eb6531fd";
+const OTHER_BLOB: &str = "c216fb8de0e24c06bf3fff9aaf6deb2036e93f1b";
+const COMMIT: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+
+// ─── A stand-in server ───────────────────────────────────────────────────────
+
+/// A replica on this device whose server is a stand-in: connected, it takes
+/// every commit as it is written unless `silent` (then nothing is answered
+/// until [`Server::answer`]) or the commit patches a row `refuse` names.
+struct Server {
+    inner: Arc<dyn Replica>,
+    silent: Mutex<bool>,
+    /// A commit writing `(table, state)` is refused with this.
+    refuse: Mutex<Option<(String, String, Rejection)>>,
+    taken: Mutex<HashSet<String>>,
+    refused: Mutex<HashMap<String, Rejection>>,
+    /// Every commit and the rows it wrote.
+    written: Mutex<Vec<(String, Vec<RowOp>)>>,
+}
+
+impl Server {
+    fn over(inner: Arc<dyn Replica>) -> Arc<Server> {
+        Arc::new(Server {
+            inner,
+            silent: Mutex::new(false),
+            refuse: Mutex::new(None),
+            taken: Mutex::new(HashSet::new()),
+            refused: Mutex::new(HashMap::new()),
+            written: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Take every commit not answered yet, as a server reached again would.
+    fn answer(&self) {
+        *self.silent.lock().expect("silent") = false;
+        let written: Vec<String> = self
+            .written
+            .lock()
+            .expect("written")
+            .iter()
+            .map(|(commit, _)| commit.clone())
+            .collect();
+        let refused = self.refused.lock().expect("refused").clone();
+        let mut taken = self.taken.lock().expect("taken");
+        taken.extend(written.into_iter().filter(|c| !refused.contains_key(c)));
+    }
+
+    fn ops(&self) -> Vec<RowOp> {
+        self.written
+            .lock()
+            .expect("written")
+            .iter()
+            .flat_map(|(_, ops)| ops.clone())
+            .collect()
+    }
+
+    fn row_id(op: &RowOp) -> (String, String) {
+        match op {
+            RowOp::Upsert { table, values, .. } | RowOp::Patch { table, values, .. } => (
+                table.clone(),
+                values
+                    .get("id")
+                    .or_else(|| values.get("session_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            RowOp::Delete { table, row_id, .. } => (table.clone(), row_id.clone()),
+        }
+    }
+}
+
+impl Replica for Server {
+    fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
+        self.mutate_superseding(ops, Vec::new())
+    }
+    fn mutate_superseding(
+        &self,
+        ops: Vec<RowOp>,
+        earlier: Vec<String>,
+    ) -> Result<String, ReplicaError> {
+        let commit = self.inner.mutate_superseding(ops.clone(), earlier)?;
+        let refusal = self
+            .refuse
+            .lock()
+            .expect("refuse")
+            .clone()
+            .and_then(|(t, s, r)| {
+                ops.iter()
+                    .any(|op| match op {
+                        RowOp::Patch { table, values, .. }
+                        | RowOp::Upsert { table, values, .. } => {
+                            *table == t && values.get("state").and_then(Value::as_str) == Some(&s)
+                        }
+                        RowOp::Delete { .. } => false,
+                    })
+                    .then_some(r)
+            });
+        match refusal {
+            Some(rejection) => {
+                self.refused
+                    .lock()
+                    .expect("refused")
+                    .insert(commit.clone(), rejection);
+            }
+            None if !*self.silent.lock().expect("silent") => {
+                self.taken.lock().expect("taken").insert(commit.clone());
+            }
+            None => {}
+        }
+        self.written
+            .lock()
+            .expect("written")
+            .push((commit.clone(), ops));
+        Ok(commit)
+    }
+    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+        self.inner.query(sql, params)
+    }
+    fn query_covered(
+        &self,
+        sql: &str,
+        params: &[Value],
+        base: &WindowBase,
+        units: &[String],
+    ) -> Result<Covered, ReplicaError> {
+        self.inner.query_covered(sql, params, base, units)
+    }
+    fn subscribe(&self, s: Subscription) -> Result<(), ReplicaError> {
+        self.inner.subscribe(s)
+    }
+    fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError> {
+        self.inner.set_window(base, units)
+    }
+    fn window_state(&self, base: &WindowBase) -> Result<WindowState, ReplicaError> {
+        self.inner.window_state(base)
+    }
+    fn set_presence(&self, key: &str, doc: Option<Value>) -> Result<(), ReplicaError> {
+        self.inner.set_presence(key, doc)
+    }
+    fn presence(&self, key: &str) -> Result<Vec<Peer>, ReplicaError> {
+        self.inner.presence(key)
+    }
+    fn commit_with_blobs(
+        &self,
+        b: Vec<crate::hq::port::BlobBody>,
+        ops: Vec<RowOp>,
+    ) -> Result<String, ReplicaError> {
+        self.inner.commit_with_blobs(b, ops)
+    }
+    fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, ReplicaError> {
+        self.inner.fetch_blob(b)
+    }
+    fn cached_blob(&self, b: &str) -> Result<Vec<u8>, ReplicaError> {
+        self.inner.cached_blob(b)
+    }
+    fn delivery(&self, commit: &str) -> Result<Delivery, ReplicaError> {
+        if let Some(rejection) = self.refused.lock().expect("refused").get(commit) {
+            return Ok(Delivery::Refused(rejection.clone()));
+        }
+        if self.taken.lock().expect("taken").contains(commit) {
+            return Ok(Delivery::Applied);
+        }
+        Ok(Delivery::Pending)
+    }
+    fn row_writes(
+        &self,
+        table: &str,
+        row_id: &str,
+        _field: Option<&str>,
+    ) -> Result<RowWrites, ReplicaError> {
+        let taken = self.taken.lock().expect("taken");
+        let refused = self.refused.lock().expect("refused");
+        let pending = self
+            .written
+            .lock()
+            .expect("written")
+            .iter()
+            .filter(|(commit, ops)| {
+                !taken.contains(commit)
+                    && !refused.contains_key(commit)
+                    && ops
+                        .iter()
+                        .any(|op| Server::row_id(op) == (table.to_owned(), row_id.to_owned()))
+            })
+            .map(|(commit, _)| commit.clone())
+            .collect();
+        Ok(RowWrites {
+            pending,
+            refused: Vec::new(),
+        })
+    }
+    fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
+        self.inner.refused_commits(table)
+    }
+    fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError> {
+        self.inner.granted(table, variable)
+    }
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError> {
+        self.inner.revoked_units(table)
+    }
+    fn upload_refusals(&self) -> Vec<UploadRefusal> {
+        self.inner.upload_refusals()
+    }
+    fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
+        self.inner.blob_cache_bytes()
+    }
+    fn remote_query(
+        &self,
+        id: &str,
+        params: Value,
+    ) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+        self.inner.remote_query(id, params)
+    }
+    fn remote_command(&self, id: &str, request: &str, params: Value) -> Result<(), ReplicaError> {
+        self.inner.remote_command(id, request, params)
+    }
+    fn sync_now(&self) {}
+    fn state(&self) -> ReplicaState {
+        ReplicaState {
+            link: crate::hq::port::LinkState::Connected,
+            ..self.inner.state()
+        }
+    }
+    fn watch(&self) -> tokio::sync::watch::Receiver<ReplicaState> {
+        self.inner.watch()
+    }
+    fn close(&self) {
+        self.inner.close();
+    }
+    fn join(&self) {
+        self.inner.join();
+    }
+}
+
+// ─── A fake drive ────────────────────────────────────────────────────────────
+
+/// A file as the fake drive holds it: its blob at `HEAD`, and its blob and
+/// bytes on the disk.
+type FakeFile = (Option<String>, Option<(String, Vec<u8>)>);
+
+/// A change the world is put through before a check.
+type Setup = Box<dyn Fn(&World)>;
+
+/// One drive, `tgdrive`, its files by path as `(blob at HEAD, blob and bytes
+/// on the disk)`; what a commit answers; what a trailer search finds.
+struct Drive {
+    keeps: Mutex<Result<(), DriveAbsent>>,
+    files: Mutex<HashMap<String, FakeFile>>,
+    refuse: Mutex<Option<drive_write::Refusal>>,
+    answer: Mutex<DriveCommitted>,
+    commits: Mutex<Vec<DriveCommit>>,
+    carried: Mutex<Option<String>>,
+    searched: Mutex<Vec<(String, i64)>>,
+}
+
+impl Drive {
+    fn new() -> Arc<Drive> {
+        let drive = Drive {
+            keeps: Mutex::new(Ok(())),
+            files: Mutex::new(HashMap::new()),
+            refuse: Mutex::new(None),
+            answer: Mutex::new(DriveCommitted::Committed(COMMIT.to_owned())),
+            commits: Mutex::new(Vec::new()),
+            carried: Mutex::new(None),
+            searched: Mutex::new(Vec::new()),
+        };
+        drive.file(PATH, BEFORE_BLOB, BEFORE);
+        Arc::new(drive)
+    }
+
+    fn file(&self, path: &str, blob: &str, text: &str) {
+        self.files.lock().expect("files").insert(
+            path.to_owned(),
+            (
+                Some(blob.to_owned()),
+                Some((blob.to_owned(), text.as_bytes().to_vec())),
+            ),
+        );
+    }
+
+    fn commits(&self) -> Vec<DriveCommit> {
+        self.commits.lock().expect("commits").clone()
+    }
+}
+
+impl DriveWrites for Drive {
+    fn keeps(&self, drive: &str) -> Result<(), DriveAbsent> {
+        if drive != "tgdrive" {
+            return Err(DriveAbsent::NotKept);
+        }
+        *self.keeps.lock().expect("keeps")
+    }
+    fn target(
+        &self,
+        _drive: &str,
+        path: &str,
+        target: DriveTarget,
+    ) -> Result<DriveFile, drive_write::Refusal> {
+        if let Some(refusal) = self.refuse.lock().expect("refuse").clone() {
+            return Err(refusal);
+        }
+        let held = self.files.lock().expect("files").get(path).cloned();
+        match (target, held) {
+            (DriveTarget::Existing, Some((head, disk))) => Ok(DriveFile {
+                key: path.to_owned(),
+                head,
+                disk,
+            }),
+            (DriveTarget::Existing, None) => Err(drive_write::Refusal::Absent {
+                path: path.to_owned(),
+            }),
+            (DriveTarget::New, Some(_)) => Err(drive_write::Refusal::Exists {
+                path: path.to_owned(),
+            }),
+            (DriveTarget::New, None) => Ok(DriveFile {
+                key: path.to_owned(),
+                head: None,
+                disk: None,
+            }),
+        }
+    }
+    fn commit(&self, _drive: &str, commit: DriveCommit) -> Result<DriveCommitted, String> {
+        self.commits.lock().expect("commits").push(commit);
+        Ok(self.answer.lock().expect("answer").clone())
+    }
+    fn carried(
+        &self,
+        _drive: &str,
+        approval: &str,
+        since_secs: i64,
+    ) -> Result<Option<String>, String> {
+        self.searched
+            .lock()
+            .expect("searched")
+            .push((approval.to_owned(), since_secs));
+        Ok(self.carried.lock().expect("carried").clone())
+    }
+}
+
+// ─── The world ───────────────────────────────────────────────────────────────
+
+fn upsert(table: &str, values: Value) -> RowOp {
+    RowOp::Upsert {
+        table: table.to_owned(),
+        values: object(values),
+        base_version: None,
+    }
+}
+
+struct World {
+    _dir: tempfile::TempDir,
+    server: Arc<Server>,
+    ana: Source,
+    drive: Arc<Drive>,
+    writes: Writes,
+    decisions: Decisions,
+}
+
+fn edit_args() -> Value {
+    json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+           "old_text": "- [ ] milk\n", "new_text": "- [x] milk\n"})
+}
+
+/// Ana's session with Nixi, `tgdrive` ticked, and Nixi's `drive_write`
+/// call `args` parked for her at T3 — its digest `digest`, or the real one.
+fn world_with(args: Value, digest: Option<&str>) -> World {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inner = SyncularReplica::open(ReplicaSpec {
+        database: "tgdrive".to_owned(),
+        path: dir.path().join("tgdrive.sqlite"),
+        client_id: Some("ana.dev".to_owned()),
+        link: None,
+        subscriptions: Vec::new(),
+        watch_presence: None,
+    })
+    .expect("opens");
+    let server = Server::over(Arc::new(inner));
+    let ana = Source {
+        database: "tgdrive".to_owned(),
+        replica: Arc::clone(&server) as Arc<dyn Replica>,
+        actor: ANA.to_owned(),
+        client: "ana.dev".to_owned(),
+    };
+    let at = sessions::now_ms() - 60_000;
+    let page = sessions::page_key(SESSION, &sessions::month(at));
+    let real = drive_write::digest(APPROVAL, SESSION, NIXI, &args, TURN, CALL_ID).expect("digest");
+    let actor = |id: &str, kind: &str, name: &str| {
+        upsert(
+            "actors",
+            json!({"id": id, "kind": kind, "display_name": name, "family": null,
+                   "dir": "tgdrive", "created_at_ms": 1, "author_actor": "server",
+                   "author_client": "server"}),
+        )
+    };
+    let member = |actor: &str, role: &str| {
+        upsert(
+            "session_members",
+            json!({"id": format!("{SESSION}/{actor}"), "session_id": SESSION, "actor_id": actor,
+                   "role": role, "reads_trace": true, "added_by_actor": ANA, "added_at_ms": 1,
+                   "read_until": null, "author_actor": "server", "author_client": "server"}),
+        )
+    };
+    ana.replica
+        .mutate(vec![
+            actor(ANA, "person", "Ana"),
+            actor(NIXI, "agent", "Nixi"),
+            upsert(
+                "clients",
+                json!({"id": "ana.dev", "actor_id": ANA, "kind": "device", "name": "hesperia",
+                       "host": "hesperia", "created_at_ms": 1, "revoked_at_ms": null,
+                       "dir": "tgdrive", "author_actor": "server", "author_client": "server"}),
+            ),
+            upsert(
+                "sessions",
+                json!({"id": SESSION, "title": "notes", "status": "open", "agent_actor": NIXI,
+                       "created_by_actor": ANA, "created_by_client": "ana.dev",
+                       "preferred_client": null, "parent_session": null, "invite": "[]",
+                       "archived": false, "heard_until": null, "created_at_ms": at,
+                       "last_activity_ms": at, "author_actor": ANA, "author_client": "ana.dev"}),
+            ),
+            member(ANA, "owner"),
+            member(NIXI, "agent"),
+            upsert(
+                "session_drives",
+                json!({"session_id": SESSION, "drives": "[\"tgdrive\"]", "updated_at_ms": at,
+                       "author_actor": ANA, "author_client": "ana.dev"}),
+            ),
+            upsert(
+                "tool_calls",
+                json!({"id": CALL_ID, "session_id": SESSION, "page_key": page, "turn_id": TURN,
+                       "name": "drive_write", "args": args.to_string(), "status": "parked",
+                       "result": null, "result_blob": null, "started_at_ms": at,
+                       "ended_at_ms": null, "created_at_ms": at, "author_actor": NIXI,
+                       "author_client": "nixi.box"}),
+            ),
+            upsert(
+                "approvals",
+                json!({"id": APPROVAL, "session_id": SESSION, "page_key": page,
+                       "tool_call_id": CALL_ID, "tier": "T3",
+                       "binding_digest": digest.unwrap_or(&real),
+                       "summary": "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 11 bytes",
+                       "approvers": json!([ANA]).to_string(), "state": "pending",
+                       "decided_by_actor": null, "decided_by_client": null,
+                       "consumed_by_client": null, "expires_at_ms": at + 86_400_000,
+                       "created_at_ms": at, "author_actor": NIXI, "author_client": "nixi.box"}),
+            ),
+        ])
+        .expect("seed");
+    // The seed is the server's own: taken, not this device's to wait on.
+    server.answer();
+    server.written.lock().expect("written").clear();
+    let drive = Drive::new();
+    let writes = Writes::default();
+    writes.set_port(Arc::clone(&drive) as Arc<dyn DriveWrites>);
+    World {
+        decisions: Decisions::load(dir.path().join("decisions.json")),
+        _dir: dir,
+        server,
+        ana,
+        drive,
+        writes,
+    }
+}
+
+fn world() -> World {
+    world_with(edit_args(), None)
+}
+
+impl World {
+    fn digest(&self) -> String {
+        text_of(&self.row("approvals", APPROVAL), "binding_digest")
+    }
+
+    fn card(&self) -> AgentApprovalVm {
+        let mut shown = approvals::of_session(
+            &self.ana,
+            SESSION,
+            &HashMap::new(),
+            &HashMap::new(),
+            sessions::now_ms(),
+        );
+        let mut all: Vec<&mut AgentApprovalVm> = shown.iter_mut().collect();
+        self.writes
+            .draw(std::slice::from_ref(&self.ana), &self.ana, &mut all);
+        shown.into_iter().next().expect("the card")
+    }
+
+    fn allow(&self) -> Result<AgentDecisionOutcomeVm, Refusal> {
+        self.writes.allow(
+            &self.ana,
+            &self.decisions,
+            SESSION,
+            APPROVAL,
+            &self.digest(),
+            sessions::now_ms(),
+        )
+    }
+
+    fn deny(&self) -> Result<AgentDecisionOutcomeVm, Refusal> {
+        self.writes.deny(
+            &self.ana,
+            &self.decisions,
+            SESSION,
+            APPROVAL,
+            &self.digest(),
+            sessions::now_ms(),
+        )
+    }
+
+    fn row(&self, table: &str, id: &str) -> Map<String, Value> {
+        self.ana
+            .replica
+            .query(
+                &format!("SELECT * FROM {table} WHERE id = ?1"),
+                &[Value::from(id)],
+            )
+            .expect("read")
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
+    fn applied(&self) -> Option<Value> {
+        let row = self.row("messages", &message_id(APPROVAL));
+        (!row.is_empty()).then(|| sessions::json(&row, "metadata"))
+    }
+
+    /// The approval as the server's own rows would have it.
+    fn set_approval(&self, values: Value) {
+        let mut values = object(values);
+        values.insert("id".to_owned(), json!(APPROVAL));
+        self.server
+            .inner
+            .mutate(vec![RowOp::Patch {
+                table: "approvals".to_owned(),
+                values,
+                base_version: None,
+            }])
+            .expect("server row");
+    }
+}
+
+fn text_of(row: &Map<String, Value>, column: &str) -> String {
+    row.get(column)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+// ─── The card ────────────────────────────────────────────────────────────────
+
+/// § 8: the card carries the write, its diff from this checkout, and Allow
+/// and Deny — never a grant.
+#[test]
+fn a_pending_write_shows_its_diff_and_offers_allow_and_deny() {
+    let w = world();
+    let card = w.card();
+    assert_eq!(
+        card.actions,
+        [
+            AgentApprovalActionVm::AllowOnce,
+            AgentApprovalActionVm::Deny
+        ]
+    );
+    assert!(card.grant.is_none());
+    let write = card.write.expect("the write");
+    assert_eq!(write.op, AgentDriveWriteOpVm::Edit);
+    assert_eq!(
+        (write.drive.as_str(), write.path.as_str()),
+        ("tgdrive", PATH)
+    );
+    assert_eq!(write.blocked, None);
+    let lines: Vec<(AgentWriteLineKindVm, &str)> = write.preview.hunks[0]
+        .lines
+        .iter()
+        .map(|line| (line.kind, line.text.as_str()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (AgentWriteLineKindVm::Remove, "- [ ] milk"),
+            (AgentWriteLineKindVm::Add, "- [x] milk")
+        ]
+    );
+}
+
+/// § 5 step 1: a digest recomputed here that is not the one parked offers
+/// Deny only, says why, and Allow writes nothing.
+#[test]
+fn a_digest_that_does_not_match_offers_deny_only_and_allow_writes_nothing() {
+    let w = world_with(edit_args(), Some("sha256:0000"));
+    let card = w.card();
+    assert_eq!(card.actions, [AgentApprovalActionVm::Deny]);
+    assert_eq!(card.write.expect("write").blocked.as_deref(), Some(CHANGED));
+    let refused = w.allow().expect_err("refused");
+    assert_eq!(refused.0, CHANGED);
+    assert!(w.server.ops().is_empty(), "no decision was written");
+    assert!(w.drive.commits().is_empty());
+}
+
+/// § 5.1: a file here that is not the version the agent read blocks Allow
+/// with the device's sentence; Deny tells the agent why in the same commit.
+#[test]
+fn a_stale_expected_blocks_allow_and_deny_says_why() {
+    let w = world();
+    w.drive.file(PATH, OTHER_BLOB, "- [x] milk\n");
+    let card = w.card();
+    let reason = "\"10-notes/inbox.md\" changed on hesperia since the agent read it.";
+    assert_eq!(card.actions, [AgentApprovalActionVm::Deny]);
+    assert_eq!(card.write.expect("write").blocked.as_deref(), Some(reason));
+    assert_eq!(w.allow().expect_err("refused").0, reason);
+
+    w.deny().expect("denied");
+    let commits = w.server.written.lock().expect("written").clone();
+    assert_eq!(commits.len(), 1, "the denial and its reason are one commit");
+    assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "denied");
+    assert_eq!(
+        w.applied(),
+        Some(
+            json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                    "outcome": "not_applied", "reason": reason, "device": "hesperia"})
+        )
+    );
+    assert!(w.drive.commits().is_empty());
+}
+
+/// A plain Deny of a write that could be carried out writes no reason.
+#[test]
+fn a_deny_of_a_write_that_could_be_made_writes_no_message() {
+    let w = world();
+    w.deny().expect("denied");
+    assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "denied");
+    assert_eq!(w.applied(), None);
+}
+
+/// § 5.1: the session unticking the drive, or switching drive_write or
+/// drive off, and a device that does not commit to the drive: Deny only,
+/// each with its sentence.
+#[test]
+fn every_device_check_blocks_allow_with_its_sentence() {
+    let cases: [(&str, Setup); 5] = [
+        (
+            "tgdrive is no longer ticked for this conversation.",
+            Box::new(|w: &World| {
+                w.ana
+                    .replica
+                    .mutate(vec![upsert(
+                        "session_drives",
+                        json!({"session_id": SESSION, "drives": "[]", "updated_at_ms": 2,
+                               "author_actor": ANA, "author_client": "ana.dev"}),
+                    )])
+                    .expect("untick");
+            }),
+        ),
+        (
+            "drive_write is switched off for this conversation.",
+            Box::new(|w: &World| {
+                w.ana
+                    .replica
+                    .mutate(vec![upsert(
+                        "session_tool_switches",
+                        json!({"session_id": SESSION, "tools_off": "[\"drive\"]",
+                               "updated_at_ms": 2, "author_actor": ANA,
+                               "author_client": "ana.dev"}),
+                    )])
+                    .expect("switch off");
+            }),
+        ),
+        (
+            "tgdrive only pulls on this device, so nothing is committed here.",
+            Box::new(|w: &World| *w.drive.keeps.lock().expect("keeps") = Err(DriveAbsent::PullsOnly)),
+        ),
+        (
+            "tgdrive's folder is not here (its disk is not attached).",
+            Box::new(|w: &World| {
+                *w.drive.keeps.lock().expect("keeps") = Err(DriveAbsent::NotAttached);
+            }),
+        ),
+        (
+            "\"10-notes/inbox.md\" is kept in the drive's large-file store (LFS), which an agent never writes.",
+            Box::new(|w: &World| {
+                *w.drive.refuse.lock().expect("refuse") = Some(drive_write::Refusal::Path {
+                    sentence: "\"10-notes/inbox.md\" is kept in the drive's large-file store \
+                               (LFS), which an agent never writes."
+                        .to_owned(),
+                });
+            }),
+        ),
+    ];
+    for (sentence, make) in cases {
+        let w = world();
+        make(&w);
+        let card = w.card();
+        assert_eq!(card.actions, [AgentApprovalActionVm::Deny], "{sentence}");
+        assert_eq!(
+            card.write.expect("write").blocked.as_deref(),
+            Some(sentence)
+        );
+        assert_eq!(w.allow().expect_err("refused").0, sentence);
+        assert!(w.drive.commits().is_empty(), "{sentence}");
+    }
+}
+
+// ─── Allow ───────────────────────────────────────────────────────────────────
+
+/// § 5 steps 2–5 and § 5.2, § 6.2: the decision, the consume by this
+/// device, one commit of exactly the request with the approval's trailer,
+/// then the `applied` message with exactly the contract's metadata, each in
+/// its own commit and in that order.
+#[test]
+fn allow_decides_consumes_commits_then_says_applied() {
+    let w = world();
+    let shown = w.card().write.expect("write").preview;
+    let outcome = w.allow().expect("allowed");
+    assert_eq!(outcome.state, AgentDecisionStateVm::Sent);
+    assert_eq!(outcome.sentence, "Approved and written as 1a2b3c4.");
+
+    assert_eq!(
+        w.drive.commits(),
+        [DriveCommit {
+            writes: vec![(PATH.to_owned(), Some(b"- [x] milk\n".to_vec()))],
+            moves: Vec::new(),
+            guards: vec![(PATH.to_owned(), Some(BEFORE_BLOB.to_owned()))],
+            subject: "Nixi: Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 11 bytes"
+                .to_owned(),
+            approval: APPROVAL.to_owned(),
+        }]
+    );
+    let commits = w.server.written.lock().expect("written").clone();
+    let states: Vec<Option<String>> = commits
+        .iter()
+        .map(|(_, ops)| match &ops[..] {
+            [RowOp::Patch { table, values, .. }] if table == "approvals" => values
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            [RowOp::Upsert { table, .. }] if table == "messages" => Some("message".to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            Some("approved".to_owned()),
+            Some("consumed".to_owned()),
+            Some("message".to_owned())
+        ]
+    );
+    let approval = w.row("approvals", APPROVAL);
+    assert_eq!(text_of(&approval, "state"), "consumed");
+    assert_eq!(text_of(&approval, "consumed_by_client"), "ana.dev");
+    assert_eq!(
+        w.applied(),
+        Some(
+            json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                    "outcome": "applied", "commit": COMMIT, "device": "hesperia"})
+        )
+    );
+    let message = w.row("messages", &message_id(APPROVAL));
+    assert_eq!(text_of(&message, "role"), "person");
+    assert_eq!(message.get("turn_id"), Some(&Value::Null));
+    assert_eq!(
+        text_of(&message, "body"),
+        "Approved and written: Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 11 bytes \
+         (1a2b3c4)."
+    );
+    let card = w.card();
+    assert_eq!(card.state, AgentApprovalStateVm::Consumed);
+    assert!(card.actions.is_empty());
+    let write = card.write.expect("write");
+    assert_eq!(
+        write.preview, shown,
+        "decided here, it keeps the diff it was allowed on"
+    );
+    assert_eq!(
+        write.outcome.as_deref(),
+        Some("Written as 1a2b3c4 on hesperia.")
+    );
+}
+
+/// Each op's commit (§ 5.2): create guards an absent path, move moves, and
+/// delete writes nothing in the file's place.
+#[test]
+fn each_op_commits_exactly_its_request() {
+    let create = world_with(
+        json!({"drive": "tgdrive", "op": "create", "path": "10-notes/new.md", "content": "hi"}),
+        None,
+    );
+    create.allow().expect("allowed");
+    let made = create.drive.commits();
+    assert_eq!(
+        made[0].writes,
+        [("10-notes/new.md".to_owned(), Some(b"hi".to_vec()))]
+    );
+    assert_eq!(made[0].guards, [("10-notes/new.md".to_owned(), None)]);
+
+    let moved = world_with(
+        json!({"drive": "tgdrive", "op": "move", "path": PATH, "expected": BEFORE_BLOB,
+               "to": "20-done/inbox.md"}),
+        None,
+    );
+    assert!(moved.card().write.expect("write").preview.hunks.is_empty());
+    moved.allow().expect("allowed");
+    let made = moved.drive.commits();
+    assert!(made[0].writes.is_empty());
+    assert_eq!(
+        made[0].moves,
+        [(PATH.to_owned(), "20-done/inbox.md".to_owned())]
+    );
+    assert_eq!(
+        made[0].guards,
+        [(PATH.to_owned(), Some(BEFORE_BLOB.to_owned()))]
+    );
+
+    let deleted = world_with(
+        json!({"drive": "tgdrive", "op": "delete", "path": PATH, "expected": BEFORE_BLOB}),
+        None,
+    );
+    let shown = deleted.card().write.expect("write").preview;
+    assert_eq!(shown.deleted.expect("deleted").lines, ["- [ ] milk"]);
+    deleted.allow().expect("allowed");
+    assert_eq!(deleted.drive.commits()[0].writes, [(PATH.to_owned(), None)]);
+}
+
+/// The file changed between the look and the commit: the commit's own
+/// guard holds it, and the agent is told it was not written.
+#[test]
+fn a_guard_the_commit_holds_is_not_applied() {
+    let w = world();
+    *w.drive.answer.lock().expect("answer") = DriveCommitted::Guarded(PATH.to_owned());
+    let outcome = w.allow().expect("allowed");
+    let reason = "\"10-notes/inbox.md\" changed on hesperia since the agent read it.";
+    assert_eq!(
+        outcome.sentence,
+        format!("Approved, but not written: {reason}")
+    );
+    assert_eq!(
+        w.applied(),
+        Some(
+            json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                    "outcome": "not_applied", "reason": reason, "device": "hesperia"})
+        )
+    );
+    assert_eq!(
+        w.card().write.expect("write").outcome.as_deref(),
+        Some(format!("Not written: {reason}").as_str())
+    );
+}
+
+/// Already as asked: `unchanged`, with no commit id.
+#[test]
+fn a_commit_that_changes_nothing_is_unchanged() {
+    let w = world();
+    *w.drive.answer.lock().expect("answer") = DriveCommitted::Unchanged;
+    w.allow().expect("allowed");
+    assert_eq!(
+        w.applied(),
+        Some(
+            json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                    "outcome": "unchanged", "device": "hesperia"})
+        )
+    );
+}
+
+/// V8 refuses the consume: nothing is written, and the agent hears the
+/// server's reason.
+#[test]
+fn a_refused_consume_writes_nothing_and_says_why() {
+    let w = world();
+    *w.server.refuse.lock().expect("refuse") = Some((
+        "approvals".to_owned(),
+        "consumed".to_owned(),
+        Rejection::new(
+            "hq.v8.consume_decider",
+            "only the deciding device consumes it",
+        ),
+    ));
+    w.allow().expect("decided");
+    assert!(w.drive.commits().is_empty(), "no effect");
+    assert_eq!(
+        w.applied(),
+        Some(
+            json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                    "outcome": "not_applied", "reason": "only the deciding device consumes it",
+                    "device": "hesperia"})
+        )
+    );
+}
+
+/// A second decision, a second consume and a second effect are refused:
+/// the request is decided once and carried out once.
+#[test]
+fn a_second_decision_or_consume_is_refused() {
+    let w = world();
+    w.allow().expect("allowed");
+    assert_eq!(
+        w.allow().expect_err("again").0,
+        "This request was already decided."
+    );
+    assert_eq!(
+        w.deny().expect_err("again").0,
+        "This request was already decided."
+    );
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(w.drive.commits().len(), 1, "carried out once");
+    let consumes = w
+        .server
+        .ops()
+        .iter()
+        .filter(|op| {
+            matches!(op, RowOp::Patch { values, .. }
+                if values.get("state").and_then(Value::as_str) == Some("consumed"))
+        })
+        .count();
+    assert_eq!(consumes, 1, "consumed once");
+}
+
+/// Approving a write anywhere but on its card — the bare decision, a
+/// notification — is refused: a bare approval would never be written.
+#[test]
+fn a_write_is_approved_only_through_its_card() {
+    let w = world();
+    let bare = approvals::decide(
+        &w.ana,
+        &w.decisions,
+        SESSION,
+        APPROVAL,
+        &w.digest(),
+        true,
+        sessions::now_ms(),
+    )
+    .expect_err("refused");
+    assert_eq!(bare.0, ON_ITS_CARD);
+    let pushed = crate::hq::push::HqActionDecision {
+        session: sessions::AgentSessionRef {
+            database: "tgdrive".to_owned(),
+            session_id: SESSION.to_owned(),
+        },
+        approval_id: APPROVAL.to_owned(),
+        binding_digest: w.digest(),
+        approve: true,
+    };
+    let source = w.ana.clone();
+    let refused = approvals::decide_pushed(
+        move || Some(source.clone()),
+        &w.decisions,
+        &pushed,
+        std::time::Instant::now(),
+    )
+    .expect_err("refused");
+    assert_eq!(refused.0, approvals::NOT_FROM_A_NOTIFICATION);
+    assert!(w.server.ops().is_empty());
+}
+
+// ─── What the server answers later, and recovery ─────────────────────────────
+
+/// The server answers neither the decision nor the consume in the wait:
+/// each step goes on once it has, and the write is made once.
+#[test]
+fn a_write_the_server_answers_later_goes_on_when_it_does() {
+    let w = world();
+    *w.server.silent.lock().expect("silent") = true;
+    let outcome = w.allow().expect("decided");
+    assert_eq!(outcome.state, AgentDecisionStateVm::Waiting);
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert!(
+        w.drive.commits().is_empty(),
+        "nothing before the server has the decision"
+    );
+
+    // The decision lands; the consume is written, and waits in turn.
+    w.server.answer();
+    *w.server.silent.lock().expect("silent") = true;
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert!(
+        w.drive.commits().is_empty(),
+        "nothing before the consume is taken"
+    );
+    assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "consumed");
+
+    w.server.answer();
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(w.drive.commits().len(), 1);
+    assert_eq!(
+        w.applied().and_then(|m| m.get("outcome").cloned()),
+        Some(json!("applied"))
+    );
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(w.drive.commits().len(), 1, "once");
+}
+
+/// § 5.3: a device stopped after it consumed and before it said so finds
+/// the commit carrying the approval by its trailer — `applied` with it — or
+/// finds none — `not_applied`, nothing written. It never writes again.
+#[test]
+fn recovery_finds_the_trailer_or_says_nothing_was_written() {
+    for carried in [Some(COMMIT), None] {
+        let w = world();
+        // As a previous run of this device left it.
+        w.set_approval(json!({"state": "consumed", "decided_by_actor": ANA,
+                              "decided_by_client": "ana.dev",
+                              "consumed_by_client": "ana.dev"}));
+        *w.drive.carried.lock().expect("carried") = carried.map(str::to_owned);
+        let relaunched = Writes::default();
+        relaunched.set_port(Arc::clone(&w.drive) as Arc<dyn DriveWrites>);
+        relaunched.carry_on(std::slice::from_ref(&w.ana));
+
+        assert!(
+            w.drive.commits().is_empty(),
+            "recovery never writes the drive"
+        );
+        let searched = w.drive.searched.lock().expect("searched").clone();
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].0, APPROVAL);
+        let expected = match carried {
+            Some(commit) => json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                                   "outcome": "applied", "commit": commit,
+                                   "device": "hesperia"}),
+            None => json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+                           "outcome": "not_applied", "reason": STOPPED,
+                           "device": "hesperia"}),
+        };
+        assert_eq!(w.applied(), Some(expected));
+        relaunched.carry_on(std::slice::from_ref(&w.ana));
+        assert_eq!(w.drive.searched.lock().expect("searched").len(), 1, "once");
+    }
+}
+
+/// A row another device consumed, or one this device approved before it
+/// was stopped and never consumed, is left alone (§ 12).
+#[test]
+fn recovery_leaves_what_this_run_did_not_start() {
+    let w = world();
+    w.set_approval(json!({"state": "consumed", "decided_by_actor": ANA,
+                          "decided_by_client": "ana.dev", "consumed_by_client": "ana.phone"}));
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    w.set_approval(json!({"state": "approved", "consumed_by_client": null}));
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert!(w.drive.searched.lock().expect("searched").is_empty());
+    assert!(w.drive.commits().is_empty());
+    assert_eq!(w.applied(), None);
+}
+
+/// The `applied` row is a control row: no bubble in the session.
+#[test]
+fn the_applied_row_is_not_drawn_as_a_message() {
+    let w = world();
+    w.allow().expect("allowed");
+    let (view, _) = crate::hq::timeline::view(
+        &w.ana,
+        SESSION,
+        &crate::hq::timeline::Opened::default(),
+        &HashMap::new(),
+        sessions::now_ms(),
+    )
+    .expect("view");
+    assert!(view.messages.iter().all(|m| m.id != message_id(APPROVAL)));
+}

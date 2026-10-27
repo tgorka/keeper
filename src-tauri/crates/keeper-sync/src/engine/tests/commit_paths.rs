@@ -215,6 +215,66 @@ async fn consolidation_commits_carry_the_trailers() {
     assert_eq!(remote_main(remote_dir.path()), commit);
 }
 
+/// 109.27, contract § 5.3: the commit that carried an approval out is found
+/// by its `Approval-Record` trailer, and only that approval's; a commit
+/// older than the span asked for is not read, and a trailer quoted in a
+/// body is not keeper's block.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_commit_carrying_an_approval_is_found_by_its_trailer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let mut ask = request("b", Some(blob_id(b"a")));
+    ask.subject = "nixi: Edit `MEMORY.md` in tgdrive: 1 bytes become 1 bytes".to_owned();
+    ask.trailers = vec![MemoryTrailer::ApprovalRecord("01JAPPR".to_owned())];
+    let CommitPaths::Committed { commit } = engine
+        .commit_paths(&p.id, &ask, yes())
+        .await
+        .expect("committed")
+    else {
+        panic!("a commit was made");
+    };
+    // A person's commit after it, whose body quotes the trailer.
+    std::fs::write(p.local_path.join("root.md"), "Approval-Record: 01JOTHER\n").expect("write");
+    commit_after_settling(&engine, &platform, &p);
+
+    assert_eq!(
+        engine
+            .approval_commit(&p.id, "01JAPPR", 0)
+            .await
+            .expect("read"),
+        Some(commit.clone())
+    );
+    assert_eq!(
+        engine
+            .approval_commit(&p.id, "01JOTHER", 0)
+            .await
+            .expect("read"),
+        None,
+        "a line in a body is no trailer"
+    );
+    assert_eq!(
+        engine
+            .approval_commit(&p.id, "01JAPP", 0)
+            .await
+            .expect("read"),
+        None,
+        "only the exact id"
+    );
+    let made = git_out(&p.local_path, &["log", "-1", "--format=%ct", &commit]);
+    let made: i64 = made.trim().parse().expect("a time");
+    assert_eq!(
+        engine
+            .approval_commit(&p.id, "01JAPPR", made + 3_600)
+            .await
+            .expect("read"),
+        None,
+        "history older than the span is not read"
+    );
+}
+
 /// Acceptance 5, the third half: an edit pushed from another device before
 /// the night arrives through the pull and is planned over; one pushed after
 /// the plan's read moves the blob at the fetched head, and the night writes

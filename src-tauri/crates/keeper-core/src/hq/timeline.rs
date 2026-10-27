@@ -418,6 +418,18 @@ pub struct AgentSessionViewVm {
     pub settings: Option<crate::hq::settings::AgentSessionPickerVm>,
 }
 
+impl AgentSessionViewVm {
+    /// Every request the view draws, wherever it is drawn: the banner's and
+    /// the reading column's.
+    pub fn approvals_mut(&mut self) -> Vec<&mut AgentApprovalVm> {
+        let mut all: Vec<&mut AgentApprovalVm> = self.approvals.iter_mut().collect();
+        if let Some(banner) = self.banner.as_mut() {
+            all.extend(banner.approvals.iter_mut());
+        }
+        all
+    }
+}
+
 /// The pages of an archived session read so far through the server.
 #[derive(Debug, Clone, Default)]
 pub struct RemotePages {
@@ -609,8 +621,13 @@ pub fn view(
         )
     };
     // A person's heard row is a mark for the claim holder, not a message
-    // (R-HQ-68): never drawn.
-    rows.retain(|row| text(row, "role") != "person" || !is_heard(&json(row, "metadata")));
+    // (R-HQ-68), and an `applied` row is keeper's word on a drive write,
+    // drawn on its approval's card (V18): neither is drawn as a message.
+    rows.retain(|row| {
+        let metadata = json(row, "metadata");
+        text(row, "role") != "person"
+            || !(is_heard(&metadata) || approvals::write::is_applied(&metadata))
+    });
     let taken = taken(source, session_id, &rows);
     let reads_trace = reads_trace(source, session_id);
     let extras = live::extras(source, session_id, reads_trace, opened.prefs.view_mode);

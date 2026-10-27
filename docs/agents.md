@@ -435,6 +435,32 @@ drawn after the column.
   only `clients.revoked_at_ms`; showing those states (and that such a grant decides again once the
   device signs in) waits for keeper-hq to sync them, ideally as a server-computed flag (RG-08).
 
+**An agent's drive write (109.27, R-HQ-87).** An agent's `drive_write` — create, replace, edit,
+append, move or delete one file of a drive the person ticked — parks at T3 in every session and is
+never granted. This device is what carries it out: the card (`AgentApprovalVm.write`,
+`approvals::write::Writes::draw`) shows the op, the drive and the path (from → to for a move), the
+line diff keeper-core computed from this device's own checkout for an edit or a replace, the new
+text for a create or an append, the deleted text for a delete, whether the chat read outside
+content, and who reads the drive beyond the session's database. *Allow once* is offered only when
+every check passes here, in this order: the digest recomputed from the rows here is the parked one;
+this device keeps the drive (a synced folder whose `_drive.toml` names it), commits to it and has
+its disk; the session still ticks the drive and leaves `drive_write` and `drive` on; keeper-sync's
+`agent_write_check` accepts the path over this checkout with an agent host's scope (never `.git`,
+`.keeper`, git's own files, an ignored, untracked or LFS-routed path, a folder or a link); the file
+at `HEAD` and on the disk is the version the agent read; and the change fits the caps. Otherwise
+the card says why and offers *Deny* only, and *Deny* tells the agent that reason. *Allow* decides,
+waits for the server, takes the approval (`approved → consumed` by this device), checks again, makes
+one commit of exactly the request through `Engine::commit_paths` with the trailer
+`Approval-Record: <approval id>`, and writes the `applied` message (`applied.<approval id>`, V18),
+each in its own commit. The card's last line is that message's outcome ("Written as 1a2b3c4 on
+hesperia.", or why not); the message itself is never drawn as a bubble. A step the server has not
+answered within the wait goes on when it does. After a stop between taking the approval and saying
+what became of it, the next start looks for the commit by its trailer: found, it is `applied`; not
+found, `not_applied` ("keeper stopped before it wrote this; nothing was written."). A request
+approved here and never taken before a stop stays approved until the agent's host expires it (24 h).
+A drive write is never approved from a notification. Mock shell: `?sessions=launch&writes=all`
+parks one write per op in alpha's device.1, plus one this device cannot carry out.
+
 Conversations agents had before they moved to the database are archived sessions of their
 database (*Imported history*, below). Instance selection is **Answers from** (below); message and
 attention state remain Rust-owned throughout.

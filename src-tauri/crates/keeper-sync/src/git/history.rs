@@ -425,6 +425,32 @@ pub fn lines_in_history(repo_path: &Path, lines: &HashSet<String>) -> Result<Has
     Ok(found)
 }
 
+/// The newest commit `HEAD` reaches whose keeper trailer block carries
+/// `Approval-Record: <approval>` ([`crate::provenance::MemoryTrailer::of_message`]):
+/// the commit that carried that approval out, once (109.27). Newest first,
+/// and only as far back as commits made at or after `since_secs` — a commit
+/// carrying an approval is made after it, so older history is never read.
+/// `None` when no commit in that span carries it.
+pub fn carrying(repo_path: &Path, approval: &str, since_secs: i64) -> Result<Option<String>> {
+    let repo = open(repo_path)?;
+    let Some(walk) = walk(&repo)? else {
+        return Ok(None);
+    };
+    let wanted = crate::provenance::MemoryTrailer::ApprovalRecord(approval.to_owned());
+    for info in walk {
+        let info = info.map_err(|err| walk_error(&err))?;
+        let commit = info.object().map_err(|err| walk_error(&err))?;
+        let revision = revision_of(&commit)?;
+        if revision.committed_secs < since_secs {
+            break;
+        }
+        if crate::provenance::MemoryTrailer::of_message(&revision.message).contains(&wanted) {
+            return Ok(Some(revision.id));
+        }
+    }
+    Ok(None)
+}
+
 /// One path's bytes as of `rev`, or `None` where that revision does not hold
 /// the path. `rev` is anything `git rev-parse` accepts — a full or abbreviated
 pub fn blob_at(repo_path: &Path, rev: &str, rel: &str) -> Result<Option<Vec<u8>>> {

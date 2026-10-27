@@ -34,6 +34,8 @@ use crate::hq::sessions::{
     authored, int, names, object, opt_text, read, reads_trace, text, Source,
 };
 
+pub mod write;
+
 /// How long a decision waits for the server before it is reported as
 /// waiting on this device.
 pub const DECISION_WAIT: Duration = Duration::from_secs(5);
@@ -135,6 +137,12 @@ pub struct AgentApprovalVm {
     #[serde(skip)]
     #[ts(skip)]
     pub waiting_for: Option<WaitingFor>,
+    /// A `drive_write` request's write (109.27): what it changes, the
+    /// preview from this device's checkout, and what became of it
+    /// ([`write::Writes::draw`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub write: Option<write::AgentDriveWriteVm>,
 }
 
 /// Who a pending request waits for, as its turn's fold line names them.
@@ -411,6 +419,7 @@ fn vm(
         undecidable,
         turn_id: opt_text(row, "turn_id"),
         waiting_for,
+        write: None,
     })
 }
 
@@ -671,6 +680,11 @@ pub fn decide(
         approve,
         now_ms,
     )?;
+    // Approving a drive write is carrying it out ([`write::Writes::allow`]);
+    // a bare approval here would leave it approved and never written.
+    if approve && text(&row, "tool_name") == crate::agents::drive_write::TOOL {
+        return Err(Refusal(write::ON_ITS_CARD.to_owned()));
+    }
     let op = decision_op(source, approval_id, approve, int(&row, "version"));
     settle(
         source,
@@ -916,19 +930,23 @@ pub fn decide_pushed(
         std::thread::sleep(Duration::from_millis(50));
     };
     if decision.approve {
-        let tier = read(
+        let row = read(
             &source,
-            "SELECT tier FROM approvals WHERE id = ?1",
+            &format!("{SELECT} WHERE a.id = ?1"),
             &[Value::from(approval_id)],
-        )
-        .first()
-        .map(|row| text(row, "tier").to_owned());
+        );
+        let tier = row.first().map(|row| text(row, "tier").to_owned());
         let below_t4 = tier.as_deref().is_some_and(|tier| {
             tier.strip_prefix('T')
                 .and_then(|n| n.parse::<u8>().ok())
                 .is_some_and(|n| n < 4)
         });
-        if tier.is_some() && !below_t4 {
+        // A drive write is allowed only where its preview is seen and this
+        // device carries it out: on its card.
+        let writes = row
+            .first()
+            .is_some_and(|row| text(row, "tool_name") == crate::agents::drive_write::TOOL);
+        if (tier.is_some() && !below_t4) || writes {
             return Err(Refusal(NOT_FROM_A_NOTIFICATION.to_owned()));
         }
     }
