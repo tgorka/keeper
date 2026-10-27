@@ -86,7 +86,7 @@ const row = (database: string, archived = false) => ({
   title: `${database} session`,
   titleWrite: { state: "confirmed" as const },
   displayName: `assistant · ${database} session`,
-  handle: "jolly-pigeon-squeaks",
+  handle: "jolly-pigeon",
   createdAtMs: 1780000000000,
   trust: "trusted",
   instances: [],
@@ -126,6 +126,7 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
         id: "m1",
         role: "agent",
         authorActor: "assistant",
+        mine: false,
         authorName: "Assistant",
         body: `Message in ${database}`,
         createdAtMs: 1780000000000,
@@ -274,6 +275,7 @@ describe("database Agents window", () => {
                 id: "own",
                 role: "person",
                 authorActor: "ana",
+                mine: true,
                 authorName: "Ana",
                 body: "Saved locally",
                 createdAtMs: 1780000000000,
@@ -307,6 +309,58 @@ describe("database Agents window", () => {
     await waitFor(() =>
       expect(mock.page).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }),
     );
+  });
+  it("marks the row whose right-click menu is open, and only while it is open, without selecting it (FR-598)", async () => {
+    draw();
+    await list();
+    const alpha = screen.getByRole("button", { name: /^assistant · alpha session,/ });
+    const beta = screen.getByRole("button", { name: /^assistant · beta session,/ });
+    fireEvent.contextMenu(alpha);
+    await screen.findByRole("menu");
+    expect(alpha).toHaveAttribute("data-menu-target");
+    expect(beta).not.toHaveAttribute("data-menu-target");
+    expect(agentSessionsStore.getState().selected).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(alpha).not.toHaveAttribute("data-menu-target");
+  });
+  it("opens that session's Details sheet from the row's Context… once its view arrives", async () => {
+    draw();
+    await list();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^assistant · beta session,/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Context…" }));
+    await waitFor(() => expect(mock.views.has("beta")).toBe(true));
+    expect(screen.queryByRole("dialog", { name: "Details" })).toBeNull();
+    act(() => mock.views.get("beta")?.(view("beta")));
+    expect(await screen.findByRole("dialog", { name: "Details" })).toBeInTheDocument();
+    expect(agentSessionsStore.getState().contextFor).toBeNull();
+  });
+  it("draws this person's own lines as bubbles on the right and another person's plain (R-HQ-86)", async () => {
+    draw();
+    await list();
+    const line = (id: string, authorActor: string, mine: boolean, body: string) => ({
+      id,
+      role: "person" as const,
+      authorActor,
+      mine,
+      authorName: authorActor,
+      body,
+      createdAtMs: 1780000000000,
+    });
+    await open("alpha", {
+      messages: [
+        line("own", "ana", true, "My question"),
+        line("theirs", "ben", false, "Ben's question"),
+      ],
+    });
+    const own = screen.getByText("My question");
+    expect(own).toHaveAttribute("data-mine");
+    expect(own).toHaveClass("bg-primary", "rounded-[14px]");
+    expect(own.closest("li")).toHaveClass("items-end");
+    const theirs = screen.getByText("Ben's question");
+    expect(theirs).not.toHaveAttribute("data-mine");
+    expect(theirs).not.toHaveClass("bg-primary");
+    expect(theirs.closest("li")).not.toHaveClass("items-end");
   });
 });
 
@@ -437,6 +491,7 @@ it("sends an ask answer through its database and waits for Rust to close its opt
         id: "ask",
         role: "agent",
         authorActor: "assistant",
+        mine: false,
         authorName: "Assistant",
         body: "Which folder?",
         createdAtMs: 1780000000000,
@@ -464,6 +519,7 @@ it("sends an ask answer through its database and waits for Rust to close its opt
             id: "ask",
             role: "agent",
             authorActor: "assistant",
+            mine: false,
             authorName: "Assistant",
             body: "Which folder?",
             createdAtMs: 1780000000000,
@@ -592,6 +648,7 @@ describe("live answer controls", () => {
               id: "final",
               role: "agent",
               authorActor: "assistant",
+              mine: false,
               authorName: "Assistant",
               body: "First paragraph.\n\nSecond paragraph.",
               createdAtMs: 1780000000000,
@@ -667,6 +724,7 @@ describe("live answer controls", () => {
               id: "final",
               role: "agent",
               authorActor: "assistant",
+              mine: false,
               authorName: "Assistant",
               body: "Earlier answer",
               createdAtMs: 1780000000000,
@@ -698,6 +756,7 @@ describe("live answer controls", () => {
               id: "final",
               role: "agent",
               authorActor: "assistant",
+              mine: false,
               authorName: "Assistant",
               body: "Partial answer",
               createdAtMs: 1780000000000,

@@ -3,6 +3,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
+import { MINE_ROW, PersonLine } from "@/components/agents/person-line";
 import { useSessionAttachmentDraft } from "@/components/agents/session-attachment-draft";
 import { SessionAttachments } from "@/components/agents/session-attachments";
 import { SessionContext, SessionContextTrigger } from "@/components/agents/session-context";
@@ -26,7 +27,6 @@ import {
   agentAttachCommit,
   agentAttachPath,
   agentAttachRelease,
-  agentCommand,
   agentCommandPreview,
   agentMentionPreview,
   agentSend,
@@ -39,7 +39,7 @@ import {
   hqStatusSubscribe,
   hqStatusUnsubscribe,
 } from "@/lib/ipc/client";
-import { lastAgentPick, rememberAgentPick } from "@/lib/stores/agent-picks";
+import { runAgentCommand } from "@/lib/stores/agent-commands";
 import { agentSessionsStore, useAgentSessionsStore } from "@/lib/stores/agent-sessions";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import {
@@ -91,6 +91,13 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     if (hasModels) setModelsOpen(true);
     agentSessionsStore.getState().modelShown();
   }, [viewed, hasModels, modelFor, database, sessionId]);
+  // Context… asks for the Details sheet, which every member may read: it opens with the first view.
+  const contextFor = useAgentSessionsStore((state) => state.contextFor);
+  useEffect(() => {
+    if (!viewed || contextFor?.database !== database || contextFor.sessionId !== sessionId) return;
+    setContextOpen(true);
+    agentSessionsStore.getState().contextShown();
+  }, [viewed, contextFor, database, sessionId]);
   const pinned = useRef(true);
   const resolveMention = useCallback(
     (before: string, after: string) => agentMentionPreview({ database, sessionId }, before, after),
@@ -355,7 +362,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
 
   function renderMessage(message: AgentMessageVm) {
     return (
-      <li key={message.id} className="min-w-0">
+      <li key={message.id} className={message.mine ? `min-w-0 ${MINE_ROW}` : "min-w-0"}>
         <div className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs">
           <span className="font-medium">{message.authorName}</span>
           <span className="text-muted-foreground">{formatMessageTime(message.createdAtMs)}</span>
@@ -364,9 +371,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         {message.role === "agent" ? (
           <AgentAnswer body={message.body} />
         ) : (
-          <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
-            {message.body}
-          </p>
+          <PersonLine body={message.body} mine={message.mine} />
         )}
         {!!message.attachments?.length && <SessionAttachments attachments={message.attachments} />}
         {message.details && <SessionAnswerDetails details={message.details} />}
@@ -663,14 +668,13 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 onCommand={async ({ name, args }) => {
                   try {
                     const line = `/${name}${args === null ? "" : ` ${args}`}`;
-                    const pick = vm ? lastAgentPick(vm.agentActor) : null;
                     // Only `/stop` declines what the banner shows (R10911-07).
                     const result =
                       name === "stop"
-                        ? await fromUnderBanner(() => agentCommand(target, line, pick, declines))
-                        : await agentCommand(target, line, pick, []);
-                    if (result.pick && vm) rememberAgentPick(vm.agentActor, result.pick);
-                    if (result.session) agentSessionsStore.getState().select(result.session);
+                        ? await fromUnderBanner(() =>
+                            runAgentCommand(target, vm?.agentActor, line, declines),
+                          )
+                        : await runAgentCommand(target, vm?.agentActor, line);
                     if (result.surface === "people") setPeopleOpen(true);
                     if (result.surface === "tools") setToolsOpen(true);
                     if (result.surface === "drives") setDrivesOpen(true);

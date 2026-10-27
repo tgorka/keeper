@@ -1167,6 +1167,36 @@ fn an_expired_grant_reads_expired_and_offers_no_revoke() {
     assert!(!grant.can_revoke);
 }
 
+/// R-HQ-86: an untitled session's grant names it by the handle the list
+/// shows — with its session number when another session here shares the two
+/// words — while it waits, and once the server refused it.
+#[test]
+fn a_grant_names_an_untitled_session_by_the_lists_handle() {
+    let w = world("zoë");
+    // Both ids hash to `mighty-toucan`.
+    for id in ["dev1.242", "dev1.752"] {
+        session(&w, id, None, false);
+        sessions::rename(&w.alpha, id, "").expect("untitled");
+    }
+    settle(&w, None);
+    request(&w, "ap1", "dev1.242", "run", "T2", git_status(), &["zoë"]);
+    settle(&w, None);
+    always_allow(
+        &w.alpha,
+        &w.decisions,
+        &ask("dev1.242", "ap1", "program", true),
+        now(),
+    )
+    .expect("written");
+    let waiting = list(std::slice::from_ref(&w.alpha), now()).grants[0].clone();
+    assert_eq!(waiting.state, AgentGrantStateVm::Waiting);
+    assert_eq!(waiting.session.as_deref(), Some("mighty-toucan-242"));
+    settle(&w, Some(("hq.v15.agent", "hq.v15.agent")));
+    let refused = list(std::slice::from_ref(&w.alpha), now()).grants[0].clone();
+    assert_eq!(refused.state, AgentGrantStateVm::Refused);
+    assert_eq!(refused.session.as_deref(), Some("mighty-toucan-242"));
+}
+
 /// RG-08: a grant made on a device signed out since decides nothing
 /// (`hq.v8.grant_credential`), so it reads Inactive — never Active — and
 /// stays revocable; one from a device still signed in stays Active.

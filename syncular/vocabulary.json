@@ -135,92 +135,26 @@
       "yak",
       "zebra"
     ],
-    "verbs": [
-      "sings",
-      "dances",
-      "juggles",
-      "giggles",
-      "naps",
-      "hops",
-      "waddles",
-      "whistles",
-      "hums",
-      "bakes",
-      "knits",
-      "paints",
-      "skates",
-      "surfs",
-      "swims",
-      "wiggles",
-      "wanders",
-      "ponders",
-      "doodles",
-      "fiddles",
-      "gallops",
-      "glides",
-      "grins",
-      "hiccups",
-      "jogs",
-      "kayaks",
-      "laughs",
-      "marches",
-      "mumbles",
-      "nibbles",
-      "paddles",
-      "prances",
-      "purrs",
-      "rambles",
-      "reads",
-      "rolls",
-      "scribbles",
-      "shuffles",
-      "skips",
-      "slides",
-      "snoozes",
-      "sneezes",
-      "snores",
-      "splashes",
-      "sprints",
-      "squeaks",
-      "strolls",
-      "struts",
-      "tiptoes",
-      "toddles",
-      "tumbles",
-      "twirls",
-      "waltzes",
-      "winks",
-      "wobbles",
-      "yodels",
-      "zooms",
-      "blinks",
-      "bounces",
-      "chuckles",
-      "drums",
-      "floats",
-      "frolics",
-      "hikes"
-    ],
     "examples": [
       {
         "sessionId": "tgorka.1a2b3c4d.1",
-        "handle": "noble-hedgehog-struts"
+        "handle": "noble-hedgehog"
       },
       {
         "sessionId": "tgorka.1a2b3c4d.2",
-        "handle": "quick-magpie-rolls"
+        "handle": "quick-magpie"
       },
       {
         "sessionId": "nixi.electra.12",
-        "handle": "zany-duck-sneezes"
+        "handle": "zany-duck"
       },
       {
         "sessionId": "marta.0f0f0f0f.7",
-        "handle": "lucky-salmon-sprints"
+        "handle": "lucky-salmon"
       },
       {
         "sessionId": "keeper-hq.import.tgdrive.3",
-        "handle": "sturdy-snail-wobbles"
+        "handle": "sturdy-snail"
       }
     ]
   },

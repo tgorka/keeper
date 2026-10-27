@@ -99,7 +99,9 @@ prefs: AgentViewPrefsVm,
 /**
  * Which instance is answering and each instance's online state, from
  * this session's database; absent while it lists no instance of the
- * agent and no claim.
+ * agent and no claim, and while the session is archived: no instance
+ * claims an archived session, so nobody answers it until it is
+ * unarchived — the read-only bar says so (R-HQ-86).
  */
 answering?: AgentSessionAnsweringVm, 
 /**

@@ -5,7 +5,13 @@ import type { AgentMessageRoleVm } from "./AgentMessageRoleVm";
 import type { AgentMessageStateVm } from "./AgentMessageStateVm";
 import type { AgentSessionAskVm } from "./AgentSessionAskVm";
 
-export type AgentMessageVm = { id: string, role: AgentMessageRoleVm, authorActor: string, authorName: string, body: string, createdAtMs: number, 
+export type AgentMessageVm = { id: string, role: AgentMessageRoleVm, authorActor: string, 
+/**
+ * Written by this device's person (`author_actor` is the source's
+ * actor), from any of their devices: drawn as their own bubble. Another
+ * person's message in the same session is not (R-HQ-86).
+ */
+mine: boolean, authorName: string, body: string, createdAtMs: number, 
 /**
  * This device's messages only.
  */

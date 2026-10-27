@@ -552,6 +552,17 @@ impl SessionNames {
         Self { members, handles }
     }
 
+    /// Session `id`'s handle as the list shows it: with its session number
+    /// when another session here shares the words. A session this replica
+    /// does not hold has no neighbours to tell apart from: its bare handle.
+    pub fn handle(&self, id: &str) -> String {
+        self.handles
+            .get(id)
+            .cloned()
+            .or_else(|| super::vocabulary::handle(id))
+            .unwrap_or_else(|| id.to_owned())
+    }
+
     pub fn presentation(&self, id: &str, agent: &str, title: &str) -> (String, String) {
         let mut agents = vec![agent];
         if let Some(members) = self.members.get(id) {

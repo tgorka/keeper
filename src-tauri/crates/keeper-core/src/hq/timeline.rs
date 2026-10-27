@@ -96,6 +96,10 @@ pub struct AgentMessageVm {
     pub id: String,
     pub role: AgentMessageRoleVm,
     pub author_actor: String,
+    /// Written by this device's person (`author_actor` is the source's
+    /// actor), from any of their devices: drawn as their own bubble. Another
+    /// person's message in the same session is not (R-HQ-86).
+    pub mine: bool,
     pub author_name: String,
     pub body: String,
     #[ts(type = "number")]
@@ -344,7 +348,9 @@ pub struct AgentSessionViewVm {
     pub prefs: AgentViewPrefsVm,
     /// Which instance is answering and each instance's online state, from
     /// this session's database; absent while it lists no instance of the
-    /// agent and no claim.
+    /// agent and no claim, and while the session is archived: no instance
+    /// claims an archived session, so nobody answers it until it is
+    /// unarchived — the read-only bar says so (R-HQ-86).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub answering: Option<AgentSessionAnsweringVm>,
@@ -583,14 +589,20 @@ pub fn view(
     let (banner, approvals) = banner(approvals::of_session(
         source, session_id, &directory, refusals, now_ms,
     ));
-    let answering = instances::answering(
-        source,
-        session_id,
-        &session.agent_actor,
-        &agent_name,
-        &opened.live,
-        now_ms,
-    );
+    // No instance claims an archived session (the runtime skips it), so any
+    // header — "no instance holds it yet", "X takes it next" — would be false.
+    let answering = if session.archived {
+        None
+    } else {
+        instances::answering(
+            source,
+            session_id,
+            &session.agent_actor,
+            &agent_name,
+            &opened.live,
+            now_ms,
+        )
+    };
     let (display_name, handle) = crate::hq::sessions::SessionNames::read(source).presentation(
         session_id,
         &session.agent_actor,
@@ -767,6 +779,7 @@ fn messages(
                     .get(&author)
                     .cloned()
                     .unwrap_or_else(|| author.clone()),
+                mine: author == source.actor,
                 author_actor: author,
                 body: text(row, "body").to_owned(),
                 created_at_ms: int(row, "created_at_ms").unwrap_or(0),
@@ -933,6 +946,7 @@ fn refused(
                 .cloned()
                 .unwrap_or_else(|| source.actor.clone()),
             author_actor: source.actor.clone(),
+            mine: true,
             body: text(&refused.values, "body").to_owned(),
             created_at_ms: int(&refused.values, "created_at_ms").unwrap_or(0),
             state: Some(AgentMessageStateVm::Refused),
