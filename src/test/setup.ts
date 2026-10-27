@@ -57,6 +57,13 @@ if (!globalThis.ResizeObserver) {
   };
 }
 
+// jsdom has no `Range.getBoundingClientRect`, which the session bar reads to tell whether the
+// model's name is cut (`useBarFold`). Like every element here, a range lays out as 0x0; a test
+// that needs a geometry arranges its own (`use-bar-fold.test.tsx`).
+if (!Range.prototype.getBoundingClientRect) {
+  Range.prototype.getBoundingClientRect = () => new DOMRect();
+}
+
 // jsdom performs no layout, so every element reports a 0x0 bounding rect. A
 // virtualised list asks the scroll element how tall it is and renders a window
 // of that height, which means an unshimmed jsdom renders exactly zero rows and

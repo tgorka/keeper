@@ -94,7 +94,7 @@ const vm: AgentSessionViewVm = {
     model: "beta-small",
     effort: "Default",
     shortModel: "beta-small",
-    compact: "beta-small · Default",
+    effortCode: "D",
     choosesModel: false,
     choosesEffort: false,
   },
@@ -239,7 +239,7 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
       footer: {
         ...vm.footer,
         effort: "Medium",
-        compact: "beta-small · Medium",
+        effortCode: "M",
         choosesModel: true,
         choosesEffort: true,
       },
@@ -305,7 +305,7 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
   it("marks an untrusted session in the header, says why in the banner, and offers a fresh chat", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";
-    const fresh = "Start a fresh chat: starts trusted, keeps drives";
+    const fresh = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
     const next = { database: "beta", sessionId: "same.2" };
     mock.command.mockResolvedValue({ session: next, surface: null, message: "" });
     const onSession = vi.fn();
@@ -350,6 +350,9 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
     expect(
       screen.getByRole("complementary", { name: "Waiting for your decision" }),
     ).toHaveTextContent(why);
+    // The Agents window shows another session meanwhile.
+    const shownInWindow = { database: "alpha", sessionId: "other.1" };
+    agentSessionsStore.getState().select(shownInWindow);
     fireEvent.click(chip);
     const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
     expect(popover).toHaveTextContent(why);
@@ -363,15 +366,35 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
         [],
       ),
     );
-    // The host that holds its own choice (the Notes Assistant dock) moves to the fresh chat.
+    // The host that holds its own choice (the Notes Assistant dock) moves to the fresh chat, and
+    // the Agents window's selection stays where it was (R601-04).
     await waitFor(() => expect(onSession).toHaveBeenCalledWith(next));
-    expect(agentSessionsStore.getState().selected).toEqual(next);
+    expect(agentSessionsStore.getState().selected).toEqual(shownInWindow);
+  });
+
+  it("moves the Agents window to the fresh chat where no host holds its own choice", async () => {
+    const next = { database: "beta", sessionId: "same.2" };
+    mock.command.mockResolvedValue({ session: next, surface: null, message: "" });
+    agentSessionsStore.getState().select({ database: "beta", sessionId: "same.1" });
+    await draw({
+      ...vm,
+      untrusted: {
+        sentence: "This chat read outside content.",
+        freshChat: "Start a fresh chat: starts trusted, keeps the drives you can still tick",
+      },
+    });
+    fireEvent.click(
+      within(screen.getByRole("banner")).getByRole("button", { name: /^Untrusted:/ }),
+    );
+    const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
+    fireEvent.click(within(popover).getByRole("button", { name: /^Start a fresh chat/ }));
+    await waitFor(() => expect(agentSessionsStore.getState().selected).toEqual(next));
   });
 
   it("says why a fresh chat could not start, in the chip's popover", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";
-    const fresh = "Start a fresh chat: starts trusted, keeps drives";
+    const fresh = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
     mock.command.mockRejectedValue({
       code: "internal",
       message: "Unarchive this conversation first.",

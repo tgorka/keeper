@@ -279,9 +279,11 @@ pub const UNTRUSTED: &str =
     "This chat read outside content, such as a web page, so its commands need your approval.";
 
 /// The honest way out of an untrusted chat: `/clean` starts a fresh one with
-/// the same agent, which starts trusted and keeps the drives (Q109-17 b),
-/// while the mark on this one never lowers (D-34, V13).
-pub const FRESH_CHAT: &str = "Start a fresh chat: starts trusted, keeps drives";
+/// the same agent, which starts trusted (Q109-17 b) and carries only the
+/// ticks this person may still tick (`drives::carry`, A109-06), while the
+/// mark on this one never lowers (D-34, V13).
+pub const FRESH_CHAT: &str =
+    "Start a fresh chat: starts trusted, keeps the drives you can still tick";
 
 /// A session that read outside content, as its header's chip says it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

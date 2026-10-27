@@ -54,13 +54,21 @@ function Picker(
         model: p.modelLabel,
         effort: p.effortLabel ?? "Default",
         shortModel: p.modelLabel,
-        compact: `${p.modelLabel} · ${p.effortLabel ?? "Default"}`,
+        effortCode: EFFORT_CODES[p.effortLabel ?? ""] ?? "D",
         choosesModel: p.models.length > 1,
         choosesEffort: p.efforts.length > 1,
       }}
     />
   );
 }
+
+/** `settings::effort_code`'s, by the label each shortens. */
+const EFFORT_CODES: Record<string, string> = {
+  Low: "L",
+  Medium: "M",
+  High: "H",
+  "Extra high": "XH",
+};
 
 function openModels() {
   fireEvent.click(screen.getByRole("button", { name: /^Model: / }));
@@ -259,19 +267,42 @@ describe("the model and effort pickers", () => {
           models: [{ id: "beta-small", provider: "Beta", current: true, default: true }],
           efforts: [],
           effortLabel: undefined,
-          resettable: true,
         })}
       />,
     );
     const bar = screen.getByRole("group", { name: "Model and effort" });
     expect(within(bar).getByText("beta-small")).toBeInTheDocument();
     expect(within(bar).getByText("Default")).toBeInTheDocument();
-    // Only Reset, for the saved choice: neither chip opens anything.
+    expect(within(bar).queryAllByRole("button")).toEqual([]);
+  });
+
+  it("keeps Reset out of the bar where nothing is chosen but a choice is saved (R601-01)", () => {
+    render(
+      <Picker
+        target={target}
+        agent="nixi"
+        picker={picker({
+          models: [{ id: "beta-small", provider: "Beta", current: true, default: true }],
+          efforts: [],
+          effortLabel: undefined,
+          resettable: true,
+        })}
+      />,
+    );
+    const bar = screen.getByRole("group", { name: "Model and effort" });
+    // The model chip opens a popover to hold Reset; the bar itself has no Reset.
     expect(
       within(bar)
         .getAllByRole("button")
-        .map((b) => b.textContent),
-    ).toEqual(["Reset"]);
+        .map((b) => b.getAttribute("aria-label")),
+    ).toEqual(["Model: beta-small"]);
+    const popover = openModels();
+    expect(popover).toHaveAccessibleName("Model");
+    expect(
+      within(popover).getByRole("button", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("resets from the effort menu when the model is a read-only chip", async () => {
@@ -298,7 +329,7 @@ describe("the model and effort pickers", () => {
     await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
   });
 
-  it("Reset keeps focus on the group when both are read-only chips", async () => {
+  it("Reset from the model chip's popover keeps focus on the group when both are read-only chips", async () => {
     render(
       <Picker
         target={target}
@@ -312,10 +343,15 @@ describe("the model and effort pickers", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+      within(openModels()).getByRole("button", {
+        name: "Reset model and effort to the agent's defaults",
+      }),
     );
-    expect(document.activeElement).toBe(screen.getByRole("group", { name: "Model and effort" }));
-    await waitFor(() => expect(mock.change).toHaveBeenCalled());
+    // The chip that opened it goes once the reset lands: focus stays in the bar (R598-06).
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("group", { name: "Model and effort" })),
+    );
+    await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
   });
 
   it("says which model failed and the way back, above everything else", () => {

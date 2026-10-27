@@ -121,7 +121,7 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
       model: "Default",
       effort: "Default",
       shortModel: "Default",
-      compact: "Default · Default",
+      effortCode: "D",
       choosesModel: false,
       choosesEffort: false,
     },

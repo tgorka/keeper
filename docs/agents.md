@@ -517,26 +517,27 @@ reader who may not, or an agent with one offer, sees read-only chips. An archive
 composer but keeps the reading: read-only model and effort chips and the context, under the
 read-only line (R598-03).
 
-**One row, at any width (FooterOneRow).** The bar holds one row from the Notes Assistant's 280px
-minimum (a 255px bar) to a full window. It reads its own width (`@container/bar`), never the
-viewport's, because the same bar sits in the panel, the tablet sheet and the Agents window:
+**One row, at any width (FooterOneRow, R601-01).** The bar holds one row from the Notes
+Assistant's 280px minimum (a 255px bar) to a full window, in the panel, the tablet sheet and the
+Agents window alike:
 
 - the model chip says the model's own name (`shortModel`, Rust's: `openrouter/z-ai/glm-5.3-flash`
-  → `glm-5.3-flash`) and truncates; its accessible name and the popover keep the whole id;
+  → `glm-5.3-flash`); its accessible name and the popover keep the whole id;
 - the model group never forces a wrap (its flex basis is 0; it grows up to its content);
 - **Reset** lives in the model popover and the effort menu; only where neither opens anything and a
   choice is still saved does it stay in the bar, so no action is dropped (AD-260);
-- under 24rem the context reading is the ring alone (its label stays in the accessible name, the
-  tooltip and Details) and Send is a 36px icon (≥44pt on the phone). The triage proposed "about
-  22rem" for the desktop's 36px targets; the phone's 44pt targets need 24rem for a 393px iPhone's
-  369px bar to keep the model's name whole;
-- under 19rem (from the panel's minimum up to a 304px bar, where the model's name would
-  otherwise lose its last letters) **the effort folds into the model chip's words**:
-  `glm-5.3-flash · Default` (`compact`, Rust's). This is the documented exception to R-HQ-85's
-  separate effort chip ("effort is a compact chip next to it"): a read-only effort chip is then
-  read aloud but not drawn, and an effort menu keeps its brain icon, so it still opens. The other
-  way out — raising the `notes-agent` floor to about 360px — would need saying so (AD-260) and
-  was not taken.
+- **the model's name is the last thing to give way.** When the row runs short, the bar
+  (`useBarFold`) gives up, in this order and only as far as it must: the context reading's label
+  (the ring stays; the label stays in the accessible name, the tooltip and Details); Send's word
+  (a 36px icon, ≥44pt on the phone); the bar's Reset word (its icon, same accessible name); the
+  chips' padding and the effort menu's chevron; the effort's words, for its level's short code
+  beside the brain (`effortCode`, Rust's: `L`, `M`, `H`, `XH`, and `D` for an unstated
+  default; the words stay the accessible name); then the row's gaps and the model's chevron. Only
+  then is the model's name cut. Width alone cannot order this — the same 335px bar holds
+  `glm-5.3-flash` beside "Medium" and cuts it beside "Extra high" — so the bar measures its own
+  row (does the model's name fit?) whenever it resizes or what it shows changes;
+- the effort is its own chip at every width, as R-HQ-85 says; nothing folds it into the model
+  chip's words (FooterOneRow's fold, `compact`, is gone).
 
 **Context** beside Send is a ring and Rust's compact label (`5.3k / 1M`), in every view mode and
 for any member: `metadata.context` is in every member's replica. Before any answer measured it, or
@@ -575,12 +576,14 @@ line for a session that has read outside content (D-34: a web page, a broker's a
 Rust's sentence, "This chat read outside content, such as a web page, so its commands need your
 approval.", and the approval banner says the same above the requests it holds. The mark never
 lowers (V13), so the popover offers the honest way out instead: **Start a fresh chat: starts
-trusted, keeps drives** (`AgentUntrustedVm.freshChat`, Rust's words), which runs `/clean` through
-the composer's command path (Q109-17 b: the new session starts trusted and keeps the drive ticks).
-It is absent on an archived session, where `/clean` refuses. A new session a command starts —
-`/clean`, `/new` or this action — opens in the Notes Assistant dock too, not only in the Agents
-window. The session's Details dialog says **Trusted** for a session with no mark, **Untrusted**
-once it read outside content.
+trusted, keeps the drives you can still tick** (`AgentUntrustedVm.freshChat`, Rust's words), which
+runs `/clean` through the composer's command path (Q109-17 b: the new session starts trusted;
+A109-06: it carries the ticks this person may still tick there, so a drive the agent no longer
+offers, the audience rule now refuses or the server refused is left behind). It is absent on an
+archived session, where `/clean` refuses. A new session a command starts — `/clean`, `/new` or
+this action — opens where the command ran: the Notes Assistant dock moves to it and leaves the
+Agents window's selection where it was; the Agents window moves its own. The session's Details
+dialog says **Trusted** for a session with no mark, **Untrusted** once it read outside content.
 
 **Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
 menu of check items. No drive is ticked until a person ticks one — not even the session's own

@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { HoverHint } from "@/components/ui/tooltip";
+import { BAR_WHOLE } from "@/hooks/use-bar-fold";
 import {
   type AgentModelOptionVm,
   type AgentSessionFooterVm,
@@ -36,17 +37,22 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /**
- * The bar's widths, read from the composer bar's own `@container/bar` (FooterOneRow), never the
- * viewport. Under 24rem (where the context is the ring alone) the chips tighten: less padding and
- * a smaller chevron on the model, none on the effort menu. Under 19rem — the Notes Assistant's 280px minimum is a 255px bar —
- * the effort folds into the model chip's words: the documented exception to R-HQ-85's separate
- * effort chip (docs/agents.md).
+ * What these chips give up when the composer's one-row bar runs short (`useBarFold`, R601-01),
+ * read from the bar's `data-fold`: the chips lose padding and the effort menu its chevron
+ * (`tight`); the effort shows its level's short code, its words still its accessible name
+ * (`effort`); the effort's brain and the model's chevron go, leaving the code as the effort's
+ * badge with a narrower padding (`snug`). The model's name is the last thing cut, and it is
+ * never folded into another chip's words.
  */
-const NARROW_TIGHT = "@max-[24rem]/bar:px-2";
-const NARROW_HIDDEN = "@max-[24rem]/bar:hidden";
-const FOLDED_HIDDEN = "@max-[19rem]/bar:hidden";
-const FOLDED_SHOWN = "hidden @max-[19rem]/bar:block";
-const FOLDED_SR_ONLY = "@max-[19rem]/bar:sr-only";
+const TIGHT = "group-data-[fold~=tight]/bar:px-2";
+const TIGHT_HIDDEN = "group-data-[fold~=tight]/bar:hidden";
+const EFFORT_WORDS = "group-data-[fold~=effort]/bar:sr-only";
+const EFFORT_CODE = "hidden group-data-[fold~=effort]/bar:inline";
+const SNUG_HIDDEN = "group-data-[fold~=snug]/bar:hidden";
+// Important: it must beat `TIGHT`, an equally specific rule this step keeps.
+const SNUG_EFFORT = "group-data-[fold~=snug]/bar:px-1.5!";
+
+const READ_ONLY_MODEL = "The next answer uses this model; there is no other to choose here.";
 
 /** A chip in the composer's bar that opens nothing: the agent offers no alternative. */
 function ReadOnlyChip({
@@ -79,12 +85,23 @@ function ReadOnlyChip({
   );
 }
 
-/** The model chip's words: the model's own name, with the effort folded in at the minimum. */
+/** The model chip's words: the model's own name, the text the bar cuts last. */
 function ModelWords({ footer }: { footer: AgentSessionFooterVm }) {
   return (
+    <span {...BAR_WHOLE} className="min-w-0 truncate">
+      {footer.shortModel}
+    </span>
+  );
+}
+
+/** The effort's words, or its level's short code where the bar folds it (Rust's both). */
+function EffortWords({ footer }: { footer: AgentSessionFooterVm }) {
+  return (
     <>
-      <span className={cn("min-w-0 truncate", FOLDED_HIDDEN)}>{footer.shortModel}</span>
-      <span className={cn("min-w-0 truncate", FOLDED_SHOWN)}>{footer.compact}</span>
+      <span className={EFFORT_WORDS}>{footer.effort}</span>
+      <span aria-hidden="true" className={EFFORT_CODE}>
+        {footer.effortCode}
+      </span>
     </>
   );
 }
@@ -103,7 +120,8 @@ function ModelWords({ footer }: { footer: AgentSessionFooterVm }) {
  * It renders as `display: contents` inside the composer's bar, which holds one row
  * (FooterOneRow): the group never forces a wrap (its basis is 0, it grows up to its content and
  * the model's name truncates), Reset lives in the model popover and the effort menu, and the
- * sentences sit on full-width lines after the row.
+ * sentences sit on full-width lines after the row. What gives way first is the bar's
+ * `useBarFold`.
  */
 export function SessionSettingsPicker({
   target,
@@ -129,6 +147,9 @@ export function SessionSettingsPicker({
   const [error, setError] = useState<string | null>(null);
   const writing = useRef(false);
   const group = useRef<HTMLFieldSetElement>(null);
+  // Reset from a popover that only holds Reset removes its own trigger once it lands: focus
+  // moves to the group in the bar, not back to a chip about to go (R598-06).
+  const focusGroup = useRef(false);
 
   async function apply(change: AgentSettingsChange) {
     // A second click while one write is in flight is ignored, never queued.
@@ -261,9 +282,31 @@ export function SessionSettingsPicker({
       Reset to the agent's defaults
     </>
   );
-  // Neither chip opens anything, yet a choice is saved: Reset stays in the bar (AD-260).
-  const resetInBar =
-    picker?.resettable && !(picker && (footer.choosesModel || footer.choosesEffort));
+  const running = picker?.running && (
+    <p className="border-t px-3 py-2 text-muted-foreground text-xs">{picker.running}</p>
+  );
+  const resetFromPopover = picker?.resettable && (
+    <div className="border-t p-1">
+      <Button
+        variant="ghost"
+        size="sm"
+        className="min-h-11 w-full justify-start"
+        aria-label="Reset model and effort to the agent's defaults"
+        onClick={() => {
+          focusGroup.current = !footer.choosesModel;
+          setModelsOpen(false);
+          void apply({ kind: "reset" });
+        }}
+      >
+        {reset}
+      </Button>
+    </div>
+  );
+  // Reset lives in the popovers, never in the bar (R601-01): where neither chip offers a choice
+  // yet one is still saved, the model chip opens a popover to hold it, so no action is dropped
+  // (AD-260).
+  const modelOpens =
+    picker !== undefined && (footer.choosesModel || (picker.resettable && !footer.choosesEffort));
   if (write?.state === "pending") {
     notes.push(
       <p key="pending" role="status" className="text-muted-foreground text-xs">
@@ -279,66 +322,67 @@ export function SessionSettingsPicker({
         aria-label="Model and effort"
         className="flex min-w-0 max-w-max flex-1 basis-0 items-center gap-0.5 text-xs"
       >
-        {picker && footer.choosesModel ? (
+        {picker && modelOpens ? (
           <Popover open={modelsOpen} onOpenChange={setModelsOpen}>
             <PopoverTrigger asChild>
               <Button
                 variant="ghost"
                 size="sm"
-                className={cn("min-h-11 min-w-0 shrink justify-start", NARROW_TIGHT)}
+                className={cn("min-h-11 min-w-0 shrink justify-start", TIGHT)}
                 aria-label={`Model: ${footer.model}`}
               >
                 <ModelWords footer={footer} />
-                <ChevronDown aria-hidden="true" className="size-4 @max-[24rem]/bar:size-3" />
+                <ChevronDown
+                  aria-hidden="true"
+                  className={cn("size-4 group-data-[fold~=tight]/bar:size-3", SNUG_HIDDEN)}
+                />
               </Button>
             </PopoverTrigger>
             <PopoverContent
               align="start"
-              aria-label="Choose a model"
+              aria-label={footer.choosesModel ? "Choose a model" : "Model"}
               className="w-[min(22rem,calc(100vw-1.5rem))] p-0"
+              onCloseAutoFocus={(event) => {
+                if (!focusGroup.current) return;
+                focusGroup.current = false;
+                event.preventDefault();
+                group.current?.focus();
+              }}
             >
-              <Command label="Search models">
-                <CommandInput placeholder="Search models…" />
-                <CommandList label="Offered models">
-                  <CommandEmpty>No offered model matches.</CommandEmpty>
-                  {starred.length > 0 && (
-                    <CommandGroup heading="Favourites">{starred.map(row)}</CommandGroup>
-                  )}
-                  {providers.map((provider) => (
-                    <CommandGroup key={provider} heading={provider}>
-                      {rest.filter((model) => model.provider === provider).map(row)}
-                    </CommandGroup>
-                  ))}
-                </CommandList>
-                {picker.running && (
-                  <p className="border-t px-3 py-2 text-muted-foreground text-xs">
-                    {picker.running}
+              {footer.choosesModel ? (
+                <Command label="Search models">
+                  <CommandInput placeholder="Search models…" />
+                  <CommandList label="Offered models">
+                    <CommandEmpty>No offered model matches.</CommandEmpty>
+                    {starred.length > 0 && (
+                      <CommandGroup heading="Favourites">{starred.map(row)}</CommandGroup>
+                    )}
+                    {providers.map((provider) => (
+                      <CommandGroup key={provider} heading={provider}>
+                        {rest.filter((model) => model.provider === provider).map(row)}
+                      </CommandGroup>
+                    ))}
+                  </CommandList>
+                  {running}
+                  {resetFromPopover}
+                </Command>
+              ) : (
+                <>
+                  <p className="space-y-1 px-3 py-2 text-xs">
+                    <span className="block break-all font-medium">{footer.model}</span>
+                    <span className="block text-muted-foreground">{READ_ONLY_MODEL}</span>
                   </p>
-                )}
-                {picker.resettable && (
-                  <div className="border-t p-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="min-h-11 w-full justify-start"
-                      aria-label="Reset model and effort to the agent's defaults"
-                      onClick={() => {
-                        setModelsOpen(false);
-                        void apply({ kind: "reset" });
-                      }}
-                    >
-                      {reset}
-                    </Button>
-                  </div>
-                )}
-              </Command>
+                  {running}
+                  {resetFromPopover}
+                </>
+              )}
             </PopoverContent>
           </Popover>
         ) : (
           <ReadOnlyChip
             name="Model"
             value={<ModelWords footer={footer} />}
-            hint="The next answer uses this model; there is no other to choose here."
+            hint={READ_ONLY_MODEL}
             className="shrink"
           />
         )}
@@ -348,12 +392,12 @@ export function SessionSettingsPicker({
               <Button
                 variant="ghost"
                 size="sm"
-                className={cn("min-h-11 shrink-0", NARROW_TIGHT)}
+                className={cn("min-h-11 shrink-0", TIGHT, SNUG_EFFORT)}
                 aria-label={`Effort: ${footer.effort}`}
               >
-                <Brain aria-hidden="true" />
-                <span className={FOLDED_SR_ONLY}>{footer.effort}</span>
-                <ChevronDown aria-hidden="true" className={NARROW_HIDDEN} />
+                <Brain aria-hidden="true" className={SNUG_HIDDEN} />
+                <EffortWords footer={footer} />
+                <ChevronDown aria-hidden="true" className={TIGHT_HIDDEN} />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="max-w-[calc(100vw-1.5rem)]">
@@ -398,27 +442,11 @@ export function SessionSettingsPicker({
         ) : (
           <ReadOnlyChip
             name="Effort"
-            icon={<Brain aria-hidden="true" className="size-3.5 shrink-0" />}
-            value={footer.effort}
+            icon={<Brain aria-hidden="true" className={cn("size-3.5 shrink-0", SNUG_HIDDEN)} />}
+            value={<EffortWords footer={footer} />}
             hint="The next answer uses this effort; there is no other to choose here."
-            // Folded into the model chip's words at the minimum; still read aloud here.
-            className={cn("shrink-0", FOLDED_SR_ONLY)}
+            className={cn("shrink-0", SNUG_EFFORT)}
           />
-        )}
-        {resetInBar && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="min-h-11 shrink-0"
-            aria-label="Reset model and effort to the agent's defaults"
-            onClick={() => {
-              // Reset removes itself; keep keyboard focus in the bar, on the group (R598-06).
-              group.current?.focus();
-              void apply({ kind: "reset" });
-            }}
-          >
-            Reset
-          </Button>
         )}
       </fieldset>
       {notes.length > 0 && <div className="order-last flex basis-full flex-col gap-1">{notes}</div>}

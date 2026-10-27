@@ -6115,7 +6115,7 @@ const ownerReport = new URLSearchParams(location.search).get("owner") === "repor
 const MOCK_UNTRUSTED =
   "This chat read outside content, such as a web page, so its commands need your approval.";
 /** `timeline::FRESH_CHAT`: the chip's `/clean`, absent on an archived session. */
-const MOCK_FRESH_CHAT = "Start a fresh chat: starts trusted, keeps drives";
+const MOCK_FRESH_CHAT = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
 /** `context::NOT_MEASURED`, before `sessionViewerVm` projects the real reading. */
 const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
   used: null,
@@ -6132,11 +6132,18 @@ const MOCK_FOOTER_SEED: AgentSessionViewVm["footer"] = {
   model: "Default",
   effort: "Default",
   shortModel: "Default",
-  compact: "Default · Default",
+  effortCode: "D",
   choosesModel: false,
   choosesEffort: false,
 };
-/** `settings::footer_of`: the chip's words are the model's own name; the fold adds the effort. */
+/** `settings::effort_code`, by the label it shortens; `EFFORT_UNSET_CODE` for "Default". */
+const MOCK_EFFORT_CODES: Record<string, string> = {
+  Low: "L",
+  Medium: "M",
+  High: "H",
+  "Extra high": "XH",
+};
+/** `settings::footer_of`: the chip's words are the model's own name; the effort has a code. */
 function mockFooter(
   model: string,
   effort: string,
@@ -6148,7 +6155,7 @@ function mockFooter(
     model,
     effort,
     shortModel,
-    compact: `${shortModel} · ${effort}`,
+    effortCode: MOCK_EFFORT_CODES[effort] ?? "D",
     choosesModel,
     choosesEffort,
   };
@@ -7311,9 +7318,10 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
 // each change a moment after it was written, through the row's outcome. `fallback` puts
 // `metadata.model_fallback` on the newest answer. Viewing aid only: Rust's `picker_of` decides.
 // ?settings=single (or ?owner=report): one model and no effort, so the bar's chips are read-only.
+// ?settings=held: the same, with a choice still saved, so Reset stays in the bar (R601-01).
 // ?settings=failed: the newest answer failed on the model in use (a 429 for days, R-HQ-85).
 const settingsScenario = new URLSearchParams(location.search).get("settings");
-const singleModel = settingsScenario === "single" || ownerReport;
+const singleModel = settingsScenario === "single" || settingsScenario === "held" || ownerReport;
 const MOCK_MODELS = singleModel
   ? ["openrouter/z-ai/glm-5.3-flash"]
   : // The ids every agent offers (keeper-hq `agents/*/agent.toml`), in their order, which
@@ -7366,7 +7374,11 @@ function mockSettingsOf(vm: AgentSessionViewVm) {
   const key = JSON.stringify([vm.database, vm.sessionId]);
   let held = mockSettings.get(key);
   if (!held) {
-    held = { model: null, effort: null, refused: null };
+    held = {
+      model: settingsScenario === "held" ? MOCK_DEFAULT_MODEL : null,
+      effort: null,
+      refused: null,
+    };
     mockSettings.set(key, held);
   }
   return held;

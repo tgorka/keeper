@@ -64,6 +64,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
+import { BAR_CLASS, useBarFold } from "@/hooks/use-bar-fold";
 import { useInlineSlash } from "@/hooks/use-inline-slash";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSlashMenu } from "@/hooks/use-slash-menu";
@@ -376,6 +377,9 @@ export function Composer({
   // The textarea handle, focused programmatically when the composer store's focus
   // nonce is *bumped* (Story 6.6 — e.g. after a new chat is resolved and opened).
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  /** The session bar, which folds its controls when one row cannot hold them (R601-01). */
+  const bar = useRef<HTMLDivElement>(null);
+  useBarFold(bar, transport === "session");
   const focusNonce = useConversationComposer((s) => s.focusNonce);
   // Seed to the current nonce so a fresh Composer mount (every room switch clears &
   // remounts the pane) does NOT self-focus off a stale, already-bumped nonce — only a
@@ -1569,12 +1573,13 @@ export function Composer({
         <SlashHelp rows={help.rows} escapeHint={help.escapeHint} onClose={() => setHelp(null)} />
       )}
       <div
+        ref={bar}
         className={cn(
           "relative flex min-w-0 items-end gap-2",
-          // The session bar holds one row under the field at any width (FooterOneRow): its
-          // controls read the bar's own width (`@container`), never the viewport's, because the
-          // same bar sits in the 280px Notes Assistant panel and in a full window.
-          transport === "session" && "@container/bar flex-wrap items-center",
+          // The session bar holds one row under the field at any width (FooterOneRow). Short of
+          // room it folds its controls in `useBarFold`'s order, so the model's name is cut
+          // last (R601-01); its last step closes the row's gaps.
+          transport === "session" && [BAR_CLASS, "flex-wrap items-center data-[fold~=snug]:gap-1"],
         )}
       >
         <SlashMenuList menu={menu} />
@@ -1764,7 +1769,9 @@ export function Composer({
         />
         <div
           className={
-            sendAccessory ? "ml-auto flex min-w-0 shrink-0 items-center gap-2" : "contents"
+            sendAccessory
+              ? "ml-auto flex min-w-0 shrink-0 items-center gap-2 group-data-[fold~=snug]/bar:gap-1"
+              : "contents"
           }
         >
           {sendAccessory}
@@ -1775,19 +1782,21 @@ export function Composer({
             aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
             // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
             // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
-            // default button size. A session bar under 24rem draws Send as a
-            // 36px icon (≥44pt on the phone) so it keeps one row.
+            // default button size. A session bar short of room draws Send as a
+            // 36px icon (≥44pt on the phone) so it keeps one row (`useBarFold`).
             className={cn(
               phone && "h-11 min-w-11",
               transport === "session" && !sendAccessory && "ml-auto",
               transport === "session" &&
-                (phone ? "@max-[24rem]/bar:px-0" : "@max-[24rem]/bar:size-9 @max-[24rem]/bar:px-0"),
+                (phone
+                  ? "group-data-[fold~=send]/bar:px-0"
+                  : "group-data-[fold~=send]/bar:size-9 group-data-[fold~=send]/bar:px-0"),
             )}
           >
             {transport === "session" && pending?.mode !== "edit" ? (
               <>
-                <span className="@max-[24rem]/bar:hidden">Send</span>
-                <ArrowUp aria-hidden="true" className="hidden @max-[24rem]/bar:block" />
+                <span className="group-data-[fold~=send]/bar:hidden">Send</span>
+                <ArrowUp aria-hidden="true" className="hidden group-data-[fold~=send]/bar:block" />
               </>
             ) : pending?.mode === "edit" ? (
               "Save"

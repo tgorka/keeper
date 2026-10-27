@@ -115,7 +115,7 @@ function view(sessionId: string): AgentSessionViewVm {
       model: "Default",
       effort: "Default",
       shortModel: "Default",
-      compact: "Default · Default",
+      effortCode: "D",
       choosesModel: false,
       choosesEffort: false,
     },

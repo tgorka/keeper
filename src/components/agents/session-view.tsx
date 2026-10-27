@@ -17,6 +17,7 @@ import { SessionAnswerDetails, SessionLiveTurn, TurnFold } from "@/components/ag
 import { SessionUntrusted } from "@/components/agents/session-untrusted";
 import { announcedElsewhere, announcedRejection, Composer } from "@/components/chat/composer";
 import { Button } from "@/components/ui/button";
+import { BAR_CLASS, useBarFold } from "@/hooks/use-bar-fold";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { logFailure } from "@/lib/failure";
 import { formatMessageTime } from "@/lib/format-time";
@@ -52,7 +53,8 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 /**
  * Mount keyed by (database, sessionId): no old page, draft or action can leak across databases.
  * `onSession` hears the session a command (`/clean`, `/new`) started, for a host such as the
- * Notes Assistant dock that holds its own choice rather than the Agents window's.
+ * Notes Assistant dock that holds its own choice: given one, the command moves that host and
+ * leaves the Agents window's selection where it was (R601-04); without one, it moves the window.
  */
 export function SessionView({
   target,
@@ -82,6 +84,9 @@ export function SessionView({
   const [stores] = useState(createConversationStores);
   const viewport = useRef<HTMLDivElement>(null);
   const backButton = useRef<HTMLButtonElement>(null);
+  /** The archived session's read-only bar, folded as the composer's is (R601-01). */
+  const readOnlyBar = useRef<HTMLDivElement>(null);
+  useBarFold(readOnlyBar, vm?.readOnly === true);
   const { phone } = useShellLayout();
   const { database, sessionId } = target;
   // Drives… in the list's right-click menu asks for this view's menu. Rust's first view of this
@@ -372,11 +377,14 @@ export function SessionView({
    * menu shares; only `/stop` declines what the banner shows (R10911-07).
    */
   async function runCommand(name: string, line: string) {
+    // A host with its own choice (`onSession`) takes the new session; the Agents window keeps its
+    // selection (R601-04). Without one, the window follows.
     const result =
       name === "stop"
-        ? await fromUnderBanner(() => runAgentCommand(target, vm?.agentActor, line, declines))
-        : await runAgentCommand(target, vm?.agentActor, line);
-    if (result.session) onSession?.(result.session);
+        ? await fromUnderBanner(() =>
+            runAgentCommand(target, vm?.agentActor, line, declines, onSession),
+          )
+        : await runAgentCommand(target, vm?.agentActor, line, [], onSession);
     if (result.surface === "people") setPeopleOpen(true);
     if (result.surface === "tools") setToolsOpen(true);
     if (result.surface === "drives") setDrivesOpen(true);
@@ -683,7 +691,10 @@ export function SessionView({
           <p className="px-1 py-1 text-muted-foreground text-sm">
             This archived session is read-only. Unarchive it to continue.
           </p>
-          <div className="@container/bar flex min-w-0 flex-wrap items-center gap-1">
+          <div
+            ref={readOnlyBar}
+            className={`${BAR_CLASS} flex min-w-0 flex-wrap items-center gap-1`}
+          >
             <SessionSettingsPicker target={target} agent={vm.agentActor} footer={vm.footer} />
             <div className="ml-auto shrink-0">
               <SessionContext context={vm.context} open={contextOpen} onOpenChange={setContextOpen}>

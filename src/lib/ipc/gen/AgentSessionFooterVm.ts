@@ -23,11 +23,12 @@ effort: string,
  */
 shortModel: string, 
 /**
- * The model chip at the panel's 280px minimum, where the effort folds
- * into it (`glm-5.3-flash · Default`): the documented exception to
- * R-HQ-85's separate effort chip.
+ * The effort's short code (`XH`, `M`; [`EFFORT_UNSET_CODE`] for the
+ * agent's unstated default): what the effort chip says when the bar is
+ * too narrow for `effort`, which stays its accessible name. The chip
+ * gives up its words before the model's name does (R601-01).
  */
-compact: string, 
+effortCode: string, 
 /**
  * The model chip opens the picker: more than one model to choose.
  */
