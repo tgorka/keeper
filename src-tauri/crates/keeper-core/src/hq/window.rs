@@ -632,6 +632,11 @@ impl Hq {
         shown: &[ShownApprovalVm],
     ) -> Result<(), HqError> {
         let files = self.staging.take(key, handles).map_err(sentence)?;
+        // 109.24: a mention starts its own thread and carries no files; the
+        // caption is never sent to this session's agent in its place.
+        if crate::hq::mention::parse(caption).is_some() {
+            return Err(HqError::Sentence(crate::hq::mention::WITH_FILES.to_owned()));
+        }
         let source = self.source(&key.database)?;
         let attached = attachments::attach(
             &source,

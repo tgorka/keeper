@@ -54,6 +54,7 @@ pub mod identity;
 pub mod instances;
 pub mod live;
 pub mod members;
+pub mod mention;
 pub mod pairing;
 pub mod port;
 pub mod push;

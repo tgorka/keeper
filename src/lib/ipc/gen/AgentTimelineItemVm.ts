@@ -4,4 +4,4 @@
  * Ordered reading column. References resolve against `messages`, `folds`,
  * and `live`; grouping and ordering are never inferred by the renderer.
  */
-export type AgentTimelineItemVm = { "kind": "message", messageId: string, } | { "kind": "fold", turnId: string, } | { "kind": "liveAnswer", turnId: string, };
+export type AgentTimelineItemVm = { "kind": "message", messageId: string, } | { "kind": "fold", turnId: string, } | { "kind": "liveAnswer", turnId: string, } | { "kind": "child", threadId: string, };

@@ -1,5 +1,5 @@
 import { Archive, ArchiveRestore, ArrowLeft } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionQuestionsPanel } from "@/components/agents/decisions-panel";
@@ -9,6 +9,7 @@ import { SessionContext, SessionContextTrigger } from "@/components/agents/sessi
 import { SessionControls } from "@/components/agents/session-controls";
 import { SessionDrives } from "@/components/agents/session-drives";
 import { SessionInstances } from "@/components/agents/session-instances";
+import { SessionChildThread } from "@/components/agents/session-mention";
 import { SessionPeople } from "@/components/agents/session-people";
 import { SessionSettingsPicker } from "@/components/agents/session-settings-picker";
 import { SessionAnswerDetails, SessionLiveTurn, TurnFold } from "@/components/agents/session-turn";
@@ -27,7 +28,9 @@ import {
   agentAttachRelease,
   agentCommand,
   agentCommandPreview,
+  agentMentionPreview,
   agentSend,
+  agentSendLine,
   agentSessionArchive,
   agentSessionClose,
   agentSessionOpen,
@@ -80,6 +83,10 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     agentSessionsStore.getState().drivesShown();
   }, [viewed, hasDrives, drivesFor, database, sessionId]);
   const pinned = useRef(true);
+  const resolveMention = useCallback(
+    (before: string, after: string) => agentMentionPreview({ database, sessionId }, before, after),
+    [database, sessionId],
+  );
   const previousHeight = useRef<number | null>(null);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: explicit retry restarts the failed subscription
@@ -334,6 +341,8 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const messages = new Map(vm?.messages.map((message) => [message.id, message]));
   const folds = new Map(vm?.folds.map((fold) => [fold.turnId, fold]));
   const live = new Map(vm?.live.map((turn) => [turn.turnId, turn]));
+  const children = new Map(vm?.children?.map((child) => [child.threadId, child]));
+  const firstChild = vm?.items.flatMap((item) => (item.kind === "child" ? [item.threadId] : []))[0];
 
   function renderMessage(message: AgentMessageVm) {
     return (
@@ -514,6 +523,27 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 const message = messages.get(item.messageId);
                 return message && renderMessage(message);
               }
+              if (item.kind === "child") {
+                // 109.24: a thread started here, where it was started; Rust's
+                // sentence about threads left out sits above the first one.
+                const child = children.get(item.threadId);
+                return (
+                  child && (
+                    <Fragment key={`child:${item.threadId}`}>
+                      {vm.childrenNote && item.threadId === firstChild && (
+                        <li className="text-muted-foreground text-xs">{vm.childrenNote}</li>
+                      )}
+                      <li className="min-w-0">
+                        <SessionChildThread
+                          database={database}
+                          child={child}
+                          onOpen={(next) => agentSessionsStore.getState().select(next)}
+                        />
+                      </li>
+                    </Fragment>
+                  )
+                );
+              }
               if (item.kind === "fold") {
                 const fold = folds.get(item.turnId);
                 return (
@@ -628,8 +658,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                     };
                   }
                 }}
+                resolveMention={resolveMention}
                 onSend={async (body) => {
-                  await fromUnderBanner(() => agentSend(target, body, declines));
+                  await fromUnderBanner(() => agentSendLine(target, body, declines));
                 }}
                 attachmentPreview={attachmentDraft.preview}
                 sendAccessory={

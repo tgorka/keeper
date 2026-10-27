@@ -27,8 +27,9 @@ use crate::hq::drives::AgentSessionDrivesVm;
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
 use crate::hq::live::{
     self, AgentLiveTurnVm, AgentMessageDetailsVm, AgentSessionToolVm, AgentToolStepVm,
-    AgentViewPrefsVm, Live,
+    AgentViewPrefsVm, Extras, Live,
 };
+use crate::hq::mention::{self, AgentChildSessionVm};
 use crate::hq::port::ReplicaError;
 use crate::hq::sessions::{
     earlier_months, int, is_ask, is_heard, json, mark, month, newest_months, opt_text, page_key,
@@ -127,9 +128,21 @@ pub struct AgentMessageVm {
 )]
 #[ts(export)]
 pub enum AgentTimelineItemVm {
-    Message { message_id: String },
-    Fold { turn_id: String },
-    LiveAnswer { turn_id: String },
+    Message {
+        message_id: String,
+    },
+    Fold {
+        turn_id: String,
+    },
+    LiveAnswer {
+        turn_id: String,
+    },
+    /// 109.24: a thread this person started from here with an `@mention`,
+    /// where it was started; resolves against `children` by `thread_id`
+    /// (its first line's id, never reused).
+    Child {
+        thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -236,6 +249,16 @@ pub struct AgentSessionViewVm {
     pub items: Vec<AgentTimelineItemVm>,
     /// One per turn, in the order the column names them.
     pub folds: Vec<AgentTurnFoldVm>,
+    /// 109.24: the conversations this person started from this one with an
+    /// `@mention`, oldest first, each with its agent's latest answer.
+    #[serde(default)]
+    #[ts(as = "Option<Vec<AgentChildSessionVm>>", optional)]
+    pub children: Vec<AgentChildSessionVm>,
+    /// 109.24 (R10924K-08): that older threads of the shown months were left
+    /// out of `children`, and where they are; drawn above the first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub children_note: Option<String>,
     /// Oldest first; empty for a member who does not read the trace. The
     /// requests that wait for this person are in `banner`, not here.
     pub approvals: Vec<AgentApprovalVm>,
@@ -418,7 +441,9 @@ pub fn view(
         .get(&session.agent_actor)
         .cloned()
         .unwrap_or_else(|| session.agent_actor.clone());
-    let (mut rows, has_earlier, loading_earlier, complete, note) = if session.archived {
+    // The oldest month the view shows: where the threads started from it by
+    // a mention are drawn from (109.24, R10924K-02). None while archived.
+    let (mut rows, has_earlier, loading_earlier, complete, note, shown_from) = if session.archived {
         let local = read(source, MESSAGES, &[Value::from(session_id)]);
         let remote = &opened.remote;
         let held: HashSet<&str> = local.iter().map(|row| text(row, "id")).collect();
@@ -440,13 +465,14 @@ pub fn view(
             remote.loading && remote.fetched,
             remote.fetched,
             remote.error.clone(),
+            None,
         )
     } else {
-        let newest: Vec<String> =
-            newest_months(session.created_ms, session.last_activity_ms, now_ms)
-                .iter()
-                .map(|m| page_key(session_id, m))
-                .collect();
+        let newest_months = newest_months(session.created_ms, session.last_activity_ms, now_ms);
+        let newest: Vec<String> = newest_months
+            .iter()
+            .map(|m| page_key(session_id, m))
+            .collect();
         let earlier = earlier_months(session.created_ms, session.last_activity_ms, opened.widen);
         let mut units = newest.clone();
         units.extend(earlier.iter().map(|m| page_key(session_id, m)));
@@ -466,7 +492,20 @@ pub fn view(
         let loading = earlier
             .iter()
             .any(|m| incomplete.contains(&page_key(session_id, m)));
-        (rows, oldest_shown > first, loading, complete, None)
+        let shown_from = newest_months
+            .iter()
+            .chain(earlier.iter())
+            .min()
+            .cloned()
+            .unwrap_or_else(|| oldest_shown.clone());
+        (
+            rows,
+            oldest_shown > first,
+            loading,
+            complete,
+            None,
+            Some(shown_from),
+        )
     };
     // A person's heard row is a mark for the claim holder, not a message
     // (R-HQ-68): never drawn.
@@ -519,8 +558,14 @@ pub fn view(
         HashSet::new()
     };
     let stopping = stopping(source, session_id, &rows);
-    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
+    let (mut items, folds) =
+        turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
     let live = live.into_iter().map(|turn| turn.vm).collect();
+    let (children, left_out) = match &shown_from {
+        Some(since) => mention::children(source, session_id, since, &directory, opened.prefs),
+        None => (Vec::new(), 0),
+    };
+    mention::place(&mut items, &messages, &children);
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -535,6 +580,8 @@ pub fn view(
             messages,
             items,
             folds,
+            children,
+            children_note: mention::left_out(left_out),
             approvals,
             banner,
             has_earlier,
@@ -679,6 +726,135 @@ fn messages(
             })
         })
         .collect()
+}
+
+/// A thread's latest turn as a parent draws it inline (109.24): the person's
+/// first line and the newest turn's own rows, projected as 109.13 projects a
+/// session — never the thread's whole view (R10924K-02).
+pub(crate) struct LatestTurn {
+    pub prompt: Option<AgentMessageVm>,
+    /// From the turn's fold on.
+    pub items: Vec<AgentTimelineItemVm>,
+    pub folds: Vec<AgentTurnFoldVm>,
+    pub messages: Vec<AgentMessageVm>,
+    pub live: Vec<AgentLiveTurnVm>,
+}
+
+/// The person's first line of `session_id`.
+const FIRST_LINE: &str = "SELECT id, role, body, metadata, created_at_ms, author_actor, \
+     author_client, turn_id, _sync_version AS version FROM messages \
+     WHERE session_id = ?1 AND role = 'person' ORDER BY created_at_ms, id LIMIT 1";
+
+/// The newest turn of `session_id` an agent wrote to, or is writing: the
+/// newest of its newest agent row and its newest streamed chunk, each read
+/// alone, so the read does not grow with the thread's history.
+const NEWEST_TURN: &str = "SELECT turn_id FROM ( \
+     SELECT * FROM (SELECT turn_id, created_at_ms FROM messages \
+     WHERE session_id = ?1 AND role = 'agent' AND turn_id IS NOT NULL \
+     ORDER BY created_at_ms DESC, id DESC LIMIT 1) \
+     UNION ALL SELECT * FROM (SELECT turn_id, created_at_ms FROM turn_chunks \
+     WHERE session_id = ?1 ORDER BY created_at_ms DESC, id DESC LIMIT 1)) \
+     ORDER BY created_at_ms DESC LIMIT 1";
+
+/// The agent's rows of one turn.
+const TURN_ROWS: &str = "SELECT id, role, body, metadata, created_at_ms, author_actor, \
+     author_client, turn_id, _sync_version AS version FROM messages \
+     WHERE session_id = ?1 AND role = 'agent' AND turn_id = ?2 ORDER BY created_at_ms, id";
+
+/// Whether an agent's turn names message `?2` of `session_id` (R465's
+/// *taken*), asked of that one message.
+const TAKEN: &str = "SELECT (EXISTS (SELECT 1 FROM messages WHERE session_id = ?1 \
+     AND role = 'agent' AND turn_id = ?2) OR EXISTS (SELECT 1 FROM turn_chunks \
+     WHERE session_id = ?1 AND turn_id = ?2)) AS taken";
+
+/// What a parent draws of a thread (R10924K-05): its first line and its
+/// newest turn, every read scoped to that line or that turn — the thread's
+/// earlier turns, their tool calls, thinking and chunks are never read.
+/// Thinking is not read at all: the parent does not draw it.
+pub(crate) fn latest_turn(
+    source: &Source,
+    session_id: &str,
+    directory: &HashMap<String, String>,
+    prefs: AgentViewPrefsVm,
+) -> LatestTurn {
+    let first = read(source, FIRST_LINE, &[Value::from(session_id)]);
+    let turn = read(source, NEWEST_TURN, &[Value::from(session_id)])
+        .first()
+        .and_then(|row| opt_text(row, "turn_id"));
+    let extras = match &turn {
+        Some(turn) => live::extras_of(
+            source,
+            session_id,
+            Some(turn),
+            reads_trace(source, session_id),
+            false,
+        ),
+        None => Extras {
+            steps: HashMap::new(),
+            reasoning: HashMap::new(),
+            thinking: false,
+        },
+    };
+    let none = HashSet::new();
+    let taken: HashSet<String> = first
+        .iter()
+        .filter_map(|row| opt_text(row, "id"))
+        .filter(|id| {
+            read(
+                source,
+                TAKEN,
+                &[Value::from(session_id), Value::from(id.as_str())],
+            )
+            .first()
+            .is_some_and(|row| truthy(row, "taken"))
+        })
+        .collect();
+    let mut prompt_rows = first;
+    let prompt = messages(source, &mut prompt_rows, directory, &taken, prefs)
+        .into_iter()
+        .next();
+    let Some(turn) = turn else {
+        return LatestTurn {
+            prompt,
+            items: Vec::new(),
+            folds: Vec::new(),
+            messages: Vec::new(),
+            live: Vec::new(),
+        };
+    };
+    let mut rows = read(
+        source,
+        TURN_ROWS,
+        &[Value::from(session_id), Value::from(turn.as_str())],
+    );
+    let ended: HashSet<String> = rows
+        .iter()
+        .filter(|row| live::is_terminal(&json(row, "metadata")))
+        .map(|_| turn.clone())
+        .collect();
+    let live = live::turns_of(
+        source,
+        session_id,
+        Some(&turn),
+        &Live::default(),
+        &ended,
+        &extras,
+    );
+    let messages = messages(source, &mut rows, directory, &none, prefs);
+    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &none, &none);
+    let live = live.into_iter().map(|turn| turn.vm).collect();
+    let items: Vec<AgentTimelineItemVm> = items
+        .iter()
+        .rposition(|item| matches!(item, AgentTimelineItemVm::Fold { .. }))
+        .map(|at| items[at..].to_vec())
+        .unwrap_or_default();
+    LatestTurn {
+        prompt,
+        items,
+        folds,
+        messages,
+        live,
+    }
 }
 
 /// This device's messages whose files the server refused, among the others

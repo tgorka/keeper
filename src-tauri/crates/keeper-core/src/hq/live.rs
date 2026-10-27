@@ -509,15 +509,30 @@ pub fn extras(
     reads_trace: bool,
     mode: AgentViewModeVm,
 ) -> Extras {
-    let show_reasoning = mode.shows_thinking();
+    extras_of(source, session_id, None, reads_trace, mode.shows_thinking())
+}
+
+/// [`extras`], of one turn only when `turn` names it: what a parent reads of
+/// a mention's thread (109.24, R10924K-05), never the thread's history.
+pub(super) fn extras_of(
+    source: &Source,
+    session_id: &str,
+    turn: Option<&str>,
+    reads_trace: bool,
+    show_reasoning: bool,
+) -> Extras {
+    let scope = [
+        Value::from(session_id),
+        turn.map_or(Value::Null, Value::from),
+    ];
     let mut steps: HashMap<String, Vec<AgentToolStepVm>> = HashMap::new();
     let mut reasoning: HashMap<String, Vec<(i64, bool, String)>> = HashMap::new();
     if reads_trace {
         for row in read(
             source,
             "SELECT id, turn_id, name, status, result, started_at_ms, ended_at_ms FROM tool_calls \
-             WHERE session_id = ?1 ORDER BY created_at_ms, id",
-            &[Value::from(session_id)],
+             WHERE session_id = ?1 AND (?2 IS NULL OR turn_id = ?2) ORDER BY created_at_ms, id",
+            &scope,
         ) {
             let (Some(id), Some(turn)) = (opt_text(&row, "id"), opt_text(&row, "turn_id")) else {
                 continue;
@@ -544,8 +559,9 @@ pub fn extras(
         if show_reasoning {
             for row in read(
                 source,
-                "SELECT turn_id, seq, compacted, text FROM reasoning WHERE session_id = ?1",
-                &[Value::from(session_id)],
+                "SELECT turn_id, seq, compacted, text FROM reasoning \
+                 WHERE session_id = ?1 AND (?2 IS NULL OR turn_id = ?2)",
+                &scope,
             ) {
                 let Some(turn) = opt_text(&row, "turn_id") else {
                     continue;
@@ -601,6 +617,19 @@ pub(super) fn turns(
     ended: &HashSet<String>,
     extras: &Extras,
 ) -> Vec<LiveTurn> {
+    turns_of(source, session_id, None, live, ended, extras)
+}
+
+/// [`turns`], of one turn's chunks only when `turn` names it (109.24,
+/// R10924K-05).
+pub(super) fn turns_of(
+    source: &Source,
+    session_id: &str,
+    turn: Option<&str>,
+    live: &Live,
+    ended: &HashSet<String>,
+    extras: &Extras,
+) -> Vec<LiveTurn> {
     struct Chunks {
         pieces: Vec<(i64, String)>,
         author: Option<String>,
@@ -610,8 +639,11 @@ pub(super) fn turns(
     for row in read(
         source,
         "SELECT turn_id, seq, text, author_client, created_at_ms FROM turn_chunks \
-         WHERE session_id = ?1",
-        &[Value::from(session_id)],
+         WHERE session_id = ?1 AND (?2 IS NULL OR turn_id = ?2)",
+        &[
+            Value::from(session_id),
+            turn.map_or(Value::Null, Value::from),
+        ],
     ) {
         let Some(turn) = opt_text(&row, "turn_id") else {
             continue;

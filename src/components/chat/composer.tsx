@@ -45,6 +45,11 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  MENTION_MENU_LABEL,
+  MENTION_PREVIEW_FAILED,
+  mentionCandidate,
+} from "@/components/agents/mention";
 import { CameraSheet, photoFilename } from "@/components/chat/camera-sheet";
 import type { ChatCommandInvocation, ChatCommandOutcome } from "@/components/chat/chat-commands";
 import { InlineSlashList } from "@/components/slash-menu/inline-slash-list";
@@ -197,6 +202,12 @@ interface ComposerProps {
    */
   resolveInline?: (before: string, after: string) => Promise<ChatInlinePreviewVm>;
   /**
+   * What a leading `@` offers in an agents session (109.24): the agents Rust says the
+   * line may bring in. Absent → no `@` menu. Sending the line stays {@link onSend}'s;
+   * Rust decides what an `@` line does.
+   */
+  resolveMention?: (before: string, after: string) => Promise<ChatInlinePreviewVm>;
+  /**
    * The text in the field, after every change. A composer whose draft is not kept by
    * Rust (New session) keeps it here; the composer never waits on it.
    */
@@ -293,6 +304,7 @@ export function Composer({
   onCommand,
   resolveCommand,
   resolveInline,
+  resolveMention,
   onDraftChange,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
@@ -1149,6 +1161,24 @@ export function Composer({
     },
     reportAs: "chat-inline-preview",
   });
+  // A leading `@` in an agents session (109.24): the same keyboard model and
+  // insertion as the mid-text menu, over Rust's agents.
+  const mention = useInlineSlash({
+    draft,
+    caret,
+    enabled: transport === "session" && resolveMention != null && pending?.mode !== "edit",
+    resolve: resolveMention ?? resolveInlineHere,
+    onInsert: (next, at) => {
+      restoreConsumed.current = true;
+      insertedCaret.current = at;
+      setDraft(next);
+      setCaret(at);
+      scheduleDraftSave(next);
+    },
+    reportAs: "agent-mention-preview",
+    candidate: mentionCandidate,
+    failureSentence: MENTION_PREVIEW_FAILED,
+  });
   useLayoutEffect(() => {
     const at = insertedCaret.current;
     const field = textareaRef.current;
@@ -1341,7 +1371,7 @@ export function Composer({
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     // The open slash menu claims ↑/↓/Enter/Tab/Escape first; everything it does
     // not claim — and every key while it is closed — keeps its meaning below.
-    if (menu.onKeyDown(e) || inline.onKeyDown(e)) {
+    if (menu.onKeyDown(e) || inline.onKeyDown(e) || mention.onKeyDown(e)) {
       return;
     }
     if (e.key === "Escape" && readingRef.current.length > 0) {
@@ -1518,6 +1548,7 @@ export function Composer({
       >
         <SlashMenuList menu={menu} />
         <InlineSlashList menu={inline} />
+        <InlineSlashList menu={mention} label={MENTION_MENU_LABEL} />
         {attachEnabled && pending?.mode !== "edit" && (
           <IconHint label="Attach file">
             <Button
@@ -1610,7 +1641,11 @@ export function Composer({
         <Textarea
           ref={textareaRef}
           aria-label="Message"
-          {...(inline.open ? inline.fieldProps : menu.fieldProps)}
+          {...(inline.open
+            ? inline.fieldProps
+            : mention.open
+              ? mention.fieldProps
+              : menu.fieldProps)}
           placeholder="Write a message…"
           value={draft}
           disabled={disabled}
@@ -1715,6 +1750,11 @@ export function Composer({
       {commandNote === null && menu.failure === null && inline.failure !== null && (
         <p role="alert" className="text-destructive text-xs">
           {inline.failure}
+        </p>
+      )}
+      {commandNote === null && mention.failure !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {mention.failure}
         </p>
       )}
       {commandNote !== null &&

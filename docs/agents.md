@@ -757,6 +757,65 @@ had grown to 954 px (the sheet's scroll area 550–555 px wider than the sheet) 
 neither scrolling sideways, its destructive control reading *Remove* with the person's whole name
 as its accessible name, both controls 44 px tall and at least 64 px wide.
 
+## Bringing another agent in with `@` (109.24)
+
+A line that starts with `@<handle>` in a session's composer is not a message to the session's
+agent (Q109-21 a, R-HQ-76). keeper, acting as the person, starts a **child session** for the agent
+the handle names: its row names this session as `parent_session`, it lives in the same database,
+the person is its owner, and the whole line is its first message — the three rows in one commit,
+through the same creation path as New session (`keeper_core::hq::sessions::create_child`). That
+is the shape keeper-hq's V3 lets a person member of the parent insert; V11 keeps it in the
+database. The session's own agent is not asked about it, and no agent prompts another: only people
+start these threads.
+
+Typing `@` at the start of the draft opens a menu of the database's directory agents other than
+the session's own, matched by handle or a word of the name — Rust's rows
+(`keeper_core::hq::mention::preview`), drawn by the mid-text menu's keyboard model: ↑/↓ move,
+Enter or Tab insert, Escape closes. A mention of the session's own agent, of an agent of another
+database, of a handle no agent has, or with nothing after the handle is refused before anything is
+written, with a sentence under the composer; the draft stays. A mention with files is refused too:
+the files go in the thread once it exists. An `@` later in a line is text for the session's agent.
+
+The parent draws the threads it started inline, where each was started: the agent's name, the
+person's line, the agent's latest turn as 109.13 folds it (`AgentChildSessionVm.items`, a `child`
+item in the parent's `items`), and **Open thread**, which opens the child like any other session
+in the list. The view is bounded: only threads started within the months the parent shows, the
+newest 30 (`MAX_INLINE_CHILDREN`), and when older ones of those months are left out the parent
+says how many, above the first, and that they open from the sessions list. For each thread only its
+first line and its newest turn are read — the newest turn's id first, then that turn's own rows,
+tool calls and chunks (`timeline::latest_turn`, `live::extras_of`, `live::turns_of`); the thread's
+earlier turns, their tool calls, thinking and chunks are never read, so what a parent reads does not
+grow with a thread's history. The inline fold is its one summary line, Rust's sentence — never its
+steps, their failures, its thinking or lead-ins — and it never opens, in any view mode, so the answer
+stays first in the box; the details are the thread's, behind Open thread. Nothing inline is a live
+region: the thread announces its work in its own view, and the inline line names whose work it is
+(*Tola Grey: Searching the web… · 1 step*). The person's line and the answer are cut at 1,200
+characters (`MAX_INLINE_ANSWER`, `truncated`), and the answer sits in a height-capped box: whenever
+either is cut or the box overflows, the block says *This continues in the thread.* Measured with 200
+threads each answered with 20 KB: 510 ms and a 4.3 MB view before the bound, 29 ms and 62 KB after;
+30 threads whose newest turn ran 1,000 tool calls each stay at 63 KB. An archived thread is one line, *Thread archived*, with
+Open thread: its rows are read only when it is opened.
+
+A thread is told apart by its first line's id (`thread_id`), never by its session id: a refused
+child's rows leave the replica, so the next creation mints the same id again. If the server
+refuses the commit (`hq.v3.parent_not_member`, `hq.v11.agent_outside_directory`, …), the child
+never existed: the line stays on the parent, marked refused, with the reason in plain words read
+from the replica's outcome journal, and there is nothing to open. Two refusals are two lines, and a
+later mention that reuses the id hides neither.
+
+A mention declines what the session's banner showed, as any message does (Q109-12 a): the local
+checks run first, so a mention refused on this device declines nothing; then the declines; then
+the child's commit (`mention::send_line` passes 109.11's `approvals::decline_pending` as
+`mention::start`'s `decline` step; the composer sends the banner's shown requests with the line,
+`agent_send_line`'s `declines`). Answering an
+agent's option button still goes to the session's own agent verbatim (`agent_send`); only the
+composer's line is read for a mention (`agent_send_line`).
+
+Development fixture: `?sessions=launch`, alpha's *Plan the next release*: `@tola-grey …` is
+answered inline with a long answer cut for the parent, `@mason …` is refused by the mock server,
+`@researcher …` is beta's agent, `@assistant …` is the session's own, any other handle is unknown;
+archiving Tola's thread draws it as archived in the parent.
+
 ## Which instance answers
 
 An agent is one actor and can run as several instances — `nixi@electra` on the server and

@@ -1100,6 +1100,44 @@ pub fn create_with_first(
     first: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
 ) -> Result<String, ReplicaError> {
+    create_in(source, agent, None, &title_from(body), body, first, pick).map(|(id, _)| id)
+}
+
+/// A session of `agent` started by this person from `parent` (109.24): the
+/// child's row naming its parent, the person's owner membership and `body`
+/// as its first message, in one commit — the shape V3 lets a person member
+/// of the parent insert. Its id and the commit's.
+pub(crate) fn create_child(
+    source: &Source,
+    parent: &str,
+    agent: &str,
+    title: &str,
+    body: &str,
+) -> Result<(String, String), ReplicaError> {
+    create_in(
+        source,
+        agent,
+        Some(parent),
+        title,
+        body,
+        &ulid::Ulid::new().to_string(),
+        None,
+    )
+}
+
+/// The one way a session is created here: its row, the owner's membership
+/// and, unless `body` is empty, its first message, in one commit — with a
+/// model/effort `pick`, in three (R10918-07). The session's id and the
+/// commit that created it.
+fn create_in(
+    source: &Source,
+    agent: &str,
+    parent: Option<&str>,
+    title: &str,
+    body: &str,
+    first: &str,
+    pick: Option<&crate::hq::settings::AgentSettingsPick>,
+) -> Result<(String, String), ReplicaError> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let at = now_ms();
     let id = next_session_id(source);
@@ -1109,13 +1147,13 @@ pub fn create_with_first(
             source,
             object(serde_json::json!({
                 "id": id,
-                "title": title_from(body),
+                "title": title,
                 "status": "open",
                 "agent_actor": agent,
                 "created_by_actor": source.actor,
                 "created_by_client": source.client,
                 "preferred_client": null,
-                "parent_session": null,
+                "parent_session": parent,
                 "invite": "[]",
                 "archived": false,
                 "heard_until": null,
@@ -1147,12 +1185,13 @@ pub fn create_with_first(
         .transpose()?
         .flatten();
     let message = (!body.is_empty()).then(|| person_message(source, &id, first, body, at));
-    match settings {
+    let commit = match settings {
         // Nothing of a pick to write: one commit, as a creation always was.
+        // A mention's child is always this one commit (109.24, V3).
         None => {
             let mut ops = vec![session, member];
             ops.extend(message);
-            source.replica.mutate(ops)?;
+            source.replica.mutate(ops)?
         }
         // Three commits, in this order (R10918-07). The pick's settings row
         // is its own commit: V16 judges it against the server's offers, which
@@ -1165,15 +1204,16 @@ pub fn create_with_first(
         // it holds the session's settings (keeper-hq `worker.rs`,
         // `start_turn`): the first turn uses the pick.
         Some(row) => {
-            source.replica.mutate(vec![session, member])?;
+            let created = source.replica.mutate(vec![session, member])?;
             source.replica.mutate(vec![row])?;
             if let Some(message) = message {
                 source.replica.mutate(vec![message])?;
             }
+            created
         }
-    }
+    };
     source.replica.sync_now();
-    Ok(id)
+    Ok((id, commit))
 }
 
 /// Rename changes only the mutable title, preserving session identity. The
