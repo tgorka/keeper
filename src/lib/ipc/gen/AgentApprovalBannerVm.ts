@@ -6,10 +6,12 @@ import type { AgentApprovalVm } from "./AgentApprovalVm";
  */
 export type AgentApprovalBannerVm = { 
 /**
- * Oldest first.
+ * Oldest first; empty when every request waiting for this person needs
+ * another of their devices (DW-E109-27).
  */
 approvals: Array<AgentApprovalVm>, 
 /**
- * What sending a message does to them, in plain words.
+ * What sending a message does to them, in plain words, and how many
+ * requests wait for another device instead.
  */
 sentence: string, };

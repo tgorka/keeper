@@ -176,6 +176,34 @@ fn request(
         .expect("request");
 }
 
+/// This device (`dev1`) on `mine`, and Nixi's instance `nixi.box` holding
+/// `session`'s claim on `holder`, as the directory records their hosts
+/// (`None`: no host recorded).
+fn hosts(w: &World, session: &str, mine: Option<&str>, holder: Option<&str>) {
+    let me = w.alpha.actor.as_str();
+    let client = |id: &str, actor: &str, kind: &str, host: Option<&str>| {
+        upsert(
+            "clients",
+            json!({"id": id, "actor_id": actor, "kind": kind, "name": id, "host": host,
+                   "created_at_ms": 1, "revoked_at_ms": null, "dir": "alpha",
+                   "author_actor": "server", "author_client": "server"}),
+        )
+    };
+    w.alpha
+        .replica
+        .mutate(vec![
+            client("dev1", me, "device", mine),
+            client("nixi.box", NIXI, "instance", holder),
+            upsert(
+                "claims",
+                json!({"session_id": session, "holder_actor": NIXI,
+                       "holder_client": "nixi.box", "epoch": 1, "renewed_at_ms": now(),
+                       "released": false, "author_actor": NIXI, "author_client": "nixi.box"}),
+            ),
+        ])
+        .expect("hosts");
+}
+
 fn git_status() -> Value {
     json!({"argv": ["git", "status", "--porcelain"]})
 }
@@ -261,6 +289,8 @@ fn always_allow_is_left_out_where_no_grant_could_apply() {
     let w = world("zoë");
     session(&w, "dev1.1", None, false);
     session(&w, "dev1.2", Some("untrusted"), false);
+    // On another host than the agent's, so the T4 request is decidable here.
+    hosts(&w, "dev1.1", Some("laptop"), Some("electra"));
     let paseo = json!({"title": "x"});
     request(
         &w,
@@ -434,6 +464,8 @@ fn outbox(w: &World) -> i64 {
 fn sending_a_message_declines_what_waits_for_the_sender() {
     let w = world("zoë");
     session(&w, "dev1.1", None, false);
+    // This device is on another host than the agent's: its T4 decisions go.
+    hosts(&w, "dev1.1", Some("laptop"), Some("electra"));
     request(&w, "mine", "dev1.1", "run", "T2", git_status(), &["zoë"]);
     request(
         &w,
@@ -496,6 +528,111 @@ fn sending_a_message_declines_what_waits_for_the_sender() {
     assert!(after.messages.iter().any(|m| m.body == "yes, do it"));
     // Each denial is its own commit, and the message its own after them.
     assert_eq!(outbox_ops(&w), vec!["approvals", "approvals", "messages"]);
+}
+
+/// DW-E109-27, R109T-02, R109T-04: V8 refuses a T4 decision — a denial
+/// too — from the host the agent runs on, or when a host is unknown. Such a
+/// card offers no decision and says why; a message leaves it waiting, out of
+/// the banner; and the banner says how many wait, and for what.
+#[test]
+fn a_t4_request_this_device_cannot_decide_offers_no_decision_and_is_not_declined() {
+    let another = "Needs a decision from another device.";
+    let unknown = "Can't be decided until the agent's host is known.";
+    let another_line =
+        "1 request needs a decision from another device; a message here leaves it waiting.";
+    let unknown_line = "1 request can't be decided until the agent's host is known; a message \
+                        here leaves it waiting.";
+    for (mine, holder, card_says, banner_says) in [
+        (Some("electra"), Some("electra"), another, another_line),
+        (None, Some("electra"), another, another_line),
+        (Some("laptop"), None, unknown, unknown_line),
+        (None, None, unknown, unknown_line),
+    ] {
+        let case = format!("{mine:?}/{holder:?}");
+        let w = world("zoë");
+        session(&w, "dev1.1", None, false);
+        hosts(&w, "dev1.1", mine, holder);
+        request(&w, "mine", "dev1.1", "run", "T2", git_status(), &["zoë"]);
+        request(&w, "t4", "dev1.1", "delegate", "T4", json!({}), &["zoë"]);
+        let view = || {
+            crate::hq::timeline::view(
+                &w.alpha,
+                "dev1.1",
+                &crate::hq::timeline::Opened::default(),
+                &w.decisions.refusals(std::slice::from_ref(&w.alpha)),
+                now(),
+            )
+            .expect("view")
+            .0
+        };
+        let before = view();
+        let banner = before.banner.expect("a banner");
+        assert_eq!(
+            banner
+                .approvals
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mine"],
+            "{case}"
+        );
+        assert_eq!(
+            banner.sentence,
+            format!(
+                "Sending a message declines this request, even a message that says yes. Use \
+                 Allow to let it run. {banner_says}"
+            ),
+            "{case}"
+        );
+        let [t4] = before.approvals.as_slice() else {
+            panic!("{case}: the T4 request alone in the reading column");
+        };
+        assert_eq!(t4.id, "t4");
+        assert_eq!(t4.sentence, card_says, "{case}");
+        assert!(!t4.can_decide, "{case}");
+        assert!(t4.actions.is_empty(), "{case}: no Allow once, no Deny");
+        assert!(
+            !crate::hq::approvals::waiting(
+                std::slice::from_ref(&w.alpha),
+                &Default::default(),
+                now()
+            )
+            .iter()
+            .any(|a| a.id == "t4"),
+            "{case}: not in the decisions panel"
+        );
+
+        // Even shown, a message declines only what this device may decide.
+        let mut shown = shown(&w, "dev1.1");
+        shown.push(crate::hq::approvals::ShownApprovalVm {
+            id: "t4".to_owned(),
+            binding_digest: "digest-t4".to_owned(),
+        });
+        crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "go on", &shown).expect("sent");
+        assert_eq!(
+            card(&w, "dev1.1", "mine").state,
+            AgentApprovalStateVm::Denied
+        );
+        assert_eq!(
+            card(&w, "dev1.1", "t4").state,
+            AgentApprovalStateVm::Pending
+        );
+        assert_eq!(outbox_ops(&w), vec!["approvals", "messages"]);
+        let after = view().banner.expect("still said");
+        assert!(after.approvals.is_empty());
+        assert_eq!(after.sentence, banner_says, "{case}");
+    }
+
+    // On another host than the agent's, the same request is this device's
+    // to decide.
+    let w = world("zoë");
+    session(&w, "dev1.1", None, false);
+    hosts(&w, "dev1.1", Some("laptop"), Some("electra"));
+    request(&w, "t4", "dev1.1", "delegate", "T4", json!({}), &["zoë"]);
+    let t4 = card(&w, "dev1.1", "t4");
+    assert_eq!(t4.sentence, "Waiting for you.");
+    assert!(t4.can_decide && t4.declined_by_send);
+    assert_eq!(t4.actions, [Action::AllowOnce, Action::Deny]);
 }
 
 /// What the session's banner shows now, as the webview sends it back with a
@@ -597,6 +734,7 @@ fn stop_declines_what_the_banner_showed_and_other_commands_do_not() {
     request(&w, "late", "dev1.1", "run", "T2", git_status(), &["zoë"]);
     crate::hq::commands::run(
         &w.alpha,
+        &[],
         &w.decisions,
         "dev1.1",
         "/rename Plans",
@@ -618,8 +756,16 @@ fn stop_declines_what_the_banner_showed_and_other_commands_do_not() {
                    "author_client": "nixi.box"}),
         )])
         .expect("a running turn");
-    crate::hq::commands::run(&w.alpha, &w.decisions, "dev1.1", "/stop", None, &banner)
-        .expect("stop");
+    crate::hq::commands::run(
+        &w.alpha,
+        &[],
+        &w.decisions,
+        "dev1.1",
+        "/stop",
+        None,
+        &banner,
+    )
+    .expect("stop");
     assert_eq!(
         card(&w, "dev1.1", "mine").state,
         AgentApprovalStateVm::Denied
@@ -1019,6 +1165,74 @@ fn an_expired_grant_reads_expired_and_offers_no_revoke() {
     assert_eq!(grant.state, AgentGrantStateVm::Expired);
     assert_eq!(grant.session.as_deref(), Some("about dev1.1"));
     assert!(!grant.can_revoke);
+}
+
+/// RG-08: a grant made on a device signed out since decides nothing
+/// (`hq.v8.grant_credential`), so it reads Inactive — never Active — and
+/// stays revocable; one from a device still signed in stays Active.
+#[test]
+fn a_grant_made_on_a_signed_out_device_reads_inactive_and_stays_revocable() {
+    let w = world("zoë");
+    let key = crate::hq::vocabulary::person_agent_key("zoë", NIXI);
+    let grant = |id: &str, device: &str| {
+        upsert(
+            TABLE,
+            json!({"id": id, "person_agent_key": key, "person_actor": "zoë",
+                   "agent_actor": NIXI, "session_id": null, "tool": "run",
+                   "args_match": "{\"program\":\"make\"}", "max_tier": "T2",
+                   "expires_at_ms": null, "revoked_at_ms": null, "granted_by_client": device,
+                   "created_at_ms": now() - 1_000, "author_actor": "zoë",
+                   "author_client": device}),
+        )
+    };
+    let device = |id: &str, name: &str, revoked: Option<i64>| {
+        upsert(
+            "clients",
+            json!({"id": id, "actor_id": "zoë", "kind": "device", "name": name, "host": null,
+                   "created_at_ms": 1, "revoked_at_ms": revoked, "dir": "alpha",
+                   "author_actor": "server", "author_client": "server"}),
+        )
+    };
+    w.alpha
+        .replica
+        .mutate(vec![
+            device("dev2", "laptop", Some(now() - 500)),
+            device("dev3", "phone", None),
+            grant("from-laptop", "dev2"),
+            grant("from-phone", "dev3"),
+        ])
+        .expect("written");
+    settle(&w, None);
+    let listed = list(std::slice::from_ref(&w.alpha), now());
+    let of = |id: &str| {
+        listed
+            .grants
+            .iter()
+            .find(|grant| grant.id == id)
+            .expect(id)
+            .clone()
+    };
+    let laptop = of("from-laptop");
+    assert_eq!(
+        (laptop.state, laptop.sentence.as_str()),
+        (
+            AgentGrantStateVm::Inactive,
+            "Inactive: made on “laptop”, a device that was signed out, so it decides nothing. \
+             Revoke it to clear it."
+        )
+    );
+    assert!(laptop.can_revoke, "the person can still clear it");
+    assert_eq!(of("from-phone").state, AgentGrantStateVm::Active);
+
+    revoke(&w.alpha, "from-laptop", now()).expect("revocable");
+    let after = list(std::slice::from_ref(&w.alpha), now());
+    let laptop = after
+        .grants
+        .iter()
+        .find(|grant| grant.id == "from-laptop")
+        .expect("listed");
+    assert_eq!(laptop.state, AgentGrantStateVm::Revoked);
+    assert!(!laptop.can_revoke);
 }
 
 /// A grant bound to a session ends with the session's archive, before the

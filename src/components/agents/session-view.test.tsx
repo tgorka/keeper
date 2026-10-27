@@ -567,6 +567,39 @@ describe("session header drives", () => {
   });
 });
 
+describe("Model… from the list (A109-05)", () => {
+  const withModels: AgentSessionViewVm = {
+    ...vm,
+    settings: {
+      models: [
+        { id: "alpha-large", current: false, default: false },
+        { id: "beta-small", current: true, default: true },
+      ],
+      efforts: [],
+      modelLabel: "beta-small",
+      resettable: false,
+      write: { state: "confirmed" },
+    },
+  };
+
+  it("opens the composer's model picker when the list's right-click menu asked for it", async () => {
+    agentSessionsStore.getState().openModel({ database: "beta", sessionId: "same.1" });
+    await draw(withModels);
+    const picker = await screen.findByRole("dialog", { name: "Choose a model" });
+    expect(within(picker).getByRole("option", { name: "beta-small, in use, default" }));
+    expect(agentSessionsStore.getState().modelFor).toBeNull();
+  });
+
+  it("drops a Model request its first view answers without a picker", async () => {
+    agentSessionsStore.getState().openModel({ database: "beta", sessionId: "same.1" });
+    await draw();
+    expect(agentSessionsStore.getState().modelFor).toBeNull();
+    act(() => mock.view?.(withModels));
+    expect(screen.getByRole("button", { name: "Model: beta-small" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
 describe("the approval banner", () => {
   const waiting = (id: string, digest: string) => ({
     id,
@@ -605,6 +638,37 @@ describe("the approval banner", () => {
         { id: "a1", bindingDigest: "d1" },
         { id: "a2", bindingDigest: "d2" },
       ]),
+    );
+  });
+
+  it("says what waits for another device, and a message then declines nothing (DW-E109-27)", async () => {
+    const elsewhere =
+      "1 request needs a decision from another device; a message here leaves it waiting.";
+    const t4 = {
+      ...waiting("t4", "d4"),
+      toolName: "delegate",
+      tier: "T4",
+      summary: "Run t4",
+      declinedBySend: false,
+    };
+    await draw();
+    act(() =>
+      mock.view?.({ ...vm, approvals: [t4], banner: { approvals: [], sentence: elsewhere } }),
+    );
+    const region = screen.getByRole("complementary", { name: "Waiting for your decision" });
+    expect(within(region).getByRole("note")).toHaveTextContent(elsewhere);
+    expect(within(region).queryByRole("article")).toBeNull();
+    expect(screen.getByRole("article", { name: "Approval: Run t4" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "go on" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(mock.send).toHaveBeenCalledWith(
+        { database: "beta", sessionId: "same.1" },
+        "go on",
+        [],
+      ),
     );
   });
 

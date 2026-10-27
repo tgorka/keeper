@@ -192,3 +192,30 @@ it("returns focus to the card's menu once the confirm closes", async () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "More actions" })),
   );
 });
+
+it("offers no decision on a T4 request this device cannot decide, and says why (R109T-02)", () => {
+  for (const sentence of [
+    "Needs a decision from another device.",
+    "Can't be decided until the agent's host is known.",
+  ]) {
+    const { unmount } = render(
+      <DatabaseApprovalCard
+        approval={card({
+          tier: "T4",
+          toolName: "delegate",
+          canDecide: false,
+          actions: [],
+          grant: undefined,
+          declinedBySend: false,
+          sentence,
+        })}
+      />,
+    );
+    const article = screen.getByRole("article");
+    expect(within(article).getByText(sentence)).toBeVisible();
+    expect(within(article).queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(within(article).queryByRole("button", { name: "Deny" })).toBeNull();
+    expect(within(article).queryByRole("button", { name: "More actions" })).toBeNull();
+    unmount();
+  }
+});

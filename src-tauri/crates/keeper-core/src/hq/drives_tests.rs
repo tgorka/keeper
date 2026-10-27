@@ -709,3 +709,169 @@ fn a_ticked_drive_the_server_refused_goes_with_one_keeper_knows_fails() {
         assert_eq!(stored(&alpha).as_deref(), Some(r#"["beta"]"#));
     }
 }
+
+/// A slash command as the composer runs it, from under an empty banner.
+fn command(source: &Source, sources: &[Source], draft: &str) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decisions = crate::hq::approvals::Decisions::load(dir.path().join("decisions.json"));
+    crate::hq::commands::run(source, sources, &decisions, SESSION, draft, None, &[])
+        .expect("runs")
+        .session
+        .expect("a fresh session")
+        .session_id
+}
+
+/// `session`'s stored drives, or `None` when it has no row.
+fn stored_in(source: &Source, session: &str) -> Option<String> {
+    read(
+        source,
+        "SELECT drives FROM session_drives WHERE session_id = ?1",
+        &[Value::from(session)],
+    )
+    .first()
+    .map(|row| text(row, "drives").to_owned())
+}
+
+/// A109-06, Q109-17 b: `/clean` is a fresh session with the same agent,
+/// database and drives; `/new` starts with none (Q109-20 b).
+#[test]
+fn clean_carries_the_ticked_drives_in_their_own_commit_and_new_carries_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("person"), false);
+    put(
+        &alpha,
+        vec![profile("nixie.box", AGENT, Some(&["alpha", "gamma"]))],
+    );
+    let sources = [alpha.clone()];
+    set(&alpha, SESSION, "gamma", true, &sources, 5).expect("ticks gamma");
+    set(&alpha, SESSION, "alpha", true, &sources, 6).expect("ticks alpha");
+
+    let fresh = command(&alpha, &sources, "/clean");
+    assert_eq!(
+        stored_in(&alpha, &fresh).as_deref(),
+        Some(r#"["gamma","alpha"]"#),
+        "the same drives, in the old row's order"
+    );
+    let vm = view(
+        &alpha,
+        &fresh,
+        &timeline::session_row(&alpha, &fresh).expect("the fresh session"),
+        &sources,
+    )
+    .expect("its owner has the control");
+    assert_eq!(
+        menu(&vm),
+        [
+            ("alpha".to_owned(), true, true),
+            ("gamma".to_owned(), true, true)
+        ]
+    );
+    let commits = |table: &str| {
+        alpha
+            .replica
+            .row_writes(table, &fresh, None)
+            .expect("journal")
+            .pending
+    };
+    let (session, selection) = (commits("sessions"), commits(TABLE));
+    assert_eq!(selection.len(), 1);
+    assert!(
+        !session.contains(&selection[0]),
+        "a refusal of the selection must not roll the conversation back"
+    );
+    assert_eq!(
+        stored(&alpha).as_deref(),
+        Some(r#"["gamma","alpha"]"#),
+        "the old session keeps its drives"
+    );
+
+    let new = command(&alpha, &sources, "/new");
+    assert_eq!(stored_in(&alpha, &new), None, "/new ticks nothing");
+}
+
+#[test]
+fn clean_leaves_behind_a_drive_this_person_may_no_longer_tick() {
+    // No longer offered.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("owner"), false);
+    put(
+        &alpha,
+        vec![profile("nixie.box", AGENT, Some(&["alpha", "gamma"]))],
+    );
+    let sources = [alpha.clone()];
+    set(&alpha, SESSION, "alpha", true, &sources, 5).expect("ticks alpha");
+    set(&alpha, SESSION, "gamma", true, &sources, 6).expect("ticks gamma");
+    put(&alpha, vec![profile("nixie.box", AGENT, Some(&["alpha"]))]);
+    let fresh = command(&alpha, &sources, "/clean");
+    assert_eq!(stored_in(&alpha, &fresh).as_deref(), Some(r#"["alpha"]"#));
+
+    // The audience rule now refuses it: Cy joins beta and not alpha.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    let beta = open(dir.path(), "beta");
+    seed(&alpha, Some("owner"), false);
+    seed(&beta, Some("owner"), false);
+    let offers = Some(&["alpha", "beta"][..]);
+    put(&alpha, vec![profile("nixie.box", AGENT, offers)]);
+    put(&beta, vec![profile("nixie.box", AGENT, offers)]);
+    let sources = [alpha.clone(), beta.clone()];
+    set(&beta, SESSION, "alpha", true, &sources, 5).expect("ticks alpha");
+    set(&beta, SESSION, "beta", true, &sources, 6).expect("ticks beta");
+    put(&beta, vec![actor("cy", "person", "Cy", "beta")]);
+    let fresh = command(&beta, &sources, "/clean");
+    assert_eq!(stored_in(&beta, &fresh).as_deref(), Some(r#"["beta"]"#));
+
+    // The server already refused it (R109T-01): this device holds alpha only,
+    // so who reads beta it cannot know, and the standing refusal of the
+    // selection names beta by the audience rule.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("owner"), false);
+    put(
+        &alpha,
+        vec![profile("nixie.box", AGENT, Some(&["alpha", "beta"]))],
+    );
+    let only = [alpha.clone()];
+    set(&alpha, SESSION, "alpha", true, &only, 5).expect("ticks alpha");
+    set(&alpha, SESSION, "beta", true, &only, 6).expect("beta: the server decides");
+    journal_refusal(
+        &dir.path().join("alpha.sqlite"),
+        "c-beta",
+        &["alpha", "beta"],
+        "hq.v17.audience",
+    );
+    let fresh = command(&alpha, &only, "/clean");
+    assert_eq!(
+        stored_in(&alpha, &fresh).as_deref(),
+        Some(r#"["alpha"]"#),
+        "a drive the server refused would have the whole carried selection refused"
+    );
+
+    // Every ticked drive left behind: no selection at all.
+    put(&beta, vec![profile("nixie.box", AGENT, Some(&[]))]);
+    let fresh = command(&beta, &sources, "/clean");
+    assert_eq!(stored_in(&beta, &fresh), None);
+}
+
+#[test]
+fn clean_in_a_chat_with_no_ticks_writes_no_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alpha = open(dir.path(), "alpha");
+    seed(&alpha, Some("owner"), false);
+    put(&alpha, vec![profile("nixie.box", AGENT, Some(&["alpha"]))]);
+    let sources = [alpha.clone()];
+
+    let fresh = command(&alpha, &sources, "/clean");
+    assert_eq!(stored_in(&alpha, &fresh), None, "no row: no drive");
+
+    set(&alpha, SESSION, "alpha", true, &sources, 5).expect("ticks");
+    set(&alpha, SESSION, "alpha", false, &sources, 6).expect("unticks: []");
+    let fresh = command(&alpha, &sources, "/clean");
+    assert_eq!(
+        stored_in(&alpha, &fresh),
+        None,
+        "an empty selection carries nothing"
+    );
+}

@@ -50,6 +50,15 @@ interface AgentSessionsState {
   openDrives: (target: AgentSessionRef) => void;
   /** The view opened the menu it was asked for. */
   drivesShown: () => void;
+  /**
+   * A session whose model picker was asked for from the list's right-click menu (A109-05): the
+   * session opens and its view opens the composer's picker once Rust's view carries it.
+   */
+  modelFor: AgentSessionRef | null;
+  /** Open `target` and ask its view for its model picker. */
+  openModel: (target: AgentSessionRef) => void;
+  /** The view opened the picker it was asked for. */
+  modelShown: () => void;
   startNew: () => void;
   keepNewDraft: (draft: NewSessionDraft | null) => void;
 }
@@ -65,6 +74,7 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
   creating: false,
   newDraft: null,
   drivesFor: null,
+  modelFor: null,
   apply: (batch) =>
     set((state) => {
       let rows = [...state.rows];
@@ -117,12 +127,38 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
       return { rows, loaded: true, error: null };
     }),
   select: (selected) =>
-    set({ selected, gone: null, newSession: null, creating: false, drivesFor: null }),
+    set({
+      selected,
+      gone: null,
+      newSession: null,
+      creating: false,
+      drivesFor: null,
+      modelFor: null,
+    }),
   openDrives: (target) => {
     const selected = { database: target.database, sessionId: target.sessionId };
-    set({ selected, gone: null, newSession: null, creating: false, drivesFor: selected });
+    set({
+      selected,
+      gone: null,
+      newSession: null,
+      creating: false,
+      drivesFor: selected,
+      modelFor: null,
+    });
   },
   drivesShown: () => set({ drivesFor: null }),
+  openModel: (target) => {
+    const selected = { database: target.database, sessionId: target.sessionId };
+    set({
+      selected,
+      gone: null,
+      newSession: null,
+      creating: false,
+      drivesFor: null,
+      modelFor: selected,
+    });
+  },
+  modelShown: () => set({ modelFor: null }),
   startNew: () => set({ selected: null, gone: null, newSession: null, creating: true }),
   keepNewDraft: (newDraft) => set({ newDraft }),
 }));

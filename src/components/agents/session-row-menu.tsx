@@ -36,6 +36,9 @@ export function SessionRowMenu({
   const [notice, setNotice] = useState<string | null>(null);
   const [details, setDetails] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  // Model… hands focus to the composer's picker: the menu must not take it back to the row on
+  // close, or the picker (a non-modal popover) reads that as focus outside and closes.
+  const handedOff = useRef(false);
   const refused = row.titleWrite.state === "refused" ? row.titleWrite : null;
   useEffect(() => {
     if (editing) focusEditor(input.current);
@@ -123,6 +126,9 @@ export function SessionRowMenu({
             if (editing) {
               event.preventDefault();
               focusEditor(input.current);
+            } else if (handedOff.current) {
+              handedOff.current = false;
+              event.preventDefault();
             }
           }}
         >
@@ -140,6 +146,16 @@ export function SessionRowMenu({
           {row.choosesDrives && (
             <ContextMenuItem onSelect={() => agentSessionsStore.getState().openDrives(row)}>
               Drives…
+            </ContextMenuItem>
+          )}
+          {row.choosesModel && (
+            <ContextMenuItem
+              onSelect={() => {
+                handedOff.current = true;
+                agentSessionsStore.getState().openModel(row);
+              }}
+            >
+              Model…
             </ContextMenuItem>
           )}
           <ContextMenuSeparator />

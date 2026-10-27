@@ -240,8 +240,10 @@ title uses the handle. Renaming changes only the title, never the session id or 
 
 Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
 menu: **Rename**, **Copy id**, **Copy name**, **Details**, **Drives…** (only where you may
-choose the session's drives; it opens the session and its Drives menu, see § Live answers) and
-**Archive** (or **Unarchive**).
+choose the session's drives; it opens the session and its Drives menu, see § Live answers),
+**Model…** (only where you may change the session's model and its agent offers more than one,
+`AgentSessionRowVm.choosesModel`; it opens the session and the composer's model picker, the same
+picker `/model` writes through) and **Archive** (or **Unarchive**).
 Rename edits inline with the current title selected, so typing replaces it; Save queues the title
 on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
 local enqueue, not server acceptance: the row says it is waiting until the server settles the
@@ -270,7 +272,8 @@ row waits, the server refuses the first rename 1.2 s later, and a retry is accep
 its save.
 Details includes the database, immutable id, creation time, reported trust and known instances;
 a known host is labelled `<agent>@<host>`.
-Pin, Mark unread, Drives and Model are absent because this surface has no operation for them.
+Pin and Mark unread are absent: this surface has no operation for them, and whether to build them
+waits for the owner's decision (A109-05).
 
 Opening a session shows its newest visible page. **Earlier messages**, or scrolling to the top,
 asks Rust to widen the history window. **Archive session** keeps the list row and marks the
@@ -295,12 +298,17 @@ the files and leaves them queued; a refusal keeps both the files and the draft. 
 leaves the session discards its unsent tray, just like navigating away. To send a literal leading
 slash as an attachment caption, double it: `//stop` sends the caption `/stop`, not a command.
 The same `//` escape applies without attachments. `/clean` and `/new [title]` open a fresh,
-empty session with the same agent and database, keeping the old conversation in the list. They
-neither clear history nor create an empty prompt. `/rename <title>` changes its title; `/archive`
-keeps its history and makes it read-only. `/people` opens People, `/tools` opens the existing tool
-switches when that agent offers tools, and `/help` opens the command list. `/context` opens the
-same context **Details** panel as the ring beside Send (below).
-`/model`, `/effort` and `/drives` are not offered until their backend operations exist. `/stop`
+empty session with the same agent and database, keeping the old conversation in the list.
+`/clean` also ticks the old session's drives that you may still tick (Q109-17 b, "same agent,
+database and drives"): a drive the agent no longer offers, or one the audience rule now refuses,
+stays behind, and the new session's drive control shows what came across. `/new` ticks none
+(Q109-20 b). They neither clear history nor create an empty prompt. `/rename <title>` changes its
+title; `/archive` keeps its history and makes it read-only. `/people` opens People, `/tools` opens
+the existing tool switches when that agent offers tools, and `/help` opens the command list.
+`/context` opens the same context **Details** panel as the ring beside Send (below).
+Each of `/model`, `/effort` and `/drives` is offered when that choice exists for you here: `/model`
+when the agent offers models, `/effort` when it offers efforts (it lists only those), and `/drives`
+when you have the session's drive control (below). `/stop`
 writes a person control row naming each unfinished turn; a compatible runtime cancels only the
 named running turn and keeps the output already received. With no unfinished turn it refuses.
 
@@ -359,14 +367,25 @@ Revoking stops new uses, not approvals already issued, and the section says so. 
 a session reads *Ended* once its session's row here is archived, and stays ended if the session is
 reopened; a session merely absent from the device (left, removed, not arrived yet) leaves the
 grant as it was, with Revoke. A grant reads *Expired* when its expiry passes: the views wake at
-the soonest one (`grants::next_expiry`). A refused grant or revocation is read back from the replica's per-row outcome record.
+the soonest one (`grants::next_expiry`). A grant made on a device that has since been signed out
+(its `clients` row, joined on `granted_by_client`, has `revoked_at_ms`) reads *Inactive*: "made on
+“<device>”, a device that was signed out, so it decides nothing" — the server refuses every
+approval it would make (`hq.v8.grant_credential`) — and keeps *Revoke* so the person can clear it
+(RG-08). A refused grant or revocation is read back from the replica's per-row outcome record.
 
 The requests waiting for this person sit in a banner above the composer (`AgentSessionViewVm
 .banner`), out of the reading column. **Sending a message declines them** — each its own denial,
 written before the message (`approvals::decline_pending`) — and the banner says so, including
 that a message saying yes still declines. The webview sends back the `(id, digest)` pairs its
 banner showed, and Rust declines only those still waiting at that digest: a request that arrived
-after the banner was drawn stays pending. A text message, a message with files, an ask option and
+after the banner was drawn stays pending. A T4 request this device cannot decide — it is on the
+host the agent runs on, or either host is unknown, which V8 refuses for a denial too
+(`hq.v8.t4_other_host`) — is not declined and offers no decision: its card says "Needs a decision
+from another device." with no *Allow once* or *Deny*, it stays in the reading column (and out of
+the decisions panel), and the banner adds "1 request needs a decision from another device; a
+message here leaves it waiting" (DW-E109-27, R109T-02). When the host of the instance holding the
+session is the unknown one, no device can decide it yet, and both say so instead: "Can't be decided
+until the agent's host is known." (R109T-04; `approvals::Undecidable`). A text message, a message with files, an ask option and
 `/stop` decline; no other slash command does, nor a spoken question (it is sent with no banner
 shown). A denial that cannot be written on the device stops the message, and the banner says
 which request still waits; the composer keeps the draft and shows the same sentence hidden from
@@ -375,7 +394,8 @@ assistive technology, so it is announced once. Mock shell: `?sessions=launch` dr
 untrusted; `&grants=refused` has the server refuse every grant write; `&grants=unserved` makes
 the session's agent one that does not serve the person; `&grants=decline-fails` fails every denial
 write; `window.__keeperMockLateApproval()` lands a request without drawing it. The grants list
-holds an ended grant and one that expires 20 s after the page opens.
+holds an ended grant, an inactive one made on a signed-out device, and one that expires 20 s
+after the page opens.
 
 **Always allow: known limits.**
 
@@ -387,6 +407,10 @@ holds an ended grant and one that expires 20 s after the page opens.
   expiry wakes one), so an idle device can wait longer; and if the second window write of a
   re-ask fails, the unit stays out of the window until the units change or keeper restarts — no
   offer and no rows meanwhile (R10911-18).
+- A grant made on a device that is suspended or whose attestation lapsed reads *Active*, though
+  the server refuses it as it does one from a signed-out device. The directory keeper syncs carries
+  only `clients.revoked_at_ms`; showing those states (and that such a grant decides again once the
+  device signs in) waits for keeper-hq to sync them, ideally as a server-computed flag (RG-08).
 
 Conversations agents had before they moved to the database are archived sessions of their
 database (*Imported history*, below). Instance selection is **Answers from** (below); message and

@@ -1,7 +1,7 @@
 //! Per-session model and effort choices (109.17) and the composer's pickers
 //! over them (109.18). No provider logic lives here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -88,6 +88,27 @@ fn offered(source: &Source, agent: &str) -> Result<Offered, ReplicaError> {
         });
     }
     Ok(offered)
+}
+
+/// The agents of `source`'s database that offer more than one model — the
+/// union of their profiles, as [`offered`] reads it: there is a model to
+/// choose, so the Agents list's right-click menu offers "Model…" (A109-05).
+/// One model, or none, is nothing to choose.
+pub(crate) fn agents_choosing_model(source: &Source) -> HashSet<String> {
+    let mut models: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for profile in read(source, "SELECT actor_id, models FROM agent_profiles", &[]) {
+        if let Some(agent) = opt_text(&profile, "actor_id") {
+            models
+                .entry(agent)
+                .or_default()
+                .extend(names(&profile, "models"));
+        }
+    }
+    models
+        .into_iter()
+        .filter(|(_, offered)| offered.len() > 1)
+        .map(|(agent, _)| agent)
+        .collect()
 }
 
 fn view(source: &Source, session: &str) -> Result<AgentSessionSettingsVm, HqError> {
@@ -581,7 +602,7 @@ mod tests {
         let decisions = crate::hq::approvals::Decisions::load(
             std::env::temp_dir().join(format!("keeper-settings-{}.json", ulid::Ulid::new())),
         );
-        crate::hq::commands::run(source, &decisions, sid, draft, pick, &[])
+        crate::hq::commands::run(source, &[], &decisions, sid, draft, pick, &[])
     }
 
     fn fixture(complete: bool) -> (tempfile::TempDir, Source) {
@@ -680,6 +701,72 @@ mod tests {
             ).expect("complete settings window");
         }
         (dir, source)
+    }
+
+    /// A109-05: the list's "Model…" is a person member's of a live session
+    /// whose agent offers more than one model, its profiles' union.
+    #[test]
+    fn the_list_offers_model_only_where_there_is_more_than_one_to_choose() {
+        let (_dir, source) = fixture(true);
+        let session = |id: &str, agent: &str, role: &str, archived: bool| {
+            vec![
+                (
+                    "sessions",
+                    json!({"id":id, "title":id, "status":"open", "agent_actor":agent, "created_by_actor":"ana", "created_by_client":"dev1", "invite":"[]", "archived":archived, "created_at_ms":1, "last_activity_ms":1}),
+                ),
+                (
+                    "session_members",
+                    json!({"id":format!("{id}/ana"), "session_id":id, "actor_id":"ana", "role":role, "reads_trace":false, "added_by_actor":"ana", "added_at_ms":1}),
+                ),
+            ]
+        };
+        let profile = |id: &str, actor: &str, model: &str| {
+            (
+                "agent_profiles",
+                json!({"id":id, "actor_id":actor, "name":actor, "description":"", "definition_hash":"h", "image_digest":"d", "started_at_ms":1, "dir":"alpha", "models":serde_json::to_string(&[model]).expect("models"), "efforts":"[]", "default_model":model, "default_effort":null}),
+            )
+        };
+        let mut rows = Vec::new();
+        rows.extend(session("dev1.2", "foreign", "owner", false));
+        rows.extend(session("dev1.3", "duo", "owner", false));
+        rows.extend(session("dev1.4", "nixi", "agent", false));
+        rows.extend(session("dev1.5", "nixi", "owner", true));
+        rows.extend(session("dev1.6", "silent", "owner", false));
+        // foreign's second instance offers the same one model; duo's two
+        // instances one model each, two together.
+        rows.push(profile("foreign.two", "foreign", "foreign"));
+        rows.push(profile("duo.one", "duo", "left"));
+        rows.push(profile("duo.two", "duo", "right"));
+        source
+            .replica
+            .mutate(
+                rows.into_iter()
+                    .map(|(table, values)| RowOp::Upsert {
+                        table: table.to_owned(),
+                        values: authored(&source, object(values)),
+                        base_version: None,
+                    })
+                    .collect(),
+            )
+            .expect("seed");
+        let mut menu: Vec<(String, bool)> = crate::hq::sessions::rows(&source, 2)
+            .into_iter()
+            .map(|row| (row.session_id, row.chooses_model))
+            .collect();
+        menu.sort();
+        assert_eq!(
+            menu,
+            [
+                ("dev1.1".to_owned(), true),
+                ("dev1.2".to_owned(), false),
+                ("dev1.3".to_owned(), true),
+                ("dev1.4".to_owned(), false),
+                ("dev1.5".to_owned(), false),
+                ("dev1.6".to_owned(), false),
+            ],
+            "three models; one model twice; two from two instances; not a person member; \
+             archived; no profile"
+        );
     }
 
     #[test]

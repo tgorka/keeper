@@ -82,6 +82,15 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     if (hasDrives) setDrivesOpen(true);
     agentSessionsStore.getState().drivesShown();
   }, [viewed, hasDrives, drivesFor, database, sessionId]);
+  // Model… in that menu asks the same way for the composer's model picker (A109-05).
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const modelFor = useAgentSessionsStore((state) => state.modelFor);
+  const hasModels = (vm?.settings?.models.length ?? 0) > 0;
+  useEffect(() => {
+    if (!viewed || modelFor?.database !== database || modelFor.sessionId !== sessionId) return;
+    if (hasModels) setModelsOpen(true);
+    agentSessionsStore.getState().modelShown();
+  }, [viewed, hasModels, modelFor, database, sessionId]);
   const pinned = useRef(true);
   const resolveMention = useCallback(
     (before: string, after: string) => agentMentionPreview({ database, sessionId }, before, after),
@@ -670,7 +679,13 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             </ConversationStoresProvider>
           </SessionContext>
           {vm?.settings && (
-            <SessionSettingsPicker target={target} agent={vm.agentActor} picker={vm.settings} />
+            <SessionSettingsPicker
+              target={target}
+              agent={vm.agentActor}
+              picker={vm.settings}
+              modelsOpen={modelsOpen}
+              onModelsOpenChange={setModelsOpen}
+            />
           )}
         </div>
       )}

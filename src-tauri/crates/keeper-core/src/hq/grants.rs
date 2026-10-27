@@ -653,6 +653,11 @@ pub enum AgentGrantStateVm {
     /// stays ended, even if the session is reopened (V15).
     Ended,
     Expired,
+    /// Made on a device that has since been signed out (its `clients` row
+    /// revoked): the server refuses every approval it would make
+    /// (`hq.v8.grant_credential`), so it decides nothing. Still revocable,
+    /// so the person can clear it (RG-08).
+    Inactive,
     /// The server refused to write it.
     Refused,
 }
@@ -754,8 +759,10 @@ fn of_source(source: &Source, now_ms: i64) -> Vec<AgentGrantVm> {
         "SELECT g.id AS id, g.agent_actor AS agent_actor, g.session_id AS session_id, \
          g.tool AS tool, g.args_match AS args_match, g.expires_at_ms AS expires_at_ms, \
          g.revoked_at_ms AS revoked_at_ms, g.created_at_ms AS created_at_ms, \
-         s.id AS session_row, s.title AS session_title, s.archived AS session_archived \
+         s.id AS session_row, s.title AS session_title, s.archived AS session_archived, \
+         c.name AS device_name, c.revoked_at_ms AS device_revoked_at_ms \
          FROM standing_grants g LEFT JOIN sessions s ON s.id = g.session_id \
+         LEFT JOIN clients c ON c.id = g.granted_by_client \
          WHERE g.person_actor = ?1",
         &[Value::from(source.actor.as_str())],
     );
@@ -785,6 +792,10 @@ fn of_source(source: &Source, now_ms: i64) -> Vec<AgentGrantVm> {
         // has not arrived yet) says nothing of the grant (R10911-03).
         let present = opt_text(row, "session_row").is_some();
         let ended = session_id.is_some() && present && truthy(row, "session_archived");
+        // The device it was made on, signed out since (RG-08). A suspended or
+        // lapsed device cannot be told apart here: the directory carries only
+        // `revoked_at_ms` (docs/agents.md, known limits).
+        let signed_out = int(row, "device_revoked_at_ms").is_some();
         (grant.state, grant.sentence) = if revoked && !writes.pending.is_empty() {
             (
                 AgentGrantStateVm::Revoked,
@@ -799,6 +810,18 @@ fn of_source(source: &Source, now_ms: i64) -> Vec<AgentGrantVm> {
             (AgentGrantStateVm::Revoked, "Revoked.".to_owned())
         } else if expired {
             (AgentGrantStateVm::Expired, "Expired.".to_owned())
+        } else if signed_out {
+            let device = opt_text(row, "device_name").map_or_else(
+                || "a device".to_owned(),
+                |name| format!("“{name}”, a device"),
+            );
+            (
+                AgentGrantStateVm::Inactive,
+                format!(
+                    "Inactive: made on {device} that was signed out, so it decides nothing. \
+                     Revoke it to clear it."
+                ),
+            )
         } else if !writes.pending.is_empty() {
             (
                 AgentGrantStateVm::Waiting,

@@ -6279,6 +6279,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentMark: sessionScenario === "names" ? "N" : "A",
           archived: false,
           choosesDrives: drivesScenario !== "nonmember",
+          choosesModel: true,
           lastActivityMs: Date.now(),
           attention: "needsYou",
         },
@@ -6297,6 +6298,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentMark: "A",
           archived: false,
           choosesDrives: drivesScenario !== "nonmember",
+          choosesModel: true,
           lastActivityMs: Date.now() - 3600000,
           attention: "needsYou",
         },
@@ -6315,6 +6317,7 @@ const sessionRows: AgentSessionRowVm[] =
           agentMark: "A",
           archived: true,
           choosesDrives: false,
+          choosesModel: false,
           lastActivityMs: Date.now() - 86400000,
         },
       ];
@@ -6568,6 +6571,20 @@ const mockGrants: AgentGrantsVm["grants"] = ["empty", "loading", "error"].includ
         state: "ended",
         sentence: "Ended with its session; it stays ended if the session is reopened.",
         canRevoke: false,
+      },
+      // Made on a device signed out since: it decides nothing, and stays revocable (RG-08).
+      {
+        id: "grant-signed-out",
+        database: "alpha",
+        agentActor: "assistant",
+        agentName: "Assistant",
+        tool: "run",
+        scope: "Run “cargo check …”, whatever follows “check”",
+        createdAtMs: Date.now() - 3 * 86_400_000,
+        state: "inactive",
+        sentence:
+          "Inactive: made on “laptop”, a device that was signed out, so it decides nothing. Revoke it to clear it.",
+        canRevoke: true,
       },
       // Expires 20 s after the page opens: the list reads Expired then, with no row changing
       // (R10911-05).
@@ -7795,11 +7812,35 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       }) as { database: string; sessionId: string };
       const fresh = mockSession(result.session);
       fresh.messages = [];
+      // Rust's `drives::carry` (A109-06): `/clean` ticks the old session's drives that may still
+      // be ticked; one ticked with a reason (no longer allowed) stays behind. `/new` ticks none.
+      // A fresh session ticks nothing; a drive no longer offered is listed as such.
+      const offered = vm.drives && mockDrives(fresh.database, false);
+      const base = offered && {
+        ...offered,
+        drives: offered.drives.map(({ name, ticked, reason }) =>
+          ticked && reason
+            ? { name, ticked: false, reason: `Assistant does not offer ${name}.` }
+            : { name, ticked: false, ...(reason ? { reason } : {}) },
+        ),
+      };
+      if (name === "clean" && vm.drives && base) {
+        const carried = vm.drives.drives.filter((d) => d.ticked && !d.reason).map((d) => d.name);
+        fresh.drives = {
+          ...base,
+          drives: base.drives.map((d) =>
+            carried.includes(d.name) ? { name: d.name, ticked: true } : d,
+          ),
+        };
+      } else if (base) fresh.drives = base;
       fresh.title = args ?? "New conversation";
       const row = sessionRows.find(
         (row) => row.database === fresh.database && row.sessionId === fresh.sessionId,
       );
-      if (row) row.title = fresh.title;
+      if (row) {
+        row.title = fresh.title;
+        row.choosesDrives = fresh.drives !== undefined;
+      }
       publishSessions();
     } else if (name === "rename") {
       vm.title = args ?? vm.title;
@@ -8026,6 +8067,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       agentMark: choice.agentMark,
       archived: false,
       choosesDrives: false,
+      choosesModel: true,
       lastActivityMs: Date.now(),
     };
     sessionRows.unshift(row);
@@ -8170,6 +8212,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       archived: false,
       lastActivityMs: now,
       choosesDrives: true,
+      choosesModel: true,
     };
     const key = JSON.stringify([row.database, row.sessionId]);
     const thread: AgentSessionViewVm = {
@@ -10814,6 +10857,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         agentMark: "R",
         archived: false,
         choosesDrives: false,
+        choosesModel: true,
         lastActivityMs: Date.now(),
       };
       sessionRows.unshift(row);

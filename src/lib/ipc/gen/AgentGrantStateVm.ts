@@ -3,4 +3,4 @@
 /**
  * A grant's state as the person reads it.
  */
-export type AgentGrantStateVm = "active" | "waiting" | "revoked" | "ended" | "expired" | "refused";
+export type AgentGrantStateVm = "active" | "waiting" | "revoked" | "ended" | "expired" | "inactive" | "refused";

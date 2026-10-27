@@ -29,4 +29,10 @@ attention?: AgentAttentionVm,
  * [`crate::hq::drives::may_choose`] and an agent that says what it
  * reads): the row's menu offers Drives….
  */
-choosesDrives: boolean, };
+choosesDrives: boolean, 
+/**
+ * This person may change the session's model, and its agent offers
+ * more than one ([`crate::hq::settings::agents_choosing_model`]): the
+ * row's menu offers Model… (A109-05), which opens the composer's picker.
+ */
+choosesModel: boolean, };

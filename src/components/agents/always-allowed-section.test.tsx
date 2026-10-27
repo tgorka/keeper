@@ -101,3 +101,18 @@ it("keeps a failed revoke's sentence beside the list", async () => {
     expect(screen.getByRole("alert")).toHaveTextContent("This grant is already revoked."),
   );
 });
+
+it("shows a grant made on a signed-out device as Inactive, in Rust's words, and still revocable", async () => {
+  const sentence =
+    "Inactive: made on “laptop”, a device that was signed out, so it decides nothing. Revoke it to clear it.";
+  show([grant({ id: "g1", state: "inactive", sentence })]);
+  const row = within(await screen.findByRole("list", { name: "Always allowed" })).getByRole(
+    "listitem",
+  );
+  expect(row).toHaveAttribute("data-state", "inactive");
+  expect(within(row).getByText("Inactive")).toBeVisible();
+  expect(within(row).queryByText("Active")).toBeNull();
+  expect(within(row).getByText(sentence)).toBeVisible();
+  fireEvent.click(within(row).getByRole("button", { name: /Revoke/ }));
+  await waitFor(() => expect(mock.revoke).toHaveBeenCalledWith("alpha", "g1"));
+});
