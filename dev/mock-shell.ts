@@ -6108,7 +6108,7 @@ const turnsScenario = new URLSearchParams(location.search).get("turns");
  * `.6`, `.9` and `.11`: the session read the web (untrusted), one T3 `run` waits for Ana, the turn
  * that parked on it closed with a 0-byte `finish = "tool_calls"` row (never its own bubble), the
  * agent offers one model and no effort (read-only chips), and the latest answer measured 5347 of a
- * 1,048,576-token window.
+ * 1,048,576-token window. Its archived device.2 read the web too, so it keeps the marker.
  */
 const ownerReport = new URLSearchParams(location.search).get("owner") === "report";
 /** `timeline::UNTRUSTED`. */
@@ -6266,7 +6266,8 @@ const sessionChoices: AgentChoiceVm[] = [
     agentName: "Assistant",
     agentMark: "A",
     databases: ["alpha", "beta"],
-    database: null,
+    // The last database chosen for it on this device, so New session opens ready to send.
+    database: "alpha",
     ask: true,
   },
   {
@@ -6701,7 +6702,9 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
         liveScenario === "stream" ||
         ((grantsScenario === "untrusted" || ownerReport) &&
           row.database === "alpha" &&
-          row.sessionId === "device.1")
+          row.sessionId === "device.1") ||
+        // An archived chat that read the web keeps its marker (R598-03).
+        (ownerReport && row.archived)
           ? MOCK_UNTRUSTED
           : undefined,
       context: MOCK_UNMEASURED,
@@ -6871,17 +6874,26 @@ function mockContext(vm: AgentSessionViewVm): AgentSessionViewVm["context"] {
   const { used, window, parts } = answer.metadata.context;
   const percent = window === null ? null : Math.round((used * 100) / window);
   const meter = percent === null ? null : Math.min(percent, 100);
+  const summary =
+    percent === null ? `used ≈ ${used} tokens` : `${percent}% · used ≈ ${used} / ${window} tokens`;
+  // `context::awaiting` (R598-02): the mock's answers ran on the default model, so a model
+  // picked since then reads unknown and names the model that measured it.
+  const picked = mockSettingsOf(vm).model;
+  const switched = picked !== null && picked !== MOCK_DEFAULT_MODEL;
   return {
     used,
     window,
-    label: window === null ? mockCompact(used) : `${mockCompact(used)} / ${mockCompact(window)}`,
-    percent: percent === null ? null : `${percent}%`,
-    meterPercent: meter,
-    ringBackground: `conic-gradient(currentColor ${Math.floor(((meter ?? 0) * 360) / 100)}deg, var(--muted) 0deg)`,
-    summary:
-      percent === null
-        ? `used ≈ ${used} tokens`
-        : `${percent}% · used ≈ ${used} / ${window} tokens`,
+    label: switched
+      ? "—"
+      : window === null
+        ? mockCompact(used)
+        : `${mockCompact(used)} / ${mockCompact(window)}`,
+    percent: switched || percent === null ? null : `${percent}%`,
+    meterPercent: switched ? null : meter,
+    ringBackground: `conic-gradient(currentColor ${switched ? 0 : Math.floor(((meter ?? 0) * 360) / 100)}deg, var(--muted) 0deg)`,
+    summary: switched
+      ? `Measured on ${MOCK_DEFAULT_MODEL}: ${summary}. ${picked} has not answered yet.`
+      : summary,
     parts: parts.map(({ part, tokens }) => ({
       label: MOCK_PART_LABELS[part]?.[0] ?? "Other",
       description: MOCK_PART_LABELS[part]?.[1] ?? "Parts this version of keeper does not name yet.",
@@ -7272,14 +7284,24 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
 const settingsScenario = new URLSearchParams(location.search).get("settings");
 const singleModel = settingsScenario === "single" || ownerReport;
 const MOCK_MODELS = singleModel
-  ? ["glm-5.3-flash"]
-  : ["claude-opus-5-5", "gpt-6-astra", "glm-5.3-flash", "qwen-4-coder"];
+  ? ["openrouter/z-ai/glm-5.3-flash"]
+  : // The five ids every agent offers at keeper-hq main c60ab1b (`agents/*/agent.toml`).
+    [
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "claude-haiku-5-5",
+      "openrouter/z-ai/glm-5.3-flash",
+      "openrouter/qwen/qwen3.7-flash",
+    ];
+/** Nixi's, Argo's and the Masons' default (R-HQ-83). */
+const MOCK_DEFAULT_MODEL = "openrouter/z-ai/glm-5.3-flash";
 /** `settings::provider_of`. */
 const MOCK_PROVIDERS: Record<string, string> = {
   "claude-opus-5-5": "Anthropic",
-  "gpt-6-astra": "OpenAI",
-  "glm-5.3-flash": "Z.ai",
-  "qwen-4-coder": "Qwen",
+  "claude-sonnet-5-5": "Anthropic",
+  "claude-haiku-5-5": "Anthropic",
+  "openrouter/z-ai/glm-5.3-flash": "Z.ai",
+  "openrouter/qwen/qwen3.7-flash": "Qwen",
 };
 const MOCK_EFFORTS: AgentEffortOptionVm["effort"][] =
   settingsScenario === "nixi" || singleModel ? [] : ["low", "medium", "high", "xhigh"];
@@ -7312,7 +7334,7 @@ function mockSettingsOf(vm: AgentSessionViewVm) {
 function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
   if (vm.archived) return undefined;
   const held = mockSettingsOf(vm);
-  const defaultModel = "glm-5.3-flash";
+  const defaultModel = MOCK_DEFAULT_MODEL;
   const defaultEffort = settingsScenario === "nixi" || singleModel ? null : "medium";
   const model = held.model ?? defaultModel;
   const effort = held.effort ?? defaultEffort;
@@ -7339,7 +7361,10 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
         }
       : {}),
     ...(settingsScenario === "fallback"
-      ? { fallback: "claude-opus-4-8 is no longer offered; using glm-5.3-flash instead." }
+      ? {
+          fallback:
+            "claude-opus-4-8 is no longer offered; using openrouter/z-ai/glm-5.3-flash instead.",
+        }
       : {}),
     ...(settingsScenario === "failed"
       ? {
@@ -7441,7 +7466,7 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     settings: picker,
     // `settings::footer`: always the labels; the chips open only where there is a choice.
     footer: {
-      model: picker?.modelLabel ?? "glm-5.3-flash",
+      model: picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
       effort: picker?.effortLabel ?? "Default",
       choosesModel: (picker?.models.length ?? 0) > 1,
       choosesEffort: (picker?.efforts.length ?? 0) > 1,

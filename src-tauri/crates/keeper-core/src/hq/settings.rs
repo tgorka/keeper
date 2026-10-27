@@ -35,6 +35,8 @@ pub struct AgentSessionSettingsVm {
     pub models: Vec<String>,
     pub efforts: Vec<Effort>,
     pub defaults: Vec<AgentSettingsDefaultVm>,
+    /// When the saved choice was last written (`session_settings.updated_at_ms`).
+    pub chosen_at_ms: Option<i64>,
 }
 
 fn sentence(error: impl std::fmt::Display) -> HqError {
@@ -43,7 +45,7 @@ fn sentence(error: impl std::fmt::Display) -> HqError {
 
 fn row(source: &Source, session: &str) -> Result<Option<Map<String, Value>>, HqError> {
     let (rows, pending) = source.replica.query_covered(
-        "SELECT model, effort, _sync_version AS version FROM session_settings WHERE session_id = ?1",
+        "SELECT model, effort, updated_at_ms, _sync_version AS version FROM session_settings WHERE session_id = ?1",
         &[session.into()],
         &WindowBase { table: "session_settings".to_owned(), variable: "session".to_owned(), fixed_scopes: Vec::new() },
         &[session.to_owned()],
@@ -132,6 +134,7 @@ fn settings_of(offered: Offered, saved: Option<&Map<String, Value>>) -> AgentSes
         models: offered.models.into_iter().collect(),
         efforts: offered.efforts.into_iter().collect(),
         defaults: offered.defaults,
+        chosen_at_ms: saved.and_then(|r| int(r, "updated_at_ms")),
     }
 }
 
@@ -154,23 +157,48 @@ pub struct AgentSessionFooterVm {
     pub chooses_effort: bool,
 }
 
-/// The bar's chips for `session` with `agent`. The labels never depend on
-/// whether this reader may change them; `picker` (absent for a reader who
-/// may not, an archived session or settings still arriving) decides only
-/// whether the chips open anything.
-pub(crate) fn footer(
-    source: &Source,
-    session: &str,
-    agent: &str,
+/// Everything the composer's bar reads, from one read of the settings.
+pub(crate) struct Bar {
+    /// Absent for a reader who may not change them, an archived session, or
+    /// settings still arriving.
+    pub picker: Option<AgentSessionPickerVm>,
+    pub footer: AgentSessionFooterVm,
+    /// When the saved choice was written: a choice newer than the latest
+    /// answer has not answered yet ([`crate::hq::context::latest`]).
+    pub chosen_at_ms: Option<i64>,
+}
+
+/// The bar of `session` with `agent`. The labels never depend on whether
+/// this reader may change them; the picker decides only whether the chips
+/// open anything. The offers and the saved row are read once (R598-07).
+pub(crate) fn bar(source: &Source, session: &str, agent: &str, archived: bool) -> Bar {
+    let (settings, may_change) = match view(source, session) {
+        Ok(settings) => (settings, !archived),
+        Err(error) => {
+            tracing::debug!(database = %source.database, %error, "the session's pickers are not shown");
+            let offered = offered(source, agent).unwrap_or_else(|error| {
+                tracing::debug!(database = %source.database, %error, "the agent's offers could not be read");
+                Offered::default()
+            });
+            // A saved choice still arriving reads as the agent's default until it lands.
+            let saved = row(source, session).ok().flatten();
+            (settings_of(offered, saved.as_ref()), false)
+        }
+    };
+    let picker = may_change.then(|| picker_over(source, session, &settings));
+    Bar {
+        footer: footer_of(&settings, picker.as_ref()),
+        chosen_at_ms: settings.chosen_at_ms,
+        picker,
+    }
+}
+
+/// The chips over `settings`: they open only where `picker` offers more than one.
+fn footer_of(
+    settings: &AgentSessionSettingsVm,
     picker: Option<&AgentSessionPickerVm>,
 ) -> AgentSessionFooterVm {
-    let offered = offered(source, agent).unwrap_or_else(|error| {
-        tracing::debug!(database = %source.database, %error, "the agent's offers could not be read");
-        Offered::default()
-    });
-    // A saved choice still arriving reads as the agent's default until it lands.
-    let saved = row(source, session).ok().flatten();
-    let (model, effort) = labels(&settings_of(offered, saved.as_ref()));
+    let (model, effort) = labels(settings);
     AgentSessionFooterVm {
         model,
         effort,
@@ -439,36 +467,72 @@ pub struct AgentModelOptionVm {
     pub default: bool,
 }
 
-/// The maker a model id names: the first segment of a routed id
-/// (`openrouter/z-ai/glm-5.3` → `openrouter`), else the family its name
-/// starts with, else "Other".
+/// Routers whose ids name the maker after their own segment
+/// (`openrouter/z-ai/glm-5.3-flash`): the deployment's provider registry
+/// (`agents/provider-models.txt`) routes OpenRouter's models under `openrouter/`.
+const ROUTERS: [&str; 1] = ["openrouter"];
+
+/// A maker's slug, as a routed id names it, and the name a person reads.
+const MAKERS: [(&str, &str); 12] = [
+    ("anthropic", "Anthropic"),
+    ("openai", "OpenAI"),
+    ("z-ai", "Z.ai"),
+    ("qwen", "Qwen"),
+    ("nvidia", "NVIDIA"),
+    ("google", "Google"),
+    ("meta-llama", "Meta"),
+    ("mistralai", "Mistral"),
+    ("deepseek", "DeepSeek"),
+    ("x-ai", "xAI"),
+    ("moonshotai", "Moonshot"),
+    ("minimax", "MiniMax"),
+];
+
+/// A model name's family, by the prefix its name starts with.
+const FAMILIES: [(&str, &str); 16] = [
+    ("claude", "Anthropic"),
+    ("gpt", "OpenAI"),
+    ("o1", "OpenAI"),
+    ("o3", "OpenAI"),
+    ("o4", "OpenAI"),
+    ("codex", "OpenAI"),
+    ("gemini", "Google"),
+    ("gemma", "Google"),
+    ("glm", "Z.ai"),
+    ("qwen", "Qwen"),
+    ("llama", "Meta"),
+    ("mistral", "Mistral"),
+    ("codestral", "Mistral"),
+    ("deepseek", "DeepSeek"),
+    ("grok", "xAI"),
+    ("kimi", "Moonshot"),
+];
+
+/// The maker a model id names (R598-01): a router's segment is skipped, then
+/// a known maker slug is named as people read it (`z-ai` → Z.ai), else the
+/// family the model's own name starts with (`claude-…` → Anthropic), else the
+/// maker slug as written, else "Other".
 pub(crate) fn provider_of(id: &str) -> String {
-    if let Some((route, _)) = id.split_once('/') {
-        return route.to_owned();
+    let mut segments: Vec<&str> = id.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() > 1 && ROUTERS.contains(&segments[0].to_ascii_lowercase().as_str()) {
+        segments.remove(0);
     }
-    let name = id.to_ascii_lowercase();
-    let family = [
-        ("claude", "Anthropic"),
-        ("gpt", "OpenAI"),
-        ("o1", "OpenAI"),
-        ("o3", "OpenAI"),
-        ("o4", "OpenAI"),
-        ("codex", "OpenAI"),
-        ("gemini", "Google"),
-        ("gemma", "Google"),
-        ("glm", "Z.ai"),
-        ("qwen", "Qwen"),
-        ("llama", "Meta"),
-        ("mistral", "Mistral"),
-        ("codestral", "Mistral"),
-        ("deepseek", "DeepSeek"),
-        ("grok", "xAI"),
-        ("kimi", "Moonshot"),
-    ]
-    .into_iter()
-    .find(|(prefix, _)| name.starts_with(prefix))
-    .map_or("Other", |(_, family)| family);
-    family.to_owned()
+    let name = segments.last().copied().unwrap_or(id).to_ascii_lowercase();
+    let slug = (segments.len() > 1).then(|| segments[0].to_ascii_lowercase());
+    if let Some((_, maker)) = slug
+        .as_deref()
+        .and_then(|slug| MAKERS.iter().find(|(known, _)| *known == slug))
+    {
+        return (*maker).to_owned();
+    }
+    if let Some((_, family)) = FAMILIES.iter().find(|(prefix, _)| name.starts_with(prefix)) {
+        return (*family).to_owned();
+    }
+    if segments.len() > 1 {
+        segments[0].to_owned()
+    } else {
+        "Other".to_owned()
+    }
 }
 
 /// One offered effort as the picker lists it.
@@ -724,16 +788,24 @@ pub(crate) fn picker_of(
 /// The pickers of `session` as its replica holds them now; an error while
 /// the settings are still arriving or the reader may not change them.
 pub(crate) fn picker(source: &Source, session: &str) -> Result<AgentSessionPickerVm, HqError> {
-    let settings = view(source, session)?;
+    Ok(picker_over(source, session, &view(source, session)?))
+}
+
+/// The pickers over `settings`, already read for `session`.
+fn picker_over(
+    source: &Source,
+    session: &str,
+    settings: &AgentSessionSettingsVm,
+) -> AgentSessionPickerVm {
     let newest = newest_answer(source, session);
     let mut picker = picker_of(
-        &settings,
+        settings,
         running(source, session),
         fallback(&newest),
         write_state(source, session),
     );
     picker.failed = failed(&newest, &picker);
-    Ok(picker)
+    picker
 }
 
 #[cfg(test)]
@@ -1084,6 +1156,7 @@ mod tests {
                     effort: *effort,
                 })
                 .collect(),
+            chosen_at_ms: None,
         }
     }
 
@@ -1350,10 +1423,7 @@ mod tests {
     #[test]
     fn the_bar_always_names_model_and_effort_and_opens_only_where_there_is_a_choice() {
         let (_dir, mut source) = fixture(true);
-        let footer_now = |source: &Source| {
-            let picker = picker(source, "dev1.1").ok();
-            footer(source, "dev1.1", "nixi", picker.as_ref())
-        };
+        let footer_now = |source: &Source| bar(source, "dev1.1", "nixi", false).footer;
         // Two instances disagree on the default model and name no default effort.
         assert_eq!(
             footer_now(&source),
@@ -1398,10 +1468,31 @@ mod tests {
         one.models.truncate(1);
         one.efforts.truncate(1);
         let only = picker_of(&one, None, None, AgentSettingsWriteVm::Confirmed);
-        let solo = footer(&source, "dev1.9", "foreign", Some(&only));
+        let solo = footer_of(&one, Some(&only));
         assert_eq!(
             (solo.model.as_str(), solo.chooses_model, solo.chooses_effort),
-            ("foreign", false, false)
+            ("primary", false, false)
+        );
+        // A session this person may not change (dev1.9's settings are not in this device's
+        // window, so they are still arriving): the agent's default, read-only.
+        let arriving = bar(&source, "dev1.9", "foreign", false);
+        assert_eq!(arriving.picker, None);
+        assert_eq!(
+            (
+                arriving.footer.model.as_str(),
+                arriving.footer.chooses_model
+            ),
+            ("foreign", false)
+        );
+        // An archived session reads its choice and opens nothing.
+        let archived = bar(&source, "dev1.1", "nixi", true);
+        assert_eq!(archived.picker, None);
+        assert_eq!(
+            (
+                archived.footer.model.as_str(),
+                archived.footer.chooses_model
+            ),
+            ("alternate", false)
         );
     }
 
@@ -1458,11 +1549,22 @@ mod tests {
 
     #[test]
     fn models_group_by_the_maker_their_id_names() {
+        // The five ids every agent offers at keeper-hq main c60ab1b (`agents/*/agent.toml`),
+        // then the held GPT-6.x ids, a CPA route, and makers this build does not name.
         for (id, provider) in [
             ("claude-opus-5-5", "Anthropic"),
+            ("claude-sonnet-5-5", "Anthropic"),
+            ("claude-haiku-5-5", "Anthropic"),
+            ("openrouter/z-ai/glm-5.3-flash", "Z.ai"),
+            ("openrouter/qwen/qwen3.7-flash", "Qwen"),
             ("gpt-6-astra", "OpenAI"),
-            ("glm-5.3-flash", "Z.ai"),
-            ("openrouter/z-ai/glm-5.3-flash", "openrouter"),
+            ("gpt-6.1-sol", "OpenAI"),
+            ("openai-codex/gpt-6-astra", "OpenAI"),
+            (
+                "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+                "NVIDIA",
+            ),
+            ("openrouter/acme/zeta-1", "acme"),
             ("mystery-1", "Other"),
         ] {
             assert_eq!(provider_of(id), provider, "{id}");

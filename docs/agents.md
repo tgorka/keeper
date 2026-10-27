@@ -432,7 +432,8 @@ agent's question where it was asked, an answer still being written last. A messa
 not name is not drawn — a lead-in ("Checking — one minute.") lives inside its turn's fold. A row
 with nothing to read — the 0-byte `finish = "tool_calls"` close a turn writes before a parked
 call (owner report 2026-10-27, `.9`), or a blank lead-in — is never a bubble: the turn is read as
-its fold, at its work, and a blank lead-in is not listed inside the fold either.
+its fold, at its work, and a blank lead-in is not listed inside the fold either. In **Verbose** a
+blank close's details (that leg's model, tokens, timings) stay inside the fold (R598-04).
 
 - **While a turn runs** its fold is one live line, Rust's sentence: "Searching the web… · 3 steps".
 - **When it ends** everything but the answer — lead-ins, thinking, tool calls — is one line above
@@ -498,13 +499,18 @@ agent's default, else "Default"), the attach controls, an **Untrusted** marker w
 read outside content, and the context reading beside Send. The model and effort are chips that
 open 109.18's pickers only where Rust says there is an alternative to choose
 (`choosesModel`/`choosesEffort`: more than one offered, and this person may change them); a
-reader who may not, or an agent with one offer, sees read-only chips.
+reader who may not, or an agent with one offer, sees read-only chips. An archived session has no
+composer but keeps the reading: read-only model and effort chips, the **Untrusted** marker and the
+context, under the read-only line (R598-03).
 
 **Context** beside Send is a ring and Rust's compact label (`5.3k / 1M`), in every view mode and
 for any member: `metadata.context` is in every member's replica. Before any answer measured it, or
 when the latest answer did not, the ring is empty, the label reads **—** and its tooltip and
 Details say why ("Context unknown: …") — never an older answer's count and never a meter claiming
-zero. It opens a side **Details** panel; `/context` opens the same panel. It shows the latest
+zero. After a person picks another model, the latest answer's window is not the next answer's: until
+that model answers, the label reads **—** and the tooltip and Details say "Measured on <model>: …
+<new model> has not answered yet." (R598-02; a choice written before the answer, or the provider's
+own spelling of the same routed id, keeps the reading). It opens a side **Details** panel; `/context` opens the same panel. It shows the latest
 answer's last-round occupancy (`metadata.context.used`), not the accumulated billing usage in
 `metadata.usage`. The ring's tooltip shows used/window and the rounded percentage; an unknown model
 window shows **used ≈ N tokens** and the label names the count alone. Tab to the context button,
@@ -521,7 +527,9 @@ For the context viewing aid, `?sessions=launch` opens alpha with 48000/200000 to
 A new session reads **—**. `?sessions=launch&owner=report` is the owner's report of 2026-10-27 on
 alpha (Nixi's `.6`, `.9`, `.11`): untrusted, one T3 `run` waiting in the banner, a 0-byte
 `finish = "tool_calls"` close that draws no bubble, one model and no effort (read-only chips), and
-`5.3k / 1M`. These are mock projections, not evidence of a running model or the packaged app.
+`5.3k / 1M`; its archived device.2 is untrusted too. The mock offers the five ids every agent offers
+at keeper-hq `c60ab1b`; picking a model other than `openrouter/z-ai/glm-5.3-flash` shows the switch
+hint. These are mock projections, not evidence of a running model or the packaged app.
 
 **Tools** contains only tools the answering instance offers, from its definition and container.
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
@@ -1598,8 +1606,10 @@ reader who may not change them. Rust decides every part of it:
 
 The composer's bar (`session-settings-picker.tsx`) is t3.chat's shape (R-HQ-85): a model button
 naming the current model, opening a popover with a search box, starred models first, then the
-offered models grouped by provider (`AgentModelOptionVm.provider`, Rust's reading of the id —
-`openrouter/…` by its route, else the family the name starts with) and a "Default" badge; an effort
+offered models grouped by the maker (`AgentModelOptionVm.provider`, `settings::provider_of`: a
+router's segment such as `openrouter/` is skipped, a maker slug is named as people read it —
+`openrouter/z-ai/glm-5.3-flash` → Z.ai, `openrouter/qwen/qwen3.7-flash` → Qwen — else the family the
+model's own name starts with, `claude-…` → Anthropic, `gpt-…` → OpenAI) and a "Default" badge; an effort
 chip with a "Default" badge in its menu; Reset. Where there is nothing to choose they are read-only
 chips, never absent. Capability badges are not drawn: the contract publishes model ids only
 (DW-E109-40). Stars are a lens, not a setting:

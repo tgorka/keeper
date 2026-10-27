@@ -100,6 +100,8 @@ export function SessionSettingsPicker({
   const [error, setError] = useState<string | null>(null);
   const writing = useRef(false);
   const modelButton = useRef<HTMLButtonElement>(null);
+  const effortButton = useRef<HTMLButtonElement>(null);
+  const group = useRef<HTMLFieldSetElement>(null);
 
   async function apply(change: AgentSettingsChange) {
     // A second click while one write is in flight is ignored, never queued.
@@ -229,6 +231,8 @@ export function SessionSettingsPicker({
   return (
     <div data-slot="agent-session-settings" className="contents">
       <fieldset
+        ref={group}
+        tabIndex={-1}
         aria-label="Model and effort"
         className="flex min-w-0 max-w-full flex-wrap items-center gap-0.5 text-xs"
       >
@@ -283,6 +287,7 @@ export function SessionSettingsPicker({
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
+                ref={effortButton}
                 variant="ghost"
                 size="sm"
                 className="min-h-11"
@@ -335,8 +340,9 @@ export function SessionSettingsPicker({
             className="min-h-11"
             aria-label="Reset model and effort to the agent's defaults"
             onClick={() => {
-              // Reset removes itself; keep keyboard focus in the bar.
-              modelButton.current?.focus();
+              // Reset removes itself; keep keyboard focus in the bar: on the model's picker, else
+              // the effort's, else the group itself when both are read-only chips (R598-06).
+              (modelButton.current ?? effortButton.current ?? group.current)?.focus();
               void apply({ kind: "reset" });
             }}
           >

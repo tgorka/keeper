@@ -247,6 +247,39 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
     expect(await screen.findByRole("dialog", { name: "Choose a model" })).toBeInTheDocument();
   });
 
+  it("keeps the reading and the untrusted marker on an archived session (R598-03)", async () => {
+    const why =
+      "This chat read outside content, such as a web page, so its commands need your approval.";
+    render(
+      <TooltipProvider>
+        <SessionView target={{ database: "beta", sessionId: "same.1" }} />
+      </TooltipProvider>,
+    );
+    await waitFor(() => expect(mock.view).not.toBeNull());
+    // An archived session takes no drop, so `draw`'s wait for one does not apply.
+    act(() =>
+      mock.view?.({
+        ...vm,
+        archived: true,
+        readOnly: true,
+        untrusted: why,
+        context: {
+          ...vm.context,
+          label: "5.3k / 1M",
+          summary: "1% · used ≈ 5347 / 1048576 tokens",
+        },
+      }),
+    );
+    expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull();
+    const bar = screen.getByRole("group", { name: "Model and effort" });
+    expect(within(bar).getByText("beta-small")).toBeInTheDocument();
+    expect(within(bar).queryByRole("button", { name: /^Model:/ })).toBeNull();
+    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Context details: 1% · used ≈ 5347 / 1048576 tokens" }),
+    ).toHaveTextContent("5.3k / 1M");
+  });
+
   it("marks an untrusted session in the bar and says why in the banner", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";

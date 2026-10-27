@@ -619,15 +619,7 @@ pub fn view(
         None => (Vec::new(), 0),
     };
     mention::place(&mut items, &messages, &children);
-    let settings = if session.archived {
-        None
-    } else {
-        crate::hq::settings::picker(source, session_id)
-            .map_err(|error| {
-                tracing::debug!(database = %source.database, %error, "the session's pickers are not shown");
-            })
-            .ok()
-    };
+    let bar = crate::hq::settings::bar(source, session_id, &session.agent_actor, session.archived);
     Ok((
         AgentSessionViewVm {
             database: source.database.clone(),
@@ -656,15 +648,16 @@ pub fn view(
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
             answering,
-            context: super::context::latest(&rows),
-            drives: None,
-            footer: crate::hq::settings::footer(
-                source,
-                session_id,
-                &session.agent_actor,
-                settings.as_ref(),
+            context: super::context::latest(
+                &rows,
+                super::context::Next {
+                    model: &bar.footer.model,
+                    chosen_at_ms: bar.chosen_at_ms,
+                },
             ),
-            settings,
+            drives: None,
+            footer: bar.footer,
+            settings: bar.picker,
             agent_actor: session.agent_actor,
         },
         newest_ms,

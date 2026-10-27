@@ -67,10 +67,12 @@ pub(super) fn project(
     // A close with nothing to read — the 0-byte `finish = "tool_calls"` row a
     // turn writes before a parked call (owner report 2026-10-27, `.9`) — is
     // never a bubble of its own: its turn is read as its fold, at its work.
-    let blank: HashSet<&str> = messages
+    // Where the view sends its details (Verbose), they stay inside the fold
+    // as that leg's (R598-04).
+    let blank: HashMap<&str, bool> = messages
         .iter()
         .filter(|m| m.body.trim().is_empty() && m.attachments.is_empty())
-        .map(|m| m.id.as_str())
+        .map(|m| (m.id.as_str(), m.details.is_some()))
         .collect();
     for row in rows.iter().filter(|row| text(row, "role") == "agent") {
         let turn = text(row, "turn_id");
@@ -83,10 +85,16 @@ pub(super) fn project(
         let id = text(row, "id");
         let at = int(row, "created_at_ms").unwrap_or(i64::MAX);
         if live::is_terminal(&details) {
-            if blank.contains(id) {
-                hidden.insert(id);
-            } else {
-                answers.insert(id, turn);
+            match blank.get(id) {
+                Some(&has_details) => {
+                    hidden.insert(id);
+                    if has_details {
+                        lead_ins.entry(turn).or_default().push(id.to_owned());
+                    }
+                }
+                None => {
+                    answers.insert(id, turn);
+                }
             }
             if let Some(error) = live::details(&details).and_then(|d| d.error) {
                 errors.entry(turn).or_default().push(one_line(&error));
@@ -100,7 +108,7 @@ pub(super) fn project(
         } else {
             hidden.insert(id);
             // A blank lead-in has nothing to read inside the fold either.
-            if !blank.contains(id) {
+            if !blank.contains_key(id) {
                 lead_ins.entry(turn).or_default().push(id.to_owned());
             }
         }

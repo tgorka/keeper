@@ -626,9 +626,29 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         </aside>
       )}
       {vm?.readOnly ? (
-        <p className="border-border border-t px-4 py-3 text-muted-foreground text-sm">
-          This archived session is read-only. Unarchive it to continue.
-        </p>
+        // R598-03: an archived session keeps the bar's reading — model, effort, context and the
+        // untrusted marker — read-only, with no composer.
+        <div
+          data-slot="agent-session-readonly-bar"
+          className="shrink-0 border-border border-t px-3 py-2"
+        >
+          <p className="px-1 py-1 text-muted-foreground text-sm">
+            This archived session is read-only. Unarchive it to continue.
+          </p>
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            <SessionSettingsPicker
+              target={target}
+              agent={vm.agentActor}
+              footer={vm.footer}
+              untrusted={vm.untrusted}
+            />
+            <div className="ml-auto">
+              <SessionContext context={vm.context} open={contextOpen} onOpenChange={setContextOpen}>
+                <SessionContextTrigger context={vm.context} />
+              </SessionContext>
+            </div>
+          </div>
+        </div>
       ) : (
         <div data-slot="agent-session-composer" className="shrink-0 border-border border-t p-3">
           <SessionContext context={vm?.context} open={contextOpen} onOpenChange={setContextOpen}>

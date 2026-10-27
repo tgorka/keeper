@@ -1111,6 +1111,18 @@ fn a_blank_close_before_a_parked_call_is_never_a_bubble_of_its_own() {
     );
     let fold = &view.folds[0];
     assert!(fold.lead_in_ids.is_empty(), "nothing blank inside the fold");
+    // R598-04: in Verbose the blank close carries that leg's details, so it is listed inside the
+    // fold for them — still never a bubble of its own; the blank lead-in has none and is not.
+    let verbose = w.view(&opened(VERBOSE, &[], &[]));
+    assert_eq!(verbose.items, view.items);
+    assert_eq!(verbose.folds[0].lead_in_ids, ["blank-close"]);
+    let leg = verbose
+        .messages
+        .iter()
+        .find(|m| m.id == "blank-close")
+        .and_then(|m| m.details.as_ref())
+        .expect("the leg's details");
+    assert_eq!(leg.model.as_deref(), Some("m"));
     assert_eq!(
         (fold.status, fold.status_label.as_str()),
         (Status::Waiting, "Waiting for you")

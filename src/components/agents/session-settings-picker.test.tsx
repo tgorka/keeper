@@ -252,6 +252,44 @@ describe("the model and effort pickers", () => {
     ).toEqual(["Reset"]);
   });
 
+  it("Reset keeps focus in the bar when the model is a read-only chip (R598-06)", async () => {
+    render(
+      <Picker
+        target={target}
+        agent="nixi"
+        picker={picker({
+          models: [{ id: "beta-small", provider: "Beta", current: true, default: true }],
+          resettable: true,
+        })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+    );
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Effort: Medium" }));
+    await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
+  });
+
+  it("Reset keeps focus on the group when both are read-only chips", async () => {
+    render(
+      <Picker
+        target={target}
+        agent="nixi"
+        picker={picker({
+          models: [{ id: "beta-small", provider: "Beta", current: true, default: true }],
+          efforts: [],
+          effortLabel: undefined,
+          resettable: true,
+        })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reset model and effort to the agent's defaults" }),
+    );
+    expect(document.activeElement).toBe(screen.getByRole("group", { name: "Model and effort" }));
+    await waitFor(() => expect(mock.change).toHaveBeenCalled());
+  });
+
   it("says which model failed and the way back, above everything else", () => {
     const failed =
       "The last answer failed on gamma-fast: provider answered 429. Choose another model, or Reset to the agent's default.";
