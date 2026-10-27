@@ -660,12 +660,15 @@ impl Hq {
         Ok(preview(&source, &key.session_id, before, after))
     }
 
-    /// The composer's line ([`send_line`]) in `key`'s database.
+    /// The composer's line ([`send_line`]) in `key`'s database; `focus` is
+    /// the note open in front of the person (109.28), carried by a message
+    /// to the session's own agent.
     pub fn send_line(
         &self,
         key: &AgentSessionRef,
         line: &str,
         shown: &[ShownApprovalVm],
+        focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
         let sent = send_line(
@@ -675,6 +678,7 @@ impl Hq {
             &key.session_id,
             line,
             shown,
+            focus,
         );
         self.touch();
         sent.map_err(HqError::Sentence)
@@ -682,9 +686,10 @@ impl Hq {
 }
 
 /// The composer's line: a mention starts its agent's child in `session_id`,
-/// any other line is a message to the session's own agent. Either declines
-/// first what the banner showed (`shown`, Q109-12 a): a mention after its
-/// local checks, so one refused here declines nothing (R10924K-03, -10).
+/// any other line is a message to the session's own agent, carrying `focus`.
+/// Either declines first what the banner showed (`shown`, Q109-12 a): a
+/// mention after its local checks, so one refused here declines nothing
+/// (R10924K-03, -10).
 pub(crate) fn send_line(
     sources: &[Source],
     source: &Source,
@@ -692,6 +697,7 @@ pub(crate) fn send_line(
     session_id: &str,
     line: &str,
     shown: &[ShownApprovalVm],
+    focus: Option<&send::AgentFocus>,
 ) -> Result<(), String> {
     match parse(line) {
         Some(mention) => start(sources, source, session_id, mention, line, || {
@@ -699,7 +705,7 @@ pub(crate) fn send_line(
         })
         .map(drop)
         .map_err(|error| error.to_string()),
-        None => send::send(source, decisions, session_id, line, shown)
+        None => send::send(source, decisions, session_id, line, shown, focus)
             .map_err(|error| error.to_string()),
     }
 }

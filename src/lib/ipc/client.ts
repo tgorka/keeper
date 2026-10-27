@@ -387,6 +387,8 @@ export type { AgentModelLineVm } from "./gen/AgentModelLineVm";
 export type { AgentModelOptionVm } from "./gen/AgentModelOptionVm";
 export type { AgentModelReq } from "./gen/AgentModelReq";
 export type { AgentModelVm } from "./gen/AgentModelVm";
+export type { AgentNoteCaret } from "./gen/AgentNoteCaret";
+export type { AgentNoteSessionVm } from "./gen/AgentNoteSessionVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
 export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
 export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
@@ -844,6 +846,8 @@ import type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";
 import type { AgentDefaultSessionVm } from "./gen/AgentDefaultSessionVm";
 import type { AgentGrantsVm } from "./gen/AgentGrantsVm";
 import type { AgentInstancesVm } from "./gen/AgentInstancesVm";
+import type { AgentNoteCaret } from "./gen/AgentNoteCaret";
+import type { AgentNoteSessionVm } from "./gen/AgentNoteSessionVm";
 import type { AgentSessionMembersVm } from "./gen/AgentSessionMembersVm";
 import type { AgentSessionRef } from "./gen/AgentSessionRef";
 import type { AgentSessionsBatch } from "./gen/AgentSessionsBatch";
@@ -4220,26 +4224,30 @@ export async function agentInstancesSet(agentActor: string, order: string[]): Pr
 /**
  * Write a person's message. `declines` is what the approval banner showed when it was sent: Rust
  * declines those requests that still wait at the shown digest, and nothing newer (Q109-12 a).
+ * `focus` is the note open in front of the person in the Notes Assistant (109.28): Rust names its
+ * drive, path and heading and writes them as the message's `metadata.focus`.
  */
 export async function agentSend(
   target: AgentSessionRef,
   body: string,
   declines: ShownApprovalVm[],
+  focus: AgentNoteCaret | null = null,
 ): Promise<void> {
-  await invoke<void>("agent_send", { ...target, body, declines });
+  await invoke<void>("agent_send", { ...target, body, declines, focus });
 }
 
 /**
  * The composer's line (109.24): `@<handle> …` starts that agent's thread from this
- * session, as Rust decides; any other line is a message, as {@link agentSend}. Either
- * declines first what the banner showed (`declines`, Q109-12 a).
+ * session, as Rust decides; any other line is a message, as {@link agentSend}, carrying
+ * `focus`. Either declines first what the banner showed (`declines`, Q109-12 a).
  */
 export async function agentSendLine(
   target: AgentSessionRef,
   line: string,
   declines: ShownApprovalVm[],
+  focus: AgentNoteCaret | null = null,
 ): Promise<void> {
-  await invoke<void>("agent_send_line", { ...target, line, declines });
+  await invoke<void>("agent_send_line", { ...target, line, declines, focus });
 }
 
 /** What an `@` at the start of a session's draft offers (109.24). */
@@ -4320,18 +4328,21 @@ export async function agentAttachBytes(
  * The composer's one Send (story 107.1): every staged file `handles` name, with `caption` as its
  * text, committed by Rust as ONE new message — or nothing, rejecting with the sentence. The handles
  * are spent either way. The message and its chips arrive over the open session's view stream.
+ * `focus` is the note open in front of the person, as {@link agentSend} carries it.
  */
 export async function agentAttachCommit(
   target: AgentSessionRef,
   handles: string[],
   caption: string | undefined,
   declines: ShownApprovalVm[],
+  focus: AgentNoteCaret | null = null,
 ): Promise<void> {
   await invoke<void>("agent_attach_commit", {
     ...target,
     handles,
     caption: caption ?? null,
     declines,
+    focus,
   });
 }
 
@@ -4371,6 +4382,25 @@ export async function agentsChoices(): Promise<AgentChoiceVm[]> {
 
 export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | null> {
   return await invoke<AgentDefaultSessionVm | null>("agent_session_default");
+}
+
+/**
+ * The Notes Assistant opened on a note (109.28, R-HQ-86): the default agent's chat in the database
+ * named after the note's drive, started there when it has none, and the drive ticked in it as the
+ * person — with the warning to say at that moment, or the reason it was not ticked. `pick` is this
+ * device's last model and effort for the default agent, for a session started now. `null` with no
+ * default agent.
+ */
+export async function agentSessionForNote(
+  vaultId: string,
+  noteId: string,
+  pick: AgentSettingsPick | null,
+): Promise<AgentNoteSessionVm | null> {
+  return await invoke<AgentNoteSessionVm | null>("agent_session_for_note", {
+    vaultId,
+    noteId,
+    pick,
+  });
 }
 
 /**

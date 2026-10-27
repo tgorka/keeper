@@ -30,8 +30,13 @@
 //!   returning, which only says the outbox took it.
 //! - **The risk is said where a drive is ticked** ([`WARNING`]; D-34's
 //!   accepted risk, R-HQ-79).
+//! - **The Notes Assistant's tick** ([`Hq::session_for_note`], R-HQ-86):
+//!   opened on a note, the dock ticks the note's drive as the person, by the
+//!   same rules a click does, and says [`WARNING`] at that moment. Nowhere
+//!   else is a drive ticked for the person.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -39,7 +44,8 @@ use ts_rs::TS;
 
 use crate::hq::port::{Rejection, ReplicaError, RowOp, CONFLICT};
 use crate::hq::sessions::{
-    self, authored, int, json, names, object, opt_text, read, text, AgentSessionRef, Source,
+    self, authored, int, json, names, object, opt_text, read, text, AgentNoteSessionVm,
+    AgentSessionRef, Source,
 };
 use crate::hq::timeline::{self, SessionRow};
 use crate::hq::{Hq, HqError};
@@ -753,6 +759,32 @@ pub fn carry(
     Ok(())
 }
 
+/// The Notes Assistant's tick (109.28, R-HQ-86): `drive` ticked in
+/// `session_id` as the person, by [`set`]'s own rules — the agent offers it,
+/// V17's audience rule allows it, no stopped drive holds it back. Whether
+/// this call ticked it (`false` when it already was), or why not.
+pub fn tick_for_note(
+    source: &Source,
+    session_id: &str,
+    drive: &str,
+    sources: &[Source],
+    now_ms: i64,
+) -> Result<bool, DriveRefused> {
+    let (drives, _) = ticked(source, session_id);
+    if drives.iter().any(|ticked| ticked == drive) {
+        return Ok(false);
+    }
+    set(source, session_id, drive, true, sources, now_ms)?;
+    Ok(true)
+}
+
+/// Said when the note's folder declares no drive.
+pub const NO_DRIVE: &str = "This note's folder is not a drive, so no drive is ticked.";
+
+/// Held from finding the drive's session to starting one, so two docks
+/// opened on one drive at once start one session, not two.
+static NOTE_SESSION: Mutex<()> = Mutex::new(());
+
 /// The row's values: the drives as a JSON array, `[]` for none.
 fn selection(session_id: &str, drives: &[String], now_ms: i64) -> Map<String, Value> {
     object(serde_json::json!({
@@ -782,6 +814,70 @@ impl Hq {
         .map_err(|refused| HqError::Sentence(refused.0))?;
         self.touch();
         Ok(())
+    }
+
+    /// The Notes Assistant opened on a note on `drive` (109.28, R-HQ-86;
+    /// `None`: its folder declares no drive). The default agent's newest
+    /// unarchived session in the drive's database, or one started there with
+    /// this device's last `pick` for the agent, and the drive ticked in it as
+    /// the person when it is not yet ([`tick_for_note`]), with [`WARNING`]
+    /// to say at that moment. A drive the agent does not offer, or V17
+    /// refuses, stays unticked and the answer says why. `None` with no
+    /// default agent.
+    pub fn session_for_note(
+        &self,
+        drive: Option<&str>,
+        pick: Option<&crate::hq::settings::AgentSettingsPick>,
+    ) -> Result<Option<AgentNoteSessionVm>, HqError> {
+        let data_dir = self.data_dir()?;
+        let chosen = crate::registry::get_agents_default(&data_dir)?;
+        let last = sessions::last_choices(&data_dir);
+        let sources = self.sources();
+        let now = sessions::now_ms();
+        let unticked = |target, drive: Option<&str>, reason: String| AgentNoteSessionVm {
+            target,
+            drive: drive.map(str::to_owned),
+            ticked_now: false,
+            warning: None,
+            reason: Some(reason),
+        };
+        let Some(drive) = drive else {
+            return Ok(
+                sessions::default_session(&sources, chosen.as_deref(), &last, now)
+                    .map(|target| unticked(target, None, NO_DRIVE.to_owned())),
+            );
+        };
+        let _held = NOTE_SESSION.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((mut target, elsewhere)) =
+            sessions::note_session(&sources, chosen.as_deref(), &last, drive, now)
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = elsewhere {
+            return Ok(Some(unticked(target, Some(drive), reason)));
+        }
+        let source = self.source(drive)?;
+        let session_id = match &target.session_id {
+            Some(id) => id.clone(),
+            None => {
+                let id = sessions::create(&source, &target.agent_actor, "", pick)
+                    .map_err(|error| HqError::Sentence(error.to_string()))?;
+                target.session_id = Some(id.clone());
+                id
+            }
+        };
+        let ticked = tick_for_note(&source, &session_id, drive, &sources, now);
+        self.touch();
+        Ok(Some(match ticked {
+            Ok(ticked_now) => AgentNoteSessionVm {
+                target,
+                drive: Some(drive.to_owned()),
+                ticked_now,
+                warning: ticked_now.then(|| WARNING.to_owned()),
+                reason: None,
+            },
+            Err(DriveRefused(reason)) => unticked(target, Some(drive), reason),
+        }))
     }
 }
 

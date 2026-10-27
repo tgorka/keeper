@@ -64,10 +64,11 @@ export function columnsUnfolded(): ColumnFold {
  * notes view's assistant dock, which starts on its rail.
  *
  * The dock is the one column whose opening is itself an act toward someone
- * else: while it is open, the note in front of the person is told to their
- * proxy (UX-DR130). That starts when they open it, never because a build
- * shipped it open. It also keeps the window's floor where it was — a folded
- * dock is a 48px strip.
+ * else: opening it ticks the note's drive for the agent to read, and what is
+ * sent from it tells the agent which note is in front of the person (UX-DR130,
+ * 109.28). That starts when they open it, never because a build shipped it
+ * open. It also keeps the window's floor where it was — a folded dock is a
+ * 48px strip.
  */
 export function columnsAtFirstRun(): ColumnFold {
   return { ...columnsUnfolded(), "notes-agent": true };

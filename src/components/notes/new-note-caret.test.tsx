@@ -49,13 +49,14 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { EditorView } from "@codemirror/view";
 import { NOTE_AUTOSAVE_IDLE_MS } from "@/hooks/use-notes-body";
-import { caretIn, noteCaretStore, textThroughCaret } from "@/lib/stores/note-caret";
+import { caretIn, focusInFront, noteCaretStore, textThroughCaret } from "@/lib/stores/note-caret";
 import {
   acceptPending,
   applyBodyBatch,
   readNoteDocument,
   resetNotesEditorStoreForTest,
 } from "@/lib/stores/notes-editor";
+import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { withRangeRects } from "@/test/layout";
 import { NOTE_ACTIONS_TEXT } from "./note-actions";
 import { NoteEditor } from "./note-editor";
@@ -455,5 +456,21 @@ describe("the caret line the assistant dock reads", () => {
     const typed = caretIn(noteCaretStore.getState(), "v1", "caret-line");
     expect(typed?.line).toBe(4);
     expect(typed === null ? "" : textThroughCaret(typed)).toMatch(/## Agenda and risks$/);
+
+    // What the dock sends with a message (109.28): the note the active panel shows, this line
+    // and the unsaved buffer through it — Rust names the heading from that buffer.
+    act(() => {
+      panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "v1", noteId: "caret-line" });
+    });
+    try {
+      expect(focusInFront()).toEqual({
+        vaultId: "v1",
+        noteId: "caret-line",
+        line: 4,
+        text: `# Unsaved\n${SCAFFOLDED.slice(0, SCAFFOLDED.indexOf("## Agenda"))}## Agenda and risks`,
+      });
+    } finally {
+      resetPanelsStoreForTest();
+    }
   });
 });

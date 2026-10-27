@@ -522,7 +522,8 @@ fn sending_a_message_declines_what_waits_for_the_sender() {
     );
 
     let shown = shown(&w, "dev1.1");
-    crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "yes, do it", &shown).expect("sent");
+    crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "yes, do it", &shown, None)
+        .expect("sent");
     for id in ["mine", "also"] {
         let declined = card(&w, "dev1.1", id);
         assert_eq!(declined.state, AgentApprovalStateVm::Denied, "{id}");
@@ -626,7 +627,8 @@ fn a_t4_request_this_device_cannot_decide_offers_no_decision_and_is_not_declined
             id: "t4".to_owned(),
             binding_digest: "digest-t4".to_owned(),
         });
-        crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "go on", &shown).expect("sent");
+        crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "go on", &shown, None)
+            .expect("sent");
         assert_eq!(
             card(&w, "dev1.1", "mine").state,
             AgentApprovalStateVm::Denied
@@ -692,7 +694,7 @@ fn a_request_that_arrived_after_the_banner_was_drawn_stays_pending() {
         moved.binding_digest = "digest-before".to_owned();
     }
     request(&w, "late", "dev1.1", "run", "T2", git_status(), &["zoë"]);
-    crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "yes", &banner).expect("sent");
+    crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "yes", &banner, None).expect("sent");
     assert_eq!(
         card(&w, "dev1.1", "seen").state,
         AgentApprovalStateVm::Denied
@@ -705,7 +707,7 @@ fn a_request_that_arrived_after_the_banner_was_drawn_stays_pending() {
         );
     }
     // A message sent with no banner shown declines nothing.
-    crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "and again", &[]).expect("sent");
+    crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "and again", &[], None).expect("sent");
     assert_eq!(
         card(&w, "dev1.1", "late").state,
         AgentApprovalStateVm::Pending
@@ -722,7 +724,7 @@ fn a_denial_that_cannot_be_written_stops_the_message() {
     let banner = shown(&w, "dev1.1");
     let (staged, source) = crate::hq::window_tests::Staged::over(&w.alpha, None);
     *staged.failing.lock().expect("failing") = Some("approvals".to_owned());
-    let refused = crate::hq::send::send(&source, &w.decisions, "dev1.1", "yes", &banner)
+    let refused = crate::hq::send::send(&source, &w.decisions, "dev1.1", "yes", &banner, None)
         .expect_err("not sent");
     assert_eq!(
         refused.to_string(),
@@ -947,7 +949,7 @@ fn a_message_with_files_declines_too_and_an_archived_session_holds_no_banner() {
             .expect("staged"),
     ];
     let banner = shown(&w, "dev1.1");
-    crate::hq::attachments::attach(&w.alpha, &w.decisions, "dev1.1", "", files, &banner)
+    crate::hq::attachments::attach(&w.alpha, &w.decisions, "dev1.1", "", files, &banner, None)
         .expect("attached");
     assert_eq!(
         card(&w, "dev1.1", "mine").state,
@@ -1484,7 +1486,15 @@ fn a_mention_declines_what_the_banner_showed_before_its_thread() {
     assert_eq!(shown.len(), 1, "the banner shows the request");
     let sources = [w.alpha.clone()];
     let send = |line: &str| {
-        crate::hq::mention::send_line(&sources, &w.alpha, &w.decisions, "dev1.1", line, &shown)
+        crate::hq::mention::send_line(
+            &sources,
+            &w.alpha,
+            &w.decisions,
+            "dev1.1",
+            line,
+            &shown,
+            None,
+        )
     };
     // Refused here: nothing declined, nothing written.
     for line in ["@nobody hi", "@nixi hi", "@tola"] {
@@ -1546,6 +1556,7 @@ fn a_plain_line_from_the_composer_declines_what_the_banner_showed() {
         "dev1.1",
         "yes, do it",
         &shown,
+        None,
     )
     .expect("sent");
     let declined = card(&w, "dev1.1", "mine");

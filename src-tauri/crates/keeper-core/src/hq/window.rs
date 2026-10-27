@@ -578,15 +578,24 @@ impl Hq {
     }
 
     /// Write a person's message into a session; it declines the requests its
-    /// banner showed (`shown`) that still wait for them (Q109-12 a).
+    /// banner showed (`shown`) that still wait for them (Q109-12 a). `focus`
+    /// is the note open in front of them in the Notes Assistant (109.28).
     pub fn send(
         &self,
         key: &AgentSessionRef,
         body: &str,
         shown: &[ShownApprovalVm],
+        focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
-        let sent = send::send(&source, self.decisions()?, &key.session_id, body, shown);
+        let sent = send::send(
+            &source,
+            self.decisions()?,
+            &key.session_id,
+            body,
+            shown,
+            focus,
+        );
         self.touch();
         sent.map_err(sentence)
     }
@@ -629,12 +638,14 @@ impl Hq {
     /// The composer's one Send: every file `handles` name, with `caption`
     /// as its text, committed as one new message of the session — or
     /// nothing, with the sentence. The handles are spent either way.
+    /// `focus` is the note open in front of the person (109.28).
     pub fn commit_attachments(
         &self,
         key: &AgentSessionRef,
         handles: &[String],
         caption: &str,
         shown: &[ShownApprovalVm],
+        focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let files = self.staging.take(key, handles).map_err(sentence)?;
         // 109.24: a mention starts its own thread and carries no files; the
@@ -650,6 +661,7 @@ impl Hq {
             caption,
             files,
             shown,
+            focus,
         );
         self.touch();
         attached.map_err(sentence)?;

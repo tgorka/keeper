@@ -758,10 +758,11 @@ export function NotesPane() {
           told which note; now the panel holds the note and the rail filters the
           list. `NotePanelBody` says so out loud if the vault is actually gone. */}
       <PanelStrip emptySentence={NOTES_PANEL_EMPTY_SENTENCE} />
-      {/* Pane 4 — the assistant (UX-DR130): the person's proxy room, docked
-          right of the panels so the note stays in the middle. Its seam is on
-          its left, and it starts folded: opening it is what starts telling the
-          proxy which note is in front of you. */}
+      {/* Pane 4 — the assistant (UX-DR130, 109.28): the default agent's chat
+          on the note's drive, docked right of the panels so the note stays in
+          the middle. Its seam is on its left, and it starts folded: opening it
+          is what ticks the note's drive for the agent, and what you send from
+          it tells the agent which note is in front of you. */}
       <NotesAgentDock />
       {naming !== null && (
         <SpaceNamePopover

@@ -7,7 +7,6 @@ use ts_rs::TS;
 use crate::bots::chat::Effort;
 use crate::chat::commands::{self, ArgMode, CommandSpec, Context, Place, Resolution, RoomKind};
 use crate::hq::approvals::{self, Decisions, ShownApprovalVm};
-use crate::hq::port::RowOp;
 use crate::hq::sessions::{self, AgentSessionRef, Source};
 use crate::hq::settings::{self, AgentSettingsChange, AgentSettingsPick};
 use crate::hq::{drives, live, timeline, Hq, HqError};
@@ -304,20 +303,14 @@ pub fn run(
             let ops = turns
                 .iter()
                 .map(|turn| {
-                    let mut row = sessions::person_message(
+                    sessions::person_message(
                         source,
                         sid,
                         &ulid::Ulid::new().to_string(),
                         "Stopped this turn.",
+                        Some(json!({"kind": "stop", "turn": turn})),
                         at,
-                    );
-                    if let RowOp::Upsert { values, .. } = &mut row {
-                        values.insert(
-                            "metadata".to_owned(),
-                            json!({"kind": "stop", "turn": turn}).to_string().into(),
-                        );
-                    }
-                    row
+                    )
                 })
                 .collect();
             source.replica.mutate(ops).map_err(|e| e.to_string())?;

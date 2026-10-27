@@ -693,6 +693,7 @@ fn a_message_is_waiting_until_the_server_has_it_and_an_ask_closes_on_an_answer()
         "dev1.1",
         "go",
         &[],
+        None,
     )
     .expect("sent");
     let (view, newest) = timeline::view(
@@ -785,6 +786,7 @@ fn an_archived_session_takes_no_message_and_is_read_through_the_server() {
             "dev1.1",
             "hi",
             &[],
+            None,
         )
         .map_err(|e| e.to_string()),
         Err("This conversation is archived; unarchive it to write in it.".to_owned())

@@ -1038,6 +1038,7 @@ pub fn run() {
                 hq_ipc::agent_session_unarchive,
                 hq_ipc::agents_choices,
                 hq_ipc::agent_session_default,
+                hq_ipc::agent_session_for_note,
                 hq_ipc::agent_approvals_subscribe,
                 hq_ipc::agent_approvals_unsubscribe,
                 hq_ipc::agent_session_approval_decide,

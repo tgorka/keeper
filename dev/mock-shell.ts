@@ -60,6 +60,7 @@ import type {
   AgentAttachmentVm,
   AgentChildSessionVm,
   AgentChoiceVm,
+  AgentDefaultSessionVm,
   AgentDriveWriteVm,
   AgentEffortOptionVm,
   AgentGrantOfferVm,
@@ -6200,6 +6201,12 @@ function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm |
       warning: DRIVES_WARNING,
       pending: false,
     };
+  if (database === "tgdrive")
+    return {
+      drives: [{ name: "tgdrive", ticked: false }],
+      warning: DRIVES_WARNING,
+      pending: false,
+    };
   return {
     drives:
       database === "alpha"
@@ -6299,7 +6306,9 @@ const sessionChoices: AgentChoiceVm[] = [
     agentActor: "assistant",
     agentName: "Assistant",
     agentMark: "A",
-    databases: ["alpha", "beta"],
+    // `?sessions=notes` (109.28): the assistant also answers in tgdrive's own database, the
+    // one named after the notes vault's drive.
+    databases: sessionScenario === "notes" ? ["alpha", "beta", "tgdrive"] : ["alpha", "beta"],
     // The last database chosen for it on this device, so New session opens ready to send.
     database: "alpha",
     ask: true,
@@ -8785,7 +8794,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       ? hqRefuse("The database directory is unavailable.")
       : sessionChoices,
   agent_session_default: () =>
-    sessionScenario === "launch"
+    sessionScenario === "launch" || sessionScenario === "notes"
       ? {
           agentActor: "assistant",
           agentName: "Assistant",
@@ -8793,6 +8802,68 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
           sessionId: "device.1",
         }
       : null,
+  // 109.28: keeper-core's `Hq::session_for_note`, crudely. A note of a vault on p1 (tgdrive's
+  // folder, whose `_drive.toml` says `tgdrive`) is on tgdrive: the default agent's newest
+  // tgdrive chat, started when it has none, and tgdrive ticked in it with the warning when it is
+  // not yet. Any other vault's note is on no drive. Viewing aid only.
+  agent_session_for_note: (payload) => {
+    const main = sessionHandlers.agent_session_default(payload) as AgentDefaultSessionVm | null;
+    if (main === null) return null;
+    const vaults = ANSWERS.notes_vaults as Array<{ id: string; profileId: string }>;
+    const drive =
+      vaults.find((vault) => vault.id === payload.vaultId)?.profileId === "p1" ? "tgdrive" : null;
+    if (drive === null)
+      return {
+        target: main,
+        tickedNow: false,
+        reason: "This note's folder is not a drive, so no drive is ticked.",
+      };
+    if (
+      !sessionChoices.some((c) => c.agentActor === main.agentActor && c.databases.includes(drive))
+    )
+      return {
+        target: main,
+        drive,
+        tickedNow: false,
+        reason: `This device holds no ${drive} database with ${main.agentName} in it, so ${drive} is not ticked.`,
+      };
+    let row = sessionRows.find(
+      (r) => r.agentActor === main.agentActor && r.database === drive && !r.archived,
+    );
+    if (row === undefined) {
+      const started = sessionHandlers.agent_session_new({
+        database: drive,
+        agentActor: main.agentActor,
+        body: "",
+        pick: payload.pick,
+      }) as { database: string; sessionId: string };
+      const fresh = mockSession(started);
+      fresh.messages = [];
+      fresh.title = "New conversation";
+      fresh.displayName = `${main.agentActor} · ${fresh.title}`;
+      fresh.drives = mockDrives(drive, false);
+      row = sessionRows.find((r) => r.database === drive && r.sessionId === started.sessionId);
+      if (row) {
+        row.title = fresh.title;
+        row.displayName = `${main.agentActor} · ${fresh.title}`;
+        row.choosesDrives = true;
+      }
+    }
+    if (row === undefined) return null;
+    const target = { ...main, database: drive, sessionId: row.sessionId };
+    const tick = mockSession(target).drives?.drives.find((d) => d.name === drive);
+    if (tick === undefined)
+      return {
+        target,
+        drive,
+        tickedNow: false,
+        reason: `${main.agentName} does not offer ${drive}.`,
+      };
+    if (tick.ticked) return { target, drive, tickedNow: false };
+    tick.ticked = true;
+    publishSessions();
+    return { target, drive, tickedNow: true, warning: DRIVES_WARNING };
+  },
   agent_session_new: (payload) => {
     if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");
     const choice = sessionChoices.find(

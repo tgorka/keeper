@@ -206,6 +206,34 @@ pub struct AgentDefaultSessionVm {
     pub session_id: Option<String>,
 }
 
+/// What the Notes Assistant opens for the note in front of the person
+/// (109.28, R-HQ-86): the default agent's chat in the database named after
+/// the note's drive (AD-433), and what became of ticking that drive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentNoteSessionVm {
+    /// The default agent and the session the dock opens: in the drive's
+    /// database, or — where the agent has none here, or the note is on no
+    /// drive — its main conversation, as [`default_session`] answers.
+    pub target: AgentDefaultSessionVm,
+    /// The note's drive; absent when its folder declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub drive: Option<String>,
+    /// This call ticked `drive` for the session's agent to read.
+    pub ticked_now: bool,
+    /// What ticking a drive allows (`drives::WARNING`, R-HQ-79): present
+    /// exactly when `ticked_now`, so it is said where the drive was ticked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub warning: Option<String>,
+    /// Why the drive is not ticked, or the chat is not in its database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Reading rows
 // ---------------------------------------------------------------------------
@@ -1025,6 +1053,45 @@ pub fn default_session(
     })
 }
 
+/// Where the Notes Assistant opens for a note on `drive` (109.28, R-HQ-86):
+/// the default agent's newest unarchived session in the database named after
+/// the drive (AD-433) — `session_id` `None` while it has none there, so one
+/// is started — and no sentence. Where this device holds no such database
+/// with the agent in its directory, the agent's main conversation
+/// ([`default_session`]) and the sentence saying why the drive is not
+/// ticked. `None` with no default agent.
+pub fn note_session(
+    sources: &[Source],
+    chosen: Option<&str>,
+    last: &HashMap<String, String>,
+    drive: &str,
+    now_ms: i64,
+) -> Option<(AgentDefaultSessionVm, Option<String>)> {
+    let main = default_session(sources, chosen, last, now_ms)?;
+    let shares = choices(sources, last).into_iter().any(|choice| {
+        choice.agent_actor == main.agent_actor && choice.databases.iter().any(|db| db == drive)
+    });
+    if !shares {
+        let reason = format!(
+            "This device holds no {drive} database with {} in it, so {drive} is not ticked.",
+            main.agent_name
+        );
+        return Some((main, Some(reason)));
+    }
+    let newest = list(sources, now_ms)
+        .into_iter()
+        .find(|row| row.agent_actor == main.agent_actor && row.database == drive && !row.archived);
+    Some((
+        AgentDefaultSessionVm {
+            agent_actor: main.agent_actor,
+            agent_name: main.agent_name,
+            database: Some(drive.to_owned()),
+            session_id: newest.map(|row| row.session_id),
+        },
+        None,
+    ))
+}
+
 /// The title a session takes from its first message: its first line, cut
 /// at a word near 80 characters.
 pub fn title_from(body: &str) -> String {
@@ -1074,12 +1141,14 @@ pub(crate) fn authored(source: &Source, mut values: Map<String, Value>) -> Map<S
     values
 }
 
-/// A person message row `id`, written now.
+/// A person message row `id`, written now; `metadata` is its JSON object
+/// (a control row's `kind`, or a sent message's `focus`), `None` for none.
 pub(crate) fn person_message(
     source: &Source,
     session_id: &str,
     id: &str,
     body: &str,
+    metadata: Option<Value>,
     at: i64,
 ) -> RowOp {
     RowOp::Upsert {
@@ -1094,7 +1163,7 @@ pub(crate) fn person_message(
                 "role": "person",
                 "body": body,
                 "body_blob": null,
-                "metadata": null,
+                "metadata": metadata.map(|metadata| metadata.to_string()),
                 "created_at_ms": at,
             })),
         ),
@@ -1214,7 +1283,7 @@ fn create_in(
         .map(|pick| crate::hq::settings::initial(source, agent, &id, pick, at))
         .transpose()?
         .flatten();
-    let message = (!body.is_empty()).then(|| person_message(source, &id, first, body, at));
+    let message = (!body.is_empty()).then(|| person_message(source, &id, first, body, None, at));
     let commit = match settings {
         // Nothing of a pick to write: one commit, as a creation always was.
         // A mention's child is always this one commit (109.24, V3).

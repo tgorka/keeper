@@ -23,6 +23,7 @@ import { logFailure } from "@/lib/failure";
 import { formatMessageTime } from "@/lib/format-time";
 import {
   type AgentMessageVm,
+  type AgentNoteCaret,
   type AgentSessionRef,
   type AgentSessionViewVm,
   agentAttachBytes,
@@ -55,15 +56,19 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  * `onSession` hears the session a command (`/clean`, `/new`) started, for a host such as the
  * Notes Assistant dock that holds its own choice: given one, the command moves that host and
  * leaves the Agents window's selection where it was (R601-04); without one, it moves the window.
+ * `focus` is the note in front of the person (the Notes Assistant), read at each send and carried
+ * by the message (109.28).
  */
 export function SessionView({
   target,
   onBack,
   onSession,
+  focus,
 }: {
   target: AgentSessionRef;
   onBack?: () => void;
   onSession?: (session: AgentSessionRef) => void;
+  focus?: () => AgentNoteCaret | null;
 }) {
   const attachmentDraft = useSessionAttachmentDraft(target);
   const [vm, setVm] = useState<AgentSessionViewVm | null>(null);
@@ -116,6 +121,9 @@ export function SessionView({
     setContextOpen(true);
     agentSessionsStore.getState().contextShown();
   }, [viewed, contextFor, database, sessionId]);
+  // The note in front of the person, read at each send (109.28); only a host that has one
+  // passes it on, so a send from anywhere else is the call it always was.
+  const noted = (): [] | [AgentNoteCaret | null] => (focus ? [focus()] : []);
   const pinned = useRef(true);
   const resolveMention = useCallback(
     (before: string, after: string) => agentMentionPreview({ database, sessionId }, before, after),
@@ -337,7 +345,9 @@ export function SessionView({
       throw raw;
     }
     try {
-      await fromUnderBanner(() => agentAttachCommit(target, handles, caption, declines));
+      await fromUnderBanner(() =>
+        agentAttachCommit(target, handles, caption, declines, ...noted()),
+      );
     } catch (raw) {
       attachmentDraft.consume(
         pending.map((attachment) => attachment.id),
@@ -438,7 +448,9 @@ export function SessionView({
                       setBusy(true);
                       setError(null);
                       try {
-                        await fromUnderBanner(() => agentSend(target, option, declines));
+                        await fromUnderBanner(() =>
+                          agentSend(target, option, declines, ...noted()),
+                        );
                       } catch (raw) {
                         setError(syncErrorMessage(raw, "keeper could not send your answer."));
                       } finally {
@@ -742,7 +754,7 @@ export function SessionView({
                 }}
                 resolveMention={resolveMention}
                 onSend={async (body) => {
-                  await fromUnderBanner(() => agentSendLine(target, body, declines));
+                  await fromUnderBanner(() => agentSendLine(target, body, declines, ...noted()));
                 }}
                 attachmentPreview={attachmentDraft.preview}
                 sendAccessory={vm && <SessionContextTrigger context={vm.context} />}

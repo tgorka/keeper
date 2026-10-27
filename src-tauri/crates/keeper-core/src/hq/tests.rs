@@ -1331,7 +1331,7 @@ async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and
         .new_session("alpha", "nixie", "plan the week", None)
         .expect("a new session with no server");
     assert_eq!(key.database, "alpha");
-    hq.send(&key, "and then the weekend", &[])
+    hq.send(&key, "and then the weekend", &[], None)
         .expect("a message");
     let status = status_until(&hq, "both writes wait", |s| s.waiting_here == before + 2).await;
     assert_eq!(status.databases[0].waiting, before + 2);
@@ -1724,4 +1724,236 @@ async fn a_spoken_question_while_the_replicas_open_is_arriving_then_goes() {
         1,
         "the question once, after the open: {written:?}"
     );
+}
+
+/// Nixie's instance in `database`, offering `drives` to read.
+fn offers(opener: &LocalOpener, database: &str, drives: &[&str]) {
+    opener
+        .replica(database)
+        .mutate(vec![RowOp::Upsert {
+            table: "agent_profiles".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": format!("nixie.{database}"), "actor_id": "nixie", "name": "nixie",
+                "description": "", "avatar_blob": null, "definition_hash": "h",
+                "image_digest": "d", "started_at_ms": 1, "dir": database,
+                "drives": Value::from(drives.to_vec()).to_string(),
+                "author_actor": "nixie", "author_client": format!("nixie.{database}")})),
+            base_version: None,
+        }])
+        .expect("profile");
+}
+
+/// The ticked drives of every session of `database`, by session id.
+fn ticks(opener: &LocalOpener, database: &str) -> Vec<(String, String)> {
+    rows(
+        &opener.replica(database),
+        "SELECT session_id, drives FROM session_drives ORDER BY session_id",
+    )
+    .iter()
+    .map(|row| {
+        (
+            sessions::text(row, "session_id").to_owned(),
+            sessions::text(row, "drives").to_owned(),
+        )
+    })
+    .collect()
+}
+
+/// 109.28 (R-HQ-86) AC 1: opened on a tgdrive note, the dock gets the
+/// default agent's chat in the tgdrive database — started there, since it
+/// has none — with tgdrive ticked as the person and the warning to say then.
+/// Opened again, it is the same chat, already ticked: nothing is ticked or
+/// said a second time. A neuradrive note gets neuradrive's own chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["neuradrive", "tgdrive"]).await;
+    for database in ["neuradrive", "tgdrive"] {
+        offers(&opener, database, &["neuradrive", "tgdrive"]);
+    }
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    // The agent's newest chat is elsewhere: the note's drive decides.
+    let elsewhere = hq
+        .new_session("neuradrive", "nixie", "groceries", None)
+        .expect("a neuradrive chat");
+
+    let first = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let session = first.target.session_id.clone().expect("a chat");
+    assert_eq!(
+        (
+            first.target.database.as_deref(),
+            first.drive.as_deref(),
+            first.ticked_now,
+            first.warning.as_deref(),
+            first.reason.as_deref(),
+        ),
+        (
+            Some("tgdrive"),
+            Some("tgdrive"),
+            true,
+            Some(drives::WARNING),
+            None
+        )
+    );
+    let started = rows(
+        &opener.replica("tgdrive"),
+        "SELECT id, agent_actor FROM sessions",
+    );
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["id"], Value::from(session.clone()));
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(session.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+
+    let again = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(again.target.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(
+        (again.ticked_now, again.warning, again.reason),
+        (false, None, None)
+    );
+    assert_eq!(
+        rows(&opener.replica("tgdrive"), "SELECT id FROM sessions").len(),
+        1,
+        "the same chat, not a second one"
+    );
+
+    let other = hq
+        .session_for_note(Some("neuradrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(
+        (
+            other.target.database.as_deref(),
+            other.target.session_id.as_deref()
+        ),
+        (Some("neuradrive"), Some(elsewhere.session_id.as_str()))
+    );
+    assert!(other.ticked_now);
+    assert_eq!(
+        ticks(&opener, "neuradrive"),
+        [(elsewhere.session_id.clone(), r#"["neuradrive"]"#.to_owned())]
+    );
+}
+
+/// 109.28 AC 1: a note whose drive the agent does not offer opens the
+/// drive's chat with nothing ticked, and says why; a drive with no database
+/// here, or a note on no drive, opens the agent's main conversation and says
+/// why nothing was ticked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_notes_assistant_says_why_it_did_not_tick_the_notes_drive() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["neuradrive"]);
+    // Ana reads tgdrive, so keeper knows the drive and judges it.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![RowOp::Upsert {
+            table: "actors".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": "ana", "kind": "person", "display_name": "Ana", "family": null,
+                "dir": "tgdrive", "created_at_ms": 1, "author_actor": "server",
+                "author_client": "server"})),
+            base_version: None,
+        }])
+        .expect("directory");
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+
+    let unoffered = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(unoffered.target.database.as_deref(), Some("tgdrive"));
+    assert!(unoffered.target.session_id.is_some());
+    assert_eq!(
+        (
+            unoffered.ticked_now,
+            unoffered.warning,
+            unoffered.reason.as_deref()
+        ),
+        (false, None, Some("Nixie does not offer tgdrive."))
+    );
+    assert!(ticks(&opener, "tgdrive").is_empty());
+
+    let main = hq.default_session().expect("reads").expect("Nixie");
+    let absent = hq
+        .session_for_note(Some("neuradrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(absent.target, main);
+    assert_eq!(
+        (absent.drive.as_deref(), absent.ticked_now, absent.reason.as_deref()),
+        (
+            Some("neuradrive"),
+            false,
+            Some("This device holds no neuradrive database with Nixie in it, so neuradrive is not ticked.")
+        )
+    );
+    let none = hq
+        .session_for_note(None, None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(
+        (none.target, none.drive, none.reason.as_deref()),
+        (main, None, Some(drives::NO_DRIVE))
+    );
+    assert_eq!(
+        rows(&opener.replica("tgdrive"), "SELECT id FROM sessions").len(),
+        1,
+        "no drive, no new chat"
+    );
+}
+
+/// 109.28 AC 2 (contract §9.1, binding): a message sent with the note in
+/// front carries `metadata.focus` — drive, path, the heading trail of the
+/// caret's line and the line — as the replica stores it for the runtime; a
+/// message sent without one carries no metadata at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_sent_from_the_notes_assistant_carries_the_note_as_focus() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    let key = hq
+        .new_session("tgdrive", "nixie", "hello", None)
+        .expect("a chat");
+    let focus = send::AgentFocus::new(
+        "tgdrive",
+        "10-notes/inbox.md",
+        "# Plans\n\nintro\n## Q3\nship it",
+        5,
+    )
+    .expect("in bounds");
+    hq.send(&key, "what am I looking at?", &[], Some(&focus))
+        .expect("sent");
+    hq.send_line(&key, "and this?", &[], Some(&focus))
+        .expect("sent");
+    hq.send(&key, "from the Agents window", &[], None)
+        .expect("sent");
+
+    let stored = rows(
+        &opener.replica("tgdrive"),
+        "SELECT body, metadata FROM messages ORDER BY created_at_ms, id",
+    );
+    let focus_of = |body: &str| {
+        let row = stored
+            .iter()
+            .find(|row| row["body"] == body)
+            .expect("the message");
+        match &row["metadata"] {
+            Value::String(text) => serde_json::from_str::<Value>(text).expect("JSON"),
+            other => other.clone(),
+        }
+    };
+    let expected = serde_json::json!({"focus": {
+        "drive": "tgdrive", "path": "10-notes/inbox.md", "heading": "Plans › Q3", "line": 5}});
+    assert_eq!(focus_of("what am I looking at?"), expected);
+    assert_eq!(focus_of("and this?"), expected);
+    assert_eq!(focus_of("from the Agents window"), Value::Null);
 }
