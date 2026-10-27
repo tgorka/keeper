@@ -176,6 +176,34 @@ fn request(
         .expect("request");
 }
 
+/// This device (`dev1`) on `mine`, and Nixi's instance `nixi.box` holding
+/// `session`'s claim on `holder`, as the directory records their hosts
+/// (`None`: no host recorded).
+fn hosts(w: &World, session: &str, mine: Option<&str>, holder: Option<&str>) {
+    let me = w.alpha.actor.as_str();
+    let client = |id: &str, actor: &str, kind: &str, host: Option<&str>| {
+        upsert(
+            "clients",
+            json!({"id": id, "actor_id": actor, "kind": kind, "name": id, "host": host,
+                   "created_at_ms": 1, "revoked_at_ms": null, "dir": "alpha",
+                   "author_actor": "server", "author_client": "server"}),
+        )
+    };
+    w.alpha
+        .replica
+        .mutate(vec![
+            client("dev1", me, "device", mine),
+            client("nixi.box", NIXI, "instance", holder),
+            upsert(
+                "claims",
+                json!({"session_id": session, "holder_actor": NIXI,
+                       "holder_client": "nixi.box", "epoch": 1, "renewed_at_ms": now(),
+                       "released": false, "author_actor": NIXI, "author_client": "nixi.box"}),
+            ),
+        ])
+        .expect("hosts");
+}
+
 fn git_status() -> Value {
     json!({"argv": ["git", "status", "--porcelain"]})
 }
@@ -434,6 +462,8 @@ fn outbox(w: &World) -> i64 {
 fn sending_a_message_declines_what_waits_for_the_sender() {
     let w = world("zoë");
     session(&w, "dev1.1", None, false);
+    // This device is on another host than the agent's: its T4 decisions go.
+    hosts(&w, "dev1.1", Some("laptop"), Some("electra"));
     request(&w, "mine", "dev1.1", "run", "T2", git_status(), &["zoë"]);
     request(
         &w,
@@ -496,6 +526,85 @@ fn sending_a_message_declines_what_waits_for_the_sender() {
     assert!(after.messages.iter().any(|m| m.body == "yes, do it"));
     // Each denial is its own commit, and the message its own after them.
     assert_eq!(outbox_ops(&w), vec!["approvals", "approvals", "messages"]);
+}
+
+/// DW-E109-27: V8 refuses a T4 decision — a denial too — from the host the
+/// agent runs on, or when a host is unknown. A message there leaves such a
+/// request waiting, out of the banner, and the banner says how many need
+/// another device.
+#[test]
+fn a_t4_request_this_device_cannot_decide_is_not_declined_and_waits_for_another_device() {
+    for (mine, holder) in [
+        (Some("electra"), Some("electra")),
+        (None, Some("electra")),
+        (Some("laptop"), None),
+    ] {
+        let w = world("zoë");
+        session(&w, "dev1.1", None, false);
+        hosts(&w, "dev1.1", mine, holder);
+        request(&w, "mine", "dev1.1", "run", "T2", git_status(), &["zoë"]);
+        request(&w, "t4", "dev1.1", "delegate", "T4", json!({}), &["zoë"]);
+        let view = || {
+            crate::hq::timeline::view(
+                &w.alpha,
+                "dev1.1",
+                &crate::hq::timeline::Opened::default(),
+                &w.decisions.refusals(std::slice::from_ref(&w.alpha)),
+                now(),
+            )
+            .expect("view")
+            .0
+        };
+        let before = view();
+        let banner = before.banner.expect("a banner");
+        assert_eq!(
+            banner
+                .approvals
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mine"],
+            "{mine:?}/{holder:?}"
+        );
+        assert_eq!(
+            banner.sentence,
+            "Sending a message declines this request, even a message that says yes. Use Allow \
+             to let it run. 1 request needs a decision from another device; a message here \
+             leaves it waiting."
+        );
+        assert_eq!(
+            before
+                .approvals
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t4"],
+            "in the reading column"
+        );
+
+        // Even shown, a message declines only what this device may decide.
+        let mut shown = shown(&w, "dev1.1");
+        shown.push(crate::hq::approvals::ShownApprovalVm {
+            id: "t4".to_owned(),
+            binding_digest: "digest-t4".to_owned(),
+        });
+        crate::hq::send::send(&w.alpha, &w.decisions, "dev1.1", "go on", &shown).expect("sent");
+        assert_eq!(
+            card(&w, "dev1.1", "mine").state,
+            AgentApprovalStateVm::Denied
+        );
+        assert_eq!(
+            card(&w, "dev1.1", "t4").state,
+            AgentApprovalStateVm::Pending
+        );
+        assert_eq!(outbox_ops(&w), vec!["approvals", "messages"]);
+        let after = view().banner.expect("still said");
+        assert!(after.approvals.is_empty());
+        assert_eq!(
+            after.sentence,
+            "1 request needs a decision from another device; a message here leaves it waiting."
+        );
+    }
 }
 
 /// What the session's banner shows now, as the webview sends it back with a

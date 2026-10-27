@@ -195,32 +195,55 @@ pub struct AgentTurnFoldVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AgentApprovalBannerVm {
-    /// Oldest first.
+    /// Oldest first; empty when every request waiting for this person needs
+    /// another of their devices (DW-E109-27).
     pub approvals: Vec<AgentApprovalVm>,
-    /// What sending a message does to them, in plain words.
+    /// What sending a message does to them, in plain words, and how many
+    /// requests wait for another device instead.
     pub sentence: String,
 }
 
 /// The banner over `approvals`' requests a message would decline, and the
-/// rest, for the reading column.
+/// rest, for the reading column. A T4 request this device cannot decide
+/// waits for another of the person's devices: a message does not decline
+/// it, so it stays in the reading column and the banner says, in one more
+/// sentence, how many wait that way (DW-E109-27).
 pub fn banner(
     approvals: Vec<AgentApprovalVm>,
 ) -> (Option<AgentApprovalBannerVm>, Vec<AgentApprovalVm>) {
+    let elsewhere = approvals
+        .iter()
+        .filter(|approval| approval.needs_another_device)
+        .count();
     let (waiting, rest): (Vec<_>, Vec<_>) = approvals
         .into_iter()
         .partition(|approval| approval.declined_by_send);
-    let banner = (!waiting.is_empty()).then(|| AgentApprovalBannerVm {
-        sentence: if waiting.len() == 1 {
+    let declines = match waiting.len() {
+        0 => None,
+        1 => Some(
             "Sending a message declines this request, even a message that says yes. Use Allow \
              to let it run."
-                .to_owned()
-        } else {
-            format!(
-                "Sending a message declines these {} requests, even a message that says yes. \
-                 Use Allow to let one run.",
-                waiting.len()
-            )
-        },
+                .to_owned(),
+        ),
+        n => Some(format!(
+            "Sending a message declines these {n} requests, even a message that says yes. \
+             Use Allow to let one run."
+        )),
+    };
+    let another = match elsewhere {
+        0 => None,
+        1 => Some(
+            "1 request needs a decision from another device; a message here leaves it waiting."
+                .to_owned(),
+        ),
+        n => Some(format!(
+            "{n} requests need a decision from another device; a message here leaves them \
+             waiting."
+        )),
+    };
+    let sentence: Vec<String> = declines.into_iter().chain(another).collect();
+    let banner = (!sentence.is_empty()).then(|| AgentApprovalBannerVm {
+        sentence: sentence.join(" "),
         approvals: waiting,
     });
     (banner, rest)

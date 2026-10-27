@@ -378,7 +378,11 @@ The requests waiting for this person sit in a banner above the composer (`AgentS
 written before the message (`approvals::decline_pending`) — and the banner says so, including
 that a message saying yes still declines. The webview sends back the `(id, digest)` pairs its
 banner showed, and Rust declines only those still waiting at that digest: a request that arrived
-after the banner was drawn stays pending. A text message, a message with files, an ask option and
+after the banner was drawn stays pending. A T4 request this device cannot decide — it is on the
+host the agent runs on, or either host is unknown, which V8 refuses for a denial too
+(`hq.v8.t4_other_host`) — is not declined: it stays in the reading column, and the banner adds
+"1 request needs a decision from another device; a message here leaves it waiting"
+(DW-E109-27). A text message, a message with files, an ask option and
 `/stop` decline; no other slash command does, nor a spoken question (it is sent with no banner
 shown). A denial that cannot be written on the device stops the message, and the banner says
 which request still waits; the composer keeps the draft and shows the same sentence hidden from

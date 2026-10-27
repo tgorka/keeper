@@ -117,6 +117,13 @@ pub struct AgentApprovalVm {
     /// It waits for this person, so a message they send in its session
     /// declines it (Q109-12 a): what the banner above the composer holds.
     pub declined_by_send: bool,
+    /// It waits for this person, but at T4 this device cannot decide it —
+    /// it is on the host the agent runs on, or a host the server cannot
+    /// tell (V8 `hq.v8.t4_other_host`) — so a message leaves it waiting for
+    /// another of their devices (DW-E109-27). The banner counts these.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub needs_another_device: bool,
 }
 
 /// How a decision went.
@@ -172,6 +179,40 @@ fn action(row: &Map<String, Value>) -> Option<String> {
 /// The server's refusals of decisions written here, by database and
 /// approval id.
 pub type Refusals = HashMap<(String, String), String>;
+
+/// A client's host as the directory records it; `None` when it has none.
+fn host_of(source: &Source, client: &str) -> Option<String> {
+    read(
+        source,
+        "SELECT host FROM clients WHERE id = ?1",
+        &[Value::from(client)],
+    )
+    .first()
+    .and_then(|row| opt_text(row, "host"))
+    .filter(|host| !host.is_empty())
+}
+
+/// V8's tier-4 rule as this device can read it (`hq.v8.t4_other_host`): a
+/// T4 decision is taken only from a device on another host than the claim
+/// holder's, and refused when either host is unknown. `false` for any other
+/// tier.
+fn decided_elsewhere(source: &Source, session_id: &str, tier: &str) -> bool {
+    if tier != "T4" {
+        return false;
+    }
+    let holder = read(
+        source,
+        "SELECT holder_client FROM claims WHERE session_id = ?1",
+        &[Value::from(session_id)],
+    )
+    .first()
+    .and_then(|row| opt_text(row, "holder_client"))
+    .and_then(|client| host_of(source, &client));
+    match (host_of(source, &source.client), holder) {
+        (Some(mine), Some(holder)) => mine == holder,
+        _ => true,
+    }
+}
 
 fn vm(
     source: &Source,
@@ -262,9 +303,14 @@ fn vm(
         }
         actions.push(AgentApprovalActionVm::Deny);
     }
-    let declined_by_send = state == AgentApprovalStateVm::Pending
+    let waits_for_me = state == AgentApprovalStateVm::Pending
         && mine
         && session.is_some_and(|session| !session.archived);
+    // A denial from here would be refused like an approval (V8 checks the
+    // host of any T4 decision), so a message must not claim to decline it.
+    let needs_another_device =
+        waits_for_me && decided_elsewhere(source, text(row, "session_id"), &tier);
+    let declined_by_send = waits_for_me && !needs_another_device;
     Some(AgentApprovalVm {
         id,
         database: source.database.clone(),
@@ -284,6 +330,7 @@ fn vm(
         actions,
         grant,
         declined_by_send,
+        needs_another_device,
     })
 }
 

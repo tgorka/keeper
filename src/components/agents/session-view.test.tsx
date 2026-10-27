@@ -641,6 +641,37 @@ describe("the approval banner", () => {
     );
   });
 
+  it("says what waits for another device, and a message then declines nothing (DW-E109-27)", async () => {
+    const elsewhere =
+      "1 request needs a decision from another device; a message here leaves it waiting.";
+    const t4 = {
+      ...waiting("t4", "d4"),
+      toolName: "delegate",
+      tier: "T4",
+      summary: "Run t4",
+      declinedBySend: false,
+    };
+    await draw();
+    act(() =>
+      mock.view?.({ ...vm, approvals: [t4], banner: { approvals: [], sentence: elsewhere } }),
+    );
+    const region = screen.getByRole("complementary", { name: "Waiting for your decision" });
+    expect(within(region).getByRole("note")).toHaveTextContent(elsewhere);
+    expect(within(region).queryByRole("article")).toBeNull();
+    expect(screen.getByRole("article", { name: "Approval: Run t4" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "go on" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(mock.send).toHaveBeenCalledWith(
+        { database: "beta", sessionId: "same.1" },
+        "go on",
+        [],
+      ),
+    );
+  });
+
   it("moves focus to a decided card's place in the reading column, else to the next request", async () => {
     mock.decide.mockResolvedValue({ state: "sent", sentence: "Approved." });
     await draw();
