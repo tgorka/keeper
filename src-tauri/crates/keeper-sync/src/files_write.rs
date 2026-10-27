@@ -233,6 +233,32 @@ pub enum WriteRefusal {
         /// The path that was asked for, profile-relative.
         subpath: String,
     },
+    /// The path is git's or keeper's own (109.27): under a `.git`, `.keeper`,
+    /// `.keeper-sync` or `.obsidian` folder, or a `.gitattributes`,
+    /// `.gitignore`, `.gitmodules`, `.lfsconfig` or `.keepervirtual` file —
+    /// files that change what the drive carries or how. [`agent_write_check`]
+    /// refuses it at any depth, case-folded.
+    Machinery { subpath: String },
+    /// The path is one `.gitignore` or the profile's exclusions leave out, so
+    /// a write there would never be part of the drive ([`agent_write_check`]).
+    Ignored { subpath: String },
+    /// The path is stored through LFS — routed there by `.gitattributes`, or
+    /// a pointer in the index or on the disk — and an agent writes text into
+    /// git only ([`agent_write_check`]).
+    LfsRouted { subpath: String },
+    /// A file is there that the drive's index does not track
+    /// ([`agent_write_check`], R-HQ-81).
+    Untracked { subpath: String },
+    /// The path is, or passes through, a symbolic link ([`agent_write_check`]):
+    /// an agent's write lands only at the path it names.
+    Link { subpath: String },
+    /// Something is already at a path an agent's write would make
+    /// ([`agent_write_check`]).
+    Exists { subpath: String },
+    /// Whether an agent may write the path could not be told — the index,
+    /// the ignore rules or the attributes could not be read — so it may not
+    /// ([`agent_write_check`] fails closed).
+    Undecidable { subpath: String, reason: String },
 }
 
 impl std::fmt::Display for WriteRefusal {
@@ -342,6 +368,33 @@ impl std::fmt::Display for WriteRefusal {
                 f,
                 "keeper cannot reach {profile_name}'s notes vault right now, so it will not \
                  change a file inside it. Try again once the folder has finished opening."
+            ),
+            Self::Machinery { subpath } => write!(
+                f,
+                "\"{subpath}\" is git's or keeper's own file, which an agent never writes."
+            ),
+            Self::Ignored { subpath } => write!(
+                f,
+                "\"{subpath}\" is ignored by this drive, so it would never be part of it."
+            ),
+            Self::LfsRouted { subpath } => write!(
+                f,
+                "\"{subpath}\" is kept in the drive's large-file store (LFS), which an agent \
+                 never writes."
+            ),
+            Self::Untracked { subpath } => {
+                write!(f, "\"{subpath}\" is not a file this drive carries.")
+            }
+            Self::Link { subpath } => write!(
+                f,
+                "\"{subpath}\" is or passes through a link; an agent writes only the file at its \
+                 own path."
+            ),
+            Self::Exists { subpath } => write!(f, "\"{subpath}\" already exists."),
+            Self::Undecidable { subpath, reason } => write!(
+                f,
+                "keeper could not tell whether \"{subpath}\" may be written ({reason}), so an \
+                 agent may not write it."
             ),
         }
     }
@@ -945,6 +998,209 @@ impl<'a> WriteScope<'a> {
             absent = Self::UNMANAGED_ABSENT,
         )
     }
+}
+
+// ─── 109.27: where an agent's write may land ─────────────────────────────────
+
+/// What an agent's write does at a path ([`agent_write_check`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTarget {
+    /// Changes the file there — `replace`, `edit`, `append`, `delete`, and a
+    /// `move`'s source: a regular file the drive's index tracks.
+    Existing,
+    /// Makes a file where nothing is — `create`, and a `move`'s destination:
+    /// a path that, committed, the drive would track.
+    New,
+}
+
+/// Folder names an agent's write never passes through, compared case-folded:
+/// git's, keeper's, the sync engine's and Obsidian's own state.
+const AGENT_NEVER_FOLDERS: [&str; 4] = [".git", ".keeper", ".keeper-sync", ".obsidian"];
+
+/// Whether `subpath` is git's or keeper's own: a segment in
+/// [`AGENT_NEVER_FOLDERS`], or a file git or keeper reads unfiltered
+/// (`lfs::stage::CONTROL_FILES`), at any depth, ASCII case-folded — on the
+/// case-insensitive volume keeper ships on `.GitIgnore` is `.gitignore`.
+fn is_machinery(subpath: &str) -> bool {
+    let segments: Vec<&str> = subpath.split('/').collect();
+    let folded = |name: &str, list: &[&str]| list.iter().any(|own| name.eq_ignore_ascii_case(own));
+    segments
+        .iter()
+        .any(|segment| folded(segment, &AGENT_NEVER_FOLDERS))
+        || segments
+            .last()
+            .is_some_and(|name| folded(name, &crate::lfs::stage::CONTROL_FILES))
+}
+
+/// Where an agent's write may land, read-only (109.27, R-HQ-87): the
+/// repository-relative key of `subpath` under the checkout at `root`, or the
+/// refusal whose sentence the agent and the deciding person are shown.
+///
+/// **One rule for both sides** (AD-65, AD-159): keeper-hq's runtime asks it
+/// over its read-only mount when the call is made, with
+/// `WriteScope::new(drive, None)` and no extra exclusions; the deciding
+/// person's keeper asks it again over its own checkout right before it
+/// commits, with the agent host's scope (sessions closed, agents fenced) and
+/// the profile's exclusions. Nothing here writes, and nothing here composes
+/// a path the caller did not send: the subpath goes through
+/// [`browse::plain_segments`] verbatim, and the key returned is that subpath.
+///
+/// In the order that produces the most useful sentence:
+///
+/// 1. a plain descendant ([`browse::plain_segments`]), not the root, each
+///    name at most [`MAX_NAME_BYTES`];
+/// 2. never git's or keeper's own ([`WriteRefusal::Machinery`]);
+/// 3. the scope's fences ([`WriteScope::fenced`]);
+/// 4. on the disk, no link at or on the way to it ([`WriteRefusal::Link`]),
+///    no file where a folder of the path should be, and not a folder;
+/// 5. not left out by the profile's exclusions or by `.gitignore`
+///    ([`WriteRefusal::Ignored`]);
+/// 6. [`AgentTarget::Existing`]: a regular file on the disk that the index
+///    tracks as one ([`WriteRefusal::Missing`], [`WriteRefusal::Untracked`]);
+///    [`AgentTarget::New`]: nothing on the disk or in the index at it, under
+///    it, or at a name differing only in case ([`WriteRefusal::Exists`]);
+/// 7. not stored through LFS: no pointer in the index or on the disk, and no
+///    `filter=lfs` from `.gitattributes` ([`WriteRefusal::LfsRouted`]).
+///
+/// Fails closed: an index, ignore rule or attribute stack that cannot be read
+/// is [`WriteRefusal::Undecidable`], never a yes — unlike the LFS repair
+/// sweep, whose "cannot tell" leaves a file alone.
+pub fn agent_write_check(
+    root: &Path,
+    scope: &WriteScope<'_>,
+    excludes: &crate::exclude::ExcludeSet,
+    subpath: &str,
+    target: AgentTarget,
+) -> Result<String, WriteRefusal> {
+    let segments = browse::plain_segments(subpath)?;
+    let Some(last) = segments.len().checked_sub(1) else {
+        // The drive's root is a folder, never one file.
+        return Err(WriteRefusal::Escapes {
+            subpath: subpath.to_owned(),
+        });
+    };
+    if let Some(name) = subpath.split('/').find(|name| name.len() > MAX_NAME_BYTES) {
+        return Err(WriteRefusal::NameTooLong {
+            name: name.to_owned(),
+            bytes: name.len(),
+        });
+    }
+    let refused = |make: fn(String) -> WriteRefusal| Err(make(subpath.to_owned()));
+    if is_machinery(subpath) {
+        return refused(|subpath| WriteRefusal::Machinery { subpath });
+    }
+    scope.fenced(subpath)?;
+    let undecidable = |reason: String| WriteRefusal::Undecidable {
+        subpath: subpath.to_owned(),
+        reason,
+    };
+
+    // The disk, one name at a time and following no link: what is at the
+    // path, if anything.
+    let mut absolute = root.to_path_buf();
+    let mut found = None;
+    // The last name looked at: when nothing is at the path, how many of its
+    // folders are on the disk.
+    let mut present = 0;
+    for (at, name) in segments.iter().enumerate() {
+        absolute.push(name);
+        present = at;
+        match absolute.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(undecidable(error.to_string())),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return refused(|subpath| WriteRefusal::Link { subpath })
+            }
+            Ok(meta) if at < last && !meta.is_dir() => {
+                return Err(WriteRefusal::NameTaken {
+                    name: name.to_string_lossy().into_owned(),
+                })
+            }
+            Ok(meta) if at == last => found = Some(meta),
+            Ok(_) => {}
+        }
+    }
+    if found.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+        return Err(WriteRefusal::IsDirectory {
+            name: last_segment(subpath).to_owned(),
+        });
+    }
+    if excludes.is_excluded(Path::new(subpath)) {
+        return refused(|subpath| WriteRefusal::Ignored { subpath });
+    }
+
+    let repo = crate::git::repo::open_read_only(root, true)
+        .map_err(|error| undecidable(error.to_string()))?;
+    let index = repo
+        .index_or_empty()
+        .map_err(|error| undecidable(error.to_string()))?;
+    let key = gix::bstr::BStr::new(subpath.as_bytes());
+    let entry = index.entry_by_path(key);
+    match target {
+        AgentTarget::Existing => {
+            let Some(meta) = found.as_ref() else {
+                return refused(|subpath| WriteRefusal::Missing { subpath });
+            };
+            match entry.map(|entry| entry.mode) {
+                Some(gix::index::entry::Mode::SYMLINK) => {
+                    return refused(|subpath| WriteRefusal::Link { subpath })
+                }
+                Some(gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE)
+                    if meta.is_file() => {}
+                _ => return refused(|subpath| WriteRefusal::Untracked { subpath }),
+            }
+        }
+        AgentTarget::New => {
+            let under = format!("{subpath}/");
+            if index
+                .prefixed_entries(gix::bstr::BStr::new(under.as_bytes()))
+                .is_some_and(|entries| !entries.is_empty())
+            {
+                return Err(WriteRefusal::IsDirectory {
+                    name: last_segment(subpath).to_owned(),
+                });
+            }
+            // Its folder is there: a name differing only in case is the same
+            // file on the volume keeper ships on.
+            let taken_in_case = match absolute.parent() {
+                Some(parent) if found.is_none() && present == last => {
+                    collides(parent, last_segment(subpath))?
+                }
+                _ => false,
+            };
+            if found.is_some() || entry.is_some() || taken_in_case {
+                return refused(|subpath| WriteRefusal::Exists { subpath });
+            }
+        }
+    }
+
+    let mode = entry.map_or(gix::index::entry::Mode::FILE, |entry| entry.mode);
+    let mut ignores = repo
+        .excludes(&index, None, Default::default())
+        .map_err(|error| undecidable(error.to_string()))?;
+    let ignored = ignores
+        .at_path(Path::new(subpath), Some(mode))
+        .map_err(|error| undecidable(error.to_string()))?
+        .is_excluded();
+    if ignored {
+        return refused(|subpath| WriteRefusal::Ignored { subpath });
+    }
+
+    let pointer_indexed =
+        entry.is_some_and(|entry| crate::lfs::stage::pointer_blob(&repo, entry.id).is_some());
+    let pointer_on_disk = match found.as_ref() {
+        Some(meta) => crate::lfs::stage::read_worktree_pointer(&absolute, meta)
+            .map_err(|error| undecidable(error.to_string()))?
+            .is_some(),
+        None => false,
+    };
+    if pointer_indexed
+        || pointer_on_disk
+        || crate::lfs::stage::lfs_routed(&repo, &index, subpath, mode).map_err(undecidable)?
+    {
+        return refused(|subpath| WriteRefusal::LfsRouted { subpath });
+    }
+    Ok(subpath.to_owned())
 }
 
 // ─── AD-102: the second writer ───────────────────────────────────────────────
@@ -3037,3 +3293,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "files_write_agent_tests.rs"]
+mod agent_tests;

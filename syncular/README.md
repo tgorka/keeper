@@ -173,11 +173,25 @@ last wrote it. Times are UTC milliseconds since the epoch.
   usage, `ttft_ms`, `duration_ms`, finish reason). An agent's question to the person is an agent
   message whose `metadata` holds `"kind": "ask"` and, when it offers answers, `"options"` (an
   array of strings); the person answers with an ordinary person message, and the ask is open until
-  one is written after it.
+  one is written after it. Two more shapes of `metadata`:
+  - **The `applied` control row** — keeper's word on a `drive_write` approval it carried out: a
+    person message whose id is `applied.` followed by the approval's id, with no `turn_id`, and
+    whose `metadata` is exactly `{"kind": "applied", "approval", "call", "outcome", "device"}`
+    plus `"commit"` (the 40-hex commit) when `outcome` is `applied`, or `"reason"` (at most 1,000
+    characters) when it is `not_applied`; `outcome` is `applied`, `unchanged` or `not_applied`,
+    `call` the approval's `tool_call_id` and `device` the writing client's name (V18). It is a
+    control row: nothing answers it, and a client draws it on its approval's card, not as a
+    message.
+  - **`focus`** — `{"focus": {"drive", "path", "heading", "line"}}` on an ordinary person message
+    sent from the Notes Assistant: what the person was looking at when they sent it — the drive
+    and the drive-relative `path` of the open note (at most 1,024 bytes), the caret's 1-based
+    `line` (1 to 2³²−1) and the `heading` it sits under (at most 200 characters) or `null`. It has
+    no `kind`, so the message starts a turn as any other.
 - **`reasoning`** — `session_id`, `page_key`, `turn_id`, `seq`, `compacted` (true on the one row
   that replaces a turn's chunks after compaction), `text`.
 - **`tool_calls`** — `session_id`, `page_key`, `turn_id`, `name`, `args` (JSON), `status`,
-  `result`, `result_blob`, `started_at_ms`, `ended_at_ms`.
+  `result`, `result_blob`, `started_at_ms`, `ended_at_ms`. A `drive_write` call's `args` are the
+  request a person's device carries out, and its approval binds them (V8, V18).
 - **`approvals`** — `session_id`, `page_key`, `tool_call_id`, `tier`, `binding_digest`, `summary`,
   `approvers` (a JSON array of actor ids), `state` (`pending` | `approved` | `denied` | `consumed`
   | `expired`), `decided_by_actor`, `decided_by_client`, `consumed_by_client`, `expires_at_ms`,
@@ -289,9 +303,13 @@ rule broken refuses the whole commit.
    `approvers`, never by an agent, with `decided_by_actor` and `decided_by_client` the commit's,
    and only by a person or owner member of the session whose `reads_trace` holds in the commit's
    candidate state — a removed or withdrawn reader is refused `hq.v8.not_reader`;
-   `approved` becomes `consumed` only by the claim holder, with `consumed_by_client` the commit's;
-   a decision on a tier-4 approval comes only from a client whose host is not the claim holder's
-   host. A consumption carries the version it read, so a second consumer conflicts.
+   `approved` becomes `consumed` only by the claim holder, with `consumed_by_client` the commit's —
+   except an approval of a `drive_write` call, which is consumed only by the device that decided
+   it (`decided_by_client`), never by the claim holder, because that device carries the write
+   out; a decision on a tier-4 approval comes only from a client whose host is not the claim
+   holder's host. A consumption carries the version it read, so a second consumer conflicts. An
+   approval of a `drive_write` call is `T3`, and its drive is ticked for the session when it is
+   made and when it is consumed.
    A new approval is `pending`, with no decision and no `grant_id`, unless it is born `approved`
    by a standing grant: then its `grant_id` names a `standing_grants` row of this database which,
    in the commit's candidate state, is not revoked and not expired by the server's clock; whose
@@ -347,6 +365,11 @@ rule broken refuses the whole commit.
     `agent_profiles` row of the session's agent offers, and each readable by every person of this
     database: a drive is ticked in a database only when everyone who reads that database may read
     the drive.
+18. **V18 — a write carried out.** A person message whose `metadata.kind` is `applied` reports what
+    became of a `drive_write` approval: its id is `applied.` followed by the approval's id, it is
+    written once and never changed, by the device that decided the approval, and it says
+    `applied` or `unchanged` only once that device consumed the approval (`applied` naming the
+    commit), or `not_applied` with a reason once the approval was decided.
 
 A server that does not enforce one of these rules yet refuses every write the rule governs: a
 table it does not serve under its rule is written by nobody, and an approval naming a grant is

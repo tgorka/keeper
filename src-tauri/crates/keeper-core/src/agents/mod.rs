@@ -12,6 +12,7 @@ pub mod approval;
 pub mod card;
 pub mod console;
 pub mod drive;
+pub mod drive_write;
 pub mod home;
 pub mod index;
 pub mod knowledge;
