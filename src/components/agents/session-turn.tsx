@@ -150,10 +150,12 @@ export function TurnFold({
         >
           {leadIns.map((message) => (
             <div key={message.id} className="min-w-0 text-muted-foreground">
-              <AgentAnswer body={message.body} />
+              {/* A blank close is listed only for its details (Verbose, R598-04). */}
+              {message.body.trim() !== "" && <AgentAnswer body={message.body} />}
               {!!message.attachments?.length && (
                 <SessionAttachments attachments={message.attachments} />
               )}
+              {message.details && <SessionAnswerDetails details={message.details} />}
             </div>
           ))}
           {fold.steps.length > 0 && <TurnSteps steps={fold.steps} />}

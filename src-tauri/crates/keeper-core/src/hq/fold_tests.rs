@@ -1075,3 +1075,73 @@ fn a_refused_turn_says_refused_on_its_fold_line() {
     assert_eq!(state(fold), (json!("refused"), "Refused"));
     assert_eq!(fold.summary, "Refused · ran 1 command");
 }
+
+/// Owner report 2026-10-27 (`.9`, 07:32:59Z): a turn that parks on a `run` first closes with a
+/// 0-byte row, `finish = "tool_calls"`. That row is never its own bubble: the turn is read as its
+/// fold, at its work, waiting for the person; and a blank lead-in is not drawn inside the fold.
+#[test]
+fn a_blank_close_before_a_parked_call_is_never_a_bubble_of_its_own() {
+    let w = world(true);
+    w.put(vec![
+        recorded_message(&w, "ask", None, "List the repo", 0, json!({})),
+        recorded_message(&w, "blank-lead", Some(TURN), "", 1, json!({})),
+        call(&w, "c1", "run", "parked", 2, None),
+        recorded_message(
+            &w,
+            "blank-close",
+            Some(TURN),
+            " \n",
+            3,
+            json!({"finish": "tool_calls", "model": "m", "duration_ms": 900}),
+        ),
+        approval(&w, sessions::now_ms() + 60_000),
+    ]);
+    let view = w.view(&Opened::default());
+    assert_eq!(
+        view.items,
+        [
+            Item::Message {
+                message_id: "ask".into()
+            },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+        ],
+        "the blank close is not an item"
+    );
+    let fold = &view.folds[0];
+    assert!(fold.lead_in_ids.is_empty(), "nothing blank inside the fold");
+    // R598-04: in Verbose the blank close carries that leg's details, so it is listed inside the
+    // fold for them — still never a bubble of its own; the blank lead-in has none and is not.
+    let verbose = w.view(&opened(VERBOSE, &[], &[]));
+    assert_eq!(verbose.items, view.items);
+    assert_eq!(verbose.folds[0].lead_in_ids, ["blank-close"]);
+    let leg = verbose
+        .messages
+        .iter()
+        .find(|m| m.id == "blank-close")
+        .and_then(|m| m.details.as_ref())
+        .expect("the leg's details");
+    assert_eq!(leg.model.as_deref(), Some("m"));
+    assert_eq!(
+        (fold.status, fold.status_label.as_str()),
+        (Status::Waiting, "Waiting for you")
+    );
+    // The turn's real answer, once the call ran, is read under the same fold.
+    w.put(vec![w.answer("Done: 3 files.", json!({"finish": "stop"}))]);
+    let answered = w.view(&Opened::default());
+    assert_eq!(
+        answered.items,
+        [
+            Item::Message {
+                message_id: "ask".into()
+            },
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::Message {
+                message_id: "m-final".into()
+            },
+        ]
+    );
+}

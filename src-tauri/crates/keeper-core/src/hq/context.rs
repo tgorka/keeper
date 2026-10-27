@@ -1,4 +1,7 @@
 //! Last-answer occupancy, independent of cumulative billing usage (Q109-19).
+//!
+//! Always present on an open session (owner ruling 2026-10-27, R-HQ-85): the composer's bar
+//! draws it in every view mode, reading unknown until an answer has measured it.
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
@@ -62,26 +65,43 @@ pub struct AgentContextPartVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AgentContextVm {
-    #[ts(type = "number")]
-    pub used: u64,
+    /// `None` until an answer has measured the context (or the latest one did not).
+    #[ts(type = "number | null")]
+    pub used: Option<u64>,
     #[ts(type = "number | null")]
     pub window: Option<u64>,
-    /// Rust-formatted rounded percentage, absent when the window is unknown.
+    /// The bar's compact reading: `5.3k / 1M`, `5.3k` when the window is unknown, `—` when
+    /// nothing was measured.
+    pub label: String,
+    /// Rust-formatted rounded percentage, absent when the window or the count is unknown.
     pub percent: Option<String>,
-    /// Bounded for the accessible meter; the label preserves over-window values.
+    /// Bounded for the accessible meter; the label preserves over-window values. Absent when
+    /// unknown, so no meter claims a zero nobody measured.
     pub meter_percent: Option<u32>,
-    pub ring_background: Option<String>,
+    /// Always drawn: an empty ring while unknown.
+    pub ring_background: String,
     pub summary: String,
     pub parts: Vec<AgentContextPartVm>,
 }
 
-/// Shown with the rest of an answer's details, to any member (R10921-02). Never falls back to
-/// an older answer (or billing usage) when the latest lacks context.
-pub fn latest(rows: &[Map<String, Value>], show_details: bool) -> Option<AgentContextVm> {
-    if !show_details {
-        return None;
-    }
-    let (row, metadata) = rows
+/// Before any answer: what the ring's tooltip and the Details panel say.
+pub const NOT_MEASURED: &str = "Context unknown: no answer has measured it yet.";
+/// The latest answer carries no (readable) measurement; never an older answer's.
+pub const LATEST_UNMEASURED: &str = "Context unknown: the latest answer did not measure it.";
+
+/// What the next answer uses: the bar's model, and when the session's choice was last written.
+pub struct Next<'a> {
+    pub model: &'a str,
+    pub chosen_at_ms: Option<i64>,
+}
+
+/// The latest answer's occupancy, shown to any member in every view mode (owner ruling
+/// 2026-10-27, superseding R10921-02's Verbose-only rule). Never falls back to an older answer
+/// (or billing usage) when the latest lacks context: that reads unknown. When a model was chosen
+/// after that answer and it is not the one it was measured on, the window it names is not the
+/// next answer's: the bar reads unknown and says which model measured it (R598-02).
+pub fn latest(rows: &[Map<String, Value>], next: Next<'_>) -> AgentContextVm {
+    let Some((row, metadata)) = rows
         .iter()
         .rev()
         .filter(|row| row.get("role").and_then(Value::as_str) == Some("agent"))
@@ -91,13 +111,103 @@ pub fn latest(rows: &[Map<String, Value>], show_details: bool) -> Option<AgentCo
                 .get("kind")
                 .is_none_or(Value::is_null)
                 .then_some((row, metadata))
-        })?;
-    let context = metadata.get("context")?;
-    let result = parse(context);
-    if result.is_none() && first_refusal(row.get("id").and_then(Value::as_str)) {
-        tracing::warn!("hq: refusing malformed answer context metadata");
+        })
+    else {
+        return unknown(NOT_MEASURED);
+    };
+    let Some(context) = metadata.get("context") else {
+        return unknown(LATEST_UNMEASURED);
+    };
+    let Some(vm) = parse(context) else {
+        if first_refusal(row.get("id").and_then(Value::as_str)) {
+            tracing::warn!("hq: refusing malformed answer context metadata");
+        }
+        return unknown(LATEST_UNMEASURED);
+    };
+    let answered_at = row.get("created_at_ms").and_then(Value::as_i64);
+    let chosen_since = next
+        .chosen_at_ms
+        .zip(answered_at)
+        .is_some_and(|(chosen, answered)| chosen > answered);
+    match metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+    {
+        Some(measured_on) if chosen_since && !same_model(measured_on, next.model) => {
+            awaiting(vm, measured_on, next.model)
+        }
+        _ => vm,
     }
-    result
+}
+
+/// The provider may answer with its own spelling of a routed id
+/// (`z-ai/glm-5.3-flash` for `openrouter/z-ai/glm-5.3-flash`): the model's own
+/// name decides.
+fn same_model(measured_on: &str, next: &str) -> bool {
+    let name = |id: &str| id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+    name(measured_on) == name(next)
+}
+
+/// `vm` was measured on `measured_on`; the next answer runs on `next`, which has not answered.
+fn awaiting(vm: AgentContextVm, measured_on: &str, next: &str) -> AgentContextVm {
+    let next = if next == "Default" {
+        "The agent's default model".to_owned()
+    } else {
+        next.to_owned()
+    };
+    AgentContextVm {
+        label: "—".to_owned(),
+        percent: None,
+        meter_percent: None,
+        ring_background: ring(0),
+        summary: format!(
+            "Measured on {measured_on}: {}. {next} has not answered yet.",
+            vm.summary
+        ),
+        ..vm
+    }
+}
+
+fn unknown(summary: &str) -> AgentContextVm {
+    AgentContextVm {
+        used: None,
+        window: None,
+        label: "—".to_owned(),
+        percent: None,
+        meter_percent: None,
+        ring_background: ring(0),
+        summary: summary.to_owned(),
+        parts: Vec::new(),
+    }
+}
+
+fn ring(percent: u32) -> String {
+    format!(
+        "conic-gradient(currentColor {}deg, var(--muted) 0deg)",
+        percent * 360 / 100
+    )
+}
+
+/// A token count as the bar reads it: `950`, `5.3k`, `48k`, `125k`, `1M`, `1.5M`.
+fn compact(n: u64) -> String {
+    let wide = u128::from(n);
+    let (unit, suffix) = if wide < 1_000 {
+        return n.to_string();
+    } else if (wide + 500) / 1_000 < 1_000 {
+        // 999 950 rounds to 1000k: the next unit says it.
+        (1_000u128, "k")
+    } else {
+        (1_000_000u128, "M")
+    };
+    let tenths = (wide * 10 + unit / 2) / unit;
+    if tenths >= 1_000 {
+        format!("{}{suffix}", (wide + unit / 2) / unit)
+    } else if tenths % 10 == 0 {
+        format!("{}{suffix}", tenths / 10)
+    } else {
+        format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+    }
 }
 
 /// True the first time an answer id is refused; an answer without an id always counts.
@@ -168,22 +278,20 @@ fn parse(context: &Value) -> Option<AgentContextVm> {
     }
     let percent = window.map(|window| rounded(used, window));
     let meter_percent = percent.map(|n| n.min(100) as u32);
-    let ring_background = meter_percent.map(|n| {
-        format!(
-            "conic-gradient(currentColor {}deg, var(--muted) 0deg)",
-            n * 360 / 100
-        )
-    });
     let summary = match (window, percent) {
         (Some(window), Some(percent)) => format!("{percent}% · used ≈ {used} / {window} tokens"),
         _ => format!("used ≈ {used} tokens"),
     };
     Some(AgentContextVm {
-        used,
+        used: Some(used),
         window,
+        label: match window {
+            Some(window) => format!("{} / {}", compact(used), compact(window)),
+            None => compact(used),
+        },
         percent: percent.map(|n| format!("{n}%")),
         meter_percent,
-        ring_background,
+        ring_background: ring(meter_percent.unwrap_or(0)),
         summary,
         parts,
     })
@@ -197,6 +305,12 @@ mod tests {
     use std::sync::Arc;
     use tracing_subscriber::layer::SubscriberExt;
 
+    /// No choice written since any answer: the measurement stands.
+    const NEXT: Next<'static> = Next {
+        model: "m",
+        chosen_at_ms: None,
+    };
+
     fn metadata(window: Value) -> Value {
         json!({"used": 101, "window": window, "parts": PARTS.iter().enumerate().map(|(i, (part, _, _))|
             json!({"part": part, "tokens": if i == 0 { 34 } else if i == 4 { 67 } else { 0 }, "estimated": true})
@@ -208,8 +322,9 @@ mod tests {
     }
     #[test]
     fn occupancy_is_not_cumulative_usage_and_rounds_in_rust() {
-        let vm = latest(&rows(metadata(json!(300))), true).expect("context");
-        assert_eq!(vm.used, 101);
+        let vm = latest(&rows(metadata(json!(300))), NEXT);
+        assert_eq!(vm.used, Some(101));
+        assert_eq!(vm.label, "101 / 300");
         assert_eq!(vm.percent.as_deref(), Some("34%"));
         assert_eq!(vm.parts[0].share, "≈ 34% of used context");
         assert_eq!(vm.parts[4].share, "≈ 66% of used context");
@@ -217,15 +332,27 @@ mod tests {
     }
     #[test]
     fn unknown_window_has_no_percentage_or_ring() {
-        let vm = latest(&rows(metadata(Value::Null)), true).expect("context");
+        let vm = latest(&rows(metadata(Value::Null)), NEXT);
         assert_eq!(vm.percent, None);
         assert_eq!(vm.meter_percent, None);
-        assert_eq!(vm.ring_background, None);
+        assert_eq!(
+            vm.ring_background,
+            "conic-gradient(currentColor 0deg, var(--muted) 0deg)"
+        );
+        assert_eq!(vm.label, "101");
         assert_eq!(vm.summary, "used ≈ 101 tokens");
     }
     #[test]
-    fn missing_old_or_hidden_details_never_show_a_zero_meter() {
-        assert!(latest(&rows(metadata(json!(300))), false).is_none());
+    fn before_any_answer_and_after_an_unmeasured_one_the_ring_reads_unknown_never_an_older_count() {
+        let before = latest(&[], NEXT);
+        assert_eq!(before.used, None);
+        assert_eq!(before.label, "—");
+        assert_eq!(
+            before.meter_percent, None,
+            "no meter claims a measured zero"
+        );
+        assert_eq!(before.summary, NOT_MEASURED);
+        assert!(before.parts.is_empty());
         let mut rows = rows(metadata(json!(300)));
         rows.push(
             json!({"role": "agent", "metadata": "{\"usage\":{\"prompt_tokens\":9999}}"})
@@ -233,8 +360,33 @@ mod tests {
                 .expect("row")
                 .clone(),
         );
-        assert!(latest(&rows, true).is_none());
-        assert!(latest(&[], true).is_none());
+        let unmeasured = latest(&rows, NEXT);
+        assert_eq!(unmeasured.used, None, "never the older answer's count");
+        assert_eq!(unmeasured.summary, LATEST_UNMEASURED);
+    }
+    #[test]
+    fn the_bar_reads_a_compact_count_over_the_window() {
+        for (n, shown) in [
+            (0, "0"),
+            (950, "950"),
+            (5347, "5.3k"),
+            (48_000, "48k"),
+            (99_960, "100k"),
+            (125_000, "125k"),
+            (999_950, "1M"),
+            (1_048_576, "1M"),
+            (1_500_000, "1.5M"),
+            (200_000_000, "200M"),
+        ] {
+            assert_eq!(compact(n), shown, "{n}");
+        }
+        // `.11`'s answer (owner report 2026-10-27): 5347 of a 1,048,576 window.
+        let mut value = metadata(json!(1_048_576));
+        value["used"] = json!(5347);
+        value["parts"][4]["tokens"] = json!(5347 - 34);
+        let vm = latest(&rows(value), NEXT);
+        assert_eq!(vm.label, "5.3k / 1M");
+        assert_eq!(vm.percent.as_deref(), Some("1%"));
     }
     #[test]
     fn malformed_parts_and_numbers_are_refused() {
@@ -247,10 +399,10 @@ mod tests {
         ] {
             let mut value = metadata(json!(300));
             value["used"] = bad.clone();
-            assert!(latest(&rows(value), true).is_none(), "used {bad}");
+            assert!(latest(&rows(value), NEXT).used.is_none(), "used {bad}");
             let mut value = metadata(json!(300));
             value["parts"][0]["tokens"] = bad;
-            assert!(latest(&rows(value), true).is_none());
+            assert!(latest(&rows(value), NEXT).used.is_none());
         }
         let extra = |part: &str, tokens: u64, estimated: bool| json!({"part": part, "tokens": tokens, "estimated": estimated});
         for field in [
@@ -283,7 +435,7 @@ mod tests {
                 }
                 _ => value["window"] = json!(0),
             }
-            assert!(latest(&rows(value), true).is_none(), "{field}");
+            assert!(latest(&rows(value), NEXT).used.is_none(), "{field}");
         }
     }
     #[test]
@@ -296,7 +448,7 @@ mod tests {
                 .expect("parts")
                 .push(json!({"part": part, "tokens": tokens, "estimated": true}));
         }
-        let vm = latest(&rows(value), true).expect("context");
+        let vm = latest(&rows(value), NEXT);
         assert_eq!(vm.summary, "42% · used ≈ 126 / 300 tokens");
         assert_eq!(vm.parts.len(), PARTS.len() + 1);
         assert_eq!(vm.parts[0].label, "System and persona");
@@ -305,7 +457,7 @@ mod tests {
         assert_eq!(other.tokens, "≈ 25 tokens");
         assert_eq!(other.share, "≈ 20% of used context");
         assert!(vm.parts.iter().all(|part| part.tokens.starts_with("≈ ")));
-        let known = latest(&rows(metadata(json!(300))), true).expect("known only");
+        let known = latest(&rows(metadata(json!(300))), NEXT);
         assert!(known.parts.iter().all(|part| part.label != "Other"));
     }
     struct Count(Arc<AtomicUsize>);
@@ -328,10 +480,10 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(Count(warnings.clone()));
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..3 {
-                assert!(latest(&first, true).is_none());
+                assert!(latest(&first, NEXT).used.is_none());
             }
-            assert!(latest(&second, true).is_none());
-            assert!(latest(&first, true).is_none());
+            assert!(latest(&second, NEXT).used.is_none());
+            assert!(latest(&first, NEXT).used.is_none());
         });
         assert_eq!(warnings.load(Ordering::SeqCst), 2);
     }
@@ -342,17 +494,76 @@ mod tests {
         for part in zero["parts"].as_array_mut().expect("parts") {
             part["tokens"] = json!(0);
         }
-        assert_eq!(
-            latest(&rows(zero), true).expect("zero").percent.as_deref(),
-            Some("0%")
-        );
-        let over = latest(&rows(metadata(json!(50))), true).expect("over");
+        assert_eq!(latest(&rows(zero), NEXT).percent.as_deref(), Some("0%"));
+        let over = latest(&rows(metadata(json!(50))), NEXT);
         assert_eq!(over.percent.as_deref(), Some("202%"));
         assert_eq!(over.meter_percent, Some(100));
         let mut extreme = metadata(json!(1));
         extreme["used"] = json!(MAX_SAFE);
-        let extreme = latest(&rows(extreme), true).expect("extreme");
+        let extreme = latest(&rows(extreme), NEXT);
         assert_eq!(extreme.percent.as_deref(), Some("900719925474099100%"));
         assert_eq!(extreme.meter_percent, Some(100));
+    }
+    /// R598-02: a model chosen after the latest answer that is not the one it was measured on
+    /// reads unknown, saying which model measured it; the same model spelt by the provider, or a
+    /// choice older than the answer, keeps the measurement.
+    #[test]
+    fn a_switch_to_another_model_reads_unknown_until_it_answers() {
+        let answer = |model: &str| {
+            let mut rows = rows(metadata(json!(300)));
+            let mut meta: Value =
+                serde_json::from_str(rows[0]["metadata"].as_str().expect("metadata"))
+                    .expect("json");
+            meta["model"] = json!(model);
+            rows[0].insert("metadata".into(), json!(meta.to_string()));
+            rows[0].insert("created_at_ms".into(), json!(100));
+            rows
+        };
+        let glm = answer("openrouter/z-ai/glm-5.3-flash");
+        let switched = latest(
+            &glm,
+            Next {
+                model: "claude-opus-5-5",
+                chosen_at_ms: Some(200),
+            },
+        );
+        assert_eq!(switched.label, "—");
+        assert_eq!(switched.meter_percent, None);
+        assert_eq!(
+            switched.used,
+            Some(101),
+            "Details still shows what was measured"
+        );
+        assert_eq!(
+            switched.summary,
+            "Measured on openrouter/z-ai/glm-5.3-flash: 34% · used ≈ 101 / 300 tokens. \
+             claude-opus-5-5 has not answered yet."
+        );
+        let older_choice = latest(
+            &glm,
+            Next {
+                model: "claude-opus-5-5",
+                chosen_at_ms: Some(50),
+            },
+        );
+        assert_eq!(older_choice.label, "101 / 300");
+        let provider_spelling = latest(
+            &answer("z-ai/glm-5.3-flash"),
+            Next {
+                model: "openrouter/z-ai/glm-5.3-flash",
+                chosen_at_ms: Some(200),
+            },
+        );
+        assert_eq!(provider_spelling.label, "101 / 300");
+        let reset = latest(
+            &glm,
+            Next {
+                model: "Default",
+                chosen_at_ms: Some(200),
+            },
+        );
+        assert!(reset
+            .summary
+            .ends_with("The agent's default model has not answered yet."));
     }
 }

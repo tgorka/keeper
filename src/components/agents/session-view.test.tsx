@@ -72,7 +72,6 @@ const vm: AgentSessionViewVm = {
   loadingEarlier: false,
   complete: true,
   readsTrace: true,
-  untrusted: false,
   live: [],
   tools: [],
   messages: [],
@@ -80,6 +79,18 @@ const vm: AgentSessionViewVm = {
   folds: [],
   approvals: [],
   prefs: { viewMode: "normal" },
+  // Rust's answers before any turn: unknown context, the agent's defaults as read-only chips.
+  context: {
+    used: null,
+    window: null,
+    label: "—",
+    percent: null,
+    meterPercent: null,
+    ringBackground: "conic-gradient(currentColor 0deg, var(--muted) 0deg)",
+    summary: "Context unknown: no answer has measured it yet.",
+    parts: [],
+  },
+  footer: { model: "beta-small", effort: "Default", choosesModel: false, choosesEffort: false },
 };
 async function draw(shown: AgentSessionViewVm = vm) {
   const result = render(
@@ -136,9 +147,10 @@ beforeEach(() => {
 });
 
 describe("session context details", () => {
-  const context: NonNullable<AgentSessionViewVm["context"]> = {
+  const context: AgentSessionViewVm["context"] = {
     used: 48000,
     window: 200000,
+    label: "48k / 200k",
     percent: "24%",
     meterPercent: 24,
     ringBackground: "conic-gradient(currentColor 86deg, var(--muted) 0deg)",
@@ -167,9 +179,12 @@ describe("session context details", () => {
     return await screen.findByRole("dialog", { name: "Details" });
   }
 
-  it("/context opens the same Details dialog the ring opens", async () => {
-    await draw({ ...vm, context, prefs: { viewMode: "verbose" } });
+  it("/context opens the same Details dialog the bar's reading opens, in the Normal view", async () => {
+    // Owner ruling 2026-10-27: the reading is in the bar whatever the view mode.
+    await draw({ ...vm, context });
     const ring = screen.getByRole("button", { name: `Context details: ${context.summary}` });
+    expect(ring).toHaveTextContent("48k / 200k");
+    expect(within(ring).getByRole("meter", { name: "Context window occupancy" })).toHaveValue(24);
     fireEvent.click(ring);
     const viaRing = await screen.findByRole("dialog", { name: "Details" });
     expect(within(viaRing).getByText("History")).toBeInTheDocument();
@@ -188,19 +203,116 @@ describe("session context details", () => {
     expect(screen.queryByRole("region", { name: "Conversation context" })).not.toBeInTheDocument();
   });
 
-  it("/context without a measurement opens Details saying why, never pointing at usage", async () => {
+  it("reads unknown before any measured answer: an empty ring, no meter, and Rust's why", async () => {
     await draw();
-    expect(screen.queryByRole("button", { name: /^Context details/ })).not.toBeInTheDocument();
-    const hidden = await runContextCommand();
-    expect(hidden).toHaveTextContent("Choose the Verbose view to see it.");
-    expect(hidden).not.toHaveTextContent(/usage/i);
-    fireEvent.keyDown(hidden, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    const ring = screen.getByRole("button", { name: `Context details: ${vm.context.summary}` });
+    expect(ring).toHaveTextContent("—");
+    expect(within(ring).queryByRole("meter")).toBeNull();
+    const details = await runContextCommand();
+    expect(details).toHaveTextContent(vm.context.summary);
+    expect(details).not.toHaveTextContent(/usage/i);
+  });
+});
 
-    act(() => mock.view?.({ ...vm, prefs: { viewMode: "verbose" } }));
-    const missing = await runContextCommand();
-    expect(missing).toHaveTextContent("The latest answer has no context window measurement.");
-    expect(missing).not.toHaveTextContent(/usage/i);
+describe("the composer's bar (owner ruling 2026-10-27)", () => {
+  it("names the model and effort as read-only chips when the agent offers no alternative", async () => {
+    await draw();
+    const bar = screen.getByRole("group", { name: "Model and effort" });
+    expect(within(bar).getByText("beta-small")).toBeInTheDocument();
+    expect(within(bar).getByText("Default")).toBeInTheDocument();
+    expect(within(bar).queryByRole("button")).toBeNull();
+  });
+
+  it("opens the pickers from the same chips where Rust says there is a choice", async () => {
+    await draw({
+      ...vm,
+      footer: { model: "beta-small", effort: "Medium", choosesModel: true, choosesEffort: true },
+      settings: {
+        models: [
+          { id: "alpha-large", provider: "Other", current: false, default: false },
+          { id: "beta-small", provider: "Other", current: true, default: true },
+        ],
+        efforts: [
+          { effort: "medium", label: "Medium", current: true, default: true },
+          { effort: "high", label: "High", current: false, default: false },
+        ],
+        modelLabel: "beta-small",
+        effortLabel: "Medium",
+        resettable: false,
+        write: { state: "confirmed" },
+      },
+    });
+    expect(screen.getByRole("button", { name: "Effort: Medium" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Model: beta-small" }));
+    expect(await screen.findByRole("dialog", { name: "Choose a model" })).toBeInTheDocument();
+  });
+
+  it("keeps the reading and the untrusted marker on an archived session (R598-03)", async () => {
+    const why =
+      "This chat read outside content, such as a web page, so its commands need your approval.";
+    render(
+      <TooltipProvider>
+        <SessionView target={{ database: "beta", sessionId: "same.1" }} />
+      </TooltipProvider>,
+    );
+    await waitFor(() => expect(mock.view).not.toBeNull());
+    // An archived session takes no drop, so `draw`'s wait for one does not apply.
+    act(() =>
+      mock.view?.({
+        ...vm,
+        archived: true,
+        readOnly: true,
+        untrusted: why,
+        context: {
+          ...vm.context,
+          label: "5.3k / 1M",
+          summary: "1% · used ≈ 5347 / 1048576 tokens",
+        },
+      }),
+    );
+    expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull();
+    const bar = screen.getByRole("group", { name: "Model and effort" });
+    expect(within(bar).getByText("beta-small")).toBeInTheDocument();
+    expect(within(bar).queryByRole("button", { name: /^Model:/ })).toBeNull();
+    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Context details: 1% · used ≈ 5347 / 1048576 tokens" }),
+    ).toHaveTextContent("5.3k / 1M");
+  });
+
+  it("marks an untrusted session in the bar and says why in the banner", async () => {
+    const why =
+      "This chat read outside content, such as a web page, so its commands need your approval.";
+    await draw({
+      ...vm,
+      untrusted: why,
+      banner: {
+        sentence: "Sending a message declines this request, even a message that says yes.",
+        approvals: [
+          {
+            id: "a6",
+            database: "beta",
+            sessionId: "same.1",
+            toolName: "run",
+            tier: "T3",
+            summary: "Run git log",
+            action: '{"argv":["git","log"]}',
+            bindingDigest: "d6",
+            expiresAtMs: 1800000000000,
+            createdAtMs: 1780000000000,
+            state: "pending",
+            canDecide: true,
+            sentence: "Waiting for you.",
+            actions: ["allowOnce", "deny"],
+            declinedBySend: true,
+          },
+        ],
+      },
+    });
+    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: "Waiting for your decision" }),
+    ).toHaveTextContent(why);
   });
 });
 
@@ -570,10 +682,11 @@ describe("session header drives", () => {
 describe("Model… from the list (A109-05)", () => {
   const withModels: AgentSessionViewVm = {
     ...vm,
+    footer: { ...vm.footer, choosesModel: true },
     settings: {
       models: [
-        { id: "alpha-large", current: false, default: false },
-        { id: "beta-small", current: true, default: true },
+        { id: "alpha-large", provider: "Other", current: false, default: false },
+        { id: "beta-small", provider: "Other", current: true, default: true },
       ],
       efforts: [],
       modelLabel: "beta-small",

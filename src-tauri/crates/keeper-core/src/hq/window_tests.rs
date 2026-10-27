@@ -1872,3 +1872,50 @@ fn stop_control_names_only_unfinished_turns_and_tools_open_the_existing_surface(
         Some(AgentCommandSurface::Tools)
     );
 }
+
+/// Owner report 2026-10-27, shaped like `tgorka.2f30698f.6`: an untrusted session (it read the
+/// web, D-34) whose T3 `run` is parked on a pending approval naming this person. The list marks
+/// the session *Needs you*, and the open session holds the request in the banner above the
+/// composer, saying why its commands ask.
+#[test]
+fn a_pending_t3_run_in_an_untrusted_session_is_marked_in_the_list_and_bannered() {
+    let w = world();
+    let t = now() - 60_000;
+    let mut ops = session("dev1.6", NIXIE, t, false, Some(t + 10));
+    if let Some(RowOp::Upsert { values, .. }) = ops.first_mut() {
+        values.insert("trust".into(), json!("untrusted"));
+    }
+    ops.push(message("m1", "dev1.6", "person", t + 1, None, Value::Null));
+    let mut asked = approval("ap6", "dev1.6", t + 2, &[ANA], true);
+    if let Some(RowOp::Upsert { values, .. }) = asked.last_mut() {
+        values.insert("tier".into(), json!("T3"));
+    }
+    ops.extend(asked);
+    w.alpha.replica.mutate(ops).expect("seed");
+    let row = sessions::list(std::slice::from_ref(&w.alpha), now())
+        .into_iter()
+        .find(|r| r.session_id == "dev1.6")
+        .expect("listed");
+    assert_eq!(row.attention, Some(AgentAttentionVm::NeedsYou));
+    let view = timeline::view(
+        &w.alpha,
+        "dev1.6",
+        &Opened::default(),
+        &HashMap::new(),
+        now(),
+    )
+    .expect("view")
+    .0;
+    let banner = view.banner.expect("the banner shows");
+    assert_eq!(
+        banner
+            .approvals
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        ["ap6"]
+    );
+    assert!(banner.approvals[0].can_decide);
+    assert!(view.approvals.is_empty(), "not also in the reading column");
+    assert_eq!(view.untrusted.as_deref(), Some(timeline::UNTRUSTED));
+}

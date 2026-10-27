@@ -35,6 +35,8 @@ pub struct AgentSessionSettingsVm {
     pub models: Vec<String>,
     pub efforts: Vec<Effort>,
     pub defaults: Vec<AgentSettingsDefaultVm>,
+    /// When the saved choice was last written (`session_settings.updated_at_ms`).
+    pub chosen_at_ms: Option<i64>,
 }
 
 fn sentence(error: impl std::fmt::Display) -> HqError {
@@ -43,7 +45,7 @@ fn sentence(error: impl std::fmt::Display) -> HqError {
 
 fn row(source: &Source, session: &str) -> Result<Option<Map<String, Value>>, HqError> {
     let (rows, pending) = source.replica.query_covered(
-        "SELECT model, effort, _sync_version AS version FROM session_settings WHERE session_id = ?1",
+        "SELECT model, effort, updated_at_ms, _sync_version AS version FROM session_settings WHERE session_id = ?1",
         &[session.into()],
         &WindowBase { table: "session_settings".to_owned(), variable: "session".to_owned(), fixed_scopes: Vec::new() },
         &[session.to_owned()],
@@ -58,6 +60,7 @@ fn row(source: &Source, session: &str) -> Result<Option<Map<String, Value>>, HqE
 
 /// What `agent` offers in `source`'s database: the union of its published
 /// profiles, and each instance's defaults.
+#[derive(Default)]
 struct Offered {
     models: BTreeSet<String>,
     efforts: BTreeSet<Effort>,
@@ -119,16 +122,89 @@ fn view(source: &Source, session: &str) -> Result<AgentSessionSettingsVm, HqErro
         .ok_or_else(|| sentence("Only a person in this conversation can change its model and effort."))?;
     let offered = offered(source, &agent).map_err(sentence)?;
     let saved = row(source, session)?;
-    Ok(AgentSessionSettingsVm {
-        model: saved.as_ref().and_then(|r| opt_text(r, "model")),
+    Ok(settings_of(offered, saved.as_ref()))
+}
+
+fn settings_of(offered: Offered, saved: Option<&Map<String, Value>>) -> AgentSessionSettingsVm {
+    AgentSessionSettingsVm {
+        model: saved.and_then(|r| opt_text(r, "model")),
         effort: saved
-            .as_ref()
             .and_then(|r| opt_text(r, "effort"))
             .and_then(|s| Effort::parse(&s)),
         models: offered.models.into_iter().collect(),
         efforts: offered.efforts.into_iter().collect(),
         defaults: offered.defaults,
-    })
+        chosen_at_ms: saved.and_then(|r| int(r, "updated_at_ms")),
+    }
+}
+
+/// The model and effort the next answer uses, as the composer's bar always
+/// shows them (owner ruling 2026-10-27, R-HQ-85): chips that open the
+/// pickers where the agent offers an alternative and this person may
+/// choose, read-only otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentSessionFooterVm {
+    /// The session's choice while the agent still offers it, else the
+    /// agent's default, else "Default".
+    pub model: String,
+    /// The same for effort.
+    pub effort: String,
+    /// The model chip opens the picker: more than one model to choose.
+    pub chooses_model: bool,
+    /// The effort chip opens its menu: more than one effort to choose.
+    pub chooses_effort: bool,
+}
+
+/// Everything the composer's bar reads, from one read of the settings.
+pub(crate) struct Bar {
+    /// Absent for a reader who may not change them, an archived session, or
+    /// settings still arriving.
+    pub picker: Option<AgentSessionPickerVm>,
+    pub footer: AgentSessionFooterVm,
+    /// When the saved choice was written: a choice newer than the latest
+    /// answer has not answered yet ([`crate::hq::context::latest`]).
+    pub chosen_at_ms: Option<i64>,
+}
+
+/// The bar of `session` with `agent`. The labels never depend on whether
+/// this reader may change them; the picker decides only whether the chips
+/// open anything. The offers and the saved row are read once (R598-07).
+pub(crate) fn bar(source: &Source, session: &str, agent: &str, archived: bool) -> Bar {
+    let (settings, may_change) = match view(source, session) {
+        Ok(settings) => (settings, !archived),
+        Err(error) => {
+            tracing::debug!(database = %source.database, %error, "the session's pickers are not shown");
+            let offered = offered(source, agent).unwrap_or_else(|error| {
+                tracing::debug!(database = %source.database, %error, "the agent's offers could not be read");
+                Offered::default()
+            });
+            // A saved choice still arriving reads as the agent's default until it lands.
+            let saved = row(source, session).ok().flatten();
+            (settings_of(offered, saved.as_ref()), false)
+        }
+    };
+    let picker = may_change.then(|| picker_over(source, session, &settings));
+    Bar {
+        footer: footer_of(&settings, picker.as_ref()),
+        chosen_at_ms: settings.chosen_at_ms,
+        picker,
+    }
+}
+
+/// The chips over `settings`: they open only where `picker` offers more than one.
+fn footer_of(
+    settings: &AgentSessionSettingsVm,
+    picker: Option<&AgentSessionPickerVm>,
+) -> AgentSessionFooterVm {
+    let (model, effort) = labels(settings);
+    AgentSessionFooterVm {
+        model,
+        effort,
+        chooses_model: picker.is_some_and(|p| p.models.len() > 1),
+        chooses_effort: picker.is_some_and(|p| p.efforts.len() > 1),
+    }
 }
 
 impl Hq {
@@ -380,11 +456,83 @@ fn set(
 #[ts(export)]
 pub struct AgentModelOptionVm {
     pub id: String,
+    /// The group the picker lists it under (t3.chat's provider groups, owner
+    /// ruling 2026-10-27): read from the id alone ([`provider_of`]), since
+    /// the contract publishes model ids and nothing about them.
+    pub provider: String,
     /// The next answer uses it: the saved choice, or a default while none
     /// that is still offered is saved.
     pub current: bool,
     /// An instance of the agent names it as its default.
     pub default: bool,
+}
+
+/// Routers whose ids name the maker after their own segment
+/// (`openrouter/z-ai/glm-5.3-flash`): the deployment's provider registry
+/// (`agents/provider-models.txt`) routes OpenRouter's models under `openrouter/`.
+const ROUTERS: [&str; 1] = ["openrouter"];
+
+/// A maker's slug, as a routed id names it, and the name a person reads.
+const MAKERS: [(&str, &str); 12] = [
+    ("anthropic", "Anthropic"),
+    ("openai", "OpenAI"),
+    ("z-ai", "Z.ai"),
+    ("qwen", "Qwen"),
+    ("nvidia", "NVIDIA"),
+    ("google", "Google"),
+    ("meta-llama", "Meta"),
+    ("mistralai", "Mistral"),
+    ("deepseek", "DeepSeek"),
+    ("x-ai", "xAI"),
+    ("moonshotai", "Moonshot"),
+    ("minimax", "MiniMax"),
+];
+
+/// A model name's family, by the prefix its name starts with.
+const FAMILIES: [(&str, &str); 16] = [
+    ("claude", "Anthropic"),
+    ("gpt", "OpenAI"),
+    ("o1", "OpenAI"),
+    ("o3", "OpenAI"),
+    ("o4", "OpenAI"),
+    ("codex", "OpenAI"),
+    ("gemini", "Google"),
+    ("gemma", "Google"),
+    ("glm", "Z.ai"),
+    ("qwen", "Qwen"),
+    ("llama", "Meta"),
+    ("mistral", "Mistral"),
+    ("codestral", "Mistral"),
+    ("deepseek", "DeepSeek"),
+    ("grok", "xAI"),
+    ("kimi", "Moonshot"),
+];
+
+/// The maker a model id names (R598-01): a router's segment is skipped, then
+/// a known maker slug is named as people read it (`z-ai` → Z.ai), else the
+/// family the model's own name starts with (`claude-…` → Anthropic), else the
+/// maker slug as written, else "Other".
+pub(crate) fn provider_of(id: &str) -> String {
+    let mut segments: Vec<&str> = id.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() > 1 && ROUTERS.contains(&segments[0].to_ascii_lowercase().as_str()) {
+        segments.remove(0);
+    }
+    let name = segments.last().copied().unwrap_or(id).to_ascii_lowercase();
+    let slug = (segments.len() > 1).then(|| segments[0].to_ascii_lowercase());
+    if let Some((_, maker)) = slug
+        .as_deref()
+        .and_then(|slug| MAKERS.iter().find(|(known, _)| *known == slug))
+    {
+        return (*maker).to_owned();
+    }
+    if let Some((_, family)) = FAMILIES.iter().find(|(prefix, _)| name.starts_with(prefix)) {
+        return (*family).to_owned();
+    }
+    if segments.len() > 1 {
+        segments[0].to_owned()
+    } else {
+        "Other".to_owned()
+    }
 }
 
 /// One offered effort as the picker lists it.
@@ -443,6 +591,11 @@ pub struct AgentSessionPickerVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub fallback: Option<String>,
+    /// The newest answer failed on the model in use: which, why, and the way
+    /// back (owner ruling 2026-10-27).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub failed: Option<String>,
     pub write: AgentSettingsWriteVm,
 }
 
@@ -486,21 +639,58 @@ fn write_state(source: &Source, session: &str) -> AgentSettingsWriteVm {
     }
 }
 
-/// The newest answer's fallback sentence, if it carries one.
-fn fallback(source: &Source, session: &str) -> Option<String> {
+/// The newest answer's metadata; `Null` while the session has none.
+fn newest_answer(source: &Source, session: &str) -> Value {
     let rows = read(
         source,
         "SELECT metadata FROM messages WHERE session_id = ?1 AND role = 'agent' \
          ORDER BY created_at_ms DESC, id DESC LIMIT 1",
         &[Value::from(session)],
     );
-    let metadata = json(rows.first()?, "metadata");
+    rows.first()
+        .map_or(Value::Null, |row| json(row, "metadata"))
+}
+
+fn trimmed(metadata: &Value, key: &str) -> Option<String> {
     metadata
-        .get("model_fallback")
+        .get(key)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// The newest answer's fallback sentence, if it carries one.
+fn fallback(newest: &Value) -> Option<String> {
+    trimmed(newest, "model_fallback")
+}
+
+/// When the newest answer failed (`finish = "failed"`: the provider or the
+/// runtime broke, not a person's stop or a restart) on a model this agent
+/// offers an alternative to: which model, why, and the way back. A model
+/// answering 429 for days is the case (owner ruling 2026-10-27); nothing
+/// marks it unavailable ahead of time (DW-E109-39).
+fn failed(newest: &Value, picker: &AgentSessionPickerVm) -> Option<String> {
+    if newest.get("finish").and_then(Value::as_str) != Some("failed") || picker.models.len() < 2 {
+        return None;
+    }
+    let model = trimmed(newest, "model")?;
+    let why = trimmed(newest, "error")
+        .map(|error| {
+            format!(
+                ": {}",
+                error.split_whitespace().collect::<Vec<_>>().join(" ")
+            )
+        })
+        .unwrap_or_default();
+    let back = if picker.resettable {
+        ", or Reset to the agent's default"
+    } else {
+        ""
+    };
+    Some(format!(
+        "The last answer failed on {model}{why}. Choose another model{back}."
+    ))
 }
 
 /// One label for a set of per-instance defaults: the one they agree on, or
@@ -511,6 +701,34 @@ fn default_label<'a>(defaults: impl Iterator<Item = &'a str>) -> String {
         [only] => (*only).to_owned(),
         _ => "Default".to_owned(),
     }
+}
+
+/// The model and the effort the next answer uses: the session's choice while
+/// the agent still offers it, else the default its instances agree on, else
+/// "Default".
+fn labels(settings: &AgentSessionSettingsVm) -> (String, String) {
+    let model = settings
+        .model
+        .as_deref()
+        .filter(|m| settings.models.iter().any(|o| o == m));
+    let effort = settings.effort.filter(|e| settings.efforts.contains(e));
+    (
+        model.map_or_else(
+            || default_label(settings.defaults.iter().filter_map(|d| d.model.as_deref())),
+            str::to_owned,
+        ),
+        effort.map_or_else(
+            || {
+                default_label(
+                    settings
+                        .defaults
+                        .iter()
+                        .filter_map(|d| d.effort.map(effort_label)),
+                )
+            },
+            |e| effort_label(e).to_owned(),
+        ),
+    )
 }
 
 /// The pickers over `settings`, given what else the session says now.
@@ -537,6 +755,7 @@ pub(crate) fn picker_of(
         .models
         .iter()
         .map(|id| AgentModelOptionVm {
+            provider: provider_of(id),
             id: id.clone(),
             current: model.map_or_else(|| default_models.contains(id.as_str()), |m| m == id),
             default: default_models.contains(id.as_str()),
@@ -552,22 +771,16 @@ pub(crate) fn picker_of(
             default: default_efforts.contains(&e),
         })
         .collect();
+    let (model_label, effort_label) = labels(settings);
     AgentSessionPickerVm {
-        model_label: model.map_or_else(
-            || default_label(default_models.iter().copied()),
-            str::to_owned,
-        ),
-        effort_label: (!efforts.is_empty()).then(|| {
-            effort.map_or_else(
-                || default_label(default_efforts.iter().map(|&e| effort_label(e))),
-                |e| effort_label(e).to_owned(),
-            )
-        }),
+        model_label,
+        effort_label: (!efforts.is_empty()).then_some(effort_label),
         models,
         efforts,
         resettable: settings.model.is_some() || settings.effort.is_some(),
         running,
         fallback,
+        failed: None,
         write,
     }
 }
@@ -575,13 +788,24 @@ pub(crate) fn picker_of(
 /// The pickers of `session` as its replica holds them now; an error while
 /// the settings are still arriving or the reader may not change them.
 pub(crate) fn picker(source: &Source, session: &str) -> Result<AgentSessionPickerVm, HqError> {
-    let settings = view(source, session)?;
-    Ok(picker_of(
-        &settings,
+    Ok(picker_over(source, session, &view(source, session)?))
+}
+
+/// The pickers over `settings`, already read for `session`.
+fn picker_over(
+    source: &Source,
+    session: &str,
+    settings: &AgentSessionSettingsVm,
+) -> AgentSessionPickerVm {
+    let newest = newest_answer(source, session);
+    let mut picker = picker_of(
+        settings,
         running(source, session),
-        fallback(source, session),
+        fallback(&newest),
         write_state(source, session),
-    ))
+    );
+    picker.failed = failed(&newest, &picker);
+    picker
 }
 
 #[cfg(test)]
@@ -932,6 +1156,7 @@ mod tests {
                     effort: *effort,
                 })
                 .collect(),
+            chosen_at_ms: None,
         }
     }
 
@@ -1190,6 +1415,160 @@ mod tests {
             None,
             "an older answer's fallback is not the newest answer's"
         );
+    }
+
+    /// Owner ruling 2026-10-27: the bar always says which model and effort the next answer
+    /// uses — the session's choice, else the agent's default, else "Default" — and the chips
+    /// open a picker only where there is an alternative and this person may choose.
+    #[test]
+    fn the_bar_always_names_model_and_effort_and_opens_only_where_there_is_a_choice() {
+        let (_dir, mut source) = fixture(true);
+        let footer_now = |source: &Source| bar(source, "dev1.1", "nixi", false).footer;
+        // Two instances disagree on the default model and name no default effort.
+        assert_eq!(
+            footer_now(&source),
+            AgentSessionFooterVm {
+                model: "Default".to_owned(),
+                effort: "Default".to_owned(),
+                chooses_model: true,
+                chooses_effort: true,
+            }
+        );
+        set(&source, "dev1.1", Some("alternate"), Some(Effort::High), 10).expect("save");
+        let chosen = footer_now(&source);
+        assert_eq!(
+            (chosen.model.as_str(), chosen.effort.as_str()),
+            ("alternate", "High")
+        );
+        // A reader who may not change them still reads them, as chips that open nothing.
+        source.actor = "outsider".to_owned();
+        assert_eq!(
+            footer_now(&source),
+            AgentSessionFooterVm {
+                model: "alternate".to_owned(),
+                effort: "High".to_owned(),
+                chooses_model: false,
+                chooses_effort: false,
+            }
+        );
+        // One model and one effort offered: read-only chips naming the agent's default.
+        source.actor = "ana".to_owned();
+        put(
+            &source,
+            "sessions",
+            json!({"id":"dev1.9", "title":"solo", "status":"open", "agent_actor":"foreign", "created_by_actor":"ana", "created_by_client":"dev1", "invite":"[]", "archived":false, "created_at_ms":1, "last_activity_ms":1}),
+        );
+        put(
+            &source,
+            "session_members",
+            json!({"id":"dev1.9/ana", "session_id":"dev1.9", "actor_id":"ana", "role":"person", "reads_trace":false, "added_by_actor":"ana", "added_at_ms":1}),
+        );
+        // The picker exists (a person member of a live session) but offers one of each.
+        let mut one = settings(None, None, &[(Some("primary"), Some(Effort::High))]);
+        one.models.truncate(1);
+        one.efforts.truncate(1);
+        let only = picker_of(&one, None, None, AgentSettingsWriteVm::Confirmed);
+        let solo = footer_of(&one, Some(&only));
+        assert_eq!(
+            (solo.model.as_str(), solo.chooses_model, solo.chooses_effort),
+            ("primary", false, false)
+        );
+        // A session this person may not change (dev1.9's settings are not in this device's
+        // window, so they are still arriving): the agent's default, read-only.
+        let arriving = bar(&source, "dev1.9", "foreign", false);
+        assert_eq!(arriving.picker, None);
+        assert_eq!(
+            (
+                arriving.footer.model.as_str(),
+                arriving.footer.chooses_model
+            ),
+            ("foreign", false)
+        );
+        // An archived session reads its choice and opens nothing.
+        let archived = bar(&source, "dev1.1", "nixi", true);
+        assert_eq!(archived.picker, None);
+        assert_eq!(
+            (
+                archived.footer.model.as_str(),
+                archived.footer.chooses_model
+            ),
+            ("alternate", false)
+        );
+    }
+
+    /// Owner ruling 2026-10-27: a model that answers 429 for days fails the turn; the picker
+    /// says which model failed and the way back. A person's stop or a restart is no failure of
+    /// the model, and nothing is said where there is no other model to choose.
+    #[test]
+    fn a_failed_answer_names_its_model_and_the_way_back() {
+        let (_dir, source) = fixture(true);
+        set(&source, "dev1.1", Some("alternate"), None, 10).expect("save");
+        answer(
+            &source,
+            "m1",
+            "t1",
+            5,
+            json!({"model": "alternate", "finish": "failed",
+                   "error": "provider answered 429:\n  usage limit reached"}),
+        );
+        assert_eq!(
+            picker(&source, "dev1.1").expect("picker").failed.as_deref(),
+            Some(
+                "The last answer failed on alternate: provider answered 429: usage limit \
+                 reached. Choose another model, or Reset to the agent's default."
+            )
+        );
+        for finish in ["cancelled", "cut", "stop"] {
+            answer(
+                &source,
+                "m2",
+                "t2",
+                6,
+                json!({"model": "alternate", "finish": finish, "error": "stopped"}),
+            );
+            assert_eq!(
+                picker(&source, "dev1.1").expect("picker").failed,
+                None,
+                "{finish}"
+            );
+        }
+        let one = AgentSessionPickerVm {
+            models: vec![AgentModelOptionVm {
+                id: "solo".to_owned(),
+                provider: "Other".to_owned(),
+                current: true,
+                default: true,
+            }],
+            ..picker(&source, "dev1.1").expect("picker")
+        };
+        assert_eq!(
+            failed(&json!({"model": "solo", "finish": "failed"}), &one),
+            None
+        );
+    }
+
+    #[test]
+    fn models_group_by_the_maker_their_id_names() {
+        // The five ids every agent offers at keeper-hq main c60ab1b (`agents/*/agent.toml`),
+        // then the held GPT-6.x ids, a CPA route, and makers this build does not name.
+        for (id, provider) in [
+            ("claude-opus-5-5", "Anthropic"),
+            ("claude-sonnet-5-5", "Anthropic"),
+            ("claude-haiku-5-5", "Anthropic"),
+            ("openrouter/z-ai/glm-5.3-flash", "Z.ai"),
+            ("openrouter/qwen/qwen3.7-flash", "Qwen"),
+            ("gpt-6-astra", "OpenAI"),
+            ("gpt-6.1-sol", "OpenAI"),
+            ("openai-codex/gpt-6-astra", "OpenAI"),
+            (
+                "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+                "NVIDIA",
+            ),
+            ("openrouter/acme/zeta-1", "acme"),
+            ("mystery-1", "Other"),
+        ] {
+            assert_eq!(provider_of(id), provider, "{id}");
+        }
     }
 
     #[test]

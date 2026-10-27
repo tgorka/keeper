@@ -37,4 +37,9 @@ running?: string,
  * The newest answer's `metadata.model_fallback`: the chosen model was
  * no longer offered, and which one answered instead.
  */
-fallback?: string, write: AgentSettingsWriteVm, };
+fallback?: string, 
+/**
+ * The newest answer failed on the model in use: which, why, and the way
+ * back (owner ruling 2026-10-27).
+ */
+failed?: string, write: AgentSettingsWriteVm, };

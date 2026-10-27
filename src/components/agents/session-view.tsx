@@ -1,4 +1,4 @@
-import { Archive, ArchiveRestore, ArrowLeft } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, ShieldAlert } from "lucide-react";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
 import { DatabaseApprovalCard } from "@/components/agents/approval-card";
@@ -85,7 +85,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   // Model… in that menu asks the same way for the composer's model picker (A109-05).
   const [modelsOpen, setModelsOpen] = useState(false);
   const modelFor = useAgentSessionsStore((state) => state.modelFor);
-  const hasModels = (vm?.settings?.models.length ?? 0) > 0;
+  const hasModels = vm?.footer.choosesModel === true;
   useEffect(() => {
     if (!viewed || modelFor?.database !== database || modelFor.sessionId !== sessionId) return;
     if (hasModels) setModelsOpen(true);
@@ -437,12 +437,6 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             <span>{vm?.handle}</span>
             {vm && <span className="break-all">{vm.agentName}</span>}
             {vm?.archived && <span>Archived</span>}
-            {vm?.untrusted && (
-              <span className="min-w-0">
-                <span className="font-medium text-foreground">Untrusted</span>: this session has
-                read outside content, so consequential actions need a person.
-              </span>
-            )}
           </p>
           {vm?.drives && (
             <SessionDrives
@@ -604,6 +598,15 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           className="max-h-[45dvh] shrink-0 overflow-y-auto border-border border-t bg-muted/30 px-3 py-2"
         >
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+            {vm.untrusted && (
+              <p
+                data-slot="agent-banner-untrusted"
+                className="flex items-start gap-1.5 text-held text-sm [overflow-wrap:anywhere]"
+              >
+                <ShieldAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                <span>{vm.untrusted}</span>
+              </p>
+            )}
             <p role="note" className="text-sm [overflow-wrap:anywhere]">
               {vm.banner.sentence}
             </p>
@@ -623,17 +626,32 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         </aside>
       )}
       {vm?.readOnly ? (
-        <p className="border-border border-t px-4 py-3 text-muted-foreground text-sm">
-          This archived session is read-only. Unarchive it to continue.
-        </p>
+        // R598-03: an archived session keeps the bar's reading — model, effort, context and the
+        // untrusted marker — read-only, with no composer.
+        <div
+          data-slot="agent-session-readonly-bar"
+          className="shrink-0 border-border border-t px-3 py-2"
+        >
+          <p className="px-1 py-1 text-muted-foreground text-sm">
+            This archived session is read-only. Unarchive it to continue.
+          </p>
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            <SessionSettingsPicker
+              target={target}
+              agent={vm.agentActor}
+              footer={vm.footer}
+              untrusted={vm.untrusted}
+            />
+            <div className="ml-auto">
+              <SessionContext context={vm.context} open={contextOpen} onOpenChange={setContextOpen}>
+                <SessionContextTrigger context={vm.context} />
+              </SessionContext>
+            </div>
+          </div>
+        </div>
       ) : (
         <div data-slot="agent-session-composer" className="shrink-0 border-border border-t p-3">
-          <SessionContext
-            context={vm?.context}
-            verbose={vm?.prefs.viewMode === "verbose"}
-            open={contextOpen}
-            onOpenChange={setContextOpen}
-          >
+          <SessionContext context={vm?.context} open={contextOpen} onOpenChange={setContextOpen}>
             <ConversationStoresProvider value={stores}>
               <Composer
                 transport="session"
@@ -672,21 +690,24 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                   await fromUnderBanner(() => agentSendLine(target, body, declines));
                 }}
                 attachmentPreview={attachmentDraft.preview}
-                sendAccessory={
-                  vm?.context ? <SessionContextTrigger context={vm.context} /> : undefined
+                sendAccessory={vm && <SessionContextTrigger context={vm.context} />}
+                // t3.chat's bar (owner ruling 2026-10-27): model and effort, always shown.
+                barStart={
+                  vm && (
+                    <SessionSettingsPicker
+                      target={target}
+                      agent={vm.agentActor}
+                      footer={vm.footer}
+                      picker={vm.settings}
+                      untrusted={vm.untrusted}
+                      modelsOpen={modelsOpen}
+                      onModelsOpenChange={setModelsOpen}
+                    />
+                  )
                 }
               />
             </ConversationStoresProvider>
           </SessionContext>
-          {vm?.settings && (
-            <SessionSettingsPicker
-              target={target}
-              agent={vm.agentActor}
-              picker={vm.settings}
-              modelsOpen={modelsOpen}
-              onModelsOpenChange={setModelsOpen}
-            />
-          )}
         </div>
       )}
     </section>
