@@ -1602,7 +1602,7 @@ offered models grouped by provider (`AgentModelOptionVm.provider`, Rust's readin
 `openrouter/…` by its route, else the family the name starts with) and a "Default" badge; an effort
 chip with a "Default" badge in its menu; Reset. Where there is nothing to choose they are read-only
 chips, never absent. Capability badges are not drawn: the contract publishes model ids only
-(DW-E109-39). Stars are a lens, not a setting:
+(DW-E109-40). Stars are a lens, not a setting:
 they live in the `keeper_model_favorites` cookie like the other remembered views (no settings
 row, no IPC write), device-wide, and only order Rust's offers — a starred model the agent does
 not offer is never listed. Enter and Space on a star star it; they never reach the list, which
@@ -1612,7 +1612,7 @@ would take Enter as choosing the highlighted model.
   alternative to — a model answering 429 for days, R-HQ-85 — so the picker says which model, why,
   and the way back ("Choose another model, or Reset to the agent's default."). A person's stop
   (`cancelled`) or a restart (`cut`) is no failure of the model. Nothing marks a model unavailable
-  ahead of time: keeper-hq publishes no availability (DW-E109-38).
+  ahead of time: keeper-hq publishes no availability (DW-E109-39).
 
 `/model <id>` and `/effort <level>` (109.19's registry) run the same change and appear only when
 the pickers would offer the matching choice. `/effort` lists only the agent's offered levels, in

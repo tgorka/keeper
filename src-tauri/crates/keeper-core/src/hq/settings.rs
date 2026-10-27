@@ -605,7 +605,7 @@ fn fallback(newest: &Value) -> Option<String> {
 /// runtime broke, not a person's stop or a restart) on a model this agent
 /// offers an alternative to: which model, why, and the way back. A model
 /// answering 429 for days is the case (owner ruling 2026-10-27); nothing
-/// marks it unavailable ahead of time (DW-E109-38).
+/// marks it unavailable ahead of time (DW-E109-39).
 fn failed(newest: &Value, picker: &AgentSessionPickerVm) -> Option<String> {
     if newest.get("finish").and_then(Value::as_str) != Some("failed") || picker.models.len() < 2 {
         return None;
