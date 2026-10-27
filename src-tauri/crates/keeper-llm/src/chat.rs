@@ -27,7 +27,8 @@
 //! stopped. The same line is also the retry boundary (see [`stream_chat`]), so
 //! the two rules are one rule.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::num::IntErrorKind;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::HeaderValue;
 use serde_json::{json, Map, Value};
@@ -1117,7 +1118,23 @@ pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 struct RetryAfter {
     wait: Duration,
     /// `None` only when now plus the header's seconds overflows the clock.
+    /// `Some` does not mean the time can be printed: see [`http_date`].
     at: Option<SystemTime>,
+}
+
+/// 10000-01-01T00:00:00Z, the first instant an HTTP date cannot name.
+///
+/// `httpdate::fmt_http_date` panics at or past it ("date must be before year
+/// 9999"), and on Linux `SystemTime` holds `i64` seconds, so now plus any
+/// delta-seconds `Retry-After` from about 2.5·10¹¹ on reaches it (R599-01).
+const HTTP_DATE_END: Duration = Duration::from_secs(253_402_300_800);
+
+/// `at` as an HTTP date, or `None` where `httpdate` would panic: before the
+/// epoch, or from year 10000 on. A panic here would unwind the caller's turn
+/// task before it reports the turn ended.
+fn http_date(at: SystemTime) -> Option<String> {
+    let since_epoch = at.duration_since(UNIX_EPOCH).ok()?;
+    (since_epoch < HTTP_DATE_END).then(|| httpdate::fmt_http_date(at))
 }
 
 /// A failed attempt, and the two facts the retry decision needs.
@@ -1258,7 +1275,7 @@ fn too_long_to_wait(failure: &AttemptFailure, model: &str) -> Option<BotsError> 
         status: *status,
         endpoint: endpoint.clone(),
         wait_secs: after.wait.as_secs(),
-        until: after.at.map(httpdate::fmt_http_date),
+        until: after.at.and_then(http_date),
         detail: detail.clone(),
     })
 }
@@ -1538,7 +1555,9 @@ async fn attempt_stream(
 
 /// `Retry-After`, in either form RFC 9110 §10.2.3 allows: delta-seconds
 /// (what both back ends send) or an HTTP date. A date already past is a wait
-/// of zero.
+/// of zero. Delta-seconds too large for a `u64` are the largest `u64`, as RFC
+/// 9111 §1.2.2 requires — an endpoint asking for forever is refused at once,
+/// not mistaken for one that sent no header and retried (R599-02).
 fn parse_retry_after(response: &reqwest::Response) -> Option<RetryAfter> {
     let value = response
         .headers()
@@ -1547,7 +1566,12 @@ fn parse_retry_after(response: &reqwest::Response) -> Option<RetryAfter> {
         .ok()?
         .trim();
     let now = SystemTime::now();
-    if let Ok(secs) = value.parse::<u64>() {
+    let secs = match value.parse::<u64>() {
+        Ok(secs) => Some(secs),
+        Err(error) if *error.kind() == IntErrorKind::PosOverflow => Some(u64::MAX),
+        Err(_) => None,
+    };
+    if let Some(secs) = secs {
         let wait = Duration::from_secs(secs);
         return Some(RetryAfter {
             wait,

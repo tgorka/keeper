@@ -103,7 +103,8 @@ pub enum BotsError {
         /// How long the endpoint asked keeper to wait, in seconds.
         wait_secs: u64,
         /// When the wait ends, as an HTTP date (`Sun, 01 Nov 2026 06:38:01
-        /// GMT`): the header's own date, or now plus its seconds.
+        /// GMT`): the header's own date, or now plus its seconds. `None` when
+        /// that is past what an HTTP date can name (year 9999).
         until: Option<String>,
         /// A bounded excerpt of the response body, or `no body`.
         detail: String,
@@ -308,6 +309,7 @@ fn retry_after_sentence(
     let wait = human_wait(wait_secs);
     let when = match until {
         Some(until) => format!("until about {until}"),
+        None if wait_secs > YEAR => "for more than a year".to_owned(),
         None => format!("for about {wait}"),
     };
     format!(
@@ -316,20 +318,26 @@ fn retry_after_sentence(
     )
 }
 
+const MINUTE: u64 = 60;
+const HOUR: u64 = 60 * MINUTE;
+const DAY: u64 = 24 * HOUR;
+/// Past this an exact figure is noise: `Retry-After` has no business asking
+/// for longer, and `u64::MAX` seconds would print as 2·10¹⁴ days (R599-03).
+const YEAR: u64 = 365 * DAY;
+
 /// A wait in the unit a person reads it in: `45 s`, `12 min`, `3.5 hours`,
-/// `4.9 days`.
+/// `4.9 days`, `more than a year`.
 fn human_wait(secs: u64) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
     if secs < 2 * MINUTE {
         format!("{secs} s")
     } else if secs < 2 * HOUR {
         format!("{} min", (secs + MINUTE / 2) / MINUTE)
     } else if secs < 2 * DAY {
         format!("{:.1} hours", secs as f64 / HOUR as f64)
-    } else {
+    } else if secs <= YEAR {
         format!("{:.1} days", secs as f64 / DAY as f64)
+    } else {
+        "more than a year".to_owned()
     }
 }
 

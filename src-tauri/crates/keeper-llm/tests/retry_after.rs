@@ -217,6 +217,39 @@ async fn a_retry_after_one_second_past_the_bound_is_not_waited_for() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_past_year_9999_is_refused_without_a_date_and_without_a_panic() {
+    // Now plus 3·10¹¹ s is past 9999-12-31, which `httpdate` panics on
+    // rather than prints; a panic here unwinds keeper-hq's turn task before it
+    // reports the turn ended, and the session never takes another (R599-01).
+    let (wait_secs, until, text) = refused_at_once("300000000000").await;
+    assert_eq!(wait_secs, 300_000_000_000);
+    assert_eq!(until, None);
+    assert!(
+        text.starts_with(
+            "gpt-6.1-sol is out of quota for more than a year \
+             (Retry-After more than a year). Pick another model."
+        ),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_too_large_for_u64_is_the_largest_and_refused_at_once() {
+    // RFC 9111 §1.2.2: delta-seconds past what the recipient can represent
+    // are the largest it can, never "no header" and a retry (R599-02).
+    let (wait_secs, until, text) = refused_at_once(&"9".repeat(30)).await;
+    assert_eq!(wait_secs, u64::MAX);
+    assert_eq!(until, None);
+    assert!(
+        text.starts_with(
+            "gpt-6.1-sol is out of quota for more than a year \
+             (Retry-After more than a year). Pick another model."
+        ),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_short_retry_after_is_waited_out_and_the_retry_answers() {
     let server = Server::start(vec![too_many("1"), answers_ok()]).await;
     let started = Instant::now();
