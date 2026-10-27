@@ -502,14 +502,23 @@ fn sending_a_message_declines_what_waits_for_the_sender() {
     assert!(banner
         .sentence
         .contains("declines these 2 requests, even a message that says yes"));
+    // Ben's request is not this person's to decline: it waits in sight at the turn that asked.
+    assert!(
+        before.approvals.is_empty(),
+        "every request here has its turn"
+    );
+    let turn = before
+        .folds
+        .iter()
+        .find(|fold| fold.turn_id == "t")
+        .expect("the turn's fold");
     assert_eq!(
-        before
-            .approvals
+        turn.waiting
             .iter()
             .map(|a| a.id.as_str())
             .collect::<Vec<_>>(),
         ["bens"],
-        "out of the reading column"
+        "in its turn's fold, out of the banner"
     );
 
     let shown = shown(&w, "dev1.1");
@@ -584,8 +593,17 @@ fn a_t4_request_this_device_cannot_decide_offers_no_decision_and_is_not_declined
             ),
             "{case}"
         );
-        let [t4] = before.approvals.as_slice() else {
-            panic!("{case}: the T4 request alone in the reading column");
+        assert!(
+            before.approvals.is_empty(),
+            "{case}: every request here has its turn"
+        );
+        let turn = before
+            .folds
+            .iter()
+            .find(|fold| fold.turn_id == "t")
+            .expect("the turn's fold");
+        let [t4] = turn.waiting.as_slice() else {
+            panic!("{case}: the T4 request alone waiting in its turn's fold");
         };
         assert_eq!(t4.id, "t4");
         assert_eq!(t4.sentence, card_says, "{case}");

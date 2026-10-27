@@ -440,9 +440,10 @@ fn held(
         })
         .collect();
     // The parent draws a fold as its one summary line, Rust's sentence
-    // (R10924K-13, -14): its steps, their failures, the thinking and the
-    // lead-ins are the thread's to show, behind "Open thread" — so the view
-    // does not grow with the steps of a thread's newest turn.
+    // (R10924K-13, -14): its steps, their failures, the thinking, the
+    // lead-ins and its requests are the thread's to show, behind "Open
+    // thread" — so the view does not grow with the steps of a thread's
+    // newest turn.
     child.folds = turn
         .folds
         .into_iter()
@@ -452,6 +453,8 @@ fn held(
             reasoning: None,
             steps: Vec::new(),
             failures: Vec::new(),
+            approvals: Vec::new(),
+            waiting: Vec::new(),
             ..fold
         })
         .collect();

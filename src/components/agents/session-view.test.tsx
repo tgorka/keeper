@@ -860,7 +860,7 @@ describe("the approval banner", () => {
     );
   });
 
-  it("says what waits for another device, and a message then declines nothing (DW-E109-27)", async () => {
+  it("says what waits for another device, keeps it at the turn that asked, and a message then declines nothing (DW-E109-27)", async () => {
     const elsewhere =
       "1 request needs a decision from another device; a message here leaves it waiting.";
     const t4 = {
@@ -868,16 +868,41 @@ describe("the approval banner", () => {
       toolName: "delegate",
       tier: "T4",
       summary: "Run t4",
+      canDecide: false,
+      sentence: "Needs a decision from another device.",
+      actions: [],
       declinedBySend: false,
+    };
+    const asked: Ipc.AgentTurnFoldVm = {
+      turnId: "t-asked",
+      leadInIds: [],
+      reasoning: null,
+      steps: [{ id: "s1", name: "delegate", status: "parked", statusLabel: "Parked" }],
+      failures: [],
+      status: "waiting",
+      statusLabel: "Waiting for you",
+      summary: "Waiting for you · called delegate 1 time",
+      durationMs: null,
+      approvals: [],
+      waiting: [t4],
     };
     await draw();
     act(() =>
-      mock.view?.({ ...vm, approvals: [t4], banner: { approvals: [], sentence: elsewhere } }),
+      mock.view?.({
+        ...vm,
+        items: [{ kind: "fold", turnId: "t-asked" }],
+        folds: [asked],
+        banner: { approvals: [], sentence: elsewhere },
+      }),
     );
     const region = screen.getByRole("complementary", { name: "Waiting for your decision" });
     expect(within(region).getByRole("note")).toHaveTextContent(elsewhere);
     expect(within(region).queryByRole("article")).toBeNull();
-    expect(screen.getByRole("article", { name: "Approval: Run t4" })).toBeInTheDocument();
+    // In sight at its turn, the fold closed: a pending request is never folded away.
+    const card = screen.getByRole("article", { name: "Approval: Run t4" });
+    expect(card.closest('[data-slot="turn-fold"]')).toHaveAttribute("data-turn-id", "t-asked");
+    expect(card.closest('[data-slot="turn-fold-body"]')).toBeNull();
+    expect(screen.queryByRole("region", { name: "Session approvals" })).toBeNull();
     fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
       target: { value: "go on" },
     });
@@ -891,7 +916,7 @@ describe("the approval banner", () => {
     );
   });
 
-  it("moves focus to a decided card's place in the reading column, else to the next request", async () => {
+  it("moves focus to the fold a decided card folded into, else to the next request", async () => {
     mock.decide.mockResolvedValue({ state: "sent", sentence: "Approved." });
     await draw();
     act(() => mock.view?.({ ...vm, banner }));
@@ -899,20 +924,41 @@ describe("the approval banner", () => {
     const a1 = within(region()).getByRole("article", { name: "Approval: Run a1" });
     fireEvent.click(within(a1).getByRole("button", { name: "Allow once" }));
     await waitFor(() => expect(mock.decide).toHaveBeenCalledTimes(1));
-    // Rust's next view moves a1 to the reading column, approved.
-    const decided = { ...waiting("a1", "d1"), state: "approved" as const, canDecide: false };
+    // Rust's next view moves a1, approved, into the fold of the turn that asked.
+    const decided = {
+      ...waiting("a1", "d1"),
+      state: "approved" as const,
+      canDecide: false,
+      sentence: "Approved by Ana.",
+      actions: [],
+      declinedBySend: false,
+    };
     act(() =>
       mock.view?.({
         ...vm,
-        approvals: [{ ...decided, actions: [], declinedBySend: false }],
+        items: [{ kind: "fold", turnId: "t-asked" }],
+        folds: [
+          {
+            turnId: "t-asked",
+            leadInIds: [],
+            reasoning: null,
+            steps: [],
+            failures: [],
+            status: "waiting",
+            statusLabel: "Waiting for you",
+            summary: "Waiting for you",
+            durationMs: null,
+            approvals: [decided],
+            waiting: [],
+          },
+        ],
         banner: { ...banner, approvals: [waiting("a2", "d2")] },
       }),
     );
     await waitFor(() =>
-      expect(document.activeElement).toBe(
-        screen.getByRole("article", { name: "Approval: Run a1" }),
-      ),
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Waiting for you" })),
     );
+    expect(screen.queryByRole("article", { name: "Approval: Run a1" })).toBeNull();
     // a2 decided, and Rust's view has it nowhere: focus goes to the next request, else the
     // composer — never the body.
     const a2 = within(region()).getByRole("article", { name: "Approval: Run a2" });
@@ -1004,6 +1050,8 @@ describe("the reading column (109.14)", () => {
     statusLabel: "Finished",
     summary: "Worked for 14 s · searched the web 2 times",
     durationMs: 14000,
+    approvals: [],
+    waiting: [],
   };
   const screenshot: AgentSessionViewVm = {
     ...vm,
@@ -1038,6 +1086,52 @@ describe("the reading column (109.14)", () => {
     // itself would draw it as a row of its own.
     expect(screen.queryByText(lead.body)).not.toBeInTheDocument();
     expect(screen.getAllByText(answer.body)).toHaveLength(1);
+  });
+
+  it("folds a decided request with its turn and keeps a pending one in sight; nothing after the column", async () => {
+    const card = (id: string, state: Ipc.AgentApprovalVm["state"], sentence: string) => ({
+      id,
+      database: "beta",
+      sessionId: "same.1",
+      toolName: "run",
+      tier: "T2",
+      summary: `Run ${id}`,
+      bindingDigest: `digest-${id}`,
+      action: '{"argv":["git","status"]}',
+      expiresAtMs: 1800000000000,
+      createdAtMs: 1780000002000,
+      state,
+      canDecide: false,
+      sentence,
+      actions: [],
+      declinedBySend: false,
+    });
+    const asked: AgentSessionViewVm = {
+      ...screenshot,
+      folds: [
+        {
+          ...turn,
+          approvals: [card("decided", "approved", "Approved by Ana.")],
+          waiting: [card("bens", "pending", "Waiting for Ben.")],
+        },
+      ],
+    };
+    await draw();
+    act(() => mock.view?.(asked));
+    const column = screen.getByRole("list", { name: "Messages" });
+    expect(column.nextElementSibling).toBeNull();
+    expect(column.lastElementChild).toHaveTextContent(answer.body);
+    // Normal: the decided card is folded with the work; the pending one is outside the body.
+    expect(screen.queryByRole("article", { name: "Approval: Run decided" })).toBeNull();
+    const bens = screen.getByRole("article", { name: "Approval: Run bens" });
+    expect(bens.closest('[data-slot="turn-fold"]')).toHaveAttribute("data-turn-id", "t1");
+    expect(bens.closest('[data-slot="turn-fold-body"]')).toBeNull();
+    // Verbose: the decided card shows, inside its turn's opened fold.
+    act(() => mock.view?.({ ...asked, prefs: { viewMode: "verbose" } }));
+    const decided = screen.getByRole("article", { name: "Approval: Run decided" });
+    expect(decided.closest('[data-slot="turn-fold-body"]')).not.toBeNull();
+    expect(decided.closest('[data-slot="turn-fold"]')).toHaveAttribute("data-turn-id", "t1");
+    expect(column.nextElementSibling).toBeNull();
   });
 
   it("opens every fold in the verbose mode", async () => {
@@ -1094,6 +1188,8 @@ const RUNNING_CHILD: AgentChildSessionVm = {
       statusLabel: "Working",
       summary: "Searching the web… · 1 step",
       durationMs: null,
+      approvals: [],
+      waiting: [],
     },
   ],
   messages: [],

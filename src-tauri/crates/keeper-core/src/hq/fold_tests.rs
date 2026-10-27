@@ -1145,3 +1145,105 @@ fn a_blank_close_before_a_parked_call_is_never_a_bubble_of_its_own() {
         ]
     );
 }
+
+/// An `approvals` row for `call`'s request, as keeper-hq writes it.
+fn request(w: &World, id: &str, call: &str, state: &str, approvers: &[&str], at: i64) -> RowOp {
+    let decided = (state != "pending").then_some("ana");
+    upsert(
+        "approvals",
+        json!({
+            "id": id, "session_id": "dev1.1", "page_key": w.page(), "tool_call_id": call,
+            "tier": "T2", "binding_digest": format!("digest-{id}"), "summary": id,
+            "approvers": serde_json::to_string(approvers).expect("json"), "state": state,
+            "decided_by_actor": decided, "decided_by_client": decided.map(|_| "dev2"),
+            "consumed_by_client": null, "expires_at_ms": sessions::now_ms() + 60_000,
+            "created_at_ms": w.at + at, "author_actor": "alpha", "author_client": INSTANCE
+        }),
+    )
+}
+
+fn ids(approvals: &[crate::hq::approvals::AgentApprovalVm]) -> Vec<&str> {
+    approvals.iter().map(|a| a.id.as_str()).collect()
+}
+
+/// Owner report 2026-10-27 (triage claims 2 and 3): a request sits in the turn that asked. A
+/// decided one rides its turn's fold, inside the body, so it folds with the work; one pending for
+/// someone else waits in sight at its turn, whose line names whom it waits for; one this person
+/// can decide is in the banner and nowhere else; one whose call is not on this device stays at
+/// the column's end. Nothing is drawn below the answer that its turn did not write.
+#[test]
+fn each_request_sits_in_the_turn_that_asked_or_in_the_banner() {
+    let w = world(true);
+    w.put(vec![
+        upsert(
+            "actors",
+            json!({"id": "ben", "kind": "person", "display_name": "Ben", "family": null,
+                   "dir": "alpha", "created_at_ms": 1, "author_actor": "server",
+                   "author_client": "server"}),
+        ),
+        call(&w, "c-done", "run", "done", 1, Some("ok")),
+        call(&w, "c-bens", "run", "parked", 2, None),
+        request(&w, "decided", "c-done", "approved", &["ana"], 1),
+        request(&w, "bens", "c-bens", "pending", &["ben"], 2),
+        request(&w, "no-call", "c-elsewhere", "denied", &["ana"], 3),
+        w.answer("Done.", json!({"finish": "stop"})),
+    ]);
+    let view = w.view(&Opened::default());
+    assert_eq!(
+        view.items,
+        [
+            Item::Fold {
+                turn_id: TURN.into()
+            },
+            Item::Message {
+                message_id: "m-final".into()
+            },
+        ],
+        "the answer last; no card is an item"
+    );
+    let fold = turn_fold(&view);
+    assert_eq!(
+        ids(&fold.approvals),
+        ["decided"],
+        "decided: in the fold's body"
+    );
+    assert_eq!(
+        ids(&fold.waiting),
+        ["bens"],
+        "pending for Ben: in sight at its turn"
+    );
+    assert_eq!(
+        (fold.status, fold.status_label.as_str()),
+        (Status::Waiting, "Waiting for Ben"),
+        "the turn waits for Ben, not for this person"
+    );
+    assert!(fold.summary.starts_with("Waiting for Ben"));
+    assert_eq!(
+        ids(&view.approvals),
+        ["no-call"],
+        "no turn here: the column's end"
+    );
+    assert_eq!(view.banner, None);
+    let wire = serde_json::to_value(&view).expect("serialize");
+    assert_eq!(wire["folds"][0]["approvals"][0]["id"], "decided");
+    assert_eq!(wire["folds"][0]["waiting"][0]["id"], "bens");
+    assert!(wire["folds"][0]["approvals"][0].get("turnId").is_none());
+
+    // A request that waits for this person is the banner's alone, and the turn waits for them.
+    w.put(vec![
+        call(&w, "c-mine", "run", "parked", 3, None),
+        request(&w, "mine", "c-mine", "pending", &["ana"], 4),
+    ]);
+    let view = w.view(&Opened::default());
+    let banner = view.banner.as_ref().expect("a banner");
+    assert_eq!(ids(&banner.approvals), ["mine"]);
+    let fold = turn_fold(&view);
+    assert_eq!(ids(&fold.approvals), ["decided"]);
+    assert_eq!(
+        ids(&fold.waiting),
+        ["bens"],
+        "the bannered request is not in its fold"
+    );
+    assert_eq!(ids(&view.approvals), ["no-call"]);
+    assert_eq!(fold.status_label, "Waiting for you", "this person first");
+}

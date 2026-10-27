@@ -6251,7 +6251,12 @@ function heldViewPrefs(): AgentViewPrefsVm {
  * sentence a member who does not read the trace is sent instead, the answer it sits above, and
  * where tool-only work reads. `sessionViewerVm` projects it as `timeline.rs` does.
  */
-type MockFold = AgentTurnFoldVm & { publicSummary: string; answerId?: string; atMs: number };
+// A fold's requests are placed when the view is projected (`timeline::place`), never stored.
+type MockFold = Omit<AgentTurnFoldVm, "approvals" | "waiting"> & {
+  publicSummary: string;
+  answerId?: string;
+  atMs: number;
+};
 const sessionFolds = new Map<string, MockFold[]>();
 function mockFoldsOf(vm: AgentSessionViewVm): MockFold[] {
   const key = JSON.stringify([vm.database, vm.sessionId]);
@@ -6379,6 +6384,22 @@ const sessionRows: AgentSessionRowVm[] =
           lastActivityMs: Date.now() - 86400000,
         },
       ];
+/**
+ * ?sessions=launch&approvals=elsewhere — alpha's device.1 read as keeper on the agent's own host
+ * reads it: the T4 Paseo start needs another device and the T2 `run` waits for Ben, so neither is
+ * in the banner; each stays in sight in its turn's fold (`timeline::place`), never below the
+ * answer, and the fold line names whom the turn waits for.
+ */
+const approvalsScenario = new URLSearchParams(location.search).get("approvals");
+/** `Undecidable::AnotherDevice.sentence()`. */
+const MOCK_ANOTHER_DEVICE = "Needs a decision from another device.";
+/** `approvals.rs` `turn_id`: the turn of each request's parked call (`tool_calls.turn_id`). */
+const mockApprovalTurns = new Map<string, string>([
+  ["approval-1", "turn-alpha-1000"],
+  ["approval-2", "turn-alpha-1000"],
+  ["approval-3", "turn-alpha-1000"],
+  ["approval-run", "turn-owner"],
+]);
 const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includes(
   sessionScenario ?? "",
 )
@@ -6423,8 +6444,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
         expiresAtMs: Date.now() + 3600000,
         createdAtMs: Date.now() + 1,
         state: "pending",
-        canDecide: true,
-        sentence: "Waiting for you.",
+        canDecide: approvalsScenario !== "elsewhere",
+        sentence: approvalsScenario === "elsewhere" ? "Waiting for Ben." : "Waiting for you.",
         actions: [],
         declinedBySend: false,
       },
@@ -6458,8 +6479,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
         expiresAtMs: Date.now() + 3600000,
         createdAtMs: Date.now() + 2,
         state: "pending",
-        canDecide: true,
-        sentence: "Waiting for you.",
+        canDecide: approvalsScenario !== "elsewhere",
+        sentence: approvalsScenario === "elsewhere" ? MOCK_ANOTHER_DEVICE : "Waiting for you.",
         actions: [],
         declinedBySend: false,
       },
@@ -7476,42 +7497,82 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     else if (at > 0 && items[at - 1].kind === "fold") at -= 1;
     items.splice(at, 0, { kind: "child", threadId: child.threadId });
   }
-  const folds = items.flatMap((item) => {
-    const fold = item.kind === "fold" && source.find((f) => f.turnId === item.turnId);
-    if (!fold) return [];
-    const { publicSummary, answerId: _answer, atMs: _at, ...vmFold } = fold;
-    return [
-      {
-        ...vmFold,
-        reasoning: thinking ? vmFold.reasoning : null,
-        steps: reader ? vmFold.steps.map((step) => ({ ...step })) : [],
-        failures: reader ? [...vmFold.failures] : vmFold.failures.filter((f) => f.stepId === ""),
-        summary: reader ? vmFold.summary : publicSummary,
-      },
-    ];
-  });
   // `timeline::banner`: what a message would decline sits above the composer.
   const cards = reader ? vm.approvals.map(mockApproval) : [];
   const picker = mockPicker(vm);
   const waiting = cards.filter((card) => card.declinedBySend);
+  const rest = cards.filter((card) => !card.declinedBySend);
+  const shown = new Set(items.flatMap((item) => (item.kind === "fold" ? [item.turnId] : [])));
+  const turnOf = (card: AgentApprovalVm) => {
+    const turn = mockApprovalTurns.get(card.id);
+    return turn !== undefined && shown.has(turn) ? turn : undefined;
+  };
+  // `WaitingFor`: a pending request waits for this person unless its sentence names others.
+  const others = (card: AgentApprovalVm) =>
+    /^Waiting for (?!you\.?$)(.*?)\.?$/.exec(card.sentence)?.[1];
+  const folds = items.flatMap((item) => {
+    const fold = item.kind === "fold" && source.find((f) => f.turnId === item.turnId);
+    if (!fold) return [];
+    const { publicSummary, answerId: _answer, atMs: _at, ...vmFold } = fold;
+    const mine = rest.filter((card) => turnOf(card) === fold.turnId);
+    // `timeline::view`: a turn whose request waits says whom for, this person first.
+    const pending = cards.filter(
+      (card) => card.state === "pending" && mockApprovalTurns.get(card.id) === fold.turnId,
+    );
+    const who = pending.length
+      ? pending.some((card) => others(card) === undefined)
+        ? "you"
+        : others(pending[0])
+      : undefined;
+    const shownSummary = reader ? vmFold.summary : publicSummary;
+    const counts = shownSummary.indexOf(" · ");
+    return [
+      {
+        ...vmFold,
+        ...(who === undefined
+          ? {}
+          : { status: "waiting" as const, statusLabel: `Waiting for ${who}` }),
+        reasoning: thinking ? vmFold.reasoning : null,
+        steps: reader ? vmFold.steps.map((step) => ({ ...step })) : [],
+        failures: reader ? [...vmFold.failures] : vmFold.failures.filter((f) => f.stepId === ""),
+        summary:
+          who === undefined
+            ? shownSummary
+            : `Waiting for ${who}${counts === -1 ? "" : shownSummary.slice(counts)}`,
+        approvals: mine.filter((card) => card.state !== "pending"),
+        waiting: mine.filter((card) => card.state === "pending"),
+      },
+    ];
+  });
+  const elsewhere = rest.filter(
+    (card) => card.state === "pending" && card.sentence === MOCK_ANOTHER_DEVICE,
+  ).length;
+  const declines =
+    waiting.length === 0
+      ? []
+      : [
+          waiting.length === 1
+            ? "Sending a message declines this request, even a message that says yes. Use Allow to let it run."
+            : `Sending a message declines these ${waiting.length} requests, even a message that says yes. Use Allow to let one run.`,
+        ];
+  const another =
+    elsewhere === 0
+      ? []
+      : [
+          elsewhere === 1
+            ? "1 request needs a decision from another device; a message here leaves it waiting."
+            : `${elsewhere} requests need a decision from another device; a message here leaves them waiting.`,
+        ];
+  const sentence = [...declines, ...another].join(" ");
   return {
     ...vm,
     prefs,
     context: mockContext(vm),
     items,
     folds,
-    approvals: cards.filter((card) => !card.declinedBySend),
-    ...(waiting.length > 0
-      ? {
-          banner: {
-            approvals: waiting,
-            sentence:
-              waiting.length === 1
-                ? "Sending a message declines this request, even a message that says yes. Use Allow to let it run."
-                : `Sending a message declines these ${waiting.length} requests, even a message that says yes. Use Allow to let one run.`,
-          },
-        }
-      : {}),
+    // `timeline::place`: only a request whose turn this view does not show.
+    approvals: rest.filter((card) => turnOf(card) === undefined),
+    ...(sentence ? { banner: { approvals: waiting, sentence } } : {}),
     tools: vm.tools.map((tool) => ({ ...tool })),
     ...(vm.drives
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
@@ -8509,6 +8570,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
           statusLabel: "Finished",
           summary: "Answered in 2 s",
           durationMs: 2000,
+          approvals: [],
+          waiting: [],
         },
       ];
       child.messages = [answer];
@@ -11178,8 +11241,10 @@ export function installMockShell(): void {
   // R10911-01: a request that lands after the banner was drawn — not published, so the banner
   // does not show it until something else changes.
   const lateApproval = () => {
+    const id = `approval-late-${++sessionSerial}`;
+    mockApprovalTurns.set(id, "turn-alpha-1000");
     sessionApprovals.push({
-      id: `approval-late-${++sessionSerial}`,
+      id,
       database: "alpha",
       sessionId: "device.1",
       toolName: "run",

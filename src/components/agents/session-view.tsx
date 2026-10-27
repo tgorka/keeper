@@ -78,7 +78,7 @@ export function SessionView({
   // A send from under the banner that failed: said in the banner too, since its requests
   // may still wait (R10911-06).
   const [bannerFailure, setBannerFailure] = useState<string | null>(null);
-  // A request decided from the banner: once Rust moves it out, focus follows it (R10911-12).
+  // A request decided from the banner: once Rust moves it to its turn, focus follows (R10911-12).
   const [decidedFromBanner, setDecidedFromBanner] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [stores] = useState(createConversationStores);
@@ -237,21 +237,31 @@ export function SessionView({
     };
   }, [vm?.complete, vm?.readOnly, stores]);
 
-  // A decision taken in the banner moves its card to the reading column when Rust's next view
-  // has it. Focus goes to that card, else to the next request still in the banner, else to the
+  // A decision taken in the banner moves its card to its turn's fold when Rust's next view has it.
+  // Focus goes to that fold's toggle (the decided card is folded with the turn), else to the card
+  // where Rust drew it in the column, else to the next request still in the banner, else to the
   // composer — never to the page's body.
   useEffect(() => {
     if (decidedFromBanner === null || !vm) return;
     if (vm.banner?.approvals.some((approval) => approval.id === decidedFromBanner)) return;
     setDecidedFromBanner(null);
+    const turn = vm.folds.find((fold) =>
+      fold.approvals.some((approval) => approval.id === decidedFromBanner),
+    )?.turnId;
+    const toggle =
+      turn === undefined
+        ? null
+        : viewport.current?.querySelector<HTMLElement>(
+            `[data-turn-id="${CSS.escape(turn)}"] [data-slot="turn-fold-toggle"]`,
+          );
     const moved = viewport.current?.querySelector<HTMLElement>(
       `[data-approval-id="${CSS.escape(decidedFromBanner)}"]`,
     );
     const next = document.querySelector<HTMLElement>(
       '[data-slot="agent-approval-banner"] [data-approval-id] button',
     );
-    if (moved) moved.focus();
-    else if (next) next.focus();
+    const target = toggle ?? moved ?? next;
+    if (target) target.focus();
     else stores.composer.getState().requestFocus();
   }, [vm, decidedFromBanner, stores]);
   // An answer that never moves the card (refused, then decided elsewhere) stops waiting for it.
@@ -630,6 +640,8 @@ export function SessionView({
             })}
           </ol>
         )}
+        {/* Only a request whose turn this view does not show: every other one is in its
+            turn's fold, or in the banner. */}
         {!!vm?.approvals.length && (
           <section
             aria-label="Session approvals"
