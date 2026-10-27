@@ -87,6 +87,9 @@ mime_guess = "2"
 # HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
 # rustls-only to match matrix-sdk's TLS backend — no second TLS stack (no native-tls/OpenSSL).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# `Retry-After` as an HTTP date, parsed and printed (keeper-llm, R58-01). Already
+# in the tree via hyper, so a direct dep adds no new crate. MIT/Apache.
+httpdate = "1"
 # keeper's own OIDC client for the organisation account (Epic 82, AD-310):
 # discovery, PKCE S256, ID-token verification, refresh, revocation and the
 # logout URL. `default-features = false` is load-bearing — the defaults pull

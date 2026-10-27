@@ -80,6 +80,36 @@ pub enum BotsError {
         detail: String,
     },
 
+    /// The endpoint refused and asked to be asked again later than a request
+    /// will wait ([`crate::chat::MAX_RETRY_AFTER`]): a 429 or 5xx whose
+    /// `Retry-After` is past the bound.
+    ///
+    /// This is how CLIProxyAPI says a model's quota is spent: HTTP 429 with
+    /// `Retry-After` set to the seconds until the reset, days away (R58-01).
+    /// Waiting that out is a turn that hangs for days, so the request fails
+    /// at once with the model, the wait and when it ends, which is the
+    /// sentence a person needs to pick another model.
+    #[error(
+        "{}",
+        retry_after_sentence(*status, model, *wait_secs, until.as_deref(), endpoint, detail)
+    )]
+    RetryAfterTooLong {
+        /// The model the request asked for.
+        model: String,
+        /// The HTTP status code, 429 or 5xx.
+        status: u16,
+        /// Method and path, e.g. `POST /v1/chat/completions`.
+        endpoint: String,
+        /// How long the endpoint asked keeper to wait, in seconds.
+        wait_secs: u64,
+        /// When the wait ends, as an HTTP date (`Sun, 01 Nov 2026 06:38:01
+        /// GMT`): the header's own date, or now plus its seconds. `None` when
+        /// that is past what an HTTP date can name (year 9999).
+        until: Option<String>,
+        /// A bounded excerpt of the response body, or `no body`.
+        detail: String,
+    },
+
     /// A body that should have been JSON was not, or was not the shape the
     /// wire promises.
     #[error("{endpoint} returned a body keeper could not read: {detail}")]
@@ -261,6 +291,56 @@ fn excerpt(text: &str) -> String {
     format!("{}… (truncated)", &trimmed[..end])
 }
 
+/// The sentence [`BotsError::RetryAfterTooLong`] says: what is wrong with
+/// which model, until when, and what to do — then the endpoint's own words.
+fn retry_after_sentence(
+    status: u16,
+    model: &str,
+    wait_secs: u64,
+    until: Option<&str>,
+    endpoint: &str,
+    detail: &str,
+) -> String {
+    let state = if status == 429 {
+        "is out of quota"
+    } else {
+        "is unavailable"
+    };
+    let wait = human_wait(wait_secs);
+    let when = match until {
+        Some(until) => format!("until about {until}"),
+        None if wait_secs > YEAR => "for more than a year".to_owned(),
+        None => format!("for about {wait}"),
+    };
+    format!(
+        "{model} {state} {when} (Retry-After {wait}). Pick another model. \
+         {endpoint} returned HTTP {status}: {detail}"
+    )
+}
+
+const MINUTE: u64 = 60;
+const HOUR: u64 = 60 * MINUTE;
+const DAY: u64 = 24 * HOUR;
+/// Past this an exact figure is noise: `Retry-After` has no business asking
+/// for longer, and `u64::MAX` seconds would print as 2·10¹⁴ days (R599-03).
+const YEAR: u64 = 365 * DAY;
+
+/// A wait in the unit a person reads it in: `45 s`, `12 min`, `3.5 hours`,
+/// `4.9 days`, `more than a year`.
+fn human_wait(secs: u64) -> String {
+    if secs < 2 * MINUTE {
+        format!("{secs} s")
+    } else if secs < 2 * HOUR {
+        format!("{} min", (secs + MINUTE / 2) / MINUTE)
+    } else if secs < 2 * DAY {
+        format!("{:.1} hours", secs as f64 / HOUR as f64)
+    } else if secs <= YEAR {
+        format!("{:.1} days", secs as f64 / DAY as f64)
+    } else {
+        "more than a year".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +377,41 @@ mod tests {
             detail: "cut".to_owned()
         }
         .is_retryable());
+    }
+
+    #[test]
+    fn a_long_retry_after_says_model_wait_end_and_the_endpoint_words() {
+        let err = BotsError::RetryAfterTooLong {
+            model: "gpt-6.1-sol".to_owned(),
+            status: 429,
+            endpoint: "POST /v1/chat/completions".to_owned(),
+            wait_secs: 427_327,
+            until: Some("Sun, 01 Nov 2026 06:38:01 GMT".to_owned()),
+            detail: "All credentials for model gpt-6.1-sol are cooling down".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "gpt-6.1-sol is out of quota until about Sun, 01 Nov 2026 06:38:01 GMT \
+             (Retry-After 4.9 days). Pick another model. POST /v1/chat/completions \
+             returned HTTP 429: All credentials for model gpt-6.1-sol are cooling down"
+        );
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn a_long_5xx_wait_says_unavailable_and_without_a_date_says_how_long() {
+        let err = BotsError::RetryAfterTooLong {
+            model: "m".to_owned(),
+            status: 503,
+            endpoint: "POST /x".to_owned(),
+            wait_secs: 3 * 3600,
+            until: None,
+            detail: "no body".to_owned(),
+        };
+        assert!(
+            err.to_string()
+                .starts_with("m is unavailable for about 3.0 hours (Retry-After 3.0 hours)."),
+            "{err}"
+        );
     }
 }

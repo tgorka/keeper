@@ -13,6 +13,8 @@ workspace = true
 # AD-431: no keeper dependency, no matrix-sdk, no SQLite, no gitoxide, no
 # tauri. `bun run check:llm-lean` asserts it over `cargo tree`.
 [dependencies]
+# `Retry-After` in its HTTP-date form, and the absolute time a refusal names.
+httpdate = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,3 +26,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+# The `Retry-After` tests stand up a loopback server (tests/retry_after.rs).
+tokio = { workspace = true, features = ["net"] }
