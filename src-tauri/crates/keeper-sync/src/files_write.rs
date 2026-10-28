@@ -93,6 +93,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::browse::{self, BrowseRefusal};
+use crate::names;
 
 /// The longest file name this surface will create.
 ///
@@ -246,8 +247,12 @@ pub enum WriteRefusal {
     /// a pointer in the index or on the disk — and an agent writes text into
     /// git only ([`agent_write_check`]).
     LfsRouted { subpath: String },
-    /// A file is there that the drive's index does not track
-    /// ([`agent_write_check`], R-HQ-81).
+    /// The index tracks the path as something other than a regular file — a
+    /// submodule, say — or the disk holds something other than a regular file
+    /// at a tracked one ([`agent_write_check`], R-HQ-81). A path the index
+    /// does not track at all is [`Self::Missing`] to an agent's write,
+    /// whatever the disk holds there, so the answer never says what a person
+    /// keeps beside the drive.
     Untracked { subpath: String },
     /// The path is, or passes through, a symbolic link ([`agent_write_check`]):
     /// an agent's write lands only at the path it names.
@@ -255,9 +260,9 @@ pub enum WriteRefusal {
     /// Something is already at a path an agent's write would make
     /// ([`agent_write_check`]).
     Exists { subpath: String },
-    /// Whether an agent may write the path could not be told — the index,
-    /// the ignore rules or the attributes could not be read — so it may not
-    /// ([`agent_write_check`] fails closed).
+    /// Whether an agent may write the path could not be told — the index, an
+    /// indexed blob, the ignore rules or the attributes could not be read —
+    /// so it may not ([`agent_write_check`] fails closed).
     Undecidable { subpath: String, reason: String },
 }
 
@@ -459,6 +464,24 @@ fn native_prefix(configured: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// The segments of `subpath` past `zone`, when `subpath` is at or under it:
+/// each of the zone's segments compared as the Mac's volume compares names
+/// ([`names::same_entry_folded`]), because a fence the shift key or a
+/// decomposed accent walks around is no fence on the volume keeper ships on.
+/// The one zone walk every zone fence reads (AD-65, AD-159).
+fn within_zone<'s>(zone: &str, subpath: &'s str) -> Option<Vec<&'s str>> {
+    let mut parts = subpath.split('/');
+    for zone_part in zone.split('/') {
+        if !parts
+            .next()
+            .is_some_and(|part| names::same_entry_folded(part, zone_part))
+        {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
 /// Where one profile's Files surface may write.
 ///
 /// Constructed per call from the vault the shell can actually reach, so this
@@ -574,12 +597,7 @@ impl<'a> WriteScope<'a> {
         else {
             return false;
         };
-        let mut parts = subpath.split('/').filter(|part| !part.is_empty());
-        zone.split('/').all(|zone_part| {
-            parts
-                .next()
-                .is_some_and(|part| part.eq_ignore_ascii_case(zone_part))
-        })
+        within_zone(zone, subpath).is_some()
     }
 
     /// The same scope, aware of the profile's agents zone (AD-361, AD-362).
@@ -592,23 +610,18 @@ impl<'a> WriteScope<'a> {
     }
 
     /// Whether a profile-relative path is a file only a person edits in an
-    /// agents zone. Every segment is compared folded, as the workspace
-    /// fence's segment is: on the case-insensitive volume keeper ships on,
-    /// `80-Agents/Nixi/soul.md` is the soul.
+    /// agents zone. Every segment is compared as the Mac's volume compares
+    /// names ([`names::same_entry_folded`]), as the workspace fence's segment
+    /// is: on the case-insensitive, normalization-insensitive volume keeper
+    /// ships on, `80-Agents/Nixi/soul.md` is the soul, and so is a zone named
+    /// `café` reached as `cafe\u{301}`.
     fn in_agent_home(&self, subpath: &str) -> bool {
         let Some(zone) = self.agents_subfolder.as_deref() else {
             return false;
         };
-        let mut parts = subpath.split('/').filter(|part| !part.is_empty());
-        for zone_part in zone.split('/') {
-            if !parts
-                .next()
-                .is_some_and(|part| part.eq_ignore_ascii_case(zone_part))
-            {
-                return false;
-            }
-        }
-        let rest: Vec<&str> = parts.collect();
+        let Some(rest) = within_zone(zone, subpath) else {
+            return false;
+        };
         match rest.as_slice() {
             // The zone's own files and folders: `_drive.toml`, `_skills/`,
             // `_workflows/`, `_template/` and anything else it reserves.
@@ -835,32 +848,33 @@ impl<'a> WriteScope<'a> {
         let Some(zone) = self.sessions_subfolder.as_deref() else {
             return WorkspacePosition::Outside;
         };
-        let Some(rest) = subpath
-            .strip_prefix(zone)
-            .and_then(|rest| rest.strip_prefix('/'))
-        else {
+        let Some(parts) = within_zone(zone, subpath) else {
             return WorkspacePosition::Outside;
         };
-        let parts: Vec<&str> = rest.split('/').collect();
         // The index the workspace segment sits at, per lifecycle layout:
         // `active/<session>/workspace/...`, `archive/<year>/<session>/...`.
-        let at = match parts.first() {
-            Some(&"active") => 2,
-            Some(&"archive") => 3,
-            _ => return WorkspacePosition::Outside,
+        let named = |at: usize, name: &str| {
+            parts
+                .get(at)
+                .is_some_and(|part| names::same_entry_folded(part, name))
         };
-        // Folded, because the segment is one an operator can make in Finder and
-        // the volume keeper ships on (APFS by default) answers `Workspace` and
-        // `workspace` with the same directory. A case-sensitive `==` here left
-        // this fence and `keeper_core::sessions::files::check_dir` sharing one
-        // blind spot, so running both predicates bought nothing: the pair only
-        // means something if neither can be defeated by the shift key. The two
-        // lifecycle names above are keeper's own and every reader in the app
-        // spells them one way, so they stay exact.
-        if !parts
-            .get(at)
-            .is_some_and(|part| part.eq_ignore_ascii_case("workspace"))
-        {
+        let at = if named(0, "active") {
+            2
+        } else if named(0, "archive") {
+            3
+        } else {
+            return WorkspacePosition::Outside;
+        };
+        // Folded, every segment of it, because each is one an operator can
+        // make in Finder and the volume keeper ships on (APFS by default)
+        // answers `Workspace` and `workspace` — and `Active` and `active` —
+        // with the same directory. A case-sensitive `==` here left this fence
+        // and `keeper_core::sessions::files::check_dir` sharing one blind
+        // spot, so running both predicates bought nothing: the pair only means
+        // something if neither can be defeated by the shift key. keeper's own
+        // readers spell the lifecycle names one way, so folding them refuses
+        // only what lands in the same folder on the Mac.
+        if !named(at, "workspace") {
             return WorkspacePosition::Outside;
         }
         if parts.len() > at + 1 {
@@ -1013,17 +1027,20 @@ pub enum AgentTarget {
     New,
 }
 
-/// Folder names an agent's write never passes through, compared case-folded:
-/// git's, keeper's, the sync engine's and Obsidian's own state.
+/// Folder names an agent's write never passes through, compared as the Mac's
+/// volume compares names: git's, keeper's, the sync engine's and Obsidian's
+/// own state.
 const AGENT_NEVER_FOLDERS: [&str; 4] = [".git", ".keeper", ".keeper-sync", ".obsidian"];
 
 /// Whether `subpath` is git's or keeper's own: a segment in
 /// [`AGENT_NEVER_FOLDERS`], or a file git or keeper reads unfiltered
-/// (`lfs::stage::CONTROL_FILES`), at any depth, ASCII case-folded — on the
-/// case-insensitive volume keeper ships on `.GitIgnore` is `.gitignore`.
+/// (`lfs::stage::CONTROL_FILES`), at any depth, folded as
+/// [`names::same_entry_folded`] folds — on the volume keeper ships on
+/// `.GitIgnore` is `.gitignore`.
 fn is_machinery(subpath: &str) -> bool {
     let segments: Vec<&str> = subpath.split('/').collect();
-    let folded = |name: &str, list: &[&str]| list.iter().any(|own| name.eq_ignore_ascii_case(own));
+    let folded =
+        |name: &str, list: &[&str]| list.iter().any(|own| names::same_entry_folded(name, own));
     segments
         .iter()
         .any(|segment| folded(segment, &AGENT_NEVER_FOLDERS))
@@ -1051,20 +1068,36 @@ fn is_machinery(subpath: &str) -> bool {
 ///    name at most [`MAX_NAME_BYTES`];
 /// 2. never git's or keeper's own ([`WriteRefusal::Machinery`]);
 /// 3. the scope's fences ([`WriteScope::fenced`]);
-/// 4. on the disk, no link at or on the way to it ([`WriteRefusal::Link`]),
-///    no file where a folder of the path should be, and not a folder;
-/// 5. not left out by the profile's exclusions or by `.gitignore`
-///    ([`WriteRefusal::Ignored`]);
-/// 6. [`AgentTarget::Existing`]: a regular file on the disk that the index
-///    tracks as one ([`WriteRefusal::Missing`], [`WriteRefusal::Untracked`]);
-///    [`AgentTarget::New`]: nothing on the disk or in the index at it, under
-///    it, or at a name differing only in case ([`WriteRefusal::Exists`]);
-/// 7. not stored through LFS: no pointer in the index or on the disk, and no
+/// 4. not left out by the profile's exclusions ([`WriteRefusal::Ignored`]);
+/// 5. the index, its names compared as the Mac's volume compares them
+///    ([`names::same_entry_folded`]): no tracked file or link where a folder
+///    of the path would be, even one gone from this disk;
+///    [`AgentTarget::Existing`]: a regular file the index tracks at exactly
+///    this path ([`WriteRefusal::Missing`] otherwise, whatever this disk
+///    holds there); [`AgentTarget::New`]: nothing tracked at it, under it, or
+///    at a spelling the Mac would take for it ([`WriteRefusal::Exists`]);
+/// 6. not left out by `.gitignore` ([`WriteRefusal::Ignored`]);
+/// 7. on the disk, no link at or on the way to it ([`WriteRefusal::Link`]),
+///    no file where a folder of the path should be; an existing target is a
+///    regular file there, and a new one finds nothing there in any spelling;
+/// 8. not stored through LFS: no pointer in the index or on the disk, and no
 ///    `filter=lfs` from `.gitattributes` ([`WriteRefusal::LfsRouted`]).
 ///
-/// Fails closed: an index, ignore rule or attribute stack that cannot be read
-/// is [`WriteRefusal::Undecidable`], never a yes — unlike the LFS repair
-/// sweep, whose "cannot tell" leaves a file alone.
+/// **Only rules and tracked files decide a sentence before the disk is
+/// read.** An ignored path is refused as ignored, and an existing target the
+/// index does not track as [`WriteRefusal::Missing`], whether or not this
+/// disk holds a file there, so no refusal tells an agent what a person keeps
+/// beside the drive. The one answer that cannot be kept apart is a new path's
+/// [`WriteRefusal::Exists`] where an untracked file already is: allowing it
+/// would write over that file.
+///
+/// Fails closed: an index, an indexed blob, an ignore rule or an attribute
+/// stack that cannot be read is [`WriteRefusal::Undecidable`], never a yes —
+/// unlike the LFS repair sweep, whose "cannot tell" leaves a file alone.
+///
+/// What it answered holds when it answered: a carrier of the write asks
+/// [`agent_apply_check`] again, with the bytes it is about to commit, right
+/// before it commits them.
 pub fn agent_write_check(
     root: &Path,
     scope: &WriteScope<'_>,
@@ -1094,6 +1127,74 @@ pub fn agent_write_check(
         subpath: subpath.to_owned(),
         reason,
     };
+    if excludes.is_excluded(Path::new(subpath)) {
+        return refused(|subpath| WriteRefusal::Ignored { subpath });
+    }
+
+    let repo = crate::git::repo::open_read_only(root, true)
+        .map_err(|error| undecidable(error.to_string()))?;
+    let index = repo
+        .index_or_empty()
+        .map_err(|error| undecidable(error.to_string()))?;
+    // `plain_segments` took the subpath apart at its `/`s, so these are its
+    // segments, spelled as they were sent.
+    let wanted: Vec<&str> = subpath.split('/').collect();
+    let tracked = Tracked::of(&index, &wanted);
+    if let Some((at, mode)) = tracked.over {
+        return if mode == gix::index::entry::Mode::SYMLINK {
+            refused(|subpath| WriteRefusal::Link { subpath })
+        } else {
+            Err(WriteRefusal::NameTaken {
+                name: wanted[at].to_owned(),
+            })
+        };
+    }
+    let entry = index.entry_by_path(gix::bstr::BStr::new(subpath.as_bytes()));
+    let folder = || {
+        Err(WriteRefusal::IsDirectory {
+            name: last_segment(subpath).to_owned(),
+        })
+    };
+    match target {
+        AgentTarget::Existing => match entry.map(|entry| entry.mode) {
+            Some(gix::index::entry::Mode::SYMLINK) => {
+                return refused(|subpath| WriteRefusal::Link { subpath })
+            }
+            Some(gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE) => {}
+            Some(_) => return refused(|subpath| WriteRefusal::Untracked { subpath }),
+            None if tracked.beneath => return folder(),
+            // Not one of the drive's files, whatever this disk holds there.
+            None => return refused(|subpath| WriteRefusal::Missing { subpath }),
+        },
+        AgentTarget::New => {
+            // The file itself, in any spelling the Mac takes for it.
+            if entry.is_some() || tracked.at_otherwise {
+                return refused(|subpath| WriteRefusal::Exists { subpath });
+            }
+            // A folder of the path the index spells otherwise: on the Mac the
+            // file lands in that folder, under a key no other device has.
+            if let Some(at) = tracked.folder_otherwise {
+                return Err(WriteRefusal::NameTaken {
+                    name: wanted[at].to_owned(),
+                });
+            }
+            if tracked.beneath {
+                return folder();
+            }
+        }
+    }
+
+    let mode = entry.map_or(gix::index::entry::Mode::FILE, |entry| entry.mode);
+    let mut ignores = repo
+        .excludes(&index, None, Default::default())
+        .map_err(|error| undecidable(error.to_string()))?;
+    let ignored = ignores
+        .at_path(Path::new(subpath), Some(mode))
+        .map_err(|error| undecidable(error.to_string()))?
+        .is_excluded();
+    if ignored {
+        return refused(|subpath| WriteRefusal::Ignored { subpath });
+    }
 
     // The disk, one name at a time and following no link: what is at the
     // path, if anything.
@@ -1120,74 +1221,35 @@ pub fn agent_write_check(
             Ok(_) => {}
         }
     }
-    if found.as_ref().is_some_and(std::fs::Metadata::is_dir) {
-        return Err(WriteRefusal::IsDirectory {
-            name: last_segment(subpath).to_owned(),
-        });
-    }
-    if excludes.is_excluded(Path::new(subpath)) {
-        return refused(|subpath| WriteRefusal::Ignored { subpath });
-    }
-
-    let repo = crate::git::repo::open_read_only(root, true)
-        .map_err(|error| undecidable(error.to_string()))?;
-    let index = repo
-        .index_or_empty()
-        .map_err(|error| undecidable(error.to_string()))?;
-    let key = gix::bstr::BStr::new(subpath.as_bytes());
-    let entry = index.entry_by_path(key);
-    match target {
-        AgentTarget::Existing => {
-            let Some(meta) = found.as_ref() else {
-                return refused(|subpath| WriteRefusal::Missing { subpath });
-            };
-            match entry.map(|entry| entry.mode) {
-                Some(gix::index::entry::Mode::SYMLINK) => {
-                    return refused(|subpath| WriteRefusal::Link { subpath })
-                }
-                Some(gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE)
-                    if meta.is_file() => {}
-                _ => return refused(|subpath| WriteRefusal::Untracked { subpath }),
-            }
+    match (target, found.as_ref()) {
+        (AgentTarget::Existing, None) => {
+            return refused(|subpath| WriteRefusal::Missing { subpath })
         }
-        AgentTarget::New => {
-            let under = format!("{subpath}/");
-            if index
-                .prefixed_entries(gix::bstr::BStr::new(under.as_bytes()))
-                .is_some_and(|entries| !entries.is_empty())
-            {
-                return Err(WriteRefusal::IsDirectory {
-                    name: last_segment(subpath).to_owned(),
-                });
-            }
-            // Its folder is there: a name differing only in case is the same
-            // file on the volume keeper ships on.
-            let taken_in_case = match absolute.parent() {
-                Some(parent) if found.is_none() && present == last => {
-                    collides(parent, last_segment(subpath))?
-                }
+        (AgentTarget::Existing, Some(meta)) if meta.is_dir() => return folder(),
+        (AgentTarget::Existing, Some(meta)) if !meta.is_file() => {
+            return refused(|subpath| WriteRefusal::Untracked { subpath })
+        }
+        (AgentTarget::Existing, Some(_)) => {}
+        (AgentTarget::New, Some(_)) => return refused(|subpath| WriteRefusal::Exists { subpath }),
+        (AgentTarget::New, None) => {
+            // Its folder is there: a name the Mac takes for this one is the
+            // same file on the volume keeper ships on.
+            let taken_otherwise = match absolute.parent() {
+                Some(parent) if present == last => collides(parent, last_segment(subpath))?,
                 _ => false,
             };
-            if found.is_some() || entry.is_some() || taken_in_case {
+            if taken_otherwise {
                 return refused(|subpath| WriteRefusal::Exists { subpath });
             }
         }
     }
 
-    let mode = entry.map_or(gix::index::entry::Mode::FILE, |entry| entry.mode);
-    let mut ignores = repo
-        .excludes(&index, None, Default::default())
-        .map_err(|error| undecidable(error.to_string()))?;
-    let ignored = ignores
-        .at_path(Path::new(subpath), Some(mode))
-        .map_err(|error| undecidable(error.to_string()))?
-        .is_excluded();
-    if ignored {
-        return refused(|subpath| WriteRefusal::Ignored { subpath });
-    }
-
-    let pointer_indexed =
-        entry.is_some_and(|entry| crate::lfs::stage::pointer_blob(&repo, entry.id).is_some());
+    let pointer_indexed = match entry {
+        Some(entry) => {
+            crate::lfs::stage::indexed_pointer_checked(&repo, entry.id).map_err(undecidable)?
+        }
+        None => false,
+    };
     let pointer_on_disk = match found.as_ref() {
         Some(meta) => crate::lfs::stage::read_worktree_pointer(&absolute, meta)
             .map_err(|error| undecidable(error.to_string()))?
@@ -1201,6 +1263,115 @@ pub fn agent_write_check(
         return refused(|subpath| WriteRefusal::LfsRouted { subpath });
     }
     Ok(subpath.to_owned())
+}
+
+/// [`agent_write_check`] at the moment of the effect (109.27, contract
+/// § 5.1): asked by the device that carries an agent's write out, over its
+/// own checkout, right before `Engine::commit_paths`, with `post_image` the
+/// exact bytes the commit will hold at `subpath` (`None` for a move's source
+/// or a delete).
+///
+/// Everything [`agent_write_check`] decides is decided again here, LFS
+/// routing included, because the drive may have changed since the card was
+/// drawn — a `.gitattributes` that now routes the path, a file that now
+/// stands in the way. And the bytes themselves must not be an LFS pointer:
+/// committed as text, a pointer is a large-file entry no agent may make
+/// ([`WriteRefusal::LfsRouted`]).
+pub fn agent_apply_check(
+    root: &Path,
+    scope: &WriteScope<'_>,
+    excludes: &crate::exclude::ExcludeSet,
+    subpath: &str,
+    target: AgentTarget,
+    post_image: Option<&[u8]>,
+) -> Result<String, WriteRefusal> {
+    let key = agent_write_check(root, scope, excludes, subpath, target)?;
+    // An empty file is the empty pointer only by the format's own carve-out:
+    // it names no object, and git stores it as the empty file it is.
+    let pointer =
+        |bytes: &[u8]| !bytes.is_empty() && crate::lfs::pointer::Pointer::parse(bytes).is_some();
+    if post_image.is_some_and(pointer) {
+        return Err(WriteRefusal::LfsRouted {
+            subpath: subpath.to_owned(),
+        });
+    }
+    Ok(key)
+}
+
+/// What the index tracks at, over and under one path, its names compared as
+/// the Mac's volume compares them ([`names::same_entry_folded`]) — the disk
+/// may no longer hold any of it, and on the device that carries a write out
+/// a tracked path gone from the disk is still one a commit would change.
+#[derive(Debug, Default)]
+struct Tracked {
+    /// A tracked file or link where a folder of the path would be, in any
+    /// spelling: that folder's position among the path's names, and the
+    /// entry's mode. A commit under it would turn the file into a folder.
+    over: Option<(usize, gix::index::entry::Mode)>,
+    /// A tracked entry at the path in another spelling.
+    at_otherwise: bool,
+    /// Tracked entries under the path, in any spelling: it is a folder.
+    beneath: bool,
+    /// The first folder of the path that the index tracks spelled otherwise.
+    folder_otherwise: Option<usize>,
+}
+
+impl Tracked {
+    /// One pass over the index; no allocation for an ASCII entry.
+    fn of(index: &gix::index::State, wanted: &[&str]) -> Self {
+        use gix::bstr::ByteSlice;
+        let mut tracked = Self::default();
+        for entry in index.entries() {
+            let path = entry.path(index).to_str_lossy();
+            let mut parts = path.split('/');
+            // How many of the entry's names matched the path's, and where the
+            // first of them was spelled otherwise.
+            let mut depth = 0;
+            let mut otherwise = None;
+            loop {
+                let part = parts.next();
+                if let (Some(_), Some(at)) = (part, otherwise) {
+                    // The entry goes on past a name spelled otherwise, so that
+                    // name is a folder; it is one of the path's folders unless
+                    // it was the path's own last name.
+                    if at < wanted.len() - 1 {
+                        tracked.folder_otherwise = Some(
+                            tracked
+                                .folder_otherwise
+                                .map_or(at, |first: usize| first.min(at)),
+                        );
+                    }
+                }
+                match (part, wanted.get(depth)) {
+                    (None, _) => {
+                        if entry.mode == gix::index::entry::Mode::DIR {
+                            // A sparse folder: the path is in it or is it.
+                            tracked.beneath |= depth == wanted.len();
+                        } else if depth < wanted.len() {
+                            tracked.over.get_or_insert((depth - 1, entry.mode));
+                        } else if otherwise.is_some() {
+                            tracked.at_otherwise = true;
+                        }
+                        break;
+                    }
+                    (Some(_), None) => {
+                        tracked.beneath = true;
+                        break;
+                    }
+                    (Some(part), Some(name)) => {
+                        if part != *name {
+                            if !names::same_entry_folded(part, name) {
+                                break;
+                            }
+                            otherwise.get_or_insert(depth);
+                        }
+                        depth += 1;
+                    }
+                }
+            }
+        }
+        tracked
+    }
 }
 
 // ─── AD-102: the second writer ───────────────────────────────────────────────
@@ -1784,7 +1955,9 @@ fn deletion_date(local_now_ms: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
 }
 
-/// Whether `name` is already taken in `directory`, matching case-insensitively.
+/// Whether `name` is already taken in `directory`, matching as the Mac's
+/// volume matches names ([`names::same_entry_folded`]): case-insensitively and
+/// whatever the Unicode normalization.
 ///
 /// **Case-insensitively, and that is the load-bearing part.** APFS and NTFS are
 /// case-insensitive by default, so `README.md` created beside an existing
@@ -1803,11 +1976,7 @@ pub fn collides(directory: &Path, name: &str) -> Result<bool, WriteRefusal> {
         let entry = entry.map_err(|error| WriteRefusal::Unreadable {
             reason: error.to_string(),
         })?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(name)
-        {
+        if names::same_entry_folded(&entry.file_name().to_string_lossy(), name) {
             return Ok(true);
         }
     }
@@ -1875,7 +2044,7 @@ fn check_name(name: &str) -> Result<(), WriteRefusal> {
     }
     if RESERVED_NAMES
         .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        .any(|reserved| names::same_entry_folded(name, reserved))
     {
         return Err(WriteRefusal::NameReserved {
             name: name.to_owned(),
@@ -2484,7 +2653,9 @@ mod tests {
         let exact = "y".repeat(MAX_NAME_BYTES);
         assert!(scope.create("10-notes", &exact).is_ok());
 
-        for name in [".keeper", ".obsidian", ".git", ".KEEPER"] {
+        // `\u{212A}` is the Kelvin sign, which decomposes to `K`: on the Mac's
+        // volume `.\u{212A}eeper` is the `.keeper` folder.
+        for name in [".keeper", ".obsidian", ".git", ".KEEPER", ".\u{212A}eeper"] {
             assert_eq!(
                 refuse(name),
                 WriteRefusal::NameReserved {

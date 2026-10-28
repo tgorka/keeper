@@ -1095,7 +1095,11 @@ fn blob_could_be_a_pointer(repo: &gix::Repository, blob: gix::hash::ObjectId) ->
     let Ok(header) = repo.find_header(blob) else {
         return false;
     };
-    let size = header.size();
+    pointer_sized(header.size())
+}
+
+/// [`blob_could_be_a_pointer`]'s size window, one rule for every reader.
+fn pointer_sized(size: u64) -> bool {
     size != 0 && size <= pointer::MAX_POINTER_BYTES as u64
 }
 
@@ -1111,6 +1115,30 @@ pub(crate) fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) ->
         return None;
     }
     Pointer::parse(&repo.find_object(blob).ok()?.data)
+}
+
+/// [`pointer_blob`]'s question for a caller that must refuse when it cannot
+/// tell (109.27): is the indexed blob `blob` an LFS pointer?
+///
+/// `Err` with the reason when the object cannot be read — missing from the
+/// object database, or unreadable — because an agent's write asks this to
+/// stay out of LFS and a blob nobody can look at may be a pointer. The
+/// listing's `None` for the same failure is right for the listing, which only
+/// ever draws a file as ordinary on it.
+pub(crate) fn indexed_pointer_checked(
+    repo: &gix::Repository,
+    blob: gix::hash::ObjectId,
+) -> std::result::Result<bool, String> {
+    let header = repo
+        .find_header(blob)
+        .map_err(|error| format!("its indexed blob {blob} cannot be read: {error}"))?;
+    if !pointer_sized(header.size()) {
+        return Ok(false);
+    }
+    let object = repo
+        .find_object(blob)
+        .map_err(|error| format!("its indexed blob {blob} cannot be read: {error}"))?;
+    Ok(Pointer::parse(&object.data).is_some())
 }
 
 /// [`pointer_blob`]'s answer, **with the blob's own bytes**.

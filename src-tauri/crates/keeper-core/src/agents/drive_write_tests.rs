@@ -492,6 +492,28 @@ fn overlapping_occurrences_of_an_edit_count_as_two_places() {
     );
 }
 
+/// R603 round 2: line breaks are bytes like any other — an edit's passage
+/// matches a CRLF file only with its `\r`, what replaces it is written as
+/// sent, and nothing else in the file is normalised.
+#[test]
+fn an_edit_matches_and_writes_line_breaks_byte_for_byte() {
+    let file = "- [ ] milk\r\n- [ ] eggs\n";
+    assert_eq!(
+        parsed(edit("- [ ] milk\n", "- [x] milk\n")).post_image(Some(file.as_bytes())),
+        Err(Refusal::EditNone {
+            path: "10-notes/inbox.md".into()
+        })
+    );
+    assert_eq!(
+        parsed(edit("- [ ] milk\r\n", "- [x] milk\n")).post_image(Some(file.as_bytes())),
+        Ok(Some("- [x] milk\n- [ ] eggs\n".to_owned()))
+    );
+    assert_eq!(
+        parsed(edit("eggs", "eggs\r")).post_image(Some(file.as_bytes())),
+        Ok(Some("- [ ] milk\r\n- [ ] eggs\r\n".to_owned()))
+    );
+}
+
 #[test]
 fn append_adds_its_text_as_given() {
     let append = parsed(json!({"drive": "tgdrive", "op": "append", "path": "log.md",

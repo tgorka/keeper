@@ -176,8 +176,16 @@ pub fn is_lossy_rendering(text: &str) -> bool {
 /// `é` decomposed. A fence that compares names it must keep keeper's own
 /// compares them this way on every platform, so it refuses on Linux what the
 /// Mac would let through.
+///
+/// The one comparison every name fence in this crate reads (109.27, AD-65):
+/// the agents' home, the sessions zone and its workspace, git's and keeper's
+/// own names, a create's collision. Two ASCII names fold as ASCII, with no
+/// allocation, because the index scans that ask it ask once per tracked file.
 pub fn same_entry_folded(a: &str, b: &str) -> bool {
     use unicode_normalization::UnicodeNormalization;
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
     let fold = |name: &str| -> String {
         name.nfd()
             .collect::<String>()

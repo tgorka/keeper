@@ -211,13 +211,15 @@ fn a_pointer_only_on_the_disk_is_refused_too() {
     );
 }
 
+/// An untracked file is not the drive's: changing it answers as a file that
+/// is not there does, and creating over it is refused as over any file.
 #[test]
 fn an_untracked_file_is_not_the_drives_and_cannot_be_created_over() {
     let dir = drive();
     let root = dir.path();
     assert_eq!(
         check(root, "notes/untracked.md", AgentTarget::Existing),
-        Err(WriteRefusal::Untracked {
+        Err(WriteRefusal::Missing {
             subpath: "notes/untracked.md".to_owned()
         })
     );
@@ -227,6 +229,269 @@ fn an_untracked_file_is_not_the_drives_and_cannot_be_created_over() {
             subpath: "notes/untracked.md".to_owned()
         })
     );
+}
+
+/// R603 (review of #603): no refusal tells an agent what a person keeps
+/// beside the drive. The same path, asked before and after an untracked or
+/// ignored file appears there, answers the same — except a new path over an
+/// untracked file, which must be refused (allowing it would write over the
+/// file), and is refused exactly as over a tracked one.
+#[test]
+fn an_untracked_or_ignored_file_is_answered_as_if_it_were_not_there() {
+    let dir = drive();
+    let root = dir.path();
+    let cases = [
+        ("private.md", AgentTarget::Existing, "file"),
+        ("private/inner.md", AgentTarget::Existing, "file"),
+        ("private-folder", AgentTarget::Existing, "folder"),
+        ("notes/secret.log", AgentTarget::Existing, "file"),
+        ("notes/secret.log", AgentTarget::New, "file"),
+        ("junk.log/inner.md", AgentTarget::New, "file"),
+        ("notes/.DS_Store", AgentTarget::Existing, "file"),
+        ("notes/.DS_Store", AgentTarget::New, "file"),
+    ];
+    for (path, target, kind) in cases {
+        let before = check(root, path, target);
+        assert!(before.is_err(), "{path} {target:?}: {before:?}");
+        match kind {
+            "folder" => std::fs::create_dir_all(root.join(path).join("x")).expect("mkdir"),
+            _ => write(root, path, "a person's own\n"),
+        }
+        assert_eq!(check(root, path, target), before, "{path} {target:?}");
+    }
+    // Something untracked in the way of a new path: the file at it, or a
+    // file where its folder would be.
+    write(root, "mine.md", "a person's own\n");
+    assert_eq!(
+        check(root, "mine.md", AgentTarget::New),
+        Err(WriteRefusal::Exists {
+            subpath: "mine.md".to_owned()
+        })
+    );
+}
+
+/// R603-1, R603-2: a tracked file or link gone from this disk still stands
+/// where a folder of a new path would be — committing under it would turn
+/// the drive's file into a folder — in any spelling the Mac takes for it.
+#[test]
+fn a_tracked_file_or_link_gone_from_the_disk_still_stands_in_a_new_paths_way() {
+    let dir = drive();
+    let root = dir.path();
+    std::fs::remove_file(root.join("notes/a.md")).expect("rm file");
+    std::fs::remove_file(root.join("linked")).expect("rm link");
+    let taken = |name: &str| {
+        Err(WriteRefusal::NameTaken {
+            name: name.to_owned(),
+        })
+    };
+    assert_eq!(
+        check(root, "notes/a.md/new.md", AgentTarget::New),
+        taken("a.md")
+    );
+    assert_eq!(
+        check(root, "notes/A.md/deeper/new.md", AgentTarget::New),
+        taken("A.md")
+    );
+    assert_eq!(
+        check(root, "notes/a.md/new.md", AgentTarget::Existing),
+        taken("a.md")
+    );
+    for path in ["linked/new.md", "Linked/new.md"] {
+        assert_eq!(
+            check(root, path, AgentTarget::New),
+            Err(WriteRefusal::Link {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+}
+
+/// R603-3: a new path the Mac's volume would take for a tracked one — in
+/// case or in Unicode normalization — is refused, whether or not the tracked
+/// file is on this disk. Always, not only where `core.ignorecase` is set: the
+/// drive syncs to every device its person keeps, and the Mac's APFS folds
+/// names whatever this checkout's configuration says.
+#[test]
+fn a_new_path_the_mac_would_take_for_a_tracked_one_is_refused() {
+    let dir = drive();
+    let root = dir.path();
+    write(root, "notes/caf\u{e9}.md", "composed\n");
+    git(root, &["add", "notes/caf\u{e9}.md"]);
+    for gone in ["notes/a.md", "notes/caf\u{e9}.md"] {
+        std::fs::remove_file(root.join(gone)).expect("rm");
+    }
+    for path in [
+        "notes/A.md",
+        "NOTES/a.md",
+        "notes/cafe\u{301}.md",
+        "notes/CAF\u{c9}.md",
+    ] {
+        assert_eq!(
+            check(root, path, AgentTarget::New),
+            Err(WriteRefusal::Exists {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    // A tracked folder spelled otherwise: on the Mac the file lands in it,
+    // under a key no other device has.
+    assert_eq!(
+        check(root, "Notes/new.md", AgentTarget::New),
+        Err(WriteRefusal::NameTaken {
+            name: "Notes".to_owned()
+        })
+    );
+    assert_eq!(
+        check(root, "notes/new.md", AgentTarget::New),
+        Ok("notes/new.md".to_owned())
+    );
+    // On this disk, untracked: the same file on the Mac in another
+    // normalization.
+    write(root, "notes/na\u{ef}ve.md", "a person's own\n");
+    assert_eq!(
+        check(root, "notes/nai\u{308}ve.md", AgentTarget::New),
+        Err(WriteRefusal::Exists {
+            subpath: "notes/nai\u{308}ve.md".to_owned()
+        })
+    );
+}
+
+/// R603-4: every fence compares names as the Mac's volume does — the agents'
+/// home, the sessions zone and its workspace, and git's and keeper's own
+/// names — so a decomposed accent, a capital or a Kelvin sign (`\u{212A}`,
+/// which decomposes to `K`) is not a way past one.
+#[test]
+fn the_fences_hold_for_any_spelling_the_mac_takes_for_them() {
+    let dir = drive();
+    let root = dir.path();
+    let excludes = ExcludeSet::new(&[]).expect("excludes");
+    for (zone, spelled) in [
+        ("caf\u{e9}", "cafe\u{301}"),
+        ("cafe\u{301}", "caf\u{e9}"),
+        ("\u{c1}gents", "\u{e1}gents"),
+        ("80-agents", "80-AGENTS"),
+    ] {
+        let path = format!("{spelled}/nixi/SOUL.md");
+        write(root, &path, "a person's own\n");
+        git(root, &["add", &path]);
+        let scope = WriteScope::new("tgdrive", None).with_agents(Some(zone));
+        assert_eq!(
+            agent_write_check(root, &scope, &excludes, &path, AgentTarget::Existing),
+            Err(WriteRefusal::AgentHome {
+                subpath: path.clone()
+            }),
+            "{zone:?} {path:?}"
+        );
+    }
+    let sessions = WriteScope::new("tgdrive", None)
+        .with_sessions(Some("60-s\u{e9}ances"))
+        .with_sessions_closed(true);
+    assert_eq!(
+        agent_write_check(
+            root,
+            &sessions,
+            &excludes,
+            "60-SE\u{301}ANCES/active/s/a.md",
+            AgentTarget::New
+        ),
+        Err(WriteRefusal::SessionsZone {
+            subpath: "60-SE\u{301}ANCES/active/s/a.md".to_owned()
+        })
+    );
+    // A person's scope keeps the zone open but its workspace fenced.
+    let person = WriteScope::new("tgdrive", None).with_sessions(Some("60-s\u{e9}ances"));
+    for path in [
+        "60-se\u{301}ances/Active/s/Workspace/x.md",
+        "60-S\u{c9}ANCES/ARCHIVE/2026/s/workspace/x.md",
+    ] {
+        assert_eq!(
+            person.fenced(path),
+            Err(WriteRefusal::SessionWorkspace {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    for path in [".\u{212A}eeper/keeper.toml", "notes/.\u{212A}EEPER-sync/x"] {
+        assert_eq!(
+            check(root, path, AgentTarget::New),
+            Err(WriteRefusal::Machinery {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+}
+
+/// R603-5: an indexed blob that cannot be read may be a pointer, so whether
+/// the path is stored through LFS cannot be told: refused, never allowed.
+#[test]
+fn an_indexed_file_whose_blob_is_gone_is_undecidable() {
+    let dir = drive();
+    let root = dir.path();
+    write(root, "notes/a.md", POINTER);
+    git(root, &["add", "notes/a.md"]);
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", ":notes/a.md"])
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs");
+    let oid = String::from_utf8(out.stdout).expect("utf-8");
+    let oid = oid.trim();
+    write(root, "notes/a.md", "the real text\n");
+    std::fs::remove_file(root.join(".git/objects").join(&oid[..2]).join(&oid[2..]))
+        .expect("rm object");
+    let (refusal, _) = subpath(check(root, "notes/a.md", AgentTarget::Existing));
+    assert!(
+        matches!(&refusal, WriteRefusal::Undecidable { subpath, .. } if subpath == "notes/a.md"),
+        "{refusal:?}"
+    );
+}
+
+/// R603-6: the device that carries a write out decides it again over its own
+/// checkout right before it commits — LFS routing included, since a
+/// `.gitattributes` may route the path by then — and refuses bytes that are
+/// themselves an LFS pointer.
+#[test]
+fn the_apply_check_decides_again_and_refuses_a_pointer_as_bytes() {
+    let dir = drive();
+    let root = dir.path();
+    let scope = WriteScope::new("tgdrive", None);
+    let excludes = ExcludeSet::new(&[]).expect("excludes");
+    let apply = |path: &str, target: AgentTarget, bytes: Option<&[u8]>| {
+        agent_apply_check(root, &scope, &excludes, path, target, bytes)
+    };
+    assert_eq!(
+        apply("notes/a.md", AgentTarget::Existing, Some(b"new text\n")),
+        Ok("notes/a.md".to_owned())
+    );
+    assert_eq!(
+        apply("notes/new.md", AgentTarget::New, Some(POINTER.as_bytes())),
+        Err(WriteRefusal::LfsRouted {
+            subpath: "notes/new.md".to_owned()
+        })
+    );
+    assert_eq!(
+        apply("notes/new.md", AgentTarget::New, Some(b"")),
+        Ok("notes/new.md".to_owned())
+    );
+    write(root, "notes/.gitattributes", "*.md filter=lfs\n");
+    for (path, target) in [
+        ("notes/a.md", AgentTarget::Existing),
+        ("notes/new.md", AgentTarget::New),
+    ] {
+        assert_eq!(
+            apply(path, target, Some(b"new text\n")),
+            Err(WriteRefusal::LfsRouted {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
 }
 
 #[test]
