@@ -6294,7 +6294,7 @@ const sessionRows: AgentSessionRowVm[] =
               : sessionScenario === "long"
                 ? `assistant · Release-${"long-title-".repeat(30)}`
                 : "assistant · Plan the next release",
-          handle: "jolly-pigeon-squeaks",
+          handle: "jolly-pigeon",
           createdAtMs: 1700000000000,
           trust: "native",
           instances: [sessionScenario === "names" ? "nixi@electra" : "assistant@electra"],
@@ -6318,7 +6318,7 @@ const sessionRows: AgentSessionRowVm[] =
           sessionId: "device.1",
           titleWrite: { state: "confirmed" },
           displayName: "assistant · Review the research notes",
-          handle: "jolly-pigeon-squeaks",
+          handle: "jolly-pigeon",
           createdAtMs: 1700000000000,
           trust: "native",
           instances: ["assistant@electra"],
@@ -6337,7 +6337,7 @@ const sessionRows: AgentSessionRowVm[] =
           sessionId: "device.2",
           titleWrite: { state: "confirmed" },
           displayName: "assistant · Archive — one thousand messages",
-          handle: "calm-weasel-scribbles",
+          handle: "calm-weasel",
           createdAtMs: 1700000000000,
           trust: "native",
           instances: ["assistant@electra"],
@@ -6732,6 +6732,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           id: "message-999",
           role: "person",
           authorActor: "ana",
+          mine: true,
           authorName: "Ana",
           body:
             row.database === "alpha"
@@ -6744,6 +6745,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           id: "message-1000",
           role: "agent",
           authorActor: "assistant",
+          mine: false,
           authorName: "Assistant",
           body:
             row.database === "alpha"
@@ -6757,6 +6759,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
                 id: "ask-1",
                 role: "agent" as const,
                 authorActor: "assistant",
+                mine: false,
                 authorName: "Assistant",
                 body: "Which notes should I review first?",
                 createdAtMs: row.lastActivityMs + 1,
@@ -6929,6 +6932,7 @@ if (ownerReport) {
       id: "owner-ask",
       role: "person",
       authorActor: "ana",
+      mine: true,
       authorName: "Ana",
       body: "What changed in the repo today?",
       createdAtMs: at,
@@ -6939,6 +6943,7 @@ if (ownerReport) {
       id: "owner-blank-close",
       role: "agent",
       authorActor: "assistant",
+      mine: false,
       authorName: "Nixi",
       body: "",
       createdAtMs: at + 1000,
@@ -6967,6 +6972,7 @@ if (turnsScenario === "all") {
         id,
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body,
         createdAtMs: at,
@@ -6982,6 +6988,7 @@ if (turnsScenario === "all") {
         id,
         role: "agent",
         authorActor: "assistant",
+        mine: false,
         authorName: "Assistant",
         body,
         createdAtMs: at,
@@ -7191,6 +7198,7 @@ if (attachmentsScenario === "chips") {
         id: "message-files",
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body: "Here are the plan, the photo, the prices and the notes.",
         createdAtMs: at + 1,
@@ -7206,6 +7214,7 @@ if (attachmentsScenario === "chips") {
         id: "message-refused",
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body: "",
         createdAtMs: at + 2,
@@ -7240,6 +7249,7 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
     id: `local-${++sessionSerial}`,
     role: "person",
     authorActor: "ana",
+    mine: true,
     authorName: "Ana",
     body: caption,
     createdAtMs: Date.now(),
@@ -7575,6 +7585,7 @@ function startLiveFixture(vm: AgentSessionViewVm) {
           id,
           role: "agent",
           authorActor: "assistant",
+          mine: false,
           authorName: "Assistant",
           body: turn.text,
           createdAtMs: Date.now(),
@@ -7908,6 +7919,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         id: "message-998",
         role: "person",
         authorActor: "ben",
+        mine: false,
         authorName: "Ben",
         body: "An earlier month, loaded only when requested.",
         createdAtMs: Date.now() - 31 * 86400000,
@@ -8066,6 +8078,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       id: `local-${++sessionSerial}`,
       role: "person" as const,
       authorActor: "ana",
+      mine: true,
       authorName: "Ana",
       body: String(payload.body),
       createdAtMs: Date.now(),
@@ -8225,7 +8238,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       title: String(payload.body).split("\n")[0],
       titleWrite: { state: "confirmed" },
       displayName: `${choice.agentActor} · ${String(payload.body).split("\n")[0]}`,
-      handle: "sturdy-snail-wobbles",
+      handle: "sturdy-snail",
       createdAtMs: Date.now(),
       trust: "native",
       instances: [],
@@ -8258,6 +8271,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
           id: `local-${sessionSerial}`,
           role: "person",
           authorActor: "ana",
+          mine: true,
           authorName: "Ana",
           body: String(payload.body),
           createdAtMs: Date.now(),
@@ -8340,6 +8354,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       id: `local-${sessionSerial}`,
       role: "person",
       authorActor: "ana",
+      mine: true,
       authorName: "Ana",
       body: line,
       createdAtMs: now,
@@ -8370,7 +8385,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       title: parsed[2].trim().split("\n")[0],
       titleWrite: { state: "confirmed" },
       displayName: `${agent.name} · ${parsed[2].trim().split("\n")[0]}`,
-      handle: "quiet-heron-listens",
+      handle: "quiet-heron",
       createdAtMs: now,
       trust: "native",
       instances: [],
@@ -8423,6 +8438,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         id: `answer-${sessionId}`,
         role: "agent",
         authorActor: agent.id,
+        mine: false,
         authorName: agent.name,
         // Long, as Rust cuts it for the parent (`MAX_INLINE_ANSWER`); the thread has it whole.
         body: brief
@@ -8890,8 +8906,9 @@ function mockAnswering(): AgentSessionAnsweringVm {
   };
 }
 if (instancesScenario) {
+  // As Rust: no instance claims an archived session, so it draws no header (R-HQ-86).
   for (const vm of sessionViews.values())
-    if (vm.agentActor === "assistant") vm.answering = mockAnswering();
+    if (vm.agentActor === "assistant" && !vm.archived) vm.answering = mockAnswering();
 }
 const instanceWatchers = new Map<string, MockChannel<AgentInstancesVm[]>>();
 function publishInstances() {
@@ -11017,7 +11034,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         title: "Arrived after the tap",
         titleWrite: { state: "confirmed" },
         displayName: "researcher · Arrived after the tap",
-        handle: "lucky-salmon-sprints",
+        handle: "lucky-salmon",
         createdAtMs: Date.now(),
         trust: "native",
         instances: [],
@@ -11050,6 +11067,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
             id: `arrived-${target.sessionId}`,
             role: "agent",
             authorActor: "researcher",
+            mine: false,
             authorName: "Researcher",
             body: "The answer the notification was about.",
             createdAtMs: Date.now(),

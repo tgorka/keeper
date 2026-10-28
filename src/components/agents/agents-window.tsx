@@ -6,6 +6,7 @@ import { NewSession } from "@/components/agents/new-session";
 import { SessionRowMenu } from "@/components/agents/session-row-menu";
 import { SessionView } from "@/components/agents/session-view";
 import { Button } from "@/components/ui/button";
+import { MENU_TARGET_RING, useMenuTarget } from "@/components/ui/menu-target";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import {
@@ -31,6 +32,8 @@ export function AgentsWindow() {
   const root = useRef<HTMLElement>(null);
   const newButton = useRef<HTMLButtonElement>(null);
   const rowButtons = useRef(new Map<string, HTMLButtonElement>());
+  // FR-598/AD-280: the row whose right-click menu is open is marked; selection does not move.
+  const menuTarget = useMenuTarget();
   const origin = useRef<string | null>(null);
   const restoreFocus = useRef(false);
   const selectedKey = selected ? JSON.stringify([selected.database, selected.sessionId]) : null;
@@ -159,58 +162,63 @@ export function AgentsWindow() {
               </p>
             )}
             <ul aria-label="Sessions" className="flex flex-col">
-              {visible.map((row) => (
-                <li key={JSON.stringify([row.database, row.sessionId])}>
-                  <SessionRowMenu row={row}>
-                    <button
-                      ref={(button) => {
-                        const key = JSON.stringify([row.database, row.sessionId]);
-                        if (button) rowButtons.current.set(key, button);
-                        else rowButtons.current.delete(key);
-                      }}
-                      type="button"
-                      aria-label={`${row.displayName}, ${row.handle}, ${row.database}, ${formatRoomTimestamp(row.lastActivityMs)}${row.archived ? ", archived" : ""}${agentAttentionLabel(row.attention)}`}
-                      aria-current={
-                        selected?.database === row.database && selected.sessionId === row.sessionId
-                          ? "true"
-                          : undefined
-                      }
-                      className={cn(
-                        "flex w-full min-w-0 flex-col gap-1 border-border border-b px-3 py-3 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                        selected?.database === row.database &&
-                          selected.sessionId === row.sessionId &&
-                          "bg-accent",
-                      )}
-                      onClick={() => {
-                        origin.current = JSON.stringify([row.database, row.sessionId]);
-                        agentSessionsStore
-                          .getState()
-                          .select({ database: row.database, sessionId: row.sessionId });
-                      }}
-                    >
-                      <span className="flex w-full min-w-0 items-baseline gap-2">
-                        <span
-                          className="min-w-0 flex-1 truncate font-medium text-sm"
-                          title={row.displayName}
-                        >
-                          {row.displayName}
+              {visible.map((row) => {
+                const key = JSON.stringify([row.database, row.sessionId]);
+                return (
+                  <li key={key}>
+                    <SessionRowMenu row={row} onOpenChange={menuTarget.onOpenChange(key)}>
+                      <button
+                        ref={(button) => {
+                          if (button) rowButtons.current.set(key, button);
+                          else rowButtons.current.delete(key);
+                        }}
+                        {...menuTarget.rowProps(key)}
+                        type="button"
+                        aria-label={`${row.displayName}, ${row.handle}, ${row.database}, ${formatRoomTimestamp(row.lastActivityMs)}${row.archived ? ", archived" : ""}${agentAttentionLabel(row.attention)}`}
+                        aria-current={
+                          selected?.database === row.database &&
+                          selected.sessionId === row.sessionId
+                            ? "true"
+                            : undefined
+                        }
+                        className={cn(
+                          "flex w-full min-w-0 flex-col gap-1 border-border border-b px-3 py-3 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                          MENU_TARGET_RING,
+                          selected?.database === row.database &&
+                            selected.sessionId === row.sessionId &&
+                            "bg-accent",
+                        )}
+                        onClick={() => {
+                          origin.current = key;
+                          agentSessionsStore
+                            .getState()
+                            .select({ database: row.database, sessionId: row.sessionId });
+                        }}
+                      >
+                        <span className="flex w-full min-w-0 items-baseline gap-2">
+                          <span
+                            className="min-w-0 flex-1 truncate font-medium text-sm"
+                            title={row.displayName}
+                          >
+                            {row.displayName}
+                          </span>
+                          <span className="shrink-0 text-muted-foreground text-xs">
+                            {formatRoomTimestamp(row.lastActivityMs)}
+                          </span>
                         </span>
-                        <span className="shrink-0 text-muted-foreground text-xs">
-                          {formatRoomTimestamp(row.lastActivityMs)}
+                        <span className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground text-xs">
+                          <span className="truncate">{row.handle}</span>
+                          <span className="break-all rounded-sm bg-muted px-1.5 py-0.5">
+                            {row.database}
+                          </span>
+                          {row.archived && <span>Archived</span>}
                         </span>
-                      </span>
-                      <span className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground text-xs">
-                        <span className="truncate">{row.handle}</span>
-                        <span className="break-all rounded-sm bg-muted px-1.5 py-0.5">
-                          {row.database}
-                        </span>
-                        {row.archived && <span>Archived</span>}
-                      </span>
-                      {row.attention && <AgentAttentionMark state={row.attention} />}
-                    </button>
-                  </SessionRowMenu>
-                </li>
-              ))}
+                        {row.attention && <AgentAttentionMark state={row.attention} />}
+                      </button>
+                    </SessionRowMenu>
+                  </li>
+                );
+              })}
             </ul>
           </div>
         </section>

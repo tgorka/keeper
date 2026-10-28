@@ -7,7 +7,7 @@
 //! - [`grant_tiers`]: the tiers a standing grant may cover (`standing_grants
 //!   .max_tier`, V8, V15) — never `T4`, which another device decides every
 //!   time;
-//! - [`handle`]: a session's handle, three words drawn from the file's lists
+//! - [`handle`]: a session's handle, two words drawn from the file's lists
 //!   by the SHA-256 of the session id (the contract's *Session handles*).
 //!   A handle is display only: never a key, a scope value or a lookup path;
 //! - [`person_agent_key`]: the key of one person's standing grants about one
@@ -52,7 +52,6 @@ struct HandleWords {
     hash: String,
     adjectives: Vec<String>,
     nouns: Vec<String>,
-    verbs: Vec<String>,
     examples: Vec<HandleExample>,
 }
 
@@ -116,9 +115,10 @@ fn pick<'a>(words: &'a [String], digest: &[u8], at: usize) -> Option<&'a str> {
     words.get(index).map(String::as_str)
 }
 
-/// A session's handle, e.g. `noble-hedgehog-struts`: the adjective, the noun
-/// and the verb picked by bytes 0–1, 2–3 and 4–5 of the SHA-256 of the
-/// session id's UTF-8 bytes. `None` only if the compiled file is malformed.
+/// A session's handle, e.g. `noble-hedgehog`: the adjective and the noun
+/// picked by bytes 0–1 and 2–3 of the SHA-256 of the session id's UTF-8
+/// bytes (R-HQ-86: two words, display only). `None` only if the compiled
+/// file is malformed.
 pub fn handle(session_id: &str) -> Option<String> {
     let words = &PARSED.as_ref()?.handle;
     if words.hash != "sha256" {
@@ -127,8 +127,7 @@ pub fn handle(session_id: &str) -> Option<String> {
     let digest = Sha256::digest(session_id.as_bytes());
     let adjective = pick(&words.adjectives, &digest, 0)?;
     let noun = pick(&words.nouns, &digest, 2)?;
-    let verb = pick(&words.verbs, &digest, 4)?;
-    Some(format!("{adjective}-{noun}-{verb}"))
+    Some(format!("{adjective}-{noun}"))
 }
 
 #[cfg(test)]

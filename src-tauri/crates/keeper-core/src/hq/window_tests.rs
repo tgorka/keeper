@@ -472,8 +472,8 @@ fn colliding_handles_append_session_numbers_without_changing_ids() {
     }
     let rows = sessions::rows(&w.alpha, now());
     for (id, expected) in [
-        ("dev1.242", "mighty-toucan-skips-242"),
-        ("dev1.752", "mighty-toucan-skips-752"),
+        ("dev1.242", "mighty-toucan-242"),
+        ("dev1.752", "mighty-toucan-752"),
     ] {
         let row = rows
             .iter()
@@ -715,6 +715,59 @@ fn a_message_is_waiting_until_the_server_has_it_and_an_ask_closes_on_an_answer()
     );
     assert_eq!(newest, Some(mine.created_at_ms));
     assert!(!view.read_only && !view.has_earlier);
+}
+
+/// R-HQ-86: the person's own messages are theirs from any of their devices;
+/// another person's message in the same session and the agent's answer are
+/// not, so only the first two are drawn as the person's bubbles.
+#[test]
+fn mine_is_the_sources_person_from_any_device_and_no_one_else() {
+    let w = world();
+    let t = now() - 60_000;
+    let mut ops = session("dev1.1", NIXIE, t, false, None);
+    ops.push(actor(BEN, "person", "Ben", "alpha"));
+    ops.push(message("here", "dev1.1", "person", t, None, Value::Null));
+    let mut elsewhere = message("phone", "dev1.1", "person", t + 1, None, Value::Null);
+    let mut ben = message("ben", "dev1.1", "person", t + 2, None, Value::Null);
+    if let (RowOp::Upsert { values: phone, .. }, RowOp::Upsert { values: other, .. }) =
+        (&mut elsewhere, &mut ben)
+    {
+        phone.insert("author_client".to_owned(), json!("dev2"));
+        other.insert("author_actor".to_owned(), json!(BEN));
+        other.insert("author_client".to_owned(), json!("ben.dev"));
+    }
+    ops.extend([elsewhere, ben]);
+    ops.push(message(
+        "answer",
+        "dev1.1",
+        "agent",
+        t + 3,
+        Some("here"),
+        Value::Null,
+    ));
+    w.alpha.replica.mutate(ops).expect("seed");
+    let (view, _) = timeline::view(
+        &w.alpha,
+        "dev1.1",
+        &Opened::default(),
+        &HashMap::new(),
+        now(),
+    )
+    .expect("view");
+    let drawn: Vec<(&str, bool)> = view
+        .messages
+        .iter()
+        .map(|m| (m.id.as_str(), m.mine))
+        .collect();
+    assert_eq!(
+        drawn,
+        vec![
+            ("here", true),
+            ("phone", true),
+            ("ben", false),
+            ("answer", false)
+        ]
+    );
 }
 
 #[test]

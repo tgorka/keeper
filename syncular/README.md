@@ -212,13 +212,15 @@ actor; `claims`, `session_tool_switches`, `session_settings`, `session_drives`, 
 
 ## Session handles
 
-A session's handle is a name a person can say, such as `noble-hedgehog-struts`: three words drawn
-from `vocabulary.json`'s `handle` lists by the SHA-256 of the session id's UTF-8 bytes. Bytes 0–1,
-2–3 and 4–5 of the digest, each read as a big-endian unsigned 16-bit number modulo its list's
-length, pick the adjective, the noun and the verb, joined by `-`. `handle.examples` holds session
-ids with the handle each must give, so every implementation can check itself. A handle is display
-only: it is a pure function of the id, never a key, a scope value or a lookup path, and two
-sessions may share one, which a client tells apart by the session number.
+A session's handle is a name a person can say, such as `noble-hedgehog`: two words drawn from
+`vocabulary.json`'s `handle` lists by the SHA-256 of the session id's UTF-8 bytes. Bytes 0–1 and
+2–3 of the digest, each read as a big-endian unsigned 16-bit number modulo its list's length, pick
+the adjective and the noun, joined by `-`. `handle.examples` holds session ids with the handle
+each must give, so every implementation can check itself. A handle is display only: it is a pure
+function of the id, never a key, a scope value or a lookup path, and two sessions may share one,
+which a client tells apart by the session number. With 64 words in each list there are 4,096
+handles, so sharing is expected (even odds at about 75 sessions in one database); the session
+number is what keeps them apart.
 
 ## The live answer
 

@@ -233,17 +233,25 @@ agent, last activity and Rust's attention state. **Active**, **Archived** and **
 which rows are shown, never their order or the underlying subscription.
 
 Rust derives each name as `<agents> · <title>`, with the primary agent first and other agent
-members in actor-id order. Person members do not enter the name. The word handle comes from
-the immutable session id and the shared Syncular vocabulary; a collision within a database
-appends the session number. It is a display label, not another identity or storage key. A blank
-title uses the handle. Renaming changes only the title, never the session id or handle.
+members in actor-id order. Person members do not enter the name. The handle is two words
+(R-HQ-86), such as `noble-hedgehog`, from the immutable session id and the shared Syncular
+vocabulary; with 4,096 handles a collision within a database is expected past a few dozen
+sessions and appends the session number (`noble-hedgehog-6`), in the list, the header and
+Settings › Agents › Always allowed alike. It is a display label, not another identity or storage
+key. A blank title uses the handle. Renaming changes only the title, never the session id or
+handle.
 
 Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
-menu: **Rename**, **Copy id**, **Copy name**, **Details**, **Drives…** (only where you may
+menu; the row stays marked while its menu is open (FR-598/AD-280), and every item leads with its
+icon: **Rename**, **Copy id**, **Copy name**, **Details**, **Context…** (opens the session and
+its context window's Details sheet, the one `/context` opens), **Drives…** (only where you may
 choose the session's drives; it opens the session and its Drives menu, see § Live answers),
 **Model…** (only where you may change the session's model and its agent offers more than one,
 `AgentSessionRowVm.choosesModel`; it opens the session and the composer's model picker, the same
-picker `/model` writes through) and **Archive** (or **Unarchive**).
+picker `/model` writes through), **Always allowed…** (Settings › Agents › Always allowed, where
+standing grants are listed and revoked), **Start fresh (trusted)** (sends `/clean` as the composer
+does: a new session that starts trusted and keeps the drives; absent on an archived session,
+where `/clean` is refused) and **Archive** (or **Unarchive**).
 Rename edits inline with the current title selected, so typing replaces it; Save queues the title
 on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
 local enqueue, not server acceptance: the row says it is waiting until the server settles the
@@ -446,6 +454,12 @@ blank close's details (that leg's model, tokens, timings) stay inside the fold (
   (`statusLabel`: Started, Finished, Refused, Interrupted, Paused, Failed, or
   `Unknown status "<word>"`), how it ended ("Interrupted 12:03", never "Finished" for every
   ending) and its result in a `max-h-64` scroll area. The renderer groups, orders and words nothing.
+
+**Your own messages are bubbles (R-HQ-86).** A message Rust marks `mine` — its author is this
+device's person, from any of their devices — is drawn on the right as a bubble with the chat
+timeline's own-message tokens (`components/chat/bubble.ts`), at most 75% of the column; so is your
+line in a thread started from the conversation. Another person's message in the same session
+stays plain text on the left, as the agent's answers do.
 
 An open answer grows as its text arrives. The transcript scrolls inside its own viewport: a growing
 answer does not move the composer or replace an unsent draft. Scrolling back stops following the
@@ -1539,7 +1553,9 @@ The run was on electra on 2026-10-23, and a second run wrote nothing:
 **In keeper,** an imported session is an archived session like any other. It is listed under
 *Archived* and *All* with its database and opens through the server's `sessionPage` (*The Agents
 window*, above). No instance reads or claims an archived session, so nothing imported is answered
-again. Each message names its author by actor id. The Matrix id an author had in the logs is kept
+again, and an archived session draws no instance header (R-HQ-86): its read-only bar says to
+unarchive it.
+Each message names its author by actor id. The Matrix id an author had in the logs is kept
 on the server only, as an alias of that actor; it is not part of keeper's contract.
 
 **Its limits:**

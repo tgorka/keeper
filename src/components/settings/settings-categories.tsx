@@ -94,6 +94,18 @@ const NOTE_KINDS: readonly { kind: DeviceNoteKind; title: string }[] = [
 export const SETTINGS_TRAVEL_SENTENCE =
   "With an organisation account signed in, these settings follow you to every device you use. What applies only to this device, or is kept only on it, says so where it sits.";
 
+/**
+ * How long a revealed section is held in place while the sections above it
+ * fill in: the hold ends after {@link REVEAL_SETTLE_QUIET_MS} with no change
+ * in their size, after {@link REVEAL_SETTLE_LIMIT_MS} whatever happens, or the
+ * moment the person scrolls, clicks, touches or types — whichever comes first.
+ */
+export const REVEAL_SETTLE_QUIET_MS = 1000;
+export const REVEAL_SETTLE_LIMIT_MS = 3000;
+
+/** What a person does that ends a hold: their scroll or click wins over keeper's. */
+const PERSON_EVENTS = ["wheel", "touchmove", "pointerdown", "keydown"] as const;
+
 export function SettingsCategories({
   layout,
   sections,
@@ -115,6 +127,9 @@ export function SettingsCategories({
   const focusBack = useRef(false);
   const reveal = useStore(settingsUiStore, (s) => s.reveal);
   const [pending, setPending] = useState<SettingsReveal | null>(reveal);
+  // The reveal whose place is held while the layout settles; outlives
+  // `pending`, which ends when the reveal lands, not when the layout stops.
+  const [holding, setHolding] = useState<SettingsReveal | null>(reveal);
   const [ownSelected, setOwnSelected] = useState<SettingsCategoryId | null>(
     reveal ? categoryOf(reveal.section) : null,
   );
@@ -163,6 +178,7 @@ export function SettingsCategories({
     }
     setSelected(categoryOf(reveal.section));
     setPending(reveal);
+    setHolding(reveal);
     settingsUiStore.getState().clearReveal();
   }, [reveal, setSelected]);
 
@@ -215,6 +231,71 @@ export function SettingsCategories({
     return () => observer.disconnect();
   }, [pending, shown?.id]);
 
+  // Hold a reveal's place until the layout settles. The sections above the
+  // revealed one read from Rust after they mount and grow when the answer
+  // comes, which pushes the revealed one down after the scroll above landed —
+  // Always allowed… ended a screen below the fold (R602-01). So every change
+  // in their size scrolls it back: the section's top, or the revealed field
+  // once it has focus. Scroll anchoring cannot do this: it keeps nothing in
+  // place at a scroll offset of zero, which is where a fresh Settings opens.
+  useEffect(() => {
+    const root = panels.current;
+    if (
+      !holding ||
+      !root ||
+      shown?.id !== categoryOf(holding.section) ||
+      typeof ResizeObserver === "undefined"
+    ) {
+      return;
+    }
+    const section = root.querySelector<HTMLElement>(`[data-settings-section="${holding.section}"]`);
+    const category = section?.parentElement;
+    if (!section || !category) {
+      return;
+    }
+    const above: Element[] = [];
+    for (const sibling of category.querySelectorAll(":scope > [data-settings-section]")) {
+      if (sibling === section) {
+        break;
+      }
+      above.push(sibling);
+    }
+    const place = () => {
+      const field =
+        holding.focusId === null
+          ? null
+          : root.querySelector<HTMLElement>(`[id="${holding.focusId}"]`);
+      if (field && field.ownerDocument.activeElement === field) {
+        field.scrollIntoView?.({ block: "center" });
+      } else {
+        section.scrollIntoView?.({ block: "start" });
+      }
+    };
+    const release = () => setHolding(null);
+    let quiet = window.setTimeout(release, REVEAL_SETTLE_QUIET_MS);
+    const limit = window.setTimeout(release, REVEAL_SETTLE_LIMIT_MS);
+    const observer = new ResizeObserver(() => {
+      place();
+      window.clearTimeout(quiet);
+      quiet = window.setTimeout(release, REVEAL_SETTLE_QUIET_MS);
+    });
+    for (const element of above) {
+      observer.observe(element);
+    }
+    const doc = root.ownerDocument;
+    for (const type of PERSON_EVENTS) {
+      doc.addEventListener(type, release, { capture: true, passive: true });
+    }
+    return () => {
+      observer.disconnect();
+      window.clearTimeout(quiet);
+      window.clearTimeout(limit);
+      for (const type of PERSON_EVENTS) {
+        doc.removeEventListener(type, release, { capture: true });
+      }
+    };
+  }, [holding, shown?.id]);
+
   // Focus follows the category that is showing: drilling in focuses the back
   // (the list's own, or the shell's), and coming back to the list — by
   // whichever back — focuses the row the person came from.
@@ -234,6 +315,7 @@ export function SettingsCategories({
   const choose = (id: SettingsCategoryId) => {
     // A person's choice wins over a reveal still waiting for its field.
     setPending(null);
+    setHolding(null);
     focusBack.current = layout === "drill";
     setSelected(id);
     if (layout === "rail") {

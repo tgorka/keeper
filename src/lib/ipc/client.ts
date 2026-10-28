@@ -357,6 +357,7 @@ export type { AgentAttachmentVm } from "./gen/AgentAttachmentVm";
 export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
 export type { AgentChildSessionVm } from "./gen/AgentChildSessionVm";
 export type { AgentChoiceVm } from "./gen/AgentChoiceVm";
+export type { AgentCommandResultVm } from "./gen/AgentCommandResultVm";
 export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentDecisionOutcomeVm } from "./gen/AgentDecisionOutcomeVm";

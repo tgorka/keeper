@@ -1,3 +1,16 @@
+import {
+  Archive,
+  ArchiveRestore,
+  Copy,
+  Cpu,
+  Gauge,
+  HardDrive,
+  Hash,
+  Info,
+  MessageSquarePlus,
+  Pencil,
+  ShieldCheck,
+} from "lucide-react";
 import type { ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -12,7 +25,10 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Input } from "@/components/ui/input";
 import type { AgentSessionRowVm } from "@/lib/ipc/client";
 import { agentSessionArchive, agentSessionRename, agentSessionUnarchive } from "@/lib/ipc/client";
+import { runAgentCommand } from "@/lib/stores/agent-commands";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 // The editor opens with the current title selected, so typing replaces it and
@@ -22,12 +38,18 @@ function focusEditor(field: HTMLInputElement | null) {
   field?.select();
 }
 
+/**
+ * A session row's right-click menu. Every item leads with its icon (R-HQ-86); `onOpenChange` lets
+ * the list mark the row the open menu acts on (FR-598/AD-280's `useMenuTarget`).
+ */
 export function SessionRowMenu({
   row,
   children,
+  onOpenChange,
 }: {
   row: AgentSessionRowVm;
   children: ReactElement;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(row.title);
@@ -74,7 +96,7 @@ export function SessionRowMenu({
     }, "Copied.");
   return (
     <>
-      <ContextMenu>
+      <ContextMenu onOpenChange={onOpenChange}>
         <ContextMenuTrigger asChild>
           {editing ? (
             <form
@@ -138,13 +160,34 @@ export function SessionRowMenu({
             </p>
           )}
           <ContextMenuItem onSelect={beginEditing}>
+            <Pencil aria-hidden="true" />
             {refused ? "Retry rename…" : "Rename…"}
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => void copy(row.sessionId)}>Copy id</ContextMenuItem>
-          <ContextMenuItem onSelect={() => void copy(row.displayName)}>Copy name</ContextMenuItem>
-          <ContextMenuItem onSelect={() => setDetails(true)}>Details</ContextMenuItem>
+          <ContextMenuItem onSelect={() => void copy(row.sessionId)}>
+            <Hash aria-hidden="true" />
+            Copy id
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => void copy(row.displayName)}>
+            <Copy aria-hidden="true" />
+            Copy name
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => setDetails(true)}>
+            <Info aria-hidden="true" />
+            Details
+          </ContextMenuItem>
+          {/* The context window's Details sheet: every member may read it, so it has no gate. */}
+          <ContextMenuItem
+            onSelect={() => {
+              handedOff.current = true;
+              agentSessionsStore.getState().openContext(row);
+            }}
+          >
+            <Gauge aria-hidden="true" />
+            Context…
+          </ContextMenuItem>
           {row.choosesDrives && (
             <ContextMenuItem onSelect={() => agentSessionsStore.getState().openDrives(row)}>
+              <HardDrive aria-hidden="true" />
               Drives…
             </ContextMenuItem>
           )}
@@ -155,15 +198,45 @@ export function SessionRowMenu({
                 agentSessionsStore.getState().openModel(row);
               }}
             >
+              <Cpu aria-hidden="true" />
               Model…
             </ContextMenuItem>
           )}
+          {/* Standing grants are listed and revoked in one place: Settings › Agents. */}
+          <ContextMenuItem
+            onSelect={() => {
+              settingsUiStore.getState().revealSection("always-allowed");
+              primaryViewStore.getState().setView("settings");
+            }}
+          >
+            <ShieldCheck aria-hidden="true" />
+            Always allowed…
+          </ContextMenuItem>
           <ContextMenuSeparator />
+          {/* `/clean`, as the composer sends it: a new session that starts trusted and keeps the
+              drives (Q109-17 b). An archived session refuses it, so it is not offered there. */}
+          {!row.archived && (
+            <ContextMenuItem
+              onSelect={() =>
+                void run(async () => {
+                  await runAgentCommand(
+                    { database: row.database, sessionId: row.sessionId },
+                    row.agentActor,
+                    "/clean",
+                  );
+                })
+              }
+            >
+              <MessageSquarePlus aria-hidden="true" />
+              Start fresh (trusted)
+            </ContextMenuItem>
+          )}
           <ContextMenuItem
             onSelect={() =>
               void run(() => (row.archived ? agentSessionUnarchive(row) : agentSessionArchive(row)))
             }
           >
+            {row.archived ? <ArchiveRestore aria-hidden="true" /> : <Archive aria-hidden="true" />}
             {row.archived ? "Unarchive" : "Archive"}
           </ContextMenuItem>
         </ContextMenuContent>

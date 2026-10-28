@@ -849,6 +849,10 @@ fn a_message_whose_files_the_server_refused_stays_shown_refused_with_the_reason(
     );
     let refused = &view.messages[0];
     assert_eq!(refused.state, Some(AgentMessageStateVm::Refused));
+    assert!(
+        refused.mine,
+        "a refused line is this replica's own, so it stays the person's bubble"
+    );
     assert_eq!(refused.body, "see the file");
     assert_eq!(refused.attachments.len(), 1);
     assert_eq!(

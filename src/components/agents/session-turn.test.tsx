@@ -7,6 +7,7 @@ const lead: AgentMessageVm = {
   id: "lead",
   role: "agent",
   authorActor: "assistant",
+  mine: false,
   authorName: "Assistant",
   body: "Checking — one minute.",
   createdAtMs: 1780000000000,

@@ -580,6 +580,7 @@ fn refused_line(source: &Source, values: &Map<String, Value>, author: &str) -> A
         id: text(values, "id").to_owned(),
         role: AgentMessageRoleVm::Person,
         author_actor: source.actor.clone(),
+        mine: true,
         author_name: author.to_owned(),
         // Cut as a held line is; a refused thread has nowhere to read the rest,
         // so nothing says it continues.
