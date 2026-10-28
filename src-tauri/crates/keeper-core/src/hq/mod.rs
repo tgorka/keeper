@@ -1415,8 +1415,15 @@ impl Hq {
     /// cannot be read — the replicas are not open, one cannot be queried, or
     /// none of them lists this device yet (its directory has not synced) —
     /// which refuses a rename rather than guessing.
+    ///
+    /// `pinned` names the server when nothing can adopt this device's
+    /// credential under a new name: no account is set up, or — a credential
+    /// that came from a pairing code — the server offers no sign-in or
+    /// refused the account's. A rename never falls back to a new pairing or
+    /// a fresh sign-in, which would be a new client id (keeper-hq R69-02).
     pub fn device_directory(&self) -> Option<crate::device_name::Directory> {
-        let (replicas, pairing, open) = {
+        let no_account = self.sign_in.account() == signin::AccountState::NoAccount;
+        let (replicas, pairing, open, server, cannot_sign_in) = {
             let inner = lock(&self.inner);
             let replicas: Vec<Arc<dyn Replica>> =
                 inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
@@ -1424,6 +1431,11 @@ impl Hq {
                 replicas,
                 inner.pairing.clone(),
                 matches!(inner.local_open, LocalOpen::Open),
+                inner.server.as_ref().map(|server| server.host().to_owned()),
+                matches!(
+                    inner.sign_in.outcome,
+                    Some(signin::Outcome::NotOffered | signin::Outcome::Refused(_))
+                ),
             )
         };
         let Some(pairing) = pairing else {
@@ -1432,8 +1444,10 @@ impl Hq {
         if !open || replicas.is_empty() {
             return None;
         }
+        let pinned = no_account || (pairing.bound.is_none() && cannot_sign_in);
         let mut directory = crate::device_name::Directory {
             bound: pairing.host.clone(),
+            pinned: pinned.then(|| server.unwrap_or_else(|| "Your agents server".to_owned())),
             ..Default::default()
         };
         let mut listed = false;

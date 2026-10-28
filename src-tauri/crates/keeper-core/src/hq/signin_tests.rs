@@ -157,6 +157,8 @@ struct Server {
     /// What `/clients/self/attest` answers first, in order: the status and
     /// the body as sent, or a 200 for the ordinary answer.
     attest_refusals: Vec<(u16, String)>,
+    /// What `/devices/enroll` answers first, in order, before anything else.
+    enroll_refusals: Vec<(u16, String)>,
     /// The attestation window the server states; a week unless set.
     attest_window_ms: Option<i64>,
     /// Every revocation: the client revoked and the bearer that asked.
@@ -206,6 +208,10 @@ fn answer(server: &mut Server, seen: &Seen) -> Reply {
             .to_string(),
         ),
         ("POST", "/devices/enroll") => {
+            if !server.enroll_refusals.is_empty() {
+                let (status, body) = server.enroll_refusals.remove(0);
+                return Reply::json(status, &body);
+            }
             let sign_in = bearer(seen);
             if server.spent.contains(&sign_in) {
                 return Reply::json(401, r#"{"error":"hq.signin.replayed"}"#);
@@ -1289,6 +1295,97 @@ async fn signed_out_a_renamed_device_asks_for_a_sign_in_and_the_sign_in_sends_th
     hq.reconcile().await.expect("reconciles");
     world.until_asked("/devices/enroll", 1).await;
     status_until(&hq, "enrolled under the new name", enrolled).await;
-    assert_eq!(world.asked("/devices/enroll")[0].json()["host"], "studio");
+    let enrol = world.asked("/devices/enroll");
+    assert_eq!(enrol[0].json()["host"], "studio");
+    assert_eq!(
+        enrol[0].json()["deviceToken"],
+        "device-token-a",
+        "the sign-in adopts this device, never a new one"
+    );
+    assert_eq!(world.kept().expect("kept").client_id, "ana.1");
     assert_eq!(world.kept().expect("kept").host.as_deref(), Some("studio"));
+}
+
+/// keeper-hq R69-02: a fresh sign-in or a new pairing is a new client id
+/// with whatever host it names, so a rename never falls back to one. An
+/// adoption the server refuses (401, 409) leaves the device's credential and
+/// client id as they were, is not followed by an enrolment without the
+/// device's token, and says so without pointing at a new pairing; signing in
+/// again adopts the same device.
+#[tokio::test]
+async fn a_rename_never_mints_a_new_client_id() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+    lock(&world.state).enroll_refusals = vec![
+        refusal(401, "hq.device_unknown"),
+        refusal(409, "hq.adopt.raced"),
+    ];
+
+    *lock(&world.host) = "studio".to_owned();
+    hq.device_renamed("hesperia").await.expect("renamed");
+    let status = status_until(&hq, "refused", |s| {
+        s.sign_in.state == HqSignInState::Refused
+    })
+    .await;
+    let host = world.server().host().to_owned();
+    assert_eq!(
+        status.sign_in.sentence.as_deref(),
+        Some(
+            format!(
+                "{host} would not move this device to its new name, so it still knows it by its \
+                 old one. Reset the name here to match it; keeper never makes this a new device \
+                 for a name."
+            )
+            .as_str()
+        )
+    );
+    // The same account again decides nothing new.
+    hq.reconcile().await.expect("reconciles");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(world.asked("/devices/enroll").len(), 1);
+
+    // A new sign-in tries again — an adoption, refused as raced, then kept.
+    world.sign_in.set(|account| account.sign_in += 1);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 2).await;
+    let raced = status_until(&hq, "raced", |s| {
+        s.sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|line| line.ends_with("keeper tries again."))
+    })
+    .await;
+    assert!(
+        raced
+            .sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|line| line.contains("hq.adopt.raced")),
+        "{raced:?}"
+    );
+    world.sign_in.set(|account| account.sign_in += 1);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 3).await;
+    status_until(&hq, "enrolled under the new name", enrolled).await;
+
+    for (n, enrol) in world.asked("/devices/enroll").iter().enumerate() {
+        assert_eq!(
+            enrol.json()["deviceToken"],
+            "device-token-a",
+            "enrolment {n} adopts this device"
+        );
+        assert_eq!(enrol.json()["host"], "studio");
+    }
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1");
+    assert_eq!(kept.host.as_deref(), Some("studio"));
+    let clients: Vec<String> = lock(&world.state)
+        .devices
+        .iter()
+        .map(|device| device.client.clone())
+        .collect();
+    assert_eq!(clients, ["ana.1"], "no new client id was minted");
 }

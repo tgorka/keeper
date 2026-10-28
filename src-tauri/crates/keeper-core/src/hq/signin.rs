@@ -437,30 +437,44 @@ impl Hq {
             state,
             sentence: Some(sentence),
         };
+        // Renamed since the server last heard: it learns the name only from
+        // an adoption under this client id, so nothing here ever points the
+        // person at a new pairing or a fresh sign-in — a new client id with
+        // whatever host it names (keeper-hq R69-02).
+        if stale {
+            return match (&inner.sign_in.running, &inner.sign_in.outcome) {
+                (Some(_), _) => vm(
+                    HqSignInState::Enrolling,
+                    format!("Signing this device in to {host} again, under its new name…"),
+                ),
+                (None, Some(Outcome::Refused(_))) => vm(
+                    HqSignInState::Refused,
+                    format!(
+                        "{host} would not move this device to its new name, so it still knows \
+                         it by its old one. Reset the name here to match it; keeper never makes \
+                         this a new device for a name."
+                    ),
+                ),
+                (None, Some(Outcome::Failed(why))) => vm(
+                    HqSignInState::Refused,
+                    format!(
+                        "{why} {host} still knows this device by its old name; keeper tries again."
+                    ),
+                ),
+                (None, Some(Outcome::NotOffered)) => vm(
+                    HqSignInState::Refused,
+                    format!(
+                        "{host} does not sign devices in, so it still knows this device by its \
+                         old name. Reset the name here to match it."
+                    ),
+                ),
+                (None, Some(Outcome::SignedOut) | None) => vm(
+                    HqSignInState::Renamed,
+                    format!("Sign in again to use the new name on {host}."),
+                ),
+            };
+        }
         if bound && !inner.authorization.removed {
-            if stale {
-                return match (&inner.sign_in.running, &inner.sign_in.outcome) {
-                    (Some(_), _) => vm(
-                        HqSignInState::Enrolling,
-                        format!("Signing this device in to {host} again, under its new name…"),
-                    ),
-                    (None, Some(Outcome::Refused(why) | Outcome::Failed(why))) => vm(
-                        HqSignInState::Refused,
-                        format!("{why} {host} still knows this device by its old name."),
-                    ),
-                    (None, Some(Outcome::NotOffered)) => vm(
-                        HqSignInState::Refused,
-                        format!(
-                            "{host} no longer signs devices in, so it still knows this device \
-                             by its old name."
-                        ),
-                    ),
-                    (None, Some(Outcome::SignedOut) | None) => vm(
-                        HqSignInState::Renamed,
-                        format!("Sign in again to use the new name on {host}."),
-                    ),
-                };
-            }
             return vm(
                 HqSignInState::Enrolled,
                 match &inner.sign_in.attest_problem {
@@ -478,13 +492,6 @@ impl Hq {
             );
         }
         match &inner.sign_in.outcome {
-            None | Some(Outcome::NotOffered) if stale => vm(
-                HqSignInState::Unavailable,
-                format!(
-                    "{host} knows this device by its old name until it is paired again with a \
-                     code."
-                ),
-            ),
             None | Some(Outcome::NotOffered) => HqSignInVm::unavailable(),
             Some(Outcome::SignedOut) => vm(
                 HqSignInState::SignedOut,

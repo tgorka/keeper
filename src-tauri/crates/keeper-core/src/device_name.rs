@@ -80,6 +80,17 @@ pub enum NameRefusal {
          until it has; try again once it is connected."
     )]
     Unread(String),
+    /// This device holds a credential the agents server can move to a new
+    /// name only by adopting it under the same client id — through the
+    /// account's sign-in — and no sign-in can do that here. A new pairing or
+    /// a fresh sign-in would be a new device with a new client id (keeper-hq
+    /// R69-02), so keeper never falls back to one for a name.
+    #[error(
+        "{server} knows this device by the name it was paired with, and only your account's \
+         sign-in can give it a new one there; pairing it again would make it a different device. \
+         Its name stays {current}."
+    )]
+    Pinned { server: String, current: String },
 }
 
 /// What the agents server's directory, as this device's replicas hold it,
@@ -94,6 +105,10 @@ pub struct Directory {
     /// The host the server bound this device's credential to, when keeper
     /// recorded it.
     pub bound: Option<String>,
+    /// The agents server that holds this device's credential, when nothing
+    /// can adopt it there under a new name: no account is set up, or the
+    /// server offers no sign-in or refused the account's.
+    pub pinned: Option<String>,
 }
 
 /// Why a name could not be set: refused, or not stored.
@@ -123,8 +138,9 @@ pub fn host_rule(raw: &str) -> Result<&str, NameRefusal> {
 /// Whether this device may stop being called `current` (R-HQ-94 amendment,
 /// R607-01): not while it is the host of one of the person's agent
 /// instances — by the name it has, or by the host the server bound its
-/// credential to — and not while the directory that would say so is unread
-/// (`None`).
+/// credential to — not while the directory that would say so is unread
+/// (`None`), and not where the server could learn the new name only from a
+/// new device ([`NameRefusal::Pinned`]).
 pub fn may_leave<'d>(
     current: &str,
     directory: Option<&'d Directory>,
@@ -138,6 +154,12 @@ pub fn may_leave<'d>(
         return Err(NameRefusal::Runs {
             agent: agent.clone(),
             host: host.clone(),
+        });
+    }
+    if let Some(server) = &directory.pinned {
+        return Err(NameRefusal::Pinned {
+            server: server.clone(),
+            current: current.to_owned(),
         });
     }
     Ok(directory)
@@ -302,6 +324,7 @@ mod tests {
                 ("nixi".to_owned(), "hesperia".to_owned()),
             ],
             bound: Some("hesperia".to_owned()),
+            pinned: None,
         }
     }
 
@@ -481,6 +504,40 @@ mod tests {
             refused(plan_reset(tmp.path(), "hesperia", None)),
             NameRefusal::Unread("studio".to_owned())
         );
+    }
+
+    /// keeper-hq R69-02: where only a new pairing or a fresh sign-in could
+    /// tell the server a new name, that would be a new device, so the name
+    /// stays; it is the device's own to keep, and another reason comes first.
+    #[test]
+    fn a_device_only_a_new_device_could_rename_keeps_its_name() {
+        let pinned = Directory {
+            pinned: Some("agents.example.org".to_owned()),
+            ..Directory::default()
+        };
+        let refusal = NameRefusal::Pinned {
+            server: "agents.example.org".to_owned(),
+            current: "iPhone".to_owned(),
+        };
+        assert_eq!(
+            check("kalypso", "iPhone", Some(&pinned)),
+            Err(refusal.clone())
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "agents.example.org knows this device by the name it was paired with, and only your \
+             account's sign-in can give it a new one there; pairing it again would make it a \
+             different device. Its name stays iPhone."
+        );
+        assert_eq!(check("iPhone", "iPhone", Some(&pinned)), Ok("iPhone"));
+        let both = Directory {
+            pinned: Some("agents.example.org".to_owned()),
+            ..hesperia_runs_nixi()
+        };
+        assert!(matches!(
+            check("studio", "hesperia", Some(&both)),
+            Err(NameRefusal::Runs { .. })
+        ));
     }
 
     /// The repository a rename plans against, as files by path.

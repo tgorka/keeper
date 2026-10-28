@@ -655,6 +655,9 @@ async fn a_rename_is_checked_against_the_replicated_directory() {
         ]
     );
     assert_eq!(directory.bound, None, "a pairing kept before hosts were");
+    // This world has no account: nothing can adopt the pairing under a new
+    // name, and a new pairing would be a new device.
+    assert_eq!(directory.pinned.as_deref(), Some("hq.example.org"));
 }
 
 #[cfg(unix)]
