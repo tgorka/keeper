@@ -2702,6 +2702,46 @@ mod tests {
         assert_eq!(collides(dir.path(), "notes.md"), Ok(false));
     }
 
+    /// R603-08: a reserved name and a collision are found under every spelling
+    /// APFS folds to one entry, not only the ones lowercasing reaches: on
+    /// hesperia `.obſidian` (U+017F long s) is the `.obsidian` folder, `ſessions`
+    /// is `sessions`, `STRASSE.md` is `straße.md` and `ς.md` is `Σ.md`.
+    #[test]
+    fn reserved_names_and_collisions_fold_as_apfs_does() {
+        let scope = scope();
+        for name in [".ob\u{17f}idian", ".OB\u{17f}IDIAN", ".\u{212A}eeper"] {
+            assert_eq!(
+                scope.create("10-notes", name),
+                Err(WriteRefusal::NameReserved {
+                    name: name.to_owned()
+                }),
+                "{name}"
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("stra\u{df}e.md"), b"kept").expect("write");
+        std::fs::write(dir.path().join("ss.md"), b"kept").expect("write");
+        std::fs::write(dir.path().join("\u{3a3}.md"), b"kept").expect("write");
+        std::fs::create_dir(dir.path().join("sessions")).expect("mkdir");
+        for taken in [
+            "STRASSE.md",
+            "strasse.md",
+            "\u{df}.md",
+            "\u{1e9e}.md",
+            "\u{3c2}.md",
+            "\u{17f}essions",
+            "\u{17f}e\u{17f}\u{17f}ions",
+        ] {
+            assert_eq!(collides(dir.path(), taken), Ok(true), "{taken}");
+        }
+        // What APFS keeps apart stays apart: a dotless `ı` is not `i`, and a
+        // zero-width joiner is a character of the name.
+        for free in ["se\u{17f}\u{17f}\u{131}ons", "s\u{200d}s.md"] {
+            assert_eq!(collides(dir.path(), free), Ok(false), "{free}");
+        }
+    }
+
     /// A folder that cannot be read is a refusal, never a cleared collision
     /// check. This is the shape of the epic-44 defect where a create could
     /// overwrite through a directory nobody could list.

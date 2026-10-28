@@ -425,6 +425,135 @@ fn the_fences_hold_for_any_spelling_the_mac_takes_for_them() {
     }
 }
 
+/// R603-08: every fence an agent's write meets folds as APFS folds, which is
+/// full case folding, not lowercasing. Measured on hesperia: `.obſidian`
+/// (U+017F long s) is the `.obsidian` folder, `ſessions` is `sessions`, and
+/// `ß` is `ss` — and lowercasing keeps each of those apart, so each was a way
+/// past the fence it names.
+#[test]
+fn the_fences_hold_for_a_full_case_fold() {
+    let dir = drive();
+    let root = dir.path();
+    let excludes = ExcludeSet::new(&[]).expect("excludes");
+
+    // Machinery: git's, keeper's, the sync engine's and Obsidian's own.
+    for path in [
+        ".ob\u{17f}idian/app.json",
+        "notes/.OB\u{17f}IDIAN/workspace.json",
+        "notes/.keeper-\u{17f}ync/state.json",
+        "notes/.gitattribute\u{17f}",
+    ] {
+        for target in [AgentTarget::Existing, AgentTarget::New] {
+            assert_eq!(
+                check(root, path, target),
+                Err(WriteRefusal::Machinery {
+                    subpath: path.to_owned()
+                }),
+                "{path} {target:?}"
+            );
+        }
+    }
+
+    // The sessions zone, closed in an agent host's scope, and its workspace,
+    // fenced in a person's.
+    let host = WriteScope::new("tgdrive", None)
+        .with_sessions(Some("sessions"))
+        .with_sessions_closed(true);
+    for path in ["\u{17f}essions/active/s/a.md", "SE\u{17f}SIONS/AGENTS.md"] {
+        assert_eq!(
+            agent_write_check(root, &host, &excludes, path, AgentTarget::New),
+            Err(WriteRefusal::SessionsZone {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    let person = WriteScope::new("tgdrive", None).with_sessions(Some("sessions"));
+    for path in [
+        "\u{17f}essions/active/s/workspace/x.md",
+        "sessions/active/s/work\u{17f}pace/x.md",
+    ] {
+        assert_eq!(
+            agent_write_check(root, &person, &excludes, path, AgentTarget::New),
+            Err(WriteRefusal::SessionWorkspace {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+
+    // An agent's home, its zone spelled with `ß` one side and `ss` the other.
+    for (zone, spelled) in [
+        ("80-stra\u{df}e", "80-STRASSE"),
+        ("80-strasse", "80-Stra\u{df}e"),
+        ("80-agents", "80-agent\u{17f}"),
+    ] {
+        let path = format!("{spelled}/nixi/SOUL.md");
+        write(root, &path, "a person's own\n");
+        git(root, &["add", &path]);
+        let scope = WriteScope::new("tgdrive", None).with_agents(Some(zone));
+        for target in [AgentTarget::Existing, AgentTarget::New] {
+            assert_eq!(
+                agent_write_check(root, &scope, &excludes, &path, target),
+                Err(WriteRefusal::AgentHome {
+                    subpath: path.clone()
+                }),
+                "{zone:?} {path:?} {target:?}"
+            );
+        }
+    }
+}
+
+/// R603-08: a new path collides, in the index and on the disk, with every
+/// spelling APFS takes for one already there — `ß`/`ss`, `ſ`/`s`, `ς`/`Σ`.
+#[test]
+fn a_new_path_collides_under_a_full_case_fold() {
+    let dir = drive();
+    let root = dir.path();
+    write(root, "notes/stra\u{df}e.md", "tracked\n");
+    write(root, "sessions/log.md", "tracked\n");
+    git(root, &["add", "notes/stra\u{df}e.md", "sessions/log.md"]);
+    // Gone from this disk, still the drive's.
+    std::fs::remove_file(root.join("notes/stra\u{df}e.md")).expect("rm");
+    for path in ["notes/STRASSE.md", "notes/stra\u{17f}\u{17f}e.md"] {
+        assert_eq!(
+            check(root, path, AgentTarget::New),
+            Err(WriteRefusal::Exists {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    // A tracked folder the Mac takes this one for.
+    assert_eq!(
+        check(root, "\u{17f}essions/new.md", AgentTarget::New),
+        Err(WriteRefusal::NameTaken {
+            name: "\u{17f}essions".to_owned()
+        })
+    );
+    // On this disk, untracked: the same file on the Mac.
+    write(root, "notes/\u{3a3}\u{3a3}.md", "a person's own\n");
+    write(root, "notes/ss.md", "a person's own\n");
+    for path in [
+        "notes/\u{3c3}\u{3c2}.md",
+        "notes/\u{df}.md",
+        "notes/\u{1e9e}.md",
+    ] {
+        assert_eq!(
+            check(root, path, AgentTarget::New),
+            Err(WriteRefusal::Exists {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    // What APFS keeps apart is still a new path.
+    assert_eq!(
+        check(root, "notes/s\u{200d}s.md", AgentTarget::New),
+        Ok("notes/s\u{200d}s.md".to_owned())
+    );
+}
+
 /// R603-5: an indexed blob that cannot be read may be a pointer, so whether
 /// the path is stored through LFS cannot be told: refused, never allowed.
 #[test]
