@@ -30,6 +30,15 @@ const POINTER: &str = "version https://git-lfs.github.com/spec/v1\n\
 /// routing `*.bin` through LFS, a tracked pointer, an untracked note, a
 /// force-added ignored file, a tracked link to a file and one to a folder,
 /// and a tracked folder no longer on the disk.
+/// Whether `root`'s file system folds case, as APFS does by default.
+fn case_insensitive(root: &Path) -> bool {
+    let probe = root.join(".case-probe");
+    std::fs::write(&probe, b"").expect("probe");
+    let folded = root.join(".CASE-PROBE").exists();
+    std::fs::remove_file(&probe).expect("probe");
+    folded
+}
+
 fn drive() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
@@ -673,7 +682,12 @@ fn exclusions_are_asked_over_the_spelling_the_drive_holds() {
 
     // Tracked in two spellings a Linux checkout keeps apart and a Mac does
     // not, the other one gone from this disk: on the Mac the file is in the
-    // excluded folder.
+    // excluded folder. Only a case-sensitive disk can hold that state (on
+    // APFS the two spellings are one folder, so removing one removes both);
+    // on a case-insensitive disk the case above already covers the rule.
+    if case_insensitive(root) {
+        return;
+    }
     write(root, "Archive/a.md", "tracked\n");
     write(root, "archive/b.md", "tracked\n");
     git(root, &["add", "Archive/a.md", "archive/b.md"]);
