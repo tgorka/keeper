@@ -144,7 +144,7 @@ export function DriveWritePreview({ write }: { write: AgentDriveWriteVm }) {
       {write.audience && <p className="text-muted-foreground text-xs">{write.audience}</p>}
       {write.blocked && (
         <p data-slot="drive-write-blocked" className="text-destructive text-xs">
-          Allow is not offered on this device: {write.blocked}
+          Allow is not offered: {write.blocked}
         </p>
       )}
       {write.outcome && (
