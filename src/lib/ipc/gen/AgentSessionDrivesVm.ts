@@ -23,9 +23,10 @@ pending: boolean,
  */
 refused?: string, 
 /**
- * Ticked drives the Notes Assistant ticked whose warning no person has
- * been shown yet (R-HQ-86, round 5 ruling): drawn beside the chips with
- * [`AgentSessionDrivesVm::warning`], Untick and OK, wherever the session
- * is shown. Read from the same rows as the chips, so the two agree.
+ * Ticked drives this person has not been shown [`WARNING`] for on this
+ * device (round 6 ruling, [`SeenTicks`]): a tick the Notes Assistant,
+ * another device or a carry made, or one whose record was lost. Drawn
+ * beside the chips with Untick and OK wherever the session is shown;
+ * read from the same selection as the chips, so the two agree.
  */
 unseen?: Array<string>, };

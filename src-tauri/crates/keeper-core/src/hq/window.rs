@@ -332,17 +332,16 @@ impl Hq {
         }
         self.writes
             .draw(&self.sources(), &source, &mut view.approvals_mut());
-        // The Notes Assistant's ticks no person has been shown yet: read
-        // beside the chips, from the same selection (round 5 ruling).
-        if let (Some(drives), Ok(data_dir)) = (view.drives.as_mut(), self.data_dir()) {
-            let marked = drives::UnseenTicks::at(&crate::hq::databases::root(&data_dir))
-                .of(&key.database, &key.session_id);
-            drives.unseen = drives
+        // Ticked drives this person has not been shown the warning for on
+        // this device, read beside the chips from the same selection.
+        if let Some(drives) = view.drives.as_mut() {
+            let ticked: Vec<String> = drives
                 .drives
                 .iter()
-                .filter(|drive| drive.ticked && marked.contains(&drive.name))
+                .filter(|drive| drive.ticked)
                 .map(|drive| drive.name.clone())
                 .collect();
+            drives.unseen = self.unseen_ticks(key, &ticked);
         }
         if let Some(held) = lock(&self.views).get_mut(key) {
             held.live.settle(&opened.live, &view.live);

@@ -180,7 +180,7 @@ it("says Rust's quiet line under a message sent again without the note (109.28 Â
   expect(within(message as HTMLElement).getByText(note)).toBeInTheDocument();
 });
 
-it("draws the Notes Assistant's unseen tick in the Agents window too (round 5 ruling)", async () => {
+it("draws the Notes Assistant's unseen tick in the Agents window too (round 6 ruling)", async () => {
   // A dock answer nobody saw left tgdrive ticked; the Agents window opens that chat.
   await draw({
     ...vm,
@@ -191,7 +191,7 @@ it("draws the Notes Assistant's unseen tick in the Agents window too (round 5 ru
       unseen: ["tgdrive"],
     },
   });
-  const note = screen.getByRole("note", { name: "tgdrive was ticked by the Notes Assistant" });
+  const note = screen.getByRole("note", { name: "What ticking tgdrive allows" });
   expect(note).toHaveTextContent("Once you tick a drive, the agent may read it.");
   expect(within(note).getByRole("button", { name: "Untick tgdrive" })).toBeInTheDocument();
   expect(within(note).getByRole("button", { name: "OK" })).toBeInTheDocument();

@@ -33,9 +33,9 @@
 //! - **The Notes Assistant's tick** ([`Hq::session_for_note`], R-HQ-86):
 //!   opened on a note, the dock ticks the note's drive as the person, by the
 //!   same rules a click does. Nowhere else is a drive ticked for the person.
-//!   The tick is marked unseen ([`UnseenTicks`]) and never taken back by
-//!   keeper: wherever the session is shown, [`WARNING`] stands beside its
-//!   chip with Untick and OK until a person answers it.
+//!   keeper never takes the tick back. Any ticked drive this person has not
+//!   been shown [`WARNING`] for on this device ([`SeenTicks`]) draws it
+//!   beside its chip, with Untick and OK, wherever the session is shown.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
@@ -99,10 +99,11 @@ pub struct AgentSessionDrivesVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub refused: Option<String>,
-    /// Ticked drives the Notes Assistant ticked whose warning no person has
-    /// been shown yet (R-HQ-86, round 5 ruling): drawn beside the chips with
-    /// [`AgentSessionDrivesVm::warning`], Untick and OK, wherever the session
-    /// is shown. Read from the same rows as the chips, so the two agree.
+    /// Ticked drives this person has not been shown [`WARNING`] for on this
+    /// device (round 6 ruling, [`SeenTicks`]): a tick the Notes Assistant,
+    /// another device or a carry made, or one whose record was lost. Drawn
+    /// beside the chips with Untick and OK wherever the session is shown;
+    /// read from the same selection as the chips, so the two agree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<String>>", optional)]
     pub unseen: Vec<String>,
@@ -781,16 +782,11 @@ pub fn carry(
 /// Said when the note's folder declares no drive.
 pub const NO_DRIVE: &str = "This note's folder is not a drive, so no drive is ticked.";
 
-/// Said when the mark that makes a dock tick visible could not be written:
-/// no tick is made without it (R605-10).
-pub fn unrecorded(drive: &str) -> String {
-    format!("keeper could not record the tick it would make, so {drive} is not ticked.")
-}
-
-/// The one lock every write of a session's drives goes through: the
-/// person's tick or untick, the Notes Assistant's tick, and the unseen marks
-/// beside them (R605-09). A tick and its mark, or an untick and its mark's
-/// removal, are one step to every other writer.
+/// The one lock the person's tick or untick, the Notes Assistant's tick,
+/// and the seen record beside them go through (R605-09): a tick and its
+/// record, or an untick and its record's removal, are one step to each
+/// other. (`/clean`'s carry and replication write ticks without it; neither
+/// records anything as seen.)
 static DRIVE_WRITES: Mutex<()> = Mutex::new(());
 
 /// The row's values: the drives as a JSON array, `[]` for none.
@@ -802,87 +798,83 @@ fn selection(session_id: &str, drives: &[String], now_ms: i64) -> Map<String, Va
     }))
 }
 
-/// The drives the Notes Assistant ticked whose warning (R-HQ-79) no person
-/// has been shown yet, kept beside the replicas by `database`, `session`
-/// and `drive` (R-HQ-86, round 5 ruling). Every dock tick is marked here
-/// before it is made, and the mark goes only when a person is shown the
-/// warning and says OK, or ticks or unticks that drive themselves. Wherever
-/// the session is shown, a ticked, marked drive draws the warning with
-/// Untick and OK ([`AgentSessionDrivesVm::unseen`]).
-pub(crate) struct UnseenTicks {
+/// The ticked drives this person has been shown [`WARNING`] for on this
+/// device and answered, by `database`, `session` and `drive` (R-HQ-79;
+/// round 6 ruling). Any ticked drive **not** in it draws the warning with
+/// Untick and OK wherever its session is shown
+/// ([`AgentSessionDrivesVm::unseen`]), so what is lost fails toward the
+/// warning: a missing, unreadable or older file is an empty record, and a
+/// tick made by the Notes Assistant, by another device or by a carry warns
+/// here until it is answered here. A tick the person makes in the drive
+/// menu — where the warning stands beside every drive — is recorded when it
+/// is made; one the dock makes is not.
+pub(crate) struct SeenTicks {
     path: std::path::PathBuf,
 }
 
-impl UnseenTicks {
-    pub(crate) fn at(root: &std::path::Path) -> UnseenTicks {
-        UnseenTicks {
-            path: root.join("note-ticks-unseen.json"),
+/// One entry of the record: database, session, drive.
+type SeenKey = (String, String, String);
+
+impl SeenTicks {
+    pub(crate) fn at(root: &std::path::Path) -> SeenTicks {
+        SeenTicks {
+            path: root.join("drive-ticks-seen.json"),
         }
     }
 
-    fn key(database: &str, session: &str, drive: &str) -> String {
-        format!("{database}\n{session}\n{drive}")
-    }
-
-    fn read(&self) -> BTreeSet<String> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
-                tracing::warn!(%error, "the unseen drive ticks could not be read");
-                BTreeSet::new()
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+    /// The record; anything that does not read as one is no record at all.
+    fn read(&self) -> BTreeSet<SeenKey> {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
             Err(error) => {
-                tracing::warn!(%error, "the unseen drive ticks could not be read");
-                BTreeSet::new()
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "the drive ticks seen could not be read; every tick warns");
+                }
+                return BTreeSet::new();
             }
-        }
+        };
+        serde_json::from_str(&raw).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the drive ticks seen do not read; every tick warns");
+            BTreeSet::new()
+        })
     }
 
     /// Written whole to a new file and renamed over the old one, so a crash
-    /// never leaves half a list.
-    fn write(&self, marks: &BTreeSet<String>) -> std::io::Result<()> {
-        let raw = serde_json::to_string(marks).map_err(std::io::Error::other)?;
+    /// never leaves half a record.
+    fn write(&self, seen: &BTreeSet<SeenKey>) -> std::io::Result<()> {
+        let raw = serde_json::to_string(seen).map_err(std::io::Error::other)?;
         let fresh = self.path.with_extension("json.new");
         std::fs::write(&fresh, raw)?;
         std::fs::rename(&fresh, &self.path)
     }
 
-    /// The marked drives of `session` in `database`.
-    pub(crate) fn of(&self, database: &str, session: &str) -> BTreeSet<String> {
-        let prefix = Self::key(database, session, "");
-        self.read()
-            .into_iter()
-            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_owned))
-            .collect()
-    }
-
-    fn mark(&self, database: &str, session: &str, drive: &str) -> std::io::Result<()> {
-        let mut marks = self.read();
-        if marks.insert(Self::key(database, session, drive)) {
-            self.write(&marks)?;
+    fn change(&self, change: impl FnOnce(&mut BTreeSet<SeenKey>)) -> std::io::Result<()> {
+        let mut seen = self.read();
+        let before = seen.clone();
+        change(&mut seen);
+        if seen == before {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    fn clear(&self, database: &str, session: &str, drive: &str) -> std::io::Result<()> {
-        let mut marks = self.read();
-        if marks.remove(&Self::key(database, session, drive)) {
-            self.write(&marks)?;
-        }
-        Ok(())
+        self.write(&seen)
     }
 }
 
+fn seen_key(database: &str, session: &str, drive: &str) -> SeenKey {
+    (database.to_owned(), session.to_owned(), drive.to_owned())
+}
+
 impl Hq {
-    fn unseen_ticks(&self) -> Result<UnseenTicks, HqError> {
-        Ok(UnseenTicks::at(&crate::hq::databases::root(
+    fn seen_ticks(&self) -> Result<SeenTicks, HqError> {
+        Ok(SeenTicks::at(&crate::hq::databases::root(
             &self.data_dir()?,
         )))
     }
 
     /// Tick or untick one drive for a session's agent to read: the person's
-    /// own choice, so it also ends the Notes Assistant's unseen mark on that
-    /// drive, in the same step ([`DRIVE_WRITES`]).
+    /// own choice in the drive menu, where [`WARNING`] stands beside every
+    /// drive, so a tick is recorded as seen and an untick drops its record,
+    /// in the same step ([`DRIVE_WRITES`]). A record that cannot be written
+    /// only means the warning is said once more.
     pub fn set_session_drive(
         &self,
         key: &AgentSessionRef,
@@ -890,7 +882,7 @@ impl Hq {
         tick: bool,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
-        let unseen = self.unseen_ticks()?;
+        let seen = self.seen_ticks()?;
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
         set(
             &source,
@@ -901,9 +893,16 @@ impl Hq {
             sessions::now_ms(),
         )
         .map_err(|refused| HqError::Sentence(refused.0))?;
-        // Left behind, a mark only says the warning once more.
-        if let Err(error) = unseen.clear(&key.database, &key.session_id, drive) {
-            tracing::warn!(%error, "an unseen drive tick could not be cleared");
+        let entry = seen_key(&key.database, &key.session_id, drive);
+        let recorded = seen.change(|seen| {
+            if tick {
+                seen.insert(entry);
+            } else {
+                seen.remove(&entry);
+            }
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "a drive tick seen could not be recorded");
         }
         self.touch();
         Ok(())
@@ -913,14 +912,14 @@ impl Hq {
     /// `None`: its folder declares no drive). The default agent's newest
     /// unarchived session in the drive's database, or one started there with
     /// this device's last `pick` for the agent, and the drive ticked in it as
-    /// the person when it is not yet — marked unseen first, so wherever the
-    /// session is shown its warning stands beside the chip until a person
-    /// says OK or unticks it (round 5 ruling). Without the mark, no tick
-    /// (R605-10). A drive the agent does not offer, or V17 refuses, stays
-    /// unticked and the answer says why. `None` with no default agent.
+    /// the person when it is not yet. The tick is not recorded as seen, so
+    /// wherever the session is shown its warning stands beside the chip
+    /// until a person says OK or unticks it (round 6 ruling). A drive the
+    /// agent does not offer, or V17 refuses, stays unticked and the answer
+    /// says why. `None` with no default agent.
     ///
     /// Nothing here is ever taken back: an answer the dock no longer wants
-    /// leaves its tick as an unseen tick of that session.
+    /// leaves its tick as a tick of that session, warning and all.
     pub fn session_for_note(
         &self,
         drive: Option<&str>,
@@ -942,10 +941,9 @@ impl Hq {
                     .map(|target| answer(target, None, Some(NO_DRIVE.to_owned()))),
             );
         };
-        let unseen = self.unseen_ticks()?;
         // Held from finding the drive's session to ticking it: two docks
-        // opened on one drive at once start one session, not two, and no
-        // other write of the drives runs between.
+        // opened on one drive at once start one session, not two, and the
+        // person's own tick or untick runs before or after, never between.
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
         let Some((mut target, elsewhere)) =
             sessions::note_session(&sources, chosen.as_deref(), &last, drive, now)
@@ -969,32 +967,59 @@ impl Hq {
         if drives.iter().any(|ticked| ticked == drive) {
             return Ok(Some(answer(target, Some(drive), None)));
         }
-        if let Err(error) = unseen.mark(drive, &session_id, drive) {
-            tracing::warn!(%error, "an unseen drive tick could not be recorded");
-            return Ok(Some(answer(target, Some(drive), Some(unrecorded(drive)))));
-        }
         let ticked = set(&source, &session_id, drive, true, &sources, now);
         self.touch();
         Ok(Some(match ticked {
             Ok(()) => answer(target, Some(drive), None),
-            Err(DriveRefused(reason)) => {
-                // Nothing was ticked: the mark marks nothing, and goes.
-                if let Err(error) = unseen.clear(drive, &session_id, drive) {
-                    tracing::debug!(%error, "a mark for a tick never made could not be cleared");
-                }
-                answer(target, Some(drive), Some(reason))
-            }
+            Err(DriveRefused(reason)) => answer(target, Some(drive), Some(reason)),
         }))
     }
 
-    /// A person was shown the warning of the Notes Assistant's tick of
-    /// `drive` in `key` and said OK (R-HQ-79): it is no longer unseen.
+    /// A person was shown [`WARNING`] for `drive` in `key` and said OK
+    /// (R-HQ-79): recorded as seen on this device, and every open view is
+    /// told (R605-13).
     pub fn note_tick_seen(&self, key: &AgentSessionRef, drive: &str) -> Result<(), HqError> {
-        let unseen = self.unseen_ticks()?;
+        let seen = self.seen_ticks()?;
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
-        unseen
-            .clear(&key.database, &key.session_id, drive)
-            .map_err(|error| HqError::Sentence(format!("keeper could not note that: {error}")))
+        seen.change(|seen| {
+            seen.insert(seen_key(&key.database, &key.session_id, drive));
+        })
+        .map_err(|error| HqError::Sentence(format!("keeper could not note that: {error}")))?;
+        self.touch();
+        Ok(())
+    }
+
+    /// The drives of `key` ticked now (`ticked`) that this person has not
+    /// been shown the warning for on this device: every one not in the seen
+    /// record. Each read also prunes the record (R605-12): an entry of a
+    /// database this device holds goes once its session is gone or its
+    /// drive is no longer ticked there. An entry of a database not held is
+    /// kept. Pruning only ever makes a warning show again.
+    pub(crate) fn unseen_ticks(&self, key: &AgentSessionRef, ticked_now: &[String]) -> Vec<String> {
+        let Ok(seen) = self.seen_ticks() else {
+            return ticked_now.to_vec();
+        };
+        let sources = self.sources();
+        let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut record = seen.read();
+        let before = record.len();
+        record.retain(|(database, session, drive)| {
+            let Some(source) = sources.iter().find(|source| &source.database == database) else {
+                return true;
+            };
+            timeline::session_row(source, session).is_some()
+                && ticked(source, session).0.iter().any(|name| name == drive)
+        });
+        if record.len() != before {
+            if let Err(error) = seen.write(&record) {
+                tracing::debug!(%error, "the drive ticks seen could not be pruned");
+            }
+        }
+        ticked_now
+            .iter()
+            .filter(|drive| !record.contains(&seen_key(&key.database, &key.session_id, drive)))
+            .cloned()
+            .collect()
     }
 }
 

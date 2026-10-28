@@ -75,9 +75,9 @@ export function NotesAgentDock() {
  * another note of the same vault keeps the chat, and so does a note of another vault Rust names the
  * same drive; a pick in the select holds until the drive changes.
  *
- * What ticking allows is never the dock's to say: Rust marks every dock tick unseen, and the
+ * What ticking allows is never the dock's to say: Rust records the dock's tick as not seen, and the
  * session itself draws the warning beside its chip, with Untick and OK, wherever it is shown
- * (`SessionDrives`, round 5 ruling). The dock only says why it did not tick.
+ * (`SessionDrives`, round 6 ruling). The dock only says why it did not tick.
  *
  * Opening and ticking are writes, so the dock decides which drive it follows before it asks for
  * any (R605-02): it first reads the note's drive, and a note on the drive it already follows asks
@@ -145,7 +145,7 @@ export function DockBody() {
           if (vm === null) return;
           // Nobody wants this answer any more (the dock closed, the person left the note or its
           // drive): it changes nothing here, and the loop goes on to what is in front now. A tick
-          // it made stays, unseen; that chat draws its warning when it is opened (round 5 ruling).
+          // it made stays, unseen; that chat draws its warning when it is opened (round 6 ruling).
           if (gone.current || wanted.current?.drive !== want.drive) continue;
           followed.current = want.drive;
           setAgent(vm.target);

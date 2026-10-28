@@ -1,7 +1,8 @@
 /**
  * The Notes Assistant on the note in front of the person (109.28, R-HQ-86), through the real
  * dock, session view, drives control and composer over a mocked IPC whose fake keeps Rust's state:
- * which drives each chat has ticked, and which of those the dock ticked unseen (round 5 ruling).
+ * which drives each chat has ticked, and which of those this person has not been shown the warning
+ * for (round 6 ruling: the dock's ticks, never the person's own).
  * The dock opens the chat Rust names for the note's drive; the warning of its tick is the chat's
  * to draw, beside the chip, from that same state; a message sent from it carries the note's caret;
  * it follows the drive rather than the note, deciding which before it asks Rust to open or tick
@@ -87,8 +88,9 @@ const WARNING =
   "Text it read on the web or in a drive can lead it to do that.";
 
 /**
- * Rust's state, as the fake keeps it: the drives each chat has ticked, and the dock's unseen
- * marks. Every view of a chat reads both, as `Hq::session_view` does.
+ * Rust's state, as the fake keeps it: the drives each chat has ticked, and those not seen (ticked
+ * by the dock and not yet answered with OK, Untick or the person's own tick). Every view of a chat
+ * reads both, as `Hq::session_view` does.
  */
 const rust = {
   ticked: new Map<string, Set<string>>(),
@@ -97,8 +99,8 @@ const rust = {
 const chatKey = (database: string, sessionId: string) => `${database}/${sessionId}`;
 
 /**
- * Rust's `session_for_note`, made now: the note's drive ticked in `sessionId`, marked unseen first,
- * unless it was already ticked. What it answers carries no tick: the session shows it.
+ * Rust's `session_for_note`, made now: the note's drive ticked in `sessionId`, not recorded as
+ * seen, unless it was already ticked. What it answers carries no tick: the session shows it.
  */
 function onDrive(drive: string, sessionId: string): AgentNoteSessionVm {
   const key = chatKey(drive, sessionId);
@@ -230,8 +232,8 @@ function shown() {
           .filter((text) => text !== "No drive ticked")
       : [],
     warnings: screen
-      .queryAllByRole("note", { name: /was ticked by the Notes Assistant$/ })
-      .map((note) => (note.getAttribute("aria-label") ?? "").split(" ")[0]),
+      .queryAllByRole("note", { name: /^What ticking \S+ allows$/ })
+      .map((note) => (note.getAttribute("aria-label") ?? "").split(" ")[2]),
   };
 }
 
@@ -297,9 +299,9 @@ it("opens the chat on the note's drive, whose own view says what the tick allows
   await waitFor(() => expect(opened()).toEqual([{ database: "tgdrive", sessionId: "tg.1" }]));
   showAll();
   expect(shown()).toEqual({ chips: ["tgdrive"], warnings: ["tgdrive"] });
-  expect(
-    screen.getByRole("note", { name: "tgdrive was ticked by the Notes Assistant" }),
-  ).toHaveTextContent(WARNING);
+  expect(screen.getByRole("note", { name: "What ticking tgdrive allows" })).toHaveTextContent(
+    WARNING,
+  );
   // The dock says nothing of its own about a tick.
   expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
 

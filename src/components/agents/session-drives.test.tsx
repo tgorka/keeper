@@ -54,11 +54,11 @@ describe("SessionDrives", () => {
   });
 
   /**
-   * Round 5 ruling: a drive the Notes Assistant ticked whose warning no person has answered is
+   * Round 6 ruling: a ticked drive this person has not been shown the warning for on this device is
    * Rust's `unseen`, read from the same view as the chips. It draws the warning beside them, with
-   * Untick (the person's own untick, which clears the mark with it) and OK (seen).
+   * Untick (the person's own untick, which drops its record) and OK (recorded as seen).
    */
-  it("says what a drive the Notes Assistant ticked allows, with Untick and OK", async () => {
+  it("says what a ticked drive not yet seen here allows, with Untick and OK", async () => {
     const vm = drives({
       drives: [
         { name: "alpha", ticked: true },
@@ -75,14 +75,12 @@ describe("SessionDrives", () => {
         onOpenChange={() => {}}
       />,
     );
-    const note = screen.getByRole("note", { name: "alpha was ticked by the Notes Assistant" });
+    const note = screen.getByRole("note", { name: "What ticking alpha allows" });
     expect(note).toHaveTextContent(
-      "The Notes Assistant ticked alpha for Nixie to read in this chat.",
+      "alpha is ticked for Nixie to read in this chat, and you have not been shown what that allows on this device.",
     );
     expect(note).toHaveTextContent(WARNING);
-    expect(
-      screen.queryByRole("note", { name: "gamma was ticked by the Notes Assistant" }),
-    ).toBeNull();
+    expect(screen.queryByRole("note", { name: "What ticking gamma allows" })).toBeNull();
     expect(
       within(screen.getByRole("list", { name: "Drives ticked" })).getByText("alpha"),
     ).toBeInTheDocument();
@@ -107,7 +105,7 @@ describe("SessionDrives", () => {
         onOpenChange={() => {}}
       />,
     );
-    expect(screen.queryByRole("note", { name: /ticked by the Notes Assistant/ })).toBeNull();
+    expect(screen.queryByRole("note", { name: /^What ticking \S+ allows$/ })).toBeNull();
   });
 
   it("says when OK could not be noted, and keeps the warning", async () => {
@@ -125,9 +123,7 @@ describe("SessionDrives", () => {
       fireEvent.click(screen.getByRole("button", { name: "OK" }));
     });
     expect(screen.getByRole("alert")).toHaveTextContent("disk full");
-    expect(
-      screen.getByRole("note", { name: "alpha was ticked by the Notes Assistant" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("note", { name: "What ticking alpha allows" })).toBeInTheDocument();
   });
 
   it("says what ticking allows beside every drive, and again once the first one is ticked", async () => {

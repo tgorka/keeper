@@ -27,10 +27,11 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  * stopped being allowed and holds every other change back: its chip says so, and its button
  * unticks every such drive at once (Rust's `set`), as the sentence under the chips says.
  *
- * A drive the Notes Assistant ticked whose warning no person has answered (`drives.unseen`, Rust's
- * mark beside the selection, round 5 ruling) draws that warning under the chips, wherever this
- * session is shown, with **Untick** (the person's own untick, which clears the mark with it) and
- * **OK** (seen). Both read the same Rust view as the chips, so they cannot disagree.
+ * A ticked drive this person has not been shown the warning for on this device (`drives.unseen`:
+ * Rust's seen record, round 6 ruling — a tick the Notes Assistant, another device or a carry made,
+ * or one whose record was lost) draws that warning under the chips, wherever this session is
+ * shown, with **Untick** (the person's own untick) and **OK** (recorded as seen). Both read the
+ * same Rust view as the chips, so they cannot disagree.
  */
 export function SessionDrives({
   target,
@@ -221,12 +222,13 @@ export function SessionDrives({
         <div
           key={name}
           role="note"
-          aria-label={`${name} was ticked by the Notes Assistant`}
+          aria-label={`What ticking ${name} allows`}
           data-slot="session-drives-unseen"
           className="mt-1 flex min-w-0 flex-col gap-1 rounded-md border border-held/40 px-2 py-1 text-held text-xs"
         >
           <p className="min-w-0 font-medium [overflow-wrap:anywhere]">
-            The Notes Assistant ticked {name} for {agentName} to read in this chat.
+            {name} is ticked for {agentName} to read in this chat, and you have not been shown what
+            that allows on this device.
           </p>
           <p className="min-w-0 [overflow-wrap:anywhere]">{drives.warning}</p>
           <div className="flex flex-wrap gap-1">

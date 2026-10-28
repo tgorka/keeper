@@ -4416,7 +4416,7 @@ export async function agentNoteDrive(vaultId: string, noteId: string): Promise<s
 /**
  * The Notes Assistant opened on a note (109.28, R-HQ-86): the default agent's chat in the database
  * named after the note's drive, started there when it has none, and the drive ticked in it as the
- * person — marked unseen, so the session draws its warning (`drives.unseen`) — or the reason it
+ * person — not recorded as seen, so the session draws its warning (`drives.unseen`) — or the reason it
  * was not ticked. `pick` is this
  * device's last model and effort for the default agent, for a session started now. `null` with no
  * default agent.

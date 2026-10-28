@@ -1103,15 +1103,19 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   database here that names the agent, opens the agent's main conversation and says why.
 - **The tick, and its warning.** In that chat keeper ticks the drive as the person, by the menu's
   own rules (the agent offers it, V17's audience rule allows it, no stopped drive holds it back).
-  Nowhere else is a drive ticked for the person (Q109-20 b). Every such tick is first marked
-  **unseen** in Rust, per session and drive (`hq/note-ticks-unseen.json`, written atomically); a
-  tick whose mark cannot be written is not made, and the dock says why. Wherever that session is
-  shown — the dock, the Agents window, after a restart — a ticked, unseen drive draws the drives'
-  warning (R-HQ-79) beside its chip, with **Untick** and **OK** (`drives.unseen`, read from the same
-  view as the chips, so the two cannot disagree). OK marks it seen (`agent_note_tick_seen`); a
-  person's own tick or untick clears the mark in the same step, under the one lock every drive
-  write takes. keeper never takes a dock tick back on its own (round 5 ruling): only a person
-  unticks it. When the dock does not tick, it says why.
+  Nowhere else is a drive ticked for the person (Q109-20 b). keeper keeps, per device, the ticks
+  this person has been shown the drives' warning (R-HQ-79) for and answered — the **seen** record
+  (`hq/drive-ticks-seen.json`, written atomically; round 6 ruling). Any ticked drive not in it draws
+  that warning beside its chip, with **Untick** and **OK**, wherever the session is shown (the dock,
+  the Agents window, after a restart): `drives.unseen`, read from the same view as the chips, so
+  the two cannot disagree. The person's own tick in the drive menu, where the warning stands, is
+  recorded when made; the dock's tick is not, so it warns. OK records it (`agent_note_tick_seen`)
+  and wakes every open view. An untick drops its entry, and each view build drops entries whose
+  session is gone or whose drive is no longer ticked. What is lost fails toward the warning: a
+  missing, unreadable or older record is an empty one, and a tick made on another device, or
+  carried by `/clean`, warns here once. The person's tick or untick, the dock's tick and the record
+  share one lock. keeper never takes a dock tick back on its own: only a person unticks it. When
+  the dock does not tick, it says why.
 - **Following.** The dock follows the drive, not the note: another note of the same vault keeps the
   chat, as does a vault on the same drive; a note on another drive opens that drive's chat. A pick
   in the dock's own select holds until the drive changes. Opening and ticking are writes, so the dock

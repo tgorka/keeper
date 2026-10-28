@@ -1932,37 +1932,228 @@ async fn a_dock_tick_stays_unseen_wherever_its_chat_is_shown_until_a_person_answ
     );
 }
 
-/// R605-10: a dock tick is never made without its unseen mark. When the
-/// mark cannot be written, nothing is ticked and the dock says why.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_dock_tick_is_made_when_its_mark_cannot_be_written() {
-    let world = World::new();
-    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+/// The seen record's file under `world`'s data directory.
+fn seen_file(world: &World) -> std::path::PathBuf {
+    crate::hq::databases::root(&world.data_dir()).join("drive-ticks-seen.json")
+}
+
+/// A started service for the Notes Assistant on tgdrive, its chat ticked by
+/// the dock: the service, the opener and the chat.
+async fn dock_ticked(world: &World) -> (Arc<Hq>, Arc<LocalOpener>, sessions::AgentSessionRef) {
+    let (hq, opener) = spoken_world(world, &["tgdrive"]).await;
     offers(&opener, "tgdrive", &["tgdrive"]);
     crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
         .expect("default agent");
-    // The file the marks are written through cannot be written.
-    std::fs::create_dir_all(
-        crate::hq::databases::root(&world.data_dir()).join("note-ticks-unseen.json.new"),
-    )
-    .expect("blocked");
-
-    let refused = hq
+    let first = hq
         .session_for_note(Some("tgdrive"), None)
         .expect("answers")
         .expect("a default agent");
-    assert_eq!(refused.reason, Some(drives::unrecorded("tgdrive")));
+    let key = chat(
+        first.target.session_id.as_deref().expect("a chat"),
+        "tgdrive",
+    );
+    (hq, opener, key)
+}
+
+/// Round 6 ruling: the person's own tick in the drive menu, where the
+/// warning stands beside every drive, is seen when it is made; the dock's
+/// is not, and warns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_s_own_tick_is_seen_and_the_dock_s_warns() {
+    let world = World::new();
+    let (hq, _opener, dock) = dock_ticked(&world).await;
+    assert_eq!(unseen_in(&hq, &dock), ["tgdrive"], "the dock's tick warns");
+    let mine = hq
+        .new_session("tgdrive", "nixie", "my own", None, None)
+        .expect("a chat");
+    hq.set_session_drive(&mine, "tgdrive", true)
+        .expect("ticked");
     assert!(
-        ticks(&opener, "tgdrive")
-            .iter()
-            .all(|(_, drives)| !drives.contains("tgdrive")),
-        "nothing ticked"
+        unseen_in(&hq, &mine).is_empty(),
+        "the person's own tick is seen"
+    );
+    assert_eq!(
+        unseen_in(&hq, &dock),
+        ["tgdrive"],
+        "another chat's seen tick of the same drive is not this one's"
     );
 }
 
-/// R605-09: the person's untick and the dock's tick go through one lock,
-/// tick and mark together. However they interleave, a drive left ticked by
-/// the dock is marked unseen — never a silent tick.
+/// R605-11: a record that is missing, does not read, is an older version's,
+/// or is another device's is no record: a tick answered before warns again
+/// rather than pass as seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    let answered = || {
+        hq.note_tick_seen(&key, "tgdrive").expect("seen");
+        assert!(unseen_in(&hq, &key).is_empty(), "answered");
+    };
+    answered();
+    std::fs::remove_file(seen_file(&world)).expect("removed");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "missing");
+    answered();
+    std::fs::write(seen_file(&world), "[[\"tgdrive\",").expect("truncated");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "unreadable");
+    answered();
+    // Round 5's shape: a list of "database\nsession\ndrive" strings.
+    std::fs::write(
+        seen_file(&world),
+        serde_json::to_string(&[format!("tgdrive\n{}\ntgdrive", key.session_id)]).expect("json"),
+    )
+    .expect("legacy");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "an older version's");
+    answered();
+
+    // Another device, holding the same rows, has seen nothing: it warns.
+    let other = World::new();
+    other.paired("https://hq.example.org", &["tgdrive"]);
+    let there = Hq::new(
+        Arc::clone(&other.platform) as Arc<dyn Platform>,
+        Arc::new(Shared(Arc::clone(&opener))) as Arc<dyn Opener>,
+        Arc::clone(&other.routes) as Arc<dyn Routes>,
+        Arc::new(signin::NoAccount),
+        "keeper on another device".to_owned(),
+        || "other".to_owned(),
+    );
+    there.start().await.expect("starts");
+    assert_eq!(unseen_in(&there, &key), ["tgdrive"], "another device's");
+    assert!(unseen_in(&hq, &key).is_empty(), "still seen here");
+}
+
+/// Opens every database as the replica `0` already opened: a second device's
+/// service reading the same rows.
+struct Shared(Arc<LocalOpener>);
+
+impl Opener for Shared {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+        Ok(self.0.replica(&spec.database))
+    }
+}
+
+/// R605-12: the record holds only current ticks. Each view drops an entry
+/// whose session is gone or whose drive is no longer ticked there — by the
+/// person or by a selection that arrived from elsewhere — and a tick made
+/// again after that warns again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seen_record_drops_gone_sessions_and_unticked_drives() {
+    let world = World::new();
+    let (hq, opener, first) = dock_ticked(&world).await;
+    hq.note_tick_seen(&first, "tgdrive").expect("seen");
+    let second = hq
+        .new_session("tgdrive", "nixie", "another", None, None)
+        .expect("a chat");
+    hq.set_session_drive(&second, "tgdrive", true)
+        .expect("ticked");
+    let record = || std::fs::read_to_string(seen_file(&world)).expect("the record");
+    assert!(record().contains(&first.session_id) && record().contains(&second.session_id));
+
+    // The first session is deleted; a view of the second prunes it.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![
+            RowOp::Delete {
+                table: "session_drives".to_owned(),
+                row_id: first.session_id.clone(),
+                base_version: None,
+            },
+            RowOp::Delete {
+                table: "sessions".to_owned(),
+                row_id: first.session_id.clone(),
+                base_version: None,
+            },
+        ])
+        .expect("deleted");
+    assert!(unseen_in(&hq, &second).is_empty());
+    assert!(!record().contains(&first.session_id), "{}", record());
+    assert!(record().contains(&second.session_id));
+
+    // The second's drive is unticked by a selection from elsewhere.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "session_id": second.session_id, "drives": "[]", "updated_at_ms": 9,
+                "author_actor": "ana", "author_client": "ana.2"})),
+            base_version: None,
+        }])
+        .expect("unticked elsewhere");
+    assert!(unseen_in(&hq, &second).is_empty());
+    assert_eq!(record(), "[]");
+    // Ticked again from elsewhere: it warns, the earlier answer gone with it.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "session_id": second.session_id, "drives": "[\"tgdrive\"]", "updated_at_ms": 10,
+                "author_actor": "ana", "author_client": "ana.2"})),
+            base_version: None,
+        }])
+        .expect("ticked elsewhere");
+    assert_eq!(unseen_in(&hq, &second), ["tgdrive"]);
+}
+
+/// R605-13: OK and Untick tell every open view, as every other change of a
+/// session does: the native stream wakes with nothing else moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ok_and_untick_wake_the_session_stream() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let mut changes = hq.changes();
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    // Let the dock tick's own writes settle: the stream is idle before OK.
+    loop {
+        changes.borrow_and_update();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if !changes.has_changed().expect("open") {
+            break;
+        }
+    }
+    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    assert!(changes.has_changed().expect("open"), "OK wakes the stream");
+    changes.borrow_and_update();
+    assert!(unseen_in(&hq, &key).is_empty());
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(
+        changes.has_changed().expect("open"),
+        "Untick wakes the stream"
+    );
+}
+
+/// A record that cannot be written only ever warns: the person's own tick
+/// is then said once more, and OK says it could not note it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seen_record_that_cannot_be_written_keeps_the_warning() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    std::fs::create_dir_all(seen_file(&world).with_extension("json.new")).expect("blocked");
+    let refused = hq.note_tick_seen(&key, "tgdrive").expect_err("not noted");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("keeper could not note that"),
+        "{refused}"
+    );
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    let mine = hq
+        .new_session("tgdrive", "nixie", "my own", None, None)
+        .expect("a chat");
+    hq.set_session_drive(&mine, "tgdrive", true)
+        .expect("ticked");
+    assert_eq!(
+        unseen_in(&hq, &mine),
+        ["tgdrive"],
+        "unrecorded: said once more"
+    );
+}
+
+/// R605-09: the person's untick and the dock's tick go through one lock.
+/// However they interleave, a drive left ticked by the dock warns — never a
+/// silent tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_person_s_untick_racing_the_dock_s_tick_never_leaves_a_silent_tick() {
     let world = World::new();
@@ -1978,11 +2169,7 @@ async fn a_person_s_untick_racing_the_dock_s_tick_never_leaves_a_silent_tick() {
         first.target.session_id.as_deref().expect("a chat"),
         "tgdrive",
     );
-    let marked = || {
-        drives::UnseenTicks::at(&crate::hq::databases::root(&world.data_dir()))
-            .of("tgdrive", &key.session_id)
-            .contains("tgdrive")
-    };
+    let marked = || unseen_in(&hq, &key).contains(&"tgdrive".to_owned());
     for round in 0..60 {
         std::thread::scope(|scope| {
             scope.spawn(|| {
