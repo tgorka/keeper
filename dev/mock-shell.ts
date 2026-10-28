@@ -6492,7 +6492,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
  * `approvals::write::Writes::draw` draws them — the diff of an edit and a replace, the new text of
  * a create and an append, from → to for a move, the deleted text, a replace that only changes line
  * endings, one holding hidden characters (shown escaped, Allow withheld), an append to a
- * 6,000-line file (the appended text after three lines) — and one this device cannot
+ * 6,000-line file (the appended text after three lines), a right-to-left line drawn in stored order,
+ * a whitespace-only change drawn visibly, one too large for a card — and one this device cannot
  * carry out (`blocked`), which offers Deny only. Allow writes and says so on the card.
  */
 const writesScenario = new URLSearchParams(location.search).get("writes");
@@ -6738,6 +6739,76 @@ if (writesScenario === "all" && sessionApprovals.length > 0) {
         },
       },
       18,
+    ),
+    mockWrite(
+      "write-rtl",
+      "Edit `10-notes/payments.md` in tgdrive: 11 bytes become 23 bytes",
+      {
+        op: "edit",
+        path: "10-notes/payments.md",
+        expected: MOCK_BLOB,
+        old_text: "…",
+        new_text: "…",
+      },
+      {
+        ...base,
+        op: "edit",
+        path: "10-notes/payments.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "- [ ] milk" },
+                { kind: "add", text: "transfer א 900 100", rtl: true },
+              ],
+            },
+          ],
+          rtlNote: "Right-to-left text is shown in stored order.",
+        },
+      },
+      19,
+    ),
+    mockWrite(
+      "write-whitespace",
+      "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 12 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "-·[·]·milk" },
+                {
+                  kind: "add",
+                  text: "-·[·]⍽milk·",
+                  note: "Only whitespace changes on this line.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      20,
+    ),
+    mockWrite(
+      "write-too-large",
+      "Create `10-notes/x.md` in tgdrive (262144 bytes)",
+      { op: "create", path: "10-notes/x.md", content: "…" },
+      {
+        ...base,
+        op: "create",
+        path: "10-notes/x.md",
+        preview: { hunks: [], tooLarge: "It takes 131072 lines; a card shows at most 5000." },
+        blocked: "This change is too large to show in full.",
+      },
+      21,
     ),
     mockWrite(
       "write-blocked",

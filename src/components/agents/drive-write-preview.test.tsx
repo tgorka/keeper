@@ -203,3 +203,52 @@ it("a change holding hidden characters shows them escaped and offers Deny only",
   expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
   expect(screen.getByRole("button", { name: "Deny" })).toBeEnabled();
 });
+
+it("a right-to-left line is drawn in stored order, under the card's note", () => {
+  const change = card({
+    preview: {
+      hunks: [
+        {
+          oldStart: 1,
+          newStart: 1,
+          lines: [{ kind: "add", text: "transfer א 900 100", rtl: true }],
+        },
+      ],
+      rtlNote: "Right-to-left text is shown in stored order.",
+    },
+  });
+  expect(within(change).getByText("Right-to-left text is shown in stored order.")).toBeVisible();
+  const text = change.querySelector("[data-slot=drive-write-line-text]");
+  expect(text).toHaveTextContent("transfer א 900 100");
+  expect(text?.className).toContain("[unicode-bidi:bidi-override]");
+  expect(text?.className).toContain("[direction:ltr]");
+});
+
+it("a whitespace-only change says so under its line; a too-large one says its size", () => {
+  const change = card({
+    preview: {
+      hunks: [
+        {
+          oldStart: 1,
+          newStart: 1,
+          lines: [
+            { kind: "remove", text: "-·[·]·milk" },
+            { kind: "add", text: "-·[·]·milk·", note: "Only whitespace changes on this line." },
+          ],
+        },
+      ],
+    },
+  });
+  expect(within(change).getByText("Only whitespace changes on this line.")).toBeVisible();
+  document.body.innerHTML = "";
+  const large = card(
+    {
+      preview: { hunks: [], tooLarge: "It takes 131072 lines; a card shows at most 5000." },
+      blocked: "This change is too large to show in full.",
+    },
+    { actions: ["deny"] },
+  );
+  expect(large).toHaveTextContent("It takes 131072 lines; a card shows at most 5000.");
+  expect(within(large).queryByRole("figure", { name: "Diff" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+});

@@ -3,4 +3,9 @@
 /**
  * A text's first lines, and how many more it has.
  */
-export type AgentWriteExcerptVm = { lines: Array<string>, more: number, };
+export type AgentWriteExcerptVm = { lines: Array<string>, more: number, 
+/**
+ * A line of it holds right-to-left text: every line drawn in stored
+ * order (R606-06).
+ */
+rtl?: boolean, };

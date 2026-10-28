@@ -1314,8 +1314,8 @@ fn a_change_of_line_endings_alone_is_named_on_the_card() {
         .collect();
     assert_eq!(
         texts,
-        ["- [ ] milk", "- [ ] milk"],
-        "the same text, removed and added"
+        ["-·[·]·milk⏎", "-·[·]·milk"],
+        "only the line ending differs: drawn visibly (R606-07)"
     );
     assert_eq!(
         preview.line_endings.as_deref(),
@@ -1718,18 +1718,18 @@ fn an_append_to_an_unfinished_line_shows_it_changed() {
         Some("# List\n- [ ] milk and eggs\n- [ ] tea\n"),
     )
     .expect("shown");
-    let lines: Vec<(LineKind, &str)> = shown.hunks[0]
-        .lines
-        .iter()
-        .map(|l| (l.kind, l.text.as_str()))
+    let lines: Vec<(AgentWriteLineKindVm, String)> = card_lines(&shown.hunks[0].lines)
+        .into_iter()
+        .map(|l| (l.kind, l.text))
         .collect();
+    use AgentWriteLineKindVm::{Add, Context, Remove};
     assert_eq!(
         lines,
         [
-            (LineKind::Context, "# List"),
-            (LineKind::Remove, "- [ ] milk"),
-            (LineKind::Add, "- [ ] milk and eggs"),
-            (LineKind::Add, "- [ ] tea"),
+            (Context, "# List".to_owned()),
+            (Remove, "- [ ] milk".to_owned()),
+            (Add, "- [ ] milk and eggs".to_owned()),
+            (Add, "- [ ] tea".to_owned()),
         ]
     );
 }
@@ -1790,18 +1790,21 @@ fn changes_far_apart_are_separate_hunks() {
     assert_eq!(starts, [(5, 24), (75, 12)]);
 }
 
-/// R606-04: a create shows all of its text, however long.
+/// R606-04: a create shows all of its text, up to the card's 5,000 lines.
 #[test]
 fn a_large_create_shows_all_of_it() {
     let args = json!({"drive": "tgdrive", "op": "create", "path": "10-notes/log.md",
-                      "content": big(6_000)});
+                      "content": big(CARD_LINES)});
     let w = world_with(args, None);
     let card = w.card();
     assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
     let preview = card.write.expect("write").preview;
     assert_eq!(preview.whole, None);
-    assert_eq!(preview.hunks[0].lines.len(), 6_000);
-    assert_eq!(preview.hunks[0].lines[5_999].text, "- [ ] entry 6000");
+    assert_eq!(preview.hunks[0].lines.len(), CARD_LINES);
+    assert_eq!(
+        preview.hunks[0].lines[CARD_LINES - 1].text,
+        "- [ ] entry 5000"
+    );
 }
 
 /// R606-04: a change the card cannot show in full — a replace of a
@@ -1904,4 +1907,144 @@ fn a_write_decided_here_keeps_its_view_in_its_turns_fold() {
         write.outcome.as_deref(),
         Some("Written as 1a2b3c4 on hesperia.")
     );
+}
+
+// ─── Round 6 (review-606 R606-05..08; contract § 8 as amended) ────────────────
+
+/// R606-05, the reviewer's case: a 256 KiB create of one character per line
+/// (131,072 lines) is past the card's 5,000 lines: Allow withheld, and the
+/// view model carries the count, not the lines. One line more than the cap,
+/// the same; an append of that size, the same.
+#[test]
+fn a_change_past_the_card_cap_withholds_allow_and_ships_no_lines() {
+    let content = "x\n".repeat(131_072);
+    assert_eq!(content.len(), 262_144);
+    let args = json!({"drive": "tgdrive", "op": "create", "path": "10-notes/x.md",
+                      "content": content});
+    let w = world_with(args, None);
+    let write = withheld(&w, TOO_LARGE);
+    assert!(write.preview.hunks.is_empty());
+    assert_eq!(
+        write.preview.too_large.as_deref(),
+        Some("It takes 131072 lines; a card shows at most 5000.")
+    );
+    let size = serde_json::to_string(&write).expect("json").len();
+    assert!(size < 2_000, "the view model is {size} bytes");
+
+    let args = json!({"drive": "tgdrive", "op": "create", "path": "10-notes/x.md",
+                      "content": big(CARD_LINES + 1)});
+    withheld(&world_with(args, None), TOO_LARGE);
+
+    let args = json!({"drive": "tgdrive", "op": "append", "path": PATH, "expected": BEFORE_BLOB,
+                      "text": "y\n".repeat(CARD_LINES)});
+    withheld(&world_with(args, None), TOO_LARGE);
+}
+
+/// R606-06: a line with a strong right-to-left letter is marked to be drawn
+/// in stored order, the card says so, and Allow is still offered.
+#[test]
+fn right_to_left_text_is_marked_for_stored_order() {
+    let args = json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+                      "old_text": "- [ ] milk\n", "new_text": "transfer \u{5d0} 900 100\n"});
+    let w = world_with(args, None);
+    let card = w.card();
+    assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+    let preview = card.write.expect("write").preview;
+    assert_eq!(preview.rtl_note.as_deref(), Some(RTL_NOTE));
+    let lines = &preview.hunks[0].lines;
+    assert_eq!(lines[0].rtl, None, "a left-to-right line is drawn as it is");
+    assert_eq!(lines[1].text, "transfer \u{5d0} 900 100");
+    assert_eq!(lines[1].rtl, Some(true));
+    // Nothing right-to-left: no note.
+    assert_eq!(world().card().write.expect("write").preview.rtl_note, None);
+}
+
+/// R606-07: a line changed only in whitespace is drawn with its whitespace
+/// visible on both sides, the added one saying so; Allow is still offered.
+#[test]
+fn a_whitespace_only_change_is_drawn_visibly() {
+    for (new_text, old_shown, new_shown) in [
+        ("- [ ] milk \n", "-·[·]·milk", "-·[·]·milk·"),
+        ("- [ ]\u{a0}milk\n", "-·[·]·milk", "-·[·]⍽milk"),
+        ("- [ ]  milk\n", "-·[·]·milk", "-·[·]··milk"),
+        ("- [ ]\tmilk\n", "-·[·]·milk", "-·[·]→milk"),
+        ("- [ ]\u{2003}milk\n", "-·[·]·milk", "-·[·]⟨U+2003⟩milk"),
+    ] {
+        let args = json!({"drive": "tgdrive", "op": "edit", "path": PATH,
+                          "expected": BEFORE_BLOB, "old_text": "- [ ] milk\n", "new_text": new_text});
+        let w = world_with(args, None);
+        let card = w.card();
+        assert!(
+            card.actions.contains(&AgentApprovalActionVm::AllowOnce),
+            "{new_text:?}"
+        );
+        let lines = &card.write.expect("write").preview.hunks[0].lines;
+        assert_eq!(
+            (lines[0].text.as_str(), lines[1].text.as_str()),
+            (old_shown, new_shown),
+            "{new_text:?}"
+        );
+        assert_eq!(lines[0].note, None);
+        assert_eq!(lines[1].note.as_deref(), Some(WHITESPACE_ONLY));
+    }
+    // A final line break added to a file that ended without one.
+    let args = json!({"drive": "tgdrive", "op": "append", "path": PATH,
+                      "expected": BEFORE_BLOB, "text": "\n"});
+    let w = world_with(args, None);
+    w.drive.file(PATH, BEFORE_BLOB, "- [ ] milk");
+    let lines = &w.card().write.expect("write").preview.hunks[0].lines;
+    let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["-·[·]·milk", "-·[·]·milk↵"]);
+    assert_eq!(lines[1].note.as_deref(), Some(WHITESPACE_ONLY));
+    // A change that is more than whitespace is drawn as it is.
+    let lines = &world().card().write.expect("write").preview.hunks[0].lines;
+    assert_eq!(lines[1].text, "- [x] milk");
+    assert_eq!(lines[1].note, None);
+}
+
+/// R606-07 and the Info: a carriage return that ends no line is shown as
+/// `⏎`, never stripped, and withholds Allow as a hidden character.
+#[test]
+fn a_lone_carriage_return_is_shown() {
+    let args = json!({"drive": "tgdrive", "op": "create", "path": "10-notes/pay.md",
+                      "content": "pay\r"});
+    let write = withheld(&world_with(args, None), HIDDEN);
+    assert_eq!(write.preview.hunks[0].lines[0].text, "pay⏎");
+    assert_eq!(escaped("a\rb"), "a⏎b");
+}
+
+/// R606-08 (surviving mutant `zwj-any-after`): a zero-width joiner after a
+/// pictograph but before a letter joins nothing: it is escaped on the card
+/// and refused on the lock screen.
+#[test]
+fn a_joiner_before_a_letter_is_escaped() {
+    assert_eq!(escaped("\u{1f468}\u{200d}b"), "\u{1f468}⟨U+200D⟩b");
+    assert!(crate::agents::push::holds_unreadable_text(
+        "\u{1f468}\u{200d}b"
+    ));
+    assert!(!crate::agents::push::holds_unreadable_text(
+        "\u{1f468}\u{200d}\u{1f469}"
+    ));
+}
+
+/// R606-08 (surviving mutant `effect-ignores-unshowable`): the check after
+/// the consume holds on its own. A write decided here whose consume the
+/// server takes later reaches the effect through `carry_on`, never through
+/// `allow`; a hidden character there is `not_applied` with [`HIDDEN`], and
+/// nothing is committed.
+#[test]
+fn the_effect_refuses_a_write_it_cannot_show() {
+    let args = json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+                      "old_text": "- [ ] milk\n", "new_text": "- [x] milk\u{200b}\n"});
+    let w = world_with(args, None);
+    w.set_approval(json!({"state": "approved", "decided_by_actor": ANA,
+                          "decided_by_client": "ana.dev"}));
+    w.writes
+        .owe(("tgdrive".to_owned(), APPROVAL.to_owned()), Owed::Decided);
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "consumed");
+    assert!(w.drive.commits().is_empty(), "nothing committed");
+    let applied = w.applied().expect("applied row");
+    assert_eq!(applied["outcome"], "not_applied");
+    assert_eq!(applied["reason"], HIDDEN);
 }

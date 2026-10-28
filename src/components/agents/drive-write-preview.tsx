@@ -44,6 +44,9 @@ const LINE_WORD: Readonly<Record<AgentWriteLineKindVm, string>> = {
   remove: "removed",
 };
 
+/** A line drawn in stored order, left to right, whatever its letters' direction (R606-06). */
+const STORED_ORDER = "[direction:ltr] [unicode-bidi:bidi-override]";
+
 const BLOCK =
   "my-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-muted p-2 font-mono text-xs [overflow-wrap:anywhere]";
 
@@ -71,7 +74,14 @@ function Hunk({ hunk }: { hunk: AgentWriteHunkVm }) {
         <div key={place} data-kind={line.kind} className={cn("min-w-0", LINE_TONE[line.kind])}>
           <span aria-hidden="true">{LINE_MARK[line.kind]} </span>
           <span className="sr-only">{LINE_WORD[line.kind]}: </span>
-          {line.text}
+          <span data-slot="drive-write-line-text" className={cn(line.rtl && STORED_ORDER)}>
+            {line.text}
+          </span>
+          {line.note && (
+            <span data-slot="drive-write-line-note" className="block text-muted-foreground">
+              {line.note}
+            </span>
+          )}
         </div>
       ))}
     </div>
@@ -82,7 +92,7 @@ function Excerpt({ label, excerpt }: { label: string; excerpt: AgentWriteExcerpt
   const numbered = excerpt.lines.map((text, at) => ({ text, number: at + 1 }));
   return (
     <figure aria-label={label}>
-      <div className={BLOCK}>
+      <div className={cn(BLOCK, excerpt.rtl && STORED_ORDER)}>
         {numbered.map(({ text, number }) => (
           <div key={number}>{text}</div>
         ))}
@@ -119,6 +129,16 @@ export function DriveWritePreview({ write }: { write: AgentDriveWriteVm }) {
       {preview.lineEndings && (
         <p data-slot="drive-write-line-endings" className="text-muted-foreground text-xs">
           {preview.lineEndings}
+        </p>
+      )}
+      {preview.rtlNote && (
+        <p data-slot="drive-write-rtl" className="text-muted-foreground text-xs">
+          {preview.rtlNote}
+        </p>
+      )}
+      {preview.tooLarge && (
+        <p data-slot="drive-write-too-large" className="text-muted-foreground text-xs">
+          {preview.tooLarge}
         </p>
       )}
       {preview.hunks.length > 0 && (

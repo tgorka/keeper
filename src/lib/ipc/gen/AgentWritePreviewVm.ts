@@ -14,4 +14,13 @@ export type AgentWritePreviewVm = { hunks: Array<AgentWriteHunkVm>, whole?: Agen
  * ("Line endings change: CRLF → LF."): lines a diff shows removed and
  * added with the same text differ only in how they end.
  */
-lineEndings?: string, };
+lineEndings?: string, 
+/**
+ * [`RTL_NOTE`], when a line shown holds right-to-left text.
+ */
+rtlNote?: string, 
+/**
+ * Why nothing of the change is shown: how many lines it has, past the
+ * card's [`CARD_LINES`] (R606-05). Allow is withheld.
+ */
+tooLarge?: string, };

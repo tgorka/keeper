@@ -78,6 +78,19 @@ pub const HIDDEN: &str = "This change contains hidden or reordering characters."
 /// change (contract § 8 as amended, R606-04).
 pub const TOO_LARGE: &str = "This change is too large to show in full.";
 
+/// The most diff lines a card shows (contract § 8 as amended, R606-05): a
+/// change that needs more withholds Allow as [`TOO_LARGE`], and its view
+/// model carries only how many lines it has.
+pub const CARD_LINES: usize = 5_000;
+
+/// Said above the diff when a line on it holds right-to-left text, which
+/// the card draws in stored order (R606-06).
+pub const RTL_NOTE: &str = "Right-to-left text is shown in stored order.";
+
+/// Said under a changed line that differs from its old line only in
+/// whitespace, both drawn with the whitespace visible (R606-07).
+pub const WHITESPACE_ONLY: &str = "Only whitespace changes on this line.";
+
 /// Lines of unchanged text a preview keeps around each change (§ 8 as
 /// amended: ±5).
 pub const AROUND: usize = 5;
@@ -146,6 +159,15 @@ pub enum AgentWriteLineKindVm {
 pub struct AgentWriteLineVm {
     pub kind: AgentWriteLineKindVm,
     pub text: String,
+    /// It holds right-to-left text: drawn in stored order, left to right
+    /// (R606-06).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rtl: Option<bool>,
+    /// What the card says under it ([`WHITESPACE_ONLY`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub note: Option<String>,
 }
 
 /// One run of changes and up to three lines of context around it; the
@@ -166,6 +188,11 @@ pub struct AgentWriteHunkVm {
 pub struct AgentWriteExcerptVm {
     pub lines: Vec<String>,
     pub more: u32,
+    /// A line of it holds right-to-left text: every line drawn in stored
+    /// order (R606-06).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rtl: Option<bool>,
 }
 
 /// What the person is shown of the change: a line diff's hunks; or the new
@@ -189,6 +216,15 @@ pub struct AgentWritePreviewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub line_endings: Option<String>,
+    /// [`RTL_NOTE`], when a line shown holds right-to-left text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rtl_note: Option<String>,
+    /// Why nothing of the change is shown: how many lines it has, past the
+    /// card's [`CARD_LINES`] (R606-05). Allow is withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub too_large: Option<String>,
 }
 
 /// How a text's lines end: `CRLF`, `LF`, `mixed`, or `None` with no line
@@ -245,15 +281,70 @@ pub fn escaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for (at, c) in chars.iter().enumerate() {
         if hides(&chars, at) {
-            let code = u32::from(*c);
-            if (0xe0000..=0xe007f).contains(&code) {
-                out.push_str(&format!("⟨TAG U+{code:04X}⟩"));
-            } else {
-                out.push_str(&format!("⟨U+{code:04X}⟩"));
-            }
+            out.push_str(&escape_form(*c));
         } else {
             out.push(*c);
         }
+    }
+    out
+}
+
+/// How a card writes out a character [`hides`] answers for: a carriage
+/// return not ending a line as `⏎` (never stripped, R606-07), a tag as
+/// `⟨TAG U+E0049⟩`, any other as `⟨U+202E⟩`.
+fn escape_form(c: char) -> String {
+    let code = u32::from(c);
+    if c == '\r' {
+        "⏎".to_owned()
+    } else if (0xe0000..=0xe007f).contains(&code) {
+        format!("⟨TAG U+{code:04X}⟩")
+    } else {
+        format!("⟨U+{code:04X}⟩")
+    }
+}
+
+/// Whether `c` is a strong right-to-left character (Bidi_Class R or AL, by
+/// block: Hebrew through Arabic Extended-A, the Hebrew and Arabic
+/// presentation forms, and the right-to-left supplementary blocks).
+fn strong_rtl(c: char) -> bool {
+    matches!(u32::from(c), 0x0590..=0x08ff | 0xfb1d..=0xfdff | 0xfe70..=0xfefe | 0x10800..=0x10fff | 0x1e800..=0x1efff)
+}
+
+/// Whether `old` and `new` differ, and only in whitespace (R606-07).
+fn whitespace_only(old: &str, new: &str) -> bool {
+    let bare = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    old != new && bare(old) == bare(new)
+}
+
+/// `raw`, a line with its break, drawn with its whitespace visible: `·` a
+/// space, `⍽` a no-break space, `→` a tab, `⏎` a carriage return, other
+/// whitespace as `⟨U+2003⟩`; its line break as `↵` when `final_break` (the
+/// pair differs in whether the file ends with one); hidden characters
+/// escaped as everywhere.
+fn visible_whitespace(raw: &str, final_break: bool) -> String {
+    let (body, broke) = match raw.strip_suffix('\n') {
+        Some(body) => (body, true),
+        None => (raw, false),
+    };
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 8);
+    for (at, c) in chars.iter().enumerate() {
+        match c {
+            ' ' => out.push('·'),
+            '\u{a0}' => out.push('⍽'),
+            '\t' => out.push('→'),
+            '\r' => out.push('⏎'),
+            c if c.is_whitespace() => out.push_str(&format!("⟨U+{:04X}⟩", u32::from(*c))),
+            c if hides(&chars, at) => out.push_str(&escape_form(*c)),
+            c => out.push(*c),
+        }
+    }
+    if broke && final_break {
+        out.push('↵');
     }
     out
 }
@@ -263,22 +354,29 @@ fn lines_of(text: &str) -> Vec<&str> {
     text.split_inclusive('\n').collect()
 }
 
-/// A line as the card shows it: without its line break.
+/// A line as the card shows it: without its line break (`\n` or `\r\n`).
+/// A carriage return that ends no line stays, for [`escaped`] to show.
 fn line_text(line: &str) -> String {
-    let line = line.strip_suffix('\n').unwrap_or(line);
-    line.strip_suffix('\r').unwrap_or(line).to_owned()
+    match line.strip_suffix('\n') {
+        Some(body) => body.strip_suffix('\r').unwrap_or(body).to_owned(),
+        None => line.to_owned(),
+    }
 }
 
+/// A preview line with its raw text, line break included: the card's
+/// rendering ([`card_lines`]) decides how it is drawn.
 fn line(kind: LineKind, text: &str) -> drive_write::PreviewLine {
     drive_write::PreviewLine {
         kind,
-        text: line_text(text),
+        text: text.to_owned(),
     }
 }
 
 /// What the person is shown of a change (contract § 8 as amended,
-/// R606-04): always the agent's change itself, never the file's first
-/// lines. `None` when it cannot be shown in full.
+/// R606-04, R606-05): always the agent's change itself, never the file's
+/// first lines, its lines raw ([`card_lines`] draws them). `Err` when it
+/// cannot be shown in full: with how many lines it would take past
+/// [`CARD_LINES`], or `None` when K1's diff cannot compare what changed.
 ///
 /// - `create`: every line of the new text;
 /// - `append`: the appended text, every line, after the [`BEFORE_APPEND`]
@@ -290,7 +388,12 @@ fn line(kind: LineKind, text: &str) -> drive_write::PreviewLine {
 ///   for K1's diff, the change cannot be shown in full;
 /// - `delete`: the deleted text's beginning, as K1 shows it; a `move`
 ///   changes no text.
-fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) -> Option<Preview> {
+fn change_preview(
+    change: &Change,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<Preview, Option<usize>> {
+    let capped = |n: usize| if n > CARD_LINES { Err(Some(n)) } else { Ok(()) };
     let hunk = |old_start, new_start, lines| Preview {
         hunks: vec![drive_write::Hunk {
             old_start,
@@ -300,14 +403,15 @@ fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) ->
         ..Preview::default()
     };
     match change {
-        Change::Move { .. } => Some(Preview::default()),
-        Change::Delete => Some(drive_write::preview(before, None)),
+        Change::Move { .. } => Ok(Preview::default()),
+        Change::Delete => Ok(drive_write::preview(before, None)),
         Change::Create { content } => {
+            capped(content.split_inclusive('\n').count())?;
             let lines: Vec<_> = lines_of(content)
                 .into_iter()
                 .map(|l| line(LineKind::Add, l))
                 .collect();
-            Some(if lines.is_empty() {
+            Ok(if lines.is_empty() {
                 Preview::default()
             } else {
                 hunk(0, 1, lines)
@@ -322,6 +426,7 @@ fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) ->
             let from = kept.saturating_sub(BEFORE_APPEND);
             let tail = old[kept..].concat();
             let joined = format!("{tail}{text}");
+            capped((kept - from) + (old.len() - kept) + joined.split_inclusive('\n').count())?;
             let mut lines: Vec<_> = old[from..kept]
                 .iter()
                 .map(|l| line(LineKind::Context, l))
@@ -333,7 +438,7 @@ fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) ->
                     .map(|l| line(LineKind::Add, l)),
             );
             let old_start = if from < old.len() { from + 1 } else { from };
-            Some(hunk(old_start, from + 1, lines))
+            Ok(hunk(old_start, from + 1, lines))
         }
         Change::Edit { .. } | Change::Replace { .. } => {
             let (old, new) = (
@@ -353,7 +458,7 @@ fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) ->
             );
             let diffed = drive_write::preview(Some(&mid_old.concat()), Some(&mid_new.concat()));
             if diffed.whole.is_some() {
-                return None;
+                return Err(None);
             }
             // The whole alignment: equal lines, then K1's hunks over the
             // middle (whose lines between hunks are equal), then equal lines.
@@ -397,8 +502,10 @@ fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) ->
                     .iter()
                     .map(|l| (LineKind::Context, *l)),
             );
-            Some(Preview {
-                hunks: regroup(&steps),
+            let hunks = regroup(&steps);
+            capped(hunks.iter().map(|hunk| hunk.lines.len()).sum())?;
+            Ok(Preview {
+                hunks,
                 ..Preview::default()
             })
         }
@@ -453,37 +560,95 @@ fn regroup(steps: &[(LineKind, &str)]) -> Vec<drive_write::Hunk> {
     hunks
 }
 
+/// A hunk's raw lines as the card draws them: hidden characters escaped
+/// (R606-03); right-to-left text marked to be drawn in stored order
+/// (R606-06); a removed line and the added line paired with it (the n-th
+/// of a run of removals with the n-th of the additions after it) that
+/// differ only in whitespace drawn with their whitespace visible, the added
+/// one saying so (R606-07).
+fn card_lines(lines: &[drive_write::PreviewLine]) -> Vec<AgentWriteLineVm> {
+    let mut whitespace = vec![None; lines.len()];
+    let mut at = 0;
+    while at < lines.len() {
+        let removed = lines[at..]
+            .iter()
+            .take_while(|l| l.kind == LineKind::Remove)
+            .count();
+        let added = lines[at + removed..]
+            .iter()
+            .take_while(|l| l.kind == LineKind::Add)
+            .count();
+        for k in 0..removed.min(added) {
+            let (old, new) = (&lines[at + k].text, &lines[at + removed + k].text);
+            if whitespace_only(old, new) {
+                let final_break = old.ends_with('\n') != new.ends_with('\n');
+                whitespace[at + k] = Some(final_break);
+                whitespace[at + removed + k] = Some(final_break);
+            }
+        }
+        at += (removed + added).max(1);
+    }
+    lines
+        .iter()
+        .zip(whitespace)
+        .map(|(line, whitespace)| AgentWriteLineVm {
+            kind: match line.kind {
+                LineKind::Context => AgentWriteLineKindVm::Context,
+                LineKind::Add => AgentWriteLineKindVm::Add,
+                LineKind::Remove => AgentWriteLineKindVm::Remove,
+            },
+            text: match whitespace {
+                Some(final_break) => visible_whitespace(&line.text, final_break),
+                None => escaped(&line_text(&line.text)),
+            },
+            rtl: line.text.chars().any(strong_rtl).then_some(true),
+            note: (whitespace.is_some() && line.kind == LineKind::Add)
+                .then(|| WHITESPACE_ONLY.to_owned()),
+        })
+        .collect()
+}
+
 impl From<Preview> for AgentWritePreviewVm {
     fn from(preview: Preview) -> Self {
         let excerpt = |e: drive_write::Excerpt| AgentWriteExcerptVm {
+            rtl: e
+                .lines
+                .iter()
+                .any(|l| l.chars().any(strong_rtl))
+                .then_some(true),
             lines: e.lines.iter().map(|line| escaped(line)).collect(),
             more: count(e.more),
         };
-        Self {
+        let mut vm = Self {
             hunks: preview
                 .hunks
                 .into_iter()
                 .map(|hunk| AgentWriteHunkVm {
                     old_start: count(hunk.old_start),
                     new_start: count(hunk.new_start),
-                    lines: hunk
-                        .lines
-                        .into_iter()
-                        .map(|line| AgentWriteLineVm {
-                            kind: match line.kind {
-                                LineKind::Context => AgentWriteLineKindVm::Context,
-                                LineKind::Add => AgentWriteLineKindVm::Add,
-                                LineKind::Remove => AgentWriteLineKindVm::Remove,
-                            },
-                            text: escaped(&line.text),
-                        })
-                        .collect(),
+                    lines: card_lines(&hunk.lines),
                 })
                 .collect(),
             whole: preview.whole.map(excerpt),
             deleted: preview.deleted.map(excerpt),
-            line_endings: None,
-        }
+            ..Self::default()
+        };
+        let rtl = vm
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .any(|l| l.rtl.is_some())
+            || vm.whole.iter().chain(&vm.deleted).any(|e| e.rtl.is_some());
+        vm.rtl_note = rtl.then(|| RTL_NOTE.to_owned());
+        vm
+    }
+}
+
+/// The card's line when a change is too large to show ([`CARD_LINES`]).
+fn too_large_line(lines: Option<usize>) -> String {
+    match lines {
+        Some(n) => format!("It takes {n} lines; a card shows at most {CARD_LINES}."),
+        None => "Too many lines change to compare them here.".to_owned(),
     }
 }
 
@@ -678,8 +843,9 @@ struct Plan {
     to: Option<DriveFile>,
     /// The file's text after the change; `None` for a move or a delete.
     post: Option<String>,
-    /// What the card shows of it; `None` when it cannot be shown in full.
-    preview: Option<AgentWritePreviewVm>,
+    /// What the card shows of it; `Err` when it cannot be shown in full,
+    /// with how many lines it would take, when that is known.
+    preview: Result<AgentWritePreviewVm, Option<usize>>,
     /// The agent's text, the path or `to` holds a character the card has to
     /// escape ([`holds_hidden`]).
     hidden: bool,
@@ -691,7 +857,7 @@ impl Plan {
     fn unshowable(&self) -> Option<&'static str> {
         if self.hidden {
             Some(HIDDEN)
-        } else if self.preview.is_none() {
+        } else if self.preview.is_err() {
             Some(TOO_LARGE)
         } else {
             None
@@ -1116,7 +1282,13 @@ impl Writes {
             Ok(plan) => Look {
                 at: Instant::now(),
                 blocked: plan.unshowable().map(str::to_owned),
-                preview: Some(plan.preview.clone().unwrap_or_default()),
+                preview: Some(match &plan.preview {
+                    Ok(preview) => preview.clone(),
+                    Err(lines) => AgentWritePreviewVm {
+                        too_large: Some(too_large_line(*lines)),
+                        ..AgentWritePreviewVm::default()
+                    },
+                }),
             },
             Err(reason) => Look {
                 at: Instant::now(),

@@ -5,4 +5,13 @@ import type { AgentWriteLineKindVm } from "./AgentWriteLineKindVm";
  * One line of a preview, its text without the line break. Text, never
  * markup.
  */
-export type AgentWriteLineVm = { kind: AgentWriteLineKindVm, text: string, };
+export type AgentWriteLineVm = { kind: AgentWriteLineKindVm, text: string, 
+/**
+ * It holds right-to-left text: drawn in stored order, left to right
+ * (R606-06).
+ */
+rtl?: boolean, 
+/**
+ * What the card says under it ([`WHITESPACE_ONLY`]).
+ */
+note?: string, };

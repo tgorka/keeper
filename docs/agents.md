@@ -441,14 +441,20 @@ never granted. This device is what carries it out: the card (`AgentApprovalVm.wr
 `approvals::write::Writes::draw`) shows the op, the drive and the path (from → to for a move), the
 agent's change itself, never the file's first lines (contract § 8 as amended, R606-04) — for an edit
 or a replace the line diff from this device's checkout with five lines around every change, for an
-append the appended text after the three lines before it, for a create all of its text (a change it
-cannot show in full withholds Allow: "This change is too large to show in full.") — the deleted
+append the appended text after the three lines before it, for a create all of its text; a change it
+cannot show in full, or that would take more than 5,000 lines on the card, withholds Allow ("This
+change is too large to show in full.", the card saying how many lines it takes; R606-05) — the deleted
 text for a delete, "Line endings change: CRLF → LF." when that is what a diff's
 identical-looking lines differ by, any character a reader cannot see or that
 reorders text (a tag, a bidirectional control, a zero-width or default-ignorable character; a
-zero-width joiner inside an emoji excepted) in the new text, the path or `to` escaped (`⟨U+202E⟩`,
+single zero-width joiner between emoji, and U+FE0F directly after an `Extended_Pictographic` character
+as in ❤️, excepted — the one classifier notification approvals use too) in the new text, the path or `to` escaped (`⟨U+202E⟩`,
 `⟨TAG U+E0049⟩`) with "This change contains hidden or reordering characters." and Allow withheld
-(R606-03; `agents::push`'s R1066K-05 classification), whether the chat read outside
+(R606-03; `agents::push`'s R1066K-05 classification; a carriage return ending no line shows as
+`⏎`), a line holding right-to-left text drawn in stored order under "Right-to-left text is shown in
+stored order." (R606-06), a line changed only in whitespace drawn with it visible (`·` space, `⍽`
+no-break space, `→` tab, `⏎` carriage return, `↵` an added final line break) under "Only whitespace
+changes on this line." (R606-07), whether the chat read outside
 content, and who reads the drive beyond the session's database. *Allow once* is offered only when
 every check passes here, in this order: the digest recomputed from the rows here is the parked one;
 this device keeps the drive (a synced folder whose `_drive.toml` names it), commits to it and has
