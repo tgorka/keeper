@@ -219,30 +219,16 @@ fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// Whether `text[at]` (`c`) is a zero-width joiner standing alone between
-/// two pictographs — inside an emoji sequence (`👨‍👩‍👧`), where it is what
-/// joins them — the one hidden character a card lets through (§ 8 as
-/// amended).
-fn joins_emoji(text: &[char], at: usize) -> bool {
-    // Pictographs, skin tones (U+1F3FB…U+1F3FF) included, and the older
-    // symbol blocks emoji sequences start from.
-    let pictograph = |c: char| matches!(u32::from(c), 0x1f000..=0x1faff | 0x2600..=0x27bf | 0x2300..=0x23ff | 0x2b00..=0x2bff);
-    text[at] == '\u{200d}'
-        && at > 0
-        && text.get(at + 1).is_some_and(|next| pictograph(*next))
-        && pictograph(text[at - 1])
-}
-
 /// Whether the character at `at` of `text` may not stand unescaped on a card
-/// (R606-03): one [`crate::agents::push::unreadable`] refuses on a lock
+/// (R606-03): one [`crate::agents::push::unreadable_at`] refuses on a lock
 /// screen (R1066K-05: a control character, a bidirectional control, a
-/// format or default-ignorable character, a variation selector, a tag) —
-/// except a tab, a line break between lines, and the zero-width joiner of
-/// an emoji sequence.
+/// format or default-ignorable character, a variation selector, a tag; the
+/// characters an emoji sequence is made of excepted) — except a tab and a
+/// line break between lines.
 fn hides(text: &[char], at: usize) -> bool {
     let c = text[at];
     let line_break = c == '\n' || (c == '\r' && text.get(at + 1) == Some(&'\n'));
-    c != '\t' && !line_break && crate::agents::push::unreadable(c) && !joins_emoji(text, at)
+    c != '\t' && !line_break && crate::agents::push::unreadable_at(text, at)
 }
 
 /// Whether `text` holds a character the card has to escape ([`hides`]).

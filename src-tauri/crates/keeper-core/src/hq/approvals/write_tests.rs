@@ -1815,3 +1815,47 @@ fn a_change_too_large_to_show_withholds_allow() {
     w.drive.file(PATH, BEFORE_BLOB, &big(6_000));
     withheld(&w, TOO_LARGE);
 }
+
+/// The coordinator's ruling on R606-03: U+FE0F directly after a pictograph
+/// (`❤️`, and inside `❤️‍🔥`) is an emoji and allowed; a lone one, one
+/// after a letter, and U+FE0E are escaped and withhold Allow.
+#[test]
+fn vs16_is_allowed_only_after_a_pictograph() {
+    for emoji in [
+        "I \u{2764}\u{fe0f} milk\n",
+        "\u{2764}\u{fe0f}\u{200d}\u{1f525} hot\n",
+    ] {
+        let args = json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+                          "old_text": "- [ ] milk\n", "new_text": emoji});
+        let w = world_with(args, None);
+        let card = w.card();
+        assert_eq!(
+            card.actions,
+            [
+                AgentApprovalActionVm::AllowOnce,
+                AgentApprovalActionVm::Deny
+            ],
+            "{emoji:?}"
+        );
+        assert!(
+            shown_lines(&card.write.expect("write").preview).contains(&emoji.trim_end().to_owned())
+        );
+    }
+    assert_eq!(escaped("\u{fe0f}"), "⟨U+FE0F⟩", "a lone one");
+    assert_eq!(escaped("a\u{fe0f}"), "a⟨U+FE0F⟩", "after a letter");
+    assert_eq!(
+        escaped("\u{2764}\u{fe0e}"),
+        "\u{2764}⟨U+FE0E⟩",
+        "text presentation"
+    );
+    assert_eq!(
+        escaped("\u{2764}\u{fe0f}\u{fe0f}"),
+        "\u{2764}\u{fe0f}⟨U+FE0F⟩",
+        "only the one right after"
+    );
+    for stray in ["milk\u{fe0f}\n", "\u{fe0f}milk\n"] {
+        let args = json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+                          "old_text": "- [ ] milk\n", "new_text": stray});
+        withheld(&world_with(args, None), HIDDEN);
+    }
+}
