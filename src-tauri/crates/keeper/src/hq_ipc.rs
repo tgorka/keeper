@@ -823,15 +823,17 @@ pub async fn agent_session_default() -> Result<Option<AgentDefaultSessionVm>, Ip
     blocking(|hq| hq.default_session()).await
 }
 
-/// A person was shown the warning of the Notes Assistant's tick of `drive`
-/// in the session and said OK (R-HQ-79): it is no longer unseen.
+/// A person was shown the warning of the tick `tick` of `drive` in the
+/// session and said OK (R-HQ-79): that tick is recorded as seen here.
 #[tauri::command]
 pub async fn agent_note_tick_seen(
     database: String,
     session_id: String,
     drive: String,
+    tick: Option<String>,
 ) -> Result<(), IpcError> {
-    blocking(move |hq| hq.note_tick_seen(&session(database, session_id), &drive)).await
+    blocking(move |hq| hq.note_tick_seen(&session(database, session_id), &drive, tick.as_deref()))
+        .await
 }
 
 /// The drive of the note `note_id` of the vault `vault_id` ([`note_drive`]),

@@ -188,7 +188,7 @@ it("draws the Notes Assistant's unseen tick in the Agents window too (round 6 ru
       drives: [{ name: "tgdrive", ticked: true }],
       warning: "Once you tick a drive, the agent may read it.",
       pending: false,
-      unseen: ["tgdrive"],
+      unseen: [{ drive: "tgdrive", tick: "01JTICK" }],
     },
   });
   const note = screen.getByRole("note", { name: "What ticking tgdrive allows" });

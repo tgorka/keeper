@@ -1874,15 +1874,31 @@ fn ticks(opener: &LocalOpener, database: &str) -> Vec<(String, String)> {
     .collect()
 }
 
-/// The drives the session `key` shows as ticked by the Notes Assistant and
-/// not yet answered: what draws the warning beside the chip, wherever the
-/// session is shown (the dock or the Agents window alike).
+/// The ticked drives the session `key` shows as not yet seen here: what
+/// draws the warning beside the chip, wherever the session is shown (the
+/// dock or the Agents window alike).
 fn unseen_in(hq: &Hq, key: &sessions::AgentSessionRef) -> Vec<String> {
+    unseen_ticks_in(hq, key)
+        .into_iter()
+        .map(|tick| tick.drive)
+        .collect()
+}
+
+fn unseen_ticks_in(hq: &Hq, key: &sessions::AgentSessionRef) -> Vec<drives::AgentUnseenTickVm> {
     hq.session_view(key)
         .expect("a view")
         .drives
         .map(|drives| drives.unseen)
         .unwrap_or_default()
+}
+
+/// OK on the warning `key` shows for `drive`, naming the tick it shows.
+fn ok(hq: &Hq, key: &sessions::AgentSessionRef, drive: &str) -> Result<(), HqError> {
+    let tick = unseen_ticks_in(hq, key)
+        .into_iter()
+        .find(|tick| tick.drive == drive)
+        .and_then(|tick| tick.tick);
+    hq.note_tick_seen(key, drive, tick.as_deref())
 }
 
 fn chat(session: &str, database: &str) -> sessions::AgentSessionRef {
@@ -2004,7 +2020,7 @@ async fn a_dock_tick_stays_unseen_wherever_its_chat_is_shown_until_a_person_answ
     );
 
     // OK: seen, and the drive stays ticked.
-    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    ok(&hq, &key, "tgdrive").expect("seen");
     assert!(unseen_in(&hq, &key).is_empty());
     assert_eq!(
         ticks(&opener, "tgdrive"),
@@ -2094,7 +2110,7 @@ async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
     let world = World::new();
     let (hq, opener, key) = dock_ticked(&world).await;
     let answered = || {
-        hq.note_tick_seen(&key, "tgdrive").expect("seen");
+        ok(&hq, &key, "tgdrive").expect("seen");
         assert!(unseen_in(&hq, &key).is_empty(), "answered");
     };
     answered();
@@ -2111,6 +2127,14 @@ async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
     )
     .expect("legacy");
     assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "an older version's");
+    answered();
+    // Round 6's shape: (database, session, drive) triples, with no tick.
+    std::fs::write(
+        seen_file(&world),
+        serde_json::to_string(&[["tgdrive", key.session_id.as_str(), "tgdrive"]]).expect("json"),
+    )
+    .expect("round 6");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "round 6's");
     answered();
 
     // Another device, holding the same rows, has seen nothing: it warns.
@@ -2147,7 +2171,7 @@ impl Opener for Shared {
 async fn the_seen_record_drops_gone_sessions_and_unticked_drives() {
     let world = World::new();
     let (hq, opener, first) = dock_ticked(&world).await;
-    hq.note_tick_seen(&first, "tgdrive").expect("seen");
+    ok(&hq, &first, "tgdrive").expect("seen");
     let second = hq
         .new_session("tgdrive", "nixie", "another", None, None)
         .expect("a chat");
@@ -2219,7 +2243,7 @@ async fn ok_and_untick_wake_the_session_stream() {
             break;
         }
     }
-    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    ok(&hq, &key, "tgdrive").expect("seen");
     assert!(changes.has_changed().expect("open"), "OK wakes the stream");
     changes.borrow_and_update();
     assert!(unseen_in(&hq, &key).is_empty());
@@ -2238,7 +2262,7 @@ async fn a_seen_record_that_cannot_be_written_keeps_the_warning() {
     let world = World::new();
     let (hq, _opener, key) = dock_ticked(&world).await;
     std::fs::create_dir_all(seen_file(&world).with_extension("json.new")).expect("blocked");
-    let refused = hq.note_tick_seen(&key, "tgdrive").expect_err("not noted");
+    let refused = ok(&hq, &key, "tgdrive").expect_err("not noted");
     assert!(
         refused
             .to_string()
@@ -2669,4 +2693,212 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
         "{said:?}"
     );
     assert!(said.contains(&("hello", None)), "{said:?}");
+}
+
+/// A `session_drives` write from another device of the same person: `drives`
+/// ticked, with `tick_ids` as given (`None`: a schema-4 client's write, with
+/// no ids).
+fn selection_from_elsewhere(
+    opener: &LocalOpener,
+    key: &sessions::AgentSessionRef,
+    drives: &[&str],
+    tick_ids: Option<Value>,
+    at: i64,
+) {
+    let mut values = serde_json::json!({
+        "session_id": key.session_id, "drives": Value::from(drives.to_vec()).to_string(),
+        "updated_at_ms": at, "author_actor": "ana", "author_client": "ana.2"});
+    if let Some(ids) = tick_ids {
+        values["tick_ids"] = Value::from(ids.to_string());
+    }
+    opener
+        .replica(&key.database)
+        .mutate(vec![RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            values: sessions::object(values),
+            base_version: None,
+        }])
+        .expect("written elsewhere");
+}
+
+/// R605-14, the reviewer's P1: the person unticks while the seen record
+/// cannot be written, and the disk comes back before the dock ticks again.
+/// The new tick has a new id, so the old answer acknowledges nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p1_a_lost_untick_record_never_acknowledges_the_next_tick() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    ok(&hq, &key, "tgdrive").expect("seen");
+    let blocked = seen_file(&world).with_extension("json.new");
+    std::fs::create_dir_all(&blocked).expect("blocked");
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(
+        unseen_in(&hq, &key).is_empty(),
+        "unticked: nothing to warn of"
+    );
+    std::fs::remove_dir_all(&blocked).expect("unblocked");
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(ticks(&opener, "tgdrive")[0].1, r#"["tgdrive"]"#);
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+}
+
+/// R605-14, P2: another device unticks, and this device's dock ticks again
+/// before any view is built here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p2_an_untick_elsewhere_never_seen_here_leaves_the_dock_s_re_tick_warning() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    ok(&hq, &key, "tgdrive").expect("seen");
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &[],
+        Some(serde_json::json!({"at": 5, "drives": {}})),
+        5,
+    );
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+}
+
+/// R605-14, P3: another device unticks and ticks again — or only the final
+/// row arrives — and this device builds no view in between. Whether that
+/// device wrote a fresh id (schema 5) or none (schema 4), it warns here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p3_an_untick_and_re_tick_elsewhere_warns_here() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    ok(&hq, &key, "tgdrive").expect("seen");
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &[],
+        Some(serde_json::json!({"at": 5, "drives": {}})),
+        5,
+    );
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at": 6, "drives": {"tgdrive": "01JELSEWHERE0000000000000"}})),
+        6,
+    );
+    assert_eq!(
+        unseen_in(&hq, &key),
+        ["tgdrive"],
+        "a fresh id from elsewhere"
+    );
+    ok(&hq, &key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    // A schema-4 device re-ticks: it leaves the old map behind and moves
+    // `updated_at_ms`, so the map no longer counts and the tick has no id.
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at": 6, "drives": {"tgdrive": "01JELSEWHERE0000000000000"}})),
+        7,
+    );
+    assert_eq!(
+        unseen_in(&hq, &key),
+        ["tgdrive"],
+        "an older device's re-tick"
+    );
+}
+
+/// A tick with no id — a schema-4 client's or the server's — warns, and OK
+/// gives it one, as the person, so that this one tick is acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_without_an_id_warns_and_ok_gives_it_one() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 8);
+    let shown = unseen_ticks_in(&hq, &key);
+    assert_eq!(
+        shown,
+        [drives::AgentUnseenTickVm {
+            drive: "tgdrive".to_owned(),
+            tick: None
+        }]
+    );
+    ok(&hq, &key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    let source = hq.source("tgdrive").expect("held");
+    assert!(drives::tick_ids(&source, &key.session_id).contains_key("tgdrive"));
+}
+
+/// OK names the tick its warning showed: shown for a tick that has since
+/// been replaced, it acknowledges nothing, and the new one still warns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ok_for_a_replaced_tick_acknowledges_nothing() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    let shown = unseen_ticks_in(&hq, &key)[0].tick.clone().expect("an id");
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at": 9, "drives": {"tgdrive": "01JREPLACED000000000000000"}})),
+        9,
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&shown))
+        .expect("asked");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+}
+
+/// The record's file, as entries.
+fn seen_entries(world: &World) -> Vec<Value> {
+    serde_json::from_str(&std::fs::read_to_string(seen_file(world)).expect("the record"))
+        .expect("entries")
+}
+
+fn write_seen(world: &World, entries: &[Value]) {
+    std::fs::write(seen_file(world), Value::from(entries.to_vec()).to_string()).expect("written");
+}
+
+/// R605-15: an answer belongs to one server and one person. Another
+/// server's or another person's entry for the same database, session, drive
+/// and even tick id acknowledges nothing here — and pruning leaves it be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_on_another_server_or_by_another_person_is_not_this_one() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let tick = unseen_ticks_in(&hq, &key)[0].tick.clone().expect("an id");
+    let entry = |server: &str, person: &str| {
+        serde_json::json!({"server": server, "person": person, "database": "tgdrive",
+                           "session": key.session_id, "drive": "tgdrive", "tick": tick})
+    };
+    let elsewhere = [
+        entry("https://other.example.org", "ana"),
+        entry("https://hq.example.org", "ben"),
+    ];
+    write_seen(&world, &elsewhere);
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    assert_eq!(seen_entries(&world).len(), 2, "left alone");
+    ok(&hq, &key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    assert_eq!(seen_entries(&world).len(), 3);
+}
+
+/// R605-16: pruning never touches an entry of a database this device does
+/// not hold; it drops this server's and person's stale entry of one it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruning_leaves_databases_not_held_alone() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let foreign = serde_json::json!({"server": "https://hq.example.org", "person": "ana",
+        "database": "neuradrive", "session": "ana.1.1", "drive": "neuradrive", "tick": "01JFOREIGN"});
+    let stale = serde_json::json!({"server": "https://hq.example.org", "person": "ana",
+        "database": "tgdrive", "session": key.session_id, "drive": "tgdrive", "tick": "01JSTALE"});
+    write_seen(&world, &[foreign.clone(), stale]);
+    assert_eq!(
+        unseen_in(&hq, &key),
+        ["tgdrive"],
+        "a stale entry acknowledges nothing"
+    );
+    assert_eq!(
+        seen_entries(&world),
+        [foreign],
+        "the stale one pruned, the foreign one kept"
+    );
 }

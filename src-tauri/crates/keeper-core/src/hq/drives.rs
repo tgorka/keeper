@@ -37,7 +37,7 @@
 //!   been shown [`WARNING`] for on this device ([`SeenTicks`]) draws it
 //!   beside its chip, with Untick and OK, wherever the session is shown.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ use crate::hq::sessions::{
     AgentSessionRef, Source,
 };
 use crate::hq::timeline::{self, SessionRow};
-use crate::hq::{Hq, HqError};
+use crate::hq::{lock, Hq, HqError};
 
 const TABLE: &str = "session_drives";
 
@@ -105,8 +105,8 @@ pub struct AgentSessionDrivesVm {
     /// beside the chips with Untick and OK wherever the session is shown;
     /// read from the same selection as the chips, so the two agree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[ts(as = "Option<Vec<String>>", optional)]
-    pub unseen: Vec<String>,
+    #[ts(as = "Option<Vec<AgentUnseenTickVm>>", optional)]
+    pub unseen: Vec<AgentUnseenTickVm>,
 }
 
 /// Who reads each database this device holds: the people of its directory.
@@ -220,6 +220,53 @@ fn ticked(source: &Source, session_id: &str) -> (Vec<String>, Option<i64>) {
         .filter(|drive| seen.insert(drive.clone()))
         .collect();
     (drives, int(row, "version"))
+}
+
+/// Each ticked drive's tick id (`session_drives.tick_ids`, schema 5;
+/// 109.28, R605-14), as the row names it: `{"at": <the row's updated_at_ms>,
+/// "drives": {<drive>: <ULID>}}`. Ids count only while `at` is the row's own
+/// `updated_at_ms`: a schema-4 client's write moves `updated_at_ms` and
+/// leaves an older map behind, and then no drive has an id. A drive with no
+/// id is a tick no device can have acknowledged.
+pub(crate) fn tick_ids(source: &Source, session_id: &str) -> BTreeMap<String, String> {
+    let rows = read(
+        source,
+        "SELECT drives, updated_at_ms, tick_ids FROM session_drives WHERE session_id = ?1",
+        &[Value::from(session_id)],
+    );
+    let Some(row) = rows.first() else {
+        return BTreeMap::new();
+    };
+    let ticks = json(row, "tick_ids");
+    if ticks.get("at").and_then(Value::as_i64) != int(row, "updated_at_ms") {
+        return BTreeMap::new();
+    }
+    let ticked = names(row, "drives");
+    ticks
+        .get("drives")
+        .and_then(Value::as_object)
+        .map(|ids| {
+            ids.iter()
+                .filter(|(drive, _)| ticked.contains(drive))
+                .filter_map(|(drive, id)| Some((drive.clone(), id.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tick ids a selection writes: the ids of the drives `drives` keeps
+/// from `before`, and a fresh ULID for each drive it ticks anew.
+fn next_ticks(before: &BTreeMap<String, String>, drives: &[String]) -> BTreeMap<String, String> {
+    drives
+        .iter()
+        .map(|drive| {
+            let id = before
+                .get(drive)
+                .cloned()
+                .unwrap_or_else(|| ulid::Ulid::new().to_string());
+            (drive.clone(), id)
+        })
+        .collect()
 }
 
 /// Whether this person has a drive control in the session at all: a person
@@ -719,9 +766,10 @@ pub fn set(
                 .collect()
         })
         .unwrap_or_default();
+    let ticks = next_ticks(&tick_ids(source, session_id), &drives);
     let row = RowOp::Upsert {
         table: TABLE.to_owned(),
-        values: authored(source, selection(session_id, &drives, now_ms)),
+        values: authored(source, selection(session_id, &drives, &ticks, now_ms)),
         base_version: version.filter(|v| *v > 0),
     };
     source
@@ -772,7 +820,15 @@ pub fn carry(
     }
     source.replica.mutate(vec![RowOp::Upsert {
         table: TABLE.to_owned(),
-        values: authored(source, selection(to, &carried, now_ms)),
+        values: authored(
+            source,
+            selection(
+                to,
+                &carried,
+                &next_ticks(&BTreeMap::new(), &carried),
+                now_ms,
+            ),
+        ),
         base_version: None,
     }])?;
     source.replica.sync_now();
@@ -789,31 +845,47 @@ pub const NO_DRIVE: &str = "This note's folder is not a drive, so no drive is ti
 /// records anything as seen.)
 static DRIVE_WRITES: Mutex<()> = Mutex::new(());
 
-/// The row's values: the drives as a JSON array, `[]` for none.
-fn selection(session_id: &str, drives: &[String], now_ms: i64) -> Map<String, Value> {
+/// The row's values: the drives as a JSON array, `[]` for none,
+/// with each ticked drive's tick id, stamped with this write's `updated_at_ms`.
+fn selection(
+    session_id: &str,
+    drives: &[String],
+    ticks: &BTreeMap<String, String>,
+    now_ms: i64,
+) -> Map<String, Value> {
     object(serde_json::json!({
         "session_id": session_id,
         "drives": Value::from(drives.to_vec()).to_string(),
         "updated_at_ms": now_ms,
+        "tick_ids": serde_json::json!({"at": now_ms, "drives": ticks}).to_string(),
     }))
 }
 
-/// The ticked drives this person has been shown [`WARNING`] for on this
-/// device and answered, by `database`, `session` and `drive` (R-HQ-79;
-/// round 6 ruling). Any ticked drive **not** in it draws the warning with
-/// Untick and OK wherever its session is shown
-/// ([`AgentSessionDrivesVm::unseen`]), so what is lost fails toward the
-/// warning: a missing, unreadable or older file is an empty record, and a
-/// tick made by the Notes Assistant, by another device or by a carry warns
-/// here until it is answered here. A tick the person makes in the drive
-/// menu — where the warning stands beside every drive — is recorded when it
-/// is made; one the dock makes is not.
+/// The ticks this person has been shown [`WARNING`] for on this device and
+/// answered (R-HQ-79; round 6 and round 7 rulings): for each (server, person,
+/// database, session, drive), the id of the tick that was acknowledged. A
+/// ticked drive warns unless this record holds **its current tick id**
+/// ([`tick_ids`]), wherever its session is shown
+/// ([`AgentSessionDrivesVm::unseen`]). An entry for another id is stale and
+/// acknowledges nothing, so an untick whose removal was lost, or an untick
+/// and re-tick made elsewhere and never seen here, warns again (R605-14). A
+/// missing, unreadable or older record is no record; a tick with no id warns.
 pub(crate) struct SeenTicks {
     path: std::path::PathBuf,
 }
 
-/// One entry of the record: database, session, drive.
-type SeenKey = (String, String, String);
+/// One entry's key: server, person, database, session, drive (R605-15).
+type SeenKey = (String, String, String, String, String);
+
+#[derive(Serialize, Deserialize)]
+struct SeenEntry {
+    server: String,
+    person: String,
+    database: String,
+    session: String,
+    drive: String,
+    tick: String,
+}
 
 impl SeenTicks {
     pub(crate) fn at(root: &std::path::Path) -> SeenTicks {
@@ -823,32 +895,51 @@ impl SeenTicks {
     }
 
     /// The record; anything that does not read as one is no record at all.
-    fn read(&self) -> BTreeSet<SeenKey> {
+    fn read(&self) -> BTreeMap<SeenKey, String> {
         let raw = match std::fs::read_to_string(&self.path) {
             Ok(raw) => raw,
             Err(error) => {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(%error, "the drive ticks seen could not be read; every tick warns");
                 }
-                return BTreeSet::new();
+                return BTreeMap::new();
             }
         };
-        serde_json::from_str(&raw).unwrap_or_else(|error| {
-            tracing::warn!(%error, "the drive ticks seen do not read; every tick warns");
-            BTreeSet::new()
-        })
+        match serde_json::from_str::<Vec<SeenEntry>>(&raw) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|e| ((e.server, e.person, e.database, e.session, e.drive), e.tick))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "the drive ticks seen do not read; every tick warns");
+                BTreeMap::new()
+            }
+        }
     }
 
     /// Written whole to a new file and renamed over the old one, so a crash
     /// never leaves half a record.
-    fn write(&self, seen: &BTreeSet<SeenKey>) -> std::io::Result<()> {
-        let raw = serde_json::to_string(seen).map_err(std::io::Error::other)?;
+    fn write(&self, seen: &BTreeMap<SeenKey, String>) -> std::io::Result<()> {
+        let entries: Vec<SeenEntry> = seen
+            .iter()
+            .map(
+                |((server, person, database, session, drive), tick)| SeenEntry {
+                    server: server.clone(),
+                    person: person.clone(),
+                    database: database.clone(),
+                    session: session.clone(),
+                    drive: drive.clone(),
+                    tick: tick.clone(),
+                },
+            )
+            .collect();
+        let raw = serde_json::to_string(&entries).map_err(std::io::Error::other)?;
         let fresh = self.path.with_extension("json.new");
         std::fs::write(&fresh, raw)?;
         std::fs::rename(&fresh, &self.path)
     }
 
-    fn change(&self, change: impl FnOnce(&mut BTreeSet<SeenKey>)) -> std::io::Result<()> {
+    fn change(&self, change: impl FnOnce(&mut BTreeMap<SeenKey, String>)) -> std::io::Result<()> {
         let mut seen = self.read();
         let before = seen.clone();
         change(&mut seen);
@@ -859,10 +950,6 @@ impl SeenTicks {
     }
 }
 
-fn seen_key(database: &str, session: &str, drive: &str) -> SeenKey {
-    (database.to_owned(), session.to_owned(), drive.to_owned())
-}
-
 impl Hq {
     fn seen_ticks(&self) -> Result<SeenTicks, HqError> {
         Ok(SeenTicks::at(&crate::hq::databases::root(
@@ -870,11 +957,36 @@ impl Hq {
         )))
     }
 
+    /// The server the held replicas belong to: the paired one, or the one
+    /// last synced with while none is (its replicas stay held). Part of
+    /// every seen key, so two servers' sessions never share an answer.
+    fn seen_server(&self) -> String {
+        let paired = lock(&self.inner).server.clone();
+        paired
+            .or_else(|| {
+                self.data_dir()
+                    .ok()
+                    .and_then(|dir| crate::hq::databases::remembered_server(&dir))
+            })
+            .map(|server| server.as_str().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn seen_key(&self, source: &Source, session: &str, drive: &str) -> SeenKey {
+        (
+            self.seen_server(),
+            source.actor.clone(),
+            source.database.clone(),
+            session.to_owned(),
+            drive.to_owned(),
+        )
+    }
+
     /// Tick or untick one drive for a session's agent to read: the person's
     /// own choice in the drive menu, where [`WARNING`] stands beside every
-    /// drive, so a tick is recorded as seen and an untick drops its record,
-    /// in the same step ([`DRIVE_WRITES`]). A record that cannot be written
-    /// only means the warning is said once more.
+    /// drive, so the tick it makes — its new tick id — is recorded as seen in
+    /// the same step ([`DRIVE_WRITES`]). An untick needs no record: its
+    /// entry names a tick that is gone, and acknowledges nothing again.
     pub fn set_session_drive(
         &self,
         key: &AgentSessionRef,
@@ -893,16 +1005,16 @@ impl Hq {
             sessions::now_ms(),
         )
         .map_err(|refused| HqError::Sentence(refused.0))?;
-        let entry = seen_key(&key.database, &key.session_id, drive);
-        let recorded = seen.change(|seen| {
-            if tick {
-                seen.insert(entry);
-            } else {
-                seen.remove(&entry);
+        if tick {
+            if let Some(id) = tick_ids(&source, &key.session_id).remove(drive) {
+                let entry = self.seen_key(&source, &key.session_id, drive);
+                if let Err(error) = seen.change(|seen| {
+                    seen.insert(entry, id);
+                }) {
+                    // Unrecorded, the person's own tick is only said once more.
+                    tracing::warn!(%error, "a drive tick seen could not be recorded");
+                }
             }
-        });
-        if let Err(error) = recorded {
-            tracing::warn!(%error, "a drive tick seen could not be recorded");
         }
         self.touch();
         Ok(())
@@ -912,11 +1024,11 @@ impl Hq {
     /// `None`: its folder declares no drive). The default agent's newest
     /// unarchived session in the drive's database, or one started there with
     /// this device's last `pick` for the agent, and the drive ticked in it as
-    /// the person when it is not yet. The tick is not recorded as seen, so
-    /// wherever the session is shown its warning stands beside the chip
-    /// until a person says OK or unticks it (round 6 ruling). A drive the
-    /// agent does not offer, or V17 refuses, stays unticked and the answer
-    /// says why. `None` with no default agent.
+    /// the person when it is not yet, under a fresh tick id no one has seen,
+    /// so wherever the session is shown its warning stands beside the chip
+    /// until a person says OK or unticks it. A drive the agent does not
+    /// offer, or V17 refuses, stays unticked and the answer says why. `None`
+    /// with no default agent.
     ///
     /// Nothing here is ever taken back: an answer the dock no longer wants
     /// leaves its tick as a tick of that session, warning and all.
@@ -975,52 +1087,133 @@ impl Hq {
         }))
     }
 
-    /// A person was shown [`WARNING`] for `drive` in `key` and said OK
-    /// (R-HQ-79): recorded as seen on this device, and every open view is
-    /// told (R605-13).
-    pub fn note_tick_seen(&self, key: &AgentSessionRef, drive: &str) -> Result<(), HqError> {
+    /// A person was shown [`WARNING`] for the tick `tick` of `drive` in `key`
+    /// and said OK (R-HQ-79): that tick is recorded as seen on this device,
+    /// and every open view is told (R605-13). A warning shown for a tick that
+    /// has since been replaced acknowledges nothing: the new one still warns.
+    /// A tick with no id (`tick` absent; a schema-4 write) gets one, as the
+    /// person, so that it can be acknowledged.
+    pub fn note_tick_seen(
+        &self,
+        key: &AgentSessionRef,
+        drive: &str,
+        tick: Option<&str>,
+    ) -> Result<(), HqError> {
+        let source = self.source(&key.database)?;
         let seen = self.seen_ticks()?;
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.change(|seen| {
-            seen.insert(seen_key(&key.database, &key.session_id, drive));
-        })
-        .map_err(|error| HqError::Sentence(format!("keeper could not note that: {error}")))?;
+        let (drives, version) = ticked(&source, &key.session_id);
+        let current = tick_ids(&source, &key.session_id);
+        let acknowledged = match (tick, current.get(drive)) {
+            _ if !drives.iter().any(|ticked| ticked == drive) => None,
+            (Some(shown), Some(now)) if shown == now => Some(now.clone()),
+            (None, None) => {
+                let ticks = next_ticks(&current, &drives);
+                let id = ticks.get(drive).cloned();
+                source
+                    .replica
+                    .mutate(vec![RowOp::Upsert {
+                        table: TABLE.to_owned(),
+                        values: authored(
+                            &source,
+                            selection(&key.session_id, &drives, &ticks, sessions::now_ms()),
+                        ),
+                        base_version: version.filter(|v| *v > 0),
+                    }])
+                    .map_err(|error| {
+                        HqError::Sentence(format!("keeper could not note that: {error}"))
+                    })?;
+                source.replica.sync_now();
+                id
+            }
+            _ => None,
+        };
+        if let Some(id) = acknowledged {
+            let entry = self.seen_key(&source, &key.session_id, drive);
+            seen.change(|seen| {
+                seen.insert(entry, id);
+            })
+            .map_err(|error| HqError::Sentence(format!("keeper could not note that: {error}")))?;
+        }
         self.touch();
         Ok(())
     }
 
-    /// The drives of `key` ticked now (`ticked`) that this person has not
-    /// been shown the warning for on this device: every one not in the seen
-    /// record. Each read also prunes the record (R605-12): an entry of a
-    /// database this device holds goes once its session is gone or its
-    /// drive is no longer ticked there. An entry of a database not held is
-    /// kept. Pruning only ever makes a warning show again.
-    pub(crate) fn unseen_ticks(&self, key: &AgentSessionRef, ticked_now: &[String]) -> Vec<String> {
-        let Ok(seen) = self.seen_ticks() else {
-            return ticked_now.to_vec();
+    /// The ticked drives of `key` (`ticked_now`) this person has not been
+    /// shown the warning for on this device, each with its tick id: every one
+    /// whose current tick id the seen record does not hold. Each read also
+    /// prunes the record (R605-12): an entry of this server and person, for a
+    /// database this device holds, goes once its session is gone, its drive
+    /// is no longer ticked, or it names another tick than the drive's
+    /// current one. Entries of another server or person, or of a database
+    /// not held, are left alone (R605-16). Pruning only ever makes a warning
+    /// show again.
+    pub(crate) fn unseen_ticks(
+        &self,
+        key: &AgentSessionRef,
+        ticked_now: &[String],
+    ) -> Vec<AgentUnseenTickVm> {
+        let Ok(source) = self.source(&key.database) else {
+            return Vec::new();
         };
-        let sources = self.sources();
+        let current = tick_ids(&source, &key.session_id);
+        let unseen = |held: &BTreeMap<SeenKey, String>| -> Vec<AgentUnseenTickVm> {
+            ticked_now
+                .iter()
+                .filter(|drive| {
+                    let tick = current.get(*drive);
+                    tick.is_none()
+                        || held.get(&self.seen_key(&source, &key.session_id, drive)) != tick
+                })
+                .map(|drive| AgentUnseenTickVm {
+                    drive: drive.clone(),
+                    tick: current.get(drive).cloned(),
+                })
+                .collect()
+        };
+        let Ok(seen) = self.seen_ticks() else {
+            return unseen(&BTreeMap::new());
+        };
+        let (server, sources) = (self.seen_server(), self.sources());
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
         let mut record = seen.read();
+        // Decided on the record as read, by tick id alone: pruning below only
+        // tidies, and acknowledges nothing whether or not it runs.
+        let answer = unseen(&record);
         let before = record.len();
-        record.retain(|(database, session, drive)| {
-            let Some(source) = sources.iter().find(|source| &source.database == database) else {
+        record.retain(|(entry_server, person, database, session, drive), tick| {
+            if *entry_server != server {
+                return true;
+            }
+            let Some(held) = sources
+                .iter()
+                .find(|held| &held.database == database && &held.actor == person)
+            else {
                 return true;
             };
-            timeline::session_row(source, session).is_some()
-                && ticked(source, session).0.iter().any(|name| name == drive)
+            timeline::session_row(held, session).is_some()
+                && tick_ids(held, session).get(drive) == Some(tick)
         });
         if record.len() != before {
             if let Err(error) = seen.write(&record) {
                 tracing::debug!(%error, "the drive ticks seen could not be pruned");
             }
         }
-        ticked_now
-            .iter()
-            .filter(|drive| !record.contains(&seen_key(&key.database, &key.session_id, drive)))
-            .cloned()
-            .collect()
+        answer
     }
+}
+
+/// A ticked drive this person has not been shown the warning for on this
+/// device, and the id of its tick (`None`: a tick written without one, by a
+/// schema-4 client), which OK names so that it acknowledges this tick only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentUnseenTickVm {
+    pub drive: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tick: Option<String>,
 }
 
 #[cfg(test)]

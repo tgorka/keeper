@@ -16,6 +16,10 @@
     {
       "name": "0004_grants_settings_drives",
       "sha256": "5d82cb2d4c59120f429537ba3fc16040050418f3ab6fccf9991f60d3987d06c2"
+    },
+    {
+      "name": "0005_session_drive_ticks",
+      "sha256": "3c527ed867f6cbe5b7fe16525d902a2d91cdedd4726e108c19a270b85c38f653"
     }
   ],
   "head": {
@@ -648,6 +652,11 @@
             "name": "author_client",
             "type": "string",
             "nullable": false
+          },
+          {
+            "name": "tick_ids",
+            "type": "json",
+            "nullable": true
           }
         ]
       },

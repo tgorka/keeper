@@ -161,6 +161,15 @@ last wrote it. Times are UTC milliseconds since the epoch.
   a person ticked for the session's agent to read, and `updated_at_ms`. No row, or an empty array,
   is no drive: none is ticked until a person ticks it. It can only name drives the agent offers
   (`agent_profiles.drives`), and it grants reading, never writing.
+  From schema 5, `tick_ids` (nullable JSON) names the identity of each tick:
+  `{"at": <this row's updated_at_ms>, "drives": {<drive>: <ULID>}}`. A schema-5 client writes it in
+  every write of the row: a fresh ULID for each drive it ticks anew, the same id for each drive it
+  leaves ticked, none for a drive it unticks, and `at` equal to the `updated_at_ms` it writes. A map
+  whose `at` is not the row's `updated_at_ms` (a schema-4 client rewrote the row and left it
+  behind), or a ticked drive it does not name, is a tick with no identity. A person's device warns
+  of a tick (R-HQ-79) until it has shown that tick's warning there, so a tick with no identity
+  warns; a client may give it one, as the person, by rewriting the row. The server enforces nothing
+  of `tick_ids`; a schema-4 client never receives it.
 - **`turn_chunks`** — the committed text of a streaming answer: `session_id`, `turn_id`, `seq`,
   `text`; deleted when the turn's message is written.
 - **`attachments`** — `session_id`, `message_id`, `blob_ref` (a syncular blob: canonical BlobRef JSON

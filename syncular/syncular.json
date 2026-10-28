@@ -13,7 +13,8 @@
     { "version": 1, "through": "0001_initial" },
     { "version": 2, "through": "0002_session_trust" },
     { "version": 3, "through": "0003_agent_profile_tools" },
-    { "version": 4, "through": "0004_grants_settings_drives" }
+    { "version": 4, "through": "0004_grants_settings_drives" },
+    { "version": 5, "through": "0005_session_drive_ticks" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
