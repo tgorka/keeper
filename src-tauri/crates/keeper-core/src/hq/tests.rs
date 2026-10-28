@@ -224,7 +224,12 @@ async fn pairing_registers_the_host_not_the_display_name() {
             Arc::new(routes::HttpRoutes::new()),
             Arc::new(signin::NoAccount),
             "My keeper".to_owned(),
-            move || DeviceHosts::same(lock(&provided_host).clone()),
+            // A name set in Settings never names a new credential: the
+            // pairing is created under the system's (R-HQ-94 amendment 2 (4)).
+            move || DeviceHosts {
+                system: lock(&provided_host).clone(),
+                name: "studio".to_owned(),
+            },
         );
         hq.start().await.expect("starts");
         hq.set_server(&server.base).await.expect("sets server");
@@ -696,6 +701,9 @@ async fn a_rename_is_checked_against_the_complete_replicated_directory() {
     opens(&["alpha", "beta", "gamma"]);
     let again = world.hq();
     again.start().await.expect("starts");
+    for database in ["alpha", "beta"] {
+        world.live(database)[0].replicate(vec![row("ana.1", "ana", "device", "test", None)]);
+    }
     assert_eq!(again.device_directory(), unread("gamma"));
 }
 
