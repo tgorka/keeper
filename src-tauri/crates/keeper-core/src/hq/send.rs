@@ -17,10 +17,10 @@
 //! keeper attaches it only where it judges the chat's readers all read the
 //! note's drive ([`AgentFocus::for_destination`]), but the server is the
 //! boundary (contract § 9.1a): it refuses a message whose focus drive the
-//! chat's readers may not all read, `hq.focus.audience`. keeper then writes
-//! the same message again once, without the focus, and says so under it
-//! ([`resend_without_focus`], [`withheld_sentence`]). The message is never
-//! dropped.
+//! chat's readers may not all read, `hq.focus.audience`, and one whose focus
+//! is not well-formed, `hq.focus.malformed`. keeper then writes the same
+//! message again once, without the focus, and says the refusal's sentence
+//! under it ([`resend_without_focus`]). The message is never dropped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -191,17 +191,43 @@ pub(crate) fn activity(source: &Source, session_id: &str, at: i64) -> RowOp {
 /// The server's code for a message whose focus drive the chat's readers may
 /// not all read (contract § 9.1a).
 pub const FOCUS_AUDIENCE: &str = "hq.focus.audience";
+/// The server's code for a message whose `focus` is not well-formed
+/// (contract § 9.1a, coordinator ruling 2026-10-28).
+pub const FOCUS_MALFORMED: &str = "hq.focus.malformed";
 
 /// What keeper says under a message it sent again without the note in
-/// front of the person (contract § 9.1a, binding).
+/// front of the person, for an audience refusal (contract § 9.1a, binding).
 pub fn withheld_sentence(drive: &str) -> String {
     format!("This chat's readers can't all read {drive}, so the note you're in wasn't sent.")
 }
 
+/// What keeper says under a message whose note the server refused as
+/// malformed (contract § 9.1a, binding).
+pub const MALFORMED_SENTENCE: &str = "The note you're in couldn't be sent with this message.";
+
+/// The sentence for the server's refusal `code` of a message whose
+/// `metadata` was `metadata`; `None` for a refusal that is not the note's.
+fn refusal_sentence(code: &str, metadata: &Value) -> Option<String> {
+    match code {
+        FOCUS_AUDIENCE => Some(
+            match metadata
+                .get("focus")
+                .and_then(|focus| focus.get("drive"))
+                .and_then(Value::as_str)
+            {
+                Some(drive) => withheld_sentence(drive),
+                None => MALFORMED_SENTENCE.to_owned(),
+            },
+        ),
+        FOCUS_MALFORMED => Some(MALFORMED_SENTENCE.to_owned()),
+        _ => None,
+    }
+}
+
 /// The messages written again without their focus, by database and message
-/// id, each with the focus's drive — what [`withheld_sentence`] names. Kept
-/// on this device beside the replicas: the drive's name is never written
-/// into the chat, and the refusal itself is set aside by the resend.
+/// id, each with the sentence keeper says under it. Kept on this device
+/// beside the replicas: the sentence is never written into the chat, and the
+/// refusal itself is set aside by the resend.
 fn withheld_path(root: &Path) -> PathBuf {
     root.join("focus-withheld.json")
 }
@@ -210,8 +236,8 @@ fn withheld_key(database: &str, message: &str) -> String {
     format!("{database}\n{message}")
 }
 
-/// The drive a message of `database` was sent again without, for each such
-/// message id.
+/// The sentence said under each message of `database` sent again without
+/// its note, by message id.
 pub(crate) fn withheld(root: &Path, database: &str) -> HashMap<String, String> {
     let all: HashMap<String, String> = std::fs::read_to_string(withheld_path(root))
         .ok()
@@ -219,17 +245,17 @@ pub(crate) fn withheld(root: &Path, database: &str) -> HashMap<String, String> {
         .unwrap_or_default();
     let prefix = withheld_key(database, "");
     all.into_iter()
-        .filter_map(|(key, drive)| Some((key.strip_prefix(&prefix)?.to_owned(), drive)))
+        .filter_map(|(key, sentence)| Some((key.strip_prefix(&prefix)?.to_owned(), sentence)))
         .collect()
 }
 
-fn record_withheld(root: &Path, database: &str, message: &str, drive: &str) {
+fn record_withheld(root: &Path, database: &str, message: &str, sentence: &str) {
     let path = withheld_path(root);
     let mut all: HashMap<String, String> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    all.insert(withheld_key(database, message), drive.to_owned());
+    all.insert(withheld_key(database, message), sentence.to_owned());
     let written = serde_json::to_string(&all)
         .map_err(std::io::Error::other)
         .and_then(|raw| std::fs::write(&path, raw));
@@ -242,37 +268,33 @@ fn record_withheld(root: &Path, database: &str, message: &str, drive: &str) {
 /// one refusal never write its message twice.
 static RESENDING: Mutex<()> = Mutex::new(());
 
-/// The focus drive of a message row's `metadata`, however the journal kept
-/// it (JSON text or JSON).
-fn focus_drive(values: &Map<String, Value>) -> Option<String> {
-    let metadata = match values.get("metadata")? {
-        Value::String(raw) => serde_json::from_str::<Value>(raw).ok()?,
-        other => other.clone(),
-    };
-    metadata
-        .get("focus")?
-        .get("drive")?
-        .as_str()
-        .map(str::to_owned)
+/// A message row's `metadata` as JSON, however the journal kept it (JSON
+/// text or JSON); `Null` for none.
+fn metadata_of(values: &Map<String, Value>) -> Value {
+    match values.get("metadata") {
+        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+        Some(other) => other.clone(),
+        None => Value::Null,
+    }
 }
 
-/// Every commit written here that the server refused for its focus's
-/// audience (`hq.focus.audience`), written once more as the same rows — the
-/// same message id, body and files — with the focus taken out, in a new
-/// commit that sets the refusal aside, and the drive kept under `root` for
-/// [`withheld_sentence`]. A row that carries no focus is never written again
-/// for this code, so nothing loops. The messages written again.
+/// Every commit written here that the server refused for its note —
+/// `hq.focus.audience` or `hq.focus.malformed` — written once more as the
+/// same rows (the same message id, body and files) with `focus` taken out of
+/// the message's metadata, in a new commit that sets the refusal aside; the
+/// sentence for the refusal is kept under `root` and said under the message.
+/// A message whose metadata holds no `focus` is never written again for
+/// these codes, so nothing loops. The messages written again.
 pub fn resend_without_focus(source: &Source, root: &Path) -> Result<usize, ReplicaError> {
     let _held = RESENDING.lock().unwrap_or_else(PoisonError::into_inner);
     let mut resent = 0;
     for commit in source.replica.refused_commits("messages")? {
-        if commit.rejection.code != FOCUS_AUDIENCE {
-            continue;
-        }
-        let Some((message, drive)) = commit.rows.iter().find_map(|(table, values)| {
-            (table == "messages")
-                .then(|| focus_drive(values).map(|drive| (values, drive)))
-                .flatten()
+        let Some((message, sentence)) = commit.rows.iter().find_map(|(table, values)| {
+            let metadata = metadata_of(values);
+            if table != "messages" || metadata.get("focus").is_none() {
+                return None;
+            }
+            refusal_sentence(&commit.rejection.code, &metadata).map(|sentence| (values, sentence))
         }) else {
             continue;
         };
@@ -287,7 +309,16 @@ pub fn resend_without_focus(source: &Source, root: &Path) -> Result<usize, Repli
             .map(|(table, values)| {
                 let mut values = values.clone();
                 if table == "messages" {
-                    values.insert("metadata".to_owned(), Value::Null);
+                    let mut metadata = metadata_of(&values);
+                    let left = metadata.as_object_mut().map(|object| {
+                        object.remove("focus");
+                        object.is_empty()
+                    });
+                    let kept = match left {
+                        Some(false) => Value::from(metadata.to_string()),
+                        _ => Value::Null,
+                    };
+                    values.insert("metadata".to_owned(), kept);
                 }
                 // A session row without its agent is the activity patch a
                 // send writes; with it, the row a creation inserts.
@@ -309,7 +340,7 @@ pub fn resend_without_focus(source: &Source, root: &Path) -> Result<usize, Repli
         source
             .replica
             .mutate_superseding(ops, vec![commit.commit_id.clone()])?;
-        record_withheld(root, &source.database, &message_id, &drive);
+        record_withheld(root, &source.database, &message_id, &sentence);
         resent += 1;
     }
     if resent > 0 {

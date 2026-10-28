@@ -166,6 +166,7 @@ it("says Rust's quiet line under a message sent again without the note (109.28 Â
         id: "m1",
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body: "what is this note?",
         createdAtMs: 1780000000000,

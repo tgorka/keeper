@@ -1119,7 +1119,15 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   are its drive's, so the focus goes only into a conversation whose database everyone who reads it
   also reads the drive — the drive's own database, or one whose people this device can see are all
   the drive's (D-34, R605-01). Anywhere wider, or where keeper cannot tell, the message goes
-  without it. The runtime
+  without it. That device check is only a first filter: the server is the boundary (contract
+  § 9.1a). It refuses a message whose focus drive the chat's readers may not all read
+  (`hq.focus.audience`) or whose focus is not well-formed (`hq.focus.malformed`); keeper then writes
+  the same message again once, without the focus (same id, body and files, a new commit), and says
+  the refusal's sentence as a quiet line under it. The message is never dropped.
+- **An unseen tick stays news.** A tick the dock made whose warning nobody saw (the dock closed, or
+  the person left the note, before the answer came, and taking the tick back failed) is answered
+  as ticked now, with the warning, the next time the dock opens that chat. The dock reports a
+  warning it showed (`agent_note_tick_seen`), and only then is the tick an old one (R605-05). The runtime
   adds one line for that turn; `drive_read` reads the drive's committed copy, so unsaved edits are
   not in what the agent can read. A message from the Agents window carries no focus.
 

@@ -2140,8 +2140,10 @@ fn journal_refused(path: &std::path::Path, commit: &str, code: &str, ops: &[(&st
 }
 
 /// Contract § 9.1a (R605-04): the server, not this device, decides who may
-/// read a note's focus. A message it refuses for that (`hq.focus.audience`)
-/// is written again once, the same message without the focus — never
+/// read a note's focus. A message it refuses for that (`hq.focus.audience`),
+/// or for a focus that is not well-formed (`hq.focus.malformed`, here one
+/// whose line is `42.0`), is written again once, the same message without
+/// the focus — never
 /// dropped — and the person reads why under it. Another refusal is left as
 /// it stands, and a second pass writes nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2181,6 +2183,18 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
             ("sessions", "upsert", activity.clone()),
         ],
     );
+    let mut broken = focused("m-broken", "and this one?");
+    broken["metadata"] = Value::from(
+        serde_json::json!({"focus": {"drive": "tgdrive", "path": "a.md", "heading": null,
+                                     "line": 42.0}})
+        .to_string(),
+    );
+    journal_refused(
+        &path,
+        "c-broken",
+        "hq.focus.malformed",
+        &[("messages", "upsert", broken)],
+    );
     journal_refused(
         &path,
         "c-other",
@@ -2197,18 +2211,18 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
 
     let stored = rows(
         &opener.replica("beta"),
-        "SELECT id, body, metadata FROM messages WHERE id IN ('m-focus', 'm-other')",
+        "SELECT id, body, metadata FROM messages WHERE id IN ('m-focus', 'm-broken', \
+         'm-other') ORDER BY id",
     );
+    let ids: Vec<&Value> = stored.iter().map(|row| &row["id"]).collect();
     assert_eq!(
-        stored.len(),
-        1,
-        "once, and only the focus refusal: {stored:?}"
+        ids,
+        [&Value::from("m-broken"), &Value::from("m-focus")],
+        "once each, and only the note's refusals: {stored:?}"
     );
-    assert_eq!(stored[0]["body"], Value::from("what is this note?"));
-    assert_eq!(
-        metadata_of(&opener, "beta", "what is this note?"),
-        Value::Null
-    );
+    for body in ["what is this note?", "and this one?"] {
+        assert_eq!(metadata_of(&opener, "beta", body), Value::Null, "{body}");
+    }
     let refused: Vec<String> = source
         .replica
         .refused_commits("messages")
@@ -2216,7 +2230,7 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
         .into_iter()
         .map(|commit| commit.commit_id)
         .collect();
-    assert_eq!(refused, ["c-other"], "the focus refusal is set aside");
+    assert_eq!(refused, ["c-other"], "the note's refusals are set aside");
 
     let view = hq.session_view(&key).expect("a view");
     let said: Vec<(&str, Option<&str>)> = view
@@ -2228,6 +2242,13 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
         said.contains(&(
             "what is this note?",
             Some("This chat's readers can't all read tgdrive, so the note you're in wasn't sent.")
+        )),
+        "{said:?}"
+    );
+    assert!(
+        said.contains(&(
+            "and this one?",
+            Some("The note you're in couldn't be sent with this message.")
         )),
         "{said:?}"
     );

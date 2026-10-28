@@ -8212,8 +8212,9 @@ function mockNoteDrive(vaultId: unknown): string | null {
  * check reads what reaches the conversation, not only what the dock handed over.
  *
  * `?focus=refused` (§ 9.1a): the server refuses that focus anyway (`hq.focus.audience`), as it
- * would for a reader this device still counts but who left the drive; keeper sends the message
- * again without it. The quiet line Rust then says under the message is the answer.
+ * would for a reader this device still counts but who left the drive; `?focus=malformed` refuses it
+ * as not well-formed (`hq.focus.malformed`). Either way keeper sends the message again without it,
+ * and the quiet line Rust then says under the message is the answer.
  */
 const focusScenario = new URLSearchParams(location.search).get("focus");
 function mockFocusWritten(payload: Record<string, unknown>): string | undefined {
@@ -8226,6 +8227,10 @@ function mockFocusWritten(payload: Record<string, unknown>): string | undefined 
   if (written && focusScenario === "refused") {
     console.debug("[mock-shell] refused hq.focus.audience; sent again →", payload.database, null);
     return `This chat's readers can't all read ${drive}, so the note you're in wasn't sent.`;
+  }
+  if (written && focusScenario === "malformed") {
+    console.debug("[mock-shell] refused hq.focus.malformed; sent again →", payload.database, null);
+    return "The note you're in couldn't be sent with this message.";
   }
   console.debug("[mock-shell] metadata", payload.database, "→", written);
   return undefined;

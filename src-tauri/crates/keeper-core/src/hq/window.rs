@@ -322,8 +322,8 @@ impl Hq {
         if let Ok(data_dir) = self.data_dir() {
             let withheld = send::withheld(&crate::hq::databases::root(&data_dir), &key.database);
             for message in &mut view.messages {
-                if let Some(drive) = withheld.get(&message.id) {
-                    message.note = Some(send::withheld_sentence(drive));
+                if let Some(sentence) = withheld.get(&message.id) {
+                    message.note = Some(sentence.clone());
                 }
             }
         }

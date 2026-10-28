@@ -28,6 +28,8 @@ const mock = vi.hoisted(() => ({
   driveSet: vi.fn(),
   seen: vi.fn(),
   create: vi.fn(),
+  preview: vi.fn(),
+  command: vi.fn(),
   send: vi.fn(),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -48,6 +50,8 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentSessionDriveSet: mock.driveSet,
   agentNoteTickSeen: mock.seen,
   agentSessionNew: mock.create,
+  agentCommandPreview: mock.preview,
+  agentCommand: mock.command,
   agentsChoices: vi.fn().mockResolvedValue([
     {
       agentActor: "assistant",
@@ -116,7 +120,14 @@ function view({ database, sessionId }: AgentSessionRef): AgentSessionViewVm {
       summary: "Context unknown: no answer has measured it yet.",
       parts: [],
     },
-    footer: { model: "Default", effort: "Default", choosesModel: false, choosesEffort: false },
+    footer: {
+      model: "Default",
+      effort: "Default",
+      shortModel: "Default",
+      effortCode: "D",
+      choosesModel: false,
+      choosesEffort: false,
+    },
     live: [],
     tools: [],
     prefs: { viewMode: "normal" },
@@ -411,4 +422,62 @@ it("never reports a tick seen that nobody saw, when the dock closed and the unti
   // The tick stays news in Rust: the next open says it, warning and all.
   expect(mock.seen).not.toHaveBeenCalled();
   expect(opened()).toEqual([]);
+});
+
+it("follows /clean to the new chat: the notice stays with the chat it is about, the note goes on", async () => {
+  openNote("v1", "inbox");
+  noteCaretStore.getState().place("v1", "inbox", 2, Text.of(["# Plans", "## Q3"]));
+  mock.forNote.mockResolvedValue(onDrive("tgdrive", "tg.1", true));
+  mock.preview.mockImplementation(async (_target: unknown, draft: string) => ({
+    draft,
+    verdict: { kind: "command", name: "clean", args: null },
+    rows: [],
+    escapeHint: "",
+  }));
+  mock.command.mockResolvedValue({
+    session: { database: "tgdrive", sessionId: "tg.2" },
+    surface: null,
+    message: "",
+    pick: null,
+  });
+  draw();
+  await waitFor(() => expect(opened()).toEqual([{ database: "tgdrive", sessionId: "tg.1" }]));
+  expect(await screen.findByRole("note", { name: DRIVE_NOTICE_LABEL })).toBeInTheDocument();
+  showNewest();
+
+  const field = screen.getByRole("textbox", { name: "Message" });
+  fireEvent.change(field, { target: { value: "/clean" } });
+  fireEvent.keyDown(field, { key: "Enter" });
+  await waitFor(() =>
+    expect(opened()).toEqual([
+      { database: "tgdrive", sessionId: "tg.1" },
+      { database: "tgdrive", sessionId: "tg.2" },
+    ]),
+  );
+  // The warning was said over tg.1, where the tick was made; tg.2 got its ticks by /clean's
+  // carry, which is not the dock's to announce again.
+  expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
+  // The window's own selection is not the dock's to move (R601-04).
+  expect(agentSessionsStore.getState().selected).toBeNull();
+
+  showNewest();
+  fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+    target: { value: "and now?" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() =>
+    expect(mock.send).toHaveBeenCalledWith(
+      { database: "tgdrive", sessionId: "tg.2" },
+      "and now?",
+      [],
+      {
+        vaultId: "v1",
+        noteId: "inbox",
+        line: 2,
+        text: "# Plans\n## Q3",
+      },
+    ),
+  );
+  // The switch asked nothing of the note's drive again.
+  expect(mock.forNote).toHaveBeenCalledTimes(1);
 });
