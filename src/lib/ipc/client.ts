@@ -4399,8 +4399,25 @@ export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | nul
  * The dock showed the warning of the tick {@link agentSessionForNote} reported (R-HQ-79): Rust no
  * longer answers it as news. Until this is said, every answer for that chat says it again (R605-05).
  */
-export async function agentNoteTickSeen(target: AgentSessionRef, drive: string): Promise<void> {
-  await invoke<void>("agent_note_tick_seen", { ...target, drive });
+export async function agentNoteTickSeen(
+  target: AgentSessionRef,
+  drive: string,
+  claim: string,
+): Promise<void> {
+  await invoke<void>("agent_note_tick_seen", { ...target, drive, claim });
+}
+
+/**
+ * Take back the tick of `drive` an answer nobody saw reported under `claim` (the dock closed, the
+ * person moved on). Rust does it only while that answer still holds the tick: a newer answer for
+ * the chat, or the person's own tick or untick, keeps it (R605-07). Whether it was unticked.
+ */
+export async function agentNoteTickUndo(
+  target: AgentSessionRef,
+  drive: string,
+  claim: string,
+): Promise<boolean> {
+  return await invoke<boolean>("agent_note_tick_undo", { ...target, drive, claim });
 }
 
 /**

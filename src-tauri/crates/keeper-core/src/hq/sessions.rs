@@ -226,6 +226,13 @@ pub struct AgentNoteSessionVm {
     /// warning no one saw did (R605-05). The dock says so and then reports it
     /// seen (`agent_note_tick_seen`).
     pub ticked_now: bool,
+    /// With `ticked_now`: this answer's hold on that unseen tick (R605-07).
+    /// Each answer that reports it takes the hold from any earlier one, so
+    /// only the newest may report it seen or take it back
+    /// (`agent_note_tick_undo`); an older one asking does nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub claim: Option<String>,
     /// What ticking a drive allows (`drives::WARNING`, R-HQ-79): present
     /// exactly when `ticked_now`, so it is said where the drive was ticked.
     #[serde(default, skip_serializing_if = "Option::is_none")]

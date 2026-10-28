@@ -1840,6 +1840,7 @@ async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
             session_id: session.clone(),
         },
         "tgdrive",
+        unseen.claim.as_deref().expect("a hold on the unseen tick"),
     )
     .expect("seen");
     let again = hq
@@ -2253,4 +2254,81 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
         "{said:?}"
     );
     assert!(said.contains(&("hello", None)), "{said:?}");
+}
+
+/// R605-07: two docks' answers report one unseen tick — a closed dock's,
+/// still on its way, and the reopened dock's. Only the newest answer holds
+/// it: the older one can neither report it seen nor take it back, so the
+/// chat the person is looking at keeps its drive and its notice tells the
+/// truth. The newest one may take it back while it is unseen; once seen, or
+/// once the person ticks or unticks it themselves, no answer can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_newest_answer_may_take_an_unseen_tick_back() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    let open = || {
+        hq.session_for_note(Some("tgdrive"), None)
+            .expect("answers")
+            .expect("a default agent")
+    };
+    let key = |vm: &sessions::AgentNoteSessionVm| sessions::AgentSessionRef {
+        database: "tgdrive".to_owned(),
+        session_id: vm.target.session_id.clone().expect("a chat"),
+    };
+    let ticked = || {
+        ticks(&opener, "tgdrive")
+            .iter()
+            .any(|(_, drives)| drives.contains("tgdrive"))
+    };
+
+    // The closed dock's answer (held), then the reopened dock's, which shows it.
+    let closed = open();
+    let shown = open();
+    assert!(closed.ticked_now && shown.ticked_now);
+    assert_ne!(closed.claim, shown.claim);
+    let chat = key(&shown);
+    let old = closed.claim.as_deref().expect("a hold");
+    // The old answer arrives: it may not report the tick seen…
+    hq.note_tick_seen(&chat, "tgdrive", old).expect("asks");
+    assert!(
+        open().ticked_now,
+        "still news: the old answer's word is not taken"
+    );
+    // …and the reopened dock shows it.
+    let shown = open();
+    hq.note_tick_seen(&chat, "tgdrive", shown.claim.as_deref().expect("a hold"))
+        .expect("seen");
+    // The old answer's untick does nothing: the drive stays ticked.
+    assert!(!hq.note_tick_undo(&chat, "tgdrive", old).expect("asks"));
+    assert!(ticked(), "the shown chat keeps its drive");
+    assert!(!open().ticked_now, "seen");
+
+    // A fresh unseen tick, taken back by the answer that holds it.
+    hq.set_session_drive(&chat, "tgdrive", false)
+        .expect("unticked by the person");
+    let fresh = open();
+    assert!(fresh.ticked_now && ticked());
+    let held = fresh.claim.as_deref().expect("a hold");
+    assert!(hq.note_tick_undo(&chat, "tgdrive", held).expect("asks"));
+    assert!(!ticked(), "taken back");
+    assert!(
+        !hq.note_tick_undo(&chat, "tgdrive", held).expect("asks"),
+        "once"
+    );
+
+    // The person ticks it themselves while an answer still holds the dock's
+    // tick: that answer can no longer take it back.
+    let again = open();
+    assert!(again.ticked_now);
+    hq.set_session_drive(&chat, "tgdrive", false)
+        .expect("unticked");
+    hq.set_session_drive(&chat, "tgdrive", true)
+        .expect("ticked by the person");
+    assert!(!hq
+        .note_tick_undo(&chat, "tgdrive", again.claim.as_deref().expect("a hold"))
+        .expect("asks"));
+    assert!(ticked(), "the person's own tick stays");
 }

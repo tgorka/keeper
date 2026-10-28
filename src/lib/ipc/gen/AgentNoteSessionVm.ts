@@ -25,6 +25,13 @@ drive?: string,
  */
 tickedNow: boolean, 
 /**
+ * With `ticked_now`: this answer's hold on that unseen tick (R605-07).
+ * Each answer that reports it takes the hold from any earlier one, so
+ * only the newest may report it seen or take it back
+ * (`agent_note_tick_undo`); an older one asking does nothing.
+ */
+claim?: string, 
+/**
  * What ticking a drive allows (`drives::WARNING`, R-HQ-79): present
  * exactly when `ticked_now`, so it is said where the drive was ticked.
  */

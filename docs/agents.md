@@ -1127,7 +1127,11 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
 - **An unseen tick stays news.** A tick the dock made whose warning nobody saw (the dock closed, or
   the person left the note, before the answer came, and taking the tick back failed) is answered
   as ticked now, with the warning, the next time the dock opens that chat. The dock reports a
-  warning it showed (`agent_note_tick_seen`), and only then is the tick an old one (R605-05). The runtime
+  warning it showed (`agent_note_tick_seen`), and only then is the tick an old one (R605-05).
+  Each answer that reports an unseen tick carries a `claim` and takes the hold from every earlier
+  one: only the holder may report it seen or take it back (`agent_note_tick_undo`), and a person's
+  own tick or untick ends every hold. So a closed dock's late answer cannot untick the chat a
+  reopened dock shows (R605-07). The runtime
   adds one line for that turn; `drive_read` reads the drive's committed copy, so unsaved edits are
   not in what the agent can read. A message from the Agents window carries no focus.
 

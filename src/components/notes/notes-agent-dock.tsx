@@ -18,8 +18,8 @@ import {
   type AgentSessionRef,
   agentNoteDrive,
   agentNoteTickSeen,
+  agentNoteTickUndo,
   agentSessionDefault,
-  agentSessionDriveSet,
   agentSessionForNote,
 } from "@/lib/ipc/client";
 import { lastAgentPick } from "@/lib/stores/agent-picks";
@@ -146,11 +146,13 @@ export function DockBody() {
           const { database, sessionId } = vm.target;
           if (gone.current || wanted.current?.drive !== want.drive) {
             // Nobody sees this chat (the dock closed, the person left the note or its drive): a
-            // tick made for it is taken back, and the loop goes on to what is in front now. Should
-            // the untick fail, Rust still holds the tick as unseen and says it, warning and all,
-            // the next time the dock opens that chat (R605-05).
-            if (vm.tickedNow && vm.drive && database && sessionId)
-              await agentSessionDriveSet({ database, sessionId }, vm.drive, false).catch(
+            // tick reported to this answer is taken back, and the loop goes on to what is in front
+            // now. Rust takes it back only while this answer still holds it: a newer answer (a
+            // reopened dock that shows it) or the person's own tick keeps it (R605-07). Should the
+            // untick fail, Rust still holds the tick as unseen and says it, warning and all, the
+            // next time the dock opens that chat (R605-05).
+            if (vm.tickedNow && vm.claim && vm.drive && database && sessionId)
+              await agentNoteTickUndo({ database, sessionId }, vm.drive, vm.claim).catch(
                 logFailure("agents.note.untick"),
               );
             continue;
@@ -160,8 +162,8 @@ export function DockBody() {
           show(vm.target);
           setNotice(vm.warning || vm.reason ? vm : null);
           // Shown: the tick is no longer news (R-HQ-79 said where it was made).
-          if (vm.tickedNow && vm.warning && vm.drive && database && sessionId)
-            void agentNoteTickSeen({ database, sessionId }, vm.drive).catch(
+          if (vm.tickedNow && vm.warning && vm.claim && vm.drive && database && sessionId)
+            void agentNoteTickSeen({ database, sessionId }, vm.drive, vm.claim).catch(
               logFailure("agents.note.seen"),
             );
         }

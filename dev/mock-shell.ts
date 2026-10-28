@@ -8235,8 +8235,13 @@ function mockFocusWritten(payload: Record<string, unknown>): string | undefined 
   console.debug("[mock-shell] metadata", payload.database, "→", written);
   return undefined;
 }
-/** The dock's ticks whose warning nobody has seen yet (keeper-core's `unseen_ticks`, R605-05). */
-const mockUnseenTicks = new Set<string>();
+/**
+ * The dock's ticks whose warning nobody has seen yet, each with the claim of the newest answer that
+ * reported it (keeper-core's `unseen_ticks`, R605-05, R605-07): only that answer may report it seen
+ * or take it back.
+ */
+const mockUnseenTicks = new Map<string, string>();
+let mockClaimSerial = 0;
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
   if (!vm) return hqRefuse("This session is not on this device.");
@@ -8266,6 +8271,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   },
   agent_session_drive_set: (payload) => {
     const vm = mockSession(payload);
+    // The person's own tick or untick: no answer of the dock holds this drive's tick any more.
+    mockUnseenTicks.delete(JSON.stringify([payload.database, payload.sessionId]));
     const drives = vm.drives;
     if (!drives) hqRefuse("Only a person in this chat may choose the drives it reads.");
     const drive = drives.drives.find((row) => row.name === payload.drive);
@@ -8904,13 +8911,24 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     const key = JSON.stringify([drive, row.sessionId]);
     if (tick.ticked && !mockUnseenTicks.has(key)) return { target, drive, tickedNow: false };
     tick.ticked = true;
-    mockUnseenTicks.add(key);
+    const claim = `claim-${++mockClaimSerial}`;
+    mockUnseenTicks.set(key, claim);
     publishSessions();
-    return { target, drive, tickedNow: true, warning: DRIVES_WARNING };
+    return { target, drive, tickedNow: true, claim, warning: DRIVES_WARNING };
   },
   agent_note_tick_seen: (payload) => {
-    mockUnseenTicks.delete(JSON.stringify([payload.database, payload.sessionId]));
+    const key = JSON.stringify([payload.database, payload.sessionId]);
+    if (mockUnseenTicks.get(key) === payload.claim) mockUnseenTicks.delete(key);
     return null;
+  },
+  agent_note_tick_undo: (payload) => {
+    const key = JSON.stringify([payload.database, payload.sessionId]);
+    if (mockUnseenTicks.get(key) !== payload.claim) return false;
+    const tick = mockSession(payload).drives?.drives.find((d) => d.name === payload.drive);
+    if (tick) tick.ticked = false;
+    mockUnseenTicks.delete(key);
+    publishSessions();
+    return true;
   },
   agent_session_new: (payload) => {
     if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");
