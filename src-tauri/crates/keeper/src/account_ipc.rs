@@ -583,24 +583,38 @@ fn system_host() -> String {
 /// the one set in Settings, else the system's. A store that does not read
 /// leaves the system's name, logged.
 fn device_name_vm(data_dir: &Path) -> DeviceNameVm {
-    let system = system_host();
-    device_name::read(data_dir, &system).unwrap_or_else(|error| {
+    device_name_vm_with(data_dir, &system_host())
+}
+
+/// [`device_name_vm`] for a system name already read.
+fn device_name_vm_with(data_dir: &Path, system: &str) -> DeviceNameVm {
+    device_name::read(data_dir, system).unwrap_or_else(|error| {
         tracing::warn!(%error, "this device's name does not read; the system's is used");
-        device_name::resolve(None, &system)
+        device_name::resolve(None, system)
     })
 }
 
-/// The one provider of this device's host (R-HQ-94): the name set in
-/// Settings › This device's name, else what the system calls the device.
-/// The agents server's pairing and sign-in read it (109.1, 109.5/109.6), and
-/// so does the default of this device's name in the account's repository
-/// ([`default_device_name`]).
-pub fn device_host(platform: &dyn Platform) -> String {
+/// The one provider of this device's host (R-HQ-94): `name` is the name set
+/// in Settings › This device's name, else what the system calls the device;
+/// `system` is what the system calls it. The agents server's pairing and
+/// sign-in read both (109.1, 109.5/109.6): every new credential is created
+/// under `system`, a name no Settings field sets, and an adoption under the
+/// same client id moves the server to `name` (R-HQ-94 amendment 2 (4)). The
+/// default of this device's name in the account's repository reads `name`
+/// too ([`default_device_name`]).
+pub fn device_hosts(platform: &dyn Platform) -> keeper_core::hq::DeviceHosts {
+    let system = system_host();
+    let name = device_name_at(platform, &system);
+    keeper_core::hq::DeviceHosts { system, name }
+}
+
+/// The name this device goes by, given what the system calls it.
+fn device_name_at(platform: &dyn Platform, system: &str) -> String {
     match platform.data_dir() {
-        Ok(data_dir) => device_name_vm(&data_dir).name,
+        Ok(data_dir) => device_name_vm_with(&data_dir, system).name,
         Err(error) => {
             tracing::warn!(%error, "no data directory; this device's system name is used");
-            system_host()
+            system.to_owned()
         }
     }
 }
@@ -656,7 +670,7 @@ fn read_or_warn<T>(read: Result<Option<T>, CoreError>, lost: &str) -> Option<T> 
 }
 
 /// The name a device not yet registered in the account's repository starts
-/// from: this device's name ([`device_host`]'s), slugged, when a person set
+/// from: this device's name ([`device_hosts`]'s), slugged, when a person set
 /// one; else the platform's default ([`system_device_name`]).
 fn default_device_name(data_dir: &Path) -> String {
     let named = device_name_vm(data_dir);
@@ -3871,7 +3885,7 @@ pub async fn device_name_set(
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let hq = crate::hq_ipc::service();
     let directory = rename_directory(hq.as_ref());
-    let after = device_name::plan_set(&data_dir, &name, &system_host(), directory.as_ref())
+    let after = device_name::plan_set(&data_dir, &name, &system_host(), &directory)
         .map_err(device_name_error)?;
     rename_to(state, &data_dir, hq, after).await
 }
@@ -3883,15 +3897,18 @@ pub async fn device_name_reset(state: State<'_, AppState>) -> Result<DeviceNameV
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let hq = crate::hq_ipc::service();
     let directory = rename_directory(hq.as_ref());
-    let after = device_name::plan_reset(&data_dir, &system_host(), directory.as_ref())
+    let after = device_name::plan_reset(&data_dir, &system_host(), &directory)
         .map_err(device_name_error)?;
     rename_to(state, &data_dir, hq, after).await
 }
 
-/// The agents server's directory as this device holds it; `None` — a
-/// rename refused as unread — while the service has not started.
-fn rename_directory(hq: Option<&Arc<keeper_core::hq::Hq>>) -> Option<device_name::Directory> {
-    hq.and_then(|hq| hq.device_directory())
+/// The agents server's directory as this device holds it; unread — a
+/// rename refused, saying so — while the service has not started.
+fn rename_directory(hq: Option<&Arc<keeper_core::hq::Hq>>) -> device_name::DirectoryRead {
+    hq.map_or_else(
+        || Err(device_name::Unread::default()),
+        |hq| hq.device_directory(),
+    )
 }
 
 fn device_name_error(error: device_name::DeviceNameError) -> IpcError {
@@ -3902,22 +3919,40 @@ fn device_name_error(error: device_name::DeviceNameError) -> IpcError {
 }
 
 /// A planned name: the account's record first, since its repository may
-/// refuse; then the name; then the agents server.
+/// refuse; then the name, which the name in this device's commits follows;
+/// then the agents server, which reads the stored name — so a quit before
+/// it hears is picked up at the next start (amendment 2 (7)).
 async fn rename_to(
     state: State<'_, AppState>,
     data_dir: &Path,
     hq: Option<Arc<keeper_core::hq::Hq>>,
     after: DeviceNameVm,
 ) -> Result<DeviceNameVm, IpcError> {
-    let previous = device_name_vm(data_dir).name;
     rename_account_device(state, &after).await?;
     device_name::store(data_dir, &after).map_err(to_ipc_error)?;
+    follow_in_commits(data_dir, &after.name);
     if let Some(hq) = hq {
-        if let Err(error) = hq.device_renamed(&previous).await {
+        if let Err(error) = hq.device_renamed().await {
             tracing::warn!(%error, "the agents server could not be told this device's new name");
         }
     }
     Ok(after)
+}
+
+/// R-HQ-94 amendment 2 (9): the name this device's commits carry (the sync
+/// engine's device label: the `Keeper-Device` trailer, conflict copies)
+/// follows its name, so there is one name to edit. The open engine's copy
+/// and its row, or the row alone before the engine opens; a failure is
+/// logged, never a refusal of a name already stored.
+fn follow_in_commits(data_dir: &Path, name: &str) {
+    let followed = match crate::sync::engine_if_open() {
+        Some(engine) => engine.set_device_label(name),
+        None => keeper_sync::db::open(data_dir)
+            .and_then(|conn| keeper_sync::db::set_device_label(&conn, name).map(|_| ())),
+    };
+    if let Err(error) = followed {
+        tracing::warn!(%error, "the name in this device's commits did not follow its name");
+    }
 }
 
 /// R607-02: this device's record in the account's repository follows its
@@ -3943,24 +3978,15 @@ async fn rename_account_device(
     renamed.map(|_| ())
 }
 
-/// Rename this device: both of its files in the person's directory move in
-/// one commit, and the name is remembered on this install. A device not yet
-/// registered only changes the name its first registration will use.
+/// Rename this device's record in the account: its files in the person's
+/// directory move in one commit, and the name is remembered on this
+/// install. A device not yet registered only changes the name its first
+/// registration will use. Reached only through This device's name
+/// ([`rename_account_device`], R-HQ-94 amendment 2 (9): one editable name).
 ///
-/// Refused — as the command's error only, leaving the account's status as it
-/// was — when the directory in the clone is not this person's, or the
-/// repository will not take the move.
-#[tauri::command]
-pub async fn account_rename_device(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<AccountVm, IpcError> {
-    let renamed = rename_device(state, name).await;
-    // The gate is free again: a change noted during the rename goes now.
-    resync_if_dirty();
-    renamed
-}
-
+/// Refused — as the error only, leaving the account's status as it was —
+/// when the directory in the clone is not this person's, or the repository
+/// will not take the move.
 async fn rename_device(state: State<'_, AppState>, name: String) -> Result<AccountVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let to = layout::device_slug(&name);

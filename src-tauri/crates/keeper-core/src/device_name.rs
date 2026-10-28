@@ -72,14 +72,15 @@ pub enum NameRefusal {
     /// would let this device approve its own agent's T4 request (R607-01).
     #[error("This device runs {agent}; its name stays {host}.")]
     Runs { agent: String, host: String },
-    /// The agents server's directory is not on this device yet, so whether
-    /// it runs an agent cannot be told.
-    #[error(
-        "keeper has not read your agents server's list of devices and agents on this device \
-         yet, so it cannot tell whether this device runs one of your agents. Its name stays {0} \
-         until it has; try again once it is connected."
-    )]
-    Unread(String),
+    /// The agents server's directory is not complete on this device yet, so
+    /// whether it runs an agent cannot be told (R-HQ-94 amendment 2 (5)).
+    #[error("{}", unread_sentence(current, database.as_deref()))]
+    Unread {
+        current: String,
+        /// The database not held, or whose client list has not synced;
+        /// `None` when the agents service has not read anything yet.
+        database: Option<String>,
+    },
     /// This device holds a credential the agents server can move to a new
     /// name only by adopting it under the same client id — through the
     /// account's sign-in — and no sign-in can do that here. A new pairing or
@@ -94,7 +95,7 @@ pub enum NameRefusal {
 }
 
 /// What the agents server's directory, as this device's replicas hold it,
-/// says about a rename (R-HQ-94 and its amendment).
+/// says about a rename (R-HQ-94 and its amendments).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Directory {
     /// The hosts the person's other live devices have.
@@ -102,13 +103,41 @@ pub struct Directory {
     /// Every live agent instance in the person's databases: its agent and
     /// the host it runs on.
     pub instances: Vec<(String, String)>,
-    /// The host the server bound this device's credential to, when keeper
-    /// recorded it.
+    /// The host the server last heard from this device's credential, when
+    /// keeper recorded it.
     pub bound: Option<String>,
+    /// The host this device's credential was created with — the one the
+    /// server's T4 rule compares (`t4_host`, amendment 2 (6)).
+    pub enrolled: Option<String>,
     /// The agents server that holds this device's credential, when nothing
     /// can adopt it there under a new name: no account is set up, or the
     /// server offers no sign-in or refused the account's.
     pub pinned: Option<String>,
+}
+
+/// Why the directory cannot be read: the database that is not held or has
+/// not synced its client list, or `None` when nothing is read yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unread {
+    pub database: Option<String>,
+}
+
+/// The directory, or why it cannot be read yet.
+pub type DirectoryRead = Result<Directory, Unread>;
+
+fn unread_sentence(current: &str, database: Option<&str>) -> String {
+    match database {
+        Some(database) => format!(
+            "keeper has not read the devices and agents of {database} on this device yet, so it \
+             cannot tell whether this device runs one of your agents there. Its name stays \
+             {current} until it has; try again once {database} has synced."
+        ),
+        None => format!(
+            "keeper has not read your agents server's list of devices and agents on this \
+             device yet, so it cannot tell whether this device runs one of your agents. Its \
+             name stays {current} until it has; try again once it is connected."
+        ),
+    }
 }
 
 /// Why a name could not be set: refused, or not stored.
@@ -120,11 +149,39 @@ pub enum DeviceNameError {
     Core(#[from] CoreError),
 }
 
+/// Whether `c` is one of the characters JavaScript's `String.prototype.trim`
+/// removes — ECMAScript's WhiteSpace and LineTerminator, which the agents
+/// server's naming rule trims with (amendment 2 (8)). Not Rust's
+/// `char::is_whitespace`: the two differ on U+FEFF (trimmed here, kept by
+/// Rust) and U+0085 (kept here, trimmed by Rust).
+pub fn is_server_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
+/// `raw` trimmed as the agents server trims a host ([`is_server_space`]).
+pub fn server_trim(raw: &str) -> &str {
+    raw.trim_matches(is_server_space)
+}
+
 /// The agents server's rule for a device's host (keeper-hq
-/// `server/src/device-name.ts`, `deviceNaming`; 109.1): trimmed, then 1 to
-/// [`MAX_HOST_UNITS`] UTF-16 code units. The host as it is sent.
+/// `server/src/device-name.ts`, `deviceNaming`; 109.1): trimmed as the
+/// server trims ([`server_trim`]), then 1 to [`MAX_HOST_UNITS`] UTF-16 code
+/// units. The host as it is sent.
 pub fn host_rule(raw: &str) -> Result<&str, NameRefusal> {
-    let host = raw.trim();
+    let host = server_trim(raw);
     if host.is_empty() {
         return Err(NameRefusal::Blank);
     }
@@ -135,21 +192,30 @@ pub fn host_rule(raw: &str) -> Result<&str, NameRefusal> {
     Ok(host)
 }
 
-/// Whether this device may stop being called `current` (R-HQ-94 amendment,
-/// R607-01): not while it is the host of one of the person's agent
-/// instances — by the name it has, or by the host the server bound its
-/// credential to — not while the directory that would say so is unread
-/// (`None`), and not where the server could learn the new name only from a
-/// new device ([`NameRefusal::Pinned`]).
+/// Whether this device may stop being called `current` (R-HQ-94
+/// amendments): not while it is the host of one of the person's agent
+/// instances — by the name it has, the system's name, the host its
+/// credential was created with, or the last host the server heard — not
+/// while the directory that would say so is incomplete, and not where the
+/// server could learn the new name only from a new device
+/// ([`NameRefusal::Pinned`]).
 pub fn may_leave<'d>(
     current: &str,
-    directory: Option<&'d Directory>,
+    system: &str,
+    directory: &'d DirectoryRead,
 ) -> Result<&'d Directory, NameRefusal> {
-    let current = current.trim();
-    let Some(directory) = directory else {
-        return Err(NameRefusal::Unread(current.to_owned()));
+    let current = server_trim(current);
+    let system = server_trim(system);
+    let directory = directory.as_ref().map_err(|unread| NameRefusal::Unread {
+        current: current.to_owned(),
+        database: unread.database.clone(),
+    })?;
+    let mine = |host: &str| {
+        host == current
+            || host == system
+            || directory.enrolled.as_deref() == Some(host)
+            || directory.bound.as_deref() == Some(host)
     };
-    let mine = |host: &str| host == current || directory.bound.as_deref() == Some(host);
     if let Some((agent, host)) = directory.instances.iter().find(|(_, host)| mine(host)) {
         return Err(NameRefusal::Runs {
             agent: agent.clone(),
@@ -173,14 +239,19 @@ pub fn may_leave<'d>(
 pub fn check<'a>(
     raw: &'a str,
     current: &str,
-    directory: Option<&Directory>,
+    system: &str,
+    directory: &DirectoryRead,
 ) -> Result<&'a str, NameRefusal> {
     let name = host_rule(raw)?;
-    if name == current.trim() {
+    if name == server_trim(current) {
         return Ok(name);
     }
-    let directory = may_leave(current, directory)?;
-    if directory.taken.iter().any(|other| other.trim() == name) {
+    let directory = may_leave(current, system, directory)?;
+    if directory
+        .taken
+        .iter()
+        .any(|other| server_trim(other) == name)
+    {
         return Err(NameRefusal::Taken(name.to_owned()));
     }
     Ok(name)
@@ -189,7 +260,7 @@ pub fn check<'a>(
 /// The effective name: `stored` — the person's — over `system`. A stored
 /// name the rule refuses (a row written by hand) is not used.
 pub fn resolve(stored: Option<&str>, system: &str) -> DeviceNameVm {
-    let system = system.trim().to_owned();
+    let system = server_trim(system).to_owned();
     match stored.map(host_rule) {
         Some(Ok(name)) => DeviceNameVm {
             name: name.to_owned(),
@@ -233,10 +304,10 @@ pub fn plan_set(
     data_dir: &Path,
     raw: &str,
     system: &str,
-    directory: Option<&Directory>,
+    directory: &DirectoryRead,
 ) -> Result<DeviceNameVm, DeviceNameError> {
     let current = read(data_dir, system)?;
-    let name = check(raw, &current.name, directory)?;
+    let name = check(raw, &current.name, system, directory)?;
     Ok(resolve(Some(name), system))
 }
 
@@ -245,12 +316,12 @@ pub fn plan_set(
 pub fn plan_reset(
     data_dir: &Path,
     system: &str,
-    directory: Option<&Directory>,
+    directory: &DirectoryRead,
 ) -> Result<DeviceNameVm, DeviceNameError> {
     let current = read(data_dir, system)?;
     let after = resolve(None, system);
     if after.name != current.name {
-        may_leave(&current.name, directory)?;
+        may_leave(&current.name, system, directory)?;
     }
     Ok(after)
 }
@@ -324,12 +395,13 @@ mod tests {
                 ("nixi".to_owned(), "hesperia".to_owned()),
             ],
             bound: Some("hesperia".to_owned()),
+            enrolled: Some("hesperia".to_owned()),
             pinned: None,
         }
     }
 
     fn set(dir: &Path, raw: &str, system: &str, directory: &Directory) -> DeviceNameVm {
-        let after = plan_set(dir, raw, system, Some(directory)).expect("planned");
+        let after = plan_set(dir, raw, system, &Ok(directory.clone())).expect("planned");
         store(dir, &after).expect("stored");
         after
     }
@@ -369,7 +441,7 @@ mod tests {
             Some("kalypso")
         );
 
-        let reset = plan_reset(dir, "iPhone", Some(&unpaired())).expect("planned");
+        let reset = plan_reset(dir, "iPhone", &Ok(unpaired())).expect("planned");
         assert_eq!(
             registry::get_device_name(dir).expect("row").as_deref(),
             Some("kalypso"),
@@ -388,7 +460,7 @@ mod tests {
     fn the_servers_host_rule_refuses_blank_and_overlong_names_and_stores_nothing() {
         let tmp = data_dir();
         let dir = tmp.path();
-        let refused = |raw: &str| refused(plan_set(dir, raw, "hesperia", Some(&unpaired())));
+        let refused = |raw: &str| refused(plan_set(dir, raw, "hesperia", &Ok(unpaired())));
         assert_eq!(refused("   "), NameRefusal::Blank);
         assert_eq!(
             refused("   ").to_string(),
@@ -413,7 +485,7 @@ mod tests {
             ..Directory::default()
         };
         assert_eq!(
-            check(" hesperia ", "iPhone", Some(&directory)),
+            check(" hesperia ", "iPhone", "macbook", &Ok(directory.clone())),
             Err(NameRefusal::Taken("hesperia".to_owned()))
         );
         assert_eq!(
@@ -422,10 +494,13 @@ mod tests {
              Give this one a name of its own."
         );
         assert_eq!(
-            check("Hesperia", "iPhone", Some(&directory)),
+            check("Hesperia", "iPhone", "macbook", &Ok(directory.clone())),
             Ok("Hesperia")
         );
-        assert_eq!(check("kalypso", "iPhone", Some(&directory)), Ok("kalypso"));
+        assert_eq!(
+            check("kalypso", "iPhone", "macbook", &Ok(directory.clone())),
+            Ok("kalypso")
+        );
     }
 
     /// R607-01: a device that is the host of one of the person's agent
@@ -441,7 +516,7 @@ mod tests {
             host: "hesperia".to_owned(),
         };
         assert_eq!(
-            check("studio", "hesperia", Some(&directory)),
+            check("studio", "hesperia", "macbook", &Ok(directory.clone())),
             Err(runs.clone())
         );
         assert_eq!(
@@ -450,22 +525,25 @@ mod tests {
         );
         // Saving the name it has changes nothing on the server.
         assert_eq!(
-            check("hesperia", "hesperia", Some(&directory)),
+            check("hesperia", "hesperia", "macbook", &Ok(directory.clone())),
             Ok("hesperia")
         );
         // Already called something else here, still bound to hesperia there.
-        assert_eq!(check("den", "studio", Some(&directory)), Err(runs.clone()));
+        assert_eq!(
+            check("den", "studio", "macbook", &Ok(directory.clone())),
+            Err(runs.clone())
+        );
 
         let tmp = data_dir();
         let dir = tmp.path();
         registry::set_device_name(dir, "hesperia").expect("row");
         assert_eq!(
-            refused(plan_reset(dir, "macbook", Some(&directory))),
+            refused(plan_reset(dir, "macbook", &Ok(directory.clone()))),
             runs,
             "Reset is a rename too"
         );
         assert_eq!(
-            refused(plan_set(dir, "studio", "macbook", Some(&directory))),
+            refused(plan_set(dir, "studio", "macbook", &Ok(directory.clone()))),
             runs
         );
         assert_eq!(
@@ -477,33 +555,126 @@ mod tests {
         let phone = Directory {
             taken: vec!["hesperia".to_owned()],
             bound: Some("iPhone".to_owned()),
+            enrolled: Some("iPhone".to_owned()),
             ..hesperia_runs_nixi()
         };
-        assert_eq!(check("kalypso", "iPhone", Some(&phone)), Ok("kalypso"));
-        assert_eq!(check("electra", "iPhone", Some(&phone)), Ok("electra"));
-    }
-
-    /// A directory not read yet is an honest refusal, never a guess; the
-    /// name it already has can still be saved.
-    #[test]
-    fn an_unread_directory_refuses_a_rename_honestly() {
         assert_eq!(
-            check("studio", "hesperia", None),
-            Err(NameRefusal::Unread("hesperia".to_owned()))
+            check("kalypso", "iPhone", "macbook", &Ok(phone.clone())),
+            Ok("kalypso")
         );
         assert_eq!(
-            NameRefusal::Unread("hesperia".to_owned()).to_string(),
+            check("electra", "iPhone", "macbook", &Ok(phone.clone())),
+            Ok("electra")
+        );
+    }
+
+    /// A directory not read, or not complete, is an honest refusal naming
+    /// what is missing, never a guess; the name it already has can still be
+    /// saved (amendment 2 (5)).
+    #[test]
+    fn an_unread_directory_refuses_a_rename_honestly() {
+        let nothing: DirectoryRead = Err(Unread::default());
+        let beta: DirectoryRead = Err(Unread {
+            database: Some("beta".to_owned()),
+        });
+        let unread = |database: Option<&str>| NameRefusal::Unread {
+            current: "hesperia".to_owned(),
+            database: database.map(str::to_owned),
+        };
+        assert_eq!(
+            check("studio", "hesperia", "hesperia", &nothing),
+            Err(unread(None))
+        );
+        assert_eq!(
+            unread(None).to_string(),
             "keeper has not read your agents server's list of devices and agents on this \
              device yet, so it cannot tell whether this device runs one of your agents. Its \
              name stays hesperia until it has; try again once it is connected."
         );
-        assert_eq!(check("hesperia", "hesperia", None), Ok("hesperia"));
+        assert_eq!(
+            check("studio", "hesperia", "hesperia", &beta),
+            Err(unread(Some("beta")))
+        );
+        assert_eq!(
+            unread(Some("beta")).to_string(),
+            "keeper has not read the devices and agents of beta on this device yet, so it \
+             cannot tell whether this device runs one of your agents there. Its name stays \
+             hesperia until it has; try again once beta has synced."
+        );
+        assert_eq!(
+            check("hesperia", "hesperia", "hesperia", &beta),
+            Ok("hesperia")
+        );
         let tmp = data_dir();
         registry::set_device_name(tmp.path(), "studio").expect("row");
         assert_eq!(
-            refused(plan_reset(tmp.path(), "hesperia", None)),
-            NameRefusal::Unread("studio".to_owned())
+            refused(plan_reset(tmp.path(), "hesperia", &beta)),
+            NameRefusal::Unread {
+                current: "studio".to_owned(),
+                database: Some("beta".to_owned()),
+            }
         );
+    }
+
+    /// Amendment 2 (6), R607-05: the check compares every name the server
+    /// may know this device by — the host its credential was created with
+    /// (`t4_host`), the last host it heard, the system's name and the name
+    /// now — so a device renamed once (hesperia → studio) before an agent was
+    /// installed under its first host still keeps its name.
+    #[test]
+    fn every_name_the_server_knows_this_device_by_counts() {
+        let runs = Err(NameRefusal::Runs {
+            agent: "nixi".to_owned(),
+            host: "hesperia".to_owned(),
+        });
+        let renamed_once = Directory {
+            bound: Some("studio".to_owned()),
+            enrolled: Some("hesperia".to_owned()),
+            ..hesperia_runs_nixi()
+        };
+        assert_eq!(check("den", "studio", "macbook", &Ok(renamed_once)), runs);
+        let by_system = Directory {
+            bound: Some("studio".to_owned()),
+            enrolled: Some("studio".to_owned()),
+            ..hesperia_runs_nixi()
+        };
+        assert_eq!(check("den", "studio", "hesperia", &Ok(by_system)), runs);
+        let elsewhere = Directory {
+            bound: Some("studio".to_owned()),
+            enrolled: Some("studio".to_owned()),
+            ..hesperia_runs_nixi()
+        };
+        assert_eq!(check("den", "studio", "macbook", &Ok(elsewhere)), Ok("den"));
+    }
+
+    /// Every character JavaScript's `String.prototype.trim` removes, as bun
+    /// 1.x answers `String.fromCodePoint(c).trim() === ""` over all of
+    /// Unicode (ECMAScript WhiteSpace + LineTerminator).
+    const SERVER_TRIMS: [u32; 25] = [
+        0x9, 0xA, 0xB, 0xC, 0xD, 0x20, 0xA0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004,
+        0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000,
+        0xFEFF,
+    ];
+
+    /// Amendment 2 (8), R607-07: keeper trims a name exactly as the agents
+    /// server does — every code point, so U+FEFF (trimmed by JS, kept by
+    /// Rust's `trim`) and U+0085 (the reverse) agree with the server.
+    #[test]
+    fn a_name_is_trimmed_exactly_as_the_server_trims_it() {
+        for code in 0..=0x10FFFF_u32 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            assert_eq!(
+                is_server_space(c),
+                SERVER_TRIMS.contains(&code),
+                "U+{code:04X}"
+            );
+        }
+        assert_eq!(host_rule("\u{FEFF}"), Err(NameRefusal::Blank));
+        assert_eq!(host_rule("\u{FEFF}kalypso\u{FEFF}"), Ok("kalypso"));
+        assert_eq!(host_rule("\u{85}kalypso"), Ok("\u{85}kalypso"));
+        assert_eq!(host_rule("\u{85}"), Ok("\u{85}"));
     }
 
     /// keeper-hq R69-02: where only a new pairing or a fresh sign-in could
@@ -520,7 +691,7 @@ mod tests {
             current: "iPhone".to_owned(),
         };
         assert_eq!(
-            check("kalypso", "iPhone", Some(&pinned)),
+            check("kalypso", "iPhone", "macbook", &Ok(pinned.clone())),
             Err(refusal.clone())
         );
         assert_eq!(
@@ -529,13 +700,16 @@ mod tests {
              account's sign-in can give it a new one there; pairing it again would make it a \
              different device. Its name stays iPhone."
         );
-        assert_eq!(check("iPhone", "iPhone", Some(&pinned)), Ok("iPhone"));
+        assert_eq!(
+            check("iPhone", "iPhone", "macbook", &Ok(pinned.clone())),
+            Ok("iPhone")
+        );
         let both = Directory {
             pinned: Some("agents.example.org".to_owned()),
             ..hesperia_runs_nixi()
         };
         assert!(matches!(
-            check("studio", "hesperia", Some(&both)),
+            check("studio", "hesperia", "macbook", &Ok(both.clone())),
             Err(NameRefusal::Runs { .. })
         ));
     }

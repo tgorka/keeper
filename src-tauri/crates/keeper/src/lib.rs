@@ -1128,7 +1128,6 @@ pub fn run() {
                 account_ipc::account_sign_in,
                 account_ipc::account_cancel_sign_in,
                 account_ipc::account_sync,
-                account_ipc::account_rename_device,
                 // This device's name (R-HQ-94): every target, the phone above all.
                 account_ipc::device_name_get,
                 account_ipc::device_name_set,
@@ -1492,7 +1491,6 @@ pub fn run() {
                 sync_ipc::sync_get_credential,
                 sync_ipc::sync_clear_credential,
                 sync_ipc::sync_device,
-                sync_ipc::sync_device_set_label,
                 // The Tasks surface (Epic 57, FR-351, AD-137): the five verbs the ⌘8
                 // view drives, over the engine door Stories 57.1–57.4 built. Desktop
                 // only with the rest of sync — `mod sync_ipc` is itself

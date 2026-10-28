@@ -14,7 +14,6 @@ vi.mock("@/lib/ipc/client", () => ({
   // The device name (Story 34.5): read once when the section opens, written by
   // the Rename button.
   syncDevice: vi.fn(),
-  syncDeviceSetLabel: vi.fn(),
   // The Advanced disclosure's access-token field (Story 32.7, Story 34.4): two
   // writes and a read the user has to ask for.
   syncSetCredential: vi.fn(),
@@ -61,9 +60,7 @@ import {
   DeviceSection,
   SYNC_ATTENTION_FALLBACK_SENTENCE,
   SYNC_DEVICE_ID_LABEL,
-  SYNC_DEVICE_NAME_LABEL,
-  SYNC_DEVICE_SAVE_LABEL,
-  SYNC_DEVICE_SAVED_SENTENCE,
+  SYNC_DEVICE_TITLE,
   SYNC_DRIVE_FOLDER_CHOOSE_LABEL,
   SYNC_DRIVE_FOLDER_DEFAULT_LABEL,
   SYNC_DRIVE_FOLDER_LABEL,
@@ -116,7 +113,6 @@ import type { SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/clien
 import {
   syncCredentialSourceSet,
   syncDevice,
-  syncDeviceSetLabel,
   syncDriveFolderGet,
   syncDriveFolderSet,
   syncFolderNow,
@@ -146,7 +142,6 @@ const mockVerify = vi.mocked(syncVerify);
 const mockSetCredential = vi.mocked(syncSetCredential);
 const mockGetCredential = vi.mocked(syncGetCredential);
 const mockDevice = vi.mocked(syncDevice);
-const mockSetDeviceLabel = vi.mocked(syncDeviceSetLabel);
 const mockPicker = vi.mocked(openFolder);
 const mockOpenPath = vi.mocked(syncOpenPath);
 const mockDriveFolderGet = vi.mocked(syncDriveFolderGet);
@@ -1094,55 +1089,19 @@ describe("syncRemoteHost", () => {
  * owns them now.
  */
 describe("DeviceSection (Story 34.5)", () => {
-  it("shows the name and the id keeper writes into every commit", async () => {
+  it("shows the name and the id keeper writes into every commit, and no field to rename it (R-HQ-94 (9))", async () => {
     render(<DeviceSection open />);
 
-    const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
-    expect(field).toHaveValue("hesperia");
+    expect(await screen.findByText("hesperia")).toBeInTheDocument();
+    expect(screen.getByText(SYNC_DEVICE_TITLE)).toBeInTheDocument();
+    // One editable name: this one follows This device's name.
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
     // The id is in every trailer, so someone reading `git log` can find it here.
     // Asserted through the line rather than as one text node: the id is its own
     // element (it is set in the mono face and the label beside it is not).
     expect(screen.getByText("01JDEVICE").closest("p")).toHaveTextContent(
       `${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`,
     );
-  });
-
-  it("renames on request, keeps the id, and says the change is for later commits", async () => {
-    mockSetDeviceLabel.mockResolvedValue({ id: "01JDEVICE", label: "Studio Mac" });
-    render(<DeviceSection open />);
-
-    const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
-    const rename = screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL });
-    // Nothing to do until the name actually differs.
-    expect(rename).toBeDisabled();
-
-    fireEvent.change(field, { target: { value: "  Studio Mac  " } });
-    fireEvent.click(screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL }));
-
-    await waitFor(() => expect(mockSetDeviceLabel).toHaveBeenCalledWith("  Studio Mac  "));
-    // Seeded from what Rust stored, not from what was typed: Rust trims.
-    await waitFor(() =>
-      expect(screen.getByLabelText(SYNC_DEVICE_NAME_LABEL)).toHaveValue("Studio Mac"),
-    );
-    expect(screen.getByText(SYNC_DEVICE_SAVED_SENTENCE)).toBeInTheDocument();
-    expect(screen.getByText("01JDEVICE").closest("p")).toHaveTextContent(
-      `${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`,
-    );
-  });
-
-  it("reports a refused rename instead of showing a name nothing will use", async () => {
-    mockSetDeviceLabel.mockRejectedValue({
-      code: "internal",
-      message: "device label must not be empty",
-    });
-    render(<DeviceSection open />);
-
-    fireEvent.change(await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL), {
-      target: { value: "renamed" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: SYNC_DEVICE_SAVE_LABEL }));
-
-    expect(await screen.findByText("device label must not be empty")).toBeInTheDocument();
-    expect(screen.queryByText(SYNC_DEVICE_SAVED_SENTENCE)).not.toBeInTheDocument();
   });
 });

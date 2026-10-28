@@ -153,6 +153,12 @@ struct Pairing {
     /// keeper recorded it: its host is learnt at the next rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host: Option<String>,
+    /// The host the credential was created with, carried across adoptions:
+    /// the one keeper-hq keeps as `t4_host` (R-HQ-94 amendment 2 (6)).
+    /// Backfilled, like `host`, for a credential kept before keeper recorded
+    /// either ([`Hq::reopen`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrolled_host: Option<String>,
 }
 
 impl std::fmt::Debug for Pairing {
@@ -275,6 +281,27 @@ struct Retired {
     contact: Option<Contact>,
 }
 
+/// This device's names as the agents server hears them (R-HQ-94 amendment
+/// 2 (4)): what the system calls it — every new credential is created under
+/// it, a name nobody sets in Settings — and the name it goes by now, which
+/// an adoption under the same client id moves the server to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceHosts {
+    pub system: String,
+    pub name: String,
+}
+
+impl DeviceHosts {
+    /// A device whose name is the system's.
+    pub fn same(host: impl Into<String>) -> DeviceHosts {
+        let host = host.into();
+        DeviceHosts {
+            system: host.clone(),
+            name: host,
+        }
+    }
+}
+
 /// The agents server, this device's pairing with it, and every replica.
 pub struct Hq {
     me: Weak<Hq>,
@@ -287,7 +314,7 @@ pub struct Hq {
     #[cfg(test)]
     wall_offset: std::sync::atomic::AtomicI64,
     device_name: String,
-    device_host: Box<dyn Fn() -> String + Send + Sync>,
+    device_host: Box<dyn Fn() -> DeviceHosts + Send + Sync>,
     /// Serialises every change of configuration. Never held across a request
     /// to the server; reads never take it.
     lifecycle: tokio::sync::Mutex<()>,
@@ -399,15 +426,16 @@ impl Hq {
     /// A service with nothing open yet; [`Hq::start`] reads the setting.
     /// `sign_in` is the account whose sign-in enrols this device.
     /// `device_name` is how the person's other devices will list this one.
-    /// `device_host` reads the OS host at redemption and at enrolment, after
-    /// any late platform setup.
+    /// `device_host` reads this device's names ([`DeviceHosts`]) at
+    /// redemption, at enrolment and at every restart, after any late
+    /// platform setup.
     pub fn new(
         platform: Arc<dyn Platform>,
         opener: Arc<dyn Opener>,
         routes: Arc<dyn Routes>,
         sign_in: Arc<dyn signin::SignIn>,
         device_name: String,
-        device_host: impl Fn() -> String + Send + Sync + 'static,
+        device_host: impl Fn() -> DeviceHosts + Send + Sync + 'static,
     ) -> Arc<Hq> {
         let (status, _) = watch::channel(no_server());
         let (changes, _) = watch::channel(0);
@@ -475,6 +503,38 @@ impl Hq {
 
     fn data_dir(&self) -> Result<PathBuf, HqError> {
         Ok(self.platform.data_dir()?)
+    }
+
+    /// A credential kept before keeper recorded hosts (R607-06, amendment 2
+    /// (6)): until #607 every credential was created and adopted under the
+    /// system's name, so that is the host the server has and the one its
+    /// `t4_host` backfill took. Recorded at once, so a rename saved before
+    /// a quit is still told to the server at the next start (amendment 2
+    /// (7)).
+    fn backfill_hosts(&self, server: &ServerUrl, pairing: Pairing, system: &str) -> Pairing {
+        if pairing.host.is_some() && pairing.enrolled_host.is_some() {
+            return pairing;
+        }
+        let record = Pairing {
+            enrolled_host: pairing
+                .enrolled_host
+                .clone()
+                .or_else(|| pairing.host.clone())
+                .or_else(|| known_host(system)),
+            host: pairing.host.clone().or_else(|| known_host(system)),
+            ..pairing
+        };
+        match serde_json::to_string(&record) {
+            Ok(stored) => {
+                if let Err(error) = self.platform.keychain_set(&keychain_key(server), &stored) {
+                    tracing::warn!(%error, "the agents server credential's hosts could not be kept");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the agents server credential's hosts could not be kept")
+            }
+        }
+        record
     }
 
     fn read_pairing(&self, server: &ServerUrl) -> Result<Option<Pairing>, HqError> {
@@ -659,8 +719,13 @@ impl Hq {
             Some(server) => Some(server.clone()),
             None => databases::remembered_server(&data_dir),
         };
+        // This device's names now, read once per configuration and never
+        // under the lock: the shell reads a setting and asks the OS.
+        let hosts = (self.device_host)();
         let pairing = match &holding {
-            Some(holding) => self.read_pairing(holding)?,
+            Some(holding) => self
+                .read_pairing(holding)?
+                .map(|pairing| self.backfill_hosts(holding, pairing, &hosts.system)),
             None => None,
         };
         if let (Some(server), Some(_)) = (&server, &pairing) {
@@ -672,10 +737,7 @@ impl Hq {
             (Some(holding), Some(_)) => Authorization::load(&data_dir, holding),
             _ => Authorization::default(),
         };
-        // This device's name now, read once per configuration and never
-        // under the lock: the shell reads a setting and, on a computer with
-        // no name set, asks the OS.
-        let host = known_host(&(self.device_host)());
+        let host = known_host(&hosts.name);
         let (retired, generation) = {
             let mut inner = lock(&self.inner);
             inner.generation += 1;
@@ -1168,7 +1230,10 @@ impl Hq {
 
     async fn redeem(&self, server: ServerUrl, code: PairingCode) -> Result<HqStatusVm, HqError> {
         let generation = lock(&self.inner).generation;
-        let host = (self.device_host)();
+        // A new credential is created under the system's name, never the one
+        // set in Settings (R-HQ-94 amendment 2 (4)): the server keeps it as
+        // `t4_host`. A name set here follows by adoption.
+        let host = (self.device_host)().system;
         let redeemed = {
             let _contact = self.contacts.hold(&server);
             self.routes
@@ -1199,6 +1264,7 @@ impl Hq {
             name: self.device_name.clone(),
             bound: None,
             host: known_host(&host),
+            enrolled_host: known_host(&host),
         };
         let stored = serde_json::to_string(&record).map_err(sentence)?;
         self.platform
@@ -1356,35 +1422,17 @@ impl Hq {
     ///
     /// The server learns a host only when a credential is issued:
     /// `/clients/self/attest` takes no host, and an enrolment's adoption
-    /// does (keeper-hq `store.adopt` sets `host`). So a credential bound to
-    /// the old name is signed in again under the new one, keeping its
-    /// client id — at once when the account can mint a sign-in token, else
-    /// once the person signs in again, which Settings asks for
-    /// ([`HqSignInState::Renamed`]).
-    ///
-    /// `previous` is the name before the change: a credential kept before
-    /// keeper recorded hosts was sent under it, and it is recorded now.
-    pub async fn device_renamed(&self, previous: &str) -> Result<HqStatusVm, HqError> {
-        let host = known_host(&(self.device_host)());
+    /// does (keeper-hq `store.adopt` sets `host`; `t4_host` stays the first,
+    /// #69). So a credential that last told the server another name is
+    /// signed in again under the new one, keeping its client id — at once
+    /// when the account can mint a sign-in token, else once the person signs
+    /// in again, which Settings asks for ([`HqSignInState::Renamed`]). The
+    /// name is the setting the shell stored before calling this, and the
+    /// credential keeps the last host the server confirmed, so a quit before
+    /// the server hears it is picked up at the next start (amendment 2 (7)).
+    pub async fn device_renamed(&self) -> Result<HqStatusVm, HqError> {
+        let host = known_host(&(self.device_host)().name);
         let lifecycle = self.lifecycle.lock().await;
-        let (server, pairing) = {
-            let inner = lock(&self.inner);
-            (inner.server.clone(), inner.pairing.clone())
-        };
-        if let (Some(server), Some(pairing), Some(previous)) =
-            (server, pairing, known_host(previous))
-        {
-            if pairing.host.is_none() {
-                let record = Pairing {
-                    host: Some(previous),
-                    ..pairing
-                };
-                let stored = serde_json::to_string(&record).map_err(sentence)?;
-                self.platform
-                    .keychain_set(&keychain_key(&server), &stored)?;
-                lock(&self.inner).pairing = Some(record);
-            }
-        }
         {
             let mut inner = lock(&self.inner);
             inner.host = host;
@@ -1406,29 +1454,37 @@ impl Hq {
     }
 
     /// What this device's replicas say about renaming it (R-HQ-94 and its
-    /// amendment, [`crate::device_name::Directory`]): the hosts of the
+    /// amendments, [`crate::device_name::Directory`]): the hosts of the
     /// person's other live devices, every live agent instance with its host,
-    /// and the host this device's credential was bound to.
+    /// and the hosts this device's credential was created with and last
+    /// sent.
     ///
     /// With no credential nothing on a server knows this device, so there is
-    /// nothing to protect: an empty directory. `None` while the directory
-    /// cannot be read — the replicas are not open, one cannot be queried, or
-    /// none of them lists this device yet (its directory has not synced) —
-    /// which refuses a rename rather than guessing.
+    /// nothing to protect: an empty directory — a credential created later
+    /// is created under the system's name (amendment 2 (4)). Otherwise the
+    /// directory is read only when it is complete (amendment 2 (5)): every
+    /// database the server opens to this credential is held here, can be
+    /// queried, and its client list has synced — it lists this device. The
+    /// first that is not is named in the [`crate::device_name::Unread`].
     ///
     /// `pinned` names the server when nothing can adopt this device's
     /// credential under a new name: no account is set up, or — a credential
     /// that came from a pairing code — the server offers no sign-in or
     /// refused the account's. A rename never falls back to a new pairing or
     /// a fresh sign-in, which would be a new client id (keeper-hq R69-02).
-    pub fn device_directory(&self) -> Option<crate::device_name::Directory> {
+    pub fn device_directory(&self) -> crate::device_name::DirectoryRead {
+        use crate::device_name::{Directory, Unread};
         let no_account = self.sign_in.account() == signin::AccountState::NoAccount;
-        let (replicas, pairing, open, server, cannot_sign_in) = {
+        let (held, listed, pairing, open, server, cannot_sign_in) = {
             let inner = lock(&self.inner);
-            let replicas: Vec<Arc<dyn Replica>> =
-                inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
+            let held: Vec<(String, Arc<dyn Replica>)> = inner
+                .dbs
+                .iter()
+                .map(|db| (db.name.clone(), Arc::clone(&db.replica)))
+                .collect();
             (
-                replicas,
+                held,
+                inner.authorization.open.clone(),
                 inner.pairing.clone(),
                 matches!(inner.local_open, LocalOpen::Open),
                 inner.server.as_ref().map(|server| server.host().to_owned()),
@@ -1439,33 +1495,42 @@ impl Hq {
             )
         };
         let Some(pairing) = pairing else {
-            return Some(crate::device_name::Directory::default());
+            return Ok(Directory::default());
         };
-        if !open || replicas.is_empty() {
-            return None;
+        // A credential that opens no database yet: nothing says the
+        // directory is empty.
+        if !open || listed.is_empty() {
+            return Err(Unread::default());
         }
         let pinned = no_account || (pairing.bound.is_none() && cannot_sign_in);
-        let mut directory = crate::device_name::Directory {
+        let mut directory = Directory {
             bound: pairing.host.clone(),
+            enrolled: pairing.enrolled_host.clone(),
             pinned: pinned.then(|| server.unwrap_or_else(|| "Your agents server".to_owned())),
             ..Default::default()
         };
-        let mut listed = false;
-        for replica in &replicas {
+        for database in &listed {
+            let unread = || Unread {
+                database: Some(database.clone()),
+            };
+            let Some((_, replica)) = held.iter().find(|(name, _)| name == database) else {
+                return Err(unread());
+            };
             let rows = match replica.query(
                 "SELECT id, actor_id, kind, host, revoked_at_ms FROM clients",
                 &[],
             ) {
                 Ok(rows) => rows,
                 Err(error) => {
-                    tracing::info!(%error, "an agents replica's directory could not be read");
-                    return None;
+                    tracing::info!(%error, database, "an agents replica's directory could not be read");
+                    return Err(unread());
                 }
             };
+            let mut synced = false;
             for row in rows {
                 let text = |key: &str| row.get(key).and_then(Value::as_str);
                 if text("id") == Some(pairing.client_id.as_str()) {
-                    listed = true;
+                    synced = true;
                     continue;
                 }
                 if row.get("revoked_at_ms").is_some_and(|v| !v.is_null()) {
@@ -1491,8 +1556,11 @@ impl Hq {
                     _ => {}
                 }
             }
+            if !synced {
+                return Err(unread());
+            }
         }
-        listed.then_some(directory)
+        Ok(directory)
     }
 }
 

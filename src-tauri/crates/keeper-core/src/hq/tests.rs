@@ -143,7 +143,7 @@ impl World {
             Arc::clone(&self.routes) as Arc<dyn Routes>,
             Arc::new(signin::NoAccount),
             "keeper on test".to_owned(),
-            || "test".to_owned(),
+            || DeviceHosts::same("test"),
         )
     }
 
@@ -162,6 +162,7 @@ impl World {
             name: "keeper on test".to_owned(),
             bound: None,
             host: None,
+            enrolled_host: None,
         };
         self.platform
             .keychain_set(
@@ -223,7 +224,7 @@ async fn pairing_registers_the_host_not_the_display_name() {
             Arc::new(routes::HttpRoutes::new()),
             Arc::new(signin::NoAccount),
             "My keeper".to_owned(),
-            move || lock(&provided_host).clone(),
+            move || DeviceHosts::same(lock(&provided_host).clone()),
         );
         hq.start().await.expect("starts");
         hq.set_server(&server.base).await.expect("sets server");
@@ -601,26 +602,42 @@ async fn the_devices_follow_the_replicated_directory() {
     .await;
 }
 
-/// R-HQ-94 and its amendment: what a rename is checked against is read from
+/// R-HQ-94 and its amendments: what a rename is checked against is read from
 /// the replicated directory — the hosts of the person's other live devices
 /// (never this one's, a removed one's, a blank one or someone else's) and
-/// every live agent instance with its host. Until this device is listed
-/// there the directory is unread, and with no credential there is nothing
-/// to protect.
+/// every live agent instance with its host — and only once it is complete:
+/// every database the server opens to this device held here, with its
+/// client list synced (it lists this device). With no credential there is
+/// nothing to protect.
+///
+/// Probe A (Rev607r2, R607-04): alpha synced, beta held but not synced, is
+/// not read — beta may list `nixi@hesperia` — and the refusal names beta.
 #[tokio::test]
-async fn a_rename_is_checked_against_the_replicated_directory() {
+async fn a_rename_is_checked_against_the_complete_replicated_directory() {
+    use crate::device_name::{Directory, Unread};
     let world = World::new();
     let unpaired = world.hq();
     unpaired.start().await.expect("starts");
-    assert_eq!(
-        unpaired.device_directory(),
-        Some(crate::device_name::Directory::default())
-    );
+    assert_eq!(unpaired.device_directory(), Ok(Directory::default()));
     unpaired.shutdown().await;
 
-    world.paired("https://hq.example.org", &["alpha"]);
+    let server = world.paired("https://hq.example.org", &["alpha", "beta"]);
+    let opens = |open: &[&str]| {
+        crate::hq::databases::Authorization {
+            removed: false,
+            open: open.iter().map(|db| (*db).to_owned()).collect(),
+        }
+        .save(&world.data_dir(), &server)
+        .expect("saved");
+    };
+    opens(&["alpha", "beta"]);
     let hq = world.hq();
     hq.start().await.expect("starts");
+    let unread = |database: &str| {
+        Err(Unread {
+            database: Some(database.to_owned()),
+        })
+    };
     let row = |id: &str, actor: &str, kind: &str, host: &str, revoked: Option<i64>| {
         let Value::Object(row) = serde_json::json!({
             "id": id, "actor_id": actor, "kind": kind, "host": host, "created_at_ms": 1,
@@ -630,34 +647,56 @@ async fn a_rename_is_checked_against_the_replicated_directory() {
         };
         row
     };
-    let alpha = world.live("alpha")[0].clone();
+    let (alpha, beta) = (
+        world.live("alpha")[0].clone(),
+        world.live("beta")[0].clone(),
+    );
     alpha.replicate(vec![row("ana.2", "ana", "device", "kalypso", None)]);
-    assert_eq!(hq.device_directory(), None, "this device is not listed yet");
+    assert_eq!(
+        hq.device_directory(),
+        unread("alpha"),
+        "this device is not listed yet"
+    );
 
     alpha.replicate(vec![
-        row("ana.1", "ana", "device", "hesperia", None),
+        row("ana.1", "ana", "device", "test", None),
         row("ana.2", "ana", "device", "kalypso", None),
         row("ana.3", "ana", "device", "electra", Some(5)),
         row("ana.4", "ana", "device", "  ", None),
         row("ana.5", "ana", "device", "kalypso", None),
         row("bo.1", "bo", "device", "attic", None),
-        row("nixi.hesperia", "nixi", "instance", "hesperia", None),
         row("dixi.electra", "dixi", "instance", "electra", None),
         row("dixi.old", "dixi", "instance", "den", Some(9)),
+    ]);
+    // Probe A: beta has not synced its client list.
+    assert_eq!(hq.device_directory(), unread("beta"));
+
+    beta.replicate(vec![
+        row("ana.1", "ana", "device", "test", None),
+        row("nixi.hesperia", "nixi", "instance", "hesperia", None),
     ]);
     let directory = hq.device_directory().expect("read");
     assert_eq!(directory.taken, ["kalypso"]);
     assert_eq!(
         directory.instances,
         [
-            ("nixi".to_owned(), "hesperia".to_owned()),
             ("dixi".to_owned(), "electra".to_owned()),
+            ("nixi".to_owned(), "hesperia".to_owned()),
         ]
     );
-    assert_eq!(directory.bound, None, "a pairing kept before hosts were");
+    // Kept before hosts were recorded: backfilled with the system's name.
+    assert_eq!(directory.bound.as_deref(), Some("test"));
+    assert_eq!(directory.enrolled.as_deref(), Some("test"));
     // This world has no account: nothing can adopt the pairing under a new
     // name, and a new pairing would be a new device.
     assert_eq!(directory.pinned.as_deref(), Some("hq.example.org"));
+    hq.shutdown().await;
+
+    // A database the server opens that this device does not hold.
+    opens(&["alpha", "beta", "gamma"]);
+    let again = world.hq();
+    again.start().await.expect("starts");
+    assert_eq!(again.device_directory(), unread("gamma"));
 }
 
 #[cfg(unix)]
@@ -932,7 +971,7 @@ async fn staged_session(
         Arc::clone(&world.routes) as Arc<dyn Routes>,
         Arc::new(signin::NoAccount),
         "keeper on test".to_owned(),
-        || "test".to_owned(),
+        || DeviceHosts::same("test"),
     );
     hq.start().await.expect("starts");
     let staged = lock(&opener.0).clone().expect("alpha opened");
@@ -1347,7 +1386,7 @@ fn real_hq(world: &World, opener: Arc<dyn Opener>) -> Arc<Hq> {
         Arc::clone(&world.routes) as Arc<dyn Routes>,
         Arc::new(signin::NoAccount),
         "keeper on test".to_owned(),
-        || "test".to_owned(),
+        || DeviceHosts::same("test"),
     )
 }
 
@@ -1621,7 +1660,7 @@ async fn spoken_world(world: &World, databases: &[&str]) -> (Arc<Hq>, Arc<LocalO
         Arc::clone(&world.routes) as Arc<dyn Routes>,
         Arc::new(signin::NoAccount),
         "keeper on test".to_owned(),
-        || "test".to_owned(),
+        || DeviceHosts::same("test"),
     );
     hq.start().await.expect("starts");
     for database in databases {

@@ -5302,22 +5302,6 @@ export async function syncDevice(): Promise<SyncDeviceVm> {
 }
 
 /**
- * Rename this device, resolving the identity as stored.
- *
- * Takes effect on the next commit and rewrites nothing: a `Keeper-Device`
- * trailer already in a repository keeps the name the machine had when it made
- * that commit. The `id` never changes -- it is what a shared history tells two
- * machines apart by, and what the git author address is derived from.
- *
- * Use the resolved label rather than the argument: the store trims it.
- *
- * Rejects with: `unsupported`, `internal` (an empty label).
- */
-export async function syncDeviceSetLabel(label: string): Promise<SyncDeviceVm> {
-  return await invoke<SyncDeviceVm>("sync_device_set_label", { label });
-}
-
-/**
  * Stream sync progress, resolving the subscription id.
  *
  * Complements {@link syncStatuses} rather than replacing it: this gives a
@@ -8706,11 +8690,6 @@ export async function accountCancelSignIn(): Promise<void> {
  */
 export async function accountSync(force: boolean): Promise<OrgAccountVm> {
   return await invoke<OrgAccountVm>("account_sync", { force });
-}
-
-/** Rename this device; its two files inside the person's directory move in one commit. */
-export async function accountRenameDevice(name: string): Promise<OrgAccountVm> {
-  return await invoke<OrgAccountVm>("account_rename_device", { name });
 }
 
 /**

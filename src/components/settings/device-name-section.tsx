@@ -26,7 +26,7 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 
 export const DEVICE_NAME_TITLE = "This device's name";
 export const DEVICE_NAME_NOTE =
-  "The name your agents server and your account know this device by. On a phone the system " +
+  "The name your agents server, your account and your commits know this device by. On a phone the system " +
   "often says only “iPhone”: give it a name of its own here.";
 export const DEVICE_NAME_SAVE = "Save";
 export const DEVICE_NAME_RESET = "Reset";

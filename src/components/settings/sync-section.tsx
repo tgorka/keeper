@@ -65,7 +65,6 @@ import type {
 import {
   type SyncListSettingsVm,
   syncDevice,
-  syncDeviceSetLabel,
   syncDriveFolderGet,
   syncDriveFolderSet,
   syncListSettingsGet,
@@ -181,22 +180,19 @@ export const SYNC_REMOVE_CONFIRM_LABEL = "Stop syncing";
 export const SYNC_REMOVE_CANCEL_LABEL = "Keep syncing";
 
 /**
- * The device name (Story 34.5). It is not a per-folder setting: one name goes
- * into every commit keeper makes, in every folder, plus the filename of any
- * second copy it has to keep — so it lives beside the folder list rather than in
- * the form.
+ * The name in commits (Story 34.5): one name goes into every commit keeper
+ * makes, in every folder, plus the filename of any second copy it has to keep.
+ * It follows This device's name, the one editable name (R-HQ-94 amendment 2
+ * (9)), so it is shown here read-only.
  *
  * The note has to say what a rename does NOT do. Nothing rewrites history, so a
  * `git log` from before the rename keeps the name this machine had then, and
  * someone who renames a machine to correct a mistake should not be left
  * expecting old commits to change.
  */
-export const SYNC_DEVICE_TITLE = "This device";
-export const SYNC_DEVICE_NAME_LABEL = "Device name";
+export const SYNC_DEVICE_TITLE = "Name in commits";
 export const SYNC_DEVICE_NOTE =
-  "keeper writes this name into every commit it makes, in every folder, and into the filename of any second copy it has to keep when two machines change the same file. Renaming it changes what later commits say — the ones already made keep the name this machine had then.";
-export const SYNC_DEVICE_SAVE_LABEL = "Rename";
-export const SYNC_DEVICE_SAVED_SENTENCE = "The next commit will carry the new name.";
+  "keeper writes this device's name into every commit it makes, in every folder, and into the filename of any second copy it has to keep when two machines change the same file. Change it under This device's name; later commits carry the new name, and the ones already made keep the name this machine had then.";
 /** The stable id, shown because it is in every trailer and never changes. */
 export const SYNC_DEVICE_ID_LABEL = "Identifier";
 export const SYNC_DEVICE_ID_NOTE =
@@ -997,17 +993,13 @@ function SyncProfileRow({
  * (`sync(tgdrive@hesperia)`). Someone looking for "what is this Mac called"
  * should not have to know that folder sync is where it was filed.
  *
- * Still rendered only where sync exists, because the identity is read and written
- * through the sync engine's own IPC — there is nothing to show on a machine that
- * has none.
+ * Read-only: it follows This device's name (R-HQ-94 amendment 2 (9)). Still
+ * rendered only where sync exists, because the identity is read through the
+ * sync engine's own IPC — there is nothing to show on a machine that has none.
  */
 export function DeviceSection({ open }: { open: boolean }) {
   const [device, setDevice] = useState<SyncDeviceVm | null>(null);
-  const [deviceName, setDeviceName] = useState("");
-  const [deviceBusy, setDeviceBusy] = useState(false);
   const [deviceError, setDeviceError] = useState<string | null>(null);
-  /** Whether a rename went through; nothing else on screen would report it. */
-  const [deviceRenamed, setDeviceRenamed] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -1019,7 +1011,6 @@ export function DeviceSection({ open }: { open: boolean }) {
         const read = await syncDevice();
         if (live) {
           setDevice(read);
-          setDeviceName(read.label);
         }
       } catch (raw) {
         logFailure("sync.device")(raw);
@@ -1033,60 +1024,11 @@ export function DeviceSection({ open }: { open: boolean }) {
     };
   }, [open]);
 
-  const renameDevice = async () => {
-    setDeviceBusy(true);
-    setDeviceError(null);
-    setDeviceRenamed(false);
-    try {
-      const stored = await syncDeviceSetLabel(deviceName);
-      setDevice(stored);
-      // Seeded from what was STORED, not from what was typed: Rust trims, and a
-      // box that kept the untrimmed text would disagree with the trailers.
-      setDeviceName(stored.label);
-      setDeviceRenamed(true);
-    } catch (raw) {
-      logFailure("sync.deviceSetLabel")(raw);
-      setDeviceError(syncErrorMessage(raw));
-    } finally {
-      setDeviceBusy(false);
-    }
-  };
-  const renameable =
-    device !== null && deviceName.trim() !== "" && deviceName.trim() !== device.label;
-
   return (
     <div className="mt-2 flex flex-col gap-3 border-border border-t pt-3 text-sm">
       <p className="font-medium">{SYNC_DEVICE_TITLE}</p>
-      <div className="flex items-center justify-between gap-2">
-        <Label htmlFor="sync-device-name">{SYNC_DEVICE_NAME_LABEL}</Label>
-        <div className="flex items-center gap-1">
-          <Input
-            id="sync-device-name"
-            className="w-56"
-            value={deviceName}
-            disabled={device === null || deviceBusy}
-            onChange={(event) => {
-              setDeviceRenamed(false);
-              setDeviceName(event.target.value);
-            }}
-          />
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            disabled={!renameable || deviceBusy}
-            onClick={() => {
-              void renameDevice();
-            }}
-          >
-            {SYNC_DEVICE_SAVE_LABEL}
-          </Button>
-        </div>
-      </div>
+      {device !== null && <p className="font-mono [overflow-wrap:anywhere]">{device.label}</p>}
       <p className="text-muted-foreground text-xs">{SYNC_DEVICE_NOTE}</p>
-      {deviceRenamed && (
-        <p className="text-muted-foreground text-xs">{SYNC_DEVICE_SAVED_SENTENCE}</p>
-      )}
       {deviceError !== null && <p className="text-destructive text-xs">{deviceError}</p>}
       {device !== null && (
         <p className="text-muted-foreground text-xs">

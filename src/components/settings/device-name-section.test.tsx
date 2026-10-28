@@ -93,11 +93,13 @@ describe("DeviceNameSection (R-HQ-94)", () => {
       push(
         hq({
           state: "enrolling",
-          sentence: "Signing this device in to agents.example.org again, under its new name…",
+          sentence: "Updating the name on agents.example.org…",
         }),
       ),
     );
-    expect(screen.getByRole("status")).toHaveTextContent("again, under its new name");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Updating the name on agents.example.org…",
+    );
   });
 
   it("shows Rust's refusal and keeps the typed name", async () => {

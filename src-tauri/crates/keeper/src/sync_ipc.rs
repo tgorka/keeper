@@ -2072,25 +2072,6 @@ pub async fn sync_device(state: tauri::State<'_, AppState>) -> Result<SyncDevice
     Ok(engine.device().into())
 }
 
-/// Rename this device, returning the identity as stored.
-///
-/// Returns the stored form rather than echoing the argument, because the store
-/// trims it and refuses an empty one — a caller that assumed its own string had
-/// been kept verbatim would render a label the trailers do not use.
-///
-/// Rejects with: `unsupported`, `internal` (an empty label).
-#[tauri::command]
-pub async fn sync_device_set_label(
-    state: tauri::State<'_, AppState>,
-    label: String,
-) -> Result<SyncDeviceVm, IpcError> {
-    let engine = engine_of(&state)?;
-    engine
-        .set_device_label(&label)
-        .map_err(|err| sync_ipc_error(&err))?;
-    Ok(engine.device().into())
-}
-
 // ---------------------------------------------------------------------------
 // Tasks (Story 57.5/57.6, FR-351, FR-352, AD-137)
 // ---------------------------------------------------------------------------

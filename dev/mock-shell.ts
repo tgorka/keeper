@@ -6150,7 +6150,7 @@ function deviceRenamed(previous: string): void {
   hqPublish(
     hqPairedStatus("connected", {
       state: "enrolling",
-      sentence: `Signing this device in to ${HQ_HOST} again, under its new name…`,
+      sentence: `Updating the name on ${HQ_HOST}…`,
     }),
   );
   setTimeout(() => hqPublish(hqPairedStatus("connected", HQ_ENROLLED)), 2000);
@@ -11496,15 +11496,6 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     deviceAccountFollows();
     deviceRenamed(previous);
     return deviceNameVm();
-  },
-  account_rename_device: (payload) => {
-    const name = String(payload.name ?? "");
-    const renamed = { ...(accountVm.device ?? ACCOUNT_THIS_DEVICE), slug: name, name };
-    return setAccount({
-      ...accountVm,
-      device: renamed,
-      devices: accountVm.devices.map((device) => (device.thisDevice ? renamed : device)),
-    });
   },
   // In `keeper_core::org_account::log_upload::LogUploadVm`'s words: a signed-in,
   // registered device sends; anything else is told to sign in. The switch is not
