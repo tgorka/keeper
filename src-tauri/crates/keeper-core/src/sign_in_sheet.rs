@@ -30,8 +30,19 @@
 //!   waiting for the link pasted by hand (`sign_in_link`, R480);
 //! - it stops without a word once the sign-in no longer waits (answered,
 //!   cancelled, timed out).
+//!
+//! [`Sheets`] is the other half: which sheets keeper has started and not
+//! yet retired, which is what [`PreviousSheet`] reports. A sheet retires on
+//! every way it can end — its completion, keeper's own cancel, a `start`
+//! Apple refused, the flow's deadline — and each retirement is explicit:
+//! Apple promises a completion when the *person* cancels, not after
+//! keeper's `cancel()`, so a sheet keeper dismissed must not wait for one
+//! (R608-01). Retiring is idempotent and keyed by [`SheetId`], so a
+//! completion that arrives after its sheet retired changes nothing, least
+//! of all a newer sheet for the same sign-in.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// How often the shell looks at keeper's window while it waits.
 pub const POLL: Duration = Duration::from_millis(250);
@@ -56,6 +67,13 @@ pub const REFUSALS: u32 = 3;
 /// The longest the sheet waits, whatever it sees: the account sign-in's own
 /// deadline (`org_account::oidc::FLOW_TIMEOUT`).
 pub const LIMIT: Duration = Duration::from_secs(300);
+
+/// How long a retired sheet's session, anchor and completion are still held
+/// after it retired. A session released before its dismiss transition has
+/// finished crashes when the transition completes (FB12132525), and the
+/// transition has not started when the completion runs; AppAuth keeps it
+/// two seconds for the same reason (`OIDRetainSessionBriefly`).
+pub const RETENTION: Duration = Duration::from_secs(2);
 
 /// Why the sheet gave up while keeper was out of front, or at [`LIMIT`].
 pub const NOT_IN_FRONT: &str = "keeper was not in front, so the sign-in sheet could not open";
@@ -102,7 +120,7 @@ impl Activation {
 pub enum PreviousSheet {
     /// None since keeper started.
     None,
-    /// Still on screen: its completion has not run yet.
+    /// Still on screen: started and not yet retired ([`Sheets`]).
     OnScreen,
     /// It went away this long ago.
     EndedAgo(Duration),
@@ -200,6 +218,152 @@ impl SheetWait {
         } else {
             Step::LookAgain(DISMISSAL)
         }
+    }
+}
+
+/// One sheet keeper started, unique for the life of the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SheetId(u64);
+
+impl SheetId {
+    /// A fresh id, taken before the sheet is built so its completion can
+    /// carry it.
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A sheet in [`Sheets`]: the sign-in it serves, and what the shell holds
+/// alive for it (`T`: the native session, its anchor, its completion).
+#[derive(Debug)]
+pub struct Sheet<T> {
+    id: SheetId,
+    state: String,
+    opened: Instant,
+    held: T,
+}
+
+impl<T> Sheet<T> {
+    /// The `state` of the sign-in the sheet was opened for.
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    pub fn held(&self) -> &T {
+        &self.held
+    }
+}
+
+/// The sheets keeper has started and not yet retired, the ones it retired
+/// and still holds for [`RETENTION`], and when the last one retired.
+///
+/// Two questions kept apart: whether a sheet still stops the next one from
+/// opening (until it retires), and how long its native objects stay alive
+/// (until [`RETENTION`] after that, released on a later turn than the
+/// retirement — never inside the completion that retired it).
+///
+/// The retirement time is when keeper stopped counting the sheet as on
+/// screen. It is not an observed end of the dismissal: nothing reports
+/// that. [`DISMISSAL`] after it is an allowance for the animation, and the
+/// observed signals are the scene's activation ([`SETTLE`]) and Apple's own
+/// `start` refusing a window ([`SheetWait::refused`]).
+#[derive(Debug)]
+pub struct Sheets<T> {
+    open: Vec<Sheet<T>>,
+    retired: Vec<(Sheet<T>, Instant)>,
+    last_retired: Option<Instant>,
+}
+
+impl<T> Default for Sheets<T> {
+    fn default() -> Self {
+        Self {
+            open: Vec::new(),
+            retired: Vec::new(),
+            last_retired: None,
+        }
+    }
+}
+
+impl<T> Sheets<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hold a sheet for `state` before it is started: from now until it
+    /// retires it is the previous sheet the next one waits for.
+    pub fn open(&mut self, id: SheetId, state: &str, held: T, now: Instant) {
+        self.open.push(Sheet {
+            id,
+            state: state.to_owned(),
+            opened: now,
+            held,
+        });
+    }
+
+    /// The sheet before the one being asked for, `now`.
+    pub fn previous(&self, now: Instant) -> PreviousSheet {
+        if !self.open.is_empty() {
+            return PreviousSheet::OnScreen;
+        }
+        self.last_retired.map_or(PreviousSheet::None, |at| {
+            PreviousSheet::EndedAgo(now.saturating_duration_since(at))
+        })
+    }
+
+    /// Retire sheet `id`: its completion ran, or Apple refused to start it.
+    /// `true` the first time only — a completion that finds its sheet
+    /// already retired (keeper cancelled it, its deadline passed) is late,
+    /// and its caller delivers nothing.
+    pub fn retire(&mut self, id: SheetId, now: Instant) -> bool {
+        let Some(at) = self.open.iter().position(|sheet| sheet.id == id) else {
+            return false;
+        };
+        let sheet = self.open.swap_remove(at);
+        self.retired.push((sheet, now));
+        self.last_retired = Some(now);
+        true
+    }
+
+    /// keeper ends the open sheets `which` picks, without waiting for any
+    /// completion: they retire now, and are returned so the shell can
+    /// dismiss each and tell its sign-in it was cancelled.
+    pub fn cancel(&mut self, now: Instant, which: impl Fn(&Sheet<T>) -> bool) -> Vec<&Sheet<T>> {
+        let ids: Vec<SheetId> = self
+            .open
+            .iter()
+            .filter(|sheet| which(sheet))
+            .map(|sheet| sheet.id)
+            .collect();
+        for &id in &ids {
+            self.retire(id, now);
+        }
+        self.retired
+            .iter()
+            .map(|(sheet, _)| sheet)
+            .filter(|sheet| ids.contains(&sheet.id))
+            .collect()
+    }
+
+    /// Cancel every sheet opened at least [`LIMIT`] ago. Its sign-in's own
+    /// deadline has passed by then, so the sheet answers nobody, and it
+    /// must not hold back a new one whatever became of its completion.
+    pub fn overdue(&mut self, now: Instant) -> Vec<&Sheet<T>> {
+        self.cancel(now, |sheet| {
+            now.saturating_duration_since(sheet.opened) >= LIMIT
+        })
+    }
+
+    /// Hand back what the shell held for every sheet retired at least
+    /// [`RETENTION`] ago, to be dropped on the main thread — outside any
+    /// borrow of this table, since a session may run its completion as it
+    /// goes.
+    pub fn release_due(&mut self, now: Instant) -> Vec<T> {
+        let (due, kept) = std::mem::take(&mut self.retired)
+            .into_iter()
+            .partition(|(_, at)| now.saturating_duration_since(*at) >= RETENTION);
+        self.retired = kept;
+        due.into_iter().map(|(sheet, _)| sheet.held).collect()
     }
 }
 
@@ -364,5 +528,114 @@ mod tests {
         assert_eq!(Activation::of_scene(true, -1), Activation::Unattached);
         assert_eq!(Activation::of_scene(false, 0), Activation::Unattached);
         assert_eq!(Activation::of_scene(true, 7), Activation::Unattached);
+    }
+
+    fn states<T>(sheets: Vec<&Sheet<T>>) -> Vec<String> {
+        sheets
+            .into_iter()
+            .map(|sheet| sheet.state().to_owned())
+            .collect()
+    }
+
+    /// R608-01: keeper cancels a sheet and Apple never runs its completion.
+    /// The next sign-in's sheet must still open once the cancelled one has
+    /// had its dismissal — not wait out the whole [`LIMIT`] behind a sheet
+    /// that is gone.
+    #[test]
+    fn a_sheet_keeper_cancelled_lets_the_next_open_without_its_completion() {
+        let start = Instant::now();
+        let mut sheets = Sheets::new();
+        sheets.open(SheetId::next(), "account", (), start);
+        sheets.open(SheetId::next(), "matrix", (), start);
+        assert_eq!(sheets.previous(start), PreviousSheet::OnScreen);
+
+        let cancelled_at = start + Duration::from_secs(30);
+        assert_eq!(
+            states(sheets.cancel(cancelled_at, |sheet| sheet.state() == "account")),
+            ["account"]
+        );
+        // The other registry's sheet is still up, so the next one waits.
+        assert_eq!(sheets.previous(cancelled_at), PreviousSheet::OnScreen);
+        assert_eq!(
+            states(sheets.cancel(cancelled_at, |sheet| sheet.state() == "matrix")),
+            ["matrix"]
+        );
+
+        // No completion ever arrives. The next sign-in looks at the table
+        // at each poll, with keeper in front and active.
+        let (step, at) = run(|now| look(Activation::Active, sheets.previous(cancelled_at + now)));
+        assert_eq!((step, at), (Step::Present, DISMISSAL));
+    }
+
+    /// A completion that runs after keeper retired its sheet — the same
+    /// sign-in's next sheet already open under the same `state` — is
+    /// refused: the newer sheet stays the one on screen, its own completion
+    /// still counts, and the dismissal clock is the real retirement's.
+    #[test]
+    fn a_late_completion_touches_neither_a_newer_sheet_nor_the_clock() {
+        let start = Instant::now();
+        let mut sheets = Sheets::new();
+        let first = SheetId::next();
+        sheets.open(first, "s", (), start);
+        let cancelled_at = start + Duration::from_secs(1);
+        assert_eq!(states(sheets.cancel(cancelled_at, |_| true)), ["s"]);
+
+        let late = cancelled_at + Duration::from_secs(5);
+        assert!(!sheets.retire(first, late), "the first sheet retired once");
+        assert_eq!(
+            sheets.previous(late),
+            PreviousSheet::EndedAgo(Duration::from_secs(5)),
+            "a late completion does not restart the dismissal"
+        );
+
+        let second = SheetId::next();
+        sheets.open(second, "s", (), late);
+        assert!(!sheets.retire(first, late + POLL));
+        assert_eq!(sheets.previous(late + POLL), PreviousSheet::OnScreen);
+        assert!(sheets.retire(second, late + SETTLE));
+        assert_eq!(
+            sheets.previous(late + SETTLE),
+            PreviousSheet::EndedAgo(Duration::ZERO)
+        );
+        assert!(!sheets.retire(second, late + SETTLE));
+    }
+
+    /// Whatever became of a sheet's completion, once its sign-in's deadline
+    /// has passed it no longer holds back a new one.
+    #[test]
+    fn a_sheet_past_its_sign_ins_deadline_stops_holding_back_the_next() {
+        let start = Instant::now();
+        let mut sheets = Sheets::new();
+        sheets.open(SheetId::next(), "stale", (), start);
+        let before = start + LIMIT - POLL;
+        assert!(sheets.overdue(before).is_empty());
+        assert_eq!(sheets.previous(before), PreviousSheet::OnScreen);
+        assert_eq!(states(sheets.overdue(start + LIMIT)), ["stale"]);
+        assert_eq!(
+            sheets.previous(start + LIMIT),
+            PreviousSheet::EndedAgo(Duration::ZERO)
+        );
+    }
+
+    /// A retired sheet's native objects outlive its retirement by
+    /// [`RETENTION`] — never released in the turn that retired it, which
+    /// may be its own completion — and are handed back exactly once.
+    #[test]
+    fn a_retired_sheet_is_held_through_its_dismissal_and_released_once() {
+        let start = Instant::now();
+        let mut sheets = Sheets::new();
+        let (done, cancelled) = (SheetId::next(), SheetId::next());
+        sheets.open(done, "done", "session one", start);
+        sheets.open(cancelled, "cancelled", "session two", start);
+        assert!(sheets.retire(done, start));
+        let later = start + Duration::from_secs(1);
+        assert_eq!(states(sheets.cancel(later, |_| true)), ["cancelled"]);
+
+        assert!(sheets.release_due(start).is_empty());
+        assert!(sheets.release_due(start + RETENTION - POLL).is_empty());
+        assert_eq!(sheets.release_due(start + RETENTION), ["session one"]);
+        assert!(sheets.release_due(start + RETENTION).is_empty());
+        assert_eq!(sheets.release_due(later + RETENTION), ["session two"]);
+        assert!(sheets.release_due(later + LIMIT).is_empty());
     }
 }

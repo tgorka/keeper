@@ -298,7 +298,7 @@ fn attempt(mut this: Attempt) -> Result<(), CoreError> {
             };
             let look = Look {
                 activation,
-                previous: crate::web_auth_apple::previous_sheet(),
+                previous: crate::web_auth_apple::previous_sheet(&app),
                 flow_waits: this.flows.waits(&this.state),
             };
             let waited = this.started.elapsed();
@@ -387,8 +387,10 @@ fn not_up() -> CoreError {
 pub fn close(state: &str) {
     #[cfg(target_os = "ios")]
     if let Some((app, _)) = HOST.get() {
-        let state = state.to_owned();
-        if let Err(error) = app.run_on_main_thread(move || crate::web_auth_apple::cancel(&state)) {
+        let (main, state) = (app.clone(), state.to_owned());
+        if let Err(error) =
+            app.run_on_main_thread(move || crate::web_auth_apple::cancel(&main, &state))
+        {
             tracing::warn!(%error, "web auth: could not reach the main thread to close a sheet");
         }
     }
@@ -397,14 +399,14 @@ pub fn close(state: &str) {
 }
 
 /// Close every sign-in sheet that reports to `flows`, leaving the other
-/// registry's open. Each one's completion then reports a cancel, which ends
-/// its flow through [`finish`].
+/// registry's open, and cancel the flow each one serves — without waiting
+/// for a completion, which Apple does not promise after keeper's own cancel.
 pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
     #[cfg(target_os = "ios")]
     if let Some((app, _)) = HOST.get() {
-        let flows = Arc::clone(flows);
+        let (main, flows) = (app.clone(), Arc::clone(flows));
         if let Err(error) =
-            app.run_on_main_thread(move || crate::web_auth_apple::cancel_for(&flows))
+            app.run_on_main_thread(move || crate::web_auth_apple::cancel_for(&main, &flows))
         {
             tracing::warn!(%error, "web auth: could not reach the main thread to cancel");
         }
