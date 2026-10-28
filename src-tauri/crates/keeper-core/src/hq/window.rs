@@ -813,20 +813,34 @@ impl Hq {
 
     /// Carry on, on a thread of its own, the drive writes this device
     /// decided and has not said the outcome of
-    /// ([`approvals::write::Writes::carry_on`]); one run at a time, and a
-    /// run asked for while one is running is that run.
+    /// ([`approvals::write::Writes::carry_on`]); one run at a time. A wake
+    /// that arrives while a pass runs is never lost (R606-02): it leaves
+    /// `carry_again` set, and the worker passes once more before it goes
+    /// idle. The flag is cleared only at the top of a pass, and the worker
+    /// looks at it only after it has let go of `carrying`, so a wake landing
+    /// between the two either sees `carrying` free and starts its own run,
+    /// or is seen by this one. A pass is driven by wakes only, so a drive
+    /// that stays unavailable is not retried in a loop.
     pub(crate) fn carry_on_writes(&self) {
+        self.carry_again.store(true, Ordering::SeqCst);
         if self.carrying.swap(true, Ordering::SeqCst) {
             return;
         }
-        let (me, carrying) = (self.me.clone(), Arc::clone(&self.carrying));
+        let me = self.me.clone();
+        let (carrying, again) = (Arc::clone(&self.carrying), Arc::clone(&self.carry_again));
         let spawned = std::thread::Builder::new()
             .name("hq-drive-writes".to_owned())
-            .spawn(move || {
+            .spawn(move || loop {
+                again.store(false, Ordering::SeqCst);
                 if let Some(hq) = me.upgrade() {
                     hq.writes.carry_on(&hq.sources());
                 }
                 carrying.store(false, Ordering::SeqCst);
+                // A wake during the pass: pass again, unless that wake has
+                // started a run of its own since `carrying` was let go.
+                if !again.load(Ordering::SeqCst) || carrying.swap(true, Ordering::SeqCst) {
+                    return;
+                }
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "the drive writes could not be carried on");

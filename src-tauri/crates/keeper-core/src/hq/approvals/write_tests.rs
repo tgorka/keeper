@@ -1334,3 +1334,225 @@ fn a_change_of_line_endings_alone_is_named_on_the_card() {
         "no line break before: nothing to change"
     );
 }
+
+// ─── Round 4 (review-606 R606-02) ─────────────────────────────────────────────
+
+/// A drive whose first trailer search blocks until released, then fails as
+/// an unavailable drive does; every later search answers at once.
+struct Review606HeldRecovery {
+    entered: std::sync::mpsc::Sender<String>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl DriveWrites for Review606HeldRecovery {
+    fn keeps(&self, _: &str) -> Result<(), DriveAbsent> {
+        Ok(())
+    }
+    fn target(&self, _: &str, _: &str, _: DriveTarget) -> Result<DriveFile, drive_write::Refusal> {
+        panic!("recovery must not assess a new write")
+    }
+    fn commit(&self, _: &str, _: DriveCommit) -> Result<DriveCommitted, String> {
+        panic!("recovery must not write")
+    }
+    fn carried(&self, _: &str, approval: &str) -> Result<Option<String>, String> {
+        self.entered.send(approval.to_owned()).expect("entered");
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.release
+                .lock()
+                .expect("release")
+                .recv()
+                .expect("release first recovery");
+            Err("drive temporarily unavailable".to_owned())
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// An `Hq` holding `w`'s replica as its one database, paired as Ana, with
+/// `port` as its drive writer.
+fn hq_over(w: &World, port: Arc<dyn DriveWrites>) -> Arc<crate::hq::Hq> {
+    use crate::hq::{Db, Hq, Pairing};
+    let hq = Hq::new(
+        Arc::new(crate::forges::testing::FakePlatform::default()),
+        Arc::new(crate::hq::port::fake::FakeOpener::default()),
+        Arc::new(crate::hq::routes::HttpRoutes::new()),
+        Arc::new(crate::hq::signin::NoAccount),
+        "hesperia".to_owned(),
+        || "hesperia".to_owned(),
+    );
+    {
+        let mut inner = hq.inner.lock().expect("inner");
+        inner.pairing = Some(Pairing {
+            token: "review-only".to_owned(),
+            actor_id: ANA.to_owned(),
+            client_id: "ana.dev".to_owned(),
+            name: "hesperia".to_owned(),
+            bound: None,
+        });
+        inner.dbs.push(Db {
+            name: w.ana.database.clone(),
+            replica: Arc::clone(&w.ana.replica),
+            linked: false,
+            refusal_counted: false,
+        });
+    }
+    hq.set_drive_writes(port);
+    hq
+}
+
+/// A second consumed approval, its own call and its own digest, as the
+/// server would hand it to this device after a pass took its snapshot.
+fn arrive_second(w: &World) {
+    let call = "review606-second-call";
+    let mut second_call = w.row("tool_calls", CALL_ID);
+    second_call.retain(|key, _| {
+        [
+            "id",
+            "session_id",
+            "page_key",
+            "turn_id",
+            "name",
+            "args",
+            "status",
+            "result",
+            "result_blob",
+            "started_at_ms",
+            "ended_at_ms",
+            "created_at_ms",
+            "author_actor",
+            "author_client",
+        ]
+        .contains(&key.as_str())
+    });
+    second_call.insert("id".to_owned(), json!(call));
+    let mut second = w.row("approvals", APPROVAL);
+    second.retain(|key, _| {
+        [
+            "id",
+            "session_id",
+            "page_key",
+            "tool_call_id",
+            "tier",
+            "binding_digest",
+            "summary",
+            "approvers",
+            "state",
+            "decided_by_actor",
+            "decided_by_client",
+            "consumed_by_client",
+            "expires_at_ms",
+            "created_at_ms",
+            "author_actor",
+            "author_client",
+        ]
+        .contains(&key.as_str())
+    });
+    second.insert("id".to_owned(), json!("review606-second"));
+    second.insert("tool_call_id".to_owned(), json!(call));
+    second.insert(
+        "binding_digest".to_owned(),
+        json!(
+            drive_write::digest("review606-second", SESSION, NIXI, &edit_args(), TURN, call)
+                .expect("second digest")
+        ),
+    );
+    for (table, values) in [("tool_calls", second_call), ("approvals", second)] {
+        w.server
+            .inner
+            .mutate(vec![RowOp::Upsert {
+                table: table.to_owned(),
+                values,
+                base_version: None,
+            }])
+            .expect("arrives");
+    }
+}
+
+/// Wait until no pass of `hq`'s carrying-on runs.
+fn idle(hq: &crate::hq::Hq) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while hq.carrying.load(std::sync::atomic::Ordering::SeqCst)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        !hq.carrying.load(std::sync::atomic::Ordering::SeqCst),
+        "worker finished"
+    );
+}
+
+/// R606-02 (review probe, adopted): a wake that arrives while a recovery
+/// pass runs — here a second consumed approval, landing after the pass took
+/// its snapshot — is not lost: the worker passes once more before it stops.
+#[test]
+fn review606_a_wakeup_during_recovery_must_not_be_lost() {
+    let w = world();
+    w.set_approval(json!({"state": "consumed", "decided_by_actor": ANA,
+                          "decided_by_client": "ana.dev", "consumed_by_client": "ana.dev"}));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let hq = hq_over(
+        &w,
+        Arc::new(Review606HeldRecovery {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    hq.carry_on_writes();
+    let wait = std::time::Duration::from_secs(2);
+    assert_eq!(
+        entered_rx
+            .recv_timeout(wait)
+            .expect("first recovery started"),
+        APPROVAL
+    );
+    arrive_second(&w);
+    hq.carry_on_writes(); // the wake the arriving change makes
+    release_tx.send(()).expect("release worker");
+    let mut seen = Vec::new();
+    while let Ok(approval) = entered_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        seen.push(approval);
+    }
+    idle(&hq);
+    assert!(
+        seen.iter().any(|a| a == "review606-second"),
+        "a change received during recovery must schedule another pass; saw {seen:?}"
+    );
+}
+
+/// The probe's causal control, kept: the second row is one recovery reaches
+/// by itself — a fresh wake after the worker is idle finds both — so the
+/// test above fails only on a lost wake, not on a row recovery skips.
+#[test]
+fn review606_the_arriving_row_is_recoverable_by_a_fresh_wake() {
+    let w = world();
+    w.set_approval(json!({"state": "consumed", "decided_by_actor": ANA,
+                          "decided_by_client": "ana.dev", "consumed_by_client": "ana.dev"}));
+    arrive_second(&w);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    release_tx
+        .send(())
+        .expect("the first search is released at once");
+    let hq = hq_over(
+        &w,
+        Arc::new(Review606HeldRecovery {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    hq.carry_on_writes();
+    let wait = std::time::Duration::from_secs(2);
+    let mut seen = vec![
+        entered_rx.recv_timeout(wait).expect("one row"),
+        entered_rx.recv_timeout(wait).expect("both rows"),
+    ];
+    seen.sort();
+    assert_eq!(seen, [APPROVAL.to_owned(), "review606-second".to_owned()]);
+    idle(&hq);
+}
