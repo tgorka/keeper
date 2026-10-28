@@ -17,6 +17,19 @@ model: string,
  */
 effort: string, 
 /**
+ * What the model chip says: `model` without its router and maker
+ * (`openrouter/z-ai/glm-5.3-flash` → `glm-5.3-flash`), so the bar holds
+ * one row in the Notes Assistant panel. `model` stays the whole id.
+ */
+shortModel: string, 
+/**
+ * The effort's short code (`XH`, `M`; [`EFFORT_UNSET_CODE`] for the
+ * agent's unstated default): what the effort chip says when the bar is
+ * too narrow for `effort`, which stays its accessible name. The chip
+ * gives up its words before the model's name does (R601-01).
+ */
+effortCode: string, 
+/**
  * The model chip opens the picker: more than one model to choose.
  */
 choosesModel: boolean, 

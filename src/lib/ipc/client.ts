@@ -413,6 +413,7 @@ export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
 export type { AgentTurnFailureVm } from "./gen/AgentTurnFailureVm";
 export type { AgentTurnFoldVm } from "./gen/AgentTurnFoldVm";
 export type { AgentTurnStatusVm } from "./gen/AgentTurnStatusVm";
+export type { AgentUntrustedVm } from "./gen/AgentUntrustedVm";
 export type { AgentViewModeVm } from "./gen/AgentViewModeVm";
 export type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
 export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";

@@ -128,8 +128,14 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   "notes-list": { label: "note list", title: "Note list", defaultWidth: 320, minWidth: 240 },
   // The proxy's room docked beside the notes (UX-DR130), to the RIGHT of the
   // panel strip. 360 holds a message bubble at a readable measure beside the
-  // header's identity line and run badge; the floor is the composer — its
-  // attach button, a field worth typing in and Send on one row.
+  // header's identity line and run badge; the floor is the composer — the
+  // message field on its own row and, under it, the session bar on ONE row:
+  // model and effort, the attach `+`, the context reading and Send. At 280 the
+  // bar is 255px (the 1px border and the composer's 12px padding each side),
+  // so the bar folds its controls as its row runs short (`useBarFold`): the
+  // context to its ring, Send to an icon, the effort to its level's
+  // short code, and only then the model's name (R601-01, docs/agents.md). Raising this
+  // floor instead would need saying so (AD-260).
   "notes-agent": { label: "assistant", title: "Assistant", defaultWidth: 360, minWidth: 280 },
   // The tree used to be `flex-1`, splitting the surface evenly with the panel
   // strip. That was never a decision — it was two panes with the same class —

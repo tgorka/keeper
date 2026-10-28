@@ -158,6 +158,15 @@ pub struct AgentSessionFooterVm {
     pub model: String,
     /// The same for effort.
     pub effort: String,
+    /// What the model chip says: `model` without its router and maker
+    /// (`openrouter/z-ai/glm-5.3-flash` → `glm-5.3-flash`), so the bar holds
+    /// one row in the Notes Assistant panel. `model` stays the whole id.
+    pub short_model: String,
+    /// The effort's short code (`XH`, `M`; [`EFFORT_UNSET_CODE`] for the
+    /// agent's unstated default): what the effort chip says when the bar is
+    /// too narrow for `effort`, which stays its accessible name. The chip
+    /// gives up its words before the model's name does (R601-01).
+    pub effort_code: String,
     /// The model chip opens the picker: more than one model to choose.
     pub chooses_model: bool,
     /// The effort chip opens its menu: more than one effort to choose.
@@ -207,11 +216,25 @@ fn footer_of(
 ) -> AgentSessionFooterVm {
     let (model, effort) = labels(settings);
     AgentSessionFooterVm {
+        short_model: short_model(&model).to_owned(),
+        effort_code: effort_in_use(settings)
+            .map_or(EFFORT_UNSET_CODE, effort_code)
+            .to_owned(),
         model,
         effort,
         chooses_model: picker.is_some_and(|p| p.models.len() > 1),
         chooses_effort: picker.is_some_and(|p| p.efforts.len() > 1),
     }
+}
+
+/// A model id's own name: its last path segment, without the router and the
+/// maker (`openrouter/z-ai/glm-5.3-flash` → `glm-5.3-flash`); an id with no
+/// segment is itself.
+fn short_model(model: &str) -> &str {
+    model
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(model)
 }
 
 impl Hq {
@@ -615,6 +638,20 @@ fn effort_label(effort: Effort) -> &'static str {
     }
 }
 
+/// [`effort_label`]'s short code, for the effort chip in a narrow bar.
+fn effort_code(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "L",
+        Effort::Medium => "M",
+        Effort::High => "H",
+        Effort::Xhigh => "XH",
+    }
+}
+
+/// The short code of the "Default" effort label: no level is chosen and the
+/// agent's instances name none, or disagree.
+const EFFORT_UNSET_CODE: &str = "D";
+
 /// A refused settings write, by the server's V16 code, matched exactly.
 fn refusal(rejection: &Rejection) -> String {
     let why = match rejection.code.as_str() {
@@ -718,24 +755,31 @@ fn labels(settings: &AgentSessionSettingsVm) -> (String, String) {
         .model
         .as_deref()
         .filter(|m| settings.models.iter().any(|o| o == m));
-    let effort = settings.effort.filter(|e| settings.efforts.contains(e));
     (
         model.map_or_else(
             || default_label(settings.defaults.iter().filter_map(|d| d.model.as_deref())),
             str::to_owned,
         ),
-        effort.map_or_else(
-            || {
-                default_label(
-                    settings
-                        .defaults
-                        .iter()
-                        .filter_map(|d| d.effort.map(effort_label)),
-                )
-            },
-            |e| effort_label(e).to_owned(),
-        ),
+        effort_in_use(settings)
+            .map_or_else(|| "Default".to_owned(), |e| effort_label(e).to_owned()),
     )
+}
+
+/// The effort the next answer uses: the session's choice while the agent
+/// still offers it, else the level its instances' defaults agree on; `None`
+/// where they name none or disagree.
+fn effort_in_use(settings: &AgentSessionSettingsVm) -> Option<Effort> {
+    settings
+        .effort
+        .filter(|e| settings.efforts.contains(e))
+        .or_else(|| {
+            let defaults: BTreeSet<Effort> =
+                settings.defaults.iter().filter_map(|d| d.effort).collect();
+            match defaults.into_iter().collect::<Vec<_>>().as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            }
+        })
 }
 
 /// The pickers over `settings`, given what else the session says now.
@@ -1517,6 +1561,8 @@ mod tests {
             AgentSessionFooterVm {
                 model: "Default".to_owned(),
                 effort: "Default".to_owned(),
+                short_model: "Default".to_owned(),
+                effort_code: "D".to_owned(),
                 chooses_model: true,
                 chooses_effort: true,
             }
@@ -1534,6 +1580,8 @@ mod tests {
             AgentSessionFooterVm {
                 model: "alternate".to_owned(),
                 effort: "High".to_owned(),
+                short_model: "alternate".to_owned(),
+                effort_code: "H".to_owned(),
                 chooses_model: false,
                 chooses_effort: false,
             }
@@ -1581,6 +1629,51 @@ mod tests {
             ),
             ("alternate", false)
         );
+    }
+
+    /// FooterOneRow: the chip names the model by its own name, never the router's or the
+    /// maker's path, so the bar holds one row at the Notes Assistant's 360px default; the
+    /// whole id stays in `model` (the context reading and the accessible name read it). The
+    /// effort carries a short code, which the chip shows before the model's name is cut
+    /// (R601-01): every level's, the agreed default's, and "D" where none is stated.
+    #[test]
+    fn the_chip_names_the_model_by_its_own_name_and_the_effort_has_a_short_code() {
+        let routed = settings(None, None, &[(Some("openrouter/z-ai/glm-5.3-flash"), None)]);
+        let footer = footer_of(&routed, None);
+        assert_eq!(footer.model, "openrouter/z-ai/glm-5.3-flash");
+        assert_eq!(footer.short_model, "glm-5.3-flash");
+        assert_eq!(
+            (footer.effort.as_str(), footer.effort_code.as_str()),
+            ("Default", "D")
+        );
+        assert_eq!(short_model("claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(short_model("maker/model/"), "model");
+        assert_eq!(short_model("/"), "/");
+        let agreed = settings(None, None, &[(None, Some(Effort::Xhigh))]);
+        let footer = footer_of(&agreed, None);
+        assert_eq!(
+            (footer.effort.as_str(), footer.effort_code.as_str()),
+            ("Extra high", "XH")
+        );
+        for (level, label, code) in [
+            (Effort::Low, "Low", "L"),
+            (Effort::Medium, "Medium", "M"),
+            (Effort::High, "High", "H"),
+            (Effort::Xhigh, "Extra high", "XH"),
+        ] {
+            // The instances disagree, so only the choice can name a level.
+            let mut chosen = settings(
+                None,
+                Some(level),
+                &[(None, Some(Effort::Medium)), (None, Some(Effort::High))],
+            );
+            chosen.efforts = vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh];
+            let footer = footer_of(&chosen, None);
+            assert_eq!(
+                (footer.effort.as_str(), footer.effort_code.as_str()),
+                (label, code)
+            );
+        }
     }
 
     /// Owner ruling 2026-10-27: a model that answers 429 for days fails the turn; the picker

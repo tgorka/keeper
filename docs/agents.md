@@ -509,13 +509,39 @@ HTML, and model-written links do not navigate.
 **The composer's bar** (R-HQ-85, owner ruling 2026-10-27, t3.chat's shape; it supersedes R10921-02
 where that hid the ring) sits under the message field and is always drawn: the model and the
 effort (`AgentSessionFooterVm`: the session's choice while the agent still offers it, else the
-agent's default, else "Default"), the attach controls, an **Untrusted** marker when the session
-read outside content, and the context reading beside Send. The model and effort are chips that
+agent's default, else "Default"), one **+** menu holding Attach file, Take photo and Choose photo,
+and the context reading beside Send. The model and effort are chips that
 open 109.18's pickers only where Rust says there is an alternative to choose
 (`choosesModel`/`choosesEffort`: more than one offered, and this person may change them); a
 reader who may not, or an agent with one offer, sees read-only chips. An archived session has no
-composer but keeps the reading: read-only model and effort chips, the **Untrusted** marker and the
-context, under the read-only line (R598-03).
+composer but keeps the reading: read-only model and effort chips and the context, under the
+read-only line (R598-03).
+
+**One row, at any width (FooterOneRow, R601-01).** The bar holds one row from the Notes
+Assistant's 280px minimum (a 255px bar) to a full window, in the panel, the tablet sheet and the
+Agents window alike:
+
+- the model chip says the model's own name (`shortModel`, Rust's: `openrouter/z-ai/glm-5.3-flash`
+  → `glm-5.3-flash`); its accessible name, its tooltip and the popover keep the whole id, on a
+  read-only chip too (R601-06);
+- the model group never forces a wrap (its flex basis is 0; it grows up to its content);
+- **Reset is never in the bar.** It lives at the foot of the model popover and of the effort menu;
+  where neither chip offers a choice yet one is still saved, the model chip opens a small "Model"
+  popover (the whole id, the read-only sentence and Reset), so no action is dropped (AD-260).
+  Enter and Space on Reset, like on a star, never reach the model list, which would take Enter as
+  choosing the highlighted model (R601-05);
+- **the model's name is the last thing to give way.** When the row runs short, the bar
+  (`useBarFold`) gives up, in this order and only as far as it must: the context reading's label
+  (the ring stays; the label stays in the accessible name, the tooltip and Details); Send's word
+  (a 36px icon, ≥44pt on the phone); the chips' padding and the effort menu's chevron; the
+  effort's words, for its level's short code
+  beside the brain (`effortCode`, Rust's: `L`, `M`, `H`, `XH`, and `D` for an unstated
+  default; the words stay the accessible name); then the row's gaps and the model's chevron. Only
+  then is the model's name cut. Width alone cannot order this — the same 335px bar holds
+  `glm-5.3-flash` beside "Medium" and cuts it beside "Extra high" — so the bar measures its own
+  row (does the model's name fit?) whenever it resizes or what it shows changes;
+- the effort is its own chip at every width, as R-HQ-85 says; nothing folds it into the model
+  chip's words (FooterOneRow's fold, `compact`, is gone).
 
 **Context** beside Send is a ring and Rust's compact label (`5.3k / 1M`), in every view mode and
 for any member: `metadata.context` is in every member's replica. Before any answer measured it, or
@@ -549,10 +575,19 @@ hint. These are mock projections, not evidence of a running model or the package
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
 unknown or absent offered-tools list renders no Tools control, and neither does a session that
 cannot be changed here (archived). Changes wait for Rust's view; a
-refusal is visible beside the controls. **Untrusted** in the composer's bar marks a session that has
-read outside content (D-34: a web page, a broker's answer); a tap opens Rust's sentence, "This chat
-read outside content, such as a web page, so its commands need your approval.", and the approval
-banner says the same above the requests it holds.
+refusal is visible beside the controls. **Untrusted** is a session-state chip on the header's meta
+line for a session that has read outside content (D-34: a web page, a broker's answer); a tap opens
+Rust's sentence, "This chat read outside content, such as a web page, so its commands need your
+approval.", and the approval banner says the same above the requests it holds. The mark never
+lowers (V13), so the popover offers the honest way out instead: **Start a fresh chat: starts
+trusted, keeps the drives you can still tick** (`AgentUntrustedVm.freshChat`, Rust's words), which
+runs `/clean` through the composer's command path (Q109-17 b: the new session starts trusted;
+A109-06: it carries the ticks this person may still tick there, so a drive the agent no longer
+offers, the audience rule now refuses or the server refused is left behind). It is absent on an
+archived session, where `/clean` refuses. A new session a command starts — `/clean`, `/new` or
+this action — opens where the command ran: the Notes Assistant dock moves to it and leaves the
+Agents window's selection where it was; the Agents window moves its own. The session's Details
+dialog says **Trusted** for a session with no mark, **Untrusted** once it read outside content.
 
 **Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
 menu of check items. No drive is ticked until a person ticks one — not even the session's own
@@ -1626,7 +1661,9 @@ offered models grouped by the maker (`AgentModelOptionVm.provider`, `settings::p
 router's segment such as `openrouter/` is skipped, a maker slug is named as people read it —
 `openrouter/z-ai/glm-5.3-flash` → Z.ai, `openrouter/qwen/qwen3.7-flash` → Qwen — else the family the
 model's own name starts with, `claude-…` → Anthropic, `gpt-…` → OpenAI) and a "Default" badge; an effort
-chip with a "Default" badge in its menu; Reset. Where there is nothing to choose they are read-only
+chip with a "Default" badge in its menu; Reset at the foot of both, never in the bar (where neither
+offers a choice yet one is saved, the model chip opens a popover holding Reset). Where there is
+nothing to choose they are read-only
 chips, never absent. Capability badges are not drawn: the contract publishes model ids only
 (DW-E109-40). Stars are a lens, not a setting:
 they live in the `keeper_model_favorites` cookie like the other remembered views (no settings

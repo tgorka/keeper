@@ -6114,6 +6114,8 @@ const ownerReport = new URLSearchParams(location.search).get("owner") === "repor
 /** `timeline::UNTRUSTED`. */
 const MOCK_UNTRUSTED =
   "This chat read outside content, such as a web page, so its commands need your approval.";
+/** `timeline::FRESH_CHAT`: the chip's `/clean`, absent on an archived session. */
+const MOCK_FRESH_CHAT = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
 /** `context::NOT_MEASURED`, before `sessionViewerVm` projects the real reading. */
 const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
   used: null,
@@ -6129,9 +6131,35 @@ const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
 const MOCK_FOOTER_SEED: AgentSessionViewVm["footer"] = {
   model: "Default",
   effort: "Default",
+  shortModel: "Default",
+  effortCode: "D",
   choosesModel: false,
   choosesEffort: false,
 };
+/** `settings::effort_code`, by the label it shortens; `EFFORT_UNSET_CODE` for "Default". */
+const MOCK_EFFORT_CODES: Record<string, string> = {
+  Low: "L",
+  Medium: "M",
+  High: "H",
+  "Extra high": "XH",
+};
+/** `settings::footer_of`: the chip's words are the model's own name; the effort has a code. */
+function mockFooter(
+  model: string,
+  effort: string,
+  choosesModel: boolean,
+  choosesEffort: boolean,
+): AgentSessionViewVm["footer"] {
+  const shortModel = model.split("/").filter(Boolean).pop() ?? model;
+  return {
+    model,
+    effort,
+    shortModel,
+    effortCode: MOCK_EFFORT_CODES[effort] ?? "D",
+    choosesModel,
+    choosesEffort,
+  };
+}
 /**
  * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
  * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
@@ -6705,7 +6733,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           row.sessionId === "device.1") ||
         // An archived chat that read the web keeps its marker (R598-03).
         (ownerReport && row.archived)
-          ? MOCK_UNTRUSTED
+          ? { sentence: MOCK_UNTRUSTED }
           : undefined,
       context: MOCK_UNMEASURED,
       footer: MOCK_FOOTER_SEED,
@@ -7290,9 +7318,11 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
 // each change a moment after it was written, through the row's outcome. `fallback` puts
 // `metadata.model_fallback` on the newest answer. Viewing aid only: Rust's `picker_of` decides.
 // ?settings=single (or ?owner=report): one model and no effort, so the bar's chips are read-only.
+// ?settings=held: the same, with a choice still saved, so the model chip opens a popover holding
+// Reset (R601-01).
 // ?settings=failed: the newest answer failed on the model in use (a 429 for days, R-HQ-85).
 const settingsScenario = new URLSearchParams(location.search).get("settings");
-const singleModel = settingsScenario === "single" || ownerReport;
+const singleModel = settingsScenario === "single" || settingsScenario === "held" || ownerReport;
 const MOCK_MODELS = singleModel
   ? ["openrouter/z-ai/glm-5.3-flash"]
   : // The ids every agent offers (keeper-hq `agents/*/agent.toml`), in their order, which
@@ -7345,7 +7375,11 @@ function mockSettingsOf(vm: AgentSessionViewVm) {
   const key = JSON.stringify([vm.database, vm.sessionId]);
   let held = mockSettings.get(key);
   if (!held) {
-    held = { model: null, effort: null, refused: null };
+    held = {
+      model: settingsScenario === "held" ? MOCK_DEFAULT_MODEL : null,
+      effort: null,
+      refused: null,
+    };
     mockSettings.set(key, held);
   }
   return held;
@@ -7483,13 +7517,22 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
       : {}),
     settings: picker,
+    // `timeline::AgentUntrustedVm::of`: the way out only where `/clean` runs.
+    ...(vm.untrusted
+      ? {
+          untrusted: {
+            sentence: vm.untrusted.sentence,
+            ...(vm.archived ? {} : { freshChat: MOCK_FRESH_CHAT }),
+          },
+        }
+      : {}),
     // `settings::footer`: always the labels; the chips open only where there is a choice.
-    footer: {
-      model: picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
-      effort: picker?.effortLabel ?? "Default",
-      choosesModel: (picker?.models.length ?? 0) > 1,
-      choosesEffort: (picker?.efforts.length ?? 0) > 1,
-    },
+    footer: mockFooter(
+      picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
+      picker?.effortLabel ?? "Default",
+      (picker?.models.length ?? 0) > 1,
+      (picker?.efforts.length ?? 0) > 1,
+    ),
     messages: vm.messages.map(({ details, ...message }) => ({
       ...message,
       ...(prefs.viewMode === "verbose" && details ? { details } : {}),

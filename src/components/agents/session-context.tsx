@@ -68,7 +68,9 @@ export function SessionContext({
 
 /**
  * The bar's context reading (t3.chat's `5.3k / 1M`): a ring and Rust's compact label, always
- * drawn — an empty ring and `—` until an answer has measured it. Render it inside
+ * drawn — an empty ring and `—` until an answer has measured it. It is the first thing the
+ * composer's bar gives up when its row runs short (`useBarFold`'s `ring`): then it is the ring
+ * alone, the label still in its accessible name, tooltip and Details. Render it inside
  * `SessionContext`.
  */
 export function SessionContextTrigger({ context }: { context: ContextVm }) {
@@ -102,7 +104,9 @@ export function SessionContextTrigger({ context }: { context: ContextVm }) {
               <span className="size-2.5 rounded-full bg-background" />
             </span>
           </span>
-          <span className="text-xs tabular-nums">{context.label}</span>
+          <span className="text-xs tabular-nums group-data-[fold~=ring]/bar:hidden">
+            {context.label}
+          </span>
         </Button>
       </SheetTrigger>
     </HoverHint>

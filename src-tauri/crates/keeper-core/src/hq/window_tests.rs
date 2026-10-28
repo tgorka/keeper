@@ -1970,5 +1970,10 @@ fn a_pending_t3_run_in_an_untrusted_session_is_marked_in_the_list_and_bannered()
     );
     assert!(banner.approvals[0].can_decide);
     assert!(view.approvals.is_empty(), "not also in the reading column");
-    assert_eq!(view.untrusted.as_deref(), Some(timeline::UNTRUSTED));
+    assert_eq!(
+        view.untrusted
+            .map(|untrusted| untrusted.sentence)
+            .as_deref(),
+        Some(timeline::UNTRUSTED)
+    );
 }

@@ -14,8 +14,10 @@ import { SessionChildThread } from "@/components/agents/session-mention";
 import { SessionPeople } from "@/components/agents/session-people";
 import { SessionSettingsPicker } from "@/components/agents/session-settings-picker";
 import { SessionAnswerDetails, SessionLiveTurn, TurnFold } from "@/components/agents/session-turn";
+import { SessionUntrusted } from "@/components/agents/session-untrusted";
 import { announcedElsewhere, announcedRejection, Composer } from "@/components/chat/composer";
 import { Button } from "@/components/ui/button";
+import { BAR_CLASS, useBarFold } from "@/hooks/use-bar-fold";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { logFailure } from "@/lib/failure";
 import { formatMessageTime } from "@/lib/format-time";
@@ -48,8 +50,21 @@ import {
 } from "@/lib/stores/conversation-stores";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
-/** Mount keyed by (database, sessionId): no old page, draft or action can leak across databases. */
-export function SessionView({ target, onBack }: { target: AgentSessionRef; onBack?: () => void }) {
+/**
+ * Mount keyed by (database, sessionId): no old page, draft or action can leak across databases.
+ * `onSession` hears the session a command (`/clean`, `/new`) started, for a host such as the
+ * Notes Assistant dock that holds its own choice: given one, the command moves that host and
+ * leaves the Agents window's selection where it was (R601-04); without one, it moves the window.
+ */
+export function SessionView({
+  target,
+  onBack,
+  onSession,
+}: {
+  target: AgentSessionRef;
+  onBack?: () => void;
+  onSession?: (session: AgentSessionRef) => void;
+}) {
   const attachmentDraft = useSessionAttachmentDraft(target);
   const [vm, setVm] = useState<AgentSessionViewVm | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -69,6 +84,9 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const [stores] = useState(createConversationStores);
   const viewport = useRef<HTMLDivElement>(null);
   const backButton = useRef<HTMLButtonElement>(null);
+  /** The archived session's read-only bar, folded as the composer's is (R601-01). */
+  const readOnlyBar = useRef<HTMLDivElement>(null);
+  useBarFold(readOnlyBar, vm?.readOnly === true);
   const { phone } = useShellLayout();
   const { database, sessionId } = target;
   // Drives… in the list's right-click menu asks for this view's menu. Rust's first view of this
@@ -354,6 +372,26 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
     }
   };
 
+  /**
+   * Run a `/` line through the composer's one path (`runAgentCommand`), which the session list's
+   * menu shares; only `/stop` declines what the banner shows (R10911-07).
+   */
+  async function runCommand(name: string, line: string) {
+    // A host with its own choice (`onSession`) takes the new session; the Agents window keeps its
+    // selection (R601-04). Without one, the window follows.
+    const result =
+      name === "stop"
+        ? await fromUnderBanner(() =>
+            runAgentCommand(target, vm?.agentActor, line, declines, onSession),
+          )
+        : await runAgentCommand(target, vm?.agentActor, line, [], onSession);
+    if (result.surface === "people") setPeopleOpen(true);
+    if (result.surface === "tools") setToolsOpen(true);
+    if (result.surface === "drives") setDrivesOpen(true);
+    if (result.surface === "context") setContextOpen(true);
+    return result;
+  }
+
   const messages = new Map(vm?.messages.map((message) => [message.id, message]));
   const folds = new Map(vm?.folds.map((fold) => [fold.turnId, fold]));
   const live = new Map(vm?.live.map((turn) => [turn.turnId, turn]));
@@ -437,11 +475,24 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           <h2 className="truncate font-semibold text-title" title={vm?.displayName}>
             {vm?.displayName ?? "Opening session…"}
           </h2>
-          <p className="flex min-w-0 flex-wrap gap-x-2 text-muted-foreground text-xs">
+          <p className="flex min-w-0 flex-wrap items-center gap-x-2 text-muted-foreground text-xs">
             <span className="break-all">{database}</span>
             <span>{vm?.handle}</span>
             {vm && <span className="break-all">{vm.agentName}</span>}
             {vm?.archived && <span>Archived</span>}
+            {vm?.untrusted && (
+              <SessionUntrusted
+                untrusted={vm.untrusted}
+                phone={phone}
+                onFreshChat={async () => {
+                  try {
+                    await runCommand("clean", "/clean");
+                  } catch (raw) {
+                    throw new Error(syncErrorMessage(raw, "keeper could not start a fresh chat."));
+                  }
+                }}
+              />
+            )}
           </p>
           {vm?.drives && (
             <SessionDrives
@@ -609,7 +660,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 className="flex items-start gap-1.5 text-held text-sm [overflow-wrap:anywhere]"
               >
                 <ShieldAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-                <span>{vm.untrusted}</span>
+                <span>{vm.untrusted.sentence}</span>
               </p>
             )}
             <p role="note" className="text-sm [overflow-wrap:anywhere]">
@@ -631,8 +682,8 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
         </aside>
       )}
       {vm?.readOnly ? (
-        // R598-03: an archived session keeps the bar's reading — model, effort, context and the
-        // untrusted marker — read-only, with no composer.
+        // R598-03: an archived session keeps the bar's reading — model, effort and context —
+        // read-only, with no composer; its untrusted chip stays in the header.
         <div
           data-slot="agent-session-readonly-bar"
           className="shrink-0 border-border border-t px-3 py-2"
@@ -640,14 +691,12 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
           <p className="px-1 py-1 text-muted-foreground text-sm">
             This archived session is read-only. Unarchive it to continue.
           </p>
-          <div className="flex min-w-0 flex-wrap items-center gap-1">
-            <SessionSettingsPicker
-              target={target}
-              agent={vm.agentActor}
-              footer={vm.footer}
-              untrusted={vm.untrusted}
-            />
-            <div className="ml-auto">
+          <div
+            ref={readOnlyBar}
+            className={`${BAR_CLASS} flex min-w-0 flex-wrap items-center gap-1`}
+          >
+            <SessionSettingsPicker target={target} agent={vm.agentActor} footer={vm.footer} />
+            <div className="ml-auto shrink-0">
               <SessionContext context={vm.context} open={contextOpen} onOpenChange={setContextOpen}>
                 <SessionContextTrigger context={vm.context} />
               </SessionContext>
@@ -668,17 +717,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                 onCommand={async ({ name, args }) => {
                   try {
                     const line = `/${name}${args === null ? "" : ` ${args}`}`;
-                    // Only `/stop` declines what the banner shows (R10911-07).
-                    const result =
-                      name === "stop"
-                        ? await fromUnderBanner(() =>
-                            runAgentCommand(target, vm?.agentActor, line, declines),
-                          )
-                        : await runAgentCommand(target, vm?.agentActor, line);
-                    if (result.surface === "people") setPeopleOpen(true);
-                    if (result.surface === "tools") setToolsOpen(true);
-                    if (result.surface === "drives") setDrivesOpen(true);
-                    if (result.surface === "context") setContextOpen(true);
+                    const result = await runCommand(name, line);
                     return result.message ? { tone: "done", message: result.message } : null;
                   } catch (raw) {
                     // A refused `/stop` from under the banner is said there, once.
@@ -703,7 +742,6 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
                       agent={vm.agentActor}
                       footer={vm.footer}
                       picker={vm.settings}
-                      untrusted={vm.untrusted}
                       modelsOpen={modelsOpen}
                       onModelsOpenChange={setModelsOpen}
                     />
