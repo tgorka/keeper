@@ -1405,52 +1405,80 @@ impl Hq {
         Ok(self.status.borrow().clone())
     }
 
-    /// The hosts the person's other devices have on the server, from the
-    /// replicas' `clients` rows: a name Settings refuses for this device.
-    /// Removed devices and this one are left out; empty while unpaired.
-    pub fn device_hosts_taken(&self) -> Vec<String> {
-        let (replicas, paired) = {
+    /// What this device's replicas say about renaming it (R-HQ-94 and its
+    /// amendment, [`crate::device_name::Directory`]): the hosts of the
+    /// person's other live devices, every live agent instance with its host,
+    /// and the host this device's credential was bound to.
+    ///
+    /// With no credential nothing on a server knows this device, so there is
+    /// nothing to protect: an empty directory. `None` while the directory
+    /// cannot be read — the replicas are not open, one cannot be queried, or
+    /// none of them lists this device yet (its directory has not synced) —
+    /// which refuses a rename rather than guessing.
+    pub fn device_directory(&self) -> Option<crate::device_name::Directory> {
+        let (replicas, pairing, open) = {
             let inner = lock(&self.inner);
-            let paired = inner
-                .server
-                .as_ref()
-                .and(inner.pairing.as_ref())
-                .map(|p| (p.actor_id.clone(), p.client_id.clone()));
             let replicas: Vec<Arc<dyn Replica>> =
                 inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
-            (replicas, paired)
+            (
+                replicas,
+                inner.pairing.clone(),
+                matches!(inner.local_open, LocalOpen::Open),
+            )
         };
-        let Some((actor, me)) = paired else {
-            return Vec::new();
+        let Some(pairing) = pairing else {
+            return Some(crate::device_name::Directory::default());
         };
-        let mut hosts: Vec<String> = Vec::new();
+        if !open || replicas.is_empty() {
+            return None;
+        }
+        let mut directory = crate::device_name::Directory {
+            bound: pairing.host.clone(),
+            ..Default::default()
+        };
+        let mut listed = false;
         for replica in &replicas {
             let rows = match replica.query(
-                "SELECT id, host, revoked_at_ms FROM clients \
-                 WHERE actor_id = ?1 AND kind = 'device'",
-                &[Value::from(actor.as_str())],
+                "SELECT id, actor_id, kind, host, revoked_at_ms FROM clients",
+                &[],
             ) {
                 Ok(rows) => rows,
                 Err(error) => {
-                    tracing::debug!(%error, "an agents replica's directory could not be read");
-                    continue;
+                    tracing::info!(%error, "an agents replica's directory could not be read");
+                    return None;
                 }
             };
             for row in rows {
-                let removed = row.get("revoked_at_ms").is_some_and(|v| !v.is_null());
-                if removed || row.get("id").and_then(Value::as_str) == Some(me.as_str()) {
+                let text = |key: &str| row.get(key).and_then(Value::as_str);
+                if text("id") == Some(pairing.client_id.as_str()) {
+                    listed = true;
                     continue;
                 }
-                let Some(host) = row.get("host").and_then(Value::as_str).and_then(known_host)
+                if row.get("revoked_at_ms").is_some_and(|v| !v.is_null()) {
+                    continue;
+                }
+                let (Some(actor), Some(host)) =
+                    (text("actor_id"), text("host").and_then(known_host))
                 else {
                     continue;
                 };
-                if !hosts.contains(&host) {
-                    hosts.push(host);
+                match text("kind") {
+                    Some("device") if actor == pairing.actor_id => {
+                        if !directory.taken.contains(&host) {
+                            directory.taken.push(host);
+                        }
+                    }
+                    Some("instance") => {
+                        let instance = (actor.to_owned(), host);
+                        if !directory.instances.contains(&instance) {
+                            directory.instances.push(instance);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        hosts
+        listed.then_some(directory)
     }
 }
 

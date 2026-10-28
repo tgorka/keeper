@@ -6090,7 +6090,10 @@ let hqEnrollStarted = false;
 // "iPhone", as iOS 16+ does without Apple's entitlement; the person's laptop holds "hesperia" on the
 // server, so that name is taken. With ?hq=enrolled a new name is signed in again, as `Hq::device_renamed`
 // does with an account that can mint a token.
-const DEVICE_NAME_SYSTEM = "iPhone";
+// ?hq=enrolled&devicename=runs: this is the Mac hesperia, which runs nixi, so it keeps its name
+// (R607-01). With ?account=ready the account's record of this device follows the name (R607-02).
+const deviceNameScenario = new URLSearchParams(window.location.search).get("devicename");
+const DEVICE_NAME_SYSTEM = deviceNameScenario === "runs" ? "hesperia" : "iPhone";
 const DEVICE_NAMES_TAKEN = hqParam === "enrolled" ? ["hesperia"] : [];
 let deviceNameStored: string | null = null;
 function deviceNameVm(): DeviceNameVm {
@@ -6109,7 +6112,30 @@ function deviceNameVm(): DeviceNameVm {
       };
 }
 // ?hq=enrolled&devicename=signedout: the account cannot mint a token, so Settings asks for a sign-in.
-const deviceNameScenario = new URLSearchParams(window.location.search).get("devicename");
+function deviceNameMayLeave(current: string): void {
+  if (deviceNameScenario === "runs" && hqParam === "enrolled" && current === "hesperia") {
+    hqRefuse("This device runs nixi; its name stays hesperia.");
+  }
+}
+// `account_device_after` + the account's rename: the record takes the name's slug, or the
+// system's after a Reset.
+function deviceAccountFollows(): void {
+  const device = accountVm.device;
+  if (device === null) return;
+  const named = deviceNameVm();
+  const slug = named.name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  const to = named.source === "you" ? slug : slug === "iphone" ? "iphone-9a0b" : slug;
+  if (to === device.slug) return;
+  const renamed = { ...device, slug: to, name: to };
+  setAccount({
+    ...accountVm,
+    device: renamed,
+    devices: accountVm.devices.map((d) => (d.thisDevice ? renamed : d)),
+  });
+}
 function deviceRenamed(previous: string): void {
   if (hqParam !== "enrolled" || deviceNameVm().name === previous) return;
   if (deviceNameScenario === "signedout") {
@@ -11457,13 +11483,17 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       );
     }
     const previous = deviceNameVm().name;
+    if (name !== previous) deviceNameMayLeave(previous);
     deviceNameStored = name;
+    deviceAccountFollows();
     deviceRenamed(previous);
     return deviceNameVm();
   },
   device_name_reset: () => {
     const previous = deviceNameVm().name;
+    if (previous !== DEVICE_NAME_SYSTEM) deviceNameMayLeave(previous);
     deviceNameStored = null;
+    deviceAccountFollows();
     deviceRenamed(previous);
     return deviceNameVm();
   },

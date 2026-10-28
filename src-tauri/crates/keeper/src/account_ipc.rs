@@ -3854,9 +3854,13 @@ pub fn device_name_get(state: State<'_, AppState>) -> Result<DeviceNameVm, IpcEr
     Ok(device_name_vm(&data_dir))
 }
 
-/// Name this device. Refused with Rust's sentence — and nothing stored —
-/// when the agents server's host rule refuses it, or another of the
-/// person's devices has it there. The agents server is then told
+/// Name this device. Refused with Rust's sentence — and nothing changed —
+/// when the agents server's host rule refuses it, another of the person's
+/// devices has it there, this device runs one of their agents (R607-01), the
+/// agents server's directory is not read yet, or the account's repository
+/// will not take the device's record under it. Then the record in the
+/// account follows the name ([`rename_account_device`], R607-02), the name
+/// is stored, and the agents server is told
 /// ([`keeper_core::hq::Hq::device_renamed`]); its sign-in line says what
 /// that took.
 #[tauri::command]
@@ -3865,40 +3869,78 @@ pub async fn device_name_set(
     name: String,
 ) -> Result<DeviceNameVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let previous = device_name_vm(&data_dir).name;
     let hq = crate::hq_ipc::service();
-    let taken = hq
-        .as_ref()
-        .map(|hq| hq.device_hosts_taken())
-        .unwrap_or_default();
-    let named = match device_name::set(&data_dir, &name, &system_host(), &taken) {
-        Ok(named) => named,
-        Err(device_name::DeviceNameError::Refused(why)) => return Err(refusal(why.to_string())),
-        Err(device_name::DeviceNameError::Core(error)) => return Err(to_ipc_error(error)),
-    };
-    tell_agents_server(hq, &previous).await;
-    Ok(named)
+    let directory = rename_directory(hq.as_ref());
+    let after = device_name::plan_set(&data_dir, &name, &system_host(), directory.as_ref())
+        .map_err(device_name_error)?;
+    rename_to(state, &data_dir, hq, after).await
 }
 
-/// Go back to the system's name for this device; the agents server is told
-/// as for a new name.
+/// Go back to the system's name for this device, held and followed as a
+/// new name is.
 #[tauri::command]
 pub async fn device_name_reset(state: State<'_, AppState>) -> Result<DeviceNameVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let previous = device_name_vm(&data_dir).name;
-    let named = device_name::reset(&data_dir, &system_host()).map_err(to_ipc_error)?;
-    tell_agents_server(crate::hq_ipc::service(), &previous).await;
-    Ok(named)
+    let hq = crate::hq_ipc::service();
+    let directory = rename_directory(hq.as_ref());
+    let after = device_name::plan_reset(&data_dir, &system_host(), directory.as_ref())
+        .map_err(device_name_error)?;
+    rename_to(state, &data_dir, hq, after).await
 }
 
-/// The name is stored either way: a server that could not be told is
-/// logged, and its sign-in line in Settings says what it knows.
-async fn tell_agents_server(hq: Option<Arc<keeper_core::hq::Hq>>, previous: &str) {
+/// The agents server's directory as this device holds it; `None` — a
+/// rename refused as unread — while the service has not started.
+fn rename_directory(hq: Option<&Arc<keeper_core::hq::Hq>>) -> Option<device_name::Directory> {
+    hq.and_then(|hq| hq.device_directory())
+}
+
+fn device_name_error(error: device_name::DeviceNameError) -> IpcError {
+    match error {
+        device_name::DeviceNameError::Refused(why) => refusal(why.to_string()),
+        device_name::DeviceNameError::Core(error) => to_ipc_error(error),
+    }
+}
+
+/// A planned name: the account's record first, since its repository may
+/// refuse; then the name; then the agents server.
+async fn rename_to(
+    state: State<'_, AppState>,
+    data_dir: &Path,
+    hq: Option<Arc<keeper_core::hq::Hq>>,
+    after: DeviceNameVm,
+) -> Result<DeviceNameVm, IpcError> {
+    let previous = device_name_vm(data_dir).name;
+    rename_account_device(state, &after).await?;
+    device_name::store(data_dir, &after).map_err(to_ipc_error)?;
     if let Some(hq) = hq {
-        if let Err(error) = hq.device_renamed(previous).await {
+        if let Err(error) = hq.device_renamed(&previous).await {
             tracing::warn!(%error, "the agents server could not be told this device's new name");
         }
     }
+    Ok(after)
+}
+
+/// R607-02: this device's record in the account's repository follows its
+/// name, through the account's own rename ([`rename_device`]): its record
+/// and every file of its own move in one commit, or — not registered yet —
+/// its first registration takes the name. Nothing without an account.
+async fn rename_account_device(
+    state: State<'_, AppState>,
+    after: &DeviceNameVm,
+) -> Result<(), IpcError> {
+    if descriptor().is_none() {
+        return Ok(());
+    }
+    let registered = lock(&RUNTIME.inner).this_device.clone();
+    let Some(to) = device_name::account_device_after(after, registered.as_deref(), || {
+        system_device_name(&after.system)
+    }) else {
+        return Ok(());
+    };
+    let renamed = rename_device(state, to).await;
+    // The gate is free again: a change noted during the rename goes now.
+    resync_if_dirty();
+    renamed.map(|_| ())
 }
 
 /// Rename this device: both of its files in the person's directory move in

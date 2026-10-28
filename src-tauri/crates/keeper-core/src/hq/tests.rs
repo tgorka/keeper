@@ -601,31 +601,60 @@ async fn the_devices_follow_the_replicated_directory() {
     .await;
 }
 
-/// R-HQ-94: the names Settings refuses for this device are the hosts the
-/// person's other devices have on the server — never this device's own, a
-/// removed one's, or a blank one.
+/// R-HQ-94 and its amendment: what a rename is checked against is read from
+/// the replicated directory — the hosts of the person's other live devices
+/// (never this one's, a removed one's, a blank one or someone else's) and
+/// every live agent instance with its host. Until this device is listed
+/// there the directory is unread, and with no credential there is nothing
+/// to protect.
 #[tokio::test]
-async fn the_names_taken_are_the_hosts_of_the_persons_other_live_devices() {
+async fn a_rename_is_checked_against_the_replicated_directory() {
     let world = World::new();
+    let unpaired = world.hq();
+    unpaired.start().await.expect("starts");
+    assert_eq!(
+        unpaired.device_directory(),
+        Some(crate::device_name::Directory::default())
+    );
+    unpaired.shutdown().await;
+
     world.paired("https://hq.example.org", &["alpha"]);
     let hq = world.hq();
     hq.start().await.expect("starts");
-    let row = |id: &str, host: &str, revoked: Option<i64>| {
+    let row = |id: &str, actor: &str, kind: &str, host: &str, revoked: Option<i64>| {
         let Value::Object(row) = serde_json::json!({
-            "id": id, "host": host, "created_at_ms": 1, "revoked_at_ms": revoked,
+            "id": id, "actor_id": actor, "kind": kind, "host": host, "created_at_ms": 1,
+            "revoked_at_ms": revoked,
         }) else {
             unreachable!("an object literal")
         };
         row
     };
-    world.live("alpha")[0].replicate(vec![
-        row("ana.1", "hesperia", None),
-        row("ana.2", "kalypso", None),
-        row("ana.3", "electra", Some(5)),
-        row("ana.4", "  ", None),
-        row("ana.5", "kalypso", None),
+    let alpha = world.live("alpha")[0].clone();
+    alpha.replicate(vec![row("ana.2", "ana", "device", "kalypso", None)]);
+    assert_eq!(hq.device_directory(), None, "this device is not listed yet");
+
+    alpha.replicate(vec![
+        row("ana.1", "ana", "device", "hesperia", None),
+        row("ana.2", "ana", "device", "kalypso", None),
+        row("ana.3", "ana", "device", "electra", Some(5)),
+        row("ana.4", "ana", "device", "  ", None),
+        row("ana.5", "ana", "device", "kalypso", None),
+        row("bo.1", "bo", "device", "attic", None),
+        row("nixi.hesperia", "nixi", "instance", "hesperia", None),
+        row("dixi.electra", "dixi", "instance", "electra", None),
+        row("dixi.old", "dixi", "instance", "den", Some(9)),
     ]);
-    assert_eq!(hq.device_hosts_taken(), ["kalypso"]);
+    let directory = hq.device_directory().expect("read");
+    assert_eq!(directory.taken, ["kalypso"]);
+    assert_eq!(
+        directory.instances,
+        [
+            ("nixi".to_owned(), "hesperia".to_owned()),
+            ("dixi".to_owned(), "electra".to_owned()),
+        ]
+    );
+    assert_eq!(directory.bound, None, "a pairing kept before hosts were");
 }
 
 #[cfg(unix)]
