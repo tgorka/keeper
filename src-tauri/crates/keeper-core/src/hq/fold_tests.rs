@@ -1247,3 +1247,100 @@ fn each_request_sits_in_the_turn_that_asked_or_in_the_banner() {
     assert_eq!(ids(&view.approvals), ["no-call"]);
     assert_eq!(fold.status_label, "Waiting for you", "this person first");
 }
+
+/// R604-01: the directory's actors come by the `dir` subscription and a request by its reader's
+/// trace window, so a request can name an approver the directory has no row for yet. The fold's
+/// line, its summary and the waiting card then say "someone else", never the raw actor id; the
+/// name follows once the row arrives, and a request this person can decide still waits for them.
+#[test]
+fn an_approver_the_directory_has_not_supplied_is_someone_else_until_named() {
+    const RAW: &str = "person-01JRAWAPPROVER";
+    let w = world(true);
+    w.put(vec![
+        call(&w, "c-raw", "run", "parked", 1, None),
+        request(&w, "raw", "c-raw", "pending", &[RAW], 1),
+    ]);
+    let view = w.view(&Opened::default());
+    let fold = turn_fold(&view);
+    assert_eq!(
+        (fold.status, fold.status_label.as_str()),
+        (Status::Waiting, "Waiting for someone else"),
+        "an unresolved approver must not be presented as a raw actor id"
+    );
+    assert!(fold.summary.starts_with("Waiting for someone else"));
+    assert_eq!(ids(&fold.waiting), ["raw"]);
+    assert_eq!(fold.waiting[0].sentence, "Waiting for someone else.");
+    assert_eq!(view.banner, None);
+    let wire = serde_json::to_string(&view).expect("serialize");
+    assert!(
+        !wire.contains(RAW),
+        "the raw id reaches no field of the view"
+    );
+
+    // A named approver beside an unresolved one: the name, and someone else for the rest.
+    w.put(vec![
+        person("ben", "Ben"),
+        request(&w, "raw", "c-raw", "pending", &["ben", RAW], 1),
+    ]);
+    let view = w.view(&Opened::default());
+    let fold = turn_fold(&view);
+    assert_eq!(fold.status_label, "Waiting for Ben, someone else");
+    assert_eq!(fold.waiting[0].sentence, "Waiting for Ben, someone else.");
+
+    // The directory supplies the row: the name, on the next projection.
+    w.put(vec![
+        person(RAW, "Cleo"),
+        request(&w, "raw", "c-raw", "pending", &[RAW], 1),
+    ]);
+    let view = w.view(&Opened::default());
+    let fold = turn_fold(&view);
+    assert_eq!(fold.status_label, "Waiting for Cleo");
+    assert!(fold.summary.starts_with("Waiting for Cleo"));
+    assert_eq!(fold.waiting[0].sentence, "Waiting for Cleo.");
+
+    // This person among the approvers: the banner's, and the turn waits for them.
+    w.put(vec![request(
+        &w,
+        "raw",
+        "c-raw",
+        "pending",
+        &[RAW, "ana"],
+        1,
+    )]);
+    let view = w.view(&Opened::default());
+    assert_eq!(
+        ids(&view.banner.as_ref().expect("a banner").approvals),
+        ["raw"]
+    );
+    assert_eq!(turn_fold(&view).status_label, "Waiting for you");
+}
+
+/// R604-01, the decided half: a decider the directory has not supplied is "someone" on the card,
+/// never the raw actor id (`request` decides as `ana`, who has no directory row in `world`).
+#[test]
+fn a_decider_the_directory_has_not_supplied_is_someone() {
+    let w = world(true);
+    w.put(vec![
+        call(&w, "c-done", "run", "done", 1, Some("ok")),
+        request(&w, "decided", "c-done", "approved", &["ana"], 1),
+    ]);
+    let view = w.view(&Opened::default());
+    let fold = turn_fold(&view);
+    assert_eq!(ids(&fold.approvals), ["decided"]);
+    assert_eq!(fold.approvals[0].decided_by, None);
+    assert_eq!(fold.approvals[0].sentence, "Approved by someone.");
+
+    w.put(vec![person("ana", "Ana")]);
+    let view = w.view(&Opened::default());
+    assert_eq!(turn_fold(&view).approvals[0].sentence, "Approved by Ana.");
+}
+
+/// A person's directory row, as the `dir` subscription delivers it.
+fn person(id: &str, name: &str) -> RowOp {
+    upsert(
+        "actors",
+        json!({"id": id, "kind": "person", "display_name": name, "family": null,
+               "dir": "alpha", "created_at_ms": 1, "author_actor": "server",
+               "author_client": "server"}),
+    )
+}

@@ -375,12 +375,14 @@ fn withheld(tier: &str, tool: &str, session: &SessionFacts) -> Option<String> {
 
 /// The grant a request's card may offer, or `None` where *Always allow …*
 /// is left out: [`withheld`], or a call whose arguments no scope names.
+/// `agent_name` is `None` while the directory has not supplied the agent's
+/// row: the offer then says "this agent", never its raw id (R604-01).
 pub fn offer(
     tier: &str,
     tool: &str,
     args: &Value,
     session: &SessionFacts,
-    agent_name: &str,
+    agent_name: Option<&str>,
     database: &str,
 ) -> Option<AgentGrantOfferVm> {
     if withheld(tier, tool, session).is_some() {
@@ -390,6 +392,10 @@ pub fn offer(
     if scopes.is_empty() {
         return None;
     }
+    let (agent_name, subject) = match agent_name {
+        Some(name) => (name, name),
+        None => ("this agent", "This agent"),
+    };
     Some(AgentGrantOfferVm {
         agent_name: agent_name.to_owned(),
         tool: tool.to_owned(),
@@ -404,14 +410,14 @@ pub fn offer(
                     Scope::Any => format!("{tool}, any arguments"),
                 },
                 standing: format!(
-                    "{agent_name} may {} in every session you share with it in {database}, \
+                    "{subject} may {} in every session you share with it in {database}, \
                      without asking — {}.{}",
                     scope.covers(tool),
                     scope.whatever(),
                     scope.any_code().unwrap_or_default()
                 ),
                 session: format!(
-                    "{agent_name} may {} in this session, without asking — {}.{}",
+                    "{subject} may {} in this session, without asking — {}.{}",
                     scope.covers(tool),
                     scope.whatever(),
                     scope.any_code().unwrap_or_default()

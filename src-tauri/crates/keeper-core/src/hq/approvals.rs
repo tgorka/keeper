@@ -282,12 +282,11 @@ fn vm(
     let action = action(row);
     let approvers = names(row, "approvers");
     let mine = approvers.contains(&source.actor);
-    let name = |actor: &str| {
-        directory
-            .get(actor)
-            .cloned()
-            .unwrap_or_else(|| actor.to_owned())
-    };
+    // An actor the directory has not supplied yet has no name here: its raw
+    // id is never shown as one. Directory rows come by the `dir`
+    // subscription and requests by trace windows, so a request can arrive
+    // first; the name follows once the row does (R604-01).
+    let name = |actor: &str| directory.get(actor).cloned();
     // A refused decision of this device's is not a decision: the request
     // reads pending again, however long its optimistic row lingers here.
     let mine_decided = text(row, "decided_by_client") == source.client;
@@ -305,7 +304,7 @@ fn vm(
     };
     let decided_by = opt_text(row, "decided_by_actor")
         .filter(|_| refused.is_none())
-        .map(|actor| name(&actor));
+        .and_then(|actor| name(&actor));
     let tier = text(row, "tier").to_owned();
     // A T4 request this device cannot decide offers no decision here: the
     // server would refuse either (R109T-02).
@@ -316,16 +315,24 @@ fn vm(
         state == AgentApprovalStateVm::Pending && mine && action.is_some() && undecidable.is_none();
     // A grant's own decision names the grant's person (V8 as amended): the
     // card says it came from their standing grant, not a click.
-    let by = |verb: &str| match (decided_by.as_deref(), opt_text(row, "grant_id")) {
-        (Some(who), Some(_)) => format!("{verb} by {who}'s standing grant"),
-        (who, _) => format!("{verb} by {}", who.unwrap_or("someone")),
+    let by = |verb: &str| {
+        let who = decided_by.as_deref().unwrap_or("someone");
+        match opt_text(row, "grant_id") {
+            Some(_) => format!("{verb} by {who}'s standing grant"),
+            None => format!("{verb} by {who}"),
+        }
     };
+    // The approvers' names, those the directory has; "someone else" stands
+    // for every one it has not supplied yet.
     let others = || {
-        approvers
-            .iter()
-            .map(|a| name(a))
-            .collect::<Vec<_>>()
-            .join(", ")
+        let mut known: Vec<String> = approvers.iter().filter_map(|a| name(a)).collect();
+        if known.is_empty() {
+            return "someone else".to_owned();
+        }
+        if known.len() < approvers.len() {
+            known.push("someone else".to_owned());
+        }
+        known.join(", ")
     };
     let waiting_for = (state == AgentApprovalStateVm::Pending).then(|| {
         if mine {
@@ -361,7 +368,7 @@ fn vm(
             &tool_name,
             &crate::hq::sessions::json(row, "args"),
             session,
-            &name(&session.agent_actor),
+            name(&session.agent_actor).as_deref(),
             &source.database,
         ),
         _ => None,
