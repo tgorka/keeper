@@ -18,6 +18,7 @@ import {
 } from "@/components/settings/at-rest-encryption-choice";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
 import { DefaultAgentSection } from "@/components/settings/default-agent-section";
+import { DeviceNameSection } from "@/components/settings/device-name-section";
 import { ModelProvidersSection } from "@/components/settings/model-providers-section";
 import { BADGE_NOT_LIVE_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
 import { OldAgentRoomsSection } from "@/components/settings/old-agent-rooms-section";
@@ -246,6 +247,7 @@ export function SettingsBody({
     // first thing Settings offers — and with no account it is one sentence
     // and one field, so an install that never meets one loses nothing.
     account: { node: <AccountSection open={open} /> },
+    "device-name": { node: <DeviceNameSection open={open} /> },
     // Its own section, not a block inside Sync: the device name is not a sync
     // setting — it rides every commit's `Keeper-Device` trailer, names this
     // machine in conflict-copy filenames, and now qualifies the commit subject

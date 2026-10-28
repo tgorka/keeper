@@ -1129,6 +1129,10 @@ pub fn run() {
                 account_ipc::account_cancel_sign_in,
                 account_ipc::account_sync,
                 account_ipc::account_rename_device,
+                // This device's name (R-HQ-94): every target, the phone above all.
+                account_ipc::device_name_get,
+                account_ipc::device_name_set,
+                account_ipc::device_name_reset,
                 account_ipc::account_send_log,
                 account_ipc::account_share,
                 account_ipc::account_sign_out,

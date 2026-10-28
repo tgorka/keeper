@@ -25,6 +25,7 @@ pub mod chat;
 pub mod config;
 pub mod container;
 pub mod demo;
+pub mod device_name;
 pub mod disclosure;
 pub mod document;
 pub mod drafts;

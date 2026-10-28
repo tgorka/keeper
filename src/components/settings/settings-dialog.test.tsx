@@ -9,6 +9,10 @@ vi.mock("@/lib/ipc/client", () => ({
   // The agents server's status (Epic 106): never answered here, so the section draws nothing.
   hqStatusSubscribe: vi.fn(() => new Promise(() => {})),
   hqStatusUnsubscribe: vi.fn(() => Promise.resolve()),
+  // This device's name (R-HQ-94): never answered here, so the section draws nothing.
+  deviceNameGet: vi.fn(() => new Promise(() => {})),
+  deviceNameSet: vi.fn(),
+  deviceNameReset: vi.fn(),
   // Settings › Agents › Answers from (106.5): never answers here, so the section stays absent.
   agentInstancesSubscribe: vi.fn(() => new Promise(() => {})),
   agentInstancesUnsubscribe: vi.fn(() => Promise.resolve()),

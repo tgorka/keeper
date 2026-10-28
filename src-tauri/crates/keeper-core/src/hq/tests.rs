@@ -161,6 +161,7 @@ impl World {
             client_id: "ana.1".to_owned(),
             name: "keeper on test".to_owned(),
             bound: None,
+            host: None,
         };
         self.platform
             .keychain_set(
@@ -598,6 +599,33 @@ async fn the_devices_follow_the_replicated_directory() {
             .any(|d| d.client_id == "ana.2" && d.revoked)
     })
     .await;
+}
+
+/// R-HQ-94: the names Settings refuses for this device are the hosts the
+/// person's other devices have on the server — never this device's own, a
+/// removed one's, or a blank one.
+#[tokio::test]
+async fn the_names_taken_are_the_hosts_of_the_persons_other_live_devices() {
+    let world = World::new();
+    world.paired("https://hq.example.org", &["alpha"]);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    let row = |id: &str, host: &str, revoked: Option<i64>| {
+        let Value::Object(row) = serde_json::json!({
+            "id": id, "host": host, "created_at_ms": 1, "revoked_at_ms": revoked,
+        }) else {
+            unreachable!("an object literal")
+        };
+        row
+    };
+    world.live("alpha")[0].replicate(vec![
+        row("ana.1", "hesperia", None),
+        row("ana.2", "kalypso", None),
+        row("ana.3", "electra", Some(5)),
+        row("ana.4", "  ", None),
+        row("ana.5", "kalypso", None),
+    ]);
+    assert_eq!(hq.device_hosts_taken(), ["kalypso"]);
 }
 
 #[cfg(unix)]

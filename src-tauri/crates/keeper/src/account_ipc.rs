@@ -42,6 +42,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use keeper_core::config::{self as layers, AccountLayerSource};
+use keeper_core::device_name::{self, DeviceNameSource, DeviceNameVm};
 use keeper_core::error::CoreError;
 use keeper_core::forges::{self, tokens::ForgeError, ForgeSource};
 use keeper_core::oauth::{OAuthCallback, OAuthFlowRegistry};
@@ -556,22 +557,51 @@ pub fn init_device() {
     });
 }
 
-/// The OS device name, not a random model suffix or an account credential.
-/// iOS may expose only the generic model name without Apple's name entitlement.
+/// What the system calls this device: `UIDevice.name` on iOS, which iOS 16+
+/// answers with the bare model ("iPhone") without Apple's name entitlement;
+/// empty before setup has read it.
 #[cfg(target_os = "ios")]
-pub fn device_host() -> String {
+fn system_host() -> String {
     IOS_DEVICE
         .get()
         .map_or_else(String::new, |device| device.name.clone())
 }
 
+/// What the system calls this device: the short host name; empty when the
+/// OS does not say.
 #[cfg(not(target_os = "ios"))]
-pub fn device_host() -> String {
+fn system_host() -> String {
     let host = keeper_core::config::read_host_label();
     if host == "unknown-host" {
         String::new()
     } else {
         host
+    }
+}
+
+/// This device's name (R-HQ-94) as `keeper_core::device_name` decides it:
+/// the one set in Settings, else the system's. A store that does not read
+/// leaves the system's name, logged.
+fn device_name_vm(data_dir: &Path) -> DeviceNameVm {
+    let system = system_host();
+    device_name::read(data_dir, &system).unwrap_or_else(|error| {
+        tracing::warn!(%error, "this device's name does not read; the system's is used");
+        device_name::resolve(None, &system)
+    })
+}
+
+/// The one provider of this device's host (R-HQ-94): the name set in
+/// Settings › This device's name, else what the system calls the device.
+/// The agents server's pairing and sign-in read it (109.1, 109.5/109.6), and
+/// so does the default of this device's name in the account's repository
+/// ([`default_device_name`]).
+pub fn device_host(platform: &dyn Platform) -> String {
+    match platform.data_dir() {
+        Ok(data_dir) => device_name_vm(&data_dir).name,
+        Err(error) => {
+            tracing::warn!(%error, "no data directory; this device's system name is used");
+            system_host()
+        }
     }
 }
 
@@ -613,7 +643,7 @@ fn device_name(data_dir: &Path, account_id: &str) -> String {
         registry::get_account_device_slug(data_dir, account_id),
         "this device's registered name; the default name is offered",
     )
-    .unwrap_or_else(default_device_name)
+    .unwrap_or_else(|| default_device_name(data_dir))
 }
 
 /// A registry read whose failure leaves the default in place — logged at
@@ -625,10 +655,21 @@ fn read_or_warn<T>(read: Result<Option<T>, CoreError>, lost: &str) -> Option<T> 
     })
 }
 
-/// On a phone, where there is no host name: the model plus a four-character
-/// suffix (`iphone-3f2a`).
+/// The name a device not yet registered in the account's repository starts
+/// from: this device's name ([`device_host`]'s), slugged, when a person set
+/// one; else the platform's default ([`system_device_name`]).
+fn default_device_name(data_dir: &Path) -> String {
+    let named = device_name_vm(data_dir);
+    match named.source {
+        DeviceNameSource::You => layout::device_slug(&named.name),
+        DeviceNameSource::System => system_device_name(&named.system),
+    }
+}
+
+/// On a phone, whose system name is the bare model: the model plus a
+/// four-character suffix (`iphone-3f2a`).
 #[cfg(target_os = "ios")]
-fn default_device_name() -> String {
+fn system_device_name(_system: &str) -> String {
     let model = IOS_DEVICE
         .get()
         .map_or("iphone", |device| device.model.as_str());
@@ -638,15 +679,19 @@ fn default_device_name() -> String {
 
 /// On Android, likewise: the model `MainActivity` reports plus a suffix.
 #[cfg(target_os = "android")]
-fn default_device_name() -> String {
+fn system_device_name(_system: &str) -> String {
     let suffix = (ulid::Ulid::new().random() & 0xffff) as u16;
     layout::device_slug(&format!("{}-{suffix:04x}", crate::android::device_model()))
 }
 
 /// The short host name, folded to a slug.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
-fn default_device_name() -> String {
-    layout::device_slug(&keeper_core::config::read_host_label())
+fn system_device_name(system: &str) -> String {
+    layout::device_slug(if system.is_empty() {
+        "unknown-host"
+    } else {
+        system
+    })
 }
 
 /// This machine to this person (A5): the sha256 of the OS's stable machine
@@ -1038,7 +1083,7 @@ fn load_local(platform: &dyn Platform, inner: &mut Inner) -> bool {
         let device = inner
             .this_device
             .clone()
-            .unwrap_or_else(default_device_name);
+            .unwrap_or_else(|| default_device_name(&data_dir));
         apply_clone(inner, &clone_dir(&data_dir, &d.id), &d, &identity, &device);
     }
     inner.descriptor = Some(d);
@@ -1505,7 +1550,7 @@ async fn converge(
             {
                 Some(device) => device,
                 None => {
-                    let device = default_device_name();
+                    let device = default_device_name(&data_dir);
                     inner.wanted_device = Some(device.clone());
                     device
                 }
@@ -1633,7 +1678,11 @@ async fn converge(
                 spec.dir.clone(),
                 identity.login.clone(),
             );
-            let slug = layout::device_slug(&wanted.clone().unwrap_or_else(default_device_name));
+            let slug = layout::device_slug(
+                &wanted
+                    .clone()
+                    .unwrap_or_else(|| default_device_name(&data_dir)),
+            );
             on_blocking_pool(move || {
                 (
                     machine_fingerprint(&sub),
@@ -1650,7 +1699,7 @@ async fn converge(
             let device = layout::free_device_slug(
                 &WorktreeFiles(&spec.dir),
                 &identity.login,
-                &wanted.unwrap_or_else(default_device_name),
+                &wanted.unwrap_or_else(|| default_device_name(&data_dir)),
                 false,
                 device_class(),
                 std::env::consts::OS,
@@ -3438,7 +3487,10 @@ pub(crate) fn drive_records(data_dir: &Path) -> (Vec<DriveRecord>, String) {
         .and_then(|bytes| DrivesFile::parse(&bytes).ok())
         .map(|file| file.drives)
         .unwrap_or_default();
-    (records, device.unwrap_or_else(default_device_name))
+    (
+        records,
+        device.unwrap_or_else(|| default_device_name(data_dir)),
+    )
 }
 
 /// A drive's remote from [`DRIVE_REMOTES`]. On a miss the map is refilled off
@@ -3792,6 +3844,61 @@ pub async fn account_sync(state: State<'_, AppState>, force: bool) -> Result<Acc
         force,
     ))
     .await)
+}
+
+/// Settings › This device's name (R-HQ-94): the effective name, where it
+/// comes from, and what the system calls this device.
+#[tauri::command]
+pub fn device_name_get(state: State<'_, AppState>) -> Result<DeviceNameVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    Ok(device_name_vm(&data_dir))
+}
+
+/// Name this device. Refused with Rust's sentence — and nothing stored —
+/// when the agents server's host rule refuses it, or another of the
+/// person's devices has it there. The agents server is then told
+/// ([`keeper_core::hq::Hq::device_renamed`]); its sign-in line says what
+/// that took.
+#[tauri::command]
+pub async fn device_name_set(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<DeviceNameVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let previous = device_name_vm(&data_dir).name;
+    let hq = crate::hq_ipc::service();
+    let taken = hq
+        .as_ref()
+        .map(|hq| hq.device_hosts_taken())
+        .unwrap_or_default();
+    let named = match device_name::set(&data_dir, &name, &system_host(), &taken) {
+        Ok(named) => named,
+        Err(device_name::DeviceNameError::Refused(why)) => return Err(refusal(why.to_string())),
+        Err(device_name::DeviceNameError::Core(error)) => return Err(to_ipc_error(error)),
+    };
+    tell_agents_server(hq, &previous).await;
+    Ok(named)
+}
+
+/// Go back to the system's name for this device; the agents server is told
+/// as for a new name.
+#[tauri::command]
+pub async fn device_name_reset(state: State<'_, AppState>) -> Result<DeviceNameVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let previous = device_name_vm(&data_dir).name;
+    let named = device_name::reset(&data_dir, &system_host()).map_err(to_ipc_error)?;
+    tell_agents_server(crate::hq_ipc::service(), &previous).await;
+    Ok(named)
+}
+
+/// The name is stored either way: a server that could not be told is
+/// logged, and its sign-in line in Settings says what it knows.
+async fn tell_agents_server(hq: Option<Arc<keeper_core::hq::Hq>>, previous: &str) {
+    if let Some(hq) = hq {
+        if let Err(error) = hq.device_renamed(previous).await {
+            tracing::warn!(%error, "the agents server could not be told this device's new name");
+        }
+    }
 }
 
 /// Rename this device: both of its files in the person's directory move in

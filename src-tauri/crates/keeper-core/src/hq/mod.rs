@@ -148,6 +148,11 @@ struct Pairing {
     /// last attested. A pairing's has none, and a sign-in adopts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bound: Option<signin::Bound>,
+    /// The host the server bound this credential to, as it was sent at
+    /// redemption or enrolment (R-HQ-94). Absent on a credential kept before
+    /// keeper recorded it: its host is learnt at the next rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
 }
 
 impl std::fmt::Debug for Pairing {
@@ -258,6 +263,10 @@ struct Inner {
     push_told: Option<(String, String, Option<push::PushTarget>)>,
     /// Sign-in enrolment on this configuration ([`signin`]).
     sign_in: signin::SignInMemo,
+    /// This device's name as of the last restart or rename ([`Hq::device_renamed`]):
+    /// a credential bound to another host is signed in again under it.
+    /// `None` while the name is not known yet (iOS before setup ran).
+    host: Option<String>,
 }
 
 /// What a reconfiguration takes out of service.
@@ -333,6 +342,18 @@ fn no_server() -> HqStatusVm {
 
 fn keychain_key(server: &ServerUrl) -> String {
     format!("{KEYCHAIN_PREFIX}{}", server.as_str())
+}
+
+/// A host as the server's rule takes it ([`crate::device_name::host_rule`]),
+/// or `None` for one it would refuse: an unknown name, never a stale one.
+fn known_host(host: &str) -> Option<String> {
+    crate::device_name::host_rule(host).ok().map(str::to_owned)
+}
+
+/// Whether the server knows this device by a host other than its name now:
+/// both known, and different (the server compares hosts exactly).
+fn renamed(pairing: &Pairing, host: Option<&str>) -> bool {
+    matches!((pairing.host.as_deref(), host), (Some(had), Some(now)) if had != now)
 }
 
 fn route_sentence(server: &ServerUrl, error: &RouteError) -> String {
@@ -651,6 +672,10 @@ impl Hq {
             (Some(holding), Some(_)) => Authorization::load(&data_dir, holding),
             _ => Authorization::default(),
         };
+        // This device's name now, read once per configuration and never
+        // under the lock: the shell reads a setting and, on a computer with
+        // no name set, asks the OS.
+        let host = known_host(&(self.device_host)());
         let (retired, generation) = {
             let mut inner = lock(&self.inner);
             inner.generation += 1;
@@ -663,6 +688,7 @@ impl Hq {
             inner.pairing = pairing.clone();
             inner.authorization = authorization.clone();
             inner.sign_in = signin::SignInMemo::default();
+            inner.host = host;
             (retired, inner.generation)
         };
         // Every old request ends before the new configuration is published.
@@ -1172,6 +1198,7 @@ impl Hq {
             client_id: redeemed.discovery.client_id,
             name: self.device_name.clone(),
             bound: None,
+            host: known_host(&host),
         };
         let stored = serde_json::to_string(&record).map_err(sentence)?;
         self.platform
@@ -1323,6 +1350,107 @@ impl Hq {
         lock(&self.inner).refusals.clear();
         self.restart().await?;
         Ok(self.status.borrow().clone())
+    }
+
+    /// This device's name changed (Settings › This device's name, R-HQ-94).
+    ///
+    /// The server learns a host only when a credential is issued:
+    /// `/clients/self/attest` takes no host, and an enrolment's adoption
+    /// does (keeper-hq `store.adopt` sets `host`). So a credential bound to
+    /// the old name is signed in again under the new one, keeping its
+    /// client id — at once when the account can mint a sign-in token, else
+    /// once the person signs in again, which Settings asks for
+    /// ([`HqSignInState::Renamed`]).
+    ///
+    /// `previous` is the name before the change: a credential kept before
+    /// keeper recorded hosts was sent under it, and it is recorded now.
+    pub async fn device_renamed(&self, previous: &str) -> Result<HqStatusVm, HqError> {
+        let host = known_host(&(self.device_host)());
+        let lifecycle = self.lifecycle.lock().await;
+        let (server, pairing) = {
+            let inner = lock(&self.inner);
+            (inner.server.clone(), inner.pairing.clone())
+        };
+        if let (Some(server), Some(pairing), Some(previous)) =
+            (server, pairing, known_host(previous))
+        {
+            if pairing.host.is_none() {
+                let record = Pairing {
+                    host: Some(previous),
+                    ..pairing
+                };
+                let stored = serde_json::to_string(&record).map_err(sentence)?;
+                self.platform
+                    .keychain_set(&keychain_key(&server), &stored)?;
+                lock(&self.inner).pairing = Some(record);
+            }
+        }
+        {
+            let mut inner = lock(&self.inner);
+            inner.host = host;
+            let stale = inner
+                .pairing
+                .as_ref()
+                .is_some_and(|pairing| renamed(pairing, inner.host.as_deref()));
+            if stale {
+                // What the last attempt decided was for the old name.
+                inner.sign_in.outcome = None;
+                inner.sign_in.tried = None;
+                inner.sign_in.superseded = 0;
+            }
+        }
+        drop(lifecycle);
+        self.consider_sign_in();
+        self.publish();
+        Ok(self.status.borrow().clone())
+    }
+
+    /// The hosts the person's other devices have on the server, from the
+    /// replicas' `clients` rows: a name Settings refuses for this device.
+    /// Removed devices and this one are left out; empty while unpaired.
+    pub fn device_hosts_taken(&self) -> Vec<String> {
+        let (replicas, paired) = {
+            let inner = lock(&self.inner);
+            let paired = inner
+                .server
+                .as_ref()
+                .and(inner.pairing.as_ref())
+                .map(|p| (p.actor_id.clone(), p.client_id.clone()));
+            let replicas: Vec<Arc<dyn Replica>> =
+                inner.dbs.iter().map(|db| Arc::clone(&db.replica)).collect();
+            (replicas, paired)
+        };
+        let Some((actor, me)) = paired else {
+            return Vec::new();
+        };
+        let mut hosts: Vec<String> = Vec::new();
+        for replica in &replicas {
+            let rows = match replica.query(
+                "SELECT id, host, revoked_at_ms FROM clients \
+                 WHERE actor_id = ?1 AND kind = 'device'",
+                &[Value::from(actor.as_str())],
+            ) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::debug!(%error, "an agents replica's directory could not be read");
+                    continue;
+                }
+            };
+            for row in rows {
+                let removed = row.get("revoked_at_ms").is_some_and(|v| !v.is_null());
+                if removed || row.get("id").and_then(Value::as_str) == Some(me.as_str()) {
+                    continue;
+                }
+                let Some(host) = row.get("host").and_then(Value::as_str).and_then(known_host)
+                else {
+                    continue;
+                };
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
+        hosts
     }
 }
 

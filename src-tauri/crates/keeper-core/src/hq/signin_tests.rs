@@ -371,6 +371,7 @@ impl World {
             client_id: client.to_owned(),
             name: "keeper".to_owned(),
             bound,
+            host: None,
         };
         self.platform
             .keychain_set(
@@ -1197,4 +1198,97 @@ async fn a_success_starts_the_retry_schedule_over() {
     // Ten minutes again, not the twenty that came after the first refusal.
     past_the_retry(&hq).await;
     world.until_asked("/clients/self/attest", 4).await;
+}
+
+/// A credential attested a day ago: nothing is due.
+fn fresh() -> Bound {
+    Bound {
+        attested_at_ms: sessions::now_ms() - DAY_MS,
+        window_ms: 7 * DAY_MS,
+    }
+}
+
+/// R-HQ-94: `/clients/self/attest` takes no host, so a device renamed after
+/// it signed in is signed in again — adopted under its own client id, with
+/// its token in the body — and the server is sent the new name. A rename to
+/// the name it already has, or a restart after, sends nothing.
+#[tokio::test]
+async fn a_renamed_device_is_signed_in_again_under_its_new_name_keeping_its_client_id() {
+    let world = World::new(true);
+    // Kept before hosts were recorded: the host it was sent under is the
+    // name before the rename.
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    *lock(&world.host) = "iPhone".to_owned();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+    hq.device_renamed("iPhone").await.expect("same name");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(world.asked("/devices/enroll").is_empty(), "nothing changed");
+
+    *lock(&world.host) = "kalypso".to_owned();
+    hq.device_renamed("iPhone").await.expect("renamed");
+    world.until_asked("/devices/enroll", 1).await;
+    status_until(&hq, "enrolled under the new name", enrolled).await;
+
+    let enrol = world.asked("/devices/enroll");
+    assert_eq!(enrol[0].json()["host"], "kalypso");
+    assert_eq!(enrol[0].json()["deviceToken"], "device-token-a");
+    assert_eq!(bearer(&enrol[0]), "signin-token-1");
+    assert!(world.asked("/clients/self/attest").is_empty());
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1", "the same device on the server");
+    assert_eq!(kept.token, "device-token-1", "the token is rotated");
+    assert_eq!(kept.host.as_deref(), Some("kalypso"));
+
+    hq.reconcile().await.expect("reconciles");
+    hq.shutdown().await;
+    let again = world.hq();
+    again.start().await.expect("starts again");
+    status_until(&again, "enrolled", enrolled).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(world.asked("/devices/enroll").len(), 1, "sent once");
+}
+
+/// Signed out, a renamed device says so — "Sign in again to use the new
+/// name on <server>" — sends nothing, and keeps the host the server has;
+/// the sign-in that follows sends the new name.
+#[tokio::test]
+async fn signed_out_a_renamed_device_asks_for_a_sign_in_and_the_sign_in_sends_the_new_name() {
+    let world = World::new(false);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+
+    *lock(&world.host) = "studio".to_owned();
+    hq.device_renamed("hesperia").await.expect("renamed");
+    let status = status_until(&hq, "asks for a sign-in", |s| {
+        s.sign_in.state == HqSignInState::Renamed
+    })
+    .await;
+    assert_eq!(
+        status.sign_in.sentence.as_deref(),
+        Some(
+            format!(
+                "Sign in again to use the new name on {}.",
+                world.server().host()
+            )
+            .as_str()
+        )
+    );
+    assert!(world.asked("/devices/enroll").is_empty());
+    assert_eq!(world.sign_in.minted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        world.kept().expect("kept").host.as_deref(),
+        Some("hesperia"),
+        "the host the server has, learnt from the name before"
+    );
+
+    world.sign_in.set(|account| account.signed_in = true);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 1).await;
+    status_until(&hq, "enrolled under the new name", enrolled).await;
+    assert_eq!(world.asked("/devices/enroll")[0].json()["host"], "studio");
+    assert_eq!(world.kept().expect("kept").host.as_deref(), Some("studio"));
 }
