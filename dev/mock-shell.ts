@@ -8034,7 +8034,18 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     ...(sentence ? { banner: { approvals: waiting, sentence } } : {}),
     tools: vm.tools.map((tool) => ({ ...tool })),
     ...(vm.drives
-      ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
+      ? {
+          drives: {
+            ...vm.drives,
+            drives: vm.drives.drives.map((drive) => ({ ...drive })),
+            unseen: vm.drives.drives
+              .filter(
+                (d) =>
+                  d.ticked && mockUnseenTicks.has(unseenKey(vm.database, vm.sessionId, d.name)),
+              )
+              .map((d) => d.name),
+          },
+        }
       : {}),
     settings: picker,
     // `timeline::AgentUntrustedVm::of`: the way out only where `/clean` runs.
@@ -8236,12 +8247,13 @@ function mockFocusWritten(payload: Record<string, unknown>): string | undefined 
   return undefined;
 }
 /**
- * The dock's ticks whose warning nobody has seen yet, each with the claim of the newest answer that
- * reported it (keeper-core's `unseen_ticks`, R605-05, R605-07): only that answer may report it seen
- * or take it back.
+ * The Notes Assistant's ticks no person has answered yet, as `[database, session, drive]` keys
+ * (keeper-core's `UnseenTicks`, round 5 ruling): a ticked, marked drive draws its warning with
+ * Untick and OK wherever the session is shown. Nothing takes a tick back but a person.
  */
-const mockUnseenTicks = new Map<string, string>();
-let mockClaimSerial = 0;
+const mockUnseenTicks = new Set<string>();
+const unseenKey = (database: unknown, sessionId: unknown, drive: unknown) =>
+  JSON.stringify([database, sessionId, drive]);
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
   if (!vm) return hqRefuse("This session is not on this device.");
@@ -8271,8 +8283,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   },
   agent_session_drive_set: (payload) => {
     const vm = mockSession(payload);
-    // The person's own tick or untick: no answer of the dock holds this drive's tick any more.
-    mockUnseenTicks.delete(JSON.stringify([payload.database, payload.sessionId]));
+    // The person's own tick or untick answers the dock's mark on that drive.
+    mockUnseenTicks.delete(unseenKey(payload.database, payload.sessionId, payload.drive));
     const drives = vm.drives;
     if (!drives) hqRefuse("Only a person in this chat may choose the drives it reads.");
     const drive = drives.drives.find((row) => row.name === payload.drive);
@@ -8864,7 +8876,6 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (drive === null)
       return {
         target: main,
-        tickedNow: false,
         reason: "This note's folder is not a drive, so no drive is ticked.",
       };
     if (
@@ -8873,7 +8884,6 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       return {
         target: main,
         drive,
-        tickedNow: false,
         reason: `This device holds no ${drive} database with ${main.agentName} in it, so ${drive} is not ticked.`,
       };
     let row = sessionRows.find(
@@ -8902,33 +8912,18 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     const target = { ...main, database: drive, sessionId: row.sessionId };
     const tick = mockSession(target).drives?.drives.find((d) => d.name === drive);
     if (tick === undefined)
-      return {
-        target,
-        drive,
-        tickedNow: false,
-        reason: `${main.agentName} does not offer ${drive}.`,
-      };
-    const key = JSON.stringify([drive, row.sessionId]);
-    if (tick.ticked && !mockUnseenTicks.has(key)) return { target, drive, tickedNow: false };
+      return { target, drive, reason: `${main.agentName} does not offer ${drive}.` };
+    if (tick.ticked) return { target, drive };
+    // Marked first, then ticked: never a tick without its mark.
+    mockUnseenTicks.add(unseenKey(drive, row.sessionId, drive));
     tick.ticked = true;
-    const claim = `claim-${++mockClaimSerial}`;
-    mockUnseenTicks.set(key, claim);
     publishSessions();
-    return { target, drive, tickedNow: true, claim, warning: DRIVES_WARNING };
+    return { target, drive };
   },
   agent_note_tick_seen: (payload) => {
-    const key = JSON.stringify([payload.database, payload.sessionId]);
-    if (mockUnseenTicks.get(key) === payload.claim) mockUnseenTicks.delete(key);
-    return null;
-  },
-  agent_note_tick_undo: (payload) => {
-    const key = JSON.stringify([payload.database, payload.sessionId]);
-    if (mockUnseenTicks.get(key) !== payload.claim) return false;
-    const tick = mockSession(payload).drives?.drives.find((d) => d.name === payload.drive);
-    if (tick) tick.ticked = false;
-    mockUnseenTicks.delete(key);
+    mockUnseenTicks.delete(unseenKey(payload.database, payload.sessionId, payload.drive));
     publishSessions();
-    return true;
+    return null;
   },
   agent_session_new: (payload) => {
     if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");

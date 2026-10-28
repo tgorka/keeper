@@ -332,6 +332,18 @@ impl Hq {
         }
         self.writes
             .draw(&self.sources(), &source, &mut view.approvals_mut());
+        // The Notes Assistant's ticks no person has been shown yet: read
+        // beside the chips, from the same selection (round 5 ruling).
+        if let (Some(drives), Ok(data_dir)) = (view.drives.as_mut(), self.data_dir()) {
+            let marked = drives::UnseenTicks::at(&crate::hq::databases::root(&data_dir))
+                .of(&key.database, &key.session_id);
+            drives.unseen = drives
+                .drives
+                .iter()
+                .filter(|drive| drive.ticked && marked.contains(&drive.name))
+                .map(|drive| drive.name.clone())
+                .collect();
+        }
         if let Some(held) = lock(&self.views).get_mut(key) {
             held.live.settle(&opened.live, &view.live);
         }

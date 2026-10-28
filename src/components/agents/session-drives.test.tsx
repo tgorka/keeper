@@ -5,10 +5,11 @@ import { SessionDrives } from "@/components/agents/session-drives";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentSessionDrivesVm } from "@/lib/ipc/client";
 
-const mock = vi.hoisted(() => ({ set: vi.fn() }));
+const mock = vi.hoisted(() => ({ set: vi.fn(), seen: vi.fn() }));
 vi.mock("@/lib/ipc/client", async (original) => ({
   ...(await original<typeof Ipc>()),
   agentSessionDriveSet: mock.set,
+  agentNoteTickSeen: mock.seen,
 }));
 
 const target = { database: "alpha", sessionId: "s.1" };
@@ -49,6 +50,84 @@ function item(name: string) {
 describe("SessionDrives", () => {
   beforeEach(() => {
     mock.set.mockReset().mockResolvedValue(undefined);
+    mock.seen.mockReset().mockResolvedValue(undefined);
+  });
+
+  /**
+   * Round 5 ruling: a drive the Notes Assistant ticked whose warning no person has answered is
+   * Rust's `unseen`, read from the same view as the chips. It draws the warning beside them, with
+   * Untick (the person's own untick, which clears the mark with it) and OK (seen).
+   */
+  it("says what a drive the Notes Assistant ticked allows, with Untick and OK", async () => {
+    const vm = drives({
+      drives: [
+        { name: "alpha", ticked: true },
+        { name: "gamma", ticked: true },
+      ],
+      unseen: ["alpha"],
+    });
+    const view = render(
+      <SessionDrives
+        target={target}
+        agentName="Nixie"
+        drives={vm}
+        open={false}
+        onOpenChange={() => {}}
+      />,
+    );
+    const note = screen.getByRole("note", { name: "alpha was ticked by the Notes Assistant" });
+    expect(note).toHaveTextContent(
+      "The Notes Assistant ticked alpha for Nixie to read in this chat.",
+    );
+    expect(note).toHaveTextContent(WARNING);
+    expect(
+      screen.queryByRole("note", { name: "gamma was ticked by the Notes Assistant" }),
+    ).toBeNull();
+    expect(
+      within(screen.getByRole("list", { name: "Drives ticked" })).getByText("alpha"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(within(note).getByRole("button", { name: "Untick alpha" }));
+    });
+    expect(mock.set).toHaveBeenCalledWith(target, "alpha", false);
+
+    await act(async () => {
+      fireEvent.click(within(note).getByRole("button", { name: "OK" }));
+    });
+    expect(mock.seen).toHaveBeenCalledWith(target, "alpha");
+
+    // Answered: Rust's next view has no unseen drive, and nothing is drawn.
+    view.rerender(
+      <SessionDrives
+        target={target}
+        agentName="Nixie"
+        drives={{ ...vm, unseen: [] }}
+        open={false}
+        onOpenChange={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("note", { name: /ticked by the Notes Assistant/ })).toBeNull();
+  });
+
+  it("says when OK could not be noted, and keeps the warning", async () => {
+    mock.seen.mockRejectedValueOnce({ message: "keeper could not note that: disk full" });
+    render(
+      <SessionDrives
+        target={target}
+        agentName="Nixie"
+        drives={drives({ drives: [{ name: "alpha", ticked: true }], unseen: ["alpha"] })}
+        open={false}
+        onOpenChange={() => {}}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "OK" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("disk full");
+    expect(
+      screen.getByRole("note", { name: "alpha was ticked by the Notes Assistant" }),
+    ).toBeInTheDocument();
   });
 
   it("says what ticking allows beside every drive, and again once the first one is ticked", async () => {

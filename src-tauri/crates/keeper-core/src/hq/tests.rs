@@ -1767,11 +1767,29 @@ fn ticks(opener: &LocalOpener, database: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// The drives the session `key` shows as ticked by the Notes Assistant and
+/// not yet answered: what draws the warning beside the chip, wherever the
+/// session is shown (the dock or the Agents window alike).
+fn unseen_in(hq: &Hq, key: &sessions::AgentSessionRef) -> Vec<String> {
+    hq.session_view(key)
+        .expect("a view")
+        .drives
+        .map(|drives| drives.unseen)
+        .unwrap_or_default()
+}
+
+fn chat(session: &str, database: &str) -> sessions::AgentSessionRef {
+    sessions::AgentSessionRef {
+        database: database.to_owned(),
+        session_id: session.to_owned(),
+    }
+}
+
 /// 109.28 (R-HQ-86) AC 1: opened on a tgdrive note, the dock gets the
 /// default agent's chat in the tgdrive database — started there, since it
-/// has none — with tgdrive ticked as the person and the warning to say then.
-/// Opened again, it is the same chat, already ticked: nothing is ticked or
-/// said a second time. A neuradrive note gets neuradrive's own chat.
+/// has none — with tgdrive ticked as the person. Opened again, it is the
+/// same chat, already ticked: nothing is ticked twice. A neuradrive note
+/// gets neuradrive's own chat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
     let world = World::new();
@@ -1795,17 +1813,9 @@ async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
         (
             first.target.database.as_deref(),
             first.drive.as_deref(),
-            first.ticked_now,
-            first.warning.as_deref(),
             first.reason.as_deref(),
         ),
-        (
-            Some("tgdrive"),
-            Some("tgdrive"),
-            true,
-            Some(drives::WARNING),
-            None
-        )
+        (Some("tgdrive"), Some("tgdrive"), None)
     );
     let started = rows(
         &opener.replica("tgdrive"),
@@ -1818,39 +1828,15 @@ async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
         [(session.clone(), r#"["tgdrive"]"#.to_owned())]
     );
 
-    // Nobody saw that answer (the dock closed, its untick failed): the tick
-    // is still news, warning and all, and nothing is ticked twice (R605-05).
-    let unseen = hq
-        .session_for_note(Some("tgdrive"), None)
-        .expect("answers")
-        .expect("a default agent");
-    assert_eq!(unseen.target.session_id.as_deref(), Some(session.as_str()));
-    assert_eq!(
-        (unseen.ticked_now, unseen.warning.as_deref()),
-        (true, Some(drives::WARNING))
-    );
-    assert_eq!(
-        ticks(&opener, "tgdrive"),
-        [(session.clone(), r#"["tgdrive"]"#.to_owned())]
-    );
-    // Shown: from then on it is a drive ticked before.
-    hq.note_tick_seen(
-        &sessions::AgentSessionRef {
-            database: "tgdrive".to_owned(),
-            session_id: session.clone(),
-        },
-        "tgdrive",
-        unseen.claim.as_deref().expect("a hold on the unseen tick"),
-    )
-    .expect("seen");
     let again = hq
         .session_for_note(Some("tgdrive"), None)
         .expect("answers")
         .expect("a default agent");
     assert_eq!(again.target.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(again.reason, None);
     assert_eq!(
-        (again.ticked_now, again.warning, again.reason),
-        (false, None, None)
+        ticks(&opener, "tgdrive"),
+        [(session.clone(), r#"["tgdrive"]"#.to_owned())]
     );
     assert_eq!(
         rows(&opener.replica("tgdrive"), "SELECT id FROM sessions").len(),
@@ -1869,13 +1855,153 @@ async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
         ),
         (Some("neuradrive"), Some(elsewhere.session_id.as_str()))
     );
-    assert!(other.ticked_now);
     assert_eq!(
         ticks(&opener, "neuradrive"),
         [(elsewhere.session_id.clone(), r#"["neuradrive"]"#.to_owned())]
     );
 }
 
+/// Round 5 ruling (R605-02/-05/-06/-07/-08): keeper never takes a dock tick
+/// back. Every one is marked unseen, and the session shows it — the chip and
+/// the warning read from the same selection — wherever it is opened: an
+/// answer the dock dropped (closed, moved on) leaves a ticked drive whose
+/// warning the Agents window draws. OK clears the mark; a person's own
+/// untick clears it with the tick, and their own tick acknowledges it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dock_tick_stays_unseen_wherever_its_chat_is_shown_until_a_person_answers_it() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+
+    // An answer nobody saw: the dock closed before it came.
+    let dropped = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let key = chat(
+        dropped.target.session_id.as_deref().expect("a chat"),
+        "tgdrive",
+    );
+    // The Agents window opens that chat: the drive is ticked, and its
+    // warning stands beside the chip.
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    // A second answer, the reopened dock's: nothing changes, nothing is
+    // taken back.
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(key.session_id.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+
+    // OK: seen, and the drive stays ticked.
+    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(key.session_id.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+
+    // The person unticks; the dock ticks again, unseen again.
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    // Untick from the warning: tick and mark go together.
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(unseen_in(&hq, &key).is_empty());
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(key.session_id.clone(), "[]".to_owned())]
+    );
+    // A person's own tick is theirs: no warning of the dock's.
+    hq.set_session_drive(&key, "tgdrive", true).expect("ticked");
+    assert!(unseen_in(&hq, &key).is_empty());
+    // A mark left over with no tick draws nothing.
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    hq.set_session_drive(&key, "tgdrive", true)
+        .expect("ticked over the dock's");
+    assert!(
+        unseen_in(&hq, &key).is_empty(),
+        "the person's tick answers it"
+    );
+}
+
+/// R605-10: a dock tick is never made without its unseen mark. When the
+/// mark cannot be written, nothing is ticked and the dock says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_dock_tick_is_made_when_its_mark_cannot_be_written() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    // The file the marks are written through cannot be written.
+    std::fs::create_dir_all(
+        crate::hq::databases::root(&world.data_dir()).join("note-ticks-unseen.json.new"),
+    )
+    .expect("blocked");
+
+    let refused = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(refused.reason, Some(drives::unrecorded("tgdrive")));
+    assert!(
+        ticks(&opener, "tgdrive")
+            .iter()
+            .all(|(_, drives)| !drives.contains("tgdrive")),
+        "nothing ticked"
+    );
+}
+
+/// R605-09: the person's untick and the dock's tick go through one lock,
+/// tick and mark together. However they interleave, a drive left ticked by
+/// the dock is marked unseen — never a silent tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_s_untick_racing_the_dock_s_tick_never_leaves_a_silent_tick() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    let first = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let key = chat(
+        first.target.session_id.as_deref().expect("a chat"),
+        "tgdrive",
+    );
+    let marked = || {
+        drives::UnseenTicks::at(&crate::hq::databases::root(&world.data_dir()))
+            .of("tgdrive", &key.session_id)
+            .contains("tgdrive")
+    };
+    for round in 0..60 {
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                hq.set_session_drive(&key, "tgdrive", false)
+                    .expect("unticked");
+            });
+            scope.spawn(|| {
+                hq.session_for_note(Some("tgdrive"), None).expect("answers");
+            });
+        });
+        let ticked = ticks(&opener, "tgdrive")
+            .iter()
+            .any(|(_, drives)| drives.contains("tgdrive"));
+        assert!(
+            !ticked || marked(),
+            "round {round}: ticked by the dock, unmarked"
+        );
+    }
+}
 /// 109.28 AC 1: a note whose drive the agent does not offer opens the
 /// drive's chat with nothing ticked, and says why; a drive with no database
 /// here, or a note on no drive, opens the agent's main conversation and says
@@ -1907,12 +2033,8 @@ async fn the_notes_assistant_says_why_it_did_not_tick_the_notes_drive() {
     assert_eq!(unoffered.target.database.as_deref(), Some("tgdrive"));
     assert!(unoffered.target.session_id.is_some());
     assert_eq!(
-        (
-            unoffered.ticked_now,
-            unoffered.warning,
-            unoffered.reason.as_deref()
-        ),
-        (false, None, Some("Nixie does not offer tgdrive."))
+        unoffered.reason.as_deref(),
+        Some("Nixie does not offer tgdrive.")
     );
     assert!(ticks(&opener, "tgdrive").is_empty());
 
@@ -1923,10 +2045,9 @@ async fn the_notes_assistant_says_why_it_did_not_tick_the_notes_drive() {
         .expect("a default agent");
     assert_eq!(absent.target, main);
     assert_eq!(
-        (absent.drive.as_deref(), absent.ticked_now, absent.reason.as_deref()),
+        (absent.drive.as_deref(), absent.reason.as_deref()),
         (
             Some("neuradrive"),
-            false,
             Some("This device holds no neuradrive database with Nixie in it, so neuradrive is not ticked.")
         )
     );
@@ -2254,81 +2375,4 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
         "{said:?}"
     );
     assert!(said.contains(&("hello", None)), "{said:?}");
-}
-
-/// R605-07: two docks' answers report one unseen tick — a closed dock's,
-/// still on its way, and the reopened dock's. Only the newest answer holds
-/// it: the older one can neither report it seen nor take it back, so the
-/// chat the person is looking at keeps its drive and its notice tells the
-/// truth. The newest one may take it back while it is unseen; once seen, or
-/// once the person ticks or unticks it themselves, no answer can.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn only_the_newest_answer_may_take_an_unseen_tick_back() {
-    let world = World::new();
-    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
-    offers(&opener, "tgdrive", &["tgdrive"]);
-    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
-        .expect("default agent");
-    let open = || {
-        hq.session_for_note(Some("tgdrive"), None)
-            .expect("answers")
-            .expect("a default agent")
-    };
-    let key = |vm: &sessions::AgentNoteSessionVm| sessions::AgentSessionRef {
-        database: "tgdrive".to_owned(),
-        session_id: vm.target.session_id.clone().expect("a chat"),
-    };
-    let ticked = || {
-        ticks(&opener, "tgdrive")
-            .iter()
-            .any(|(_, drives)| drives.contains("tgdrive"))
-    };
-
-    // The closed dock's answer (held), then the reopened dock's, which shows it.
-    let closed = open();
-    let shown = open();
-    assert!(closed.ticked_now && shown.ticked_now);
-    assert_ne!(closed.claim, shown.claim);
-    let chat = key(&shown);
-    let old = closed.claim.as_deref().expect("a hold");
-    // The old answer arrives: it may not report the tick seen…
-    hq.note_tick_seen(&chat, "tgdrive", old).expect("asks");
-    assert!(
-        open().ticked_now,
-        "still news: the old answer's word is not taken"
-    );
-    // …and the reopened dock shows it.
-    let shown = open();
-    hq.note_tick_seen(&chat, "tgdrive", shown.claim.as_deref().expect("a hold"))
-        .expect("seen");
-    // The old answer's untick does nothing: the drive stays ticked.
-    assert!(!hq.note_tick_undo(&chat, "tgdrive", old).expect("asks"));
-    assert!(ticked(), "the shown chat keeps its drive");
-    assert!(!open().ticked_now, "seen");
-
-    // A fresh unseen tick, taken back by the answer that holds it.
-    hq.set_session_drive(&chat, "tgdrive", false)
-        .expect("unticked by the person");
-    let fresh = open();
-    assert!(fresh.ticked_now && ticked());
-    let held = fresh.claim.as_deref().expect("a hold");
-    assert!(hq.note_tick_undo(&chat, "tgdrive", held).expect("asks"));
-    assert!(!ticked(), "taken back");
-    assert!(
-        !hq.note_tick_undo(&chat, "tgdrive", held).expect("asks"),
-        "once"
-    );
-
-    // The person ticks it themselves while an answer still holds the dock's
-    // tick: that answer can no longer take it back.
-    let again = open();
-    assert!(again.ticked_now);
-    hq.set_session_drive(&chat, "tgdrive", false)
-        .expect("unticked");
-    hq.set_session_drive(&chat, "tgdrive", true)
-        .expect("ticked by the person");
-    assert!(!hq
-        .note_tick_undo(&chat, "tgdrive", again.claim.as_deref().expect("a hold"))
-        .expect("asks"));
-    assert!(ticked(), "the person's own tick stays");
 }

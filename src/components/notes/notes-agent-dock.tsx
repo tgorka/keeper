@@ -11,14 +11,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { logFailure } from "@/lib/failure";
 import {
   type AgentDefaultSessionVm,
   type AgentNoteSessionVm,
   type AgentSessionRef,
   agentNoteDrive,
-  agentNoteTickSeen,
-  agentNoteTickUndo,
   agentSessionDefault,
   agentSessionForNote,
 } from "@/lib/ipc/client";
@@ -74,16 +71,19 @@ export function NotesAgentDock() {
 /**
  * Both docks mirror the same database session list; their selection remains local. Opened on a
  * note, the dock follows the note's drive (109.28, R-HQ-86): Rust opens the default agent's chat
- * in the database named after it and ticks it, and the dock says what ticking allows at that
- * moment, over that chat. A vault is one synced folder and so one drive: another note of the same
- * vault keeps the chat, and so does a note of another vault Rust names the same drive; a pick in
- * the select holds until the drive changes.
+ * in the database named after it and ticks it. A vault is one synced folder and so one drive:
+ * another note of the same vault keeps the chat, and so does a note of another vault Rust names the
+ * same drive; a pick in the select holds until the drive changes.
+ *
+ * What ticking allows is never the dock's to say: Rust marks every dock tick unseen, and the
+ * session itself draws the warning beside its chip, with Untick and OK, wherever it is shown
+ * (`SessionDrives`, round 5 ruling). The dock only says why it did not tick.
  *
  * Opening and ticking are writes, so the dock decides which drive it follows before it asks for
  * any (R605-02): it first reads the note's drive, and a note on the drive it already follows asks
  * for nothing. The writing call runs one at a time; one answered after the person moved to another
- * drive, left the note, or closed the dock, is not shown, and a tick it made is taken back; a tick
- * whose warning was shown is reported seen, and one never shown stays news in Rust until it is.
+ * drive, left the note, or closed the dock, does nothing here. Nothing is ever taken back: a tick
+ * it made stays, unseen, and its chat says so when it is opened.
  */
 export function DockBody() {
   useAgentSessionsSubscription();
@@ -102,8 +102,8 @@ export function DockBody() {
   const [creating, setCreating] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Rust's word on the note's drive — ticked now (with the warning), or why not — and the chat it
-  // is about: shown only while that chat is the one in the dock.
+  // Why the note's drive is not ticked, and the chat it is about: shown only while that chat is
+  // the one in the dock.
   const [notice, setNotice] = useState<AgentNoteSessionVm | null>(null);
   // The drive the dock follows: `undefined` before it followed any, `null` for a note on none.
   const followed = useRef<string | null | undefined>(undefined);
@@ -143,29 +143,14 @@ export function DockBody() {
             lastAgentPick(main.agentActor),
           );
           if (vm === null) return;
-          const { database, sessionId } = vm.target;
-          if (gone.current || wanted.current?.drive !== want.drive) {
-            // Nobody sees this chat (the dock closed, the person left the note or its drive): a
-            // tick reported to this answer is taken back, and the loop goes on to what is in front
-            // now. Rust takes it back only while this answer still holds it: a newer answer (a
-            // reopened dock that shows it) or the person's own tick keeps it (R605-07). Should the
-            // untick fail, Rust still holds the tick as unseen and says it, warning and all, the
-            // next time the dock opens that chat (R605-05).
-            if (vm.tickedNow && vm.claim && vm.drive && database && sessionId)
-              await agentNoteTickUndo({ database, sessionId }, vm.drive, vm.claim).catch(
-                logFailure("agents.note.untick"),
-              );
-            continue;
-          }
+          // Nobody wants this answer any more (the dock closed, the person left the note or its
+          // drive): it changes nothing here, and the loop goes on to what is in front now. A tick
+          // it made stays, unseen; that chat draws its warning when it is opened (round 5 ruling).
+          if (gone.current || wanted.current?.drive !== want.drive) continue;
           followed.current = want.drive;
           setAgent(vm.target);
           show(vm.target);
-          setNotice(vm.warning || vm.reason ? vm : null);
-          // Shown: the tick is no longer news (R-HQ-79 said where it was made).
-          if (vm.tickedNow && vm.warning && vm.claim && vm.drive && database && sessionId)
-            void agentNoteTickSeen({ database, sessionId }, vm.drive, vm.claim).catch(
-              logFailure("agents.note.seen"),
-            );
+          setNotice(vm.reason ? vm : null);
         }
       } finally {
         working.current = false;
@@ -268,22 +253,13 @@ export function DockBody() {
         </p>
       )}
       {noticeHere && (
-        // Said where the drive was ticked (R-HQ-79), or why it was not.
+        // Why the note's drive is not ticked in this chat.
         <div
           role="note"
           aria-label={DRIVE_NOTICE_LABEL}
           className="border-border border-b p-3 text-sm"
         >
-          {noticeHere.warning ? (
-            <>
-              <p className="font-medium">
-                {noticeHere.drive} is ticked for {noticeHere.target.agentName} to read.
-              </p>
-              <p className="text-muted-foreground">{noticeHere.warning}</p>
-            </>
-          ) : (
-            <p className="text-muted-foreground">{noticeHere.reason}</p>
-          )}
+          <p className="text-muted-foreground">{noticeHere.reason}</p>
         </div>
       )}
       {!loaded && (

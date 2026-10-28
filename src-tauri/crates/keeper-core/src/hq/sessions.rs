@@ -208,7 +208,9 @@ pub struct AgentDefaultSessionVm {
 
 /// What the Notes Assistant opens for the note in front of the person
 /// (109.28, R-HQ-86): the default agent's chat in the database named after
-/// the note's drive (AD-433), and what became of ticking that drive.
+/// the note's drive (AD-433), and why that drive is not ticked there, if it
+/// is not. A tick it made is the session's to show (`drives.unseen`), never
+/// this answer's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -221,23 +223,6 @@ pub struct AgentNoteSessionVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub drive: Option<String>,
-    /// `drive` is ticked for the session's agent to read, and the person has
-    /// not been shown it yet: this call ticked it, or an earlier one whose
-    /// warning no one saw did (R605-05). The dock says so and then reports it
-    /// seen (`agent_note_tick_seen`).
-    pub ticked_now: bool,
-    /// With `ticked_now`: this answer's hold on that unseen tick (R605-07).
-    /// Each answer that reports it takes the hold from any earlier one, so
-    /// only the newest may report it seen or take it back
-    /// (`agent_note_tick_undo`); an older one asking does nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub claim: Option<String>,
-    /// What ticking a drive allows (`drives::WARNING`, R-HQ-79): present
-    /// exactly when `ticked_now`, so it is said where the drive was ticked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub warning: Option<String>,
     /// Why the drive is not ticked, or the chat is not in its database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

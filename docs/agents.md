@@ -1101,16 +1101,24 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   starts one there with this device's last model and effort for the agent
   (`Hq::session_for_note`, IPC `agent_session_for_note`). A note on no drive, or a drive with no
   database here that names the agent, opens the agent's main conversation and says why.
-- **The tick.** In that chat keeper ticks the drive as the person, by the menu's own rules (the
-  agent offers it, V17's audience rule allows it, no stopped drive holds it back). When it ticks,
-  the dock says the drives' warning at that moment (R-HQ-79); when it does not, the dock says why.
-  Nowhere else is a drive ticked for the person (Q109-20 b).
+- **The tick, and its warning.** In that chat keeper ticks the drive as the person, by the menu's
+  own rules (the agent offers it, V17's audience rule allows it, no stopped drive holds it back).
+  Nowhere else is a drive ticked for the person (Q109-20 b). Every such tick is first marked
+  **unseen** in Rust, per session and drive (`hq/note-ticks-unseen.json`, written atomically); a
+  tick whose mark cannot be written is not made, and the dock says why. Wherever that session is
+  shown — the dock, the Agents window, after a restart — a ticked, unseen drive draws the drives'
+  warning (R-HQ-79) beside its chip, with **Untick** and **OK** (`drives.unseen`, read from the same
+  view as the chips, so the two cannot disagree). OK marks it seen (`agent_note_tick_seen`); a
+  person's own tick or untick clears the mark in the same step, under the one lock every drive
+  write takes. keeper never takes a dock tick back on its own (round 5 ruling): only a person
+  unticks it. When the dock does not tick, it says why.
 - **Following.** The dock follows the drive, not the note: another note of the same vault keeps the
   chat, as does a vault on the same drive; a note on another drive opens that drive's chat. A pick
   in the dock's own select holds until the drive changes. Opening and ticking are writes, so the dock
   first reads the note's drive (`agent_note_drive`, read-only) and asks for them only when the
-  drive changed; one writing call runs at a time, and an answer for a drive the person already left
-  is not shown and its tick is taken back (R605-02). The warning stands over the chat it is about.
+  drive changed; one writing call runs at a time. An answer the dock no longer wants (the person
+  left the note or its drive, or closed the dock) does nothing in the dock; a tick it made stays,
+  unseen, and its chat draws the warning whenever it is opened.
 - **The note as context.** A message sent from the dock carries `metadata.focus`
   `{drive, path, heading, line}` (contract §9.1): the caret's 1-based body line, and the heading
   trail Rust reads from the editor's buffer through that line, unsaved text included. That holds for
@@ -1123,15 +1131,7 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   § 9.1a). It refuses a message whose focus drive the chat's readers may not all read
   (`hq.focus.audience`) or whose focus is not well-formed (`hq.focus.malformed`); keeper then writes
   the same message again once, without the focus (same id, body and files, a new commit), and says
-  the refusal's sentence as a quiet line under it. The message is never dropped.
-- **An unseen tick stays news.** A tick the dock made whose warning nobody saw (the dock closed, or
-  the person left the note, before the answer came, and taking the tick back failed) is answered
-  as ticked now, with the warning, the next time the dock opens that chat. The dock reports a
-  warning it showed (`agent_note_tick_seen`), and only then is the tick an old one (R605-05).
-  Each answer that reports an unseen tick carries a `claim` and takes the hold from every earlier
-  one: only the holder may report it seen or take it back (`agent_note_tick_undo`), and a person's
-  own tick or untick ends every hold. So a closed dock's late answer cannot untick the chat a
-  reopened dock shows (R605-07). The runtime
+  the refusal's sentence as a quiet line under it. The message is never dropped. The runtime
   adds one line for that turn; `drive_read` reads the drive's committed copy, so unsaved edits are
   not in what the agent can read. A message from the Agents window carries no focus.
 

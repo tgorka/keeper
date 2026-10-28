@@ -21,4 +21,11 @@ pending: boolean,
 /**
  * The server refused the newest selection written here, as a sentence.
  */
-refused?: string, };
+refused?: string, 
+/**
+ * Ticked drives the Notes Assistant ticked whose warning no person has
+ * been shown yet (R-HQ-86, round 5 ruling): drawn beside the chips with
+ * [`AgentSessionDrivesVm::warning`], Untick and OK, wherever the session
+ * is shown. Read from the same rows as the chips, so the two agree.
+ */
+unseen?: Array<string>, };

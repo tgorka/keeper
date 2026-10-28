@@ -820,29 +820,15 @@ pub async fn agent_session_default() -> Result<Option<AgentDefaultSessionVm>, Ip
     blocking(|hq| hq.default_session()).await
 }
 
-/// The dock showed the warning of the tick [`agent_session_for_note`]
-/// reported under `claim` (R-HQ-79): it is no longer news (R605-05), unless a
-/// newer answer took the hold (R605-07).
+/// A person was shown the warning of the Notes Assistant's tick of `drive`
+/// in the session and said OK (R-HQ-79): it is no longer unseen.
 #[tauri::command]
 pub async fn agent_note_tick_seen(
     database: String,
     session_id: String,
     drive: String,
-    claim: String,
 ) -> Result<(), IpcError> {
-    blocking(move |hq| hq.note_tick_seen(&session(database, session_id), &drive, &claim)).await
-}
-
-/// Take back the tick an answer nobody saw reported under `claim`, if that
-/// answer still holds it (R605-07); whether it was unticked.
-#[tauri::command]
-pub async fn agent_note_tick_undo(
-    database: String,
-    session_id: String,
-    drive: String,
-    claim: String,
-) -> Result<bool, IpcError> {
-    blocking(move |hq| hq.note_tick_undo(&session(database, session_id), &drive, &claim)).await
+    blocking(move |hq| hq.note_tick_seen(&session(database, session_id), &drive)).await
 }
 
 /// The drive of the note `note_id` of the vault `vault_id` ([`note_drive`]),
