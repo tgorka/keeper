@@ -139,7 +139,7 @@ it("Allow and Deny are buttons in the tab order, and Allow approves the write", 
 it("a write this device cannot carry out offers Deny only and says why; the outcome is shown", () => {
   const reason = '"10-notes/inbox.md" changed on hesperia since the agent read it.';
   const blocked = card({ blocked: reason }, { actions: ["deny"] });
-  expect(blocked).toHaveTextContent(`Allow is not offered on this device: ${reason}`);
+  expect(blocked).toHaveTextContent(`Allow is not offered: ${reason}`);
   expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
   expect(screen.getByRole("button", { name: "Deny" })).toBeEnabled();
   document.body.innerHTML = "";
@@ -178,4 +178,28 @@ it("a change of line endings alone says so, beside lines whose text looks the sa
     },
   });
   expect(within(change).getByText("Line endings change: CRLF → LF.")).toBeInTheDocument();
+});
+
+it("a change holding hidden characters shows them escaped and offers Deny only", () => {
+  const change = card(
+    {
+      preview: {
+        hunks: [
+          {
+            oldStart: 1,
+            newStart: 1,
+            lines: [{ kind: "add", text: "pay to ⟨U+202E⟩tnuocca-lacol⟨U+202C⟩ now" }],
+          },
+        ],
+      },
+      blocked: "This change contains hidden or reordering characters.",
+    },
+    { actions: ["deny"] },
+  );
+  expect(change).toHaveTextContent("pay to ⟨U+202E⟩tnuocca-lacol⟨U+202C⟩ now");
+  expect(change).toHaveTextContent(
+    "Allow is not offered: This change contains hidden or reordering characters.",
+  );
+  expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Deny" })).toBeEnabled();
 });

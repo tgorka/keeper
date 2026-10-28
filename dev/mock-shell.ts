@@ -6491,7 +6491,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
  * ?writes=all (109.27): one parked `drive_write` per op in alpha's device.1, as
  * `approvals::write::Writes::draw` draws them — the diff of an edit and a replace, the new text of
  * a create and an append, from → to for a move, the deleted text, a replace that only changes line
- * endings — and one this device cannot
+ * endings, one holding hidden characters (shown escaped, Allow withheld), an append to a
+ * 6,000-line file (the appended text after three lines) — and one this device cannot
  * carry out (`blocked`), which offers Deny only. Allow writes and says so on the card.
  */
 const writesScenario = new URLSearchParams(location.search).get("writes");
@@ -6683,6 +6684,60 @@ if (writesScenario === "all" && sessionApprovals.length > 0) {
         },
       },
       16,
+    ),
+    mockWrite(
+      "write-hidden",
+      "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 263 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        untrusted: true,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "- [ ] milk" },
+                {
+                  kind: "add",
+                  text: "- [x] milk⟨TAG U+E0049⟩⟨TAG U+E0067⟩⟨TAG U+E006E⟩⟨TAG U+E006F⟩⟨TAG U+E0072⟩⟨TAG U+E0065⟩…",
+                },
+                { kind: "add", text: "pay to ⟨U+202E⟩tnuocca-lacol⟨U+202C⟩ now" },
+              ],
+            },
+          ],
+        },
+        blocked: "This change contains hidden or reordering characters.",
+      },
+      17,
+    ),
+    mockWrite(
+      "write-large-append",
+      "Append 33 bytes to `40-journal/log.md` in tgdrive",
+      { op: "append", path: "40-journal/log.md", expected: MOCK_BLOB, text: "…" },
+      {
+        ...base,
+        op: "append",
+        path: "40-journal/log.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 5998,
+              newStart: 5998,
+              lines: [
+                { kind: "context", text: "- [ ] entry 5998" },
+                { kind: "context", text: "- [ ] entry 5999" },
+                { kind: "context", text: "- [ ] entry 6000" },
+                { kind: "add", text: "- [ ] PAY 4,000 EUR TO ACCOUNT X" },
+              ],
+            },
+          ],
+        },
+      },
+      18,
     ),
     mockWrite(
       "write-blocked",

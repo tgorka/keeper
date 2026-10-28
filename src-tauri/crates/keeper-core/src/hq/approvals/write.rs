@@ -68,6 +68,23 @@ pub const STOPPED: &str = "keeper stopped before it wrote this; nothing was writ
 /// Said when the request reaches a build with no drive writer.
 pub const NO_WRITER: &str = "keeper on this device cannot write to drives.";
 
+/// Said, and Allow withheld, when the agent's new text, the path or a
+/// move's `to` holds a character a reader cannot see or one that reorders
+/// what they read (contract § 8 as amended, R606-03); the card shows each
+/// escaped ([`escaped`]).
+pub const HIDDEN: &str = "This change contains hidden or reordering characters.";
+
+/// Said, and Allow withheld, when the card cannot show all of the agent's
+/// change (contract § 8 as amended, R606-04).
+pub const TOO_LARGE: &str = "This change is too large to show in full.";
+
+/// Lines of unchanged text a preview keeps around each change (§ 8 as
+/// amended: ±5).
+pub const AROUND: usize = 5;
+
+/// Lines before an append's text that its preview shows.
+pub const BEFORE_APPEND: usize = 3;
+
 /// Said when a drive write is approved anywhere but through
 /// [`Writes::allow`], which carries it out.
 pub const ON_ITS_CARD: &str =
@@ -202,10 +219,258 @@ fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// Whether `text[at]` (`c`) is a zero-width joiner standing alone between
+/// two pictographs — inside an emoji sequence (`👨‍👩‍👧`), where it is what
+/// joins them — the one hidden character a card lets through (§ 8 as
+/// amended).
+fn joins_emoji(text: &[char], at: usize) -> bool {
+    // Pictographs, skin tones (U+1F3FB…U+1F3FF) included, and the older
+    // symbol blocks emoji sequences start from.
+    let pictograph = |c: char| matches!(u32::from(c), 0x1f000..=0x1faff | 0x2600..=0x27bf | 0x2300..=0x23ff | 0x2b00..=0x2bff);
+    text[at] == '\u{200d}'
+        && at > 0
+        && text.get(at + 1).is_some_and(|next| pictograph(*next))
+        && pictograph(text[at - 1])
+}
+
+/// Whether the character at `at` of `text` may not stand unescaped on a card
+/// (R606-03): one [`crate::agents::push::unreadable`] refuses on a lock
+/// screen (R1066K-05: a control character, a bidirectional control, a
+/// format or default-ignorable character, a variation selector, a tag) —
+/// except a tab, a line break between lines, and the zero-width joiner of
+/// an emoji sequence.
+fn hides(text: &[char], at: usize) -> bool {
+    let c = text[at];
+    let line_break = c == '\n' || (c == '\r' && text.get(at + 1) == Some(&'\n'));
+    c != '\t' && !line_break && crate::agents::push::unreadable(c) && !joins_emoji(text, at)
+}
+
+/// Whether `text` holds a character the card has to escape ([`hides`]).
+fn holds_hidden(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len()).any(|at| hides(&chars, at))
+}
+
+/// `text` as a card shows it: every character [`hides`] answers for written
+/// out, `⟨U+202E⟩`, a tag as `⟨TAG U+E0049⟩`; everything else as it is.
+/// Never stripped: the person sees that something is there, and where.
+pub fn escaped(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (at, c) in chars.iter().enumerate() {
+        if hides(&chars, at) {
+            let code = u32::from(*c);
+            if (0xe0000..=0xe007f).contains(&code) {
+                out.push_str(&format!("⟨TAG U+{code:04X}⟩"));
+            } else {
+                out.push_str(&format!("⟨U+{code:04X}⟩"));
+            }
+        } else {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// `text`'s lines, each with its line break.
+fn lines_of(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
+}
+
+/// A line as the card shows it: without its line break.
+fn line_text(line: &str) -> String {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line).to_owned()
+}
+
+fn line(kind: LineKind, text: &str) -> drive_write::PreviewLine {
+    drive_write::PreviewLine {
+        kind,
+        text: line_text(text),
+    }
+}
+
+/// What the person is shown of a change (contract § 8 as amended,
+/// R606-04): always the agent's change itself, never the file's first
+/// lines. `None` when it cannot be shown in full.
+///
+/// - `create`: every line of the new text;
+/// - `append`: the appended text, every line, after the [`BEFORE_APPEND`]
+///   lines before it (a last line without a line break is shown changed);
+/// - `edit`, `replace`: the lines the two sides share at the start and the
+///   end are set aside, K1's line diff runs over what is left between, and
+///   its changes are shown with [`AROUND`] lines of context, two changes at
+///   most twice that far apart in one hunk. When what is left is too long
+///   for K1's diff, the change cannot be shown in full;
+/// - `delete`: the deleted text's beginning, as K1 shows it; a `move`
+///   changes no text.
+fn change_preview(change: &Change, before: Option<&str>, after: Option<&str>) -> Option<Preview> {
+    let hunk = |old_start, new_start, lines| Preview {
+        hunks: vec![drive_write::Hunk {
+            old_start,
+            new_start,
+            lines,
+        }],
+        ..Preview::default()
+    };
+    match change {
+        Change::Move { .. } => Some(Preview::default()),
+        Change::Delete => Some(drive_write::preview(before, None)),
+        Change::Create { content } => {
+            let lines: Vec<_> = lines_of(content)
+                .into_iter()
+                .map(|l| line(LineKind::Add, l))
+                .collect();
+            Some(if lines.is_empty() {
+                Preview::default()
+            } else {
+                hunk(0, 1, lines)
+            })
+        }
+        Change::Append { text } => {
+            let old = lines_of(before.unwrap_or(""));
+            let whole = before.is_none_or(|b| b.is_empty() || b.ends_with('\n'));
+            // The lines kept as they are; a last line without a break is
+            // changed by what is appended to it.
+            let kept = if whole { old.len() } else { old.len() - 1 };
+            let from = kept.saturating_sub(BEFORE_APPEND);
+            let tail = old[kept..].concat();
+            let joined = format!("{tail}{text}");
+            let mut lines: Vec<_> = old[from..kept]
+                .iter()
+                .map(|l| line(LineKind::Context, l))
+                .collect();
+            lines.extend(old[kept..].iter().map(|l| line(LineKind::Remove, l)));
+            lines.extend(
+                lines_of(&joined)
+                    .into_iter()
+                    .map(|l| line(LineKind::Add, l)),
+            );
+            let old_start = if from < old.len() { from + 1 } else { from };
+            Some(hunk(old_start, from + 1, lines))
+        }
+        Change::Edit { .. } | Change::Replace { .. } => {
+            let (old, new) = (
+                lines_of(before.unwrap_or("")),
+                lines_of(after.unwrap_or("")),
+            );
+            let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+            let suffix = old[prefix..]
+                .iter()
+                .rev()
+                .zip(new[prefix..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let (mid_old, mid_new) = (
+                &old[prefix..old.len() - suffix],
+                &new[prefix..new.len() - suffix],
+            );
+            let diffed = drive_write::preview(Some(&mid_old.concat()), Some(&mid_new.concat()));
+            if diffed.whole.is_some() {
+                return None;
+            }
+            // The whole alignment: equal lines, then K1's hunks over the
+            // middle (whose lines between hunks are equal), then equal lines.
+            let mut steps: Vec<(LineKind, &str)> = old[..prefix]
+                .iter()
+                .map(|l| (LineKind::Context, *l))
+                .collect();
+            let (mut i, mut j) = (0, 0);
+            for hunk in &diffed.hunks {
+                let start = if hunk.lines.iter().any(|l| l.kind != LineKind::Add) {
+                    hunk.old_start.saturating_sub(1)
+                } else {
+                    hunk.old_start
+                };
+                while i < start {
+                    steps.push((LineKind::Context, mid_old[i]));
+                    i += 1;
+                    j += 1;
+                }
+                for shown in &hunk.lines {
+                    match shown.kind {
+                        LineKind::Context => {
+                            steps.push((LineKind::Context, mid_old[i]));
+                            i += 1;
+                            j += 1;
+                        }
+                        LineKind::Remove => {
+                            steps.push((LineKind::Remove, mid_old[i]));
+                            i += 1;
+                        }
+                        LineKind::Add => {
+                            steps.push((LineKind::Add, mid_new[j]));
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            steps.extend(mid_old[i..].iter().map(|l| (LineKind::Context, *l)));
+            steps.extend(
+                old[old.len() - suffix..]
+                    .iter()
+                    .map(|l| (LineKind::Context, *l)),
+            );
+            Some(Preview {
+                hunks: regroup(&steps),
+                ..Preview::default()
+            })
+        }
+    }
+}
+
+/// `steps`, a whole file's alignment, as hunks: each change with [`AROUND`]
+/// lines of context, two changes at most twice that apart in one hunk.
+fn regroup(steps: &[(LineKind, &str)]) -> Vec<drive_write::Hunk> {
+    // The 1-based line each step's sides are at before it.
+    let mut at = Vec::with_capacity(steps.len());
+    let (mut old, mut new) = (1, 1);
+    for (kind, _) in steps {
+        at.push((old, new));
+        match kind {
+            LineKind::Context => {
+                old += 1;
+                new += 1;
+            }
+            LineKind::Remove => old += 1,
+            LineKind::Add => new += 1,
+        }
+    }
+    let changes: Vec<usize> = (0..steps.len())
+        .filter(|&k| steps[k].0 != LineKind::Context)
+        .collect();
+    let mut hunks = Vec::new();
+    let mut k = 0;
+    while k < changes.len() {
+        let first = changes[k];
+        let mut last = first;
+        while k + 1 < changes.len() && changes[k + 1] - last <= 2 * AROUND + 1 {
+            k += 1;
+            last = changes[k];
+        }
+        k += 1;
+        let from = first.saturating_sub(AROUND);
+        let to = (last + AROUND + 1).min(steps.len());
+        let window = &steps[from..to];
+        let (old_at, new_at) = at[from];
+        let shows_old = window.iter().any(|(kind, _)| *kind != LineKind::Add);
+        let shows_new = window.iter().any(|(kind, _)| *kind != LineKind::Remove);
+        hunks.push(drive_write::Hunk {
+            old_start: if shows_old { old_at } else { old_at - 1 },
+            new_start: if shows_new { new_at } else { new_at - 1 },
+            lines: window
+                .iter()
+                .map(|(kind, text)| line(*kind, text))
+                .collect(),
+        });
+    }
+    hunks
+}
+
 impl From<Preview> for AgentWritePreviewVm {
     fn from(preview: Preview) -> Self {
         let excerpt = |e: drive_write::Excerpt| AgentWriteExcerptVm {
-            lines: e.lines,
+            lines: e.lines.iter().map(|line| escaped(line)).collect(),
             more: count(e.more),
         };
         Self {
@@ -224,7 +489,7 @@ impl From<Preview> for AgentWritePreviewVm {
                                 LineKind::Add => AgentWriteLineKindVm::Add,
                                 LineKind::Remove => AgentWriteLineKindVm::Remove,
                             },
-                            text: line.text,
+                            text: escaped(&line.text),
                         })
                         .collect(),
                 })
@@ -427,32 +692,23 @@ struct Plan {
     to: Option<DriveFile>,
     /// The file's text after the change; `None` for a move or a delete.
     post: Option<String>,
+    /// What the card shows of it; `None` when it cannot be shown in full.
+    preview: Option<AgentWritePreviewVm>,
+    /// The agent's text, the path or `to` holds a character the card has to
+    /// escape ([`holds_hidden`]).
+    hidden: bool,
 }
 
 impl Plan {
-    /// The file's text here before the change, when it is text.
-    fn before(&self) -> Option<&str> {
-        self.path
-            .disk
-            .as_ref()
-            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-    }
-
-    fn blob(&self) -> Option<String> {
-        self.path.disk.as_ref().map(|(blob, _)| blob.clone())
-    }
-
-    fn preview(&self) -> AgentWritePreviewVm {
-        match self.request.change {
-            Change::Move { .. } => AgentWritePreviewVm::default(),
-            _ => {
-                let mut preview: AgentWritePreviewVm =
-                    drive_write::preview(self.before(), self.post.as_deref()).into();
-                if let (Some(before), Some(after)) = (self.before(), self.post.as_deref()) {
-                    preview.line_endings = line_endings_change(before, after);
-                }
-                preview
-            }
+    /// Why Allow is withheld for what the card shows, whatever this device
+    /// holds: hidden characters, or a change too large to show in full.
+    fn unshowable(&self) -> Option<&'static str> {
+        if self.hidden {
+            Some(HIDDEN)
+        } else if self.preview.is_none() {
+            Some(TOO_LARGE)
+        } else {
+            None
         }
     }
 
@@ -568,11 +824,32 @@ fn assess(source: &Source, port: &dyn DriveWrites, call: &Call) -> Result<Plan, 
     let post = request
         .post_image(path.disk.as_ref().map(|(_, bytes)| bytes.as_slice()))
         .map_err(reason)?;
+    let before = path
+        .disk
+        .as_ref()
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok());
+    let preview = change_preview(&request.change, before, post.as_deref()).map(|shown| {
+        let mut preview = AgentWritePreviewVm::from(shown);
+        if let (Some(before), Some(after)) = (before, post.as_deref()) {
+            preview.line_endings = line_endings_change(before, after);
+        }
+        preview
+    });
+    let texts: Vec<&str> = match &request.change {
+        Change::Create { content } | Change::Replace { content } => vec![content],
+        Change::Edit { new_text, .. } => vec![new_text],
+        Change::Append { text } => vec![text],
+        Change::Move { to } => vec![to],
+        Change::Delete => Vec::new(),
+    };
+    let hidden = holds_hidden(&request.path) || texts.iter().any(|text| holds_hidden(text));
     Ok(Plan {
         request,
         path,
         to,
         post,
+        preview,
+        hidden,
     })
 }
 
@@ -767,8 +1044,8 @@ enum Owed {
 struct Look {
     at: Instant,
     blocked: Option<String>,
-    /// The file's blob id here when the preview was made, and the preview.
-    preview: Option<(Option<String>, AgentWritePreviewVm)>,
+    /// The preview last shown.
+    preview: Option<AgentWritePreviewVm>,
 }
 
 /// This device's drive writes: the port, the looks the cards show, the
@@ -837,8 +1114,8 @@ impl Writes {
         lock(&self.owed).remove(key);
     }
 
-    /// A look at `call`'s write: kept for [`LOOK_FOR`], the preview made
-    /// again only when the file here changed.
+    /// A look at `call`'s write: kept for [`LOOK_FOR`]; a look that finds
+    /// the write refused keeps the preview last shown.
     fn look(&self, source: &Source, port: &dyn DriveWrites, call: &Call) -> Look {
         let key = (source.database.clone(), call.approval.clone());
         if let Some(look) = lock(&self.looks).get(&key) {
@@ -850,18 +1127,11 @@ impl Writes {
             .get(&key)
             .and_then(|look| look.preview.clone());
         let look = match assess(source, port, call) {
-            Ok(plan) => {
-                let blob = plan.blob();
-                let preview = match kept {
-                    Some((was, preview)) if was == blob => preview,
-                    _ => plan.preview(),
-                };
-                Look {
-                    at: Instant::now(),
-                    blocked: None,
-                    preview: Some((blob, preview)),
-                }
-            }
+            Ok(plan) => Look {
+                at: Instant::now(),
+                blocked: plan.unshowable().map(str::to_owned),
+                preview: Some(plan.preview.clone().unwrap_or_default()),
+            },
             Err(reason) => Look {
                 at: Instant::now(),
                 blocked: Some(reason),
@@ -911,8 +1181,8 @@ impl Writes {
         let mut vm = AgentDriveWriteVm {
             op: request.op().into(),
             drive: request.drive.clone(),
-            path: request.path.clone(),
-            to: request.to().map(str::to_owned),
+            path: escaped(&request.path),
+            to: request.to().map(escaped),
             preview: AgentWritePreviewVm::default(),
             untrusted: call.untrusted,
             audience: audience(sources, source, &request.drive),
@@ -934,12 +1204,11 @@ impl Writes {
                     .retain(|action| *action != AgentApprovalActionVm::AllowOnce);
                 vm.blocked = Some(reason);
             }
-            if let Some((_, preview)) = look.preview {
+            if let Some(preview) = look.preview {
                 vm.preview = preview;
             }
         } else if call.decided_by_client.as_deref() == Some(source.client.as_str()) {
-            if let Some((_, preview)) = lock(&self.looks).get(&key).and_then(|l| l.preview.clone())
-            {
+            if let Some(preview) = lock(&self.looks).get(&key).and_then(|l| l.preview.clone()) {
                 vm.preview = preview;
             }
         }
@@ -950,6 +1219,9 @@ impl Writes {
                 approval.decided_by.as_deref().unwrap_or("someone")
             );
         }
+        // Every place the card shows the request's words shows them escaped.
+        approval.summary = escaped(&approval.summary);
+        approval.action = approval.action.as_deref().map(escaped);
         approval.write = Some(vm);
     }
 
@@ -983,7 +1255,10 @@ impl Writes {
         let call = Call::read(source, approval_id)
             .ok_or_else(|| Refusal("This request is not on this device any more.".to_owned()))?;
         // The look stays: the card decided here keeps the diff it was allowed on.
-        assess(source, port.as_ref(), &call).map_err(Refusal)?;
+        let plan = assess(source, port.as_ref(), &call).map_err(Refusal)?;
+        if let Some(reason) = plan.unshowable() {
+            return Err(Refusal(reason.to_owned()));
+        }
         let decided = settle(
             source,
             decisions,
@@ -1036,7 +1311,10 @@ impl Writes {
         )];
         if let Some(call) = Call::read(source, approval_id) {
             let blocked = match self.port() {
-                Some(port) => assess(source, port.as_ref(), &call).err(),
+                Some(port) => match assess(source, port.as_ref(), &call) {
+                    Ok(plan) => plan.unshowable().map(str::to_owned),
+                    Err(reason) => Some(reason),
+                },
                 None => Some(NO_WRITER.to_owned()),
             };
             if let Some(reason) = blocked {
@@ -1099,6 +1377,9 @@ impl Writes {
     ) -> AgentDecisionOutcomeVm {
         let outcome = match assess(source, port, call) {
             Err(reason) => Outcome::NotApplied { reason },
+            Ok(plan) if plan.unshowable().is_some() => Outcome::NotApplied {
+                reason: plan.unshowable().unwrap_or(HIDDEN).to_owned(),
+            },
             Ok(plan) => {
                 let subject = format!(
                     "{}: {}",
