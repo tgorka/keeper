@@ -4825,7 +4825,7 @@ function restoreSignInFixture(): Pick<AccountRestoreVm, "matrixSignIn"> {
         url: mockAuthorizationUrl("mas.acme.dev", "01J8KEEPERRESTORE"),
         notOpened:
           param === "unopened"
-            ? "keeper could not open your browser. Copy this link into a browser to finish signing in."
+            ? "keeper could not open the sign-in page. Press Copy link, paste it into your browser's address bar and finish signing in there — keeper keeps waiting. Or cancel and sign in again."
             : null,
       },
     },
@@ -4949,7 +4949,7 @@ function matrixSignInFlow(payload: Record<string, unknown>): Promise<AccountVm> 
     channel?.onmessage?.({
       url,
       notOpened:
-        "keeper could not open your browser. Copy this link into a browser to finish signing in.",
+        "keeper could not open the sign-in page. Press Copy link, paste it into your browser's address bar and finish signing in there — keeper keeps waiting. Or cancel and sign in again.",
     });
   }
   return new Promise<AccountVm>((_, reject) => {
@@ -5046,7 +5046,7 @@ function accountSignInFlow(
     url: mockAuthorizationUrl("id.acme.dev", "keeper-acme"),
     notOpened:
       signInParam === "unopened"
-        ? "keeper could not open your browser. Copy this link into a browser to finish signing in."
+        ? "keeper could not open the sign-in page. Press Copy link, paste it into your browser's address bar and finish signing in there — keeper keeps waiting. Or cancel and sign in again."
         : null,
   };
   setAccount({ ...signedInAccount("signingIn", device), attempt: "running", signInLink });

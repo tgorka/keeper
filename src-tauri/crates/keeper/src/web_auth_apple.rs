@@ -32,12 +32,14 @@
 //! comment, and all are listed in the audit inventory in
 //! `docs/constraints-and-limitations.md`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use block2::RcBlock;
 use keeper_core::oauth::OAuthFlowRegistry;
+use keeper_core::sign_in_sheet::{Activation, PreviousSheet};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
 use objc2::{available, AnyThread, MainThreadMarker};
@@ -116,6 +118,9 @@ thread_local! {
     /// The sheets this process has open, by the `state` of their flow. Only
     /// the main thread touches it — see the module doc.
     static LIVE: RefCell<HashMap<String, Live>> = RefCell::new(HashMap::new());
+    /// When the last sheet was released, after its completion ran: the
+    /// next one gives its dismissal time (`sign_in_sheet::DISMISSAL`).
+    static LAST_RELEASED: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// The main window's native window, as the anchor type the protocol returns.
@@ -145,7 +150,7 @@ fn window_of(
 }
 
 /// What Apple's `start` checks the anchor against, read the same way: does
-/// the window have a scene, is that scene `foregroundActive` (0), is the
+/// the window have a scene, what is that scene's `activationState`, is the
 /// window key. Logged when a sheet is refused, so a refusal names its cause.
 #[derive(Clone, Copy)]
 struct AnchorState {
@@ -154,20 +159,12 @@ struct AnchorState {
     key: bool,
 }
 
-impl AnchorState {
-    /// `UISceneActivationStateForegroundActive`.
-    const FOREGROUND_ACTIVE: isize = 0;
-
-    fn ready(self) -> bool {
-        self.scene && self.activation == Self::FOREGROUND_ACTIVE
-    }
-}
-
 #[allow(unsafe_code)]
 fn anchor_state(window: &objc2_ui_kit::UIWindow) -> AnchorState {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
-    // SAFETY: on the main thread (the caller is `present`), `windowScene`
+    // SAFETY: on the main thread (the callers are `activation` and `present`,
+    // both inside `with_webview`'s closure), `windowScene`
     // answers a `UIWindowScene` or nil, `activationState` is an `NSInteger`
     // enum on that scene, and `isKeyWindow` a `BOOL` on the window; none
     // retains or keeps anything beyond the call.
@@ -188,17 +185,45 @@ fn anchor_state(window: &objc2_ui_kit::UIWindow) -> AnchorState {
 
 /// Why [`present`] did not start a sheet.
 pub enum Refusal {
-    /// keeper's window is not the active one yet; try again shortly.
-    NotActive,
+    /// Apple's `start` refused the window it was given; another may be
+    /// handed later (`sign_in_sheet::SheetWait::refused`).
+    Refused,
     /// It will not start; the sentence is for the person.
     Failed(String),
 }
 
+/// keeper's window as Apple's `start` will judge it: its scene's
+/// activation, read after the keyboard of a just-pasted setup link is
+/// dismissed (it holds the window's attention, and a sheet over it is
+/// refused; dismissing it is what a tap elsewhere does). `Err` is a window
+/// that is not there to look at, worded for the person.
+pub fn activation(webview: &tauri::webview::PlatformWebview) -> Result<Activation, String> {
+    let window = window_of(webview)?;
+    let _ = window.endEditing(true);
+    let anchor = anchor_state(&window);
+    Ok(Activation::of_scene(anchor.scene, anchor.activation))
+}
+
+/// The sheet shown before the one being asked for: still on screen while
+/// any sheet's completion has not run, otherwise how long ago the last one
+/// was released. Main thread only, like the table it reads.
+pub fn previous_sheet() -> PreviousSheet {
+    if LIVE.with(|live| !live.borrow().is_empty()) {
+        return PreviousSheet::OnScreen;
+    }
+    LAST_RELEASED
+        .with(Cell::get)
+        .map_or(PreviousSheet::None, |at| {
+            PreviousSheet::EndedAgo(at.elapsed())
+        })
+}
+
 /// Start one sheet for `url`, whose callback comes back on `scheme`, and
-/// report its ending for `state` through [`finish`].
+/// report its ending for `state` through [`finish`]. The caller has already
+/// judged the window ready ([`activation`], `sign_in_sheet::SheetWait`).
 ///
-/// `Err` is a sheet that never started, worded for the person; the caller
-/// delivers it to the flow so it ends at once.
+/// `Err` is a sheet that never started: [`Refusal::Refused`] when Apple
+/// refused the window, [`Refusal::Failed`] worded for the person otherwise.
 #[allow(unsafe_code)]
 pub fn present(
     app: &tauri::AppHandle,
@@ -214,13 +239,7 @@ pub fn present(
         ));
     };
     let window = window_of(webview).map_err(Refusal::Failed)?;
-    // The keyboard of a just-pasted setup link holds the window's attention;
-    // a sheet over it is refused. Dismissing it is what a tap elsewhere does.
-    let _ = window.endEditing(true);
     let anchor_was = anchor_state(&window);
-    if !anchor_was.ready() {
-        return Err(Refusal::NotActive);
-    }
     let window: Retained<NSObject> =
         Retained::into_super(Retained::into_super(Retained::into_super(window)));
     let auth_url = NSURL::URLWithString(&NSString::from_str(url)).ok_or_else(|| {
@@ -313,9 +332,7 @@ pub fn present(
             key = anchor_was.key,
             "web auth: Apple refused the sign-in sheet's window"
         );
-        return Err(Refusal::Failed(
-            "the sign-in sheet could not start; try again with keeper in front".to_owned(),
-        ));
+        return Err(Refusal::Refused);
     }
     Ok(())
 }
@@ -354,10 +371,12 @@ fn is_session_error(error: &NSError) -> bool {
     *error.domain() == *domain
 }
 
-/// Drop one sheet's session, anchor and block on the main thread's next turn.
+/// Drop one sheet's session, anchor and block on the main thread's next
+/// turn, and note when, for the next sheet's wait.
 fn release(app: &tauri::AppHandle, state: String) {
     let queued = app.run_on_main_thread(move || {
         LIVE.with(|live| live.borrow_mut().remove(&state));
+        LAST_RELEASED.with(|at| at.set(Some(Instant::now())));
     });
     if let Err(error) = queued {
         tracing::warn!(%error, "web auth: could not release a finished sign-in sheet");

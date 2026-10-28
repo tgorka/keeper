@@ -236,10 +236,13 @@ pub fn start(url: &str, callback_scheme: &str) -> Result<(), CoreError> {
 /// `with_webview` is the way in because its closure runs on the main thread
 /// (its whole contract) and is handed the native window the sheet anchors to.
 ///
-/// A window that is not the active one yet — the keyboard still up from the
-/// pasted setup link, an alert, a return from another app — is waited for, up
-/// to three seconds ([`ACTIVE_TRIES`] × [`ACTIVE_POLL`]), rather than handed to Apple, which refuses it with
-/// `presentationContextInvalid` (kalypso, 2026-10-01).
+/// The sheet opens only over a window Apple will accept, and when keeper's
+/// window is not ready yet — the keyboard still up from a pasted setup link,
+/// the previous sheet still going away, an alert, a return from another app —
+/// it is looked at again every `sign_in_sheet::POLL`, for as long as
+/// `keeper_core::sign_in_sheet::SheetWait` says to. A forge sign-in's second
+/// sheet used to get three seconds of that and fall back to the link with
+/// keeper in front the whole time (kalypso, 2026-10-17 to 10-28).
 #[cfg(target_os = "ios")]
 pub fn start_in(
     url: &str,
@@ -248,32 +251,35 @@ pub fn start_in(
 ) -> Result<(), CoreError> {
     let state = state_of(url)
         .ok_or_else(|| CoreError::Internal("the authorization URL carries no state".to_owned()))?;
-    attempt(
-        url.to_owned(),
-        callback_scheme.to_owned(),
+    attempt(Attempt {
+        url: url.to_owned(),
+        scheme: callback_scheme.to_owned(),
         state,
         flows,
-        ACTIVE_TRIES,
-    )
+        wait: keeper_core::sign_in_sheet::SheetWait::new(),
+        started: std::time::Instant::now(),
+    })
 }
 
-/// How many more times a sign-in looks for keeper's window to be the active
-/// one before it gives up: three seconds at [`ACTIVE_POLL`].
+/// One sheet waiting for keeper's window, carried from look to look.
 #[cfg(target_os = "ios")]
-const ACTIVE_TRIES: u64 = 12;
-/// How often it looks again meanwhile.
-#[cfg(target_os = "ios")]
-const ACTIVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-
-#[cfg(target_os = "ios")]
-fn attempt(
+struct Attempt {
     url: String,
     scheme: String,
     state: String,
     flows: Arc<OAuthFlowRegistry>,
-    tries_left: u64,
-) -> Result<(), CoreError> {
+    wait: keeper_core::sign_in_sheet::SheetWait,
+    /// When the first look was taken: the wait's clock.
+    started: std::time::Instant,
+}
+
+/// Look at keeper's window once, on the main thread, and do what the wait
+/// says: present the sheet, look again later, stop, or give the flow the
+/// reason the sheet could not open.
+#[cfg(target_os = "ios")]
+fn attempt(mut this: Attempt) -> Result<(), CoreError> {
     use crate::web_auth_apple::Refusal;
+    use keeper_core::sign_in_sheet::{Look, Step};
     use tauri::Manager;
 
     let (app, _) = HOST.get().ok_or_else(not_up)?;
@@ -286,31 +292,63 @@ fn attempt(
     let app = app.clone();
     window
         .with_webview(move |webview| {
-            match crate::web_auth_apple::present(&app, &webview, &url, &scheme, &state, &flows) {
-                Ok(()) => {}
-                Err(Refusal::NotActive) if tries_left > 0 => {
+            let activation = match crate::web_auth_apple::activation(&webview) {
+                Ok(activation) => activation,
+                Err(reason) => return finish(&this.flows, &this.state, Ending::Failed(reason)),
+            };
+            let look = Look {
+                activation,
+                previous: crate::web_auth_apple::previous_sheet(),
+                flow_waits: this.flows.waits(&this.state),
+            };
+            let waited = this.started.elapsed();
+            let mut step = this.wait.next(look, waited);
+            if step == Step::Present {
+                match crate::web_auth_apple::present(
+                    &app,
+                    &webview,
+                    &this.url,
+                    &this.scheme,
+                    &this.state,
+                    &this.flows,
+                ) {
+                    Ok(()) => {
+                        if !waited.is_zero() {
+                            tracing::info!(
+                                waited_ms = waited.as_millis(),
+                                "web auth: the sign-in sheet opened once keeper's window was ready"
+                            );
+                        }
+                        return;
+                    }
+                    Err(Refusal::Refused) => step = this.wait.refused(),
+                    Err(Refusal::Failed(reason)) => {
+                        return finish(&this.flows, &this.state, Ending::Failed(reason))
+                    }
+                }
+            }
+            match step {
+                Step::Present => {}
+                Step::LookAgain(after) => {
                     std::thread::spawn(move || {
-                        std::thread::sleep(ACTIVE_POLL);
-                        if let Err(error) = attempt(
-                            url,
-                            scheme,
-                            state.clone(),
-                            Arc::clone(&flows),
-                            tries_left - 1,
-                        ) {
+                        std::thread::sleep(after);
+                        let (flows, state) = (Arc::clone(&this.flows), this.state.clone());
+                        if let Err(error) = attempt(this) {
                             finish(&flows, &state, Ending::Failed(error.to_string()));
                         }
                     });
                 }
-                Err(Refusal::NotActive) => finish(
-                    &flows,
-                    &state,
-                    Ending::Failed(
-                        "keeper was not in front, so the sign-in sheet could not open; try again"
-                            .to_owned(),
-                    ),
-                ),
-                Err(Refusal::Failed(reason)) => finish(&flows, &state, Ending::Failed(reason)),
+                Step::Stop => {
+                    tracing::debug!("web auth: the sign-in ended before its sheet could open");
+                }
+                Step::GiveUp(reason) => {
+                    tracing::warn!(
+                        ?activation,
+                        waited_ms = waited.as_millis(),
+                        "web auth: stopped waiting for keeper's window to open the sign-in sheet"
+                    );
+                    finish(&this.flows, &this.state, Ending::Failed(reason.to_owned()));
+                }
             }
         })
         .map_err(|error| CoreError::Internal(format!("could not reach the main window: {error}")))

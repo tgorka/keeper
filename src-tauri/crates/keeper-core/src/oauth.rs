@@ -240,6 +240,12 @@ impl OAuthFlowRegistry {
         let _ = self.lock().remove(state);
     }
 
+    /// Whether a flow still waits under `state`: a sign-in sheet that has not
+    /// opened yet stops trying once its flow has ended (`sign_in_sheet`).
+    pub fn waits(&self, state: &str) -> bool {
+        self.lock().contains_key(state)
+    }
+
     /// Forward an incoming callback URL to its matching in-flight flow.
     ///
     /// Parses the `state` query parameter, looks up the pending sender, removes

@@ -320,13 +320,13 @@ describe("AccountSetupSheet", () => {
           signInLink: {
             url,
             notOpened:
-              "keeper could not open your browser. Copy this link into a browser to finish signing in.",
+              "keeper could not open the sign-in page. Press Copy link, paste it into your browser's address bar and finish signing in there — keeper keeps waiting. Or cancel and sign in again.",
           },
         }),
       ),
     );
     expect(screen.getByText(url)).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("keeper could not open your browser.");
+    expect(screen.getByRole("alert")).toHaveTextContent("keeper could not open the sign-in page.");
     expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
 
     act(() =>

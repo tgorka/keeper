@@ -54,6 +54,7 @@ pub mod secret_file;
 pub mod send;
 pub mod sessions;
 pub mod sign_in_link;
+pub mod sign_in_sheet;
 pub mod signals;
 pub mod size;
 pub mod tasks;

@@ -66,9 +66,13 @@ impl std::fmt::Debug for SignInLinkVm {
     }
 }
 
-/// The sentence beside a link no browser was opened for.
-pub const NOT_OPENED: &str =
-    "keeper could not open your browser. Copy this link into a browser to finish signing in.";
+/// The sentence beside a link no browser or sign-in sheet was opened for:
+/// what happened, and what to do — copy the whole link with the button (a
+/// hand selection can cut it or carry a stray space), paste it, and finish
+/// there while keeper waits; or start again.
+pub const NOT_OPENED: &str = "keeper could not open the sign-in page. Press Copy link, paste it \
+     into your browser's address bar and finish signing in there — keeper keeps waiting. Or cancel \
+     and sign in again.";
 
 /// Each sign-in's own number, so a surface can tell one sign-in's link from
 /// the next one's.
