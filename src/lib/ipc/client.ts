@@ -426,6 +426,7 @@ export type { AgentWriteHunkVm } from "./gen/AgentWriteHunkVm";
 export type { AgentWriteLineKindVm } from "./gen/AgentWriteLineKindVm";
 export type { AgentWriteLineVm } from "./gen/AgentWriteLineVm";
 export type { AgentWritePreviewVm } from "./gen/AgentWritePreviewVm";
+export type { AgentWriteRunVm } from "./gen/AgentWriteRunVm";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { ApprovalScope } from "./gen/ApprovalScope";

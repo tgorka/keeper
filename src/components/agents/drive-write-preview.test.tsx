@@ -252,3 +252,48 @@ it("a whitespace-only change says so under its line; a too-large one says its si
   expect(within(large).queryByRole("figure", { name: "Diff" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
 });
+
+it("markers are their own named spans; content beside them is plain text", () => {
+  const change = card({
+    preview: {
+      hunks: [
+        {
+          oldStart: 1,
+          newStart: 1,
+          lines: [
+            {
+              kind: "remove",
+              text: "a·⟨U+00B7⟩b",
+              runs: [{ text: "a" }, { text: "·", mark: "space" }, { text: "⟨U+00B7⟩b" }],
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const marks = within(change).getAllByRole("img", { name: "space" });
+  expect(marks).toHaveLength(1);
+  expect(marks[0]).toHaveTextContent("·");
+  expect(change.querySelector("[data-slot=drive-write-line-text]")).toHaveTextContent(
+    "a·⟨U+00B7⟩b",
+  );
+});
+
+it("a request whose words hold right-to-left text draws its path, to, summary and action in stored order", () => {
+  card(
+    {
+      op: "move",
+      path: "10-notes/inbox.md",
+      to: "10-notes/א 900 100.md",
+      preview: { hunks: [], rtlNote: "Right-to-left text is shown in stored order." },
+      rtl: true,
+    },
+    { summary: "Move `10-notes/inbox.md` to `10-notes/א 900 100.md` in tgdrive" },
+  );
+  const stored = (el: Element | null) => el?.className.includes("[unicode-bidi:bidi-override]");
+  expect(stored(screen.getByText("10-notes/א 900 100.md"))).toBe(true);
+  expect(stored(screen.getByText(/^Move `10-notes/))).toBe(true);
+  expect(stored(screen.getByRole("figure", { name: "Exact action" }).querySelector("pre"))).toBe(
+    true,
+  );
+});

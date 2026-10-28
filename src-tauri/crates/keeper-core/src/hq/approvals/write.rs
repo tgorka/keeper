@@ -83,6 +83,15 @@ pub const TOO_LARGE: &str = "This change is too large to show in full.";
 /// model carries only how many lines it has.
 pub const CARD_LINES: usize = 5_000;
 
+/// The most characters one line on a card may take, counted as drawn
+/// (escapes included): past it, Allow is withheld as [`TOO_LARGE`] and the
+/// card carries no lines (contract § 8 as amended, R606-09).
+pub const LINE_CHARS: usize = 10_000;
+
+/// The most characters a whole card may take, counted as drawn: its diff,
+/// excerpts, path, `to`, summary and exact action (R606-09).
+pub const CARD_CHARS: usize = 400_000;
+
 /// Said above the diff when a line on it holds right-to-left text, which
 /// the card draws in stored order (R606-06).
 pub const RTL_NOTE: &str = "Right-to-left text is shown in stored order.";
@@ -168,6 +177,26 @@ pub struct AgentWriteLineVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub note: Option<String>,
+    /// The line as runs, when it holds a marker the card draws in place of
+    /// a character — a space, a no-break space, a tab, a carriage return, a
+    /// final line break: each marker its own run with an accessible name,
+    /// so content can never draw one (R606-13). `text` is the same line as
+    /// one string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runs: Option<Vec<AgentWriteRunVm>>,
+}
+
+/// A piece of a line: text as it is, or a marker the card draws (`mark` is
+/// its accessible name: "space", "tab", …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentWriteRunVm {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mark: Option<String>,
 }
 
 /// One run of changes and up to three lines of context around it; the
@@ -220,8 +249,9 @@ pub struct AgentWritePreviewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub rtl_note: Option<String>,
-    /// Why nothing of the change is shown: how many lines it has, past the
-    /// card's [`CARD_LINES`] (R606-05). Allow is withheld.
+    /// Why nothing of the change is shown: which of the card's caps it is
+    /// past, and by how much ([`CARD_LINES`], [`LINE_CHARS`],
+    /// [`CARD_CHARS`]; R606-05, R606-09). Allow is withheld.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub too_large: Option<String>,
@@ -320,47 +350,81 @@ fn whitespace_only(old: &str, new: &str) -> bool {
     old != new && bare(old) == bare(new)
 }
 
-/// `raw`, a line with its break, drawn with its whitespace visible: `·` a
-/// space, `⍽` a no-break space, `→` a tab, `⏎` a carriage return, other
-/// whitespace as `⟨U+2003⟩`; its line break as `↵` when `final_break` (the
-/// pair differs in whether the file ends with one); hidden characters
-/// escaped as everywhere.
-fn visible_whitespace(raw: &str, final_break: bool) -> String {
+/// The characters content may hold that look like the card's markers: on
+/// a line that draws a marker, each is escaped, so none can pass for one
+/// (R606-13).
+const MARKERS: [char; 5] = ['·', '⍽', '→', '⏎', '↵'];
+
+/// `raw`, a line with its break, as the card draws it: the text and, when
+/// it draws a marker, the runs ([`AgentWriteRunVm`]).
+///
+/// With `whitespace` — the line is one of a pair differing only in
+/// whitespace, `Some(final_break)` saying whether the pair differs in
+/// ending the file with a line break — every space, no-break space, tab and
+/// carriage return is a marker (`·` `⍽` `→` `⏎`), other whitespace an
+/// escape (`⟨U+2003⟩`), and the line break a marker `↵` when `final_break`
+/// (R606-07). Without, a carriage return ending no line is a marker `⏎`.
+/// Everywhere, hidden characters are escaped ([`hides`]); and on a line
+/// with a marker, so is each character of [`MARKERS`].
+fn render_line(raw: &str, whitespace: Option<bool>) -> (String, Option<Vec<AgentWriteRunVm>>) {
     let (body, broke) = match raw.strip_suffix('\n') {
         Some(body) => (body, true),
         None => (raw, false),
     };
+    // Drawn as it is, a CR before the line's LF is its ending, not shown.
+    let body = match (whitespace, broke) {
+        (None, true) => body.strip_suffix('\r').unwrap_or(body),
+        _ => body,
+    };
     let chars: Vec<char> = body.chars().collect();
-    let mut out = String::with_capacity(body.len() + 8);
+    let mark_at = |at: usize| -> Option<(&'static str, &'static str)> {
+        match (whitespace.is_some(), chars[at]) {
+            (true, ' ') => Some(("·", "space")),
+            (true, '\u{a0}') => Some(("⍽", "no-break space")),
+            (true, '\t') => Some(("→", "tab")),
+            (true, '\r') => Some(("⏎", "carriage return")),
+            (false, '\r') if hides(&chars, at) => Some(("⏎", "carriage return")),
+            _ => None,
+        }
+    };
+    let final_mark = whitespace == Some(true) && broke;
+    let marked = final_mark || (0..chars.len()).any(|at| mark_at(at).is_some());
+    let mut runs: Vec<AgentWriteRunVm> = Vec::new();
+    let plain = |runs: &mut Vec<AgentWriteRunVm>, piece: &str| match runs.last_mut() {
+        Some(last) if last.mark.is_none() => last.text.push_str(piece),
+        _ => runs.push(AgentWriteRunVm {
+            text: piece.to_owned(),
+            mark: None,
+        }),
+    };
+    let mut one = [0u8; 4];
     for (at, c) in chars.iter().enumerate() {
-        match c {
-            ' ' => out.push('·'),
-            '\u{a0}' => out.push('⍽'),
-            '\t' => out.push('→'),
-            '\r' => out.push('⏎'),
-            c if c.is_whitespace() => out.push_str(&format!("⟨U+{:04X}⟩", u32::from(*c))),
-            c if hides(&chars, at) => out.push_str(&escape_form(*c)),
-            c => out.push(*c),
+        if let Some((glyph, name)) = mark_at(at) {
+            runs.push(AgentWriteRunVm {
+                text: glyph.to_owned(),
+                mark: Some(name.to_owned()),
+            });
+        } else if hides(&chars, at) {
+            plain(&mut runs, &escape_form(*c));
+        } else if (whitespace.is_some() && c.is_whitespace()) || (marked && MARKERS.contains(c)) {
+            plain(&mut runs, &format!("⟨U+{:04X}⟩", u32::from(*c)));
+        } else {
+            plain(&mut runs, c.encode_utf8(&mut one));
         }
     }
-    if broke && final_break {
-        out.push('↵');
+    if final_mark {
+        runs.push(AgentWriteRunVm {
+            text: "↵".to_owned(),
+            mark: Some("line break at the end of the file".to_owned()),
+        });
     }
-    out
+    let text = runs.iter().map(|run| run.text.as_str()).collect();
+    (text, marked.then_some(runs))
 }
 
 /// `text`'s lines, each with its line break.
 fn lines_of(text: &str) -> Vec<&str> {
     text.split_inclusive('\n').collect()
-}
-
-/// A line as the card shows it: without its line break (`\n` or `\r\n`).
-/// A carriage return that ends no line stays, for [`escaped`] to show.
-fn line_text(line: &str) -> String {
-    match line.strip_suffix('\n') {
-        Some(body) => body.strip_suffix('\r').unwrap_or(body).to_owned(),
-        None => line.to_owned(),
-    }
 }
 
 /// A preview line with its raw text, line break included: the card's
@@ -591,19 +655,20 @@ fn card_lines(lines: &[drive_write::PreviewLine]) -> Vec<AgentWriteLineVm> {
     lines
         .iter()
         .zip(whitespace)
-        .map(|(line, whitespace)| AgentWriteLineVm {
-            kind: match line.kind {
-                LineKind::Context => AgentWriteLineKindVm::Context,
-                LineKind::Add => AgentWriteLineKindVm::Add,
-                LineKind::Remove => AgentWriteLineKindVm::Remove,
-            },
-            text: match whitespace {
-                Some(final_break) => visible_whitespace(&line.text, final_break),
-                None => escaped(&line_text(&line.text)),
-            },
-            rtl: line.text.chars().any(strong_rtl).then_some(true),
-            note: (whitespace.is_some() && line.kind == LineKind::Add)
-                .then(|| WHITESPACE_ONLY.to_owned()),
+        .map(|(line, whitespace)| {
+            let (text, runs) = render_line(&line.text, whitespace);
+            AgentWriteLineVm {
+                kind: match line.kind {
+                    LineKind::Context => AgentWriteLineKindVm::Context,
+                    LineKind::Add => AgentWriteLineKindVm::Add,
+                    LineKind::Remove => AgentWriteLineKindVm::Remove,
+                },
+                text,
+                rtl: line.text.chars().any(strong_rtl).then_some(true),
+                note: (whitespace.is_some() && line.kind == LineKind::Add)
+                    .then(|| WHITESPACE_ONLY.to_owned()),
+                runs,
+            }
         })
         .collect()
 }
@@ -644,12 +709,104 @@ impl From<Preview> for AgentWritePreviewVm {
     }
 }
 
-/// The card's line when a change is too large to show ([`CARD_LINES`]).
-fn too_large_line(lines: Option<usize>) -> String {
-    match lines {
-        Some(n) => format!("It takes {n} lines; a card shows at most {CARD_LINES}."),
-        None => "Too many lines change to compare them here.".to_owned(),
+/// Which of the card's caps a change is past (R606-05, R606-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TooLarge {
+    /// It takes this many lines, past [`CARD_LINES`].
+    Lines(usize),
+    /// K1's diff cannot compare what changed.
+    Compare,
+    /// One line takes this many characters as drawn, past [`LINE_CHARS`].
+    LineChars(usize),
+    /// The card takes this many characters as drawn, past [`CARD_CHARS`].
+    CardChars(usize),
+}
+
+impl TooLarge {
+    /// The card's line for it, naming the cap.
+    fn sentence(self) -> String {
+        match self {
+            Self::Lines(n) => format!("It takes {n} lines; a card shows at most {CARD_LINES}."),
+            Self::Compare => "Too many lines change to compare them here.".to_owned(),
+            Self::LineChars(n) => format!(
+                "A line of it takes {n} characters; a card shows at most {LINE_CHARS} on one line."
+            ),
+            Self::CardChars(n) => {
+                format!("It takes {n} characters; a card shows at most {CARD_CHARS}.")
+            }
+        }
     }
+}
+
+/// Whether a card drawing `preview` and `words` (its path, `to`, summary,
+/// exact action, each as drawn) is past a character cap: one line over
+/// [`LINE_CHARS`], or all of it over [`CARD_CHARS`] (R606-09). Counted as
+/// drawn: escapes and markers included.
+fn over_chars(preview: &AgentWritePreviewVm, words: &[&str]) -> Option<TooLarge> {
+    let lines = preview
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter().map(|line| line.text.as_str()))
+        .chain(
+            preview
+                .whole
+                .iter()
+                .chain(&preview.deleted)
+                .flat_map(|excerpt| excerpt.lines.iter().map(String::as_str)),
+        )
+        .chain(words.iter().flat_map(|text| text.split('\n')));
+    let (mut longest, mut total) = (0, 0);
+    for line in lines {
+        let n = line.chars().count();
+        longest = longest.max(n);
+        total += n;
+    }
+    if longest > LINE_CHARS {
+        Some(TooLarge::LineChars(longest))
+    } else if total > CARD_CHARS {
+        Some(TooLarge::CardChars(total))
+    } else {
+        None
+    }
+}
+
+/// The card's view of a change too large to show: no lines, the cap it is
+/// past.
+fn too_large_preview(too_large: TooLarge) -> AgentWritePreviewVm {
+    AgentWritePreviewVm {
+        too_large: Some(too_large.sentence()),
+        ..AgentWritePreviewVm::default()
+    }
+}
+
+/// The sentence for a file over [`drive_write::MAX_FILE_BYTES`] on this
+/// device (contract as ruled, R606-10): no op changes it.
+fn over_one_mb(path: &str) -> String {
+    format!("\"{path}\" is over 1 MB; agents can't change files that large.")
+}
+
+/// A write's exact action as its card shows it: the call's arguments as
+/// JSON, each text argument (`content`, `old_text`, `new_text`, `text`) by
+/// its size — the card's diff above shows that text itself, line by line,
+/// escaped and within the card's caps; inside the JSON it would be one
+/// line as long as the text (R606-09). The digest binds the whole call.
+fn shown_action(args: &Value) -> String {
+    let mut shown = args.clone();
+    if let Some(object) = shown.as_object_mut() {
+        for key in ["content", "old_text", "new_text", "text"] {
+            if let Some(Value::String(text)) = object.get(key) {
+                let said = format!("({} bytes: the change above)", text.len());
+                object.insert(key.to_owned(), Value::String(said));
+            }
+        }
+    }
+    escaped(&serde_json::to_string_pretty(&shown).unwrap_or_default())
+}
+
+/// The `Approval-Record` trailer of a write: the database and the approval,
+/// so an id another database also holds never matches it (R606-11).
+fn record(database: &str, approval: &str) -> String {
+    format!("{database}/{approval}")
 }
 
 /// A `drive_write` request on its card (contract § 8).
@@ -683,6 +840,11 @@ pub struct AgentDriveWriteVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub outcome: Option<String>,
+    /// The request's own words — its path, `to`, summary or exact action —
+    /// hold right-to-left text: each drawn in stored order (R606-12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rtl: Option<bool>,
 }
 
 // ─── The rows a write is read from ───────────────────────────────────────────
@@ -844,8 +1006,8 @@ struct Plan {
     /// The file's text after the change; `None` for a move or a delete.
     post: Option<String>,
     /// What the card shows of it; `Err` when it cannot be shown in full,
-    /// with how many lines it would take, when that is known.
-    preview: Result<AgentWritePreviewVm, Option<usize>>,
+    /// with the cap it is past.
+    preview: Result<AgentWritePreviewVm, TooLarge>,
     /// The agent's text, the path or `to` holds a character the card has to
     /// escape ([`holds_hidden`]).
     hidden: bool,
@@ -952,6 +1114,15 @@ fn assess(source: &Source, port: &dyn DriveWrites, call: &Call) -> Result<Plan, 
     let path = port
         .target(&request.drive, &request.path, target)
         .map_err(reason)?;
+    // No op changes a file over 1 MB on this device, whatever the agent's
+    // host said (R606-10).
+    if path
+        .disk
+        .as_ref()
+        .is_some_and(|(_, bytes)| bytes.len() > drive_write::MAX_FILE_BYTES)
+    {
+        return Err(over_one_mb(&request.path));
+    }
     let to = match request.to() {
         Some(to) => Some(
             port.target(&request.drive, to, DriveTarget::New)
@@ -980,13 +1151,25 @@ fn assess(source: &Source, port: &dyn DriveWrites, call: &Call) -> Result<Plan, 
         .disk
         .as_ref()
         .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok());
-    let preview = change_preview(&request.change, before, post.as_deref()).map(|shown| {
-        let mut preview = AgentWritePreviewVm::from(shown);
-        if let (Some(before), Some(after)) = (before, post.as_deref()) {
-            preview.line_endings = line_endings_change(before, after);
-        }
-        preview
-    });
+    let action = shown_action(&call.args);
+    let words = [
+        escaped(&request.path),
+        request.to().map(escaped).unwrap_or_default(),
+        action,
+    ];
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let preview = change_preview(&request.change, before, post.as_deref())
+        .map_err(|lines| lines.map_or(TooLarge::Compare, TooLarge::Lines))
+        .and_then(|shown| {
+            let mut preview = AgentWritePreviewVm::from(shown);
+            if let (Some(before), Some(after)) = (before, post.as_deref()) {
+                preview.line_endings = line_endings_change(before, after);
+            }
+            match over_chars(&preview, &words) {
+                Some(too_large) => Err(too_large),
+                None => Ok(preview),
+            }
+        });
     let texts: Vec<&str> = match &request.change {
         Change::Create { content } | Change::Replace { content } => vec![content],
         Change::Edit { new_text, .. } => vec![new_text],
@@ -1284,10 +1467,7 @@ impl Writes {
                 blocked: plan.unshowable().map(str::to_owned),
                 preview: Some(match &plan.preview {
                     Ok(preview) => preview.clone(),
-                    Err(lines) => AgentWritePreviewVm {
-                        too_large: Some(too_large_line(*lines)),
-                        ..AgentWritePreviewVm::default()
-                    },
+                    Err(too_large) => too_large_preview(*too_large),
                 }),
             },
             Err(reason) => Look {
@@ -1346,6 +1526,7 @@ impl Writes {
             audience: audience(sources, source, &request.drive),
             blocked: None,
             outcome: applied_message(source, &call.approval).and_then(|m| outcome_line(&m)),
+            rtl: None,
         };
         if approval.can_decide {
             let look = match self.port() {
@@ -1377,9 +1558,53 @@ impl Writes {
                 approval.decided_by.as_deref().unwrap_or("someone")
             );
         }
-        // Every place the card shows the request's words shows them escaped.
+        // Every place the card shows the request's words shows them escaped
+        // (R606-03), in stored order when they hold right-to-left text
+        // (R606-12).
         approval.summary = escaped(&approval.summary);
-        approval.action = approval.action.as_deref().map(escaped);
+        approval.action = approval.action.is_some().then(|| shown_action(&call.args));
+        vm.blocked = vm.blocked.as_deref().map(escaped);
+        let words = [
+            Some(request.path.as_str()),
+            request.to(),
+            Some(approval.summary.as_str()),
+            approval.action.as_deref(),
+        ];
+        if words
+            .iter()
+            .flatten()
+            .any(|text| text.chars().any(strong_rtl))
+        {
+            vm.rtl = Some(true);
+            vm.preview.rtl_note = Some(RTL_NOTE.to_owned());
+        }
+        // Whatever this device looked at, a card never draws more than its
+        // caps allow (R606-09): past them, no lines and no exact action —
+        // only the cap it is past.
+        let drawn = [
+            vm.path.as_str(),
+            vm.to.as_deref().unwrap_or_default(),
+            approval.summary.as_str(),
+            approval.action.as_deref().unwrap_or_default(),
+        ];
+        let over = match vm.preview.too_large {
+            Some(_) => None,
+            None => over_chars(&vm.preview, &drawn),
+        };
+        if over.is_some() || vm.preview.too_large.is_some() {
+            approval.action = None;
+            if let Some(too_large) = over {
+                let rtl_note = vm.preview.rtl_note.take();
+                vm.preview = too_large_preview(too_large);
+                vm.preview.rtl_note = rtl_note;
+                approval
+                    .actions
+                    .retain(|action| *action != AgentApprovalActionVm::AllowOnce);
+                if approval.can_decide && vm.blocked.is_none() {
+                    vm.blocked = Some(TOO_LARGE.to_owned());
+                }
+            }
+        }
         approval.write = Some(vm);
     }
 
@@ -1544,7 +1769,10 @@ impl Writes {
                     agent_name(source, &call.agent),
                     plan.request.summary()
                 );
-                match port.commit(&plan.request.drive, plan.commit(subject, &call.approval)) {
+                match port.commit(
+                    &plan.request.drive,
+                    plan.commit(subject, &record(&source.database, &call.approval)),
+                ) {
                     Ok(DriveCommitted::Committed(commit)) => Outcome::Applied { commit },
                     Ok(DriveCommitted::Unchanged) => Outcome::Unchanged,
                     Ok(DriveCommitted::Guarded(path)) => Outcome::NotApplied {
@@ -1685,7 +1913,7 @@ impl Writes {
                 return;
             }
         };
-        match port.carried(&drive, &call.approval) {
+        match port.carried(&drive, &record(&source.database, &call.approval)) {
             Ok(Some(commit)) => {
                 self.finish(source, call, key, Outcome::Applied { commit });
             }

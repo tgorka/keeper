@@ -29,4 +29,9 @@ blocked?: string,
 /**
  * What became of it, from its `applied` message.
  */
-outcome?: string, };
+outcome?: string, 
+/**
+ * The request's own words — its path, `to`, summary or exact action —
+ * hold right-to-left text: each drawn in stored order (R606-12).
+ */
+rtl?: boolean, };

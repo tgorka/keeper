@@ -20,7 +20,8 @@ lineEndings?: string,
  */
 rtlNote?: string, 
 /**
- * Why nothing of the change is shown: how many lines it has, past the
- * card's [`CARD_LINES`] (R606-05). Allow is withheld.
+ * Why nothing of the change is shown: which of the card's caps it is
+ * past, and by how much ([`CARD_LINES`], [`LINE_CHARS`],
+ * [`CARD_CHARS`]; R606-05, R606-09). Allow is withheld.
  */
 tooLarge?: string, };

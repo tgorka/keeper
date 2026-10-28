@@ -414,3 +414,30 @@ fn a_post_image_that_is_an_lfs_pointer_is_refused() {
     );
     assert_eq!(d.head(), before);
 }
+
+/// R606-10: a file over 1 MB on this device is never changed, checked again
+/// on the disk right before the commit.
+#[test]
+fn a_file_over_one_mb_is_refused_at_the_commit() {
+    let Some(d) = drive() else { return };
+    let inbox = "10-notes/inbox.md";
+    let large = "a".repeat(1_000_001);
+    std::fs::write(d.root.join(inbox), &large).expect("large");
+    git(&d.root, &["commit", "-q", "-am", "a large note"]);
+    let before = d.head();
+    let done = d.writes.commit(
+        "tgdrive",
+        DriveCommit {
+            writes: vec![(inbox.to_owned(), None)],
+            moves: Vec::new(),
+            guards: vec![(inbox.to_owned(), Some(blob_id(large.as_bytes())))],
+            subject: "Nixi: delete".to_owned(),
+            approval: "tgdrive/01JLARGE".to_owned(),
+        },
+    );
+    assert_eq!(
+        done,
+        Err("\"10-notes/inbox.md\" is over 1 MB; agents can't change files that large.".to_owned())
+    );
+    assert_eq!(d.head(), before, "nothing committed");
+}

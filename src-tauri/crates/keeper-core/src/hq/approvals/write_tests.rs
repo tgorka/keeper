@@ -283,7 +283,8 @@ struct Drive {
     targets: Mutex<usize>,
     answer: Mutex<Result<DriveCommitted, String>>,
     commits: Mutex<Vec<DriveCommit>>,
-    carried: Mutex<Option<String>>,
+    /// The commits the history holds, by their `Approval-Record` trailer.
+    carried: Mutex<HashMap<String, String>>,
     searched: Mutex<Vec<String>>,
 }
 
@@ -297,7 +298,7 @@ impl Drive {
             targets: Mutex::new(0),
             answer: Mutex::new(Ok(DriveCommitted::Committed(COMMIT.to_owned()))),
             commits: Mutex::new(Vec::new()),
-            carried: Mutex::new(None),
+            carried: Mutex::new(HashMap::new()),
             searched: Mutex::new(Vec::new()),
         };
         drive.file(PATH, BEFORE_BLOB, BEFORE);
@@ -372,7 +373,7 @@ impl DriveWrites for Drive {
             .lock()
             .expect("searched")
             .push(approval.to_owned());
-        Ok(self.carried.lock().expect("carried").clone())
+        Ok(self.carried.lock().expect("carried").get(approval).cloned())
     }
 }
 
@@ -762,7 +763,7 @@ fn allow_decides_consumes_commits_then_says_applied() {
             guards: vec![(PATH.to_owned(), Some(BEFORE_BLOB.to_owned()))],
             subject: "Nixi: Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 11 bytes"
                 .to_owned(),
-            approval: APPROVAL.to_owned(),
+            approval: format!("tgdrive/{APPROVAL}"),
         }]
     );
     let commits = w.server.written.lock().expect("written").clone();
@@ -1039,7 +1040,13 @@ fn recovery_finds_the_trailer_or_says_nothing_was_written() {
         w.set_approval(json!({"state": "consumed", "decided_by_actor": ANA,
                               "decided_by_client": "ana.dev",
                               "consumed_by_client": "ana.dev"}));
-        *w.drive.carried.lock().expect("carried") = carried.map(str::to_owned);
+        if let Some(commit) = carried {
+            w.drive
+                .carried
+                .lock()
+                .expect("carried")
+                .insert(format!("tgdrive/{APPROVAL}"), commit.to_owned());
+        }
         let relaunched = Writes::default();
         relaunched.set_port(Arc::clone(&w.drive) as Arc<dyn DriveWrites>);
         relaunched.carry_on(std::slice::from_ref(&w.ana));
@@ -1050,7 +1057,7 @@ fn recovery_finds_the_trailer_or_says_nothing_was_written() {
         );
         let searched = w.drive.searched.lock().expect("searched").clone();
         assert_eq!(searched.len(), 1);
-        assert_eq!(searched[0], APPROVAL);
+        assert_eq!(searched[0], format!("tgdrive/{APPROVAL}"));
         let expected = match carried {
             Some(commit) => json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
                                    "outcome": "applied", "commit": commit,
@@ -1508,7 +1515,7 @@ fn review606_a_wakeup_during_recovery_must_not_be_lost() {
         entered_rx
             .recv_timeout(wait)
             .expect("first recovery started"),
-        APPROVAL
+        format!("tgdrive/{APPROVAL}")
     );
     arrive_second(&w);
     hq.carry_on_writes(); // the wake the arriving change makes
@@ -1519,7 +1526,7 @@ fn review606_a_wakeup_during_recovery_must_not_be_lost() {
     }
     idle(&hq);
     assert!(
-        seen.iter().any(|a| a == "review606-second"),
+        seen.iter().any(|a| a == "tgdrive/review606-second"),
         "a change received during recovery must schedule another pass; saw {seen:?}"
     );
 }
@@ -1553,7 +1560,13 @@ fn review606_the_arriving_row_is_recoverable_by_a_fresh_wake() {
         entered_rx.recv_timeout(wait).expect("both rows"),
     ];
     seen.sort();
-    assert_eq!(seen, [APPROVAL.to_owned(), "review606-second".to_owned()]);
+    assert_eq!(
+        seen,
+        [
+            format!("tgdrive/{APPROVAL}"),
+            "tgdrive/review606-second".to_owned()
+        ]
+    );
     idle(&hq);
 }
 
@@ -2047,4 +2060,298 @@ fn the_effect_refuses_a_write_it_cannot_show() {
     let applied = w.applied().expect("applied row");
     assert_eq!(applied["outcome"], "not_applied");
     assert_eq!(applied["reason"], HIDDEN);
+}
+
+// ─── Round 7 (review-606 R606-09..14; contract § 8 as amended) ────────────────
+
+/// R606-09, the reviewer's case: 65,536 tag characters on one line would
+/// draw 851,968 characters. The card carries no lines and no exact action,
+/// only the cap it is past, and withholds Allow.
+#[test]
+fn a_line_past_the_character_cap_ships_no_lines() {
+    let tags: String = std::iter::repeat_n('\u{e0041}', 65_536).collect();
+    let args =
+        json!({"drive": "tgdrive", "op": "create", "path": "10-notes/t.md", "content": tags});
+    let w = world_with(args, None);
+    let card = w.card();
+    assert_eq!(card.actions, [AgentApprovalActionVm::Deny]);
+    assert_eq!(card.action, None, "no exact action");
+    let write = card.write.clone().expect("write");
+    assert!(write.preview.hunks.is_empty());
+    assert!(
+        write
+            .preview
+            .too_large
+            .as_deref()
+            .is_some_and(|said| said.starts_with("A line of it takes")
+                && said.ends_with("a card shows at most 10000 on one line.")),
+        "{:?}",
+        write.preview.too_large
+    );
+    let size = serde_json::to_string(&card).expect("json").len();
+    assert!(size < 4_000, "the card is {size} bytes");
+    // A visible line that long is past the cap as well, though nothing is hidden.
+    let args = json!({"drive": "tgdrive", "op": "create", "path": "10-notes/t.md",
+                      "content": "⟨TAG U+E0041⟩".repeat(800)});
+    let write = withheld(&world_with(args, None), TOO_LARGE);
+    assert!(write.preview.hunks.is_empty());
+}
+
+/// R606-09: lines each under 10,000 characters that add up past 400,000
+/// are past the card cap; just under both caps, the card is drawn.
+#[test]
+fn a_card_past_the_total_cap_ships_no_lines_and_just_under_is_drawn() {
+    // A replace of 25 lines of 9,000 characters, each changed: 25 removed
+    // and 25 added lines draw 450,025 characters, inside the 256 KiB a call
+    // may send.
+    let line = "x".repeat(9_000);
+    let before: String = (0..25).map(|_| format!("{line}\n")).collect();
+    let after: String = (0..25).map(|_| format!("{line}z\n")).collect();
+    let args = json!({"drive": "tgdrive", "op": "replace", "path": PATH, "expected": BEFORE_BLOB,
+                      "content": after});
+    let w = world_with(args, None);
+    w.drive.file(PATH, BEFORE_BLOB, &before);
+    let write = withheld(&w, TOO_LARGE);
+    assert!(write
+        .preview
+        .too_large
+        .as_deref()
+        .is_some_and(|said| said.starts_with("It takes")
+            && said.ends_with("characters; a card shows at most 400000.")));
+    // 20 lines of 9,999 characters: under both, with the path and the exact
+    // action (the content again, as JSON) counted too.
+    let line = "y".repeat(9_999);
+    let under: String = (0..19).map(|_| format!("{line}\n")).collect();
+    let args =
+        json!({"drive": "tgdrive", "op": "create", "path": "10-notes/t.md", "content": under});
+    let card = world_with(args, None).card();
+    assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+    assert_eq!(card.write.expect("write").preview.hunks[0].lines.len(), 19);
+}
+
+/// R606-10: no op changes a file over 1 MB on this device, whatever the
+/// agent's host said: Deny only, with the sentence, at the card and at the
+/// effect.
+#[test]
+fn every_op_on_a_file_over_one_mb_is_refused() {
+    let large = "a".repeat(drive_write::MAX_FILE_BYTES + 1);
+    let said = "\"10-notes/inbox.md\" is over 1 MB; agents can't change files that large.";
+    for args in [
+        json!({"drive": "tgdrive", "op": "delete", "path": PATH, "expected": BEFORE_BLOB}),
+        json!({"drive": "tgdrive", "op": "move", "path": PATH, "expected": BEFORE_BLOB,
+               "to": "10-notes/moved.md"}),
+        json!({"drive": "tgdrive", "op": "replace", "path": PATH, "expected": BEFORE_BLOB,
+               "content": "ok\n"}),
+        json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+               "old_text": "aaaa", "new_text": "b"}),
+        json!({"drive": "tgdrive", "op": "append", "path": PATH, "expected": BEFORE_BLOB,
+               "text": "x"}),
+    ] {
+        let op = args["op"].clone();
+        let w = world_with(args, None);
+        w.drive.file(PATH, BEFORE_BLOB, &large);
+        withheld(&w, said);
+        assert!(w.drive.commits().is_empty(), "{op}");
+    }
+    // At the effect too: the file grew past 1 MB after the decision.
+    let args = json!({"drive": "tgdrive", "op": "delete", "path": PATH, "expected": BEFORE_BLOB});
+    let w = world_with(args, None);
+    w.set_approval(json!({"state": "approved", "decided_by_actor": ANA,
+                          "decided_by_client": "ana.dev"}));
+    w.drive.file(PATH, BEFORE_BLOB, &large);
+    w.writes
+        .owe(("tgdrive".to_owned(), APPROVAL.to_owned()), Owed::Decided);
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert!(w.drive.commits().is_empty());
+    assert_eq!(w.applied().expect("applied")["reason"], said);
+}
+
+/// R606-11: the trailer names the database. Recovery in this database finds
+/// only its own commit: another database's commit for the same approval id,
+/// or one with a bare id, is not this write's.
+#[test]
+fn recovery_matches_the_database_and_the_id() {
+    let consumed = json!({"state": "consumed", "decided_by_actor": ANA,
+                          "decided_by_client": "ana.dev", "consumed_by_client": "ana.dev"});
+    // Another database's write of the same id is in the drive's history.
+    let w = world();
+    w.set_approval(consumed.clone());
+    let others = [format!("otherdb/{APPROVAL}"), APPROVAL.to_owned()];
+    for other in &others {
+        w.drive
+            .carried
+            .lock()
+            .expect("carried")
+            .insert(other.clone(), COMMIT.to_owned());
+    }
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(w.applied().expect("applied")["outcome"], "not_applied");
+    assert_eq!(w.applied().expect("applied")["reason"], STOPPED);
+    // Its own is found.
+    let w = world();
+    w.set_approval(consumed);
+    w.drive
+        .carried
+        .lock()
+        .expect("carried")
+        .insert(format!("tgdrive/{APPROVAL}"), COMMIT.to_owned());
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(w.applied().expect("applied")["commit"], COMMIT);
+    // And the commit it makes names both.
+    let w = world();
+    w.allow().expect("allowed");
+    assert_eq!(w.drive.commits()[0].approval, format!("tgdrive/{APPROVAL}"));
+}
+
+/// R606-12: right-to-left text in the path, a move's `to` or the summary
+/// is drawn in stored order, with the note; Allow is still offered.
+#[test]
+fn right_to_left_words_of_the_request_are_marked() {
+    let args = json!({"drive": "tgdrive", "op": "move", "path": PATH, "expected": BEFORE_BLOB,
+                      "to": "10-notes/\u{5d0} 900 100.md"});
+    let card = world_with(args, None).card();
+    assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+    let write = card.write.expect("write");
+    assert_eq!(write.rtl, Some(true));
+    assert_eq!(write.preview.rtl_note.as_deref(), Some(RTL_NOTE));
+    assert_eq!(world().card().write.expect("write").rtl, None);
+}
+
+/// R606-13: on a line drawn with markers, a literal marker character is
+/// escaped, and each marker is its own run with a name; a line with none
+/// is plain text.
+#[test]
+fn markers_cannot_be_forged() {
+    // A space moved across a real middle dot.
+    let args = json!({"drive": "tgdrive", "op": "edit", "path": PATH, "expected": BEFORE_BLOB,
+                      "old_text": "a \u{b7}b\n", "new_text": "a\u{b7} b\n"});
+    let w = world_with(args, None);
+    w.drive.file(PATH, BEFORE_BLOB, "a \u{b7}b\n");
+    let lines = w.card().write.expect("write").preview.hunks[0]
+        .lines
+        .clone();
+    assert_eq!(lines[0].text, "a·⟨U+00B7⟩b");
+    assert_eq!(lines[1].text, "a⟨U+00B7⟩·b");
+    assert_ne!(lines[0].text, lines[1].text);
+    let runs = lines[0].runs.clone().expect("runs");
+    assert_eq!(
+        runs,
+        [
+            AgentWriteRunVm {
+                text: "a".to_owned(),
+                mark: None
+            },
+            AgentWriteRunVm {
+                text: "·".to_owned(),
+                mark: Some("space".to_owned())
+            },
+            AgentWriteRunVm {
+                text: "⟨U+00B7⟩b".to_owned(),
+                mark: None
+            },
+        ]
+    );
+    // A lone carriage return replaced by a real ⏎: the old line's is a
+    // marker run, the new line's is text.
+    let (old, old_runs) = render_line("ab\rcd\n", None);
+    let (new, new_runs) = render_line("ab\u{23ce}cd\n", None);
+    assert_eq!((old.as_str(), new.as_str()), ("ab⏎cd", "ab⏎cd"));
+    assert_eq!(
+        old_runs.expect("marked")[1],
+        AgentWriteRunVm {
+            text: "⏎".to_owned(),
+            mark: Some("carriage return".to_owned())
+        }
+    );
+    assert_eq!(new_runs, None, "no marker on the new line");
+    // Every marker character is escaped on a marked line.
+    let (text, _) = render_line("· ⍽→⏎↵\n", Some(false));
+    assert_eq!(text, "⟨U+00B7⟩·⟨U+237D⟩⟨U+2192⟩⟨U+23CE⟩⟨U+21B5⟩");
+}
+
+/// R606-14 (surviving mutant `no-replace-cap`): a replace whose hunks take
+/// 5,001 lines is withheld; 5,000 are drawn and commit the post-image
+/// (the reviewer's construction).
+#[test]
+fn a_replace_past_the_line_cap_is_withheld() {
+    let before = big(10_000);
+    for (last, drawn) in [(7usize, true), (8, false)] {
+        let mut after = String::new();
+        for n in 1..=10_000 {
+            after.push_str(&format!("- [ ] entry {n}\n"));
+            if (100..=4_630).contains(&n) && n % 10 == 0 {
+                let k = if n == 4_630 { last } else { 1 };
+                for j in 0..k {
+                    after.push_str(&format!("+ inserted {n}.{j}\n"));
+                }
+            }
+        }
+        let args = json!({"drive": "tgdrive", "op": "replace", "path": PATH,
+                          "expected": BEFORE_BLOB, "content": after.clone()});
+        let w = world_with(args, None);
+        w.drive.file(PATH, BEFORE_BLOB, &before);
+        if drawn {
+            let card = w.card();
+            let lines: usize = card
+                .write
+                .expect("write")
+                .preview
+                .hunks
+                .iter()
+                .map(|h| h.lines.len())
+                .sum();
+            assert_eq!(lines, CARD_LINES);
+            w.allow().expect("allowed");
+            let bytes = w.drive.commits()[0].writes[0].1.clone().expect("bytes");
+            assert_eq!(String::from_utf8(bytes).expect("utf-8"), after);
+        } else {
+            let write = withheld(&w, TOO_LARGE);
+            assert_eq!(
+                write.preview.too_large.as_deref(),
+                Some("It takes 5001 lines; a card shows at most 5000.")
+            );
+        }
+    }
+}
+
+/// R606-14 (surviving mutant `rtl-hebrew-only`): Arabic, NKo and a
+/// supplementary right-to-left block are marked too.
+#[test]
+fn right_to_left_beyond_hebrew_is_marked() {
+    for text in [
+        "\u{645}\u{628}\u{644}\u{63a} 900 100",
+        "\u{7ca}\u{7cb} 900 100",
+        "\u{1e900}\u{1e901} 900 100",
+    ] {
+        let (rendered, _) = render_line(&format!("{text}\n"), None);
+        let line = &card_lines(&[drive_write::PreviewLine {
+            kind: LineKind::Add,
+            text: format!("{text}\n"),
+        }])[0];
+        assert_eq!(line.text, rendered);
+        assert_eq!(line.rtl, Some(true), "{text}");
+    }
+}
+
+/// A write's exact action shows its text arguments by size: the diff shows
+/// the text itself (R606-09). The rest of the call is there as it is.
+#[test]
+fn the_exact_action_shows_text_by_size() {
+    let action = world().card().action.expect("action");
+    assert!(
+        action.contains("\"old_text\": \"(11 bytes: the change above)\""),
+        "{action}"
+    );
+    assert!(
+        action.contains("\"new_text\": \"(11 bytes: the change above)\""),
+        "{action}"
+    );
+    assert!(
+        action.contains(&format!("\"expected\": \"{BEFORE_BLOB}\"")),
+        "{action}"
+    );
+    assert!(
+        action.contains("\"path\": \"10-notes/inbox.md\""),
+        "{action}"
+    );
 }

@@ -442,20 +442,29 @@ never granted. This device is what carries it out: the card (`AgentApprovalVm.wr
 agent's change itself, never the file's first lines (contract § 8 as amended, R606-04) — for an edit
 or a replace the line diff from this device's checkout with five lines around every change, for an
 append the appended text after the three lines before it, for a create all of its text; a change it
-cannot show in full, or that would take more than 5,000 lines on the card, withholds Allow ("This
-change is too large to show in full.", the card saying how many lines it takes; R606-05) — the deleted
+cannot show in full, that would take more than 5,000 lines on the card, or more than 10,000
+characters on one line or 400,000 on the whole card as drawn (escapes included), withholds Allow
+("This change is too large to show in full.", the card naming the cap, and then drawing no lines and
+no exact action; R606-05, R606-09; a drawn line the card's scroll box does not show is not laid out
+until it is scrolled to, so a card just under both caps draws in well under 2 s) — the deleted
 text for a delete, "Line endings change: CRLF → LF." when that is what a diff's
 identical-looking lines differ by, any character a reader cannot see or that
 reorders text (a tag, a bidirectional control, a zero-width or default-ignorable character; a
 single zero-width joiner between emoji, and U+FE0F directly after an `Extended_Pictographic` character
 as in ❤️, excepted — the one classifier notification approvals use too) in the new text, the path or `to` escaped (`⟨U+202E⟩`,
 `⟨TAG U+E0049⟩`) with "This change contains hidden or reordering characters." and Allow withheld
-(R606-03; `agents::push`'s R1066K-05 classification; a carriage return ending no line shows as
-`⏎`), a line holding right-to-left text drawn in stored order under "Right-to-left text is shown in
-stored order." (R606-06), a line changed only in whitespace drawn with it visible (`·` space, `⍽`
-no-break space, `→` tab, `⏎` carriage return, `↵` an added final line break) under "Only whitespace
-changes on this line." (R606-07), whether the chat read outside
-content, and who reads the drive beyond the session's database. *Allow once* is offered only when
+(R606-03; `agents::push`'s R1066K-05 classification; a carriage return ending no line shows as a
+`⏎` marker), any line holding right-to-left text — a diff line, the path, `to`, the summary or the
+exact action — drawn in stored order under "Right-to-left text is shown in stored order." (R606-06,
+R606-12), a line changed only in whitespace drawn with it visible under "Only whitespace changes on
+this line." (R606-07). Markers (`·` space, `⍽` no-break space, `→` tab, `⏎` carriage return, `↵` an
+added final line break) are their own styled spans with an accessible name, and on a line that draws
+one a literal `·` `⍽` `→` `⏎` `↵` in the content is escaped (`⟨U+00B7⟩`), so content cannot pass for
+a marker (R606-13). The exact action shows the call's text arguments by their size: the diff above
+is that text. The card also says whether the chat read
+outside content, and who reads the drive beyond the session's database. No op changes a file over 1 MB on this
+device: its card offers Deny only, saying `"<path>" is over 1 MB; agents can't change files that
+large.`, and the commit is refused again on the disk (R606-10). *Allow once* is offered only when
 every check passes here, in this order: the digest recomputed from the rows here is the parked one;
 this device keeps the drive (a synced folder whose `_drive.toml` names it), commits to it and has
 its disk; the session still ticks the drive and leaves `drive_write` and `drive` on; keeper-sync's
@@ -468,7 +477,8 @@ path it changes with the bytes it puts there (no pointer as text)
 (a `.gitattributes` that began routing the file through LFS since the card was drawn refuses it)
 and the profile's LFS size rule over the new text, so no agent write makes an LFS object — makes
 one commit of exactly the request through `Engine::commit_paths` with the trailer
-`Approval-Record: <approval id>`, and writes the `applied` message (`applied.<approval id>`, V18),
+`Approval-Record: <database>/<approval id>` (an approval id another database also holds never
+matches it; R606-11), and writes the `applied` message (`applied.<approval id>`, V18),
 each in its own commit. The card's last line is that message's outcome ("Written as 1a2b3c4 on
 hesperia.", or why not); the message itself is never drawn as a bubble. A step the server has not
 answered within the wait goes on when it does. After a stop between taking the approval and saying

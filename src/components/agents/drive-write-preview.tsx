@@ -7,6 +7,7 @@
  * never markup, and nothing here decides.
  */
 import { ShieldAlert } from "lucide-react";
+import type { CSSProperties } from "react";
 import type {
   AgentDriveWriteOpVm,
   AgentDriveWriteVm,
@@ -45,10 +46,23 @@ const LINE_WORD: Readonly<Record<AgentWriteLineKindVm, string>> = {
 };
 
 /** A line drawn in stored order, left to right, whatever its letters' direction (R606-06). */
-const STORED_ORDER = "[direction:ltr] [unicode-bidi:bidi-override]";
+export const STORED_ORDER = "[direction:ltr] [unicode-bidi:bidi-override]";
 
 const BLOCK =
   "my-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-muted p-2 font-mono text-xs [overflow-wrap:anywhere]";
+
+/**
+ * A drawn line the scroll box does not show is not laid out (R606-09). A card just under both
+ * character caps wraps into ~250,000 px of text, and laying all of it out held the Notes panel's
+ * first render for 3.3-3.8 s in headless Chromium. Until a line is laid out it holds the height
+ * its length would wrap to at the narrowest card (40 monospace characters a row), so a one-row
+ * guess cannot pull every line of the card into the browser's margin at once. A line stays in the
+ * accessibility tree and in find-in-page either way.
+ */
+function offscreenSkipped(text: string): CSSProperties {
+  const rows = Math.max(1, Math.ceil(text.length / 40));
+  return { contentVisibility: "auto", containIntrinsicBlockSize: `auto ${rows}lh` };
+}
 
 /** Each line of a hunk with its place on the side it is on: a key that names the line. */
 function placed(hunk: AgentWriteHunkVm) {
@@ -71,11 +85,34 @@ function Hunk({ hunk }: { hunk: AgentWriteHunkVm }) {
         Line {hunk.oldStart} → {hunk.newStart}
       </div>
       {placed(hunk).map(({ line, place }) => (
-        <div key={place} data-kind={line.kind} className={cn("min-w-0", LINE_TONE[line.kind])}>
+        <div
+          key={place}
+          data-kind={line.kind}
+          className={cn("min-w-0", LINE_TONE[line.kind])}
+          style={offscreenSkipped(line.text)}
+        >
           <span aria-hidden="true">{LINE_MARK[line.kind]} </span>
           <span className="sr-only">{LINE_WORD[line.kind]}: </span>
           <span data-slot="drive-write-line-text" className={cn(line.rtl && STORED_ORDER)}>
-            {line.text}
+            {line.runs
+              ? line.runs.map((run, at) =>
+                  run.mark ? (
+                    <span
+                      // biome-ignore lint/suspicious/noArrayIndexKey: a line's runs are fixed
+                      key={at}
+                      role="img"
+                      aria-label={run.mark}
+                      data-slot="drive-write-mark"
+                      className="rounded-xs bg-muted-foreground/20 text-muted-foreground"
+                    >
+                      {run.text}
+                    </span>
+                  ) : (
+                    // biome-ignore lint/suspicious/noArrayIndexKey: a line's runs are fixed
+                    <span key={at}>{run.text}</span>
+                  ),
+                )
+              : line.text}
           </span>
           {line.note && (
             <span data-slot="drive-write-line-note" className="block text-muted-foreground">
@@ -94,7 +131,9 @@ function Excerpt({ label, excerpt }: { label: string; excerpt: AgentWriteExcerpt
     <figure aria-label={label}>
       <div className={cn(BLOCK, excerpt.rtl && STORED_ORDER)}>
         {numbered.map(({ text, number }) => (
-          <div key={number}>{text}</div>
+          <div key={number} style={offscreenSkipped(text)}>
+            {text}
+          </div>
         ))}
       </div>
       {excerpt.more > 0 && (
@@ -112,7 +151,7 @@ export function DriveWritePreview({ write }: { write: AgentDriveWriteVm }) {
     <section data-slot="drive-write" aria-label="The change" className="my-2 min-w-0 text-sm">
       <p className="break-words [overflow-wrap:anywhere]">
         <span className="font-medium">{WRITE_OP_LABEL[write.op]}</span>{" "}
-        <code className="font-mono text-xs">{write.path}</code>{" "}
+        <code className={cn("font-mono text-xs", write.rtl && STORED_ORDER)}>{write.path}</code>{" "}
         <span className="text-muted-foreground">in {write.drive}</span>
       </p>
       {write.op === "move" && write.to !== undefined && (
@@ -121,9 +160,13 @@ export function DriveWritePreview({ write }: { write: AgentDriveWriteVm }) {
           className="my-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 rounded-sm bg-muted p-2 font-mono text-xs"
         >
           <dt className="text-muted-foreground">From</dt>
-          <dd className="break-words [overflow-wrap:anywhere]">{write.path}</dd>
+          <dd className={cn("break-words [overflow-wrap:anywhere]", write.rtl && STORED_ORDER)}>
+            {write.path}
+          </dd>
           <dt className="text-muted-foreground">To</dt>
-          <dd className="break-words [overflow-wrap:anywhere]">{write.to}</dd>
+          <dd className={cn("break-words [overflow-wrap:anywhere]", write.rtl && STORED_ORDER)}>
+            {write.to}
+          </dd>
         </dl>
       )}
       {preview.lineEndings && (

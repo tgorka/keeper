@@ -261,6 +261,35 @@ async fn the_commit_carrying_an_approval_is_found_by_its_trailer() {
     );
 }
 
+/// R606-11: a trailer naming the database matches only that database's
+/// search. Two databases that share an approval id each find their own
+/// commit, and a bare id finds neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_approval_id_finds_only_its_own_databases_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, _platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let mut first = request("b", Some(blob_id(b"a")));
+    first.trailers = vec![MemoryTrailer::ApprovalRecord("alpha/01JSHARED".to_owned())];
+    let CommitPaths::Committed { commit } = engine
+        .commit_paths(&p.id, &first, yes())
+        .await
+        .expect("commit")
+    else {
+        panic!("a commit was made")
+    };
+    let found = |record: &'static str| {
+        let engine = Arc::clone(&engine);
+        let id = p.id.clone();
+        async move { engine.approval_commit(&id, record).await.expect("read") }
+    };
+    assert_eq!(found("alpha/01JSHARED").await, Some(commit));
+    assert_eq!(found("beta/01JSHARED").await, None, "another database's id");
+    assert_eq!(found("01JSHARED").await, None, "a bare id");
+}
+
 /// R606 (review probe, adopted): a descendant whose clock was years behind
 /// does not hide the commit that carried an approval out — the search walks
 /// the commit graph, not the commit times.

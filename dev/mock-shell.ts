@@ -6493,7 +6493,9 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
  * a create and an append, from → to for a move, the deleted text, a replace that only changes line
  * endings, one holding hidden characters (shown escaped, Allow withheld), an append to a
  * 6,000-line file (the appended text after three lines), a right-to-left line drawn in stored order,
- * a whitespace-only change drawn visibly, one too large for a card — and one this device cannot
+ * a whitespace-only change drawn visibly, one too large for a card, one line past the character cap,
+ * a delete of a file over 1 MB, a move to a right-to-left path, markers beside literal marker
+ * characters — and one this device cannot
  * carry out (`blocked`), which offers Deny only. Allow writes and says so on the card.
  */
 const writesScenario = new URLSearchParams(location.search).get("writes");
@@ -6524,7 +6526,37 @@ function mockWrite(
   };
 }
 const MOCK_INBOX = "10-notes/inbox.md";
+/**
+ * ?writes=heavy (R606-09's acceptance): one card just under both character caps — 39 lines of
+ * 9,999 drawn characters (389,961 in all, escapes and right-to-left text among them) — for timing
+ * its first render in the panel.
+ */
+function mockHeavyLines() {
+  const piece = "⟨TAG U+E0041⟩ אב 900 100 ";
+  const line = piece.repeat(Math.ceil(9999 / piece.length)).slice(0, 9999);
+  return Array.from({ length: 39 }, () => ({ kind: "add" as const, text: line, rtl: true }));
+}
 const MOCK_BLOB = "28571bedbb9cdd80fe3b7a4b691ebed6eb6531fd";
+if (writesScenario === "heavy" && sessionApprovals.length > 0) {
+  sessionApprovals.push(
+    mockWrite(
+      "write-heavy",
+      "Create `10-notes/heavy.md` in tgdrive (389961 bytes)",
+      { op: "create", path: "10-notes/heavy.md", content: "…" },
+      {
+        drive: "tgdrive",
+        untrusted: false,
+        op: "create",
+        path: "10-notes/heavy.md",
+        preview: {
+          hunks: [{ oldStart: 0, newStart: 1, lines: mockHeavyLines() }],
+          rtlNote: "Right-to-left text is shown in stored order.",
+        },
+      },
+      30,
+    ),
+  );
+}
 if (writesScenario === "all" && sessionApprovals.length > 0) {
   const base = { drive: "tgdrive", untrusted: false };
   sessionApprovals.push(
@@ -6809,6 +6841,81 @@ if (writesScenario === "all" && sessionApprovals.length > 0) {
         blocked: "This change is too large to show in full.",
       },
       21,
+    ),
+    mockWrite(
+      "write-long-line",
+      "Create `10-notes/t.md` in tgdrive (262144 bytes)",
+      { op: "create", path: "10-notes/t.md", content: "…" },
+      {
+        ...base,
+        op: "create",
+        path: "10-notes/t.md",
+        preview: {
+          hunks: [],
+          tooLarge: "A line of it takes 851968 characters; a card shows at most 10000 on one line.",
+        },
+        blocked: "This change is too large to show in full.",
+      },
+      22,
+    ),
+    mockWrite(
+      "write-over-1mb",
+      "Delete `20-archive/export.csv` in tgdrive",
+      { op: "delete", path: "20-archive/export.csv", expected: MOCK_BLOB },
+      {
+        ...base,
+        op: "delete",
+        path: "20-archive/export.csv",
+        preview: { hunks: [] },
+        blocked: '"20-archive/export.csv" is over 1 MB; agents can\'t change files that large.',
+      },
+      23,
+    ),
+    mockWrite(
+      "write-rtl-path",
+      "Move `10-notes/inbox.md` to `10-notes/א 900 100.md` in tgdrive",
+      { op: "move", path: MOCK_INBOX, expected: MOCK_BLOB, to: "10-notes/א 900 100.md" },
+      {
+        ...base,
+        op: "move",
+        path: MOCK_INBOX,
+        to: "10-notes/א 900 100.md",
+        rtl: true,
+        preview: { hunks: [], rtlNote: "Right-to-left text is shown in stored order." },
+      },
+      24,
+    ),
+    mockWrite(
+      "write-markers",
+      "Edit `10-notes/inbox.md` in tgdrive: 5 bytes become 5 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                {
+                  kind: "remove",
+                  text: "a·⟨U+00B7⟩b",
+                  runs: [{ text: "a" }, { text: "·", mark: "space" }, { text: "⟨U+00B7⟩b" }],
+                },
+                {
+                  kind: "add",
+                  text: "a⟨U+00B7⟩·b",
+                  runs: [{ text: "a⟨U+00B7⟩" }, { text: "·", mark: "space" }, { text: "b" }],
+                  note: "Only whitespace changes on this line.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      25,
     ),
     mockWrite(
       "write-blocked",

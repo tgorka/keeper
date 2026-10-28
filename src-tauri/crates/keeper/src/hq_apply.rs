@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use keeper_core::agents::drive_write::Refusal;
+use keeper_core::agents::drive_write::{Refusal, MAX_FILE_BYTES};
 use keeper_core::hq::port::{
     DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
 };
@@ -106,6 +106,20 @@ impl ShellDriveWrites {
                 post_image,
             )
             .map_err(|refused| said(refused, key))?;
+            // No op changes a file over 1 MB (R606-10), checked again on the
+            // disk right before the commit.
+            if target == AgentTarget::Existing {
+                let size = keeper_sync::browse::resolve(&profile.local_path, key)
+                    .ok()
+                    .flatten()
+                    .and_then(|file| std::fs::metadata(file).ok())
+                    .map_or(0, |meta| meta.len());
+                if size > MAX_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "\"{key}\" is over 1 MB; agents can't change files that large."
+                    ));
+                }
+            }
         }
         let policy = LfsPolicy::from_profile(profile).map_err(|error| error.to_string())?;
         for (key, bytes) in &commit.writes {
