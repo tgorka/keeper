@@ -43,6 +43,11 @@ struct Drive {
 }
 
 fn drive() -> Option<Drive> {
+    drive_with(|_| {})
+}
+
+/// [`drive`], its profile changed by `tune` before the engine keeps it.
+fn drive_with(tune: impl FnOnce(&mut SyncProfile)) -> Option<Drive> {
     let dir = tempfile::tempdir().expect("tempdir");
     let remote = dir.path().join("remote.git");
     let seed = dir.path().join("seed");
@@ -82,6 +87,7 @@ fn drive() -> Option<Drive> {
     );
     profile.agents = Some(Default::default());
     profile.sessions = Some(Default::default());
+    tune(&mut profile);
     engine.upsert_profile(&profile).expect("upsert");
     let writes = ShellDriveWrites {
         engine: Box::new(move || Some(Arc::clone(&engine))),
@@ -148,7 +154,7 @@ impl Drive {
             "{approval}: {message}"
         );
         assert_eq!(
-            self.writes.carried("tgdrive", approval, 0),
+            self.writes.carried("tgdrive", approval),
             Ok(Some(commit.clone()))
         );
     }
@@ -219,7 +225,7 @@ fn each_op_is_one_commit_carrying_its_approval() {
         "",
         "nothing left on the disk"
     );
-    assert_eq!(d.writes.carried("tgdrive", "01JNEVER", 0), Ok(None));
+    assert_eq!(d.writes.carried("tgdrive", "01JNEVER"), Ok(None));
 }
 
 /// A file changed since it was read is not written over.
@@ -301,4 +307,87 @@ fn machinery_lfs_and_folders_are_refused() {
         d.writes.keeps("neuradrive"),
         Err(keeper_core::hq::port::DriveAbsent::NotKept)
     );
+}
+
+/// The edit a card showed for `10-notes/inbox.md`, as keeper-core builds it.
+fn inbox_edit(d: &Drive, approval: &str) -> DriveCommit {
+    let read = d
+        .writes
+        .target("tgdrive", "10-notes/inbox.md", DriveTarget::Existing)
+        .expect("the card's check passes");
+    DriveCommit {
+        writes: vec![(read.key.clone(), Some(b"- [x] milk\n".to_vec()))],
+        moves: Vec::new(),
+        guards: vec![(read.key, read.disk.map(|(blob, _)| blob))],
+        subject: "Nixi: edit".to_owned(),
+        approval: approval.to_owned(),
+    }
+}
+
+/// Review-603 item 6: a `.gitattributes` that starts routing `*.md` through
+/// LFS between showing the card and pressing Allow (a person's commit, or
+/// a pull) is read again right before the commit: nothing is written, no
+/// LFS object made, and the sentence is keeper-sync's.
+#[test]
+fn a_gitattributes_change_after_the_card_refuses_the_commit() {
+    let Some(d) = drive() else { return };
+    let commit = inbox_edit(&d, "01JATTRS");
+    std::fs::write(
+        d.root.join(".gitattributes"),
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n*.md filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .expect("attributes");
+    git(&d.root, &["commit", "-q", "-am", "route notes through lfs"]);
+    let before = d.head();
+    assert_eq!(
+        d.writes.commit("tgdrive", commit),
+        Err(
+            "\"10-notes/inbox.md\" is kept in the drive's large-file store (LFS), which an agent \
+             never writes."
+                .to_owned()
+        )
+    );
+    assert_eq!(d.head(), before, "no commit");
+    assert_eq!(d.read("10-notes/inbox.md").as_deref(), Some("- [ ] milk\n"));
+    assert!(
+        !d.root.join(".git/lfs/objects").exists()
+            || walk_files(&d.root.join(".git/lfs/objects")) == 0,
+        "no LFS object"
+    );
+}
+
+/// What `commit_paths` would route by size — the profile's LFS threshold
+/// over the new text — is refused too: no agent write makes an LFS object.
+#[test]
+fn a_post_image_over_the_lfs_threshold_is_refused() {
+    let Some(d) = drive_with(|profile| profile.lfs_threshold_bytes = 8) else {
+        return;
+    };
+    let commit = inbox_edit(&d, "01JSIZE");
+    let before = d.head();
+    assert_eq!(
+        d.writes.commit("tgdrive", commit),
+        Err(
+            "\"10-notes/inbox.md\" is kept in the drive's large-file store (LFS), which an agent \
+             never writes."
+                .to_owned()
+        )
+    );
+    assert_eq!(d.head(), before);
+}
+
+fn walk_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_files(&path)
+                } else {
+                    1
+                }
+            })
+            .sum()
+    })
 }

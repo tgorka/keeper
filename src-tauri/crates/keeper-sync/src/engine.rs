@@ -1315,7 +1315,6 @@ impl Engine {
         self: &Arc<Self>,
         _profile_id: &str,
         _approval: &str,
-        _since_secs: i64,
     ) -> Result<Option<String>> {
         Err(SyncError::Config(
             "an authored commit is read only on a Unix host".to_owned(),

@@ -425,30 +425,27 @@ pub fn lines_in_history(repo_path: &Path, lines: &HashSet<String>) -> Result<Has
     Ok(found)
 }
 
-/// The newest commit `HEAD` reaches whose keeper trailer block carries
+/// A commit `HEAD` reaches whose keeper trailer block carries
 /// `Approval-Record: <approval>` ([`crate::provenance::MemoryTrailer::of_message`]):
-/// the commit that carried that approval out, once (109.27). Newest first,
-/// and only as far back as commits made at or after `since_secs` — a commit
-/// carrying an approval is made after it, so older history is never read.
-/// `None` when no commit in that span carries it.
-pub fn carrying(repo_path: &Path, approval: &str, since_secs: i64) -> Result<Option<String>> {
+/// the commit that carried that approval out, once (109.27). The whole
+/// history is walked by the commit graph, never stopped by a commit's time:
+/// a commit's time is its author's clock, and a descendant dated before it
+/// (another device's wrong clock) must not hide it (R606). Only after a
+/// stop between taking an approval and saying what became of it.
+/// `None` when no commit carries it.
+pub fn carrying(repo_path: &Path, approval: &str) -> Result<Option<String>> {
     let repo = open(repo_path)?;
-    let Some(walk) = walk(&repo)? else {
-        return Ok(None);
-    };
     let wanted = crate::provenance::MemoryTrailer::ApprovalRecord(approval.to_owned());
-    for info in walk {
-        let info = info.map_err(|err| walk_error(&err))?;
+    let mut found = None;
+    each_reached(&repo, |info| {
         let commit = info.object().map_err(|err| walk_error(&err))?;
-        let revision = revision_of(&commit)?;
-        if revision.committed_secs < since_secs {
-            break;
+        let message = commit.message_raw().map_err(|err| walk_error(&err))?;
+        if crate::provenance::MemoryTrailer::of_message(&message.to_str_lossy()).contains(&wanted) {
+            found = Some(commit.id().to_hex().to_string());
         }
-        if crate::provenance::MemoryTrailer::of_message(&revision.message).contains(&wanted) {
-            return Ok(Some(revision.id));
-        }
-    }
-    Ok(None)
+        Ok(found.is_none())
+    })?;
+    Ok(found)
 }
 
 /// One path's bytes as of `rev`, or `None` where that revision does not hold
