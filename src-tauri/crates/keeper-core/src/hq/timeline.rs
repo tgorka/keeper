@@ -419,12 +419,16 @@ pub struct AgentSessionViewVm {
 }
 
 impl AgentSessionViewVm {
-    /// Every request the view draws, wherever it is drawn: the banner's and
-    /// the reading column's.
+    /// Every request the view draws, wherever it is drawn: the banner's, the
+    /// turn folds' (decided and waiting) and the reading column's.
     pub fn approvals_mut(&mut self) -> Vec<&mut AgentApprovalVm> {
         let mut all: Vec<&mut AgentApprovalVm> = self.approvals.iter_mut().collect();
         if let Some(banner) = self.banner.as_mut() {
             all.extend(banner.approvals.iter_mut());
+        }
+        for fold in &mut self.folds {
+            all.extend(fold.approvals.iter_mut());
+            all.extend(fold.waiting.iter_mut());
         }
         all
     }

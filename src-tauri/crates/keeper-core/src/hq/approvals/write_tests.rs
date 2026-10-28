@@ -1859,3 +1859,49 @@ fn vs16_is_allowed_only_after_a_pictograph() {
         withheld(&world_with(args, None), HIDDEN);
     }
 }
+
+/// With approvals placed in their turn's fold (keeper #604), a write decided
+/// here is drawn in that fold and keeps its write view: the diff it was
+/// allowed on and its outcome.
+#[test]
+fn a_write_decided_here_keeps_its_view_in_its_turns_fold() {
+    let w = world();
+    let at = sessions::now_ms() - 50_000;
+    w.ana
+        .replica
+        .mutate(vec![upsert(
+            "messages",
+            json!({"id": "m-lead", "session_id": SESSION,
+                   "page_key": sessions::page_key(SESSION, &sessions::month(at)),
+                   "turn_id": TURN, "role": "agent", "body": "Ticking milk off.",
+                   "body_blob": null, "metadata": "{}", "created_at_ms": at,
+                   "author_actor": NIXI, "author_client": "nixi.box"}),
+        )])
+        .expect("lead-in");
+    let shown = w.card().write.expect("write").preview;
+    w.allow().expect("allowed");
+    let (mut view, _) = crate::hq::timeline::view(
+        &w.ana,
+        SESSION,
+        &crate::hq::timeline::Opened::default(),
+        &HashMap::new(),
+        sessions::now_ms(),
+    )
+    .expect("view");
+    w.writes.draw(
+        std::slice::from_ref(&w.ana),
+        &w.ana,
+        &mut view.approvals_mut(),
+    );
+    let fold = view
+        .folds
+        .iter()
+        .find(|fold| fold.approvals.iter().any(|a| a.id == APPROVAL))
+        .expect("the decided write sits in its turn's fold");
+    let write = fold.approvals[0].write.clone().expect("its write view");
+    assert_eq!(write.preview, shown);
+    assert_eq!(
+        write.outcome.as_deref(),
+        Some("Written as 1a2b3c4 on hesperia.")
+    );
+}
