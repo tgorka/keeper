@@ -244,7 +244,7 @@ pub fn run(
     match name {
         "clean" | "new" => {
             // Empty body creates no message and therefore no phantom model turn.
-            let id = sessions::create(source, &session.agent_actor, "", pick)
+            let id = sessions::create(source, &session.agent_actor, "", pick, None)
                 .map_err(|e| e.to_string())?;
             if name == "clean" {
                 drives::carry(source, sid, &session, &id, sources, sessions::now_ms())

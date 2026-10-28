@@ -1,5 +1,5 @@
 import { MessagesSquare, Plus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { NewSession } from "@/components/agents/new-session";
 import { SessionView } from "@/components/agents/session-view";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
@@ -11,11 +11,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { logFailure } from "@/lib/failure";
 import {
   type AgentDefaultSessionVm,
   type AgentNoteSessionVm,
   type AgentSessionRef,
+  agentNoteDrive,
   agentSessionDefault,
+  agentSessionDriveSet,
   agentSessionForNote,
 } from "@/lib/ipc/client";
 import { lastAgentPick } from "@/lib/stores/agent-picks";
@@ -71,9 +74,14 @@ export function NotesAgentDock() {
  * Both docks mirror the same database session list; their selection remains local. Opened on a
  * note, the dock follows the note's drive (109.28, R-HQ-86): Rust opens the default agent's chat
  * in the database named after it and ticks it, and the dock says what ticking allows at that
- * moment. A vault is one synced folder and so one drive: another note of the same vault keeps the
- * chat, and so does a note of another vault Rust names the same drive; a pick in the select holds
- * until the drive changes.
+ * moment, over that chat. A vault is one synced folder and so one drive: another note of the same
+ * vault keeps the chat, and so does a note of another vault Rust names the same drive; a pick in
+ * the select holds until the drive changes.
+ *
+ * Opening and ticking are writes, so the dock decides which drive it follows before it asks for
+ * any (R605-02): it first reads the note's drive, and a note on the drive it already follows asks
+ * for nothing. The writing call runs one at a time; one answered after the person moved to another
+ * drive, or closed the dock, is not shown, and a tick it made is taken back.
  */
 export function DockBody() {
   useAgentSessionsSubscription();
@@ -92,45 +100,86 @@ export function DockBody() {
   const [creating, setCreating] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Rust's word on the note's drive: ticked now (with the warning), or why not.
+  // Rust's word on the note's drive — ticked now (with the warning), or why not — and the chat it
+  // is about: shown only while that chat is the one in the dock.
   const [notice, setNotice] = useState<AgentNoteSessionVm | null>(null);
-  // The drive the dock follows: `undefined` before it opened anything, `null` for none.
+  // The drive the dock follows: `undefined` before it followed any, `null` for a note on none.
   const followed = useRef<string | null | undefined>(undefined);
+  // The note last in front and its drive: what the dock wants to follow.
+  const wanted = useRef<{ vaultId: string; noteId: string; drive: string | null } | null>(null);
+  // Whether a chat is open in the dock yet, and whether a writing call is under way.
+  const opened = useRef(false);
+  const working = useRef(false);
+  const gone = useRef(false);
+  useEffect(() => {
+    gone.current = false;
+    return () => {
+      gone.current = true;
+    };
+  }, []);
+  const show = useCallback((target: AgentDefaultSessionVm) => {
+    opened.current = true;
+    if (target.database && target.sessionId) {
+      setChosen({ database: target.database, sessionId: target.sessionId });
+      setCreating(false);
+    } else setCreating(true);
+  }, []);
+  // Ask Rust for the wanted drive's chat until the dock follows the drive in front, one call at a
+  // time, so no answer races another.
+  const follow = useCallback(
+    async (main: AgentDefaultSessionVm) => {
+      if (working.current) return;
+      working.current = true;
+      try {
+        for (;;) {
+          const want = wanted.current;
+          if (gone.current || want === null) return;
+          if (followed.current !== undefined && want.drive === followed.current) return;
+          const vm = await agentSessionForNote(
+            want.vaultId,
+            want.noteId,
+            lastAgentPick(main.agentActor),
+          );
+          if (vm === null) return;
+          if (gone.current || wanted.current?.drive !== want.drive) {
+            // Nobody sees this chat: a tick made for it is taken back, and the loop goes on to
+            // the drive now in front.
+            const { database, sessionId } = vm.target;
+            if (vm.tickedNow && vm.drive && database && sessionId)
+              await agentSessionDriveSet({ database, sessionId }, vm.drive, false).catch(
+                logFailure("agents.note.untick"),
+              );
+            continue;
+          }
+          followed.current = want.drive;
+          setAgent(vm.target);
+          show(vm.target);
+          setNotice(vm.warning || vm.reason ? vm : null);
+        }
+      } finally {
+        working.current = false;
+      }
+    },
+    [show],
+  );
   useEffect(() => {
     let active = true;
-    const open = (target: AgentDefaultSessionVm) => {
-      if (target.database && target.sessionId) {
-        setChosen({ database: target.database, sessionId: target.sessionId });
-        setCreating(false);
-      } else setCreating(true);
-    };
     const note = noteId.current;
     void (async () => {
       try {
         const main = await agentSessionDefault();
         if (!active) return;
         setAgent(main);
-        if (main !== null && (vaultId === null || note === null)) {
-          // No note in front: the agent's main conversation, once; the chat stays after.
-          if (followed.current === undefined) {
-            followed.current = null;
-            open(main);
-          }
-        } else if (main !== null && vaultId !== null && note !== null) {
-          const vm = await agentSessionForNote(vaultId, note, lastAgentPick(main.agentActor));
+        if (main !== null && vaultId !== null && note !== null) {
+          const drive = await agentNoteDrive(vaultId, note);
           if (!active) return;
-          if (vm !== null) {
-            setAgent(vm.target);
-            setNotice(vm.warning || vm.reason ? vm : null);
-            const drive = vm.drive ?? null;
-            // The same drive keeps the chat, the person's own pick included.
-            if (followed.current === undefined || drive !== followed.current) {
-              followed.current = drive;
-              open(vm.target);
-            }
-          }
+          wanted.current = { vaultId, noteId: note, drive };
+          await follow(main);
+        } else if (main !== null && !opened.current) {
+          // No note in front: the agent's main conversation; the chat stays after.
+          show(main);
         }
-        setLoaded(true);
+        if (active) setLoaded(true);
       } catch (raw: unknown) {
         if (active) {
           setError(syncErrorMessage(raw, "keeper could not read your default agent."));
@@ -141,7 +190,15 @@ export function DockBody() {
     return () => {
       active = false;
     };
-  }, [vaultId]);
+  }, [vaultId, follow, show]);
+  const noticeHere =
+    notice !== null &&
+    !creating &&
+    chosen !== null &&
+    notice.target.database === chosen.database &&
+    notice.target.sessionId === chosen.sessionId
+      ? notice
+      : null;
   const sessions = rows.filter((row) => row.agentActor === agent?.agentActor);
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -197,22 +254,22 @@ export function DockBody() {
           {error}
         </p>
       )}
-      {notice && (
+      {noticeHere && (
         // Said where the drive was ticked (R-HQ-79), or why it was not.
         <div
           role="note"
           aria-label={DRIVE_NOTICE_LABEL}
           className="border-border border-b p-3 text-sm"
         >
-          {notice.warning ? (
+          {noticeHere.warning ? (
             <>
               <p className="font-medium">
-                {notice.drive} is ticked for {notice.target.agentName} to read.
+                {noticeHere.drive} is ticked for {noticeHere.target.agentName} to read.
               </p>
-              <p className="text-muted-foreground">{notice.warning}</p>
+              <p className="text-muted-foreground">{noticeHere.warning}</p>
             </>
           ) : (
-            <p className="text-muted-foreground">{notice.reason}</p>
+            <p className="text-muted-foreground">{noticeHere.reason}</p>
           )}
         </div>
       )}
@@ -229,6 +286,7 @@ export function DockBody() {
             setChosen(target);
             setCreating(false);
           }}
+          focus={focusInFront}
         />
       ) : chosen ? (
         <SessionView

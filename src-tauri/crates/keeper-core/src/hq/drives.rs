@@ -396,6 +396,15 @@ fn audience(
     }
 }
 
+/// Whether everyone who reads `source`'s database reads `drive` too, as
+/// this device can establish it (D-34's audience rule, the same judgement a
+/// tick gets): the drive is the database itself, or both directories are
+/// held and the database's people are among the drive's. Unknown readers
+/// are not "everyone", so they answer `false` (R605-01).
+pub(crate) fn read_by_every_reader(source: &Source, drive: &str, sources: &[Source]) -> bool {
+    audience(source, drive, &Audiences::read(sources), &HashMap::new()) == Verdict::Allowed
+}
+
 /// What the server's refusal of a selection says about `drive`, a drive of
 /// it keeper knows fails that way, or about the selection when `drive` is
 /// `None`.
@@ -860,7 +869,7 @@ impl Hq {
         let session_id = match &target.session_id {
             Some(id) => id.clone(),
             None => {
-                let id = sessions::create(&source, &target.agent_actor, "", pick)
+                let id = sessions::create(&source, &target.agent_actor, "", pick, None)
                     .map_err(|error| HqError::Sentence(error.to_string()))?;
                 target.session_id = Some(id.clone());
                 id

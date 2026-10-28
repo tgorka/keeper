@@ -1328,7 +1328,7 @@ async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and
         [("nixie", Some("alpha"))]
     );
     let key = hq
-        .new_session("alpha", "nixie", "plan the week", None)
+        .new_session("alpha", "nixie", "plan the week", None, None)
         .expect("a new session with no server");
     assert_eq!(key.database, "alpha");
     hq.send(&key, "and then the weekend", &[], None)
@@ -1386,7 +1386,7 @@ async fn a_device_never_paired_offers_no_agent_and_asks_nothing() {
     hq.start().await.expect("starts");
     assert!(hq.choices().expect("choices").is_empty());
     assert!(matches!(
-        hq.new_session("local", "nixie", "hello", None),
+        hq.new_session("local", "nixie", "hello", None, None),
         Err(HqError::Sentence(_))
     ));
     assert_eq!(world.routes.discovered.load(Ordering::SeqCst), 0);
@@ -1479,7 +1479,7 @@ async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens(
     })
     .await;
     let key = first
-        .new_session("alpha", "nixie", "plan the week", None)
+        .new_session("alpha", "nixie", "plan the week", None, None)
         .expect("a session");
     first.shutdown().await;
 
@@ -1775,7 +1775,7 @@ async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
         .expect("default agent");
     // The agent's newest chat is elsewhere: the note's drive decides.
     let elsewhere = hq
-        .new_session("neuradrive", "nixie", "groceries", None)
+        .new_session("neuradrive", "nixie", "groceries", None, None)
         .expect("a neuradrive chat");
 
     let first = hq
@@ -1912,48 +1912,158 @@ async fn the_notes_assistant_says_why_it_did_not_tick_the_notes_drive() {
     );
 }
 
-/// 109.28 AC 2 (contract §9.1, binding): a message sent with the note in
-/// front carries `metadata.focus` — drive, path, the heading trail of the
-/// caret's line and the line — as the replica stores it for the runtime; a
-/// message sent without one carries no metadata at all.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_message_sent_from_the_notes_assistant_carries_the_note_as_focus() {
-    let world = World::new();
-    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
-    let key = hq
-        .new_session("tgdrive", "nixie", "hello", None)
-        .expect("a chat");
-    let focus = send::AgentFocus::new(
-        "tgdrive",
+/// Directory rows for `database`: each `(id, kind)` as an actor of it.
+fn directory(opener: &LocalOpener, database: &str, actors: &[(&str, &str)]) {
+    let ops = actors
+        .iter()
+        .map(|(id, kind)| RowOp::Upsert {
+            table: "actors".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": id, "kind": kind, "display_name": id, "family": null, "dir": database,
+                "created_at_ms": 1, "author_actor": "server", "author_client": "server"})),
+            base_version: None,
+        })
+        .collect();
+    opener.replica(database).mutate(ops).expect("directory");
+}
+
+/// The `metadata` of `database`'s message whose body is `body`, parsed;
+/// `Null` when it has none.
+fn metadata_of(opener: &LocalOpener, database: &str, body: &str) -> Value {
+    let stored = rows(
+        &opener.replica(database),
+        "SELECT body, metadata FROM messages",
+    );
+    let row = stored
+        .iter()
+        .find(|row| row["body"] == body)
+        .unwrap_or_else(|| panic!("{body:?} in {database}: {stored:?}"));
+    match &row["metadata"] {
+        Value::String(text) => serde_json::from_str::<Value>(text).expect("JSON"),
+        other => other.clone(),
+    }
+}
+
+fn inbox_focus(drive: &str) -> send::AgentFocus {
+    send::AgentFocus::new(
+        drive,
         "10-notes/inbox.md",
         "# Plans\n\nintro\n## Q3\nship it",
         5,
     )
-    .expect("in bounds");
+    .expect("in bounds")
+}
+
+/// 109.28 AC 2 (contract §9.1, binding): every message the Notes Assistant
+/// writes with the note in front — an ordinary line, a captionless ask
+/// answer through `send`, the first message of a chat it starts, and the
+/// first message of an `@` thread (R605-03) — carries `metadata.focus`:
+/// drive, path, the heading trail of the caret's line and the line, as the
+/// replica stores it for the runtime. A message sent without one carries no
+/// metadata at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_sent_from_the_notes_assistant_carries_the_note_as_focus() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    directory(&opener, "tgdrive", &[("tola", "agent")]);
+    let focus = inbox_focus("tgdrive");
+    let key = hq
+        .new_session(
+            "tgdrive",
+            "nixie",
+            "a new chat from the note",
+            None,
+            Some(&focus),
+        )
+        .expect("a chat");
     hq.send(&key, "what am I looking at?", &[], Some(&focus))
         .expect("sent");
     hq.send_line(&key, "and this?", &[], Some(&focus))
         .expect("sent");
+    hq.send_line(&key, "@tola what is this note?", &[], Some(&focus))
+        .expect("a thread");
     hq.send(&key, "from the Agents window", &[], None)
         .expect("sent");
 
-    let stored = rows(
-        &opener.replica("tgdrive"),
-        "SELECT body, metadata FROM messages ORDER BY created_at_ms, id",
-    );
-    let focus_of = |body: &str| {
-        let row = stored
-            .iter()
-            .find(|row| row["body"] == body)
-            .expect("the message");
-        match &row["metadata"] {
-            Value::String(text) => serde_json::from_str::<Value>(text).expect("JSON"),
-            other => other.clone(),
-        }
-    };
     let expected = serde_json::json!({"focus": {
         "drive": "tgdrive", "path": "10-notes/inbox.md", "heading": "Plans › Q3", "line": 5}});
-    assert_eq!(focus_of("what am I looking at?"), expected);
-    assert_eq!(focus_of("and this?"), expected);
-    assert_eq!(focus_of("from the Agents window"), Value::Null);
+    for body in [
+        "a new chat from the note",
+        "what am I looking at?",
+        "and this?",
+        "@tola what is this note?",
+    ] {
+        assert_eq!(metadata_of(&opener, "tgdrive", body), expected, "{body}");
+    }
+    assert_eq!(
+        metadata_of(&opener, "tgdrive", "from the Agents window"),
+        Value::Null
+    );
+}
+
+/// R605-01 (D-34): a note's path and heading are its drive's, so a message
+/// carries them only into a conversation everyone of whose readers reads
+/// that drive. A database read by someone the drive's readers do not
+/// include, or one whose readers keeper cannot compare (the drive's
+/// database is not held here), gets the message without its focus — on a
+/// line, an `@` thread, and a chat started from the note alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_s_focus_never_reaches_a_wider_audience_than_its_drive() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive", "beta", "solo"]).await;
+    directory(&opener, "tgdrive", &[("ana", "person"), ("ben", "person")]);
+    directory(
+        &opener,
+        "beta",
+        &[
+            ("ana", "person"),
+            ("ben", "person"),
+            ("cy", "person"),
+            ("tola", "agent"),
+        ],
+    );
+    directory(&opener, "solo", &[("ana", "person")]);
+    let tg = inbox_focus("tgdrive");
+    let elsewhere = inbox_focus("neuradrive");
+
+    // beta is also read by Cy, who does not read tgdrive.
+    let wide = hq
+        .new_session("beta", "nixie", "started in beta", None, Some(&tg))
+        .expect("a beta chat");
+    hq.send(&wide, "sent to beta", &[], Some(&tg))
+        .expect("sent");
+    hq.send_line(&wide, "a line to beta", &[], Some(&tg))
+        .expect("sent");
+    hq.send_line(&wide, "@tola in beta", &[], Some(&tg))
+        .expect("a thread");
+    for body in [
+        "started in beta",
+        "sent to beta",
+        "a line to beta",
+        "@tola in beta",
+    ] {
+        assert_eq!(metadata_of(&opener, "beta", body), Value::Null, "{body}");
+    }
+
+    // solo is read by Ana alone, who reads tgdrive: the focus goes.
+    let narrow = hq
+        .new_session("solo", "nixie", "started in solo", None, Some(&tg))
+        .expect("a solo chat");
+    hq.send(&narrow, "tgdrive's note to solo", &[], Some(&tg))
+        .expect("sent");
+    assert_eq!(
+        metadata_of(&opener, "solo", "tgdrive's note to solo")["focus"]["drive"],
+        Value::from("tgdrive")
+    );
+    assert_eq!(
+        metadata_of(&opener, "solo", "started in solo")["focus"]["drive"],
+        Value::from("tgdrive")
+    );
+    // neuradrive's readers are unknown here: no focus.
+    hq.send(&narrow, "neuradrive's note to solo", &[], Some(&elsewhere))
+        .expect("sent");
+    assert_eq!(
+        metadata_of(&opener, "solo", "neuradrive's note to solo"),
+        Value::Null
+    );
 }

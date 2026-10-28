@@ -1181,13 +1181,27 @@ static CREATING: Mutex<()> = Mutex::new(());
 /// session ids). `pick` is this device's last choice of model and effort for
 /// `agent`: what the agent still offers of it starts the session's settings
 /// (Q109-16 b). See [`create_with_first`] for the commits it writes.
+/// `focus` is the note in front of the person, carried by the first message
+/// (109.28); the caller has judged its audience.
 pub fn create(
     source: &Source,
     agent: &str,
     body: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<String, ReplicaError> {
-    create_with_first(source, agent, body, &ulid::Ulid::new().to_string(), pick)
+    let first = ulid::Ulid::new().to_string();
+    create_in(
+        source,
+        agent,
+        None,
+        &title_from(body),
+        body,
+        &first,
+        pick,
+        focus,
+    )
+    .map(|(id, _)| id)
 }
 
 /// [`create`], its first message's id `first` — what a spoken question's
@@ -1199,19 +1213,31 @@ pub fn create_with_first(
     first: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
 ) -> Result<String, ReplicaError> {
-    create_in(source, agent, None, &title_from(body), body, first, pick).map(|(id, _)| id)
+    create_in(
+        source,
+        agent,
+        None,
+        &title_from(body),
+        body,
+        first,
+        pick,
+        None,
+    )
+    .map(|(id, _)| id)
 }
 
 /// A session of `agent` started by this person from `parent` (109.24): the
 /// child's row naming its parent, the person's owner membership and `body`
 /// as its first message, in one commit — the shape V3 lets a person member
-/// of the parent insert. Its id and the commit's.
+/// of the parent insert. Its id and the commit's. `focus` rides on the first
+/// message, as on any message the person sends from the Notes Assistant.
 pub(crate) fn create_child(
     source: &Source,
     parent: &str,
     agent: &str,
     title: &str,
     body: &str,
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<(String, String), ReplicaError> {
     create_in(
         source,
@@ -1221,13 +1247,15 @@ pub(crate) fn create_child(
         body,
         &ulid::Ulid::new().to_string(),
         None,
+        focus,
     )
 }
 
 /// The one way a session is created here: its row, the owner's membership
 /// and, unless `body` is empty, its first message, in one commit — with a
 /// model/effort `pick`, in three (R10918-07). The session's id and the
-/// commit that created it.
+/// commit that created it. `focus` is the first message's `metadata.focus`.
+#[allow(clippy::too_many_arguments)]
 fn create_in(
     source: &Source,
     agent: &str,
@@ -1236,6 +1264,7 @@ fn create_in(
     body: &str,
     first: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<(String, String), ReplicaError> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let at = now_ms();
@@ -1283,7 +1312,9 @@ fn create_in(
         .map(|pick| crate::hq::settings::initial(source, agent, &id, pick, at))
         .transpose()?
         .flatten();
-    let message = (!body.is_empty()).then(|| person_message(source, &id, first, body, None, at));
+    let metadata = focus.map(crate::hq::send::AgentFocus::metadata);
+    let message =
+        (!body.is_empty()).then(|| person_message(source, &id, first, body, metadata, at));
     let commit = match settings {
         // Nothing of a pick to write: one commit, as a creation always was.
         // A mention's child is always this one commit (109.24, V3).

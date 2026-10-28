@@ -8197,6 +8197,29 @@ function publishSessions() {
     if (vm) channel.onmessage?.(sessionViewerVm(vm));
   }
 }
+/**
+ * The note drive the mock knows (109.28): a vault on p1 (tgdrive's folder) is on tgdrive, any
+ * other vault is on no drive.
+ */
+function mockNoteDrive(vaultId: unknown): string | null {
+  const vaults = ANSWERS.notes_vaults as Array<{ id: string; profileId: string }>;
+  return vaults.find((vault) => vault.id === vaultId)?.profileId === "p1" ? "tgdrive" : null;
+}
+/**
+ * keeper-core's `AgentFocus::for_destination` (R605-01), crudely: a note's focus is written only
+ * into the database named after its drive, whose readers are the drive's; every other database
+ * here has a reader the drive does not. Logged as the `metadata` Rust would write, so a browser
+ * check reads what reaches the conversation, not only what the dock handed over.
+ */
+function mockFocusWritten(payload: Record<string, unknown>): void {
+  const caret = payload.focus as { vaultId: string; line: number } | null | undefined;
+  const drive = caret ? mockNoteDrive(caret.vaultId) : null;
+  const written =
+    caret && drive !== null && drive === payload.database
+      ? { focus: { drive, path: "10-notes/inbox.md", heading: null, line: caret.line } }
+      : null;
+  console.debug("[mock-shell] metadata", payload.database, "→", written);
+}
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
   if (!vm) return hqRefuse("This session is not on this device.");
@@ -8650,6 +8673,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   agent_send: (payload) => {
     if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
     const vm = mockSession(payload);
+    mockFocusWritten(payload);
     mockDecline(vm, payload.declines);
     for (const message of vm.messages) if (message.ask) message.ask.open = false;
     const message = {
@@ -8708,6 +8732,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (chips.some((chip) => chip === undefined))
       hqRefuse("A file of this message is no longer ready to send. Attach it again.");
     mockDecline(vm, payload.declines);
+    mockFocusWritten(payload);
     mockAttach(
       vm,
       String(payload.caption ?? ""),
@@ -8806,12 +8831,11 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   // folder, whose `_drive.toml` says `tgdrive`) is on tgdrive: the default agent's newest
   // tgdrive chat, started when it has none, and tgdrive ticked in it with the warning when it is
   // not yet. Any other vault's note is on no drive. Viewing aid only.
+  agent_note_drive: (payload) => mockNoteDrive(payload.vaultId),
   agent_session_for_note: (payload) => {
     const main = sessionHandlers.agent_session_default(payload) as AgentDefaultSessionVm | null;
     if (main === null) return null;
-    const vaults = ANSWERS.notes_vaults as Array<{ id: string; profileId: string }>;
-    const drive =
-      vaults.find((vault) => vault.id === payload.vaultId)?.profileId === "p1" ? "tgdrive" : null;
+    const drive = mockNoteDrive(payload.vaultId);
     if (drive === null)
       return {
         target: main,
@@ -8872,6 +8896,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         choice.databases.includes(String(payload.database)),
     );
     if (!choice) return hqRefuse("That agent does not serve this database.");
+    if (String(payload.body) !== "") mockFocusWritten(payload);
     const row: AgentSessionRowVm = {
       database: String(payload.database),
       sessionId: `device.${++sessionSerial + 10}`,
@@ -8988,6 +9013,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     // Q109-12 a (R10924K-10): past its local checks, a mention declines what the
     // banner showed, as any message does.
     mockDecline(vm, payload.declines);
+    mockFocusWritten(payload);
     const now = Date.now();
     const sessionId = `device.${++sessionSerial + 10}`;
     const prompt: AgentMessageVm = {

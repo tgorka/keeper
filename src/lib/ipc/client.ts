@@ -4354,14 +4354,25 @@ export async function agentAttachRelease(
   await invoke<void>("agent_attach_release", { ...target, handles });
 }
 
-/** `pick` is this device's last model and effort for the agent; Rust writes what it still offers. */
+/**
+ * `pick` is this device's last model and effort for the agent; Rust writes what it still offers.
+ * `focus` is the note in front of the person when the Notes Assistant starts the session (109.28),
+ * carried by its first message as {@link agentSend} carries it.
+ */
 export async function agentSessionNew(
   database: string,
   agentActor: string,
   body: string,
   pick: AgentSettingsPick | null,
+  focus: AgentNoteCaret | null = null,
 ): Promise<AgentSessionRef> {
-  return await invoke<AgentSessionRef>("agent_session_new", { database, agentActor, body, pick });
+  return await invoke<AgentSessionRef>("agent_session_new", {
+    database,
+    agentActor,
+    body,
+    pick,
+    focus,
+  });
 }
 
 export async function agentSessionRename(target: AgentSessionRef, title: string): Promise<void> {
@@ -4382,6 +4393,15 @@ export async function agentsChoices(): Promise<AgentChoiceVm[]> {
 
 export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | null> {
   return await invoke<AgentDefaultSessionVm | null>("agent_session_default");
+}
+
+/**
+ * The drive of the note `noteId` of `vaultId`, or `null` when its folder declares none. Reads only:
+ * the Notes Assistant asks it before {@link agentSessionForNote}, so a note on the drive it already
+ * follows opens, starts and ticks nothing (R605-02).
+ */
+export async function agentNoteDrive(vaultId: string, noteId: string): Promise<string | null> {
+  return await invoke<string | null>("agent_note_drive", { vaultId, noteId });
 }
 
 /**

@@ -84,6 +84,18 @@ impl AgentFocus {
         })
     }
 
+    /// The focus a message to `source`'s database may carry (D-34, R605-01):
+    /// a note's path and heading are the drive's, so they go only where
+    /// everyone who reads the conversation reads that drive. A wider or
+    /// unknown audience gets no focus, and the message goes without it.
+    pub(crate) fn for_destination<'a>(
+        focus: Option<&'a AgentFocus>,
+        source: &Source,
+        sources: &[Source],
+    ) -> Option<&'a AgentFocus> {
+        focus.filter(|focus| crate::hq::drives::read_by_every_reader(source, &focus.drive, sources))
+    }
+
     /// The message's `metadata`: `{"focus": {drive, path, heading, line}}`.
     pub fn metadata(&self) -> Value {
         serde_json::json!({ "focus": self })

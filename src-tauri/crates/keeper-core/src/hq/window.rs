@@ -588,6 +588,7 @@ impl Hq {
         focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
+        let focus = send::AgentFocus::for_destination(focus, &source, &self.sources());
         let sent = send::send(
             &source,
             self.decisions()?,
@@ -654,6 +655,7 @@ impl Hq {
             return Err(HqError::Sentence(crate::hq::mention::WITH_FILES.to_owned()));
         }
         let source = self.source(&key.database)?;
+        let focus = send::AgentFocus::for_destination(focus, &source, &self.sources());
         let attached = attachments::attach(
             &source,
             self.decisions()?,
@@ -701,13 +703,16 @@ impl Hq {
     /// Open a session with `agent` in `database` and write its first
     /// message; the database is remembered as the person's choice. `pick`
     /// is this device's last model and effort for `agent`: what it still
-    /// offers starts the session's settings (Q109-16 b).
+    /// offers starts the session's settings (Q109-16 b). `focus` is the note
+    /// in front of the person when the Notes Assistant starts the session
+    /// (109.28), carried by the first message where its audience allows.
     pub fn new_session(
         &self,
         database: &str,
         agent: &str,
         body: &str,
         pick: Option<&crate::hq::settings::AgentSettingsPick>,
+        focus: Option<&send::AgentFocus>,
     ) -> Result<AgentSessionRef, HqError> {
         if body.trim().is_empty() {
             return Err(HqError::Sentence("Write something first.".to_owned()));
@@ -724,7 +729,8 @@ impl Hq {
             )));
         }
         let source = self.source(database)?;
-        let session_id = sessions::create(&source, agent, body, pick).map_err(sentence)?;
+        let focus = send::AgentFocus::for_destination(focus, &source, &sources);
+        let session_id = sessions::create(&source, agent, body, pick, focus).map_err(sentence)?;
         sessions::remember_choice(&self.data_dir()?, agent, database);
         self.touch();
         Ok(AgentSessionRef {

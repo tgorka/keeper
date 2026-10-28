@@ -761,14 +761,29 @@ pub fn agent_attach_release(
 
 /// Open a session with an agent in one database, with its first message;
 /// `pick` is this device's last model and effort for the agent (109.18).
+/// `focus` is the note in front of the person when the Notes Assistant
+/// starts it (109.28), as [`agent_send`] carries it.
 #[tauri::command]
 pub async fn agent_session_new(
+    state: tauri::State<'_, crate::ipc::AppState>,
     database: String,
     agent_actor: String,
     body: String,
     pick: Option<keeper_core::hq::settings::AgentSettingsPick>,
+    focus: Option<AgentNoteCaret>,
 ) -> Result<AgentSessionRef, IpcError> {
-    blocking(move |hq| hq.new_session(&database, &agent_actor, &body, pick.as_ref())).await
+    let platform = Arc::clone(&state.platform);
+    blocking(move |hq| {
+        let focus = focus_of(&platform, focus.as_ref());
+        hq.new_session(
+            &database,
+            &agent_actor,
+            &body,
+            pick.as_ref(),
+            focus.as_ref(),
+        )
+    })
+    .await
 }
 
 /// Rename the title without changing the session id.
@@ -803,6 +818,29 @@ pub async fn agents_choices() -> Result<Vec<AgentChoiceVm>, IpcError> {
 #[tauri::command]
 pub async fn agent_session_default() -> Result<Option<AgentDefaultSessionVm>, IpcError> {
     blocking(|hq| hq.default_session()).await
+}
+
+/// The drive of the note `note_id` of the vault `vault_id` ([`note_drive`]),
+/// or `None` when its folder declares none. Reads only: the Notes Assistant
+/// asks it first, so a note on the drive it already follows changes nothing
+/// (R605-02).
+#[tauri::command]
+pub async fn agent_note_drive(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    vault_id: String,
+    note_id: String,
+) -> Result<Option<String>, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        note_drive(&platform, &vault_id, &note_id).map(|note| note.drive)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: join.to_string(),
+        account_id: None,
+        retriable: true,
+    })
 }
 
 /// The Notes Assistant opened on a note (109.28, R-HQ-86): the note's drive

@@ -1940,6 +1940,7 @@ mod tests {
             "nixi",
             "hello",
             Some(&pick(Some("second"), Some(Effort::High))),
+            None,
         )
         .expect("created");
         assert_eq!(seeded(&source, &id), Some((json!("second"), json!("high"))));
@@ -1949,6 +1950,7 @@ mod tests {
             "nixi",
             "hello",
             Some(&pick(Some("gone"), Some(Effort::Medium))),
+            None,
         )
         .expect("created");
         assert_eq!(seeded(&source, &id), Some((Value::Null, json!("medium"))));
@@ -1958,12 +1960,13 @@ mod tests {
             "nixi",
             "hello",
             Some(&pick(Some("foreign"), Some(Effort::Low))),
+            None,
         )
         .expect("created");
         assert_eq!(seeded(&source, &id), None);
         // No pick kept for the agent (or a reset one): nothing written.
         for none in [None, Some(&AgentSettingsPick::default())] {
-            let id = create(&source, "nixi", "hello", none).expect("created");
+            let id = create(&source, "nixi", "hello", none, None).expect("created");
             assert_eq!(seeded(&source, &id), None);
         }
     }
@@ -2071,7 +2074,7 @@ mod tests {
             model: Some("second".to_owned()),
             effort: Some(Effort::High),
         };
-        crate::hq::sessions::create(&source, "nixi", "hello", Some(&pick)).expect("created");
+        crate::hq::sessions::create(&source, "nixi", "hello", Some(&pick), None).expect("created");
         let created: Vec<Vec<String>> = outbox(&dir)
             .into_iter()
             .skip(before)
@@ -2096,7 +2099,8 @@ mod tests {
             }),
         ] {
             let before = outbox(&dir).len();
-            crate::hq::sessions::create(&source, "nixi", "hello", pick.as_ref()).expect("created");
+            crate::hq::sessions::create(&source, "nixi", "hello", pick.as_ref(), None)
+                .expect("created");
             let created: Vec<Vec<String>> = outbox(&dir)
                 .into_iter()
                 .skip(before)
@@ -2124,7 +2128,7 @@ mod tests {
             model: Some("second".to_owned()),
             effort: None,
         };
-        let id = crate::hq::sessions::create(&source, "nixi", "hello there", Some(&pick))
+        let id = crate::hq::sessions::create(&source, "nixi", "hello there", Some(&pick), None)
             .expect("created");
         let commits = outbox(&dir);
         let (settings_commit, _) = commits

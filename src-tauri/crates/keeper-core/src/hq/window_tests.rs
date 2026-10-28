@@ -877,8 +877,9 @@ fn archiving_shrinks_the_windows_and_an_outbox_pinned_row_survives() {
 fn a_new_session_takes_the_next_id_and_its_database_is_the_only_one_or_the_last_chosen() {
     let w = world();
     let sources = [w.alpha.clone(), w.beta.clone()];
-    let first = sessions::create(&w.alpha, NIXIE, "plan the week\nthen more", None).expect("first");
-    let second = sessions::create(&w.alpha, NIXIE, "again", None).expect("second");
+    let first =
+        sessions::create(&w.alpha, NIXIE, "plan the week\nthen more", None, None).expect("first");
+    let second = sessions::create(&w.alpha, NIXIE, "again", None, None).expect("second");
     assert_eq!((first.as_str(), second.as_str()), ("dev1.1", "dev1.2"));
     let row = timeline::session_row(&w.alpha, &first).expect("row");
     assert_eq!(
@@ -1246,7 +1247,8 @@ fn sessions_created_at_once_never_share_an_id() {
             .map(|n| {
                 let alpha = w.alpha.clone();
                 scope.spawn(move || {
-                    sessions::create(&alpha, NIXIE, &format!("hello {n}"), None).expect("created")
+                    sessions::create(&alpha, NIXIE, &format!("hello {n}"), None, None)
+                        .expect("created")
                 })
             })
             .collect();

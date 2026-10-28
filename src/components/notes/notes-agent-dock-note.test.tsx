@@ -1,8 +1,9 @@
 /**
  * The Notes Assistant on the note in front of the person (109.28, R-HQ-86), through the real
  * dock, session view and composer over a mocked IPC: it opens the chat Rust names for the note's
- * drive and says what ticking it allows, a message sent from it carries the note's caret,
- * and it follows the drive rather than the note.
+ * drive and says what ticking it allows over that chat, a message sent from it carries the note's
+ * caret, a new conversation's first message too, and it follows the drive rather than the note —
+ * deciding which before it asks Rust to open or tick anything (R605-02).
  */
 import { Text } from "@codemirror/state";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -10,7 +11,12 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { DockBody, DRIVE_NOTICE_LABEL } from "@/components/notes/notes-agent-dock";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
-import type { AgentNoteSessionVm, AgentSessionRef, AgentSessionViewVm } from "@/lib/ipc/client";
+import type {
+  AgentNoteSessionVm,
+  AgentSessionRef,
+  AgentSessionRowVm,
+  AgentSessionViewVm,
+} from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 import { noteCaretStore, resetNoteCaretForTest } from "@/lib/stores/note-caret";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
@@ -18,6 +24,9 @@ import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 const mock = vi.hoisted(() => ({
   opened: [] as { target: AgentSessionRef; show: (vm: AgentSessionViewVm) => void }[],
   forNote: vi.fn(),
+  drive: vi.fn(),
+  driveSet: vi.fn(),
+  create: vi.fn(),
   send: vi.fn(),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -34,6 +43,19 @@ vi.mock("@/lib/ipc/client", async (original) => ({
     sessionId: "main.1",
   }),
   agentSessionForNote: mock.forNote,
+  agentNoteDrive: mock.drive,
+  agentSessionDriveSet: mock.driveSet,
+  agentSessionNew: mock.create,
+  agentsChoices: vi.fn().mockResolvedValue([
+    {
+      agentActor: "assistant",
+      agentName: "Assistant",
+      agentMark: "A",
+      databases: ["tgdrive"],
+      database: "tgdrive",
+      ask: false,
+    },
+  ]),
   agentsSessionsSubscribe: vi.fn(async () => "list"),
   agentsSessionsUnsubscribe: vi.fn().mockResolvedValue(undefined),
   agentSessionOpen: vi.fn(async (target: AgentSessionRef, show) => {
@@ -107,6 +129,30 @@ function openNote(vaultId: string, noteId: string) {
   act(() => panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId }));
 }
 
+/** The drive Rust names for each vault's notes. */
+const DRIVES: Record<string, string | null> = { v1: "tgdrive", v2: "tgdrive", v3: "neuradrive" };
+
+function row(database: string, sessionId: string, title: string): AgentSessionRowVm {
+  return {
+    database,
+    sessionId,
+    title,
+    titleWrite: { state: "confirmed" },
+    displayName: `assistant · ${title}`,
+    handle: "jolly-pigeon-squeaks",
+    createdAtMs: 1,
+    trust: "native",
+    instances: [],
+    agentActor: "assistant",
+    agentName: "Assistant",
+    agentMark: "A",
+    archived: false,
+    choosesDrives: true,
+    choosesModel: false,
+    lastActivityMs: 1,
+  };
+}
+
 const opened = () => mock.opened.map((entry) => entry.target);
 
 /** Draw the newest opened session, so its composer is live. */
@@ -128,6 +174,9 @@ beforeEach(() => {
   mock.opened = [];
   mock.send.mockReset().mockResolvedValue(undefined);
   mock.forNote.mockReset();
+  mock.drive.mockReset().mockImplementation(async (vaultId: string) => DRIVES[vaultId] ?? null);
+  mock.driveSet.mockReset().mockResolvedValue(undefined);
+  mock.create.mockReset().mockResolvedValue({ database: "tgdrive", sessionId: "tg.2" });
   resetPanelsStoreForTest();
   resetNoteCaretForTest();
   agentSessionsStore.setState({ selected: null, rows: [], newSession: null });
@@ -180,31 +229,94 @@ it("says why the note's drive was not ticked", async () => {
   expect(notice).not.toHaveTextContent(WARNING);
 });
 
-it("follows the note's drive, not the note", async () => {
+const last = () => opened()[opened().length - 1];
+
+it("follows the note's drive, not the note, and asks for no write on the drive it follows", async () => {
   openNote("v1", "inbox");
   mock.forNote.mockResolvedValueOnce(onDrive("tgdrive", "tg.1", true));
   draw();
   await waitFor(() => expect(opened()).toEqual([{ database: "tgdrive", sessionId: "tg.1" }]));
+  expect(await screen.findByRole("note", { name: DRIVE_NOTICE_LABEL })).toBeInTheDocument();
 
-  // Another note of the same vault: the same drive, nothing asked.
+  // The person picks another chat: it holds, and the tick's notice, about tg.1, goes with it.
+  act(() =>
+    agentSessionsStore.setState({
+      rows: [row("tgdrive", "tg.1", "Notes"), row("alpha", "main.1", "Plan the release")],
+    }),
+  );
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "Conversation" }), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: /Plan the release/ }));
+  await waitFor(() => expect(last()).toEqual({ database: "alpha", sessionId: "main.1" }));
+  expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
+
+  // Another note of the same vault, a file and back, another vault on the same drive: the drive
+  // is read, nothing is opened or ticked, and the pick holds.
   openNote("v1", "plans");
+  act(() =>
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "a.txt" }),
+  );
+  openNote("v1", "inbox");
+  openNote("v2", "journal");
+  await waitFor(() => expect(mock.drive).toHaveBeenLastCalledWith("v2", "journal"));
   await act(async () => {});
   expect(mock.forNote).toHaveBeenCalledTimes(1);
-
-  // Another vault Rust names the same drive: the chat stays, whatever Rust would open.
-  mock.forNote.mockResolvedValueOnce(onDrive("tgdrive", "tg.9", false));
-  openNote("v2", "journal");
-  await waitFor(() => expect(mock.forNote).toHaveBeenLastCalledWith("v2", "journal", null));
-  await act(async () => {});
-  expect(opened()).toEqual([{ database: "tgdrive", sessionId: "tg.1" }]);
+  expect(last()).toEqual({ database: "alpha", sessionId: "main.1" });
+  expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
 
   // A note on another drive: that drive's chat.
   mock.forNote.mockResolvedValueOnce(onDrive("neuradrive", "nd.1", true));
   openNote("v3", "lab");
+  await waitFor(() => expect(last()).toEqual({ database: "neuradrive", sessionId: "nd.1" }));
+  expect(mock.forNote).toHaveBeenCalledTimes(2);
+});
+
+it("takes back a tick no one sees, when the person moved to another drive before it answered", async () => {
+  let answer: (vm: AgentNoteSessionVm) => void = () => {};
+  mock.forNote.mockImplementationOnce(
+    () =>
+      new Promise<AgentNoteSessionVm>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  mock.forNote.mockResolvedValueOnce(onDrive("neuradrive", "nd.1", false));
+  openNote("v1", "inbox");
+  draw();
+  await waitFor(() => expect(mock.forNote).toHaveBeenCalledTimes(1));
+  openNote("v3", "lab");
+  await waitFor(() => expect(mock.drive).toHaveBeenLastCalledWith("v3", "lab"));
+  await act(async () => answer(onDrive("tgdrive", "tg.1", true)));
+
   await waitFor(() =>
-    expect(opened()).toEqual([
+    expect(mock.driveSet).toHaveBeenCalledWith(
       { database: "tgdrive", sessionId: "tg.1" },
-      { database: "neuradrive", sessionId: "nd.1" },
-    ]),
+      "tgdrive",
+      false,
+    ),
+  );
+  await waitFor(() => expect(opened()).toEqual([{ database: "neuradrive", sessionId: "nd.1" }]));
+  expect(mock.forNote).toHaveBeenLastCalledWith("v3", "lab", null);
+  expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
+});
+
+it("sends the note with the first message of a conversation started in the dock", async () => {
+  openNote("v1", "inbox");
+  noteCaretStore.getState().place("v1", "inbox", 2, Text.of(["# Plans", "## Q3"]));
+  mock.forNote.mockResolvedValue(onDrive("tgdrive", "tg.1", false));
+  draw();
+  await waitFor(() => expect(opened()).toEqual([{ database: "tgdrive", sessionId: "tg.1" }]));
+  fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
+  const field = await screen.findByRole("textbox", { name: "Message" });
+  fireEvent.change(field, { target: { value: "what is this note?" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() =>
+    expect(mock.create).toHaveBeenCalledWith("tgdrive", "assistant", "what is this note?", null, {
+      vaultId: "v1",
+      noteId: "inbox",
+      line: 2,
+      text: "# Plans\n## Q3",
+    }),
   );
 });

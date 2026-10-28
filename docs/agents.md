@@ -1107,10 +1107,19 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   Nowhere else is a drive ticked for the person (Q109-20 b).
 - **Following.** The dock follows the drive, not the note: another note of the same vault keeps the
   chat, as does a vault on the same drive; a note on another drive opens that drive's chat. A pick
-  in the dock's own select holds until the drive changes.
+  in the dock's own select holds until the drive changes. Opening and ticking are writes, so the dock
+  first reads the note's drive (`agent_note_drive`, read-only) and asks for them only when the
+  drive changed; one writing call runs at a time, and an answer for a drive the person already left
+  is not shown and its tick is taken back (R605-02). The warning stands over the chat it is about.
 - **The note as context.** A message sent from the dock carries `metadata.focus`
   `{drive, path, heading, line}` (contract §9.1): the caret's 1-based body line, and the heading
-  trail Rust reads from the editor's buffer through that line, unsaved text included. The runtime
+  trail Rust reads from the editor's buffer through that line, unsaved text included. That holds for
+  every message the dock writes: a line, an ask's answer, a file message, the first message of a
+  conversation started in the dock, and an `@` thread's first message. A note's path and heading
+  are its drive's, so the focus goes only into a conversation whose database everyone who reads it
+  also reads the drive — the drive's own database, or one whose people this device can see are all
+  the drive's (D-34, R605-01). Anywhere wider, or where keeper cannot tell, the message goes
+  without it. The runtime
   adds one line for that turn; `drive_read` reads the drive's committed copy, so unsaved edits are
   not in what the agent can read. A message from the Agents window carries no focus.
 

@@ -184,14 +184,17 @@ pub const MAX_INLINE_ANSWER: usize = 1_200;
 /// `line` its first message — or refuse, writing nothing. `sources` are every
 /// database this device holds: an agent found only in another is named so.
 /// `decline` declines what the banner showed, after every local check and
-/// before the child's commit; it says whether it declined anything. The
-/// child's id and its commit's.
+/// before the child's commit; it says whether it declined anything. `focus`
+/// is the note in front of the person (109.28), carried by the child's first
+/// message. The child's id and its commit's.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     sources: &[Source],
     source: &Source,
     parent: &str,
     mention: Mention<'_>,
     line: &str,
+    focus: Option<&send::AgentFocus>,
     decline: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(String, String), MentionError> {
     let session = timeline::session_row(source, parent).ok_or(SendError::Unknown)?;
@@ -232,12 +235,18 @@ pub fn start(
         });
     }
     let declined = decline().map_err(MentionError::Declines)?;
-    sessions::create_child(source, parent, &agent.id, &title_from(mention.rest), line).map_err(
-        |error| match declined {
-            true => MentionError::AfterDeclines(error),
-            false => SendError::Replica(error).into(),
-        },
+    sessions::create_child(
+        source,
+        parent,
+        &agent.id,
+        &title_from(mention.rest),
+        line,
+        focus,
     )
+    .map_err(|error| match declined {
+        true => MentionError::AfterDeclines(error),
+        false => SendError::Replica(error).into(),
+    })
 }
 
 /// What an `@` at the start of the draft offers: the database's agents other
@@ -671,8 +680,10 @@ impl Hq {
         focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
+        let sources = self.sources();
+        let focus = send::AgentFocus::for_destination(focus, &source, &sources);
         let sent = send_line(
-            &self.sources(),
+            &sources,
             &source,
             self.decisions()?,
             &key.session_id,
@@ -700,7 +711,7 @@ pub(crate) fn send_line(
     focus: Option<&send::AgentFocus>,
 ) -> Result<(), String> {
     match parse(line) {
-        Some(mention) => start(sources, source, session_id, mention, line, || {
+        Some(mention) => start(sources, source, session_id, mention, line, focus, || {
             decline(source, decisions, session_id, shown)
         })
         .map(drop)
