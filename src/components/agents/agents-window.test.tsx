@@ -166,6 +166,8 @@ function fold(patch: Partial<Ipc.AgentTurnFoldVm> = {}): Ipc.AgentTurnFoldVm {
     statusLabel: "Finished",
     summary: "Worked for 3 s",
     durationMs: 3000,
+    approvals: [],
+    waiting: [],
     ...patch,
   };
 }
@@ -454,26 +456,31 @@ it("binds approval to the shown action and keeps the server's refusal visible", 
   mock.decide.mockRejectedValueOnce({ message: "Decide from another host." });
   draw();
   await list();
+  // A card this person decides here is the banner's (Q109-12 a): the shape Rust sends.
   await open("beta", {
-    approvals: [
-      {
-        id: "a1",
-        database: "beta",
-        sessionId: "same.1",
-        toolName: "write",
-        tier: "T4",
-        summary: "Write a file",
-        action: '{"path":"notes/a.md"}',
-        bindingDigest: "digest-beta",
-        expiresAtMs: 1800000000000,
-        createdAtMs: 1780000000000,
-        state: "pending",
-        canDecide: true,
-        sentence: "Waiting for you",
-        actions: ["allowOnce", "deny"],
-        declinedBySend: true,
-      },
-    ],
+    banner: {
+      sentence:
+        "Sending a message declines this request, even a message that says yes. Use Allow to let it run.",
+      approvals: [
+        {
+          id: "a1",
+          database: "beta",
+          sessionId: "same.1",
+          toolName: "write",
+          tier: "T4",
+          summary: "Write a file",
+          action: '{"path":"notes/a.md"}',
+          bindingDigest: "digest-beta",
+          expiresAtMs: 1800000000000,
+          createdAtMs: 1780000000000,
+          state: "pending",
+          canDecide: true,
+          sentence: "Waiting for you",
+          actions: ["allowOnce", "deny"],
+          declinedBySend: true,
+        },
+      ],
+    },
   });
   expect(screen.getByLabelText("Exact action")).toHaveTextContent("notes/a.md");
   fireEvent.click(screen.getByRole("button", { name: "Allow once" }));

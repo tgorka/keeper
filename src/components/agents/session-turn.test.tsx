@@ -27,6 +27,8 @@ function fold(patch: Partial<AgentTurnFoldVm> = {}): AgentTurnFoldVm {
     statusLabel: "Finished",
     summary: "Worked for 14 s · ran 1 command, searched the web 1 time",
     durationMs: 14000,
+    approvals: [],
+    waiting: [],
     ...patch,
   };
 }

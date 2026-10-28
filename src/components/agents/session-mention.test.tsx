@@ -44,6 +44,8 @@ const ANSWERED: AgentChildSessionVm = {
       statusLabel: "Finished",
       summary: "Answered in 2 s",
       durationMs: 2000,
+      approvals: [],
+      waiting: [],
     },
   ],
   messages: [

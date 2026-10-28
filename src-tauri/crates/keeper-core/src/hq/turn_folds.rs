@@ -42,14 +42,15 @@ impl Close {
 }
 
 /// All steps stay with their turn, even when committed after its answer.
-/// `live` is oldest first; `stopping` holds the turns a person's stop row
-/// names.
+/// `live` is oldest first; `pending` holds, by turn, the fold line of a turn
+/// whose request waits ("Waiting for you", "Waiting for Ben"); `stopping`
+/// holds the turns a person's stop row names.
 pub(super) fn project(
     rows: &[Map<String, Value>],
     messages: &[AgentMessageVm],
     live: &[LiveTurn],
     extras: &Extras,
-    pending: &HashSet<String>,
+    pending: &HashMap<String, String>,
     stopping: &HashSet<String>,
 ) -> (Vec<Item>, Vec<AgentTurnFoldVm>) {
     // A terminal row's turn, by message id; the turn's last close, which
@@ -206,7 +207,7 @@ pub(super) fn project(
         let interrupted = close == Some(Close::Interrupted)
             || active.is_some_and(|turn| turn.vm.stopped)
             || steps.iter().any(|step| step.status == Step::Interrupted);
-        let waiting = pending.contains(id);
+        let waiting = pending.get(id);
         // Only a step the runtime says started is running work, and only
         // until the turn closes: the close decides a closed turn, even over
         // a step its row still calls started. An unknown status word is
@@ -219,8 +220,8 @@ pub(super) fn project(
             || (close.is_none() && steps.iter().any(|step| step.status == Step::Refused));
         let (status, label) = if stopped {
             (Status::Stopped, "Stopped")
-        } else if waiting {
-            (Status::Waiting, "Waiting for you")
+        } else if let Some(label) = waiting {
+            (Status::Waiting, label.as_str())
         } else if steps.iter().any(|step| step.status == Step::Parked) {
             (Status::Parked, "Paused")
         } else if interrupted {
@@ -275,6 +276,7 @@ pub(super) fn project(
             &steps,
             active.and_then(|turn| turn.tool.as_deref()),
             status,
+            label,
             duration_ms,
         );
         folds.push(AgentTurnFoldVm {
@@ -289,6 +291,8 @@ pub(super) fn project(
             status_label: label.to_owned(),
             summary,
             duration_ms,
+            approvals: Vec::new(),
+            waiting: Vec::new(),
         });
     }
     (items, folds)
@@ -305,16 +309,19 @@ fn one_line(text: &str) -> String {
     line
 }
 
+/// `label` is the fold line's status words, the summary's opening while the
+/// turn waits.
 fn summary(
     steps: &[AgentToolStepVm],
     tool: Option<&str>,
     status: Status,
+    label: &str,
     duration_ms: Option<i64>,
 ) -> String {
     use std::fmt::Write as _;
 
     let mut sentence = match status {
-        Status::Waiting => "Waiting for you".to_owned(),
+        Status::Waiting => label.to_owned(),
         Status::Parked => "Paused".to_owned(),
         Status::Interrupted => "Interrupted".to_owned(),
         Status::Stopped => "Stopped".to_owned(),

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
-use crate::hq::approvals::{self, AgentApprovalVm, Undecidable};
+use crate::hq::approvals::{self, AgentApprovalStateVm, AgentApprovalVm, Undecidable, WaitingFor};
 use crate::hq::attachments::{self, AgentAttachmentVm};
 use crate::hq::drives::AgentSessionDrivesVm;
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
@@ -178,6 +178,9 @@ pub struct AgentTurnFailureVm {
 
 /// One turn's work, separate from its terminal answer. Lead-ins reference
 /// the original messages so attachments and author identity are retained.
+/// The requests its parked calls raised are read with it: decided ones in
+/// its body, folded with its work; pending ones that are not in the banner
+/// always visible, like `failures`, and never inside a closed fold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -192,6 +195,13 @@ pub struct AgentTurnFoldVm {
     pub summary: String,
     #[ts(type = "number | null")]
     pub duration_ms: Option<i64>,
+    /// Its requests that were decided (or expired), oldest first: inside the
+    /// fold's body, so they fold with the turn.
+    pub approvals: Vec<AgentApprovalVm>,
+    /// Its requests still pending that the banner does not hold — they wait
+    /// for someone else, or for another of this person's devices — oldest
+    /// first; always visible, outside the body.
+    pub waiting: Vec<AgentApprovalVm>,
 }
 
 /// The requests a message sent now would decline, held above the composer.
@@ -341,8 +351,10 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub children_note: Option<String>,
-    /// Oldest first; empty for a member who does not read the trace. The
-    /// requests that wait for this person are in `banner`, not here.
+    /// Oldest first; empty for a member who does not read the trace. Only
+    /// the requests whose turn this view does not show: the others are in
+    /// their turn's fold, and the requests that wait for this person are in
+    /// `banner`.
     pub approvals: Vec<AgentApprovalVm>,
     /// The requests waiting for this person, above the composer and out of
     /// the reading column (Q109-12 a); absent while none waits.
@@ -616,9 +628,19 @@ pub fn view(
         refused(source, session_id, &directory, &mut messages);
     }
     let newest_ms = messages.last().map(|m| m.created_at_ms);
-    let (banner, approvals) = banner(approvals::of_session(
-        source, session_id, &directory, refusals, now_ms,
-    ));
+    let approvals = approvals::of_session(source, session_id, &directory, refusals, now_ms);
+    // A turn whose request waits reads so on its fold line, naming whom it
+    // waits for; this person first.
+    let mut pending: HashMap<String, String> = HashMap::new();
+    for approval in &approvals {
+        let (Some(turn), Some(who)) = (&approval.turn_id, &approval.waiting_for) else {
+            continue;
+        };
+        if *who == WaitingFor::You || !pending.contains_key(turn) {
+            pending.insert(turn.clone(), who.label());
+        }
+    }
+    let (banner, rest) = banner(approvals);
     // No instance claims an archived session (the runtime skips it), so any
     // header — "no instance holds it yet", "X takes it next" — would be false.
     let answering = if session.archived {
@@ -639,22 +661,10 @@ pub fn view(
         &session.title,
     );
     let live = live::turns(source, session_id, &opened.live, &ended, &extras);
-    let pending: HashSet<String> = if reads_trace {
-        read(
-            source,
-            "SELECT DISTINCT t.turn_id FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
-             WHERE a.session_id = ?1 AND a.state = 'pending' AND a.expires_at_ms > ?2",
-            &[Value::from(session_id), Value::from(now_ms)],
-        )
-        .iter()
-        .filter_map(|row| opt_text(row, "turn_id"))
-        .collect()
-    } else {
-        HashSet::new()
-    };
     let stopping = stopping(source, session_id, &rows);
-    let (mut items, folds) =
+    let (mut items, mut folds) =
         turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
+    let approvals = place(rest, &mut folds);
     let live = live.into_iter().map(|turn| turn.vm).collect();
     let (children, left_out) = match &shown_from {
         Some(since) => mention::children(source, session_id, since, &directory, opened.prefs),
@@ -706,6 +716,28 @@ pub fn view(
         },
         newest_ms,
     ))
+}
+
+/// Each request outside the banner read in its turn's fold: a decided one in
+/// its body, a pending one always visible. What has no turn this view shows
+/// — its call is not on this device, or its turn is not in the shown months —
+/// is returned, oldest first, for the column's end.
+fn place(rest: Vec<AgentApprovalVm>, folds: &mut [AgentTurnFoldVm]) -> Vec<AgentApprovalVm> {
+    let mut unplaced = Vec::new();
+    for approval in rest {
+        let fold = approval
+            .turn_id
+            .as_deref()
+            .and_then(|turn| folds.iter_mut().find(|fold| fold.turn_id == turn));
+        match fold {
+            Some(fold) if approval.state == AgentApprovalStateVm::Pending => {
+                fold.waiting.push(approval)
+            }
+            Some(fold) => fold.approvals.push(approval),
+            None => unplaced.push(approval),
+        }
+    }
+    unplaced
 }
 
 /// The turns a person asked to stop (109.19), as the runtime's
@@ -939,7 +971,8 @@ pub(crate) fn latest_turn(
         &extras,
     );
     let messages = messages(source, &mut rows, directory, &none, prefs);
-    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &none, &none);
+    let (items, folds) =
+        turn_folds::project(&rows, &messages, &live, &extras, &HashMap::new(), &none);
     let live = live.into_iter().map(|turn| turn.vm).collect();
     let items: Vec<AgentTimelineItemVm> = items
         .iter()

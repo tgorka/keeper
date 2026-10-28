@@ -47,8 +47,10 @@ children?: Array<AgentChildSessionVm>,
  */
 childrenNote?: string, 
 /**
- * Oldest first; empty for a member who does not read the trace. The
- * requests that wait for this person are in `banner`, not here.
+ * Oldest first; empty for a member who does not read the trace. Only
+ * the requests whose turn this view does not show: the others are in
+ * their turn's fold, and the requests that wait for this person are in
+ * `banner`.
  */
 approvals: Array<AgentApprovalVm>, 
 /**

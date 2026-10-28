@@ -365,8 +365,9 @@ with any option first (`bash -lc`, `sh -ec`, `python3 -c`, `node -e` …) or an 
 (`deno eval`), for a program whose first argument is program text (`awk`), and for a wrapper
 that runs whatever program follows it (`env`, `sudo`, `ssh`, `nice`, `timeout`, `xargs` …). The
 confirm returns focus to the card's `…` menu when it closes; a decision taken in the banner moves
-focus to the card's new place in the reading column, else to the next request in the banner,
-else to the composer. The scope is derived again in Rust from the request's own call; the
+focus to the toggle of the fold its card moved into (the decided card folds with its turn), else
+to the card where Rust drew it, else to the next request in the banner, else to the composer
+(R10911-12). The scope is derived again in Rust from the request's own call; the
 grant row (`standing_grants`, keyed by `vocabulary::person_agent_key`, the server's
 `personAgentKey`) and the approval go in one commit, so a refused grant leaves the request
 waiting with the server's words. Settings › Agents › *Always allowed* lists every grant the
@@ -389,8 +390,8 @@ banner showed, and Rust declines only those still waiting at that digest: a requ
 after the banner was drawn stays pending. A T4 request this device cannot decide — it is on the
 host the agent runs on, or either host is unknown, which V8 refuses for a denial too
 (`hq.v8.t4_other_host`) — is not declined and offers no decision: its card says "Needs a decision
-from another device." with no *Allow once* or *Deny*, it stays in the reading column (and out of
-the decisions panel), and the banner adds "1 request needs a decision from another device; a
+from another device." with no *Allow once* or *Deny*, it stays out of the banner (and out of the
+decisions panel), and the banner adds "1 request needs a decision from another device; a
 message here leaves it waiting" (DW-E109-27, R109T-02). When the host of the instance holding the
 session is the unknown one, no device can decide it yet, and both say so instead: "Can't be decided
 until the agent's host is known." (R109T-04; `approvals::Undecidable`). A text message, a message with files, an ask option and
@@ -398,12 +399,26 @@ until the agent's host is known." (R109T-04; `approvals::Undecidable`). A text m
 shown). A denial that cannot be written on the device stops the message, and the banner says
 which request still waits; the composer keeps the draft and shows the same sentence hidden from
 assistive technology, so it is announced once. Mock shell: `?sessions=launch` draws a trusted T2
-`run` (grants offered) and a T4 Paseo start (none); `&grants=untrusted` makes that session
+`run` (grants offered) and a T4 Paseo start (none), each in its turn's fold once decided;
+`&approvals=elsewhere` reads the T4 one as needing another device and the T2 `run` as waiting for
+Ben, both in sight in their turn's fold; `&grants=untrusted` makes that session
 untrusted; `&grants=refused` has the server refuse every grant write; `&grants=unserved` makes
 the session's agent one that does not serve the person; `&grants=decline-fails` fails every denial
 write; `window.__keeperMockLateApproval()` lands a request without drawing it. The grants list
 holds an ended grant, an inactive one made on a signed-out device, and one that expires 20 s
 after the page opens.
+
+**Every other request sits in the turn that asked** (`timeline::place`): the turn of its parked
+call (`tool_calls.turn_id`), whose fold is drawn at the time of its work — above the answer the
+agent writes once the call runs, which comes in a later turn. A request still pending that the
+banner does not hold (one waiting for someone else, or the T4 one above) is in the fold's
+`waiting`, drawn under the fold line and its failures, outside the fold's body: a pending request
+is never inside a closed fold. A decided or expired request is in the fold's `approvals`, inside
+its body, so it folds with the turn's work in Normal and Thinking and shows in Verbose. The fold
+line names whom its turn waits for — "Waiting for you" when any request of the turn waits for this
+person, else "Waiting for Ben". Only a request whose turn the view does not show (its call is not on
+this device, or its turn is outside the shown months) stays in `AgentSessionViewVm.approvals`,
+drawn after the column.
 
 **Always allow: known limits.**
 
@@ -435,7 +450,8 @@ not evidence for that target.
 ## Live answers, the turn fold and view modes
 
 **The answer last (109.14, Q109-13 a).** The window draws Rust's reading column (`items`) in its
-order and nothing else: a person's message, each turn's **fold**, the turn's answer below it, an
+order, and after it only the approvals whose turn the view does not show: a person's message, each
+turn's **fold** (with that turn's approvals), the turn's answer below it, an
 agent's question where it was asked, an answer still being written last. A message the column does
 not name is not drawn — a lead-in ("Checking — one minute.") lives inside its turn's fold. A row
 with nothing to read — the 0-byte `finish = "tool_calls"` close a turn writes before a parked
