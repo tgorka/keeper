@@ -391,3 +391,26 @@ fn walk_files(dir: &Path) -> usize {
             .sum()
     })
 }
+
+/// The apply-time check (§ 5.1 as amended): new text that is itself an LFS
+/// pointer is refused, whatever the path's attributes say.
+#[test]
+fn a_post_image_that_is_an_lfs_pointer_is_refused() {
+    let Some(d) = drive() else { return };
+    let mut commit = inbox_edit(&d, "01JPOINTER");
+    commit.writes[0].1 = Some(
+        b"version https://git-lfs.github.com/spec/v1\noid sha256:\
+          4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n"
+            .to_vec(),
+    );
+    let before = d.head();
+    assert_eq!(
+        d.writes.commit("tgdrive", commit),
+        Err(
+            "\"10-notes/inbox.md\" is kept in the drive's large-file store (LFS), which an agent \
+             never writes."
+                .to_owned()
+        )
+    );
+    assert_eq!(d.head(), before);
+}

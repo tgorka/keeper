@@ -8,4 +8,10 @@ import type { AgentWriteHunkVm } from "./AgentWriteHunkVm";
  * deleted text's beginning. Empty for a move, and wherever this device did
  * not look at the file.
  */
-export type AgentWritePreviewVm = { hunks: Array<AgentWriteHunkVm>, whole?: AgentWriteExcerptVm, deleted?: AgentWriteExcerptVm, };
+export type AgentWritePreviewVm = { hunks: Array<AgentWriteHunkVm>, whole?: AgentWriteExcerptVm, deleted?: AgentWriteExcerptVm, 
+/**
+ * The change turns the file's line breaks from one kind to another
+ * ("Line endings change: CRLF → LF."): lines a diff shows removed and
+ * added with the same text differ only in how they end.
+ */
+lineEndings?: string, };

@@ -440,7 +440,8 @@ append, move or delete one file of a drive the person ticked — parks at T3 in 
 never granted. This device is what carries it out: the card (`AgentApprovalVm.write`,
 `approvals::write::Writes::draw`) shows the op, the drive and the path (from → to for a move), the
 line diff keeper-core computed from this device's own checkout for an edit or a replace, the new
-text for a create or an append, the deleted text for a delete, whether the chat read outside
+text for a create or an append, the deleted text for a delete, "Line endings change: CRLF → LF." when that is what a diff's
+identical-looking lines differ by, whether the chat read outside
 content, and who reads the drive beyond the session's database. *Allow once* is offered only when
 every check passes here, in this order: the digest recomputed from the rows here is the parked one;
 this device keeps the drive (a synced folder whose `_drive.toml` names it), commits to it and has
@@ -449,7 +450,8 @@ its disk; the session still ticks the drive and leaves `drive_write` and `drive`
 `.keeper`, git's own files, an ignored, untracked or LFS-routed path, a folder or a link); the file
 at `HEAD` and on the disk is the version the agent read; and the change fits the caps. Otherwise
 the card says why and offers *Deny* only, and *Deny* tells the agent that reason. *Allow* decides,
-waits for the server, takes the approval (`approved → consumed` by this device), checks again — and once more right before the commit, the path rule over every path it changes
+waits for the server, takes the approval (`approved → consumed` by this device), checks again — and once more right before the commit, keeper-sync's `agent_apply_check` over every
+path it changes with the bytes it puts there (no pointer as text)
 (a `.gitattributes` that began routing the file through LFS since the card was drawn refuses it)
 and the profile's LFS size rule over the new text, so no agent write makes an LFS object — makes
 one commit of exactly the request through `Engine::commit_paths` with the trailer

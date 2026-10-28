@@ -166,6 +166,36 @@ pub struct AgentWritePreviewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub deleted: Option<AgentWriteExcerptVm>,
+    /// The change turns the file's line breaks from one kind to another
+    /// ("Line endings change: CRLF → LF."): lines a diff shows removed and
+    /// added with the same text differ only in how they end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub line_endings: Option<String>,
+}
+
+/// How a text's lines end: `CRLF`, `LF`, `mixed`, or `None` with no line
+/// break at all.
+fn endings(text: &str) -> Option<&'static str> {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count() - crlf;
+    match (crlf, lf) {
+        (0, 0) => None,
+        (_, 0) => Some("CRLF"),
+        (0, _) => Some("LF"),
+        _ => Some("mixed"),
+    }
+}
+
+/// The card's sentence when `before` and `after` end their lines
+/// differently; `None` when either has no line break or both end alike.
+fn line_endings_change(before: &str, after: &str) -> Option<String> {
+    match (endings(before), endings(after)) {
+        (Some(was), Some(now)) if was != now => {
+            Some(format!("Line endings change: {was} → {now}."))
+        }
+        _ => None,
+    }
 }
 
 fn count(n: usize) -> u32 {
@@ -201,6 +231,7 @@ impl From<Preview> for AgentWritePreviewVm {
                 .collect(),
             whole: preview.whole.map(excerpt),
             deleted: preview.deleted.map(excerpt),
+            line_endings: None,
         }
     }
 }
@@ -414,7 +445,14 @@ impl Plan {
     fn preview(&self) -> AgentWritePreviewVm {
         match self.request.change {
             Change::Move { .. } => AgentWritePreviewVm::default(),
-            _ => drive_write::preview(self.before(), self.post.as_deref()).into(),
+            _ => {
+                let mut preview: AgentWritePreviewVm =
+                    drive_write::preview(self.before(), self.post.as_deref()).into();
+                if let (Some(before), Some(after)) = (self.before(), self.post.as_deref()) {
+                    preview.line_endings = line_endings_change(before, after);
+                }
+                preview
+            }
         }
     }
 

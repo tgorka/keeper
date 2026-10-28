@@ -19,7 +19,7 @@ use keeper_core::hq::port::{
 use keeper_sync::engine::{blob_id, CommitFence, CommitPaths, CommitRequest, Engine};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::files_write::{
-    agent_write_check, AgentTarget, WriteRefusal, WriteRoute, WriteScope,
+    agent_apply_check, agent_write_check, AgentTarget, WriteRefusal, WriteRoute, WriteScope,
 };
 use keeper_sync::lfs::stage::LfsPolicy;
 use keeper_sync::volume::{self, VolumeStatus};
@@ -59,38 +59,53 @@ impl ShellDriveWrites {
         Some((engine, profile))
     }
 
-    /// keeper-sync's path rule once more over every path `commit` changes,
-    /// right before `commit_paths` (review-603 item 6): a `.gitattributes`
-    /// that began routing a path through LFS since the card was drawn, or
-    /// a link, an ignore or a fence that appeared, refuses the write. And
-    /// what `commit_paths` itself would route by size — the profile's LFS
-    /// threshold over the post-image — is refused too: no agent write ever
-    /// makes an LFS object. A file there is the one guarded; a new path is
-    /// one where nothing is.
-    fn recheck(
-        &self,
-        drive: &str,
-        profile: &SyncProfile,
-        commit: &DriveCommit,
-    ) -> Result<(), String> {
-        let said = |refusal: Refusal| {
-            let said = refusal.to_string();
+    /// The apply-time check (contract § 5.1 as amended by Fix603), right
+    /// before `commit_paths`: keeper-sync's `agent_apply_check` over every
+    /// path `commit` changes — each guarded path, Existing if it was read
+    /// and New if not, with the exact bytes the commit puts there, and a
+    /// move's destination — so a `.gitattributes` that began routing a path
+    /// through LFS since the card was drawn, a link, an ignore or a fence
+    /// that appeared, or bytes that are themselves a pointer, refuse the
+    /// write. And what `commit_paths` would route by size — the profile's
+    /// LFS threshold over the post-image, which `agent_apply_check` does not
+    /// ask — is refused too: no agent write ever makes an LFS object.
+    fn recheck(&self, profile: &SyncProfile, commit: &DriveCommit) -> Result<(), String> {
+        let vault = (self.vault)(&profile.id).map(|vault| vault.config.subfolder.clone());
+        let scope = scope(profile, vault.as_deref());
+        let excludes = ExcludeSet::new(&profile.excludes).map_err(|error| error.to_string())?;
+        let said = |refused: WriteRefusal, path: &str| {
+            let said = refusal(refused, path).to_string();
             said.strip_suffix(" Nothing was asked.")
                 .map_or(said.clone(), str::to_owned)
         };
+        let bytes_at = |key: &str| {
+            commit
+                .writes
+                .iter()
+                .find(|(path, _)| path == key)
+                .and_then(|(_, bytes)| bytes.as_deref())
+        };
         let guards = commit.guards.iter().map(|(key, read)| {
             let target = match read {
-                Some(_) => DriveTarget::Existing,
-                None => DriveTarget::New,
+                Some(_) => AgentTarget::Existing,
+                None => AgentTarget::New,
             };
-            (key.as_str(), target)
+            (key.as_str(), target, bytes_at(key))
         });
         let moved_to = commit
             .moves
             .iter()
-            .map(|(_, to)| (to.as_str(), DriveTarget::New));
-        for (key, target) in guards.chain(moved_to) {
-            self.target(drive, key, target).map_err(said)?;
+            .map(|(_, to)| (to.as_str(), AgentTarget::New, None));
+        for (key, target, post_image) in guards.chain(moved_to) {
+            agent_apply_check(
+                &profile.local_path,
+                &scope,
+                &excludes,
+                key,
+                target,
+                post_image,
+            )
+            .map_err(|refused| said(refused, key))?;
         }
         let policy = LfsPolicy::from_profile(profile).map_err(|error| error.to_string())?;
         for (key, bytes) in &commit.writes {
@@ -221,7 +236,7 @@ impl DriveWrites for ShellDriveWrites {
             .chain(commit.moves.iter().map(|(from, _)| from))
             .filter_map(|key| self.note(&profile, key))
             .collect();
-        self.recheck(drive, &profile, &commit)?;
+        self.recheck(&profile, &commit)?;
         let request = CommitRequest {
             writes: commit.writes.clone(),
             moves: commit.moves.clone(),

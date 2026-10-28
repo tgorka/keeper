@@ -6490,7 +6490,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
 /**
  * ?writes=all (109.27): one parked `drive_write` per op in alpha's device.1, as
  * `approvals::write::Writes::draw` draws them — the diff of an edit and a replace, the new text of
- * a create and an append, from → to for a move, the deleted text — and one this device cannot
+ * a create and an append, from → to for a move, the deleted text, a replace that only changes line
+ * endings — and one this device cannot
  * carry out (`blocked`), which offers Deny only. Allow writes and says so on the card.
  */
 const writesScenario = new URLSearchParams(location.search).get("writes");
@@ -6658,6 +6659,30 @@ if (writesScenario === "all" && sessionApprovals.length > 0) {
         preview: { hunks: [], deleted: { lines: ["# Old", "nothing to keep"], more: 0 } },
       },
       15,
+    ),
+    mockWrite(
+      "write-crlf",
+      "Replace the text of `10-notes/windows.md` in tgdrive (22 bytes)",
+      { op: "replace", path: "10-notes/windows.md", expected: MOCK_BLOB, content: "…" },
+      {
+        ...base,
+        op: "replace",
+        path: "10-notes/windows.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "# Written on Windows" },
+                { kind: "add", text: "# Written on Windows" },
+              ],
+            },
+          ],
+          lineEndings: "Line endings change: CRLF → LF.",
+        },
+      },
+      16,
     ),
     mockWrite(
       "write-blocked",
