@@ -75,6 +75,14 @@ function openModels() {
   return screen.getByRole("dialog");
 }
 
+/**
+ * A key on a button as the browser plays it: Enter and Space click it unless a handler cancelled
+ * the keydown (jsdom fires no click of its own).
+ */
+function press(button: HTMLElement, key: "Enter" | " ") {
+  if (fireEvent.keyDown(button, { key })) fireEvent.click(button);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mock.change.mockResolvedValue({ note: null, pick: { model: "gamma-fast", effort: null } });
@@ -258,6 +266,25 @@ describe("the model and effort pickers", () => {
     expect(screen.getByRole("dialog")).toBe(dialog);
   });
 
+  it("Enter or Space on Reset in the model list resets and never chooses the highlighted model (R601-05)", async () => {
+    render(<Picker target={target} agent="nixi" picker={picker({ resettable: true })} />);
+    const resetIn = (dialog: HTMLElement) =>
+      within(dialog).getByRole("button", {
+        name: "Reset model and effort to the agent's defaults",
+      });
+    let dialog = openModels();
+    // The list has a highlighted model, which cmdk's Enter would write.
+    expect(within(dialog).getAllByRole("option")[0]).toHaveAttribute("aria-selected", "true");
+    press(resetIn(dialog), "Enter");
+    await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
+    expect(mock.change).toHaveBeenCalledTimes(1);
+    mock.change.mockClear();
+    dialog = openModels();
+    press(resetIn(dialog), " ");
+    await waitFor(() => expect(mock.change).toHaveBeenCalledWith(target, { kind: "reset" }));
+    expect(mock.change).toHaveBeenCalledTimes(1);
+  });
+
   it("names model and effort as read-only chips where there is nothing to choose", () => {
     render(
       <Picker
@@ -274,6 +301,35 @@ describe("the model and effort pickers", () => {
     expect(within(bar).getByText("beta-small")).toBeInTheDocument();
     expect(within(bar).getByText("Default")).toBeInTheDocument();
     expect(within(bar).queryAllByRole("button")).toEqual([]);
+  });
+
+  it("names the whole model id on a read-only chip and in its tooltip, drawing the short name (R601-06)", async () => {
+    render(
+      <SessionSettingsPicker
+        target={target}
+        agent="nixi"
+        footer={{
+          model: "openrouter/z-ai/glm-5.3-flash",
+          effort: "Default",
+          shortModel: "glm-5.3-flash",
+          effortCode: "D",
+          choosesModel: false,
+          choosesEffort: false,
+        }}
+      />,
+    );
+    const bar = screen.getByRole("group", { name: "Model and effort" });
+    // Read aloud: the whole id. Drawn: the short name, hidden from the reading so it is not said twice.
+    expect(within(bar).getByText("Model: openrouter/z-ai/glm-5.3-flash")).toHaveClass("sr-only");
+    expect(within(bar).getByText("glm-5.3-flash").closest("[aria-hidden='true']")).not.toBeNull();
+    const chip = within(bar)
+      .getByText("glm-5.3-flash")
+      .closest("[data-slot='agent-readonly-chip']");
+    if (!(chip instanceof HTMLElement)) throw new Error("no read-only model chip");
+    fireEvent.focus(chip);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Model: openrouter/z-ai/glm-5.3-flash",
+    );
   });
 
   it("keeps Reset out of the bar where nothing is chosen but a choice is saved (R601-01)", () => {

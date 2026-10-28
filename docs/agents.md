@@ -522,15 +522,19 @@ Assistant's 280px minimum (a 255px bar) to a full window, in the panel, the tabl
 Agents window alike:
 
 - the model chip says the model's own name (`shortModel`, Rust's: `openrouter/z-ai/glm-5.3-flash`
-  → `glm-5.3-flash`); its accessible name and the popover keep the whole id;
+  → `glm-5.3-flash`); its accessible name, its tooltip and the popover keep the whole id, on a
+  read-only chip too (R601-06);
 - the model group never forces a wrap (its flex basis is 0; it grows up to its content);
-- **Reset** lives in the model popover and the effort menu; only where neither opens anything and a
-  choice is still saved does it stay in the bar, so no action is dropped (AD-260);
+- **Reset is never in the bar.** It lives at the foot of the model popover and of the effort menu;
+  where neither chip offers a choice yet one is still saved, the model chip opens a small "Model"
+  popover (the whole id, the read-only sentence and Reset), so no action is dropped (AD-260).
+  Enter and Space on Reset, like on a star, never reach the model list, which would take Enter as
+  choosing the highlighted model (R601-05);
 - **the model's name is the last thing to give way.** When the row runs short, the bar
   (`useBarFold`) gives up, in this order and only as far as it must: the context reading's label
   (the ring stays; the label stays in the accessible name, the tooltip and Details); Send's word
-  (a 36px icon, ≥44pt on the phone); the bar's Reset word (its icon, same accessible name); the
-  chips' padding and the effort menu's chevron; the effort's words, for its level's short code
+  (a 36px icon, ≥44pt on the phone); the chips' padding and the effort menu's chevron; the
+  effort's words, for its level's short code
   beside the brain (`effortCode`, Rust's: `L`, `M`, `H`, `XH`, and `D` for an unstated
   default; the words stay the accessible name); then the row's gaps and the model's chevron. Only
   then is the model's name cut. Width alone cannot order this — the same 335px bar holds
@@ -1657,8 +1661,9 @@ offered models grouped by the maker (`AgentModelOptionVm.provider`, `settings::p
 router's segment such as `openrouter/` is skipped, a maker slug is named as people read it —
 `openrouter/z-ai/glm-5.3-flash` → Z.ai, `openrouter/qwen/qwen3.7-flash` → Qwen — else the family the
 model's own name starts with, `claude-…` → Anthropic, `gpt-…` → OpenAI) and a "Default" badge; an effort
-chip with a "Default" badge in its menu; Reset at the foot of both (in the bar only where neither
-opens anything). Where there is nothing to choose they are read-only
+chip with a "Default" badge in its menu; Reset at the foot of both, never in the bar (where neither
+offers a choice yet one is saved, the model chip opens a popover holding Reset). Where there is
+nothing to choose they are read-only
 chips, never absent. Capability badges are not drawn: the contract publishes model ids only
 (DW-E109-40). Stars are a lens, not a setting:
 they live in the `keeper_model_favorites` cookie like the other remembered views (no settings

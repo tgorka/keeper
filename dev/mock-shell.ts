@@ -7318,7 +7318,8 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
 // each change a moment after it was written, through the row's outcome. `fallback` puts
 // `metadata.model_fallback` on the newest answer. Viewing aid only: Rust's `picker_of` decides.
 // ?settings=single (or ?owner=report): one model and no effort, so the bar's chips are read-only.
-// ?settings=held: the same, with a choice still saved, so Reset stays in the bar (R601-01).
+// ?settings=held: the same, with a choice still saved, so the model chip opens a popover holding
+// Reset (R601-01).
 // ?settings=failed: the newest answer failed on the model in use (a 429 for days, R-HQ-85).
 const settingsScenario = new URLSearchParams(location.search).get("settings");
 const singleModel = settingsScenario === "single" || settingsScenario === "held" || ownerReport;

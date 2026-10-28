@@ -54,22 +54,28 @@ const SNUG_EFFORT = "group-data-[fold~=snug]/bar:px-1.5!";
 
 const READ_ONLY_MODEL = "The next answer uses this model; there is no other to choose here.";
 
-/** A chip in the composer's bar that opens nothing: the agent offers no alternative. */
+/**
+ * A chip in the composer's bar that opens nothing: the agent offers no alternative. The bar draws
+ * `value`, which it may shorten or fold; the accessible name and the tooltip carry `spoken`, the
+ * whole value (R601-06).
+ */
 function ReadOnlyChip({
   name,
   value,
+  spoken,
   hint,
   icon,
   className,
 }: {
   name: string;
   value: ReactNode;
+  spoken: string;
   hint: string;
   icon?: ReactNode;
   className?: string;
 }) {
   return (
-    <HoverHint label={name} detail={hint}>
+    <HoverHint label={`${name}: ${spoken}`} detail={hint}>
       <span
         data-slot="agent-readonly-chip"
         className={cn(
@@ -78,8 +84,10 @@ function ReadOnlyChip({
         )}
       >
         {icon}
-        <span className="sr-only">{name}: </span>
-        {value}
+        <span className="sr-only">{`${name}: ${spoken}`}</span>
+        <span aria-hidden="true" className="contents">
+          {value}
+        </span>
       </span>
     </HoverHint>
   );
@@ -292,6 +300,12 @@ export function SessionSettingsPicker({
         size="sm"
         className="min-h-11 w-full justify-start"
         aria-label="Reset model and effort to the agent's defaults"
+        // Enter and Space belong to Reset, as they do to a star: left to bubble, the model list's
+        // `Command` takes Enter as choosing the highlighted model and cancels this click, which
+        // writes that model instead of resetting (R601-05).
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+        }}
         onClick={() => {
           focusGroup.current = !footer.choosesModel;
           setModelsOpen(false);
@@ -382,6 +396,7 @@ export function SessionSettingsPicker({
           <ReadOnlyChip
             name="Model"
             value={<ModelWords footer={footer} />}
+            spoken={footer.model}
             hint={READ_ONLY_MODEL}
             className="shrink"
           />
@@ -444,6 +459,7 @@ export function SessionSettingsPicker({
             name="Effort"
             icon={<Brain aria-hidden="true" className={cn("size-3.5 shrink-0", SNUG_HIDDEN)} />}
             value={<EffortWords footer={footer} />}
+            spoken={footer.effort}
             hint="The next answer uses this effort; there is no other to choose here."
             className={cn("shrink-0", SNUG_EFFORT)}
           />
