@@ -160,3 +160,22 @@ it("lines are text, never markup", () => {
   expect(change.querySelector("b")).toBeNull();
   expect(lines(change)).toEqual([["add", "+ added: <b>bold</b>"]]);
 });
+
+it("a change of line endings alone says so, beside lines whose text looks the same", () => {
+  const change = card({
+    preview: {
+      hunks: [
+        {
+          oldStart: 1,
+          newStart: 1,
+          lines: [
+            { kind: "remove", text: "- [ ] milk" },
+            { kind: "add", text: "- [ ] milk" },
+          ],
+        },
+      ],
+      lineEndings: "Line endings change: CRLF → LF.",
+    },
+  });
+  expect(within(change).getByText("Line endings change: CRLF → LF.")).toBeInTheDocument();
+});

@@ -1296,3 +1296,41 @@ fn a_path_that_became_lfs_routed_after_the_card_is_not_written() {
     assert_wire(&applied);
     assert_eq!(applied["reason"], reason);
 }
+
+/// Fix603's finding: a replace that only turns CRLF into LF diffs as lines
+/// removed and added with the same text; the card says the line endings
+/// change. A change that keeps them says nothing of them.
+#[test]
+fn a_change_of_line_endings_alone_is_named_on_the_card() {
+    let args = json!({"drive": "tgdrive", "op": "replace", "path": PATH,
+                      "expected": BEFORE_BLOB, "content": "- [ ] milk\n"});
+    let w = world_with(args, None);
+    w.drive.file(PATH, BEFORE_BLOB, "- [ ] milk\r\n");
+    let preview = w.card().write.expect("write").preview;
+    let texts: Vec<&str> = preview.hunks[0]
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        ["- [ ] milk", "- [ ] milk"],
+        "the same text, removed and added"
+    );
+    assert_eq!(
+        preview.line_endings.as_deref(),
+        Some("Line endings change: CRLF → LF.")
+    );
+
+    let w = world();
+    assert_eq!(w.card().write.expect("write").preview.line_endings, None);
+    assert_eq!(
+        line_endings_change("a\r\nb\n", "a\nb\n").as_deref(),
+        Some("Line endings change: mixed → LF.")
+    );
+    assert_eq!(
+        line_endings_change("a", "a\n"),
+        None,
+        "no line break before: nothing to change"
+    );
+}

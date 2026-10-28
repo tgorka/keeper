@@ -116,6 +116,11 @@ export function DriveWritePreview({ write }: { write: AgentDriveWriteVm }) {
           <dd className="break-words [overflow-wrap:anywhere]">{write.to}</dd>
         </dl>
       )}
+      {preview.lineEndings && (
+        <p data-slot="drive-write-line-endings" className="text-muted-foreground text-xs">
+          {preview.lineEndings}
+        </p>
+      )}
       {preview.hunks.length > 0 && (
         <figure aria-label="Diff" className={BLOCK}>
           {preview.hunks.map((hunk) => (
