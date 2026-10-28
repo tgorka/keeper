@@ -349,6 +349,25 @@ impl Engine {
                 return Ok(CommitPaths::Guarded { path: path.clone() });
             }
         }
+        // A file at `HEAD` where a folder of a written or moved-to path would
+        // be: the tree built below would make it that folder, removing a file
+        // the request never named nor guarded (109.27) — or, spelled
+        // otherwise (`BLOCKED/child.txt` beside `blocked`), hold both, a tree
+        // no Mac can check out. Its names are compared as the Mac's volume
+        // compares them. Refused here, so no caller's check — or a caller
+        // that skipped one — decides it.
+        let targets = request
+            .writes
+            .iter()
+            .map(|(path, _)| path)
+            .chain(request.moves.iter().map(|(_, to)| to));
+        for path in targets {
+            if let Some(file) = base.file_over(path) {
+                return Err(SyncError::Config(format!(
+                    "{file} is a file at HEAD; nothing is written under it"
+                )));
+            }
+        }
 
         let attributes = Path::new(".gitattributes");
         let mut prefixes: Vec<&Path> = request

@@ -176,17 +176,66 @@ pub fn is_lossy_rendering(text: &str) -> bool {
 /// `é` decomposed. A fence that compares names it must keep keeper's own
 /// compares them this way on every platform, so it refuses on Linux what the
 /// Mac would let through.
+///
+/// The comparison is Unicode's canonical caseless match (D145):
+/// `NFD(fold(NFD(name)))`, where `fold` is **full** case folding
+/// (`CaseFolding.txt` C+F, never the Turkic T rows). Lowercasing is not it:
+/// APFS takes `.obſidian` (U+017F long s) for `.obsidian`, `ß` for `ss`, and
+/// `ς` for `Σ`, and lowercasing keeps every one of those apart. Measured on
+/// hesperia (macOS 27, APFS) over every code point whose canonical caseless
+/// key differs from itself, 14,369 of them, and 114 pairs picked by hand, and
+/// in agreement on every one — including where both say *different*:
+/// `ı`/`i`, `İ`/`i`, a fullwidth `Ａ` and `A`, a zero-width joiner, `①` and
+/// `1`, `ﬃ` and `iff`. The tables are `tests/apfs_caseless_sweep.rs` and
+/// `the_comparison_answers_as_apfs_did_on_every_measured_pair` below. The
+/// whole name is folded; nothing is stripped or skipped.
+///
+/// The one comparison every name fence in this crate reads (109.27, AD-65):
+/// the agents' home, the sessions zone and its workspace, git's and keeper's
+/// own names, a create's collision. Two ASCII names fold as ASCII, with no
+/// allocation, because the index scans that ask it ask once per tracked file
+/// — full folding of ASCII is ASCII lowercasing, and only a non-ASCII name
+/// (`ſ`, the Kelvin sign) can fold *into* ASCII.
 pub fn same_entry_folded(a: &str, b: &str) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    let fold = |name: &str| -> String {
-        name.nfd()
-            .collect::<String>()
-            .to_lowercase()
-            .nfd()
-            .collect()
-    };
-    fold(a) == fold(b)
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    caseless(a) == caseless(b)
 }
+
+/// `NFD(full_case_fold(NFD(name)))`: the key two names APFS takes for one
+/// entry share. The second decomposition is not redundant — folding can
+/// leave a sequence that is not in NFD (`ΐ` folds to three characters).
+///
+/// The fold is `unicase`'s, but for [`UNICASE_OUT_OF_ORDER`], which is
+/// spelled out before it folds.
+fn caseless(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let mut decomposed = String::with_capacity(name.len());
+    for c in name.nfd() {
+        match UNICASE_OUT_OF_ORDER.iter().find(|(from, _)| *from == c) {
+            Some((_, fold)) => decomposed.push_str(fold),
+            None => decomposed.push(c),
+        }
+    }
+    unicase::UniCase::unicode(decomposed.as_str())
+        .to_folded_case()
+        .nfd()
+        .collect()
+}
+
+/// The code points whose full case fold `unicase` 2.9.0 emits in the wrong
+/// order, with the fold `CaseFolding.txt` gives them (R603-09).
+///
+/// Its three-character fold (`Fold::Three`) yields its third character
+/// first, so `ﬃ` folds to `iff` and `ﬄ` to `lff`: APFS takes `oﬃce` for
+/// `Office` and keeps `ﬃ` and `iff` apart, and the plain fold said the
+/// opposite of both. After the first NFD these two are the only code points
+/// that reach a three-character fold — every Greek one decomposes first —
+/// and what replaces each is ASCII, which folds to itself. Exactly these two:
+/// `tests/apfs_caseless_sweep.rs` holds every code point whose fold differs,
+/// with the answer APFS gave on hesperia, and fails on any other.
+const UNICASE_OUT_OF_ORDER: [(char, &str); 2] = [('\u{fb03}', "ffi"), ('\u{fb04}', "ffl")];
 
 /// Byte-exact ASCII rendering: printable ASCII verbatim, `\xNN` for the rest.
 ///
@@ -244,13 +293,75 @@ pub(crate) const UNSPELLABLE_UNAVAILABLE: &str =
 
 #[cfg(test)]
 mod tests {
-    /// The Mac's volume reads these as one entry, so a fence compares them
-    /// alike on every platform.
+    /// R603-08: every pair `/home/dev/wt/reviews/evidence/fix603r3/apfs-probe.py`
+    /// measured on hesperia (macOS 27, APFS, case-insensitive): it created `a`
+    /// in an empty folder and asked the filesystem whether `b` was there. Where
+    /// APFS said one entry, so must this; where it said two, so must this —
+    /// a fence that over-folds refuses a name the Mac keeps apart. Asked both
+    /// ways round, because the comparison must not depend on which side the
+    /// index or the agent spelled.
     #[test]
-    fn names_fold_as_the_macs_volume_folds_them() {
-        assert!(super::same_entry_folded("README.md", "readme.md"));
-        assert!(super::same_entry_folded("Caf\u{e9}", "cafe\u{301}"));
-        assert!(!super::same_entry_folded("log", "logs"));
+    fn the_comparison_answers_as_apfs_did_on_every_measured_pair() {
+        let measured: [(&str, &str, bool); 51] = [
+            (".obsidian", ".ob\u{17f}idian", true),
+            ("sessions", "\u{17f}essions", true),
+            ("\u{3a3}", "\u{3c2}", true),
+            ("\u{df}", "ss", true),
+            ("README.md", "readme.md", true),
+            ("caf\u{e9}", "cafe\u{301}", true),
+            ("Caf\u{e9}", "cafe\u{301}", true),
+            ("log", "logs", false),
+            ("\u{1e9e}", "ss", true),
+            ("\u{1e9e}", "\u{df}", true),
+            ("agents", "agent\u{17f}", true),
+            ("stra\u{df}e", "STRASSE", true),
+            ("\u{3c3}", "\u{3c2}", true),
+            ("\u{3a3}\u{3a3}", "\u{3c3}\u{3c2}", true),
+            ("\u{131}", "i", false),
+            ("\u{131}", "I", false),
+            ("\u{130}", "i", false),
+            ("\u{130}", "I", false),
+            ("\u{130}", "i\u{307}", true),
+            ("\u{130}", "I\u{307}", true),
+            ("\u{131}", "\u{130}", false),
+            ("\u{fb01}", "fi", true),
+            ("\u{fb01}", "FI", true),
+            ("\u{fb00}", "ff", true),
+            ("\u{fb06}", "st", true),
+            ("\u{212a}", "K", true),
+            ("\u{212a}", "k", true),
+            ("\u{212b}", "\u{c5}", true),
+            ("\u{212b}", "\u{e5}", true),
+            ("\u{212b}", "a\u{30a}", true),
+            ("\u{386}", "\u{3ac}", true),
+            ("\u{386}", "\u{3b1}\u{301}", true),
+            ("\u{390}", "\u{3b9}\u{308}\u{301}", true),
+            ("\u{1f88}", "\u{1f00}\u{3b9}", true),
+            ("\u{3b9}\u{345}", "\u{3b9}\u{3b9}", true),
+            ("\u{345}", "\u{3b9}", true),
+            ("\u{ff21}", "\u{ff41}", true),
+            ("\u{ff21}", "A", false),
+            ("\u{ff41}", "a", false),
+            ("ab", "a\u{200d}b", false),
+            ("ab", "a\u{200c}b", false),
+            ("ab", "a\u{feff}b", false),
+            ("a\u{200d}b", "A\u{200d}B", true),
+            ("\u{2460}", "1", false),
+            ("\u{b5}", "\u{3bc}", true),
+            ("\u{b5}", "\u{39c}", true),
+            ("\u{1c90}", "\u{10d0}", true),
+            ("\u{13a0}", "\u{ab70}", true),
+            ("\u{a7c0}", "\u{a7c1}", true),
+            ("\u{2c2f}", "\u{2c5f}", true),
+            ("\u{d55c}", "\u{1112}\u{1161}\u{11ab}", true),
+        ];
+        let wrong: Vec<String> = measured
+            .iter()
+            .flat_map(|&(a, b, apfs)| [(a, b, apfs), (b, a, apfs)])
+            .filter(|&(a, b, apfs)| super::same_entry_folded(a, b) != apfs)
+            .map(|(a, b, apfs)| format!("{a:?} vs {b:?}: APFS said same={apfs}"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     use super::*;

@@ -448,6 +448,12 @@ flate2 = "1"
 # direct edge on `keeper-core` adds no package to the tree and drags in neither
 # tauri nor gix. MIT OR Apache-2.0 — passes `cargo deny check`.
 unicode-normalization = "0.1"
+# Unicode full case folding (`CaseFolding.txt` C+F: `ß` → `ss`, `ſ` → `s`,
+# final sigma → σ) for `keeper_sync::names::same_entry_folded`, which must
+# answer as the Mac's APFS does (R603-08). Already resolved in Cargo.lock as
+# `mime_guess`'s dependency of `keeper-core`, so the direct edge adds no
+# package. MIT OR Apache-2.0 — passes `cargo deny check`.
+unicase = "2.9"
 # The speech recogniser and synthesiser on Apple platforms (Epic 62, Story
 # 62.4, AD-166, AD-167; Epic 63, Story 63.4, AD-175). System frameworks: keeper
 # ships no model weights, and the on-device recogniser is the only one asked

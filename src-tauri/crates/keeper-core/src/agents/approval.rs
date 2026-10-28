@@ -436,6 +436,24 @@ pub struct Checkpoint {
     pub sha256: String,
 }
 
+/// Where a call stood when it parked on a host that keeps no session log —
+/// keeper-hq's runtime, whose calls are `tool_calls` rows: the turn and the
+/// call in place of a log chunk and its line, and the SHA-256 of
+/// `{"call":<call>,"turn":<turn>}` as `serde_json` writes it (keys sorted).
+///
+/// The one source of that checkpoint (109.27): the runtime parks with it
+/// and a person's device recomputes a `drive_write` approval's digest from
+/// the rows with it ([`crate::agents::drive_write::digest`]), so the two
+/// cannot drift apart.
+pub fn row_checkpoint(turn: &str, call: &str) -> Checkpoint {
+    let bound = json!({ "turn": turn, "call": call });
+    Checkpoint {
+        chunk: turn.to_owned(),
+        through: call.to_owned(),
+        sha256: sha256_hex(bound.to_string().as_bytes()),
+    }
+}
+
 /// The action, exactly as it will run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

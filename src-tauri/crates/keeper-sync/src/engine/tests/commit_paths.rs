@@ -390,6 +390,103 @@ async fn a_path_through_a_link_or_unguarded_is_refused() {
     assert!(!p.local_path.join("new.md").exists());
 }
 
+/// R603-7: a new path under a file `HEAD` tracks — a file or a link, here
+/// gone from the disk — is refused by `commit_paths` itself, whatever its
+/// caller checked: the tree it would build turns that file into a folder,
+/// removing a file the request never named. A move onto such a path too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_path_under_a_tracked_file_never_removes_it() {
+    for kind in ["file", "link"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        let Some((engine, _platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await
+        else {
+            return;
+        };
+        let root = p.local_path.clone();
+        if kind == "file" {
+            std::fs::write(root.join("blocked"), "a person's file").expect("write");
+        } else {
+            std::os::unix::fs::symlink("root.md", root.join("blocked")).expect("link");
+        }
+        git_out(&root, &["add", "blocked"]);
+        commit_as_person(&root, "the parent");
+        let head = git_out(&root, &["rev-parse", "HEAD"]);
+        std::fs::remove_file(root.join("blocked")).expect("gone from the disk");
+        let create = CommitRequest {
+            writes: vec![("blocked/child.md".to_owned(), Some(b"new text\n".to_vec()))],
+            guards: vec![("blocked/child.md".to_owned(), None)],
+            ..CommitRequest::default()
+        };
+        let moved = CommitRequest {
+            moves: vec![("root.md".to_owned(), "blocked/root.md".to_owned())],
+            guards: vec![
+                ("root.md".to_owned(), Some(blob_id(b"root"))),
+                ("blocked/root.md".to_owned(), None),
+            ],
+            ..CommitRequest::default()
+        };
+        for ask in [create, moved] {
+            let result = engine.commit_paths(&p.id, &ask, yes()).await;
+            assert!(
+                matches!(&result, Err(SyncError::Config(why)) if why.contains("blocked is a file at HEAD")),
+                "{kind}: {result:?}"
+            );
+            assert_eq!(git_out(&root, &["rev-parse", "HEAD"]), head, "{kind}");
+        }
+        assert_eq!(
+            git_out(&root, &["ls-files", "blocked"]).trim(),
+            "blocked",
+            "{kind}"
+        );
+    }
+}
+
+/// R603-11: the guard compares a folder of the path with `HEAD`'s files as
+/// the Mac's volume compares names. `BLOCKED/child.txt` and
+/// `bloc\u{212a}ed/child.txt` (Kelvin sign) are under the file `blocked` on
+/// APFS; a tree holding both is one no Mac can check out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_path_under_a_tracked_file_spelled_otherwise_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, _platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let root = p.local_path.clone();
+    std::fs::write(root.join("blocked"), "a person's file").expect("write");
+    git_out(&root, &["add", "blocked"]);
+    commit_as_person(&root, "the parent");
+    let head = git_out(&root, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(root.join("blocked")).expect("gone from the disk");
+    for path in ["BLOCKED/child.txt", "bloc\u{212a}ed/child.txt"] {
+        let create = CommitRequest {
+            writes: vec![(path.to_owned(), Some(b"new text\n".to_vec()))],
+            guards: vec![(path.to_owned(), None)],
+            ..CommitRequest::default()
+        };
+        let result = engine.commit_paths(&p.id, &create, yes()).await;
+        assert!(
+            matches!(&result, Err(SyncError::Config(why)) if why.contains("blocked is a file at HEAD")),
+            "{path}: {result:?}"
+        );
+        assert_eq!(git_out(&root, &["rev-parse", "HEAD"]), head, "{path}");
+    }
+    // A name APFS keeps apart from `blocked` is a folder of its own.
+    let beside = CommitRequest {
+        writes: vec![("blocks/child.txt".to_owned(), Some(b"new text\n".to_vec()))],
+        guards: vec![("blocks/child.txt".to_owned(), None)],
+        ..CommitRequest::default()
+    };
+    assert!(
+        matches!(
+            engine.commit_paths(&p.id, &beside, yes()).await,
+            Ok(CommitPaths::Committed { .. })
+        ),
+        "blocks/child.txt"
+    );
+}
+
 /// R95CR-02 and R95CR-04, before the publication: a request killed once its
 /// record is written changed nothing — and a person who then commits
 /// something else of their own does not make it look published. The next

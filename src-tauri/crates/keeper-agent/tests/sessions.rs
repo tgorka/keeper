@@ -422,6 +422,28 @@ fn session_write_refuses_log_approvals_and_keepers_files() {
     assert!(!zone.path().join("active/s/README.md").exists());
 }
 
+/// R603-08: keeper's own session entries are refused under every spelling the
+/// Mac's APFS takes for them — full case folding, so `ſ` (U+017F long s) is
+/// `s` — not only under the ones lowercasing reaches.
+#[test]
+fn session_write_refuses_keepers_files_under_a_full_case_fold() {
+    let zone = zone();
+    std::fs::create_dir_all(zone.path().join("active/s")).expect("session");
+    let write = |rel: &str| session_write(zone.path(), "active/s", rel, "text\n", &|| true);
+    for refused in [
+        "AGENT\u{17f}.md",
+        "approval\u{17f}/a.md",
+        "attachment\u{17f}/notes.md",
+    ] {
+        assert!(write(refused).is_err(), "{refused} was written");
+        assert!(
+            !zone.path().join("active/s").join(refused).exists(),
+            "{refused} is on the disk"
+        );
+    }
+    write("AGENT\u{17f}-notes.md").expect("a pool file that only starts like one");
+}
+
 /// Story 101.2: a person's file lands in the session's `attachments/` as
 /// its exact bytes; the same file again is the same one (a turn run again),
 /// another file of that name takes the next free name and leaves the first

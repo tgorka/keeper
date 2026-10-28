@@ -115,7 +115,7 @@ pub fn applies(profile: &SyncProfile, size: u64) -> bool {
 /// worktree, so a pointerised one is a policy that erased itself. Both used to
 /// be protected from *virtualization* and not from *conversion*, which is the
 /// step that produces the pointer the first protection feared.
-const CONTROL_FILES: [&str; 5] = [
+pub(crate) const CONTROL_FILES: [&str; 5] = [
     ".gitattributes",
     ".gitignore",
     ".gitmodules",
@@ -1095,7 +1095,11 @@ fn blob_could_be_a_pointer(repo: &gix::Repository, blob: gix::hash::ObjectId) ->
     let Ok(header) = repo.find_header(blob) else {
         return false;
     };
-    let size = header.size();
+    pointer_sized(header.size())
+}
+
+/// [`blob_could_be_a_pointer`]'s size window, one rule for every reader.
+fn pointer_sized(size: u64) -> bool {
     size != 0 && size <= pointer::MAX_POINTER_BYTES as u64
 }
 
@@ -1111,6 +1115,30 @@ pub(crate) fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) ->
         return None;
     }
     Pointer::parse(&repo.find_object(blob).ok()?.data)
+}
+
+/// [`pointer_blob`]'s question for a caller that must refuse when it cannot
+/// tell (109.27): is the indexed blob `blob` an LFS pointer?
+///
+/// `Err` with the reason when the object cannot be read — missing from the
+/// object database, or unreadable — because an agent's write asks this to
+/// stay out of LFS and a blob nobody can look at may be a pointer. The
+/// listing's `None` for the same failure is right for the listing, which only
+/// ever draws a file as ordinary on it.
+pub(crate) fn indexed_pointer_checked(
+    repo: &gix::Repository,
+    blob: gix::hash::ObjectId,
+) -> std::result::Result<bool, String> {
+    let header = repo
+        .find_header(blob)
+        .map_err(|error| format!("its indexed blob {blob} cannot be read: {error}"))?;
+    if !pointer_sized(header.size()) {
+        return Ok(false);
+    }
+    let object = repo
+        .find_object(blob)
+        .map_err(|error| format!("its indexed blob {blob} cannot be read: {error}"))?;
+    Ok(Pointer::parse(&object.data).is_some())
 }
 
 /// [`pointer_blob`]'s answer, **with the blob's own bytes**.
@@ -1578,6 +1606,25 @@ fn routed_through_lfs(
     LfsRouting::new(repo, index).is_some_and(|mut routing| routing.routes(key, mode))
 }
 
+/// [`routed_through_lfs`]'s question for a caller that must refuse when it
+/// cannot tell (109.27): does `.gitattributes` route `key` — the
+/// slash-separated index key, of an entry with `mode` or of a new file's
+/// [`gix::index::entry::Mode::FILE`] — through the LFS filter?
+///
+/// `Err` with the reason when the attribute stack cannot be built or cannot
+/// descend to the path: an agent's write asks this to stay out of LFS, and
+/// "could not tell" must not read as "not routed" there. The repair sweep's
+/// `false` for the same failure is right for the sweep, which only ever
+/// declines to touch a file on it.
+pub fn lfs_routed(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    key: &str,
+    mode: gix::index::entry::Mode,
+) -> std::result::Result<bool, String> {
+    LfsRouting::build(repo, index)?.ask(key, mode)
+}
+
 /// One repository's attribute stack, held across many `filter=lfs` questions.
 ///
 /// [`gix::Repository::attributes_only`] is not a lookup, it is a build: it
@@ -1607,12 +1654,22 @@ impl<'repo> LfsRouting<'repo> {
     /// configuration cannot be read — the failure the per-path version
     /// answered `false` for, hoisted to the one place it can now happen.
     fn new(repo: &'repo gix::Repository, index: &gix::index::State) -> Option<Self> {
+        Self::build(repo, index).ok()
+    }
+
+    /// [`Self::new`], with the reason a stack could not be built.
+    fn build(
+        repo: &'repo gix::Repository,
+        index: &gix::index::State,
+    ) -> std::result::Result<Self, String> {
         let source = gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping;
-        let stack = repo.attributes_only(index, source).ok()?;
+        let stack = repo
+            .attributes_only(index, source)
+            .map_err(|error| error.to_string())?;
         // Only `filter` is collected, so the outcome holds one slot rather than
         // one per attribute the repository happens to define.
         let outcome = stack.selected_attribute_matches(["filter"]);
-        Some(Self { stack, outcome })
+        Ok(Self { stack, outcome })
     }
 
     /// Does `.gitattributes` route `key` through the LFS filter?
@@ -1621,19 +1678,27 @@ impl<'repo> LfsRouting<'repo> {
     /// attribute stack matches patterns against. A path the stack cannot
     /// descend to answers `false`, for [`routed_through_lfs`]'s reason.
     fn routes(&mut self, key: &str, mode: gix::index::entry::Mode) -> bool {
-        let Ok(platform) = self
+        self.ask(key, mode).unwrap_or(false)
+    }
+
+    /// [`Self::routes`], with the reason a path the stack cannot descend to
+    /// could not be asked about.
+    fn ask(
+        &mut self,
+        key: &str,
+        mode: gix::index::entry::Mode,
+    ) -> std::result::Result<bool, String> {
+        let platform = self
             .stack
             .at_entry(gix::bstr::BStr::new(key.as_bytes()), Some(mode))
-        else {
-            return false;
-        };
+            .map_err(|error| error.to_string())?;
         // The returned bool only says whether some pattern matched at all, which
         // is not the question: an explicitly unset or unspecified `filter` is a
         // perfectly good "not routed". The resolved state is what decides.
         platform.matching_attributes(&mut self.outcome);
-        self.outcome.iter_selected().any(|attribute| {
+        Ok(self.outcome.iter_selected().any(|attribute| {
             attribute.assignment.state.as_bstr() == Some(gix::bstr::BStr::new(LFS_FILTER_DRIVER))
-        })
+        }))
     }
 }
 
