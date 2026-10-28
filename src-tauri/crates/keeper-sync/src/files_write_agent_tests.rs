@@ -554,6 +554,145 @@ fn a_new_path_collides_under_a_full_case_fold() {
     );
 }
 
+/// R603-09: `ﬃ` and `ﬄ` are `ffi` and `ffl` on APFS, so a name holding
+/// either ligature meets every fence the plain letters meet — and `iff`,
+/// which APFS keeps apart from `ﬃ`, meets none of them.
+#[test]
+fn the_fences_hold_for_the_ffi_and_ffl_ligatures() {
+    let dir = drive();
+    let root = dir.path();
+    let excludes = ExcludeSet::new(&[]).expect("excludes");
+
+    // An agents' home named `Office`, reached through the ligature.
+    let scope = WriteScope::new("tgdrive", None).with_agents(Some("Office"));
+    let path = "O\u{fb03}ce/nixi/SOUL.md";
+    assert_eq!(
+        agent_write_check(root, &scope, &excludes, path, AgentTarget::New),
+        Err(WriteRefusal::AgentHome {
+            subpath: path.to_owned()
+        })
+    );
+
+    // A tracked file, gone from this disk, and a tracked folder.
+    write(root, "Office.md", "tracked\n");
+    write(root, "Waffles/a.md", "tracked\n");
+    write(root, "\u{fb03}.md", "tracked\n");
+    git(root, &["add", "Office.md", "Waffles/a.md", "\u{fb03}.md"]);
+    std::fs::remove_file(root.join("Office.md")).expect("rm");
+    assert_eq!(
+        check(root, "O\u{fb03}ce.md", AgentTarget::New),
+        Err(WriteRefusal::Exists {
+            subpath: "O\u{fb03}ce.md".to_owned()
+        })
+    );
+    assert_eq!(
+        check(root, "wa\u{fb04}es/b.md", AgentTarget::New),
+        Err(WriteRefusal::NameTaken {
+            name: "wa\u{fb04}es".to_owned()
+        })
+    );
+
+    // `ﬃ.md` is tracked, and `iff.md` is another file on APFS.
+    assert_eq!(
+        check(root, "iff.md", AgentTarget::New),
+        Ok("iff.md".to_owned())
+    );
+}
+
+/// R603-10: `.gitignore` is asked over the spelling this disk holds. The
+/// repository is configured as a Mac's clone is (`core.ignorecase`,
+/// `core.precomposeunicode`), each ignored folder is on the disk and not
+/// tracked, and every path below is that folder on APFS — `ſ` is `s`, an
+/// NFD `é` is the NFC one, `É` is `é`, `ss` is `ß`, the Kelvin sign is `k`.
+#[test]
+fn gitignore_is_asked_over_the_spelling_the_disk_holds() {
+    let dir = drive();
+    let root = dir.path();
+    git(root, &["config", "core.ignorecase", "true"]);
+    git(root, &["config", "core.precomposeunicode", "true"]);
+    write(
+        root,
+        ".gitignore",
+        "*.log\nSecrets/\nCaf\u{e9}/\nStra\u{df}e/\nkeys\n",
+    );
+    write(root, "Secrets/keys.md", "a person's own\n");
+    write(root, "Caf\u{e9}/a.md", "a person's own\n");
+    write(root, "Stra\u{df}e/a.md", "a person's own\n");
+    write(root, "keys", "a person's own\n");
+    for path in [
+        "Secrets/new.md",
+        "secrets/new.md",
+        "\u{17f}ecrets/new.md",
+        "Cafe\u{301}/new.md",
+        "CAF\u{c9}/new.md",
+        "STRASSE/new.md",
+        "strasse/new.md",
+        "\u{212a}eys/new.md",
+    ] {
+        assert_eq!(
+            check(root, path, AgentTarget::New),
+            Err(WriteRefusal::Ignored {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    // A name APFS keeps apart from the ignored folder is another folder.
+    assert_eq!(
+        check(root, "Secret/new.md", AgentTarget::New),
+        Ok("Secret/new.md".to_owned())
+    );
+}
+
+/// R603-10: the profile's own exclusions are asked over the spelling the
+/// drive holds — on this disk, and in the index where the disk no longer
+/// holds it. `private/` and `PRIVATE/` are the person's `Private/` on APFS; a
+/// Cyrillic `а` makes another name there too.
+#[test]
+fn exclusions_are_asked_over_the_spelling_the_drive_holds() {
+    let dir = drive();
+    let root = dir.path();
+    let excludes = ExcludeSet::new(&["Private/**".to_owned()]).expect("excludes");
+    let scope = WriteScope::new("tgdrive", None);
+    let ask = |path: &str, target| agent_write_check(root, &scope, &excludes, path, target);
+
+    write(root, "Private/a.md", "a person's own\n");
+    for path in ["Private/new.md", "private/new.md", "PRIVATE/new.md"] {
+        assert_eq!(
+            ask(path, AgentTarget::New),
+            Err(WriteRefusal::Ignored {
+                subpath: path.to_owned()
+            }),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        ask("Priv\u{430}te/new.md", AgentTarget::New),
+        Ok("Priv\u{430}te/new.md".to_owned())
+    );
+
+    // Tracked in two spellings a Linux checkout keeps apart and a Mac does
+    // not, the other one gone from this disk: on the Mac the file is in the
+    // excluded folder.
+    write(root, "Archive/a.md", "tracked\n");
+    write(root, "archive/b.md", "tracked\n");
+    git(root, &["add", "Archive/a.md", "archive/b.md"]);
+    std::fs::remove_dir_all(root.join("Archive")).expect("rm");
+    let excludes = ExcludeSet::new(&["Archive/**".to_owned()]).expect("excludes");
+    assert_eq!(
+        agent_write_check(
+            root,
+            &scope,
+            &excludes,
+            "archive/b.md",
+            AgentTarget::Existing
+        ),
+        Err(WriteRefusal::Ignored {
+            subpath: "archive/b.md".to_owned()
+        })
+    );
+}
+
 /// R603-5: an indexed blob that cannot be read may be a pointer, so whether
 /// the path is stored through LFS cannot be told: refused, never allowed.
 #[test]

@@ -724,6 +724,27 @@ impl Base {
             .map(|entry| entry.id.to_hex().to_string())
     }
 
+    /// The entry it holds where a folder of `path` would be, as it spells
+    /// it, its names compared as the Mac's volume compares them
+    /// ([`crate::names::same_entry_folded`]): on APFS `BLOCKED/child.txt` is
+    /// under the file `blocked`, and a tree holding both is one no Mac can
+    /// check out. `None` when every folder of `path` is free.
+    pub fn file_over(&self, path: &str) -> Option<String> {
+        use gix::bstr::ByteSlice;
+        let folders: Vec<&str> = path.split('/').collect();
+        let folders = &folders[..folders.len().saturating_sub(1)];
+        self.index.entries().iter().find_map(|entry| {
+            let key = entry.path(&self.index).to_str_lossy();
+            let names = key.split('/').count();
+            let over = names <= folders.len()
+                && key
+                    .split('/')
+                    .zip(folders)
+                    .all(|(name, folder)| crate::names::same_entry_folded(name, folder));
+            over.then(|| key.into_owned())
+        })
+    }
+
     /// What it holds at or under each of `prefixes`: [`head_files_under`]
     /// of this commit.
     pub fn files_under(

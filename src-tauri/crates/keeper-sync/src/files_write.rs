@@ -1076,7 +1076,10 @@ fn is_machinery(subpath: &str) -> bool {
 ///    this path ([`WriteRefusal::Missing`] otherwise, whatever this disk
 ///    holds there); [`AgentTarget::New`]: nothing tracked at it, under it, or
 ///    at a spelling the Mac would take for it ([`WriteRefusal::Exists`]);
-/// 6. not left out by `.gitignore` ([`WriteRefusal::Ignored`]);
+/// 6. not left out by `.gitignore` or the profile's exclusions, asked again
+///    over every spelling of the path the drive holds — on this disk and in
+///    the index, names compared as at 5 ([`spellings`]) — since neither
+///    rule folds a name as the Mac's volume does ([`WriteRefusal::Ignored`]);
 /// 7. on the disk, no link at or on the way to it ([`WriteRefusal::Link`]),
 ///    no file where a folder of the path should be; an existing target is a
 ///    regular file there, and a new one finds nothing there in any spelling;
@@ -1084,12 +1087,15 @@ fn is_machinery(subpath: &str) -> bool {
 ///    `filter=lfs` from `.gitattributes` ([`WriteRefusal::LfsRouted`]).
 ///
 /// **Only rules and tracked files decide a sentence before the disk is
-/// read.** An ignored path is refused as ignored, and an existing target the
+/// walked; the disk's names only add spellings for the rules.** An ignored
+/// path is refused as ignored, and an existing target the
 /// index does not track as [`WriteRefusal::Missing`], whether or not this
 /// disk holds a file there, so no refusal tells an agent what a person keeps
-/// beside the drive. The one answer that cannot be kept apart is a new path's
-/// [`WriteRefusal::Exists`] where an untracked file already is: allowing it
-/// would write over that file.
+/// beside the drive. Two answers cannot be kept apart: a new path's
+/// [`WriteRefusal::Exists`] where an untracked file already is (allowing it
+/// would write over that file), and [`WriteRefusal::Ignored`] for a path
+/// spelled otherwise than an ignored folder this disk holds (allowing it
+/// would write into that folder).
 ///
 /// Fails closed: an index, an indexed blob, an ignore rule or an attribute
 /// stack that cannot be read is [`WriteRefusal::Undecidable`], never a yes —
@@ -1184,16 +1190,29 @@ pub fn agent_write_check(
         }
     }
 
+    // The rules are asked over the path as the drive spells it, not only as
+    // the agent did: on the Mac `ſecrets/new.md` lands in the person's
+    // ignored `Secrets/`, and neither rule folds a name as APFS does.
+    let spellings = spellings(root, &wanted, &tracked.spelled)
+        .map_err(|error| undecidable(error.to_string()))?;
+    if spellings
+        .iter()
+        .any(|spelled| excludes.is_excluded(Path::new(spelled)))
+    {
+        return refused(|subpath| WriteRefusal::Ignored { subpath });
+    }
     let mode = entry.map_or(gix::index::entry::Mode::FILE, |entry| entry.mode);
     let mut ignores = repo
         .excludes(&index, None, Default::default())
         .map_err(|error| undecidable(error.to_string()))?;
-    let ignored = ignores
-        .at_path(Path::new(subpath), Some(mode))
-        .map_err(|error| undecidable(error.to_string()))?
-        .is_excluded();
-    if ignored {
-        return refused(|subpath| WriteRefusal::Ignored { subpath });
+    for spelled in &spellings {
+        let ignored = ignores
+            .at_path(Path::new(spelled), Some(mode))
+            .map_err(|error| undecidable(error.to_string()))?
+            .is_excluded();
+        if ignored {
+            return refused(|subpath| WriteRefusal::Ignored { subpath });
+        }
     }
 
     // The disk, one name at a time and following no link: what is at the
@@ -1314,6 +1333,10 @@ struct Tracked {
     beneath: bool,
     /// The first folder of the path that the index tracks spelled otherwise.
     folder_otherwise: Option<usize>,
+    /// The path as a tracked entry spells it where it spells any of the
+    /// path's names otherwise: the entry's own names as far as they match,
+    /// the path's after that.
+    spelled: std::collections::BTreeSet<String>,
 }
 
 impl Tracked {
@@ -1369,9 +1392,76 @@ impl Tracked {
                     }
                 }
             }
+            if otherwise.is_some() {
+                let spelled: Vec<&str> = path
+                    .split('/')
+                    .take(depth)
+                    .chain(wanted[depth..].iter().copied())
+                    .collect();
+                tracked.spelled.insert(spelled.join("/"));
+            }
         }
         tracked
     }
+}
+
+/// Every spelling of `wanted` the drive already holds, its names compared as
+/// the Mac's volume compares them ([`names::same_entry_folded`]), and the
+/// path as it was sent: what `.gitignore` and the profile's exclusions are
+/// asked over (R603-10). Neither rule folds a name as APFS does — gix's
+/// `core.ignorecase` is ASCII-only and an exclusion glob matches case — and
+/// on the Mac `ſecrets/new.md`, `Cafe\u{301}/new.md` and `private/new.md`
+/// land in the folders `Secrets/`, `Café/` and `Private/` hold. So each
+/// existing name is asked as it is spelled where it exists: on this disk,
+/// one folder at a time and following no link, and in the index (`tracked`,
+/// from [`Tracked::of`]). The names after the last that exists are the
+/// path's own; a new name's collision with a name beside it is the disk
+/// walk's question, not this one's.
+///
+/// Fails closed: a folder that cannot be listed is an error, never a
+/// spelling left out.
+fn spellings(
+    root: &Path,
+    wanted: &[&str],
+    tracked: &std::collections::BTreeSet<String>,
+) -> std::io::Result<std::collections::BTreeSet<String>> {
+    let mut spellings = tracked.clone();
+    spellings.insert(wanted.join("/"));
+    // The folders this disk holds for the path's first names, as it spells them.
+    let mut folders = vec![String::new()];
+    for (at, name) in wanted.iter().enumerate() {
+        let mut deeper = Vec::new();
+        for folder in &folders {
+            let entries = match std::fs::read_dir(root.join(folder)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                entries => entries?,
+            };
+            for entry in entries {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                // A name that is not UTF-8 is no spelling of a plain segment.
+                let Some(spelled) = file_name.to_str() else {
+                    continue;
+                };
+                if !names::same_entry_folded(spelled, name) {
+                    continue;
+                }
+                let prefix = if folder.is_empty() {
+                    spelled.to_owned()
+                } else {
+                    format!("{folder}/{spelled}")
+                };
+                let mut whole = vec![prefix.as_str()];
+                whole.extend_from_slice(&wanted[at + 1..]);
+                spellings.insert(whole.join("/"));
+                if at + 1 < wanted.len() && entry.file_type()?.is_dir() {
+                    deeper.push(prefix);
+                }
+            }
+        }
+        folders = deeper;
+    }
+    Ok(spellings)
 }
 
 // ─── AD-102: the second writer ───────────────────────────────────────────────

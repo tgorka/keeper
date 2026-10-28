@@ -182,9 +182,11 @@ pub fn is_lossy_rendering(text: &str) -> bool {
 /// (`CaseFolding.txt` C+F, never the Turkic T rows). Lowercasing is not it:
 /// APFS takes `.obſidian` (U+017F long s) for `.obsidian`, `ß` for `ss`, and
 /// `ς` for `Σ`, and lowercasing keeps every one of those apart. Measured on
-/// hesperia (macOS 27, APFS) over 51 pairs, and in agreement on every one —
-/// including where both say *different*: `ı`/`i`, `İ`/`i`, a fullwidth `Ａ`
-/// and `A`, a zero-width joiner, `①` and `1`. The table is
+/// hesperia (macOS 27, APFS) over every code point whose canonical caseless
+/// key differs from itself, 14,369 of them, and 114 pairs picked by hand, and
+/// in agreement on every one — including where both say *different*:
+/// `ı`/`i`, `İ`/`i`, a fullwidth `Ａ` and `A`, a zero-width joiner, `①` and
+/// `1`, `ﬃ` and `iff`. The tables are `tests/apfs_caseless_sweep.rs` and
 /// `the_comparison_answers_as_apfs_did_on_every_measured_pair` below. The
 /// whole name is folded; nothing is stripped or skipped.
 ///
@@ -204,14 +206,36 @@ pub fn same_entry_folded(a: &str, b: &str) -> bool {
 /// `NFD(full_case_fold(NFD(name)))`: the key two names APFS takes for one
 /// entry share. The second decomposition is not redundant — folding can
 /// leave a sequence that is not in NFD (`ΐ` folds to three characters).
+///
+/// The fold is `unicase`'s, but for [`UNICASE_OUT_OF_ORDER`], which is
+/// spelled out before it folds.
 fn caseless(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
-    let decomposed: String = name.nfd().collect();
+    let mut decomposed = String::with_capacity(name.len());
+    for c in name.nfd() {
+        match UNICASE_OUT_OF_ORDER.iter().find(|(from, _)| *from == c) {
+            Some((_, fold)) => decomposed.push_str(fold),
+            None => decomposed.push(c),
+        }
+    }
     unicase::UniCase::unicode(decomposed.as_str())
         .to_folded_case()
         .nfd()
         .collect()
 }
+
+/// The code points whose full case fold `unicase` 2.9.0 emits in the wrong
+/// order, with the fold `CaseFolding.txt` gives them (R603-09).
+///
+/// Its three-character fold (`Fold::Three`) yields its third character
+/// first, so `ﬃ` folds to `iff` and `ﬄ` to `lff`: APFS takes `oﬃce` for
+/// `Office` and keeps `ﬃ` and `iff` apart, and the plain fold said the
+/// opposite of both. After the first NFD these two are the only code points
+/// that reach a three-character fold — every Greek one decomposes first —
+/// and what replaces each is ASCII, which folds to itself. Exactly these two:
+/// `tests/apfs_caseless_sweep.rs` holds every code point whose fold differs,
+/// with the answer APFS gave on hesperia, and fails on any other.
+const UNICASE_OUT_OF_ORDER: [(char, &str); 2] = [('\u{fb03}', "ffi"), ('\u{fb04}', "ffl")];
 
 /// Byte-exact ASCII rendering: printable ASCII verbatim, `\xNN` for the rest.
 ///
