@@ -133,7 +133,7 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   // model and effort, the attach `+`, the context reading and Send. At 280 the
   // bar is 255px (the 1px border and the composer's 12px padding each side),
   // so the bar folds its controls as its row runs short (`useBarFold`): the
-  // context to its ring, Send and Reset to icons, the effort to its level's
+  // context to its ring, Send to an icon, the effort to its level's
   // short code, and only then the model's name (R601-01, docs/agents.md). Raising this
   // floor instead would need saying so (AD-260).
   "notes-agent": { label: "assistant", title: "Assistant", defaultWidth: 360, minWidth: 280 },
