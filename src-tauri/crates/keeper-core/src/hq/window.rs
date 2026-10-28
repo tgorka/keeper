@@ -318,6 +318,15 @@ impl Hq {
         let refusals = self.refusals();
         let mut view = view_now(&source, &key.session_id, &opened, &refusals, now_ms)
             .map_err(HqError::Sentence)?;
+        // Said under a message sent again without the note (§ 9.1a).
+        if let Ok(data_dir) = self.data_dir() {
+            let withheld = send::withheld(&crate::hq::databases::root(&data_dir), &key.database);
+            for message in &mut view.messages {
+                if let Some(drive) = withheld.get(&message.id) {
+                    message.note = Some(send::withheld_sentence(drive));
+                }
+            }
+        }
         if let Some(session) = timeline::session_row(&source, &key.session_id) {
             view.drives = drives::view(&source, &key.session_id, &session, &self.sources());
         }
@@ -575,6 +584,22 @@ impl Hq {
         }
         self.touch();
         Ok(())
+    }
+
+    /// The messages of `database` the server refused for their focus's
+    /// audience, written again without it (contract § 9.1a,
+    /// [`send::resend_without_focus`]).
+    pub(crate) fn resend_withheld(&self, database: &str) {
+        let (Ok(source), Ok(data_dir)) = (self.source(database), self.data_dir()) else {
+            return;
+        };
+        match send::resend_without_focus(&source, &crate::hq::databases::root(&data_dir)) {
+            Ok(0) => {}
+            Ok(_) => self.touch(),
+            Err(error) => {
+                tracing::warn!(%database, %error, "a message refused for its note could not be sent again")
+            }
+        }
     }
 
     /// Write a person's message into a session; it declines the requests its

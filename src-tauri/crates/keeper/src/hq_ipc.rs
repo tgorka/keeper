@@ -820,6 +820,17 @@ pub async fn agent_session_default() -> Result<Option<AgentDefaultSessionVm>, Ip
     blocking(|hq| hq.default_session()).await
 }
 
+/// The dock showed the warning of the tick [`agent_session_for_note`]
+/// reported (R-HQ-79): it is no longer news (R605-05).
+#[tauri::command]
+pub async fn agent_note_tick_seen(
+    database: String,
+    session_id: String,
+    drive: String,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.note_tick_seen(&session(database, session_id), &drive)).await
+}
+
 /// The drive of the note `note_id` of the vault `vault_id` ([`note_drive`]),
 /// or `None` when its folder declares none. Reads only: the Notes Assistant
 /// asks it first, so a note on the drive it already follows changes nothing

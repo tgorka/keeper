@@ -24,4 +24,9 @@ details?: AgentMessageDetailsVm,
 /**
  * The files attached to it, in the order they were attached.
  */
-attachments?: Array<AgentAttachmentVm>, };
+attachments?: Array<AgentAttachmentVm>, 
+/**
+ * A quiet line keeper says under this device's message: the note the
+ * person was in was not sent with it (contract § 9.1a).
+ */
+note?: string, };

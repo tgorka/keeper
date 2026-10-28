@@ -1521,11 +1521,15 @@ async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens(
 /// Opens every replica as a real local syncular replica (no server), so a
 /// write goes through syncular's own column codec.
 #[derive(Default)]
-struct LocalOpener(Mutex<HashMap<String, Arc<dyn Replica>>>);
+struct LocalOpener(
+    Mutex<HashMap<String, Arc<dyn Replica>>>,
+    Mutex<HashMap<String, std::path::PathBuf>>,
+);
 
 impl Opener for LocalOpener {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
         let database = spec.database.clone();
+        lock(&self.1).insert(database.clone(), spec.path.clone());
         let replica: Arc<dyn Replica> =
             Arc::new(crate::hq::syncular::SyncularReplica::open(ReplicaSpec {
                 link: None,
@@ -1539,6 +1543,10 @@ impl Opener for LocalOpener {
 impl LocalOpener {
     fn replica(&self, database: &str) -> Arc<dyn Replica> {
         lock(&self.0).get(database).cloned().expect("opened")
+    }
+
+    fn path(&self, database: &str) -> std::path::PathBuf {
+        lock(&self.1).get(database).cloned().expect("opened")
     }
 }
 
@@ -1810,6 +1818,30 @@ async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
         [(session.clone(), r#"["tgdrive"]"#.to_owned())]
     );
 
+    // Nobody saw that answer (the dock closed, its untick failed): the tick
+    // is still news, warning and all, and nothing is ticked twice (R605-05).
+    let unseen = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(unseen.target.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(
+        (unseen.ticked_now, unseen.warning.as_deref()),
+        (true, Some(drives::WARNING))
+    );
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(session.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+    // Shown: from then on it is a drive ticked before.
+    hq.note_tick_seen(
+        &sessions::AgentSessionRef {
+            database: "tgdrive".to_owned(),
+            session_id: session.clone(),
+        },
+        "tgdrive",
+    )
+    .expect("seen");
     let again = hq
         .session_for_note(Some("tgdrive"), None)
         .expect("answers")
@@ -2066,4 +2098,138 @@ async fn a_note_s_focus_never_reaches_a_wider_audience_than_its_drive() {
         metadata_of(&opener, "solo", "neuradrive's note to solo"),
         Value::Null
     );
+}
+
+/// Record, as a round would, the server refusing commit `commit` with
+/// `code`; it wrote `ops` (`table`, `op`, values).
+fn journal_refused(path: &std::path::Path, commit: &str, code: &str, ops: &[(&str, &str, Value)]) {
+    use syncular_client::api::{CommitOperation, CommitOperationOutcome, RejectionRecord};
+    let operations: Vec<CommitOperation> = ops
+        .iter()
+        .map(|(table, op, values)| CommitOperation {
+            table: (*table).to_owned(),
+            row_id: values["id"].as_str().unwrap_or_default().to_owned(),
+            op: (*op).to_owned(),
+            base_version: None,
+            values: values.as_object().cloned(),
+        })
+        .collect();
+    let results = vec![CommitOperationOutcome::Error {
+        rejection: RejectionRecord {
+            client_commit_id: commit.to_owned(),
+            op_index: 0,
+            code: code.to_owned(),
+            message: code.to_owned(),
+            retryable: false,
+            details: None,
+            operation: None,
+        },
+    }];
+    let conn = rusqlite::Connection::open(path).expect("opens");
+    conn.busy_timeout(Duration::from_secs(5)).expect("timeout");
+    conn.execute(
+        "INSERT INTO _syncular_commit_outcomes(client_commit_id, status, recorded_at_ms, \
+         results_json, operations_json) VALUES (?1, 'rejected', 1, ?2, ?3)",
+        rusqlite::params![
+            commit,
+            serde_json::to_string(&results).expect("results"),
+            serde_json::to_string(&operations).expect("operations")
+        ],
+    )
+    .expect("records");
+}
+
+/// Contract § 9.1a (R605-04): the server, not this device, decides who may
+/// read a note's focus. A message it refuses for that (`hq.focus.audience`)
+/// is written again once, the same message without the focus — never
+/// dropped — and the person reads why under it. Another refusal is left as
+/// it stands, and a second pass writes nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["beta"]).await;
+    let key = hq
+        .new_session("beta", "nixie", "hello", None, None)
+        .expect("a chat");
+    let source = hq.source("beta").expect("beta");
+    let at = sessions::now_ms();
+    let focused = |id: &str, body: &str| match sessions::person_message(
+        &source,
+        &key.session_id,
+        id,
+        body,
+        Some(inbox_focus("tgdrive").metadata()),
+        at,
+    ) {
+        RowOp::Upsert { values, .. } => Value::Object(values),
+        _ => unreachable!("a message is an upsert"),
+    };
+    let activity = serde_json::json!({"id": key.session_id, "last_activity_ms": at,
+        "author_actor": "ana", "author_client": "ana.1"});
+    let path = opener.path("beta");
+    journal_refused(
+        &path,
+        "c-focus",
+        "hq.focus.audience",
+        &[
+            (
+                "messages",
+                "upsert",
+                focused("m-focus", "what is this note?"),
+            ),
+            // A patch is journaled as an upsert of the values it wrote.
+            ("sessions", "upsert", activity.clone()),
+        ],
+    );
+    journal_refused(
+        &path,
+        "c-other",
+        "hq.v5.page",
+        &[(
+            "messages",
+            "upsert",
+            focused("m-other", "refused otherwise"),
+        )],
+    );
+
+    hq.resend_withheld("beta");
+    hq.resend_withheld("beta");
+
+    let stored = rows(
+        &opener.replica("beta"),
+        "SELECT id, body, metadata FROM messages WHERE id IN ('m-focus', 'm-other')",
+    );
+    assert_eq!(
+        stored.len(),
+        1,
+        "once, and only the focus refusal: {stored:?}"
+    );
+    assert_eq!(stored[0]["body"], Value::from("what is this note?"));
+    assert_eq!(
+        metadata_of(&opener, "beta", "what is this note?"),
+        Value::Null
+    );
+    let refused: Vec<String> = source
+        .replica
+        .refused_commits("messages")
+        .expect("reads")
+        .into_iter()
+        .map(|commit| commit.commit_id)
+        .collect();
+    assert_eq!(refused, ["c-other"], "the focus refusal is set aside");
+
+    let view = hq.session_view(&key).expect("a view");
+    let said: Vec<(&str, Option<&str>)> = view
+        .messages
+        .iter()
+        .map(|message| (message.body.as_str(), message.note.as_deref()))
+        .collect();
+    assert!(
+        said.contains(&(
+            "what is this note?",
+            Some("This chat's readers can't all read tgdrive, so the note you're in wasn't sent.")
+        )),
+        "{said:?}"
+    );
+    assert!(said.contains(&("hello", None)), "{said:?}");
 }

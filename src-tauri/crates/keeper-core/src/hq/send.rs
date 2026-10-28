@@ -13,9 +13,21 @@
 //! the person is looking at (109.28, R-HQ-86): `metadata.focus`
 //! ([`AgentFocus`]). It has no `kind`, so it is an ordinary message that
 //! starts a turn; the runtime turns it into one line of that turn.
+//!
+//! keeper attaches it only where it judges the chat's readers all read the
+//! note's drive ([`AgentFocus::for_destination`]), but the server is the
+//! boundary (contract § 9.1a): it refuses a message whose focus drive the
+//! chat's readers may not all read, `hq.focus.audience`. keeper then writes
+//! the same message again once, without the focus, and says so under it
+//! ([`resend_without_focus`], [`withheld_sentence`]). The message is never
+//! dropped.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use ts_rs::TS;
 
 use crate::hq::approvals::{self, Decisions, ShownApprovalVm};
@@ -174,6 +186,136 @@ pub(crate) fn activity(source: &Source, session_id: &str, at: i64) -> RowOp {
         ),
         base_version: None,
     }
+}
+
+/// The server's code for a message whose focus drive the chat's readers may
+/// not all read (contract § 9.1a).
+pub const FOCUS_AUDIENCE: &str = "hq.focus.audience";
+
+/// What keeper says under a message it sent again without the note in
+/// front of the person (contract § 9.1a, binding).
+pub fn withheld_sentence(drive: &str) -> String {
+    format!("This chat's readers can't all read {drive}, so the note you're in wasn't sent.")
+}
+
+/// The messages written again without their focus, by database and message
+/// id, each with the focus's drive — what [`withheld_sentence`] names. Kept
+/// on this device beside the replicas: the drive's name is never written
+/// into the chat, and the refusal itself is set aside by the resend.
+fn withheld_path(root: &Path) -> PathBuf {
+    root.join("focus-withheld.json")
+}
+
+fn withheld_key(database: &str, message: &str) -> String {
+    format!("{database}\n{message}")
+}
+
+/// The drive a message of `database` was sent again without, for each such
+/// message id.
+pub(crate) fn withheld(root: &Path, database: &str) -> HashMap<String, String> {
+    let all: HashMap<String, String> = std::fs::read_to_string(withheld_path(root))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let prefix = withheld_key(database, "");
+    all.into_iter()
+        .filter_map(|(key, drive)| Some((key.strip_prefix(&prefix)?.to_owned(), drive)))
+        .collect()
+}
+
+fn record_withheld(root: &Path, database: &str, message: &str, drive: &str) {
+    let path = withheld_path(root);
+    let mut all: HashMap<String, String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    all.insert(withheld_key(database, message), drive.to_owned());
+    let written = serde_json::to_string(&all)
+        .map_err(std::io::Error::other)
+        .and_then(|raw| std::fs::write(&path, raw));
+    if let Err(error) = written {
+        tracing::warn!(%error, "the note withheld from a message could not be kept");
+    }
+}
+
+/// Held from reading the refusals to setting them aside, so two passes over
+/// one refusal never write its message twice.
+static RESENDING: Mutex<()> = Mutex::new(());
+
+/// The focus drive of a message row's `metadata`, however the journal kept
+/// it (JSON text or JSON).
+fn focus_drive(values: &Map<String, Value>) -> Option<String> {
+    let metadata = match values.get("metadata")? {
+        Value::String(raw) => serde_json::from_str::<Value>(raw).ok()?,
+        other => other.clone(),
+    };
+    metadata
+        .get("focus")?
+        .get("drive")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Every commit written here that the server refused for its focus's
+/// audience (`hq.focus.audience`), written once more as the same rows — the
+/// same message id, body and files — with the focus taken out, in a new
+/// commit that sets the refusal aside, and the drive kept under `root` for
+/// [`withheld_sentence`]. A row that carries no focus is never written again
+/// for this code, so nothing loops. The messages written again.
+pub fn resend_without_focus(source: &Source, root: &Path) -> Result<usize, ReplicaError> {
+    let _held = RESENDING.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut resent = 0;
+    for commit in source.replica.refused_commits("messages")? {
+        if commit.rejection.code != FOCUS_AUDIENCE {
+            continue;
+        }
+        let Some((message, drive)) = commit.rows.iter().find_map(|(table, values)| {
+            (table == "messages")
+                .then(|| focus_drive(values).map(|drive| (values, drive)))
+                .flatten()
+        }) else {
+            continue;
+        };
+        let message_id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let ops = commit
+            .rows
+            .iter()
+            .map(|(table, values)| {
+                let mut values = values.clone();
+                if table == "messages" {
+                    values.insert("metadata".to_owned(), Value::Null);
+                }
+                // A session row without its agent is the activity patch a
+                // send writes; with it, the row a creation inserts.
+                if table == "sessions" && !values.contains_key("agent_actor") {
+                    RowOp::Patch {
+                        table: table.clone(),
+                        values,
+                        base_version: None,
+                    }
+                } else {
+                    RowOp::Upsert {
+                        table: table.clone(),
+                        values,
+                        base_version: None,
+                    }
+                }
+            })
+            .collect();
+        source
+            .replica
+            .mutate_superseding(ops, vec![commit.commit_id.clone()])?;
+        record_withheld(root, &source.database, &message_id, &drive);
+        resent += 1;
+    }
+    if resent > 0 {
+        source.replica.sync_now();
+    }
+    Ok(resent)
 }
 
 #[cfg(test)]

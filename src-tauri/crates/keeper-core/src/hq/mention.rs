@@ -602,6 +602,7 @@ fn refused_line(source: &Source, values: &Map<String, Value>, author: &str) -> A
         ask: None,
         details: None,
         attachments: Vec::new(),
+        note: None,
     }
 }
 

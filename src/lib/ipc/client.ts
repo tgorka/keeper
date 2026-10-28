@@ -4396,6 +4396,14 @@ export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | nul
 }
 
 /**
+ * The dock showed the warning of the tick {@link agentSessionForNote} reported (R-HQ-79): Rust no
+ * longer answers it as news. Until this is said, every answer for that chat says it again (R605-05).
+ */
+export async function agentNoteTickSeen(target: AgentSessionRef, drive: string): Promise<void> {
+  await invoke<void>("agent_note_tick_seen", { ...target, drive });
+}
+
+/**
  * The drive of the note `noteId` of `vaultId`, or `null` when its folder declares none. Reads only:
  * the Notes Assistant asks it before {@link agentSessionForNote}, so a note on the drive it already
  * follows opens, starts and ticks nothing (R605-02).

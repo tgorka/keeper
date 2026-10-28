@@ -8210,16 +8210,28 @@ function mockNoteDrive(vaultId: unknown): string | null {
  * into the database named after its drive, whose readers are the drive's; every other database
  * here has a reader the drive does not. Logged as the `metadata` Rust would write, so a browser
  * check reads what reaches the conversation, not only what the dock handed over.
+ *
+ * `?focus=refused` (§ 9.1a): the server refuses that focus anyway (`hq.focus.audience`), as it
+ * would for a reader this device still counts but who left the drive; keeper sends the message
+ * again without it. The quiet line Rust then says under the message is the answer.
  */
-function mockFocusWritten(payload: Record<string, unknown>): void {
+const focusScenario = new URLSearchParams(location.search).get("focus");
+function mockFocusWritten(payload: Record<string, unknown>): string | undefined {
   const caret = payload.focus as { vaultId: string; line: number } | null | undefined;
   const drive = caret ? mockNoteDrive(caret.vaultId) : null;
   const written =
     caret && drive !== null && drive === payload.database
       ? { focus: { drive, path: "10-notes/inbox.md", heading: null, line: caret.line } }
       : null;
+  if (written && focusScenario === "refused") {
+    console.debug("[mock-shell] refused hq.focus.audience; sent again →", payload.database, null);
+    return `This chat's readers can't all read ${drive}, so the note you're in wasn't sent.`;
+  }
   console.debug("[mock-shell] metadata", payload.database, "→", written);
+  return undefined;
 }
+/** The dock's ticks whose warning nobody has seen yet (keeper-core's `unseen_ticks`, R605-05). */
+const mockUnseenTicks = new Set<string>();
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
   if (!vm) return hqRefuse("This session is not on this device.");
@@ -8673,10 +8685,11 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   agent_send: (payload) => {
     if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
     const vm = mockSession(payload);
-    mockFocusWritten(payload);
+    const note = mockFocusWritten(payload);
     mockDecline(vm, payload.declines);
     for (const message of vm.messages) if (message.ask) message.ask.open = false;
     const message = {
+      ...(note ? { note } : {}),
       id: `local-${++sessionSerial}`,
       role: "person" as const,
       authorActor: "ana",
@@ -8883,10 +8896,16 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         tickedNow: false,
         reason: `${main.agentName} does not offer ${drive}.`,
       };
-    if (tick.ticked) return { target, drive, tickedNow: false };
+    const key = JSON.stringify([drive, row.sessionId]);
+    if (tick.ticked && !mockUnseenTicks.has(key)) return { target, drive, tickedNow: false };
     tick.ticked = true;
+    mockUnseenTicks.add(key);
     publishSessions();
     return { target, drive, tickedNow: true, warning: DRIVES_WARNING };
+  },
+  agent_note_tick_seen: (payload) => {
+    mockUnseenTicks.delete(JSON.stringify([payload.database, payload.sessionId]));
+    return null;
   },
   agent_session_new: (payload) => {
     if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");

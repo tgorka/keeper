@@ -221,7 +221,10 @@ pub struct AgentNoteSessionVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub drive: Option<String>,
-    /// This call ticked `drive` for the session's agent to read.
+    /// `drive` is ticked for the session's agent to read, and the person has
+    /// not been shown it yet: this call ticked it, or an earlier one whose
+    /// warning no one saw did (R605-05). The dock says so and then reports it
+    /// seen (`agent_note_tick_seen`).
     pub ticked_now: bool,
     /// What ticking a drive allows (`drives::WARNING`, R-HQ-79): present
     /// exactly when `ticked_now`, so it is said where the drive was ticked.

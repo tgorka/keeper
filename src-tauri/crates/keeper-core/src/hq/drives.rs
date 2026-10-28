@@ -877,17 +877,67 @@ impl Hq {
         };
         let ticked = tick_for_note(&source, &session_id, drive, &sources, now);
         self.touch();
+        let root = crate::hq::databases::root(&data_dir);
+        let tick = (drive, session_id.as_str(), drive);
         Ok(Some(match ticked {
-            Ok(ticked_now) => AgentNoteSessionVm {
-                target,
-                drive: Some(drive.to_owned()),
-                ticked_now,
-                warning: ticked_now.then(|| WARNING.to_owned()),
-                reason: None,
-            },
+            Ok(ticked_now) => {
+                if ticked_now {
+                    unseen_ticks(&root, |unseen| unseen.insert(tick_key(tick)));
+                }
+                // A tick the dock made and never showed is still news: it is
+                // said now, whether it was made by this call or by one whose
+                // answer nobody saw and whose untick failed (R605-05).
+                let news =
+                    ticked_now || unseen_ticks(&root, |unseen| unseen.contains(&tick_key(tick)));
+                AgentNoteSessionVm {
+                    target,
+                    drive: Some(drive.to_owned()),
+                    ticked_now: news,
+                    warning: news.then(|| WARNING.to_owned()),
+                    reason: None,
+                }
+            }
             Err(DriveRefused(reason)) => unticked(target, Some(drive), reason),
         }))
     }
+
+    /// The dock showed the warning of `drive`'s tick in `key` (R-HQ-79): the
+    /// tick is no longer news ([`Hq::session_for_note`] answers it as ticked
+    /// before). Until this is said, every answer for the chat says it again.
+    pub fn note_tick_seen(&self, key: &AgentSessionRef, drive: &str) -> Result<(), HqError> {
+        let root = crate::hq::databases::root(&self.data_dir()?);
+        unseen_ticks(&root, |unseen| {
+            unseen.remove(&tick_key((&key.database, &key.session_id, drive)))
+        });
+        Ok(())
+    }
+}
+
+/// The dock's ticks whose warning no one has seen yet, kept beside the
+/// replicas as `database\nsession\ndrive`: a tick whose answer was dropped
+/// (the dock closed, the person moved on) and whose untick failed is said on
+/// the next open, never passed off as one the person ticked before (R605-05).
+fn unseen_ticks<T>(root: &std::path::Path, change: impl FnOnce(&mut BTreeSet<String>) -> T) -> T {
+    let path = root.join("note-ticks-unseen.json");
+    let mut unseen: BTreeSet<String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let before = unseen.clone();
+    let answer = change(&mut unseen);
+    if unseen != before {
+        let written = serde_json::to_string(&unseen)
+            .map_err(std::io::Error::other)
+            .and_then(|raw| std::fs::write(&path, raw));
+        if let Err(error) = written {
+            tracing::warn!(%error, "a drive tick not yet shown could not be kept");
+        }
+    }
+    answer
+}
+
+fn tick_key((database, session, drive): (&str, &str, &str)) -> String {
+    format!("{database}\n{session}\n{drive}")
 }
 
 #[cfg(test)]

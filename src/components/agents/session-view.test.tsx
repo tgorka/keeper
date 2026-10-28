@@ -156,6 +156,29 @@ beforeEach(() => {
   mock.command.mockReset().mockResolvedValue({ session: null, surface: "context", message: "" });
 });
 
+it("says Rust's quiet line under a message sent again without the note (109.28 § 9.1a)", async () => {
+  const note = "This chat's readers can't all read tgdrive, so the note you're in wasn't sent.";
+  await draw({
+    ...vm,
+    items: [{ kind: "message", messageId: "m1" }],
+    messages: [
+      {
+        id: "m1",
+        role: "person",
+        authorActor: "ana",
+        authorName: "Ana",
+        body: "what is this note?",
+        createdAtMs: 1780000000000,
+        state: "sent",
+        note,
+      },
+    ],
+  });
+  const message = screen.getByText("what is this note?").closest("li");
+  expect(message).not.toBeNull();
+  expect(within(message as HTMLElement).getByText(note)).toBeInTheDocument();
+});
+
 describe("session context details", () => {
   const context: AgentSessionViewVm["context"] = {
     used: 48000,

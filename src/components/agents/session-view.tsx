@@ -432,6 +432,10 @@ export function SessionView({
           <PersonLine body={message.body} mine={message.mine} />
         )}
         {!!message.attachments?.length && <SessionAttachments attachments={message.attachments} />}
+        {message.note && (
+          // Rust's quiet line under this device's message (109.28 § 9.1a).
+          <p className="mt-1 text-muted-foreground text-xs">{message.note}</p>
+        )}
         {message.details && <SessionAnswerDetails details={message.details} />}
         {message.ask && (
           <fieldset className="mt-2 flex min-w-0 flex-wrap gap-2" aria-label="Question options">

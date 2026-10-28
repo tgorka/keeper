@@ -26,6 +26,7 @@ const mock = vi.hoisted(() => ({
   forNote: vi.fn(),
   drive: vi.fn(),
   driveSet: vi.fn(),
+  seen: vi.fn(),
   create: vi.fn(),
   send: vi.fn(),
 }));
@@ -45,6 +46,7 @@ vi.mock("@/lib/ipc/client", async (original) => ({
   agentSessionForNote: mock.forNote,
   agentNoteDrive: mock.drive,
   agentSessionDriveSet: mock.driveSet,
+  agentNoteTickSeen: mock.seen,
   agentSessionNew: mock.create,
   agentsChoices: vi.fn().mockResolvedValue([
     {
@@ -176,6 +178,7 @@ beforeEach(() => {
   mock.forNote.mockReset();
   mock.drive.mockReset().mockImplementation(async (vaultId: string) => DRIVES[vaultId] ?? null);
   mock.driveSet.mockReset().mockResolvedValue(undefined);
+  mock.seen.mockReset().mockResolvedValue(undefined);
   mock.create.mockReset().mockResolvedValue({ database: "tgdrive", sessionId: "tg.2" });
   resetPanelsStoreForTest();
   resetNoteCaretForTest();
@@ -199,6 +202,10 @@ it("opens the chat on the note's drive, says what ticking it allows, and sends t
   const notice = await screen.findByRole("note", { name: DRIVE_NOTICE_LABEL });
   expect(notice).toHaveTextContent("tgdrive is ticked for Assistant to read.");
   expect(notice).toHaveTextContent(WARNING);
+  // Shown, so Rust no longer answers it as news (R605-05).
+  await waitFor(() =>
+    expect(mock.seen).toHaveBeenCalledWith({ database: "tgdrive", sessionId: "tg.1" }, "tgdrive"),
+  );
   // Straight to the drive's chat: the agent's main conversation elsewhere never opens here.
   await waitFor(() => expect(opened()).toEqual([{ database: "tgdrive", sessionId: "tg.1" }]));
   showNewest();
@@ -319,4 +326,89 @@ it("sends the note with the first message of a conversation started in the dock"
       text: "# Plans\n## Q3",
     }),
   );
+});
+
+/** `agentSessionForNote`'s next answer, held until the test gives it. */
+function held(): (vm: AgentNoteSessionVm) => Promise<void> {
+  let answer: (vm: AgentNoteSessionVm) => void = () => {};
+  mock.forNote.mockImplementationOnce(
+    () =>
+      new Promise<AgentNoteSessionVm>((resolve) => {
+        answer = resolve;
+      }),
+  );
+  return async (vm) => {
+    await act(async () => answer(vm));
+  };
+}
+
+it("drops an answer for a note the person left for a file, and takes its tick back (R605-06)", async () => {
+  const answer = held();
+  openNote("v1", "inbox");
+  draw();
+  await waitFor(() => expect(mock.forNote).toHaveBeenCalledTimes(1));
+  act(() =>
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "a.txt" }),
+  );
+  await answer(onDrive("tgdrive", "tg.1", true));
+
+  await waitFor(() =>
+    expect(mock.driveSet).toHaveBeenCalledWith(
+      { database: "tgdrive", sessionId: "tg.1" },
+      "tgdrive",
+      false,
+    ),
+  );
+  await waitFor(() => expect(opened()).toEqual([{ database: "alpha", sessionId: "main.1" }]));
+  expect(mock.seen).not.toHaveBeenCalled();
+  expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
+});
+
+it("drops an answer while the next note's drive is still being read (R605-06)", async () => {
+  const answer = held();
+  openNote("v1", "inbox");
+  draw();
+  await waitFor(() => expect(mock.forNote).toHaveBeenCalledTimes(1));
+  let lookup: (drive: string | null) => void = () => {};
+  mock.drive.mockImplementationOnce(
+    () =>
+      new Promise<string | null>((resolve) => {
+        lookup = resolve;
+      }),
+  );
+  openNote("v3", "lab");
+  await waitFor(() => expect(mock.drive).toHaveBeenLastCalledWith("v3", "lab"));
+  await answer(onDrive("tgdrive", "tg.1", true));
+  await waitFor(() => expect(mock.driveSet).toHaveBeenCalledTimes(1));
+  expect(opened()).toEqual([]);
+
+  mock.forNote.mockResolvedValueOnce(onDrive("neuradrive", "nd.1", true));
+  await act(async () => lookup("neuradrive"));
+  await waitFor(() => expect(opened()).toEqual([{ database: "neuradrive", sessionId: "nd.1" }]));
+  expect(mock.seen).toHaveBeenCalledWith(
+    { database: "neuradrive", sessionId: "nd.1" },
+    "neuradrive",
+  );
+});
+
+it("never reports a tick seen that nobody saw, when the dock closed and the untick failed (R605-05)", async () => {
+  const answer = held();
+  mock.driveSet.mockRejectedValueOnce({ message: "The replica could not be written." });
+  openNote("v1", "inbox");
+  const { unmount } = render(
+    <TooltipProvider>
+      <DockBody />
+    </TooltipProvider>,
+  );
+  await waitFor(() => expect(mock.forNote).toHaveBeenCalledTimes(1));
+  unmount();
+  await answer(onDrive("tgdrive", "tg.1", true));
+
+  await waitFor(() => expect(mock.driveSet).toHaveBeenCalledTimes(1));
+  await act(async () => {});
+  // The tick stays news in Rust: the next open says it, warning and all.
+  expect(mock.seen).not.toHaveBeenCalled();
+  expect(opened()).toEqual([]);
 });

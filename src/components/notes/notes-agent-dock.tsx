@@ -17,6 +17,7 @@ import {
   type AgentNoteSessionVm,
   type AgentSessionRef,
   agentNoteDrive,
+  agentNoteTickSeen,
   agentSessionDefault,
   agentSessionDriveSet,
   agentSessionForNote,
@@ -81,7 +82,8 @@ export function NotesAgentDock() {
  * Opening and ticking are writes, so the dock decides which drive it follows before it asks for
  * any (R605-02): it first reads the note's drive, and a note on the drive it already follows asks
  * for nothing. The writing call runs one at a time; one answered after the person moved to another
- * drive, or closed the dock, is not shown, and a tick it made is taken back.
+ * drive, left the note, or closed the dock, is not shown, and a tick it made is taken back; a tick
+ * whose warning was shown is reported seen, and one never shown stays news in Rust until it is.
  */
 export function DockBody() {
   useAgentSessionsSubscription();
@@ -141,10 +143,12 @@ export function DockBody() {
             lastAgentPick(main.agentActor),
           );
           if (vm === null) return;
+          const { database, sessionId } = vm.target;
           if (gone.current || wanted.current?.drive !== want.drive) {
-            // Nobody sees this chat: a tick made for it is taken back, and the loop goes on to
-            // the drive now in front.
-            const { database, sessionId } = vm.target;
+            // Nobody sees this chat (the dock closed, the person left the note or its drive): a
+            // tick made for it is taken back, and the loop goes on to what is in front now. Should
+            // the untick fail, Rust still holds the tick as unseen and says it, warning and all,
+            // the next time the dock opens that chat (R605-05).
             if (vm.tickedNow && vm.drive && database && sessionId)
               await agentSessionDriveSet({ database, sessionId }, vm.drive, false).catch(
                 logFailure("agents.note.untick"),
@@ -155,6 +159,11 @@ export function DockBody() {
           setAgent(vm.target);
           show(vm.target);
           setNotice(vm.warning || vm.reason ? vm : null);
+          // Shown: the tick is no longer news (R-HQ-79 said where it was made).
+          if (vm.tickedNow && vm.warning && vm.drive && database && sessionId)
+            void agentNoteTickSeen({ database, sessionId }, vm.drive).catch(
+              logFailure("agents.note.seen"),
+            );
         }
       } finally {
         working.current = false;
@@ -165,6 +174,8 @@ export function DockBody() {
   useEffect(() => {
     let active = true;
     const note = noteId.current;
+    // The note in front changed: until its drive is read, no earlier answer is wanted (R605-06).
+    wanted.current = null;
     void (async () => {
       try {
         const main = await agentSessionDefault();

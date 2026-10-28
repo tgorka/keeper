@@ -18,7 +18,10 @@ target: AgentDefaultSessionVm,
  */
 drive?: string, 
 /**
- * This call ticked `drive` for the session's agent to read.
+ * `drive` is ticked for the session's agent to read, and the person has
+ * not been shown it yet: this call ticked it, or an earlier one whose
+ * warning no one saw did (R605-05). The dock says so and then reports it
+ * seen (`agent_note_tick_seen`).
  */
 tickedNow: boolean, 
 /**
