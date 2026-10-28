@@ -500,15 +500,11 @@ pub trait DriveWrites: Send + Sync {
     /// Commit `commit` into `drive`'s checkout as one authored commit
     /// (`Engine::commit_paths`); an error is its sentence.
     fn commit(&self, drive: &str, commit: DriveCommit) -> Result<DriveCommitted, String>;
-    /// The commit on `drive`'s branch, made at or after `since_secs`, that
-    /// carries out `approval` (its `Approval-Record` trailer), once the
-    /// folder's authored-commit record is settled; an error is its sentence.
-    fn carried(
-        &self,
-        drive: &str,
-        approval: &str,
-        since_secs: i64,
-    ) -> Result<Option<String>, String>;
+    /// The commit on `drive`'s branch that carries out `approval` (its
+    /// `Approval-Record` trailer), the whole history walked by the commit
+    /// graph, once the folder's authored-commit record is settled; an error
+    /// is its sentence.
+    fn carried(&self, drive: &str, approval: &str) -> Result<Option<String>, String>;
 }
 
 /// A replica held in memory, with a state the test sets.

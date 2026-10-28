@@ -9,6 +9,7 @@
 //! closed, agents fenced, the profile's own exclusions — and committed only
 //! by `Engine::commit_paths` over the keys it answered (AD-65, AD-159).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use keeper_core::agents::drive_write::Refusal;
@@ -20,6 +21,7 @@ use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::files_write::{
     agent_write_check, AgentTarget, WriteRefusal, WriteRoute, WriteScope,
 };
+use keeper_sync::lfs::stage::LfsPolicy;
 use keeper_sync::volume::{self, VolumeStatus};
 use keeper_sync::{MemoryTrailer, SyncProfile};
 
@@ -55,6 +57,54 @@ impl ShellDriveWrites {
             keeper_agent::surface::declared(profile).is_ok_and(|decl| decl.id == drive)
         })?;
         Some((engine, profile))
+    }
+
+    /// keeper-sync's path rule once more over every path `commit` changes,
+    /// right before `commit_paths` (review-603 item 6): a `.gitattributes`
+    /// that began routing a path through LFS since the card was drawn, or
+    /// a link, an ignore or a fence that appeared, refuses the write. And
+    /// what `commit_paths` itself would route by size — the profile's LFS
+    /// threshold over the post-image — is refused too: no agent write ever
+    /// makes an LFS object. A file there is the one guarded; a new path is
+    /// one where nothing is.
+    fn recheck(
+        &self,
+        drive: &str,
+        profile: &SyncProfile,
+        commit: &DriveCommit,
+    ) -> Result<(), String> {
+        let said = |refusal: Refusal| {
+            let said = refusal.to_string();
+            said.strip_suffix(" Nothing was asked.")
+                .map_or(said.clone(), str::to_owned)
+        };
+        let guards = commit.guards.iter().map(|(key, read)| {
+            let target = match read {
+                Some(_) => DriveTarget::Existing,
+                None => DriveTarget::New,
+            };
+            (key.as_str(), target)
+        });
+        let moved_to = commit
+            .moves
+            .iter()
+            .map(|(_, to)| (to.as_str(), DriveTarget::New));
+        for (key, target) in guards.chain(moved_to) {
+            self.target(drive, key, target).map_err(said)?;
+        }
+        let policy = LfsPolicy::from_profile(profile).map_err(|error| error.to_string())?;
+        for (key, bytes) in &commit.writes {
+            let routed = bytes
+                .as_ref()
+                .is_some_and(|bytes| policy.applies(Path::new(key), bytes.len() as u64));
+            if routed {
+                return Err(WriteRefusal::LfsRouted {
+                    subpath: key.clone(),
+                }
+                .to_string());
+            }
+        }
+        Ok(())
     }
 
     /// The vault-relative path of `key`, where it is one of the vault's
@@ -171,6 +221,7 @@ impl DriveWrites for ShellDriveWrites {
             .chain(commit.moves.iter().map(|(from, _)| from))
             .filter_map(|key| self.note(&profile, key))
             .collect();
+        self.recheck(drive, &profile, &commit)?;
         let request = CommitRequest {
             writes: commit.writes.clone(),
             moves: commit.moves.clone(),
@@ -210,16 +261,11 @@ impl DriveWrites for ShellDriveWrites {
         Ok(outcome)
     }
 
-    fn carried(
-        &self,
-        drive: &str,
-        approval: &str,
-        since_secs: i64,
-    ) -> Result<Option<String>, String> {
+    fn carried(&self, drive: &str, approval: &str) -> Result<Option<String>, String> {
         let (engine, profile) = self
             .profile(drive)
             .ok_or_else(|| format!("This device does not keep {drive}."))?;
-        tauri::async_runtime::block_on(engine.approval_commit(&profile.id, approval, since_secs))
+        tauri::async_runtime::block_on(engine.approval_commit(&profile.id, approval))
             .map_err(|error| error.to_string())
     }
 }

@@ -216,9 +216,8 @@ async fn consolidation_commits_carry_the_trailers() {
 }
 
 /// 109.27, contract § 5.3: the commit that carried an approval out is found
-/// by its `Approval-Record` trailer, and only that approval's; a commit
-/// older than the span asked for is not read, and a trailer quoted in a
-/// body is not keeper's block.
+/// by its `Approval-Record` trailer, and only that approval's; a trailer
+/// quoted in a body is not keeper's block.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_commit_carrying_an_approval_is_found_by_its_trailer() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -242,36 +241,110 @@ async fn the_commit_carrying_an_approval_is_found_by_its_trailer() {
 
     assert_eq!(
         engine
-            .approval_commit(&p.id, "01JAPPR", 0)
+            .approval_commit(&p.id, "01JAPPR")
             .await
             .expect("read"),
         Some(commit.clone())
     );
     assert_eq!(
         engine
-            .approval_commit(&p.id, "01JOTHER", 0)
+            .approval_commit(&p.id, "01JOTHER")
             .await
             .expect("read"),
         None,
         "a line in a body is no trailer"
     );
     assert_eq!(
-        engine
-            .approval_commit(&p.id, "01JAPP", 0)
-            .await
-            .expect("read"),
+        engine.approval_commit(&p.id, "01JAPP").await.expect("read"),
         None,
         "only the exact id"
     );
-    let made = git_out(&p.local_path, &["log", "-1", "--format=%ct", &commit]);
-    let made: i64 = made.trim().parse().expect("a time");
+}
+
+/// R606 (review probe, adopted): a descendant whose clock was years behind
+/// does not hide the commit that carried an approval out — the search walks
+/// the commit graph, not the commit times.
+#[tokio::test(flavor = "multi_thread")]
+async fn review606_recovery_finds_approval_under_a_backdated_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, _platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let mut ask = request("b", Some(blob_id(b"a")));
+    ask.trailers = vec![MemoryTrailer::ApprovalRecord("review606".to_owned())];
+    let CommitPaths::Committed { commit } = engine
+        .commit_paths(&p.id, &ask, yes())
+        .await
+        .expect("commit")
+    else {
+        panic!("a commit was made")
+    };
+    let child = git_dated(
+        &p.local_path,
+        "2001-01-01T00:00:00Z",
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "backdated child",
+        ],
+    );
+    git_out(&p.local_path, &["update-ref", "HEAD", child.trim()]);
     assert_eq!(
         engine
-            .approval_commit(&p.id, "01JAPPR", made + 3_600)
+            .approval_commit(&p.id, "review606")
             .await
-            .expect("read"),
-        None,
-        "history older than the span is not read"
+            .expect("recovery read"),
+        Some(commit),
+        "a backdated descendant does not undo the published approval"
+    );
+}
+
+/// R606 (review probe, adopted): once the branch has moved to the commit, a
+/// failure tidying up after it — the intent record that cannot be removed —
+/// is not "nothing was written": the answer is still `Committed`, so a
+/// caller never reports a write that landed as not made.
+#[tokio::test(flavor = "multi_thread")]
+async fn review606_postpublication_cleanup_error_must_not_mean_not_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, _platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let root = p.local_path.clone();
+    let mut ask = request("b", Some(blob_id(b"a")));
+    ask.trailers = vec![MemoryTrailer::ApprovalRecord("review606".to_owned())];
+    let done = engine.commit_paths_held(&p, &ask, &|| true, &|at| {
+        if at == Cut::Published {
+            // The record's removal fails for real (EISDIR), with the
+            // requested bytes, the published commit, index and checkout
+            // untouched.
+            std::fs::rename(record(&root), root.join(".git/review606-intent-backup"))
+                .expect("keep record");
+            std::fs::create_dir(record(&root)).expect("inject unlink failure");
+        }
+        true
+    });
+    assert_eq!(
+        read(&root, "MEMORY.md"),
+        "b",
+        "the drive's bytes were written"
+    );
+    assert!(
+        crate::git::history::carrying(&root, "review606")
+            .expect("history")
+            .is_some(),
+        "the approved commit is already published"
+    );
+    std::fs::remove_dir(record(&root)).expect("remove injected directory");
+    std::fs::rename(root.join(".git/review606-intent-backup"), record(&root))
+        .expect("restore record");
+    assert!(
+        matches!(done, Ok(CommitPaths::Committed { .. })),
+        "a published write must not become an error that K2 reports not_applied: {done:?}"
     );
 }
 

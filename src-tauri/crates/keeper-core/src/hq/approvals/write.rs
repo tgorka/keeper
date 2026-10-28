@@ -249,7 +249,6 @@ struct Call {
     state: String,
     decided_by_client: Option<String>,
     consumed_by_client: Option<String>,
-    created_at_ms: i64,
     version: Option<i64>,
     call: String,
     turn: String,
@@ -260,7 +259,7 @@ struct Call {
 
 const CALL: &str = "SELECT a.id AS id, a.session_id AS session_id, a.binding_digest AS digest, \
      a.state AS state, a.decided_by_client AS decided_by_client, \
-     a.consumed_by_client AS consumed_by_client, a.created_at_ms AS created_at_ms, \
+     a.consumed_by_client AS consumed_by_client, \
      a._sync_version AS version, t.id AS call_id, t.turn_id AS turn_id, t.args AS args, \
      s.agent_actor AS agent_actor, s.trust AS trust \
      FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
@@ -275,7 +274,6 @@ impl Call {
             state: text(row, "state").to_owned(),
             decided_by_client: opt_text(row, "decided_by_client"),
             consumed_by_client: opt_text(row, "consumed_by_client"),
-            created_at_ms: int(row, "created_at_ms").unwrap_or(0),
             version: int(row, "version"),
             call: opt_text(row, "call_id")?,
             turn: text(row, "turn_id").to_owned(),
@@ -573,8 +571,38 @@ pub enum Outcome {
     NotApplied { reason: String },
 }
 
-/// The most characters `metadata.reason` holds (V18).
+/// The most characters `metadata.reason` holds (V18), counted as the server
+/// counts a string: in UTF-16 code units.
 const MAX_REASON: usize = 1_000;
+
+/// Said where a refusal came with no words of its own: V18 refuses an empty
+/// `reason`.
+const NO_REASON: &str = "keeper was given no reason.";
+
+/// `reason` as V18 takes it: non-empty, at most [`MAX_REASON`] UTF-16 code
+/// units, cut at a character.
+fn wire_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return NO_REASON.to_owned();
+    }
+    let mut units = 0;
+    reason
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= MAX_REASON
+        })
+        .collect()
+}
+
+/// Whether `commit` is a commit id as V18 takes it: 40 lowercase hex.
+fn is_commit_id(commit: &str) -> bool {
+    commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// The `applied` message of `call` (V18): its id, a person message in the
 /// approval's session, `metadata` with exactly the contract's keys.
@@ -606,7 +634,7 @@ fn outcome_op(
             format!("Approved: {summary}; the file already was as asked, so nothing was committed.")
         }
         Outcome::NotApplied { reason } => {
-            let reason: String = reason.chars().take(MAX_REASON).collect();
+            let reason = wire_reason(reason);
             metadata["outcome"] = json!("not_applied");
             metadata["reason"] = json!(reason);
             if denied {
@@ -692,6 +720,8 @@ enum Owed {
     Decided,
     /// Consumed here by `commit`; the effect follows once the server took it.
     Consumed { commit: String },
+    /// Committed under an id V18 cannot record: nothing more is done here.
+    Unrecordable,
 }
 
 /// A look at one write's checkout, kept for [`LOOK_FOR`].
@@ -752,10 +782,13 @@ impl Writes {
         self.port.get().cloned()
     }
 
+    /// Hold `key` for this call, or `None` while another call holds it. The
+    /// lock is let go before the holder is made, and the holder is made only
+    /// on success: a refused one must not release the other call's hold, nor
+    /// lock `busy` again while it is held (R606-01).
     fn hold(&self, key: Key) -> Option<Held<'_>> {
-        lock(&self.busy)
-            .insert(key.clone())
-            .then_some(Held { writes: self, key })
+        let taken = lock(&self.busy).insert(key.clone());
+        taken.then(|| Held { writes: self, key })
     }
 
     fn owe(&self, key: Key, owed: Owed) {
@@ -1057,9 +1090,28 @@ impl Writes {
     ) -> AgentDecisionOutcomeVm {
         self.settled(key);
         let summary = summary_of(call);
-        let op = outcome_op(source, call, &summary, &outcome, false);
-        if let Err(error) = source.replica.mutate(vec![op]) {
-            tracing::warn!(database = %source.database, %error, "what became of a drive write could not be written");
+        let commit = match &outcome {
+            Outcome::Applied { commit } => Some(commit.to_ascii_lowercase()),
+            _ => None,
+        };
+        let outcome = match commit {
+            Some(commit) => Outcome::Applied { commit },
+            None => outcome,
+        };
+        match &outcome {
+            // V18 takes a 40-hex commit only: a row it would refuse is not
+            // written, and the agent hears that no word came back, which is
+            // the truth (R66-01).
+            Outcome::Applied { commit } if !is_commit_id(commit) => {
+                tracing::error!(database = %source.database, commit, "a drive write was committed under an id the agents server cannot record");
+                self.owe(key.clone(), Owed::Unrecordable);
+            }
+            _ => {
+                let op = outcome_op(source, call, &summary, &outcome, false);
+                if let Err(error) = source.replica.mutate(vec![op]) {
+                    tracing::warn!(database = %source.database, %error, "what became of a drive write could not be written");
+                }
+            }
         }
         source.replica.sync_now();
         let sentence = match &outcome {
@@ -1070,7 +1122,9 @@ impl Writes {
             Outcome::Unchanged => {
                 "Approved; the file already was as asked, so nothing was committed.".to_owned()
             }
-            Outcome::NotApplied { reason } => format!("Approved, but not written: {reason}"),
+            Outcome::NotApplied { reason } => {
+                format!("Approved, but not written: {}", wire_reason(reason))
+            }
         };
         AgentDecisionOutcomeVm {
             state: AgentDecisionStateVm::Sent,
@@ -1119,6 +1173,7 @@ impl Writes {
         let owed = lock(&self.owed).get(&key).cloned();
         let mine = call.consumed_by_client.as_deref() == Some(source.client.as_str());
         match (call.state.as_str(), owed) {
+            (_, Some(Owed::Unrecordable)) => {}
             ("approved", Some(Owed::Decided)) => {
                 self.consume(source, port, call, &key);
             }
@@ -1153,10 +1208,7 @@ impl Writes {
                 return;
             }
         };
-        // A commit carrying it is made after it was asked; a day of clock
-        // difference between the devices is allowed for.
-        let since = call.created_at_ms / 1_000 - 86_400;
-        match port.carried(&drive, &call.approval, since) {
+        match port.carried(&drive, &call.approval) {
             Ok(Some(commit)) => {
                 self.finish(source, call, key, Outcome::Applied { commit });
             }

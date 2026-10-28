@@ -449,13 +449,16 @@ its disk; the session still ticks the drive and leaves `drive_write` and `drive`
 `.keeper`, git's own files, an ignored, untracked or LFS-routed path, a folder or a link); the file
 at `HEAD` and on the disk is the version the agent read; and the change fits the caps. Otherwise
 the card says why and offers *Deny* only, and *Deny* tells the agent that reason. *Allow* decides,
-waits for the server, takes the approval (`approved → consumed` by this device), checks again, makes
+waits for the server, takes the approval (`approved → consumed` by this device), checks again — and once more right before the commit, the path rule over every path it changes
+(a `.gitattributes` that began routing the file through LFS since the card was drawn refuses it)
+and the profile's LFS size rule over the new text, so no agent write makes an LFS object — makes
 one commit of exactly the request through `Engine::commit_paths` with the trailer
 `Approval-Record: <approval id>`, and writes the `applied` message (`applied.<approval id>`, V18),
 each in its own commit. The card's last line is that message's outcome ("Written as 1a2b3c4 on
 hesperia.", or why not); the message itself is never drawn as a bubble. A step the server has not
 answered within the wait goes on when it does. After a stop between taking the approval and saying
-what became of it, the next start looks for the commit by its trailer: found, it is `applied`; not
+what became of it, the next start looks for the commit by its trailer, walking the whole history by the commit graph
+(a descendant with a wrong clock does not hide it): found, it is `applied`; not
 found, `not_applied` ("keeper stopped before it wrote this; nothing was written."). A request
 approved here and never taken before a stop stays approved until the agent's host expires it (24 h).
 A drive write is never approved from a notification. Mock shell: `?sessions=launch&writes=all`

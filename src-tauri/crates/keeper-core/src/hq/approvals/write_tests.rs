@@ -278,10 +278,13 @@ struct Drive {
     keeps: Mutex<Result<(), DriveAbsent>>,
     files: Mutex<HashMap<String, FakeFile>>,
     refuse: Mutex<Option<drive_write::Refusal>>,
-    answer: Mutex<DriveCommitted>,
+    /// Refuse every path check from this one on (counted from 1).
+    refuse_from: Mutex<Option<(usize, drive_write::Refusal)>>,
+    targets: Mutex<usize>,
+    answer: Mutex<Result<DriveCommitted, String>>,
     commits: Mutex<Vec<DriveCommit>>,
     carried: Mutex<Option<String>>,
-    searched: Mutex<Vec<(String, i64)>>,
+    searched: Mutex<Vec<String>>,
 }
 
 impl Drive {
@@ -290,7 +293,9 @@ impl Drive {
             keeps: Mutex::new(Ok(())),
             files: Mutex::new(HashMap::new()),
             refuse: Mutex::new(None),
-            answer: Mutex::new(DriveCommitted::Committed(COMMIT.to_owned())),
+            refuse_from: Mutex::new(None),
+            targets: Mutex::new(0),
+            answer: Mutex::new(Ok(DriveCommitted::Committed(COMMIT.to_owned()))),
             commits: Mutex::new(Vec::new()),
             carried: Mutex::new(None),
             searched: Mutex::new(Vec::new()),
@@ -330,6 +335,14 @@ impl DriveWrites for Drive {
         if let Some(refusal) = self.refuse.lock().expect("refuse").clone() {
             return Err(refusal);
         }
+        let mut targets = self.targets.lock().expect("targets");
+        *targets += 1;
+        if let Some((from, refusal)) = self.refuse_from.lock().expect("refuse from").clone() {
+            if *targets >= from {
+                return Err(refusal);
+            }
+        }
+        drop(targets);
         let held = self.files.lock().expect("files").get(path).cloned();
         match (target, held) {
             (DriveTarget::Existing, Some((head, disk))) => Ok(DriveFile {
@@ -352,18 +365,13 @@ impl DriveWrites for Drive {
     }
     fn commit(&self, _drive: &str, commit: DriveCommit) -> Result<DriveCommitted, String> {
         self.commits.lock().expect("commits").push(commit);
-        Ok(self.answer.lock().expect("answer").clone())
+        self.answer.lock().expect("answer").clone()
     }
-    fn carried(
-        &self,
-        _drive: &str,
-        approval: &str,
-        since_secs: i64,
-    ) -> Result<Option<String>, String> {
+    fn carried(&self, _drive: &str, approval: &str) -> Result<Option<String>, String> {
         self.searched
             .lock()
             .expect("searched")
-            .push((approval.to_owned(), since_secs));
+            .push(approval.to_owned());
         Ok(self.carried.lock().expect("carried").clone())
     }
 }
@@ -858,7 +866,7 @@ fn each_op_commits_exactly_its_request() {
 #[test]
 fn a_guard_the_commit_holds_is_not_applied() {
     let w = world();
-    *w.drive.answer.lock().expect("answer") = DriveCommitted::Guarded(PATH.to_owned());
+    *w.drive.answer.lock().expect("answer") = Ok(DriveCommitted::Guarded(PATH.to_owned()));
     let outcome = w.allow().expect("allowed");
     let reason = "\"10-notes/inbox.md\" changed on hesperia since the agent read it.";
     assert_eq!(
@@ -882,7 +890,7 @@ fn a_guard_the_commit_holds_is_not_applied() {
 #[test]
 fn a_commit_that_changes_nothing_is_unchanged() {
     let w = world();
-    *w.drive.answer.lock().expect("answer") = DriveCommitted::Unchanged;
+    *w.drive.answer.lock().expect("answer") = Ok(DriveCommitted::Unchanged);
     w.allow().expect("allowed");
     assert_eq!(
         w.applied(),
@@ -1042,7 +1050,7 @@ fn recovery_finds_the_trailer_or_says_nothing_was_written() {
         );
         let searched = w.drive.searched.lock().expect("searched").clone();
         assert_eq!(searched.len(), 1);
-        assert_eq!(searched[0].0, APPROVAL);
+        assert_eq!(searched[0], APPROVAL);
         let expected = match carried {
             Some(commit) => json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
                                    "outcome": "applied", "commit": commit,
@@ -1086,4 +1094,205 @@ fn the_applied_row_is_not_drawn_as_a_message() {
     )
     .expect("view");
     assert!(view.messages.iter().all(|m| m.id != message_id(APPROVAL)));
+}
+
+// ─── Round 2 (review-606, review-66 R66-01, review-603 item 6) ────────────────
+
+/// R606-01 (review probe, adopted): a call that finds the write held by
+/// another is refused at once — never deadlocked on the hold's own lock —
+/// and does not release the other's hold.
+#[test]
+fn review606_contending_write_returns_refused_without_deadlock() {
+    let writes = Arc::new(Writes::default());
+    let key = ("tgdrive".to_owned(), APPROVAL.to_owned());
+    let owner = writes
+        .hold(key.clone())
+        .expect("first operation owns the request");
+    let other = Arc::clone(&writes);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe = key.clone();
+    std::thread::spawn(move || {
+        let refused = other.hold(probe.clone()).is_none();
+        let still = other.hold(probe).is_none();
+        tx.send((refused, still)).expect("send result");
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(2));
+    if got.is_err() {
+        // A deadlocked hold: do not block this test's unwinding on it.
+        std::mem::forget(owner);
+        panic!("a competing write deadlocked instead of being refused");
+    }
+    assert_eq!(
+        got,
+        Ok((true, true)),
+        "refused, and refused again while the first holds it"
+    );
+    drop(owner);
+    assert!(writes.hold(key).is_some(), "free once the first lets go");
+}
+
+struct ErrorDrive(Arc<Drive>, &'static str);
+impl DriveWrites for ErrorDrive {
+    fn keeps(&self, drive: &str) -> Result<(), DriveAbsent> {
+        self.0.keeps(drive)
+    }
+    fn target(
+        &self,
+        drive: &str,
+        path: &str,
+        target: DriveTarget,
+    ) -> Result<DriveFile, drive_write::Refusal> {
+        self.0.target(drive, path, target)
+    }
+    fn commit(&self, _drive: &str, _commit: DriveCommit) -> Result<DriveCommitted, String> {
+        Err(self.1.to_owned())
+    }
+    fn carried(&self, drive: &str, approval: &str) -> Result<Option<String>, String> {
+        self.0.carried(drive, approval)
+    }
+}
+
+/// Review probe, adopted: a commit that fails is `not_applied` with its
+/// sentence, and the agent is told exactly that.
+#[test]
+fn review606_failed_commit_is_not_applied() {
+    let mut w = world();
+    w.writes = Writes::default();
+    w.writes.set_port(Arc::new(ErrorDrive(
+        Arc::clone(&w.drive),
+        "the drive is full",
+    )));
+    let outcome = w.allow().expect("the person decides");
+    assert_eq!(
+        outcome.sentence,
+        "Approved, but not written: the drive is full"
+    );
+    assert_eq!(
+        w.applied(),
+        Some(json!({
+            "kind": "applied", "approval": APPROVAL, "call": CALL_ID,
+            "outcome": "not_applied", "reason": "the drive is full", "device": "hesperia"
+        }))
+    );
+}
+
+/// V18's wire shape exactly (R66-01): every value a string, the keys of its
+/// outcome and no other, `outcome` one of the three words, `commit` 40
+/// lowercase hex, `reason` non-empty and at most 1,000 UTF-16 units.
+fn assert_wire(metadata: &Value) {
+    let object = metadata.as_object().expect("an object");
+    assert!(object.values().all(Value::is_string), "{metadata}");
+    let outcome = object["outcome"].as_str().expect("outcome");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let extra = match outcome {
+        "applied" => vec!["commit"],
+        "unchanged" => vec![],
+        "not_applied" => vec!["reason"],
+        other => panic!("outcome {other}"),
+    };
+    let mut wanted = vec!["approval", "call", "device", "kind", "outcome"];
+    wanted.extend(extra);
+    wanted.sort_unstable();
+    assert_eq!(keys, wanted, "{metadata}");
+    assert_eq!(object["kind"], "applied");
+    if let Some(commit) = object.get("commit").and_then(Value::as_str) {
+        assert!(is_commit_id(commit), "{commit}");
+    }
+    if let Some(reason) = object.get("reason").and_then(Value::as_str) {
+        assert!(!reason.is_empty());
+        assert!(
+            reason.encode_utf16().count() <= MAX_REASON,
+            "{}",
+            reason.len()
+        );
+    }
+}
+
+#[test]
+fn every_applied_row_has_v18s_exact_types() {
+    // applied, with an id the port answered in capitals
+    let w = world();
+    *w.drive.answer.lock().expect("answer") =
+        Ok(DriveCommitted::Committed(COMMIT.to_ascii_uppercase()));
+    w.allow().expect("allowed");
+    let applied = w.applied().expect("applied");
+    assert_wire(&applied);
+    assert_eq!(applied["commit"], COMMIT);
+    // unchanged
+    let w = world();
+    *w.drive.answer.lock().expect("answer") = Ok(DriveCommitted::Unchanged);
+    w.allow().expect("allowed");
+    assert_wire(&w.applied().expect("unchanged"));
+    // not_applied: a long reason in characters of two UTF-16 units, an
+    // empty one, and a denial's.
+    for (said, expected_len) in [("🗂".repeat(900), 500), (String::new(), 0)] {
+        let mut w = world();
+        w.writes = Writes::default();
+        let said: &'static str = Box::leak(said.into_boxed_str());
+        w.writes
+            .set_port(Arc::new(ErrorDrive(Arc::clone(&w.drive), said)));
+        w.allow().expect("decided");
+        let row = w.applied().expect("not_applied");
+        assert_wire(&row);
+        let reason = row["reason"].as_str().expect("reason");
+        if expected_len > 0 {
+            assert_eq!(reason.chars().count(), expected_len, "cut at a character");
+        } else {
+            assert_eq!(reason, NO_REASON);
+        }
+    }
+    let w = world();
+    w.drive.file(PATH, OTHER_BLOB, "- [x] milk\n");
+    w.deny().expect("denied");
+    assert_wire(&w.applied().expect("declined with a reason"));
+}
+
+/// A commit id V18 could not record is never written as a malformed row;
+/// the agent hears no word came back, and nothing is tried again.
+#[test]
+fn a_commit_id_v18_cannot_record_writes_no_row() {
+    let w = world();
+    *w.drive.answer.lock().expect("answer") = Ok(DriveCommitted::Committed("not-a-sha".to_owned()));
+    w.allow().expect("allowed");
+    assert_eq!(w.applied(), None);
+    w.writes.carry_on(std::slice::from_ref(&w.ana));
+    assert_eq!(w.drive.commits().len(), 1, "never committed again");
+    assert!(w.drive.searched.lock().expect("searched").is_empty());
+}
+
+/// Review-603 item 6: the path rule runs again right before the commit. A
+/// `.gitattributes` that began routing the file through LFS after the card
+/// was drawn — between showing it and pressing Allow, and between taking
+/// the approval and the commit — writes nothing, and says so.
+#[test]
+fn a_path_that_became_lfs_routed_after_the_card_is_not_written() {
+    let lfs = drive_write::Refusal::Path {
+        sentence: "\"10-notes/inbox.md\" is kept in the drive's large-file store (LFS), which an \
+                   agent never writes."
+            .to_owned(),
+    };
+    let reason = "\"10-notes/inbox.md\" is kept in the drive's large-file store (LFS), which an \
+                  agent never writes.";
+    // Between the card and Allow: Allow is refused, nothing is decided.
+    let w = world();
+    assert_eq!(w.card().actions[0], AgentApprovalActionVm::AllowOnce);
+    *w.drive.refuse_from.lock().expect("refuse from") = Some((2, lfs.clone()));
+    assert_eq!(w.allow().expect_err("refused").0, reason);
+    assert!(w.server.ops().is_empty(), "nothing decided");
+    assert!(w.drive.commits().is_empty());
+    // Between the consume and the commit: decided and taken, not written.
+    let w = world();
+    w.card();
+    *w.drive.refuse_from.lock().expect("refuse from") = Some((3, lfs));
+    let outcome = w.allow().expect("decided");
+    assert_eq!(
+        outcome.sentence,
+        format!("Approved, but not written: {reason}")
+    );
+    assert!(w.drive.commits().is_empty(), "no commit");
+    assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "consumed");
+    let applied = w.applied().expect("applied row");
+    assert_wire(&applied);
+    assert_eq!(applied["reason"], reason);
 }
