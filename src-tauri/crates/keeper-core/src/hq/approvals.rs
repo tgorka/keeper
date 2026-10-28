@@ -126,12 +126,42 @@ pub struct AgentApprovalVm {
     #[serde(skip)]
     #[ts(skip)]
     pub undecidable: Option<Undecidable>,
+    /// The turn of the parked call it would run (`tool_calls.turn_id`):
+    /// where the reading column draws it, in that turn's fold. Absent when
+    /// the call is not on this device.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub turn_id: Option<String>,
+    /// Who it waits for, while it is pending: what its turn's fold line
+    /// names.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub waiting_for: Option<WaitingFor>,
     /// A `drive_write` request's write (109.27): what it changes, the
     /// preview from this device's checkout, and what became of it
     /// ([`write::Writes::draw`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub write: Option<write::AgentDriveWriteVm>,
+}
+
+/// Who a pending request waits for, as its turn's fold line names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitingFor {
+    /// This person is one of its approvers.
+    You,
+    /// Only others are: their names, joined.
+    Others(String),
+}
+
+impl WaitingFor {
+    /// The fold line's words for it.
+    pub fn label(&self) -> String {
+        match self {
+            WaitingFor::You => "Waiting for you".to_owned(),
+            WaitingFor::Others(names) => format!("Waiting for {names}"),
+        }
+    }
 }
 
 /// Why a T4 request waiting for this person cannot be decided on this
@@ -180,7 +210,7 @@ const SELECT: &str = "SELECT a.id AS id, a.session_id AS session_id, a.tier AS t
      a.binding_digest AS binding_digest, a.summary AS summary, a.approvers AS approvers, \
      a.state AS state, a.decided_by_actor AS decided_by_actor, a.decided_by_client AS decided_by_client, a.expires_at_ms AS expires_at_ms, \
      a.created_at_ms AS created_at_ms, a.grant_id AS grant_id, a._sync_version AS version, \
-     t.id AS call_id, t.name AS tool_name, t.args AS args \
+     t.id AS call_id, t.name AS tool_name, t.args AS args, t.turn_id AS turn_id \
      FROM approvals a LEFT JOIN tool_calls t ON t.id = a.tool_call_id";
 
 fn state_of(row: &Map<String, Value>, now_ms: i64) -> AgentApprovalStateVm {
@@ -260,12 +290,11 @@ fn vm(
     let action = action(row);
     let approvers = names(row, "approvers");
     let mine = approvers.contains(&source.actor);
-    let name = |actor: &str| {
-        directory
-            .get(actor)
-            .cloned()
-            .unwrap_or_else(|| actor.to_owned())
-    };
+    // An actor the directory has not supplied yet has no name here: its raw
+    // id is never shown as one. Directory rows come by the `dir`
+    // subscription and requests by trace windows, so a request can arrive
+    // first; the name follows once the row does (R604-01).
+    let name = |actor: &str| directory.get(actor).cloned();
     // A refused decision of this device's is not a decision: the request
     // reads pending again, however long its optimistic row lingers here.
     let mine_decided = text(row, "decided_by_client") == source.client;
@@ -283,7 +312,7 @@ fn vm(
     };
     let decided_by = opt_text(row, "decided_by_actor")
         .filter(|_| refused.is_none())
-        .map(|actor| name(&actor));
+        .and_then(|actor| name(&actor));
     let tier = text(row, "tier").to_owned();
     // A T4 request this device cannot decide offers no decision here: the
     // server would refuse either (R109T-02).
@@ -294,23 +323,38 @@ fn vm(
         state == AgentApprovalStateVm::Pending && mine && action.is_some() && undecidable.is_none();
     // A grant's own decision names the grant's person (V8 as amended): the
     // card says it came from their standing grant, not a click.
-    let by = |verb: &str| match (decided_by.as_deref(), opt_text(row, "grant_id")) {
-        (Some(who), Some(_)) => format!("{verb} by {who}'s standing grant"),
-        (who, _) => format!("{verb} by {}", who.unwrap_or("someone")),
+    let by = |verb: &str| {
+        let who = decided_by.as_deref().unwrap_or("someone");
+        match opt_text(row, "grant_id") {
+            Some(_) => format!("{verb} by {who}'s standing grant"),
+            None => format!("{verb} by {who}"),
+        }
     };
+    // The approvers' names, those the directory has; "someone else" stands
+    // for every one it has not supplied yet.
+    let others = || {
+        let mut known: Vec<String> = approvers.iter().filter_map(|a| name(a)).collect();
+        if known.is_empty() {
+            return "someone else".to_owned();
+        }
+        if known.len() < approvers.len() {
+            known.push("someone else".to_owned());
+        }
+        known.join(", ")
+    };
+    let waiting_for = (state == AgentApprovalStateVm::Pending).then(|| {
+        if mine {
+            WaitingFor::You
+        } else {
+            WaitingFor::Others(others())
+        }
+    });
     let sentence = match state {
         AgentApprovalStateVm::Pending if refused.is_some() => format!(
             "The server refused your decision: {}",
             refused.as_deref().unwrap_or_default()
         ),
-        AgentApprovalStateVm::Pending if !mine => format!(
-            "Waiting for {}.",
-            approvers
-                .iter()
-                .map(|a| name(a))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        AgentApprovalStateVm::Pending if !mine => format!("Waiting for {}.", others()),
         AgentApprovalStateVm::Pending if undecidable.is_some() => undecidable
             .map(Undecidable::sentence)
             .unwrap_or_default()
@@ -332,7 +376,7 @@ fn vm(
             &tool_name,
             &crate::hq::sessions::json(row, "args"),
             session,
-            &name(&session.agent_actor),
+            name(&session.agent_actor).as_deref(),
             &source.database,
         ),
         _ => None,
@@ -373,6 +417,8 @@ fn vm(
         grant,
         declined_by_send,
         undecidable,
+        turn_id: opt_text(row, "turn_id"),
+        waiting_for,
         write: None,
     })
 }

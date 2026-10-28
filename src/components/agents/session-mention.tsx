@@ -19,6 +19,7 @@
  */
 import { useLayoutEffect, useRef, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
+import { MINE_ROW, PersonLine } from "@/components/agents/person-line";
 import { Button } from "@/components/ui/button";
 import { formatMessageTime } from "@/lib/format-time";
 import type {
@@ -91,10 +92,8 @@ export function SessionChildThread({
         )}
       </header>
       {prompt && (
-        <div className="mt-1 min-w-0">
-          <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
-            {prompt.body}
-          </p>
+        <div className={prompt.mine ? `mt-1 min-w-0 ${MINE_ROW}` : "mt-1 min-w-0"}>
+          <PersonLine body={prompt.body} mine={prompt.mine} />
           {prompt.state && refusal == null && (
             <span className="text-muted-foreground text-xs">{prompt.state}</span>
           )}
@@ -175,7 +174,7 @@ function ChildItem({
       const message = byId.get(item.messageId);
       if (!message) return null;
       return (
-        <li className="min-w-0">
+        <li className={message.mine ? `min-w-0 ${MINE_ROW}` : "min-w-0"}>
           <div className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs">
             <span className="font-medium">{message.authorName}</span>
             <span className="text-muted-foreground">{formatMessageTime(message.createdAtMs)}</span>
@@ -183,9 +182,7 @@ function ChildItem({
           {message.role === "agent" ? (
             <AgentAnswer body={message.body} />
           ) : (
-            <p className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">
-              {message.body}
-            </p>
+            <PersonLine body={message.body} mine={message.mine} />
           )}
         </li>
       );

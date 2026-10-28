@@ -34,7 +34,7 @@
  * Pending messenger attachments use raw captions; session captions still ask Rust.
  */
 import { type DialogFilter, open } from "@tauri-apps/plugin-dialog";
-import { Camera, Image, Paperclip, Plus, X } from "lucide-react";
+import { ArrowUp, Camera, Image, Paperclip, Plus, X } from "lucide-react";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
@@ -56,8 +56,15 @@ import { InlineSlashList } from "@/components/slash-menu/inline-slash-list";
 import { isCommandLine, type SlashRow } from "@/components/slash-menu/slash-menu";
 import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
+import { BAR_CLASS, useBarFold } from "@/hooks/use-bar-fold";
 import { useInlineSlash } from "@/hooks/use-inline-slash";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSlashMenu } from "@/hooks/use-slash-menu";
@@ -370,6 +377,9 @@ export function Composer({
   // The textarea handle, focused programmatically when the composer store's focus
   // nonce is *bumped* (Story 6.6 — e.g. after a new chat is resolved and opened).
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  /** The session bar, which folds its controls when one row cannot hold them (R601-01). */
+  const bar = useRef<HTMLDivElement>(null);
+  useBarFold(bar, transport === "session");
   const focusNonce = useConversationComposer((s) => s.focusNonce);
   // Seed to the current nonce so a fresh Composer mount (every room switch clears &
   // remounts the pane) does NOT self-focus off a stale, already-bumped nonce — only a
@@ -1220,6 +1230,22 @@ export function Composer({
     }
   }
 
+  /** The camera is offered where the phone's capture input or this webview's camera exists. */
+  const canTakePhoto = phone || typeof navigator.mediaDevices?.getUserMedia === "function";
+  function takePhoto() {
+    if (phone) captureInput.current?.click();
+    else setCameraOpen(true);
+  }
+  function choosePhoto() {
+    if (phone) photoInput.current?.click();
+    // A path the host sends as it is: a HEIC chosen here reaches the agent with its host's note
+    // that its format can't be shown to the model (R444/05).
+    else
+      void pickFiles([
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "heic"] },
+      ]);
+  }
+
   /**
    * Stop holding Send for batch `id`. Returns whether it was still pending: `false` means it was
    * already cancelled, timed out or landed, and whatever its read comes to is no longer wanted.
@@ -1547,9 +1573,13 @@ export function Composer({
         <SlashHelp rows={help.rows} escapeHint={help.escapeHint} onClose={() => setHelp(null)} />
       )}
       <div
+        ref={bar}
         className={cn(
           "relative flex min-w-0 items-end gap-2",
-          transport === "session" && "flex-wrap",
+          // The session bar holds one row under the field at any width (FooterOneRow). Short of
+          // room it folds its controls in `useBarFold`'s order, so the model's name is cut
+          // last (R601-01); its last step closes the row's gaps.
+          transport === "session" && [BAR_CLASS, "flex-wrap items-center data-[fold~=snug]:gap-1"],
         )}
       >
         <SlashMenuList menu={menu} />
@@ -1557,62 +1587,86 @@ export function Composer({
         <InlineSlashList menu={mention} label={MENTION_MENU_LABEL} />
         {barStart}
         {attachEnabled && pending?.mode !== "edit" && (
-          <IconHint label="Attach file">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Attach file"
-              disabled={disabled}
-              onClick={() => void pickFiles()}
-              // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
-              // presenting the same native picker; desktop keeps the 36px paperclip.
-              className={cn(phone && "size-11")}
-            >
-              {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
-            </Button>
-          </IconHint>
-        )}
-        {attachEnabled && pending?.mode !== "edit" && (
           <>
-            {(phone || typeof navigator.mediaDevices?.getUserMedia === "function") && (
-              <IconHint label="Take photo">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label="Take photo"
-                  className={cn(phone && "size-11")}
-                  onClick={() => (phone ? captureInput.current?.click() : setCameraOpen(true))}
-                >
-                  <Camera aria-hidden="true" />
-                </Button>
-              </IconHint>
+            {transport === "session" ? (
+              // One 36px `+` (≥44pt on the phone) holds attach, camera and photo, so the bar
+              // keeps one row in the Notes Assistant panel; no action is dropped (AD-260).
+              <DropdownMenu>
+                <IconHint label="Attach">
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Attach"
+                      className={cn("shrink-0", phone && "size-11")}
+                    >
+                      <Plus aria-hidden="true" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </IconHint>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem className="min-h-11" onSelect={() => void pickFiles()}>
+                    <Paperclip aria-hidden="true" />
+                    Attach file
+                  </DropdownMenuItem>
+                  {canTakePhoto && (
+                    <DropdownMenuItem className="min-h-11" onSelect={takePhoto}>
+                      <Camera aria-hidden="true" />
+                      Take photo
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem className="min-h-11" onSelect={choosePhoto}>
+                    <Image aria-hidden="true" />
+                    Choose photo
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <>
+                <IconHint label="Attach file">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Attach file"
+                    disabled={disabled}
+                    onClick={() => void pickFiles()}
+                    // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
+                    // presenting the same native picker; desktop keeps the 36px paperclip.
+                    className={cn(phone && "size-11")}
+                  >
+                    {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
+                  </Button>
+                </IconHint>
+                {canTakePhoto && (
+                  <IconHint label="Take photo">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Take photo"
+                      className={cn(phone && "size-11")}
+                      onClick={takePhoto}
+                    >
+                      <Camera aria-hidden="true" />
+                    </Button>
+                  </IconHint>
+                )}
+                <IconHint label="Choose photo">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Choose photo"
+                    className={cn(phone && "size-11")}
+                    onClick={choosePhoto}
+                  >
+                    <Image aria-hidden="true" />
+                  </Button>
+                </IconHint>
+              </>
             )}
-            <IconHint label="Choose photo">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Choose photo"
-                className={cn(phone && "size-11")}
-                onClick={() =>
-                  phone
-                    ? photoInput.current?.click()
-                    : // A path the host sends as it is: a HEIC chosen here
-                      // reaches the agent with its host's note that its
-                      // format can't be shown to the model (R444/05).
-                      void pickFiles([
-                        {
-                          name: "Images",
-                          extensions: ["png", "jpg", "jpeg", "webp", "gif", "heic"],
-                        },
-                      ])
-                }
-              >
-                <Image aria-hidden="true" />
-              </Button>
-            </IconHint>
             {phone && (
               <>
                 <input
@@ -1713,7 +1767,13 @@ export function Composer({
           )}
           data-incognito={incognitoEffective ? "true" : undefined}
         />
-        <div className={sendAccessory ? "ml-auto flex min-w-0 items-center gap-2" : "contents"}>
+        <div
+          className={
+            sendAccessory
+              ? "ml-auto flex min-w-0 shrink-0 items-center gap-2 group-data-[fold~=snug]/bar:gap-1"
+              : "contents"
+          }
+        >
           {sendAccessory}
           <Button
             type="button"
@@ -1722,13 +1782,27 @@ export function Composer({
             aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
             // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
             // path on touch (tap = the FR-41 approval trigger). Desktop keeps the
-            // default button size.
+            // default button size. A session bar short of room draws Send as a
+            // 36px icon (≥44pt on the phone) so it keeps one row (`useBarFold`).
             className={cn(
               phone && "h-11 min-w-11",
               transport === "session" && !sendAccessory && "ml-auto",
+              transport === "session" &&
+                (phone
+                  ? "group-data-[fold~=send]/bar:px-0"
+                  : "group-data-[fold~=send]/bar:size-9 group-data-[fold~=send]/bar:px-0"),
             )}
           >
-            {pending?.mode === "edit" ? "Save" : "Send"}
+            {transport === "session" && pending?.mode !== "edit" ? (
+              <>
+                <span className="group-data-[fold~=send]/bar:hidden">Send</span>
+                <ArrowUp aria-hidden="true" className="hidden group-data-[fold~=send]/bar:block" />
+              </>
+            ) : pending?.mode === "edit" ? (
+              "Save"
+            ) : (
+              "Send"
+            )}
           </Button>
         </div>
       </div>

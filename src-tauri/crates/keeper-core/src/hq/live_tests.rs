@@ -862,18 +862,46 @@ fn a_session_offers_only_what_the_agent_offers_and_a_switch_only_narrows() {
     assert!(switched_off(&w.source, "dev1.1").0.is_empty());
 }
 
+/// D-34/V13: the mark never lowers, so the chip's way out is `/clean` (Q109-17 b: a fresh chat
+/// starts trusted and keeps the drives), offered only where `/clean` runs — never on an
+/// archived session. The Details dialog says "Trusted" for a session with no mark.
 #[test]
-fn a_session_that_read_outside_content_is_marked_and_says_why() {
+fn a_session_that_read_outside_content_is_marked_and_says_why_and_the_way_out() {
     let w = world(true);
+    let trust = |w: &World| {
+        sessions::list(std::slice::from_ref(&w.source), 0)
+            .into_iter()
+            .find(|row| row.session_id == "dev1.1")
+            .expect("listed")
+            .trust
+    };
     assert_eq!(w.view(&Opened::default()).untrusted, None);
+    assert_eq!(trust(&w), "Trusted");
     w.put(vec![RowOp::Patch {
         table: "sessions".to_owned(),
         values: object(json!({"id": "dev1.1", "trust": "untrusted"})),
         base_version: None,
     }]);
     assert_eq!(
-        w.view(&Opened::default()).untrusted.as_deref(),
-        Some(timeline::UNTRUSTED)
+        w.view(&Opened::default()).untrusted,
+        Some(timeline::AgentUntrustedVm {
+            sentence: timeline::UNTRUSTED.to_owned(),
+            fresh_chat: Some(timeline::FRESH_CHAT.to_owned()),
+        })
+    );
+    assert_eq!(trust(&w), "Untrusted");
+    w.put(vec![RowOp::Patch {
+        table: "sessions".to_owned(),
+        values: object(json!({"id": "dev1.1", "archived": true})),
+        base_version: None,
+    }]);
+    assert_eq!(
+        w.view(&Opened::default()).untrusted,
+        Some(timeline::AgentUntrustedVm {
+            sentence: timeline::UNTRUSTED.to_owned(),
+            fresh_chat: None,
+        }),
+        "/clean refuses on an archived session, so nothing offers it"
     );
 }
 

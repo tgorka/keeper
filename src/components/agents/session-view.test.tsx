@@ -63,7 +63,7 @@ const vm: AgentSessionViewVm = {
   sessionId: "same.1",
   title: "Research",
   displayName: "assistant · Research",
-  handle: "jolly-pigeon-squeaks",
+  handle: "jolly-pigeon",
   agentActor: "assistant",
   agentName: "Assistant",
   readOnly: false,
@@ -90,12 +90,22 @@ const vm: AgentSessionViewVm = {
     summary: "Context unknown: no answer has measured it yet.",
     parts: [],
   },
-  footer: { model: "beta-small", effort: "Default", choosesModel: false, choosesEffort: false },
+  footer: {
+    model: "beta-small",
+    effort: "Default",
+    shortModel: "beta-small",
+    effortCode: "D",
+    choosesModel: false,
+    choosesEffort: false,
+  },
 };
-async function draw(shown: AgentSessionViewVm = vm) {
+async function draw(
+  shown: AgentSessionViewVm = vm,
+  onSession?: (session: { database: string; sessionId: string }) => void,
+) {
   const result = render(
     <TooltipProvider>
-      <SessionView target={{ database: "beta", sessionId: "same.1" }} />
+      <SessionView target={{ database: "beta", sessionId: "same.1" }} onSession={onSession} />
     </TooltipProvider>,
   );
   await waitFor(() => expect(mock.view).not.toBeNull());
@@ -226,7 +236,13 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
   it("opens the pickers from the same chips where Rust says there is a choice", async () => {
     await draw({
       ...vm,
-      footer: { model: "beta-small", effort: "Medium", choosesModel: true, choosesEffort: true },
+      footer: {
+        ...vm.footer,
+        effort: "Medium",
+        effortCode: "M",
+        choosesModel: true,
+        choosesEffort: true,
+      },
       settings: {
         models: [
           { id: "alpha-large", provider: "Other", current: false, default: false },
@@ -247,7 +263,7 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
     expect(await screen.findByRole("dialog", { name: "Choose a model" })).toBeInTheDocument();
   });
 
-  it("keeps the reading and the untrusted marker on an archived session (R598-03)", async () => {
+  it("keeps the reading on an archived session, and its untrusted chip offers no fresh chat (R598-03)", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";
     render(
@@ -262,7 +278,8 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
         ...vm,
         archived: true,
         readOnly: true,
-        untrusted: why,
+        // Rust leaves the way out off where `/clean` refuses.
+        untrusted: { sentence: why },
         context: {
           ...vm.context,
           label: "5.3k / 1M",
@@ -274,52 +291,141 @@ describe("the composer's bar (owner ruling 2026-10-27)", () => {
     const bar = screen.getByRole("group", { name: "Model and effort" });
     expect(within(bar).getByText("beta-small")).toBeInTheDocument();
     expect(within(bar).queryByRole("button", { name: /^Model:/ })).toBeNull();
-    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole("banner")).getByRole("button", { name: `Untrusted: ${why}` }),
+    );
+    const why_ = await screen.findByRole("dialog", { name: "Why commands ask" });
+    expect(why_).toHaveTextContent(why);
+    expect(within(why_).queryByRole("button")).toBeNull();
     expect(
       screen.getByRole("button", { name: "Context details: 1% · used ≈ 5347 / 1048576 tokens" }),
     ).toHaveTextContent("5.3k / 1M");
   });
 
-  it("marks an untrusted session in the bar and says why in the banner", async () => {
+  it("marks an untrusted session in the header, says why in the banner, and offers a fresh chat", async () => {
     const why =
       "This chat read outside content, such as a web page, so its commands need your approval.";
-    await draw({
-      ...vm,
-      untrusted: why,
-      banner: {
-        sentence: "Sending a message declines this request, even a message that says yes.",
-        approvals: [
-          {
-            id: "a6",
-            database: "beta",
-            sessionId: "same.1",
-            toolName: "run",
-            tier: "T3",
-            summary: "Run git log",
-            action: '{"argv":["git","log"]}',
-            bindingDigest: "d6",
-            expiresAtMs: 1800000000000,
-            createdAtMs: 1780000000000,
-            state: "pending",
-            canDecide: true,
-            sentence: "Waiting for you.",
-            actions: ["allowOnce", "deny"],
-            declinedBySend: true,
-          },
-        ],
+    const fresh = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
+    const next = { database: "beta", sessionId: "same.2" };
+    mock.command.mockResolvedValue({ session: next, surface: null, message: "" });
+    const onSession = vi.fn();
+    await draw(
+      {
+        ...vm,
+        untrusted: { sentence: why, freshChat: fresh },
+        banner: {
+          sentence: "Sending a message declines this request, even a message that says yes.",
+          approvals: [
+            {
+              id: "a6",
+              database: "beta",
+              sessionId: "same.1",
+              toolName: "run",
+              tier: "T3",
+              summary: "Run git log",
+              action: '{"argv":["git","log"]}',
+              bindingDigest: "d6",
+              expiresAtMs: 1800000000000,
+              createdAtMs: 1780000000000,
+              state: "pending",
+              canDecide: true,
+              sentence: "Waiting for you.",
+              actions: ["allowOnce", "deny"],
+              declinedBySend: true,
+            },
+          ],
+        },
       },
+      onSession,
+    );
+    // A session-state chip on the header's meta line, not a control in the composer's bar.
+    const chip = within(screen.getByRole("banner")).getByRole("button", {
+      name: `Untrusted: ${why}`,
     });
-    expect(screen.getByRole("button", { name: `Untrusted: ${why}` })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("group", { name: "Model and effort" })).queryByRole("button", {
+        name: /Untrusted/,
+      }),
+    ).toBeNull();
     expect(
       screen.getByRole("complementary", { name: "Waiting for your decision" }),
     ).toHaveTextContent(why);
+    // The Agents window shows another session meanwhile.
+    const shownInWindow = { database: "alpha", sessionId: "other.1" };
+    agentSessionsStore.getState().select(shownInWindow);
+    fireEvent.click(chip);
+    const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
+    expect(popover).toHaveTextContent(why);
+    fireEvent.click(within(popover).getByRole("button", { name: fresh }));
+    // `/clean` through the composer's command path; it declines nothing the banner shows.
+    await waitFor(() =>
+      expect(mock.command).toHaveBeenCalledWith(
+        { database: "beta", sessionId: "same.1" },
+        "/clean",
+        null,
+        [],
+      ),
+    );
+    // The host that holds its own choice (the Notes Assistant dock) moves to the fresh chat, and
+    // the Agents window's selection stays where it was (R601-04).
+    await waitFor(() => expect(onSession).toHaveBeenCalledWith(next));
+    expect(agentSessionsStore.getState().selected).toEqual(shownInWindow);
+  });
+
+  it("moves the Agents window to the fresh chat where no host holds its own choice", async () => {
+    const next = { database: "beta", sessionId: "same.2" };
+    mock.command.mockResolvedValue({ session: next, surface: null, message: "" });
+    agentSessionsStore.getState().select({ database: "beta", sessionId: "same.1" });
+    await draw({
+      ...vm,
+      untrusted: {
+        sentence: "This chat read outside content.",
+        freshChat: "Start a fresh chat: starts trusted, keeps the drives you can still tick",
+      },
+    });
+    fireEvent.click(
+      within(screen.getByRole("banner")).getByRole("button", { name: /^Untrusted:/ }),
+    );
+    const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
+    fireEvent.click(within(popover).getByRole("button", { name: /^Start a fresh chat/ }));
+    await waitFor(() => expect(agentSessionsStore.getState().selected).toEqual(next));
+  });
+
+  it("says why a fresh chat could not start, in the chip's popover", async () => {
+    const why =
+      "This chat read outside content, such as a web page, so its commands need your approval.";
+    const fresh = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
+    mock.command.mockRejectedValue({
+      code: "internal",
+      message: "Unarchive this conversation first.",
+      accountId: null,
+    });
+    await draw({ ...vm, untrusted: { sentence: why, freshChat: fresh } });
+    fireEvent.click(
+      within(screen.getByRole("banner")).getByRole("button", { name: `Untrusted: ${why}` }),
+    );
+    const popover = await screen.findByRole("dialog", { name: "Why commands ask" });
+    fireEvent.click(within(popover).getByRole("button", { name: fresh }));
+    expect(await within(popover).findByRole("alert")).toHaveTextContent(
+      "Unarchive this conversation first.",
+    );
   });
 });
 
 describe("session composer attachments", () => {
   it("sends a picked batch with one caption into its own database, without a second text message", async () => {
     await draw();
-    fireEvent.click(screen.getByRole("button", { name: "Attach file" }));
+    // Attach, camera and photo share the bar's one `+` menu (FooterOneRow).
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Attach" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(
+      within(await screen.findByRole("menu"))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Attach file", "Choose photo"]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Attach file" }));
     await screen.findByRole("button", { name: "Remove plan.pdf" });
     fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
       target: { value: "Read both files" },
@@ -754,7 +860,7 @@ describe("the approval banner", () => {
     );
   });
 
-  it("says what waits for another device, and a message then declines nothing (DW-E109-27)", async () => {
+  it("says what waits for another device, keeps it at the turn that asked, and a message then declines nothing (DW-E109-27)", async () => {
     const elsewhere =
       "1 request needs a decision from another device; a message here leaves it waiting.";
     const t4 = {
@@ -762,16 +868,41 @@ describe("the approval banner", () => {
       toolName: "delegate",
       tier: "T4",
       summary: "Run t4",
+      canDecide: false,
+      sentence: "Needs a decision from another device.",
+      actions: [],
       declinedBySend: false,
+    };
+    const asked: Ipc.AgentTurnFoldVm = {
+      turnId: "t-asked",
+      leadInIds: [],
+      reasoning: null,
+      steps: [{ id: "s1", name: "delegate", status: "parked", statusLabel: "Parked" }],
+      failures: [],
+      status: "waiting",
+      statusLabel: "Waiting for you",
+      summary: "Waiting for you · called delegate 1 time",
+      durationMs: null,
+      approvals: [],
+      waiting: [t4],
     };
     await draw();
     act(() =>
-      mock.view?.({ ...vm, approvals: [t4], banner: { approvals: [], sentence: elsewhere } }),
+      mock.view?.({
+        ...vm,
+        items: [{ kind: "fold", turnId: "t-asked" }],
+        folds: [asked],
+        banner: { approvals: [], sentence: elsewhere },
+      }),
     );
     const region = screen.getByRole("complementary", { name: "Waiting for your decision" });
     expect(within(region).getByRole("note")).toHaveTextContent(elsewhere);
     expect(within(region).queryByRole("article")).toBeNull();
-    expect(screen.getByRole("article", { name: "Approval: Run t4" })).toBeInTheDocument();
+    // In sight at its turn, the fold closed: a pending request is never folded away.
+    const card = screen.getByRole("article", { name: "Approval: Run t4" });
+    expect(card.closest('[data-slot="turn-fold"]')).toHaveAttribute("data-turn-id", "t-asked");
+    expect(card.closest('[data-slot="turn-fold-body"]')).toBeNull();
+    expect(screen.queryByRole("region", { name: "Session approvals" })).toBeNull();
     fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
       target: { value: "go on" },
     });
@@ -785,7 +916,7 @@ describe("the approval banner", () => {
     );
   });
 
-  it("moves focus to a decided card's place in the reading column, else to the next request", async () => {
+  it("moves focus to the fold a decided card folded into, else to the next request", async () => {
     mock.decide.mockResolvedValue({ state: "sent", sentence: "Approved." });
     await draw();
     act(() => mock.view?.({ ...vm, banner }));
@@ -793,20 +924,41 @@ describe("the approval banner", () => {
     const a1 = within(region()).getByRole("article", { name: "Approval: Run a1" });
     fireEvent.click(within(a1).getByRole("button", { name: "Allow once" }));
     await waitFor(() => expect(mock.decide).toHaveBeenCalledTimes(1));
-    // Rust's next view moves a1 to the reading column, approved.
-    const decided = { ...waiting("a1", "d1"), state: "approved" as const, canDecide: false };
+    // Rust's next view moves a1, approved, into the fold of the turn that asked.
+    const decided = {
+      ...waiting("a1", "d1"),
+      state: "approved" as const,
+      canDecide: false,
+      sentence: "Approved by Ana.",
+      actions: [],
+      declinedBySend: false,
+    };
     act(() =>
       mock.view?.({
         ...vm,
-        approvals: [{ ...decided, actions: [], declinedBySend: false }],
+        items: [{ kind: "fold", turnId: "t-asked" }],
+        folds: [
+          {
+            turnId: "t-asked",
+            leadInIds: [],
+            reasoning: null,
+            steps: [],
+            failures: [],
+            status: "waiting",
+            statusLabel: "Waiting for you",
+            summary: "Waiting for you",
+            durationMs: null,
+            approvals: [decided],
+            waiting: [],
+          },
+        ],
         banner: { ...banner, approvals: [waiting("a2", "d2")] },
       }),
     );
     await waitFor(() =>
-      expect(document.activeElement).toBe(
-        screen.getByRole("article", { name: "Approval: Run a1" }),
-      ),
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Waiting for you" })),
     );
+    expect(screen.queryByRole("article", { name: "Approval: Run a1" })).toBeNull();
     // a2 decided, and Rust's view has it nowhere: focus goes to the next request, else the
     // composer — never the body.
     const a2 = within(region()).getByRole("article", { name: "Approval: Run a2" });
@@ -865,6 +1017,7 @@ describe("the reading column (109.14)", () => {
     id: "p1",
     role: "person",
     authorActor: "ana",
+    mine: true,
     authorName: "Ana",
     body: "What will the weather be tomorrow?",
     createdAtMs: 1780000000000,
@@ -873,6 +1026,7 @@ describe("the reading column (109.14)", () => {
     id: "lead",
     role: "agent",
     authorActor: "assistant",
+    mine: false,
     authorName: "Assistant",
     body: "Checking — one minute.",
     createdAtMs: 1780000001000,
@@ -881,6 +1035,7 @@ describe("the reading column (109.14)", () => {
     id: "answer",
     role: "agent",
     authorActor: "assistant",
+    mine: false,
     authorName: "Assistant",
     body: "Cloudy, then sunny.",
     createdAtMs: 1780000015000,
@@ -895,6 +1050,8 @@ describe("the reading column (109.14)", () => {
     statusLabel: "Finished",
     summary: "Worked for 14 s · searched the web 2 times",
     durationMs: 14000,
+    approvals: [],
+    waiting: [],
   };
   const screenshot: AgentSessionViewVm = {
     ...vm,
@@ -931,6 +1088,52 @@ describe("the reading column (109.14)", () => {
     expect(screen.getAllByText(answer.body)).toHaveLength(1);
   });
 
+  it("folds a decided request with its turn and keeps a pending one in sight; nothing after the column", async () => {
+    const card = (id: string, state: Ipc.AgentApprovalVm["state"], sentence: string) => ({
+      id,
+      database: "beta",
+      sessionId: "same.1",
+      toolName: "run",
+      tier: "T2",
+      summary: `Run ${id}`,
+      bindingDigest: `digest-${id}`,
+      action: '{"argv":["git","status"]}',
+      expiresAtMs: 1800000000000,
+      createdAtMs: 1780000002000,
+      state,
+      canDecide: false,
+      sentence,
+      actions: [],
+      declinedBySend: false,
+    });
+    const asked: AgentSessionViewVm = {
+      ...screenshot,
+      folds: [
+        {
+          ...turn,
+          approvals: [card("decided", "approved", "Approved by Ana.")],
+          waiting: [card("bens", "pending", "Waiting for Ben.")],
+        },
+      ],
+    };
+    await draw();
+    act(() => mock.view?.(asked));
+    const column = screen.getByRole("list", { name: "Messages" });
+    expect(column.nextElementSibling).toBeNull();
+    expect(column.lastElementChild).toHaveTextContent(answer.body);
+    // Normal: the decided card is folded with the work; the pending one is outside the body.
+    expect(screen.queryByRole("article", { name: "Approval: Run decided" })).toBeNull();
+    const bens = screen.getByRole("article", { name: "Approval: Run bens" });
+    expect(bens.closest('[data-slot="turn-fold"]')).toHaveAttribute("data-turn-id", "t1");
+    expect(bens.closest('[data-slot="turn-fold-body"]')).toBeNull();
+    // Verbose: the decided card shows, inside its turn's opened fold.
+    act(() => mock.view?.({ ...asked, prefs: { viewMode: "verbose" } }));
+    const decided = screen.getByRole("article", { name: "Approval: Run decided" });
+    expect(decided.closest('[data-slot="turn-fold-body"]')).not.toBeNull();
+    expect(decided.closest('[data-slot="turn-fold"]')).toHaveAttribute("data-turn-id", "t1");
+    expect(column.nextElementSibling).toBeNull();
+  });
+
   it("opens every fold in the verbose mode", async () => {
     await draw();
     act(() => mock.view?.({ ...screenshot, prefs: { viewMode: "verbose" } }));
@@ -956,6 +1159,7 @@ const RUNNING_CHILD: AgentChildSessionVm = {
     id: "line-1",
     role: "person",
     authorActor: "ana",
+    mine: true,
     authorName: "Ana",
     body: "@tola-grey check the notes",
     createdAtMs: 1,
@@ -984,6 +1188,8 @@ const RUNNING_CHILD: AgentChildSessionVm = {
       statusLabel: "Working",
       summary: "Searching the web… · 1 step",
       durationMs: null,
+      approvals: [],
+      waiting: [],
     },
   ],
   messages: [],

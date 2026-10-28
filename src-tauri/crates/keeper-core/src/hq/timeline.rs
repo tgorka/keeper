@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
-use crate::hq::approvals::{self, AgentApprovalVm, Undecidable};
+use crate::hq::approvals::{self, AgentApprovalStateVm, AgentApprovalVm, Undecidable, WaitingFor};
 use crate::hq::attachments::{self, AgentAttachmentVm};
 use crate::hq::drives::AgentSessionDrivesVm;
 use crate::hq::instances::{self, AgentSessionAnsweringVm};
@@ -96,6 +96,10 @@ pub struct AgentMessageVm {
     pub id: String,
     pub role: AgentMessageRoleVm,
     pub author_actor: String,
+    /// Written by this device's person (`author_actor` is the source's
+    /// actor), from any of their devices: drawn as their own bubble. Another
+    /// person's message in the same session is not (R-HQ-86).
+    pub mine: bool,
     pub author_name: String,
     pub body: String,
     #[ts(type = "number")]
@@ -174,6 +178,9 @@ pub struct AgentTurnFailureVm {
 
 /// One turn's work, separate from its terminal answer. Lead-ins reference
 /// the original messages so attachments and author identity are retained.
+/// The requests its parked calls raised are read with it: decided ones in
+/// its body, folded with its work; pending ones that are not in the banner
+/// always visible, like `failures`, and never inside a closed fold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -188,6 +195,13 @@ pub struct AgentTurnFoldVm {
     pub summary: String,
     #[ts(type = "number | null")]
     pub duration_ms: Option<i64>,
+    /// Its requests that were decided (or expired), oldest first: inside the
+    /// fold's body, so they fold with the turn.
+    pub approvals: Vec<AgentApprovalVm>,
+    /// Its requests still pending that the banner does not hold — they wait
+    /// for someone else, or for another of this person's devices — oldest
+    /// first; always visible, outside the body.
+    pub waiting: Vec<AgentApprovalVm>,
 }
 
 /// The requests a message sent now would decline, held above the composer.
@@ -274,6 +288,36 @@ pub fn banner(
 pub const UNTRUSTED: &str =
     "This chat read outside content, such as a web page, so its commands need your approval.";
 
+/// The honest way out of an untrusted chat: `/clean` starts a fresh one with
+/// the same agent, which starts trusted (Q109-17 b) and carries only the
+/// ticks this person may still tick (`drives::carry`, A109-06), while the
+/// mark on this one never lowers (D-34, V13).
+pub const FRESH_CHAT: &str =
+    "Start a fresh chat: starts trusted, keeps the drives you can still tick";
+
+/// A session that read outside content, as its header's chip says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentUntrustedVm {
+    /// Why its commands ask ([`UNTRUSTED`]).
+    pub sentence: String,
+    /// The words of the action that runs `/clean` ([`FRESH_CHAT`]); absent
+    /// on an archived session, where `/clean` refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fresh_chat: Option<String>,
+}
+
+impl AgentUntrustedVm {
+    fn of(archived: bool) -> Self {
+        Self {
+            sentence: UNTRUSTED.to_owned(),
+            fresh_chat: (!archived).then(|| FRESH_CHAT.to_owned()),
+        }
+    }
+}
+
 /// What an opened session shows, whole, every time it changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -307,8 +351,10 @@ pub struct AgentSessionViewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub children_note: Option<String>,
-    /// Oldest first; empty for a member who does not read the trace. The
-    /// requests that wait for this person are in `banner`, not here.
+    /// Oldest first; empty for a member who does not read the trace. Only
+    /// the requests whose turn this view does not show: the others are in
+    /// their turn's fold, and the requests that wait for this person are in
+    /// `banner`.
     pub approvals: Vec<AgentApprovalVm>,
     /// The requests waiting for this person, above the composer and out of
     /// the reading column (Q109-12 a); absent while none waits.
@@ -328,10 +374,10 @@ pub struct AgentSessionViewVm {
     /// This person may read the session's thinking and tool results.
     pub reads_trace: bool,
     /// The session has read outside content (`sessions.trust`, D-34): why its
-    /// commands ask, in one plain sentence ([`UNTRUSTED`]); absent while trusted.
+    /// commands ask, and the way out; absent while trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub untrusted: Option<String>,
+    pub untrusted: Option<AgentUntrustedVm>,
     /// The answers still being written, oldest first; each one's work is its
     /// turn's fold.
     pub live: Vec<AgentLiveTurnVm>,
@@ -344,7 +390,9 @@ pub struct AgentSessionViewVm {
     pub prefs: AgentViewPrefsVm,
     /// Which instance is answering and each instance's online state, from
     /// this session's database; absent while it lists no instance of the
-    /// agent and no claim.
+    /// agent and no claim, and while the session is archived: no instance
+    /// claims an archived session, so nobody answers it until it is
+    /// unarchived — the read-only bar says so (R-HQ-86).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub answering: Option<AgentSessionAnsweringVm>,
@@ -371,12 +419,16 @@ pub struct AgentSessionViewVm {
 }
 
 impl AgentSessionViewVm {
-    /// Every request the view draws, wherever it is drawn: the banner's and
-    /// the reading column's.
+    /// Every request the view draws, wherever it is drawn: the banner's, the
+    /// turn folds' (decided and waiting) and the reading column's.
     pub fn approvals_mut(&mut self) -> Vec<&mut AgentApprovalVm> {
         let mut all: Vec<&mut AgentApprovalVm> = self.approvals.iter_mut().collect();
         if let Some(banner) = self.banner.as_mut() {
             all.extend(banner.approvals.iter_mut());
+        }
+        for fold in &mut self.folds {
+            all.extend(fold.approvals.iter_mut());
+            all.extend(fold.waiting.iter_mut());
         }
         all
     }
@@ -597,39 +649,43 @@ pub fn view(
         refused(source, session_id, &directory, &mut messages);
     }
     let newest_ms = messages.last().map(|m| m.created_at_ms);
-    let (banner, approvals) = banner(approvals::of_session(
-        source, session_id, &directory, refusals, now_ms,
-    ));
-    let answering = instances::answering(
-        source,
-        session_id,
-        &session.agent_actor,
-        &agent_name,
-        &opened.live,
-        now_ms,
-    );
+    let approvals = approvals::of_session(source, session_id, &directory, refusals, now_ms);
+    // A turn whose request waits reads so on its fold line, naming whom it
+    // waits for; this person first.
+    let mut pending: HashMap<String, String> = HashMap::new();
+    for approval in &approvals {
+        let (Some(turn), Some(who)) = (&approval.turn_id, &approval.waiting_for) else {
+            continue;
+        };
+        if *who == WaitingFor::You || !pending.contains_key(turn) {
+            pending.insert(turn.clone(), who.label());
+        }
+    }
+    let (banner, rest) = banner(approvals);
+    // No instance claims an archived session (the runtime skips it), so any
+    // header — "no instance holds it yet", "X takes it next" — would be false.
+    let answering = if session.archived {
+        None
+    } else {
+        instances::answering(
+            source,
+            session_id,
+            &session.agent_actor,
+            &agent_name,
+            &opened.live,
+            now_ms,
+        )
+    };
     let (display_name, handle) = crate::hq::sessions::SessionNames::read(source).presentation(
         session_id,
         &session.agent_actor,
         &session.title,
     );
     let live = live::turns(source, session_id, &opened.live, &ended, &extras);
-    let pending: HashSet<String> = if reads_trace {
-        read(
-            source,
-            "SELECT DISTINCT t.turn_id FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
-             WHERE a.session_id = ?1 AND a.state = 'pending' AND a.expires_at_ms > ?2",
-            &[Value::from(session_id), Value::from(now_ms)],
-        )
-        .iter()
-        .filter_map(|row| opt_text(row, "turn_id"))
-        .collect()
-    } else {
-        HashSet::new()
-    };
     let stopping = stopping(source, session_id, &rows);
-    let (mut items, folds) =
+    let (mut items, mut folds) =
         turn_folds::project(&rows, &messages, &live, &extras, &pending, &stopping);
+    let approvals = place(rest, &mut folds);
     let live = live.into_iter().map(|turn| turn.vm).collect();
     let (children, left_out) = match &shown_from {
         Some(since) => mention::children(source, session_id, since, &directory, opened.prefs),
@@ -660,7 +716,9 @@ pub fn view(
             complete,
             note,
             reads_trace,
-            untrusted: session.untrusted.then(|| UNTRUSTED.to_owned()),
+            untrusted: session
+                .untrusted
+                .then(|| AgentUntrustedVm::of(session.archived)),
             live,
             tools: live::tools(source, session_id, &session.agent_actor),
             prefs: opened.prefs,
@@ -679,6 +737,28 @@ pub fn view(
         },
         newest_ms,
     ))
+}
+
+/// Each request outside the banner read in its turn's fold: a decided one in
+/// its body, a pending one always visible. What has no turn this view shows
+/// — its call is not on this device, or its turn is not in the shown months —
+/// is returned, oldest first, for the column's end.
+fn place(rest: Vec<AgentApprovalVm>, folds: &mut [AgentTurnFoldVm]) -> Vec<AgentApprovalVm> {
+    let mut unplaced = Vec::new();
+    for approval in rest {
+        let fold = approval
+            .turn_id
+            .as_deref()
+            .and_then(|turn| folds.iter_mut().find(|fold| fold.turn_id == turn));
+        match fold {
+            Some(fold) if approval.state == AgentApprovalStateVm::Pending => {
+                fold.waiting.push(approval)
+            }
+            Some(fold) => fold.approvals.push(approval),
+            None => unplaced.push(approval),
+        }
+    }
+    unplaced
 }
 
 /// The turns a person asked to stop (109.19), as the runtime's
@@ -784,6 +864,7 @@ fn messages(
                     .get(&author)
                     .cloned()
                     .unwrap_or_else(|| author.clone()),
+                mine: author == source.actor,
                 author_actor: author,
                 body: text(row, "body").to_owned(),
                 created_at_ms: int(row, "created_at_ms").unwrap_or(0),
@@ -911,7 +992,8 @@ pub(crate) fn latest_turn(
         &extras,
     );
     let messages = messages(source, &mut rows, directory, &none, prefs);
-    let (items, folds) = turn_folds::project(&rows, &messages, &live, &extras, &none, &none);
+    let (items, folds) =
+        turn_folds::project(&rows, &messages, &live, &extras, &HashMap::new(), &none);
     let live = live.into_iter().map(|turn| turn.vm).collect();
     let items: Vec<AgentTimelineItemVm> = items
         .iter()
@@ -950,6 +1032,7 @@ fn refused(
                 .cloned()
                 .unwrap_or_else(|| source.actor.clone()),
             author_actor: source.actor.clone(),
+            mine: true,
             body: text(&refused.values, "body").to_owned(),
             created_at_ms: int(&refused.values, "created_at_ms").unwrap_or(0),
             state: Some(AgentMessageStateVm::Refused),

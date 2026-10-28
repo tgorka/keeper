@@ -59,6 +59,16 @@ interface AgentSessionsState {
   openModel: (target: AgentSessionRef) => void;
   /** The view opened the picker it was asked for. */
   modelShown: () => void;
+  /**
+   * A session whose Details sheet (the context window, `/context`) was asked for from the list's
+   * right-click menu (R-HQ-86): the session opens and its view opens the sheet once Rust's first
+   * view of it arrives.
+   */
+  contextFor: AgentSessionRef | null;
+  /** Open `target` and ask its view for its Details sheet. */
+  openContext: (target: AgentSessionRef) => void;
+  /** The view opened the sheet it was asked for. */
+  contextShown: () => void;
   startNew: () => void;
   keepNewDraft: (draft: NewSessionDraft | null) => void;
 }
@@ -74,6 +84,7 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
   creating: false,
   newDraft: null,
   drivesFor: null,
+  contextFor: null,
   modelFor: null,
   apply: (batch) =>
     set((state) => {
@@ -134,6 +145,7 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
       creating: false,
       drivesFor: null,
       modelFor: null,
+      contextFor: null,
     }),
   openDrives: (target) => {
     const selected = { database: target.database, sessionId: target.sessionId };
@@ -144,6 +156,7 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
       creating: false,
       drivesFor: selected,
       modelFor: null,
+      contextFor: null,
     });
   },
   drivesShown: () => set({ drivesFor: null }),
@@ -156,9 +169,23 @@ export const agentSessionsStore = createStore<AgentSessionsState>()((set) => ({
       creating: false,
       drivesFor: null,
       modelFor: selected,
+      contextFor: null,
     });
   },
   modelShown: () => set({ modelFor: null }),
+  contextShown: () => set({ contextFor: null }),
+  openContext: (target) => {
+    const selected = { database: target.database, sessionId: target.sessionId };
+    set({
+      selected,
+      gone: null,
+      newSession: null,
+      creating: false,
+      drivesFor: null,
+      modelFor: null,
+      contextFor: selected,
+    });
+  },
   startNew: () => set({ selected: null, gone: null, newSession: null, creating: true }),
   keepNewDraft: (newDraft) => set({ newDraft }),
 }));

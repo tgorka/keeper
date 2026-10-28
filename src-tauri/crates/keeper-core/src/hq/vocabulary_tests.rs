@@ -33,14 +33,14 @@ fn a_handle_depends_on_the_id_alone() {
 
 /// Each list is a power of two long (no index is likelier than another) and
 /// holds distinct lowercase ASCII words, so a handle splits back on `-`
-/// into exactly three words.
+/// into exactly two words.
 #[test]
 fn the_word_lists_are_even_and_hyphen_free() {
     let Some(vocabulary) = PARSED.as_ref() else {
         panic!("syncular/vocabulary.json does not parse");
     };
     let words = &vocabulary.handle;
-    for list in [&words.adjectives, &words.nouns, &words.verbs] {
+    for list in [&words.adjectives, &words.nouns] {
         assert!(list.len().is_power_of_two() && list.len() <= 1 << 16);
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), list.len());
         assert!(list

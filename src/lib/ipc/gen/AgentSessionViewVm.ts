@@ -12,6 +12,7 @@ import type { AgentSessionPickerVm } from "./AgentSessionPickerVm";
 import type { AgentSessionToolVm } from "./AgentSessionToolVm";
 import type { AgentTimelineItemVm } from "./AgentTimelineItemVm";
 import type { AgentTurnFoldVm } from "./AgentTurnFoldVm";
+import type { AgentUntrustedVm } from "./AgentUntrustedVm";
 import type { AgentViewPrefsVm } from "./AgentViewPrefsVm";
 
 /**
@@ -46,8 +47,10 @@ children?: Array<AgentChildSessionVm>,
  */
 childrenNote?: string, 
 /**
- * Oldest first; empty for a member who does not read the trace. The
- * requests that wait for this person are in `banner`, not here.
+ * Oldest first; empty for a member who does not read the trace. Only
+ * the requests whose turn this view does not show: the others are in
+ * their turn's fold, and the requests that wait for this person are in
+ * `banner`.
  */
 approvals: Array<AgentApprovalVm>, 
 /**
@@ -77,9 +80,9 @@ note?: string,
 readsTrace: boolean, 
 /**
  * The session has read outside content (`sessions.trust`, D-34): why its
- * commands ask, in one plain sentence ([`UNTRUSTED`]); absent while trusted.
+ * commands ask, and the way out; absent while trusted.
  */
-untrusted?: string, 
+untrusted?: AgentUntrustedVm, 
 /**
  * The answers still being written, oldest first; each one's work is its
  * turn's fold.
@@ -99,7 +102,9 @@ prefs: AgentViewPrefsVm,
 /**
  * Which instance is answering and each instance's online state, from
  * this session's database; absent while it lists no instance of the
- * agent and no claim.
+ * agent and no claim, and while the session is archived: no instance
+ * claims an archived session, so nobody answers it until it is
+ * unarchived — the read-only bar says so (R-HQ-86).
  */
 answering?: AgentSessionAnsweringVm, 
 /**

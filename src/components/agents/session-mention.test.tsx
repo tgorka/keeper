@@ -12,6 +12,7 @@ const PROMPT: AgentMessageVm = {
   id: "m-1",
   role: "person",
   authorActor: "ana",
+  mine: true,
   authorName: "Ana",
   body: "@tola-grey what do the notes say?",
   createdAtMs: 1_000,
@@ -43,6 +44,8 @@ const ANSWERED: AgentChildSessionVm = {
       statusLabel: "Finished",
       summary: "Answered in 2 s",
       durationMs: 2000,
+      approvals: [],
+      waiting: [],
     },
   ],
   messages: [
@@ -50,6 +53,7 @@ const ANSWERED: AgentChildSessionVm = {
       id: "a-1",
       role: "agent",
       authorActor: "tola-grey",
+      mine: false,
       authorName: "Tola Grey",
       body: "Ship on Friday.",
       createdAtMs: 2_000,
@@ -70,6 +74,22 @@ describe("SessionChildThread", () => {
     expect(within(latest).getByText("Ship on Friday.")).toBeInTheDocument();
     fireEvent.click(within(thread).getByRole("button", { name: "Open thread with Tola Grey" }));
     expect(onOpen).toHaveBeenCalledWith({ database: "alpha", sessionId: "dev1.7" });
+  });
+
+  it("draws the person's own line as their bubble, and another person's line plain (R-HQ-86)", () => {
+    const { unmount } = render(
+      <SessionChildThread database="alpha" child={ANSWERED} onOpen={vi.fn()} />,
+    );
+    const own = screen.getByText(PROMPT.body);
+    expect(own).toHaveAttribute("data-mine");
+    expect(own).toHaveClass("bg-primary");
+    unmount();
+    const ben = { ...PROMPT, authorActor: "ben", authorName: "Ben", mine: false };
+    render(
+      <SessionChildThread database="alpha" child={{ ...ANSWERED, prompt: ben }} onOpen={vi.fn()} />,
+    );
+    expect(screen.getByText(PROMPT.body)).not.toHaveAttribute("data-mine");
+    expect(screen.getByText(PROMPT.body)).not.toHaveClass("bg-primary");
   });
 
   it("shows a refused line with Rust's sentence and nothing to open", () => {

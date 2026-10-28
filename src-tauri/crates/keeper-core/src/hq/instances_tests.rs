@@ -500,38 +500,41 @@ fn the_header_names_the_holder_as_the_claim_moves_and_presence_comes_and_goes() 
     assert_eq!(answering_vm("Nixie", &[], None, false, None, &None), None);
 }
 
+/// Session `s.1` of Nixie's, ana its owner, active at `at`.
+fn session_s1(at: i64, archived: bool) -> Vec<RowOp> {
+    vec![
+        upsert(
+            "sessions",
+            json!({"id": "s.1", "title": "plans", "status": "open", "agent_actor": NIXIE,
+                   "created_by_actor": ANA, "created_by_client": "ana.dev",
+                   "preferred_client": null, "parent_session": null, "invite": "[]",
+                   "archived": archived, "heard_until": null, "created_at_ms": at,
+                   "last_activity_ms": at, "author_actor": ANA, "author_client": "ana.dev"}),
+        ),
+        upsert(
+            "session_members",
+            json!({"id": "s.1/ana", "session_id": "s.1", "actor_id": ANA, "role": "owner",
+                   "reads_trace": true, "added_by_actor": ANA, "added_at_ms": at,
+                   "read_until": null, "author_actor": ANA, "author_client": "ana.dev"}),
+        ),
+    ]
+}
+
 #[test]
 fn an_open_session_carries_its_header_from_its_own_database() {
     use crate::hq::timeline::{self, Opened};
     let (_dir, sources) = world();
     let alpha = &sources[0];
     let at = crate::hq::sessions::now_ms();
-    alpha
-        .replica
-        .mutate(vec![
-            prefs(B, &[A], 10),
-            upsert(
-                "sessions",
-                json!({"id": "s.1", "title": "plans", "status": "open", "agent_actor": NIXIE,
-                       "created_by_actor": ANA, "created_by_client": "ana.dev",
-                       "preferred_client": null, "parent_session": null, "invite": "[]",
-                       "archived": false, "heard_until": null, "created_at_ms": at,
-                       "last_activity_ms": at, "author_actor": ANA, "author_client": "ana.dev"}),
-            ),
-            upsert(
-                "session_members",
-                json!({"id": "s.1/ana", "session_id": "s.1", "actor_id": ANA, "role": "owner",
-                       "reads_trace": true, "added_by_actor": ANA, "added_at_ms": at,
-                       "read_until": null, "author_actor": ANA, "author_client": "ana.dev"}),
-            ),
-            upsert(
-                "claims",
-                json!({"session_id": "s.1", "holder_actor": NIXIE, "holder_client": A,
-                       "epoch": 1, "renewed_at_ms": at, "released": false,
-                       "author_actor": NIXIE, "author_client": A}),
-            ),
-        ])
-        .expect("seed");
+    let mut ops = vec![prefs(B, &[A], 10)];
+    ops.extend(session_s1(at, false));
+    ops.push(upsert(
+        "claims",
+        json!({"session_id": "s.1", "holder_actor": NIXIE, "holder_client": A,
+               "epoch": 1, "renewed_at_ms": at, "released": false,
+               "author_actor": NIXIE, "author_client": A}),
+    ));
+    alpha.replica.mutate(ops).expect("seed");
     let (view, _) =
         timeline::view(alpha, "s.1", &Opened::default(), &Default::default(), at).expect("a view");
     let answering = view.answering.expect("the header");
@@ -539,6 +542,27 @@ fn an_open_session_carries_its_header_from_its_own_database() {
     // alpha does not sync in this test: who holds it, never "offline".
     assert_eq!(answering.sentence, "nixie@electra holds this conversation.");
     assert_eq!(answering.instances.len(), 2);
+}
+
+/// R-HQ-86: no instance claims an archived session (an imported chat is
+/// one), so it draws no "No instance holds this conversation yet" header
+/// although its agent lists instances; its read-only bar says what to do.
+#[test]
+fn an_archived_session_draws_no_answering_header() {
+    use crate::hq::timeline::{self, Opened};
+    let (_dir, sources) = world();
+    let alpha = &sources[0];
+    let at = crate::hq::sessions::now_ms();
+    alpha.replica.mutate(session_s1(at, true)).expect("seed");
+    assert_eq!(
+        instances_of(alpha, NIXIE).len(),
+        2,
+        "the agent lists instances"
+    );
+    let (view, _) =
+        timeline::view(alpha, "s.1", &Opened::default(), &Default::default(), at).expect("a view");
+    assert!(view.archived);
+    assert_eq!(view.answering, None);
 }
 
 fn row_of(source: &Source) -> Option<(String, Vec<String>)> {

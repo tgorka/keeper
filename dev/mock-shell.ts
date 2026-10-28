@@ -6115,6 +6115,8 @@ const ownerReport = new URLSearchParams(location.search).get("owner") === "repor
 /** `timeline::UNTRUSTED`. */
 const MOCK_UNTRUSTED =
   "This chat read outside content, such as a web page, so its commands need your approval.";
+/** `timeline::FRESH_CHAT`: the chip's `/clean`, absent on an archived session. */
+const MOCK_FRESH_CHAT = "Start a fresh chat: starts trusted, keeps the drives you can still tick";
 /** `context::NOT_MEASURED`, before `sessionViewerVm` projects the real reading. */
 const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
   used: null,
@@ -6130,9 +6132,35 @@ const MOCK_UNMEASURED: AgentSessionViewVm["context"] = {
 const MOCK_FOOTER_SEED: AgentSessionViewVm["footer"] = {
   model: "Default",
   effort: "Default",
+  shortModel: "Default",
+  effortCode: "D",
   choosesModel: false,
   choosesEffort: false,
 };
+/** `settings::effort_code`, by the label it shortens; `EFFORT_UNSET_CODE` for "Default". */
+const MOCK_EFFORT_CODES: Record<string, string> = {
+  Low: "L",
+  Medium: "M",
+  High: "H",
+  "Extra high": "XH",
+};
+/** `settings::footer_of`: the chip's words are the model's own name; the effort has a code. */
+function mockFooter(
+  model: string,
+  effort: string,
+  choosesModel: boolean,
+  choosesEffort: boolean,
+): AgentSessionViewVm["footer"] {
+  const shortModel = model.split("/").filter(Boolean).pop() ?? model;
+  return {
+    model,
+    effort,
+    shortModel,
+    effortCode: MOCK_EFFORT_CODES[effort] ?? "D",
+    choosesModel,
+    choosesEffort,
+  };
+}
 /**
  * The drive selection (109.23). By default the person is an owner and the agent offers `alpha`
  * and `gamma`: `beta` is refused by the audience rule as Rust reads it from the directories this
@@ -6224,7 +6252,12 @@ function heldViewPrefs(): AgentViewPrefsVm {
  * sentence a member who does not read the trace is sent instead, the answer it sits above, and
  * where tool-only work reads. `sessionViewerVm` projects it as `timeline.rs` does.
  */
-type MockFold = AgentTurnFoldVm & { publicSummary: string; answerId?: string; atMs: number };
+// A fold's requests are placed when the view is projected (`timeline::place`), never stored.
+type MockFold = Omit<AgentTurnFoldVm, "approvals" | "waiting"> & {
+  publicSummary: string;
+  answerId?: string;
+  atMs: number;
+};
 const sessionFolds = new Map<string, MockFold[]>();
 function mockFoldsOf(vm: AgentSessionViewVm): MockFold[] {
   const key = JSON.stringify([vm.database, vm.sessionId]);
@@ -6295,7 +6328,7 @@ const sessionRows: AgentSessionRowVm[] =
               : sessionScenario === "long"
                 ? `assistant · Release-${"long-title-".repeat(30)}`
                 : "assistant · Plan the next release",
-          handle: "jolly-pigeon-squeaks",
+          handle: "jolly-pigeon",
           createdAtMs: 1700000000000,
           trust: "native",
           instances: [sessionScenario === "names" ? "nixi@electra" : "assistant@electra"],
@@ -6319,7 +6352,7 @@ const sessionRows: AgentSessionRowVm[] =
           sessionId: "device.1",
           titleWrite: { state: "confirmed" },
           displayName: "assistant · Review the research notes",
-          handle: "jolly-pigeon-squeaks",
+          handle: "jolly-pigeon",
           createdAtMs: 1700000000000,
           trust: "native",
           instances: ["assistant@electra"],
@@ -6338,7 +6371,7 @@ const sessionRows: AgentSessionRowVm[] =
           sessionId: "device.2",
           titleWrite: { state: "confirmed" },
           displayName: "assistant · Archive — one thousand messages",
-          handle: "calm-weasel-scribbles",
+          handle: "calm-weasel",
           createdAtMs: 1700000000000,
           trust: "native",
           instances: ["assistant@electra"],
@@ -6352,6 +6385,22 @@ const sessionRows: AgentSessionRowVm[] =
           lastActivityMs: Date.now() - 86400000,
         },
       ];
+/**
+ * ?sessions=launch&approvals=elsewhere — alpha's device.1 read as keeper on the agent's own host
+ * reads it: the T4 Paseo start needs another device and the T2 `run` waits for Ben, so neither is
+ * in the banner; each stays in sight in its turn's fold (`timeline::place`), never below the
+ * answer, and the fold line names whom the turn waits for.
+ */
+const approvalsScenario = new URLSearchParams(location.search).get("approvals");
+/** `Undecidable::AnotherDevice.sentence()`. */
+const MOCK_ANOTHER_DEVICE = "Needs a decision from another device.";
+/** `approvals.rs` `turn_id`: the turn of each request's parked call (`tool_calls.turn_id`). */
+const mockApprovalTurns = new Map<string, string>([
+  ["approval-1", "turn-alpha-1000"],
+  ["approval-2", "turn-alpha-1000"],
+  ["approval-3", "turn-alpha-1000"],
+  ["approval-run", "turn-owner"],
+]);
 const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includes(
   sessionScenario ?? "",
 )
@@ -6396,8 +6445,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
         expiresAtMs: Date.now() + 3600000,
         createdAtMs: Date.now() + 1,
         state: "pending",
-        canDecide: true,
-        sentence: "Waiting for you.",
+        canDecide: approvalsScenario !== "elsewhere",
+        sentence: approvalsScenario === "elsewhere" ? "Waiting for Ben." : "Waiting for you.",
         actions: [],
         declinedBySend: false,
       },
@@ -6431,8 +6480,8 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
         expiresAtMs: Date.now() + 3600000,
         createdAtMs: Date.now() + 2,
         state: "pending",
-        canDecide: true,
-        sentence: "Waiting for you.",
+        canDecide: approvalsScenario !== "elsewhere",
+        sentence: approvalsScenario === "elsewhere" ? MOCK_ANOTHER_DEVICE : "Waiting for you.",
         actions: [],
         declinedBySend: false,
       },
@@ -6977,7 +7026,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           row.sessionId === "device.1") ||
         // An archived chat that read the web keeps its marker (R598-03).
         (ownerReport && row.archived)
-          ? MOCK_UNTRUSTED
+          ? { sentence: MOCK_UNTRUSTED }
           : undefined,
       context: MOCK_UNMEASURED,
       footer: MOCK_FOOTER_SEED,
@@ -7004,6 +7053,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           id: "message-999",
           role: "person",
           authorActor: "ana",
+          mine: true,
           authorName: "Ana",
           body:
             row.database === "alpha"
@@ -7016,6 +7066,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
           id: "message-1000",
           role: "agent",
           authorActor: "assistant",
+          mine: false,
           authorName: "Assistant",
           body:
             row.database === "alpha"
@@ -7029,6 +7080,7 @@ const sessionViews = new Map<string, AgentSessionViewVm>(
                 id: "ask-1",
                 role: "agent" as const,
                 authorActor: "assistant",
+                mine: false,
                 authorName: "Assistant",
                 body: "Which notes should I review first?",
                 createdAtMs: row.lastActivityMs + 1,
@@ -7201,6 +7253,7 @@ if (ownerReport) {
       id: "owner-ask",
       role: "person",
       authorActor: "ana",
+      mine: true,
       authorName: "Ana",
       body: "What changed in the repo today?",
       createdAtMs: at,
@@ -7211,6 +7264,7 @@ if (ownerReport) {
       id: "owner-blank-close",
       role: "agent",
       authorActor: "assistant",
+      mine: false,
       authorName: "Nixi",
       body: "",
       createdAtMs: at + 1000,
@@ -7239,6 +7293,7 @@ if (turnsScenario === "all") {
         id,
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body,
         createdAtMs: at,
@@ -7254,6 +7309,7 @@ if (turnsScenario === "all") {
         id,
         role: "agent",
         authorActor: "assistant",
+        mine: false,
         authorName: "Assistant",
         body,
         createdAtMs: at,
@@ -7463,6 +7519,7 @@ if (attachmentsScenario === "chips") {
         id: "message-files",
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body: "Here are the plan, the photo, the prices and the notes.",
         createdAtMs: at + 1,
@@ -7478,6 +7535,7 @@ if (attachmentsScenario === "chips") {
         id: "message-refused",
         role: "person",
         authorActor: "ana",
+        mine: true,
         authorName: "Ana",
         body: "",
         createdAtMs: at + 2,
@@ -7512,6 +7570,7 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
     id: `local-${++sessionSerial}`,
     role: "person",
     authorActor: "ana",
+    mine: true,
     authorName: "Ana",
     body: caption,
     createdAtMs: Date.now(),
@@ -7552,16 +7611,23 @@ function mockAttach(vm: AgentSessionViewVm, caption: string, chips: AgentAttachm
 // each change a moment after it was written, through the row's outcome. `fallback` puts
 // `metadata.model_fallback` on the newest answer. Viewing aid only: Rust's `picker_of` decides.
 // ?settings=single (or ?owner=report): one model and no effort, so the bar's chips are read-only.
+// ?settings=held: the same, with a choice still saved, so the model chip opens a popover holding
+// Reset (R601-01).
 // ?settings=failed: the newest answer failed on the model in use (a 429 for days, R-HQ-85).
 const settingsScenario = new URLSearchParams(location.search).get("settings");
-const singleModel = settingsScenario === "single" || ownerReport;
+const singleModel = settingsScenario === "single" || settingsScenario === "held" || ownerReport;
 const MOCK_MODELS = singleModel
   ? ["openrouter/z-ai/glm-5.3-flash"]
-  : // The five ids every agent offers at keeper-hq main c60ab1b (`agents/*/agent.toml`).
+  : // The ids every agent offers (keeper-hq `agents/*/agent.toml`), in their order, which
+    // Rust's `settings::offered` keeps (R-HQ-86: the owner's order).
     [
       "claude-opus-5-5",
       "claude-sonnet-5-5",
       "claude-haiku-5-5",
+      "gpt-6-astra",
+      "gpt-6.1-sol",
+      "gpt-6.1-terra",
+      "gpt-6.1-luna",
       "openrouter/z-ai/glm-5.3-flash",
       "openrouter/qwen/qwen3.7-flash",
     ];
@@ -7572,6 +7638,10 @@ const MOCK_PROVIDERS: Record<string, string> = {
   "claude-opus-5-5": "Anthropic",
   "claude-sonnet-5-5": "Anthropic",
   "claude-haiku-5-5": "Anthropic",
+  "gpt-6-astra": "OpenAI",
+  "gpt-6.1-sol": "OpenAI",
+  "gpt-6.1-terra": "OpenAI",
+  "gpt-6.1-luna": "OpenAI",
   "openrouter/z-ai/glm-5.3-flash": "Z.ai",
   "openrouter/qwen/qwen3.7-flash": "Qwen",
 };
@@ -7598,7 +7668,11 @@ function mockSettingsOf(vm: AgentSessionViewVm) {
   const key = JSON.stringify([vm.database, vm.sessionId]);
   let held = mockSettings.get(key);
   if (!held) {
-    held = { model: null, effort: null, refused: null };
+    held = {
+      model: settingsScenario === "held" ? MOCK_DEFAULT_MODEL : null,
+      effort: null,
+      refused: null,
+    };
     mockSettings.set(key, held);
   }
   return held;
@@ -7695,54 +7769,103 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     else if (at > 0 && items[at - 1].kind === "fold") at -= 1;
     items.splice(at, 0, { kind: "child", threadId: child.threadId });
   }
-  const folds = items.flatMap((item) => {
-    const fold = item.kind === "fold" && source.find((f) => f.turnId === item.turnId);
-    if (!fold) return [];
-    const { publicSummary, answerId: _answer, atMs: _at, ...vmFold } = fold;
-    return [
-      {
-        ...vmFold,
-        reasoning: thinking ? vmFold.reasoning : null,
-        steps: reader ? vmFold.steps.map((step) => ({ ...step })) : [],
-        failures: reader ? [...vmFold.failures] : vmFold.failures.filter((f) => f.stepId === ""),
-        summary: reader ? vmFold.summary : publicSummary,
-      },
-    ];
-  });
   // `timeline::banner`: what a message would decline sits above the composer.
   const cards = reader ? vm.approvals.map(mockApproval) : [];
   const picker = mockPicker(vm);
   const waiting = cards.filter((card) => card.declinedBySend);
+  const rest = cards.filter((card) => !card.declinedBySend);
+  const shown = new Set(items.flatMap((item) => (item.kind === "fold" ? [item.turnId] : [])));
+  const turnOf = (card: AgentApprovalVm) => {
+    const turn = mockApprovalTurns.get(card.id);
+    return turn !== undefined && shown.has(turn) ? turn : undefined;
+  };
+  // `WaitingFor`: a pending request waits for this person unless its sentence names others.
+  const others = (card: AgentApprovalVm) =>
+    /^Waiting for (?!you\.?$)(.*?)\.?$/.exec(card.sentence)?.[1];
+  const folds = items.flatMap((item) => {
+    const fold = item.kind === "fold" && source.find((f) => f.turnId === item.turnId);
+    if (!fold) return [];
+    const { publicSummary, answerId: _answer, atMs: _at, ...vmFold } = fold;
+    const mine = rest.filter((card) => turnOf(card) === fold.turnId);
+    // `timeline::view`: a turn whose request waits says whom for, this person first.
+    const pending = cards.filter(
+      (card) => card.state === "pending" && mockApprovalTurns.get(card.id) === fold.turnId,
+    );
+    const who = pending.length
+      ? pending.some((card) => others(card) === undefined)
+        ? "you"
+        : others(pending[0])
+      : undefined;
+    const shownSummary = reader ? vmFold.summary : publicSummary;
+    const counts = shownSummary.indexOf(" · ");
+    return [
+      {
+        ...vmFold,
+        ...(who === undefined
+          ? {}
+          : { status: "waiting" as const, statusLabel: `Waiting for ${who}` }),
+        reasoning: thinking ? vmFold.reasoning : null,
+        steps: reader ? vmFold.steps.map((step) => ({ ...step })) : [],
+        failures: reader ? [...vmFold.failures] : vmFold.failures.filter((f) => f.stepId === ""),
+        summary:
+          who === undefined
+            ? shownSummary
+            : `Waiting for ${who}${counts === -1 ? "" : shownSummary.slice(counts)}`,
+        approvals: mine.filter((card) => card.state !== "pending"),
+        waiting: mine.filter((card) => card.state === "pending"),
+      },
+    ];
+  });
+  const elsewhere = rest.filter(
+    (card) => card.state === "pending" && card.sentence === MOCK_ANOTHER_DEVICE,
+  ).length;
+  const declines =
+    waiting.length === 0
+      ? []
+      : [
+          waiting.length === 1
+            ? "Sending a message declines this request, even a message that says yes. Use Allow to let it run."
+            : `Sending a message declines these ${waiting.length} requests, even a message that says yes. Use Allow to let one run.`,
+        ];
+  const another =
+    elsewhere === 0
+      ? []
+      : [
+          elsewhere === 1
+            ? "1 request needs a decision from another device; a message here leaves it waiting."
+            : `${elsewhere} requests need a decision from another device; a message here leaves them waiting.`,
+        ];
+  const sentence = [...declines, ...another].join(" ");
   return {
     ...vm,
     prefs,
     context: mockContext(vm),
     items,
     folds,
-    approvals: cards.filter((card) => !card.declinedBySend),
-    ...(waiting.length > 0
-      ? {
-          banner: {
-            approvals: waiting,
-            sentence:
-              waiting.length === 1
-                ? "Sending a message declines this request, even a message that says yes. Use Allow to let it run."
-                : `Sending a message declines these ${waiting.length} requests, even a message that says yes. Use Allow to let one run.`,
-          },
-        }
-      : {}),
+    // `timeline::place`: only a request whose turn this view does not show.
+    approvals: rest.filter((card) => turnOf(card) === undefined),
+    ...(sentence ? { banner: { approvals: waiting, sentence } } : {}),
     tools: vm.tools.map((tool) => ({ ...tool })),
     ...(vm.drives
       ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
       : {}),
     settings: picker,
+    // `timeline::AgentUntrustedVm::of`: the way out only where `/clean` runs.
+    ...(vm.untrusted
+      ? {
+          untrusted: {
+            sentence: vm.untrusted.sentence,
+            ...(vm.archived ? {} : { freshChat: MOCK_FRESH_CHAT }),
+          },
+        }
+      : {}),
     // `settings::footer`: always the labels; the chips open only where there is a choice.
-    footer: {
-      model: picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
-      effort: picker?.effortLabel ?? "Default",
-      choosesModel: (picker?.models.length ?? 0) > 1,
-      choosesEffort: (picker?.efforts.length ?? 0) > 1,
-    },
+    footer: mockFooter(
+      picker?.modelLabel ?? mockSettingsOf(vm).model ?? MOCK_DEFAULT_MODEL,
+      picker?.effortLabel ?? "Default",
+      (picker?.models.length ?? 0) > 1,
+      (picker?.efforts.length ?? 0) > 1,
+    ),
     messages: vm.messages.map(({ details, ...message }) => ({
       ...message,
       ...(prefs.viewMode === "verbose" && details ? { details } : {}),
@@ -7838,6 +7961,7 @@ function startLiveFixture(vm: AgentSessionViewVm) {
           id,
           role: "agent",
           authorActor: "assistant",
+          mine: false,
           authorName: "Assistant",
           body: turn.text,
           createdAtMs: Date.now(),
@@ -8186,6 +8310,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         id: "message-998",
         role: "person",
         authorActor: "ben",
+        mine: false,
         authorName: "Ben",
         body: "An earlier month, loaded only when requested.",
         createdAtMs: Date.now() - 31 * 86400000,
@@ -8344,6 +8469,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       id: `local-${++sessionSerial}`,
       role: "person" as const,
       authorActor: "ana",
+      mine: true,
       authorName: "Ana",
       body: String(payload.body),
       createdAtMs: Date.now(),
@@ -8503,7 +8629,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       title: String(payload.body).split("\n")[0],
       titleWrite: { state: "confirmed" },
       displayName: `${choice.agentActor} · ${String(payload.body).split("\n")[0]}`,
-      handle: "sturdy-snail-wobbles",
+      handle: "sturdy-snail",
       createdAtMs: Date.now(),
       trust: "native",
       instances: [],
@@ -8536,6 +8662,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
           id: `local-${sessionSerial}`,
           role: "person",
           authorActor: "ana",
+          mine: true,
           authorName: "Ana",
           body: String(payload.body),
           createdAtMs: Date.now(),
@@ -8618,6 +8745,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       id: `local-${sessionSerial}`,
       role: "person",
       authorActor: "ana",
+      mine: true,
       authorName: "Ana",
       body: line,
       createdAtMs: now,
@@ -8648,7 +8776,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       title: parsed[2].trim().split("\n")[0],
       titleWrite: { state: "confirmed" },
       displayName: `${agent.name} · ${parsed[2].trim().split("\n")[0]}`,
-      handle: "quiet-heron-listens",
+      handle: "quiet-heron",
       createdAtMs: now,
       trust: "native",
       instances: [],
@@ -8701,6 +8829,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         id: `answer-${sessionId}`,
         role: "agent",
         authorActor: agent.id,
+        mine: false,
         authorName: agent.name,
         // Long, as Rust cuts it for the parent (`MAX_INLINE_ANSWER`); the thread has it whole.
         body: brief
@@ -8728,6 +8857,8 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
           statusLabel: "Finished",
           summary: "Answered in 2 s",
           durationMs: 2000,
+          approvals: [],
+          waiting: [],
         },
       ];
       child.messages = [answer];
@@ -9168,8 +9299,9 @@ function mockAnswering(): AgentSessionAnsweringVm {
   };
 }
 if (instancesScenario) {
+  // As Rust: no instance claims an archived session, so it draws no header (R-HQ-86).
   for (const vm of sessionViews.values())
-    if (vm.agentActor === "assistant") vm.answering = mockAnswering();
+    if (vm.agentActor === "assistant" && !vm.archived) vm.answering = mockAnswering();
 }
 const instanceWatchers = new Map<string, MockChannel<AgentInstancesVm[]>>();
 function publishInstances() {
@@ -11295,7 +11427,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
         title: "Arrived after the tap",
         titleWrite: { state: "confirmed" },
         displayName: "researcher · Arrived after the tap",
-        handle: "lucky-salmon-sprints",
+        handle: "lucky-salmon",
         createdAtMs: Date.now(),
         trust: "native",
         instances: [],
@@ -11328,6 +11460,7 @@ function pushTap(target: { database: string; sessionId: string }, arriveAfterMs?
             id: `arrived-${target.sessionId}`,
             role: "agent",
             authorActor: "researcher",
+            mine: false,
             authorName: "Researcher",
             body: "The answer the notification was about.",
             createdAtMs: Date.now(),
@@ -11395,8 +11528,10 @@ export function installMockShell(): void {
   // R10911-01: a request that lands after the banner was drawn — not published, so the banner
   // does not show it until something else changes.
   const lateApproval = () => {
+    const id = `approval-late-${++sessionSerial}`;
+    mockApprovalTurns.set(id, "turn-alpha-1000");
     sessionApprovals.push({
-      id: `approval-late-${++sessionSerial}`,
+      id,
       database: "alpha",
       sessionId: "device.1",
       toolName: "run",

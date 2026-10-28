@@ -502,14 +502,23 @@ fn sending_a_message_declines_what_waits_for_the_sender() {
     assert!(banner
         .sentence
         .contains("declines these 2 requests, even a message that says yes"));
+    // Ben's request is not this person's to decline: it waits in sight at the turn that asked.
+    assert!(
+        before.approvals.is_empty(),
+        "every request here has its turn"
+    );
+    let turn = before
+        .folds
+        .iter()
+        .find(|fold| fold.turn_id == "t")
+        .expect("the turn's fold");
     assert_eq!(
-        before
-            .approvals
+        turn.waiting
             .iter()
             .map(|a| a.id.as_str())
             .collect::<Vec<_>>(),
         ["bens"],
-        "out of the reading column"
+        "in its turn's fold, out of the banner"
     );
 
     let shown = shown(&w, "dev1.1");
@@ -584,8 +593,17 @@ fn a_t4_request_this_device_cannot_decide_offers_no_decision_and_is_not_declined
             ),
             "{case}"
         );
-        let [t4] = before.approvals.as_slice() else {
-            panic!("{case}: the T4 request alone in the reading column");
+        assert!(
+            before.approvals.is_empty(),
+            "{case}: every request here has its turn"
+        );
+        let turn = before
+            .folds
+            .iter()
+            .find(|fold| fold.turn_id == "t")
+            .expect("the turn's fold");
+        let [t4] = turn.waiting.as_slice() else {
+            panic!("{case}: the T4 request alone waiting in its turn's fold");
         };
         assert_eq!(t4.id, "t4");
         assert_eq!(t4.sentence, card_says, "{case}");
@@ -1165,6 +1183,36 @@ fn an_expired_grant_reads_expired_and_offers_no_revoke() {
     assert_eq!(grant.state, AgentGrantStateVm::Expired);
     assert_eq!(grant.session.as_deref(), Some("about dev1.1"));
     assert!(!grant.can_revoke);
+}
+
+/// R-HQ-86: an untitled session's grant names it by the handle the list
+/// shows — with its session number when another session here shares the two
+/// words — while it waits, and once the server refused it.
+#[test]
+fn a_grant_names_an_untitled_session_by_the_lists_handle() {
+    let w = world("zoë");
+    // Both ids hash to `mighty-toucan`.
+    for id in ["dev1.242", "dev1.752"] {
+        session(&w, id, None, false);
+        sessions::rename(&w.alpha, id, "").expect("untitled");
+    }
+    settle(&w, None);
+    request(&w, "ap1", "dev1.242", "run", "T2", git_status(), &["zoë"]);
+    settle(&w, None);
+    always_allow(
+        &w.alpha,
+        &w.decisions,
+        &ask("dev1.242", "ap1", "program", true),
+        now(),
+    )
+    .expect("written");
+    let waiting = list(std::slice::from_ref(&w.alpha), now()).grants[0].clone();
+    assert_eq!(waiting.state, AgentGrantStateVm::Waiting);
+    assert_eq!(waiting.session.as_deref(), Some("mighty-toucan-242"));
+    settle(&w, Some(("hq.v15.agent", "hq.v15.agent")));
+    let refused = list(std::slice::from_ref(&w.alpha), now()).grants[0].clone();
+    assert_eq!(refused.state, AgentGrantStateVm::Refused);
+    assert_eq!(refused.session.as_deref(), Some("mighty-toucan-242"));
 }
 
 /// RG-08: a grant made on a device signed out since decides nothing

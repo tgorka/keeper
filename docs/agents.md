@@ -233,17 +233,25 @@ agent, last activity and Rust's attention state. **Active**, **Archived** and **
 which rows are shown, never their order or the underlying subscription.
 
 Rust derives each name as `<agents> · <title>`, with the primary agent first and other agent
-members in actor-id order. Person members do not enter the name. The word handle comes from
-the immutable session id and the shared Syncular vocabulary; a collision within a database
-appends the session number. It is a display label, not another identity or storage key. A blank
-title uses the handle. Renaming changes only the title, never the session id or handle.
+members in actor-id order. Person members do not enter the name. The handle is two words
+(R-HQ-86), such as `noble-hedgehog`, from the immutable session id and the shared Syncular
+vocabulary; with 4,096 handles a collision within a database is expected past a few dozen
+sessions and appends the session number (`noble-hedgehog-6`), in the list, the header and
+Settings › Agents › Always allowed alike. It is a display label, not another identity or storage
+key. A blank title uses the handle. Renaming changes only the title, never the session id or
+handle.
 
 Right-click a row, use Shift+F10 on a focused row, or long-press it on a touch screen to open its
-menu: **Rename**, **Copy id**, **Copy name**, **Details**, **Drives…** (only where you may
+menu; the row stays marked while its menu is open (FR-598/AD-280), and every item leads with its
+icon: **Rename**, **Copy id**, **Copy name**, **Details**, **Context…** (opens the session and
+its context window's Details sheet, the one `/context` opens), **Drives…** (only where you may
 choose the session's drives; it opens the session and its Drives menu, see § Live answers),
 **Model…** (only where you may change the session's model and its agent offers more than one,
 `AgentSessionRowVm.choosesModel`; it opens the session and the composer's model picker, the same
-picker `/model` writes through) and **Archive** (or **Unarchive**).
+picker `/model` writes through), **Always allowed…** (Settings › Agents › Always allowed, where
+standing grants are listed and revoked), **Start fresh (trusted)** (sends `/clean` as the composer
+does: a new session that starts trusted and keeps the drives; absent on an archived session,
+where `/clean` is refused) and **Archive** (or **Unarchive**).
 Rename edits inline with the current title selected, so typing replaces it; Save queues the title
 on this device, including offline, and Cancel/Escape leaves it unchanged. Closing the editor means
 local enqueue, not server acceptance: the row says it is waiting until the server settles the
@@ -357,8 +365,9 @@ with any option first (`bash -lc`, `sh -ec`, `python3 -c`, `node -e` …) or an 
 (`deno eval`), for a program whose first argument is program text (`awk`), and for a wrapper
 that runs whatever program follows it (`env`, `sudo`, `ssh`, `nice`, `timeout`, `xargs` …). The
 confirm returns focus to the card's `…` menu when it closes; a decision taken in the banner moves
-focus to the card's new place in the reading column, else to the next request in the banner,
-else to the composer. The scope is derived again in Rust from the request's own call; the
+focus to the toggle of the fold its card moved into (the decided card folds with its turn), else
+to the card where Rust drew it, else to the next request in the banner, else to the composer
+(R10911-12). The scope is derived again in Rust from the request's own call; the
 grant row (`standing_grants`, keyed by `vocabulary::person_agent_key`, the server's
 `personAgentKey`) and the approval go in one commit, so a refused grant leaves the request
 waiting with the server's words. Settings › Agents › *Always allowed* lists every grant the
@@ -381,8 +390,8 @@ banner showed, and Rust declines only those still waiting at that digest: a requ
 after the banner was drawn stays pending. A T4 request this device cannot decide — it is on the
 host the agent runs on, or either host is unknown, which V8 refuses for a denial too
 (`hq.v8.t4_other_host`) — is not declined and offers no decision: its card says "Needs a decision
-from another device." with no *Allow once* or *Deny*, it stays in the reading column (and out of
-the decisions panel), and the banner adds "1 request needs a decision from another device; a
+from another device." with no *Allow once* or *Deny*, it stays out of the banner (and out of the
+decisions panel), and the banner adds "1 request needs a decision from another device; a
 message here leaves it waiting" (DW-E109-27, R109T-02). When the host of the instance holding the
 session is the unknown one, no device can decide it yet, and both say so instead: "Can't be decided
 until the agent's host is known." (R109T-04; `approvals::Undecidable`). A text message, a message with files, an ask option and
@@ -390,12 +399,26 @@ until the agent's host is known." (R109T-04; `approvals::Undecidable`). A text m
 shown). A denial that cannot be written on the device stops the message, and the banner says
 which request still waits; the composer keeps the draft and shows the same sentence hidden from
 assistive technology, so it is announced once. Mock shell: `?sessions=launch` draws a trusted T2
-`run` (grants offered) and a T4 Paseo start (none); `&grants=untrusted` makes that session
+`run` (grants offered) and a T4 Paseo start (none), each in its turn's fold once decided;
+`&approvals=elsewhere` reads the T4 one as needing another device and the T2 `run` as waiting for
+Ben, both in sight in their turn's fold; `&grants=untrusted` makes that session
 untrusted; `&grants=refused` has the server refuse every grant write; `&grants=unserved` makes
 the session's agent one that does not serve the person; `&grants=decline-fails` fails every denial
 write; `window.__keeperMockLateApproval()` lands a request without drawing it. The grants list
 holds an ended grant, an inactive one made on a signed-out device, and one that expires 20 s
 after the page opens.
+
+**Every other request sits in the turn that asked** (`timeline::place`): the turn of its parked
+call (`tool_calls.turn_id`), whose fold is drawn at the time of its work — above the answer the
+agent writes once the call runs, which comes in a later turn. A request still pending that the
+banner does not hold (one waiting for someone else, or the T4 one above) is in the fold's
+`waiting`, drawn under the fold line and its failures, outside the fold's body: a pending request
+is never inside a closed fold. A decided or expired request is in the fold's `approvals`, inside
+its body, so it folds with the turn's work in Normal and Thinking and shows in Verbose. The fold
+line names whom its turn waits for — "Waiting for you" when any request of the turn waits for this
+person, else "Waiting for Ben". Only a request whose turn the view does not show (its call is not on
+this device, or its turn is outside the shown months) stays in `AgentSessionViewVm.approvals`,
+drawn after the column.
 
 **Always allow: known limits.**
 
@@ -465,7 +488,8 @@ not evidence for that target.
 ## Live answers, the turn fold and view modes
 
 **The answer last (109.14, Q109-13 a).** The window draws Rust's reading column (`items`) in its
-order and nothing else: a person's message, each turn's **fold**, the turn's answer below it, an
+order, and after it only the approvals whose turn the view does not show: a person's message, each
+turn's **fold** (with that turn's approvals), the turn's answer below it, an
 agent's question where it was asked, an answer still being written last. A message the column does
 not name is not drawn — a lead-in ("Checking — one minute.") lives inside its turn's fold. A row
 with nothing to read — the 0-byte `finish = "tool_calls"` close a turn writes before a parked
@@ -484,6 +508,12 @@ blank close's details (that leg's model, tokens, timings) stay inside the fold (
   (`statusLabel`: Started, Finished, Refused, Interrupted, Paused, Failed, or
   `Unknown status "<word>"`), how it ended ("Interrupted 12:03", never "Finished" for every
   ending) and its result in a `max-h-64` scroll area. The renderer groups, orders and words nothing.
+
+**Your own messages are bubbles (R-HQ-86).** A message Rust marks `mine` — its author is this
+device's person, from any of their devices — is drawn on the right as a bubble with the chat
+timeline's own-message tokens (`components/chat/bubble.ts`), at most 75% of the column; so is your
+line in a thread started from the conversation. Another person's message in the same session
+stays plain text on the left, as the agent's answers do.
 
 An open answer grows as its text arrives. The transcript scrolls inside its own viewport: a growing
 answer does not move the composer or replace an unsent draft. Scrolling back stops following the
@@ -533,13 +563,39 @@ HTML, and model-written links do not navigate.
 **The composer's bar** (R-HQ-85, owner ruling 2026-10-27, t3.chat's shape; it supersedes R10921-02
 where that hid the ring) sits under the message field and is always drawn: the model and the
 effort (`AgentSessionFooterVm`: the session's choice while the agent still offers it, else the
-agent's default, else "Default"), the attach controls, an **Untrusted** marker when the session
-read outside content, and the context reading beside Send. The model and effort are chips that
+agent's default, else "Default"), one **+** menu holding Attach file, Take photo and Choose photo,
+and the context reading beside Send. The model and effort are chips that
 open 109.18's pickers only where Rust says there is an alternative to choose
 (`choosesModel`/`choosesEffort`: more than one offered, and this person may change them); a
 reader who may not, or an agent with one offer, sees read-only chips. An archived session has no
-composer but keeps the reading: read-only model and effort chips, the **Untrusted** marker and the
-context, under the read-only line (R598-03).
+composer but keeps the reading: read-only model and effort chips and the context, under the
+read-only line (R598-03).
+
+**One row, at any width (FooterOneRow, R601-01).** The bar holds one row from the Notes
+Assistant's 280px minimum (a 255px bar) to a full window, in the panel, the tablet sheet and the
+Agents window alike:
+
+- the model chip says the model's own name (`shortModel`, Rust's: `openrouter/z-ai/glm-5.3-flash`
+  → `glm-5.3-flash`); its accessible name, its tooltip and the popover keep the whole id, on a
+  read-only chip too (R601-06);
+- the model group never forces a wrap (its flex basis is 0; it grows up to its content);
+- **Reset is never in the bar.** It lives at the foot of the model popover and of the effort menu;
+  where neither chip offers a choice yet one is still saved, the model chip opens a small "Model"
+  popover (the whole id, the read-only sentence and Reset), so no action is dropped (AD-260).
+  Enter and Space on Reset, like on a star, never reach the model list, which would take Enter as
+  choosing the highlighted model (R601-05);
+- **the model's name is the last thing to give way.** When the row runs short, the bar
+  (`useBarFold`) gives up, in this order and only as far as it must: the context reading's label
+  (the ring stays; the label stays in the accessible name, the tooltip and Details); Send's word
+  (a 36px icon, ≥44pt on the phone); the chips' padding and the effort menu's chevron; the
+  effort's words, for its level's short code
+  beside the brain (`effortCode`, Rust's: `L`, `M`, `H`, `XH`, and `D` for an unstated
+  default; the words stay the accessible name); then the row's gaps and the model's chevron. Only
+  then is the model's name cut. Width alone cannot order this — the same 335px bar holds
+  `glm-5.3-flash` beside "Medium" and cuts it beside "Extra high" — so the bar measures its own
+  row (does the model's name fit?) whenever it resizes or what it shows changes;
+- the effort is its own chip at every width, as R-HQ-85 says; nothing folds it into the model
+  chip's words (FooterOneRow's fold, `compact`, is gone).
 
 **Context** beside Send is a ring and Rust's compact label (`5.3k / 1M`), in every view mode and
 for any member: `metadata.context` is in every member's replica. Before any answer measured it, or
@@ -573,10 +629,19 @@ hint. These are mock projections, not evidence of a running model or the package
 Switching off narrows that set; switching on restores an offered tool and never adds one. An
 unknown or absent offered-tools list renders no Tools control, and neither does a session that
 cannot be changed here (archived). Changes wait for Rust's view; a
-refusal is visible beside the controls. **Untrusted** in the composer's bar marks a session that has
-read outside content (D-34: a web page, a broker's answer); a tap opens Rust's sentence, "This chat
-read outside content, such as a web page, so its commands need your approval.", and the approval
-banner says the same above the requests it holds.
+refusal is visible beside the controls. **Untrusted** is a session-state chip on the header's meta
+line for a session that has read outside content (D-34: a web page, a broker's answer); a tap opens
+Rust's sentence, "This chat read outside content, such as a web page, so its commands need your
+approval.", and the approval banner says the same above the requests it holds. The mark never
+lowers (V13), so the popover offers the honest way out instead: **Start a fresh chat: starts
+trusted, keeps the drives you can still tick** (`AgentUntrustedVm.freshChat`, Rust's words), which
+runs `/clean` through the composer's command path (Q109-17 b: the new session starts trusted;
+A109-06: it carries the ticks this person may still tick there, so a drive the agent no longer
+offers, the audience rule now refuses or the server refused is left behind). It is absent on an
+archived session, where `/clean` refuses. A new session a command starts — `/clean`, `/new` or
+this action — opens where the command ran: the Notes Assistant dock moves to it and leaves the
+Agents window's selection where it was; the Agents window moves its own. The session's Details
+dialog says **Trusted** for a session with no mark, **Untrusted** once it read outside content.
 
 **Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
 menu of check items. No drive is ticked until a person ticks one — not even the session's own
@@ -1577,7 +1642,9 @@ The run was on electra on 2026-10-23, and a second run wrote nothing:
 **In keeper,** an imported session is an archived session like any other. It is listed under
 *Archived* and *All* with its database and opens through the server's `sessionPage` (*The Agents
 window*, above). No instance reads or claims an archived session, so nothing imported is answered
-again. Each message names its author by actor id. The Matrix id an author had in the logs is kept
+again, and an archived session draws no instance header (R-HQ-86): its read-only bar says to
+unarchive it.
+Each message names its author by actor id. The Matrix id an author had in the logs is kept
 on the server only, as an alias of that actor; it is not part of keeper's contract.
 
 **Its limits:**
@@ -1648,7 +1715,9 @@ offered models grouped by the maker (`AgentModelOptionVm.provider`, `settings::p
 router's segment such as `openrouter/` is skipped, a maker slug is named as people read it —
 `openrouter/z-ai/glm-5.3-flash` → Z.ai, `openrouter/qwen/qwen3.7-flash` → Qwen — else the family the
 model's own name starts with, `claude-…` → Anthropic, `gpt-…` → OpenAI) and a "Default" badge; an effort
-chip with a "Default" badge in its menu; Reset. Where there is nothing to choose they are read-only
+chip with a "Default" badge in its menu; Reset at the foot of both, never in the bar (where neither
+offers a choice yet one is saved, the model chip opens a popover holding Reset). Where there is
+nothing to choose they are read-only
 chips, never absent. Capability badges are not drawn: the contract publishes model ids only
 (DW-E109-40). Stars are a lens, not a setting:
 they live in the `keeper_model_favorites` cookie like the other remembered views (no settings

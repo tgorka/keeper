@@ -1,6 +1,7 @@
 import { Ban, ChevronDown, ChevronRight } from "lucide-react";
 import { useId, useState } from "react";
 import { AgentAnswer } from "@/components/agents/agent-answer";
+import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { SessionAttachments } from "@/components/agents/session-attachments";
 import { countLabel, TOKENS } from "@/lib/count-label";
 import type {
@@ -40,10 +41,12 @@ export function SessionLiveTurn({ turn, agentName }: { turn: AgentLiveTurnVm; ag
 /**
  * One turn's work, folded into one line above its answer (Q109-13 a): Rust's
  * summary sentence, then each refusal or failure as one line of its own, the
- * thinking where Rust sent it, and — opened — the lead-ins and tool calls in a
- * bounded scroll area. Opened by default only in the verbose view mode; the
- * answer is never inside it. Rust decides every word and what a viewer who
- * does not read the trace receives (no thinking, no steps).
+ * requests of the turn that still wait outside the banner (never folded away),
+ * the thinking where Rust sent it, and — opened — the lead-ins, tool calls and
+ * the turn's decided requests in a bounded scroll area. Opened by default only
+ * in the verbose view mode; the answer is never inside it. Rust decides every
+ * word, which request sits where, and what a viewer who does not read the
+ * trace receives (no thinking, no steps, no requests).
  */
 export function TurnFold({
   fold,
@@ -65,7 +68,7 @@ export function TurnFold({
     setToggled(null);
   }
   const bodyId = useId();
-  const hasBody = leadIns.length > 0 || fold.steps.length > 0;
+  const hasBody = leadIns.length > 0 || fold.steps.length > 0 || fold.approvals.length > 0;
   const open = hasBody && (toggled ?? verbose);
   const running = fold.status === "running";
   const summary = (
@@ -76,6 +79,7 @@ export function TurnFold({
       className="min-w-0"
       data-slot="turn-fold"
       data-status={fold.status}
+      data-turn-id={fold.turnId}
       aria-label={`Work of ${agentName}`}
     >
       {hasBody ? (
@@ -83,6 +87,7 @@ export function TurnFold({
         // button leaves Chromium computing an empty name (R10914-01).
         <button
           type="button"
+          data-slot="turn-fold-toggle"
           className="flex min-h-11 w-full min-w-0 items-center gap-1 rounded-md px-1 text-left text-muted-foreground text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label={fold.summary}
           aria-expanded={open}
@@ -131,6 +136,18 @@ export function TurnFold({
           ))}
         </ul>
       )}
+      {/* A pending request is never inside a closed fold (audit-109): one waiting for someone
+          else, or for another of this person's devices, stays in sight at its turn. */}
+      {fold.waiting.length > 0 && (
+        <section aria-label="Waiting requests" className="mt-2 flex min-w-0 flex-col gap-2">
+          {fold.waiting.map((approval) => (
+            <DatabaseApprovalCard
+              key={JSON.stringify([approval.id, approval.bindingDigest])}
+              approval={approval}
+            />
+          ))}
+        </section>
+      )}
       {fold.reasoning && (
         <section
           aria-label="Thinking"
@@ -159,6 +176,12 @@ export function TurnFold({
             </div>
           ))}
           {fold.steps.length > 0 && <TurnSteps steps={fold.steps} />}
+          {fold.approvals.map((approval) => (
+            <DatabaseApprovalCard
+              key={JSON.stringify([approval.id, approval.bindingDigest])}
+              approval={approval}
+            />
+          ))}
         </div>
       )}
     </li>

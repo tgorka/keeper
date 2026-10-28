@@ -4,11 +4,15 @@ import { SessionRowMenu } from "@/components/agents/session-row-menu";
 import type * as Ipc from "@/lib/ipc/client";
 import type { AgentSessionRowVm } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 
 const rename = vi.hoisted(() => vi.fn());
+const command = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/ipc/client", async (original) => ({
   ...(await original<typeof Ipc>()),
   agentSessionRename: rename,
+  agentCommand: command,
 }));
 const row: AgentSessionRowVm = {
   database: "alpha",
@@ -16,7 +20,7 @@ const row: AgentSessionRowVm = {
   title: "plan",
   titleWrite: { state: "confirmed" },
   displayName: "nixi · plan",
-  handle: "jolly-pigeon-squeaks",
+  handle: "jolly-pigeon",
   createdAtMs: 1700000000000,
   trust: "native",
   instances: ["nixi@electra"],
@@ -28,7 +32,10 @@ const row: AgentSessionRowVm = {
   choosesDrives: false,
   choosesModel: false,
 };
-beforeEach(() => rename.mockReset());
+beforeEach(() => {
+  rename.mockReset();
+  command.mockReset();
+});
 
 it("retains the proposed title after a refused rename and permits a successful retry", async () => {
   rename.mockRejectedValueOnce(new Error("This device cannot write."));
@@ -197,4 +204,74 @@ it("offers Model… only where Rust says there is a model to choose, and opens t
   expect(selected).toEqual(target);
   expect(modelFor).toEqual(target);
   expect(drivesFor).toBeNull();
+});
+
+function openMenu(patch: Partial<AgentSessionRowVm> = {}) {
+  render(
+    <SessionRowMenu row={{ ...row, ...patch }}>
+      <button type="button">{row.displayName}</button>
+    </SessionRowMenu>,
+  );
+  fireEvent.contextMenu(screen.getByRole("button", { name: row.displayName }));
+}
+
+it("leads every item with its icon (R-HQ-86)", async () => {
+  openMenu({ choosesDrives: true, choosesModel: true });
+  await screen.findByRole("menu");
+  const items = screen.getAllByRole("menuitem");
+  expect(items.map((item) => item.textContent)).toEqual([
+    "Rename…",
+    "Copy id",
+    "Copy name",
+    "Details",
+    "Context…",
+    "Drives…",
+    "Model…",
+    "Always allowed…",
+    "Start fresh (trusted)",
+    "Archive",
+  ]);
+  for (const item of items) {
+    expect(item.firstElementChild?.tagName.toLowerCase(), item.textContent ?? "").toBe("svg");
+    expect(item.firstElementChild).toHaveAttribute("aria-hidden", "true");
+  }
+});
+
+it("asks for that session's Details sheet from Context…", async () => {
+  openMenu();
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Context…" }));
+  const { selected, contextFor, modelFor } = agentSessionsStore.getState();
+  const target = { database: "alpha", sessionId: "device.1" };
+  expect(selected).toEqual(target);
+  expect(contextFor).toEqual(target);
+  expect(modelFor).toBeNull();
+});
+
+it("deep-links Always allowed… to Settings › Agents › Always allowed", async () => {
+  primaryViewStore.getState().setView("agents");
+  settingsUiStore.getState().clearReveal();
+  openMenu();
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Always allowed…" }));
+  expect(settingsUiStore.getState().reveal).toEqual({ section: "always-allowed", focusId: null });
+  expect(primaryViewStore.getState().view).toBe("settings");
+});
+
+it("starts fresh with `/clean` as the composer sends it, and opens the new session", async () => {
+  const fresh = { database: "alpha", sessionId: "device.2" };
+  command.mockResolvedValue({ session: fresh, surface: null, message: "", pick: null });
+  openMenu();
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Start fresh (trusted)" }));
+  await waitFor(() => expect(agentSessionsStore.getState().selected).toEqual(fresh));
+  expect(command).toHaveBeenCalledWith(
+    { database: "alpha", sessionId: "device.1" },
+    "/clean",
+    null,
+    [],
+  );
+});
+
+it("offers no Start fresh on an archived session, where `/clean` is refused", async () => {
+  openMenu({ archived: true });
+  await screen.findByRole("menuitem", { name: "Unarchive" });
+  expect(screen.queryByRole("menuitem", { name: "Start fresh (trusted)" })).toBeNull();
 });

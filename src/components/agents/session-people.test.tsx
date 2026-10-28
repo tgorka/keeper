@@ -225,7 +225,7 @@ describe("a session that leaves the list", () => {
     title: `about ${sessionId}`,
     titleWrite: { state: "confirmed" as const },
     displayName: `nixie · about ${sessionId}`,
-    handle: "jolly-pigeon-squeaks",
+    handle: "jolly-pigeon",
     createdAtMs: 1780000000000,
     trust: "native",
     instances: [],

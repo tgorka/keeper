@@ -86,7 +86,7 @@ const row = (database: string, archived = false) => ({
   title: `${database} session`,
   titleWrite: { state: "confirmed" as const },
   displayName: `assistant · ${database} session`,
-  handle: "jolly-pigeon-squeaks",
+  handle: "jolly-pigeon",
   createdAtMs: 1780000000000,
   trust: "trusted",
   instances: [],
@@ -117,7 +117,14 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
       summary: "Context unknown: no answer has measured it yet.",
       parts: [],
     },
-    footer: { model: "Default", effort: "Default", choosesModel: false, choosesEffort: false },
+    footer: {
+      model: "Default",
+      effort: "Default",
+      shortModel: "Default",
+      effortCode: "D",
+      choosesModel: false,
+      choosesEffort: false,
+    },
     live: [],
     tools: [],
     prefs: { viewMode: "normal" },
@@ -126,6 +133,7 @@ function view(database: string, patch: Partial<AgentSessionViewVm> = {}): AgentS
         id: "m1",
         role: "agent",
         authorActor: "assistant",
+        mine: false,
         authorName: "Assistant",
         body: `Message in ${database}`,
         createdAtMs: 1780000000000,
@@ -158,6 +166,8 @@ function fold(patch: Partial<Ipc.AgentTurnFoldVm> = {}): Ipc.AgentTurnFoldVm {
     statusLabel: "Finished",
     summary: "Worked for 3 s",
     durationMs: 3000,
+    approvals: [],
+    waiting: [],
     ...patch,
   };
 }
@@ -274,6 +284,7 @@ describe("database Agents window", () => {
                 id: "own",
                 role: "person",
                 authorActor: "ana",
+                mine: true,
                 authorName: "Ana",
                 body: "Saved locally",
                 createdAtMs: 1780000000000,
@@ -307,6 +318,58 @@ describe("database Agents window", () => {
     await waitFor(() =>
       expect(mock.page).toHaveBeenCalledWith({ database: "beta", sessionId: "same.1" }),
     );
+  });
+  it("marks the row whose right-click menu is open, and only while it is open, without selecting it (FR-598)", async () => {
+    draw();
+    await list();
+    const alpha = screen.getByRole("button", { name: /^assistant · alpha session,/ });
+    const beta = screen.getByRole("button", { name: /^assistant · beta session,/ });
+    fireEvent.contextMenu(alpha);
+    await screen.findByRole("menu");
+    expect(alpha).toHaveAttribute("data-menu-target");
+    expect(beta).not.toHaveAttribute("data-menu-target");
+    expect(agentSessionsStore.getState().selected).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(alpha).not.toHaveAttribute("data-menu-target");
+  });
+  it("opens that session's Details sheet from the row's Context… once its view arrives", async () => {
+    draw();
+    await list();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^assistant · beta session,/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Context…" }));
+    await waitFor(() => expect(mock.views.has("beta")).toBe(true));
+    expect(screen.queryByRole("dialog", { name: "Details" })).toBeNull();
+    act(() => mock.views.get("beta")?.(view("beta")));
+    expect(await screen.findByRole("dialog", { name: "Details" })).toBeInTheDocument();
+    expect(agentSessionsStore.getState().contextFor).toBeNull();
+  });
+  it("draws this person's own lines as bubbles on the right and another person's plain (R-HQ-86)", async () => {
+    draw();
+    await list();
+    const line = (id: string, authorActor: string, mine: boolean, body: string) => ({
+      id,
+      role: "person" as const,
+      authorActor,
+      mine,
+      authorName: authorActor,
+      body,
+      createdAtMs: 1780000000000,
+    });
+    await open("alpha", {
+      messages: [
+        line("own", "ana", true, "My question"),
+        line("theirs", "ben", false, "Ben's question"),
+      ],
+    });
+    const own = screen.getByText("My question");
+    expect(own).toHaveAttribute("data-mine");
+    expect(own).toHaveClass("bg-primary", "rounded-[14px]");
+    expect(own.closest("li")).toHaveClass("items-end");
+    const theirs = screen.getByText("Ben's question");
+    expect(theirs).not.toHaveAttribute("data-mine");
+    expect(theirs).not.toHaveClass("bg-primary");
+    expect(theirs.closest("li")).not.toHaveClass("items-end");
   });
 });
 
@@ -393,26 +456,31 @@ it("binds approval to the shown action and keeps the server's refusal visible", 
   mock.decide.mockRejectedValueOnce({ message: "Decide from another host." });
   draw();
   await list();
+  // A card this person decides here is the banner's (Q109-12 a): the shape Rust sends.
   await open("beta", {
-    approvals: [
-      {
-        id: "a1",
-        database: "beta",
-        sessionId: "same.1",
-        toolName: "write",
-        tier: "T4",
-        summary: "Write a file",
-        action: '{"path":"notes/a.md"}',
-        bindingDigest: "digest-beta",
-        expiresAtMs: 1800000000000,
-        createdAtMs: 1780000000000,
-        state: "pending",
-        canDecide: true,
-        sentence: "Waiting for you",
-        actions: ["allowOnce", "deny"],
-        declinedBySend: true,
-      },
-    ],
+    banner: {
+      sentence:
+        "Sending a message declines this request, even a message that says yes. Use Allow to let it run.",
+      approvals: [
+        {
+          id: "a1",
+          database: "beta",
+          sessionId: "same.1",
+          toolName: "write",
+          tier: "T4",
+          summary: "Write a file",
+          action: '{"path":"notes/a.md"}',
+          bindingDigest: "digest-beta",
+          expiresAtMs: 1800000000000,
+          createdAtMs: 1780000000000,
+          state: "pending",
+          canDecide: true,
+          sentence: "Waiting for you",
+          actions: ["allowOnce", "deny"],
+          declinedBySend: true,
+        },
+      ],
+    },
   });
   expect(screen.getByLabelText("Exact action")).toHaveTextContent("notes/a.md");
   fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
@@ -437,6 +505,7 @@ it("sends an ask answer through its database and waits for Rust to close its opt
         id: "ask",
         role: "agent",
         authorActor: "assistant",
+        mine: false,
         authorName: "Assistant",
         body: "Which folder?",
         createdAtMs: 1780000000000,
@@ -464,6 +533,7 @@ it("sends an ask answer through its database and waits for Rust to close its opt
             id: "ask",
             role: "agent",
             authorActor: "assistant",
+            mine: false,
             authorName: "Assistant",
             body: "Which folder?",
             createdAtMs: 1780000000000,
@@ -592,6 +662,7 @@ describe("live answer controls", () => {
               id: "final",
               role: "agent",
               authorActor: "assistant",
+              mine: false,
               authorName: "Assistant",
               body: "First paragraph.\n\nSecond paragraph.",
               createdAtMs: 1780000000000,
@@ -667,6 +738,7 @@ describe("live answer controls", () => {
               id: "final",
               role: "agent",
               authorActor: "assistant",
+              mine: false,
               authorName: "Assistant",
               body: "Earlier answer",
               createdAtMs: 1780000000000,
@@ -698,6 +770,7 @@ describe("live answer controls", () => {
               id: "final",
               role: "agent",
               authorActor: "assistant",
+              mine: false,
               authorName: "Assistant",
               body: "Partial answer",
               createdAtMs: 1780000000000,
@@ -822,8 +895,10 @@ describe("live answer controls", () => {
       { kind: "liveAnswer", turnId: "t1" },
     ];
     await open("alpha", {
-      untrusted:
-        "This chat read outside content, such as a web page, so its commands need your approval.",
+      untrusted: {
+        sentence:
+          "This chat read outside content, such as a web page, so its commands need your approval.",
+      },
       live: [turn],
       items: column,
       folds: [
@@ -835,8 +910,8 @@ describe("live answer controls", () => {
         }),
       ],
     });
-    // Said in words, not in a `title` touch and most screen readers never reach: the bar's
-    // marker names the reason and opens it on a tap.
+    // Said in words, not in a `title` touch and most screen readers never reach: the header's
+    // chip names the reason and opens it on a tap.
     const marker = screen.getByRole("button", { name: /^Untrusted: .*need your approval/ });
     fireEvent.click(marker);
     expect(await screen.findByRole("dialog", { name: "Why commands ask" })).toHaveTextContent(

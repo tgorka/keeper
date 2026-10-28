@@ -11,6 +11,7 @@
  * (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
  */
 
+import { BUBBLE_SHAPE, OWN_BUBBLE } from "@/components/chat/bubble";
 import { EditHistoryPopover } from "@/components/chat/edit-history-popover";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
@@ -177,8 +178,8 @@ export function MessageBubble({
   const touchMenu = phone && Boolean(onReply || onEdit || onDelete || onToggleReaction);
 
   const bubbleClass = cn(
-    "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
-    isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
+    BUBBLE_SHAPE,
+    isOwn ? OWN_BUBBLE : "bg-muted text-foreground",
     selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
   );
 
