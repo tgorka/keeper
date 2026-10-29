@@ -755,6 +755,9 @@ struct Staged {
     /// The People sheet read on thread `people` says it has read the
     /// members, and returns them once released.
     people: Mutex<Option<Gate>>,
+    /// One replacement delivered after the selection write, before its
+    /// caller can persist the seen record (R605-18).
+    after_sync: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// What every thread the staging does not name reads.
     others: Mutex<Vec<crate::hq::port::Peer>>,
 }
@@ -927,6 +930,10 @@ impl Replica for Staged {
     }
     fn sync_now(&self) {
         self.inner.sync_now();
+        let hook = lock(&self.after_sync).take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
     fn state(&self) -> ReplicaState {
         self.inner.state()
@@ -956,6 +963,7 @@ impl Opener for StagedOpener {
             early_done: Mutex::new(Some(early_done)),
             projecting: Mutex::new(None),
             people: Mutex::new(None),
+            after_sync: Mutex::new(None),
             others: Mutex::new(tail(6, "")),
         });
         *lock(&self.0) = Some(Arc::clone(&staged));
@@ -2806,10 +2814,11 @@ async fn p3_an_untick_and_re_tick_elsewhere_warns_here() {
     );
 }
 
-/// A tick with no id — a schema-4 client's or the server's — warns, and OK
-/// gives it one, as the person, so that this one tick is acknowledged.
+/// A legacy tick has no verifiable identity: OK must refuse without
+/// adopting it. Only an explicit untick and manual reselect can make a
+/// fresh, seen grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tick_without_an_id_warns_and_ok_gives_it_one() {
+async fn a_tick_without_an_id_refuses_ok_until_unticked_and_selected_again() {
     let world = World::new();
     let (hq, opener, key) = dock_ticked(&world).await;
     selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 8);
@@ -2821,10 +2830,41 @@ async fn a_tick_without_an_id_warns_and_ok_gives_it_one() {
             tick: None
         }]
     );
-    ok(&hq, &key, "tgdrive").expect("seen");
-    assert!(unseen_in(&hq, &key).is_empty());
     let source = hq.source("tgdrive").expect("held");
-    assert!(drives::tick_ids(&source, &key.session_id).contains_key("tgdrive"));
+    let refused = ok(&hq, &key, "tgdrive").expect_err("legacy OK cannot identify the shown tick");
+    assert!(matches!(refused, HqError::Sentence(_)));
+    let remedy = refused.to_string();
+    assert!(
+        remedy.contains("Untick") && remedy.contains("select it again"),
+        "{remedy}"
+    );
+    assert_eq!(
+        unseen_ticks_in(&hq, &key),
+        shown,
+        "refusal keeps the warning"
+    );
+    assert!(
+        drives::tick_ids(&source, &key.session_id).is_empty(),
+        "OK never adopts a legacy tick"
+    );
+    // Merely repeating a tick command is not a new selection either.
+    hq.set_session_drive(&key, "tgdrive", true)
+        .expect("already ticked");
+    assert_eq!(unseen_ticks_in(&hq, &key), shown);
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(unseen_in(&hq, &key).is_empty());
+    hq.set_session_drive(&key, "tgdrive", true)
+        .expect("selected again");
+    let fresh = drives::tick_ids(&source, &key.session_id)
+        .remove("tgdrive")
+        .expect("fresh id");
+    assert!(ulid::Ulid::from_string(&fresh).is_ok());
+    assert_eq!(seen_entries(&world)[0]["tick"], fresh);
+    assert!(
+        unseen_in(&hq, &key).is_empty(),
+        "only the fresh manual selection is seen"
+    );
 }
 
 /// OK names the tick its warning showed: shown for a tick that has since
@@ -2922,4 +2962,141 @@ async fn clean_carries_a_fresh_tick_that_warns_until_its_own_ok() {
     assert!(unseen_in(&hq, &key).is_empty(), "the old answer holds");
     ok(&hq, &fresh, "tgdrive").expect("new grant seen");
     assert!(unseen_in(&hq, &fresh).is_empty());
+}
+
+/// R605-17: retain the old no-ID warning across a legacy untick/re-tick.
+/// Null/null cannot identify the displayed tick, even if timestamps repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_legacy_ok_never_adopts_a_later_legacy_tick() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 40);
+    let shown = unseen_ticks_in(&hq, &key);
+    assert_eq!(shown[0].drive, "tgdrive");
+    assert_eq!(shown[0].tick, None);
+    // No view in between; the replacement repeats the original timestamp.
+    selection_from_elsewhere(&opener, &key, &[], None, 41);
+    selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 40);
+    let refused = hq
+        .note_tick_seen(&key, "tgdrive", shown[0].tick.as_deref())
+        .expect_err("a delayed no-ID OK cannot identify a later legacy tick");
+    assert!(matches!(refused, HqError::Sentence(_)));
+    assert_eq!(
+        unseen_ticks_in(&hq, &key),
+        shown,
+        "an old null-id warning must not acknowledge a later legacy tick"
+    );
+    let source = hq.source("tgdrive").expect("held");
+    assert!(
+        drives::tick_ids(&source, &key.session_id).is_empty(),
+        "refusing OK must not mint an identity for the replacement"
+    );
+}
+
+/// Modern identities, not milliseconds, bind an OK to its displayed tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_ms_modern_retick_rejects_stale_ok_and_accepts_matching_ok() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    let first = ulid::Ulid::new().to_string();
+    let fresh = ulid::Ulid::new().to_string();
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at":42,"drives":{"tgdrive":first}})),
+        42,
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&first))
+        .expect("first seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &[],
+        Some(serde_json::json!({"at":42,"drives":{}})),
+        42,
+    );
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at":42,"drives":{"tgdrive":fresh}})),
+        42,
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&first))
+        .expect("stale OK");
+    assert_eq!(
+        unseen_ticks_in(&hq, &key)[0].tick.as_deref(),
+        Some(fresh.as_str())
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&fresh))
+        .expect("matching OK");
+    assert!(unseen_in(&hq, &key).is_empty());
+}
+
+/// R605-18: the replica owner may deliver a remote replacement while local
+/// DRIVE_WRITES is held. Persist only the person's operation's identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manual_tick_records_its_own_id_not_a_post_write_replacement() {
+    let world = World::new();
+    let (hq, staged, key) = staged_session(&world, false, &[]).await;
+    staged.inner.mutate(vec![RowOp::Upsert {
+        table: "agent_profiles".to_owned(),
+        values: sessions::object(serde_json::json!({
+            "id":"nixie.alpha", "actor_id":"nixie", "name":"nixie", "description":"",
+            "avatar_blob":null, "definition_hash":"h", "image_digest":"d", "started_at_ms":1,
+            "dir":"alpha", "drives":"[\"alpha\"]", "author_actor":"nixie", "author_client":"nixie.alpha"})),
+        base_version: None,
+    }]).expect("offers");
+    let remote_tick = ulid::Ulid::new().to_string();
+    let remote_expected = remote_tick.clone();
+    let own_tick = Arc::new(Mutex::new(None));
+    let own_written = Arc::clone(&own_tick);
+    let replica = Arc::clone(&staged.inner);
+    let session = key.session_id.clone();
+    *lock(&staged.after_sync) = Some(Box::new(move || {
+        let own = replica
+            .query("SELECT tick_ids FROM session_drives", &[])
+            .expect("own row");
+        let ids: Value =
+            serde_json::from_str(own[0]["tick_ids"].as_str().expect("tick map")).expect("tick ids");
+        *lock(&own_written) = Some(ids["drives"]["alpha"].as_str().expect("own id").to_owned());
+        let upsert = |drives: &str, ids: Value| RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            base_version: None,
+            values: sessions::object(serde_json::json!({"session_id":session,"drives":drives,
+                "updated_at_ms":42,"tick_ids":ids.to_string(),"author_actor":"ana","author_client":"ana.2"})),
+        };
+        replica
+            .mutate(vec![upsert("[]", serde_json::json!({"at":42,"drives":{}}))])
+            .expect("untick delivered");
+        replica
+            .mutate(vec![upsert(
+                "[\"alpha\"]",
+                serde_json::json!({"at":42,"drives":{"alpha":remote_tick}}),
+            )])
+            .expect("new tick delivered");
+    }));
+    hq.set_session_drive(&key, "alpha", true)
+        .expect("person's tick returns");
+    let own = lock(&own_tick).clone().expect("operation intercepted");
+    assert_ne!(own, remote_expected);
+    assert!(ulid::Ulid::from_string(&own).is_ok());
+    assert_eq!(
+        seen_entries(&world),
+        [serde_json::json!({
+            "server":"https://hq.example.org", "person":"ana", "database":"alpha",
+            "session":key.session_id, "drive":"alpha", "tick":own
+        })],
+        "manual action must record its own minted id, never a later synced replacement"
+    );
+    assert_eq!(
+        unseen_ticks_in(&hq, &key),
+        [drives::AgentUnseenTickVm {
+            drive: "alpha".to_owned(),
+            tick: Some(remote_expected)
+        }],
+        "the replacement must still warn"
+    );
 }

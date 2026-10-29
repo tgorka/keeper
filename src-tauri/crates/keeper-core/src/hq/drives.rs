@@ -711,6 +711,11 @@ pub struct DriveRefused(pub String);
 /// drives keeper knows fail ([`Stale`]) go together: unticking any of them
 /// unticks all of them, and every other change is refused here, naming
 /// them. A selection written sets aside the refusals of the ones before it.
+///
+/// Returns this operation's chosen tick id (also for an already ticked
+/// drive), or `None` for an untick or a legacy tick with no identity. A
+/// caller recording this choice as seen must use this id, not reread a
+/// selection another device may have replaced after the write.
 pub fn set(
     source: &Source,
     session_id: &str,
@@ -718,7 +723,7 @@ pub fn set(
     tick: bool,
     sources: &[Source],
     now_ms: i64,
-) -> Result<(), DriveRefused> {
+) -> Result<Option<String>, DriveRefused> {
     let session = timeline::session_row(source, session_id)
         .ok_or_else(|| DriveRefused("This conversation is not on this device.".to_owned()))?;
     let Judgement { judged, agent, .. } =
@@ -728,7 +733,11 @@ pub fn set(
     let database = source.database.as_str();
     let (mut drives, version) = ticked(source, session_id);
     if drives.iter().any(|ticked| ticked == drive) == tick {
-        return Ok(());
+        return Ok(if tick {
+            tick_ids(source, session_id).remove(drive)
+        } else {
+            None
+        });
     }
     let stale = Stale::of(&judged);
     if !tick && stale.contains(drive) {
@@ -766,7 +775,7 @@ pub fn set(
                 .collect()
         })
         .unwrap_or_default();
-    let ticks = next_ticks(&tick_ids(source, session_id), &drives);
+    let mut ticks = next_ticks(&tick_ids(source, session_id), &drives);
     let row = RowOp::Upsert {
         table: TABLE.to_owned(),
         values: authored(source, selection(session_id, &drives, &ticks, now_ms)),
@@ -776,8 +785,9 @@ pub fn set(
         .replica
         .mutate_superseding(vec![row], earlier)
         .map_err(|error| DriveRefused(error.to_string()))?;
+    let chosen = if tick { ticks.remove(drive) } else { None };
     source.replica.sync_now();
-    Ok(())
+    Ok(chosen)
 }
 
 /// `/clean`'s carry-over (Q109-17 b: a fresh session with "the same agent,
@@ -996,7 +1006,7 @@ impl Hq {
         let source = self.source(&key.database)?;
         let seen = self.seen_ticks()?;
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
-        set(
+        let chosen = set(
             &source,
             &key.session_id,
             drive,
@@ -1005,15 +1015,13 @@ impl Hq {
             sessions::now_ms(),
         )
         .map_err(|refused| HqError::Sentence(refused.0))?;
-        if tick {
-            if let Some(id) = tick_ids(&source, &key.session_id).remove(drive) {
-                let entry = self.seen_key(&source, &key.session_id, drive);
-                if let Err(error) = seen.change(|seen| {
-                    seen.insert(entry, id);
-                }) {
-                    // Unrecorded, the person's own tick is only said once more.
-                    tracing::warn!(%error, "a drive tick seen could not be recorded");
-                }
+        if let Some(id) = chosen {
+            let entry = self.seen_key(&source, &key.session_id, drive);
+            if let Err(error) = seen.change(|seen| {
+                seen.insert(entry, id);
+            }) {
+                // Unrecorded, the person's own tick is only said once more.
+                tracing::warn!(%error, "a drive tick seen could not be recorded");
             }
         }
         self.touch();
@@ -1082,7 +1090,7 @@ impl Hq {
         let ticked = set(&source, &session_id, drive, true, &sources, now);
         self.touch();
         Ok(Some(match ticked {
-            Ok(()) => answer(target, Some(drive), None),
+            Ok(_) => answer(target, Some(drive), None),
             Err(DriveRefused(reason)) => answer(target, Some(drive), Some(reason)),
         }))
     }
@@ -1091,8 +1099,8 @@ impl Hq {
     /// and said OK (R-HQ-79): that tick is recorded as seen on this device,
     /// and every open view is told (R605-13). A warning shown for a tick that
     /// has since been replaced acknowledges nothing: the new one still warns.
-    /// A tick with no id (`tick` absent; a schema-4 write) gets one, as the
-    /// person, so that it can be acknowledged.
+    /// A tick with no id cannot be bound to the displayed warning: refuse
+    /// it with the remedy of unticking and selecting again in this app.
     pub fn note_tick_seen(
         &self,
         key: &AgentSessionRef,
@@ -1102,29 +1110,15 @@ impl Hq {
         let source = self.source(&key.database)?;
         let seen = self.seen_ticks()?;
         let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
-        let (drives, version) = ticked(&source, &key.session_id);
+        let (drives, _) = ticked(&source, &key.session_id);
         let current = tick_ids(&source, &key.session_id);
         let acknowledged = match (tick, current.get(drive)) {
             _ if !drives.iter().any(|ticked| ticked == drive) => None,
             (Some(shown), Some(now)) if shown == now => Some(now.clone()),
-            (None, None) => {
-                let ticks = next_ticks(&current, &drives);
-                let id = ticks.get(drive).cloned();
-                source
-                    .replica
-                    .mutate(vec![RowOp::Upsert {
-                        table: TABLE.to_owned(),
-                        values: authored(
-                            &source,
-                            selection(&key.session_id, &drives, &ticks, sessions::now_ms()),
-                        ),
-                        base_version: version.filter(|v| *v > 0),
-                    }])
-                    .map_err(|error| {
-                        HqError::Sentence(format!("keeper could not note that: {error}"))
-                    })?;
-                source.replica.sync_now();
-                id
+            (None, _) => {
+                return Err(HqError::Sentence(format!(
+                    "keeper cannot identify this tick of {drive}. Untick it, then select it again using this app."
+                )));
             }
             _ => None,
         };

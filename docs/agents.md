@@ -1121,13 +1121,18 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   **Untick** and **OK**, wherever the session is shown (the dock, the Agents window, after a
   restart), unless the record holds its current tick id: `drives.unseen`, read from the same view
   as the chips, so the two cannot disagree. The person's own tick in the drive menu, where the
-  warning stands, records its new id when made; the dock's tick does not, so it warns. OK names the
-  tick its warning showed (`agent_note_tick_seen`) and acknowledges that tick only, then wakes every
-  open view; a tick with no id (a schema-4 write) is given one, as the person. An entry for another
-  id acknowledges nothing, so an untick and a re-tick with fresh identities — here, elsewhere, or
-  unseen in between — warn again; each view build drops stale entries and those of gone sessions. What is
-  lost fails toward the warning: a missing, unreadable or older record is an empty one, and a tick
-  made on another device, or carried by `/clean`, warns here once. The person's tick or untick, the
+  warning stands, records only the exact id chosen by that selection operation, never a later
+  replica reread; a remote replacement arriving before seen persistence remains unseen. The dock's
+  tick does not record an acknowledgement, so it warns. OK names the tick its warning showed
+  (`agent_note_tick_seen`) and acknowledges that tick only, then wakes every open view. A tick with
+  no id (a legacy/schema-4 write) cannot be identified: OK refuses without clearing the warning or
+  adopting the current selection. Untick that drive, then select it again in the drive menu using
+  the current app. Null/null is not an identity match, and timestamps cannot replace tick ids.
+  An entry for another id acknowledges nothing, so an untick and a re-tick with fresh identities —
+  here, elsewhere, or unseen in between — warn again; each view build drops stale entries and
+  those of gone sessions. What is lost fails toward the warning: a missing, unreadable or older
+  record is an empty one, and a tick made on another device, or carried with a fresh id by `/clean`,
+  warns until its own id is acknowledged here. The person's tick or untick, the
   dock's tick and the record share one lock. keeper never takes a dock tick back on its own: only a
   person unticks it. When the dock does not tick, it says why.
   Schema 5 requires a server-first contract migration and schema-4 writes that invalidate old

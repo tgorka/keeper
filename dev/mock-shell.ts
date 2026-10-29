@@ -8387,8 +8387,8 @@ function mockFocusWritten(payload: Record<string, unknown>): string | undefined 
  * and the ticks this person has been shown the warning for on this device (keeper-core's
  * `SeenTicks`, round 7 ruling): `[database, session, drive]` → the id acknowledged. A ticked drive
  * warns unless its current id is the one acknowledged. The person's own tick in the drive menu is
- * recorded when it is made, the dock's never; OK records the id its warning showed; a fixture's
- * tick has no id and warns once, as a schema-4 tick does natively.
+ * recorded when it is made, the dock's never; OK records only the id its warning showed.
+ * A fixture's legacy tick has no id and keeps warning until explicitly unticked and reselected.
  */
 const mockTickIds = new Map<string, string>();
 const mockSeenTicks = new Map<string, string>();
@@ -8405,6 +8405,21 @@ function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   if (!vm) return hqRefuse("This session is not on this device.");
   return vm;
 }
+/** Stage a replica-delivered selection for renderer probes; never a person's acknowledgement. */
+export function stageSessionDriveTick(
+  target: { database: string; sessionId: string },
+  drive: string,
+  tick: string | null | false,
+): void {
+  const row = mockSession(target).drives?.drives.find((row) => row.name === drive);
+  if (!row) hqRefuse(`${drive} is not a drive this chat's agent offers.`);
+  row.ticked = tick !== false;
+  const key = seenKey(target.database, target.sessionId, drive);
+  if (typeof tick === "string") mockTickIds.set(key, tick);
+  else mockTickIds.delete(key);
+  publishSessions();
+}
+
 const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   agent_view_prefs_set: (payload) => {
     if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
@@ -8798,6 +8813,9 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
             carried.includes(d.name) ? { name: d.name, ticked: true } : d,
           ),
         };
+        for (const drive of fresh.drives.drives) {
+          if (drive.ticked) mintTick(seenKey(fresh.database, fresh.sessionId, drive.name));
+        }
       } else if (base) fresh.drives = base;
       fresh.title = args ?? "New conversation";
       const row = sessionRows.find(
@@ -9077,12 +9095,14 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     const ticked = mockSession(payload).drives?.drives.some(
       (d) => d.name === payload.drive && d.ticked,
     );
-    // A tick with no id is given one, as the person; a warning for a tick since replaced, or a
-    // drive no longer ticked, acknowledges nothing.
-    if (!ticked) {
-      // nothing to acknowledge
-    } else if (payload.tick == null && current === undefined) mockSeenTicks.set(key, mintTick(key));
-    else if (current !== undefined && payload.tick === current) mockSeenTicks.set(key, current);
+    // Missing identity cannot bind this OK to the displayed selection, even if the current
+    // selection also has no id. Never adopt it or a replacement on the person's behalf.
+    if (ticked && payload.tick == null)
+      hqRefuse(
+        `keeper cannot identify this tick of ${String(payload.drive)}. Untick it, then select it again using this app.`,
+      );
+    if (ticked && current !== undefined && payload.tick === current)
+      mockSeenTicks.set(key, current);
     publishSessions();
     return null;
   },
