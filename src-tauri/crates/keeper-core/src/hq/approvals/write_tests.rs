@@ -1056,7 +1056,7 @@ fn recovery_finds_the_trailer_or_says_nothing_was_written() {
             "recovery never writes the drive"
         );
         let searched = w.drive.searched.lock().expect("searched").clone();
-        assert_eq!(searched.len(), 1);
+        assert_eq!(searched.len(), if carried.is_some() { 1 } else { 2 });
         assert_eq!(searched[0], format!("tgdrive/{APPROVAL}"));
         let expected = match carried {
             Some(commit) => json!({"kind": "applied", "approval": APPROVAL, "call": CALL_ID,
@@ -1068,7 +1068,11 @@ fn recovery_finds_the_trailer_or_says_nothing_was_written() {
         };
         assert_eq!(w.applied(), Some(expected));
         relaunched.carry_on(std::slice::from_ref(&w.ana));
-        assert_eq!(w.drive.searched.lock().expect("searched").len(), 1, "once");
+        assert_eq!(
+            w.drive.searched.lock().expect("searched").len(),
+            searched.len(),
+            "once"
+        );
     }
 }
 
@@ -1733,7 +1737,8 @@ fn an_append_to_an_unfinished_line_shows_it_changed() {
         Some("# List\n- [ ] milk and eggs\n- [ ] tea\n"),
     )
     .expect("shown");
-    let lines: Vec<(AgentWriteLineKindVm, String)> = card_lines(&shown.hunks[0].lines)
+    let lines: Vec<(AgentWriteLineKindVm, String)> = card_lines(&shown.hunks[0].lines, &mut 0)
+        .expect("bounded preview")
         .into_iter()
         .map(|l| (l.kind, l.text))
         .collect();
@@ -2178,7 +2183,7 @@ fn recovery_matches_the_database_and_the_id() {
     // Another database's write of the same id is in the drive's history.
     let w = world();
     w.set_approval(consumed.clone());
-    let others = [format!("otherdb/{APPROVAL}"), APPROVAL.to_owned()];
+    let others = [format!("otherdb/{APPROVAL}")];
     for other in &others {
         w.drive
             .carried
@@ -2257,7 +2262,7 @@ fn markers_cannot_be_forged() {
     // marker run, the new line's is text.
     let (old, old_runs) = render_line("ab\rcd\n", None);
     let (new, new_runs) = render_line("ab\u{23ce}cd\n", None);
-    assert_eq!((old.as_str(), new.as_str()), ("ab⏎cd", "ab⏎cd"));
+    assert_eq!((old.as_str(), new.as_str()), ("ab⏎cd", "ab⟨U+23CE⟩cd"));
     assert_eq!(
         old_runs.expect("marked")[1],
         AgentWriteRunVm {
@@ -2326,10 +2331,14 @@ fn right_to_left_beyond_hebrew_is_marked() {
         "\u{1e900}\u{1e901} 900 100",
     ] {
         let (rendered, _) = render_line(&format!("{text}\n"), None);
-        let line = &card_lines(&[drive_write::PreviewLine {
-            kind: LineKind::Add,
-            text: format!("{text}\n"),
-        }])[0];
+        let line = &card_lines(
+            &[drive_write::PreviewLine {
+                kind: LineKind::Add,
+                text: format!("{text}\n"),
+            }],
+            &mut 0,
+        )
+        .expect("bounded preview")[0];
         assert_eq!(line.text, rendered);
         assert_eq!(line.rtl, Some(true), "{text}");
     }
@@ -2355,5 +2364,300 @@ fn the_exact_action_shows_text_by_size() {
     assert!(
         action.contains("\"path\": \"10-notes/inbox.md\""),
         "{action}"
+    );
+}
+
+// ─── Round 8 (review-606 R606-15..18) ────────────────────────────────────────
+
+/// Reviewer canonical-summary boundary: the exact drawn words, including
+/// the summary, participate in all three enforcement points.
+#[test]
+fn canonical_card_caps_hold_at_allow_and_after_consume() {
+    let before = format!("{}\n", "a".repeat(9_990)).repeat(20);
+    let base_after = format!("{}\n", "b".repeat(9_990)).repeat(20);
+    for target in [CARD_CHARS, CARD_CHARS + 1] {
+        let mut tail = 0usize;
+        let (args, summary) = loop {
+            let after = format!("{base_after}{}", "z".repeat(tail));
+            let args = json!({"drive":"tgdrive","op":"replace","path":PATH,
+                              "expected":BEFORE_BLOB,"content":after});
+            let request = Request::parse(&args).expect("valid");
+            let summary = request.summary();
+            let preview = AgentWritePreviewVm::from(
+                change_preview(&request.change, Some(&before), Some(&after)).expect("preview"),
+            );
+            let action = shown_action(&args);
+            let total = preview
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .map(|l| l.text.chars().count())
+                .sum::<usize>()
+                + [PATH, action.as_str(), summary.as_str()]
+                    .iter()
+                    .flat_map(|s| s.split('\n'))
+                    .map(|s| s.chars().count())
+                    .sum::<usize>();
+            if total == target {
+                break (args, summary);
+            }
+            tail = if total < target {
+                tail + target - total
+            } else {
+                tail - (total - target)
+            };
+        };
+        let w = world_with(args, None);
+        w.drive.file(PATH, BEFORE_BLOB, &before);
+        w.set_approval(json!({"summary":summary}));
+        let card = w.card();
+        if target == CARD_CHARS {
+            assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+            w.allow().expect("exact cap is showable");
+            assert_eq!(w.drive.commits().len(), 1);
+        } else {
+            assert_eq!(card.actions, [AgentApprovalActionVm::Deny]);
+            assert!(
+                w.allow().is_err(),
+                "unshowable card must refuse before deciding"
+            );
+            assert!(
+                w.server
+                    .ops()
+                    .iter()
+                    .all(|op| Server::row_id(op).0 != "approvals"),
+                "unshowable Allow must neither decide nor consume"
+            );
+            assert!(
+                w.drive.commits().is_empty(),
+                "unshowable Allow must not commit"
+            );
+            // A decision made by an older build still gets the same guard
+            // after consumption, independently of the Allow entry.
+            w.set_approval(json!({"state":"approved","decided_by_actor":ANA,
+                                  "decided_by_client":"ana.dev"}));
+            w.writes
+                .owe(("tgdrive".to_owned(), APPROVAL.to_owned()), Owed::Decided);
+            w.writes.carry_on(std::slice::from_ref(&w.ana));
+            assert!(
+                w.drive.commits().is_empty(),
+                "post-consume cap must not commit"
+            );
+            assert_eq!(w.applied().expect("outcome")["reason"], TOO_LARGE);
+        }
+    }
+}
+
+#[test]
+fn an_oversized_summary_cannot_bypass_the_card_refusal() {
+    let w = world();
+    assert!(
+        w.card().actions.contains(&AgentApprovalActionVm::AllowOnce),
+        "warm the showable cache before the summary changes"
+    );
+    w.set_approval(json!({"summary": "s".repeat(LINE_CHARS + 1)}));
+    assert_eq!(w.card().actions, [AgentApprovalActionVm::Deny]);
+    assert!(w.allow().is_err(), "a card without Allow must not commit");
+    assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "pending");
+    assert!(w.drive.commits().is_empty());
+}
+
+/// Same-name runs retain every glyph but cost one span per adjacent run.
+/// Alternating markers/text cannot evade the separate run budget.
+#[test]
+fn dense_markers_are_compact_and_alternating_runs_are_bounded() {
+    let before: String = (0..26).map(|k| format!("para {k}\n\n")).collect();
+    for unit in [" ", "\t"] {
+        let after: String = (0..26)
+            .map(|k| format!("para {k}\n{}\n", unit.repeat(9_999)))
+            .collect();
+        let w = world_with(
+            json!({"drive":"tgdrive","op":"replace","path":PATH,
+                                  "expected":BEFORE_BLOB,"content":after}),
+            None,
+        );
+        w.drive.file(PATH, BEFORE_BLOB, &before);
+        let card = w.card();
+        assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+        let write = card.write.expect("write");
+        let runs: Vec<_> = write
+            .preview
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|l| l.runs.as_ref())
+            .flatten()
+            .collect();
+        assert_eq!(runs.len(), 26, "each dense marker line needs one named run");
+        for run in runs {
+            assert_eq!(
+                run.text.chars().count(),
+                9_999,
+                "all markers remain visible"
+            );
+            assert_eq!(
+                run.mark.as_deref(),
+                Some(if unit == " " { "space" } else { "tab" })
+            );
+        }
+        w.allow().expect("compact exact change can be approved");
+        assert_eq!(w.drive.commits().len(), 1);
+    }
+    for runs in [CARD_RUNS, CARD_RUNS + 1] {
+        let before = format!("{}\n", "a".repeat(runs.div_ceil(2)));
+        let after = format!(
+            "{}{}\n",
+            "a ".repeat(runs / 2),
+            if runs % 2 == 1 { "a" } else { "" }
+        );
+        let w = world_with(
+            json!({"drive":"tgdrive","op":"replace","path":PATH,
+                                  "expected":BEFORE_BLOB,"content":after}),
+            None,
+        );
+        w.drive.file(PATH, BEFORE_BLOB, &before);
+        if runs == CARD_RUNS {
+            assert!(w.card().actions.contains(&AgentApprovalActionVm::AllowOnce));
+            w.allow().expect("exact run budget remains approvable");
+            assert_eq!(
+                w.drive.commits()[0].writes[0].1.as_deref(),
+                Some(after.as_bytes())
+            );
+        } else {
+            assert!(withheld(&w, TOO_LARGE).preview.hunks.is_empty());
+        }
+    }
+    let before = format!("{}\n", "a".repeat(5_000));
+    let after = format!("{}a\n", "a ".repeat(4_999));
+    let w = world_with(
+        json!({"drive":"tgdrive","op":"replace","path":PATH,
+                              "expected":BEFORE_BLOB,"content":after}),
+        None,
+    );
+    w.drive.file(PATH, BEFORE_BLOB, &before);
+    let write = withheld(&w, TOO_LARGE);
+    assert!(
+        write.preview.hunks.is_empty(),
+        "never ship an oversized partial diff"
+    );
+    assert_eq!(write.preview.too_large, Some(TooLarge::Runs.sentence()));
+}
+
+#[test]
+fn literal_escape_syntax_cannot_hide_a_whitespace_move() {
+    for c in ['\u{2003}', '\u{3000}'] {
+        let syntax = format!("⟨U+{:04X}⟩", u32::from(c));
+        let before = format!("a{c}{syntax}b\n");
+        let after = format!("a{syntax}{c}b\n");
+        let w = world_with(
+            json!({"drive":"tgdrive","op":"edit","path":PATH,
+            "expected":BEFORE_BLOB,"old_text":before,"new_text":after}),
+            None,
+        );
+        w.drive.file(PATH, BEFORE_BLOB, &before);
+        let card = w.card();
+        assert!(card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+        let write = card.write.expect("write");
+        let lines = &write.preview.hunks[0].lines;
+        assert_ne!(
+            (&lines[0].text, &lines[0].runs),
+            (&lines[1].text, &lines[1].runs),
+            "distinct approved bytes must not draw identically"
+        );
+        w.allow().expect("visible whitespace move");
+        assert_eq!(
+            w.drive.commits()[0].writes[0].1.as_deref(),
+            Some(after.as_bytes()),
+            "escaping must never alter approved bytes"
+        );
+    }
+    // Metadata uses the same literal delimiter convention.
+    assert_ne!(escaped("\u{200b}"), escaped("⟨U+200B⟩"));
+    assert_ne!(escaped("\r"), escaped("⏎"));
+}
+
+/// An older build actually committed, but its bare trailer cannot identify
+/// the database. Never tell the server/person that no write occurred.
+#[test]
+fn legacy_recovery_is_indeterminate_and_never_replays() {
+    let w = world();
+    w.set_approval(json!({"state":"consumed","decided_by_actor":ANA,
+        "decided_by_client":"ana.dev","consumed_by_client":"ana.dev"}));
+    for trailer in [APPROVAL.to_owned(), format!("otherdb/{APPROVAL}")] {
+        w.drive
+            .carried
+            .lock()
+            .expect("history")
+            .insert(trailer, COMMIT.to_owned());
+    }
+    for _ in 0..2 {
+        let relaunched = Writes::default();
+        relaunched.set_port(Arc::clone(&w.drive) as Arc<dyn DriveWrites>);
+        relaunched.carry_on(std::slice::from_ref(&w.ana));
+        assert!(
+            w.applied().is_none(),
+            "legacy ambiguity must not emit a false terminal outcome"
+        );
+        assert_eq!(text_of(&w.row("approvals", APPROVAL), "state"), "consumed");
+        let mut card = w.card();
+        relaunched.draw(std::slice::from_ref(&w.ana), &w.ana, &mut [&mut card]);
+        assert_eq!(
+            card.write.expect("write").outcome.as_deref(),
+            Some(INDETERMINATE)
+        );
+        assert!(
+            card.actions.is_empty(),
+            "consumed state is never approvable again"
+        );
+        relaunched.carry_on(std::slice::from_ref(&w.ana));
+        assert!(
+            w.drive.commits().is_empty(),
+            "indeterminate must not enter effect"
+        );
+    }
+    assert!(
+        w.allow().is_err(),
+        "indeterminate consumed approval is non-replayable"
+    );
+}
+
+/// A local-only migration result still reaches an already-open view. It
+/// emits no server row and must not produce an endless recovery wake loop.
+#[test]
+fn legacy_recovery_wakes_open_views_once_without_a_wire_outcome() {
+    let w = world();
+    w.set_approval(json!({"state":"consumed","decided_by_actor":ANA,
+        "decided_by_client":"ana.dev","consumed_by_client":"ana.dev"}));
+    w.drive
+        .carried
+        .lock()
+        .expect("history")
+        .insert(APPROVAL.to_owned(), COMMIT.to_owned());
+    let hq = hq_over(&w, Arc::clone(&w.drive) as Arc<dyn DriveWrites>);
+    let mut changes = hq.changes();
+    hq.carry_on_writes();
+    idle(&hq);
+    assert!(
+        changes.has_changed().expect("open subscription"),
+        "local indeterminacy must wake an already-open view"
+    );
+    changes.borrow_and_update();
+    let mut card = w.card();
+    hq.writes
+        .draw(std::slice::from_ref(&w.ana), &w.ana, &mut [&mut card]);
+    assert_eq!(
+        card.write.expect("write").outcome.as_deref(),
+        Some(INDETERMINATE)
+    );
+    hq.carry_on_writes();
+    idle(&hq);
+    assert!(
+        !changes.has_changed().expect("open subscription"),
+        "an unchanged indeterminate state must not generate another wake"
+    );
+    assert!(w.applied().is_none(), "no false V18 outcome");
+    assert!(
+        w.drive.commits().is_empty(),
+        "never replay the consumed write"
     );
 }

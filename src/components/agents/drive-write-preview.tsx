@@ -7,7 +7,6 @@
  * never markup, and nothing here decides.
  */
 import { ShieldAlert } from "lucide-react";
-import type { CSSProperties } from "react";
 import type {
   AgentDriveWriteOpVm,
   AgentDriveWriteVm,
@@ -49,20 +48,10 @@ const LINE_WORD: Readonly<Record<AgentWriteLineKindVm, string>> = {
 export const STORED_ORDER = "[direction:ltr] [unicode-bidi:bidi-override]";
 
 const BLOCK =
-  "my-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-muted p-2 font-mono text-xs [overflow-wrap:anywhere]";
+  "my-2 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-sm bg-muted p-2 font-mono text-xs [overflow-wrap:anywhere]";
 
-/**
- * A drawn line the scroll box does not show is not laid out (R606-09). A card just under both
- * character caps wraps into ~250,000 px of text, and laying all of it out held the Notes panel's
- * first render for 3.3-3.8 s in headless Chromium. Until a line is laid out it holds the height
- * its length would wrap to at the narrowest card (40 monospace characters a row), so a one-row
- * guess cannot pull every line of the card into the browser's margin at once. A line stays in the
- * accessibility tree and in find-in-page either way.
- */
-function offscreenSkipped(text: string): CSSProperties {
-  const rows = Math.max(1, Math.ceil(text.length / 40));
-  return { contentVisibility: "auto", containIntrinsicBlockSize: `auto ${rows}lh` };
-}
+// Every approved line is laid out and exposed to accessibility before scrolling. Rust bounds
+// lines, characters and runs before sending the VM; content-visibility would hide offscreen AX.
 
 /** Each line of a hunk with its place on the side it is on: a key that names the line. */
 function placed(hunk: AgentWriteHunkVm) {
@@ -85,12 +74,7 @@ function Hunk({ hunk }: { hunk: AgentWriteHunkVm }) {
         Line {hunk.oldStart} → {hunk.newStart}
       </div>
       {placed(hunk).map(({ line, place }) => (
-        <div
-          key={place}
-          data-kind={line.kind}
-          className={cn("min-w-0", LINE_TONE[line.kind])}
-          style={offscreenSkipped(line.text)}
-        >
+        <div key={place} data-kind={line.kind} className={cn("min-w-0", LINE_TONE[line.kind])}>
           <span aria-hidden="true">{LINE_MARK[line.kind]} </span>
           <span className="sr-only">{LINE_WORD[line.kind]}: </span>
           <span data-slot="drive-write-line-text" className={cn(line.rtl && STORED_ORDER)}>
@@ -101,7 +85,9 @@ function Hunk({ hunk }: { hunk: AgentWriteHunkVm }) {
                       // biome-ignore lint/suspicious/noArrayIndexKey: a line's runs are fixed
                       key={at}
                       role="img"
-                      aria-label={run.mark}
+                      aria-label={
+                        run.text.length > 1 ? `${run.text.length} × ${run.mark}` : run.mark
+                      }
                       data-slot="drive-write-mark"
                       className="rounded-xs bg-muted-foreground/20 text-muted-foreground"
                     >
@@ -131,9 +117,7 @@ function Excerpt({ label, excerpt }: { label: string; excerpt: AgentWriteExcerpt
     <figure aria-label={label}>
       <div className={cn(BLOCK, excerpt.rtl && STORED_ORDER)}>
         {numbered.map(({ text, number }) => (
-          <div key={number} style={offscreenSkipped(text)}>
-            {text}
-          </div>
+          <div key={number}>{text}</div>
         ))}
       </div>
       {excerpt.more > 0 && (

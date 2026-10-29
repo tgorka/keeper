@@ -6997,6 +6997,59 @@ if (writesScenario === "all" && sessionApprovals.length > 0) {
       25,
     ),
     mockWrite(
+      "write-grouped-markers",
+      "Edit `10-notes/inbox.md` in tgdrive: 1 byte becomes 5 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "\n", new_text: "    \n" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "" },
+                {
+                  kind: "add",
+                  text: "····",
+                  runs: [{ text: "····", mark: "space" }],
+                  note: "Only whitespace changes on this line.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      26,
+    ),
+    {
+      ...mockWrite(
+        "write-indeterminate",
+        "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 11 bytes",
+        {
+          op: "edit",
+          path: MOCK_INBOX,
+          expected: MOCK_BLOB,
+          old_text: "- [ ] milk\n",
+          new_text: "- [x] milk\n",
+        },
+        {
+          ...base,
+          op: "edit",
+          path: MOCK_INBOX,
+          preview: { hunks: [] },
+          outcome:
+            "Write outcome unknown: an older keeper commit has this approval id without a database. Inspect the drive history before making another change; keeper will not retry this write.",
+        },
+        27,
+      ),
+      state: "consumed",
+      canDecide: false,
+      sentence: "Approved by Ana.",
+    },
+    mockWrite(
       "write-blocked",
       "Edit `10-notes/todo.md` in tgdrive: 6 bytes become 7 bytes",
       { op: "edit", path: "10-notes/todo.md", expected: MOCK_BLOB, old_text: "…", new_text: "…" },

@@ -887,7 +887,11 @@ impl Hq {
             .spawn(move || loop {
                 again.store(false, Ordering::SeqCst);
                 if let Some(hq) = me.upgrade() {
-                    hq.writes.carry_on(&hq.sources());
+                    if hq.writes.carry_on(&hq.sources()) {
+                        // Local migration ambiguity emits no V18 row, so
+                        // wake the views explicitly, only on its first pass.
+                        hq.touch();
+                    }
                 }
                 carrying.store(false, Ordering::SeqCst);
                 // A wake during the pass: pass again, unless that wake has

@@ -1,6 +1,7 @@
 import { open as openFile } from "@tauri-apps/plugin-dialog";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TranscribeAFileHost, transcribeAFile } from "@/components/transcription/transcribe-a-file";
 import { TRANSCRIPTION_PROGRESS_LABEL } from "@/components/transcription/transcription-progress";
 import { Toaster } from "@/components/ui/sonner";
@@ -36,6 +37,8 @@ const send = (phase: ipc.TranscriptionProgressVm["phase"], extra: object = {}) =
     }),
   );
 beforeEach(() => {
+  // Own Sonner's delayed removal callbacks instead of letting them outlive jsdom.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
   // Clear, not reset: setup.ts's matchMedia stub, which the Toaster reads, is a mock too.
   vi.clearAllMocks();
   progress = undefined;
@@ -52,6 +55,19 @@ beforeEach(() => {
     hasCamera: false,
     hasScreen: false,
   });
+});
+
+afterEach(async () => {
+  // A retry can leave a job subscription alive. End it before resetting the shared store.
+  await send("cancelled");
+  await act(async () => {
+    toast.dismiss();
+    await vi.runOnlyPendingTimersAsync();
+  });
+  cleanup();
+  // Sonner schedules removal after its exit animation, including during dismissal.
+  await act(() => vi.runOnlyPendingTimersAsync());
+  vi.useRealTimers();
 });
 
 describe("Transcribe a File…", () => {

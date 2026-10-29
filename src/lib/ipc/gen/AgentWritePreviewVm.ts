@@ -20,8 +20,8 @@ lineEndings?: string,
  */
 rtlNote?: string, 
 /**
- * Why nothing of the change is shown: which of the card's caps it is
- * past, and by how much ([`CARD_LINES`], [`LINE_CHARS`],
- * [`CARD_CHARS`]; R606-05, R606-09). Allow is withheld.
+ * Why nothing of the change is shown: which cap it is past
+ * ([`CARD_LINES`], [`LINE_CHARS`], [`CARD_CHARS`], [`CARD_RUNS`]).
+ * Allow is withheld by the same assessment at draw, Allow and effect.
  */
 tooLarge?: string, };
