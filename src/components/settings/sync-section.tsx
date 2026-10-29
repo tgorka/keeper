@@ -56,12 +56,9 @@ import type {
   SyncStatusVm,
   SyncVerifyVm,
 } from "@/lib/ipc/client";
-// Read and written straight through rather than through the mirror store: the
-// device name is one app-global string nothing else changes, so mirroring it
-// would be a second source of truth for a value read once per open. The drive
-// folder is the same kind of value. Opening a folder is here for the adjacent
-// reason — it changes nothing, so there is no mirrored state for a store
-// action to keep in step.
+// Read directly from Rust, including after a successful device-name change:
+// the returned commit label, not the typed name, is authoritative. The drive
+// folder is likewise read/written directly rather than mirrored in a store.
 import {
   type SyncListSettingsVm,
   syncDevice,
@@ -996,6 +993,8 @@ function SyncProfileRow({
  * Read-only: it follows This device's name (R-HQ-94 amendment 2 (9)). Still
  * rendered only where sync exists, because the identity is read through the
  * sync engine's own IPC — there is nothing to show on a machine that has none.
+ * Settings remounts this row after Save/Reset, so its next native read cannot
+ * race an older identity read from the previous row.
  */
 export function DeviceSection({ open }: { open: boolean }) {
   const [device, setDevice] = useState<SyncDeviceVm | null>(null);
@@ -1011,6 +1010,7 @@ export function DeviceSection({ open }: { open: boolean }) {
         const read = await syncDevice();
         if (live) {
           setDevice(read);
+          setDeviceError(null);
         }
       } catch (raw) {
         logFailure("sync.device")(raw);

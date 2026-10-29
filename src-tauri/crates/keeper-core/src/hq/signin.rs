@@ -426,15 +426,22 @@ fn json_sentence(error: serde_json::Error) -> HqError {
 impl Hq {
     /// Sign-in enrolment's view of this configuration (Settings).
     pub(super) fn sign_in_vm(inner: &Inner) -> HqSignInVm {
+        let stale = inner
+            .pairing
+            .as_ref()
+            .is_some_and(|pairing| renamed(pairing, inner.host.as_deref()));
         let Some(server) = &inner.server else {
-            return HqSignInVm::unavailable();
+            return HqSignInVm {
+                name_pending: stale,
+                ..HqSignInVm::unavailable()
+            };
         };
         let host = server.host();
         let pairing = inner.pairing.as_ref();
         let bound = pairing.is_some_and(|pairing| pairing.bound.is_some());
-        let stale = pairing.is_some_and(|pairing| renamed(pairing, inner.host.as_deref()));
         let vm = |state, sentence: String| HqSignInVm {
             state,
+            name_pending: stale,
             sentence: Some(sentence),
         };
         // Renamed since the server last heard: it learns the name only from
@@ -763,15 +770,12 @@ impl Hq {
         // an adopted credential carries (amendment 2 (6)).
         let enrolled_host = match ask {
             Ask::New => known_host(&sent_host),
-            Ask::Adopt => pairing
-                .as_ref()
-                .and_then(|pairing| {
-                    pairing
-                        .enrolled_host
-                        .clone()
-                        .or_else(|| pairing.host.clone())
-                })
-                .or_else(|| known_host(&sent_host)),
+            Ask::Adopt => pairing.as_ref().and_then(|pairing| {
+                pairing
+                    .enrolled_host
+                    .clone()
+                    .or_else(|| pairing.host.clone())
+            }),
         };
         match self
             .keep_enrolled(server, enrolled, started_from, &sent_host, enrolled_host)

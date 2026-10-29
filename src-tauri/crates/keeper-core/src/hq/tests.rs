@@ -161,8 +161,8 @@ impl World {
             client_id: "ana.1".to_owned(),
             name: "keeper on test".to_owned(),
             bound: None,
-            host: None,
-            enrolled_host: None,
+            host: Some("test".to_owned()),
+            enrolled_host: Some("test".to_owned()),
         };
         self.platform
             .keychain_set(
@@ -638,9 +638,13 @@ async fn a_rename_is_checked_against_the_complete_replicated_directory() {
     opens(&["alpha", "beta"]);
     let hq = world.hq();
     hq.start().await.expect("starts");
+    hq.apply_discovery(generation(&hq), Ok(found(&["alpha", "beta"])))
+        .await
+        .expect("current discovery");
     let unread = |database: &str| {
         Err(Unread {
             database: Some(database.to_owned()),
+            ..Default::default()
         })
     };
     let row = |id: &str, actor: &str, kind: &str, host: &str, revoked: Option<i64>| {
@@ -689,7 +693,7 @@ async fn a_rename_is_checked_against_the_complete_replicated_directory() {
             ("nixi".to_owned(), "hesperia".to_owned()),
         ]
     );
-    // Kept before hosts were recorded: backfilled with the system's name.
+    // The credential's recorded hosts, never inferred from today's OS.
     assert_eq!(directory.bound.as_deref(), Some("test"));
     assert_eq!(directory.enrolled.as_deref(), Some("test"));
     // This world has no account: nothing can adopt the pairing under a new
@@ -701,6 +705,10 @@ async fn a_rename_is_checked_against_the_complete_replicated_directory() {
     opens(&["alpha", "beta", "gamma"]);
     let again = world.hq();
     again.start().await.expect("starts");
+    again
+        .apply_discovery(generation(&again), Ok(found(&["alpha", "beta", "gamma"])))
+        .await
+        .expect("current discovery");
     for database in ["alpha", "beta"] {
         world.live(database)[0].replicate(vec![row("ana.1", "ana", "device", "test", None)]);
     }
@@ -3099,4 +3107,65 @@ async fn a_manual_tick_records_its_own_id_not_a_post_write_replacement() {
         }],
         "the replacement must still warn"
     );
+}
+
+/// R607-10: a persisted registry subset plus cached rows is not current
+/// discovery. Fresh discovery can reveal an unsynced, previously unknown DB.
+#[tokio::test]
+async fn cached_registry_rows_do_not_authorize_a_rename_before_discovery() {
+    use crate::device_name::{check, NameRefusal, Unread};
+    let world = World::new();
+    let server = world.paired("https://hq.example.org", &["alpha"]);
+    Authorization {
+        removed: false,
+        open: vec!["alpha".to_owned()],
+    }
+    .save(&world.data_dir(), &server)
+    .expect("cached authorization");
+    let hq = world.hq();
+    hq.start().await.expect("starts offline");
+    let Value::Object(row) = serde_json::json!({
+        "id": "ana.1", "actor_id": "ana", "kind": "device",
+        "host": "test", "revoked_at_ms": null
+    }) else {
+        unreachable!("object")
+    };
+    world.live("alpha")[0].replicate(vec![row.clone()]);
+    let cached = hq.device_directory();
+    assert_eq!(
+        cached,
+        Err(Unread {
+            database: Some("alpha".to_owned()),
+            ..Default::default()
+        })
+    );
+    assert!(matches!(
+        check("studio", "test", "test", &cached),
+        Err(NameRefusal::Unread { .. })
+    ));
+    hq.apply_discovery(generation(&hq), Ok(found(&["alpha", "beta"])))
+        .await
+        .expect("fresh discovery");
+    world.live("alpha")[0].replicate(vec![row.clone()]);
+    assert_eq!(
+        hq.device_directory(),
+        Err(Unread {
+            database: Some("beta".to_owned()),
+            ..Default::default()
+        })
+    );
+    world.live("beta")[0].replicate(vec![row]);
+    assert!(hq.device_directory().is_ok(), "complete current directory");
+    hq.shutdown().await;
+    let again = world.hq();
+    again.start().await.expect("restarts offline");
+    world.live("alpha")[0].replicate(vec![serde_json::from_value(serde_json::json!({
+        "id": "ana.1", "actor_id": "ana", "kind": "device", "host": "test"
+    }))
+    .expect("row")]);
+    assert!(
+        again.device_directory().is_err(),
+        "freshness does not survive restart"
+    );
+    again.shutdown().await;
 }

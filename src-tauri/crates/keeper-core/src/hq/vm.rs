@@ -119,6 +119,8 @@ pub enum HqSignInState {
 #[ts(export)]
 pub struct HqSignInVm {
     pub state: HqSignInState,
+    /// The effective name is not yet acknowledged by the existing credential.
+    pub name_pending: bool,
     /// The line Settings shows under the server, when there is one.
     pub sentence: Option<String>,
 }
@@ -127,6 +129,7 @@ impl HqSignInVm {
     pub fn unavailable() -> HqSignInVm {
         HqSignInVm {
             state: HqSignInState::Unavailable,
+            name_pending: false,
             sentence: None,
         }
     }

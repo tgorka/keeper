@@ -387,14 +387,15 @@ impl World {
             Some(&server),
         )
         .expect("stores");
+        let host = lock(&self.system).clone();
         let pairing = Pairing {
             token: token.to_owned(),
             actor_id: "ana".to_owned(),
             client_id: client.to_owned(),
             name: "keeper".to_owned(),
             bound,
-            host: None,
-            enrolled_host: None,
+            host: Some(host.clone()),
+            enrolled_host: Some(host.clone()),
         };
         self.platform
             .keychain_set(
@@ -407,8 +408,8 @@ impl World {
             client: client.to_owned(),
             bound: bound.is_some(),
             lapsed,
-            host: "hesperia".to_owned(),
-            t4_host: "hesperia".to_owned(),
+            host: host.clone(),
+            t4_host: host,
         });
     }
 
@@ -1241,11 +1242,9 @@ fn fresh() -> Bound {
 #[tokio::test]
 async fn a_renamed_device_is_signed_in_again_under_its_new_name_keeping_its_client_id() {
     let world = World::new(true);
-    // Kept before hosts were recorded: the host it was sent under is the
-    // system's name, which every credential was created under then.
-    world.holds("device-token-a", "ana.1", Some(fresh()), false);
     *lock(&world.host) = "iPhone".to_owned();
     *lock(&world.system) = "iPhone".to_owned();
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
     let hq = world.hq();
     hq.start().await.expect("starts");
     status_until(&hq, "enrolled", enrolled).await;
@@ -1477,11 +1476,8 @@ async fn a_new_credential_is_created_under_the_systems_name_and_then_takes_the_o
     );
 }
 
-/// Probe C (Rev607r2, R607-06; amendment 2 (7)): a credential kept before
-/// keeper recorded hosts, and a name saved just before keeper quit, so the
-/// server was never told. At the next start the credential is backfilled
-/// with the system's name, the name is sent by adoption, and until the
-/// server answers Settings says so — never "Signed in".
+/// Probe C (R607-06): a credential with a known host, and a name saved
+/// before keeper quit, is adopted at the next start under the same id.
 #[tokio::test]
 async fn a_rename_the_server_has_not_heard_is_sent_at_the_next_start() {
     let world = World::new(true);
@@ -1495,6 +1491,7 @@ async fn a_rename_the_server_has_not_heard_is_sent_at_the_next_start() {
         s.sign_in.state == HqSignInState::Enrolling
     })
     .await;
+    assert!(waiting.sign_in.name_pending);
     assert_eq!(
         waiting.sign_in.sentence.as_deref(),
         Some(format!("Updating the name on {host}…").as_str())
@@ -1513,4 +1510,132 @@ async fn a_rename_the_server_has_not_heard_is_sent_at_the_next_start() {
         server_hosts(&world, "ana.1"),
         ("studio".to_owned(), "hesperia".to_owned())
     );
+}
+
+/// R607-05: a host-less legacy record must not guess the old OS name,
+/// mutate the credential, or authorize a rename after an OS-name change.
+#[tokio::test]
+async fn a_hostless_legacy_credential_refuses_an_uncertain_rename_and_stays_kept() {
+    use crate::device_name::{check, NameRefusal};
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let mut legacy = world.kept().expect("kept");
+    legacy.host = None;
+    legacy.enrolled_host = None;
+    let stored = serde_json::to_string(&legacy).expect("json");
+    world
+        .platform
+        .keychain_set(&keychain_key(&world.server()), &stored)
+        .expect("legacy");
+    *lock(&world.system) = "macbook".to_owned();
+    *lock(&world.host) = "macbook".to_owned();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "existing credential", enrolled).await;
+    assert_eq!(
+        check("studio", "macbook", "macbook", &hq.device_directory()),
+        Err(NameRefusal::UnknownHost {
+            current: "macbook".to_owned()
+        })
+    );
+    assert_eq!(
+        world
+            .platform
+            .keychain_get(&keychain_key(&world.server()))
+            .expect("reads"),
+        Some(stored)
+    );
+    assert_eq!(
+        server_hosts(&world, "ana.1"),
+        ("hesperia".to_owned(), "hesperia".to_owned())
+    );
+    assert!(
+        world.asked("/devices/enroll").is_empty(),
+        "no replacement credential"
+    );
+    hq.shutdown().await;
+}
+
+/// The pending bit belongs to credential/name truth, not a UI mount or a
+/// sign-in state. Every pending refusal/availability state carries it.
+#[tokio::test]
+async fn pending_name_truth_survives_sign_out_refusal_unavailability_and_acknowledgement() {
+    let world = World::new(false);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    *lock(&world.host) = "studio".to_owned();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    let pending = status_until(&hq, "pending sign-in", |s| {
+        s.sign_in.state == HqSignInState::Renamed
+    })
+    .await;
+    assert!(pending.sign_in.name_pending);
+    {
+        let mut inner = lock(&hq.inner);
+        for outcome in [
+            Some(signin::Outcome::Failed("offline".to_owned())),
+            Some(signin::Outcome::Refused("refused".to_owned())),
+            Some(signin::Outcome::NotOffered),
+        ] {
+            inner.sign_in.outcome = outcome;
+            let vm = Hq::sign_in_vm(&inner);
+            assert_eq!(vm.state, HqSignInState::Refused);
+            assert!(vm.name_pending);
+        }
+        inner.pairing.as_mut().expect("pairing").bound = None;
+        inner.sign_in.outcome = None;
+        let vm = Hq::sign_in_vm(&inner);
+        assert_eq!(vm.state, HqSignInState::Unavailable);
+        assert!(vm.name_pending);
+        inner.pairing.as_mut().expect("pairing").host = Some("studio".to_owned());
+        assert!(!Hq::sign_in_vm(&inner).name_pending, "acknowledged");
+        inner.pairing = None;
+        assert!(!Hq::sign_in_vm(&inner).name_pending, "no credential");
+    }
+    hq.shutdown().await;
+}
+
+/// A recorded last host remains usable even when the OS changed; adoption
+/// failure/restart keeps that host and retries the same credential.
+#[tokio::test]
+async fn a_known_host_backfill_and_failed_rename_survive_restart() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let mut old = world.kept().expect("kept");
+    old.host = Some("studio".to_owned());
+    old.enrolled_host = None;
+    world
+        .platform
+        .keychain_set(
+            &keychain_key(&world.server()),
+            &serde_json::to_string(&old).expect("json"),
+        )
+        .expect("old credential");
+    *lock(&world.host) = "den".to_owned();
+    lock(&world.state).enroll_refusals = vec![refusal(502, "offline")];
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    let failed = status_until(&hq, "failed adoption", |s| {
+        s.sign_in.state == HqSignInState::Refused
+    })
+    .await;
+    assert!(failed.sign_in.name_pending);
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1");
+    assert_eq!(kept.enrolled_host.as_deref(), Some("studio"));
+    hq.shutdown().await;
+    let again = world.hq();
+    again.start().await.expect("restarts");
+    world.until_asked("/devices/enroll", 2).await;
+    let acknowledged = status_until(&again, "adoption confirmed", enrolled).await;
+    assert!(!acknowledged.sign_in.name_pending);
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1");
+    assert_eq!(kept.host.as_deref(), Some("den"));
+    assert_eq!(kept.enrolled_host.as_deref(), Some("studio"));
+    for request in world.asked("/devices/enroll") {
+        assert_eq!(request.json()["host"], "den");
+        assert_eq!(request.json()["deviceToken"], "device-token-a");
+    }
+    again.shutdown().await;
 }

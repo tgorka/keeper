@@ -655,10 +655,11 @@ Settings › Account shows *keeper 0.8.33* beside each device that records one.
   exist are skipped, and the settings files are merged again against what just arrived.
 
 **Device names and classes come from keeper, never from a token:**
-- **The name.** On desktop it is the short hostname, lower-cased to `[a-z0-9-]` (at most 32
-  characters). On iOS, where there is no hostname, it is the model plus four characters
-  (`iphone-3f2a`), kept across launches. You can edit it on the confirmation sheet before
-  the device is first registered.
+- **The name.** Settings › Account & device › **This device's name** uses the local override,
+  or the system name when none is set. The account record uses its slug (lower-cased
+  `[a-z0-9-]`, at most 32 characters); on iOS the system-derived account default is the
+  model plus four characters (`iphone-3f2a`). You can also edit it on the confirmation
+  sheet before the device is first registered.
 - **A reinstall keeps its name.** A device record written by this version of keeper carries
   `machine`, a fingerprint: the SHA-256 of the operating system's machine id together with
   your sign-in's `sub`. It recognises this machine for you and reveals no hardware id. When
@@ -672,9 +673,13 @@ Settings › Account shows *keeper 0.8.33* beside each device that records one.
   iPhone or iPad has no machine id and draws a new name when keeper is reinstalled, so it
   does not restore itself (DW-318). On Linux and Windows, reinstalling the operating system
   gives a new machine id; reinstalling keeper does not.
-- **Renaming later.** Settings › Account › *Rename* moves this device's files (its record,
-  `keeper.<device>.toml`, `settings.<device>.toml`, `device.<device>.toml` and
-  `logs/<device>.log`) in one commit.
+- **Renaming later.** Save or Reset under **This device's name** moves this device's files
+  (its record, `keeper.<device>.toml`, `settings.<device>.toml`, `device.<device>.toml`
+  and `logs/<device>.log`) through the account's existing rename operation. The account's
+  Devices list and **Name in commits** are read-only, not separate name editors.
+  After a successful Save or Reset, **Name in commits** re-reads the app's native sync
+  identity without closing Settings. It shows the actual returned label, not an optimistic
+  copy of the name field; a failed read is reported beside the row.
 - **The class.** `desktop` on macOS, Linux and Windows. On iOS, `tablet` on an iPad and
   `mobile` otherwise.
 

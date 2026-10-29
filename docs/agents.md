@@ -146,6 +146,18 @@ app does not currently hold. Apple must grant that entitlement for assigned-name
 `iPhone` differs from `hesperia`, but two iPhones would share it; the actual kalypso enrollment
 and T4 decision still require the physical-device check.
 
+**Changing the device's name (R-HQ-94).** Settings › Account & device has one name editor.
+An override changes the display host of an existing credential by adoption, keeping its client
+id and immutable first-enrolled T4 host. Creating a credential still sends the system host;
+the app override does not change T4 identity. Rust's `HqSignInVm.namePending` says that the
+effective name has not yet been acknowledged by that credential. While true, the name section
+shows Rust's pending or failed adoption sentence on first mount and after Settings is reopened,
+including Enrolling, Refused and Unavailable answers that have a sentence. It does not infer
+pending state from sentence text or remember a local Save flag. A Renamed answer keeps
+**Sign in again** available. Once native status acknowledges the name, the extra line disappears;
+ordinary sign-in status remains in Agents server.
+
+
 **Signing in** (Story 109.6; Q109-01 … Q109-06 a, S-ID-1 … S-ID-9; the server half is keeper-hq's
 109.5). A device whose person is signed in to the organisation account gets its credential by
 signing in, with no code (`keeper-core/src/hq/signin.rs`):

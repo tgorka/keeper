@@ -197,7 +197,7 @@ impl Provenance {
         let _ = writeln!(
             out,
             "{K_DEVICE}: {} ({})",
-            sanitize(&self.device_label),
+            sanitize_device_label(&self.device_label),
             sanitize(&self.device_id)
         );
         let _ = writeln!(out, "{K_ORIGIN}: {}", sanitize(&self.origin));
@@ -233,7 +233,11 @@ impl Provenance {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
             };
-            let value = value.trim();
+            let value = if key == K_DEVICE {
+                trim_device_label(value)
+            } else {
+                value.trim()
+            };
             match key {
                 K_PROFILE => {
                     profile = value.to_owned();
@@ -284,7 +288,7 @@ impl Provenance {
 fn split_device(value: &str) -> (String, String) {
     match (value.rfind('('), value.strip_suffix(')')) {
         (Some(open), Some(_)) => (
-            value[..open].trim().to_owned(),
+            trim_device_label(&value[..open]).to_owned(),
             value[open + 1..value.len() - 1].trim().to_owned(),
         ),
         _ => (value.to_owned(), String::new()),
@@ -302,6 +306,24 @@ fn sanitize(value: &str) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// Commit labels follow accepted app/server names: ECMAScript trim differs
+/// from Rust whitespace only at U+0085 (kept) and U+FEFF (trimmed).
+/// Keep this representation normalization core-free (AD-40): it must never
+/// pull Matrix dependencies into the standalone sync daemon.
+pub(crate) fn trim_device_label(value: &str) -> &str {
+    value.trim_matches(|c: char| c != '\u{85}' && (c.is_whitespace() || c == '\u{feff}'))
+}
+
+/// Preserve the accepted device-name grammar, but keep the trailer's
+/// existing CR/LF injection protection. Other provenance fields retain
+/// their original normalization.
+fn sanitize_device_label(value: &str) -> String {
+    trim_device_label(value)
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
 }
 
 /// Build the full commit message: a generated subject, an optional body, then
@@ -375,8 +397,8 @@ pub const SUBJECT_PLACEHOLDERS: [&str; 7] = [
 /// appeared or vanished with the casing of a hostname would be a mystery rather
 /// than a feature.
 pub fn device_qualifier<'a>(label: &'a str, host_label: &str) -> Option<&'a str> {
-    let trimmed = label.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(host_label.trim()) {
+    let trimmed = trim_device_label(label);
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(trim_device_label(host_label)) {
         return None;
     }
     Some(trimmed)

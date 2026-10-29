@@ -92,6 +92,12 @@ pub enum NameRefusal {
          Its name stays {current}."
     )]
     Pinned { server: String, current: String },
+    #[error(
+        "keeper has no record of this credential's original server host, and the system's \
+         current name cannot recover it safely. Its name stays {current}; the existing \
+         credential is kept."
+    )]
+    UnknownHost { current: String },
 }
 
 /// What the agents server's directory, as this device's replicas hold it,
@@ -120,6 +126,8 @@ pub struct Directory {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Unread {
     pub database: Option<String>,
+    /// A legacy credential has no trustworthy recorded host.
+    pub host_unknown: bool,
 }
 
 /// The directory, or why it cannot be read yet.
@@ -206,9 +214,17 @@ pub fn may_leave<'d>(
 ) -> Result<&'d Directory, NameRefusal> {
     let current = server_trim(current);
     let system = server_trim(system);
-    let directory = directory.as_ref().map_err(|unread| NameRefusal::Unread {
-        current: current.to_owned(),
-        database: unread.database.clone(),
+    let directory = directory.as_ref().map_err(|unread| {
+        if unread.host_unknown {
+            NameRefusal::UnknownHost {
+                current: current.to_owned(),
+            }
+        } else {
+            NameRefusal::Unread {
+                current: current.to_owned(),
+                database: unread.database.clone(),
+            }
+        }
     })?;
     let mine = |host: &str| {
         host == current
@@ -312,7 +328,7 @@ pub fn plan_set(
 }
 
 /// What this device's name becomes at Reset — the system's — refused by
-/// [`may_leave`] when that is another name. Nothing is written.
+/// [`check`] just like Save, before any account move or name write.
 pub fn plan_reset(
     data_dir: &Path,
     system: &str,
@@ -320,9 +336,7 @@ pub fn plan_reset(
 ) -> Result<DeviceNameVm, DeviceNameError> {
     let current = read(data_dir, system)?;
     let after = resolve(None, system);
-    if after.name != current.name {
-        may_leave(&current.name, system, directory)?;
-    }
+    check(&after.name, &current.name, system, directory)?;
     Ok(after)
 }
 
@@ -576,6 +590,7 @@ mod tests {
         let nothing: DirectoryRead = Err(Unread::default());
         let beta: DirectoryRead = Err(Unread {
             database: Some("beta".to_owned()),
+            ..Default::default()
         });
         let unread = |database: Option<&str>| NameRefusal::Unread {
             current: "hesperia".to_owned(),
@@ -815,6 +830,37 @@ mod tests {
         assert_eq!(
             none.sentence,
             "The system has not named this device yet. Type a name."
+        );
+    }
+
+    /// R607-15: Reset validates the destination before any name write.
+    #[test]
+    fn reset_refuses_taken_blank_and_overlong_system_names_before_writing() {
+        let tmp = data_dir();
+        registry::set_device_name(tmp.path(), "kalypso").expect("stored");
+        let taken = Ok(Directory {
+            taken: vec!["iPhone".to_owned()],
+            ..Default::default()
+        });
+        assert_eq!(
+            refused(plan_reset(tmp.path(), "iPhone", &taken)),
+            NameRefusal::Taken("iPhone".to_owned())
+        );
+        for blank in ["", " \u{feff} "] {
+            assert_eq!(
+                refused(plan_reset(tmp.path(), blank, &Ok(unpaired()))),
+                NameRefusal::Blank
+            );
+        }
+        assert_eq!(
+            refused(plan_reset(tmp.path(), &"😀".repeat(101), &Ok(unpaired()))),
+            NameRefusal::TooLong(202)
+        );
+        assert_eq!(
+            registry::get_device_name(tmp.path())
+                .expect("read")
+                .as_deref(),
+            Some("kalypso")
         );
     }
 }
