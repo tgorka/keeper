@@ -102,6 +102,6 @@ export const CAPTURE_NOTE: DeviceNote = {
 };
 
 export const DEVICE_NAME_NOTE: DeviceNote = {
-  text: "This device's name: it is kept for this device in your account, and published with every change it commits, so anyone who reads a drive's history sees it.",
-  kept: "account",
+  text: "This device's name: it is kept on this device. Your account lists the device by it, your agents server knows it by it, and every change it commits carries it, so anyone who reads a drive's history sees it.",
+  kept: "device",
 };

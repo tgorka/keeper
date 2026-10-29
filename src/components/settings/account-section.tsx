@@ -21,8 +21,9 @@
  * blocked sentence naming the file that disagreed. This section composes no
  * state word of its own.
  *
- * Rename is an inline disclosure on this device's row (a modal over a list
- * hides the rows being compared). Sign out and Forget are
+ * This device's row is marked, never edited here: its name in the account
+ * follows This device's name, the one editable name (R-HQ-94 amendment 2
+ * (9)). Sign out and Forget are
  * AlertDialogs, and each names what goes and what stays: signing out keeps the
  * account set up and the repository's files where they are; forgetting
  * deletes this device's copy and never touches the server.
@@ -37,7 +38,7 @@
  * switch first so a stale offer can never flip listening OFF, and "Keep it
  * off" writes the switch off as the person's choice and never arms it.
  */
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { DEVICE_CLASS_LABEL, SetupLinkField } from "@/components/account/account-setup-sheet";
 import { AccountShareSheet } from "@/components/account/account-share-sheet";
 import { SignInLink } from "@/components/auth/sign-in-link";
@@ -53,7 +54,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { toggleVoiceListening } from "@/components/voice/listening-toggle";
 import { reportFrontendError } from "@/lib/crash-report";
 import { logFailure, sayFailure } from "@/lib/failure";
@@ -61,7 +61,6 @@ import {
   type AccountDeviceVm,
   accountCancelSignIn,
   accountForget,
-  accountRenameDevice,
   accountSignIn,
   accountSignOut,
   accountState,
@@ -87,8 +86,6 @@ export const ACCOUNT_SIGN_OUT_LABEL = "Sign out…";
 export const ACCOUNT_FORGET_LABEL = "Forget this account…";
 export const ACCOUNT_DEVICES_LABEL = "Devices";
 export const ACCOUNT_THIS_DEVICE = "This device";
-export const ACCOUNT_RENAME_LABEL = "Rename";
-export const ACCOUNT_RENAME_SAVE_LABEL = "Save";
 export const ACCOUNT_CANCEL_LABEL = "Cancel";
 export const ACCOUNT_ROLES_LABEL = "Roles";
 /** What a failed call says when Rust gave no sentence of its own. */
@@ -445,12 +442,7 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
         )}
       </div>
 
-      {signedIn && vm.devices.length > 0 && (
-        <DeviceList
-          devices={vm.devices}
-          onRename={(next) => run(() => accountRenameDevice(next))}
-        />
-      )}
+      {signedIn && vm.devices.length > 0 && <DeviceList devices={vm.devices} />}
 
       <div className="flex flex-wrap gap-2">
         {signedIn && (
@@ -504,104 +496,29 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
 }
 
 /**
- * The person's devices from `<login>/devices/`, this one marked and renameable.
- *
- * Rename is a disclosure, so its toggle says whether it is open and what it
- * opens; opening moves focus into the field, and Save or Cancel hands it back
- * to the toggle rather than dropping it on `body` (EXPERIENCE.md §Accessibility).
+ * The person's devices from `<login>/devices/`, this one marked. Its name here
+ * follows This device's name, so it is read-only (R-HQ-94 amendment 2 (9)).
  */
-function DeviceList({
-  devices,
-  onRename,
-}: {
-  devices: AccountDeviceVm[];
-  onRename: (name: string) => void;
-}) {
-  const [renaming, setRenaming] = useState(false);
-  const [draft, setDraft] = useState("");
-  const formId = useId();
-  const toggleRef = useRef<HTMLButtonElement>(null);
-  const fieldRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (renaming) {
-      fieldRef.current?.focus();
-    }
-  }, [renaming]);
-  const finish = () => {
-    setRenaming(false);
-    toggleRef.current?.focus();
-  };
+function DeviceList({ devices }: { devices: AccountDeviceVm[] }) {
   return (
     <div className="flex flex-col gap-1">
       <p className="text-muted-foreground text-xs">{ACCOUNT_DEVICES_LABEL}</p>
       <ul aria-label={ACCOUNT_DEVICES_LABEL} className="flex flex-col gap-1">
         {devices.map((device) => (
-          <li key={device.slug} className="flex flex-col gap-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="min-w-40 flex-1">
-                <span className="font-mono">{device.name}</span>
-                {device.class !== null && (
-                  <span className="text-muted-foreground">
-                    {" "}
-                    · {DEVICE_CLASS_LABEL[device.class]}
-                  </span>
-                )}
-                {device.platform !== null && (
-                  <span className="text-muted-foreground"> · {device.platform}</span>
-                )}
-                {device.version !== null && (
-                  <span className="text-muted-foreground"> · keeper {device.version}</span>
-                )}
-              </span>
-              {device.thisDevice && (
-                <>
-                  <Badge variant="secondary">{ACCOUNT_THIS_DEVICE}</Badge>
-                  <Button
-                    ref={toggleRef}
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    aria-expanded={renaming}
-                    aria-controls={renaming ? formId : undefined}
-                    onClick={() => {
-                      setDraft(device.name);
-                      setRenaming(!renaming);
-                    }}
-                  >
-                    {ACCOUNT_RENAME_LABEL}
-                  </Button>
-                </>
+          <li key={device.slug} className="flex flex-wrap items-center gap-2">
+            <span className="min-w-40 flex-1">
+              <span className="font-mono">{device.name}</span>
+              {device.class !== null && (
+                <span className="text-muted-foreground"> · {DEVICE_CLASS_LABEL[device.class]}</span>
               )}
-            </div>
-            {device.thisDevice && renaming && (
-              <form
-                id={formId}
-                className="flex flex-wrap gap-2 rounded-md border border-border p-2"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const next = draft.trim();
-                  if (next !== "" && next !== device.name) {
-                    onRename(next);
-                  }
-                  finish();
-                }}
-              >
-                <Input
-                  ref={fieldRef}
-                  aria-label={`${ACCOUNT_RENAME_LABEL} ${device.name}`}
-                  className="min-w-40 flex-1 font-mono"
-                  autoComplete="off"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                />
-                <Button type="submit" size="sm" disabled={draft.trim() === ""}>
-                  {ACCOUNT_RENAME_SAVE_LABEL}
-                </Button>
-                <Button type="button" variant="outline" size="sm" onClick={finish}>
-                  {ACCOUNT_CANCEL_LABEL}
-                </Button>
-              </form>
-            )}
+              {device.platform !== null && (
+                <span className="text-muted-foreground"> · {device.platform}</span>
+              )}
+              {device.version !== null && (
+                <span className="text-muted-foreground"> · keeper {device.version}</span>
+              )}
+            </span>
+            {device.thisDevice && <Badge variant="secondary">{ACCOUNT_THIS_DEVICE}</Badge>}
           </li>
         ))}
       </ul>

@@ -548,7 +548,7 @@ fn hq(device: &Arc<Device>, name: &str) -> Arc<Hq> {
         Arc::new(HttpRoutes::new()),
         Arc::new(keeper_core::hq::signin::NoAccount),
         name.to_owned(),
-        move || host.clone(),
+        move || keeper_core::hq::DeviceHosts::same(host.clone()),
     )
 }
 
@@ -3785,7 +3785,7 @@ fn signed_in_hq(device: &Arc<Device>, sign_in: &Arc<LiveSignIn>, host: &str) -> 
         Arc::new(HttpRoutes::new()),
         Arc::clone(sign_in) as Arc<dyn keeper_core::hq::signin::SignIn>,
         "keeper".to_owned(),
-        move || host.clone(),
+        move || keeper_core::hq::DeviceHosts::same(host.clone()),
     )
 }
 

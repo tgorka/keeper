@@ -76,7 +76,7 @@ async fn cold_start(data_dir: &Path) -> Option<String> {
         Arc::new(HttpRoutes::new()),
         Arc::new(keeper_core::hq::signin::NoAccount),
         format!("keeper on {HOST}"),
-        || HOST.to_owned(),
+        || keeper_core::hq::DeviceHosts::same(HOST),
     );
     if let Err(error) = hq.start().await {
         panic!("the service did not start: {error}");

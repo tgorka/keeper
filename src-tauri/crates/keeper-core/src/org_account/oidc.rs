@@ -3370,7 +3370,7 @@ mod tests {
             Arc::new(crate::hq::routes::HttpRoutes::new()),
             Arc::new(org(p, d)),
             "keeper".to_owned(),
-            || "hesperia".to_owned(),
+            || crate::hq::DeviceHosts::same("hesperia"),
         )
     }
 

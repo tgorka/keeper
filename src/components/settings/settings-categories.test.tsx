@@ -103,7 +103,7 @@ describe.each<SettingsLayout>(["rail", "drill"])("SettingsCategories (%s)", (lay
 describe("SettingsCategories rail", () => {
   it("opens on the first category and swaps the sections when another is chosen", () => {
     render(<SettingsCategories layout="rail" sections={everySection()} />);
-    expect(visibleSections()).toEqual(["account", "device", "encryption", "setup"]);
+    expect(visibleSections()).toEqual(["account", "device-name", "device", "encryption", "setup"]);
     expect(screen.getByRole("button", { name: "Account & device" })).toHaveAttribute(
       "aria-current",
       "page",

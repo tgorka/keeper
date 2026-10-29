@@ -5,4 +5,4 @@
  * Q109-01 a): the account's sign-in exchanged once for the device's
  * credential, with no code to type.
  */
-export type HqSignInState = "unavailable" | "signedOut" | "enrolling" | "enrolled" | "refused";
+export type HqSignInState = "unavailable" | "signedOut" | "enrolling" | "enrolled" | "renamed" | "refused";

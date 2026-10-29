@@ -492,6 +492,24 @@ pub const KEYS: &[KeySpec] = &[
         summary: "On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong.",
         example: "true",
     },
+    // ---- device ----------------------------------------------------------
+    KeySpec {
+        key: "device.name",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is the name this device gives itself, and the file named after this device is \
+             found by it: a file cannot choose the name it is found by, and a shared one would \
+             give two devices one name",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "The name this device goes by (Settings › This device's name): the host your \
+                  agents server records for it, and the default of its name in your account. \
+                  Absent means the system's name — the short host name on a computer, the \
+                  device name on a phone.",
+        example: "",
+    },
     // ---- diagnostics -----------------------------------------------------
     KeySpec {
         key: "diagnostics.log_upload",

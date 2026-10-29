@@ -106,6 +106,9 @@ pub enum HqSignInState {
     Enrolling,
     /// This device's credential comes from the account's sign-in.
     Enrolled,
+    /// This device's credential comes from a sign-in under its old name
+    /// (R-HQ-94): signing in again gives the server the new one.
+    Renamed,
     /// Signing in did not work; the sentence says why. A pairing code still
     /// works.
     Refused,

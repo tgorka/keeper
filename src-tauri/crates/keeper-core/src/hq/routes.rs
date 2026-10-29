@@ -478,16 +478,11 @@ async fn redeem(
 }
 
 /// This device's host as the server's naming rule takes it (`device-name.ts`,
-/// for pairing and enrolment alike): trimmed, non-empty, at most 200 UTF-16
-/// code units.
+/// for pairing and enrolment alike): [`crate::device_name::host_rule`], the
+/// rule Settings › This device's name checks a name with too.
 fn checked_host(host: &str) -> Result<&str, RouteError> {
-    let host = host.trim();
-    if host.is_empty() || host.encode_utf16().count() > 200 {
-        return Err(RouteError::Unexpected(
-            "this device has no valid host name".to_owned(),
-        ));
-    }
-    Ok(host)
+    crate::device_name::host_rule(host)
+        .map_err(|_| RouteError::Unexpected("this device has no valid host name".to_owned()))
 }
 
 /// A sign-in route's request: a success, or the server's refusal with its

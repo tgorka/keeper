@@ -1380,14 +1380,14 @@ impl DriveWrites for Review606HeldRecovery {
 /// An `Hq` holding `w`'s replica as its one database, paired as Ana, with
 /// `port` as its drive writer.
 fn hq_over(w: &World, port: Arc<dyn DriveWrites>) -> Arc<crate::hq::Hq> {
-    use crate::hq::{Db, Hq, Pairing};
+    use crate::hq::{Db, DeviceHosts, Hq, Pairing};
     let hq = Hq::new(
         Arc::new(crate::forges::testing::FakePlatform::default()),
         Arc::new(crate::hq::port::fake::FakeOpener::default()),
         Arc::new(crate::hq::routes::HttpRoutes::new()),
         Arc::new(crate::hq::signin::NoAccount),
         "hesperia".to_owned(),
-        || "hesperia".to_owned(),
+        || DeviceHosts::same("hesperia"),
     );
     {
         let mut inner = hq.inner.lock().expect("inner");
@@ -1397,6 +1397,8 @@ fn hq_over(w: &World, port: Arc<dyn DriveWrites>) -> Arc<crate::hq::Hq> {
             client_id: "ana.dev".to_owned(),
             name: "hesperia".to_owned(),
             bound: None,
+            host: None,
+            enrolled_host: None,
         });
         inner.dbs.push(Db {
             name: w.ana.database.clone(),

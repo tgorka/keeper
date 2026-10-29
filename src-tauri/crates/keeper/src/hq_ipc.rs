@@ -104,13 +104,16 @@ pub fn ensure(app: &tauri::AppHandle) -> Arc<Hq> {
         crate::account_ipc::descriptor,
         || crate::account_ipc::http().cloned(),
     ));
+    // This device's names, read at each pairing, sign-in and restart
+    // (R-HQ-94 and amendment 2 (4)).
+    let host_platform = Arc::clone(&platform);
     let hq = Hq::new(
         platform,
         Arc::new(SyncularOpener),
         Arc::new(HttpRoutes::new()),
         sign_in,
         "keeper".to_owned(),
-        crate::account_ipc::device_host,
+        move || crate::account_ipc::device_hosts(host_platform.as_ref()),
     );
     if HQ.set(Arc::clone(&hq)).is_err() {
         return HQ.get().map_or(hq, Arc::clone);

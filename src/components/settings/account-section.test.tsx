@@ -6,7 +6,6 @@ vi.mock("@/lib/ipc/client", () => ({
   accountSignIn: vi.fn(),
   accountCancelSignIn: vi.fn(),
   accountSync: vi.fn(),
-  accountRenameDevice: vi.fn(),
   accountSignOut: vi.fn(),
   accountForget: vi.fn(),
   accountShare: vi.fn(),
@@ -36,7 +35,6 @@ import {
 import type { AccountRestoreVm, OrgAccountVm, VoiceWakeVm } from "@/lib/ipc/client";
 import {
   accountForget,
-  accountRenameDevice,
   accountSignIn,
   accountSignOut,
   accountState,
@@ -300,32 +298,12 @@ describe("AccountSection signed in", () => {
     }
   });
 
-  it("renames inline with a disclosure that says it is open and hands focus back", async () => {
-    vi.mocked(accountRenameDevice).mockResolvedValue(accountVm());
+  it("marks this device in the list and offers no second place to rename it (R-HQ-94 (9))", () => {
     render(<AccountSection open />);
-    const toggle = screen.getByRole("button", { name: "Rename" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    const field = screen.getByLabelText("Rename hesperia");
-    const controlled = toggle.getAttribute("aria-controls");
-    expect(controlled).not.toBeNull();
-    expect(field.closest("form")).toHaveAttribute("id", controlled ?? "");
-    await waitFor(() => expect(field).toHaveFocus());
-
-    // Cancel returns focus to the toggle rather than dropping it on <body>.
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByLabelText("Rename hesperia")).not.toBeInTheDocument();
-    expect(toggle).toHaveFocus();
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-
-    // Save sends the new name and does the same.
-    fireEvent.click(toggle);
-    fireEvent.change(screen.getByLabelText("Rename hesperia"), { target: { value: "studio" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(accountRenameDevice).toHaveBeenCalledWith("studio"));
-    expect(toggle).toHaveFocus();
+    const list = screen.getByRole("list", { name: ACCOUNT_DEVICES_LABEL });
+    expect(within(list).getByText("This device")).toBeInTheDocument();
+    expect(within(list).queryByRole("button")).toBeNull();
+    expect(within(list).queryByRole("textbox")).toBeNull();
   });
 
   it("shows which keeper each device runs, and nothing for one that never said", () => {

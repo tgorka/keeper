@@ -502,6 +502,8 @@ export type { DemoItem } from "./gen/DemoItem";
 export type { DestinationVm } from "./gen/DestinationVm";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
 export type { DeviceCodeVm } from "./gen/DeviceCodeVm";
+export type { DeviceNameSource } from "./gen/DeviceNameSource";
+export type { DeviceNameVm } from "./gen/DeviceNameVm";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
 export type { DistributorOfferVm } from "./gen/DistributorOfferVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
@@ -875,6 +877,7 @@ import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 import type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
 import type { DeviceCodeVm } from "./gen/DeviceCodeVm";
+import type { DeviceNameVm } from "./gen/DeviceNameVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 import type { DriveFolderVm } from "./gen/DriveFolderVm";
 import type { EditVersionVm } from "./gen/EditVersionVm";
@@ -5299,22 +5302,6 @@ export async function syncDevice(): Promise<SyncDeviceVm> {
 }
 
 /**
- * Rename this device, resolving the identity as stored.
- *
- * Takes effect on the next commit and rewrites nothing: a `Keeper-Device`
- * trailer already in a repository keeps the name the machine had when it made
- * that commit. The `id` never changes -- it is what a shared history tells two
- * machines apart by, and what the git author address is derived from.
- *
- * Use the resolved label rather than the argument: the store trims it.
- *
- * Rejects with: `unsupported`, `internal` (an empty label).
- */
-export async function syncDeviceSetLabel(label: string): Promise<SyncDeviceVm> {
-  return await invoke<SyncDeviceVm>("sync_device_set_label", { label });
-}
-
-/**
  * Stream sync progress, resolving the subscription id.
  *
  * Complements {@link syncStatuses} rather than replacing it: this gives a
@@ -8705,9 +8692,26 @@ export async function accountSync(force: boolean): Promise<OrgAccountVm> {
   return await invoke<OrgAccountVm>("account_sync", { force });
 }
 
-/** Rename this device; its two files inside the person's directory move in one commit. */
-export async function accountRenameDevice(name: string): Promise<OrgAccountVm> {
-  return await invoke<OrgAccountVm>("account_rename_device", { name });
+/**
+ * This device's name (R-HQ-94): the one set in Settings, else the system's — the host the agents
+ * server records for it, and the default of its name in the account.
+ */
+export async function deviceNameGet(): Promise<DeviceNameVm> {
+  return await invoke<DeviceNameVm>("device_name_get");
+}
+
+/**
+ * Name this device. Rejects with Rust's sentence, storing nothing, when the agents server's host
+ * rule refuses the name or another of your devices has it there; the server is then told, and its
+ * sign-in line says what that took.
+ */
+export async function deviceNameSet(name: string): Promise<DeviceNameVm> {
+  return await invoke<DeviceNameVm>("device_name_set", { name });
+}
+
+/** Go back to the system's name for this device; the agents server is told as for a new name. */
+export async function deviceNameReset(): Promise<DeviceNameVm> {
+  return await invoke<DeviceNameVm>("device_name_reset");
 }
 
 /**

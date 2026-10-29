@@ -20,6 +20,7 @@
 /** Every Settings section, by the id deep links and the category table use. */
 export const SETTINGS_SECTION_IDS = [
   "account",
+  "device-name",
   "device",
   "encryption",
   "setup",
@@ -74,7 +75,7 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategory[] = [
   {
     id: "account",
     title: "Account & device",
-    sections: ["account", "device", "encryption", "setup"],
+    sections: ["account", "device-name", "device", "encryption", "setup"],
   },
   { id: "notifications", title: "Notifications & dock", sections: ["notifications", "background"] },
   {

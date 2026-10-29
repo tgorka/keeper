@@ -95,6 +95,7 @@ import type {
   CredentialChoicesVm,
   DefaultAgentVm,
   DeviceCodeVm,
+  DeviceNameVm,
   DocumentVm,
   DriveFolderVm,
   FailureOperation,
@@ -6085,6 +6086,75 @@ function hqClearedWrite(database: string): void {
 }
 let hqStatus: HqStatusVm = hqFixture();
 let hqEnrollStarted = false;
+// This device's name (R-HQ-94), in `keeper_core::device_name`'s words. The system says only
+// "iPhone", as iOS 16+ does without Apple's entitlement; the person's laptop holds "hesperia" on the
+// server, so that name is taken. With ?hq=enrolled a new name is signed in again, as `Hq::device_renamed`
+// does with an account that can mint a token.
+// ?hq=enrolled&devicename=runs: this is the Mac hesperia, which runs nixi, so it keeps its name
+// (R607-01). With ?account=ready the account's record of this device follows the name (R607-02).
+const deviceNameScenario = new URLSearchParams(window.location.search).get("devicename");
+const DEVICE_NAME_SYSTEM = deviceNameScenario === "runs" ? "hesperia" : "iPhone";
+const DEVICE_NAMES_TAKEN = hqParam === "enrolled" ? ["hesperia"] : [];
+let deviceNameStored: string | null = null;
+function deviceNameVm(): DeviceNameVm {
+  return deviceNameStored === null
+    ? {
+        name: DEVICE_NAME_SYSTEM,
+        source: "system",
+        system: DEVICE_NAME_SYSTEM,
+        sentence: "From the system.",
+      }
+    : {
+        name: deviceNameStored,
+        source: "you",
+        system: DEVICE_NAME_SYSTEM,
+        sentence: `Set by you. The system calls this device ${DEVICE_NAME_SYSTEM}.`,
+      };
+}
+// ?hq=enrolled&devicename=signedout: the account cannot mint a token, so Settings asks for a sign-in.
+function deviceNameMayLeave(current: string): void {
+  if (deviceNameScenario === "runs" && hqParam === "enrolled" && current === "hesperia") {
+    hqRefuse("This device runs nixi; its name stays hesperia.");
+  }
+}
+// `account_device_after` + the account's rename: the record takes the name's slug, or the
+// system's after a Reset.
+function deviceAccountFollows(): void {
+  const device = accountVm.device;
+  if (device === null) return;
+  const named = deviceNameVm();
+  const slug = named.name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  const to = named.source === "you" ? slug : slug === "iphone" ? "iphone-9a0b" : slug;
+  if (to === device.slug) return;
+  const renamed = { ...device, slug: to, name: to };
+  setAccount({
+    ...accountVm,
+    device: renamed,
+    devices: accountVm.devices.map((d) => (d.thisDevice ? renamed : d)),
+  });
+}
+function deviceRenamed(previous: string): void {
+  if (hqParam !== "enrolled" || deviceNameVm().name === previous) return;
+  if (deviceNameScenario === "signedout") {
+    hqPublish(
+      hqPairedStatus("connected", {
+        state: "renamed",
+        sentence: `Sign in again to use the new name on ${HQ_HOST}.`,
+      }),
+    );
+    return;
+  }
+  hqPublish(
+    hqPairedStatus("connected", {
+      state: "enrolling",
+      sentence: `Updating the name on ${HQ_HOST}…`,
+    }),
+  );
+  setTimeout(() => hqPublish(hqPairedStatus("connected", HQ_ENROLLED)), 2000);
+}
 const hqWatchers = new Map<string, MockChannel<HqStatusVm>>();
 function hqPublish(next: HqStatusVm): HqStatusVm {
   hqStatus = next;
@@ -11395,14 +11465,37 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     }
     return setAccount(signedInAccount("ready", accountVm.device ?? ACCOUNT_THIS_DEVICE));
   },
-  account_rename_device: (payload) => {
-    const name = String(payload.name ?? "");
-    const renamed = { ...(accountVm.device ?? ACCOUNT_THIS_DEVICE), slug: name, name };
-    return setAccount({
-      ...accountVm,
-      device: renamed,
-      devices: accountVm.devices.map((device) => (device.thisDevice ? renamed : device)),
-    });
+  device_name_get: () => deviceNameVm(),
+  device_name_set: (payload) => {
+    const name = String(payload.name ?? "").trim();
+    if (name === "") {
+      hqRefuse("A device's name cannot be blank. Type one, or Reset to use the system's.");
+    }
+    // UTF-16 code units, as the server's `length` counts them.
+    if (name.length > 200) {
+      hqRefuse(
+        `A device's name is at most 200 characters; this one has ${name.length}. Shorten it.`,
+      );
+    }
+    if (DEVICE_NAMES_TAKEN.includes(name)) {
+      hqRefuse(
+        `${name} is already the name of another of your devices on your agents server. Give this one a name of its own.`,
+      );
+    }
+    const previous = deviceNameVm().name;
+    if (name !== previous) deviceNameMayLeave(previous);
+    deviceNameStored = name;
+    deviceAccountFollows();
+    deviceRenamed(previous);
+    return deviceNameVm();
+  },
+  device_name_reset: () => {
+    const previous = deviceNameVm().name;
+    if (previous !== DEVICE_NAME_SYSTEM) deviceNameMayLeave(previous);
+    deviceNameStored = null;
+    deviceAccountFollows();
+    deviceRenamed(previous);
+    return deviceNameVm();
   },
   // In `keeper_core::org_account::log_upload::LogUploadVm`'s words: a signed-in,
   // registered device sends; anything else is told to sign in. The switch is not

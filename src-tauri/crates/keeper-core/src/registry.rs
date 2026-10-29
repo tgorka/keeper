@@ -1194,6 +1194,27 @@ pub fn set_recordings_last_reconcile_ms(data_dir: &Path, ms: i64) -> Result<(), 
     set_setting(data_dir, RECORDINGS_LAST_RECONCILE_MS_KEY, &ms.to_string())
 }
 
+/// The `settings` key holding the name this device goes by where a person
+/// set one (R-HQ-94, [`crate::device_name`]). Kept on this install only: it is
+/// session state, so no file sets it and no account sync carries it.
+const DEVICE_NAME_KEY: &str = "device.name";
+
+/// The name a person gave this device, as stored; `None` when the system's
+/// name is used.
+pub fn get_device_name(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    get_setting(data_dir, DEVICE_NAME_KEY)
+}
+
+/// Store the name a person gave this device.
+pub fn set_device_name(data_dir: &Path, name: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, DEVICE_NAME_KEY, name)
+}
+
+/// Forget the name a person gave this device: the system's is used again.
+pub fn clear_device_name(data_dir: &Path) -> Result<(), CoreError> {
+    delete_setting(data_dir, DEVICE_NAME_KEY)
+}
+
 /// The `settings` key holding the opt-in menu-bar (tray) presence toggle (Story 10.3).
 /// Stored as `"1"`/`"0"`; absent = off (no tray by default).
 const SYSTEM_MENU_BAR_PRESENCE_KEY: &str = "system.menu_bar_presence";

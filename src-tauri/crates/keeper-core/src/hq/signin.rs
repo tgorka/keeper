@@ -17,7 +17,10 @@
 //!   session keeps it in the keychain, and what the server answers — the
 //!   device token — goes to the keychain item a pairing's lives in.
 //! - **Host.** The device's host is read from the shell's provider at each
-//!   enrolment, never at construction (S-ID-7, 109.1).
+//!   enrolment, never at construction (S-ID-7, 109.1), and kept with the
+//!   credential. A credential bound to a host other than this device's name
+//!   now (Settings › This device's name, R-HQ-94) is signed in again under
+//!   it the way a paired one is adopted: attestation cannot carry a host.
 //! - **Pairing** stays for a person keeper cannot sign in for (no account,
 //!   a server without sign-in, a refusal); 109.7 retires it.
 
@@ -35,7 +38,9 @@ use crate::hq::routes::{AuthConfig, Enrolled, EnrolmentKind, RouteError};
 use crate::hq::server::ServerUrl;
 use crate::hq::sessions::now_ms;
 use crate::hq::vm::{HqEnrolmentVm, HqSignInState, HqSignInVm};
-use crate::hq::{keychain_key, lock, route_sentence, Hq, HqError, Inner, Pairing};
+use crate::hq::{
+    keychain_key, known_host, lock, renamed, route_sentence, Hq, HqError, Inner, Pairing,
+};
 use crate::org_account::descriptor::AccountDescriptor;
 use crate::org_account::{oidc, session, AccountError};
 use crate::platform::Platform;
@@ -425,14 +430,59 @@ impl Hq {
             return HqSignInVm::unavailable();
         };
         let host = server.host();
-        let bound = inner
-            .pairing
-            .as_ref()
-            .is_some_and(|pairing| pairing.bound.is_some());
+        let pairing = inner.pairing.as_ref();
+        let bound = pairing.is_some_and(|pairing| pairing.bound.is_some());
+        let stale = pairing.is_some_and(|pairing| renamed(pairing, inner.host.as_deref()));
         let vm = |state, sentence: String| HqSignInVm {
             state,
             sentence: Some(sentence),
         };
+        // Renamed since the server last heard: it learns the name only from
+        // an adoption under this client id, so nothing here ever points the
+        // person at a new pairing or a fresh sign-in — a new client id with
+        // whatever host it names (keeper-hq R69-02).
+        if stale {
+            return match (&inner.sign_in.running, &inner.sign_in.outcome) {
+                (Some(_), _) => vm(
+                    HqSignInState::Enrolling,
+                    format!("Updating the name on {host}…"),
+                ),
+                (None, Some(Outcome::Refused(_))) => vm(
+                    HqSignInState::Refused,
+                    format!(
+                        "{host} would not move this device to its new name, so it still knows \
+                         it by its old one. Reset the name here to match it; keeper never makes \
+                         this a new device for a name."
+                    ),
+                ),
+                (None, Some(Outcome::Failed(why))) => vm(
+                    HqSignInState::Refused,
+                    format!(
+                        "{why} {host} still knows this device by its old name; keeper tries again."
+                    ),
+                ),
+                (None, Some(Outcome::NotOffered)) => vm(
+                    HqSignInState::Refused,
+                    format!(
+                        "{host} does not sign devices in, so it still knows this device by its \
+                         old name. Reset the name here to match it."
+                    ),
+                ),
+                // A pairing code's credential with no account to sign in
+                // with: nothing can tell the server, and nothing pretends to.
+                (None, None) if !bound => vm(
+                    HqSignInState::Unavailable,
+                    format!(
+                        "{host} knows this device by the name it was paired with; only your \
+                         account's sign-in can give it this one."
+                    ),
+                ),
+                (None, Some(Outcome::SignedOut) | None) => vm(
+                    HqSignInState::Renamed,
+                    format!("Sign in again to use the new name on {host}."),
+                ),
+            };
+        }
         if bound && !inner.authorization.removed {
             return vm(
                 HqSignInState::Enrolled,
@@ -485,6 +535,8 @@ impl Hq {
         let ask = match &inner.pairing {
             None => Ask::New,
             Some(pairing) if pairing.bound.is_none() || inner.authorization.removed => Ask::Adopt,
+            // Bound to the old name: adopted again under the new one (R-HQ-94).
+            Some(pairing) if renamed(pairing, inner.host.as_deref()) => Ask::Adopt,
             // Signed in already: attestation keeps it.
             Some(_) => return,
         };
@@ -608,7 +660,7 @@ impl Hq {
         committed: &Arc<AtomicBool>,
     ) -> Attempted {
         let host = server.host().to_owned();
-        let answer = {
+        let (answer, sent_host) = {
             let _contact = self.contacts.hold(server);
             let config = match self.routes.auth_config(server).await {
                 Ok(config) => config,
@@ -653,9 +705,22 @@ impl Hq {
                 Ask::New => None,
                 Ask::Adopt => pairing.as_ref().map(|pairing| pairing.token.as_str()),
             };
-            // The host as the OS names it now, not when keeper started.
-            let device_host = (self.device_host)();
-            self.routes
+            // The names as they are now, not when keeper started. A new
+            // credential — and the first sign-in of one a pairing code made,
+            // which the server may hold with no host — is created under the
+            // system's name, never the one set in Settings: the server keeps
+            // that as `t4_host` (R-HQ-94 amendment 2 (4)). The name set here
+            // follows by the adoption that comes after, under the same id.
+            let hosts = (self.device_host)();
+            let first = match ask {
+                Ask::New => true,
+                Ask::Adopt => pairing
+                    .as_ref()
+                    .is_none_or(|pairing| pairing.bound.is_none()),
+            };
+            let device_host = if first { hosts.system } else { hosts.name };
+            let answer = self
+                .routes
                 .enroll(
                     server,
                     &token,
@@ -663,7 +728,8 @@ impl Hq {
                     &device_host,
                     device_token,
                 )
-                .await
+                .await;
+            (answer, device_host)
         };
         let enrolled = match answer {
             Ok(enrolled) => enrolled,
@@ -693,7 +759,24 @@ impl Hq {
             Ask::New => None,
             Ask::Adopt => pairing.as_ref().map(|pairing| pairing.token.clone()),
         };
-        match self.keep_enrolled(server, enrolled, started_from).await {
+        // The host the credential was created with: this one's, or the one
+        // an adopted credential carries (amendment 2 (6)).
+        let enrolled_host = match ask {
+            Ask::New => known_host(&sent_host),
+            Ask::Adopt => pairing
+                .as_ref()
+                .and_then(|pairing| {
+                    pairing
+                        .enrolled_host
+                        .clone()
+                        .or_else(|| pairing.host.clone())
+                })
+                .or_else(|| known_host(&sent_host)),
+        };
+        match self
+            .keep_enrolled(server, enrolled, started_from, &sent_host, enrolled_host)
+            .await
+        {
             Ok(()) => Attempted::Kept,
             Err(error) => {
                 tracing::warn!(%error, "the agents server's credential could not be kept");
@@ -718,6 +801,8 @@ impl Hq {
         server: &ServerUrl,
         enrolled: Enrolled,
         started_from: Option<String>,
+        sent_host: &str,
+        enrolled_host: Option<String>,
     ) -> Result<(), HqError> {
         let lifecycle = self.lifecycle.lock().await;
         let key = keychain_key(server);
@@ -754,6 +839,8 @@ impl Hq {
                 attested_at_ms: self.wall_ms(),
                 window_ms: ATTEST_WINDOW_MS,
             }),
+            host: known_host(sent_host),
+            enrolled_host,
         };
         let stored = serde_json::to_string(&record).map_err(json_sentence)?;
         self.platform.keychain_set(&key, &stored)?;

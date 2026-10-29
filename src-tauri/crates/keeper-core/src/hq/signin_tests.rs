@@ -145,6 +145,11 @@ struct Device {
     client: String,
     bound: bool,
     lapsed: bool,
+    /// The host the last enrolment named, as keeper-hq's `host`.
+    host: String,
+    /// The host the credential was created with, frozen as keeper-hq #69's
+    /// `t4_host`: what T4's other-host rule compares.
+    t4_host: String,
 }
 
 /// keeper-hq as 109.5 serves it, for one person `ana` in database `alpha`.
@@ -157,6 +162,8 @@ struct Server {
     /// What `/clients/self/attest` answers first, in order: the status and
     /// the body as sent, or a 200 for the ordinary answer.
     attest_refusals: Vec<(u16, String)>,
+    /// What `/devices/enroll` answers first, in order, before anything else.
+    enroll_refusals: Vec<(u16, String)>,
     /// The attestation window the server states; a week unless set.
     attest_window_ms: Option<i64>,
     /// Every revocation: the client revoked and the bearer that asked.
@@ -206,6 +213,10 @@ fn answer(server: &mut Server, seen: &Seen) -> Reply {
             .to_string(),
         ),
         ("POST", "/devices/enroll") => {
+            if !server.enroll_refusals.is_empty() {
+                let (status, body) = server.enroll_refusals.remove(0);
+                return Reply::json(status, &body);
+            }
             let sign_in = bearer(seen);
             if server.spent.contains(&sign_in) {
                 return Reply::json(401, r#"{"error":"hq.signin.replayed"}"#);
@@ -225,15 +236,19 @@ fn answer(server: &mut Server, seen: &Seen) -> Reply {
                     device.token = token.clone();
                     device.bound = true;
                     device.lapsed = false;
+                    device.host = body["host"].as_str().unwrap_or("").to_owned();
                     (device.client.clone(), true)
                 }
                 None => {
                     let client = format!("ana.new{}", server.minted);
+                    let host = body["host"].as_str().unwrap_or("").to_owned();
                     server.devices.push(Device {
                         token: token.clone(),
                         client: client.clone(),
                         bound: true,
                         lapsed: false,
+                        t4_host: host.clone(),
+                        host,
                     });
                     (client, false)
                 }
@@ -311,7 +326,10 @@ struct World {
     state: Arc<Mutex<Server>>,
     fake: Fake,
     sign_in: Arc<FakeSignIn>,
+    /// The name this device goes by now ([`DeviceHosts::name`]).
     host: Arc<Mutex<String>>,
+    /// What the system calls it ([`DeviceHosts::system`]).
+    system: Arc<Mutex<String>>,
 }
 
 impl World {
@@ -326,18 +344,22 @@ impl World {
             state,
             sign_in: FakeSignIn::new(signed_in),
             host: Arc::new(Mutex::new("hesperia".to_owned())),
+            system: Arc::new(Mutex::new("hesperia".to_owned())),
         }
     }
 
     fn hq(&self) -> Arc<Hq> {
-        let host = Arc::clone(&self.host);
+        let (host, system) = (Arc::clone(&self.host), Arc::clone(&self.system));
         Hq::new(
             Arc::clone(&self.platform) as Arc<dyn Platform>,
             Arc::new(FakeOpener::default()),
             Arc::new(routes::HttpRoutes::new()),
             Arc::clone(&self.sign_in) as Arc<dyn SignIn>,
             "keeper".to_owned(),
-            move || lock(&host).clone(),
+            move || DeviceHosts {
+                system: lock(&system).clone(),
+                name: lock(&host).clone(),
+            },
         )
     }
 
@@ -371,6 +393,8 @@ impl World {
             client_id: client.to_owned(),
             name: "keeper".to_owned(),
             bound,
+            host: None,
+            enrolled_host: None,
         };
         self.platform
             .keychain_set(
@@ -383,6 +407,8 @@ impl World {
             client: client.to_owned(),
             bound: bound.is_some(),
             lapsed,
+            host: "hesperia".to_owned(),
+            t4_host: "hesperia".to_owned(),
         });
     }
 
@@ -442,6 +468,7 @@ async fn a_signed_in_device_enrols_with_the_host_of_the_moment_and_keeps_the_tok
     let hq = world.hq();
     // The OS host is known only after construction (109.1): enrolment reads it then.
     *lock(&world.host) = "kalypso".to_owned();
+    *lock(&world.system) = "kalypso".to_owned();
     hq.start().await.expect("starts");
     hq.set_server(&world.fake.base).await.expect("sets");
     let status = status_until(&hq, "enrolled", enrolled).await;
@@ -1197,4 +1224,293 @@ async fn a_success_starts_the_retry_schedule_over() {
     // Ten minutes again, not the twenty that came after the first refusal.
     past_the_retry(&hq).await;
     world.until_asked("/clients/self/attest", 4).await;
+}
+
+/// A credential attested a day ago: nothing is due.
+fn fresh() -> Bound {
+    Bound {
+        attested_at_ms: sessions::now_ms() - DAY_MS,
+        window_ms: 7 * DAY_MS,
+    }
+}
+
+/// R-HQ-94: `/clients/self/attest` takes no host, so a device renamed after
+/// it signed in is signed in again — adopted under its own client id, with
+/// its token in the body — and the server is sent the new name. A rename to
+/// the name it already has, or a restart after, sends nothing.
+#[tokio::test]
+async fn a_renamed_device_is_signed_in_again_under_its_new_name_keeping_its_client_id() {
+    let world = World::new(true);
+    // Kept before hosts were recorded: the host it was sent under is the
+    // system's name, which every credential was created under then.
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    *lock(&world.host) = "iPhone".to_owned();
+    *lock(&world.system) = "iPhone".to_owned();
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+    hq.device_renamed().await.expect("same name");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(world.asked("/devices/enroll").is_empty(), "nothing changed");
+
+    *lock(&world.host) = "kalypso".to_owned();
+    hq.device_renamed().await.expect("renamed");
+    world.until_asked("/devices/enroll", 1).await;
+    status_until(&hq, "enrolled under the new name", enrolled).await;
+
+    let enrol = world.asked("/devices/enroll");
+    assert_eq!(enrol[0].json()["host"], "kalypso");
+    assert_eq!(enrol[0].json()["deviceToken"], "device-token-a");
+    assert_eq!(bearer(&enrol[0]), "signin-token-1");
+    assert!(world.asked("/clients/self/attest").is_empty());
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1", "the same device on the server");
+    assert_eq!(kept.token, "device-token-1", "the token is rotated");
+    assert_eq!(kept.host.as_deref(), Some("kalypso"));
+
+    hq.reconcile().await.expect("reconciles");
+    hq.shutdown().await;
+    let again = world.hq();
+    again.start().await.expect("starts again");
+    status_until(&again, "enrolled", enrolled).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(world.asked("/devices/enroll").len(), 1, "sent once");
+}
+
+/// Signed out, a renamed device says so — "Sign in again to use the new
+/// name on <server>" — sends nothing, and keeps the host the server has;
+/// the sign-in that follows sends the new name.
+#[tokio::test]
+async fn signed_out_a_renamed_device_asks_for_a_sign_in_and_the_sign_in_sends_the_new_name() {
+    let world = World::new(false);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+
+    *lock(&world.host) = "studio".to_owned();
+    hq.device_renamed().await.expect("renamed");
+    let status = status_until(&hq, "asks for a sign-in", |s| {
+        s.sign_in.state == HqSignInState::Renamed
+    })
+    .await;
+    assert_eq!(
+        status.sign_in.sentence.as_deref(),
+        Some(
+            format!(
+                "Sign in again to use the new name on {}.",
+                world.server().host()
+            )
+            .as_str()
+        )
+    );
+    assert!(world.asked("/devices/enroll").is_empty());
+    assert_eq!(world.sign_in.minted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        world.kept().expect("kept").host.as_deref(),
+        Some("hesperia"),
+        "the host the server has: the system's, every credential's before #607"
+    );
+
+    world.sign_in.set(|account| account.signed_in = true);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 1).await;
+    status_until(&hq, "enrolled under the new name", enrolled).await;
+    let enrol = world.asked("/devices/enroll");
+    assert_eq!(enrol[0].json()["host"], "studio");
+    assert_eq!(
+        enrol[0].json()["deviceToken"],
+        "device-token-a",
+        "the sign-in adopts this device, never a new one"
+    );
+    assert_eq!(world.kept().expect("kept").client_id, "ana.1");
+    assert_eq!(world.kept().expect("kept").host.as_deref(), Some("studio"));
+}
+
+/// keeper-hq R69-02: a fresh sign-in or a new pairing is a new client id
+/// with whatever host it names, so a rename never falls back to one. An
+/// adoption the server refuses (401, 409) leaves the device's credential and
+/// client id as they were, is not followed by an enrolment without the
+/// device's token, and says so without pointing at a new pairing; signing in
+/// again adopts the same device.
+#[tokio::test]
+async fn a_rename_never_mints_a_new_client_id() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+    lock(&world.state).enroll_refusals = vec![
+        refusal(401, "hq.device_unknown"),
+        refusal(409, "hq.adopt.raced"),
+    ];
+
+    *lock(&world.host) = "studio".to_owned();
+    hq.device_renamed().await.expect("renamed");
+    let status = status_until(&hq, "refused", |s| {
+        s.sign_in.state == HqSignInState::Refused
+    })
+    .await;
+    let host = world.server().host().to_owned();
+    assert_eq!(
+        status.sign_in.sentence.as_deref(),
+        Some(
+            format!(
+                "{host} would not move this device to its new name, so it still knows it by its \
+                 old one. Reset the name here to match it; keeper never makes this a new device \
+                 for a name."
+            )
+            .as_str()
+        )
+    );
+    // The same account again decides nothing new.
+    hq.reconcile().await.expect("reconciles");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(world.asked("/devices/enroll").len(), 1);
+
+    // A new sign-in tries again — an adoption, refused as raced, then kept.
+    world.sign_in.set(|account| account.sign_in += 1);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 2).await;
+    let raced = status_until(&hq, "raced", |s| {
+        s.sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|line| line.ends_with("keeper tries again."))
+    })
+    .await;
+    assert!(
+        raced
+            .sign_in
+            .sentence
+            .as_deref()
+            .is_some_and(|line| line.contains("hq.adopt.raced")),
+        "{raced:?}"
+    );
+    world.sign_in.set(|account| account.sign_in += 1);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 3).await;
+    status_until(&hq, "enrolled under the new name", enrolled).await;
+
+    for (n, enrol) in world.asked("/devices/enroll").iter().enumerate() {
+        assert_eq!(
+            enrol.json()["deviceToken"],
+            "device-token-a",
+            "enrolment {n} adopts this device"
+        );
+        assert_eq!(enrol.json()["host"], "studio");
+    }
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1");
+    assert_eq!(kept.host.as_deref(), Some("studio"));
+    let clients: Vec<String> = lock(&world.state)
+        .devices
+        .iter()
+        .map(|device| device.client.clone())
+        .collect();
+    assert_eq!(clients, ["ana.1"], "no new client id was minted");
+}
+
+/// The server's record of `client`: its last host and its frozen T4 host.
+fn server_hosts(world: &World, client: &str) -> (String, String) {
+    let state = lock(&world.state);
+    let device = state
+        .devices
+        .iter()
+        .find(|device| device.client == client)
+        .expect("the server knows the device");
+    (device.host.clone(), device.t4_host.clone())
+}
+
+/// Probe B (Rev607r2, R607-03; R-HQ-94 amendment 2 (4)): Forget, then a
+/// name set here, then a sign-in. The new credential is created under the
+/// system's name — the one keeper-hq freezes as `t4_host` — never the name
+/// typed in Settings, which follows by an adoption under the same client id.
+#[tokio::test]
+async fn a_new_credential_is_created_under_the_systems_name_and_then_takes_the_one_set_here() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    status_until(&hq, "enrolled", enrolled).await;
+    world.sign_in.set(|account| account.signed_in = false);
+    hq.forget().await.expect("forgets");
+    assert_eq!(
+        hq.device_directory(),
+        Ok(crate::device_name::Directory::default()),
+        "no credential: nothing on the server to protect"
+    );
+
+    *lock(&world.host) = "studio".to_owned();
+    hq.device_renamed().await.expect("renamed");
+    crate::registry::set_agents_server_url(
+        &world.platform.data_dir().expect("dir"),
+        Some(&world.server()),
+    )
+    .expect("stores");
+    world.sign_in.set(|account| account.signed_in = true);
+    hq.reconcile().await.expect("reconciles");
+    world.until_asked("/devices/enroll", 2).await;
+    status_until(&hq, "enrolled under the name set here", enrolled).await;
+
+    let enrol = world.asked("/devices/enroll");
+    assert_eq!(
+        enrol[0].json()["host"],
+        "hesperia",
+        "created under the system's name"
+    );
+    assert!(enrol[0].json().get("deviceToken").is_none(), "a new device");
+    assert_eq!(enrol[1].json()["host"], "studio");
+    assert_eq!(
+        enrol[1].json()["deviceToken"],
+        "device-token-1",
+        "the name follows by adopting the new credential"
+    );
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.new1");
+    assert_eq!(kept.host.as_deref(), Some("studio"));
+    assert_eq!(kept.enrolled_host.as_deref(), Some("hesperia"));
+    assert_eq!(
+        server_hosts(&world, "ana.new1"),
+        ("studio".to_owned(), "hesperia".to_owned()),
+        "T4 compares the system's name, which Settings cannot set"
+    );
+}
+
+/// Probe C (Rev607r2, R607-06; amendment 2 (7)): a credential kept before
+/// keeper recorded hosts, and a name saved just before keeper quit, so the
+/// server was never told. At the next start the credential is backfilled
+/// with the system's name, the name is sent by adoption, and until the
+/// server answers Settings says so — never "Signed in".
+#[tokio::test]
+async fn a_rename_the_server_has_not_heard_is_sent_at_the_next_start() {
+    let world = World::new(true);
+    world.holds("device-token-a", "ana.1", Some(fresh()), false);
+    *lock(&world.host) = "studio".to_owned();
+    let release = world.hold("before", "/devices/enroll");
+    let hq = world.hq();
+    hq.start().await.expect("starts");
+    let host = world.server().host().to_owned();
+    let waiting = status_until(&hq, "updating", |s| {
+        s.sign_in.state == HqSignInState::Enrolling
+    })
+    .await;
+    assert_eq!(
+        waiting.sign_in.sentence.as_deref(),
+        Some(format!("Updating the name on {host}…").as_str())
+    );
+    release.send(()).expect("released");
+    status_until(&hq, "enrolled under the saved name", enrolled).await;
+    let enrol = world.asked("/devices/enroll");
+    assert_eq!(enrol.len(), 1);
+    assert_eq!(enrol[0].json()["host"], "studio");
+    assert_eq!(enrol[0].json()["deviceToken"], "device-token-a");
+    let kept = world.kept().expect("kept");
+    assert_eq!(kept.client_id, "ana.1");
+    assert_eq!(kept.host.as_deref(), Some("studio"));
+    assert_eq!(kept.enrolled_host.as_deref(), Some("hesperia"));
+    assert_eq!(
+        server_hosts(&world, "ana.1"),
+        ("studio".to_owned(), "hesperia".to_owned())
+    );
 }
