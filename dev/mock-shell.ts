@@ -8037,9 +8037,15 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
  * reader; steps and their failure lines only to a reader; details only in verbose.
  */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
-  // Rust's view build prunes the seen record: a drive no longer ticked here loses its entry.
-  for (const drive of vm.drives?.drives ?? [])
-    if (!drive.ticked) mockSeenTicks.delete(seenKey(vm.database, vm.sessionId, drive.name));
+  // Rust's view build prunes the seen record: an entry whose drive is no longer ticked here, or
+  // that names another tick than the drive's current one, goes.
+  for (const drive of vm.drives?.drives ?? []) {
+    const key = seenKey(vm.database, vm.sessionId, drive.name);
+    const current = mockTickIds.get(key);
+    if (!drive.ticked) mockTickIds.delete(key);
+    if (!drive.ticked || (mockSeenTicks.has(key) && mockSeenTicks.get(key) !== current))
+      mockSeenTicks.delete(key);
+  }
   const prefs = heldViewPrefs();
   const reader = vm.readsTrace;
   const thinking = reader && prefs.viewMode !== "normal";
@@ -8165,10 +8171,15 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
             ...vm.drives,
             drives: vm.drives.drives.map((drive) => ({ ...drive })),
             unseen: vm.drives.drives
-              .filter(
-                (d) => d.ticked && !mockSeenTicks.has(seenKey(vm.database, vm.sessionId, d.name)),
-              )
-              .map((d) => d.name),
+              .filter((d) => {
+                const key = seenKey(vm.database, vm.sessionId, d.name);
+                const tick = mockTickIds.get(key);
+                return d.ticked && (tick === undefined || mockSeenTicks.get(key) !== tick);
+              })
+              .map((d) => ({
+                drive: d.name,
+                tick: mockTickIds.get(seenKey(vm.database, vm.sessionId, d.name)),
+              })),
           },
         }
       : {}),
@@ -8372,14 +8383,21 @@ function mockFocusWritten(payload: Record<string, unknown>): string | undefined 
   return undefined;
 }
 /**
- * The ticks this person has been shown the warning for on this device, as `[database, session,
- * drive]` keys (keeper-core's `SeenTicks`, round 6 ruling): any ticked drive not here draws its
- * warning with Untick and OK wherever the session is shown. The person's own tick in the drive
- * menu is recorded when it is made, the dock's never; OK records it; an untick drops it; and each
- * view drops entries whose drive is no longer ticked. A fresh page is a fresh device: every drive
- * a fixture starts ticked warns once, as native keeper does with no record.
+ * Each ticked drive's tick id (`session_drives.tick_ids`, schema 5), minted by whatever ticks it,
+ * and the ticks this person has been shown the warning for on this device (keeper-core's
+ * `SeenTicks`, round 7 ruling): `[database, session, drive]` → the id acknowledged. A ticked drive
+ * warns unless its current id is the one acknowledged. The person's own tick in the drive menu is
+ * recorded when it is made, the dock's never; OK records only the id its warning showed.
+ * A fixture's legacy tick has no id and keeps warning until explicitly unticked and reselected.
  */
-const mockSeenTicks = new Set<string>();
+const mockTickIds = new Map<string, string>();
+const mockSeenTicks = new Map<string, string>();
+let mockTickSerial = 0;
+const mintTick = (key: string) => {
+  const id = `tick-${++mockTickSerial}`;
+  mockTickIds.set(key, id);
+  return id;
+};
 const seenKey = (database: unknown, sessionId: unknown, drive: unknown) =>
   JSON.stringify([database, sessionId, drive]);
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
@@ -8387,6 +8405,21 @@ function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   if (!vm) return hqRefuse("This session is not on this device.");
   return vm;
 }
+/** Stage a replica-delivered selection for renderer probes; never a person's acknowledgement. */
+export function stageSessionDriveTick(
+  target: { database: string; sessionId: string },
+  drive: string,
+  tick: string | null | false,
+): void {
+  const row = mockSession(target).drives?.drives.find((row) => row.name === drive);
+  if (!row) hqRefuse(`${drive} is not a drive this chat's agent offers.`);
+  row.ticked = tick !== false;
+  const key = seenKey(target.database, target.sessionId, drive);
+  if (typeof tick === "string") mockTickIds.set(key, tick);
+  else mockTickIds.delete(key);
+  publishSessions();
+}
+
 const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   agent_view_prefs_set: (payload) => {
     if (liveScenario === "refused") hqRefuse("keeper could not save your answer preference.");
@@ -8435,14 +8468,14 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     // Rust's `set_session_drive`: the person's own tick, made where the warning stands, is seen;
     // an untick drops its record.
     const seen = seenKey(payload.database, payload.sessionId, payload.drive);
-    if (tick) mockSeenTicks.add(seen);
-    else mockSeenTicks.delete(seen);
+    if (tick) mockSeenTicks.set(seen, mintTick(seen));
+    else mockTickIds.delete(seen);
     if (unticking) {
       // Unticked, they are no longer the agent's to read: listed as not offered, after the others.
       for (const row of stale) {
         row.ticked = false;
         row.reason = `Assistant does not offer ${row.name}.`;
-        mockSeenTicks.delete(seenKey(payload.database, payload.sessionId, row.name));
+        mockTickIds.delete(seenKey(payload.database, payload.sessionId, row.name));
       }
       drives.drives.sort((a, b) => Number(!!a.reason) - Number(!!b.reason));
     }
@@ -8780,6 +8813,9 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
             carried.includes(d.name) ? { name: d.name, ticked: true } : d,
           ),
         };
+        for (const drive of fresh.drives.drives) {
+          if (drive.ticked) mintTick(seenKey(fresh.database, fresh.sessionId, drive.name));
+        }
       } else if (base) fresh.drives = base;
       fresh.title = args ?? "New conversation";
       const row = sessionRows.find(
@@ -9046,14 +9082,27 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (tick === undefined)
       return { target, drive, reason: `${main.agentName} does not offer ${drive}.` };
     if (tick.ticked) return { target, drive };
-    // The dock's tick is not recorded as seen: it warns wherever the chat is shown.
+    // The dock's tick gets a fresh id no one has seen: it warns wherever the chat is shown.
+    mintTick(seenKey(drive, row.sessionId, drive));
     tick.ticked = true;
     publishSessions();
     return { target, drive };
   },
   // Rust's `note_tick_seen`: recorded, then `touch()`, which every open view reads again on.
   agent_note_tick_seen: (payload) => {
-    mockSeenTicks.add(seenKey(payload.database, payload.sessionId, payload.drive));
+    const key = seenKey(payload.database, payload.sessionId, payload.drive);
+    const current = mockTickIds.get(key);
+    const ticked = mockSession(payload).drives?.drives.some(
+      (d) => d.name === payload.drive && d.ticked,
+    );
+    // Missing identity cannot bind this OK to the displayed selection, even if the current
+    // selection also has no id. Never adopt it or a replacement on the person's behalf.
+    if (ticked && payload.tick == null)
+      hqRefuse(
+        `keeper cannot identify this tick of ${String(payload.drive)}. Untick it, then select it again using this app.`,
+      );
+    if (ticked && current !== undefined && payload.tick === current)
+      mockSeenTicks.set(key, current);
     publishSessions();
     return null;
   },

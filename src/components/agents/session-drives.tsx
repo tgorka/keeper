@@ -27,11 +27,12 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  * stopped being allowed and holds every other change back: its chip says so, and its button
  * unticks every such drive at once (Rust's `set`), as the sentence under the chips says.
  *
- * A ticked drive this person has not been shown the warning for on this device (`drives.unseen`:
- * Rust's seen record, round 6 ruling — a tick the Notes Assistant, another device or a carry made,
- * or one whose record was lost) draws that warning under the chips, wherever this session is
- * shown, with **Untick** (the person's own untick) and **OK** (recorded as seen). Both read the
- * same Rust view as the chips, so they cannot disagree.
+ * A ticked drive whose current tick this person has not been shown the warning for on this device
+ * (`drives.unseen`, each with its tick id: Rust's seen record, round 7 ruling — a tick the Notes
+ * Assistant, another device or a carry made, one with no id, or one whose record was lost) draws
+ * that warning under the chips, wherever this session is shown, with **Untick** (the person's own
+ * untick) and **OK**, which names that tick so it acknowledges this one only. Both read the same
+ * Rust view as the chips, so they cannot disagree.
  */
 export function SessionDrives({
   target,
@@ -75,13 +76,13 @@ export function SessionDrives({
     }
   };
 
-  const seen = async (name: string) => {
+  const seen = async (name: string, tick: string | null) => {
     if (writing.current) return;
     writing.current = true;
     setBusy(name);
     setError(null);
     try {
-      await agentNoteTickSeen(target, name);
+      await agentNoteTickSeen(target, name, tick);
     } catch (raw) {
       setError(syncErrorMessage(raw, "keeper could not note that."));
     } finally {
@@ -218,7 +219,7 @@ export function SessionDrives({
           {failing[0].reason}
         </p>
       )}
-      {unseen.map((name) => (
+      {unseen.map(({ drive: name, tick }) => (
         <div
           key={name}
           role="note"
@@ -244,7 +245,7 @@ export function SessionDrives({
               variant="ghost"
               size="xs"
               aria-busy={busy === name}
-              onClick={() => void seen(name)}
+              onClick={() => void seen(name, tick ?? null)}
             >
               OK
             </Button>

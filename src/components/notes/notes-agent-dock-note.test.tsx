@@ -172,7 +172,9 @@ function view({ database, sessionId }: AgentSessionRef): AgentSessionViewVm {
       drives: ["tgdrive", "neuradrive"].map((name) => ({ name, ticked: ticked.includes(name) })),
       warning: WARNING,
       pending: false,
-      unseen: ticked.filter((name) => rust.unseen.has(`${key}/${name}`)),
+      unseen: ticked
+        .filter((name) => rust.unseen.has(`${key}/${name}`))
+        .map((name) => ({ drive: name, tick: `tick-${key}/${name}` })),
     },
   };
 }
@@ -322,7 +324,11 @@ it("opens the chat on the note's drive, whose own view says what the tick allows
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "OK" }));
   });
-  expect(mock.seen).toHaveBeenCalledWith({ database: "tgdrive", sessionId: "tg.1" }, "tgdrive");
+  expect(mock.seen).toHaveBeenCalledWith(
+    { database: "tgdrive", sessionId: "tg.1" },
+    "tgdrive",
+    "tick-tgdrive/tg.1/tgdrive",
+  );
   expect(shown()).toEqual({ chips: ["tgdrive"], warnings: [] });
 });
 
@@ -407,7 +413,9 @@ it("leaves an answer for a drive the person moved off unseen and unchosen, never
   showAll();
   expect(shown()).toEqual({ chips: ["neuradrive"], warnings: ["neuradrive"] });
   // The tgdrive chat keeps its tick, unseen: opened anywhere, it says so.
-  expect(view({ database: "tgdrive", sessionId: "tg.1" }).drives?.unseen).toEqual(["tgdrive"]);
+  expect(
+    view({ database: "tgdrive", sessionId: "tg.1" }).drives?.unseen?.map((tick) => tick.drive),
+  ).toEqual(["tgdrive"]);
 });
 
 it("does nothing with an answer for a note the person left for a file (R605-06)", async () => {
@@ -427,7 +435,9 @@ it("does nothing with an answer for a note the person left for a file (R605-06)"
   expect(shown()).toEqual({ chips: [], warnings: [] });
   expect(mock.driveSet).not.toHaveBeenCalled();
   expect(screen.queryByRole("note", { name: DRIVE_NOTICE_LABEL })).not.toBeInTheDocument();
-  expect(view({ database: "tgdrive", sessionId: "tg.1" }).drives?.unseen).toEqual(["tgdrive"]);
+  expect(
+    view({ database: "tgdrive", sessionId: "tg.1" }).drives?.unseen?.map((tick) => tick.drive),
+  ).toEqual(["tgdrive"]);
 });
 
 it("does nothing with an answer while the next note's drive is still being read (R605-06)", async () => {

@@ -417,6 +417,7 @@ export type { AgentToolStepVm } from "./gen/AgentToolStepVm";
 export type { AgentTurnFailureVm } from "./gen/AgentTurnFailureVm";
 export type { AgentTurnFoldVm } from "./gen/AgentTurnFoldVm";
 export type { AgentTurnStatusVm } from "./gen/AgentTurnStatusVm";
+export type { AgentUnseenTickVm } from "./gen/AgentUnseenTickVm";
 export type { AgentUntrustedVm } from "./gen/AgentUntrustedVm";
 export type { AgentViewModeVm } from "./gen/AgentViewModeVm";
 export type { AgentViewPrefsVm } from "./gen/AgentViewPrefsVm";
@@ -4399,12 +4400,17 @@ export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | nul
 }
 
 /**
- * A person was shown the warning of the Notes Assistant's tick of `drive` in this chat and said OK
- * (R-HQ-79): Rust no longer marks it unseen. Unticking it (`agentSessionDriveSet`) clears the mark
- * too, in the same step.
+ * A person was shown the warning of the tick `tick` of `drive` in this chat and said OK (R-HQ-79):
+ * Rust records only a matching non-null tick as seen on this device; a stale id acknowledges
+ * nothing. A null id refuses while the drive is selected: Untick it, then select it again.
+ * If the drive is already unticked, this is a harmless no-op.
  */
-export async function agentNoteTickSeen(target: AgentSessionRef, drive: string): Promise<void> {
-  await invoke<void>("agent_note_tick_seen", { ...target, drive });
+export async function agentNoteTickSeen(
+  target: AgentSessionRef,
+  drive: string,
+  tick: string | null,
+): Promise<void> {
+  await invoke<void>("agent_note_tick_seen", { ...target, drive, tick });
 }
 
 /**

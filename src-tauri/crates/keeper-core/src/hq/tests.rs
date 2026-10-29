@@ -755,6 +755,9 @@ struct Staged {
     /// The People sheet read on thread `people` says it has read the
     /// members, and returns them once released.
     people: Mutex<Option<Gate>>,
+    /// One replacement delivered after the selection write, before its
+    /// caller can persist the seen record (R605-18).
+    after_sync: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// What every thread the staging does not name reads.
     others: Mutex<Vec<crate::hq::port::Peer>>,
 }
@@ -927,6 +930,10 @@ impl Replica for Staged {
     }
     fn sync_now(&self) {
         self.inner.sync_now();
+        let hook = lock(&self.after_sync).take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
     fn state(&self) -> ReplicaState {
         self.inner.state()
@@ -956,6 +963,7 @@ impl Opener for StagedOpener {
             early_done: Mutex::new(Some(early_done)),
             projecting: Mutex::new(None),
             people: Mutex::new(None),
+            after_sync: Mutex::new(None),
             others: Mutex::new(tail(6, "")),
         });
         *lock(&self.0) = Some(Arc::clone(&staged));
@@ -1874,15 +1882,31 @@ fn ticks(opener: &LocalOpener, database: &str) -> Vec<(String, String)> {
     .collect()
 }
 
-/// The drives the session `key` shows as ticked by the Notes Assistant and
-/// not yet answered: what draws the warning beside the chip, wherever the
-/// session is shown (the dock or the Agents window alike).
+/// The ticked drives the session `key` shows as not yet seen here: what
+/// draws the warning beside the chip, wherever the session is shown (the
+/// dock or the Agents window alike).
 fn unseen_in(hq: &Hq, key: &sessions::AgentSessionRef) -> Vec<String> {
+    unseen_ticks_in(hq, key)
+        .into_iter()
+        .map(|tick| tick.drive)
+        .collect()
+}
+
+fn unseen_ticks_in(hq: &Hq, key: &sessions::AgentSessionRef) -> Vec<drives::AgentUnseenTickVm> {
     hq.session_view(key)
         .expect("a view")
         .drives
         .map(|drives| drives.unseen)
         .unwrap_or_default()
+}
+
+/// OK on the warning `key` shows for `drive`, naming the tick it shows.
+fn ok(hq: &Hq, key: &sessions::AgentSessionRef, drive: &str) -> Result<(), HqError> {
+    let tick = unseen_ticks_in(hq, key)
+        .into_iter()
+        .find(|tick| tick.drive == drive)
+        .and_then(|tick| tick.tick);
+    hq.note_tick_seen(key, drive, tick.as_deref())
 }
 
 fn chat(session: &str, database: &str) -> sessions::AgentSessionRef {
@@ -2004,7 +2028,7 @@ async fn a_dock_tick_stays_unseen_wherever_its_chat_is_shown_until_a_person_answ
     );
 
     // OK: seen, and the drive stays ticked.
-    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    ok(&hq, &key, "tgdrive").expect("seen");
     assert!(unseen_in(&hq, &key).is_empty());
     assert_eq!(
         ticks(&opener, "tgdrive"),
@@ -2094,7 +2118,7 @@ async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
     let world = World::new();
     let (hq, opener, key) = dock_ticked(&world).await;
     let answered = || {
-        hq.note_tick_seen(&key, "tgdrive").expect("seen");
+        ok(&hq, &key, "tgdrive").expect("seen");
         assert!(unseen_in(&hq, &key).is_empty(), "answered");
     };
     answered();
@@ -2111,6 +2135,14 @@ async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
     )
     .expect("legacy");
     assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "an older version's");
+    answered();
+    // Round 6's shape: (database, session, drive) triples, with no tick.
+    std::fs::write(
+        seen_file(&world),
+        serde_json::to_string(&[["tgdrive", key.session_id.as_str(), "tgdrive"]]).expect("json"),
+    )
+    .expect("round 6");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "round 6's");
     answered();
 
     // Another device, holding the same rows, has seen nothing: it warns.
@@ -2147,7 +2179,7 @@ impl Opener for Shared {
 async fn the_seen_record_drops_gone_sessions_and_unticked_drives() {
     let world = World::new();
     let (hq, opener, first) = dock_ticked(&world).await;
-    hq.note_tick_seen(&first, "tgdrive").expect("seen");
+    ok(&hq, &first, "tgdrive").expect("seen");
     let second = hq
         .new_session("tgdrive", "nixie", "another", None, None)
         .expect("a chat");
@@ -2219,7 +2251,7 @@ async fn ok_and_untick_wake_the_session_stream() {
             break;
         }
     }
-    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    ok(&hq, &key, "tgdrive").expect("seen");
     assert!(changes.has_changed().expect("open"), "OK wakes the stream");
     changes.borrow_and_update();
     assert!(unseen_in(&hq, &key).is_empty());
@@ -2238,7 +2270,7 @@ async fn a_seen_record_that_cannot_be_written_keeps_the_warning() {
     let world = World::new();
     let (hq, _opener, key) = dock_ticked(&world).await;
     std::fs::create_dir_all(seen_file(&world).with_extension("json.new")).expect("blocked");
-    let refused = hq.note_tick_seen(&key, "tgdrive").expect_err("not noted");
+    let refused = ok(&hq, &key, "tgdrive").expect_err("not noted");
     assert!(
         refused
             .to_string()
@@ -2669,4 +2701,402 @@ async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
         "{said:?}"
     );
     assert!(said.contains(&("hello", None)), "{said:?}");
+}
+
+/// A `session_drives` write from another device of the same person: `drives`
+/// ticked, with `tick_ids` as given (`None`: a schema-4 client's write, with
+/// no ids).
+fn selection_from_elsewhere(
+    opener: &LocalOpener,
+    key: &sessions::AgentSessionRef,
+    drives: &[&str],
+    tick_ids: Option<Value>,
+    at: i64,
+) {
+    let mut values = serde_json::json!({
+        "session_id": key.session_id, "drives": Value::from(drives.to_vec()).to_string(),
+        "updated_at_ms": at, "author_actor": "ana", "author_client": "ana.2"});
+    if let Some(ids) = tick_ids {
+        values["tick_ids"] = Value::from(ids.to_string());
+    }
+    opener
+        .replica(&key.database)
+        .mutate(vec![RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            values: sessions::object(values),
+            base_version: None,
+        }])
+        .expect("written elsewhere");
+}
+
+/// R605-14, the reviewer's P1: the person unticks while the seen record
+/// cannot be written, and the disk comes back before the dock ticks again.
+/// The new tick has a new id, so the old answer acknowledges nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p1_a_lost_untick_record_never_acknowledges_the_next_tick() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    ok(&hq, &key, "tgdrive").expect("seen");
+    let blocked = seen_file(&world).with_extension("json.new");
+    std::fs::create_dir_all(&blocked).expect("blocked");
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(
+        unseen_in(&hq, &key).is_empty(),
+        "unticked: nothing to warn of"
+    );
+    std::fs::remove_dir_all(&blocked).expect("unblocked");
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(ticks(&opener, "tgdrive")[0].1, r#"["tgdrive"]"#);
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+}
+
+/// R605-14, P2: another device unticks, and this device's dock ticks again
+/// before any view is built here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p2_an_untick_elsewhere_never_seen_here_leaves_the_dock_s_re_tick_warning() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    ok(&hq, &key, "tgdrive").expect("seen");
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &[],
+        Some(serde_json::json!({"at": 5, "drives": {}})),
+        5,
+    );
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+}
+
+/// R605-14, P3: another device unticks and ticks again — or only the final
+/// row arrives — and this device builds no view in between. Whether that
+/// device wrote a fresh id (schema 5) or none (schema 4), it warns here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p3_an_untick_and_re_tick_elsewhere_warns_here() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    ok(&hq, &key, "tgdrive").expect("seen");
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &[],
+        Some(serde_json::json!({"at": 5, "drives": {}})),
+        5,
+    );
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at": 6, "drives": {"tgdrive": "01JELSEWHERE0000000000000"}})),
+        6,
+    );
+    assert_eq!(
+        unseen_in(&hq, &key),
+        ["tgdrive"],
+        "a fresh id from elsewhere"
+    );
+    ok(&hq, &key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    // A schema-4 device re-ticks: it leaves the old map behind and moves
+    // `updated_at_ms`, so the map no longer counts and the tick has no id.
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at": 6, "drives": {"tgdrive": "01JELSEWHERE0000000000000"}})),
+        7,
+    );
+    assert_eq!(
+        unseen_in(&hq, &key),
+        ["tgdrive"],
+        "an older device's re-tick"
+    );
+}
+
+/// A legacy tick has no verifiable identity: OK must refuse without
+/// adopting it. Only an explicit untick and manual reselect can make a
+/// fresh, seen grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_without_an_id_refuses_ok_until_unticked_and_selected_again() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 8);
+    let shown = unseen_ticks_in(&hq, &key);
+    assert_eq!(
+        shown,
+        [drives::AgentUnseenTickVm {
+            drive: "tgdrive".to_owned(),
+            tick: None
+        }]
+    );
+    let source = hq.source("tgdrive").expect("held");
+    let refused = ok(&hq, &key, "tgdrive").expect_err("legacy OK cannot identify the shown tick");
+    assert!(matches!(refused, HqError::Sentence(_)));
+    let remedy = refused.to_string();
+    assert!(
+        remedy.contains("Untick") && remedy.contains("select it again"),
+        "{remedy}"
+    );
+    assert_eq!(
+        unseen_ticks_in(&hq, &key),
+        shown,
+        "refusal keeps the warning"
+    );
+    assert!(
+        drives::tick_ids(&source, &key.session_id).is_empty(),
+        "OK never adopts a legacy tick"
+    );
+    // Merely repeating a tick command is not a new selection either.
+    hq.set_session_drive(&key, "tgdrive", true)
+        .expect("already ticked");
+    assert_eq!(unseen_ticks_in(&hq, &key), shown);
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(unseen_in(&hq, &key).is_empty());
+    hq.set_session_drive(&key, "tgdrive", true)
+        .expect("selected again");
+    let fresh = drives::tick_ids(&source, &key.session_id)
+        .remove("tgdrive")
+        .expect("fresh id");
+    assert!(ulid::Ulid::from_string(&fresh).is_ok());
+    assert_eq!(seen_entries(&world)[0]["tick"], fresh);
+    assert!(
+        unseen_in(&hq, &key).is_empty(),
+        "only the fresh manual selection is seen"
+    );
+}
+
+/// OK names the tick its warning showed: shown for a tick that has since
+/// been replaced, it acknowledges nothing, and the new one still warns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ok_for_a_replaced_tick_acknowledges_nothing() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    let shown = unseen_ticks_in(&hq, &key)[0].tick.clone().expect("an id");
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at": 9, "drives": {"tgdrive": "01JREPLACED000000000000000"}})),
+        9,
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&shown))
+        .expect("asked");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+}
+
+/// The record's file, as entries.
+fn seen_entries(world: &World) -> Vec<Value> {
+    serde_json::from_str(&std::fs::read_to_string(seen_file(world)).expect("the record"))
+        .expect("entries")
+}
+
+fn write_seen(world: &World, entries: &[Value]) {
+    std::fs::write(seen_file(world), Value::from(entries.to_vec()).to_string()).expect("written");
+}
+
+/// R605-15: an answer belongs to one server and one person. Another
+/// server's or another person's entry for the same database, session, drive
+/// and even tick id acknowledges nothing here — and pruning leaves it be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_on_another_server_or_by_another_person_is_not_this_one() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let tick = unseen_ticks_in(&hq, &key)[0].tick.clone().expect("an id");
+    let entry = |server: &str, person: &str| {
+        serde_json::json!({"server": server, "person": person, "database": "tgdrive",
+                           "session": key.session_id, "drive": "tgdrive", "tick": tick})
+    };
+    let elsewhere = [
+        entry("https://other.example.org", "ana"),
+        entry("https://hq.example.org", "ben"),
+    ];
+    write_seen(&world, &elsewhere);
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    assert_eq!(seen_entries(&world).len(), 2, "left alone");
+    ok(&hq, &key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    assert_eq!(seen_entries(&world).len(), 3);
+}
+
+/// R605-16: pruning never touches an entry of a database this device does
+/// not hold; it drops this server's and person's stale entry of one it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruning_leaves_databases_not_held_alone() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let foreign = serde_json::json!({"server": "https://hq.example.org", "person": "ana",
+        "database": "neuradrive", "session": "ana.1.1", "drive": "neuradrive", "tick": "01JFOREIGN"});
+    let stale = serde_json::json!({"server": "https://hq.example.org", "person": "ana",
+        "database": "tgdrive", "session": key.session_id, "drive": "tgdrive", "tick": "01JSTALE"});
+    write_seen(&world, &[foreign.clone(), stale]);
+    assert_eq!(
+        unseen_in(&hq, &key),
+        ["tgdrive"],
+        "a stale entry acknowledges nothing"
+    );
+    assert_eq!(
+        seen_entries(&world),
+        [foreign],
+        "the stale one pruned, the foreign one kept"
+    );
+}
+
+/// `/clean` creates new grants, not acknowledgements inherited from the old
+/// conversation, even when every carried drive was already seen here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_carries_a_fresh_tick_that_warns_until_its_own_ok() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let old_tick = unseen_ticks_in(&hq, &key)[0].tick.clone().expect("an id");
+    ok(&hq, &key, "tgdrive").expect("old grant seen");
+    let result = hq.command(&key, "/clean", None, &[]).expect("clean");
+    let fresh = result.session.expect("the new conversation");
+    let carried = unseen_ticks_in(&hq, &fresh);
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].drive, "tgdrive");
+    let new_tick = carried[0].tick.as_deref().expect("a carried tick id");
+    assert_ne!(new_tick, old_tick, "a new chat has a new grant");
+    assert!(ulid::Ulid::from_string(new_tick).is_ok());
+    assert!(unseen_in(&hq, &key).is_empty(), "the old answer holds");
+    ok(&hq, &fresh, "tgdrive").expect("new grant seen");
+    assert!(unseen_in(&hq, &fresh).is_empty());
+}
+
+/// R605-17: retain the old no-ID warning across a legacy untick/re-tick.
+/// Null/null cannot identify the displayed tick, even if timestamps repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_legacy_ok_never_adopts_a_later_legacy_tick() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 40);
+    let shown = unseen_ticks_in(&hq, &key);
+    assert_eq!(shown[0].drive, "tgdrive");
+    assert_eq!(shown[0].tick, None);
+    // No view in between; the replacement repeats the original timestamp.
+    selection_from_elsewhere(&opener, &key, &[], None, 41);
+    selection_from_elsewhere(&opener, &key, &["tgdrive"], None, 40);
+    let refused = hq
+        .note_tick_seen(&key, "tgdrive", shown[0].tick.as_deref())
+        .expect_err("a delayed no-ID OK cannot identify a later legacy tick");
+    assert!(matches!(refused, HqError::Sentence(_)));
+    assert_eq!(
+        unseen_ticks_in(&hq, &key),
+        shown,
+        "an old null-id warning must not acknowledge a later legacy tick"
+    );
+    let source = hq.source("tgdrive").expect("held");
+    assert!(
+        drives::tick_ids(&source, &key.session_id).is_empty(),
+        "refusing OK must not mint an identity for the replacement"
+    );
+}
+
+/// Modern identities, not milliseconds, bind an OK to its displayed tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_ms_modern_retick_rejects_stale_ok_and_accepts_matching_ok() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    let first = ulid::Ulid::new().to_string();
+    let fresh = ulid::Ulid::new().to_string();
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at":42,"drives":{"tgdrive":first}})),
+        42,
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&first))
+        .expect("first seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &[],
+        Some(serde_json::json!({"at":42,"drives":{}})),
+        42,
+    );
+    selection_from_elsewhere(
+        &opener,
+        &key,
+        &["tgdrive"],
+        Some(serde_json::json!({"at":42,"drives":{"tgdrive":fresh}})),
+        42,
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&first))
+        .expect("stale OK");
+    assert_eq!(
+        unseen_ticks_in(&hq, &key)[0].tick.as_deref(),
+        Some(fresh.as_str())
+    );
+    hq.note_tick_seen(&key, "tgdrive", Some(&fresh))
+        .expect("matching OK");
+    assert!(unseen_in(&hq, &key).is_empty());
+}
+
+/// R605-18: the replica owner may deliver a remote replacement while local
+/// DRIVE_WRITES is held. Persist only the person's operation's identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manual_tick_records_its_own_id_not_a_post_write_replacement() {
+    let world = World::new();
+    let (hq, staged, key) = staged_session(&world, false, &[]).await;
+    staged.inner.mutate(vec![RowOp::Upsert {
+        table: "agent_profiles".to_owned(),
+        values: sessions::object(serde_json::json!({
+            "id":"nixie.alpha", "actor_id":"nixie", "name":"nixie", "description":"",
+            "avatar_blob":null, "definition_hash":"h", "image_digest":"d", "started_at_ms":1,
+            "dir":"alpha", "drives":"[\"alpha\"]", "author_actor":"nixie", "author_client":"nixie.alpha"})),
+        base_version: None,
+    }]).expect("offers");
+    let remote_tick = ulid::Ulid::new().to_string();
+    let remote_expected = remote_tick.clone();
+    let own_tick = Arc::new(Mutex::new(None));
+    let own_written = Arc::clone(&own_tick);
+    let replica = Arc::clone(&staged.inner);
+    let session = key.session_id.clone();
+    *lock(&staged.after_sync) = Some(Box::new(move || {
+        let own = replica
+            .query("SELECT tick_ids FROM session_drives", &[])
+            .expect("own row");
+        let ids: Value =
+            serde_json::from_str(own[0]["tick_ids"].as_str().expect("tick map")).expect("tick ids");
+        *lock(&own_written) = Some(ids["drives"]["alpha"].as_str().expect("own id").to_owned());
+        let upsert = |drives: &str, ids: Value| RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            base_version: None,
+            values: sessions::object(serde_json::json!({"session_id":session,"drives":drives,
+                "updated_at_ms":42,"tick_ids":ids.to_string(),"author_actor":"ana","author_client":"ana.2"})),
+        };
+        replica
+            .mutate(vec![upsert("[]", serde_json::json!({"at":42,"drives":{}}))])
+            .expect("untick delivered");
+        replica
+            .mutate(vec![upsert(
+                "[\"alpha\"]",
+                serde_json::json!({"at":42,"drives":{"alpha":remote_tick}}),
+            )])
+            .expect("new tick delivered");
+    }));
+    hq.set_session_drive(&key, "alpha", true)
+        .expect("person's tick returns");
+    let own = lock(&own_tick).clone().expect("operation intercepted");
+    assert_ne!(own, remote_expected);
+    assert!(ulid::Ulid::from_string(&own).is_ok());
+    assert_eq!(
+        seen_entries(&world),
+        [serde_json::json!({
+            "server":"https://hq.example.org", "person":"ana", "database":"alpha",
+            "session":key.session_id, "drive":"alpha", "tick":own
+        })],
+        "manual action must record its own minted id, never a later synced replacement"
+    );
+    assert_eq!(
+        unseen_ticks_in(&hq, &key),
+        [drives::AgentUnseenTickVm {
+            drive: "alpha".to_owned(),
+            tick: Some(remote_expected)
+        }],
+        "the replacement must still warn"
+    );
 }

@@ -38,6 +38,21 @@ first and serves the previous version beside the new one through syncular's sche
 client rebootstraps on its own schema bump. Removing or renaming a column, changing a type, a
 scope or a primary key is a new table, not an edit.
 
+### Schema 5 release prerequisite
+
+The server must adopt this contract, migrate `session_drives.tick_ids`, and serve schema 4
+alongside schema 5 before a schema-5 keeper ships. The schema-4 projection omits the new column;
+old clients continue to read and write `drives` and `updated_at_ms`.
+
+For a schema-4 write, the server must also invalidate the stored `tick_ids` in the **same row
+transaction**, including on an untick. An omitted column must not preserve an earlier identity
+map. The client's `at == updated_at_ms` check rejects a stale map when the timestamp changes,
+but timestamps are not grant identities: two writes can use the same millisecond, or an old
+device's clock can repeat it. Clearing the map makes every legacy tick unacknowledged until a
+schema-5 client explicitly acknowledges it. Contract adoption, version-window projection and
+legacy-write invalidation need keeper-hq verification; client-only checks do not establish them.
+
+
 ## Scopes
 
 A scope variable is one dimension a row is authorised along; a client requests values, the server
@@ -161,6 +176,16 @@ last wrote it. Times are UTC milliseconds since the epoch.
   a person ticked for the session's agent to read, and `updated_at_ms`. No row, or an empty array,
   is no drive: none is ticked until a person ticks it. It can only name drives the agent offers
   (`agent_profiles.drives`), and it grants reading, never writing.
+  From schema 5, `tick_ids` (nullable JSON) names the identity of each tick:
+  `{"at": <this row's updated_at_ms>, "drives": {<drive>: <ULID>}}`. A schema-5 client writes it in
+  every write of the row: a fresh ULID for each drive it ticks anew, the same id for each drive it
+  leaves ticked, none for a drive it unticks, and `at` equal to the `updated_at_ms` it writes. A map
+  whose `at` is not the row's `updated_at_ms` (a schema-4 client rewrote the row and left it
+  behind), or a ticked drive it does not name, is a tick with no identity. A person's device warns
+  of a tick (R-HQ-79) until it has shown that tick's warning there, so a tick with no identity
+  warns; a client may give it one, as the person, by rewriting the row. A schema-4 client never
+  receives `tick_ids`. Its writes must invalidate the stored map as described above; preserving
+  it is unsafe even when the timestamp guard usually detects it.
 - **`turn_chunks`** — the committed text of a streaming answer: `session_id`, `turn_id`, `seq`,
   `text`; deleted when the turn's message is written.
 - **`attachments`** — `session_id`, `message_id`, `blob_ref` (a syncular blob: canonical BlobRef JSON

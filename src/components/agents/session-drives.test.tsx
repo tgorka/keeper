@@ -54,7 +54,8 @@ describe("SessionDrives", () => {
   });
 
   /**
-   * Round 6 ruling: a ticked drive this person has not been shown the warning for on this device is
+   * Round 7 ruling: a ticked drive whose current tick this person has not been shown the warning for
+   * on this device is
    * Rust's `unseen`, read from the same view as the chips. It draws the warning beside them, with
    * Untick (the person's own untick, which drops its record) and OK (recorded as seen).
    */
@@ -64,7 +65,7 @@ describe("SessionDrives", () => {
         { name: "alpha", ticked: true },
         { name: "gamma", ticked: true },
       ],
-      unseen: ["alpha"],
+      unseen: [{ drive: "alpha", tick: "01JTICK" }],
     });
     const view = render(
       <SessionDrives
@@ -93,7 +94,7 @@ describe("SessionDrives", () => {
     await act(async () => {
       fireEvent.click(within(note).getByRole("button", { name: "OK" }));
     });
-    expect(mock.seen).toHaveBeenCalledWith(target, "alpha");
+    expect(mock.seen).toHaveBeenCalledWith(target, "alpha", "01JTICK");
 
     // Answered: Rust's next view has no unseen drive, and nothing is drawn.
     view.rerender(
@@ -114,7 +115,10 @@ describe("SessionDrives", () => {
       <SessionDrives
         target={target}
         agentName="Nixie"
-        drives={drives({ drives: [{ name: "alpha", ticked: true }], unseen: ["alpha"] })}
+        drives={drives({
+          drives: [{ name: "alpha", ticked: true }],
+          unseen: [{ drive: "alpha", tick: "01JTICK" }],
+        })}
         open={false}
         onOpenChange={() => {}}
       />,

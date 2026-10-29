@@ -745,7 +745,19 @@ fn clean_carries_the_ticked_drives_in_their_own_commit_and_new_carries_none() {
     );
     let sources = [alpha.clone()];
     set(&alpha, SESSION, "gamma", true, &sources, 5).expect("ticks gamma");
+    let gamma_tick = tick_ids(&alpha, SESSION)["gamma"].clone();
     set(&alpha, SESSION, "alpha", true, &sources, 6).expect("ticks alpha");
+    let original_ticks = tick_ids(&alpha, SESSION);
+    assert_eq!(
+        original_ticks["gamma"], gamma_tick,
+        "ticking another drive preserves the existing grant's identity"
+    );
+    for id in original_ticks.values() {
+        assert!(
+            ulid::Ulid::from_string(id).is_ok(),
+            "a real tick ULID: {id}"
+        );
+    }
 
     let fresh = command(&alpha, &sources, "/clean");
     assert_eq!(
@@ -753,6 +765,20 @@ fn clean_carries_the_ticked_drives_in_their_own_commit_and_new_carries_none() {
         Some(r#"["gamma","alpha"]"#),
         "the same drives, in the old row's order"
     );
+    let carried_ticks = tick_ids(&alpha, &fresh);
+    for drive in ["alpha", "gamma"] {
+        assert_ne!(
+            carried_ticks.get(drive),
+            original_ticks.get(drive),
+            "a carry is a fresh grant in the new chat"
+        );
+        assert!(
+            carried_ticks
+                .get(drive)
+                .is_some_and(|id| ulid::Ulid::from_string(id).is_ok()),
+            "the carried drive has its own tick identity"
+        );
+    }
     let vm = view(
         &alpha,
         &fresh,
