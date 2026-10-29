@@ -209,6 +209,9 @@ impl Hq {
                 let Some(hq) = me.upgrade() else { return };
                 let done = tokio::task::spawn_blocking(move || {
                     hq.reconcile_windows();
+                    // A drive write decided here whose answer the server
+                    // has now given — or that a stop left — goes on (109.27).
+                    hq.carry_on_writes();
                     let (sources, now) = (hq.sources(), sessions::now_ms());
                     // A request or a grant expiring changes what is shown
                     // with no row changing.
@@ -318,6 +321,8 @@ impl Hq {
         if let Some(session) = timeline::session_row(&source, &key.session_id) {
             view.drives = drives::view(&source, &key.session_id, &session, &self.sources());
         }
+        self.writes
+            .draw(&self.sources(), &source, &mut view.approvals_mut());
         if let Some(held) = lock(&self.views).get_mut(key) {
             held.live.settle(&opened.live, &view.live);
         }
@@ -787,7 +792,60 @@ impl Hq {
 
     /// Every approval this person may decide now.
     pub fn approvals_waiting(&self) -> Vec<AgentApprovalVm> {
-        approvals::waiting(&self.sources(), &self.refusals(), sessions::now_ms())
+        let sources = self.sources();
+        let mut waiting = approvals::waiting(&sources, &self.refusals(), sessions::now_ms());
+        for source in &sources {
+            let mut here: Vec<&mut AgentApprovalVm> = waiting
+                .iter_mut()
+                .filter(|approval| approval.database == source.database)
+                .collect();
+            self.writes.draw(&sources, source, &mut here);
+        }
+        waiting
+    }
+
+    /// Set this device's drive writer (109.27): the shell's, over its synced
+    /// folders. Until it is, a drive write is never offered *Allow* here.
+    pub fn set_drive_writes(&self, port: Arc<dyn crate::hq::port::DriveWrites>) {
+        self.writes.set_port(port);
+        self.touch();
+    }
+
+    /// Carry on, on a thread of its own, the drive writes this device
+    /// decided and has not said the outcome of
+    /// ([`approvals::write::Writes::carry_on`]); one run at a time. A wake
+    /// that arrives while a pass runs is never lost (R606-02): it leaves
+    /// `carry_again` set, and the worker passes once more before it goes
+    /// idle. The flag is cleared only at the top of a pass, and the worker
+    /// looks at it only after it has let go of `carrying`, so a wake landing
+    /// between the two either sees `carrying` free and starts its own run,
+    /// or is seen by this one. A pass is driven by wakes only, so a drive
+    /// that stays unavailable is not retried in a loop.
+    pub(crate) fn carry_on_writes(&self) {
+        self.carry_again.store(true, Ordering::SeqCst);
+        if self.carrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.me.clone();
+        let (carrying, again) = (Arc::clone(&self.carrying), Arc::clone(&self.carry_again));
+        let spawned = std::thread::Builder::new()
+            .name("hq-drive-writes".to_owned())
+            .spawn(move || loop {
+                again.store(false, Ordering::SeqCst);
+                if let Some(hq) = me.upgrade() {
+                    hq.writes.carry_on(&hq.sources());
+                }
+                carrying.store(false, Ordering::SeqCst);
+                // A wake during the pass: pass again, unless that wake has
+                // started a run of its own since `carrying` was let go.
+                if !again.load(Ordering::SeqCst) || carrying.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "the drive writes could not be carried on");
+            self.carrying.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Decide an approval. Blocking: it waits briefly for the server.
@@ -799,15 +857,36 @@ impl Hq {
         approve: bool,
     ) -> Result<AgentDecisionOutcomeVm, HqError> {
         let source = self.source(&key.database)?;
-        let outcome = approvals::decide(
-            &source,
-            self.decisions()?,
-            &key.session_id,
-            approval_id,
-            binding_digest,
-            approve,
-            sessions::now_ms(),
-        )
+        let decisions = self.decisions()?;
+        let now = sessions::now_ms();
+        let writes = approvals::write::Writes::is_write(&source, approval_id);
+        let outcome = match (writes, approve) {
+            (true, true) => self.writes.allow(
+                &source,
+                decisions,
+                &key.session_id,
+                approval_id,
+                binding_digest,
+                now,
+            ),
+            (true, false) => self.writes.deny(
+                &source,
+                decisions,
+                &key.session_id,
+                approval_id,
+                binding_digest,
+                now,
+            ),
+            (false, _) => approvals::decide(
+                &source,
+                decisions,
+                &key.session_id,
+                approval_id,
+                binding_digest,
+                approve,
+                now,
+            ),
+        }
         .map_err(sentence);
         self.touch();
         outcome

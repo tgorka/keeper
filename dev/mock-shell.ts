@@ -60,6 +60,7 @@ import type {
   AgentAttachmentVm,
   AgentChildSessionVm,
   AgentChoiceVm,
+  AgentDriveWriteVm,
   AgentEffortOptionVm,
   AgentGrantOfferVm,
   AgentGrantsVm,
@@ -6487,6 +6488,452 @@ const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includ
     ];
 
 /**
+ * ?writes=all (109.27): one parked `drive_write` per op in alpha's device.1, as
+ * `approvals::write::Writes::draw` draws them — the diff of an edit and a replace, the new text of
+ * a create and an append, from → to for a move, the deleted text, a replace that only changes line
+ * endings, one holding hidden characters (shown escaped, Allow withheld), an append to a
+ * 6,000-line file (the appended text after three lines), a right-to-left line drawn in stored order,
+ * a whitespace-only change drawn visibly, one too large for a card, one line past the character cap,
+ * a delete of a file over 1 MB, a move to a right-to-left path, markers beside literal marker
+ * characters — and one this device cannot
+ * carry out (`blocked`), which offers Deny only. Allow writes and says so on the card.
+ */
+const writesScenario = new URLSearchParams(location.search).get("writes");
+function mockWrite(
+  id: string,
+  summary: string,
+  args: Record<string, string>,
+  write: AgentDriveWriteVm,
+  at: number,
+): AgentApprovalVm {
+  return {
+    id,
+    database: "alpha",
+    sessionId: "device.1",
+    toolName: "drive_write",
+    tier: "T3",
+    summary,
+    bindingDigest: `sha256:fixture-${id}`,
+    action: JSON.stringify({ drive: "tgdrive", ...args }, null, 2),
+    expiresAtMs: Date.now() + 86400000,
+    createdAtMs: Date.now() + at,
+    state: "pending",
+    canDecide: true,
+    sentence: "Waiting for you.",
+    actions: [],
+    declinedBySend: false,
+    write,
+  };
+}
+const MOCK_INBOX = "10-notes/inbox.md";
+/**
+ * ?writes=heavy (R606-09's acceptance): one card just under both character caps — 39 lines of
+ * 9,999 drawn characters (389,961 in all, escapes and right-to-left text among them) — for timing
+ * its first render in the panel.
+ */
+function mockHeavyLines() {
+  const piece = "⟨TAG U+E0041⟩ אב 900 100 ";
+  const line = piece.repeat(Math.ceil(9999 / piece.length)).slice(0, 9999);
+  return Array.from({ length: 39 }, () => ({ kind: "add" as const, text: line, rtl: true }));
+}
+const MOCK_BLOB = "28571bedbb9cdd80fe3b7a4b691ebed6eb6531fd";
+if (writesScenario === "heavy" && sessionApprovals.length > 0) {
+  sessionApprovals.push(
+    mockWrite(
+      "write-heavy",
+      "Create `10-notes/heavy.md` in tgdrive (389961 bytes)",
+      { op: "create", path: "10-notes/heavy.md", content: "…" },
+      {
+        drive: "tgdrive",
+        untrusted: false,
+        op: "create",
+        path: "10-notes/heavy.md",
+        preview: {
+          hunks: [{ oldStart: 0, newStart: 1, lines: mockHeavyLines() }],
+          rtlNote: "Right-to-left text is shown in stored order.",
+        },
+      },
+      30,
+    ),
+  );
+}
+if (writesScenario === "all" && sessionApprovals.length > 0) {
+  const base = { drive: "tgdrive", untrusted: false };
+  sessionApprovals.push(
+    mockWrite(
+      "write-edit",
+      "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 11 bytes",
+      {
+        op: "edit",
+        path: MOCK_INBOX,
+        expected: MOCK_BLOB,
+        old_text: "- [ ] milk\n",
+        new_text: "- [x] milk\n",
+      },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "context", text: "# Inbox" },
+                { kind: "remove", text: "- [ ] milk" },
+                { kind: "add", text: "- [x] milk" },
+                { kind: "context", text: "- [ ] bread" },
+              ],
+            },
+          ],
+        },
+        audience: "Also read by: Marta.",
+      },
+      10,
+    ),
+    mockWrite(
+      "write-replace",
+      "Replace the text of `10-notes/plans.md` in tgdrive (42 bytes)",
+      { op: "replace", path: "10-notes/plans.md", expected: MOCK_BLOB, content: "…" },
+      {
+        ...base,
+        op: "replace",
+        path: "10-notes/plans.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "# Plans for the third quarter of the year, unsorted" },
+                { kind: "add", text: "# Plans · Q3" },
+                { kind: "context", text: "" },
+                { kind: "add", text: "- ship the drive writes, then the notes focus line" },
+              ],
+            },
+          ],
+        },
+      },
+      11,
+    ),
+    mockWrite(
+      "write-create",
+      "Create `10-notes/reading-list.md` in tgdrive (64 bytes)",
+      { op: "create", path: "10-notes/reading-list.md", content: "…" },
+      {
+        ...base,
+        op: "create",
+        path: "10-notes/reading-list.md",
+        untrusted: true,
+        preview: {
+          hunks: [
+            {
+              oldStart: 0,
+              newStart: 1,
+              lines: [
+                { kind: "add", text: "# Reading list" },
+                { kind: "add", text: "- The Mythical Man-Month" },
+              ],
+            },
+          ],
+        },
+      },
+      12,
+    ),
+    mockWrite(
+      "write-append",
+      "Append 24 bytes to `40-journal/2026-10.md` in tgdrive",
+      { op: "append", path: "40-journal/2026-10.md", expected: MOCK_BLOB, text: "…" },
+      {
+        ...base,
+        op: "append",
+        path: "40-journal/2026-10.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 30,
+              newStart: 30,
+              lines: [
+                { kind: "context", text: "## 27 October" },
+                { kind: "add", text: "- Wrote the K2 card." },
+              ],
+            },
+          ],
+        },
+      },
+      13,
+    ),
+    mockWrite(
+      "write-move",
+      "Move `10-notes/inbox.md` to `20-archive/2026/inbox-october-with-a-very-long-name.md` in tgdrive",
+      {
+        op: "move",
+        path: MOCK_INBOX,
+        expected: MOCK_BLOB,
+        to: "20-archive/2026/inbox-october-with-a-very-long-name.md",
+      },
+      {
+        ...base,
+        op: "move",
+        path: MOCK_INBOX,
+        to: "20-archive/2026/inbox-october-with-a-very-long-name.md",
+        preview: { hunks: [] },
+      },
+      14,
+    ),
+    mockWrite(
+      "write-delete",
+      "Delete `10-notes/old.md` in tgdrive",
+      { op: "delete", path: "10-notes/old.md", expected: MOCK_BLOB },
+      {
+        ...base,
+        op: "delete",
+        path: "10-notes/old.md",
+        preview: { hunks: [], deleted: { lines: ["# Old", "nothing to keep"], more: 0 } },
+      },
+      15,
+    ),
+    mockWrite(
+      "write-crlf",
+      "Replace the text of `10-notes/windows.md` in tgdrive (22 bytes)",
+      { op: "replace", path: "10-notes/windows.md", expected: MOCK_BLOB, content: "…" },
+      {
+        ...base,
+        op: "replace",
+        path: "10-notes/windows.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "# Written on Windows" },
+                { kind: "add", text: "# Written on Windows" },
+              ],
+            },
+          ],
+          lineEndings: "Line endings change: CRLF → LF.",
+        },
+      },
+      16,
+    ),
+    mockWrite(
+      "write-hidden",
+      "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 263 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        untrusted: true,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "- [ ] milk" },
+                {
+                  kind: "add",
+                  text: "- [x] milk⟨TAG U+E0049⟩⟨TAG U+E0067⟩⟨TAG U+E006E⟩⟨TAG U+E006F⟩⟨TAG U+E0072⟩⟨TAG U+E0065⟩…",
+                },
+                { kind: "add", text: "pay to ⟨U+202E⟩tnuocca-lacol⟨U+202C⟩ now" },
+              ],
+            },
+          ],
+        },
+        blocked: "This change contains hidden or reordering characters.",
+      },
+      17,
+    ),
+    mockWrite(
+      "write-large-append",
+      "Append 33 bytes to `40-journal/log.md` in tgdrive",
+      { op: "append", path: "40-journal/log.md", expected: MOCK_BLOB, text: "…" },
+      {
+        ...base,
+        op: "append",
+        path: "40-journal/log.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 5998,
+              newStart: 5998,
+              lines: [
+                { kind: "context", text: "- [ ] entry 5998" },
+                { kind: "context", text: "- [ ] entry 5999" },
+                { kind: "context", text: "- [ ] entry 6000" },
+                { kind: "add", text: "- [ ] PAY 4,000 EUR TO ACCOUNT X" },
+              ],
+            },
+          ],
+        },
+      },
+      18,
+    ),
+    mockWrite(
+      "write-rtl",
+      "Edit `10-notes/payments.md` in tgdrive: 11 bytes become 23 bytes",
+      {
+        op: "edit",
+        path: "10-notes/payments.md",
+        expected: MOCK_BLOB,
+        old_text: "…",
+        new_text: "…",
+      },
+      {
+        ...base,
+        op: "edit",
+        path: "10-notes/payments.md",
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "- [ ] milk" },
+                { kind: "add", text: "transfer א 900 100", rtl: true },
+              ],
+            },
+          ],
+          rtlNote: "Right-to-left text is shown in stored order.",
+        },
+      },
+      19,
+    ),
+    mockWrite(
+      "write-whitespace",
+      "Edit `10-notes/inbox.md` in tgdrive: 11 bytes become 12 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                { kind: "remove", text: "-·[·]·milk" },
+                {
+                  kind: "add",
+                  text: "-·[·]⍽milk·",
+                  note: "Only whitespace changes on this line.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      20,
+    ),
+    mockWrite(
+      "write-too-large",
+      "Create `10-notes/x.md` in tgdrive (262144 bytes)",
+      { op: "create", path: "10-notes/x.md", content: "…" },
+      {
+        ...base,
+        op: "create",
+        path: "10-notes/x.md",
+        preview: { hunks: [], tooLarge: "It takes 131072 lines; a card shows at most 5000." },
+        blocked: "This change is too large to show in full.",
+      },
+      21,
+    ),
+    mockWrite(
+      "write-long-line",
+      "Create `10-notes/t.md` in tgdrive (262144 bytes)",
+      { op: "create", path: "10-notes/t.md", content: "…" },
+      {
+        ...base,
+        op: "create",
+        path: "10-notes/t.md",
+        preview: {
+          hunks: [],
+          tooLarge: "A line of it takes 851968 characters; a card shows at most 10000 on one line.",
+        },
+        blocked: "This change is too large to show in full.",
+      },
+      22,
+    ),
+    mockWrite(
+      "write-over-1mb",
+      "Delete `20-archive/export.csv` in tgdrive",
+      { op: "delete", path: "20-archive/export.csv", expected: MOCK_BLOB },
+      {
+        ...base,
+        op: "delete",
+        path: "20-archive/export.csv",
+        preview: { hunks: [] },
+        blocked: '"20-archive/export.csv" is over 1 MB; agents can\'t change files that large.',
+      },
+      23,
+    ),
+    mockWrite(
+      "write-rtl-path",
+      "Move `10-notes/inbox.md` to `10-notes/א 900 100.md` in tgdrive",
+      { op: "move", path: MOCK_INBOX, expected: MOCK_BLOB, to: "10-notes/א 900 100.md" },
+      {
+        ...base,
+        op: "move",
+        path: MOCK_INBOX,
+        to: "10-notes/א 900 100.md",
+        rtl: true,
+        preview: { hunks: [], rtlNote: "Right-to-left text is shown in stored order." },
+      },
+      24,
+    ),
+    mockWrite(
+      "write-markers",
+      "Edit `10-notes/inbox.md` in tgdrive: 5 bytes become 5 bytes",
+      { op: "edit", path: MOCK_INBOX, expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: MOCK_INBOX,
+        preview: {
+          hunks: [
+            {
+              oldStart: 1,
+              newStart: 1,
+              lines: [
+                {
+                  kind: "remove",
+                  text: "a·⟨U+00B7⟩b",
+                  runs: [{ text: "a" }, { text: "·", mark: "space" }, { text: "⟨U+00B7⟩b" }],
+                },
+                {
+                  kind: "add",
+                  text: "a⟨U+00B7⟩·b",
+                  runs: [{ text: "a⟨U+00B7⟩" }, { text: "·", mark: "space" }, { text: "b" }],
+                  note: "Only whitespace changes on this line.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+      25,
+    ),
+    mockWrite(
+      "write-blocked",
+      "Edit `10-notes/todo.md` in tgdrive: 6 bytes become 7 bytes",
+      { op: "edit", path: "10-notes/todo.md", expected: MOCK_BLOB, old_text: "…", new_text: "…" },
+      {
+        ...base,
+        op: "edit",
+        path: "10-notes/todo.md",
+        preview: { hunks: [] },
+        blocked: '"10-notes/todo.md" changed on hesperia since the agent read it.',
+      },
+      16,
+    ),
+  );
+}
+
+/**
  * ?grants=refused|untrusted|unserved|decline-fails (109.11). `refused`: the server refuses every
  * grant write, as `hq.v15.agent` would (`grants::refused_because`), and the list starts with one
  * it refused; `untrusted`: alpha's device.1 has read outside content, so no card there offers a
@@ -6583,8 +7030,11 @@ function mockApproval(row: AgentApprovalVm): AgentApprovalVm {
   return {
     ...row,
     ...(grant ? { grant } : {}),
+    // `Writes::draw`: a write this device cannot carry out offers Deny only.
     actions: row.canDecide
-      ? ["allowOnce", ...(grant ? (["alwaysAllow", "sessionOnly"] as const) : []), "deny"]
+      ? row.write?.blocked
+        ? ["deny"]
+        : ["allowOnce", ...(grant ? (["alwaysAllow", "sessionOnly"] as const) : []), "deny"]
       : [],
     declinedBySend: row.state === "pending" && row.canDecide && !vm?.archived,
   };
@@ -7963,10 +8413,25 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       return hqRefuse("The action changed. Read it again before deciding.");
     if (sessionScenario === "refused")
       return hqRefuse("This T4 action must be approved from another host.");
+    if (payload.approve && row.write?.blocked) return hqRefuse(row.write.blocked);
     delete row.refused;
     row.state = payload.approve ? "approved" : "denied";
     row.canDecide = false;
     row.sentence = payload.approve ? "Approved by Ana" : "Denied by Ana";
+    if (row.write) {
+      // `Writes::allow` / `Writes::deny`: decided, taken, committed, and said on the card.
+      if (payload.approve) {
+        row.state = "consumed";
+        row.sentence = "Approved by Ana.";
+        row.write = { ...row.write, outcome: "Written as 1a2b3c4 on hesperia." };
+      } else if (row.write.blocked) {
+        row.write = { ...row.write, outcome: `Not written: ${row.write.blocked}` };
+      }
+      publishSessions();
+      return payload.approve
+        ? { state: "sent", sentence: "Approved and written as 1a2b3c4." }
+        : { state: "sent", sentence: "Denied." };
+    }
     publishSessions();
     if (sessionScenario === "queued") {
       setTimeout(() => {

@@ -425,6 +425,29 @@ pub fn lines_in_history(repo_path: &Path, lines: &HashSet<String>) -> Result<Has
     Ok(found)
 }
 
+/// A commit `HEAD` reaches whose keeper trailer block carries
+/// `Approval-Record: <approval>` ([`crate::provenance::MemoryTrailer::of_message`]):
+/// the commit that carried that approval out, once (109.27). The whole
+/// history is walked by the commit graph, never stopped by a commit's time:
+/// a commit's time is its author's clock, and a descendant dated before it
+/// (another device's wrong clock) must not hide it (R606). Only after a
+/// stop between taking an approval and saying what became of it.
+/// `None` when no commit carries it.
+pub fn carrying(repo_path: &Path, approval: &str) -> Result<Option<String>> {
+    let repo = open(repo_path)?;
+    let wanted = crate::provenance::MemoryTrailer::ApprovalRecord(approval.to_owned());
+    let mut found = None;
+    each_reached(&repo, |info| {
+        let commit = info.object().map_err(|err| walk_error(&err))?;
+        let message = commit.message_raw().map_err(|err| walk_error(&err))?;
+        if crate::provenance::MemoryTrailer::of_message(&message.to_str_lossy()).contains(&wanted) {
+            found = Some(commit.id().to_hex().to_string());
+        }
+        Ok(found.is_none())
+    })?;
+    Ok(found)
+}
+
 /// One path's bytes as of `rev`, or `None` where that revision does not hold
 /// the path. `rev` is anything `git rev-parse` accepts — a full or abbreviated
 pub fn blob_at(repo_path: &Path, rev: &str, rel: &str) -> Result<Option<Vec<u8>>> {

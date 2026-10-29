@@ -1311,6 +1311,16 @@ impl Engine {
         ))
     }
 
+    pub async fn approval_commit(
+        self: &Arc<Self>,
+        _profile_id: &str,
+        _approval: &str,
+    ) -> Result<Option<String>> {
+        Err(SyncError::Config(
+            "an authored commit is read only on a Unix host".to_owned(),
+        ))
+    }
+
     fn settle_commit_paths(&self, _profile: &SyncProfile) -> Result<bool> {
         Ok(false)
     }

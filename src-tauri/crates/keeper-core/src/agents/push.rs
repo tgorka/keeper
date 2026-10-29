@@ -336,15 +336,144 @@ pub(crate) fn unreadable(c: char) -> bool {
     misreads(c) || hidden(c)
 }
 
+/// The `Extended_Pictographic` code points of Unicode 16.0's emoji data
+/// (`emoji-data.txt`), as ranges: where an emoji sequence starts.
+const PICTOGRAPHIC: [(u32, u32); 77] = [
+    (0x00a9, 0x00a9),
+    (0x00ae, 0x00ae),
+    (0x203c, 0x203c),
+    (0x2049, 0x2049),
+    (0x2122, 0x2122),
+    (0x2139, 0x2139),
+    (0x2194, 0x2199),
+    (0x21a9, 0x21aa),
+    (0x231a, 0x231b),
+    (0x2328, 0x2328),
+    (0x2388, 0x2388),
+    (0x23cf, 0x23cf),
+    (0x23e9, 0x23f3),
+    (0x23f8, 0x23fa),
+    (0x24c2, 0x24c2),
+    (0x25aa, 0x25ab),
+    (0x25b6, 0x25b6),
+    (0x25c0, 0x25c0),
+    (0x25fb, 0x25fe),
+    (0x2600, 0x2605),
+    (0x2607, 0x2612),
+    (0x2614, 0x2685),
+    (0x2690, 0x2705),
+    (0x2708, 0x2712),
+    (0x2714, 0x2714),
+    (0x2716, 0x2716),
+    (0x271d, 0x271d),
+    (0x2721, 0x2721),
+    (0x2728, 0x2728),
+    (0x2733, 0x2734),
+    (0x2744, 0x2744),
+    (0x2747, 0x2747),
+    (0x274c, 0x274c),
+    (0x274e, 0x274e),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2763, 0x2767),
+    (0x2795, 0x2797),
+    (0x27a1, 0x27a1),
+    (0x27b0, 0x27b0),
+    (0x27bf, 0x27bf),
+    (0x2934, 0x2935),
+    (0x2b05, 0x2b07),
+    (0x2b1b, 0x2b1c),
+    (0x2b50, 0x2b50),
+    (0x2b55, 0x2b55),
+    (0x3030, 0x3030),
+    (0x303d, 0x303d),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0x1f000, 0x1f0ff),
+    (0x1f10d, 0x1f10f),
+    (0x1f12f, 0x1f12f),
+    (0x1f16c, 0x1f171),
+    (0x1f17e, 0x1f17f),
+    (0x1f18e, 0x1f18e),
+    (0x1f191, 0x1f19a),
+    (0x1f1ad, 0x1f1e5),
+    (0x1f201, 0x1f20f),
+    (0x1f21a, 0x1f21a),
+    (0x1f22f, 0x1f22f),
+    (0x1f232, 0x1f23a),
+    (0x1f23c, 0x1f23f),
+    (0x1f249, 0x1f3fa),
+    (0x1f400, 0x1f53d),
+    (0x1f546, 0x1f64f),
+    (0x1f680, 0x1f6ff),
+    (0x1f774, 0x1f77f),
+    (0x1f7d5, 0x1f7ff),
+    (0x1f80c, 0x1f80f),
+    (0x1f848, 0x1f84f),
+    (0x1f85a, 0x1f85f),
+    (0x1f888, 0x1f88f),
+    (0x1f8ae, 0x1f8ff),
+    (0x1f90c, 0x1f93a),
+    (0x1f93c, 0x1f945),
+    (0x1f947, 0x1faff),
+];
+
+/// Whether `c` is `Extended_Pictographic` ([`PICTOGRAPHIC`]).
+pub(crate) fn pictographic(c: char) -> bool {
+    let code = u32::from(c);
+    PICTOGRAPHIC
+        .iter()
+        .any(|(first, last)| (*first..=*last).contains(&code))
+}
+
+/// Whether `text[at]` is a hidden character an emoji sequence is made of,
+/// which shows nothing on its own (contract § 8 as amended, R606-03, and the
+/// coordinator's ruling on it):
+/// - U+FE0F VARIATION SELECTOR-16 directly after a pictograph (`❤️`), an
+///   emoji presentation sequence; U+FE0E and every other selector are not;
+/// - a single U+200D ZERO WIDTH JOINER between a pictograph (or a skin
+///   tone, U+1F3FB…U+1F3FF, or such a VS16) and a pictograph (`👨‍👩‍👧`).
+fn joins_emoji(text: &[char], at: usize) -> bool {
+    let before = at.checked_sub(1).map(|i| text[i]);
+    match text[at] {
+        '\u{fe0f}' => before.is_some_and(pictographic),
+        '\u{200d}' => {
+            let after = text.get(at + 1).copied();
+            let joined = |i: usize| {
+                let c = text[i];
+                pictographic(c)
+                    || ('\u{1f3fb}'..='\u{1f3ff}').contains(&c)
+                    || (c == '\u{fe0f}' && joins_emoji(text, i))
+            };
+            at.checked_sub(1).is_some_and(joined) && after.is_some_and(pictographic)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `text[at]` may not stand unescaped where a person decides on
+/// what they read: it is [`unreadable`], and not part of an emoji sequence
+/// ([`joins_emoji`]). The one classifier a notification's request and a
+/// drive write's card share.
+pub(crate) fn unreadable_at(text: &[char], at: usize) -> bool {
+    unreadable(text[at]) && !joins_emoji(text, at)
+}
+
+/// Whether `text` holds a character that is [`unreadable_at`].
+pub(crate) fn holds_unreadable_text(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len()).any(|at| unreadable_at(&chars, at))
+}
+
 /// Whether any string in `value` — a key or a value, at any depth — holds a
-/// character that is [`unreadable`].
+/// character that is [`unreadable_at`].
 pub(crate) fn holds_unreadable(value: &Value) -> bool {
     match value {
-        Value::String(text) => text.chars().any(unreadable),
+        Value::String(text) => holds_unreadable_text(text),
         Value::Array(items) => items.iter().any(holds_unreadable),
         Value::Object(map) => map
             .iter()
-            .any(|(key, value)| key.chars().any(unreadable) || holds_unreadable(value)),
+            .any(|(key, value)| holds_unreadable_text(key) || holds_unreadable(value)),
         _ => false,
     }
 }

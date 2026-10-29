@@ -35,9 +35,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::agents::push::{
-    holds_unreadable, misreads, open_body, shown_name, tier_word, unreadable, ActionRefusal,
-    ActionTap, ApnsEnvironment, Category, Gateway, NotificationAction, PushOpenVm, BODY_MAX_CHARS,
-    SHOWN_INFO,
+    holds_unreadable, holds_unreadable_text, misreads, open_body, shown_name, tier_word,
+    ActionRefusal, ActionTap, ApnsEnvironment, Category, Gateway, NotificationAction, PushOpenVm,
+    BODY_MAX_CHARS, SHOWN_INFO,
 };
 
 /// What a streamed answer's row says before its first words (the agents'
@@ -254,7 +254,7 @@ const PROMPT_VERBS: [&str; 2] = ["create_agent", "send_agent_prompt"];
 pub fn request_line(call: Option<&Map<String, Value>>) -> Option<String> {
     let call = call?;
     let tool = text(call, "name");
-    if tool.is_empty() || tool.chars().any(unreadable) {
+    if tool.is_empty() || holds_unreadable_text(tool) {
         return None;
     }
     let args = json_column(call, "args");
@@ -1110,8 +1110,17 @@ mod tests {
                 class,
             );
         }
-        // Visible characters next to those ranges are shown and still fit.
-        for visible in ["café", "a\u{2010}b", "x\u{fe10}y", "\u{1bc9f}"] {
+        // Visible characters next to those ranges are shown and still fit, and
+        // so are emoji sequences, one classifier with the drive write's card
+        // (R606-03 ruling): VS16 after a pictograph, a joiner between two.
+        for visible in [
+            "café",
+            "a\u{2010}b",
+            "x\u{fe10}y",
+            "\u{1bc9f}",
+            "I \u{2764}\u{fe0f} it",
+            "\u{2764}\u{fe0f}\u{200d}\u{1f525}",
+        ] {
             let read = approval_with("T2", summary, Some(run(json!(["cat", visible]))));
             let shown = show(classify(&pushed(ItemKind::Approval), &read, ANA, 1_500));
             assert_eq!(shown.category, Some(Category::Approval), "{visible}");
