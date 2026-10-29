@@ -2122,7 +2122,7 @@ async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
         Arc::clone(&other.routes) as Arc<dyn Routes>,
         Arc::new(signin::NoAccount),
         "keeper on another device".to_owned(),
-        || "other".to_owned(),
+        || DeviceHosts::same("other"),
     );
     there.start().await.expect("starts");
     assert_eq!(unseen_in(&there, &key), ["tgdrive"], "another device's");
