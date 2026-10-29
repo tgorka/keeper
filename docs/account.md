@@ -488,7 +488,18 @@ A callback whose `state` or `nonce` does not match is refused.
 **The forge leg (`oauth` mode).** keeper runs a second sign-in against the forge, in the
 same browser session:
 - When `signin_url` is set, keeper opens it with `{authorize_path_and_query}` filled in, so
-  the forge's own identity-provider login carries you through.
+  the forge's own identity-provider login carries you through. The value is the
+  authorization request's path and query, percent-encoded down to RFC 3986's unreserved
+  characters (`&`, `=`, `?`, `/`, `%`, `#`, `+` and spaces all escaped), so it is one value
+  wherever the template puts it — the query (`?redirect_to=`, every template so far), a path
+  segment or a fragment. Unencoded, a forge reads `client_id`, `state` and the rest as its
+  own parameters and answers "Client ID not registered". The sign-in sheet, the default
+  browser and the link to copy by hand all carry that one URL.
+- **On an iPhone the forge's sheet waits for keeper's window.** It is asked for while the
+  identity provider's sheet is still going away; it opens once keeper's window is active and
+  that sheet has been gone a second, however long that takes while keeper is in front. It
+  gives up — and offers the link — only when keeper has been in the background for two
+  seconds, or Apple refused the sheet three times (`keeper_core::sign_in_sheet`).
 - The `scope` string is sent byte for byte the same on every device and version.
 - **The forge must agree who you are.** If it signs you in as someone else, the connection
   is refused and its tokens are discarded: "The forge signed you in as ana, but your keeper

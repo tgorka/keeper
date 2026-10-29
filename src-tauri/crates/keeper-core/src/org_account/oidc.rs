@@ -528,17 +528,42 @@ impl Drop for FlowGuard<'_> {
     }
 }
 
-/// `{authorize_path_and_query}` in a forge's `signin_url`, filled with the
-/// authorization request's path and query, query-encoded, so the forge's own
+/// What [`fill_signin_url`] leaves unencoded: RFC 3986's `unreserved` set
+/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`), and nothing else.
+const SIGNIN_VALUE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// A forge's `signin_url` with `{authorize_path_and_query}` filled with the
+/// authorization request's path and query, so the forge's own
 /// identity-provider login lands back on the authorization request.
+///
+/// The one place that substitution happens: the sign-in sheet (iOS), the
+/// default browser (macOS, desktop) and the link on screen to copy by hand
+/// all carry the URL this returns (`authorize` → `sign_in_link::offer`).
+///
+/// The value is percent-encoded down to RFC 3986's `unreserved` characters —
+/// `&`, `=`, `?`, `/`, `%`, `#`, `+` and a space included — so it stays one
+/// opaque value wherever the template puts it. Every template keeper has met
+/// puts it in the query (`…/user/oauth2/<source>?redirect_to={…}`), where an
+/// unencoded `&` hands the forge `client_id`, `state` and the rest as its
+/// own parameters and keeps only `…/authorize?response_type=code` — which
+/// Forgejo then answers with "Client ID not registered" (electra, 2026-10-28).
+/// The same encoding is also a valid path segment and a valid fragment, so a
+/// template that put it there would get one segment or one fragment, never
+/// a path that walks elsewhere. A space is `%20`, not form encoding's `+`:
+/// a forge that decodes the query as RFC 3986 rather than as a form reads
+/// the same request.
 fn fill_signin_url(signin_url: &str, authorize: &Url) -> String {
     let mut path_and_query = authorize.path().to_owned();
     if let Some(query) = authorize.query() {
         path_and_query.push('?');
         path_and_query.push_str(query);
     }
-    let encoded: String = url::form_urlencoded::byte_serialize(path_and_query.as_bytes()).collect();
-    signin_url.replace("{authorize_path_and_query}", &encoded)
+    let encoded = percent_encoding::utf8_percent_encode(&path_and_query, SIGNIN_VALUE).to_string();
+    signin_url.replace(super::descriptor::AUTHORIZE_PLACEHOLDER, &encoded)
 }
 
 /// Check a callback against the attempt it answers and return its code.
@@ -3542,7 +3567,20 @@ mod tests {
             .await
             .expect("connected");
 
-        let shown = Url::parse(&p.shown.lock().expect("shown")[0].0).expect("url");
+        let sheet = p.shown.lock().expect("shown")[0].0.clone();
+        let link = p.links.lock().expect("links")[0]
+            .clone()
+            .expect("the link on screen");
+        assert_eq!(
+            link.url, sheet,
+            "the link to copy by hand is the page the sheet or browser was given"
+        );
+        assert_eq!(
+            forge_reads(&sheet).len(),
+            1,
+            "the forge reads one parameter, redirect_to"
+        );
+        let shown = Url::parse(&sheet).expect("url");
         assert_eq!(shown.path(), "/user/oauth2/acme");
         let authorize = shown.join(&one(&shown, "redirect_to")).expect("inner");
         assert_eq!(
@@ -4351,19 +4389,97 @@ mod tests {
 
     // ---- pure helpers ----------------------------------------------------
 
+    /// makistack's descriptor's `signin_url`, as published to the devices.
+    const MAKISTACK_SIGNIN: &str =
+        "https://electra.siren-alsephina.ts.net/git/user/oauth2/zitadel?redirect_to={authorize_path_and_query}";
+
+    /// The query of a filled `signin_url`, split the way a forge splits it:
+    /// as a form (Go's `url.ParseQuery`, which Forgejo uses).
+    fn forge_reads(filled: &str) -> Vec<(String, String)> {
+        let (_, query) = filled.split_once('?').expect("a query");
+        url::form_urlencoded::parse(query.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    /// The request kalypso sent at 08:22:28Z on 2026-10-28 (Forgejo's router
+    /// log; `state`, `code_challenge` and `nonce` replaced). Unencoded, the
+    /// forge kept `redirect_to=/git/login/oauth/authorize?response_type=code`
+    /// and answered the callback with "Client ID not registered". Built by
+    /// keeper from the same template, it is one `redirect_to` carrying the
+    /// whole authorization request.
     #[test]
-    fn the_signin_url_carries_the_authorize_request_query_encoded() {
+    fn the_request_from_the_forge_log_comes_out_as_one_encoded_redirect_to() {
+        let inner = "/git/login/oauth/authorize?response_type=code\
+             &client_id=232f4981-7dcc-4d3c-9ded-39af2a8a851c&state=S7a-_b&code_challenge=C9x-_y\
+             &code_challenge_method=S256&redirect_uri=keeper%3A%2F%2Foauth%2Fforgejo%2Fcallback\
+             &scope=openid+profile+write%3Arepository&nonce=N3c-_d";
         let authorize =
-            Url::parse("https://git.acme.dev/git/login/oauth/authorize?client_id=c&state=s%20t")
-                .expect("url");
+            Url::parse(&format!("https://electra.siren-alsephina.ts.net{inner}")).expect("url");
+
+        let filled = fill_signin_url(MAKISTACK_SIGNIN, &authorize);
+
+        assert_eq!(
+            filled,
+            "https://electra.siren-alsephina.ts.net/git/user/oauth2/zitadel?redirect_to=\
+             %2Fgit%2Flogin%2Foauth%2Fauthorize%3Fresponse_type%3Dcode\
+             %26client_id%3D232f4981-7dcc-4d3c-9ded-39af2a8a851c%26state%3DS7a-_b\
+             %26code_challenge%3DC9x-_y%26code_challenge_method%3DS256\
+             %26redirect_uri%3Dkeeper%253A%252F%252Foauth%252Fforgejo%252Fcallback\
+             %26scope%3Dopenid%2Bprofile%2Bwrite%253Arepository%26nonce%3DN3c-_d"
+        );
+        assert_eq!(
+            forge_reads(&filled),
+            vec![("redirect_to".to_owned(), inner.to_owned())],
+            "the forge sees one parameter, and the authorization request whole inside it"
+        );
+    }
+
+    /// `&`, `#`, `%`, `+`, `=`, `?`, `/` and a space inside the authorization
+    /// request come back out of `redirect_to` byte for byte — read as a form
+    /// (Forgejo) or as plain RFC 3986 percent-encoding — and the parameter
+    /// they sit in reads back as it was sent.
+    #[test]
+    fn reserved_characters_in_the_authorize_request_round_trip_through_redirect_to() {
+        let state = "a&b#c%d+e=f?g/h i~j*k";
+        let mut authorize =
+            Url::parse("https://git.acme.dev/git/login/oauth/authorize").expect("url");
+        authorize
+            .query_pairs_mut()
+            .append_pair("client_id", "c")
+            .append_pair("state", state);
+        let inner = format!(
+            "{}?{}",
+            authorize.path(),
+            authorize.query().expect("a query")
+        );
+
         let filled = fill_signin_url(
             "https://git.acme.dev/git/user/oauth2/acme-id?redirect_to={authorize_path_and_query}",
             &authorize,
         );
-        let filled = Url::parse(&filled).expect("url");
-        assert_eq!(
-            one(&filled, "redirect_to"),
-            "/git/login/oauth/authorize?client_id=c&state=s%20t"
+
+        let (_, raw) = filled
+            .split_once("?redirect_to=")
+            .expect("the placeholder's spot");
+        assert!(
+            raw.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b)),
+            "only unreserved characters and escapes: {raw}"
         );
+        assert_eq!(
+            forge_reads(&filled),
+            vec![("redirect_to".to_owned(), inner.clone())]
+        );
+        assert_eq!(
+            percent_encoding::percent_decode_str(raw)
+                .decode_utf8()
+                .expect("utf-8"),
+            inner,
+            "a forge decoding RFC 3986 rather than a form reads the same request"
+        );
+        let back = authorize.join(&inner).expect("the inner request");
+        assert_eq!(one(&back, "state"), state);
+        assert_eq!(one(&back, "client_id"), "c");
     }
 }

@@ -256,7 +256,7 @@ pub struct ForgeOauth {
 
 const DEFAULT_GIT_USERNAME: &str = "oauth2";
 const DEFAULT_USERNAME_FIELD: &str = "login";
-const AUTHORIZE_PLACEHOLDER: &str = "{authorize_path_and_query}";
+pub(crate) const AUTHORIZE_PLACEHOLDER: &str = "{authorize_path_and_query}";
 const API_BASE_PLACEHOLDER: &str = "{api_base}";
 
 fn default_scopes() -> Vec<String> {

@@ -407,11 +407,16 @@ safe binding. Current inventory:
   `ASWebAuthenticationSessionCallback` — the epic's one new crate), behind
   `keeper_core::platform::Platform::start_web_auth` — `crates/keeper/src/web_auth_apple.rs`:
   the `anchor` module (`#[allow(unsafe_code)]` on the module, because `define_class!` is
-  `unsafe impl`s by construction), `window_of` (`UIWindow` through `PlatformWebview::view_controller`), `anchor_state` (three `msg_send!` reads — `windowScene`, `activationState`, `isKeyWindow` — so a window that is not the active one is waited for rather than refused by Apple), `present`, `is_session_error` and `cancel_all` —
+  `unsafe impl`s by construction), `window_of` (`UIWindow` through `PlatformWebview::view_controller`), `anchor_state` (three `msg_send!` reads — `windowScene`, `activationState`, `isKeyWindow` — so a window that is not the active one is waited for rather than refused by Apple; when to present and when to give up is `keeper_core::sign_in_sheet`'s, and `activation`/`previous_sheet` beside it hold no `unsafe`), `present`, `is_session_error` and `dismiss` (`cancel` on sheets keeper has already retired; `cancel` and `cancel_for` reach it and hold no `unsafe`) —
   each function-level `#[allow(unsafe_code)]` with a `// SAFETY:` comment on every block.
-  The session, the anchor (a weak property on the session) and the completion block are
-  held together in a main-thread table keyed by the flow's `state` until the main
-  thread's next turn after the completion ran, never released from inside it. The
+  Which sheets are open is `keeper_core::sign_in_sheet::Sheets`, a main-thread table
+  keyed by a per-sheet id: a sheet retires explicitly on its completion, keeper's own
+  cancel, a refused `start` and its sign-in's deadline — never by waiting for a completion
+  after keeper's `cancel()`, which Apple does not promise (R608-01) — and a completion that
+  finds its sheet retired does nothing. The session, the anchor (a weak property on the
+  session) and the completion block are held together until `RETENTION` (2 s) after the
+  retirement and released by a task queued from a background thread, so never inside the
+  completion (tauri-runtime-wry runs `run_on_main_thread` inline on the main thread). The
   completion hands the callback URL to `OAuthFlowRegistry::resolve`, a cancel to
   `OAuthFlowRegistry::cancel` for that one `state`, and any other ending to the flow as an
   `error=` callback so it ends at once (`crates/keeper/src/web_auth.rs`, tested on Linux).
