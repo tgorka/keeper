@@ -4401,8 +4401,9 @@ export async function agentSessionDefault(): Promise<AgentDefaultSessionVm | nul
 
 /**
  * A person was shown the warning of the tick `tick` of `drive` in this chat and said OK (R-HQ-79):
- * Rust records that tick, and only that one, as seen on this device. A warning shown for a tick
- * since replaced acknowledges nothing; a tick with no id (`null`) is given one as the person.
+ * Rust records only a matching non-null tick as seen on this device; a stale id acknowledges
+ * nothing. A null id refuses while the drive is selected: Untick it, then select it again.
+ * If the drive is already unticked, this is a harmless no-op.
  */
 export async function agentNoteTickSeen(
   target: AgentSessionRef,
