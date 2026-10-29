@@ -30,8 +30,15 @@
 //!   returning, which only says the outbox took it.
 //! - **The risk is said where a drive is ticked** ([`WARNING`]; D-34's
 //!   accepted risk, R-HQ-79).
+//! - **The Notes Assistant's tick** ([`Hq::session_for_note`], R-HQ-86):
+//!   opened on a note, the dock ticks the note's drive as the person, by the
+//!   same rules a click does. Nowhere else is a drive ticked for the person.
+//!   keeper never takes the tick back. Any ticked drive this person has not
+//!   been shown [`WARNING`] for on this device ([`SeenTicks`]) draws it
+//!   beside its chip, with Untick and OK, wherever the session is shown.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -39,7 +46,8 @@ use ts_rs::TS;
 
 use crate::hq::port::{Rejection, ReplicaError, RowOp, CONFLICT};
 use crate::hq::sessions::{
-    self, authored, int, json, names, object, opt_text, read, text, AgentSessionRef, Source,
+    self, authored, int, json, names, object, opt_text, read, text, AgentNoteSessionVm,
+    AgentSessionRef, Source,
 };
 use crate::hq::timeline::{self, SessionRow};
 use crate::hq::{Hq, HqError};
@@ -91,6 +99,14 @@ pub struct AgentSessionDrivesVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub refused: Option<String>,
+    /// Ticked drives this person has not been shown [`WARNING`] for on this
+    /// device (round 6 ruling, [`SeenTicks`]): a tick the Notes Assistant,
+    /// another device or a carry made, or one whose record was lost. Drawn
+    /// beside the chips with Untick and OK wherever the session is shown;
+    /// read from the same selection as the chips, so the two agree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub unseen: Vec<String>,
 }
 
 /// Who reads each database this device holds: the people of its directory.
@@ -390,6 +406,15 @@ fn audience(
     }
 }
 
+/// Whether everyone who reads `source`'s database reads `drive` too, as
+/// this device can establish it (D-34's audience rule, the same judgement a
+/// tick gets): the drive is the database itself, or both directories are
+/// held and the database's people are among the drive's. Unknown readers
+/// are not "everyone", so they answer `false` (R605-01).
+pub(crate) fn read_by_every_reader(source: &Source, drive: &str, sources: &[Source]) -> bool {
+    audience(source, drive, &Audiences::read(sources), &HashMap::new()) == Verdict::Allowed
+}
+
 /// What the server's refusal of a selection says about `drive`, a drive of
 /// it keeper knows fails that way, or about the selection when `drive` is
 /// `None`.
@@ -624,6 +649,7 @@ pub fn view(
         warning: WARNING.to_owned(),
         pending,
         refused,
+        unseen: Vec::new(),
     })
 }
 
@@ -753,6 +779,16 @@ pub fn carry(
     Ok(())
 }
 
+/// Said when the note's folder declares no drive.
+pub const NO_DRIVE: &str = "This note's folder is not a drive, so no drive is ticked.";
+
+/// The one lock the person's tick or untick, the Notes Assistant's tick,
+/// and the seen record beside them go through (R605-09): a tick and its
+/// record, or an untick and its record's removal, are one step to each
+/// other. (`/clean`'s carry and replication write ticks without it; neither
+/// records anything as seen.)
+static DRIVE_WRITES: Mutex<()> = Mutex::new(());
+
 /// The row's values: the drives as a JSON array, `[]` for none.
 fn selection(session_id: &str, drives: &[String], now_ms: i64) -> Map<String, Value> {
     object(serde_json::json!({
@@ -762,8 +798,83 @@ fn selection(session_id: &str, drives: &[String], now_ms: i64) -> Map<String, Va
     }))
 }
 
+/// The ticked drives this person has been shown [`WARNING`] for on this
+/// device and answered, by `database`, `session` and `drive` (R-HQ-79;
+/// round 6 ruling). Any ticked drive **not** in it draws the warning with
+/// Untick and OK wherever its session is shown
+/// ([`AgentSessionDrivesVm::unseen`]), so what is lost fails toward the
+/// warning: a missing, unreadable or older file is an empty record, and a
+/// tick made by the Notes Assistant, by another device or by a carry warns
+/// here until it is answered here. A tick the person makes in the drive
+/// menu — where the warning stands beside every drive — is recorded when it
+/// is made; one the dock makes is not.
+pub(crate) struct SeenTicks {
+    path: std::path::PathBuf,
+}
+
+/// One entry of the record: database, session, drive.
+type SeenKey = (String, String, String);
+
+impl SeenTicks {
+    pub(crate) fn at(root: &std::path::Path) -> SeenTicks {
+        SeenTicks {
+            path: root.join("drive-ticks-seen.json"),
+        }
+    }
+
+    /// The record; anything that does not read as one is no record at all.
+    fn read(&self) -> BTreeSet<SeenKey> {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "the drive ticks seen could not be read; every tick warns");
+                }
+                return BTreeSet::new();
+            }
+        };
+        serde_json::from_str(&raw).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the drive ticks seen do not read; every tick warns");
+            BTreeSet::new()
+        })
+    }
+
+    /// Written whole to a new file and renamed over the old one, so a crash
+    /// never leaves half a record.
+    fn write(&self, seen: &BTreeSet<SeenKey>) -> std::io::Result<()> {
+        let raw = serde_json::to_string(seen).map_err(std::io::Error::other)?;
+        let fresh = self.path.with_extension("json.new");
+        std::fs::write(&fresh, raw)?;
+        std::fs::rename(&fresh, &self.path)
+    }
+
+    fn change(&self, change: impl FnOnce(&mut BTreeSet<SeenKey>)) -> std::io::Result<()> {
+        let mut seen = self.read();
+        let before = seen.clone();
+        change(&mut seen);
+        if seen == before {
+            return Ok(());
+        }
+        self.write(&seen)
+    }
+}
+
+fn seen_key(database: &str, session: &str, drive: &str) -> SeenKey {
+    (database.to_owned(), session.to_owned(), drive.to_owned())
+}
+
 impl Hq {
-    /// Tick or untick one drive for a session's agent to read.
+    fn seen_ticks(&self) -> Result<SeenTicks, HqError> {
+        Ok(SeenTicks::at(&crate::hq::databases::root(
+            &self.data_dir()?,
+        )))
+    }
+
+    /// Tick or untick one drive for a session's agent to read: the person's
+    /// own choice in the drive menu, where [`WARNING`] stands beside every
+    /// drive, so a tick is recorded as seen and an untick drops its record,
+    /// in the same step ([`DRIVE_WRITES`]). A record that cannot be written
+    /// only means the warning is said once more.
     pub fn set_session_drive(
         &self,
         key: &AgentSessionRef,
@@ -771,6 +882,8 @@ impl Hq {
         tick: bool,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
+        let seen = self.seen_ticks()?;
+        let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
         set(
             &source,
             &key.session_id,
@@ -780,8 +893,133 @@ impl Hq {
             sessions::now_ms(),
         )
         .map_err(|refused| HqError::Sentence(refused.0))?;
+        let entry = seen_key(&key.database, &key.session_id, drive);
+        let recorded = seen.change(|seen| {
+            if tick {
+                seen.insert(entry);
+            } else {
+                seen.remove(&entry);
+            }
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "a drive tick seen could not be recorded");
+        }
         self.touch();
         Ok(())
+    }
+
+    /// The Notes Assistant opened on a note on `drive` (109.28, R-HQ-86;
+    /// `None`: its folder declares no drive). The default agent's newest
+    /// unarchived session in the drive's database, or one started there with
+    /// this device's last `pick` for the agent, and the drive ticked in it as
+    /// the person when it is not yet. The tick is not recorded as seen, so
+    /// wherever the session is shown its warning stands beside the chip
+    /// until a person says OK or unticks it (round 6 ruling). A drive the
+    /// agent does not offer, or V17 refuses, stays unticked and the answer
+    /// says why. `None` with no default agent.
+    ///
+    /// Nothing here is ever taken back: an answer the dock no longer wants
+    /// leaves its tick as a tick of that session, warning and all.
+    pub fn session_for_note(
+        &self,
+        drive: Option<&str>,
+        pick: Option<&crate::hq::settings::AgentSettingsPick>,
+    ) -> Result<Option<AgentNoteSessionVm>, HqError> {
+        let data_dir = self.data_dir()?;
+        let chosen = crate::registry::get_agents_default(&data_dir)?;
+        let last = sessions::last_choices(&data_dir);
+        let sources = self.sources();
+        let now = sessions::now_ms();
+        let answer = |target, drive: Option<&str>, reason: Option<String>| AgentNoteSessionVm {
+            target,
+            drive: drive.map(str::to_owned),
+            reason,
+        };
+        let Some(drive) = drive else {
+            return Ok(
+                sessions::default_session(&sources, chosen.as_deref(), &last, now)
+                    .map(|target| answer(target, None, Some(NO_DRIVE.to_owned()))),
+            );
+        };
+        // Held from finding the drive's session to ticking it: two docks
+        // opened on one drive at once start one session, not two, and the
+        // person's own tick or untick runs before or after, never between.
+        let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((mut target, elsewhere)) =
+            sessions::note_session(&sources, chosen.as_deref(), &last, drive, now)
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = elsewhere {
+            return Ok(Some(answer(target, Some(drive), Some(reason))));
+        }
+        let source = self.source(drive)?;
+        let session_id = match &target.session_id {
+            Some(id) => id.clone(),
+            None => {
+                let id = sessions::create(&source, &target.agent_actor, "", pick, None)
+                    .map_err(|error| HqError::Sentence(error.to_string()))?;
+                target.session_id = Some(id.clone());
+                id
+            }
+        };
+        let (drives, _) = ticked(&source, &session_id);
+        if drives.iter().any(|ticked| ticked == drive) {
+            return Ok(Some(answer(target, Some(drive), None)));
+        }
+        let ticked = set(&source, &session_id, drive, true, &sources, now);
+        self.touch();
+        Ok(Some(match ticked {
+            Ok(()) => answer(target, Some(drive), None),
+            Err(DriveRefused(reason)) => answer(target, Some(drive), Some(reason)),
+        }))
+    }
+
+    /// A person was shown [`WARNING`] for `drive` in `key` and said OK
+    /// (R-HQ-79): recorded as seen on this device, and every open view is
+    /// told (R605-13).
+    pub fn note_tick_seen(&self, key: &AgentSessionRef, drive: &str) -> Result<(), HqError> {
+        let seen = self.seen_ticks()?;
+        let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.change(|seen| {
+            seen.insert(seen_key(&key.database, &key.session_id, drive));
+        })
+        .map_err(|error| HqError::Sentence(format!("keeper could not note that: {error}")))?;
+        self.touch();
+        Ok(())
+    }
+
+    /// The drives of `key` ticked now (`ticked`) that this person has not
+    /// been shown the warning for on this device: every one not in the seen
+    /// record. Each read also prunes the record (R605-12): an entry of a
+    /// database this device holds goes once its session is gone or its
+    /// drive is no longer ticked there. An entry of a database not held is
+    /// kept. Pruning only ever makes a warning show again.
+    pub(crate) fn unseen_ticks(&self, key: &AgentSessionRef, ticked_now: &[String]) -> Vec<String> {
+        let Ok(seen) = self.seen_ticks() else {
+            return ticked_now.to_vec();
+        };
+        let sources = self.sources();
+        let _writing = DRIVE_WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut record = seen.read();
+        let before = record.len();
+        record.retain(|(database, session, drive)| {
+            let Some(source) = sources.iter().find(|source| &source.database == database) else {
+                return true;
+            };
+            timeline::session_row(source, session).is_some()
+                && ticked(source, session).0.iter().any(|name| name == drive)
+        });
+        if record.len() != before {
+            if let Err(error) = seen.write(&record) {
+                tracing::debug!(%error, "the drive ticks seen could not be pruned");
+            }
+        }
+        ticked_now
+            .iter()
+            .filter(|drive| !record.contains(&seen_key(&key.database, &key.session_id, drive)))
+            .cloned()
+            .collect()
     }
 }
 

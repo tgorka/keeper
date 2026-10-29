@@ -376,7 +376,8 @@ fn ordered_ids(count: usize) -> impl Iterator<Item = String> {
 /// `attachments` rows and the session's last activity committed, in one step
 /// of the replica's owner — so no round can upload a blob, and nothing can
 /// evict it, before the commit that references it pins it. The message's
-/// id.
+/// id. `focus` is the note open in front of the person (109.28), as a text
+/// message carries it.
 pub fn attach(
     source: &Source,
     decisions: &crate::hq::approvals::Decisions,
@@ -384,6 +385,7 @@ pub fn attach(
     caption: &str,
     files: Vec<StagedFile>,
     shown: &[crate::hq::approvals::ShownApprovalVm],
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<String, AttachError> {
     if files.is_empty() {
         return Err(AttachError::Nothing);
@@ -403,7 +405,15 @@ pub fn attach(
     } else {
         caption
     };
-    let mut ops = vec![person_message(source, session_id, &message_id, body, at)];
+    let metadata = focus.map(crate::hq::send::AgentFocus::metadata);
+    let mut ops = vec![person_message(
+        source,
+        session_id,
+        &message_id,
+        body,
+        metadata,
+        at,
+    )];
     let mut blobs = Vec::with_capacity(files.len());
     let ids = ordered_ids(files.len());
     for (file, id) in files.into_iter().zip(ids) {

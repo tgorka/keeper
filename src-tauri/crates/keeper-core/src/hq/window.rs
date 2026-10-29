@@ -318,11 +318,31 @@ impl Hq {
         let refusals = self.refusals();
         let mut view = view_now(&source, &key.session_id, &opened, &refusals, now_ms)
             .map_err(HqError::Sentence)?;
+        // Said under a message sent again without the note (§ 9.1a).
+        if let Ok(data_dir) = self.data_dir() {
+            let withheld = send::withheld(&crate::hq::databases::root(&data_dir), &key.database);
+            for message in &mut view.messages {
+                if let Some(sentence) = withheld.get(&message.id) {
+                    message.note = Some(sentence.clone());
+                }
+            }
+        }
         if let Some(session) = timeline::session_row(&source, &key.session_id) {
             view.drives = drives::view(&source, &key.session_id, &session, &self.sources());
         }
         self.writes
             .draw(&self.sources(), &source, &mut view.approvals_mut());
+        // Ticked drives this person has not been shown the warning for on
+        // this device, read beside the chips from the same selection.
+        if let Some(drives) = view.drives.as_mut() {
+            let ticked: Vec<String> = drives
+                .drives
+                .iter()
+                .filter(|drive| drive.ticked)
+                .map(|drive| drive.name.clone())
+                .collect();
+            drives.unseen = self.unseen_ticks(key, &ticked);
+        }
         if let Some(held) = lock(&self.views).get_mut(key) {
             held.live.settle(&opened.live, &view.live);
         }
@@ -577,16 +597,42 @@ impl Hq {
         Ok(())
     }
 
+    /// The messages of `database` the server refused for their focus's
+    /// audience, written again without it (contract § 9.1a,
+    /// [`send::resend_without_focus`]).
+    pub(crate) fn resend_withheld(&self, database: &str) {
+        let (Ok(source), Ok(data_dir)) = (self.source(database), self.data_dir()) else {
+            return;
+        };
+        match send::resend_without_focus(&source, &crate::hq::databases::root(&data_dir)) {
+            Ok(0) => {}
+            Ok(_) => self.touch(),
+            Err(error) => {
+                tracing::warn!(%database, %error, "a message refused for its note could not be sent again")
+            }
+        }
+    }
+
     /// Write a person's message into a session; it declines the requests its
-    /// banner showed (`shown`) that still wait for them (Q109-12 a).
+    /// banner showed (`shown`) that still wait for them (Q109-12 a). `focus`
+    /// is the note open in front of them in the Notes Assistant (109.28).
     pub fn send(
         &self,
         key: &AgentSessionRef,
         body: &str,
         shown: &[ShownApprovalVm],
+        focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
-        let sent = send::send(&source, self.decisions()?, &key.session_id, body, shown);
+        let focus = send::AgentFocus::for_destination(focus, &source, &self.sources());
+        let sent = send::send(
+            &source,
+            self.decisions()?,
+            &key.session_id,
+            body,
+            shown,
+            focus,
+        );
         self.touch();
         sent.map_err(sentence)
     }
@@ -629,12 +675,14 @@ impl Hq {
     /// The composer's one Send: every file `handles` name, with `caption`
     /// as its text, committed as one new message of the session — or
     /// nothing, with the sentence. The handles are spent either way.
+    /// `focus` is the note open in front of the person (109.28).
     pub fn commit_attachments(
         &self,
         key: &AgentSessionRef,
         handles: &[String],
         caption: &str,
         shown: &[ShownApprovalVm],
+        focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let files = self.staging.take(key, handles).map_err(sentence)?;
         // 109.24: a mention starts its own thread and carries no files; the
@@ -643,6 +691,7 @@ impl Hq {
             return Err(HqError::Sentence(crate::hq::mention::WITH_FILES.to_owned()));
         }
         let source = self.source(&key.database)?;
+        let focus = send::AgentFocus::for_destination(focus, &source, &self.sources());
         let attached = attachments::attach(
             &source,
             self.decisions()?,
@@ -650,6 +699,7 @@ impl Hq {
             caption,
             files,
             shown,
+            focus,
         );
         self.touch();
         attached.map_err(sentence)?;
@@ -689,13 +739,16 @@ impl Hq {
     /// Open a session with `agent` in `database` and write its first
     /// message; the database is remembered as the person's choice. `pick`
     /// is this device's last model and effort for `agent`: what it still
-    /// offers starts the session's settings (Q109-16 b).
+    /// offers starts the session's settings (Q109-16 b). `focus` is the note
+    /// in front of the person when the Notes Assistant starts the session
+    /// (109.28), carried by the first message where its audience allows.
     pub fn new_session(
         &self,
         database: &str,
         agent: &str,
         body: &str,
         pick: Option<&crate::hq::settings::AgentSettingsPick>,
+        focus: Option<&send::AgentFocus>,
     ) -> Result<AgentSessionRef, HqError> {
         if body.trim().is_empty() {
             return Err(HqError::Sentence("Write something first.".to_owned()));
@@ -712,7 +765,8 @@ impl Hq {
             )));
         }
         let source = self.source(database)?;
-        let session_id = sessions::create(&source, agent, body, pick).map_err(sentence)?;
+        let focus = send::AgentFocus::for_destination(focus, &source, &sources);
+        let session_id = sessions::create(&source, agent, body, pick, focus).map_err(sentence)?;
         sessions::remember_choice(&self.data_dir()?, agent, database);
         self.touch();
         Ok(AgentSessionRef {

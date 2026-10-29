@@ -1,13 +1,14 @@
 /**
  * The caret's line in each note an editor holds open, and the editor's buffer.
  *
- * The notes view's assistant dock tells the proxy which note is in front of the
- * person and where in it (UX-DR130): Rust turns `(vault, note, line, text)` into
- * the note's drive, path and the heading above the line. The editor owns the
- * caret and the buffer, so it publishes both here on every selection or
- * document change; the dock reads the active panel's note out of it. The
- * buffer is CodeMirror's immutable `Text`, so publishing it copies nothing: the
- * dock slices out what Rust reads only when it sends.
+ * The notes view's assistant dock tells the agent which note is in front of the
+ * person and where in it (UX-DR130, 109.28): Rust turns `(vault, note, line,
+ * text)` into the note's drive, path and the heading above the line, carried by
+ * the message as `metadata.focus`. The editor owns the caret and the buffer, so
+ * it publishes both here on every selection or document change; the dock reads
+ * the active panel's note out of it ({@link focusInFront}). The buffer is
+ * CodeMirror's immutable `Text`, so publishing it copies nothing: the dock
+ * slices out what Rust reads only when it sends.
  *
  * The line is 1-based in the editor's buffer — the note's body, without the
  * frontmatter, which is never in the buffer. Two panels on one note publish to
@@ -16,6 +17,8 @@
 import type { Text } from "@codemirror/state";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import type { AgentNoteCaret } from "@/lib/ipc/client";
+import { activePanel, panelsStore } from "@/lib/stores/panels";
 
 /** Where the caret is in one note, and the buffer it is in. */
 export interface NoteCaret {
@@ -66,6 +69,25 @@ export function useNoteCaret(vaultId: string | null, noteId: string | null): Not
 export function textThroughCaret(caret: NoteCaret): string {
   const line = Math.min(Math.max(caret.line, 1), caret.doc.lines);
   return caret.doc.sliceString(0, caret.doc.line(line).to);
+}
+
+/**
+ * What the assistant dock sends with a message (109.28): the note the active panel shows, its
+ * caret's line and the buffer through it, read at the moment of sending. Rust names the note's
+ * drive, path and heading from it (`metadata.focus`). `null` while the active panel shows no note,
+ * or its editor has not placed a caret yet.
+ */
+export function focusInFront(): AgentNoteCaret | null {
+  const target = activePanel(panelsStore.getState())?.target;
+  if (target?.kind !== "note") return null;
+  const caret = caretIn(noteCaretStore.getState(), target.vaultId, target.noteId);
+  if (caret === null) return null;
+  return {
+    vaultId: target.vaultId,
+    noteId: target.noteId,
+    line: caret.line,
+    text: textThroughCaret(caret),
+  };
 }
 
 /** Test-only reset. */

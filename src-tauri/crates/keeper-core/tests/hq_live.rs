@@ -1248,7 +1248,7 @@ async fn agents_window_archive_and_an_archived_session_opens_within_a_second() {
         let a = Arc::clone(&a);
         let (database, agent) = (database.clone(), agent.clone());
         tokio::task::spawn_blocking(move || {
-            a.new_session(&database, &agent, "the first of a thousand", None)
+            a.new_session(&database, &agent, "the first of a thousand", None, None)
         })
         .await
         .expect("joins")
@@ -1482,10 +1482,12 @@ async fn a_live_answer_grows_token_by_token_and_a_late_opener_sees_it_so_far() {
     let key: AgentSessionRef = {
         let a = Arc::clone(&a);
         let (database, agent) = (database.clone(), agent.clone());
-        tokio::task::spawn_blocking(move || a.new_session(&database, &agent, "long: tell me", None))
-            .await
-            .expect("joins")
-            .expect("a new session")
+        tokio::task::spawn_blocking(move || {
+            a.new_session(&database, &agent, "long: tell me", None, None)
+        })
+        .await
+        .expect("joins")
+        .expect("a new session")
     };
     a.open_session(&key).expect("opens");
     let view_of = |hq: &Arc<Hq>, key: &AgentSessionRef| {
@@ -1918,7 +1920,7 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
 
     a.set_session_tool(&key, &off, false).expect("switches off");
     tool_on_k(false).await;
-    a.send(&key, "tools: one off", &[]).expect("sends");
+    a.send(&key, "tools: one off", &[], None).expect("sends");
     let asked = offered_for("tools: one off").await;
     assert!(
         !asked.contains(&off) && asked.contains(&kept),
@@ -1928,7 +1930,7 @@ async fn a_non_reader_holds_no_thinking_and_a_switched_off_tool_is_not_offered()
 
     a.set_session_tool(&key, &off, true).expect("switches on");
     tool_on_k(true).await;
-    a.send(&key, "tools: all on", &[]).expect("sends");
+    a.send(&key, "tools: all on", &[], None).expect("sends");
     let asked = offered_for("tools: all on").await;
     assert!(
         asked.contains(&off) && asked.contains(&kept),
@@ -1970,7 +1972,7 @@ async fn an_answer_whose_instance_was_killed_says_it_stopped() {
     let key = {
         let a = Arc::clone(&a);
         tokio::task::spawn_blocking(move || {
-            a.new_session(&database, &agent, "cut: a long one", None)
+            a.new_session(&database, &agent, "cut: a long one", None, None)
         })
         .await
         .expect("joins")
@@ -2161,7 +2163,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     let new_session = |db: String, agent: String, body: &'static str| {
         let a = Arc::clone(&a);
         async move {
-            tokio::task::spawn_blocking(move || a.new_session(&db, &agent, body, None))
+            tokio::task::spawn_blocking(move || a.new_session(&db, &agent, body, None, None))
                 .await
                 .expect("joins")
                 .expect("a new session")
@@ -2283,7 +2285,8 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
         !joined.reads_trace,
         "an added person does not read the trace"
     );
-    k.send(&key, "hello from the guest", &[]).expect("k sends");
+    k.send(&key, "hello from the guest", &[], None)
+        .expect("k sends");
     let shown = until(
         &a,
         "the guest's message on a",
@@ -2355,7 +2358,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     }
 
     // 3: the reader flag. Not a reader: no thinking reaches the guest.
-    a.send(&key, "long: think about the plan", &[])
+    a.send(&key, "long: think about the plan", &[], None)
         .expect("a asks");
     // The owner reads the trace (and shows no thinking, so its window holds
     // none): the final answer ends the turn; the guest is never sent it.
@@ -2413,7 +2416,7 @@ async fn many_people_in_one_session_by_the_owner_and_the_server() {
     // the flag is withdrawn, so the withdrawal has one to take away.
     let approval = std::env::var("KEEPER_HQ_LIVE_APPROVAL").ok();
     if let Some(asking) = &approval {
-        a.send(&key, asking, &[]).expect("a asks for a run");
+        a.send(&key, asking, &[], None).expect("a asks for a run");
         let shown = until(
             &k,
             "the guest is shown the agent's approval",
@@ -2791,7 +2794,7 @@ async fn two_instances_answer_by_the_persons_choice_and_who_is_online() {
         let key = {
             let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
             tokio::task::spawn_blocking(move || {
-                mac.new_session(&database, &agent, "who answers this one?", None)
+                mac.new_session(&database, &agent, "who answers this one?", None, None)
             })
             .await
             .expect("joins")
@@ -2839,7 +2842,7 @@ async fn two_instances_answer_by_the_persons_choice_and_who_is_online() {
     let other = {
         let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
         tokio::task::spawn_blocking(move || {
-            mac.new_session(&database, &agent, "and this one?", None)
+            mac.new_session(&database, &agent, "and this one?", None, None)
         })
         .await
         .expect("joins")
@@ -3088,7 +3091,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     .await;
     let key = {
         let (mac, database, agent) = (Arc::clone(&mac), database.clone(), agent.clone());
-        off(move || mac.new_session(&database, &agent, "files for you", None)).await
+        off(move || mac.new_session(&database, &agent, "files for you", None, None)).await
     }
     .expect("a new session");
     wait_status(
@@ -3117,7 +3120,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
         off(move || {
             let handles =
                 mac.stage_paths(&key, &[files.join("prices.csv"), files.join("photo.png")])?;
-            mac.commit_attachments(&key, &handles, "what costs more?", &[])
+            mac.commit_attachments(&key, &handles, "what costs more?", &[], None)
         })
         .await
         .expect("attaches");
@@ -3202,7 +3205,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
         let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), offline.clone());
         off(move || {
             let handle = mac.stage_bytes(&key, "train.txt", "text/plain", bytes)?;
-            mac.commit_attachments(&key, &[handle], "from the train", &[])
+            mac.commit_attachments(&key, &[handle], "from the train", &[], None)
         })
         .await
         .expect("attaches offline");
@@ -3284,7 +3287,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
         let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), cut.clone());
         off(move || {
             let handle = mac.stage_bytes(&key, "cut.txt", "text/plain", bytes)?;
-            mac.commit_attachments(&key, &[handle], "cut after the upload", &[])
+            mac.commit_attachments(&key, &[handle], "cut after the upload", &[], None)
         })
         .await
         .expect("attaches");
@@ -3460,7 +3463,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
         let (mac, key, bytes) = (Arc::clone(&mac), key.clone(), huge.clone());
         off(move || {
             let handle = mac.stage_bytes(&key, "huge.zip", "application/zip", bytes)?;
-            mac.commit_attachments(&key, &[handle], "too big", &[])
+            mac.commit_attachments(&key, &[handle], "too big", &[], None)
         })
         .await
     };
@@ -3569,7 +3572,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     // Every other write of that replica goes on: a new session.
     let after = {
         let (skipper, database, agent) = (Arc::clone(&skipper), database.clone(), agent.clone());
-        off(move || skipper.new_session(&database, &agent, "after the refusal", None)).await
+        off(move || skipper.new_session(&database, &agent, "after the refusal", None, None)).await
     }
     .expect("a new session");
     until(
@@ -3606,7 +3609,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     .await;
     {
         let (skipper, after) = (Arc::clone(&skipper), after.clone());
-        off(move || skipper.send(&after, "after the relaunch", &[])).await
+        off(move || skipper.send(&after, "after the relaunch", &[], None)).await
     }
     .expect("sends");
     until(

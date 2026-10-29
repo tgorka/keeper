@@ -184,14 +184,17 @@ pub const MAX_INLINE_ANSWER: usize = 1_200;
 /// `line` its first message — or refuse, writing nothing. `sources` are every
 /// database this device holds: an agent found only in another is named so.
 /// `decline` declines what the banner showed, after every local check and
-/// before the child's commit; it says whether it declined anything. The
-/// child's id and its commit's.
+/// before the child's commit; it says whether it declined anything. `focus`
+/// is the note in front of the person (109.28), carried by the child's first
+/// message. The child's id and its commit's.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     sources: &[Source],
     source: &Source,
     parent: &str,
     mention: Mention<'_>,
     line: &str,
+    focus: Option<&send::AgentFocus>,
     decline: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(String, String), MentionError> {
     let session = timeline::session_row(source, parent).ok_or(SendError::Unknown)?;
@@ -232,12 +235,18 @@ pub fn start(
         });
     }
     let declined = decline().map_err(MentionError::Declines)?;
-    sessions::create_child(source, parent, &agent.id, &title_from(mention.rest), line).map_err(
-        |error| match declined {
-            true => MentionError::AfterDeclines(error),
-            false => SendError::Replica(error).into(),
-        },
+    sessions::create_child(
+        source,
+        parent,
+        &agent.id,
+        &title_from(mention.rest),
+        line,
+        focus,
     )
+    .map_err(|error| match declined {
+        true => MentionError::AfterDeclines(error),
+        false => SendError::Replica(error).into(),
+    })
 }
 
 /// What an `@` at the start of the draft offers: the database's agents other
@@ -593,6 +602,7 @@ fn refused_line(source: &Source, values: &Map<String, Value>, author: &str) -> A
         ask: None,
         details: None,
         attachments: Vec::new(),
+        note: None,
     }
 }
 
@@ -660,21 +670,27 @@ impl Hq {
         Ok(preview(&source, &key.session_id, before, after))
     }
 
-    /// The composer's line ([`send_line`]) in `key`'s database.
+    /// The composer's line ([`send_line`]) in `key`'s database; `focus` is
+    /// the note open in front of the person (109.28), carried by a message
+    /// to the session's own agent.
     pub fn send_line(
         &self,
         key: &AgentSessionRef,
         line: &str,
         shown: &[ShownApprovalVm],
+        focus: Option<&send::AgentFocus>,
     ) -> Result<(), HqError> {
         let source = self.source(&key.database)?;
+        let sources = self.sources();
+        let focus = send::AgentFocus::for_destination(focus, &source, &sources);
         let sent = send_line(
-            &self.sources(),
+            &sources,
             &source,
             self.decisions()?,
             &key.session_id,
             line,
             shown,
+            focus,
         );
         self.touch();
         sent.map_err(HqError::Sentence)
@@ -682,9 +698,10 @@ impl Hq {
 }
 
 /// The composer's line: a mention starts its agent's child in `session_id`,
-/// any other line is a message to the session's own agent. Either declines
-/// first what the banner showed (`shown`, Q109-12 a): a mention after its
-/// local checks, so one refused here declines nothing (R10924K-03, -10).
+/// any other line is a message to the session's own agent, carrying `focus`.
+/// Either declines first what the banner showed (`shown`, Q109-12 a): a
+/// mention after its local checks, so one refused here declines nothing
+/// (R10924K-03, -10).
 pub(crate) fn send_line(
     sources: &[Source],
     source: &Source,
@@ -692,14 +709,15 @@ pub(crate) fn send_line(
     session_id: &str,
     line: &str,
     shown: &[ShownApprovalVm],
+    focus: Option<&send::AgentFocus>,
 ) -> Result<(), String> {
     match parse(line) {
-        Some(mention) => start(sources, source, session_id, mention, line, || {
+        Some(mention) => start(sources, source, session_id, mention, line, focus, || {
             decline(source, decisions, session_id, shown)
         })
         .map(drop)
         .map_err(|error| error.to_string()),
-        None => send::send(source, decisions, session_id, line, shown)
+        None => send::send(source, decisions, session_id, line, shown, focus)
             .map_err(|error| error.to_string()),
     }
 }

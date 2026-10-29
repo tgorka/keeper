@@ -17,9 +17,10 @@ use keeper_core::hq::live::{AgentViewPrefsPatch, AgentViewPrefsVm};
 use keeper_core::hq::members::AgentSessionMembersVm;
 use keeper_core::hq::push::PushTarget;
 use keeper_core::hq::routes::HttpRoutes;
+use keeper_core::hq::send::{AgentFocus, AgentNoteCaret};
 use keeper_core::hq::sessions::{
-    diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
-    AgentSessionsOp,
+    diff, AgentChoiceVm, AgentDefaultSessionVm, AgentNoteSessionVm, AgentSessionRef,
+    AgentSessionsBatch, AgentSessionsOp,
 };
 use keeper_core::hq::signin::OrgAccount;
 use keeper_core::hq::spoken::{FollowSlot, SpokenStep};
@@ -27,6 +28,7 @@ use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::timeline::AgentSessionViewVm;
 use keeper_core::hq::vm::{HqEnrolmentVm, HqPairCodeVm, HqStatusVm};
 use keeper_core::hq::{Hq, HqError};
+use keeper_core::platform::Platform;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceAgentTargetVm};
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
@@ -343,6 +345,43 @@ fn session(database: String, session_id: String) -> AgentSessionRef {
     }
 }
 
+/// The drive, and the path from its root, of the note `note_id` of the
+/// vault `vault_id` (109.28): the vault's synced folder's `_drive.toml` and
+/// the note's vault-relative path, joined by
+/// [`keeper_agent::surface::drive_of`] (AD-65) — never by string arithmetic
+/// here. `None` when the folder declares no drive, or the note is not a file
+/// of it. Blocking: it reads the folder.
+fn note_drive(
+    platform: &Arc<dyn Platform>,
+    vault_id: &str,
+    note_id: &str,
+) -> Option<keeper_agent::surface::DriveRef> {
+    let vault = crate::notes_vault::vault(vault_id)?;
+    let path = crate::notes_vault::snapshot(vault_id)?
+        .by_id(note_id)?
+        .path
+        .clone();
+    let profiles =
+        match crate::sync::engine(Arc::clone(platform)).and_then(|engine| engine.list_profiles()) {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::debug!(%error, "the synced folders could not be read for a note's drive");
+                return None;
+            }
+        };
+    let profile = profiles.iter().find(|profile| profile.id == vault.id)?;
+    keeper_agent::surface::drive_of(profile, &vault.config.subfolder, &path)
+}
+
+/// What a message sent from the Notes Assistant carries as
+/// `metadata.focus` (109.28): the note's drive and path ([`note_drive`]) and
+/// the editor's caret; none when the note is on no drive.
+fn focus_of(platform: &Arc<dyn Platform>, caret: Option<&AgentNoteCaret>) -> Option<AgentFocus> {
+    let caret = caret?;
+    let note = note_drive(platform, &caret.vault_id, &caret.note_id)?;
+    AgentFocus::new(&note.drive, &note.path, &caret.text, caret.line)
+}
+
 /// Stream the Agents window's rows — every held database merged, read from
 /// the replicas — as a reset, then the changes.
 #[tauri::command]
@@ -513,28 +552,54 @@ pub fn agent_session_page_back(database: String, session_id: String) -> Result<(
         .map_err(error)
 }
 
-/// Write a message into a session; it shows as waiting at once.
+/// Write a message into a session; it shows as waiting at once. `focus` is
+/// the note open in front of the person in the Notes Assistant (109.28).
 #[tauri::command]
 pub async fn agent_send(
+    state: tauri::State<'_, crate::ipc::AppState>,
     database: String,
     session_id: String,
     body: String,
     declines: Vec<ShownApprovalVm>,
+    focus: Option<AgentNoteCaret>,
 ) -> Result<(), IpcError> {
-    blocking(move |hq| hq.send(&session(database, session_id), &body, &declines)).await
+    let platform = Arc::clone(&state.platform);
+    blocking(move |hq| {
+        let focus = focus_of(&platform, focus.as_ref());
+        hq.send(
+            &session(database, session_id),
+            &body,
+            &declines,
+            focus.as_ref(),
+        )
+    })
+    .await
 }
 
 /// The composer's line (109.24): `@<handle> …` starts that agent's thread
-/// from this session; any other line is a message, as [`agent_send`]. Either
-/// declines first what the banner showed (`declines`, Q109-12 a).
+/// from this session; any other line is a message, as [`agent_send`],
+/// carrying `focus`. Either declines first what the banner showed
+/// (`declines`, Q109-12 a).
 #[tauri::command]
 pub async fn agent_send_line(
+    state: tauri::State<'_, crate::ipc::AppState>,
     database: String,
     session_id: String,
     line: String,
     declines: Vec<ShownApprovalVm>,
+    focus: Option<AgentNoteCaret>,
 ) -> Result<(), IpcError> {
-    blocking(move |hq| hq.send_line(&session(database, session_id), &line, &declines)).await
+    let platform = Arc::clone(&state.platform);
+    blocking(move |hq| {
+        let focus = focus_of(&platform, focus.as_ref());
+        hq.send_line(
+            &session(database, session_id),
+            &line,
+            &declines,
+            focus.as_ref(),
+        )
+    })
+    .await
 }
 
 /// What an `@` at the start of a session's draft offers (109.24): Rust's
@@ -657,21 +722,27 @@ pub async fn agent_attach_bytes(request: tauri::ipc::Request<'_>) -> Result<Stri
 
 /// The composer's one Send: every staged file `handles` name, `caption` its
 /// text, committed as one new message of the session — or nothing, with the
-/// sentence. The handles are spent either way.
+/// sentence. The handles are spent either way. `focus` is the note open in
+/// front of the person, as [`agent_send`] carries it.
 #[tauri::command]
 pub async fn agent_attach_commit(
+    state: tauri::State<'_, crate::ipc::AppState>,
     database: String,
     session_id: String,
     handles: Vec<String>,
     caption: Option<String>,
     declines: Vec<ShownApprovalVm>,
+    focus: Option<AgentNoteCaret>,
 ) -> Result<(), IpcError> {
+    let platform = Arc::clone(&state.platform);
     blocking(move |hq| {
+        let focus = focus_of(&platform, focus.as_ref());
         hq.commit_attachments(
             &session(database, session_id),
             &handles,
             caption.as_deref().unwrap_or(""),
             &declines,
+            focus.as_ref(),
         )
     })
     .await
@@ -690,14 +761,29 @@ pub fn agent_attach_release(
 
 /// Open a session with an agent in one database, with its first message;
 /// `pick` is this device's last model and effort for the agent (109.18).
+/// `focus` is the note in front of the person when the Notes Assistant
+/// starts it (109.28), as [`agent_send`] carries it.
 #[tauri::command]
 pub async fn agent_session_new(
+    state: tauri::State<'_, crate::ipc::AppState>,
     database: String,
     agent_actor: String,
     body: String,
     pick: Option<keeper_core::hq::settings::AgentSettingsPick>,
+    focus: Option<AgentNoteCaret>,
 ) -> Result<AgentSessionRef, IpcError> {
-    blocking(move |hq| hq.new_session(&database, &agent_actor, &body, pick.as_ref())).await
+    let platform = Arc::clone(&state.platform);
+    blocking(move |hq| {
+        let focus = focus_of(&platform, focus.as_ref());
+        hq.new_session(
+            &database,
+            &agent_actor,
+            &body,
+            pick.as_ref(),
+            focus.as_ref(),
+        )
+    })
+    .await
 }
 
 /// Rename the title without changing the session id.
@@ -732,6 +818,59 @@ pub async fn agents_choices() -> Result<Vec<AgentChoiceVm>, IpcError> {
 #[tauri::command]
 pub async fn agent_session_default() -> Result<Option<AgentDefaultSessionVm>, IpcError> {
     blocking(|hq| hq.default_session()).await
+}
+
+/// A person was shown the warning of the Notes Assistant's tick of `drive`
+/// in the session and said OK (R-HQ-79): it is no longer unseen.
+#[tauri::command]
+pub async fn agent_note_tick_seen(
+    database: String,
+    session_id: String,
+    drive: String,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.note_tick_seen(&session(database, session_id), &drive)).await
+}
+
+/// The drive of the note `note_id` of the vault `vault_id` ([`note_drive`]),
+/// or `None` when its folder declares none. Reads only: the Notes Assistant
+/// asks it first, so a note on the drive it already follows changes nothing
+/// (R605-02).
+#[tauri::command]
+pub async fn agent_note_drive(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    vault_id: String,
+    note_id: String,
+) -> Result<Option<String>, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        note_drive(&platform, &vault_id, &note_id).map(|note| note.drive)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: join.to_string(),
+        account_id: None,
+        retriable: true,
+    })
+}
+
+/// The Notes Assistant opened on a note (109.28, R-HQ-86): the note's drive
+/// ([`note_drive`]), then core's answer — the default agent's chat in the
+/// database named after that drive, started with `pick` when it has none,
+/// and the drive ticked in it as the person, or why not.
+#[tauri::command]
+pub async fn agent_session_for_note(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    vault_id: String,
+    note_id: String,
+    pick: Option<keeper_core::hq::settings::AgentSettingsPick>,
+) -> Result<Option<AgentNoteSessionVm>, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    blocking(move |hq| {
+        let drive = note_drive(&platform, &vault_id, &note_id).map(|note| note.drive);
+        hq.session_for_note(drive.as_deref(), pick.as_ref())
+    })
+    .await
 }
 
 /// Stream the approvals waiting for this person, in every held database.

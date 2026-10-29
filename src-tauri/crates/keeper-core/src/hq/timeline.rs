@@ -120,6 +120,11 @@ pub struct AgentMessageVm {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<AgentAttachmentVm>>", optional)]
     pub attachments: Vec<AgentAttachmentVm>,
+    /// A quiet line keeper says under this device's message: the note the
+    /// person was in was not sent with it (contract § 9.1a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub note: Option<String>,
 }
 
 /// Ordered reading column. References resolve against `messages`, `folds`,
@@ -874,6 +879,7 @@ fn messages(
                     .then(|| live::details(&metadata))
                     .flatten(),
                 attachments: Vec::new(),
+                note: None,
             })
         })
         .collect()
@@ -1039,6 +1045,7 @@ fn refused(
             ask: None,
             details: None,
             attachments: refused.attachments,
+            note: None,
         };
         let at = messages.partition_point(|shown| {
             (shown.created_at_ms, shown.id.as_str()) <= (message.created_at_ms, message.id.as_str())

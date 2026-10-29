@@ -21,4 +21,12 @@ pending: boolean,
 /**
  * The server refused the newest selection written here, as a sentence.
  */
-refused?: string, };
+refused?: string, 
+/**
+ * Ticked drives this person has not been shown [`WARNING`] for on this
+ * device (round 6 ruling, [`SeenTicks`]): a tick the Notes Assistant,
+ * another device or a carry made, or one whose record was lost. Drawn
+ * beside the chips with Untick and OK wherever the session is shown;
+ * read from the same selection as the chips, so the two agree.
+ */
+unseen?: Array<string>, };

@@ -775,6 +775,10 @@ impl Hq {
                 }
                 if let Some(database) = &database {
                     hq.on_link(database, &watched, state.link, generation);
+                    // A refusal of a note's focus may have arrived (§ 9.1a):
+                    // its message goes again without it, off this task.
+                    let (hq, database) = (Arc::clone(&hq), database.clone());
+                    tokio::task::spawn_blocking(move || hq.resend_withheld(&database));
                 }
                 hq.publish();
             }

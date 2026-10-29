@@ -206,6 +206,29 @@ pub struct AgentDefaultSessionVm {
     pub session_id: Option<String>,
 }
 
+/// What the Notes Assistant opens for the note in front of the person
+/// (109.28, R-HQ-86): the default agent's chat in the database named after
+/// the note's drive (AD-433), and why that drive is not ticked there, if it
+/// is not. A tick it made is the session's to show (`drives.unseen`), never
+/// this answer's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentNoteSessionVm {
+    /// The default agent and the session the dock opens: in the drive's
+    /// database, or — where the agent has none here, or the note is on no
+    /// drive — its main conversation, as [`default_session`] answers.
+    pub target: AgentDefaultSessionVm,
+    /// The note's drive; absent when its folder declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub drive: Option<String>,
+    /// Why the drive is not ticked, or the chat is not in its database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Reading rows
 // ---------------------------------------------------------------------------
@@ -1025,6 +1048,45 @@ pub fn default_session(
     })
 }
 
+/// Where the Notes Assistant opens for a note on `drive` (109.28, R-HQ-86):
+/// the default agent's newest unarchived session in the database named after
+/// the drive (AD-433) — `session_id` `None` while it has none there, so one
+/// is started — and no sentence. Where this device holds no such database
+/// with the agent in its directory, the agent's main conversation
+/// ([`default_session`]) and the sentence saying why the drive is not
+/// ticked. `None` with no default agent.
+pub fn note_session(
+    sources: &[Source],
+    chosen: Option<&str>,
+    last: &HashMap<String, String>,
+    drive: &str,
+    now_ms: i64,
+) -> Option<(AgentDefaultSessionVm, Option<String>)> {
+    let main = default_session(sources, chosen, last, now_ms)?;
+    let shares = choices(sources, last).into_iter().any(|choice| {
+        choice.agent_actor == main.agent_actor && choice.databases.iter().any(|db| db == drive)
+    });
+    if !shares {
+        let reason = format!(
+            "This device holds no {drive} database with {} in it, so {drive} is not ticked.",
+            main.agent_name
+        );
+        return Some((main, Some(reason)));
+    }
+    let newest = list(sources, now_ms)
+        .into_iter()
+        .find(|row| row.agent_actor == main.agent_actor && row.database == drive && !row.archived);
+    Some((
+        AgentDefaultSessionVm {
+            agent_actor: main.agent_actor,
+            agent_name: main.agent_name,
+            database: Some(drive.to_owned()),
+            session_id: newest.map(|row| row.session_id),
+        },
+        None,
+    ))
+}
+
 /// The title a session takes from its first message: its first line, cut
 /// at a word near 80 characters.
 pub fn title_from(body: &str) -> String {
@@ -1074,12 +1136,14 @@ pub(crate) fn authored(source: &Source, mut values: Map<String, Value>) -> Map<S
     values
 }
 
-/// A person message row `id`, written now.
+/// A person message row `id`, written now; `metadata` is its JSON object
+/// (a control row's `kind`, or a sent message's `focus`), `None` for none.
 pub(crate) fn person_message(
     source: &Source,
     session_id: &str,
     id: &str,
     body: &str,
+    metadata: Option<Value>,
     at: i64,
 ) -> RowOp {
     RowOp::Upsert {
@@ -1094,7 +1158,7 @@ pub(crate) fn person_message(
                 "role": "person",
                 "body": body,
                 "body_blob": null,
-                "metadata": null,
+                "metadata": metadata.map(|metadata| metadata.to_string()),
                 "created_at_ms": at,
             })),
         ),
@@ -1112,13 +1176,27 @@ static CREATING: Mutex<()> = Mutex::new(());
 /// session ids). `pick` is this device's last choice of model and effort for
 /// `agent`: what the agent still offers of it starts the session's settings
 /// (Q109-16 b). See [`create_with_first`] for the commits it writes.
+/// `focus` is the note in front of the person, carried by the first message
+/// (109.28); the caller has judged its audience.
 pub fn create(
     source: &Source,
     agent: &str,
     body: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<String, ReplicaError> {
-    create_with_first(source, agent, body, &ulid::Ulid::new().to_string(), pick)
+    let first = ulid::Ulid::new().to_string();
+    create_in(
+        source,
+        agent,
+        None,
+        &title_from(body),
+        body,
+        &first,
+        pick,
+        focus,
+    )
+    .map(|(id, _)| id)
 }
 
 /// [`create`], its first message's id `first` — what a spoken question's
@@ -1130,19 +1208,31 @@ pub fn create_with_first(
     first: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
 ) -> Result<String, ReplicaError> {
-    create_in(source, agent, None, &title_from(body), body, first, pick).map(|(id, _)| id)
+    create_in(
+        source,
+        agent,
+        None,
+        &title_from(body),
+        body,
+        first,
+        pick,
+        None,
+    )
+    .map(|(id, _)| id)
 }
 
 /// A session of `agent` started by this person from `parent` (109.24): the
 /// child's row naming its parent, the person's owner membership and `body`
 /// as its first message, in one commit — the shape V3 lets a person member
-/// of the parent insert. Its id and the commit's.
+/// of the parent insert. Its id and the commit's. `focus` rides on the first
+/// message, as on any message the person sends from the Notes Assistant.
 pub(crate) fn create_child(
     source: &Source,
     parent: &str,
     agent: &str,
     title: &str,
     body: &str,
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<(String, String), ReplicaError> {
     create_in(
         source,
@@ -1152,13 +1242,15 @@ pub(crate) fn create_child(
         body,
         &ulid::Ulid::new().to_string(),
         None,
+        focus,
     )
 }
 
 /// The one way a session is created here: its row, the owner's membership
 /// and, unless `body` is empty, its first message, in one commit — with a
 /// model/effort `pick`, in three (R10918-07). The session's id and the
-/// commit that created it.
+/// commit that created it. `focus` is the first message's `metadata.focus`.
+#[allow(clippy::too_many_arguments)]
 fn create_in(
     source: &Source,
     agent: &str,
@@ -1167,6 +1259,7 @@ fn create_in(
     body: &str,
     first: &str,
     pick: Option<&crate::hq::settings::AgentSettingsPick>,
+    focus: Option<&crate::hq::send::AgentFocus>,
 ) -> Result<(String, String), ReplicaError> {
     let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let at = now_ms();
@@ -1214,7 +1307,9 @@ fn create_in(
         .map(|pick| crate::hq::settings::initial(source, agent, &id, pick, at))
         .transpose()?
         .flatten();
-    let message = (!body.is_empty()).then(|| person_message(source, &id, first, body, at));
+    let metadata = focus.map(crate::hq::send::AgentFocus::metadata);
+    let message =
+        (!body.is_empty()).then(|| person_message(source, &id, first, body, metadata, at));
     let commit = match settings {
         // Nothing of a pick to write: one commit, as a creation always was.
         // A mention's child is always this one commit (109.24, V3).

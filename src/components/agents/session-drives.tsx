@@ -12,6 +12,7 @@ import {
 import {
   type AgentSessionDrivesVm,
   type AgentSessionRef,
+  agentNoteTickSeen,
   agentSessionDriveSet,
 } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -25,6 +26,12 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  * the chips when a tick takes the selection from none to one. A ticked drive Rust gives a reason
  * stopped being allowed and holds every other change back: its chip says so, and its button
  * unticks every such drive at once (Rust's `set`), as the sentence under the chips says.
+ *
+ * A ticked drive this person has not been shown the warning for on this device (`drives.unseen`:
+ * Rust's seen record, round 6 ruling — a tick the Notes Assistant, another device or a carry made,
+ * or one whose record was lost) draws that warning under the chips, wherever this session is
+ * shown, with **Untick** (the person's own untick) and **OK** (recorded as seen). Both read the
+ * same Rust view as the chips, so they cannot disagree.
  */
 export function SessionDrives({
   target,
@@ -68,6 +75,22 @@ export function SessionDrives({
     }
   };
 
+  const seen = async (name: string) => {
+    if (writing.current) return;
+    writing.current = true;
+    setBusy(name);
+    setError(null);
+    try {
+      await agentNoteTickSeen(target, name);
+    } catch (raw) {
+      setError(syncErrorMessage(raw, "keeper could not note that."));
+    } finally {
+      writing.current = false;
+      setBusy(null);
+    }
+  };
+
+  const unseen = drives.unseen ?? [];
   const alert = error ?? drives.refused;
   return (
     <div data-slot="session-drives" className="min-w-0 pt-1">
@@ -195,6 +218,39 @@ export function SessionDrives({
           {failing[0].reason}
         </p>
       )}
+      {unseen.map((name) => (
+        <div
+          key={name}
+          role="note"
+          aria-label={`What ticking ${name} allows`}
+          data-slot="session-drives-unseen"
+          className="mt-1 flex min-w-0 flex-col gap-1 rounded-md border border-held/40 px-2 py-1 text-held text-xs"
+        >
+          <p className="min-w-0 font-medium [overflow-wrap:anywhere]">
+            {name} is ticked for {agentName} to read in this chat, and you have not been shown what
+            that allows on this device.
+          </p>
+          <p className="min-w-0 [overflow-wrap:anywhere]">{drives.warning}</p>
+          <div className="flex flex-wrap gap-1">
+            <Button
+              variant="outline"
+              size="xs"
+              aria-busy={busy === name}
+              onClick={() => void change(name, false)}
+            >
+              Untick {name}
+            </Button>
+            <Button
+              variant="ghost"
+              size="xs"
+              aria-busy={busy === name}
+              onClick={() => void seen(name)}
+            >
+              OK
+            </Button>
+          </div>
+        </div>
+      ))}
       {firstTick && ticked.length > 0 && (
         <div
           role="note"

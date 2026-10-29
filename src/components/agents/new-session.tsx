@@ -12,6 +12,7 @@ import {
 import {
   type AgentChoiceVm,
   type AgentDefaultSessionVm,
+  type AgentNoteCaret,
   type AgentSessionRef,
   agentSessionNew,
   agentsChoices,
@@ -24,14 +25,20 @@ import {
 } from "@/lib/stores/conversation-stores";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
+/**
+ * The new-session composer. `focus` is the note in front of the person (the Notes Assistant),
+ * read when the first message is sent and carried by it (109.28); without it, nothing is.
+ */
 export function NewSession({
   initial,
   onCreated,
   onCancel,
+  focus,
 }: {
   initial?: AgentDefaultSessionVm | null;
   onCreated: (target: AgentSessionRef) => void;
   onCancel: () => void;
+  focus?: () => AgentNoteCaret | null;
 }) {
   // Words a screen that took over left here (a tapped notification) come back.
   const [kept] = useState(() => agentSessionsStore.getState().newDraft);
@@ -178,6 +185,7 @@ export function NewSession({
                 choice.agentActor,
                 body,
                 lastAgentPick(choice.agentActor),
+                ...(focus ? [focus()] : []),
               );
               agentSessionsStore.getState().keepNewDraft(null);
               onCreated(target);

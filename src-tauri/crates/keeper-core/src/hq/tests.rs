@@ -1328,10 +1328,10 @@ async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and
         [("nixie", Some("alpha"))]
     );
     let key = hq
-        .new_session("alpha", "nixie", "plan the week", None)
+        .new_session("alpha", "nixie", "plan the week", None, None)
         .expect("a new session with no server");
     assert_eq!(key.database, "alpha");
-    hq.send(&key, "and then the weekend", &[])
+    hq.send(&key, "and then the weekend", &[], None)
         .expect("a message");
     let status = status_until(&hq, "both writes wait", |s| s.waiting_here == before + 2).await;
     assert_eq!(status.databases[0].waiting, before + 2);
@@ -1386,7 +1386,7 @@ async fn a_device_never_paired_offers_no_agent_and_asks_nothing() {
     hq.start().await.expect("starts");
     assert!(hq.choices().expect("choices").is_empty());
     assert!(matches!(
-        hq.new_session("local", "nixie", "hello", None),
+        hq.new_session("local", "nixie", "hello", None, None),
         Err(HqError::Sentence(_))
     ));
     assert_eq!(world.routes.discovered.load(Ordering::SeqCst), 0);
@@ -1479,7 +1479,7 @@ async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens(
     })
     .await;
     let key = first
-        .new_session("alpha", "nixie", "plan the week", None)
+        .new_session("alpha", "nixie", "plan the week", None, None)
         .expect("a session");
     first.shutdown().await;
 
@@ -1521,11 +1521,15 @@ async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens(
 /// Opens every replica as a real local syncular replica (no server), so a
 /// write goes through syncular's own column codec.
 #[derive(Default)]
-struct LocalOpener(Mutex<HashMap<String, Arc<dyn Replica>>>);
+struct LocalOpener(
+    Mutex<HashMap<String, Arc<dyn Replica>>>,
+    Mutex<HashMap<String, std::path::PathBuf>>,
+);
 
 impl Opener for LocalOpener {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
         let database = spec.database.clone();
+        lock(&self.1).insert(database.clone(), spec.path.clone());
         let replica: Arc<dyn Replica> =
             Arc::new(crate::hq::syncular::SyncularReplica::open(ReplicaSpec {
                 link: None,
@@ -1539,6 +1543,10 @@ impl Opener for LocalOpener {
 impl LocalOpener {
     fn replica(&self, database: &str) -> Arc<dyn Replica> {
         lock(&self.0).get(database).cloned().expect("opened")
+    }
+
+    fn path(&self, database: &str) -> std::path::PathBuf {
+        lock(&self.1).get(database).cloned().expect("opened")
     }
 }
 
@@ -1724,4 +1732,834 @@ async fn a_spoken_question_while_the_replicas_open_is_arriving_then_goes() {
         1,
         "the question once, after the open: {written:?}"
     );
+}
+
+/// Nixie's instance in `database`, offering `drives` to read.
+fn offers(opener: &LocalOpener, database: &str, drives: &[&str]) {
+    opener
+        .replica(database)
+        .mutate(vec![RowOp::Upsert {
+            table: "agent_profiles".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": format!("nixie.{database}"), "actor_id": "nixie", "name": "nixie",
+                "description": "", "avatar_blob": null, "definition_hash": "h",
+                "image_digest": "d", "started_at_ms": 1, "dir": database,
+                "drives": Value::from(drives.to_vec()).to_string(),
+                "author_actor": "nixie", "author_client": format!("nixie.{database}")})),
+            base_version: None,
+        }])
+        .expect("profile");
+}
+
+/// The ticked drives of every session of `database`, by session id.
+fn ticks(opener: &LocalOpener, database: &str) -> Vec<(String, String)> {
+    rows(
+        &opener.replica(database),
+        "SELECT session_id, drives FROM session_drives ORDER BY session_id",
+    )
+    .iter()
+    .map(|row| {
+        (
+            sessions::text(row, "session_id").to_owned(),
+            sessions::text(row, "drives").to_owned(),
+        )
+    })
+    .collect()
+}
+
+/// The drives the session `key` shows as ticked by the Notes Assistant and
+/// not yet answered: what draws the warning beside the chip, wherever the
+/// session is shown (the dock or the Agents window alike).
+fn unseen_in(hq: &Hq, key: &sessions::AgentSessionRef) -> Vec<String> {
+    hq.session_view(key)
+        .expect("a view")
+        .drives
+        .map(|drives| drives.unseen)
+        .unwrap_or_default()
+}
+
+fn chat(session: &str, database: &str) -> sessions::AgentSessionRef {
+    sessions::AgentSessionRef {
+        database: database.to_owned(),
+        session_id: session.to_owned(),
+    }
+}
+
+/// 109.28 (R-HQ-86) AC 1: opened on a tgdrive note, the dock gets the
+/// default agent's chat in the tgdrive database — started there, since it
+/// has none — with tgdrive ticked as the person. Opened again, it is the
+/// same chat, already ticked: nothing is ticked twice. A neuradrive note
+/// gets neuradrive's own chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_notes_assistant_opens_the_notes_drive_chat_and_ticks_it_once() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["neuradrive", "tgdrive"]).await;
+    for database in ["neuradrive", "tgdrive"] {
+        offers(&opener, database, &["neuradrive", "tgdrive"]);
+    }
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    // The agent's newest chat is elsewhere: the note's drive decides.
+    let elsewhere = hq
+        .new_session("neuradrive", "nixie", "groceries", None, None)
+        .expect("a neuradrive chat");
+
+    let first = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let session = first.target.session_id.clone().expect("a chat");
+    assert_eq!(
+        (
+            first.target.database.as_deref(),
+            first.drive.as_deref(),
+            first.reason.as_deref(),
+        ),
+        (Some("tgdrive"), Some("tgdrive"), None)
+    );
+    let started = rows(
+        &opener.replica("tgdrive"),
+        "SELECT id, agent_actor FROM sessions",
+    );
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["id"], Value::from(session.clone()));
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(session.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+
+    let again = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(again.target.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(again.reason, None);
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(session.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+    assert_eq!(
+        rows(&opener.replica("tgdrive"), "SELECT id FROM sessions").len(),
+        1,
+        "the same chat, not a second one"
+    );
+
+    let other = hq
+        .session_for_note(Some("neuradrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(
+        (
+            other.target.database.as_deref(),
+            other.target.session_id.as_deref()
+        ),
+        (Some("neuradrive"), Some(elsewhere.session_id.as_str()))
+    );
+    assert_eq!(
+        ticks(&opener, "neuradrive"),
+        [(elsewhere.session_id.clone(), r#"["neuradrive"]"#.to_owned())]
+    );
+}
+
+/// Round 5 ruling (R605-02/-05/-06/-07/-08): keeper never takes a dock tick
+/// back. Every one is marked unseen, and the session shows it — the chip and
+/// the warning read from the same selection — wherever it is opened: an
+/// answer the dock dropped (closed, moved on) leaves a ticked drive whose
+/// warning the Agents window draws. OK clears the mark; a person's own
+/// untick clears it with the tick, and their own tick acknowledges it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dock_tick_stays_unseen_wherever_its_chat_is_shown_until_a_person_answers_it() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+
+    // An answer nobody saw: the dock closed before it came.
+    let dropped = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let key = chat(
+        dropped.target.session_id.as_deref().expect("a chat"),
+        "tgdrive",
+    );
+    // The Agents window opens that chat: the drive is ticked, and its
+    // warning stands beside the chip.
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    // A second answer, the reopened dock's: nothing changes, nothing is
+    // taken back.
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(key.session_id.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+
+    // OK: seen, and the drive stays ticked.
+    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    assert!(unseen_in(&hq, &key).is_empty());
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(key.session_id.clone(), r#"["tgdrive"]"#.to_owned())]
+    );
+
+    // The person unticks; the dock ticks again, unseen again.
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    // Untick from the warning: tick and mark go together.
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(unseen_in(&hq, &key).is_empty());
+    assert_eq!(
+        ticks(&opener, "tgdrive"),
+        [(key.session_id.clone(), "[]".to_owned())]
+    );
+    // A person's own tick is theirs: no warning of the dock's.
+    hq.set_session_drive(&key, "tgdrive", true).expect("ticked");
+    assert!(unseen_in(&hq, &key).is_empty());
+    // A mark left over with no tick draws nothing.
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    hq.session_for_note(Some("tgdrive"), None).expect("answers");
+    hq.set_session_drive(&key, "tgdrive", true)
+        .expect("ticked over the dock's");
+    assert!(
+        unseen_in(&hq, &key).is_empty(),
+        "the person's tick answers it"
+    );
+}
+
+/// The seen record's file under `world`'s data directory.
+fn seen_file(world: &World) -> std::path::PathBuf {
+    crate::hq::databases::root(&world.data_dir()).join("drive-ticks-seen.json")
+}
+
+/// A started service for the Notes Assistant on tgdrive, its chat ticked by
+/// the dock: the service, the opener and the chat.
+async fn dock_ticked(world: &World) -> (Arc<Hq>, Arc<LocalOpener>, sessions::AgentSessionRef) {
+    let (hq, opener) = spoken_world(world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    let first = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let key = chat(
+        first.target.session_id.as_deref().expect("a chat"),
+        "tgdrive",
+    );
+    (hq, opener, key)
+}
+
+/// Round 6 ruling: the person's own tick in the drive menu, where the
+/// warning stands beside every drive, is seen when it is made; the dock's
+/// is not, and warns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_s_own_tick_is_seen_and_the_dock_s_warns() {
+    let world = World::new();
+    let (hq, _opener, dock) = dock_ticked(&world).await;
+    assert_eq!(unseen_in(&hq, &dock), ["tgdrive"], "the dock's tick warns");
+    let mine = hq
+        .new_session("tgdrive", "nixie", "my own", None, None)
+        .expect("a chat");
+    hq.set_session_drive(&mine, "tgdrive", true)
+        .expect("ticked");
+    assert!(
+        unseen_in(&hq, &mine).is_empty(),
+        "the person's own tick is seen"
+    );
+    assert_eq!(
+        unseen_in(&hq, &dock),
+        ["tgdrive"],
+        "another chat's seen tick of the same drive is not this one's"
+    );
+}
+
+/// R605-11: a record that is missing, does not read, is an older version's,
+/// or is another device's is no record: a tick answered before warns again
+/// rather than pass as seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
+    let world = World::new();
+    let (hq, opener, key) = dock_ticked(&world).await;
+    let answered = || {
+        hq.note_tick_seen(&key, "tgdrive").expect("seen");
+        assert!(unseen_in(&hq, &key).is_empty(), "answered");
+    };
+    answered();
+    std::fs::remove_file(seen_file(&world)).expect("removed");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "missing");
+    answered();
+    std::fs::write(seen_file(&world), "[[\"tgdrive\",").expect("truncated");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "unreadable");
+    answered();
+    // Round 5's shape: a list of "database\nsession\ndrive" strings.
+    std::fs::write(
+        seen_file(&world),
+        serde_json::to_string(&[format!("tgdrive\n{}\ntgdrive", key.session_id)]).expect("json"),
+    )
+    .expect("legacy");
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"], "an older version's");
+    answered();
+
+    // Another device, holding the same rows, has seen nothing: it warns.
+    let other = World::new();
+    other.paired("https://hq.example.org", &["tgdrive"]);
+    let there = Hq::new(
+        Arc::clone(&other.platform) as Arc<dyn Platform>,
+        Arc::new(Shared(Arc::clone(&opener))) as Arc<dyn Opener>,
+        Arc::clone(&other.routes) as Arc<dyn Routes>,
+        Arc::new(signin::NoAccount),
+        "keeper on another device".to_owned(),
+        || "other".to_owned(),
+    );
+    there.start().await.expect("starts");
+    assert_eq!(unseen_in(&there, &key), ["tgdrive"], "another device's");
+    assert!(unseen_in(&hq, &key).is_empty(), "still seen here");
+}
+
+/// Opens every database as the replica `0` already opened: a second device's
+/// service reading the same rows.
+struct Shared(Arc<LocalOpener>);
+
+impl Opener for Shared {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+        Ok(self.0.replica(&spec.database))
+    }
+}
+
+/// R605-12: the record holds only current ticks. Each view drops an entry
+/// whose session is gone or whose drive is no longer ticked there — by the
+/// person or by a selection that arrived from elsewhere — and a tick made
+/// again after that warns again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seen_record_drops_gone_sessions_and_unticked_drives() {
+    let world = World::new();
+    let (hq, opener, first) = dock_ticked(&world).await;
+    hq.note_tick_seen(&first, "tgdrive").expect("seen");
+    let second = hq
+        .new_session("tgdrive", "nixie", "another", None, None)
+        .expect("a chat");
+    hq.set_session_drive(&second, "tgdrive", true)
+        .expect("ticked");
+    let record = || std::fs::read_to_string(seen_file(&world)).expect("the record");
+    assert!(record().contains(&first.session_id) && record().contains(&second.session_id));
+
+    // The first session is deleted; a view of the second prunes it.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![
+            RowOp::Delete {
+                table: "session_drives".to_owned(),
+                row_id: first.session_id.clone(),
+                base_version: None,
+            },
+            RowOp::Delete {
+                table: "sessions".to_owned(),
+                row_id: first.session_id.clone(),
+                base_version: None,
+            },
+        ])
+        .expect("deleted");
+    assert!(unseen_in(&hq, &second).is_empty());
+    assert!(!record().contains(&first.session_id), "{}", record());
+    assert!(record().contains(&second.session_id));
+
+    // The second's drive is unticked by a selection from elsewhere.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "session_id": second.session_id, "drives": "[]", "updated_at_ms": 9,
+                "author_actor": "ana", "author_client": "ana.2"})),
+            base_version: None,
+        }])
+        .expect("unticked elsewhere");
+    assert!(unseen_in(&hq, &second).is_empty());
+    assert_eq!(record(), "[]");
+    // Ticked again from elsewhere: it warns, the earlier answer gone with it.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![RowOp::Upsert {
+            table: "session_drives".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "session_id": second.session_id, "drives": "[\"tgdrive\"]", "updated_at_ms": 10,
+                "author_actor": "ana", "author_client": "ana.2"})),
+            base_version: None,
+        }])
+        .expect("ticked elsewhere");
+    assert_eq!(unseen_in(&hq, &second), ["tgdrive"]);
+}
+
+/// R605-13: OK and Untick tell every open view, as every other change of a
+/// session does: the native stream wakes with nothing else moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ok_and_untick_wake_the_session_stream() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let mut changes = hq.changes();
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    // Let the dock tick's own writes settle: the stream is idle before OK.
+    loop {
+        changes.borrow_and_update();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if !changes.has_changed().expect("open") {
+            break;
+        }
+    }
+    hq.note_tick_seen(&key, "tgdrive").expect("seen");
+    assert!(changes.has_changed().expect("open"), "OK wakes the stream");
+    changes.borrow_and_update();
+    assert!(unseen_in(&hq, &key).is_empty());
+    hq.set_session_drive(&key, "tgdrive", false)
+        .expect("unticked");
+    assert!(
+        changes.has_changed().expect("open"),
+        "Untick wakes the stream"
+    );
+}
+
+/// A record that cannot be written only ever warns: the person's own tick
+/// is then said once more, and OK says it could not note it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seen_record_that_cannot_be_written_keeps_the_warning() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    std::fs::create_dir_all(seen_file(&world).with_extension("json.new")).expect("blocked");
+    let refused = hq.note_tick_seen(&key, "tgdrive").expect_err("not noted");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("keeper could not note that"),
+        "{refused}"
+    );
+    assert_eq!(unseen_in(&hq, &key), ["tgdrive"]);
+    let mine = hq
+        .new_session("tgdrive", "nixie", "my own", None, None)
+        .expect("a chat");
+    hq.set_session_drive(&mine, "tgdrive", true)
+        .expect("ticked");
+    assert_eq!(
+        unseen_in(&hq, &mine),
+        ["tgdrive"],
+        "unrecorded: said once more"
+    );
+}
+
+/// R605-09: the person's untick and the dock's tick go through one lock.
+/// However they interleave, a drive left ticked by the dock warns — never a
+/// silent tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_s_untick_racing_the_dock_s_tick_never_leaves_a_silent_tick() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["tgdrive"]);
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+    let first = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    let key = chat(
+        first.target.session_id.as_deref().expect("a chat"),
+        "tgdrive",
+    );
+    let marked = || unseen_in(&hq, &key).contains(&"tgdrive".to_owned());
+    for round in 0..60 {
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                hq.set_session_drive(&key, "tgdrive", false)
+                    .expect("unticked");
+            });
+            scope.spawn(|| {
+                hq.session_for_note(Some("tgdrive"), None).expect("answers");
+            });
+        });
+        let ticked = ticks(&opener, "tgdrive")
+            .iter()
+            .any(|(_, drives)| drives.contains("tgdrive"));
+        assert!(
+            !ticked || marked(),
+            "round {round}: ticked by the dock, unmarked"
+        );
+    }
+}
+/// 109.28 AC 1: a note whose drive the agent does not offer opens the
+/// drive's chat with nothing ticked, and says why; a drive with no database
+/// here, or a note on no drive, opens the agent's main conversation and says
+/// why nothing was ticked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_notes_assistant_says_why_it_did_not_tick_the_notes_drive() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    offers(&opener, "tgdrive", &["neuradrive"]);
+    // Ana reads tgdrive, so keeper knows the drive and judges it.
+    opener
+        .replica("tgdrive")
+        .mutate(vec![RowOp::Upsert {
+            table: "actors".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": "ana", "kind": "person", "display_name": "Ana", "family": null,
+                "dir": "tgdrive", "created_at_ms": 1, "author_actor": "server",
+                "author_client": "server"})),
+            base_version: None,
+        }])
+        .expect("directory");
+    crate::registry::set_agents_default(&world.data_dir(), Some("@nixie:hq.example.org"))
+        .expect("default agent");
+
+    let unoffered = hq
+        .session_for_note(Some("tgdrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(unoffered.target.database.as_deref(), Some("tgdrive"));
+    assert!(unoffered.target.session_id.is_some());
+    assert_eq!(
+        unoffered.reason.as_deref(),
+        Some("Nixie does not offer tgdrive.")
+    );
+    assert!(ticks(&opener, "tgdrive").is_empty());
+
+    let main = hq.default_session().expect("reads").expect("Nixie");
+    let absent = hq
+        .session_for_note(Some("neuradrive"), None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(absent.target, main);
+    assert_eq!(
+        (absent.drive.as_deref(), absent.reason.as_deref()),
+        (
+            Some("neuradrive"),
+            Some("This device holds no neuradrive database with Nixie in it, so neuradrive is not ticked.")
+        )
+    );
+    let none = hq
+        .session_for_note(None, None)
+        .expect("answers")
+        .expect("a default agent");
+    assert_eq!(
+        (none.target, none.drive, none.reason.as_deref()),
+        (main, None, Some(drives::NO_DRIVE))
+    );
+    assert_eq!(
+        rows(&opener.replica("tgdrive"), "SELECT id FROM sessions").len(),
+        1,
+        "no drive, no new chat"
+    );
+}
+
+/// Directory rows for `database`: each `(id, kind)` as an actor of it.
+fn directory(opener: &LocalOpener, database: &str, actors: &[(&str, &str)]) {
+    let ops = actors
+        .iter()
+        .map(|(id, kind)| RowOp::Upsert {
+            table: "actors".to_owned(),
+            values: sessions::object(serde_json::json!({
+                "id": id, "kind": kind, "display_name": id, "family": null, "dir": database,
+                "created_at_ms": 1, "author_actor": "server", "author_client": "server"})),
+            base_version: None,
+        })
+        .collect();
+    opener.replica(database).mutate(ops).expect("directory");
+}
+
+/// The `metadata` of `database`'s message whose body is `body`, parsed;
+/// `Null` when it has none.
+fn metadata_of(opener: &LocalOpener, database: &str, body: &str) -> Value {
+    let stored = rows(
+        &opener.replica(database),
+        "SELECT body, metadata FROM messages",
+    );
+    let row = stored
+        .iter()
+        .find(|row| row["body"] == body)
+        .unwrap_or_else(|| panic!("{body:?} in {database}: {stored:?}"));
+    match &row["metadata"] {
+        Value::String(text) => serde_json::from_str::<Value>(text).expect("JSON"),
+        other => other.clone(),
+    }
+}
+
+fn inbox_focus(drive: &str) -> send::AgentFocus {
+    send::AgentFocus::new(
+        drive,
+        "10-notes/inbox.md",
+        "# Plans\n\nintro\n## Q3\nship it",
+        5,
+    )
+    .expect("in bounds")
+}
+
+/// 109.28 AC 2 (contract §9.1, binding): every message the Notes Assistant
+/// writes with the note in front — an ordinary line, a captionless ask
+/// answer through `send`, the first message of a chat it starts, and the
+/// first message of an `@` thread (R605-03) — carries `metadata.focus`:
+/// drive, path, the heading trail of the caret's line and the line, as the
+/// replica stores it for the runtime. A message sent without one carries no
+/// metadata at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_sent_from_the_notes_assistant_carries_the_note_as_focus() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive"]).await;
+    directory(&opener, "tgdrive", &[("tola", "agent")]);
+    let focus = inbox_focus("tgdrive");
+    let key = hq
+        .new_session(
+            "tgdrive",
+            "nixie",
+            "a new chat from the note",
+            None,
+            Some(&focus),
+        )
+        .expect("a chat");
+    hq.send(&key, "what am I looking at?", &[], Some(&focus))
+        .expect("sent");
+    hq.send_line(&key, "and this?", &[], Some(&focus))
+        .expect("sent");
+    hq.send_line(&key, "@tola what is this note?", &[], Some(&focus))
+        .expect("a thread");
+    hq.send(&key, "from the Agents window", &[], None)
+        .expect("sent");
+
+    let expected = serde_json::json!({"focus": {
+        "drive": "tgdrive", "path": "10-notes/inbox.md", "heading": "Plans › Q3", "line": 5}});
+    for body in [
+        "a new chat from the note",
+        "what am I looking at?",
+        "and this?",
+        "@tola what is this note?",
+    ] {
+        assert_eq!(metadata_of(&opener, "tgdrive", body), expected, "{body}");
+    }
+    assert_eq!(
+        metadata_of(&opener, "tgdrive", "from the Agents window"),
+        Value::Null
+    );
+}
+
+/// R605-01 (D-34): a note's path and heading are its drive's, so a message
+/// carries them only into a conversation everyone of whose readers reads
+/// that drive. A database read by someone the drive's readers do not
+/// include, or one whose readers keeper cannot compare (the drive's
+/// database is not held here), gets the message without its focus — on a
+/// line, an `@` thread, and a chat started from the note alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_s_focus_never_reaches_a_wider_audience_than_its_drive() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["tgdrive", "beta", "solo"]).await;
+    directory(&opener, "tgdrive", &[("ana", "person"), ("ben", "person")]);
+    directory(
+        &opener,
+        "beta",
+        &[
+            ("ana", "person"),
+            ("ben", "person"),
+            ("cy", "person"),
+            ("tola", "agent"),
+        ],
+    );
+    directory(&opener, "solo", &[("ana", "person")]);
+    let tg = inbox_focus("tgdrive");
+    let elsewhere = inbox_focus("neuradrive");
+
+    // beta is also read by Cy, who does not read tgdrive.
+    let wide = hq
+        .new_session("beta", "nixie", "started in beta", None, Some(&tg))
+        .expect("a beta chat");
+    hq.send(&wide, "sent to beta", &[], Some(&tg))
+        .expect("sent");
+    hq.send_line(&wide, "a line to beta", &[], Some(&tg))
+        .expect("sent");
+    hq.send_line(&wide, "@tola in beta", &[], Some(&tg))
+        .expect("a thread");
+    for body in [
+        "started in beta",
+        "sent to beta",
+        "a line to beta",
+        "@tola in beta",
+    ] {
+        assert_eq!(metadata_of(&opener, "beta", body), Value::Null, "{body}");
+    }
+
+    // solo is read by Ana alone, who reads tgdrive: the focus goes.
+    let narrow = hq
+        .new_session("solo", "nixie", "started in solo", None, Some(&tg))
+        .expect("a solo chat");
+    hq.send(&narrow, "tgdrive's note to solo", &[], Some(&tg))
+        .expect("sent");
+    assert_eq!(
+        metadata_of(&opener, "solo", "tgdrive's note to solo")["focus"]["drive"],
+        Value::from("tgdrive")
+    );
+    assert_eq!(
+        metadata_of(&opener, "solo", "started in solo")["focus"]["drive"],
+        Value::from("tgdrive")
+    );
+    // neuradrive's readers are unknown here: no focus.
+    hq.send(&narrow, "neuradrive's note to solo", &[], Some(&elsewhere))
+        .expect("sent");
+    assert_eq!(
+        metadata_of(&opener, "solo", "neuradrive's note to solo"),
+        Value::Null
+    );
+}
+
+/// Record, as a round would, the server refusing commit `commit` with
+/// `code`; it wrote `ops` (`table`, `op`, values).
+fn journal_refused(path: &std::path::Path, commit: &str, code: &str, ops: &[(&str, &str, Value)]) {
+    use syncular_client::api::{CommitOperation, CommitOperationOutcome, RejectionRecord};
+    let operations: Vec<CommitOperation> = ops
+        .iter()
+        .map(|(table, op, values)| CommitOperation {
+            table: (*table).to_owned(),
+            row_id: values["id"].as_str().unwrap_or_default().to_owned(),
+            op: (*op).to_owned(),
+            base_version: None,
+            values: values.as_object().cloned(),
+        })
+        .collect();
+    let results = vec![CommitOperationOutcome::Error {
+        rejection: RejectionRecord {
+            client_commit_id: commit.to_owned(),
+            op_index: 0,
+            code: code.to_owned(),
+            message: code.to_owned(),
+            retryable: false,
+            details: None,
+            operation: None,
+        },
+    }];
+    let conn = rusqlite::Connection::open(path).expect("opens");
+    conn.busy_timeout(Duration::from_secs(5)).expect("timeout");
+    conn.execute(
+        "INSERT INTO _syncular_commit_outcomes(client_commit_id, status, recorded_at_ms, \
+         results_json, operations_json) VALUES (?1, 'rejected', 1, ?2, ?3)",
+        rusqlite::params![
+            commit,
+            serde_json::to_string(&results).expect("results"),
+            serde_json::to_string(&operations).expect("operations")
+        ],
+    )
+    .expect("records");
+}
+
+/// Contract § 9.1a (R605-04): the server, not this device, decides who may
+/// read a note's focus. A message it refuses for that (`hq.focus.audience`),
+/// or for a focus that is not well-formed (`hq.focus.malformed`, here one
+/// whose line is `42.0`), is written again once, the same message without
+/// the focus — never
+/// dropped — and the person reads why under it. Another refusal is left as
+/// it stands, and a second pass writes nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_the_server_refuses_for_its_note_goes_again_without_it() {
+    let world = World::new();
+    let (hq, opener) = spoken_world(&world, &["beta"]).await;
+    let key = hq
+        .new_session("beta", "nixie", "hello", None, None)
+        .expect("a chat");
+    let source = hq.source("beta").expect("beta");
+    let at = sessions::now_ms();
+    let focused = |id: &str, body: &str| match sessions::person_message(
+        &source,
+        &key.session_id,
+        id,
+        body,
+        Some(inbox_focus("tgdrive").metadata()),
+        at,
+    ) {
+        RowOp::Upsert { values, .. } => Value::Object(values),
+        _ => unreachable!("a message is an upsert"),
+    };
+    let activity = serde_json::json!({"id": key.session_id, "last_activity_ms": at,
+        "author_actor": "ana", "author_client": "ana.1"});
+    let path = opener.path("beta");
+    journal_refused(
+        &path,
+        "c-focus",
+        "hq.focus.audience",
+        &[
+            (
+                "messages",
+                "upsert",
+                focused("m-focus", "what is this note?"),
+            ),
+            // A patch is journaled as an upsert of the values it wrote.
+            ("sessions", "upsert", activity.clone()),
+        ],
+    );
+    let mut broken = focused("m-broken", "and this one?");
+    broken["metadata"] = Value::from(
+        serde_json::json!({"focus": {"drive": "tgdrive", "path": "a.md", "heading": null,
+                                     "line": 42.0}})
+        .to_string(),
+    );
+    journal_refused(
+        &path,
+        "c-broken",
+        "hq.focus.malformed",
+        &[("messages", "upsert", broken)],
+    );
+    journal_refused(
+        &path,
+        "c-other",
+        "hq.v5.page",
+        &[(
+            "messages",
+            "upsert",
+            focused("m-other", "refused otherwise"),
+        )],
+    );
+
+    hq.resend_withheld("beta");
+    hq.resend_withheld("beta");
+
+    let stored = rows(
+        &opener.replica("beta"),
+        "SELECT id, body, metadata FROM messages WHERE id IN ('m-focus', 'm-broken', \
+         'm-other') ORDER BY id",
+    );
+    let ids: Vec<&Value> = stored.iter().map(|row| &row["id"]).collect();
+    assert_eq!(
+        ids,
+        [&Value::from("m-broken"), &Value::from("m-focus")],
+        "once each, and only the note's refusals: {stored:?}"
+    );
+    for body in ["what is this note?", "and this one?"] {
+        assert_eq!(metadata_of(&opener, "beta", body), Value::Null, "{body}");
+    }
+    let refused: Vec<String> = source
+        .replica
+        .refused_commits("messages")
+        .expect("reads")
+        .into_iter()
+        .map(|commit| commit.commit_id)
+        .collect();
+    assert_eq!(refused, ["c-other"], "the note's refusals are set aside");
+
+    let view = hq.session_view(&key).expect("a view");
+    let said: Vec<(&str, Option<&str>)> = view
+        .messages
+        .iter()
+        .map(|message| (message.body.as_str(), message.note.as_deref()))
+        .collect();
+    assert!(
+        said.contains(&(
+            "what is this note?",
+            Some("This chat's readers can't all read tgdrive, so the note you're in wasn't sent.")
+        )),
+        "{said:?}"
+    );
+    assert!(
+        said.contains(&(
+            "and this one?",
+            Some("The note you're in couldn't be sent with this message.")
+        )),
+        "{said:?}"
+    );
+    assert!(said.contains(&("hello", None)), "{said:?}");
 }

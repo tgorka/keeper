@@ -156,6 +156,50 @@ beforeEach(() => {
   mock.command.mockReset().mockResolvedValue({ session: null, surface: "context", message: "" });
 });
 
+it("says Rust's quiet line under a message sent again without the note (109.28 § 9.1a)", async () => {
+  const note = "This chat's readers can't all read tgdrive, so the note you're in wasn't sent.";
+  await draw({
+    ...vm,
+    items: [{ kind: "message", messageId: "m1" }],
+    messages: [
+      {
+        id: "m1",
+        role: "person",
+        authorActor: "ana",
+        mine: true,
+        authorName: "Ana",
+        body: "what is this note?",
+        createdAtMs: 1780000000000,
+        state: "sent",
+        note,
+      },
+    ],
+  });
+  const message = screen.getByText("what is this note?").closest("li");
+  expect(message).not.toBeNull();
+  expect(within(message as HTMLElement).getByText(note)).toBeInTheDocument();
+});
+
+it("draws the Notes Assistant's unseen tick in the Agents window too (round 6 ruling)", async () => {
+  // A dock answer nobody saw left tgdrive ticked; the Agents window opens that chat.
+  await draw({
+    ...vm,
+    drives: {
+      drives: [{ name: "tgdrive", ticked: true }],
+      warning: "Once you tick a drive, the agent may read it.",
+      pending: false,
+      unseen: ["tgdrive"],
+    },
+  });
+  const note = screen.getByRole("note", { name: "What ticking tgdrive allows" });
+  expect(note).toHaveTextContent("Once you tick a drive, the agent may read it.");
+  expect(within(note).getByRole("button", { name: "Untick tgdrive" })).toBeInTheDocument();
+  expect(within(note).getByRole("button", { name: "OK" })).toBeInTheDocument();
+  expect(
+    within(screen.getByRole("list", { name: "Drives ticked" })).getByText("tgdrive"),
+  ).toBeInTheDocument();
+});
+
 describe("session context details", () => {
   const context: AgentSessionViewVm["context"] = {
     used: 48000,

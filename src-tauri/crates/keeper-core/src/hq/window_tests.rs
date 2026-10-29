@@ -693,6 +693,7 @@ fn a_message_is_waiting_until_the_server_has_it_and_an_ask_closes_on_an_answer()
         "dev1.1",
         "go",
         &[],
+        None,
     )
     .expect("sent");
     let (view, newest) = timeline::view(
@@ -785,6 +786,7 @@ fn an_archived_session_takes_no_message_and_is_read_through_the_server() {
             "dev1.1",
             "hi",
             &[],
+            None,
         )
         .map_err(|e| e.to_string()),
         Err("This conversation is archived; unarchive it to write in it.".to_owned())
@@ -875,8 +877,9 @@ fn archiving_shrinks_the_windows_and_an_outbox_pinned_row_survives() {
 fn a_new_session_takes_the_next_id_and_its_database_is_the_only_one_or_the_last_chosen() {
     let w = world();
     let sources = [w.alpha.clone(), w.beta.clone()];
-    let first = sessions::create(&w.alpha, NIXIE, "plan the week\nthen more", None).expect("first");
-    let second = sessions::create(&w.alpha, NIXIE, "again", None).expect("second");
+    let first =
+        sessions::create(&w.alpha, NIXIE, "plan the week\nthen more", None, None).expect("first");
+    let second = sessions::create(&w.alpha, NIXIE, "again", None, None).expect("second");
     assert_eq!((first.as_str(), second.as_str()), ("dev1.1", "dev1.2"));
     let row = timeline::session_row(&w.alpha, &first).expect("row");
     assert_eq!(
@@ -1244,7 +1247,8 @@ fn sessions_created_at_once_never_share_an_id() {
             .map(|n| {
                 let alpha = w.alpha.clone();
                 scope.spawn(move || {
-                    sessions::create(&alpha, NIXIE, &format!("hello {n}"), None).expect("created")
+                    sessions::create(&alpha, NIXIE, &format!("hello {n}"), None, None)
+                        .expect("created")
                 })
             })
             .collect();

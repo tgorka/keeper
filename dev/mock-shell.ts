@@ -60,6 +60,7 @@ import type {
   AgentAttachmentVm,
   AgentChildSessionVm,
   AgentChoiceVm,
+  AgentDefaultSessionVm,
   AgentDriveWriteVm,
   AgentEffortOptionVm,
   AgentGrantOfferVm,
@@ -6200,6 +6201,12 @@ function mockDrives(database: string, archived: boolean): AgentSessionDrivesVm |
       warning: DRIVES_WARNING,
       pending: false,
     };
+  if (database === "tgdrive")
+    return {
+      drives: [{ name: "tgdrive", ticked: false }],
+      warning: DRIVES_WARNING,
+      pending: false,
+    };
   return {
     drives:
       database === "alpha"
@@ -6299,7 +6306,9 @@ const sessionChoices: AgentChoiceVm[] = [
     agentActor: "assistant",
     agentName: "Assistant",
     agentMark: "A",
-    databases: ["alpha", "beta"],
+    // `?sessions=notes` (109.28): the assistant also answers in tgdrive's own database, the
+    // one named after the notes vault's drive.
+    databases: sessionScenario === "notes" ? ["alpha", "beta", "tgdrive"] : ["alpha", "beta"],
     // The last database chosen for it on this device, so New session opens ready to send.
     database: "alpha",
     ask: true,
@@ -7905,6 +7914,9 @@ function mockPicker(vm: AgentSessionViewVm): AgentSessionPickerVm | undefined {
  * reader; steps and their failure lines only to a reader; details only in verbose.
  */
 function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
+  // Rust's view build prunes the seen record: a drive no longer ticked here loses its entry.
+  for (const drive of vm.drives?.drives ?? [])
+    if (!drive.ticked) mockSeenTicks.delete(seenKey(vm.database, vm.sessionId, drive.name));
   const prefs = heldViewPrefs();
   const reader = vm.readsTrace;
   const thinking = reader && prefs.viewMode !== "normal";
@@ -8025,7 +8037,17 @@ function sessionViewerVm(vm: AgentSessionViewVm): AgentSessionViewVm {
     ...(sentence ? { banner: { approvals: waiting, sentence } } : {}),
     tools: vm.tools.map((tool) => ({ ...tool })),
     ...(vm.drives
-      ? { drives: { ...vm.drives, drives: vm.drives.drives.map((drive) => ({ ...drive })) } }
+      ? {
+          drives: {
+            ...vm.drives,
+            drives: vm.drives.drives.map((drive) => ({ ...drive })),
+            unseen: vm.drives.drives
+              .filter(
+                (d) => d.ticked && !mockSeenTicks.has(seenKey(vm.database, vm.sessionId, d.name)),
+              )
+              .map((d) => d.name),
+          },
+        }
       : {}),
     settings: picker,
     // `timeline::AgentUntrustedVm::of`: the way out only where `/clean` runs.
@@ -8188,6 +8210,55 @@ function publishSessions() {
     if (vm) channel.onmessage?.(sessionViewerVm(vm));
   }
 }
+/**
+ * The note drive the mock knows (109.28): a vault on p1 (tgdrive's folder) is on tgdrive, any
+ * other vault is on no drive.
+ */
+function mockNoteDrive(vaultId: unknown): string | null {
+  const vaults = ANSWERS.notes_vaults as Array<{ id: string; profileId: string }>;
+  return vaults.find((vault) => vault.id === vaultId)?.profileId === "p1" ? "tgdrive" : null;
+}
+/**
+ * keeper-core's `AgentFocus::for_destination` (R605-01), crudely: a note's focus is written only
+ * into the database named after its drive, whose readers are the drive's; every other database
+ * here has a reader the drive does not. Logged as the `metadata` Rust would write, so a browser
+ * check reads what reaches the conversation, not only what the dock handed over.
+ *
+ * `?focus=refused` (§ 9.1a): the server refuses that focus anyway (`hq.focus.audience`), as it
+ * would for a reader this device still counts but who left the drive; `?focus=malformed` refuses it
+ * as not well-formed (`hq.focus.malformed`). Either way keeper sends the message again without it,
+ * and the quiet line Rust then says under the message is the answer.
+ */
+const focusScenario = new URLSearchParams(location.search).get("focus");
+function mockFocusWritten(payload: Record<string, unknown>): string | undefined {
+  const caret = payload.focus as { vaultId: string; line: number } | null | undefined;
+  const drive = caret ? mockNoteDrive(caret.vaultId) : null;
+  const written =
+    caret && drive !== null && drive === payload.database
+      ? { focus: { drive, path: "10-notes/inbox.md", heading: null, line: caret.line } }
+      : null;
+  if (written && focusScenario === "refused") {
+    console.debug("[mock-shell] refused hq.focus.audience; sent again →", payload.database, null);
+    return `This chat's readers can't all read ${drive}, so the note you're in wasn't sent.`;
+  }
+  if (written && focusScenario === "malformed") {
+    console.debug("[mock-shell] refused hq.focus.malformed; sent again →", payload.database, null);
+    return "The note you're in couldn't be sent with this message.";
+  }
+  console.debug("[mock-shell] metadata", payload.database, "→", written);
+  return undefined;
+}
+/**
+ * The ticks this person has been shown the warning for on this device, as `[database, session,
+ * drive]` keys (keeper-core's `SeenTicks`, round 6 ruling): any ticked drive not here draws its
+ * warning with Untick and OK wherever the session is shown. The person's own tick in the drive
+ * menu is recorded when it is made, the dock's never; OK records it; an untick drops it; and each
+ * view drops entries whose drive is no longer ticked. A fresh page is a fresh device: every drive
+ * a fixture starts ticked warns once, as native keeper does with no record.
+ */
+const mockSeenTicks = new Set<string>();
+const seenKey = (database: unknown, sessionId: unknown, drive: unknown) =>
+  JSON.stringify([database, sessionId, drive]);
 function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
   const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
   if (!vm) return hqRefuse("This session is not on this device.");
@@ -8238,11 +8309,17 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     for (const row of drives.drives) delete row.refused;
     delete drives.refused;
     drive.ticked = tick;
+    // Rust's `set_session_drive`: the person's own tick, made where the warning stands, is seen;
+    // an untick drops its record.
+    const seen = seenKey(payload.database, payload.sessionId, payload.drive);
+    if (tick) mockSeenTicks.add(seen);
+    else mockSeenTicks.delete(seen);
     if (unticking) {
       // Unticked, they are no longer the agent's to read: listed as not offered, after the others.
       for (const row of stale) {
         row.ticked = false;
         row.reason = `Assistant does not offer ${row.name}.`;
+        mockSeenTicks.delete(seenKey(payload.database, payload.sessionId, row.name));
       }
       drives.drives.sort((a, b) => Number(!!a.reason) - Number(!!b.reason));
     }
@@ -8641,9 +8718,11 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
   agent_send: (payload) => {
     if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
     const vm = mockSession(payload);
+    const note = mockFocusWritten(payload);
     mockDecline(vm, payload.declines);
     for (const message of vm.messages) if (message.ask) message.ask.open = false;
     const message = {
+      ...(note ? { note } : {}),
       id: `local-${++sessionSerial}`,
       role: "person" as const,
       authorActor: "ana",
@@ -8699,6 +8778,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     if (chips.some((chip) => chip === undefined))
       hqRefuse("A file of this message is no longer ready to send. Attach it again.");
     mockDecline(vm, payload.declines);
+    mockFocusWritten(payload);
     mockAttach(
       vm,
       String(payload.caption ?? ""),
@@ -8785,7 +8865,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       ? hqRefuse("The database directory is unavailable.")
       : sessionChoices,
   agent_session_default: () =>
-    sessionScenario === "launch"
+    sessionScenario === "launch" || sessionScenario === "notes"
       ? {
           agentActor: "assistant",
           agentName: "Assistant",
@@ -8793,6 +8873,67 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
           sessionId: "device.1",
         }
       : null,
+  // 109.28: keeper-core's `Hq::session_for_note`, crudely. A note of a vault on p1 (tgdrive's
+  // folder, whose `_drive.toml` says `tgdrive`) is on tgdrive: the default agent's newest
+  // tgdrive chat, started when it has none, and tgdrive ticked in it with the warning when it is
+  // not yet. Any other vault's note is on no drive. Viewing aid only.
+  agent_note_drive: (payload) => mockNoteDrive(payload.vaultId),
+  agent_session_for_note: (payload) => {
+    const main = sessionHandlers.agent_session_default(payload) as AgentDefaultSessionVm | null;
+    if (main === null) return null;
+    const drive = mockNoteDrive(payload.vaultId);
+    if (drive === null)
+      return {
+        target: main,
+        reason: "This note's folder is not a drive, so no drive is ticked.",
+      };
+    if (
+      !sessionChoices.some((c) => c.agentActor === main.agentActor && c.databases.includes(drive))
+    )
+      return {
+        target: main,
+        drive,
+        reason: `This device holds no ${drive} database with ${main.agentName} in it, so ${drive} is not ticked.`,
+      };
+    let row = sessionRows.find(
+      (r) => r.agentActor === main.agentActor && r.database === drive && !r.archived,
+    );
+    if (row === undefined) {
+      const started = sessionHandlers.agent_session_new({
+        database: drive,
+        agentActor: main.agentActor,
+        body: "",
+        pick: payload.pick,
+      }) as { database: string; sessionId: string };
+      const fresh = mockSession(started);
+      fresh.messages = [];
+      fresh.title = "New conversation";
+      fresh.displayName = `${main.agentActor} · ${fresh.title}`;
+      fresh.drives = mockDrives(drive, false);
+      row = sessionRows.find((r) => r.database === drive && r.sessionId === started.sessionId);
+      if (row) {
+        row.title = fresh.title;
+        row.displayName = `${main.agentActor} · ${fresh.title}`;
+        row.choosesDrives = true;
+      }
+    }
+    if (row === undefined) return null;
+    const target = { ...main, database: drive, sessionId: row.sessionId };
+    const tick = mockSession(target).drives?.drives.find((d) => d.name === drive);
+    if (tick === undefined)
+      return { target, drive, reason: `${main.agentName} does not offer ${drive}.` };
+    if (tick.ticked) return { target, drive };
+    // The dock's tick is not recorded as seen: it warns wherever the chat is shown.
+    tick.ticked = true;
+    publishSessions();
+    return { target, drive };
+  },
+  // Rust's `note_tick_seen`: recorded, then `touch()`, which every open view reads again on.
+  agent_note_tick_seen: (payload) => {
+    mockSeenTicks.add(seenKey(payload.database, payload.sessionId, payload.drive));
+    publishSessions();
+    return null;
+  },
   agent_session_new: (payload) => {
     if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");
     const choice = sessionChoices.find(
@@ -8801,6 +8942,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         choice.databases.includes(String(payload.database)),
     );
     if (!choice) return hqRefuse("That agent does not serve this database.");
+    if (String(payload.body) !== "") mockFocusWritten(payload);
     const row: AgentSessionRowVm = {
       database: String(payload.database),
       sessionId: `device.${++sessionSerial + 10}`,
@@ -8917,6 +9059,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     // Q109-12 a (R10924K-10): past its local checks, a mention declines what the
     // banner showed, as any message does.
     mockDecline(vm, payload.declines);
+    mockFocusWritten(payload);
     const now = Date.now();
     const sessionId = `device.${++sessionSerial + 10}`;
     const prompt: AgentMessageVm = {

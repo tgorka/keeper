@@ -661,7 +661,8 @@ dialog says **Trusted** for a session with no mark, **Untrusted** once it read o
 
 **Drives** (109.23; Q109-20 b, V17) sits under the session's title: a chip per ticked drive and a
 menu of check items. No drive is ticked until a person ticks one — not even the session's own
-database. The menu lists every drive the agent offers (`agent_profiles.drives`, any instance of it,
+database — with one exception, below: the Notes Assistant ticks the open note's drive for the
+person (R-HQ-86). The menu lists every drive the agent offers (`agent_profiles.drives`, any instance of it,
 as the server reads the ceiling), then the drives keeper knows of that it may not read here, each
 with Rust's reason: another agent's drive ("Nixie does not offer omega."), or one the audience rule
 refuses — drive D in database S only when everyone who reads S reads D (D-34), read from the
@@ -1089,6 +1090,54 @@ as having held its sessions (**nixie.hesperia held this conversation; its lease 
 nixie.electra takes it over next.**) 29.4 s after the kill, before `nixie.electra` took them over at
 29.9–30.5 s. Nothing ever said a holder whose lease had run out was answering. The rest of the case
 held as before.
+
+## The Notes Assistant (109.28)
+
+The notes view's dock is the default agent's chat **on the open note's drive** (R-HQ-86):
+
+- **Which chat.** keeper maps the note to its drive (`keeper_agent::surface::drive_of`: the vault's
+  synced folder's `_drive.toml` and the note's path, through `browse`'s segment rules) and opens the
+  default agent's newest unarchived session in the database named after that drive (AD-433), or
+  starts one there with this device's last model and effort for the agent
+  (`Hq::session_for_note`, IPC `agent_session_for_note`). A note on no drive, or a drive with no
+  database here that names the agent, opens the agent's main conversation and says why.
+- **The tick, and its warning.** In that chat keeper ticks the drive as the person, by the menu's
+  own rules (the agent offers it, V17's audience rule allows it, no stopped drive holds it back).
+  Nowhere else is a drive ticked for the person (Q109-20 b). keeper keeps, per device, the ticks
+  this person has been shown the drives' warning (R-HQ-79) for and answered — the **seen** record
+  (`hq/drive-ticks-seen.json`, written atomically; round 6 ruling). Any ticked drive not in it draws
+  that warning beside its chip, with **Untick** and **OK**, wherever the session is shown (the dock,
+  the Agents window, after a restart): `drives.unseen`, read from the same view as the chips, so
+  the two cannot disagree. The person's own tick in the drive menu, where the warning stands, is
+  recorded when made; the dock's tick is not, so it warns. OK records it (`agent_note_tick_seen`)
+  and wakes every open view. An untick drops its entry, and each view build drops entries whose
+  session is gone or whose drive is no longer ticked. What is lost fails toward the warning: a
+  missing, unreadable or older record is an empty one, and a tick made on another device, or
+  carried by `/clean`, warns here once. The person's tick or untick, the dock's tick and the record
+  share one lock. keeper never takes a dock tick back on its own: only a person unticks it. When
+  the dock does not tick, it says why.
+- **Following.** The dock follows the drive, not the note: another note of the same vault keeps the
+  chat, as does a vault on the same drive; a note on another drive opens that drive's chat. A pick
+  in the dock's own select holds until the drive changes. Opening and ticking are writes, so the dock
+  first reads the note's drive (`agent_note_drive`, read-only) and asks for them only when the
+  drive changed; one writing call runs at a time. An answer the dock no longer wants (the person
+  left the note or its drive, or closed the dock) does nothing in the dock; a tick it made stays,
+  unseen, and its chat draws the warning whenever it is opened.
+- **The note as context.** A message sent from the dock carries `metadata.focus`
+  `{drive, path, heading, line}` (contract §9.1): the caret's 1-based body line, and the heading
+  trail Rust reads from the editor's buffer through that line, unsaved text included. That holds for
+  every message the dock writes: a line, an ask's answer, a file message, the first message of a
+  conversation started in the dock, and an `@` thread's first message. A note's path and heading
+  are its drive's, so the focus goes only into a conversation whose database everyone who reads it
+  also reads the drive — the drive's own database, or one whose people this device can see are all
+  the drive's (D-34, R605-01). Anywhere wider, or where keeper cannot tell, the message goes
+  without it. That device check is only a first filter: the server is the boundary (contract
+  § 9.1a). It refuses a message whose focus drive the chat's readers may not all read
+  (`hq.focus.audience`) or whose focus is not well-formed (`hq.focus.malformed`); keeper then writes
+  the same message again once, without the focus (same id, body and files, a new commit), and says
+  the refusal's sentence as a quiet line under it. The message is never dropped. The runtime
+  adds one line for that turn; `drive_read` reads the drive's committed copy, so unsaved edits are
+  not in what the agent can read. A message from the Agents window carries no focus.
 
 ## A push from the agents server
 
