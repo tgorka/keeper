@@ -12,16 +12,16 @@
 //!    read, waited for; refused → nothing is written, and the agent is told
 //!    the server's reason.
 //! 4. **Effect**: the apply checks again, then one authored commit through
-//!    the [`DriveWrites`] port, carrying `Approval-Record: <approval id>`.
+//!    the [`DriveWrites`] port, carrying `Approval-Record: <database>/<id>`.
 //! 5. **Outcome**: the `applied` message (V18) in its own commit.
 //!
 //! Steps 3–5 follow 2 in the same call; whatever the wait leaves to the
 //! server is picked up by [`Writes::carry_on`] when the replica has the
 //! answer. A device stopped between 3 and 5 settles on its next start: the
-//! commit carrying the approval is looked for by its trailer — found, it is
-//! reported `applied`; not found, `not_applied` (§ 5.3). A device stopped
-//! between 2 and 3 leaves the row approved until the claim holder expires
-//! it (§ 12).
+//! commit carrying the database-qualified approval is looked for by its
+//! trailer — found, it is reported `applied`; absent, a legacy bare-id
+//! trailer leaves an indeterminate, non-replayable consumed row for manual
+//! inspection. Only absence of both formats reports `not_applied` (§ 5.3).
 //!
 //! Every decision and sentence is here; the port answers what the checkout
 //! holds with keeper-sync's own path rule, and commits.
@@ -65,6 +65,10 @@ pub const CHANGED: &str = "This request changed since it was shown.";
 /// said what became of it, and no commit carries it (§ 5.3).
 pub const STOPPED: &str = "keeper stopped before it wrote this; nothing was written.";
 
+/// A bare-id trailer is not attributable to this database. Keep the
+/// consumed approval, never replay it or emit a false terminal V18 outcome.
+pub const INDETERMINATE: &str = "Write outcome unknown: an older keeper commit has this approval id without a database. Inspect the drive history before making another change; keeper will not retry this write.";
+
 /// Said when the request reaches a build with no drive writer.
 pub const NO_WRITER: &str = "keeper on this device cannot write to drives.";
 
@@ -91,6 +95,12 @@ pub const LINE_CHARS: usize = 10_000;
 /// The most characters a whole card may take, counted as drawn: its diff,
 /// excerpts, path, `to`, summary and exact action (R606-09).
 pub const CARD_CHARS: usize = 400_000;
+
+/// Bound actual rendered spans and their named accessibility nodes, not
+/// just glyphs. Adjacent equivalent markers share a run; alternating ones
+/// still cost separate nodes. Enforced while building, before allocating
+/// another run.
+pub const CARD_RUNS: usize = 2_000;
 
 /// Said above the diff when a line on it holds right-to-left text, which
 /// the card draws in stored order (R606-06).
@@ -177,18 +187,17 @@ pub struct AgentWriteLineVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub note: Option<String>,
-    /// The line as runs, when it holds a marker the card draws in place of
-    /// a character — a space, a no-break space, a tab, a carriage return, a
-    /// final line break: each marker its own run with an accessible name,
-    /// so content can never draw one (R606-13). `text` is the same line as
-    /// one string.
+    /// The line as runs when it holds markers: adjacent equivalent markers
+    /// share a run, whose accessible name must include their exact count.
+    /// Literal marker glyphs are escaped, never drawn as markers.
+    /// `text` is the same line as one string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub runs: Option<Vec<AgentWriteRunVm>>,
 }
 
-/// A piece of a line: text as it is, or a marker the card draws (`mark` is
-/// its accessible name: "space", "tab", …).
+/// A piece of a line: text, or consecutive equivalent markers (`mark`
+/// names one: "space", "tab", …; the renderer also announces their count).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -249,9 +258,9 @@ pub struct AgentWritePreviewVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub rtl_note: Option<String>,
-    /// Why nothing of the change is shown: which of the card's caps it is
-    /// past, and by how much ([`CARD_LINES`], [`LINE_CHARS`],
-    /// [`CARD_CHARS`]; R606-05, R606-09). Allow is withheld.
+    /// Why nothing of the change is shown: which cap it is past
+    /// ([`CARD_LINES`], [`LINE_CHARS`], [`CARD_CHARS`], [`CARD_RUNS`]).
+    /// Allow is withheld by the same assessment at draw, Allow and effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub too_large: Option<String>,
@@ -303,14 +312,14 @@ fn holds_hidden(text: &str) -> bool {
     (0..chars.len()).any(|at| hides(&chars, at))
 }
 
-/// `text` as a card shows it: every character [`hides`] answers for written
-/// out, `⟨U+202E⟩`, a tag as `⟨TAG U+E0049⟩`; everything else as it is.
-/// Never stripped: the person sees that something is there, and where.
+/// `text` as a card shows it: hidden characters written out, and literal
+/// escape delimiters and marker glyphs escaped too. The convention is
+/// injective: content cannot impersonate an escape or a drawn CR marker.
 pub fn escaped(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     for (at, c) in chars.iter().enumerate() {
-        if hides(&chars, at) {
+        if hides(&chars, at) || escape_literal(*c) {
             out.push_str(&escape_form(*c));
         } else {
             out.push(*c);
@@ -331,6 +340,12 @@ fn escape_form(c: char) -> String {
     } else {
         format!("⟨U+{code:04X}⟩")
     }
+}
+
+/// Escape syntax itself is data too. Always escape both delimiters and
+/// literal marker glyphs in metadata and diff text alike.
+fn escape_literal(c: char) -> bool {
+    matches!(c, '⟨' | '⟩') || MARKERS.contains(&c)
 }
 
 /// Whether `c` is a strong right-to-left character (Bidi_Class R or AL, by
@@ -364,9 +379,12 @@ const MARKERS: [char; 5] = ['·', '⍽', '→', '⏎', '↵'];
 /// carriage return is a marker (`·` `⍽` `→` `⏎`), other whitespace an
 /// escape (`⟨U+2003⟩`), and the line break a marker `↵` when `final_break`
 /// (R606-07). Without, a carriage return ending no line is a marker `⏎`.
-/// Everywhere, hidden characters are escaped ([`hides`]); and on a line
-/// with a marker, so is each character of [`MARKERS`].
-fn render_line(raw: &str, whitespace: Option<bool>) -> (String, Option<Vec<AgentWriteRunVm>>) {
+/// Everywhere, hidden characters and literal escape syntax are escaped.
+fn render_line_bounded(
+    raw: &str,
+    whitespace: Option<bool>,
+    run_count: &mut usize,
+) -> Result<(String, Option<Vec<AgentWriteRunVm>>), TooLarge> {
     let (body, broke) = match raw.strip_suffix('\n') {
         Some(body) => (body, true),
         None => (raw, false),
@@ -389,37 +407,64 @@ fn render_line(raw: &str, whitespace: Option<bool>) -> (String, Option<Vec<Agent
     };
     let final_mark = whitespace == Some(true) && broke;
     let marked = final_mark || (0..chars.len()).any(|at| mark_at(at).is_some());
+    // Plain lines cost one row, already bounded by CARD_LINES. Only
+    // structured runs create extra spans/accessibility nodes.
+    let mut plain_count = 0;
+    let run_count = if marked { run_count } else { &mut plain_count };
     let mut runs: Vec<AgentWriteRunVm> = Vec::new();
-    let plain = |runs: &mut Vec<AgentWriteRunVm>, piece: &str| match runs.last_mut() {
-        Some(last) if last.mark.is_none() => last.text.push_str(piece),
-        _ => runs.push(AgentWriteRunVm {
-            text: piece.to_owned(),
-            mark: None,
-        }),
+    let piece = |runs: &mut Vec<AgentWriteRunVm>,
+                 run_count: &mut usize,
+                 text: &str,
+                 mark: Option<&str>|
+     -> Result<(), TooLarge> {
+        if let Some(last) = runs.last_mut() {
+            if last.mark.as_deref() == mark {
+                last.text.push_str(text);
+                return Ok(());
+            }
+        }
+        if *run_count == CARD_RUNS {
+            return Err(TooLarge::Runs);
+        }
+        *run_count += 1;
+        runs.push(AgentWriteRunVm {
+            text: text.to_owned(),
+            mark: mark.map(str::to_owned),
+        });
+        Ok(())
     };
     let mut one = [0u8; 4];
     for (at, c) in chars.iter().enumerate() {
         if let Some((glyph, name)) = mark_at(at) {
-            runs.push(AgentWriteRunVm {
-                text: glyph.to_owned(),
-                mark: Some(name.to_owned()),
-            });
+            piece(&mut runs, run_count, glyph, Some(name))?;
         } else if hides(&chars, at) {
-            plain(&mut runs, &escape_form(*c));
-        } else if (whitespace.is_some() && c.is_whitespace()) || (marked && MARKERS.contains(c)) {
-            plain(&mut runs, &format!("⟨U+{:04X}⟩", u32::from(*c)));
+            piece(&mut runs, run_count, &escape_form(*c), None)?;
+        } else if (whitespace.is_some() && c.is_whitespace()) || escape_literal(*c) {
+            piece(
+                &mut runs,
+                run_count,
+                &format!("⟨U+{:04X}⟩", u32::from(*c)),
+                None,
+            )?;
         } else {
-            plain(&mut runs, c.encode_utf8(&mut one));
+            piece(&mut runs, run_count, c.encode_utf8(&mut one), None)?;
         }
     }
     if final_mark {
-        runs.push(AgentWriteRunVm {
-            text: "↵".to_owned(),
-            mark: Some("line break at the end of the file".to_owned()),
-        });
+        piece(
+            &mut runs,
+            run_count,
+            "↵",
+            Some("line break at the end of the file"),
+        )?;
     }
     let text = runs.iter().map(|run| run.text.as_str()).collect();
-    (text, marked.then_some(runs))
+    Ok((text, marked.then_some(runs)))
+}
+
+#[cfg(test)]
+fn render_line(raw: &str, whitespace: Option<bool>) -> (String, Option<Vec<AgentWriteRunVm>>) {
+    render_line_bounded(raw, whitespace, &mut 0).expect("test line fits the run budget")
 }
 
 /// `text`'s lines, each with its line break.
@@ -630,7 +675,10 @@ fn regroup(steps: &[(LineKind, &str)]) -> Vec<drive_write::Hunk> {
 /// of a run of removals with the n-th of the additions after it) that
 /// differ only in whitespace drawn with their whitespace visible, the added
 /// one saying so (R606-07).
-fn card_lines(lines: &[drive_write::PreviewLine]) -> Vec<AgentWriteLineVm> {
+fn card_lines(
+    lines: &[drive_write::PreviewLine],
+    run_count: &mut usize,
+) -> Result<Vec<AgentWriteLineVm>, TooLarge> {
     let mut whitespace = vec![None; lines.len()];
     let mut at = 0;
     while at < lines.len() {
@@ -656,8 +704,8 @@ fn card_lines(lines: &[drive_write::PreviewLine]) -> Vec<AgentWriteLineVm> {
         .iter()
         .zip(whitespace)
         .map(|(line, whitespace)| {
-            let (text, runs) = render_line(&line.text, whitespace);
-            AgentWriteLineVm {
+            let (text, runs) = render_line_bounded(&line.text, whitespace, run_count)?;
+            Ok(AgentWriteLineVm {
                 kind: match line.kind {
                     LineKind::Context => AgentWriteLineKindVm::Context,
                     LineKind::Add => AgentWriteLineKindVm::Add,
@@ -668,45 +716,54 @@ fn card_lines(lines: &[drive_write::PreviewLine]) -> Vec<AgentWriteLineVm> {
                 note: (whitespace.is_some() && line.kind == LineKind::Add)
                     .then(|| WHITESPACE_ONLY.to_owned()),
                 runs,
-            }
+            })
         })
         .collect()
 }
 
 impl From<Preview> for AgentWritePreviewVm {
     fn from(preview: Preview) -> Self {
-        let excerpt = |e: drive_write::Excerpt| AgentWriteExcerptVm {
-            rtl: e
-                .lines
-                .iter()
-                .any(|l| l.chars().any(strong_rtl))
-                .then_some(true),
-            lines: e.lines.iter().map(|line| escaped(line)).collect(),
-            more: count(e.more),
-        };
-        let mut vm = Self {
-            hunks: preview
-                .hunks
-                .into_iter()
-                .map(|hunk| AgentWriteHunkVm {
+        render_preview(preview).unwrap_or_else(too_large_preview)
+    }
+}
+
+/// Build only bounded render work. A refusal drops the partial VM; no
+/// over-budget runs ever cross IPC.
+fn render_preview(preview: Preview) -> Result<AgentWritePreviewVm, TooLarge> {
+    let mut run_count = 0;
+    let excerpt = |e: drive_write::Excerpt| AgentWriteExcerptVm {
+        rtl: e
+            .lines
+            .iter()
+            .any(|l| l.chars().any(strong_rtl))
+            .then_some(true),
+        lines: e.lines.iter().map(|line| escaped(line)).collect(),
+        more: count(e.more),
+    };
+    let mut vm = AgentWritePreviewVm {
+        hunks: preview
+            .hunks
+            .into_iter()
+            .map(|hunk| {
+                Ok(AgentWriteHunkVm {
                     old_start: count(hunk.old_start),
                     new_start: count(hunk.new_start),
-                    lines: card_lines(&hunk.lines),
+                    lines: card_lines(&hunk.lines, &mut run_count)?,
                 })
-                .collect(),
-            whole: preview.whole.map(excerpt),
-            deleted: preview.deleted.map(excerpt),
-            ..Self::default()
-        };
-        let rtl = vm
-            .hunks
-            .iter()
-            .flat_map(|h| &h.lines)
-            .any(|l| l.rtl.is_some())
-            || vm.whole.iter().chain(&vm.deleted).any(|e| e.rtl.is_some());
-        vm.rtl_note = rtl.then(|| RTL_NOTE.to_owned());
-        vm
-    }
+            })
+            .collect::<Result<_, TooLarge>>()?,
+        whole: preview.whole.map(excerpt),
+        deleted: preview.deleted.map(excerpt),
+        ..AgentWritePreviewVm::default()
+    };
+    let rtl = vm
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .any(|l| l.rtl.is_some())
+        || vm.whole.iter().chain(&vm.deleted).any(|e| e.rtl.is_some());
+    vm.rtl_note = rtl.then(|| RTL_NOTE.to_owned());
+    Ok(vm)
 }
 
 /// Which of the card's caps a change is past (R606-05, R606-09).
@@ -720,6 +777,8 @@ enum TooLarge {
     LineChars(usize),
     /// The card takes this many characters as drawn, past [`CARD_CHARS`].
     CardChars(usize),
+    /// More rendered runs would exceed [`CARD_RUNS`].
+    Runs,
 }
 
 impl TooLarge {
@@ -734,6 +793,7 @@ impl TooLarge {
             Self::CardChars(n) => {
                 format!("It takes {n} characters; a card shows at most {CARD_CHARS}.")
             }
+            Self::Runs => format!("It needs more than {CARD_RUNS} text or marker runs; a card shows at most {CARD_RUNS}."),
         }
     }
 }
@@ -863,6 +923,7 @@ struct Call {
     turn: String,
     args: Value,
     agent: String,
+    summary: String,
     untrusted: bool,
 }
 
@@ -870,7 +931,7 @@ const CALL: &str = "SELECT a.id AS id, a.session_id AS session_id, a.binding_dig
      a.state AS state, a.decided_by_client AS decided_by_client, \
      a.consumed_by_client AS consumed_by_client, \
      a._sync_version AS version, t.id AS call_id, t.turn_id AS turn_id, t.args AS args, \
-     s.agent_actor AS agent_actor, s.trust AS trust \
+     s.agent_actor AS agent_actor, s.trust AS trust, a.summary AS summary \
      FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
      JOIN sessions s ON s.id = a.session_id";
 
@@ -888,6 +949,7 @@ impl Call {
             turn: text(row, "turn_id").to_owned(),
             args: json_column(row, "args"),
             agent: text(row, "agent_actor").to_owned(),
+            summary: text(row, "summary").to_owned(),
             untrusted: text(row, "trust") == "untrusted",
         })
     }
@@ -1155,13 +1217,14 @@ fn assess(source: &Source, port: &dyn DriveWrites, call: &Call) -> Result<Plan, 
     let words = [
         escaped(&request.path),
         request.to().map(escaped).unwrap_or_default(),
+        escaped(&call.summary),
         action,
     ];
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     let preview = change_preview(&request.change, before, post.as_deref())
         .map_err(|lines| lines.map_or(TooLarge::Compare, TooLarge::Lines))
         .and_then(|shown| {
-            let mut preview = AgentWritePreviewVm::from(shown);
+            let mut preview = render_preview(shown)?;
             if let (Some(before), Some(after)) = (before, post.as_deref()) {
                 preview.line_endings = line_endings_change(before, after);
             }
@@ -1372,12 +1435,19 @@ enum Owed {
     Consumed { commit: String },
     /// Committed under an id V18 cannot record: nothing more is done here.
     Unrecordable,
+    /// A legacy bare-id commit cannot be attributed to this database.
+    /// This must never enter `effect` on a subsequent recovery pass.
+    Indeterminate,
 }
 
 /// A look at one write's checkout, kept for [`LOOK_FOR`].
 #[derive(Debug, Clone)]
 struct Look {
     at: Instant,
+    /// Call rows are immutable; the binding and summary identify the
+    /// approval words this assessment checked, even within LOOK_FOR.
+    digest: String,
+    summary: String,
     blocked: Option<String>,
     /// The preview last shown.
     preview: Option<AgentWritePreviewVm>,
@@ -1454,7 +1524,10 @@ impl Writes {
     fn look(&self, source: &Source, port: &dyn DriveWrites, call: &Call) -> Look {
         let key = (source.database.clone(), call.approval.clone());
         if let Some(look) = lock(&self.looks).get(&key) {
-            if look.at.elapsed() < LOOK_FOR {
+            if look.at.elapsed() < LOOK_FOR
+                && look.digest == call.digest
+                && look.summary == call.summary
+            {
                 return look.clone();
             }
         }
@@ -1464,6 +1537,8 @@ impl Writes {
         let look = match assess(source, port, call) {
             Ok(plan) => Look {
                 at: Instant::now(),
+                digest: call.digest.clone(),
+                summary: call.summary.clone(),
                 blocked: plan.unshowable().map(str::to_owned),
                 preview: Some(match &plan.preview {
                     Ok(preview) => preview.clone(),
@@ -1472,6 +1547,8 @@ impl Writes {
             },
             Err(reason) => Look {
                 at: Instant::now(),
+                digest: call.digest.clone(),
+                summary: call.summary.clone(),
                 blocked: Some(reason),
                 preview: kept,
             },
@@ -1525,7 +1602,12 @@ impl Writes {
             untrusted: call.untrusted,
             audience: audience(sources, source, &request.drive),
             blocked: None,
-            outcome: applied_message(source, &call.approval).and_then(|m| outcome_line(&m)),
+            outcome: applied_message(source, &call.approval)
+                .and_then(|m| outcome_line(&m))
+                .or_else(|| {
+                    (lock(&self.owed).get(&key) == Some(&Owed::Indeterminate))
+                        .then(|| INDETERMINATE.to_owned())
+                }),
             rtl: None,
         };
         if approval.can_decide {
@@ -1533,6 +1615,8 @@ impl Writes {
                 Some(port) => self.look(source, port.as_ref(), &call),
                 None => Look {
                     at: Instant::now(),
+                    digest: call.digest.clone(),
+                    summary: call.summary.clone(),
                     blocked: Some(NO_WRITER.to_owned()),
                     preview: None,
                 },
@@ -1561,7 +1645,7 @@ impl Writes {
         // Every place the card shows the request's words shows them escaped
         // (R606-03), in stored order when they hold right-to-left text
         // (R606-12).
-        approval.summary = escaped(&approval.summary);
+        approval.summary = escaped(&call.summary);
         approval.action = approval.action.is_some().then(|| shown_action(&call.args));
         vm.blocked = vm.blocked.as_deref().map(escaped);
         let words = [
@@ -1578,32 +1662,11 @@ impl Writes {
             vm.rtl = Some(true);
             vm.preview.rtl_note = Some(RTL_NOTE.to_owned());
         }
-        // Whatever this device looked at, a card never draws more than its
-        // caps allow (R606-09): past them, no lines and no exact action —
-        // only the cap it is past.
-        let drawn = [
-            vm.path.as_str(),
-            vm.to.as_deref().unwrap_or_default(),
-            approval.summary.as_str(),
-            approval.action.as_deref().unwrap_or_default(),
-        ];
-        let over = match vm.preview.too_large {
-            Some(_) => None,
-            None => over_chars(&vm.preview, &drawn),
-        };
-        if over.is_some() || vm.preview.too_large.is_some() {
+        // The same assessment used by Allow and effect made this refusal.
+        // Never carry the exact action beside an omitted change.
+        if vm.preview.too_large.is_some() {
             approval.action = None;
-            if let Some(too_large) = over {
-                let rtl_note = vm.preview.rtl_note.take();
-                vm.preview = too_large_preview(too_large);
-                vm.preview.rtl_note = rtl_note;
-                approval
-                    .actions
-                    .retain(|action| *action != AgentApprovalActionVm::AllowOnce);
-                if approval.can_decide && vm.blocked.is_none() {
-                    vm.blocked = Some(TOO_LARGE.to_owned());
-                }
-            }
+            approval.summary = "Drive write too large to show in full.".to_owned();
         }
         approval.write = Some(vm);
     }
@@ -1841,9 +1904,19 @@ impl Writes {
     /// outcome it has not written: what a call left to the server's answer,
     /// and — after a stop between taking an approval and saying what became
     /// of it — recovery by the commit's trailer (§ 5.3). A row whose last
-    /// write here is still in the outbox waits for it. Blocking.
-    pub fn carry_on(&self, sources: &[Source]) {
-        let Some(port) = self.port() else { return };
+    /// write here is still in the outbox waits for it. Blocking. Returns
+    /// whether a new local indeterminate outcome needs a view refresh.
+    pub fn carry_on(&self, sources: &[Source]) -> bool {
+        let Some(port) = self.port() else {
+            return false;
+        };
+        let indeterminate = || {
+            lock(&self.owed)
+                .values()
+                .filter(|owed| **owed == Owed::Indeterminate)
+                .count()
+        };
+        let before = indeterminate();
         for source in sources {
             let rows = read(
                 source,
@@ -1861,6 +1934,7 @@ impl Writes {
                 self.carry_one(source, port.as_ref(), &call);
             }
         }
+        indeterminate() != before
     }
 
     fn carry_one(&self, source: &Source, port: &dyn DriveWrites, call: &Call) {
@@ -1878,7 +1952,7 @@ impl Writes {
         let owed = lock(&self.owed).get(&key).cloned();
         let mine = call.consumed_by_client.as_deref() == Some(source.client.as_str());
         match (call.state.as_str(), owed) {
-            (_, Some(Owed::Unrecordable)) => {}
+            (_, Some(Owed::Unrecordable | Owed::Indeterminate)) => {}
             ("approved", Some(Owed::Decided)) => {
                 self.consume(source, port, call, &key);
             }
@@ -1902,8 +1976,8 @@ impl Writes {
         }
     }
 
-    /// § 5.3: the commit carrying the approval, found by its trailer, is
-    /// what became of it; none is [`STOPPED`].
+    /// § 5.3: only a database-qualified trailer proves this effect.
+    /// A legacy bare trailer proves ambiguity, never success or absence.
     fn recover(&self, source: &Source, port: &dyn DriveWrites, call: &Call, key: &Key) {
         let drive = match Request::parse(&call.args) {
             Ok(request) => request.drive,
@@ -1917,16 +1991,22 @@ impl Writes {
             Ok(Some(commit)) => {
                 self.finish(source, call, key, Outcome::Applied { commit });
             }
-            Ok(None) => {
-                self.finish(
-                    source,
-                    call,
-                    key,
-                    Outcome::NotApplied {
-                        reason: STOPPED.to_owned(),
-                    },
-                );
-            }
+            Ok(None) => match port.carried(&drive, &call.approval) {
+                Ok(Some(_)) => self.owe(key.clone(), Owed::Indeterminate),
+                Ok(None) => {
+                    self.finish(
+                        source,
+                        call,
+                        key,
+                        Outcome::NotApplied {
+                            reason: STOPPED.to_owned(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(database = %source.database, %error, "legacy drive write history could not be checked");
+                }
+            },
             Err(error) => {
                 tracing::warn!(database = %source.database, %error, "a drive write taken here could not be looked for");
             }

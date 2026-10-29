@@ -17,10 +17,9 @@ rtl?: boolean,
  */
 note?: string, 
 /**
- * The line as runs, when it holds a marker the card draws in place of
- * a character — a space, a no-break space, a tab, a carriage return, a
- * final line break: each marker its own run with an accessible name,
- * so content can never draw one (R606-13). `text` is the same line as
- * one string.
+ * The line as runs when it holds markers: adjacent equivalent markers
+ * share a run, whose accessible name must include their exact count.
+ * Literal marker glyphs are escaped, never drawn as markers.
+ * `text` is the same line as one string.
  */
 runs?: Array<AgentWriteRunVm>, };

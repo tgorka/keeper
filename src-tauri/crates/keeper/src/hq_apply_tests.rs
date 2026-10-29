@@ -76,6 +76,10 @@ fn drive_with(tune: impl FnOnce(&mut SyncProfile)) -> Option<Drive> {
         dir.path(),
         &["clone", "-q", remote.to_str()?, root.to_str()?],
     );
+    // The engine's in-process git also updates the reflog. Command-local
+    // `git -c user.*` does not supply that committer; the fixture owns it.
+    git(&root, &["config", "user.name", "Ana"]);
+    git(&root, &["config", "user.email", "ana@example.org"]);
 
     let platform = Arc::new(TestPlatform::new(dir.path().join("data")));
     let engine = Arc::new(Engine::open(platform as Arc<dyn SyncPlatform>).ok()?);
@@ -166,7 +170,7 @@ impl Drive {
 
 #[test]
 fn each_op_is_one_commit_carrying_its_approval() {
-    let Some(d) = drive() else { return };
+    let d = drive().expect("strict real-checkout fixture");
     assert_eq!(d.writes.keeps("tgdrive"), Ok(()));
     let inbox = "10-notes/inbox.md".to_owned();
 
@@ -440,4 +444,41 @@ fn a_file_over_one_mb_is_refused_at_the_commit() {
         Err("\"10-notes/inbox.md\" is over 1 MB; agents can't change files that large.".to_owned())
     );
     assert_eq!(d.head(), before, "nothing committed");
+}
+
+/// A committed pre-upgrade write remains visible in history, but its bare
+/// id cannot establish success for any database. Core recovery probes both
+/// formats and retains this case as indeterminate without replaying it.
+#[test]
+fn legacy_committed_effect_is_detectable_but_never_database_qualified() {
+    let d = drive().expect("strict real-checkout fixture");
+    let key = "10-notes/inbox.md";
+    let before = d.head();
+    let done = d.commit(
+        "01JLEGACY",
+        key,
+        vec![(key.to_owned(), Some(b"old-version applied this\n".to_vec()))],
+        Vec::new(),
+        DriveTarget::Existing,
+    );
+    d.one_commit(&before, &done, "01JLEGACY");
+    assert_eq!(d.read(key).as_deref(), Some("old-version applied this\n"));
+    for database in ["tgdrive", "otherdb"] {
+        assert_eq!(
+            d.writes
+                .carried("tgdrive", &format!("{database}/01JLEGACY")),
+            Ok(None)
+        );
+    }
+    let head = d.head();
+    assert!(d
+        .writes
+        .carried("tgdrive", "01JLEGACY")
+        .expect("history")
+        .is_some());
+    assert_eq!(
+        d.head(),
+        head,
+        "history inspection never creates a second effect"
+    );
 }

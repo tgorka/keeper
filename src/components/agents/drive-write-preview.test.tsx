@@ -279,6 +279,34 @@ it("markers are their own named spans; content beside them is plain text", () =>
   );
 });
 
+it("compacted marker runs announce the exact count without losing visible glyphs", () => {
+  const spaces = "·".repeat(9999);
+  const change = card({
+    preview: {
+      hunks: [
+        {
+          oldStart: 1,
+          newStart: 1,
+          lines: [
+            { kind: "add", text: spaces, runs: [{ text: spaces, mark: "space" }] },
+            {
+              kind: "add",
+              text: "→→⏎",
+              runs: [
+                { text: "→→", mark: "tab" },
+                { text: "⏎", mark: "carriage return" },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  });
+  expect(within(change).getByRole("img", { name: "9999 × space" }).textContent).toBe(spaces);
+  expect(within(change).getByRole("img", { name: "2 × tab" })).toHaveTextContent("→→");
+  expect(within(change).getByRole("img", { name: "carriage return" })).toHaveTextContent("⏎");
+});
+
 it("a request whose words hold right-to-left text draws its path, to, summary and action in stored order", () => {
   card(
     {
