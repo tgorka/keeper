@@ -187,6 +187,9 @@ struct Runtime {
     /// one a newer sign-in superseded (`account_sign_in`) does not write its
     /// closed attempt over the newer one's.
     sign_ins: AtomicU64,
+    /// Serialize cancellation, the new latch and attempt ownership across
+    /// concurrent commands. Never held while waiting for the async gate.
+    sign_in_requests: Mutex<()>,
     /// When this process last found this device's log in the repository up
     /// to date — pushed, or already holding the same bytes — for which
     /// account and path, in seconds. The daily upload's own clock: a quiet
@@ -1274,15 +1277,28 @@ fn at_step(step: AccountStep) {
 /// the blocking git work the run started has stopped, so the gate is never
 /// let go while something still writes into the clone.
 async fn cancellable<T>(queued_at: u64, work: impl Future<Output = T>) -> Run<T> {
+    cancellable_until(queued_at, std::future::pending(), work).await
+}
+
+/// An interactive retry stops only its predecessor, including discovery.
+/// The caller captured `superseded` before waiting for the account gate.
+async fn cancellable_until<T>(
+    queued_at: u64,
+    superseded: impl Future<Output = ()>,
+    work: impl Future<Output = T>,
+) -> Run<T> {
     // Fresh before the boundary checks the stop count: a stop after the
     // check sets this very token.
     fresh_interrupt();
     let account = descriptor().map(|d| d.id);
     let ran = RUNTIME
         .attempts
-        .run(queued_at, account.as_deref(), work)
+        .run_until(queued_at, account.as_deref(), superseded, work)
         .await;
     if matches!(ran, Run::Cancelled) {
+        // Stop only this gate-holder's blocking git work. Model downloads
+        // and background attempts do not share this interactive stop.
+        interrupt().store(true, Ordering::SeqCst);
         update(|inner| inner.phase = AccountPhase::Idle);
     }
     blocking_idle().await;
@@ -3243,14 +3259,25 @@ async fn sync(
 /// cancel, sign-out or forget comes while it waits.
 async fn sign_in_and_sync(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>) -> AccountVm {
     let queued_at = epoch();
-    let this_sign_in = RUNTIME.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
-    update(|inner| inner.attempt = Some(AccountAttemptVm::Running));
+    let (superseded, this_sign_in) = {
+        let _request = lock(&RUNTIME.sign_in_requests);
+        // Cancel only earlier interactive work, even before its OAuth
+        // registration. Capture this attempt's latch in the same step, so
+        // another command cannot cancel between the two and go unnoticed.
+        flows.cancel_all();
+        let superseded = flows.cancel_latch();
+        let this_sign_in = RUNTIME.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
+        update(|inner| inner.attempt = Some(AccountAttemptVm::Running));
+        (superseded, this_sign_in)
+    };
     let gate = RUNTIME.gate.lock().await;
-    RUNTIME.dirty.store(false, Ordering::SeqCst);
-    // Cancelled while it ran, or stopped while it queued: the person closed
-    // it — core's `Run::attempt` decides (R387, R410). Set here, once,
-    // whichever way the attempt ended.
-    let attempt = cancellable(queued_at, converge(platform, flows, true))
+    // An obsolete queued request must not even clear the dirty marker.
+    // The latched stop is checked before polling discovery or later legs.
+    let work = async {
+        RUNTIME.dirty.store(false, Ordering::SeqCst);
+        converge(platform, flows, true).await
+    };
+    let attempt = cancellable_until(queued_at, superseded.cancelled(), work)
         .await
         .attempt();
     update(|inner| {
@@ -3834,13 +3861,9 @@ pub async fn account_sign_in(state: State<'_, AppState>) -> Result<AccountVm, Ip
     // Whoever signs in may not be who was signed in: nothing the forge
     // sources learnt under the previous sign-in carries over.
     crate::forge_ipc::forget_identity();
-    // A new sign-in supersedes one still waiting for its answer — started
-    // from another surface, or left open: its flow ends as cancelled and the
-    // registry's end hook closes its sheet (R608-02), rather than this one
-    // queueing behind it for up to its five minutes. Only the account's
-    // flows: a Matrix sign-in beside it is not this one's, and nothing else
-    // in flight (a sync, a models download) is stopped.
-    state.account_flows.cancel_all();
+    // sign_in_and_sync supersedes earlier interactive work atomically,
+    // before waiting for the account gate. Matrix flows, background sync
+    // and model downloads are not stopped by that interactive boundary.
     update(|inner| inner.grant_dead = true);
     Ok(Box::pin(sign_in_and_sync(
         Arc::clone(&state.platform),

@@ -2000,6 +2000,8 @@ mod tests {
         forge_login: Option<String>,
         /// Answer discovery with this status line instead of the document.
         discovery_status: Option<&'static str>,
+        /// Hold the actual discovery response until the interactive retry.
+        discovery_hold: Option<Arc<DiscoveryHold>>,
         /// Replace one field of the discovery document.
         discovery_patch: Option<(&'static str, String)>,
         /// Return an ID token on refresh: these claims over the sign-in's,
@@ -2013,6 +2015,11 @@ mod tests {
         /// earlier count refused ("was used twice"). Serve the application
         /// registration API to a token whose scope carries `write:user`.
         forgejo: bool,
+    }
+
+    struct DiscoveryHold {
+        arrived: tokio::sync::Notify,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     /// The claims every fake ID token starts from.
@@ -2190,6 +2197,10 @@ mod tests {
         let behaviour = behaviour.lock().expect("behaviour").clone();
         match (method.as_str(), target.as_str()) {
             ("GET", "/.well-known/openid-configuration") => {
+                if let Some(hold) = &behaviour.discovery_hold {
+                    hold.arrived.notify_one();
+                    let _ = hold.release.lock().expect("discovery release").recv();
+                }
                 if let Some(status) = behaviour.discovery_status {
                     reply(&mut stream, status, "{}");
                     return;
@@ -3088,6 +3099,46 @@ mod tests {
             .filter(|line| line.contains("account: a step did not finish"))
             .map(str::to_owned)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn retry_during_actual_discovery_opens_no_obsolete_sign_in_sheet() {
+        use crate::org_account::attempt::{Attempts, Run};
+
+        let (release, held) = std::sync::mpsc::channel();
+        let discovery = Arc::new(DiscoveryHold {
+            arrived: tokio::sync::Notify::new(),
+            release: Mutex::new(held),
+        });
+        let fake = start_fake(Behaviour {
+            discovery_hold: Some(Arc::clone(&discovery)),
+            ..Default::default()
+        });
+        let p = FakePlatform::new(&fake, Browser::Waits);
+        let d = account(&fake, "superseded-discovery", None);
+        let attempts = Attempts::default();
+        let queued_at = attempts.epoch();
+        let superseded = p.flows.cancel_latch();
+        let client = http();
+        let old = attempts.run_until(
+            queued_at,
+            Some(d.id.as_str()),
+            superseded.cancelled(),
+            sign_in_within(&p, &p.flows, &client, &d, FLOW_TIMEOUT),
+        );
+        let retry = async {
+            discovery.arrived.notified().await;
+            p.flows.cancel_all();
+            let _ = release.send(());
+        };
+        let (ran, ()) = tokio::join!(old, retry);
+        assert!(
+            matches!(ran, Run::Cancelled),
+            "retry must end the interactive attempt before discovery can open its sheet"
+        );
+        assert!(p.shown.lock().expect("shown").is_empty());
+        assert!(p.session(&d.id).is_none());
+        assert_eq!(attempts.epoch(), queued_at);
     }
 
     /// One interactive attempt through the account's attempt boundary, as
