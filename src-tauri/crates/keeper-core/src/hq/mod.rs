@@ -505,23 +505,14 @@ impl Hq {
         Ok(self.platform.data_dir()?)
     }
 
-    /// A credential kept before keeper recorded hosts (R607-06, amendment 2
-    /// (6)): until #607 every credential was created and adopted under the
-    /// system's name, so that is the host the server has and the one its
-    /// `t4_host` backfill took. Recorded at once, so a rename saved before
-    /// a quit is still told to the server at the next start (amendment 2
-    /// (7)).
-    fn backfill_hosts(&self, server: &ServerUrl, pairing: Pairing, system: &str) -> Pairing {
-        if pairing.host.is_some() && pairing.enrolled_host.is_some() {
+    /// Backfill only from a host already recorded with this credential.
+    /// Today's OS name cannot recover its former server host (R607-05).
+    fn backfill_hosts(&self, server: &ServerUrl, pairing: Pairing) -> Pairing {
+        if pairing.enrolled_host.is_some() || pairing.host.is_none() {
             return pairing;
         }
         let record = Pairing {
-            enrolled_host: pairing
-                .enrolled_host
-                .clone()
-                .or_else(|| pairing.host.clone())
-                .or_else(|| known_host(system)),
-            host: pairing.host.clone().or_else(|| known_host(system)),
+            enrolled_host: pairing.host.clone(),
             ..pairing
         };
         match serde_json::to_string(&record) {
@@ -725,7 +716,7 @@ impl Hq {
         let pairing = match &holding {
             Some(holding) => self
                 .read_pairing(holding)?
-                .map(|pairing| self.backfill_hosts(holding, pairing, &hosts.system)),
+                .map(|pairing| self.backfill_hosts(holding, pairing)),
             None => None,
         };
         if let (Some(server), Some(_)) = (&server, &pairing) {
@@ -1477,16 +1468,16 @@ impl Hq {
         let no_account = self.sign_in.account() == signin::AccountState::NoAccount;
         let (held, listed, pairing, open, server, cannot_sign_in) = {
             let inner = lock(&self.inner);
-            let held: Vec<(String, Arc<dyn Replica>)> = inner
+            let held: Vec<(String, Arc<dyn Replica>, bool)> = inner
                 .dbs
                 .iter()
-                .map(|db| (db.name.clone(), Arc::clone(&db.replica)))
+                .map(|db| (db.name.clone(), Arc::clone(&db.replica), db.linked))
                 .collect();
             (
                 held,
                 inner.authorization.open.clone(),
                 inner.pairing.clone(),
-                matches!(inner.local_open, LocalOpen::Open),
+                matches!(inner.local_open, LocalOpen::Open) && !inner.authorization.removed,
                 inner.server.as_ref().map(|server| server.host().to_owned()),
                 matches!(
                     inner.sign_in.outcome,
@@ -1497,6 +1488,12 @@ impl Hq {
         let Some(pairing) = pairing else {
             return Ok(Directory::default());
         };
+        if pairing.host.is_none() || pairing.enrolled_host.is_none() {
+            return Err(Unread {
+                host_unknown: true,
+                ..Default::default()
+            });
+        }
         // A credential that opens no database yet: nothing says the
         // directory is empty.
         if !open || listed.is_empty() {
@@ -1512,10 +1509,17 @@ impl Hq {
         for database in &listed {
             let unread = || Unread {
                 database: Some(database.clone()),
+                ..Default::default()
             };
-            let Some((_, replica)) = held.iter().find(|(name, _)| name == database) else {
+            let Some((_, replica, linked)) = held.iter().find(|(name, _, _)| name == database)
+            else {
                 return Err(unread());
             };
+            // Cached authorization opens local replicas; only successful
+            // discovery in this configuration links them.
+            if !linked {
+                return Err(unread());
+            }
             let rows = match replica.query(
                 "SELECT id, actor_id, kind, host, revoked_at_ms FROM clients",
                 &[],

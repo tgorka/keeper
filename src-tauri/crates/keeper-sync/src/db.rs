@@ -1854,18 +1854,21 @@ pub fn device_identity(conn: &Connection, default_label: &str) -> Result<DeviceI
 ///
 /// Validation runs first, the way [`upsert_profile`] validates a profile, so no
 /// route can store a label that makes a trailer meaningless: an empty one would
-/// print `Keeper-Device:  (01J…)` on every commit from here on. The stored
-/// (trimmed) label comes back so a caller holding an in-memory copy does not
-/// have to re-derive the normalization and risk disagreeing with the row.
+/// print `Keeper-Device:  (01J…)` on every commit from here on. Normalize with
+/// the app/server device-name trim grammar, preserving accepted U+0085.
+/// Before the engine first opens, create the same stable identity it would.
 pub fn set_device_label(conn: &Connection, label: &str) -> Result<String> {
-    let trimmed = label.trim();
+    let trimmed = crate::provenance::trim_device_label(label);
     if trimmed.is_empty() {
         return Err(SyncError::Config("device label must not be empty".into()));
     }
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE device SET label = ?1 WHERE singleton = 0",
         [trimmed],
     )?;
+    if updated == 0 {
+        device_identity(conn, trimmed)?;
+    }
     Ok(trimmed.to_owned())
 }
 
@@ -6050,6 +6053,37 @@ mod tests {
             );
         }
         assert_eq!(device_identity(&c, "ignored").expect("read"), before);
+    }
+
+    /// R607-13: a successful pre-engine name survives first engine identity.
+    #[test]
+    fn naming_before_first_identity_is_durable() {
+        let dir = tempfile::tempdir().expect("dir");
+        let c = open(dir.path()).expect("open");
+        set_device_label(&c, "kalypso").expect("pre-engine rename");
+        drop(c);
+        let c = open(dir.path()).expect("reopen");
+        let first = device_identity(&c, "iPhone").expect("first engine identity");
+        assert_eq!(
+            first.label, "kalypso",
+            "successful pre-engine name survives"
+        );
+    }
+
+    /// R607-14: accepted device names never lose U+0085 at label storage.
+    #[test]
+    fn accepted_server_names_are_preserved_in_the_commit_identity() {
+        let c = conn();
+        let first = device_identity(&c, "iPhone").expect("identity");
+        for name in ["\u{85}", "\u{85}studio", "studio\u{85}"] {
+            assert_eq!(set_device_label(&c, name).expect("accepted name"), name);
+            let next = device_identity(&c, "ignored").expect("identity");
+            assert_eq!(next.label, name);
+            assert_eq!(next.id, first.id, "label changes never replace identity");
+        }
+        let before = device_identity(&c, "ignored").expect("identity");
+        assert!(set_device_label(&c, "\u{feff}").is_err());
+        assert_eq!(device_identity(&c, "ignored").expect("identity"), before);
     }
 
     #[test]

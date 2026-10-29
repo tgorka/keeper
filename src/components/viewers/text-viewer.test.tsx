@@ -542,7 +542,7 @@ describe("TextEditorSurface, and the writing tools", () => {
     const view = await liveView();
     view.dispatch({ selection: { anchor: 0, head: "alpha".length } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Bold" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Bold" }));
 
     // Read back through the host's buffer, not the view: what a toolbar owes is
     // an edit the surface REPORTS, because that is the only text a save can see.

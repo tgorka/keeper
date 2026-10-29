@@ -46,7 +46,7 @@ const NO_SERVER: HqStatusVm = {
   waitingHere: 0,
   devices: [],
   offer: null,
-  signIn: { state: "unavailable", sentence: null },
+  signIn: { state: "unavailable", sentence: null, namePending: false },
 };
 
 let push: (status: HqStatusVm) => void = () => {};
@@ -131,7 +131,7 @@ describe("AgentsServerSection (UX-DR-E106-1)", () => {
         kalypso,
       ],
       offer: null,
-      signIn: { state: "unavailable", sentence: null },
+      signIn: { state: "unavailable", sentence: null, namePending: false },
     };
     vi.mocked(hqStatusSubscribe).mockImplementation((onStatus) => {
       push = onStatus;
@@ -196,6 +196,7 @@ describe("AgentsServerSection (UX-DR-E106-1)", () => {
           ...NOT_CONNECTED,
           signIn: {
             state: "signedOut",
+            namePending: false,
             sentence: "Sign in to your account under Account, and keeper connects this device.",
           },
         });
@@ -208,7 +209,11 @@ describe("AgentsServerSection (UX-DR-E106-1)", () => {
       act(() =>
         push({
           ...NOT_CONNECTED,
-          signIn: { state: "refused", sentence: "agents.example.org trusts a different sign-in." },
+          signIn: {
+            state: "refused",
+            sentence: "agents.example.org trusts a different sign-in.",
+            namePending: false,
+          },
         }),
       );
       expect(await screen.findByLabelText(PAIR_CODE_LABEL)).toBeInTheDocument();
@@ -225,7 +230,7 @@ describe("AgentsServerSection (UX-DR-E106-1)", () => {
           phase: "paired",
           sentence: "Paired with agents.example.org.",
           device: { clientId: "ana.1", name: "keeper" },
-          signIn: { state: "enrolled", sentence: "Signed in." },
+          signIn: { state: "enrolled", sentence: "Signed in.", namePending: false },
         });
         return Promise.resolve("sub-1");
       });

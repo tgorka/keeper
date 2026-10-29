@@ -5,8 +5,8 @@
  * name in the account. Prefilled with the effective name, it says where that name comes from — the
  * system, or you — and Reset goes back to the system's. Rust decides all of it: the precedence, the
  * server's host rule and every refusal sentence (`keeper_core::device_name`), and what the agents
- * server does about a new name (`Hq::device_renamed`), whose sign-in line shows here once the name
- * has changed.
+ * server does about a new name (`Hq::device_renamed`). Rust's pending-name flag keeps that
+ * sign-in line visible even when Settings is reopened.
  */
 import { useEffect, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -33,15 +33,13 @@ export const DEVICE_NAME_RESET = "Reset";
 export const DEVICE_NAME_SIGN_IN = "Sign in again";
 const READ_FAILED = "Could not read this device's name.";
 
-export function DeviceNameSection({ open }: { open: boolean }) {
+export function DeviceNameSection({ open, onChanged }: { open: boolean; onChanged?: () => void }) {
   const id = useId();
   const [vm, setVm] = useState<DeviceNameVm | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [alert, setAlert] = useState<string | null>(null);
   const [status, setStatus] = useState<HqStatusVm | null>(null);
-  /** Changed here since Settings opened: the agents server's answer to it is worth a line. */
-  const [changed, setChanged] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -81,7 +79,7 @@ export function DeviceNameSection({ open }: { open: boolean }) {
         setVm(next);
         // What was STORED, not what was typed: Rust trims.
         setDraft(next.name);
-        setChanged(true);
+        onChanged?.();
       })
       .catch((raw: unknown) => {
         logFailure(scope)(raw);
@@ -100,7 +98,7 @@ export function DeviceNameSection({ open }: { open: boolean }) {
 
   const signIn = status?.signIn ?? null;
   const renamed = signIn?.state === "renamed";
-  const agentsLine = signIn !== null && signIn.sentence !== null && (renamed || changed);
+  const agentsLine = signIn !== null && signIn.sentence !== null && signIn.namePending;
 
   return (
     <section

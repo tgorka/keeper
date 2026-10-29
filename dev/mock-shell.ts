@@ -1822,7 +1822,6 @@ const ANSWERS: Record<string, unknown> = {
     },
   ] satisfies SyncActivityVm[],
   sync_git_status: { available: true, path: "/usr/bin/git", version: "2.53.0" },
-  sync_device: { id: "01DEVICE", label: "hesperia" },
   // No token stored for either folder. Without this the edit form's keychain
   // read falls through to `fallback`, which answers `null` — the same answer,
   // by accident rather than on purpose. Spelled out so the form's opening read
@@ -5946,9 +5945,14 @@ let hqDevices: HqStatusVm["devices"] = [
 ];
 const HQ_NOT_PAIRED = `This device is not paired with ${HQ_HOST}. Type the code a paired device shows under Add a device.`;
 const HQ_NOT_CONNECTED = `This device is not connected to ${HQ_HOST} yet.`;
-const HQ_SIGN_IN_UNAVAILABLE: HqStatusVm["signIn"] = { state: "unavailable", sentence: null };
+const HQ_SIGN_IN_UNAVAILABLE: HqStatusVm["signIn"] = {
+  state: "unavailable",
+  sentence: null,
+  namePending: false,
+};
 const HQ_ENROLLED: HqStatusVm["signIn"] = {
   state: "enrolled",
+  namePending: false,
   sentence: `Signed in: ${HQ_HOST} knows this device by your account.`,
 };
 const hqNone: HqStatusVm = {
@@ -6033,12 +6037,14 @@ function hqFixture(): HqStatusVm {
     case "signedout":
       return hqNotConnected({
         state: "signedOut",
+        namePending: false,
         sentence: `Sign in to your account under Account, and keeper connects this device to ${HQ_HOST}. There is no code to type.`,
       });
     case "enrolling":
       // Lands signed in two seconds after Settings first subscribes (`hq_status_subscribe`).
       return hqNotConnected({
         state: "enrolling",
+        namePending: false,
         sentence: `Signing this device in to ${HQ_HOST}…`,
       });
     case "enrolled":
@@ -6047,6 +6053,7 @@ function hqFixture(): HqStatusVm {
       return {
         ...hqNotConnected({
           state: "refused",
+          namePending: false,
           sentence: `${HQ_HOST} trusts a different sign-in than your account's, so keeper sent it nothing. Pair this device with a code.`,
         }),
         sentence: HQ_NOT_PAIRED,
@@ -6092,8 +6099,10 @@ let hqEnrollStarted = false;
 // does with an account that can mint a token.
 // ?hq=enrolled&devicename=runs: this is the Mac hesperia, which runs nixi, so it keeps its name
 // (R607-01). With ?account=ready the account's record of this device follows the name (R607-02).
+// ?devicename=pending|refused keeps a rename pending across Settings mounts for browser checks.
 const deviceNameScenario = new URLSearchParams(window.location.search).get("devicename");
 const DEVICE_NAME_SYSTEM = deviceNameScenario === "runs" ? "hesperia" : "iPhone";
+ANSWERS.sync_device = { id: "01DEVICE", label: DEVICE_NAME_SYSTEM };
 const DEVICE_NAMES_TAKEN = hqParam === "enrolled" ? ["hesperia"] : [];
 let deviceNameStored: string | null = null;
 function deviceNameVm(): DeviceNameVm {
@@ -6142,6 +6151,7 @@ function deviceRenamed(previous: string): void {
     hqPublish(
       hqPairedStatus("connected", {
         state: "renamed",
+        namePending: true,
         sentence: `Sign in again to use the new name on ${HQ_HOST}.`,
       }),
     );
@@ -6150,10 +6160,25 @@ function deviceRenamed(previous: string): void {
   hqPublish(
     hqPairedStatus("connected", {
       state: "enrolling",
+      namePending: true,
       sentence: `Updating the name on ${HQ_HOST}…`,
     }),
   );
-  setTimeout(() => hqPublish(hqPairedStatus("connected", HQ_ENROLLED)), 2000);
+  if (deviceNameScenario === "pending") return;
+  setTimeout(() => {
+    hqPublish(
+      hqPairedStatus(
+        "connected",
+        deviceNameScenario === "refused"
+          ? {
+              state: "refused",
+              namePending: true,
+              sentence: `Could not update the name on ${HQ_HOST} (hq.host_taken). keeper tries again.`,
+            }
+          : HQ_ENROLLED,
+      ),
+    );
+  }, 2000);
 }
 const hqWatchers = new Map<string, MockChannel<HqStatusVm>>();
 function hqPublish(next: HqStatusVm): HqStatusVm {
@@ -11588,6 +11613,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     if (name !== previous) deviceNameMayLeave(previous);
     deviceNameStored = name;
     deviceAccountFollows();
+    ANSWERS.sync_device = { id: "01DEVICE", label: deviceNameVm().name };
     deviceRenamed(previous);
     return deviceNameVm();
   },
@@ -11596,6 +11622,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     if (previous !== DEVICE_NAME_SYSTEM) deviceNameMayLeave(previous);
     deviceNameStored = null;
     deviceAccountFollows();
+    ANSWERS.sync_device = { id: "01DEVICE", label: deviceNameVm().name };
     deviceRenamed(previous);
     return deviceNameVm();
   },

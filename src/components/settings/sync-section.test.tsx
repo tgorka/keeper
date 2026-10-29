@@ -11,8 +11,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncVerify: vi.fn(),
   // The path control (Story 32.4): resolves and opens the folder in Rust.
   syncOpenPath: vi.fn(),
-  // The device name (Story 34.5): read once when the section opens, written by
-  // the Rename button.
+  // The read-only commit label refreshes after a successful name change.
   syncDevice: vi.fn(),
   // The Advanced disclosure's access-token field (Story 32.7, Story 34.4): two
   // writes and a read the user has to ask for.

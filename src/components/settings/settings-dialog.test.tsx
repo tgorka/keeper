@@ -251,6 +251,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  syncDevice: vi.fn(() => Promise.resolve({ id: "01DEVICE", label: "iPhone" })),
   // Settings › Sync's "New drives go in": absent here, as on a phone.
   syncDriveFolderGet: vi.fn(() => Promise.resolve(null)),
   // The git report (Story 34.14) renders BESIDE the `sync` gate, so it mounts on
@@ -308,6 +309,11 @@ import {
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
 import {
+  DEVICE_NAME_RESET,
+  DEVICE_NAME_SAVE,
+  DEVICE_NAME_TITLE,
+} from "@/components/settings/device-name-section";
+import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
@@ -334,6 +340,9 @@ import { SYNC_GIT_TITLE } from "@/components/settings/sync-git-row";
 import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
+  deviceNameGet,
+  deviceNameReset,
+  deviceNameSet,
   dockBadgeModeSet,
   encryptionPosture,
   type HotkeyVm,
@@ -354,6 +363,7 @@ import {
   setHonorRemoteDeletions,
   setUndoSendAgentWindow,
   setUndoSendWindow,
+  syncDevice,
   syncGitStatus,
   syncProfiles,
   undoSendAgentWindow,
@@ -1318,6 +1328,49 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
     expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
     await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
+  });
+
+  it.each([
+    "save",
+    "reset",
+  ] as const)("refreshes the authoritative commit label after %s without reopening Settings", async (operation) => {
+    const original = {
+      name: "iPhone",
+      source: "system",
+      system: "iPhone",
+      sentence: "System.",
+    } as const;
+    const changed = {
+      name: "kalypso",
+      source: "you",
+      system: "iPhone",
+      sentence: "Override.",
+    } as const;
+    vi.mocked(deviceNameGet).mockResolvedValueOnce(operation === "save" ? original : changed);
+    vi.mocked(deviceNameSet).mockResolvedValueOnce(changed);
+    vi.mocked(deviceNameReset).mockResolvedValueOnce(original);
+    // A distinct answer proves we re-read native state rather than copying the name field.
+    vi.mocked(syncDevice)
+      .mockReset()
+      .mockResolvedValue({ id: "01DEVICE", label: "iPhone" })
+      .mockResolvedValueOnce({ id: "01DEVICE", label: "old-native-label" })
+      .mockResolvedValueOnce({ id: "01DEVICE", label: "new-native-label" });
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, sync: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
+    expect(await screen.findByText("old-native-label")).toBeInTheDocument();
+    const input = await screen.findByRole("textbox", { name: DEVICE_NAME_TITLE });
+    if (operation === "save") {
+      fireEvent.change(input, { target: { value: "kalypso" } });
+    }
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: operation === "save" ? DEVICE_NAME_SAVE : DEVICE_NAME_RESET,
+      }),
+    );
+    expect(await screen.findByText("new-native-label")).toBeInTheDocument();
+    expect(screen.queryByText("old-native-label")).toBeNull();
   });
 
   it("shows the old agent rooms the accounts are still in, on every tier, and leaves them (108.2)", async () => {

@@ -1977,6 +1977,16 @@ What a fresh process believes from the row, in order:
 The same engine with no application installed. Linux-first, depends on neither
 Tauri nor matrix-sdk.
 
+**App and daemon display names (R607-16, Info).** The app's **This device's name** override
+controls its own sync identity's commit label, visible read-only as **Name in commits**.
+`keeper-syncd` uses its independent OS-host-derived identity in its own XDG data directory;
+changing the app name does not rename or configure that daemon. The same machine can therefore
+write app commits labelled `kalypso` and daemon commits labelled `hesperia`. Cross-process
+display-label convergence is not promised by this change. Neither the daemon's stable OS host
+nor the app credential's immutable T4 identity changes. No daemon configuration or deployment
+cutover is included.
+
+
 ```
 keeper-syncd init                 # write a documented example config
 keeper-syncd add ...              # register a profile

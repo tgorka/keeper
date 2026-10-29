@@ -15,6 +15,7 @@ import {
   deviceNameSet,
   type HqStatusVm,
   hqStatusSubscribe,
+  hqStatusUnsubscribe,
 } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -54,6 +55,7 @@ function hq(signIn: HqStatusVm["signIn"]): HqStatusVm {
 }
 const ENROLLED = hq({
   state: "enrolled",
+  namePending: false,
   sentence: "Signed in: agents.example.org knows this device by your account.",
 });
 
@@ -93,6 +95,7 @@ describe("DeviceNameSection (R-HQ-94)", () => {
       push(
         hq({
           state: "enrolling",
+          namePending: true,
           sentence: "Updating the name on agents.example.org…",
         }),
       ),
@@ -133,6 +136,7 @@ describe("DeviceNameSection (R-HQ-94)", () => {
       push(
         hq({
           state: "renamed",
+          namePending: true,
           sentence: "Sign in again to use the new name on agents.example.org.",
         }),
       ),
@@ -142,5 +146,49 @@ describe("DeviceNameSection (R-HQ-94)", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: DEVICE_NAME_SIGN_IN }));
     expect(accountSignIn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "enrolling",
+    "refused",
+    "unavailable",
+  ] as const)("shows an initial pending-name %s answer again after Settings remounts", async (state) => {
+    const pending = hq({ state, sentence: "Native rename answer.", namePending: true });
+    vi.mocked(deviceNameGet).mockResolvedValue(KALYPSO);
+    vi.mocked(hqStatusSubscribe).mockImplementation((onStatus) => {
+      push = onStatus;
+      onStatus(pending);
+      return Promise.resolve("pending-sub");
+    });
+    const first = render(<DeviceNameSection open />);
+    expect(await screen.findByRole("status")).toHaveTextContent(pending.signIn.sentence ?? "");
+    first.unmount();
+    render(<DeviceNameSection open />);
+    expect(await screen.findByRole("status")).toHaveTextContent(pending.signIn.sentence ?? "");
+    act(() => push(ENROLLED));
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("does not infer pending names from a sign-in state or its sentence", async () => {
+    vi.mocked(deviceNameGet).mockResolvedValue(KALYPSO);
+    render(<DeviceNameSection open />);
+    await waitFor(() => expect(field()).toHaveValue("kalypso"));
+    act(() => push(hq({ state: "refused", sentence: "Updating the name…", namePending: false })));
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("releases a subscription that resolves after Settings has closed", async () => {
+    vi.mocked(deviceNameGet).mockResolvedValue(SYSTEM);
+    // This project's ES2020 lib does not expose Promise.withResolvers.
+    let resolve!: (id: string) => void;
+    const pending = new Promise<string>((done) => {
+      resolve = done;
+    });
+    vi.mocked(hqStatusSubscribe).mockReturnValue(pending);
+    const view = render(<DeviceNameSection open />);
+    await waitFor(() => expect(field()).toHaveValue("iPhone"));
+    view.unmount();
+    await act(async () => resolve("late-sub"));
+    expect(hqStatusUnsubscribe).toHaveBeenCalledWith("late-sub");
   });
 });

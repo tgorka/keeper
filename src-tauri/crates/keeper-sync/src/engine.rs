@@ -32332,6 +32332,22 @@ mod tests {
         // was rather than blanking the trailer on every commit from here on.
         assert!(engine.set_device_label("   ").is_err());
         assert_eq!(engine.device().label, "Studio Mac");
+
+        // R607-14: the server accepts U+0085 as a name, not trim space.
+        // It must reach a real commit trailer unchanged, even alone.
+        for (i, name) in ["\u{85}", "\u{85}studio", "studio\u{85}"]
+            .iter()
+            .enumerate()
+        {
+            engine.set_device_label(name).expect("accepted name");
+            platform.advance_ms(1_000);
+            std::fs::write(p.local_path.join(format!("server-name-{i}.txt")), b"name")
+                .expect("write");
+            assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+            let committed = head_provenance(&p);
+            assert_eq!(committed.device_label, *name);
+            assert_eq!(committed.device_id, minted.id);
+        }
     }
 
     /// `last_sync_ms` was stamped inside `do_push` and nowhere else, so a

@@ -3,6 +3,10 @@ import type { HqSignInState } from "./HqSignInState";
 
 export type HqSignInVm = { state: HqSignInState, 
 /**
+ * The effective name is not yet acknowledged by the existing credential.
+ */
+namePending: boolean, 
+/**
  * The line Settings shows under the server, when there is one.
  */
 sentence: string | null, };

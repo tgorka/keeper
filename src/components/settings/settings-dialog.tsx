@@ -205,6 +205,7 @@ export function SettingsBody({
   // status line from momentarily claiming "not encrypted" before the real posture
   // arrives, on both first open and reopen.
   const [posture, setPosture] = useState<boolean | null | undefined>(undefined);
+  const [deviceRevision, setDeviceRevision] = useState(0);
 
   useEffect(() => {
     if (!open) {
@@ -247,13 +248,21 @@ export function SettingsBody({
     // first thing Settings offers — and with no account it is one sentence
     // and one field, so an install that never meets one loses nothing.
     account: { node: <AccountSection open={open} /> },
-    "device-name": { node: <DeviceNameSection open={open} />, staysHere: [DEVICE_NAME_NOTE] },
+    "device-name": {
+      node: (
+        <DeviceNameSection
+          open={open}
+          onChanged={() => setDeviceRevision((revision) => revision + 1)}
+        />
+      ),
+      staysHere: [DEVICE_NAME_NOTE],
+    },
     // Its own section, not a block inside Sync: the device name is not a sync
     // setting — it rides every commit's `Keeper-Device` trailer, names this
     // machine in conflict-copy filenames, and now qualifies the commit subject
     // itself. Same capability gate, because the identity is read and written
     // through the sync engine's own IPC.
-    device: sync ? { node: <DeviceSection open={open} /> } : null,
+    device: sync ? { node: <DeviceSection key={deviceRevision} open={open} /> } : null,
     encryption: { node: <EncryptionSection /> },
     setup: { node: <SetupSection onOpenChange={onOpenChange} /> },
     notifications: { node: <NotificationsSection open={open} /> },
