@@ -407,19 +407,27 @@ safe binding. Current inventory:
   `ASWebAuthenticationSessionCallback` — the epic's one new crate), behind
   `keeper_core::platform::Platform::start_web_auth` — `crates/keeper/src/web_auth_apple.rs`:
   the `anchor` module (`#[allow(unsafe_code)]` on the module, because `define_class!` is
-  `unsafe impl`s by construction), `window_of` (`UIWindow` through `PlatformWebview::view_controller`), `anchor_state` (three `msg_send!` reads — `windowScene`, `activationState`, `isKeyWindow` — so a window that is not the active one is waited for rather than refused by Apple; when to present and when to give up is `keeper_core::sign_in_sheet`'s, and `activation`/`previous_sheet` beside it hold no `unsafe`), `present`, `is_session_error` and `dismiss` (`cancel` on sheets keeper has already retired; `cancel` and `cancel_for` reach it and hold no `unsafe`) —
+  `unsafe impl`s by construction), `window_of` (`UIWindow` through `PlatformWebview::view_controller`), `anchor_state` (three `msg_send!` reads — `windowScene`, `activationState`, `isKeyWindow` — so a window that is not the active one is waited for rather than refused by Apple; when to present and when to give up is `keeper_core::sign_in_sheet`'s, and `activation`/`previous_sheet` beside it hold no `unsafe`), `present`, `is_session_error` and `dismiss` (`cancel` on sheets keeper has already retired; `retire_ended` reaches it and holds no `unsafe`) —
   each function-level `#[allow(unsafe_code)]` with a `// SAFETY:` comment on every block.
   Which sheets are open is `keeper_core::sign_in_sheet::Sheets`, a main-thread table
   keyed by a per-sheet id: a sheet retires explicitly on its completion, keeper's own
-  cancel, a refused `start` and its sign-in's deadline — never by waiting for a completion
-  after keeper's `cancel()`, which Apple does not promise (R608-01) — and a completion that
-  finds its sheet retired does nothing. The session, the anchor (a weak property on the
-  session) and the completion block are held together until `RETENTION` (2 s) after the
-  retirement and released by a task queued from a background thread, so never inside the
-  completion (tauri-runtime-wry runs `run_on_main_thread` inline on the main thread). The
-  completion hands the callback URL to `OAuthFlowRegistry::resolve`, a cancel to
-  `OAuthFlowRegistry::cancel` for that one `state`, and any other ending to the flow as an
-  `error=` callback so it ends at once (`crates/keeper/src/web_auth.rs`, tested on Linux).
+  cancel, a refused `start` and its sign-in ending however it ends — the registry's end
+  hook (`OAuthFlowRegistry::on_end`) queues `retire_ended` on the main dispatch queue the
+  moment a flow stops waiting, its deadline and a superseding sign-in included (R608-02) —
+  never by waiting for a completion after keeper's `cancel()`, which Apple does not promise
+  (R608-01); a completion that finds its sheet retired does nothing. Each sheet also holds
+  its original registry registration's `FlowId`: delayed cleanup retires that sheet even
+  if its OAuth state was reused, and never cancels the replacement. The session, the
+  anchor (a weak property on the session) and the completion block are held together and
+  released on the main thread in AppAuth's `OIDRetainSessionBriefly` order (R608-03):
+  `dispatch_async` to the main queue, and from that turn `dispatch_after` `RETENTION` (2 s)
+  on the main queue (dispatch2 0.3, safe bindings, already in the tree through tao), so the
+  retention starts once the main thread is free and never runs inside the completion.
+  Release is per sheet; an older timer cannot release a newer retired sheet. The
+  completion hands the callback URL to `OAuthFlowRegistry::resolve` and a cancel to
+  `OAuthFlowRegistry::cancel` for that one state. A system failure goes through
+  `not_shown`: linked sign-ins keep waiting for the manual callback; other flows fail
+  (`crates/keeper/src/web_auth.rs`, tested on Linux).
   On iOS the class is reached only by name, so `gen/apple/project.yml` links
   `AuthenticationServices.framework` explicitly (Speech's reason). macOS, Linux and Windows keep the port's default — the default
   browser and the `keeper://` deep link. On a Mac the sheet was a separate Safari window

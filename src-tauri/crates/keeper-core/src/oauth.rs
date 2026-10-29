@@ -17,7 +17,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use matrix_sdk::authentication::oauth::registration::{
@@ -124,13 +125,20 @@ pub struct OAuthFlowRegistry {
     /// sign-in that took a [`CancelLatch`] before a cancel sees it, even one
     /// still discovering its server with no entry in `pending` yet.
     cancels: watch::Sender<u64>,
+    /// Told the `state` of every flow that stops waiting
+    /// ([`on_end`](OAuthFlowRegistry::on_end)).
+    ended: OnceLock<EndHook>,
 }
+
+/// What [`OAuthFlowRegistry::on_end`] calls.
+type EndHook = Box<dyn Fn(&str) + Send + Sync>;
 
 impl Default for OAuthFlowRegistry {
     fn default() -> Self {
         Self {
             pending: Mutex::default(),
             cancels: watch::channel(0).0,
+            ended: OnceLock::new(),
         }
     }
 }
@@ -161,8 +169,20 @@ impl CancelLatch {
     }
 }
 
+/// Identity of one registration, even if its OAuth `state` is reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowId(u64);
+
+impl FlowId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// One flow waiting for its callback.
 struct Waiting {
+    id: FlowId,
     answer: oneshot::Sender<OAuthCallback>,
     /// A sign-in whose link the person can use by hand
     /// ([`OAuthFlowRegistry::register_with_link`]): a page that could not be
@@ -182,6 +202,26 @@ impl OAuthFlowRegistry {
         CancelLatch(self.cancels.subscribe())
     }
 
+    /// Call `hook` with a flow's `state` whenever that flow stops waiting,
+    /// however it stops: answered, failed, cancelled, removed by its
+    /// sign-in's guard (its deadline, an error, a sign-in dropped), or
+    /// replaced by a flow registered under the same `state`. It runs once per
+    /// flow, after the registry's lock is let go, on whichever thread ended
+    /// the flow. The iPhone shell closes that flow's sign-in sheet from it,
+    /// so a sheet never outlives the sign-in it answers (`sign_in_sheet`,
+    /// R608-02). One hook per registry: `false`, and `hook` dropped, when
+    /// one is already set.
+    pub fn on_end(&self, hook: impl Fn(&str) + Send + Sync + 'static) -> bool {
+        self.ended.set(Box::new(hook)).is_ok()
+    }
+
+    /// The flow under `state` has stopped waiting.
+    fn tell_ended(&self, state: &str) {
+        if let Some(hook) = self.ended.get() {
+            hook(state);
+        }
+    }
+
     /// Register a pending flow keyed by its `state` secret, returning the
     /// receiver the caller awaits. The caller MUST pair this with [`remove`]
     /// (typically via an RAII guard) so the entry is dropped on every exit path:
@@ -195,13 +235,17 @@ impl OAuthFlowRegistry {
     /// [`not_shown`]: OAuthFlowRegistry::not_shown
     pub fn register(&self, state: String) -> oneshot::Receiver<OAuthCallback> {
         let (answer, rx) = oneshot::channel();
-        self.lock().insert(
-            state,
+        let replaced = self.lock().insert(
+            state.clone(),
             Waiting {
+                id: FlowId::next(),
                 answer,
                 unshown: None,
             },
         );
+        if replaced.is_some() {
+            self.tell_ended(&state);
+        }
         rx
     }
 
@@ -222,13 +266,17 @@ impl OAuthFlowRegistry {
     ) {
         let (answer, rx) = oneshot::channel();
         let (unshown, unshown_rx) = mpsc::unbounded_channel();
-        self.lock().insert(
-            state,
+        let replaced = self.lock().insert(
+            state.clone(),
             Waiting {
+                id: FlowId::next(),
                 answer,
                 unshown: Some(unshown),
             },
         );
+        if replaced.is_some() {
+            self.tell_ended(&state);
+        }
         (rx, unshown_rx)
     }
 
@@ -237,13 +285,23 @@ impl OAuthFlowRegistry {
     /// abandoned/timed-out/errored flow leaves no dangling sender or leaked
     /// `state` secret in the map (a matched callback already removes it).
     pub fn remove(&self, state: &str) {
-        let _ = self.lock().remove(state);
+        let removed = self.lock().remove(state).is_some();
+        if removed {
+            self.tell_ended(state);
+        }
     }
 
     /// Whether a flow still waits under `state`: a sign-in sheet that has not
     /// opened yet stops trying once its flow has ended (`sign_in_sheet`).
     pub fn waits(&self, state: &str) -> bool {
         self.lock().contains_key(state)
+    }
+
+    /// The registration currently waiting under `state`. Native sheets keep
+    /// this identity so delayed cleanup cannot mistake a replacement for
+    /// the flow that ended.
+    pub fn flow_id(&self, state: &str) -> Option<FlowId> {
+        self.lock().get(state).map(|waiting| waiting.id)
     }
 
     /// Forward an incoming callback URL to its matching in-flight flow.
@@ -289,6 +347,7 @@ impl OAuthFlowRegistry {
             tracing::debug!("oauth callback: state matched no in-flight flow; ignored");
             return false;
         };
+        self.tell_ended(&state);
 
         let outcome = match error {
             Some(error) => OAuthCallback::Error { error, description },
@@ -310,13 +369,11 @@ impl OAuthFlowRegistry {
     pub fn cancel_all(&self) {
         self.cancels
             .send_modify(|cancels| *cancels = cancels.wrapping_add(1));
-        let drained: Vec<_> = {
-            let mut pending = self.lock();
-            pending.drain().map(|(_, waiting)| waiting.answer).collect()
-        };
-        for tx in drained {
+        let drained: Vec<_> = self.lock().drain().collect();
+        for (state, waiting) in drained {
+            self.tell_ended(&state);
             // Ignore send errors: a dropped receiver is already-cancelled.
-            let _ = tx.send(OAuthCallback::Cancelled);
+            let _ = waiting.answer.send(OAuthCallback::Cancelled);
         }
     }
 
@@ -328,6 +385,7 @@ impl OAuthFlowRegistry {
     pub fn cancel(&self, state: &str) {
         let sender = self.lock().remove(state);
         if let Some(waiting) = sender {
+            self.tell_ended(state);
             // A dropped receiver is already-cancelled.
             let _ = waiting.answer.send(OAuthCallback::Cancelled);
         }
@@ -342,6 +400,9 @@ impl OAuthFlowRegistry {
     /// refusal.
     pub fn fail(&self, state: &str, reason: &str) -> bool {
         let sender = self.lock().remove(state);
+        if sender.is_some() {
+            self.tell_ended(state);
+        }
         // A dropped receiver is an already-ended flow.
         sender.is_some_and(|waiting| {
             waiting
@@ -675,5 +736,52 @@ mod tests {
             "Can't reach electra.siren-alsephina.ts.net:8451: it did not answer within 10 \
              seconds. Check that this device is on a network (or VPN) that can reach it."
         );
+    }
+
+    /// Every way a flow stops waiting tells the end hook once, with its
+    /// `state` — the guard's `remove` included, which is how a sign-in's
+    /// deadline ends it (R608-02) — and nothing that leaves a flow waiting,
+    /// or touches none, tells it anything.
+    #[test]
+    fn every_way_a_flow_ends_tells_the_end_hook_once() {
+        let registry = OAuthFlowRegistry::new();
+        let ended = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let told = std::sync::Arc::clone(&ended);
+        assert!(registry.on_end(move |state| {
+            told.lock().expect("not poisoned").push(state.to_owned());
+        }));
+        assert!(!registry.on_end(|_| {}), "one hook per registry");
+        let ends = || std::mem::take(&mut *ended.lock().expect("not poisoned"));
+
+        let _deadline = registry.register_with_link("deadline".to_owned());
+        registry.remove("deadline");
+        registry.remove("deadline");
+        assert_eq!(ends(), ["deadline"], "the guard's remove, once");
+
+        let _answered = registry.register("answered".to_owned());
+        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?code=c&state=answered"));
+        let _cancelled = registry.register("cancelled".to_owned());
+        registry.cancel("cancelled");
+        let _failed = registry.register("failed".to_owned());
+        assert!(registry.fail("failed", "broken"));
+        let _unshown = registry.register("unshown".to_owned());
+        assert!(registry.not_shown("unshown", "refused"));
+        assert_eq!(ends(), ["answered", "cancelled", "failed", "unshown"]);
+
+        let (_linked, _reasons) = registry.register_with_link("linked".to_owned());
+        assert!(registry.not_shown("linked", "refused"));
+        assert!(!registry.resolve("dev.tgorka.keeper:/oauth/callback?code=c&state=nobody"));
+        registry.cancel("nobody");
+        assert!(!registry.fail("nobody", "broken"));
+        assert_eq!(ends(), Vec::<String>::new(), "the linked flow still waits");
+
+        let _replaced = registry.register("linked".to_owned());
+        assert_eq!(ends(), ["linked"], "replaced under its own state");
+
+        let _other = registry.register("other".to_owned());
+        registry.cancel_all();
+        let mut drained = ends();
+        drained.sort();
+        assert_eq!(drained, ["linked", "other"]);
     }
 }

@@ -4,31 +4,33 @@
 //! `UIWindow`. macOS used it too until the Mac moved to the default browser:
 //! there it was a separate Safari window whatever the person's browser was.
 //! Everything here runs on the main thread: [`present`] and
-//! [`previous_sheet`] are reached from `with_webview`'s closure, [`cancel`]
-//! and [`cancel_for`] from `run_on_main_thread`, and the table of sheets is
-//! a main-thread `thread_local` for that reason.
+//! [`previous_sheet`] are reached from `with_webview`'s closure,
+//! [`retire_ended`] from the main dispatch queue, and the table of sheets
+//! is a main-thread `thread_local` for that reason.
 //!
 //! # When a sheet ends, and what must stay alive until when
 //!
 //! The table is `keeper_core::sign_in_sheet::Sheets`, and two questions are
 //! kept apart in it. A sheet stops holding back the next one when it
 //! *retires*, which this file does explicitly on every way a sheet ends: its
-//! completion ran, keeper cancelled it ([`cancel`], [`cancel_for`]), Apple
-//! refused to start it, or its sign-in's deadline passed
-//! ([`previous_sheet`]). keeper never waits for a completion after its own
-//! `cancel()` — Apple documents one for the person's cancel, not the app's
-//! (R608-01) — so a cancel retires the sheet and tells its flow itself, and
-//! a completion that comes later finds its sheet retired and does nothing.
+//! completion ran, Apple refused to start it, or its sign-in ended however
+//! it ended ([`retire_ended`]: cancellation included, the
+//! registry's end hook queues it the moment a flow stops waiting — its
+//! deadline, a new sign-in superseding it, a Matrix sign-in returning — and
+//! [`previous_sheet`] runs it before every look). keeper never waits for a
+//! completion after its own `cancel()` — Apple documents one for the
+//! person's cancel, not the app's (R608-01) — so a cancel ends its flow and
+//! retires the sheet explicitly, and a completion that comes later finds
+//! its sheet retired and does nothing.
 //!
 //! The native objects live longer. Apple's session must be held until its
 //! dismissal has finished, or it crashes when the transition completes
 //! (FB12132525); its `presentationContextProvider` is a *weak* property, so
 //! the anchor is held too; and the completion block beside them. All three
-//! are released together `sign_in_sheet::RETENTION` after the retirement,
-//! from a task a background thread queues ([`release_later`]). That is a
-//! later turn of the main thread by construction: tauri-runtime-wry's
-//! `run_on_main_thread` runs a task *inline* when called on the main thread
-//! (2.11.4, `send_user_message`), and queues it only from another thread.
+//! are released together on the main thread, `sign_in_sheet::RETENTION`
+//! after the main thread is next free following the retirement
+//! ([`release_later`]) — AppAuth's order, not a sleep that starts before the
+//! main thread is free (R608-03).
 //!
 //! # The sheet is not ephemeral
 //!
@@ -49,8 +51,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use block2::RcBlock;
+use dispatch2::{DispatchQueue, DispatchTime};
 use keeper_core::oauth::OAuthFlowRegistry;
-use keeper_core::sign_in_sheet::{Activation, PreviousSheet, Sheet, SheetId, Sheets, RETENTION};
+use keeper_core::sign_in_sheet::{Activation, PreviousSheet, Retention, Sheet, SheetId, Sheets};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
 use objc2::{available, AnyThread, MainThreadMarker};
@@ -115,13 +118,10 @@ mod anchor {
     }
 }
 
-/// What one sheet holds alive, from before its `start` until
-/// `RETENTION` after it retired.
+/// What one sheet holds alive, from before its `start` through its
+/// main-queue retention window after retirement ([`release_later`]).
 struct Live {
     session: Retained<ASWebAuthenticationSession>,
-    /// The registry the sheet reports to: a cancel of one registry's
-    /// sign-ins leaves the other's sheets open.
-    flows: Arc<OAuthFlowRegistry>,
     _anchor: Retained<anchor::Anchor>,
     _completion: RcBlock<dyn Fn(*mut NSURL, *mut NSError)>,
 }
@@ -217,21 +217,28 @@ pub fn activation(webview: &tauri::webview::PlatformWebview) -> Result<Activatio
 
 /// The sheet shown before the one being asked for: on screen while any
 /// sheet keeper started has not retired, otherwise how long ago the last one
-/// retired. A sheet past its sign-in's deadline is cancelled and retired
-/// first (`Sheets::overdue`), so nothing holds a new sheet back for longer
-/// than that whatever became of its completion. Main thread only, like the
-/// table it reads.
-pub fn previous_sheet(app: &tauri::AppHandle) -> PreviousSheet {
-    let now = Instant::now();
-    let overdue = SHEETS.with(|sheets| dismissed(sheets.borrow_mut().overdue(now)));
-    if !overdue.is_empty() {
-        tracing::warn!(
-            sheets = overdue.len(),
-            "web auth: closed a sign-in sheet still open past its sign-in's deadline"
+/// retired. The sheets of sign-ins that have ended are retired and dismissed
+/// first ([`retire_ended`]), so no look counts one as on screen. Main thread
+/// only, like the table it reads.
+pub fn previous_sheet() -> PreviousSheet {
+    retire_ended();
+    SHEETS.with(|sheets| sheets.borrow().previous(Instant::now()))
+}
+
+/// Retire and dismiss every open sheet whose sign-in no longer waits
+/// (`Sheets::ended`): it answers nobody. Queued on the main dispatch queue
+/// by each registry's end hook (`web_auth::close_sheets_when_flows_end`),
+/// so a sheet closes when its sign-in ends — at its deadline too, with no
+/// later sign-in needed to notice (R608-02).
+pub fn retire_ended() {
+    let ended = SHEETS.with(|sheets| dismissed(sheets.borrow_mut().ended(Instant::now())));
+    if !ended.is_empty() {
+        tracing::info!(
+            sheets = ended.len(),
+            "web auth: closed the sign-in sheet of a sign-in that had ended"
         );
     }
-    dismiss(app, overdue);
-    SHEETS.with(|sheets| sheets.borrow().previous(now))
+    dismiss(ended);
 }
 
 /// Start one sheet for `url`, whose callback comes back on `scheme`, and
@@ -242,7 +249,6 @@ pub fn previous_sheet(app: &tauri::AppHandle) -> PreviousSheet {
 /// refused the window, [`Refusal::Failed`] worded for the person otherwise.
 #[allow(unsafe_code)]
 pub fn present(
-    app: &tauri::AppHandle,
     webview: &tauri::webview::PlatformWebview,
     url: &str,
     scheme: &str,
@@ -263,12 +269,12 @@ pub fn present(
     })?;
 
     let id = SheetId::next();
+    let flow = flows.flow_id(state);
     let completion: RcBlock<dyn Fn(*mut NSURL, *mut NSError)> = {
         let flows = Arc::clone(flows);
         let state = state.to_owned();
-        let app = app.clone();
         RcBlock::new(move |callback: *mut NSURL, error: *mut NSError| {
-            // Retired already — keeper cancelled it, or its deadline passed —
+            // Retired already — keeper cancelled it, or its sign-in ended —
             // and its flow was told then: a late answer is nobody's, and must
             // not end a newer sheet or flow under the same `state`.
             if !SHEETS.with(|sheets| sheets.borrow_mut().retire(id, Instant::now())) {
@@ -282,8 +288,10 @@ pub fn present(
             let callback = unsafe { callback.as_ref() };
             // SAFETY: as above.
             let error = unsafe { error.as_ref() };
-            finish(&flows, &state, ending(callback, error));
-            release_later(&app);
+            if flow.is_some() && flows.flow_id(&state) == flow {
+                finish(&flows, &state, ending(callback, error));
+            }
+            release_later(id);
         })
     };
 
@@ -301,7 +309,7 @@ pub fn present(
         // fresh allocation; the URL is http(s) (core builds it from the
         // provider's https authorization endpoint), and the handler pointer
         // is a live heap block that the session copies and that `Live` also
-        // keeps until `RETENTION` after the sheet retired.
+        // keeps through the main-queue retention window after retirement.
         unsafe {
             ASWebAuthenticationSession::initWithURL_callback_completionHandler(
                 ASWebAuthenticationSession::alloc(),
@@ -337,14 +345,13 @@ pub fn present(
     SHEETS.with(|sheets| {
         sheets.borrow_mut().open(
             id,
+            Arc::clone(flows),
             state,
             Live {
                 session: session.clone(),
-                flows: Arc::clone(flows),
                 _anchor: anchor,
                 _completion: completion,
             },
-            Instant::now(),
         );
     });
     // SAFETY: `start` is called once, on the main thread, after the provider
@@ -352,7 +359,7 @@ pub fn present(
     let started = unsafe { session.start() };
     if !started {
         SHEETS.with(|sheets| sheets.borrow_mut().retire(id, Instant::now()));
-        release_later(app);
+        release_later(id);
         tracing::warn!(
             scene = anchor_was.scene,
             activation = anchor_was.activation,
@@ -398,37 +405,57 @@ fn is_session_error(error: &NSError) -> bool {
     *error.domain() == *domain
 }
 
-/// Release, on a later turn of the main thread, what every sheet retired at
-/// least `RETENTION` ago held: its session, anchor and block.
+/// Release what retired sheet `id` held — its session, anchor and block —
+/// `RETENTION` after the main thread is next free, on the main thread.
 ///
-/// The task is queued from a thread of its own, after `RETENTION`. From the
-/// main thread `run_on_main_thread` would run it inline (tauri-runtime-wry
-/// 2.11.4 `send_user_message`), inside the completion that retired the
-/// sheet; from any other thread it goes through the event loop, so it runs
-/// once the main thread is free. The table judges what is due, so a task
-/// that runs early releases nothing too soon, and each retirement queues
-/// its own task, so none is held past the next one due.
-fn release_later(app: &tauri::AppHandle) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(RETENTION);
-        let queued = app.run_on_main_thread(|| {
-            let due = SHEETS.with(|sheets| sheets.borrow_mut().release_due(Instant::now()));
-            // Dropped outside the table's borrow: a session may run its
-            // completion as it goes, and that borrows the table.
-            drop(due);
-        });
-        if let Err(error) = queued {
-            tracing::warn!(%error, "web auth: could not release a finished sign-in sheet");
+/// AppAuth's `OIDRetainSessionBriefly` (openid/AppAuth-iOS,
+/// `Sources/AppAuth/iOS/OIDExternalUserAgentIOS.m`, 0dd80ef3), in its order:
+/// `dispatch_async` to the main queue first; from that turn, once the main
+/// thread is free, `dispatch_after` the retention on the main queue; the
+/// release runs there. Both go through libdispatch's main queue
+/// (`DispatchQueue::main`, dispatch2's `dispatch_async_f` and
+/// `dispatch_after_f`): the serial queue the main thread drains, so every
+/// block runs on the main thread, and `dispatch_async` queues even when
+/// called on it — never inline inside the completion that retired the sheet,
+/// which tauri's `run_on_main_thread` would do from the main thread
+/// (tauri-runtime-wry 2.11.4, `send_user_message`). When to release is
+/// `Sheets::retention`'s, per sheet: no other sheet's release takes this
+/// one, and a timer that fires early is asked to wait out the rest.
+fn release_later(id: SheetId) {
+    DispatchQueue::main().exec_async(move || retain(id));
+}
+
+/// One main-thread turn of [`release_later`]'s retention for sheet `id`.
+fn retain(id: SheetId) {
+    let step = SHEETS.with(|sheets| sheets.borrow_mut().retention(id, Instant::now()));
+    match step {
+        Retention::After(delay) => {
+            let queued = DispatchTime::try_from(delay)
+                .map_err(|()| "the delay does not fit a dispatch time".to_owned())
+                .and_then(|when| {
+                    DispatchQueue::main()
+                        .after(when, move || retain(id))
+                        .map_err(|error| format!("{error:?}"))
+                });
+            if let Err(error) = queued {
+                // Kept in the table rather than dropped off schedule.
+                tracing::warn!(
+                    %error,
+                    "web auth: could not schedule a finished sign-in sheet's release"
+                );
+            }
         }
-    });
+        // Dropped outside the table's borrow: a session may run its
+        // completion as it goes, and that borrows the table.
+        Retention::Release(held) => drop(held),
+        Retention::Gone => {}
+    }
 }
 
 /// A sheet keeper retired itself, taken out of the table's borrow to be
 /// dismissed.
 struct Dismissed {
-    state: String,
-    flows: Arc<OAuthFlowRegistry>,
+    id: SheetId,
     session: Retained<ASWebAuthenticationSession>,
 }
 
@@ -436,57 +463,25 @@ fn dismissed(sheets: Vec<&Sheet<Live>>) -> Vec<Dismissed> {
     sheets
         .into_iter()
         .map(|sheet| Dismissed {
-            state: sheet.state().to_owned(),
-            flows: Arc::clone(&sheet.held().flows),
+            id: sheet.id(),
             session: sheet.held().session.clone(),
         })
         .collect()
 }
 
-/// Dismiss sheets keeper has already retired, and tell each one's flow it
-/// was cancelled — here, not in a completion Apple does not promise after
-/// an app's `cancel()`. A completion that does come finds its sheet retired
-/// and does nothing.
+/// Dismiss sheets keeper has already retired. Their flows have already
+/// ended; do not deliver a cancellation by state, which could now name a
+/// replacement registration. A completion that does come finds its sheet
+/// retired and does nothing.
 #[allow(unsafe_code)]
-fn dismiss(app: &tauri::AppHandle, sheets: Vec<Dismissed>) {
-    if sheets.is_empty() {
-        return;
-    }
+fn dismiss(sheets: Vec<Dismissed>) {
     for sheet in sheets {
         // SAFETY: `cancel` is documented as safe to call at any time on a
         // started session, and a no-op on one already finished; it runs on
-        // the main thread (every caller is reached through `with_webview` or
-        // `run_on_main_thread`) and outside the table's borrow, since it may
-        // run the completion before it returns.
+        // the main thread (every caller is reached through `with_webview`
+        // or the main dispatch queue) and outside the table's borrow,
+        // since it may run the completion before it returns.
         unsafe { sheet.session.cancel() };
-        finish(&sheet.flows, &sheet.state, Ending::Cancelled);
+        release_later(sheet.id);
     }
-    release_later(app);
-}
-
-/// Cancel every open sheet that reports to `flows`, and the flow each one
-/// serves.
-pub fn cancel_for(app: &tauri::AppHandle, flows: &Arc<OAuthFlowRegistry>) {
-    let now = Instant::now();
-    let sheets = SHEETS.with(|sheets| {
-        dismissed(
-            sheets
-                .borrow_mut()
-                .cancel(now, |sheet| Arc::ptr_eq(&sheet.held().flows, flows)),
-        )
-    });
-    dismiss(app, sheets);
-}
-
-/// Cancel the sheet open for `state`, if there still is one.
-pub fn cancel(app: &tauri::AppHandle, state: &str) {
-    let now = Instant::now();
-    let sheets = SHEETS.with(|sheets| {
-        dismissed(
-            sheets
-                .borrow_mut()
-                .cancel(now, |sheet| sheet.state() == state),
-        )
-    });
-    dismiss(app, sheets);
 }

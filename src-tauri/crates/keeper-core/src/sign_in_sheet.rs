@@ -34,15 +34,20 @@
 //! [`Sheets`] is the other half: which sheets keeper has started and not
 //! yet retired, which is what [`PreviousSheet`] reports. A sheet retires on
 //! every way it can end — its completion, keeper's own cancel, a `start`
-//! Apple refused, the flow's deadline — and each retirement is explicit:
-//! Apple promises a completion when the *person* cancels, not after
-//! keeper's `cancel()`, so a sheet keeper dismissed must not wait for one
-//! (R608-01). Retiring is idempotent and keyed by [`SheetId`], so a
-//! completion that arrives after its sheet retired changes nothing, least
-//! of all a newer sheet for the same sign-in.
+//! Apple refused, its sign-in ending however it ends (answered elsewhere,
+//! failed, superseded by a new sign-in, timed out) — and each retirement is
+//! explicit: Apple promises a completion when the *person* cancels, not
+//! after keeper's `cancel()`, so a sheet keeper dismissed must not wait for
+//! one (R608-01), and a sheet whose sign-in has ended must not wait for a
+//! later sign-in to notice (R608-02). Retiring is idempotent and keyed by
+//! [`SheetId`], so a completion that arrives after its sheet retired
+//! changes nothing, least of all a newer sheet for the same sign-in.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::oauth::{FlowId, OAuthFlowRegistry};
 
 /// How often the shell looks at keeper's window while it waits.
 pub const POLL: Duration = Duration::from_millis(250);
@@ -69,10 +74,11 @@ pub const REFUSALS: u32 = 3;
 pub const LIMIT: Duration = Duration::from_secs(300);
 
 /// How long a retired sheet's session, anchor and completion are still held
-/// after it retired. A session released before its dismiss transition has
-/// finished crashes when the transition completes (FB12132525), and the
-/// transition has not started when the completion runs; AppAuth keeps it
-/// two seconds for the same reason (`OIDRetainSessionBriefly`).
+/// once the main thread is next free after the retirement. A session
+/// released before its dismiss transition has finished crashes when the
+/// transition completes (FB12132525), and the transition has not started
+/// when the completion runs; AppAuth keeps it two seconds for the same
+/// reason, counted from the same turn (`OIDRetainSessionBriefly`).
 pub const RETENTION: Duration = Duration::from_secs(2);
 
 /// Why the sheet gave up while keeper was out of front, or at [`LIMIT`].
@@ -239,15 +245,31 @@ impl SheetId {
 #[derive(Debug)]
 pub struct Sheet<T> {
     id: SheetId,
+    flows: Arc<OAuthFlowRegistry>,
+    flow: Option<FlowId>,
     state: String,
-    opened: Instant,
     held: T,
 }
 
 impl<T> Sheet<T> {
+    pub fn id(&self) -> SheetId {
+        self.id
+    }
+
+    /// The registry the sign-in waits in: the account's or Matrix's.
+    pub fn flows(&self) -> &Arc<OAuthFlowRegistry> {
+        &self.flows
+    }
+
     /// The `state` of the sign-in the sheet was opened for.
     pub fn state(&self) -> &str {
         &self.state
+    }
+
+    /// Whether this sheet's original registration still waits, not a later
+    /// registration that reused its state.
+    pub fn flow_waits(&self) -> bool {
+        self.flow.is_some() && self.flows.flow_id(&self.state) == self.flow
     }
 
     pub fn held(&self) -> &T {
@@ -255,13 +277,41 @@ impl<T> Sheet<T> {
     }
 }
 
+/// A retired sheet, held for [`RETENTION`] from `since`.
+#[derive(Debug)]
+struct Retired<T> {
+    sheet: Sheet<T>,
+    /// When the main thread first got to it after the retirement — the
+    /// retention's start. `None` until then.
+    since: Option<Instant>,
+}
+
+/// What to do with a retired sheet's native objects, asked on the main
+/// thread ([`Sheets::retention`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Retention<T> {
+    /// Ask again this long from now, on the main thread.
+    After(Duration),
+    /// Drop these now, outside the table's borrow.
+    Release(T),
+    /// Nothing held: the sheet is still open, never existed, or was
+    /// released already.
+    Gone,
+}
+
 /// The sheets keeper has started and not yet retired, the ones it retired
 /// and still holds for [`RETENTION`], and when the last one retired.
 ///
 /// Two questions kept apart: whether a sheet still stops the next one from
 /// opening (until it retires), and how long its native objects stay alive
-/// (until [`RETENTION`] after that, released on a later turn than the
-/// retirement — never inside the completion that retired it).
+/// ([`Sheets::retention`]: [`RETENTION`] from the first main-thread turn
+/// after the retirement, never in the turn that retired it).
+///
+/// A sheet lives exactly as long as its sign-in waits: whatever ends the
+/// flow — its answer, a failure, keeper's cancel, a new sign-in superseding
+/// it, its deadline when the sign-in's guard lets go — ends the sheet with
+/// it ([`Sheets::ended`], R608-02). The sheet has no clock of its own: its
+/// deadline is its flow's.
 ///
 /// The retirement time is when keeper stopped counting the sheet as on
 /// screen. It is not an observed end of the dismissal: nothing reports
@@ -271,7 +321,7 @@ impl<T> Sheet<T> {
 #[derive(Debug)]
 pub struct Sheets<T> {
     open: Vec<Sheet<T>>,
-    retired: Vec<(Sheet<T>, Instant)>,
+    retired: Vec<Retired<T>>,
     last_retired: Option<Instant>,
 }
 
@@ -290,13 +340,15 @@ impl<T> Sheets<T> {
         Self::default()
     }
 
-    /// Hold a sheet for `state` before it is started: from now until it
-    /// retires it is the previous sheet the next one waits for.
-    pub fn open(&mut self, id: SheetId, state: &str, held: T, now: Instant) {
+    /// Hold a sheet for the sign-in waiting under `state` in `flows`, before
+    /// the sheet is started: from now until it retires it is the previous
+    /// sheet the next one waits for.
+    pub fn open(&mut self, id: SheetId, flows: Arc<OAuthFlowRegistry>, state: &str, held: T) {
         self.open.push(Sheet {
             id,
+            flow: flows.flow_id(state),
+            flows,
             state: state.to_owned(),
-            opened: now,
             held,
         });
     }
@@ -313,14 +365,14 @@ impl<T> Sheets<T> {
 
     /// Retire sheet `id`: its completion ran, or Apple refused to start it.
     /// `true` the first time only — a completion that finds its sheet
-    /// already retired (keeper cancelled it, its deadline passed) is late,
+    /// already retired (keeper cancelled it, its sign-in ended) is late,
     /// and its caller delivers nothing.
     pub fn retire(&mut self, id: SheetId, now: Instant) -> bool {
         let Some(at) = self.open.iter().position(|sheet| sheet.id == id) else {
             return false;
         };
         let sheet = self.open.swap_remove(at);
-        self.retired.push((sheet, now));
+        self.retired.push(Retired { sheet, since: None });
         self.last_retired = Some(now);
         true
     }
@@ -340,30 +392,43 @@ impl<T> Sheets<T> {
         }
         self.retired
             .iter()
-            .map(|(sheet, _)| sheet)
+            .map(|retired| &retired.sheet)
             .filter(|sheet| ids.contains(&sheet.id))
             .collect()
     }
 
-    /// Cancel every sheet opened at least [`LIMIT`] ago. Its sign-in's own
-    /// deadline has passed by then, so the sheet answers nobody, and it
-    /// must not hold back a new one whatever became of its completion.
-    pub fn overdue(&mut self, now: Instant) -> Vec<&Sheet<T>> {
-        self.cancel(now, |sheet| {
-            now.saturating_duration_since(sheet.opened) >= LIMIT
-        })
+    /// Retire every open sheet whose sign-in no longer waits, however it
+    /// ended, and return them to be dismissed: such a sheet answers nobody,
+    /// and must not hold back a new one. The shell asks on the main thread
+    /// as soon as a flow ends (`OAuthFlowRegistry::on_end`), and again
+    /// before every look, so no look ever counts an ended sign-in's sheet as
+    /// on screen.
+    pub fn ended(&mut self, now: Instant) -> Vec<&Sheet<T>> {
+        self.cancel(now, |sheet| !sheet.flow_waits())
     }
 
-    /// Hand back what the shell held for every sheet retired at least
-    /// [`RETENTION`] ago, to be dropped on the main thread — outside any
-    /// borrow of this table, since a session may run its completion as it
-    /// goes.
-    pub fn release_due(&mut self, now: Instant) -> Vec<T> {
-        let (due, kept) = std::mem::take(&mut self.retired)
-            .into_iter()
-            .partition(|(_, at)| now.saturating_duration_since(*at) >= RETENTION);
-        self.retired = kept;
-        due.into_iter().map(|(sheet, _)| sheet.held).collect()
+    /// Where retired sheet `id`'s native objects stand, asked on the main
+    /// thread. The first ask starts its [`RETENTION`] and must come on the
+    /// first main-thread turn *after* the one that retired it, queued from
+    /// there: the dismissal transition has not started while the
+    /// retirement's turn runs, and a main thread that stays busy after it
+    /// must not use the retention up (AppAuth's `OIDRetainSessionBriefly`,
+    /// R608-03). Each sheet has its own clock, so no other sheet's release
+    /// takes it early.
+    pub fn retention(&mut self, id: SheetId, now: Instant) -> Retention<T> {
+        let Some(at) = self
+            .retired
+            .iter()
+            .position(|retired| retired.sheet.id == id)
+        else {
+            return Retention::Gone;
+        };
+        let since = *self.retired[at].since.get_or_insert(now);
+        let held = now.saturating_duration_since(since);
+        if held < RETENTION {
+            return Retention::After(RETENTION - held);
+        }
+        Retention::Release(self.retired.swap_remove(at).sheet.held)
     }
 }
 
@@ -382,7 +447,7 @@ mod tests {
     /// Run one wait the way the shell does — look, then look again after
     /// the step's delay — with `world` answering what each look sees at
     /// `now`. Returns the first step that is not a look-again, and when.
-    fn run(world: impl Fn(Duration) -> Look) -> (Step, Duration) {
+    fn run(mut world: impl FnMut(Duration) -> Look) -> (Step, Duration) {
         let mut wait = SheetWait::new();
         let mut now = Duration::ZERO;
         loop {
@@ -537,6 +602,17 @@ mod tests {
             .collect()
     }
 
+    fn registry() -> Arc<OAuthFlowRegistry> {
+        Arc::new(OAuthFlowRegistry::new())
+    }
+
+    /// The shell's look, on the main thread: retire the sheets of sign-ins
+    /// that ended, then report the previous sheet.
+    fn shell_look<T>(sheets: &mut Sheets<T>, now: Instant) -> Look {
+        sheets.ended(now);
+        look(Activation::Active, sheets.previous(now))
+    }
+
     /// R608-01: keeper cancels a sheet and Apple never runs its completion.
     /// The next sign-in's sheet must still open once the cancelled one has
     /// had its dismissal — not wait out the whole [`LIMIT`] behind a sheet
@@ -544,9 +620,10 @@ mod tests {
     #[test]
     fn a_sheet_keeper_cancelled_lets_the_next_open_without_its_completion() {
         let start = Instant::now();
+        let flows = registry();
         let mut sheets = Sheets::new();
-        sheets.open(SheetId::next(), "account", (), start);
-        sheets.open(SheetId::next(), "matrix", (), start);
+        sheets.open(SheetId::next(), Arc::clone(&flows), "account", ());
+        sheets.open(SheetId::next(), Arc::clone(&flows), "matrix", ());
         assert_eq!(sheets.previous(start), PreviousSheet::OnScreen);
 
         let cancelled_at = start + Duration::from_secs(30);
@@ -574,9 +651,10 @@ mod tests {
     #[test]
     fn a_late_completion_touches_neither_a_newer_sheet_nor_the_clock() {
         let start = Instant::now();
+        let flows = registry();
         let mut sheets = Sheets::new();
         let first = SheetId::next();
-        sheets.open(first, "s", (), start);
+        sheets.open(first, Arc::clone(&flows), "s", ());
         let cancelled_at = start + Duration::from_secs(1);
         assert_eq!(states(sheets.cancel(cancelled_at, |_| true)), ["s"]);
 
@@ -589,7 +667,7 @@ mod tests {
         );
 
         let second = SheetId::next();
-        sheets.open(second, "s", (), late);
+        sheets.open(second, Arc::clone(&flows), "s", ());
         assert!(!sheets.retire(first, late + POLL));
         assert_eq!(sheets.previous(late + POLL), PreviousSheet::OnScreen);
         assert!(sheets.retire(second, late + SETTLE));
@@ -600,42 +678,160 @@ mod tests {
         assert!(!sheets.retire(second, late + SETTLE));
     }
 
-    /// Whatever became of a sheet's completion, once its sign-in's deadline
-    /// has passed it no longer holds back a new one.
+    /// R608-02, the reviewer's sequence: the account sign-in's sheet opens
+    /// at t=299 of its flow, and the flow times out at t=300 with no
+    /// completion — its guard lets go of the registry entry, nothing else.
+    /// The registry says so at once, the sheet retires on that, and the next
+    /// sign-in's sheet opens after the dismissal allowance — not at t=599,
+    /// 300 s after the old sheet opened, where its own wait gives up.
     #[test]
-    fn a_sheet_past_its_sign_ins_deadline_stops_holding_back_the_next() {
-        let start = Instant::now();
+    fn a_sheet_retires_when_its_sign_in_times_out_and_the_next_opens_after_its_dismissal() {
+        let flow_start = Instant::now();
+        let flows = registry();
+        let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hook = Arc::clone(&told);
+        assert!(flows.on_end(move |state| {
+            hook.lock().expect("not poisoned").push(state.to_owned());
+        }));
+        let _old = flows.register_with_link("old".to_owned());
+
         let mut sheets = Sheets::new();
-        sheets.open(SheetId::next(), "stale", (), start);
-        let before = start + LIMIT - POLL;
-        assert!(sheets.overdue(before).is_empty());
-        assert_eq!(sheets.previous(before), PreviousSheet::OnScreen);
-        assert_eq!(states(sheets.overdue(start + LIMIT)), ["stale"]);
+        let presented = flow_start + Duration::from_secs(299);
+        sheets.open(SheetId::next(), Arc::clone(&flows), "old", ());
+        assert!(sheets.ended(presented + SETTLE).is_empty(), "still waits");
+        assert_eq!(sheets.previous(presented + SETTLE), PreviousSheet::OnScreen);
+
+        // `authorize`'s timeout: its `FlowGuard` drops, and only removes.
+        let deadline = flow_start + Duration::from_secs(300);
+        flows.remove("old");
         assert_eq!(
-            sheets.previous(start + LIMIT),
-            PreviousSheet::EndedAgo(Duration::ZERO)
+            *told.lock().expect("not poisoned"),
+            ["old"],
+            "the shell is told when the flow ends, not at a later sign-in"
         );
+        assert_eq!(states(sheets.ended(deadline)), ["old"]);
+        assert!(sheets.ended(deadline).is_empty(), "retired once");
+
+        let _next = flows.register_with_link("next".to_owned());
+        let (step, at) = run(|now| shell_look(&mut sheets, deadline + now));
+        assert_eq!((step, at), (Step::Present, DISMISSAL));
     }
 
-    /// A retired sheet's native objects outlive its retirement by
-    /// [`RETENTION`] — never released in the turn that retired it, which
-    /// may be its own completion — and are handed back exactly once.
+    /// A new sign-in supersedes one whose sheet is still open: ending the
+    /// waiting flows (`account_sign_in`) retires that sheet, so the new
+    /// sheet opens after its dismissal. A sheet whose sign-in still waits —
+    /// the Matrix sign-in beside it, in its own registry — stays on screen
+    /// and keeps holding the next one back until its own sign-in ends.
     #[test]
-    fn a_retired_sheet_is_held_through_its_dismissal_and_released_once() {
+    fn a_new_sign_in_supersedes_an_open_sheet_and_opens_after_its_dismissal() {
         let start = Instant::now();
+        let (account, matrix) = (registry(), registry());
+        let _old = account.register_with_link("old".to_owned());
+        let _matrix = matrix.register_with_link("matrix".to_owned());
         let mut sheets = Sheets::new();
-        let (done, cancelled) = (SheetId::next(), SheetId::next());
-        sheets.open(done, "done", "session one", start);
-        sheets.open(cancelled, "cancelled", "session two", start);
-        assert!(sheets.retire(done, start));
-        let later = start + Duration::from_secs(1);
-        assert_eq!(states(sheets.cancel(later, |_| true)), ["cancelled"]);
+        sheets.open(SheetId::next(), Arc::clone(&account), "old", ());
+        sheets.open(SheetId::next(), Arc::clone(&matrix), "matrix", ());
 
-        assert!(sheets.release_due(start).is_empty());
-        assert!(sheets.release_due(start + RETENTION - POLL).is_empty());
-        assert_eq!(sheets.release_due(start + RETENTION), ["session one"]);
-        assert!(sheets.release_due(start + RETENTION).is_empty());
-        assert_eq!(sheets.release_due(later + RETENTION), ["session two"]);
-        assert!(sheets.release_due(later + LIMIT).is_empty());
+        let retry = start + Duration::from_secs(40);
+        account.cancel_all();
+        let _new = account.register_with_link("new".to_owned());
+        assert_eq!(states(sheets.ended(retry)), ["old"]);
+        assert_eq!(
+            sheets.previous(retry),
+            PreviousSheet::OnScreen,
+            "the Matrix sheet's sign-in still waits"
+        );
+
+        // The Matrix sign-in ends 3 s later; the new sheet opens after its
+        // sheet's dismissal, with keeper in front and active throughout.
+        let matrix_ends = Duration::from_secs(3);
+        let (step, at) = run(|now| {
+            if now >= matrix_ends {
+                matrix.remove("matrix");
+            }
+            shell_look(&mut sheets, retry + now)
+        });
+        assert_eq!((step, at), (Step::Present, matrix_ends + DISMISSAL));
+    }
+
+    /// Delayed end-hook cleanup must retire an old registration's sheet
+    /// even after a replacement reuses its state, without touching the
+    /// replacement's sheet or accepting the old completion.
+    #[test]
+    fn delayed_cleanup_retires_only_the_replaced_registration() {
+        let now = Instant::now();
+        let flows = registry();
+        let _old = flows.register_with_link("same".to_owned());
+        let mut sheets = Sheets::new();
+        let old = SheetId::next();
+        sheets.open(old, Arc::clone(&flows), "same", "old");
+        let (_new, mut reasons) = flows.register_with_link("same".to_owned());
+        let new = SheetId::next();
+        sheets.open(new, Arc::clone(&flows), "same", "replacement");
+
+        let ended = sheets.ended(now);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].held(), &"old");
+        assert!(
+            !ended[0].flow_waits(),
+            "do not cancel a replacement on dismissal"
+        );
+        assert!(!sheets.retire(old, now + POLL), "ignore the old completion");
+        assert_eq!(sheets.previous(now + POLL), PreviousSheet::OnScreen);
+        assert!(sheets.ended(now + POLL).is_empty());
+        assert!(flows.not_shown("same", "the replacement still waits"));
+        assert_eq!(
+            reasons.try_recv().expect("replacement"),
+            "the replacement still waits"
+        );
+        flows.remove("same");
+        let ended = sheets.ended(now + SETTLE);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id(), new);
+    }
+
+    /// R608-03: a retired sheet's objects are held [`RETENTION`] from the
+    /// first main-thread turn after its retirement, not from the retirement.
+    /// The reviewer's main thread is busy for 2.25 s after it: the queued
+    /// turn then starts the retention rather than releasing at once. Each
+    /// sheet keeps its own clock, so releasing one never takes another
+    /// early, and nothing is released twice.
+    #[test]
+    fn retention_starts_once_the_main_thread_is_free_and_runs_per_sheet() {
+        let retired_at = Instant::now();
+        let flows = registry();
+        let mut sheets = Sheets::new();
+        let (first, second, open) = (SheetId::next(), SheetId::next(), SheetId::next());
+        sheets.open(first, Arc::clone(&flows), "first", "session one");
+        sheets.open(second, Arc::clone(&flows), "second", "session two");
+        sheets.open(open, Arc::clone(&flows), "open", "session three");
+        assert!(sheets.retire(first, retired_at));
+
+        let free = retired_at + Duration::from_millis(2_250);
+        assert_eq!(sheets.retention(first, free), Retention::After(RETENTION));
+        assert!(sheets.retire(second, free + POLL));
+        assert_eq!(
+            sheets.retention(first, free + RETENTION - POLL),
+            Retention::After(POLL),
+            "a timer that fires early is asked to wait out the rest"
+        );
+        assert_eq!(
+            sheets.retention(first, free + RETENTION),
+            Retention::Release("session one")
+        );
+        assert_eq!(sheets.retention(first, free + RETENTION), Retention::Gone);
+
+        // The second sheet's first main turn comes later still; the first's
+        // release took nothing of it.
+        let second_free = free + RETENTION + SETTLE;
+        assert_eq!(
+            sheets.retention(second, second_free),
+            Retention::After(RETENTION)
+        );
+        assert_eq!(
+            sheets.retention(second, second_free + RETENTION),
+            Retention::Release("session two")
+        );
+        assert_eq!(sheets.retention(open, second_free), Retention::Gone);
     }
 }

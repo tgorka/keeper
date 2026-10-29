@@ -135,6 +135,12 @@ objc2 = "0.6"
 # direct name for a crate that was going to be compiled either way.
 objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKPDFConfiguration"] }
 block2 = "0.6"
+# libdispatch's main queue for the iPhone sign-in sheet's retention
+# (`crates/keeper/src/web_auth_apple.rs`, R608-03): `dispatch_async` then
+# `dispatch_after` on the main queue, AppAuth's `OIDRetainSessionBriefly`
+# order. Already in the tree through tao, so only the edge is new. Safe
+# bindings; `Zlib OR Apache-2.0 OR MIT` — passes the cargo-deny license firewall.
+dispatch2 = "0.3"
 # The account sign-in sheet (Epic 82, AD-311): `ASWebAuthenticationSession`,
 # presented from `crates/keeper/src/web_auth_apple.rs` on iOS (macOS signs in
 # in the default browser) — the only new crate of the epic's shell half.

@@ -2000,6 +2000,8 @@ mod tests {
         forge_login: Option<String>,
         /// Answer discovery with this status line instead of the document.
         discovery_status: Option<&'static str>,
+        /// Hold the actual discovery response until the interactive retry.
+        discovery_hold: Option<Arc<DiscoveryHold>>,
         /// Replace one field of the discovery document.
         discovery_patch: Option<(&'static str, String)>,
         /// Return an ID token on refresh: these claims over the sign-in's,
@@ -2013,6 +2015,11 @@ mod tests {
         /// earlier count refused ("was used twice"). Serve the application
         /// registration API to a token whose scope carries `write:user`.
         forgejo: bool,
+    }
+
+    struct DiscoveryHold {
+        arrived: tokio::sync::Notify,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     /// The claims every fake ID token starts from.
@@ -2190,6 +2197,10 @@ mod tests {
         let behaviour = behaviour.lock().expect("behaviour").clone();
         match (method.as_str(), target.as_str()) {
             ("GET", "/.well-known/openid-configuration") => {
+                if let Some(hold) = &behaviour.discovery_hold {
+                    hold.arrived.notify_one();
+                    let _ = hold.release.lock().expect("discovery release").recv();
+                }
                 if let Some(status) = behaviour.discovery_status {
                     reply(&mut stream, status, "{}");
                     return;
@@ -2891,6 +2902,74 @@ mod tests {
         assert!(p.session("foreign-state").is_none());
     }
 
+    /// R608-02: drive the actual authorization future and its FlowGuard,
+    /// not a manual registry removal. Its sheet opens at t=299, then the
+    /// original 300 s timeout (or dropping the future) must retire it even
+    /// if no later presentation attempt ever looks at the table.
+    #[tokio::test(start_paused = true)]
+    async fn an_authorize_timeout_or_drop_retires_its_sheet_without_another_attempt() {
+        use crate::sign_in_sheet::{PreviousSheet, SheetId, Sheets, DISMISSAL};
+
+        let fake = start_fake(Behaviour::default());
+        for timed_out in [true, false] {
+            let p = FakePlatform::new(&fake, Browser::Waits);
+            let provider = Provider {
+                host: "git.acme.dev".to_owned(),
+                client_id: ClientId::new(CLIENT_ID.to_owned()),
+                auth_url: AuthUrl::new("https://git.acme.dev/authorize".to_owned()).expect("url"),
+                token_url: TokenUrl::new("https://git.acme.dev/token".to_owned()).expect("url"),
+                revocation_url: None,
+                oidc: None,
+            };
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(300);
+            let sheets = Arc::new(Mutex::new(Sheets::new()));
+            let weak = Arc::downgrade(&sheets);
+            assert!(p.flows.on_end(move |_| {
+                weak.upgrade()
+                    .expect("table")
+                    .lock()
+                    .expect("table")
+                    .ended(deadline);
+            }));
+            let mut authorizing = Box::pin(authorize(
+                &p,
+                &p.flows,
+                &provider,
+                "keeper://oauth/test/callback",
+                &[],
+                None,
+                Duration::from_secs(300),
+            ));
+            assert!(futures_util::poll!(authorizing.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(299)).await;
+            let state = one(
+                &Url::parse(&p.shown.lock().expect("shown")[0].0).expect("url"),
+                "state",
+            );
+            sheets
+                .lock()
+                .expect("table")
+                .open(SheetId::next(), Arc::clone(&p.flows), &state, ());
+            assert_eq!(
+                sheets.lock().expect("table").previous(deadline),
+                PreviousSheet::OnScreen
+            );
+            if timed_out {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert!(matches!(authorizing.await, Err(AccountError::TimedOut)));
+            } else {
+                drop(authorizing);
+            }
+            assert_eq!(
+                sheets.lock().expect("table").previous(deadline + DISMISSAL),
+                PreviousSheet::EndedAgo(DISMISSAL),
+                "the authorization's guard must retire its sheet without another look"
+            );
+            assert!(!p.flows.waits(&state));
+        }
+    }
+
     /// R381 / 100.1 #2: a sign-in that ends without a code reads four ways —
     /// closed by the person (quiet), refused by the identity provider (with
     /// its own words when it sent any), timed out, or a broken round trip —
@@ -3020,6 +3099,46 @@ mod tests {
             .filter(|line| line.contains("account: a step did not finish"))
             .map(str::to_owned)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn retry_during_actual_discovery_opens_no_obsolete_sign_in_sheet() {
+        use crate::org_account::attempt::{Attempts, Run};
+
+        let (release, held) = std::sync::mpsc::channel();
+        let discovery = Arc::new(DiscoveryHold {
+            arrived: tokio::sync::Notify::new(),
+            release: Mutex::new(held),
+        });
+        let fake = start_fake(Behaviour {
+            discovery_hold: Some(Arc::clone(&discovery)),
+            ..Default::default()
+        });
+        let p = FakePlatform::new(&fake, Browser::Waits);
+        let d = account(&fake, "superseded-discovery", None);
+        let attempts = Attempts::default();
+        let queued_at = attempts.epoch();
+        let superseded = p.flows.cancel_latch();
+        let client = http();
+        let old = attempts.run_until(
+            queued_at,
+            Some(d.id.as_str()),
+            superseded.cancelled(),
+            sign_in_within(&p, &p.flows, &client, &d, FLOW_TIMEOUT),
+        );
+        let retry = async {
+            discovery.arrived.notified().await;
+            p.flows.cancel_all();
+            let _ = release.send(());
+        };
+        let (ran, ()) = tokio::join!(old, retry);
+        assert!(
+            matches!(ran, Run::Cancelled),
+            "retry must end the interactive attempt before discovery can open its sheet"
+        );
+        assert!(p.shown.lock().expect("shown").is_empty());
+        assert!(p.session(&d.id).is_none());
+        assert_eq!(attempts.epoch(), queued_at);
     }
 
     /// One interactive attempt through the account's attempt boundary, as

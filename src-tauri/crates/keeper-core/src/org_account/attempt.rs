@@ -117,16 +117,38 @@ impl Attempts {
         account: Option<&str>,
         work: impl Future<Output = T>,
     ) -> Run<T> {
+        self.run_until(queued_at, account, std::future::pending(), work)
+            .await
+    }
+
+    /// Run an interactive attempt until it ends, the account is stopped, or
+    /// `superseded` resolves. Capture that extra stop before waiting for the
+    /// account gate: it reaches discovery before an OAuth state exists, and
+    /// an obsolete queued attempt never polls its work. Unlike [`Self::interrupt`],
+    /// supersession does not stop unrelated background work or advance its epoch.
+    pub async fn run_until<T>(
+        &self,
+        queued_at: u64,
+        account: Option<&str>,
+        superseded: impl Future<Output = ()>,
+        work: impl Future<Output = T>,
+    ) -> Run<T> {
         let cancelled = self.cancel.notified();
         tokio::pin!(cancelled);
         cancelled.as_mut().enable();
         if self.epoch() != queued_at {
             return Run::NotStarted;
         }
+        let stopped = async {
+            tokio::select! {
+                () = &mut cancelled => {},
+                () = superseded => {},
+            }
+        };
         self.set_step(None);
         let ran = tokio::select! {
             biased;
-            () = &mut cancelled => {
+            () = stopped => {
                 let step = self.step.lock().unwrap_or_else(PoisonError::into_inner).take();
                 if let (Some(step), Some(account)) = (step, account) {
                     step_failed(step, account, AccountError::Cancelled);
@@ -137,5 +159,85 @@ impl Attempts {
         };
         self.set_step(None);
         ran
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oauth::OAuthFlowRegistry;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    #[tokio::test]
+    async fn retry_during_discovery_prevents_an_old_flow_from_registering() {
+        let attempts = Attempts::default();
+        let flows = OAuthFlowRegistry::default();
+        let before_retry = flows.cancel_latch();
+        let (entered, discovering) = oneshot::channel();
+        let (finish_discovery, discovered) = oneshot::channel();
+        let registered = AtomicBool::new(false);
+        let work = async {
+            entered.send(()).expect("discovery starts");
+            discovered.await.expect("discovery answer");
+            registered.store(true, Ordering::SeqCst);
+            let _waiting = flows.register("old".to_owned());
+        };
+        let retry = async {
+            discovering.await.expect("discovery reached");
+            flows.cancel_all();
+            let _ = finish_discovery.send(());
+        };
+        let (ran, ()) = tokio::join!(
+            attempts.run_until(attempts.epoch(), None, before_retry.cancelled(), work),
+            retry
+        );
+        assert!(matches!(ran, Run::Cancelled));
+        assert!(!registered.load(Ordering::SeqCst));
+        assert!(!flows.waits("old"));
+    }
+
+    #[tokio::test]
+    async fn retry_skips_queued_interactive_work_without_stopping_other_work() {
+        let attempts = Attempts::default();
+        let flows = OAuthFlowRegistry::default();
+        let matrix = OAuthFlowRegistry::default();
+        let _matrix_waiting = matrix.register("matrix".to_owned());
+        let gate = AsyncMutex::new(());
+        let held = gate.lock().await;
+        let before_retry = flows.cancel_latch();
+        let queued_at = attempts.epoch();
+        let old_started = AtomicBool::new(false);
+        let old = async {
+            let _gate = gate.lock().await;
+            attempts
+                .run_until(queued_at, None, before_retry.cancelled(), async {
+                    old_started.store(true, Ordering::SeqCst);
+                })
+                .await
+        };
+        tokio::pin!(old);
+        tokio::select! {
+            biased;
+            _ = &mut old => panic!("the background gate is held"),
+            () = tokio::task::yield_now() => {}
+        }
+        flows.cancel_all();
+        let replacement = flows.cancel_latch();
+        assert_eq!(attempts.epoch(), queued_at);
+        assert!(matrix.waits("matrix"));
+        drop(held);
+        assert!(matches!(old.await, Run::Cancelled));
+        assert!(!old_started.load(Ordering::SeqCst));
+        assert_eq!(
+            attempts
+                .run_until(queued_at, None, replacement.cancelled(), async { 7 })
+                .await,
+            Run::Finished(7)
+        );
+        assert_eq!(
+            attempts.run(queued_at, None, async { 9 }).await,
+            Run::Finished(9)
+        );
     }
 }
