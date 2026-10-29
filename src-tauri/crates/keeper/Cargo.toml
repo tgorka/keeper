@@ -249,3 +249,5 @@ block2 = { workspace = true }
 # session and a passkey manager's prompt both carry over. macOS signs in in
 # the default browser instead.
 objc2-authentication-services = { workspace = true }
+# The sheet's retention runs on the main dispatch queue (R608-03).
+dispatch2 = { workspace = true }

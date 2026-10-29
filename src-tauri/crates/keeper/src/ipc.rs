@@ -2568,9 +2568,9 @@ pub(crate) async fn sign_in_oidc(
     let browser =
         crate::web_auth::MatrixSignIn::new(state.platform.as_ref(), state.oauth_flows.clone());
     let shows = keeper_core::sign_in_link::ShowsSignInLink::new(&browser, on_link);
-    let added = auth::login_oidc(&shows, homeserver, state.oauth_flows.clone(), cancel).await;
-    browser.close();
-    let mut added = added?;
+    // Its sheet closes when its flow ends, by the registry's end hook
+    // (`web_auth::close_sheets_when_flows_end`).
+    let mut added = auth::login_oidc(&shows, homeserver, state.oauth_flows.clone(), cancel).await?;
     crate::account_ipc::matrix_account_added(state, &mut added);
     Ok(added)
 }

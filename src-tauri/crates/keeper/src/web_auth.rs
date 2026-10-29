@@ -21,10 +21,10 @@
 //!
 //! This file is the part of that relay that is not FFI: where the sheet's
 //! outcome goes. It compiles and is tested on every target; only
-//! [`start`] and [`cancel_all`] reach the iOS half, and [`start`] the Android
-//! one. An Auth Tab cannot be closed by the app, so [`close`] and
-//! [`cancel_all`] end only the flow there; the tab stays until the person
-//! closes it.
+//! [`start`], [`cancel_all`] and [`close_sheets_when_flows_end`] reach the
+//! iOS half, and [`start`] the Android one. An Auth Tab cannot be closed by
+//! the app, so [`cancel_all`] ends only the flow there; the tab stays until
+//! the person closes it.
 //!
 //! [`Platform::start_web_auth`]: keeper_core::platform::Platform::start_web_auth
 
@@ -34,7 +34,7 @@
 #![cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 use keeper_core::error::CoreError;
 use keeper_core::oauth::OAuthFlowRegistry;
@@ -289,7 +289,6 @@ fn attempt(mut this: Attempt) -> Result<(), CoreError> {
                 .to_owned(),
         )
     })?;
-    let app = app.clone();
     window
         .with_webview(move |webview| {
             let activation = match crate::web_auth_apple::activation(&webview) {
@@ -298,14 +297,13 @@ fn attempt(mut this: Attempt) -> Result<(), CoreError> {
             };
             let look = Look {
                 activation,
-                previous: crate::web_auth_apple::previous_sheet(&app),
+                previous: crate::web_auth_apple::previous_sheet(),
                 flow_waits: this.flows.waits(&this.state),
             };
             let waited = this.started.elapsed();
             let mut step = this.wait.next(look, waited);
             if step == Step::Present {
                 match crate::web_auth_apple::present(
-                    &app,
                     &webview,
                     &this.url,
                     &this.scheme,
@@ -381,38 +379,30 @@ fn not_up() -> CoreError {
     CoreError::Unsupported("the sign-in sheet is not available before the app starts".to_owned())
 }
 
-/// Close the sheet shown for `state`, if it is still open: its flow has
-/// already ended (cancelled or timed out), and a sheet left behind would
-/// answer nobody.
-pub fn close(state: &str) {
+/// Close the sign-in sheet of every flow of `flows` as soon as that flow
+/// stops waiting, however it stops — answered, failed, cancelled, superseded
+/// by a new sign-in, or its sign-in's deadline (`OAuthFlowRegistry::on_end`,
+/// R608-02): a sheet left behind would answer nobody and hold the next one
+/// back. The hook runs on whichever thread ended the flow and only queues
+/// `web_auth_apple::retire_ended` on the main dispatch queue, which always
+/// runs it on a later main-thread turn, outside any borrow of the sheets.
+/// Set once per registry, from `lib.rs`'s setup.
+pub fn close_sheets_when_flows_end(flows: &OAuthFlowRegistry) {
     #[cfg(target_os = "ios")]
-    if let Some((app, _)) = HOST.get() {
-        let (main, state) = (app.clone(), state.to_owned());
-        if let Err(error) =
-            app.run_on_main_thread(move || crate::web_auth_apple::cancel(&main, &state))
-        {
-            tracing::warn!(%error, "web auth: could not reach the main thread to close a sheet");
-        }
-    }
-    #[cfg(not(target_os = "ios"))]
-    let _ = state;
-}
-
-/// Close every sign-in sheet that reports to `flows`, leaving the other
-/// registry's open, and cancel the flow each one serves — without waiting
-/// for a completion, which Apple does not promise after keeper's own cancel.
-pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
-    #[cfg(target_os = "ios")]
-    if let Some((app, _)) = HOST.get() {
-        let (main, flows) = (app.clone(), Arc::clone(flows));
-        if let Err(error) =
-            app.run_on_main_thread(move || crate::web_auth_apple::cancel_for(&main, &flows))
-        {
-            tracing::warn!(%error, "web auth: could not reach the main thread to cancel");
-        }
+    if !flows.on_end(|_| {
+        dispatch2::DispatchQueue::main().exec_async(crate::web_auth_apple::retire_ended);
+    }) {
+        tracing::warn!("web auth: a sign-in registry already had an end hook");
     }
     #[cfg(not(target_os = "ios"))]
     let _ = flows;
+}
+
+/// End every sign-in flow in this registry now. Its end hook queues native
+/// sheet retirement on main; cleanup never cancels a later registration
+/// that started before the main queue became free.
+pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
+    flows.cancel_all();
 }
 
 /// The platform a Matrix single sign-on runs against (AD-331): the app's
@@ -427,30 +417,18 @@ pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
 /// the callback.
 pub struct MatrixSignIn<'a> {
     inner: &'a dyn Platform,
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     flows: Arc<OAuthFlowRegistry>,
-    /// The `state` of the sheet this sign-in opened.
-    shown: Mutex<Option<String>>,
 }
 
 impl<'a> MatrixSignIn<'a> {
     pub fn new(inner: &'a dyn Platform, flows: Arc<OAuthFlowRegistry>) -> Self {
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let _ = flows;
         Self {
             inner,
+            #[cfg(any(target_os = "ios", target_os = "android"))]
             flows,
-            shown: Mutex::new(None),
-        }
-    }
-
-    /// Close the sheet this sign-in opened, once the sign-in has ended: a
-    /// cancel or a timeout ends the flow, not the sheet.
-    pub fn close(&self) {
-        let shown = self
-            .shown
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(state) = shown {
-            close(&state);
         }
     }
 }
@@ -470,13 +448,10 @@ impl Platform for MatrixSignIn<'_> {
     }
     fn open_url(&self, url: &str) -> Result<(), CoreError> {
         #[cfg(any(target_os = "ios", target_os = "android"))]
-        if let (Some(state), Ok(redirect)) = (state_of(url), keeper_core::oauth::redirect_uri()) {
+        if let (Some(_), Ok(redirect)) = (state_of(url), keeper_core::oauth::redirect_uri()) {
             if sheet_can_deliver(redirect.scheme()) {
                 match start_in(url, redirect.scheme(), Arc::clone(&self.flows)) {
-                    Ok(()) => {
-                        *self.shown.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
-                        return Ok(());
-                    }
+                    Ok(()) => return Ok(()),
                     Err(error) => {
                         tracing::warn!(%error, "web auth: the Matrix sign-in opens in the browser");
                     }

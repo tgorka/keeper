@@ -552,6 +552,9 @@ pub fn run() {
             let account_flows = app.state::<ipc::AppState>().account_flows.clone();
             // Only the account's sign-ins are shown in the sheet (Epic 82).
             web_auth::install(app.handle(), account_flows.clone());
+            // A sheet closes when its sign-in ends, in either registry (R608-02).
+            web_auth::close_sheets_when_flows_end(&account_flows);
+            web_auth::close_sheets_when_flows_end(&flows);
             // This phone's idiom and model, read here because setup runs on
             // the UIKit main thread and `UIDevice` wants it.
             #[cfg(target_os = "ios")]

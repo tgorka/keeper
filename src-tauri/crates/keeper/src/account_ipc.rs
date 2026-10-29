@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -183,6 +183,10 @@ struct Runtime {
     /// Stops the models hydration in flight (AD-341); its own flag, because
     /// it runs beside syncs rather than inside one.
     models_interrupt: Mutex<Arc<AtomicBool>>,
+    /// How many sign-ins have started: the newest owns the attempt line, so
+    /// one a newer sign-in superseded (`account_sign_in`) does not write its
+    /// closed attempt over the newer one's.
+    sign_ins: AtomicU64,
     /// When this process last found this device's log in the repository up
     /// to date — pushed, or already holding the same bytes — for which
     /// account and path, in seconds. The daily upload's own clock: a quiet
@@ -3239,6 +3243,7 @@ async fn sync(
 /// cancel, sign-out or forget comes while it waits.
 async fn sign_in_and_sync(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>) -> AccountVm {
     let queued_at = epoch();
+    let this_sign_in = RUNTIME.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
     update(|inner| inner.attempt = Some(AccountAttemptVm::Running));
     let gate = RUNTIME.gate.lock().await;
     RUNTIME.dirty.store(false, Ordering::SeqCst);
@@ -3248,7 +3253,11 @@ async fn sign_in_and_sync(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegis
     let attempt = cancellable(queued_at, converge(platform, flows, true))
         .await
         .attempt();
-    update(|inner| inner.attempt = Some(attempt));
+    update(|inner| {
+        if RUNTIME.sign_ins.load(Ordering::SeqCst) == this_sign_in {
+            inner.attempt = Some(attempt);
+        }
+    });
     drop(gate);
     // Signed in now, the agents server may take this device by its sign-in
     // (109.6) — whether or not the settings sync went through.
@@ -3825,6 +3834,13 @@ pub async fn account_sign_in(state: State<'_, AppState>) -> Result<AccountVm, Ip
     // Whoever signs in may not be who was signed in: nothing the forge
     // sources learnt under the previous sign-in carries over.
     crate::forge_ipc::forget_identity();
+    // A new sign-in supersedes one still waiting for its answer — started
+    // from another surface, or left open: its flow ends as cancelled and the
+    // registry's end hook closes its sheet (R608-02), rather than this one
+    // queueing behind it for up to its five minutes. Only the account's
+    // flows: a Matrix sign-in beside it is not this one's, and nothing else
+    // in flight (a sync, a models download) is stopped.
+    state.account_flows.cancel_all();
     update(|inner| inner.grant_dead = true);
     Ok(Box::pin(sign_in_and_sync(
         Arc::clone(&state.platform),

@@ -2891,6 +2891,74 @@ mod tests {
         assert!(p.session("foreign-state").is_none());
     }
 
+    /// R608-02: drive the actual authorization future and its FlowGuard,
+    /// not a manual registry removal. Its sheet opens at t=299, then the
+    /// original 300 s timeout (or dropping the future) must retire it even
+    /// if no later presentation attempt ever looks at the table.
+    #[tokio::test(start_paused = true)]
+    async fn an_authorize_timeout_or_drop_retires_its_sheet_without_another_attempt() {
+        use crate::sign_in_sheet::{PreviousSheet, SheetId, Sheets, DISMISSAL};
+
+        let fake = start_fake(Behaviour::default());
+        for timed_out in [true, false] {
+            let p = FakePlatform::new(&fake, Browser::Waits);
+            let provider = Provider {
+                host: "git.acme.dev".to_owned(),
+                client_id: ClientId::new(CLIENT_ID.to_owned()),
+                auth_url: AuthUrl::new("https://git.acme.dev/authorize".to_owned()).expect("url"),
+                token_url: TokenUrl::new("https://git.acme.dev/token".to_owned()).expect("url"),
+                revocation_url: None,
+                oidc: None,
+            };
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(300);
+            let sheets = Arc::new(Mutex::new(Sheets::new()));
+            let weak = Arc::downgrade(&sheets);
+            assert!(p.flows.on_end(move |_| {
+                weak.upgrade()
+                    .expect("table")
+                    .lock()
+                    .expect("table")
+                    .ended(deadline);
+            }));
+            let mut authorizing = Box::pin(authorize(
+                &p,
+                &p.flows,
+                &provider,
+                "keeper://oauth/test/callback",
+                &[],
+                None,
+                Duration::from_secs(300),
+            ));
+            assert!(futures_util::poll!(authorizing.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(299)).await;
+            let state = one(
+                &Url::parse(&p.shown.lock().expect("shown")[0].0).expect("url"),
+                "state",
+            );
+            sheets
+                .lock()
+                .expect("table")
+                .open(SheetId::next(), Arc::clone(&p.flows), &state, ());
+            assert_eq!(
+                sheets.lock().expect("table").previous(deadline),
+                PreviousSheet::OnScreen
+            );
+            if timed_out {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert!(matches!(authorizing.await, Err(AccountError::TimedOut)));
+            } else {
+                drop(authorizing);
+            }
+            assert_eq!(
+                sheets.lock().expect("table").previous(deadline + DISMISSAL),
+                PreviousSheet::EndedAgo(DISMISSAL),
+                "the authorization's guard must retire its sheet without another look"
+            );
+            assert!(!p.flows.waits(&state));
+        }
+    }
+
     /// R381 / 100.1 #2: a sign-in that ends without a code reads four ways —
     /// closed by the person (quiet), refused by the identity provider (with
     /// its own words when it sent any), timed out, or a broken round trip —

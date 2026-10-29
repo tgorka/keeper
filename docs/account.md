@@ -500,6 +500,10 @@ same browser session:
   that sheet has been gone a second, however long that takes while keeper is in front. It
   gives up — and offers the link — only when keeper has been in the background for two
   seconds, or Apple refused the sheet three times (`keeper_core::sign_in_sheet`).
+- **A sheet lasts as long as its sign-in.** When a sign-in ends without the sheet answering
+  — its five minutes ran out, it was cancelled, or **Sign in** was pressed again, which
+  ends the sign-in still waiting — keeper closes its sheet at once, so the next one is not
+  held back behind it.
 - The `scope` string is sent byte for byte the same on every device and version.
 - **The forge must agree who you are.** If it signs you in as someone else, the connection
   is refused and its tokens are discarded: "The forge signed you in as ana, but your keeper
