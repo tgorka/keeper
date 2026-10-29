@@ -224,10 +224,10 @@ fn ticked(source: &Source, session_id: &str) -> (Vec<String>, Option<i64>) {
 
 /// Each ticked drive's tick id (`session_drives.tick_ids`, schema 5;
 /// 109.28, R605-14), as the row names it: `{"at": <the row's updated_at_ms>,
-/// "drives": {<drive>: <ULID>}}`. Ids count only while `at` is the row's own
-/// `updated_at_ms`: a schema-4 client's write moves `updated_at_ms` and
-/// leaves an older map behind, and then no drive has an id. A drive with no
-/// id is a tick no device can have acknowledged.
+/// "drives": {<drive>: <ULID>}}`. A mismatched `at` makes a retained map
+/// unusable. The server must also invalidate maps on schema-4 writes:
+/// repeated timestamps cannot distinguish them (syncular/README.md).
+/// A drive with no id is a tick no device can have acknowledged.
 pub(crate) fn tick_ids(source: &Source, session_id: &str) -> BTreeMap<String, String> {
     let rows = read(
         source,

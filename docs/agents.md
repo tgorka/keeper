@@ -1124,12 +1124,15 @@ The notes view's dock is the default agent's chat **on the open note's drive** (
   warning stands, records its new id when made; the dock's tick does not, so it warns. OK names the
   tick its warning showed (`agent_note_tick_seen`) and acknowledges that tick only, then wakes every
   open view; a tick with no id (a schema-4 write) is given one, as the person. An entry for another
-  id acknowledges nothing, so an untick and a re-tick — here, elsewhere, or unseen in between —
-  always warn again; each view build drops such stale entries, and those of gone sessions. What is
+  id acknowledges nothing, so an untick and a re-tick with fresh identities — here, elsewhere, or
+  unseen in between — warn again; each view build drops stale entries and those of gone sessions. What is
   lost fails toward the warning: a missing, unreadable or older record is an empty one, and a tick
   made on another device, or carried by `/clean`, warns here once. The person's tick or untick, the
   dock's tick and the record share one lock. keeper never takes a dock tick back on its own: only a
   person unticks it. When the dock does not tick, it says why.
+  Schema 5 requires a server-first contract migration and schema-4 writes that invalidate old
+  identity maps atomically. A timestamp alone cannot distinguish every legacy re-tick; see
+  [the contract's release prerequisite](../syncular/README.md#schema-5-release-prerequisite).
 - **Following.** The dock follows the drive, not the note: another note of the same vault keeps the
   chat, as does a vault on the same drive; a note on another drive opens that drive's chat. A pick
   in the dock's own select holds until the drive changes. Opening and ticking are writes, so the dock

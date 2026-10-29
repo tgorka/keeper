@@ -2902,3 +2902,24 @@ async fn pruning_leaves_databases_not_held_alone() {
         "the stale one pruned, the foreign one kept"
     );
 }
+
+/// `/clean` creates new grants, not acknowledgements inherited from the old
+/// conversation, even when every carried drive was already seen here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_carries_a_fresh_tick_that_warns_until_its_own_ok() {
+    let world = World::new();
+    let (hq, _opener, key) = dock_ticked(&world).await;
+    let old_tick = unseen_ticks_in(&hq, &key)[0].tick.clone().expect("an id");
+    ok(&hq, &key, "tgdrive").expect("old grant seen");
+    let result = hq.command(&key, "/clean", None, &[]).expect("clean");
+    let fresh = result.session.expect("the new conversation");
+    let carried = unseen_ticks_in(&hq, &fresh);
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].drive, "tgdrive");
+    let new_tick = carried[0].tick.as_deref().expect("a carried tick id");
+    assert_ne!(new_tick, old_tick, "a new chat has a new grant");
+    assert!(ulid::Ulid::from_string(new_tick).is_ok());
+    assert!(unseen_in(&hq, &key).is_empty(), "the old answer holds");
+    ok(&hq, &fresh, "tgdrive").expect("new grant seen");
+    assert!(unseen_in(&hq, &fresh).is_empty());
+}
