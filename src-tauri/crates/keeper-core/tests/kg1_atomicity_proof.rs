@@ -962,10 +962,19 @@ fn native_caller_resumes_after_crash_before_outcome_persistence() {
 
 // ─── S02-AC5: one runtime instance, its per-domain replicas, two sessions ───
 
+/// A remote refusal's reason: a query error renders `code: reason`, a command error the reason.
+fn reason(message: String) -> String {
+    message
+        .rsplit_once(": ")
+        .map_or(message.clone(), |(_, reason)| reason.to_owned())
+}
+
 /// The runtime instance: one replica per domain, shared by all its sessions.
 struct Runtime {
     client: String,
     month: String,
+    /// The next of this instance's fresh session numbers (the server's window).
+    children: std::cell::Cell<u32>,
     replicas: BTreeMap<String, SyncularReplica>,
 }
 
@@ -986,11 +995,21 @@ impl Runtime {
                         base_url: format!("{url}/{domain}"),
                         token: token.clone(),
                     }),
-                    subscriptions: vec![Subscription {
-                        id: "kg_nodes".into(),
-                        table: "kg_nodes".into(),
-                        scopes: vec![("kg_graph".into(), vec![domain.into()])],
-                    }],
+                    subscriptions: vec![
+                        Subscription {
+                            id: "kg_nodes".into(),
+                            table: "kg_nodes".into(),
+                            scopes: vec![("kg_graph".into(), vec![domain.into()])],
+                        },
+                        Subscription {
+                            id: "kg_receipts".into(),
+                            table: "kg_receipts".into(),
+                            scopes: vec![(
+                                "kg_client".into(),
+                                vec![format!("4:nixi{}:{client}", client.len())],
+                            )],
+                        },
+                    ],
                     watch_presence: None,
                 })
                 .expect("runtime replica");
@@ -1000,6 +1019,7 @@ impl Runtime {
         Runtime {
             client,
             month,
+            children: std::cell::Cell::new(1),
             replicas,
         }
     }
@@ -1011,8 +1031,8 @@ impl Runtime {
         self.at(domain)
             .remote_query("kg.proof.context", params)
             .map_err(|error| match error {
-                ReplicaError::Remote { message, .. } => message,
-                other => other.to_string(),
+                ReplicaError::Remote { message, .. } => reason(message),
+                other => reason(other.to_string()),
             })
             .map(|rows| rows.into_iter().next().unwrap_or_default())
     }
@@ -1052,14 +1072,17 @@ impl Runtime {
             .as_millis() as i64;
         let page = format!("{session}/{}", self.month);
         let id = || ulid::Ulid::new().to_string();
-        let turn = format!("turn-{}", id());
-        let child = format!("{}.{}", self.client, at);
+        // Each sink is its own turn: one final agent message per turn (V6).
+        let turn = || format!("turn-{}", id());
+        let n = self.children.get();
+        self.children.set(n + 1);
+        let child = format!("{}.{n}", self.client);
         BTreeMap::from([
-            ("message", vec![self.upsert("messages", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn,"role":"agent","body":"labelled answer","body_blob":null,"metadata":null,"created_at_ms":at}))]),
-            ("focus", vec![self.upsert("messages", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn,"role":"agent","body":"in this note","body_blob":null,"metadata":json!({"focus":{"drive":"tgdrive","path":"notes/kg1.md"}}).to_string(),"created_at_ms":at}))]),
-            ("chunk", vec![self.upsert("turn_chunks", json!({"id":id(),"session_id":session,"turn_id":turn,"seq":1,"text":"partial","created_at_ms":at}))]),
-            ("reasoning", vec![self.upsert("reasoning", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn,"seq":1,"compacted":false,"text":"thinking","created_at_ms":at}))]),
-            ("trace", vec![self.upsert("tool_calls", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn,"name":"run","args":"{}","status":"started","result":null,"result_blob":null,"started_at_ms":at,"ended_at_ms":null,"created_at_ms":at}))]),
+            ("message", vec![self.upsert("messages", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn(),"role":"agent","body":"labelled answer","body_blob":null,"metadata":null,"created_at_ms":at}))]),
+            ("focus", vec![self.upsert("messages", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn(),"role":"agent","body":"in this note","body_blob":null,"metadata":json!({"focus":{"drive":"tgdrive","path":"notes/kg1.md"}}).to_string(),"created_at_ms":at}))]),
+            ("chunk", vec![self.upsert("turn_chunks", json!({"id":id(),"session_id":session,"turn_id":turn(),"seq":1,"text":"partial","created_at_ms":at}))]),
+            ("reasoning", vec![self.upsert("reasoning", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn(),"seq":1,"compacted":false,"text":"thinking","created_at_ms":at}))]),
+            ("trace", vec![self.upsert("tool_calls", json!({"id":id(),"session_id":session,"page_key":page,"turn_id":turn(),"name":"run","args":"{}","status":"started","result":null,"result_blob":null,"started_at_ms":at,"ended_at_ms":null,"created_at_ms":at}))]),
             ("memory", vec![self.upsert("agent_memory", json!({"id":id(),"agent_actor":"nixi","family":"nixi","kind":"journal","text":"labelled memory","source_session":session,"created_at_ms":at}))]),
             ("delegation", vec![
                 self.upsert("sessions", json!({"id":child,"title":"delegated","status":"open","agent_actor":"nixi","created_by_actor":"nixi","created_by_client":self.client,"preferred_client":null,"parent_session":session,"invite":"[]","archived":false,"heard_until":null,"created_at_ms":at,"last_activity_ms":at})),
@@ -1173,8 +1196,8 @@ fn one_runtime_instance_isolates_handles_results_and_every_output_sink() {
         );
         match attempt {
             Ok(_) => Ok(request),
-            Err(ReplicaError::Remote { message, .. }) => Err(message),
-            Err(other) => Err(other.to_string()),
+            Err(ReplicaError::Remote { message, .. }) => Err(reason(message)),
+            Err(other) => Err(reason(other.to_string())),
         }
     };
     if phase == "handles" {
@@ -1264,6 +1287,10 @@ fn one_runtime_instance_isolates_handles_results_and_every_output_sink() {
         let plain_proposal = propose("neuradrive", &plain_handle.context)
             .err()
             .unwrap_or_else(|| "proposed".into());
+        println!(
+            "KG1_RUNTIME_SINKS {}",
+            json!({"labelled":outcomes["labelled"],"neverGraph":outcomes["never_graph"],"labelledProposal":proposal,"neverGraphProposal":plain_proposal})
+        );
         for outcome in outcomes["labelled"].values() {
             assert_eq!(outcome, "kg.source_audience");
         }
@@ -1272,10 +1299,6 @@ fn one_runtime_instance_isolates_handles_results_and_every_output_sink() {
         }
         assert_eq!(proposal, "source_audience");
         assert_eq!(plain_proposal, "proposed");
-        println!(
-            "KG1_RUNTIME_SINKS {}",
-            json!({"labelled":outcomes["labelled"],"neverGraph":outcomes["never_graph"],"labelledProposal":proposal,"neverGraphProposal":plain_proposal})
-        );
     }
     rt.close();
 }
