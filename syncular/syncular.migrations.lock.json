@@ -23,7 +23,7 @@
     },
     {
       "name": "0006_atomicity_proof",
-      "sha256": "42e234cc249fc729d785f890d115c9302c26a85102b09661cad03bd3f5bf2cab"
+      "sha256": "c14c20961e228c5a239bdef06b455233485ea78c2d2302464538f0e5fae01a70"
     }
   ],
   "head": {
@@ -670,6 +670,42 @@
           },
           {
             "name": "event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "kg_node_tags",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "graph",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "node_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "tag",
             "type": "string",
             "nullable": false
           },

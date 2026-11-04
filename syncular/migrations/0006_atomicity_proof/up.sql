@@ -18,6 +18,16 @@ CREATE TABLE kg_edges (
   author_actor TEXT NOT NULL,
   author_client TEXT NOT NULL
 );
+-- Tag membership: removable rows, so history carries explicit removal deltas
+-- without ever deleting a canonical node.
+CREATE TABLE kg_node_tags (
+  id TEXT PRIMARY KEY,
+  graph TEXT NOT NULL,
+  node_id TEXT NOT NULL REFERENCES kg_nodes(id) ON DELETE RESTRICT,
+  tag TEXT NOT NULL,
+  author_actor TEXT NOT NULL,
+  author_client TEXT NOT NULL
+);
 CREATE TABLE kg_events (
   id TEXT PRIMARY KEY,
   graph TEXT NOT NULL,

@@ -20,6 +20,7 @@
   "tables": [
     { "name": "kg_nodes", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_edges", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_node_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_events", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_event_ops", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_head", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
@@ -82,6 +83,7 @@
   "subscriptions": [
     { "name": "kgNodes", "table": "kg_nodes", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgEdges", "table": "kg_edges", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgNodeTags", "table": "kg_node_tags", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgEvents", "table": "kg_events", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgEventOps", "table": "kg_event_ops", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgHead", "table": "kg_head", "scopes": { "kg_graph": ["{database}"] } },

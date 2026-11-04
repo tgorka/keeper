@@ -42,10 +42,12 @@ scope or a primary key is a new table, not an edit.
 
 Schema 6 (`0006_atomicity_proof`) on this proof branch is not a production
 migration reservation. Do not merge or deploy this contract. `kg_nodes`,
-`kg_edges`, `kg_events`, `kg_event_ops` and `kg_head` use only `kg_graph`;
-`kg_receipts` uses only the injective, length-prefixed actor/client `kg_client`.
-All six tables require internal named-command admission, including service
-writes. Accepted entity after-images, immutable event/ordinal groups, head and
+`kg_edges`, `kg_node_tags`, `kg_events`, `kg_event_ops` and `kg_head` use only
+`kg_graph`; `kg_receipts` uses only the injective, length-prefixed actor/client
+`kg_client`. All seven tables require internal named-command admission,
+including service writes. A tag membership is the only removable row: its
+removal is an explicit `after: null` delta, and canonical nodes are never
+deleted. Accepted entity after-images, immutable event/ordinal groups, head and
 scoped business receipt belong to one server transaction. Transport commitSeq
 is returned separately by `Replica::remote_command` as `CommandResult`; it is
 a visibility bound, never application acceptance by itself.
