@@ -221,18 +221,27 @@ allowances, never crate/module allowances or first-party unsafe impls:
 | U10 | `allocation::sqlite_realloc` | Exact xRealloc ABI adapter |
 | U11 | `allocation::sqlite_size` | Exact xSize ABI and owned-header read |
 
+Test-only row (never shipped): **T12** `examples/allocation_probe.rs::exercise_allocator_case`,
+one private function-scoped allowance in a proof executable built only with the
+non-default `proof-executables` feature. It calls the six existing exports and the
+callbacks read back with `SQLITE_CONFIG_GETMALLOC`, one fixed case per process, using
+only pointers it obtained itself; it adds no export, unsafe impl or C code.
+Measurement-only row (never linked into the worker): **M1** `scripts/alloc-interposer.c`,
+an `LD_PRELOAD` observer used by the Linux proof.
+
 `sqlite_roundup`, `sqlite_init` and `sqlite_shutdown` are safe, unexported C-ABI
 callbacks with no allowances. Every callback checks a const-TLS main-thread flag
-before allocation or pointer access. That flag is granted only by
-`allocation::enter`, a process-wide one-shot claim made by the worker's entry
-(`engine::start`); a repeated or second-thread claim exits 73, so at most one thread
+before allocation or pointer access. That flag is granted only by the crate-private
+`allocation::enter`, a process-wide one-shot claim made by the worker's sole entry
+(`engine::start`); proof executables reach it only through the `proof-executables`
+feature. A repeated or second-thread claim exits 73, so at most one thread
 ever holds it. Allocating callbacks never return NULL, including
 zero-size requests, and return 16-byte-aligned pointers; exhaustion exits without
 unwinding. Registration rejects live statements before entering upstream code,
 whose create_function_v2 failure path otherwise double-frees its cache.
 `scripts/check-graph-boundary.py` enforces the inventory lexically over every
 first-party Rust file of the graph crates (src, examples, tests, build scripts): every
-`unsafe` token and export attribute must lie inside one of the eleven functions, no
+`unsafe` token and export attribute must lie inside one of the eleven functions or T12, no
 other `unsafe_code` attribute form exists, the three safe callbacks stay safe and
 unexported, and the redirect header contains no function bodies.
 
@@ -243,13 +252,14 @@ Concurrent allocation failure can permanently defeat its counter. Therefore this
 proof permits only single-threaded execution, mandatory callback thread checks,
 no set_limit, and process-wide Linux clone/fork denial. It is not a multithreaded
 allocator guarantee. Rust, redirected GraphQLite and SQLite share the charged domain.
-**Measured limit of the charged budget (Linux, `scripts/alloc-interposer.c`):** libc
-internal allocations outside that domain are a constant 32,832 bytes across the
-corpus, but glibc's per-chunk overhead on charged allocations is not charged and grows
-with the number of live allocations (33 KB to 285 KB in the proof corpus, about 18
-bytes per allocation). The 256 MiB charged budget therefore does not by itself bound
-real allocator memory; Linux relies on the 512 MiB `RLIMIT_AS` backstop, and closing
-the gap needs a reviewed accounting change to this inventory.
+**Measured limit of the charged budget (Linux, M1):** allocations made through the
+interposed symbols by shared libraries are a constant 32,832 bytes across the corpus
+(this observes exported-symbol calls only; it is not a complete bypass audit), but
+glibc's per-chunk overhead on charged allocations is not charged and grows with the
+number of live allocations (33 KB to 285 KB in the proof corpus). The 256 MiB charged
+budget therefore does not by itself bound real allocation cost; Linux relies on the
+512 MiB `RLIMIT_AS` backstop. The accounted-cost conversion that closes this gap is
+under review and not implemented.
 
 GraphQLite is source-built MIT v0.12.0 commit
 `995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629`, using the sole libsqlite3-sys headers
@@ -270,15 +280,23 @@ transaction, and both roles verify the complete `sqlite_schema` against it (bund
 SQLite also adds its STAT4 table). The query authorizer allows exactly the 41
 `(table, column)` reads and 9 functions the full positive corpus uses, derived with
 `native_probe read-trace`; any other read or function is denied and the query fails
-typed. GraphQLite keeps some prepared statements from trusted startup (measured:
-`sqlite3_close` reports unfinalized statements). Installing the final authorizer
-expires every prepared statement (`sqlite3_set_authorizer` ->
-`sqlite3ExpirePreparedStatements`), so they re-prepare under the exact policy before
-running again; naming them would need additional reviewed FFI.
+typed. GraphQLite keeps prepared statements from trusted startup (`sqlite3_close`
+reports unfinalized statements): with `GQL_STMT_CACHE=0` it retains each MATCH's
+generated SQL as a helper statement keyed by its text and resets it on every exit, and
+the warm-up is fully stepped and finalized before the authorizer is installed.
+Installing it expires every prepared statement (`sqlite3_set_authorizer` ->
+`sqlite3ExpirePreparedStatements`), so a retained statement re-prepares under the exact
+policy before running again, and a denial there fails the whole query (proven by reusing
+the retained helper statement under a reduced policy, and by `engine` unit tests; a
+statement left running would finish, which is why the warm-up is drained).
 
 The supervisor admits one builder at a time (`MAX_BUILDERS`), refuses a build while
 `MAX_RETAINED_GENERATIONS` (2) generations are referenced, reclaims unreferenced owned
-artifacts before creating staging, and holds an exclusive lock on its root. Every
+artifacts before creating staging, and holds an exclusive lock on its root. That lock
+and the live-generation registry belong to an owner shared with every published
+`Generation`: dropping the supervisor while a generation is held keeps the root
+locked, so a new supervisor on that root is refused until the generation is released.
+Bounds are per supervisor root. Every
 failure from staging creation to the directory sync removes the staging file or the
 new generation; one that cannot be removed is reclaimed (or refuses) at the next build.
 Query and inspection deadlines (3 s) run from before spawn through exit and reap.

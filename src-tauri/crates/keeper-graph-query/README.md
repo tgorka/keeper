@@ -37,7 +37,7 @@ The unsafe inventory (U01–U11) is in `docs/constraints-and-limitations.md`.
 ## Proof
 
 ```sh
-cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bins --examples
+cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bins --examples --features proof-executables
 cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-driver --bins --examples
 python3 scripts/graph-proof.py src-tauri/target/release <new-scratch-dir> [--benchmark]
 python3 scripts/check-graph-boundary.py

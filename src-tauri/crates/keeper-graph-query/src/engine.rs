@@ -131,6 +131,17 @@ const FUNCTIONS: &[&str] = &[
     "count",
     "json",
 ];
+/// Fixed trusted warm-up: completes GraphQLite's lazy executor/schema initialization
+/// before any caller input, with immutable/read-only/query_only already in force.
+const WARMUP: &str = "MATCH (n) RETURN count(*) AS total LIMIT 1";
+
+#[cfg(feature = "proof-executables")]
+pub(crate) fn policy() -> (
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+) {
+    (READS, FUNCTIONS)
+}
 
 pub struct Reader {
     connection: Connection,
@@ -138,16 +149,31 @@ pub struct Reader {
 }
 impl Reader {
     pub fn new(connection: Connection) -> Result<Self> {
-        // Fixed trusted startup before caller input; no writes are allowed by the
-        // immutable descriptor/query_only. Upstream lazy initialization runs here.
+        Self::with_policy(connection, WARMUP, "{}", READS.to_vec(), FUNCTIONS.to_vec())
+    }
+    /// Transition invariant (R3). The outer warm-up statement is fully stepped and
+    /// finalized before the policy is installed. GraphQLite keeps the MATCH statement it
+    /// generated as a helper statement keyed by SQL text (`GQL_STMT_CACHE=0` disables
+    /// capture, `cypher_executor.c:885`) and resets it on every exit path
+    /// (`executor_match.c:151-209`), so nothing is running at the transition; the
+    /// schema manager's write slots are reached only by write paths outside the profile.
+    /// Installing the authorizer expires every prepared statement
+    /// (`sqlite3_set_authorizer` -> `sqlite3ExpirePreparedStatements`), so a retained
+    /// statement re-prepares under this exact policy before it can run again, and any
+    /// denial during that re-preparation is recorded and fails the whole query.
+    pub(crate) fn with_policy(
+        connection: Connection,
+        warmup: &str,
+        warmup_parameters: &str,
+        reads: Vec<(&'static str, &'static str)>,
+        functions: Vec<&'static str>,
+    ) -> Result<Self> {
         if std::env::var("GQL_STMT_CACHE").as_deref() != Ok("0") {
             return Err("statement cache must be disabled".into());
         }
         {
-            let mut stmt = connection.prepare(
-                "SELECT row FROM cypher_rows('MATCH (n) RETURN count(*) AS total LIMIT 1', '{}')",
-            )?;
-            let mut rows = stmt.query([])?;
+            let mut stmt = connection.prepare("SELECT row FROM cypher_rows(?1, ?2)")?;
+            let mut rows = stmt.query([warmup, warmup_parameters])?;
             while rows.next()?.is_some() {}
         }
         let denied = Arc::new(Mutex::new(None));
@@ -159,8 +185,8 @@ impl Reader {
                 AuthAction::Read {
                     table_name,
                     column_name,
-                } => READS.contains(&(table_name, column_name)),
-                AuthAction::Function { function_name } => FUNCTIONS.contains(&function_name),
+                } => reads.contains(&(table_name, column_name)),
+                AuthAction::Function { function_name } => functions.contains(&function_name),
                 _ => false,
             };
             if allowed {
@@ -179,8 +205,8 @@ impl Reader {
         }))?;
         Ok(Self { connection, denied })
     }
-    /// N3 transition proof: `sqlite3_close` (not close_v2) refuses with SQLITE_BUSY
-    /// while any statement prepared during trusted startup is still unfinalized.
+    /// `sqlite3_close` (not close_v2) reports SQLITE_BUSY while GraphQLite still holds
+    /// prepared slot statements; recorded as an observation, not a safety failure.
     pub fn close(self) -> Result<()> {
         self.connection.close().map_err(|(_, e)| e)?;
         Ok(())
@@ -234,5 +260,78 @@ impl Reader {
     }
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! R3 transition invariant on the pinned rusqlite/SQLite, independent of GraphQLite:
+    //! installing the final authorizer re-authorizes every *inactive* prepared
+    //! statement before it runs again, while a *running* one may finish (advisory
+    //! expiry), which is why `Reader::with_policy` drains its warm-up first.
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use rusqlite::Connection;
+
+    fn fixture() -> Connection {
+        let c = Connection::open_in_memory().expect("memory");
+        c.execute_batch(
+            "CREATE TABLE secret(x); CREATE TABLE open(y); INSERT INTO open VALUES (1),(2);",
+        )
+        .expect("fixture");
+        c
+    }
+    fn final_policy(c: &Connection) {
+        c.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Select => Authorization::Allow,
+            AuthAction::Read {
+                table_name: "open", ..
+            } => Authorization::Allow,
+            _ => Authorization::Deny,
+        }))
+        .expect("authorizer");
+    }
+
+    #[test]
+    fn inactive_statements_prepared_before_the_final_policy_are_reauthorized() {
+        let c = fixture();
+        let mut write = c.prepare("INSERT INTO secret VALUES (1)").expect("write");
+        let mut hidden = c.prepare("SELECT x FROM secret").expect("hidden read");
+        let mut allowed = c
+            .prepare("SELECT y FROM open ORDER BY y")
+            .expect("allowed read");
+        final_policy(&c);
+        let write_result = write.execute([]);
+        let hidden_result = hidden.query_row([], |r| r.get::<_, i64>(0));
+        let rows: Vec<i64> = allowed
+            .query_map([], |r| r.get(0))
+            .expect("allowed retained read")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        drop((write, hidden, allowed));
+        c.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .expect("clear");
+        let written: i64 = c
+            .query_row("SELECT count(*) FROM secret", [], |r| r.get(0))
+            .expect("count");
+        assert!(
+            write_result.is_err(),
+            "privileged write ran: {write_result:?}"
+        );
+        assert!(hidden_result.is_err(), "denied read ran: {hidden_result:?}");
+        assert_eq!(written, 0, "denied write had an effect");
+        assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_running_statement_finishes_under_the_old_policy_so_warmup_must_drain() {
+        let c = fixture();
+        let mut running = c.prepare("SELECT y FROM open ORDER BY y").expect("read");
+        let mut rows = running.query([]).expect("query");
+        let first: i64 = rows.next().expect("step").expect("row").get(0).expect("y");
+        c.authorizer(Some(|_: AuthContext<'_>| Authorization::Deny))
+            .expect("deny all");
+        let second = rows.next().expect("advisory expiry lets it continue");
+        assert_eq!(first, 1);
+        assert_eq!(second.map(|r| r.get::<_, i64>(0).expect("y")), Some(2));
     }
 }

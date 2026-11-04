@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.get(1).ok_or("probe mode required")?;
     match mode.as_str() {
         "wrong-thread" | "live-statement" | "wrong-thread-native" => {
-            allocation::enter();
+            keeper_graph_query::proof::enter();
             allocation::install_sqlite();
             if mode == "wrong-thread" {
                 let result = std::thread::spawn(Connection::open_in_memory).join();
@@ -33,13 +33,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("wrong-thread native path survived: {result:?}").into());
         }
         "repeat-entry" => {
-            allocation::enter();
-            allocation::enter();
+            keeper_graph_query::proof::enter();
+            keeper_graph_query::proof::enter();
             return Err("repeated entry survived".into());
         }
         "concurrent-entry" => {
-            allocation::enter();
-            let result = std::thread::spawn(allocation::enter).join();
+            keeper_graph_query::proof::enter();
+            let result = std::thread::spawn(keeper_graph_query::proof::enter).join();
             return Err(format!("second-thread entry survived: {result:?}").into());
         }
         _ => {}
@@ -113,6 +113,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::io::stdout(),
                 "{}",
                 serde_json::json!({"no_retained_statement":closed.is_ok(),"error":closed.err().map(|e| e.to_string())})
+            )?;
+        }
+        "retained-reprepare" => {
+            // R3 on the real GraphQLite path. With GQL_STMT_CACHE=0 the executor runs
+            // each MATCH through cypher_executor_helper_stmt, which keeps the prepared
+            // statement keyed by its generated SQL and resets it on every exit
+            // (executor_match.c:151-209, cypher_executor.c:223-240, :885). The warm-up
+            // here is exactly the admitted query's engine text, so that retained, reset
+            // statement is the one the query reuses. Under the reduced policy (its
+            // node_props_text.value read removed) the reuse must re-prepare, be denied
+            // and fail the whole query; under the full policy it answers.
+            let policy = args.get(3).ok_or("policy full|reduced")?.clone();
+            let source = "MATCH (n:Concept) WHERE n.title = $t RETURN n.title AS t LIMIT 1";
+            let parameters = br#"{"t":"same title"}"#;
+            let admitted =
+                keeper_graph_protocol::admit(keeper_graph_protocol::PROFILE, source, parameters)?;
+            let (reads, functions) = keeper_graph_query::proof::production_policy();
+            let reads: Vec<_> = reads
+                .iter()
+                .copied()
+                .filter(|read| policy == "full" || *read != ("node_props_text", "value"))
+                .collect();
+            let reader = keeper_graph_query::proof::reader_with_policy(
+                connection,
+                &admitted.engine_text(),
+                &admitted.parameters_json()?,
+                reads,
+                functions.to_vec(),
+            )?;
+            let result = reader.query(&admitted);
+            writeln!(
+                std::io::stdout(),
+                "{}",
+                serde_json::json!({
+                    "policy": policy,
+                    "rows": result.as_ref().ok().map(Vec::len),
+                    "error": result.err().map(|e| e.to_string()),
+                })
             )?;
         }
         "read-trace" => {

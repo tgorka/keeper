@@ -28,3 +28,16 @@ seccompiler = "=0.5.0"
 
 [build-dependencies]
 cc = "1"
+
+[features]
+# Only the separate proof executables below enable this. The shipped worker binary is
+# built without it, so its sole entry is `engine::start`.
+proof-executables = []
+
+[[example]]
+name = "native_probe"
+required-features = ["proof-executables"]
+
+[[example]]
+name = "allocation_probe"
+required-features = ["proof-executables"]

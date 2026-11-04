@@ -14,8 +14,10 @@ static ENTERED: AtomicBool = AtomicBool::new(false);
 /// Grants allocation-callback permission to the calling thread, once per process.
 /// Any second claim (repeated, or from another thread, concurrently or later)
 /// terminates with 73, so at most one thread can ever hold the permission.
-/// Callbacks and helpers never grant it.
-pub fn enter() {
+/// Callbacks and helpers never grant it. Crate-private: the worker's sole entry is
+/// `engine::start`; the separate proof executables reach it only through the
+/// non-default `proof-executables` feature (`crate::proof::enter`).
+pub(crate) fn enter() {
     if ENTERED.swap(true, Ordering::SeqCst) {
         std::process::exit(73);
     }

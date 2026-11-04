@@ -82,7 +82,9 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
   function-scoped registration/allocation exceptions U01–U11 enumerated in
   `docs/constraints-and-limitations.md`. Six named C exports, three safe SQLite
   callbacks without allowances; no first-party unsafe impl or module/crate allowance.
-  Core/protocol/driver remain unsafe-free; Linux confinement uses safe bindings.
+  Core/protocol/driver remain unsafe-free; Linux confinement uses safe bindings. The
+  one reviewed test-only allowance T12 (`examples/allocation_probe.rs::exercise_allocator_case`,
+  built only with the `proof-executables` feature) is never shipped and adds no export.
   Any additional unsafe item requires independent inventory review before execution.
 - `clippy::unwrap_used = "warn"` and clippy runs with `-D warnings`: **never use `.unwrap()` (or bare `.expect()`) in production paths.** Use `?` with `thiserror` error types; `expect` is tolerated only in tests and startup code that cannot proceed (e.g. `tauri::Builder::run`).
 - `clippy --all-targets -- -D warnings` must pass — treat every clippy lint as an error.

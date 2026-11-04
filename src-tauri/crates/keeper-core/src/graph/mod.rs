@@ -46,6 +46,9 @@ pub const MAX_RETAINED_GENERATIONS: usize = 2;
 #[derive(Clone)]
 pub struct Generation {
     file: Arc<PathBuf>,
+    /// Keeps the root's exclusive lock and live-generation registry alive while any
+    /// generation is held, so no new supervisor can take over the root and reclaim it.
+    owner: Arc<Owner>,
     pub manifest: Manifest,
     /// Builder worker charged-allocation high-water mark and residual at exit, and its
     /// peak resident set. Measurements only; the budget is enforced inside the worker.
@@ -58,21 +61,26 @@ impl Generation {
         &self.file
     }
 }
+/// Exclusive owner of one supervisor root: the advisory lock and the registry of live
+/// generations. Shared by the supervisor and every generation it published; the lock is
+/// released only when all of them are gone. Holds generations weakly (no cycle).
+struct Owner {
+    root: PathBuf,
+    generations: Mutex<Vec<Weak<PathBuf>>>,
+    _lock: std::fs::File,
+}
 #[derive(Clone)]
 pub struct Supervisor(Arc<Inner>);
 struct Inner {
     worker: PathBuf,
-    root: PathBuf,
+    owner: Arc<Owner>,
     global: Arc<Semaphore>,
     queued: Semaphore,
     builds: Semaphore,
-    generations: Mutex<Vec<Weak<PathBuf>>>,
     identities: Mutex<Identities>,
     last_reaped: AtomicU32,
     live: Mutex<BTreeSet<u32>>,
     peak: AtomicUsize,
-    /// Exclusive advisory lock: every `<ulid>` artifact in root belongs to this supervisor.
-    _owner: std::fs::File,
 }
 #[derive(Default)]
 struct Identities {
@@ -98,24 +106,27 @@ impl Supervisor {
         std::fs::create_dir_all(root)?;
         let worker = worker.canonicalize()?;
         let root = root.canonicalize()?;
-        let owner = std::fs::OpenOptions::new()
+        let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(root.join(".supervisor.lock"))?;
-        owner.try_lock().map_err(|_| Error::Unavailable)?;
+        // Refused while another supervisor, or any generation it published, is alive.
+        lock.try_lock().map_err(|_| Error::Unavailable)?;
         Ok(Self(Arc::new(Inner {
             worker,
-            root,
+            owner: Arc::new(Owner {
+                root,
+                generations: Mutex::new(Vec::new()),
+                _lock: lock,
+            }),
             global: Arc::new(Semaphore::new(if headless { 2 } else { 4 })),
             queued: Semaphore::new(16),
             builds: Semaphore::new(MAX_BUILDERS),
-            generations: Mutex::new(Vec::new()),
             identities: Mutex::new(Identities::default()),
             last_reaped: AtomicU32::new(0),
             live: Mutex::new(BTreeSet::new()),
             peak: AtomicUsize::new(0),
-            _owner: owner,
         })))
     }
     /// PIDs of currently running workers; proof drivers use them for crash injection.
@@ -129,7 +140,7 @@ impl Supervisor {
     /// Owned generation/staging artifacts currently on disk (bounded-storage proof).
     pub fn artifacts(&self) -> Result<Vec<PathBuf>> {
         let mut found = Vec::new();
-        for entry in std::fs::read_dir(&self.0.root)? {
+        for entry in std::fs::read_dir(&self.0.owner.root)? {
             let path = entry?.path();
             if owned_artifact(&path) {
                 found.push(path);
@@ -194,7 +205,7 @@ impl Supervisor {
         }
         self.reserve_build()?;
         let id = ulid::Ulid::new().to_string();
-        let mut artifact = Artifact(Some(self.0.root.join(format!("{id}.staging"))));
+        let mut artifact = Artifact(Some(self.0.owner.root.join(format!("{id}.staging"))));
         let staging = artifact.path()?.to_owned();
         std::fs::OpenOptions::new()
             .write(true)
@@ -211,15 +222,17 @@ impl Supervisor {
         if &response.manifest != expected || !response.rows.is_empty() {
             return Err(Error::Unavailable);
         }
-        let published = Arc::new(self.0.root.join(format!("{id}.db")));
-        publish(&Filesystem, &mut artifact, &published, &self.0.root)?;
+        let published = Arc::new(self.0.owner.root.join(format!("{id}.db")));
+        publish(&Filesystem, &mut artifact, &published, &self.0.owner.root)?;
         self.0
+            .owner
             .generations
             .lock()
             .map_err(|_| Error::Unavailable)?
             .push(Arc::downgrade(&published));
         Ok(Generation {
             file: published,
+            owner: self.0.owner.clone(),
             manifest: response.manifest,
             build_peak_allocated_bytes: response.peak_allocated_bytes,
             build_final_allocated_bytes: response.allocated_bytes,
@@ -229,7 +242,12 @@ impl Supervisor {
     /// Refuses while MAX_RETAINED_GENERATIONS are referenced, then removes every owned
     /// artifact no live Generation references (earlier failures, dropped generations).
     fn reserve_build(&self) -> Result<()> {
-        let mut generations = self.0.generations.lock().map_err(|_| Error::Unavailable)?;
+        let mut generations = self
+            .0
+            .owner
+            .generations
+            .lock()
+            .map_err(|_| Error::Unavailable)?;
         generations.retain(|g| g.strong_count() > 0);
         if generations.len() >= MAX_RETAINED_GENERATIONS {
             return Err(Error::Limit);
@@ -473,7 +491,10 @@ impl Session {
         bytes: Vec<u8>,
         cancel: &Cancellation,
     ) -> Result<Response> {
-        if generation.manifest.domain != self.domain {
+        // A generation is only served by the supervisor that owns its root.
+        if generation.manifest.domain != self.domain
+            || !Arc::ptr_eq(&generation.owner, &self.supervisor.0.owner)
+        {
             return Err(Error::Unavailable);
         }
         let _queue = self

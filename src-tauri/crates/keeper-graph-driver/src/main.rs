@@ -528,7 +528,12 @@ mod proof {
         }
         Ok(())
     }
-    async fn limits(supervisor: &Supervisor, root: &Path, fake: &Path) -> Result<()> {
+    async fn limits(
+        supervisor: &Supervisor,
+        root: &Path,
+        worker: &Path,
+        fake: &Path,
+    ) -> Result<()> {
         let domain = "fixture-limits";
         let export = root.join("limits.ndjson");
         let m = limits_export(&export, domain)?;
@@ -771,6 +776,34 @@ mod proof {
             outcomes.push(json!({"case":format!("worker_{behaviour}"),"error":result.err().map(|e| e.to_string()),"elapsed_ms":elapsed,
                 "reaped_pid":absent(fake_supervisor.last_reaped())?}));
         }
+        // A held generation keeps its root owned: dropping the supervisor and opening a
+        // new one on the same root is refused until the generation is released, so the
+        // new owner can never reclaim a live generation.
+        let lease_root = root.join("lease-generations");
+        let first = Supervisor::new(worker, &lease_root, true)?;
+        let held = first.build_export(&small, &small_m, &cancel).await?;
+        let held_files = generation_files_in(&lease_root);
+        drop(first);
+        let takeover = Supervisor::new(worker, &lease_root, true);
+        let refused_while_held = matches!(takeover, Err(keeper_core::graph::Error::Unavailable));
+        drop(takeover);
+        let still_there = generation_files_in(&lease_root) == held_files;
+        drop(held);
+        let reopened = Supervisor::new(worker, &lease_root, true)?;
+        let after_build = {
+            let next = reopened.build_export(&small, &small_m, &cancel).await?;
+            let names = generation_files_in(&lease_root);
+            drop(next);
+            names
+        };
+        let reclaimed = !after_build.iter().any(|n| held_files.contains(n));
+        if !refused_while_held || !still_there || !reclaimed {
+            return Err(format!("generation lease violated: refused={refused_while_held} kept={still_there} reclaimed_after_release={reclaimed}").into());
+        }
+        outcomes.push(
+            json!({"case":"generation_outlives_supervisor","takeover_refused_while_held":true,
+            "held_files":held_files,"after_release_and_rebuild":after_build}),
+        );
         // Projection intact after every limit fired.
         let after = session
             .query(&generation, control, hub.as_bytes(), &cancel)
@@ -841,7 +874,7 @@ mod proof {
             }
             "limits" => {
                 let fake = PathBuf::from(args.get(4).ok_or("fake worker executable required")?);
-                limits(&supervisor, &root, &fake).await?
+                limits(&supervisor, &root, &worker, &fake).await?
             }
             _ => return Err("unknown proof mode".into()),
         }

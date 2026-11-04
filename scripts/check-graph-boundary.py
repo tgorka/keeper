@@ -32,6 +32,9 @@ INVENTORY = {
                                              'native_realloc', 'native_strdup', 'native_strndup', 'sqlite_malloc',
                                              'sqlite_realloc', 'sqlite_size'},
 }
+# Test-only row T12 (inventory round 3, R2(a)): exactly one function in exactly this
+# proof executable; never counted as, or allowed alongside, production items.
+TEST_ONLY = {'keeper-graph-query/examples/allocation_probe.rs': {'exercise_allocator_case'}}
 EXPORTS = sorted('keeper_graph_' + n for n in ['malloc', 'free', 'calloc', 'realloc', 'strdup', 'strndup'])
 SAFE_CALLBACKS = {'sqlite_roundup', 'sqlite_init', 'sqlite_shutdown'}
 
@@ -84,8 +87,9 @@ def first_party(crate):
 
 # Every first-party Rust file of the graph crates (src, examples, tests, build.rs),
 # all cfgs alike: each `unsafe` token and export attribute must lie inside one of the
-# eleven inventoried functions; no other unsafe_code attribute form may exist.
-allowances, exports = [], []
+# eleven production functions or the single test-only T12 function; no other
+# unsafe_code attribute form may exist.
+allowances, test_only, exports = [], [], []
 for crate in ['keeper-graph-query', 'keeper-graph-protocol', 'keeper-graph-driver']:
     for path in first_party(crate):
         rel = str(path.relative_to(CRATES))
@@ -99,10 +103,13 @@ for crate in ['keeper-graph-query', 'keeper-graph-protocol', 'keeper-graph-drive
             if not item:
                 raise SystemExit(f'unsafe_code allowance not on a function in {rel}')
             name = item.group(1)
-            if name not in INVENTORY.get(rel, set()):
+            if name in INVENTORY.get(rel, set()):
+                allowances.append(name)
+            elif name in TEST_ONLY.get(rel, set()):
+                test_only.append(name)
+            else:
                 raise SystemExit(f'allowance outside the approved inventory: {rel}::{name}')
             spans.append((m.start(), block_end(text, text.index('{', item.end()))))
-            allowances.append(name)
         def inside(position):
             return any(a <= position < b for a, b in spans)
         for m in re.finditer(r'\bunsafe\b', text):
@@ -123,6 +130,8 @@ for path in (CRATES / 'keeper-core/src/graph').rglob('*.rs'):
         raise SystemExit(f'unsafe in credential-bearing graph client: {path}')
 if len(allowances) != 11 or sorted(allowances) != sorted(set().union(*INVENTORY.values())):
     raise SystemExit(f'unsafe inventory drift: {sorted(allowances)}')
+if test_only != ['exercise_allocator_case']:
+    raise SystemExit(f'test-only T12 drift: {test_only}')
 if sorted(exports) != EXPORTS:
     raise SystemExit(f'export inventory drift: {exports}')
 worker = CRATES / 'keeper-graph-query'

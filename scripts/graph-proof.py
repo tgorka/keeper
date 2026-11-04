@@ -39,6 +39,7 @@ def tool(*command):
 sources = {}
 for base in ('src-tauri/crates/keeper-graph-protocol', 'src-tauri/crates/keeper-graph-query/src',
              'src-tauri/crates/keeper-graph-query/examples', 'src-tauri/crates/keeper-graph-query/build.rs',
+             'src-tauri/crates/keeper-graph-query/Cargo.toml', 'src-tauri/Cargo.toml', 'rust-toolchain.toml',
              'src-tauri/crates/keeper-graph-query/native-allocation.h', 'src-tauri/crates/keeper-graph-driver',
              'src-tauri/crates/keeper-core/src/graph', 'scripts/graph-proof.py', 'scripts/alloc-interposer.c',
              'src-tauri/Cargo.lock', 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/source-sha256.json',
@@ -53,10 +54,15 @@ evidence['provenance'] = {
     'git_dirty_files': subprocess.run(['git', 'status', '--porcelain', '--', 'src-tauri', 'scripts', 'docs'], capture_output=True,
                                       text=True, cwd=root).stdout.splitlines() if os.path.isdir(os.path.join(root, '.git')) or
                        os.path.isfile(os.path.join(root, '.git')) else None,
-    'rustc': tool('rustc', '+stable', '--version'), 'cc': tool('cc', '--version'),
+    'rustc': tool('rustc', '+stable', '--version'), 'cargo': tool('cargo', '+stable', '--version'), 'cc': tool('cc', '--version'),
+    # Not exhaustive build provenance: compiler/link flags and the bundled SQLite
+    # object are not captured here.
+    'build_commands': ['cargo +stable build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bins --examples --features proof-executables',
+                       'cargo +stable build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-driver --bins --examples'],
     'binaries': {name: sha256(path) for name, path in (
         ('keeper-graph-query', os.path.join(target, 'keeper-graph-query')), ('keeper-graph-driver', os.path.join(target, 'keeper-graph-driver')),
-        ('native_probe', os.path.join(target, 'examples', 'native_probe')), ('fake_worker', os.path.join(target, 'examples', 'fake_worker')))},
+        ('native_probe', os.path.join(target, 'examples', 'native_probe')), ('fake_worker', os.path.join(target, 'examples', 'fake_worker')),
+        ('allocation_probe', os.path.join(target, 'examples', 'allocation_probe')))},
     'sources': sources,
 }
 profiles = {}
@@ -128,13 +134,45 @@ case('authorizer_denials_are_sqlite_auth', r, r['exit'] == 0 and authz['denied']
      all(v == 'auth' for v in authz['denied'].values()) and authz['controls']['fixed_row_statement'] == 'allowed'
      and authz['controls']['missing_function'].startswith('other') and authz['controls']['syntax_error'].startswith('other'))
 r = run(['startup-transition', generation], generation)
-out = json.loads(r['stdout']) if r['exit'] == 0 else {}
-# N3 literal claim. Measured: GraphQLite keeps prepared slot statements across the
-# transition (sqlite3_close reports unfinalized statements). Installing the final
-# authorizer expires them (bundled sqlite3.c sqlite3_set_authorizer ->
-# sqlite3ExpirePreparedStatements), so they re-prepare under the exact policy before
-# running again; naming them needs reviewed enumeration FFI. Recorded, not waived.
-case('no_statement_survives_trusted_startup', r, out.get('no_retained_statement') is True, fatal=False)
+closed = json.loads(r['stdout']) if r['exit'] == 0 else {}
+full = run(['retained-reprepare', generation, 'full'], generation)
+reduced = run(['retained-reprepare', generation, 'reduced'], generation)
+full_out = json.loads(full['stdout']) if full['exit'] == 0 else {}
+reduced_out = json.loads(reduced['stdout']) if reduced['exit'] == 0 else {}
+# R3 (inventory round 3). The literal "no retained statement" claim stays false and is
+# recorded as an observation (sqlite3_close BUSY). The asserted invariant uses the
+# statement GraphQLite actually retains: the warm-up is the admitted query's own engine
+# text, so its reset helper statement is reused by the query. Under the full policy the
+# query answers; with one of its reads removed the reuse re-prepares, is denied and
+# fails the whole query, never an empty success.
+case('startup_transition_reauthorizes_retained_statements',
+     {'close': closed, 'close_busy_observed': closed.get('no_retained_statement') is False,
+      'full_policy': full_out, 'reduced_policy': reduced_out, 'stderr': full['stderr'] + reduced['stderr']},
+     full_out.get('rows') == 1 and reduced_out.get('rows') is None
+     and 'native internal authorization failure' in (reduced_out.get('error') or '')
+     and 'node_props_text' in (reduced_out.get('error') or ''))
+
+# T12 (inventory round 3, R2(a)): direct per-symbol checks of the audited hooks in a
+# fresh process each; refusals must exit with their code and print nothing.
+allocation_probe = os.path.realpath(os.path.join(target, 'examples', 'allocation_probe'))
+def allocation_case(name):
+    process = subprocess.run([allocation_probe, name], env=env, capture_output=True, text=True, timeout=30)
+    return {'exit': process.returncode, 'stdout': process.stdout.strip(), 'stderr': process.stderr.strip()[-300:]}
+r = allocation_case('positive')
+report = json.loads(r['stdout']) if r['exit'] == 0 else {}
+case('allocation_hooks_positive', dict(r, report=report),
+     r['exit'] == 0 and all(v is True for k, v in report.items() if k != 'residual_charged_bytes'))
+families = ['malloc', 'malloc-zero', 'free-null', 'free-live', 'calloc', 'realloc-null', 'realloc-live', 'strdup', 'strndup',
+            'sqlite-malloc', 'sqlite-free', 'sqlite-realloc', 'sqlite-size', 'sqlite-roundup', 'sqlite-init', 'sqlite-shutdown']
+outcomes = {f: allocation_case('wrong-thread-' + f) for f in families}
+case('allocation_hooks_refuse_wrong_thread', {'outcomes': outcomes},
+     all(o['exit'] == 73 and not o['stdout'] for o in outcomes.values()))
+outcomes = {name: allocation_case(name) for name in ('malloc-overflow', 'calloc-overflow', 'realloc-overflow')}
+case('allocation_hooks_overflow_exit_72', {'outcomes': outcomes},
+     all(o['exit'] == 72 and not o['stdout'] for o in outcomes.values()))
+outcomes = {name: allocation_case(name) for name in ('sqlite-negative-malloc', 'sqlite-negative-roundup')}
+case('allocation_hooks_negative_size_exit_73', {'outcomes': outcomes},
+     all(o['exit'] == 73 and not o['stdout'] for o in outcomes.values()))
 
 sentinel = os.path.join(scratch, 'sentinel-unrelated.csv')
 with open(sentinel, 'w') as f:
@@ -270,12 +308,18 @@ else:
     valid = all(s['exit'] == 0 and 'peak_uncharged_remainder_bytes' in s and s['table_overflow'] == 0 for s in samples)
     remainder = [s.get('peak_uncharged_remainder_bytes', 0) for s in samples]
     library_bytes = [s.get('peak_library_bytes', 0) for s in samples]
+    allocator_remainder = [s.get('peak_allocator_in_use_minus_charged_bytes', 0) for s in samples]
     # The interposer's charged peak must match Cap's own high-water mark: same domain.
     agree = all(s.get('peak_charged_bytes') == s.get('worker_peak_charged_bytes') for s in samples)
-    tolerance = 64 * 1024
-    result = {'samples': samples, 'tolerance_bytes': tolerance, 'charged_accounting_agrees_with_cap': agree,
-              'remainder_spread_bytes': max(remainder) - min(remainder), 'library_bypass_spread_bytes': max(library_bytes) - min(library_bytes)}
-    ok = valid and agree and result['remainder_spread_bytes'] <= tolerance and result['library_bypass_spread_bytes'] <= tolerance
+    result = {'samples': samples, 'charged_accounting_agrees_with_cap': agree,
+              'remainder_spread_bytes': max(remainder) - min(remainder),
+              'library_bypass_spread_bytes': max(library_bytes) - min(library_bytes),
+              'allocator_wide_remainder_spread_bytes': max(allocator_remainder) - min(allocator_remainder),
+              'alignment_above_16_calls': sum(s.get('alignment_above_16_calls', 0) for s in samples)}
+    # No acceptance window: until the reviewed accounted-cost envelope (R1) replaces
+    # this assertion, any input-dependent uncharged remainder fails the proof.
+    ok = (valid and agree and result['remainder_spread_bytes'] == 0 and result['library_bypass_spread_bytes'] == 0
+          and result['allocator_wide_remainder_spread_bytes'] == 0 and result['alignment_above_16_calls'] == 0)
     case('memory_uncharged_remainder', result, ok, fatal=False)
 print(json.dumps(evidence, indent=1))
 failed = [name for name, result in evidence['cases'].items() if not result['pass']]
