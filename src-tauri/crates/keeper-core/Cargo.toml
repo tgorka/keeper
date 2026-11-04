@@ -11,6 +11,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+keeper-graph-protocol = { path = "../keeper-graph-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

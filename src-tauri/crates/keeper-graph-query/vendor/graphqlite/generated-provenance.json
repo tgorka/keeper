@@ -1,0 +1,11 @@
+{
+  "source_commit": "995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629",
+  "bison": "bison (GNU Bison) 3.8.2",
+  "flex": "flex 2.6.4",
+  "files": {
+    "generated/cypher_flex.h": "4a477e7adca70d2aa458647997ec4a280c4c74b9fd7e889e4a29ed0b498a88c3",
+    "generated/cypher_gram.tab.c": "08a99d428cb640e80e1aa0ceddd4bae263b74afc04f2905c2c6649d337033fd3",
+    "generated/cypher_gram.tab.h": "e91175aab54d5febace62cd9bdca7c3f9c135f1352d23596e9447bd59578ad34",
+    "generated/cypher_scanner.c": "2ed06fe725d49ddafb437aabcd0b74b36a027d060bb3b9a375475be4417540d8"
+  }
+}

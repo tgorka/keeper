@@ -196,11 +196,54 @@ why (`docs/android.md` has the whole list):
   covers groups, not single artifacts: a new artifact in a listed group passes unread
   (DW-1290).
 
-## Audited `unsafe` FFI inventory (shell crate only)
+## Audited `unsafe` FFI inventory
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
 carry function-level, audited `#[allow(unsafe_code)]` exceptions for platform FFI with no
 safe binding. Current inventory:
+
+### Isolated graph proof worker (110.1)
+
+The independently reviewed worker-only exception permits exactly eleven function-level
+allowances, never crate/module allowances or first-party unsafe impls:
+
+| ID | `keeper-graph-query` function | Boundary |
+|---|---|---|
+| U01 | `native::register` | Guarded connection handle/statement inspection and pinned static registration |
+| U02 | `allocation::install_sqlite` | Pre-initialization SQLite allocator/mmap/journal-spill configuration |
+| U03 | `allocation::native_malloc` | Checked charged positive allocation, export `keeper_graph_malloc` |
+| U04 | `allocation::native_free` | Owned-header deallocation, also SQLite xFree, export `keeper_graph_free` |
+| U05 | `allocation::native_calloc` | Checked multiplication/zeroing, export `keeper_graph_calloc` |
+| U06 | `allocation::native_realloc` | Charged replacement/copy/free, export `keeper_graph_realloc` |
+| U07 | `allocation::native_strdup` | Valid C-string copy, export `keeper_graph_strdup` |
+| U08 | `allocation::native_strndup` | Bounded C-string copy, export `keeper_graph_strndup` |
+| U09 | `allocation::sqlite_malloc` | Exact xMalloc ABI adapter |
+| U10 | `allocation::sqlite_realloc` | Exact xRealloc ABI adapter |
+| U11 | `allocation::sqlite_size` | Exact xSize ABI and owned-header read |
+
+`sqlite_roundup`, `sqlite_init` and `sqlite_shutdown` are safe, unexported C-ABI
+callbacks with no allowances. Every callback checks a const-TLS main-thread flag
+before allocation or pointer access. Allocating callbacks never return NULL, including
+zero-size requests, and return 16-byte-aligned pointers; exhaustion exits without
+unwinding. Registration rejects live statements before entering upstream code,
+whose create_function_v2 failure path otherwise double-frees its cache.
+
+The dependency-provided unsafe GlobalAlloc implementation in cap **0.1.2** is part
+of this audit (crate SHA-256
+`6f125eb85b84a24c36b02ed1d22c9dd8632f53b3cde6e4d23512f94021030003`).
+Concurrent allocation failure can permanently defeat its counter. Therefore this
+proof permits only single-threaded execution, mandatory callback thread checks,
+no set_limit, and process-wide Linux clone/fork denial. It is not a multithreaded
+allocator guarantee. Rust, redirected GraphQLite and SQLite share the charged domain;
+libc/internal allocator overhead still requires independent native proof.
+
+GraphQLite is source-built MIT v0.12.0 commit
+`995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629`, using the sole libsqlite3-sys headers
+and symbols. No native engine in core/driver and no unsafe Linux confinement.
+macOS uses deprecated sandbox-exec only for isolated proof, not production enablement.
+Inventory approval does not establish runtime safety or satisfy story acceptance.
+
+### Existing platform exceptions
 
 - iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via
   objc2-foundation, behind `Platform::exclude_from_backup` — the single function-level

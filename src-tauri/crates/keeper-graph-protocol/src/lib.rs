@@ -1,5 +1,6 @@
 //! Closed KG-Cypher/1 admission. This crate owns no storage, transport or native code.
 //! Only `AdmittedQuery` can produce engine text; its representation is private.
+pub mod wire;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
