@@ -107,7 +107,7 @@ def bundle(dest):
                 'src-tauri/crates/keeper-graph-query/Cargo.toml', 'src-tauri/Cargo.toml', 'rust-toolchain.toml',
                 'src-tauri/crates/keeper-graph-query/native-allocation.h', 'src-tauri/crates/keeper-graph-driver',
                 'src-tauri/crates/keeper-core/src/graph', 'scripts/graph-proof.py', 'scripts/alloc-interposer.c',
-                'scripts/graph-reference-run.py', 'src-tauri/Cargo.lock',
+                'scripts/graph-reference-run.py', 'scripts/kg1_reference_monitor.py', 'src-tauri/Cargo.lock',
                 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/source-sha256.json',
                 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/generated-provenance.json'):
         source, copy = os.path.join(repo, rel), os.path.join(staged, rel)
@@ -182,10 +182,38 @@ def bundle(dest):
         for d, _, fs in sorted(os.walk(rootfs)):
             for name in sorted(fs):
                 path = os.path.join(d, name)
-                if not os.path.islink(path) and not path.endswith('/bundle/SHA256SUMS'):
+                if not os.path.islink(path) and not path.endswith(('/bundle/SHA256SUMS', '/bundle/TOPOLOGY.json')):
                     f.write(f'{sha256(path)}  {os.path.relpath(path, rootfs)}\n')
+    write(os.path.join(staged, 'TOPOLOGY.json'), topology(rootfs))
     print(json.dumps({'bundle': rootfs, 'dsos': len(packages), 'pinned_glibc': manifest['pinned_glibc']}))
     return 0
+
+
+def topology(rootfs):
+    """Every entry of the rootfs except the run-output directory: type, permission bits
+    and, for links, the exact target. Ownership is checked separately (the extracting
+    user)."""
+    import stat
+    entries = {}
+    for d, dirs, fs in os.walk(rootfs):
+        rel_d = os.path.relpath(d, rootfs)
+        if rel_d == 'bundle/out' or rel_d.startswith('bundle/out/'):
+            dirs[:] = []
+            continue
+        for name in dirs + fs:
+            path = os.path.join(d, name)
+            rel = os.path.relpath(path, rootfs)
+            if rel in ('bundle/TOPOLOGY.json',):
+                continue
+            st = os.lstat(path)
+            kind = 'link' if stat.S_ISLNK(st.st_mode) else 'dir' if stat.S_ISDIR(st.st_mode) else 'file'
+            entry = {'type': kind}
+            if kind == 'link':
+                entry['target'] = os.readlink(path)
+            else:
+                entry['mode'] = oct(st.st_mode & 0o7777)
+            entries[rel] = entry
+    return entries
 
 
 # ------------------------------------------------------------ reference host (outside)
@@ -221,6 +249,23 @@ def preflight(directory):
     problems = []
     if sums.returncode != 0:
         problems.append('bundle hashes do not verify')
+    expected_topology = json.load(open(os.path.join(BUNDLE, 'TOPOLOGY.json')))
+    actual_topology = topology(ROOT)
+    drift = sorted(set(expected_topology) ^ set(actual_topology)) + sorted(
+        k for k in set(expected_topology) & set(actual_topology) if expected_topology[k] != actual_topology[k])
+    owners = {os.lstat(os.path.join(ROOT, rel)).st_uid for rel in actual_topology}
+    interpreter = os.path.realpath(os.path.join(ROOT, 'lib64/ld-linux-x86-64.so.2'))
+    pinned_interp = manifest['dsos'].get('/lib64/ld-linux-x86-64.so.2', {})
+    record['topology'] = {'entries': len(actual_topology), 'drift': drift[:50], 'owners': sorted(owners),
+                          'topology_sha256': sha256(os.path.join(BUNDLE, 'TOPOLOGY.json')),
+                          'interpreter_resolves_inside_rootfs': interpreter.startswith(ROOT + '/'),
+                          'interpreter_sha256_matches_pin': interpreter.startswith(ROOT + '/') and sha256(interpreter) == pinned_interp.get('sha256')}
+    if drift:
+        problems.append(f'rootfs topology drift: {drift[:10]}')
+    if owners != {os.getuid()}:
+        problems.append(f'rootfs entries not all owned by the invoking user: {sorted(owners)}')
+    if not record['topology']['interpreter_sha256_matches_pin']:
+        problems.append('PT_INTERP path does not resolve to the pinned loader inside the rootfs')
     if manifest['pinned_glibc'] != PINNED_GLIBC or manifest['pinned_libgcc_s1'] != PINNED_LIBGCC:
         problems.append('bundle rootfs does not carry the pinned glibc/libgcc')
     if 'landlock' not in lsm.split(','):
@@ -266,123 +311,475 @@ def reference(directory):
 
 # --------------------------------------------------------- inside the scope and chroot
 
+def scope_topology(cgroup):
+    """The verified dedicated scope and every ancestor's restriction (none tighter)."""
+    problems, ancestors = [], []
+    if not os.path.basename(cgroup).startswith('kg1-1101-reference-') or not cgroup.endswith('.scope'):
+        problems.append(f'not the dedicated kg1 reference scope: {cgroup}')
+    node = os.path.dirname(cgroup)
+    while node.startswith('/sys/fs/cgroup') and node != '/sys/fs/cgroup':
+        entry = {name: text(os.path.join(node, name)) for name in ('memory.max', 'memory.swap.max', 'cpu.max', 'cpuset.cpus.effective')}
+        ancestors.append({'path': node, **entry})
+        memory = entry['memory.max']
+        if memory != 'max' and (not memory.isdigit() or int(memory) < 8 * 1024 ** 3):
+            problems.append(f'ancestor {node} memory.max {memory} is tighter than 8 GiB')
+        quota = entry['cpu.max'].split()
+        if entry['cpu.max'].startswith('unreadable') or (quota and quota[0] != 'max' and int(quota[0]) * 100000 < 400000 * int(quota[1])):
+            problems.append(f'ancestor {node} cpu.max {entry["cpu.max"]} is tighter than 400%')
+        cpus = entry['cpuset.cpus.effective']
+        if cpus.startswith('unreadable') or not {0, 1, 2, 3} <= expand_cpus(cpus):
+            problems.append(f'ancestor {node} cpuset {cpus} does not include 0-3')
+        node = os.path.dirname(node)
+    return ancestors, problems
+
+
+def expand_cpus(spec):
+    cpus = set()
+    for part in spec.split(','):
+        if '-' in part:
+            low, high = part.split('-')
+            cpus.update(range(int(low), int(high) + 1))
+        elif part:
+            cpus.add(int(part))
+    return cpus
+
+
+def auxv():
+    names = {6: 'AT_PAGESZ', 16: 'AT_HWCAP', 23: 'AT_SECURE', 26: 'AT_HWCAP2', 51: 'AT_MINSIGSTKSZ'}
+    import struct
+    data = open('/proc/self/auxv', 'rb').read()
+    values = {}
+    for i in range(0, len(data), 16):
+        key, value = struct.unpack('QQ', data[i:i + 16])
+        if key in names:
+            values[names[key]] = value
+    return values
+
+
 def inner(directory):
+    import resource
+    os.makedirs(directory, exist_ok=True)
+    sys.path.insert(0, HERE)
+    import kg1_reference_monitor as monitor
     cgroup = '/sys/fs/cgroup' + text('/proc/self/cgroup').split('::', 1)[-1]
     effective = {name: text(os.path.join(cgroup, name)) for name in LIMITS}
     affinity = sorted(os.sched_getaffinity(0))
-    verified = effective == LIMITS and affinity == [0, 1, 2, 3]
-    limits = {'cgroup': cgroup, 'expected': LIMITS, 'effective': effective, 'affinity': affinity, 'verified': verified,
-              'documented_deviation': 'MemoryMax=8G exceeds this host\'s physical RAM (recorded below); '
-                                      'this is not a clean 4-core/8-GiB result',
-              'pinned_libc_in_chroot': platform.libc_ver(), 'host_before': host_snapshot(directory)}
-    if not verified:
-        write(os.path.join(directory, 'limits.json'), limits)
-        print(json.dumps({'reference': 'refused', 'reason': 'effective limits not verified', 'effective': effective,
-                          'affinity': affinity}))
+    ancestors, problems = scope_topology(cgroup)
+    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    if effective != LIMITS or affinity != [0, 1, 2, 3]:
+        problems.append('effective scope limits or affinity not verified')
+    if hard != resource.RLIM_INFINITY:
+        problems.append(f'inherited hard RLIMIT_STACK is {hard}, not unlimited')
+    diagnostics = subprocess.run(['/lib64/ld-linux-x86-64.so.2', '--list-diagnostics'], env={}, capture_output=True, text=True)
+    with open(os.path.join(directory, 'ld-so-diagnostics.txt'), 'w') as f:
+        f.write(diagnostics.stdout)
+    record = {'predicate_version': monitor.PREDICATE_VERSION, 'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
+              'runner_sha256': sha256(os.path.abspath(__file__)), 'cgroup': cgroup, 'expected': LIMITS, 'effective': effective,
+              'affinity': affinity, 'ancestors': ancestors, 'stack_rlimit_inherited': {'soft': soft, 'hard': 'unlimited' if hard == resource.RLIM_INFINITY else hard},
+              'auxv': auxv(), 'ld_so_diagnostics_sha256': sha256(os.path.join(directory, 'ld-so-diagnostics.txt')),
+              'pinned_libc_in_chroot': platform.libc_ver(),
+              'documented_deviation': 'owner-approved physical MemTotal 8,323,547,136 B (about 7.75 GiB) < MemoryMax=8G; '
+                                      'never a physically clean 8-GiB machine', 'problems': problems}
+    if problems:
+        write(os.path.join(directory, 'reference.json'), record)
+        print(json.dumps({'reference': 'refused', 'problems': problems}))
         return 4
     scratch = os.path.join(directory, 'scratch')
     env = {'PATH': '/usr/bin:/bin', 'HOME': '/bundle', 'KG1_WORKER': os.path.join(BUNDLE, 'feature-off', 'keeper-graph-query'),
            'KG1_UNWIND_CONTROL_WORKER': os.path.join(BUNDLE, 'release', 'keeper-graph-query'),
            'KG1_NATIVE_PREBUILT': os.path.join(BUNDLE, 'native')}
-    started = time.time()
+
+    def soft_stack():
+        # Soft 8 MiB only; the hard limit stays unlimited so P6c's case can raise it.
+        resource.setrlimit(resource.RLIMIT_STACK, (8 * 1024 * 1024, resource.RLIM_INFINITY))
     with open(os.path.join(directory, 'proof.json'), 'w') as stdout, open(os.path.join(directory, 'proof.err'), 'w') as stderr:
-        # Soft limit only: P6c's case raises the soft limit above 8 MiB, which a hard
-        # limit of 8 MiB (plain `ulimit -s`) would reject with EINVAL.
-        process = subprocess.run(['sh', '-c', 'ulimit -S -s 8192 && exec "$@"', 'sh', sys.executable,
-                                  os.path.join(BUNDLE, 'scripts', 'graph-proof.py'), os.path.join(BUNDLE, 'target', 'graph-worker'),
-                                  scratch, '--benchmark'], env=env, stdout=stdout, stderr=stderr)
-    elapsed = round(time.time() - started, 1)
-    after = host_snapshot(directory)
-    names = ('memory.peak', 'memory.events', 'memory.events.local', 'memory.pressure', 'cpu.pressure', 'io.pressure',
-             'memory.swap.current', 'memory.swap.peak', 'memory.swap.events', 'memory.stat', 'cpu.stat')
-    cgroup_after = {name: text(os.path.join(cgroup, name)) for name in names}
-    events = dict(line.split() for line in cgroup_after['memory.events'].splitlines() if len(line.split()) == 2)
-    full = next((line for line in cgroup_after['memory.pressure'].splitlines() if line.startswith('full')), '')
-    full_total = int(dict(p.split('=') for p in full.split()[1:]).get('total', '0')) if full else None
-    swap_peak = cgroup_after['memory.swap.peak']
-    host_swapout = int(after['pswpout'] or 0) - int(limits['host_before']['pswpout'] or 0)
-    starved = {'oom_events': {k: int(events.get(k, 0)) for k in ('oom', 'oom_kill', 'oom_group_kill')},
-               'cgroup_swap_peak': swap_peak, 'host_pswpout_delta': host_swapout,
-               'memory_full_stall_total_us': full_total, 'full_stall_limit_us': FULL_STALL_LIMIT_US}
-    is_starved = (any(starved['oom_events'].values()) or (swap_peak.isdigit() and int(swap_peak) > 0)
-                  or host_swapout > 0 or full_total is None or full_total > FULL_STALL_LIMIT_US)
+        result = monitor.run_monitored(
+            [sys.executable, os.path.join(BUNDLE, 'scripts', 'graph-proof.py'), os.path.join(BUNDLE, 'target', 'graph-worker'),
+             scratch, '--benchmark'], os.path.join(directory, 'samples.jsonl'), lambda: monitor.collect(cgroup),
+            env=env, stdout=stdout, stderr=stderr, preexec_fn=soft_stack, self_pid=os.getpid())
     shutil.rmtree(scratch, ignore_errors=True)
-    limits.update({'host_after': after, 'cgroup_after': cgroup_after, 'proof_exit': process.returncode,
-                   'proof_elapsed_s': elapsed, 'starvation': starved, 'memory_starved': is_starved})
-    write(os.path.join(directory, 'limits.json'), limits)
-    verdict = 'MEMORY_STARVED' if is_starved else ('PASS' if process.returncode == 0 else 'PROOF_FAILED')
-    print(json.dumps({'reference': verdict, 'proof_exit': process.returncode, 'memory_peak': cgroup_after['memory.peak'],
-                      'starvation': starved}))
-    return 5 if is_starved else process.returncode
+    record['monitor'] = result
+    write(os.path.join(directory, 'reference.json'), record)
+    print(json.dumps({'reference': result['verdict'], 'latched': result['latched'], 'proof_exit': result['proof_exit']}))
+    return {'PASS': 0, 'PROOF_FAILED': 1, 'MEMORY_STARVED': 5, 'HOST_CONTENDED': 6, 'MONITOR_INVALID': 7}[result['verdict']]
 
 
 # --------------------------------------------------------------------- P6c preload
 
-def preload(directory, in_chroot):
+STACK_GUARD = 'test "$(ulimit -H -s)" = unlimited || exit 97; ulimit -S -s 8192 && exec "$@"'
+
+
+def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120):
+    """P6c preload refusal controller. `root`/`driver_command` are overridable only for
+    the local self-test; the real cases use ROOT and the bundled driver."""
+    import selectors
+    root = root or ROOT
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(ROOT, 'etc', 'ld.so.preload') if in_chroot else '/etc/ld.so.preload'
+    etc = os.path.join(root, 'etc') if in_chroot else '/etc'
+    path = os.path.join(etc, 'ld.so.preload')
     if os.path.lexists(path):
         print(json.dumps({'preload': 'refused', 'reason': f'{path} exists before the case'}))
         return 3
     # The rootfs /etc belongs to the invoking user; the host /etc needs sudo.
     privileged = [] if in_chroot else ['sudo', '-n']
-    variants = {'empty-file': privileged + ['install', '-m', '0644', '/dev/null', path],
-                'dangling-symlink': privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path]}
-    created = {'value': False}
+    saved_mode = os.stat(etc).st_mode & 0o7777
 
-    def remove(*_):
-        if created['value'] or os.path.lexists(path):
+    def must(command):
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f'{command} failed: {result.stderr.strip()}')
+
+    def absent_and_restored():
+        return not os.path.lexists(path) and os.stat(etc).st_mode & 0o7777 == saved_mode
+
+    def restore():
+        if os.stat(etc).st_mode & 0o7777 != saved_mode:
+            os.chmod(etc, saved_mode)
+        if os.path.lexists(path):
             subprocess.run(privileged + ['rm', '-f', path])
-            created['value'] = False
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *a: (remove(), sys.exit(130)))
+    variants = {'empty-file': lambda: must(privileged + ['install', '-m', '0644', '/dev/null', path]),
+                'dangling-symlink': lambda: must(privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path])}
+    if in_chroot:
+        # EACCES: remove every search bit from the private rootfs /etc only (never the
+        # host /etc); the non-root, capability-free supervisor then fails the lookup.
+        variants['unsearchable-etc'] = lambda: os.chmod(etc, saved_mode & ~0o111)
     driver_args = ['preload', os.path.join(BUNDLE, 'feature-off', 'keeper-graph-query'), os.path.join(directory, 'scratch')] + list(variants)
     driver = os.path.join(BUNDLE, 'target', 'graph-worker', 'keeper-graph-driver')
-    if in_chroot:
-        command = ['sudo', '-n'] + jail('sh', '-c', 'ulimit -S -s 8192 && exec "$@"', 'sh', chrooted(driver)) + \
+    if driver_command is not None:
+        command = driver_command + list(variants)
+    elif in_chroot:
+        command = ['sudo', '-n'] + jail('sh', '-c', STACK_GUARD, 'sh', chrooted(driver)) + \
             [chrooted(a) if a.startswith(BUNDLE) else a for a in driver_args]
     else:
-        command = ['sh', '-c', 'ulimit -S -s 8192 && exec "$@"', 'sh', driver] + driver_args
-    log = []
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        command = ['sh', '-c', STACK_GUARD, 'sh', driver] + driver_args
+    log, failure = [], None
+    stderr_file = open(os.path.join(directory, 'driver.stderr'), 'w')
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, text=True,
+                               start_new_session=True)
+
+    def kill_tree():
+        if process.poll() is None:
+            if command[:2] == ['sudo', '-n']:
+                subprocess.run(['sudo', '-n', 'kill', '-KILL', '--', f'-{process.pid}'])
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def on_signal(*_):
+        raise KeyboardInterrupt('signal')
+    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
     try:
-        for line in process.stdout:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(timeout=remaining):
+                raise TimeoutError(f'driver handshake exceeded {timeout_s}s')
+            line = process.stdout.readline()
+            if not line:
+                break
             if not line.startswith('{'):
                 continue
             record = json.loads(line)
             log.append(record)
             if 'await' not in record:
                 continue
+            variant = record['variant']
             if record['await'] == 'present':
-                result = subprocess.run(variants[record['variant']], capture_output=True, text=True)
-                created['value'] = True
-                log.append({'runner': 'created', 'variant': record['variant'], 'exit': result.returncode,
-                            'stat': run('stat', '-c', '%F %s %N', path)})
+                variants[variant]()
+                log.append({'runner': 'created', 'variant': variant, 'etc_mode': oct(os.stat(etc).st_mode & 0o7777),
+                            'stat': run('stat', '-c', '%F %s %N', path) if variant != 'unsearchable-etc' else None})
             else:
-                remove()
-                log.append({'runner': 'removed', 'variant': record['variant'], 'absent': not os.path.lexists(path)})
+                restore()
+                if not absent_and_restored():
+                    raise RuntimeError(f'restoration after {variant} not verified')
+                log.append({'runner': 'restored', 'variant': variant, 'absent': True, 'etc_mode': oct(saved_mode)})
             process.stdin.write('ready\n')
             process.stdin.flush()
-        process.wait(timeout=300)
+            deadline = time.monotonic() + timeout_s
+        process.wait(timeout=timeout_s)
+    except BaseException as error:
+        failure = repr(error)
     finally:
-        remove()
-        if process.poll() is None:
-            process.kill()
-    absent = not os.path.lexists(path)
-    stderr = process.stderr.read()
+        restore()
+        kill_tree()
+        selector.close()
+        stderr_file.close()
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    restored = absent_and_restored()
     shutil.rmtree(os.path.join(directory, 'scratch'), ignore_errors=True)
-    ok = process.returncode == 0 and absent and any(r.get('complete') for r in log)
+    ok = failure is None and process.returncode == 0 and restored and any(r.get('complete') for r in log)
     write(os.path.join(directory, 'preload.json'), {'where': 'pinned rootfs (chroot)' if in_chroot else 'host /etc (host libc)',
                                                     'path': path, 'command': command, 'driver_exit': process.returncode,
-                                                    'records': log, 'stderr_tail': stderr[-800:],
-                                                    'preload_absent_after': absent, 'pass': ok})
-    print(json.dumps({'preload': 'PASS' if ok else 'FAIL', 'where': path, 'driver_exit': process.returncode, 'absent_after': absent}))
+                                                    'failure': failure, 'records': log,
+                                                    'stderr_tail': open(os.path.join(directory, 'driver.stderr')).read()[-800:],
+                                                    'preload_absent_and_etc_mode_restored': restored, 'pass': ok})
+    print(json.dumps({'preload': 'PASS' if ok else 'FAIL', 'where': path, 'driver_exit': process.returncode,
+                      'failure': failure, 'restored': restored}))
     return 0 if ok else 1
+
+# ------------------------------------------------------------------ local self-test
+
+def selftest(directory):
+    """Discriminating checks for every monitor rejection branch, invalid telemetry, gap,
+    counter regression, child cleanup, the preload controller (including the EACCES
+    variant, a hung driver and a failed setup) and topology drift. Local only."""
+    import tempfile
+    sys.path.insert(0, HERE)
+    import kg1_reference_monitor as m
+    os.makedirs(directory, exist_ok=True)
+    results = {}
+
+    def base_sample(t):
+        psi = lambda: {'avg10': 0.0, 'avg60': 0.0, 'avg300': 0.0, 'total': 0}
+        return {'t': t, 'wall': t, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [100],
+                'events': {k: 0 for k in m.EVENT_KEYS + ('low',)}, 'events_local': {k: 0 for k in m.EVENT_KEYS + ('low',)},
+                'swap_current': 0, 'swap_peak': 0, 'swap_events': {k: 0 for k in m.SWAP_EVENT_KEYS},
+                'memory_current': 1, 'memory_peak': 1,
+                'scope_mem_psi': {'some': psi(), 'full': psi()}, 'scope_cpu_psi': {'some': psi(), 'full': psi()},
+                'cpu_stat': {'usage_usec': 0}, 'host_mem_available': 3 * 1024 ** 3, 'host_swap_free': 1,
+                'host_mem_psi': {'some': psi(), 'full': psi()}, 'host_io_psi': {'some': psi(), 'full': psi()},
+                'host_cpu_psi': {'some': psi(), 'full': psi()},
+                'host_stat': {c: [0] * 8 for c in ('cpu',) + m.ASSIGNED_CPUS}, 'host_pswpin': 0, 'host_pswpout': 0}
+
+    def series(seconds, mutate=None, step=0.25):
+        """Clean series: every CPU accrues user and idle time; `mutate(sample, t)` alters it."""
+        out = []
+        for n in range(int(seconds / step) + 1):
+            t = n * step
+            s = base_sample(t)
+            for c in s['host_stat']:
+                s['host_stat'][c] = [int(t * 100), 0, 0, int(t * 100), 0, 0, 0, 0]
+            if mutate:
+                mutate(s, t)
+            out.append(s)
+        return out
+
+    def verdict(samples):
+        p = m.Predicate(self_pid=100)
+        for s in samples:
+            r = p.observe(s)
+            if r:
+                return r[0]
+        return None
+
+    def psi_at(field, kind, key, value_at):
+        def mutate(s, t):
+            s[field][kind][key] = value_at(t)
+        return mutate
+
+    def steal(cpu, per_s=30.0, after=15):
+        # Steady steal accrual (no step): per_s ticks/s against 200 user+idle ticks/s.
+        def mutate(s, t):
+            s['host_stat'][cpu][7] = int((t - after) * per_s) if t > after else 0
+        return mutate
+
+    def zero_cpu(s, t):
+        s['host_stat']['cpu3'] = [0] * 8
+
+    def leave(s, t):
+        if t > 1:
+            s['procs'] = [7]
+
+    def widen(s, t):
+        if t > 1:
+            s['limits']['memory.max'] = 'max'
+    cases = {
+        'clean_60s': (series(60), None),
+        'oom_event': (series(12, lambda s, t: s['events'].update(oom=int(t > 5))), 'MEMORY_STARVED'),
+        'oom_kill_event': (series(12, lambda s, t: s['events'].update(oom_kill=int(t > 5))), 'MEMORY_STARVED'),
+        'oom_group_kill_event': (series(12, lambda s, t: s['events'].update(oom_group_kill=int(t > 5))), 'MEMORY_STARVED'),
+        'max_event': (series(12, lambda s, t: s['events'].update(max=int(t > 5))), 'MEMORY_STARVED'),
+        'high_event_local_only': (series(12, lambda s, t: s['events_local'].update(high=int(t > 5))), 'MEMORY_STARVED'),
+        'swap_current': (series(12, lambda s, t: s.update(swap_current=4096 if t > 5 else 0)), 'MEMORY_STARVED'),
+        'swap_peak': (series(12, lambda s, t: s.update(swap_peak=4096 if t > 5 else 0)), 'MEMORY_STARVED'),
+        'swap_event_fail': (series(12, lambda s, t: s['swap_events'].update(fail=int(t > 5))), 'MEMORY_STARVED'),
+        'scope_some_avg10': (series(12, psi_at('scope_mem_psi', 'some', 'avg10', lambda t: 1.5 if t > 5 else 0)), 'MEMORY_STARVED'),
+        'scope_some_avg300': (series(12, psi_at('scope_mem_psi', 'some', 'avg300', lambda t: 1.01 if t > 5 else 0)), 'MEMORY_STARVED'),
+        'scope_full_avg60': (series(12, psi_at('scope_mem_psi', 'full', 'avg60', lambda t: 0.11 if t > 5 else 0)), 'MEMORY_STARVED'),
+        'scope_some_total_abs': (series(8, psi_at('scope_mem_psi', 'some', 'total', lambda t: 10_000_001 if t > 5 else 0)), 'MEMORY_STARVED'),
+        'scope_full_total_abs': (series(8, psi_at('scope_mem_psi', 'full', 'total', lambda t: 1_000_001 if t > 5 else 0)), 'MEMORY_STARVED'),
+        # 1.05% some for 20 s: under the 10 s absolute ceiling, over the 1.00% cumulative rate
+        'scope_some_cumulative_rate': (series(20, psi_at('scope_mem_psi', 'some', 'total', lambda t: int(t * 10_500))), 'MEMORY_STARVED'),
+        # 310 s quiet, then 12 ms of full stall: cumulative 0.004%, 10 s window 0.12%
+        'scope_full_acute_window': (series(320, psi_at('scope_mem_psi', 'full', 'total', lambda t: 12_000 if t >= 310 else 0)), 'MEMORY_STARVED'),
+        'host_mem_available_floor': (series(12, lambda s, t: s.update(host_mem_available=1024 ** 3 - 1 if t > 5 else 3 * 1024 ** 3)), 'MEMORY_STARVED'),
+        'host_mem_full_avg10': (series(12, psi_at('host_mem_psi', 'full', 'avg10', lambda t: 0.2 if t > 5 else 0)), 'HOST_CONTENDED'),
+        'host_mem_full_window_rate': (series(320, psi_at('host_mem_psi', 'full', 'total', lambda t: 12_000 if t >= 310 else 0)), 'HOST_CONTENDED'),
+        'host_io_full_avg10': (series(12, psi_at('host_io_psi', 'full', 'avg10', lambda t: 5.5 if t > 5 else 0)), 'HOST_CONTENDED'),
+        'host_io_full_window_rate': (series(30, psi_at('host_io_psi', 'full', 'total', lambda t: 600_000 if t >= 20 else 0)), 'HOST_CONTENDED'),
+        'scope_cpu_some_avg10': (series(12, psi_at('scope_cpu_psi', 'some', 'avg10', lambda t: 5.5 if t > 5 else 0)), 'HOST_CONTENDED'),
+        'scope_cpu_some_window_rate': (series(30, psi_at('scope_cpu_psi', 'some', 'total', lambda t: 600_000 if t >= 20 else 0)), 'HOST_CONTENDED'),
+        'steal_cpu2': (series(30, steal('cpu2')), 'HOST_CONTENDED'),
+        'steal_aggregate': (series(30, steal('cpu')), 'HOST_CONTENDED'),
+        'steal_cpu1_just_above_1pct': (series(30, steal('cpu1', per_s=2.1, after=0)), 'HOST_CONTENDED'),
+        'steal_cpu1_below_1pct_control': (series(30, steal('cpu1', per_s=1.0, after=0)), None),
+        'scope_full_avg_at_limit_control': (series(12, psi_at('scope_mem_psi', 'full', 'avg10', lambda t: 0.10)), None),
+        'scope_some_avg_at_limit_control': (series(12, psi_at('scope_mem_psi', 'some', 'avg60', lambda t: 1.00)), None),
+        'host_mem_available_at_floor_control': (series(12, lambda s, t: s.update(host_mem_available=1024 ** 3)), None),
+        # exactly the 1 s absolute ceiling within the first 10 s (rate rules not yet active): not a breach
+        'scope_full_total_at_ceiling_control': (series(8, psi_at('scope_mem_psi', 'full', 'total', lambda t: 1_000_000 if t > 5 else 0)), None),
+        'host_swap_alone_is_context': (series(30, lambda s, t: s.update(host_pswpout=int(t * 1000))), None),
+        'sample_gap': ([base_sample(0.0), base_sample(1.5)], 'MONITOR_INVALID'),
+        'counter_decrease': (series(3, psi_at('host_io_psi', 'some', 'total', lambda t: 100 if t < 2 else 50)), 'MONITOR_INVALID'),
+        'limits_changed': (series(3, widen), 'MONITOR_INVALID'),
+        'monitor_left_scope': (series(3, leave), 'MONITOR_INVALID'),
+        'fresh_scope_not_fresh': (series(3, lambda s, t: s['events'].update(high=3)), 'MONITOR_INVALID'),
+        'zero_cpu_denominator': (series(12, zero_cpu), 'MONITOR_INVALID'),
+    }
+    for name, (samples, expected) in cases.items():
+        got = verdict(samples)
+        results[f'predicate:{name}'] = {'expected': expected, 'got': got, 'pass': got == expected}
+    for name, text_value, parser in (('psi_missing_full', 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n', lambda x: m.parse_psi(x, 'psi')),
+                                     ('psi_garbage', 'some avg10=x avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n', lambda x: m.parse_psi(x, 'psi')),
+                                     ('events_missing_oom', 'low 0\nhigh 0\nmax 0\n', lambda x: m.parse_keyed(x, 'events', m.EVENT_KEYS)),
+                                     ('stat_missing_cpu3', 'cpu 1 2 3 4 5 6 7 8 0 0\ncpu0 1 2 3 4 5 6 7 8 0 0\n', m.parse_stat)):
+        try:
+            parser(text_value)
+            ok = False
+        except m.Invalid:
+            ok = True
+        results[f'parse:{name}'] = {'expected': 'Invalid', 'pass': ok}
+    try:
+        m._read(os.path.join(directory, 'no-such-telemetry'))
+        unreadable = False
+    except m.Invalid:
+        unreadable = True
+    results['parse:unreadable_file_is_invalid_not_zero'] = {'pass': unreadable}
+    # Child cleanup: a proof tree including a setsid grandchild; breach after 3 s.
+    clock = {'n': 0, 'breach_after': 12}
+
+    def fake_collect():
+        clock['n'] += 1
+        s = base_sample(time.monotonic())
+        s['procs'] = [os.getpid()]
+        for c in s['host_stat']:
+            s['host_stat'][c] = [clock['n'] * 100, 0, 0, clock['n'] * 100, 0, 0, 0, 0]
+        if clock['breach_after'] and clock['n'] > clock['breach_after']:
+            s['events']['oom_kill'] = 1
+        return s
+    pids_file = os.path.join(directory, 'tree.pids')
+    tree = ['sh', '-c', f'sleep 300 & echo $! >> {pids_file}; setsid sleep 300 & echo $! >> {pids_file}; '
+            f'sh -c "sleep 300 & echo \\$! >> {pids_file}; wait" & wait']
+    r = m.run_monitored(tree, os.path.join(directory, 'cleanup.jsonl'), fake_collect, baseline_s=0.5, self_pid=os.getpid())
+    spawned = [int(x) for x in open(pids_file).read().split()]
+
+    def live(pid):
+        try:
+            return open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()[0] != 'Z'
+        except OSError:
+            return False
+    alive = [p for p in spawned if live(p)]
+    results['cleanup:breach_kills_tree'] = {'verdict': r['verdict'], 'latched': r['latched'], 'spawned': spawned,
+                                            'alive_after': alive, 'leftover': r['leftover_descendants'],
+                                            'pass': r['verdict'] == 'MEMORY_STARVED' and len(spawned) == 3 and not alive
+                                            and not r['leftover_descendants']}
+    calls = {'n': 0}
+
+    def failing_collect():
+        calls['n'] += 1
+        if calls['n'] > 6:
+            raise m.Invalid('memory.pressure: empty')
+        return fake_collect()
+    clock.update(n=0, breach_after=0)
+    r = m.run_monitored(['sleep', '300'], os.path.join(directory, 'invalid.jsonl'), failing_collect, baseline_s=0.5,
+                        self_pid=os.getpid())
+    results['cleanup:telemetry_loss_stops'] = {'verdict': r['verdict'], 'latched': r['latched'], 'leftover': r['leftover_descendants'],
+                                               'pass': r['verdict'] == 'MONITOR_INVALID' and not r['leftover_descendants']}
+    clock.update(n=0, breach_after=0)
+    r = m.run_monitored(['sh', '-c', 'exit 0'], os.path.join(directory, 'pass.jsonl'), fake_collect, baseline_s=0.5, self_pid=os.getpid())
+    results['cleanup:clean_run_passes'] = {'verdict': r['verdict'], 'pass': r['verdict'] == 'PASS'}
+    clock.update(n=0, breach_after=0)
+    r = m.run_monitored(['sh', '-c', 'exit 3'], os.path.join(directory, 'fail.jsonl'), fake_collect, baseline_s=0.5, self_pid=os.getpid())
+    results['cleanup:proof_failure_is_not_pass'] = {'verdict': r['verdict'], 'pass': r['verdict'] == 'PROOF_FAILED'}
+    # Preload controller against a fake driver in a private temp root.
+    fake_driver = os.path.join(directory, 'fake_driver.py')
+    with open(fake_driver, 'w') as f:
+        f.write('''import json, os, stat, sys, time
+etc, mode, variants = sys.argv[1], sys.argv[2], sys.argv[3:]
+path = os.path.join(etc, 'ld.so.preload')
+def state():
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return 'absent'
+    except OSError as e:
+        return 'errno:%d' % e.errno
+    return 'symlink' if stat.S_ISLNK(st.st_mode) else 'file:%d' % st.st_size
+expected = {'empty-file': 'file:0', 'dangling-symlink': 'symlink', 'unsearchable-etc': 'errno:13'}
+out = []
+for v in variants:
+    print(json.dumps({'await': 'present', 'variant': v}), flush=True)
+    if sys.stdin.readline().strip() != 'ready': sys.exit(3)
+    observed = state()
+    if mode == 'hang': time.sleep(600)
+    print(json.dumps({'await': 'absent', 'variant': v}), flush=True)
+    if sys.stdin.readline().strip() != 'ready': sys.exit(3)
+    if observed != expected[v] or state() != 'absent':
+        print('bad', v, observed, file=sys.stderr); sys.exit(4)
+    out.append({'variant': v, 'observed': observed})
+print(json.dumps({'mode': 'preload', 'outcomes': out}), flush=True)
+print(json.dumps({'complete': True}), flush=True)
+''')
+    for label, mode, expect_pass, timeout_s, break_setup in (('all_variants_pass', 'ok', True, 20, False),
+                                                             ('hung_driver_times_out_and_restores', 'hang', False, 2, False),
+                                                             ('setup_failure_aborts_and_restores', 'ok', False, 20, True)):
+        root = tempfile.mkdtemp(prefix='kg1-preload-selftest-', dir=directory)
+        etc = os.path.join(root, 'etc')
+        os.makedirs(etc)
+        os.chmod(etc, 0o555 if break_setup else 0o755)
+        out_dir = os.path.join(directory, f'preload-{label}')
+        code = preload(out_dir, True, root=root, driver_command=[sys.executable, fake_driver, etc, mode], timeout_s=timeout_s)
+        record = json.load(open(os.path.join(out_dir, 'preload.json')))
+        mode_after = oct(os.stat(etc).st_mode & 0o7777)
+        expected_mode = oct(0o555 if break_setup else 0o755)
+        unsearchable_seen = any(r.get('variant') == 'unsearchable-etc' and r.get('etc_mode') == oct(0o755 & ~0o111)
+                                for r in record['records'] if r.get('runner') == 'created')
+        observed = [o.get('observed') for r in record['records'] if r.get('mode') == 'preload' for o in r['outcomes']]
+        results[f'preload:{label}'] = {'exit': code, 'failure': record['failure'], 'mode_after': mode_after,
+                                       'absent_after': not os.path.lexists(os.path.join(etc, 'ld.so.preload')),
+                                       'eacces_variant_exercised': unsearchable_seen, 'observed': observed,
+                                       'pass': (code == 0) == expect_pass and mode_after == expected_mode
+                                       and not os.path.lexists(os.path.join(etc, 'ld.so.preload'))
+                                       and (not expect_pass or (unsearchable_seen and observed == ['file:0', 'symlink', 'errno:13']))}
+        os.chmod(etc, 0o755)
+        shutil.rmtree(root)
+    # Topology drift detection.
+    root = tempfile.mkdtemp(prefix='kg1-topology-selftest-', dir=directory)
+    os.makedirs(os.path.join(root, 'usr/lib'))
+    open(os.path.join(root, 'usr/lib/ld.so'), 'w').close()
+    os.chmod(os.path.join(root, 'usr/lib/ld.so'), 0o755)
+    os.symlink('usr/lib', os.path.join(root, 'lib'))
+    before = topology(root)
+    os.remove(os.path.join(root, 'lib'))
+    os.symlink('/usr/lib', os.path.join(root, 'lib'))
+    os.chmod(os.path.join(root, 'usr/lib/ld.so'), 0o777)
+    after = topology(root)
+    changed = sorted(k for k in before if before[k] != after.get(k))
+    results['topology:link_target_and_mode_drift_detected'] = {'changed': changed, 'pass': changed == ['lib', 'usr/lib/ld.so']}
+    shutil.rmtree(root)
+    failed = [k for k, v in results.items() if not v['pass']]
+    write(os.path.join(directory, 'selftest.json'), {'predicate_version': m.PREDICATE_VERSION,
+                                                     'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
+                                                     'runner_sha256': sha256(os.path.abspath(__file__)), 'results': results,
+                                                     'failed': failed})
+    print(json.dumps({'selftest': 'PASS' if not failed else 'FAIL', 'cases': len(results), 'failed': failed}))
+    return 0 if not failed else 1
+
 
 
 if __name__ == '__main__':
     commands = {'bundle': bundle, 'preflight': preflight, 'reference': reference, 'inner': inner,
-                'preload-chroot': lambda d: preload(d, True), 'preload-host': lambda d: preload(d, False)}
+                'preload-chroot': lambda d: preload(d, True), 'preload-host': lambda d: preload(d, False),
+                'selftest': selftest}
     if len(sys.argv) != 3 or sys.argv[1] not in commands:
         sys.exit(__doc__)
     sys.exit(commands[sys.argv[1]](os.path.abspath(sys.argv[2])))

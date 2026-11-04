@@ -970,13 +970,15 @@ mod proof {
     /// P6c system-preload refusal through the real supervisor, for a privileged runner.
     /// The driver itself never touches `/etc`: for each named variant it prints
     /// `{"await":"present",...}` and waits for one stdin line while the runner creates
-    /// `/etc/ld.so.preload` (an empty file, or a dangling symlink), then requires the
-    /// same no-side-effect refusal as the stack case (writerless FIFO input never
-    /// opened, planted reclaimable artifact kept, directory mtime/ctime unchanged, no
-    /// reaped or live child, typed `Unavailable` for build/query/inspect). It then
-    /// prints `{"await":"absent",...}`, waits for removal and requires the prior
-    /// generation to answer unchanged. A final real build reclaims the planted
-    /// artifact (detector control).
+    /// the condition — `empty-file`, `dangling-symlink`, or `unsearchable-etc` (the
+    /// runner removes search permission from the private rootfs `/etc`, so the lookup
+    /// fails with EACCES rather than reporting absence) — then requires exactly that
+    /// observed state and the same no-side-effect refusal as the stack case
+    /// (writerless FIFO input never opened, planted reclaimable artifact kept,
+    /// directory mtime/ctime unchanged, no reaped or live child, typed `Unavailable`
+    /// for build/query/inspect). It then prints `{"await":"absent",...}`, waits for
+    /// restoration, and requires absence and the prior generation to answer unchanged.
+    /// A final real build reclaims the planted artifact (detector control).
     #[cfg(target_os = "linux")]
     async fn preload(supervisor: &Supervisor, root: &Path, variants: &[String]) -> Result<()> {
         use std::io::BufRead;
@@ -985,7 +987,13 @@ mod proof {
             Ok(m) if m.file_type().is_symlink() => "symlink".to_owned(),
             Ok(m) => format!("file:{}", m.len()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
-            Err(e) => format!("error:{e}"),
+            Err(e) => format!("errno:{}", e.raw_os_error().unwrap_or(-1)),
+        };
+        let expected = |variant: &str| match variant {
+            "empty-file" => Ok("file:0"),
+            "dangling-symlink" => Ok("symlink"),
+            "unsearchable-etc" => Ok("errno:13"),
+            _ => Err(format!("unknown preload variant {variant}")),
         };
         let mut stdin = std::io::stdin().lock();
         let mut wait = |phase: &str, variant: &str| -> Result<()> {
@@ -1033,6 +1041,7 @@ mod proof {
         for variant in variants {
             wait("present", variant)?;
             let observed = state();
+            let wanted = expected(variant)?;
             let reaped = supervisor.last_reaped();
             let before = stamp()?;
             let build = tokio::time::timeout(
@@ -1059,7 +1068,7 @@ mod proof {
                 .query(&generation, control, b"{}", &cancel)
                 .await?
                 .rows;
-            if observed == "absent"
+            if observed != wanted
                 || after_state != "absent"
                 || !(typed && no_child && unchanged && untouched)
                 || rows != baseline
