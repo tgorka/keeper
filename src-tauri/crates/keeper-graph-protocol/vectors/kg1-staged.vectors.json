@@ -1,0 +1,33 @@
+{
+  "status": "staged by story 110.1; story 110.3 adopts it as syncular/knowledge-graph.vectors.json",
+  "profile": "KG-Cypher/1",
+  "symbols": [
+    {"kind": "node", "canonical": "work:Item", "symbol": "K_776f726b3a4974656d"},
+    {"kind": "node", "canonical": "work:żółć", "symbol": "K_776f726b3ac5bcc3b3c582c487"},
+    {"kind": "edge", "canonical": "work:depends_on", "symbol": "R_776f726b3a646570656e64735f6f6e"},
+    {"kind": "property", "canonical": "score", "symbol": "P_73636f7265"},
+    {"kind": "property", "canonical": "score.α", "symbol": "P_73636f72652eceb1"}
+  ],
+  "reserved_property_refusals": ["id", "kind", "title", "description", "lifecycle", "revision", "from_id", "to_id", "type"],
+  "parameters": [
+    {"input": "{\"p\":1}", "normalized": "{\"p\":1.0}"},
+    {"input": "{\"p\":1.0}", "normalized": "{\"p\":1.0}"},
+    {"input": "{\"p\":-0.0}", "normalized": "{\"p\":0.0}"},
+    {"input": "{\"p\":9007199254740991}", "normalized": "{\"p\":9007199254740991.0}"},
+    {"input": "{\"p\":9007199254740992}", "refusal": "query_unsupported"},
+    {"input": "{\"p\":1,\"p\":2}", "refusal": "query_unsupported"},
+    {"input": "{\"p\":[1]}", "refusal": "query_unsupported"}
+  ],
+  "jcs": [
+    {"source": "RFC 8785 §3.2.3", "input": "{\"\\u20ac\":\"Euro Sign\",\"\\r\":\"Carriage Return\",\"\\ufb33\":\"Hebrew Letter Dalet With Dagesh\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji: Grinning Face\",\"\\u0080\":\"Control\",\"\\u00f6\":\"Latin Small Letter O With Diaeresis\"}", "canonical": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\u0080\":\"Control\",\"\u00f6\":\"Latin Small Letter O With Diaeresis\",\"\u20ac\":\"Euro Sign\",\"\ud83d\ude00\":\"Emoji: Grinning Face\",\"\ufb33\":\"Hebrew Letter Dalet With Dagesh\"}"},
+    {"source": "RFC 8785 Appendix B", "input": "-0.0", "canonical": "0"},
+    {"source": "RFC 8785 Appendix B", "input": "0.000001", "canonical": "0.000001"},
+    {"source": "RFC 8785 Appendix B", "input": "333333333.3333333", "canonical": "333333333.3333333"},
+    {"source": "KG1 number equivalence", "input": "1.0", "canonical": "1"},
+    {"source": "KG1 numeric-looking keys", "input": "{\"2\":0,\"10\":0,\"1\":0}", "canonical": "{\"1\":0,\"10\":0,\"2\":0}"}
+  ],
+  "renderer": [
+    {"source": "MATCH (n:Concept)-[e:HAS_TAG]->(t:Tag) WHERE t.text = $tag RETURN n.id AS node, e.id AS edge ORDER BY node LIMIT 10",
+     "engine": "MATCH (v0:Concept)-[v1:HAS_TAG]->(v2:Tag) WHERE v2.text = $tag RETURN v0.id AS a0, v1.id AS a1 ORDER BY a0 ASC, v0.id ASC, v1.id ASC, v2.id ASC LIMIT 10"}
+  ]
+}

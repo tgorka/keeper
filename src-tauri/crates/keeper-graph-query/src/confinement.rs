@@ -155,6 +155,7 @@ pub fn restrict(path: &Path, writable: bool) -> Result<()> {
         libc::SYS_getuid,
         libc::SYS_geteuid,
         libc::SYS_getrandom,
+        libc::SYS_getrusage,
         libc::SYS_futex,
         libc::SYS_rt_sigaction,
         libc::SYS_rt_sigprocmask,

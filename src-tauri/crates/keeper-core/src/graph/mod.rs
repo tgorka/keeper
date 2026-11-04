@@ -3,6 +3,7 @@ use keeper_graph_protocol::wire::{Manifest, QueryRequest, Response, MAX_EXPORT_B
 use keeper_graph_protocol::{admit, MAX_RESULT_BYTES, PROFILE};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +39,9 @@ impl Cancellation {
 pub struct Generation {
     path: PathBuf,
     pub manifest: Manifest,
+    /// Builder worker's charged allocation and peak resident set (measurement only).
+    pub build_allocated_bytes: usize,
+    pub build_peak_rss_bytes: u64,
 }
 #[derive(Clone)]
 pub struct Supervisor(Arc<Inner>);
@@ -47,6 +51,9 @@ struct Inner {
     global: Arc<Semaphore>,
     queued: Semaphore,
     identities: Mutex<Identities>,
+    last_reaped: AtomicU32,
+    live: AtomicUsize,
+    peak: AtomicUsize,
 }
 #[derive(Default)]
 struct Identities {
@@ -78,7 +85,18 @@ impl Supervisor {
             global: Arc::new(Semaphore::new(if headless { 2 } else { 4 })),
             queued: Semaphore::new(16),
             identities: Mutex::new(Identities::default()),
+            last_reaped: AtomicU32::new(0),
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
         })))
+    }
+    /// PID of the most recently waited-for worker; proof drivers verify its absence.
+    pub fn last_reaped(&self) -> Option<u32> {
+        Some(self.0.last_reaped.load(Ordering::SeqCst)).filter(|pid| *pid != 0)
+    }
+    /// Highest number of simultaneously live worker processes observed.
+    pub fn peak_workers(&self) -> usize {
+        self.0.peak.load(Ordering::SeqCst)
     }
     pub fn session(&self, agent: &str, context: &str, domain: &str) -> Result<Session> {
         if [agent, context, domain]
@@ -110,7 +128,12 @@ impl Supervisor {
         })
     }
     /// Host-only accepted export input, never exposed as a model/tool path argument.
-    pub async fn build_export(&self, export: &Path, expected: &Manifest) -> Result<Generation> {
+    pub async fn build_export(
+        &self,
+        export: &Path,
+        expected: &Manifest,
+        cancel: &Cancellation,
+    ) -> Result<Generation> {
         expected.validate().map_err(|_| Error::Unsupported)?;
         let id = ulid::Ulid::new().to_string();
         let staging = self.0.root.join(format!("{id}.staging"));
@@ -125,19 +148,17 @@ impl Supervisor {
             return Err(Error::Limit);
         }
         let result = self
-            .run(
-                "build",
-                &staging,
-                input,
-                Duration::from_secs(180),
-                &Cancellation::default(),
-            )
+            .run("build", &staging, input, Duration::from_secs(180), cancel)
             .await;
         let response = match result {
             Ok(r) if &r.manifest == expected && r.rows.is_empty() => r,
-            _ => {
+            failed => {
                 let _ = std::fs::remove_file(&staging);
-                return Err(Error::Unavailable);
+                return Err(match failed {
+                    Err(Error::Cancelled) => Error::Cancelled,
+                    Err(Error::Limit) => Error::Limit,
+                    _ => Error::Unavailable,
+                });
             }
         };
         // N2: header bytes and absent sidefiles, not a journal_mode PRAGMA, prove layout.
@@ -160,6 +181,8 @@ impl Supervisor {
         Ok(Generation {
             path: published,
             manifest: response.manifest,
+            build_allocated_bytes: response.allocated_bytes,
+            build_peak_rss_bytes: response.peak_rss_bytes,
         })
     }
     async fn run<R: tokio::io::AsyncRead + Unpin>(
@@ -183,7 +206,15 @@ impl Supervisor {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         let mut child = command.spawn()?;
-        let pid = child.id().ok_or(Error::Unavailable)?;
+        let live = self.0.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.peak.fetch_max(live, Ordering::SeqCst);
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                self.0.live.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::Unavailable);
+            }
+        };
         let mut stdin = child.stdin.take().ok_or(Error::Unavailable)?;
         let stdout = child.stdout.take().ok_or(Error::Unavailable)?;
         let execute = async {
@@ -207,7 +238,7 @@ impl Supervisor {
             let (_, bytes) = tokio::try_join!(write, read)?;
             let status = child.wait().await?;
             if !status.success() {
-                return Err(if status.code() == Some(72) {
+                return Err(if matches!(status.code(), Some(72 | 75)) {
                     Error::Limit
                 } else {
                     Error::Unavailable
@@ -226,49 +257,113 @@ impl Supervisor {
         };
         if result.is_err() {
             let _ = child.start_kill();
-            child.wait().await?;
         }
+        // Every path reaps the child before reporting, including success.
+        let waited = child.wait().await;
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+        self.0.last_reaped.store(pid, Ordering::SeqCst);
+        waited?;
         result
     }
 }
 impl Session {
-    pub async fn query(&self, generation: &Generation, source: &str, parameters: &[u8], cancel: &Cancellation) -> Result<Response> {
+    pub async fn query(
+        &self,
+        generation: &Generation,
+        source: &str,
+        parameters: &[u8],
+        cancel: &Cancellation,
+    ) -> Result<Response> {
         let admitted = admit(PROFILE, source, parameters).map_err(|e| match e {
             keeper_graph_protocol::Refusal::QueryLimit => Error::Limit,
             _ => Error::Unsupported,
         })?;
-        let request = QueryRequest { source: source.to_owned(), parameters: admitted.parameters_json().map_err(|_| Error::Unsupported)? };
+        let request = QueryRequest {
+            source: source.to_owned(),
+            parameters: admitted.parameters_json().map_err(|_| Error::Unsupported)?,
+        };
         let bytes = serde_json::to_vec(&request).map_err(|_| Error::Unsupported)?;
         let response = self.request(generation, "query", bytes, cancel).await?;
-        if response.rows.len() > admitted.limit() { return Err(Error::Unavailable); }
+        if response.rows.len() > admitted.limit() {
+            return Err(Error::Unavailable);
+        }
         Ok(response)
     }
-    pub async fn inspect(&self, generation: &Generation, id: &str, include_archived: bool, cancel: &Cancellation) -> Result<Response> {
-        if !keeper_graph_protocol::wire::ulid(id) { return Err(Error::Unsupported); }
-        let request = keeper_graph_protocol::wire::InspectRequest { id: id.to_owned(), include_archived };
+    pub async fn inspect(
+        &self,
+        generation: &Generation,
+        id: &str,
+        include_archived: bool,
+        cancel: &Cancellation,
+    ) -> Result<Response> {
+        if !keeper_graph_protocol::wire::ulid(id) {
+            return Err(Error::Unsupported);
+        }
+        let request = keeper_graph_protocol::wire::InspectRequest {
+            id: id.to_owned(),
+            include_archived,
+        };
         let bytes = serde_json::to_vec(&request).map_err(|_| Error::Unsupported)?;
         let response = self.request(generation, "inspect", bytes, cancel).await?;
-        if response.rows.len() > 1 { return Err(Error::Unavailable); }
+        if response.rows.len() > 1 {
+            return Err(Error::Unavailable);
+        }
         Ok(response)
     }
-    async fn request(&self, generation: &Generation, role: &str, mut bytes: Vec<u8>, cancel: &Cancellation) -> Result<Response> {
-        if generation.manifest.domain != self.domain { return Err(Error::Unavailable); }
-        let _queue = self.supervisor.0.queued.try_acquire().map_err(|_| Error::Limit)?;
+    async fn request(
+        &self,
+        generation: &Generation,
+        role: &str,
+        mut bytes: Vec<u8>,
+        cancel: &Cancellation,
+    ) -> Result<Response> {
+        if generation.manifest.domain != self.domain {
+            return Err(Error::Unavailable);
+        }
+        let _queue = self
+            .supervisor
+            .0
+            .queued
+            .try_acquire()
+            .map_err(|_| Error::Limit)?;
         let mut cancellation = cancel.0.subscribe();
-        if *cancellation.borrow() { return Err(Error::Cancelled); }
+        if *cancellation.borrow() {
+            return Err(Error::Cancelled);
+        }
         let admission = async {
-            let a = self.context.acquire().await.map_err(|_| Error::Unavailable)?;
+            let a = self
+                .context
+                .acquire()
+                .await
+                .map_err(|_| Error::Unavailable)?;
             let b = self.agent.acquire().await.map_err(|_| Error::Unavailable)?;
-            let c = self.supervisor.0.global.acquire().await.map_err(|_| Error::Unavailable)?;
-            Ok::<_, Error>((a,b,c))
+            let c = self
+                .supervisor
+                .0
+                .global
+                .acquire()
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            Ok::<_, Error>((a, b, c))
         };
         let _permits = tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(3), admission) => result.map_err(|_| Error::Limit)??,
             _ = cancellation.changed() => return Err(Error::Cancelled),
         };
         bytes.push(b'\n');
-        let response = self.supervisor.run(role, &generation.path, bytes.as_slice(), Duration::from_secs(3), cancel).await?;
-        if response.manifest != generation.manifest { return Err(Error::Unavailable); }
+        let response = self
+            .supervisor
+            .run(
+                role,
+                &generation.path,
+                bytes.as_slice(),
+                Duration::from_secs(3),
+                cancel,
+            )
+            .await?;
+        if response.manifest != generation.manifest {
+            return Err(Error::Unavailable);
+        }
         Ok(response)
     }
 }

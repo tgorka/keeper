@@ -20,6 +20,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manifest,
             pid: std::process::id(),
             allocated_bytes: allocation::allocated(),
+            peak_allocated_bytes: allocation::peak_allocated(),
+            peak_rss_bytes: peak_rss()?,
             rows: Vec::new(),
         }
     } else {
@@ -31,12 +33,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         manifest.validate()?;
         let rows = if role == "inspect" {
             use rusqlite::OptionalExtension;
-            let request: InspectRequest = serde_json::from_slice(&builder::frame(&mut input, 8192)?)?;
-            if !keeper_graph_protocol::wire::ulid(&request.id) { return Err("invalid inspection id".into()); }
+            let request: InspectRequest =
+                serde_json::from_slice(&builder::frame(&mut input, 8192)?)?;
+            if !keeper_graph_protocol::wire::ulid(&request.id) {
+                return Err("invalid inspection id".into());
+            }
             let body: Option<String> = connection.query_row(
                 "SELECT body FROM _kg_entities WHERE id=?1 AND body IS NOT NULL AND (?2 OR coalesce(json_extract(body,'$.lifecycle'),'active')='active')",
                 rusqlite::params![request.id, request.include_archived], |row|row.get(0)).optional()?;
-            body.map(|body|serde_json::from_str(&body)).transpose()?.into_iter().collect()
+            body.map(|body| serde_json::from_str(&body))
+                .transpose()?
+                .into_iter()
+                .collect()
         } else {
             let reader = engine::Reader::new(connection)?;
             let bytes = builder::frame(&mut input, 8192 + 65536 + 8192)?;
@@ -47,6 +55,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manifest,
             pid: std::process::id(),
             allocated_bytes: allocation::allocated(),
+            peak_allocated_bytes: allocation::peak_allocated(),
+            peak_rss_bytes: peak_rss()?,
             rows,
         }
     };
@@ -59,9 +69,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn peak_rss() -> Result<u64, Box<dyn std::error::Error>> {
+    use nix::sys::resource::{getrusage, UsageWho};
+    let max = u64::try_from(getrusage(UsageWho::RUSAGE_SELF)?.max_rss())?;
+    // Linux reports KiB, macOS bytes.
+    Ok(if cfg!(target_os = "linux") {
+        max * 1024
+    } else {
+        max
+    })
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
-    if run().is_err() {
-        std::process::exit(74);
+    match run() {
+        Ok(()) => {}
+        // 75: bounded result/row limit; 72 stays reserved for allocation budget exits.
+        Err(error) if error.to_string() == "query_limit" => std::process::exit(75),
+        Err(_) => std::process::exit(74),
     }
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

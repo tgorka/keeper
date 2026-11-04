@@ -194,5 +194,9 @@ pub struct Response {
     pub manifest: Manifest,
     pub pid: u32,
     pub allocated_bytes: usize,
+    /// Highest charged allocation at any point in the worker (Cap statistics).
+    pub peak_allocated_bytes: usize,
+    /// Worker's own peak resident set (getrusage), measured not enforced.
+    pub peak_rss_bytes: u64,
     pub rows: Vec<Value>,
 }

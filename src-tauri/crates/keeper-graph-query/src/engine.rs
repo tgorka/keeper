@@ -9,6 +9,10 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 pub fn start(path: &Path, writable: bool) -> Result<Connection> {
     crate::allocation::mark_main();
+    // Fail closed if the parent passed anything but the fixed non-secret setting.
+    if std::env::vars_os().any(|(key, _)| key != "GQL_STMT_CACHE") {
+        return Err("worker environment must be cleared".into());
+    }
     crate::confinement::close_inherited()?;
     crate::confinement::limit_resources()?;
     #[cfg(target_os = "linux")]
@@ -158,6 +162,7 @@ impl Reader {
                         | "_gql_cmp"
                         | "_gql_order_rank"
                         | "_gql_order_key"
+                        | "_gql_order_cmp"
                 ),
                 _ => false,
             };

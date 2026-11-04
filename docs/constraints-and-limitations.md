@@ -243,6 +243,16 @@ and symbols. No native engine in core/driver and no unsafe Linux confinement.
 macOS uses deprecated sandbox-exec only for isolated proof, not production enablement.
 Inventory approval does not establish runtime safety or satisfy story acceptance.
 
+Measured proof prerequisites (no additional unsafe): the macOS profile must allow
+reading exactly `/` (dyld's libignition opens it as an `openat` root; without it the
+worker aborts in `ignition_halt` before `main`) and metadata of the worker/generation
+path ancestors (SQLite path resolution). Neither rule grants descendant file data.
+Linux seccomp additionally allows `getrusage` so a worker can report its own peak RSS.
+cap's `stats` feature adds only relaxed peak/total counters to the audited body. The
+query authorizer admits GraphQLite's internal ordering helpers `_gql_order_rank`,
+`_gql_order_key` and `_gql_order_cmp` after source audit; any other internal function
+is denied and surfaces as a typed failure.
+
 ### Existing platform exceptions
 
 - iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via

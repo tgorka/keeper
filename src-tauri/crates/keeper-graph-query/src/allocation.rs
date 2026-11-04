@@ -22,6 +22,9 @@ pub(crate) fn require_main() {
 pub fn allocated() -> usize {
     ALLOCATOR.allocated()
 }
+pub fn peak_allocated() -> usize {
+    ALLOCATOR.max_allocated()
+}
 fn limit() -> ! {
     std::process::exit(72)
 }
