@@ -1,0 +1,15 @@
+[package]
+name = "keeper-graph-protocol"
+description = "Safe bounded graph query admission and worker value contract"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

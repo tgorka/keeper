@@ -4660,6 +4660,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-graph-protocol"
+version = "0.10.6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "keeper-llm"
 version = "0.10.6"
 dependencies = [

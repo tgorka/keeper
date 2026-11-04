@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol"]
 
 [workspace.package]
 version = "0.10.6"
