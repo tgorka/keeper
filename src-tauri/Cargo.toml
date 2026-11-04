@@ -545,6 +545,16 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
 # `transpose`) are MIT OR Apache-2.0 — on deny.toml's allow-list.
 rustfft = "6.4"
 
+# The isolated graph worker artifact (story 110.1) and its proof executables are built
+# with this profile only: `cargo build --profile graph-worker -p keeper-graph-query
+# -p keeper-graph-driver --features keeper-graph-query/proof-executables --bins
+# --examples`, output in `target/graph-worker/`. `panic = "abort"` links
+# `panic_abort`, so no panic in the process unwinds, including std runtime init before
+# `main` (signal-stack setup). Every other profile and test build is unchanged.
+[profile.graph-worker]
+inherits = "release"
+panic = "abort"
+
 # tao, the window layer under Tauri, from `tools/tao`: 0.35.3 as crates.io serves
 # it plus one hunk in `ios/app_state.rs`'s `connect_scene`, so a URL that LAUNCHED
 # the app (a scanned `keeper://setup?…` code while keeper is closed) is still

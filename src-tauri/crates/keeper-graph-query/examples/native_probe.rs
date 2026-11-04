@@ -37,10 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             keeper_graph_query::proof::enter();
             return Err("repeated entry survived".into());
         }
-        "panic-aborts" | "panic-unwinds" => {
-            // The worker's first statement, then a panic inside engine work: with the
-            // hook it must abort with no unwinding and no default-hook message; the
-            // `panic-unwinds` negative control omits the hook.
+        "panic-aborts" | "panic-default-hook" => {
+            // The worker's first statement, then a panic inside engine work. The
+            // graph-worker profile is panic=abort, so neither mode can unwind; with the
+            // hook the abort is silent, while the `panic-default-hook` control keeps
+            // std's default hook (message, then the same abort).
             if mode == "panic-aborts" {
                 engine::abort_on_panic();
             }

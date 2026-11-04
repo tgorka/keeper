@@ -137,15 +137,62 @@ case('missing_statement_cache_refused_every_role', refusals,
      all(v['exit'] != 0 and v['named'] for k, v in refusals.items() if k.startswith('probe_'))
      and all(v['exit'] == 74 and v['stdout_bytes'] == 0 for k, v in refusals.items() if k.startswith('worker_'))
      and refusals['worker_build']['db_bytes'] == 0)
-# The worker's first statement makes any panic abort from the hook: no unwinding
-# (libgcc never runs), no default-hook message or backtrace formatting. After Linux
-# confinement seccomp denies tgkill (EPERM), so glibc 2.43 abort() falls through to its
-# ABORT_INSTRUCTION (x86_64 hlt) and the kernel kills with SIGSEGV; macOS raises SIGABRT.
+# The artifacts are built with the graph-worker profile (panic = "abort"): no panic in
+# the process can unwind, from exec on, so std's pre-main init panics (signal-stack
+# mmap/mprotect failure) also abort. The worker's first statement additionally makes a
+# post-main panic silent. After Linux confinement seccomp denies tgkill (EPERM), so
+# glibc 2.43 abort() falls through to ABORT_INSTRUCTION (x86_64 hlt) -> SIGSEGV;
+# before confinement, and on macOS, it is SIGABRT.
+signalled = -6 if mac else -11
 r = run(['panic-aborts', generation], generation)
-unwound = run(['panic-unwinds', generation], generation)
-case('panic_aborts_without_unwinding', {'with_hook': r, 'without_hook_control': unwound},
-     r['exit'] == (-6 if mac else -11) and r['stderr'] == '' and r['stdout'] == ''
-     and unwound['exit'] == 101 and 'panicked' in unwound['stderr'])
+default_hook = run(['panic-default-hook', generation], generation)
+case('panic_aborts_without_unwinding', {'with_hook': r, 'default_hook_control': default_hook},
+     r['exit'] == signalled and r['stderr'] == '' and r['stdout'] == ''
+     and default_hook['exit'] == signalled and 'panicked' in default_hook['stderr'])
+# Structural: neither the worker nor the probe links an unwinder entry point that can
+# start unwinding (panic_unwind absent); `__rust_start_panic` reaches abort().
+if not mac:
+    def start_panic_target(binary):
+        import re
+        text = subprocess.run(['objdump', '-d', '-C', '--no-show-raw-insn', binary], capture_output=True, text=True).stdout
+        names = {int(a, 16): n for a, n in re.findall(r'^([0-9a-f]+) <(.*)>:$', text, re.M)}
+        relative = {}
+        for line in subprocess.run(['readelf', '-rW', binary], capture_output=True, text=True).stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] == 'R_X86_64_RELATIVE':
+                relative[int(parts[0], 16)] = int(parts[3], 16)
+        body = re.search(r'^[0-9a-f]+ <__rustc::__rust_start_panic>:\n(.*?)\n\n', text, re.M | re.S)
+        slots = [int(s, 16) for s in re.findall(r'call\s+\*0x[0-9a-f]+\(%rip\)\s+# ([0-9a-f]+)', body.group(1))] if body else []
+        direct = re.findall(r'call\s+[0-9a-f]+ <([^>]+)>', body.group(1)) if body else []
+        return [names.get(relative.get(s), hex(s)) for s in slots] + direct
+    structure = {}
+    for label, binary in (('worker', worker), ('probe', probe)):
+        imports = subprocess.run(['nm', '-D', '--undefined-only', binary], capture_output=True, text=True).stdout
+        targets = start_panic_target(binary)
+        structure[label] = {'unwinder_entry_imports': [s for s in ('_Unwind_RaiseException', '_Unwind_ForcedUnwind', '_Unwind_Resume_or_Rethrow') if s in imports],
+                            'start_panic_calls': targets}
+    case('artifact_cannot_unwind', structure,
+         all(not v['unwinder_entry_imports'] and v['start_panic_calls'] and all('abort' in t for t in v['start_panic_calls'])
+             for v in structure.values()))
+    # Pre-main: drive std's signal-stack mmap into failure with a tight inherited
+    # RLIMIT_AS. Under panic=abort the init panic prints std's message and aborts
+    # (SIGABRT, before confinement) with no caught unwind ("initialization or cleanup
+    # bug" is printed only by rt's handler after an unwind).
+    import resource
+    outcomes = {}
+    for kib in range(2048, 16384, 4):
+        def tight(limit=kib * 1024):
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        process = subprocess.run([worker, 'query', generation], input=b'', env=env, capture_output=True,
+                                 timeout=10, preexec_fn=tight)
+        stderr = process.stderr.decode(errors='replace')
+        key = ('alt_stack' if 'alternative stack' in stderr else 'guard_page' if 'stack guard page' in stderr
+               else 'rt_unwind_caught' if 'initialization or cleanup bug' in stderr else 'other')
+        outcomes.setdefault(key, {}).setdefault(process.returncode, []).append(kib)
+    hits = outcomes.get('alt_stack', {})
+    case('premain_init_panic_aborts_without_unwinding',
+         {k: {code: [min(v), max(v), len(v)] for code, v in m.items()} for k, m in outcomes.items()},
+         hits and set(hits) == {-6} and 'rt_unwind_caught' not in outcomes)
 r = run(['wrong-thread'])
 case('wrong_thread_sqlite_callback_exit_73', r, r['exit'] == 73)
 r = run(['wrong-thread-native'])
