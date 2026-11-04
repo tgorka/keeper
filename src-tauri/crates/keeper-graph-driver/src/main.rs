@@ -847,9 +847,13 @@ mod proof {
     }
     /// P6c through the real supervisor API: the driver changes only its own soft
     /// RLIMIT_STACK (inherited by any child) between calls. At exactly 8 MiB every role
-    /// runs; above it, and at infinity, build/query/inspect are refused before any child
-    /// exists (no reaped worker, no live worker, no new artifact); back at 8 MiB the
-    /// prior generation answers unchanged.
+    /// runs; above it, and at infinity, build/query/inspect are refused before any side
+    /// effect: the build's export is a FIFO with no writer (opening it would block, so a
+    /// prompt refusal proves it was never opened), a planted reclaimable artifact
+    /// survives, and the owned directory's mtime/ctime (which any transient create or
+    /// remove would change) stay identical. No child is reaped or live. Back at 8 MiB a
+    /// real build reclaims the planted artifact and changes the directory (controls),
+    /// and the prior generation answers unchanged.
     #[cfg(target_os = "linux")]
     async fn prerequisites(supervisor: &Supervisor, root: &Path) -> Result<()> {
         use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
@@ -878,41 +882,174 @@ mod proof {
             .rows;
         let inspected = session.inspect(&generation, &id(1), false, &cancel).await?;
         let published = generation_files(root)?;
+        let directory = root.join("generations");
+        let planted = directory.join(format!("{}.staging", ulid_text()));
+        std::fs::write(&planted, b"")?;
+        let fifo = root.join("prerequisites.fifo");
+        if !std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()?
+            .success()
+        {
+            return Err("mkfifo failed".into());
+        }
+        let stamp = || -> Result<(i64, i64, i64, i64)> {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(&directory)?;
+            Ok((m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+        };
         let mut outcomes = vec![
             json!({"stack_soft":LIMIT,"build":"ok","query_rows":baseline,"inspect_rows":inspected.rows.len()}),
         ];
         for soft in [Some(LIMIT + 1), None] {
             set(soft)?;
             let reaped = supervisor.last_reaped();
-            let build = supervisor.build_export(&export, &m, &cancel).await;
+            let before = stamp()?;
+            let build = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                supervisor.build_export(&fifo, &m, &cancel),
+            )
+            .await;
+            let Ok(build) = build else {
+                // The FIFO was opened: unblock the waiting open before failing.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                set(original.current)?;
+                return Err(format!("P6c at {soft:?} opened the build input").into());
+            };
             let query = session.query(&generation, control, b"{}", &cancel).await;
             let inspect = session.inspect(&generation, &id(1), false, &cancel).await;
-            let refused = [build.is_err(), query.is_err(), inspect.is_err()]
-                .iter()
-                .all(|r| *r);
             let typed = matches!(build, Err(keeper_core::graph::Error::Unavailable))
                 && matches!(query, Err(keeper_core::graph::Error::Unavailable))
                 && matches!(inspect, Err(keeper_core::graph::Error::Unavailable));
             let no_child =
                 supervisor.last_reaped() == reaped && supervisor.live_workers().is_empty();
-            let unchanged = generation_files(root)? == published;
-            if !(refused && typed && no_child && unchanged) {
+            let unchanged = generation_files(root)? == published_with(&published, &planted);
+            let untouched = stamp()? == before && planted.exists();
+            if !(typed && no_child && unchanged && untouched) {
                 set(original.current)?;
-                return Err(format!("P6c did not refuse at {soft:?}: typed={typed} no_child={no_child} unchanged={unchanged}").into());
+                return Err(format!("P6c did not refuse cleanly at {soft:?}: typed={typed} no_child={no_child} unchanged={unchanged} untouched={untouched}").into());
             }
-            outcomes.push(json!({"stack_soft":soft,"build":"projection_unavailable","query":"projection_unavailable","inspect":"projection_unavailable","no_child":no_child,"artifacts_unchanged":unchanged}));
+            outcomes.push(json!({"stack_soft":soft,"build":"projection_unavailable","query":"projection_unavailable","inspect":"projection_unavailable","no_child":no_child,"artifacts_unchanged":unchanged,"input_never_opened":true,"planted_artifact_kept":true,"directory_mtime_ctime_unchanged":true}));
         }
         set(Some(LIMIT))?;
+        let before = stamp()?;
+        let second = supervisor.build_export(&export, &m, &cancel).await?;
+        let controls = json!({"real_build_reclaims_planted":!planted.exists(),"real_build_changes_directory":stamp()? != before});
+        drop(second);
         let after = session
             .query(&generation, control, b"{}", &cancel)
             .await?
             .rows;
         set(original.current)?;
-        if after != baseline {
-            return Err("prior generation changed after P6c refusals".into());
+        if after != baseline || planted.exists() {
+            return Err(format!(
+                "P6c controls failed: rows_unchanged={} {controls}",
+                after == baseline
+            )
+            .into());
         }
-        outcomes.push(json!({"stack_soft":LIMIT,"prior_generation_query":"unchanged"}));
+        outcomes.push(
+            json!({"stack_soft":LIMIT,"prior_generation_query":"unchanged","controls":controls}),
+        );
         emit(json!({"mode":"prerequisites","outcomes":outcomes}))
+    }
+    #[cfg(target_os = "linux")]
+    fn ulid_text() -> String {
+        // A syntactically valid owned-artifact name the supervisor will treat as its own.
+        format!("01{:024}", std::process::id())
+    }
+    #[cfg(target_os = "linux")]
+    fn published_with(published: &[String], planted: &Path) -> Vec<String> {
+        let mut names = published.to_vec();
+        if let Some(name) = planted.file_name() {
+            names.push(name.to_string_lossy().into_owned());
+        }
+        names.sort();
+        names
+    }
+    /// B0 through the real supervisor: `worker` is a test-only wrapper that execs the
+    /// real worker with a measurement preload whose variant the driver selects through
+    /// `control` before each call (a real brk-heap inflation, or a replaced
+    /// `/proc/self/status` content at the exact boundary or malformed). Every refused
+    /// variant must be a typed `Unavailable` in build, query and inspect, with the worker
+    /// reaped and absent, no staging or new generation left, and the prior generation's
+    /// rows unchanged; every admitted variant must succeed.
+    #[cfg(target_os = "linux")]
+    async fn boundary(supervisor: &Supervisor, root: &Path, control: &Path) -> Result<()> {
+        let domain = "fixture-boundary";
+        let export = root.join("boundary.ndjson");
+        let m = oracle_export(&export, domain)?;
+        let cancel = Cancellation::default();
+        std::fs::write(control, b"none")?;
+        let generation = supervisor.build_export(&export, &m, &cancel).await?;
+        let session = supervisor.session("boundary", "boundary", domain)?;
+        let query_source = "MATCH (n:Concept) RETURN count(*) AS total LIMIT 1";
+        let baseline = session
+            .query(&generation, query_source, b"{}", &cancel)
+            .await?
+            .rows;
+        let mut outcomes = Vec::new();
+        for (variant, admitted) in [
+            ("exact_h0_1024_kb", true),
+            ("heap_16_kib", true),
+            ("over_h0_1025_kb", false),
+            ("heap_2_mib", false),
+            ("malformed", false),
+            ("missing", false),
+            ("duplicate", false),
+            ("overflow", false),
+        ] {
+            std::fs::write(control, variant)?;
+            let published = generation_files(root)?;
+            let build = supervisor.build_export(&export, &m, &cancel).await;
+            let build_reaped = supervisor.last_reaped();
+            let after_build = generation_files(root)?;
+            let query = session
+                .query(&generation, query_source, b"{}", &cancel)
+                .await;
+            let query_reaped = supervisor.last_reaped();
+            let inspect = session.inspect(&generation, &id(1), false, &cancel).await;
+            let inspect_reaped = supervisor.last_reaped();
+            // A refused build may still reclaim a generation an earlier admitted variant
+            // dropped (ordinary retention); it must create nothing that remains.
+            let created: Vec<&String> = after_build
+                .iter()
+                .filter(|n| !published.contains(n))
+                .collect();
+            let ok = if admitted {
+                build.is_ok() && query.is_ok() && inspect.is_ok()
+            } else {
+                matches!(build, Err(keeper_core::graph::Error::Unavailable))
+                    && matches!(query, Err(keeper_core::graph::Error::Unavailable))
+                    && matches!(inspect, Err(keeper_core::graph::Error::Unavailable))
+                    && created.is_empty()
+            };
+            let detail = format!(
+                "build={:?} query={:?} inspect={:?} created={created:?}",
+                build.as_ref().err(),
+                query.as_ref().err(),
+                inspect.as_ref().err()
+            );
+            let reaped = [build_reaped, query_reaped, inspect_reaped]
+                .into_iter()
+                .map(absent)
+                .collect::<Result<Vec<_>>>()?;
+            drop(build);
+            std::fs::write(control, b"none")?;
+            let rows = session
+                .query(&generation, query_source, b"{}", &cancel)
+                .await?
+                .rows;
+            if !ok || rows != baseline || !supervisor.live_workers().is_empty() {
+                return Err(format!(
+                    "B0 variant {variant} did not behave: ok={ok} rows_unchanged={} {detail}",
+                    rows == baseline
+                )
+                .into());
+            }
+            outcomes.push(json!({"variant":variant,"admitted":admitted,"typed_and_clean":ok,"reaped_absent_pids":reaped,"prior_generation_rows_unchanged":true}));
+        }
+        emit(json!({"mode":"boundary","baseline_rows":baseline,"outcomes":outcomes}))
     }
     pub async fn run() -> Result<()> {
         let args: Vec<String> = std::env::args().collect();
@@ -947,6 +1084,11 @@ mod proof {
             }
             #[cfg(target_os = "linux")]
             "prerequisites" => prerequisites(&supervisor, &root).await?,
+            #[cfg(target_os = "linux")]
+            "boundary" => {
+                let control = PathBuf::from(args.get(4).ok_or("variant control file required")?);
+                boundary(&supervisor, &root, &control).await?
+            }
             _ => return Err("unknown proof mode".into()),
         }
         emit(json!({"mode":mode,"complete":true,"peak_live_workers":supervisor.peak_workers()}))

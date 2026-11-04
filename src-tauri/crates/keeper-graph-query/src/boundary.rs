@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// H0: the reserve for everything live at the boundary, Cap-charged or not.
 pub const H0: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const STATUS_BYTES: usize = 4096;
 
 static VM_DATA: AtomicU64 = AtomicU64::new(0);

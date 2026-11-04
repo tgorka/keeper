@@ -194,6 +194,10 @@ impl Supervisor {
         cancel: &Cancellation,
     ) -> Result<Generation> {
         expected.validate().map_err(|_| Error::Unsupported)?;
+        // P6c first: a refused launch opens no input, reclaims no artifact and creates
+        // no staging. `run` repeats the check immediately before the spawn.
+        #[cfg(target_os = "linux")]
+        launch_prerequisites()?;
         // Admission and storage reservation happen before any file is created.
         let _builder = self.0.builds.try_acquire().map_err(|_| Error::Limit)?;
         if *cancel.0.borrow() {

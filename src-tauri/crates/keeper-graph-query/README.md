@@ -45,8 +45,13 @@ The unsafe inventory (U01–U11) is in `docs/constraints-and-limitations.md`.
 ## Proof
 
 ```sh
+# the worker under proof, built exactly as shipped (no proof-executables), copied aside
+cargo build --profile graph-worker --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bin keeper-graph-query
+mkdir -p src-tauri/target/graph-worker-feature-off && cp src-tauri/target/graph-worker/keeper-graph-query src-tauri/target/graph-worker-feature-off/
+# driver, probes and examples
 cargo build --profile graph-worker --manifest-path src-tauri/Cargo.toml -p keeper-graph-query -p keeper-graph-driver --features keeper-graph-query/proof-executables --bins --examples
-python3 scripts/graph-proof.py src-tauri/target/graph-worker <new-scratch-dir> [--benchmark]
+KG1_WORKER=$PWD/src-tauri/target/graph-worker-feature-off/keeper-graph-query \
+  python3 scripts/graph-proof.py src-tauri/target/graph-worker <new-scratch-dir> [--benchmark]
 python3 scripts/check-graph-boundary.py
 ```
 

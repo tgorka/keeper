@@ -9,6 +9,11 @@
 //!   take `realloc_fallback` (aligned alloc, copy, dealloc), on growth and on shrink;
 //!   an over-budget growth is refused by Cap before System runs and the old block is
 //!   retained intact.
+//! * `rust-fallback-failure`: the same align-32 growth, sized well inside the remaining
+//!   budget so Cap admits it, is run by the harness under a low `RLIMIT_DATA`: the
+//!   aligned allocation inside `realloc_fallback` fails in System, Cap releases its
+//!   reservation, and the old block keeps its pointer, capacity, charge and contents.
+//!   Without the limit the identical request succeeds (control).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
     use keeper_graph_query::allocation::{allocated, BUDGET};
@@ -64,6 +69,26 @@ fn main() {
                 "charged_small": small, "charged_grown": grown, "grown_capacity": grown_capacity,
                 "charged_shrunk": shrunk, "grow_preserved": grow_preserved,
                 "shrink_preserved": shrink_preserved, "refused": refused, "retained": retained,
+            })
+        }
+        "rust-fallback-failure" => {
+            #[derive(Clone, Copy, PartialEq)]
+            #[repr(align(32))]
+            struct Wide([u8; 32]);
+            let item = |i: usize| Wide([u8::try_from(i % 251).unwrap_or(0); 32]);
+            let mut v: Vec<Wide> = Vec::with_capacity(4);
+            v.extend((0..4).map(item));
+            // 20 MiB of elements: below R minus the live charge, so Cap admits it.
+            let additional = 20 * 1024 * 1024 / std::mem::size_of::<Wide>();
+            let before = (allocated(), v.capacity(), v.as_ptr() as usize);
+            let within_budget = additional * std::mem::size_of::<Wide>() < BUDGET - before.0;
+            let failed = v.try_reserve_exact(additional).is_err();
+            let after = (allocated(), v.capacity(), v.as_ptr() as usize);
+            let retained = before == after && (0..4).all(|i| v[i] == item(i));
+            serde_json::json!({
+                "align": std::mem::align_of::<Wide>(), "within_budget": within_budget,
+                "failed": failed, "retained": retained, "charged_before": before.0,
+                "charged_after": after.0, "capacity_after": after.1,
             })
         }
         _ => std::process::exit(2),

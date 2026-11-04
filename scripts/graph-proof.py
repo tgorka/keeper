@@ -17,7 +17,10 @@ if os.path.exists(scratch):
 os.makedirs(scratch)
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 probe = os.path.realpath(os.path.join(target, 'examples', 'native_probe'))
-worker = os.path.realpath(os.path.join(target, 'keeper-graph-query'))
+# The production worker under proof. `KG1_WORKER` names a separately built feature-off
+# artifact (the shipped recipe, without `proof-executables`); examples, driver and
+# probes always come from `target`.
+worker = os.path.realpath(os.environ.get('KG1_WORKER') or os.path.join(target, 'keeper-graph-query'))
 driver = os.path.realpath(os.path.join(target, 'keeper-graph-driver'))
 mac = platform.system() == 'Darwin'
 env = {'GQL_STMT_CACHE': '0'}
@@ -59,8 +62,8 @@ evidence['provenance'] = {
                                       text=True, cwd=root).stdout.splitlines() if os.path.isdir(os.path.join(root, '.git')) or
                        os.path.isfile(os.path.join(root, '.git')) else None,
     'rustc': tool('rustc', '+stable', '--version'), 'cargo': tool('cargo', '+stable', '--version'), 'cc': tool('cc', '--version'),
-    # Not exhaustive build provenance: compiler/link flags and the bundled SQLite
-    # object are not captured here.
+    # Compiler/link/native-object/DSO/std identities are captured separately by the
+    # round's native-provenance record (see the report); this records the recipes.
     # The recipe that produced `target`: its directory name is the cargo profile. The
     # worker artifact must come from the reviewed panic=abort `graph-worker` profile.
     'build_profile': os.path.basename(os.path.normpath(target)),
@@ -68,10 +71,15 @@ evidence['provenance'] = {
                        + ('--release' if os.path.basename(os.path.normpath(target)) == 'release'
                           else '--profile ' + os.path.basename(os.path.normpath(target)))
                        + ' -p keeper-graph-query -p keeper-graph-driver --features keeper-graph-query/proof-executables --bins --examples'],
+    'worker_under_proof': {'path': worker, 'sha256': sha256(worker),
+                           'feature_off': bool(os.environ.get('KG1_WORKER')),
+                           'recipe': ('cargo +stable build --manifest-path src-tauri/Cargo.toml --profile graph-worker '
+                                      '-p keeper-graph-query --bin keeper-graph-query (no features), copied aside')
+                           if os.environ.get('KG1_WORKER') else 'the proof-feature build above'},
     'binaries': {name: sha256(path) for name, path in (
-        ('keeper-graph-query', os.path.join(target, 'keeper-graph-query')), ('keeper-graph-driver', os.path.join(target, 'keeper-graph-driver')),
+        ('keeper-graph-query (proof-feature build)', os.path.join(target, 'keeper-graph-query')), ('keeper-graph-driver', os.path.join(target, 'keeper-graph-driver')),
         ('native_probe', os.path.join(target, 'examples', 'native_probe')), ('fake_worker', os.path.join(target, 'examples', 'fake_worker')),
-        ('allocation_probe', os.path.join(target, 'examples', 'allocation_probe')))},
+        ('allocation_probe', os.path.join(target, 'examples', 'allocation_probe')), ('budget_probe', os.path.join(target, 'examples', 'budget_probe')))},
     'sources': sources,
 }
 profiles = {}
@@ -286,10 +294,14 @@ case('allocation_hooks_negative_size_exit_73', {'outcomes': outcomes},
 # `realloc_fallback` (align 32) on growth, shrink and refused growth, through the same
 # Cap<System> and BUDGET as the worker (safe example, no FFI).
 budget_probe = os.path.realpath(os.path.join(target, 'examples', 'budget_probe'))
-def budget_case(name, extra_env=None):
-    process = subprocess.run([budget_probe, name], env=dict(env, **(extra_env or {})), capture_output=True, text=True, timeout=60)
+def budget_case(name, extra_env=None, data_limit=None):
+    def limit():
+        import resource
+        resource.setrlimit(resource.RLIMIT_DATA, (data_limit, data_limit))
+    process = subprocess.run([budget_probe, name], env=dict(env, **(extra_env or {})), capture_output=True, text=True, timeout=60,
+                             preexec_fn=limit if data_limit else None)
     return {'exit': process.returncode, 'report': json.loads(process.stdout) if process.returncode == 0 else {},
-            'stderr': process.stderr.strip()[-300:]}
+            'stderr': process.stderr.strip()[-300:], 'rlimit_data': data_limit}
 r = budget_case('cap-boundary')
 b = r['report']
 case('budget_r_exact_boundary', r, r['exit'] == 0 and b.get('budget') == 28 * 1024 * 1024 and b.get('exact_ok') is True
@@ -301,6 +313,19 @@ case('rust_realloc_fallback_grow_shrink_refusal', r, r['exit'] == 0 and b.get('a
      and b.get('grow_preserved') is True and b.get('shrink_preserved') is True
      and b.get('charged_grown', 0) > b.get('charged_small', 0) > 0 and b.get('charged_shrunk', 0) < b.get('charged_grown', 0)
      and b.get('refused') is True and b.get('retained') is True)
+# Failure *inside* std's align-32 `realloc_fallback`: Cap admits the 20 MiB growth (it
+# is within R), so the refusal can only come from System's aligned allocation under the
+# 8 MiB RLIMIT_DATA. Cap must release its reservation and the old block must keep its
+# pointer, capacity, charge and contents. The identical request without the limit
+# succeeds (control), so the failure is the limit's, not Cap's.
+if not mac:
+    failing = budget_case('rust-fallback-failure', data_limit=8 * 1024 * 1024)
+    control = budget_case('rust-fallback-failure')
+    f, c = failing['report'], control['report']
+    case('rust_realloc_fallback_internal_failure', {'under_rlimit_data': failing, 'control_without_limit': control},
+         failing['exit'] == 0 and f.get('align') == 32 and f.get('within_budget') is True and f.get('failed') is True
+         and f.get('retained') is True and f.get('charged_after') == f.get('charged_before')
+         and control['exit'] == 0 and c.get('within_budget') is True and c.get('failed') is False)
 
 sentinel = os.path.join(scratch, 'sentinel-unrelated.csv')
 with open(sentinel, 'w') as f:
@@ -482,12 +507,81 @@ if not mac:
                 'inspect': worker_run('inspect', limits_db, (json.dumps({'id': '0' * 25 + '1', 'include_archived': False}) + '\n').encode(), {'LD_PRELOAD': library})}
         b0[label] = {role: {'exit': x['exit'], 'stdout_bytes': len(x['stdout']), 'stderr': x['stderr'][-160:]} for role, x in runs.items()}
         b0[label]['build_published'] = published(staged)
-    case('b0_over_h0_refused_every_role_74', dict(b0, after_rows=json.loads(worker_run('query', limits_db, count_query)['stdout'] or b'{}').get('rows')),
+    after_b0_rows = json.loads(worker_run('query', limits_db, count_query)['stdout'] or b'{}').get('rows')
+    case('b0_over_h0_refused_every_role_74', dict(b0, baseline_rows=baseline_rows, after_rows=after_b0_rows),
          all(b0['over_h0'][role]['exit'] == 74 and b0['over_h0'][role]['stdout_bytes'] == 0
              for role in ('build', 'query', 'inspect'))
          and not b0['over_h0']['build_published']
          and all(b0['control_small'][role]['exit'] == 0 for role in ('build', 'query', 'inspect'))
-         and b0['control_small']['build_published'])
+         and b0['control_small']['build_published'] and baseline_rows and after_b0_rows == baseline_rows)
+    # B0 end to end through the real supervisor (driver `boundary` mode). The worker it
+    # is given is a test-only wrapper that execs the real worker with a measurement
+    # preload; the driver selects the variant per call through a control file:
+    # a real brk-heap inflation (16 KiB admitted, 2 MiB refused), or `/proc/self/status`
+    # replaced (only that path, via open64) with exact-boundary content (1024 kB
+    # admitted, 1025 kB refused) and malformed/missing/duplicate/overflow content.
+    control_file = os.path.join(scratch, 'b0-variant')
+    variant_source = os.path.join(scratch, 'b0-variant.c')
+    with open(variant_source, 'w') as f:
+        f.write(r'''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+static char variant[64];
+void *volatile kg_b0_inflation;
+__attribute__((constructor)) static void init(void) {
+  int fd = open(CONTROL, O_RDONLY);
+  if (fd >= 0) { ssize_t n = read(fd, variant, sizeof variant - 1); if (n > 0) variant[n] = 0; close(fd); }
+  size_t bytes = !strcmp(variant, "heap_2_mib") ? 2u << 20 : !strcmp(variant, "heap_16_kib") ? 16u << 10 : 0;
+  if (bytes) { char *p = malloc(bytes); if (p) memset(p, 1, bytes); kg_b0_inflation = p; }
+  unsetenv("LD_PRELOAD");
+}
+static const char *status(void) {
+  if (!strcmp(variant, "exact_h0_1024_kb")) return "Name:\tw\nVmPeak:\t9000 kB\nVmData:\t1024 kB\n";
+  if (!strcmp(variant, "over_h0_1025_kb")) return "Name:\tw\nVmPeak:\t9000 kB\nVmData:\t1025 kB\n";
+  if (!strcmp(variant, "malformed")) return "Name:\tw\nVmData:\t1x24 kB\n";
+  if (!strcmp(variant, "missing")) return "Name:\tw\nVmPeak:\t9000 kB\n";
+  if (!strcmp(variant, "duplicate")) return "VmData:\t10 kB\nVmData:\t10 kB\n";
+  if (!strcmp(variant, "overflow")) return "VmData:\t99999999999999999999 kB\n";
+  return NULL;
+}
+int open64(const char *path, int flags, ...) {
+  static int (*real)(const char *, int, ...);
+  if (!real) real = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open64");
+  mode_t mode = 0;
+  if (flags & (O_CREAT | O_TMPFILE)) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+  const char *content = status();
+  if (content && !strcmp(path, "/proc/self/status")) {
+    int m = memfd_create("kg-b0-status", 0);
+    if (m < 0 || write(m, content, strlen(content)) != (ssize_t)strlen(content)) _exit(70);
+    return m;
+  }
+  return real(path, flags, mode);
+}
+''')
+    variant_library = os.path.join(scratch, 'b0-variant.so')
+    subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', f'-DCONTROL="{control_file}"',
+                    '-o', variant_library, variant_source, '-ldl'], check=True)
+    wrapper = os.path.join(scratch, 'b0-wrapper-worker')
+    with open(wrapper, 'w') as f:
+        f.write('#!/bin/sh\nexec /usr/bin/env -i GQL_STMT_CACHE="$GQL_STMT_CACHE" GLIBC_TUNABLES="$GLIBC_TUNABLES" '
+                f'LD_PRELOAD={variant_library} {worker} "$@"\n')
+    os.chmod(wrapper, 0o755)
+    process = subprocess.run([driver, 'boundary', wrapper, os.path.join(scratch, 'driver-boundary'), control_file],
+                             capture_output=True, text=True, timeout=600)
+    lines = [json.loads(line) for line in process.stdout.splitlines() if line.startswith('{')]
+    record = next((l for l in lines if l.get('mode') == 'boundary' and 'outcomes' in l), {})
+    expected = {'exact_h0_1024_kb': True, 'heap_16_kib': True, 'over_h0_1025_kb': False, 'heap_2_mib': False,
+                'malformed': False, 'missing': False, 'duplicate': False, 'overflow': False}
+    case('b0_through_supervisor_boundary_and_malformed', {'exit': process.returncode, 'records': lines,
+                                                           'stderr_tail': process.stderr[-600:] if process.returncode else ''},
+         process.returncode == 0 and lines and lines[-1].get('complete')
+         and {o['variant']: o['admitted'] for o in record.get('outcomes', [])} == expected
+         and all(o['typed_and_clean'] and o['prior_generation_rows_unchanged'] for o in record['outcomes']))
 
 # F1: external allocation accounting. A measurement-only LD_PRELOAD interposer
 # attributes every libc allocation to the worker executable (Cap-charged) or a shared
