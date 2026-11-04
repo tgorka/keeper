@@ -259,6 +259,16 @@ pub struct UploadRefusal {
     pub commit_rows: Vec<String>,
 }
 
+/// A transport acknowledgement, not a business acceptance receipt. A cached
+/// acknowledgement retains the original visibility bound. Callers must inspect
+/// their scoped receipt before reporting that an application change was accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+    pub request_id: String,
+    pub commit_seq: Option<i64>,
+    pub cached: bool,
+}
+
 /// Why a replica call failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicaError {
@@ -402,7 +412,7 @@ pub trait Replica: Send + Sync {
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<(), ReplicaError>;
+    ) -> Result<CommandResult, ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
     /// The state its owner last published.
@@ -632,7 +642,12 @@ pub(crate) mod fake {
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
-        fn remote_command(&self, _: &str, _: &str, _: Value) -> Result<(), ReplicaError> {
+        fn remote_command(
+            &self,
+            _: &str,
+            _: &str,
+            _: Value,
+        ) -> Result<CommandResult, ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
         fn sync_now(&self) {}

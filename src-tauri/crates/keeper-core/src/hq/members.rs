@@ -501,7 +501,9 @@ fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> R
         // Nothing was sent: an earlier unheard request stays as it was.
         Err(ReplicaError::NotSyncing | ReplicaError::Closed | ReplicaError::Client(_)) => {}
     }
-    answer.map_err(|error| command_sentence(&source.database, &error))
+    answer
+        .map(|_| ())
+        .map_err(|error| command_sentence(&source.database, &error))
 }
 
 /// Why a command failed, by the server's stable code (and, for

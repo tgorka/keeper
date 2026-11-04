@@ -2110,7 +2110,7 @@ impl Replica for SyncularReplica {
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<(), ReplicaError> {
+    ) -> Result<super::port::CommandResult, ReplicaError> {
         let Some(remote) = &self.remote else {
             return Err(ReplicaError::NotSyncing);
         };
@@ -2152,7 +2152,18 @@ impl Replica for SyncularReplica {
                 retryable: false,
             });
         }
-        Ok(())
+        if !matches!(answer.status.as_str(), "applied" | "cached") {
+            return Err(ReplicaError::Unheard {
+                code: "operation.unreadable".to_owned(),
+                message: "unknown command acknowledgement".to_owned(),
+                retryable: false,
+            });
+        }
+        Ok(super::port::CommandResult {
+            request_id: answer.request_id,
+            commit_seq: answer.commit_seq,
+            cached: answer.status == "cached",
+        })
     }
 
     fn sync_now(&self) {

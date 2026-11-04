@@ -38,6 +38,24 @@ first and serves the previous version beside the new one through syncular's sche
 client rebootstraps on its own schema bump. Removing or renaming a column, changing a type, a
 scope or a primary key is a new table, not an edit.
 
+### Disposable 110.2 atomicity proof
+
+Schema 6 (`0006_atomicity_proof`) on this proof branch is not a production
+migration reservation. Do not merge or deploy this contract. `kg_nodes`,
+`kg_edges`, `kg_events`, `kg_event_ops` and `kg_head` use only `kg_graph`;
+`kg_receipts` uses only the injective, length-prefixed actor/client `kg_client`.
+All six tables require internal named-command admission, including service
+writes. Accepted entity after-images, immutable event/ordinal groups, head and
+scoped business receipt belong to one server transaction. Transport commitSeq
+is returned separately by `Replica::remote_command` as `CommandResult`; it is
+a visibility bound, never application acceptance by itself.
+
+The native `kg1_atomicity_proof` test replays complete digest-checked event
+prefixes into a separate SQLite publication transaction. It never fills gaps
+from current entity rows. Its ignored live case requires the matching exported
+proof contract and transient `KEEPER_HQ_LIVE_*` inputs; local fixture tests
+alone do not establish server/native acceptance.
+
 ### Schema 5 release prerequisite
 
 The server must adopt this contract, migrate `session_drives.tick_ids`, and serve schema 4
