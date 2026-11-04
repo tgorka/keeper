@@ -22,6 +22,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allocated_bytes: allocation::allocated(),
             peak_allocated_bytes: allocation::peak_allocated(),
             peak_rss_bytes: peak_rss()?,
+            boundary_vm_data_bytes: keeper_graph_query::boundary::recorded().0,
+            boundary_vm_peak_bytes: keeper_graph_query::boundary::recorded().1,
             rows: Vec::new(),
         }
     } else {
@@ -60,6 +62,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allocated_bytes: allocation::allocated(),
             peak_allocated_bytes: allocation::peak_allocated(),
             peak_rss_bytes: peak_rss()?,
+            boundary_vm_data_bytes: keeper_graph_query::boundary::recorded().0,
+            boundary_vm_peak_bytes: keeper_graph_query::boundary::recorded().1,
             rows,
         }
     };

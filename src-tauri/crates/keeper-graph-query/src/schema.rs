@@ -113,7 +113,14 @@ pub fn verify(connection: &Connection, phase: Phase) -> Result<()> {
             Some(sql)
                 if (name == "sqlite_stat1" && sql == STATISTICS)
                     || (name == "sqlite_stat4" && sql == STATISTICS4) => {}
-            Some(sql) if expected.iter().any(|(n, s)| *n == name && *s == sql) => seen.push(name),
+            // P6b: a repeated expected name is refused before it is retained, so `seen`
+            // never exceeds the fixed expected set.
+            Some(sql) if expected.iter().any(|(n, s)| *n == name && *s == sql) => {
+                if seen.contains(&name) {
+                    return Err("repeated projection schema object".into());
+                }
+                seen.push(name)
+            }
             _ => return Err("unexpected projection schema object".into()),
         }
     }
@@ -195,5 +202,30 @@ mod tests {
                 "{deviation}"
             );
         }
+    }
+
+    /// P6b: a second row carrying an expected object's exact name and SQL is refused as
+    /// a repeat, not counted toward completeness.
+    #[test]
+    fn repeated_expected_schema_name_is_refused() {
+        let connection = Connection::open_in_memory().expect("memory");
+        create(&connection).expect("create");
+        for sql in KEEPER {
+            connection.execute_batch(sql).expect("keeper table");
+        }
+        connection.execute_batch("ANALYZE").expect("analyze");
+        verify(&connection, Phase::Published).expect("published phase");
+        let name = object_name(KEEPER[0]).to_owned();
+        connection
+            .execute_batch("PRAGMA writable_schema=ON")
+            .expect("writable schema");
+        connection
+            .execute(
+                "INSERT INTO sqlite_schema SELECT * FROM sqlite_schema WHERE name=?1",
+                [&name],
+            )
+            .expect("duplicate row");
+        let error = verify(&connection, Phase::Published).expect_err("repeat refused");
+        assert_eq!(error.to_string(), "repeated projection schema object");
     }
 }

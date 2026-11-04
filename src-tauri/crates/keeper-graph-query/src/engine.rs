@@ -37,9 +37,18 @@ pub fn start(path: &Path, writable: bool) -> Result<Connection> {
         return Err("worker environment must carry the fixed allocator tunables".into());
     }
     crate::confinement::close_inherited()?;
+    // P6: the owned status descriptor is opened after inherited-descriptor closure and
+    // before confinement (Landlock checks at open time), and read at B0 below.
+    #[cfg(target_os = "linux")]
+    let status = crate::boundary::Status::open()?;
     crate::confinement::limit_resources()?;
     #[cfg(target_os = "linux")]
     crate::confinement::restrict(path, writable)?;
+    // B0: immediately after confinement, before any generation content or frame.
+    #[cfg(target_os = "linux")]
+    status
+        .admit()
+        .map_err(|refusal| format!("input boundary refused: {refusal:?}"))?;
     // On macOS the parent installs the constant sandbox-exec profile before exec.
     // There is no environment flag pretending to prove that OS boundary.
     crate::allocation::install_sqlite();

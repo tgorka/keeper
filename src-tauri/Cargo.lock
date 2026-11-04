@@ -4644,6 +4644,7 @@ dependencies = [
  "reqwest",
  "rsa",
  "rusqlite",
+ "rustix",
  "rustls",
  "semver",
  "serde",
@@ -4672,6 +4673,7 @@ version = "0.10.6"
 dependencies = [
  "keeper-core",
  "keeper-graph-protocol",
+ "rustix",
  "serde_json",
  "tokio",
 ]

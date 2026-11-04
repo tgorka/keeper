@@ -284,6 +284,9 @@ impl Supervisor {
         if *cancellation.borrow() {
             return Err(Error::Cancelled);
         }
+        // P6c: the launch prerequisites hold before any child exists.
+        #[cfg(target_os = "linux")]
+        launch_prerequisites()?;
         let mut command = worker_command(&self.0.worker, path, role)?;
         command.env_clear().env("GQL_STMT_CACHE", "0");
         #[cfg(target_os = "linux")]
@@ -547,6 +550,37 @@ impl Session {
         Ok(response)
     }
 }
+/// Largest inherited soft `RLIMIT_STACK` the worker's startup accounting admits.
+#[cfg(any(target_os = "linux", test))]
+pub const MAX_INHERITED_STACK: u64 = 8 * 1024 * 1024;
+/// P6c (story 110.1, R1 design v7): checked before every Linux worker spawn. The child
+/// inherits this process's soft stack limit and runs ld.so with this host's loader
+/// configuration; both are startup premises of the worker's allocation accounting.
+/// A prerequisite check, not an atomic setter: nothing in the supervisor changes its
+/// rlimits or the loader configuration between this check and exec.
+#[cfg(target_os = "linux")]
+fn launch_prerequisites() -> Result<()> {
+    let stack = rustix::process::getrlimit(rustix::process::Resource::Stack).current;
+    launch_decision(
+        stack,
+        std::fs::symlink_metadata("/etc/ld.so.preload").map(|_| ()),
+    )
+}
+/// The decision alone: a finite soft stack limit of at most 8 MiB (`None` is
+/// infinite), and `/etc/ld.so.preload` positively absent. Any other lookup outcome,
+/// including permission errors and a dangling symlink (which `symlink_metadata`
+/// reports as present), refuses.
+#[cfg(any(target_os = "linux", test))]
+fn launch_decision(stack_soft: Option<u64>, preload: std::io::Result<()>) -> Result<()> {
+    match stack_soft {
+        Some(limit) if limit <= MAX_INHERITED_STACK => {}
+        _ => return Err(Error::Unavailable),
+    }
+    match preload {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(Error::Unavailable),
+    }
+}
 fn worker_command(worker: &Path, path: &Path, role: &str) -> Result<tokio::process::Command> {
     #[cfg(target_os = "macos")]
     {
@@ -580,6 +614,32 @@ fn worker_command(worker: &Path, path: &Path, role: &str) -> Result<tokio::proce
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn launch_is_refused_unless_the_stack_limit_is_finite_and_at_most_8_mib_and_no_preload_exists()
+    {
+        use std::io::{Error as IoError, ErrorKind};
+        let absent = || Err(IoError::from(ErrorKind::NotFound));
+        assert!(launch_decision(Some(MAX_INHERITED_STACK), absent()).is_ok());
+        assert!(launch_decision(Some(4096), absent()).is_ok());
+        for stack in [Some(MAX_INHERITED_STACK + 1), Some(u64::MAX), None] {
+            assert!(matches!(
+                launch_decision(stack, absent()),
+                Err(Error::Unavailable)
+            ));
+        }
+        // Present (including a dangling symlink), unreadable or otherwise unknown.
+        for preload in [
+            Ok(()),
+            Err(IoError::from(ErrorKind::PermissionDenied)),
+            Err(IoError::other("lookup failed")),
+        ] {
+            assert!(matches!(
+                launch_decision(Some(MAX_INHERITED_STACK), preload),
+                Err(Error::Unavailable)
+            ));
+        }
+    }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Step {

@@ -4,7 +4,11 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const BUDGET: usize = 256 * 1024 * 1024;
+/// R (story 110.1, R1 design v7, approved round 10): the conservative accounted-cost
+/// conversion of the 256 MiB real-allocation budget. Every charged Layout byte counts
+/// once; the envelope `H0 + 4R + 64·N_max + 64 + STACK = 261,357,632 B` (H0 = 1 MiB,
+/// N_max = 2,101,248, STACK = 8 MiB) stays below 268,435,456 B.
+pub const BUDGET: usize = 28 * 1024 * 1024;
 #[global_allocator]
 static ALLOCATOR: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, BUDGET);
 thread_local! { static MAIN: Cell<bool> = const { Cell::new(false) }; }

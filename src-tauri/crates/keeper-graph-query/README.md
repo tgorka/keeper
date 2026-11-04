@@ -22,16 +22,22 @@ replays it in one checked host transaction (MEMORY journal, EXCLUSIVE lock, no W
 `query <generation>` and `inspect <generation>` open the immutable generation
 (`mode=ro&immutable=1`, `query_only`, default-deny authorizer) and answer one framed request.
 The worker requires exactly the supervisor's fixed environment — `GQL_STMT_CACHE=0`, plus on
-Linux `GLIBC_TUNABLES=glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0` (no mmapped
-chunks, no tcache; `wire::LINUX_WORKER_GLIBC_TUNABLES`) — and refuses anything else, closes inherited
+Linux `GLIBC_TUNABLES=glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912`
+(no mmapped chunks, no tcache, no heap trim under the 512 MiB `RLIMIT_AS`;
+`wire::LINUX_WORKER_GLIBC_TUNABLES`) — and refuses anything else, closes inherited
 descriptors, then confines itself (Linux: Landlock ABI 6 hard requirement, seccomp,
-`RLIMIT_AS` 512 MiB; macOS: the parent's constant `sandbox-exec` profile).
+`RLIMIT_AS` 512 MiB; macOS: the parent's constant `sandbox-exec` profile). On Linux it then
+passes the input boundary B0 (`boundary.rs`): `VmData` from its own `/proc/self/status`,
+opened before confinement, must be at most 1 MiB, or it exits 74 before reading anything.
+Before every Linux spawn the supervisor checks its own inherited soft `RLIMIT_STACK`
+(at most 8 MiB, finite) and that `/etc/ld.so.preload` is absent (P6c), and spawns nothing
+otherwise.
 
 | Exit | Meaning |
 |---|---|
-| 72 | 256 MiB charged allocation budget exhausted |
+| 72 | charged allocation budget R = 28 MiB exhausted (the accounted-cost conversion of the 256 MiB real-allocation budget) |
 | 73 | callback/thread/registration precondition violated |
-| 74 | initialization, confinement or checked-state failure |
+| 74 | initialization, confinement, input-boundary (B0) or checked-state failure |
 | 75 | result row/byte cap (1,000 rows / 1 MiB) |
 
 The unsafe inventory (U01–U11) is in `docs/constraints-and-limitations.md`.
@@ -39,9 +45,8 @@ The unsafe inventory (U01–U11) is in `docs/constraints-and-limitations.md`.
 ## Proof
 
 ```sh
-cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bins --examples --features proof-executables
-cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-driver --bins --examples
-python3 scripts/graph-proof.py src-tauri/target/release <new-scratch-dir> [--benchmark]
+cargo build --profile graph-worker --manifest-path src-tauri/Cargo.toml -p keeper-graph-query -p keeper-graph-driver --features keeper-graph-query/proof-executables --bins --examples
+python3 scripts/graph-proof.py src-tauri/target/graph-worker <new-scratch-dir> [--benchmark]
 python3 scripts/check-graph-boundary.py
 ```
 
@@ -54,8 +59,12 @@ write / COMMIT, allocation/result/deadline/cancel/abort limits with reaped-PID c
 misbehaving worker executables (`keeper-graph-driver` example `fake_worker`), builder
 admission and retention bounds, a real rename failure, the escaped-parameter frame
 boundary, the two-client exact oracle and, with `--benchmark`, 100k nodes / 300k
-relationships / 10k retained events per domain. On Linux it measures allocation outside
-the charged budget with the measurement-only `scripts/alloc-interposer.c` preload.
+relationships / 10k retained events per domain. On Linux it checks the accounted-cost
+memory invariant with the measurement-only `scripts/alloc-interposer.c` preload.
 `native_probe read-trace` re-derives the authorizer's read set from a corpus on stdin.
 macOS confinement uses the deprecated, undocumented `sandbox-exec`; it is proof-only and not
 an approved production mechanism.
+
+The worker artifact must be built with the `graph-worker` profile (`panic = "abort"`): no
+panic in the process can unwind. A worker rebuilt with plain `--release` does not meet the
+proof's premises.

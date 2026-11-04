@@ -22,8 +22,8 @@ driver = os.path.realpath(os.path.join(target, 'keeper-graph-driver'))
 mac = platform.system() == 'Darwin'
 env = {'GQL_STMT_CACHE': '0'}
 if not mac:
-    # P1: the supervisor's fixed Linux allocator setting; the worker requires it exactly.
-    tunables = 'glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0'
+    # P1′: the supervisor's fixed Linux allocator setting; the worker requires it exactly.
+    tunables = 'glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912'
     env['GLIBC_TUNABLES'] = tunables
 evidence = {'platform': platform.platform(), 'machine': platform.machine(), 'command': sys.argv, 'cases': {}}
 
@@ -282,6 +282,26 @@ outcomes = {name: allocation_case(name) for name in ('sqlite-negative-malloc', '
 case('allocation_hooks_negative_size_exit_73', {'outcomes': outcomes},
      all(o['exit'] == 73 and not o['stdout'] for o in outcomes.values()))
 
+# R (enacted 28 MiB): exact Cap acceptance/refusal at the budget, and std's real
+# `realloc_fallback` (align 32) on growth, shrink and refused growth, through the same
+# Cap<System> and BUDGET as the worker (safe example, no FFI).
+budget_probe = os.path.realpath(os.path.join(target, 'examples', 'budget_probe'))
+def budget_case(name, extra_env=None):
+    process = subprocess.run([budget_probe, name], env=dict(env, **(extra_env or {})), capture_output=True, text=True, timeout=60)
+    return {'exit': process.returncode, 'report': json.loads(process.stdout) if process.returncode == 0 else {},
+            'stderr': process.stderr.strip()[-300:]}
+r = budget_case('cap-boundary')
+b = r['report']
+case('budget_r_exact_boundary', r, r['exit'] == 0 and b.get('budget') == 28 * 1024 * 1024 and b.get('exact_ok') is True
+     and b.get('allocated_at_limit') == b.get('budget') and b.get('over_refused') is True
+     and b.get('allocated_after_refusal') == b.get('allocated_before'))
+r = budget_case('rust-fallback')
+b = r['report']
+case('rust_realloc_fallback_grow_shrink_refusal', r, r['exit'] == 0 and b.get('align') == 32
+     and b.get('grow_preserved') is True and b.get('shrink_preserved') is True
+     and b.get('charged_grown', 0) > b.get('charged_small', 0) > 0 and b.get('charged_shrunk', 0) < b.get('charged_grown', 0)
+     and b.get('refused') is True and b.get('retained') is True)
+
 sentinel = os.path.join(scratch, 'sentinel-unrelated.csv')
 with open(sentinel, 'w') as f:
     f.write('secret,value\nSENTINEL_SECRET,1\n')
@@ -329,7 +349,7 @@ case('denied_sidecar_create', r, r['exit'] == 0 and out == {'denied': True, 'sid
 
 import resource
 fake = os.path.realpath(os.path.join(target, 'examples', 'fake_worker'))
-for mode in ('oracle', 'limits') + (('benchmark',) if benchmark else ()):
+for mode in ('oracle', 'limits') + (() if mac else ('prerequisites',)) + (('benchmark',) if benchmark else ()):
     command = [driver, mode, worker, os.path.join(scratch, 'driver-' + mode)] + ([fake] if mode == 'limits' else [])
     started = time.monotonic()
     process = subprocess.run(command, capture_output=True, text=True, timeout=3600,
@@ -378,13 +398,104 @@ for mode in ('oracle', 'limits') + (('benchmark',) if benchmark else ()):
             case(name, {'exit': process.returncode, 'stdout_bytes': len(process.stdout)},
                  process.returncode == code and not process.stdout)
 
+def worker_run(role, db, stdin_bytes, extra_env=None, timeout=60):
+    command = [worker, role, db]
+    if mac:
+        command = ['/usr/bin/sandbox-exec', '-p', profiles['BUILD' if role == 'build' else 'READ'], '-D', 'WORKER=' + worker, '-D', 'DB=' + db] + command
+    process = subprocess.run(command, input=stdin_bytes, env=dict(env, **(extra_env or {})), capture_output=True, timeout=timeout)
+    return {'exit': process.returncode, 'stdout': process.stdout, 'stderr': process.stderr.decode(errors='replace').strip()[-300:]}
+def published(db):
+    import sqlite3
+    try:
+        return '_kg_manifest' in [t for (t,) in sqlite3.connect('file:' + db + '?mode=ro', uri=True)
+                                  .execute("SELECT name FROM sqlite_schema WHERE type='table'")]
+    except sqlite3.DatabaseError:
+        return False
+count_query = (json.dumps({'source': 'MATCH (n:Concept) RETURN count(*) AS total LIMIT 1', 'parameters': {}}) + '\n').encode()
+baseline_rows = json.loads(worker_run('query', limits_db, count_query)['stdout'] or b'{}').get('rows')
+
+# Adversarial frames at the event-frame limit (2,097,151 content bytes + newline) in
+# both input roles: a well-typed event whose `after` carries ~524k one-byte strings (the
+# N_max premise) and a query frame of the same size, which the 81,984-byte query bound
+# refuses before parsing. Each is a typed whole-request refusal with nothing written or
+# published: the builder parses the whole frame and its existing value limits refuse it
+# as `query_limit` (75); the query worker refuses the oversize frame (74). The prior
+# generation answers unchanged afterwards.
+event_limit = 2 * 1024 * 1024 - 1
+oracle_export = os.path.join(scratch, 'driver-oracle', 'fixture-personal.ndjson')
+with open(oracle_export, 'rb') as f:
+    head_line, event_line = f.readline(), f.readline()
+manifest_line = json.loads(head_line)
+manifest_line['accepted_head'] = 1
+event = json.loads(event_line)
+event['operations'] = event['operations'][:1]
+event['operations'][0]['after']['properties'] = {'p': []}
+skeleton = len(json.dumps(event, separators=(',', ':')).encode())
+strings = (event_limit - skeleton) // 4
+event['operations'][0]['after']['properties'] = {'p': ['a'] * strings}
+line = json.dumps(event, separators=(',', ':')).encode()
+line = line[:-3] + b' ' * (event_limit - len(line)) + line[-3:]
+adversarial_build_frame = json.dumps(manifest_line, separators=(',', ':')).encode() + b'\n' + line + b'\n'
+adversarial_query_frame = b'{"source":"' + b'a' * (event_limit - 13) + b'"}' + b'\n'
+frames = {}
+db = fresh('adversarial-build.db')
+r = worker_run('build', db, adversarial_build_frame)
+frames['build'] = {'exit': r['exit'], 'event_content_bytes': len(line), 'one_byte_strings': strings,
+                   'stdout_bytes': len(r['stdout']), 'published': published(db), 'stderr': r['stderr']}
+r = worker_run('query', limits_db, adversarial_query_frame)
+frames['query'] = {'exit': r['exit'], 'frame_content_bytes': len(adversarial_query_frame) - 1,
+                   'stdout_bytes': len(r['stdout']), 'stderr': r['stderr']}
+after_rows = json.loads(worker_run('query', limits_db, count_query)['stdout'] or b'{}').get('rows')
+case('adversarial_frames_at_event_limit_both_roles', dict(frames, prior_generation_rows=baseline_rows, after_rows=after_rows),
+     len(line) == event_limit and len(adversarial_query_frame) - 1 == event_limit
+     and frames['build']['exit'] == 75 and frames['query']['exit'] == 74
+     and all(f['stdout_bytes'] == 0 for f in frames.values())
+     and not frames['build']['published'] and baseline_rows and after_rows == baseline_rows)
+
+if not mac:
+    # B0 on the unmodified worker: VmData admitted at the boundary is reported and <= H0.
+    r = worker_run('query', limits_db, count_query)
+    out = json.loads(r['stdout']) if r['exit'] == 0 else {}
+    case('b0_admitted_unmodified_worker', {'exit': r['exit'], 'boundary_vm_data_bytes': out.get('boundary_vm_data_bytes'),
+                                           'boundary_vm_peak_bytes': out.get('boundary_vm_peak_bytes'), 'h0': 1024 * 1024},
+         r['exit'] == 0 and 0 < out.get('boundary_vm_data_bytes', 0) <= 1024 * 1024 and out.get('boundary_vm_peak_bytes', 0) > 0)
+    # B0 refusal through a test-only preload that grows the brk heap before main (P1′
+    # forbids mmapped chunks, so the bytes land in VmData) and then removes LD_PRELOAD
+    # from the environment. Over H0 every role exits 74 before reading or writing
+    # anything; a small inflation is admitted (control).
+    inflate_source = os.path.join(scratch, 'b0-inflate.c')
+    with open(inflate_source, 'w') as f:
+        # The volatile global keeps -O2 from eliding the otherwise unused allocation.
+        f.write('#include <stdlib.h>\n#include <string.h>\nvoid *volatile kg_b0_inflation;\n'
+                '__attribute__((constructor)) static void inflate(void) {\n'
+                '  char *p = malloc(INFLATE_BYTES); if (p) memset(p, 1, INFLATE_BYTES);\n'
+                '  kg_b0_inflation = p;\n  unsetenv("LD_PRELOAD");\n}\n')
+    b0 = {}
+    for label, size in (('over_h0', 2 * 1024 * 1024), ('control_small', 16 * 1024)):
+        library = os.path.join(scratch, f'b0-inflate-{label}.so')
+        subprocess.run(['cc', '-O2', '-Wall', '-Werror', '-shared', '-fPIC', f'-DINFLATE_BYTES={size}', '-o', library, inflate_source], check=True)
+        staged = fresh(f'b0-{label}-build.db')
+        with open(oracle_export, 'rb') as f:
+            export_bytes = f.read()
+        runs = {'build': worker_run('build', staged, export_bytes, {'LD_PRELOAD': library}),
+                'query': worker_run('query', limits_db, count_query, {'LD_PRELOAD': library}),
+                'inspect': worker_run('inspect', limits_db, (json.dumps({'id': '0' * 25 + '1', 'include_archived': False}) + '\n').encode(), {'LD_PRELOAD': library})}
+        b0[label] = {role: {'exit': x['exit'], 'stdout_bytes': len(x['stdout']), 'stderr': x['stderr'][-160:]} for role, x in runs.items()}
+        b0[label]['build_published'] = published(staged)
+    case('b0_over_h0_refused_every_role_74', dict(b0, after_rows=json.loads(worker_run('query', limits_db, count_query)['stdout'] or b'{}').get('rows')),
+         all(b0['over_h0'][role]['exit'] == 74 and b0['over_h0'][role]['stdout_bytes'] == 0
+             for role in ('build', 'query', 'inspect'))
+         and not b0['over_h0']['build_published']
+         and all(b0['control_small'][role]['exit'] == 0 for role in ('build', 'query', 'inspect'))
+         and b0['control_small']['build_published'])
+
 # F1: external allocation accounting. A measurement-only LD_PRELOAD interposer
 # attributes every libc allocation to the worker executable (Cap-charged) or a shared
-# library (uncharged bypass) and reports simultaneous peaks. The proof requires the
-# uncharged remainder to be input-independent across a corpus varying rows, string
-# length, numeric spelling, sort/count fan-out and allocation count; it does not pass
-# on charged usage below 256 MiB alone. Measured last so a failure here does not hide
-# the other evidence; it still fails the run.
+# library (uncharged bypass) and samples the allocator after every call. Since round 10
+# the case asserts the reviewed accounted-cost invariant (R1 design v7 §7, inventory
+# round 10 §4.6), not a constant raw remainder: raw chunk overhead stays input-dependent
+# and is recorded, never asserted. LD_PRELOAD changes startup, so this is instrumented
+# evidence, kept apart from the unmodified B0 case above.
 hub = {'id': '0' * 25 + '1'}
 corpus = (
     ('count_hub_10000', 'MATCH (h:Concept)-[e:contains]->(x) WHERE h.id = $id RETURN count(*) AS total LIMIT 1', hub),
@@ -424,7 +535,7 @@ else:
          and all(v == 1 for k, v in unfixed_controls.items() if k != 'envelope_within_untracked'))
     def observed(command, stdin_bytes, label):
         process = subprocess.run(command, input=stdin_bytes, env=dict(env, LD_PRELOAD=library),
-                                 capture_output=True, timeout=600)
+                                 capture_output=True, timeout=1800)
         stderr = process.stderr.decode(errors='replace')
         report = [json.loads(l[len('KG_ALLOC '):]) for l in stderr.splitlines() if l.startswith('KG_ALLOC ')]
         response = json.loads(process.stdout) if process.returncode == 0 else {}
@@ -432,44 +543,88 @@ else:
                     worker_peak_charged_bytes=response.get('peak_allocated_bytes'))
     samples = [observed([worker, 'query', limits_db], (json.dumps({'source': query, 'parameters': params}) + '\n').encode(), name)
                for name, query, params in corpus]
-    # Builder role over the accepted exports the driver already built and published
-    # (the deliberately faulted exports are refused by design and are not measured).
+    # Builder role over every accepted export the driver built and published (the
+    # deliberately faulted exports are refused by design and are not measured).
     faults = ('-truncated', '-digest', '-before-image', '-dangling', '-gap', '-trailing')
     exports = sorted(os.path.join(dirpath, n) for dirpath, _, names in os.walk(scratch) for n in names
                      if n.endswith('.ndjson') and not n[:-len('.ndjson')].endswith(faults))
-    build_samples, skipped_exports = [], []
+    build_samples = []
     for export in exports:
         label = os.path.relpath(export, scratch)
-        if os.path.getsize(export) > 128 * 1024 * 1024:
-            skipped_exports.append(label)
-            continue
         with open(export, 'rb') as f:
             stream = f.read()
         staged = fresh('observed-build-' + label.replace(os.sep, '-') + '.db')
         build_samples.append(observed([worker, 'build', staged], stream, 'build:' + label))
-    every = samples + build_samples
-    valid = all(s['exit'] == 0 and 'peak_uncharged_remainder_bytes' in s and s['table_overflow'] == 0 for s in every)
-    remainder = [s.get('peak_uncharged_remainder_bytes', 0) for s in samples]
-    library_bytes = [s.get('peak_library_bytes', 0) for s in samples]
-    allocator_remainder = [s.get('peak_allocator_in_use_minus_charged_bytes', 0) for s in samples]
-    # The interposer's charged peak must match Cap's own high-water mark: same domain.
-    agree = all(s.get('peak_charged_bytes') == s.get('worker_peak_charged_bytes') for s in every)
-    result = {'samples': samples, 'build_samples': build_samples, 'charged_accounting_agrees_with_cap': agree,
-              'remainder_spread_bytes': max(remainder) - min(remainder),
-              'library_bypass_spread_bytes': max(library_bytes) - min(library_bytes),
-              'allocator_wide_remainder_spread_bytes': max(allocator_remainder) - min(allocator_remainder),
-              'alignment_above_16_calls': sum(s.get('alignment_above_16_calls', 0) for s in every),
-              # Separate series, never compared with each other (design §1).
+    # Typed refusals are measured too: the adversarial frames (exit 74) and the native
+    # materialization that exhausts R (exit 72). Their allocation reports must exist.
+    refusal_samples = [
+        dict(observed([worker, 'build', fresh('observed-adversarial-build.db')], adversarial_build_frame, 'adversarial_build_frame'), expected_exit=75),
+        dict(observed([worker, 'query', limits_db], adversarial_query_frame, 'adversarial_query_frame'), expected_exit=74),
+        dict(observed([worker, 'query', limits_db], (json.dumps({'source': f'MATCH (n:Concept) WHERE n.P_626c6f62 IS NOT NULL RETURN {wide} LIMIT 1000', 'parameters': {}}) + '\n').encode(),
+                      'native_materialization_exit_72'), expected_exit=72),
+    ]
+    every = samples + build_samples + refusal_samples
+    R, H0, N_MAX, STACK = 28 * 1024 * 1024, 1024 * 1024, 2_101_248, 8 * 1024 * 1024
+    ENVELOPE = H0 + 4 * R + 64 * N_MAX + 64 + STACK
+    def accounted(s):
+        """The accounted-cost invariant for one run: the per-sample D1 envelope
+        I - 2S - 64*N32 - L <= I_start held at every post-call sample, with S <= R,
+        N32 <= N_max, I_start + L <= H0, no mmapped chunk and no wide/aligned executable
+        entry. Structurally X <= 2R + 64 (design D2), so the run's real heap cost is at
+        most H0 + 4R + 64*N_max + 64, plus the separate 8 MiB stack term."""
+        if 'peak_envelope_excess_bytes' not in s or s.get('table_overflow') != 0 or s.get('bootstrap_refused') != 0:
+            return False
+        return (s['peak_envelope_excess_bytes'] <= s['untracked_in_use_at_start_bytes']
+                and s['peak_charged_bytes'] <= R
+                and s['peak_live_executable_allocations_below_32'] <= N_MAX
+                and s['untracked_in_use_at_start_bytes'] + s['peak_library_bytes'] <= H0
+                and s['peak_mmapped_bytes'] == 0 and s['alignment_above_16_calls'] == 0
+                and s['executable_aligned_calls'] == 0)
+    def accounted_bound(s):
+        X = 2 * s.get('peak_charged_bytes', 0) + 64
+        return (s.get('untracked_in_use_at_start_bytes', 0) + s.get('peak_library_bytes', 0) + 2 * s.get('peak_charged_bytes', 0)
+                + 64 * s.get('peak_live_executable_allocations_below_32', 0) + 64 + X + STACK)
+    exits_ok = all(s['exit'] == s.get('expected_exit', 0) for s in every)
+    # Cap and the observer must agree on the charged high-water mark (same domain).
+    agree = all(s.get('peak_charged_bytes') == s.get('worker_peak_charged_bytes') for s in samples + build_samples)
+    # F_post = 0 falsifier: uncharged library bytes are identical within each role.
+    library_spread = {role: max(v) - min(v) for role, v in (
+        ('query', [s.get('peak_library_bytes', -1) for s in samples]),
+        ('build', [s.get('peak_library_bytes', -1) for s in build_samples]))}
+    # Discriminating controls on the predicate itself: each single premise broken on a
+    # real sample must be rejected.
+    reference = samples[0]
+    mutations = {
+        'd1_excess_above_untracked': {'peak_envelope_excess_bytes': reference.get('untracked_in_use_at_start_bytes', 0) + 1},
+        'charged_above_r': {'peak_charged_bytes': R + 1},
+        'small_count_above_n_max': {'peak_live_executable_allocations_below_32': N_MAX + 1},
+        'startup_above_h0': {'peak_library_bytes': H0 + 1},
+        'mmapped_chunk': {'peak_mmapped_bytes': 4096},
+        'wide_alignment': {'alignment_above_16_calls': 1},
+        'table_overflow': {'table_overflow': 1},
+    }
+    controls = {name: not accounted(dict(reference, **change)) for name, change in mutations.items()}
+    # Observer control: std's real realloc_fallback (budget_probe, align 32) is seen as
+    # executable aligned allocation, which the worker runs above never reach.
+    fallback = observed([budget_probe, 'rust-fallback'], b'', 'budget_probe_rust_fallback')
+    controls['observer_sees_rust_realloc_fallback'] = fallback.get('executable_aligned_calls', 0) > 0 and fallback.get('alignment_above_16_calls', 0) > 0
+    raw = [s.get('peak_uncharged_remainder_bytes', 0) for s in samples]
+    result = {'samples': samples, 'build_samples': build_samples, 'refusal_samples': refusal_samples,
+              'fallback_control_sample': fallback, 'predicate_controls': controls,
+              'charged_accounting_agrees_with_cap': agree, 'exits_as_expected': exits_ok,
+              'per_run_invariant': {s['query']: accounted(s) for s in every},
+              'max_accounted_bound_bytes': max(accounted_bound(s) for s in every), 'envelope_bytes': ENVELOPE,
+              'library_bypass_spread_bytes': library_spread,
+              # Recorded, not asserted: raw chunk overhead is input-dependent by design.
+              'raw_remainder_spread_bytes': max(raw) - min(raw),
               'max_live_below_32': max(s.get('peak_live_executable_allocations_below_32', 0) for s in every),
-              'max_realloc_old_bytes': max(s.get('max_realloc_old_bytes', 0) for s in every),
               'max_reconstructed_overlap_bytes': max(s.get('peak_reconstructed_overlap_bytes', 0) for s in every),
-              'max_mmapped_bytes': max(s.get('peak_mmapped_bytes', 0) for s in every),
-              'bootstrap_refused': sum(s.get('bootstrap_refused', 0) for s in every)}
-    # No acceptance window: until the reviewed accounted-cost envelope (R1) replaces
-    # this assertion, any input-dependent uncharged remainder fails the proof.
-    ok = (valid and agree and result['remainder_spread_bytes'] == 0 and result['library_bypass_spread_bytes'] == 0
-          and result['allocator_wide_remainder_spread_bytes'] == 0 and result['alignment_above_16_calls'] == 0)
+              'historical_round9_raw_spread_fail_bytes': 253243}
+    ok = (exits_ok and agree and build_samples and all(result['per_run_invariant'].values())
+          and result['max_accounted_bound_bytes'] <= ENVELOPE <= 256 * 1024 * 1024
+          and all(v == 0 for v in library_spread.values()) and all(controls.values()))
     case('memory_uncharged_remainder', result, ok, fatal=False)
+    valid = all('peak_envelope_excess_bytes' in s and s.get('table_overflow') == 0 for s in every)
     # Mechanism falsifier (design v3 D1 under P1), not the R1 bound: at every post-call
     # sample, allocator in-use <= 2*charged + 64*small32 + library chunks + untracked
     # pre-observer bytes; no mmapped chunk; no wide alignment; and no executable aligned
@@ -477,7 +632,7 @@ else:
     d1 = {s['query']: {k: s.get(k) for k in ('peak_envelope_excess_bytes', 'untracked_in_use_at_start_bytes',
                                               'peak_mmapped_bytes', 'alignment_above_16_calls',
                                               'executable_aligned_calls', 'allocator_samples')} for s in every}
-    case('d1_heap_envelope_under_p1', {'runs': d1, 'build_runs': len(build_samples), 'skipped_exports_over_128_mib': skipped_exports},
+    case('d1_heap_envelope_under_p1', {'runs': d1, 'build_runs': len(build_samples)},
          valid and build_samples and all(
              v['peak_envelope_excess_bytes'] is not None
              and v['peak_envelope_excess_bytes'] <= v['untracked_in_use_at_start_bytes']

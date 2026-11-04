@@ -144,6 +144,12 @@ tracing-subscriber = { workspace = true }
 # gix-free; its SQLite is the workspace's rusqlite.
 syncular-client = { workspace = true }
 
+# Graph worker launch prerequisite P6c (story 110.1): the supervisor reads its own
+# inherited soft RLIMIT_STACK before every worker spawn. Already in the graph via
+# polling/tempfile; no new package.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 # The privacy lifecycle tests observe real localhost connection/cancellation;
 # the display-name bound is measured on tokio's paused clock.

@@ -252,14 +252,24 @@ Concurrent allocation failure can permanently defeat its counter. Therefore this
 proof permits only single-threaded execution, mandatory callback thread checks,
 no set_limit, and process-wide Linux clone/fork denial. It is not a multithreaded
 allocator guarantee. Rust, redirected GraphQLite and SQLite share the charged domain.
-**Measured limit of the charged budget (Linux, M1):** allocations made through the
-interposed symbols by shared libraries are a constant 32,832 bytes across the corpus
-(this observes exported-symbol calls only; it is not a complete bypass audit), but
-glibc's per-chunk overhead on charged allocations is not charged and grows with the
-number of live allocations (33 KB to 285 KB in the proof corpus). The 256 MiB charged
-budget therefore does not by itself bound real allocation cost; Linux relies on the
-512 MiB `RLIMIT_AS` backstop. The accounted-cost conversion that closes this gap is
-under review and not implemented.
+**Accounted-cost conversion (Linux, enacted in story 110.1, R1 design v7):** glibc's
+per-chunk overhead on charged allocations is not charged and grows with the number of
+live allocations (the raw remainder still varies by about 250 KB across the proof
+corpus), so the charge is a conservative conversion of the unchanged 256 MiB
+real-allocation budget rather than that budget itself. The charged ceiling is
+**R = 28 MiB**, chosen so that `H0 + 4R + 64·N_max + 64 + 8 MiB stack = 261,357,632 B`
+stays below 256 MiB (H0 = 1 MiB, N_max = 2,101,248 live allocations under 32 bytes).
+Its premises are enforced, not assumed: the supervisor passes the fixed
+`GLIBC_TUNABLES` (no mmapped chunks, no tcache, a 512 MiB trim threshold) and the
+worker refuses any other environment; the worker checks its own `VmData` against H0
+at the input boundary B0 (after confinement, before any input) and exits 74 above it;
+before every Linux spawn the supervisor refuses (no child) unless its inherited soft
+`RLIMIT_STACK` is finite and at most 8 MiB and `/etc/ld.so.preload` is absent; the
+schema check refuses a repeated object name; and the worker is built with the
+`graph-worker` profile (`panic = "abort"`). The proof checks the per-sample envelope
+with a measurement-only `LD_PRELOAD` observer; that is sampled evidence under
+instrumented startup, not an all-times proof by itself. The 512 MiB `RLIMIT_AS` stays
+an independent backstop. macOS has no corresponding mechanism or evidence yet.
 
 GraphQLite is source-built MIT v0.12.0 commit
 `995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629`, using the sole libsqlite3-sys headers

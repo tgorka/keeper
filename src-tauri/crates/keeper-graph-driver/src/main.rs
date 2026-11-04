@@ -550,7 +550,7 @@ mod proof {
             .await?
             .rows;
         let mut outcomes = Vec::new();
-        // Native materialization: 1,000 rows × 16 cells × 60 KiB exceeds the 256 MiB budget.
+        // Native materialization: 1,000 rows × 16 cells × 60 KiB exceeds the 28 MiB budget R.
         let wide = (0..16)
             .map(|i| format!("n.P_626c6f62 AS b{i}"))
             .collect::<Vec<_>>()
@@ -845,6 +845,75 @@ mod proof {
         .await;
         outputs
     }
+    /// P6c through the real supervisor API: the driver changes only its own soft
+    /// RLIMIT_STACK (inherited by any child) between calls. At exactly 8 MiB every role
+    /// runs; above it, and at infinity, build/query/inspect are refused before any child
+    /// exists (no reaped worker, no live worker, no new artifact); back at 8 MiB the
+    /// prior generation answers unchanged.
+    #[cfg(target_os = "linux")]
+    async fn prerequisites(supervisor: &Supervisor, root: &Path) -> Result<()> {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        let original = getrlimit(Resource::Stack);
+        let set = |soft: Option<u64>| {
+            setrlimit(
+                Resource::Stack,
+                Rlimit {
+                    current: soft,
+                    maximum: original.maximum,
+                },
+            )
+        };
+        const LIMIT: u64 = 8 * 1024 * 1024;
+        let domain = "fixture-prerequisites";
+        let export = root.join("prerequisites.ndjson");
+        let m = oracle_export(&export, domain)?;
+        let cancel = Cancellation::default();
+        set(Some(LIMIT))?;
+        let generation = supervisor.build_export(&export, &m, &cancel).await?;
+        let session = supervisor.session("prerequisites", "prerequisites", domain)?;
+        let control = "MATCH (n:Concept) RETURN count(*) AS total LIMIT 1";
+        let baseline = session
+            .query(&generation, control, b"{}", &cancel)
+            .await?
+            .rows;
+        let inspected = session.inspect(&generation, &id(1), false, &cancel).await?;
+        let published = generation_files(root)?;
+        let mut outcomes = vec![
+            json!({"stack_soft":LIMIT,"build":"ok","query_rows":baseline,"inspect_rows":inspected.rows.len()}),
+        ];
+        for soft in [Some(LIMIT + 1), None] {
+            set(soft)?;
+            let reaped = supervisor.last_reaped();
+            let build = supervisor.build_export(&export, &m, &cancel).await;
+            let query = session.query(&generation, control, b"{}", &cancel).await;
+            let inspect = session.inspect(&generation, &id(1), false, &cancel).await;
+            let refused = [build.is_err(), query.is_err(), inspect.is_err()]
+                .iter()
+                .all(|r| *r);
+            let typed = matches!(build, Err(keeper_core::graph::Error::Unavailable))
+                && matches!(query, Err(keeper_core::graph::Error::Unavailable))
+                && matches!(inspect, Err(keeper_core::graph::Error::Unavailable));
+            let no_child =
+                supervisor.last_reaped() == reaped && supervisor.live_workers().is_empty();
+            let unchanged = generation_files(root)? == published;
+            if !(refused && typed && no_child && unchanged) {
+                set(original.current)?;
+                return Err(format!("P6c did not refuse at {soft:?}: typed={typed} no_child={no_child} unchanged={unchanged}").into());
+            }
+            outcomes.push(json!({"stack_soft":soft,"build":"projection_unavailable","query":"projection_unavailable","inspect":"projection_unavailable","no_child":no_child,"artifacts_unchanged":unchanged}));
+        }
+        set(Some(LIMIT))?;
+        let after = session
+            .query(&generation, control, b"{}", &cancel)
+            .await?
+            .rows;
+        set(original.current)?;
+        if after != baseline {
+            return Err("prior generation changed after P6c refusals".into());
+        }
+        outcomes.push(json!({"stack_soft":LIMIT,"prior_generation_query":"unchanged"}));
+        emit(json!({"mode":"prerequisites","outcomes":outcomes}))
+    }
     pub async fn run() -> Result<()> {
         let args: Vec<String> = std::env::args().collect();
         let mode = args
@@ -876,6 +945,8 @@ mod proof {
                 let fake = PathBuf::from(args.get(4).ok_or("fake worker executable required")?);
                 limits(&supervisor, &root, &worker, &fake).await?
             }
+            #[cfg(target_os = "linux")]
+            "prerequisites" => prerequisites(&supervisor, &root).await?,
             _ => return Err("unknown proof mode".into()),
         }
         emit(json!({"mode":mode,"complete":true,"peak_live_workers":supervisor.peak_workers()}))

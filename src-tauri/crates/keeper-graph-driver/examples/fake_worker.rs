@@ -72,6 +72,8 @@ fn response(manifest: Manifest, pid: u32) -> Response {
         allocated_bytes: 0,
         peak_allocated_bytes: 0,
         peak_rss_bytes: 0,
+        boundary_vm_data_bytes: 0,
+        boundary_vm_peak_bytes: 0,
         rows: Vec::new(),
     }
 }

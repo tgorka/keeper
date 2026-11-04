@@ -11,8 +11,11 @@ pub const MAX_ENTITIES: u64 = 1_000_000;
 pub const ENGINE: &str = "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629";
 /// Fixed, non-secret allocator configuration the supervisor sets on every Linux worker
 /// child (after `env_clear`, before exec); the worker refuses any other value. No mmapped
-/// chunks (no page rounding, no persistent shrink after failed mremap) and no tcache.
-pub const LINUX_WORKER_GLIBC_TUNABLES: &str = "glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0";
+/// chunks (no page rounding, no persistent shrink after failed mremap), no tcache, and
+/// (P1′) a trim threshold above the worker's 512 MiB `RLIMIT_AS`, so the main-arena heap
+/// is never trimmed while that ceiling is in force.
+pub const LINUX_WORKER_GLIBC_TUNABLES: &str =
+    "glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -257,5 +260,9 @@ pub struct Response {
     pub peak_allocated_bytes: usize,
     /// Worker's own peak resident set (getrusage), measured not enforced.
     pub peak_rss_bytes: u64,
+    /// `VmData` admitted at the input boundary B0 (Linux; 0 elsewhere).
+    pub boundary_vm_data_bytes: u64,
+    /// `VmPeak` read at B0: an observation, never an allocation oracle.
+    pub boundary_vm_peak_bytes: u64,
     pub rows: Vec<Value>,
 }

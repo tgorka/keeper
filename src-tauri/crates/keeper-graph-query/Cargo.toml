@@ -41,3 +41,7 @@ required-features = ["proof-executables"]
 [[example]]
 name = "allocation_probe"
 required-features = ["proof-executables"]
+
+[[example]]
+name = "budget_probe"
+required-features = ["proof-executables"]

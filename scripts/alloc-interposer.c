@@ -33,7 +33,9 @@
 // observable here; the design bounds them analytically.
 // Heap chunk cost uses glibc 2.43's model (malloc_usable_size + 8); mmapped chunks are
 // visible in the allocator-wide view (hblkhd). The observer's own table is a direct
-// mmap and appears in neither view. Results go to fd 2 at exit.
+// MAP_SHARED anonymous mapping: observer-owned measurement state, outside both views
+// and outside the worker's VmData (so B0 judges the worker, not the observer).
+// Results go to fd 2 at exit.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <link.h>
@@ -206,7 +208,7 @@ static void resolve(void) {
 __attribute__((constructor)) static void start(void) {
     resolve();
     void *m = mmap(NULL, sizeof(struct slot) * SLOTS, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) _exit(70);
     dl_iterate_phdr(executable, NULL);
     // The worker refuses any inherited environment; the preload is already active.
