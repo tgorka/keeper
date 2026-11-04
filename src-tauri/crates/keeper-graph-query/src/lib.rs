@@ -5,3 +5,4 @@ pub mod builder;
 pub mod confinement;
 pub mod engine;
 pub mod native;
+pub mod schema;

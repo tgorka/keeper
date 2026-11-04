@@ -19,10 +19,10 @@ pub fn build<R: BufRead>(connection: Connection, reader: &mut R) -> Result<Manif
     let first = frame(reader, 8192)?;
     let manifest: Manifest = serde_json::from_slice(&first)?;
     manifest.validate()?;
-    connection.execute_batch("PRAGMA max_page_count=524288;
-        CREATE TABLE _kg_entities(id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, body TEXT);
-        CREATE TABLE _kg_events(sequence INTEGER PRIMARY KEY, digest TEXT NOT NULL, delta TEXT NOT NULL);
-        CREATE TABLE _kg_manifest(body TEXT NOT NULL);")?;
+    connection.execute_batch("PRAGMA max_page_count=524288")?;
+    for sql in &crate::schema::KEEPER[..3] {
+        connection.execute_batch(sql)?;
+    }
     let mut total = first.len() as u64;
     for sequence in 1..=manifest.accepted_head {
         let bytes = frame(reader, MAX_EVENT_BYTES)?;
@@ -86,7 +86,9 @@ pub fn build<R: BufRead>(connection: Connection, reader: &mut R) -> Result<Manif
         "INSERT INTO _kg_manifest(body) VALUES (?1)",
         [serde_json::to_string(&manifest)?],
     )?;
-    connection.execute_batch("ANALYZE; COMMIT")?;
+    connection.execute_batch("ANALYZE")?;
+    crate::schema::verify(&connection, crate::schema::Phase::Published)?;
+    connection.execute_batch("COMMIT")?;
     let mode: String = connection.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
     if mode != "delete" {
         return Err("journal transition refused".into());
@@ -185,9 +187,7 @@ fn mapped(kind: SymbolKind, name: &str) -> Result<String> {
     }
 }
 fn project(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE _kg_native(id TEXT PRIMARY KEY, native_id INTEGER NOT NULL);",
-    )?;
+    connection.execute_batch(crate::schema::KEEPER[3])?;
     let mut stmt=connection.prepare("SELECT id,entity_type,body FROM _kg_entities WHERE body IS NOT NULL AND (entity_type='tag' OR (entity_type='node' AND json_extract(body,'$.lifecycle')='active')) ORDER BY id")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {

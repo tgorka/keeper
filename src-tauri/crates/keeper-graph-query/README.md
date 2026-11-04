@@ -37,16 +37,23 @@ The unsafe inventory (U01–U11) is in `docs/constraints-and-limitations.md`.
 ## Proof
 
 ```sh
-cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --all-targets
-cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-driver
+cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bins --examples
+cargo build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-driver --bins --examples
 python3 scripts/graph-proof.py src-tauri/target/release <new-scratch-dir> [--benchmark]
 python3 scripts/check-graph-boundary.py
 ```
 
-`graph-proof.py` runs the real binaries: confinement (sentinel file, loopback listener,
-canonical-file write, leaked descriptors, denied sidecar create), authorizer denials,
-wrong-thread and live-statement registration negatives, allocation/result/deadline/cancel
-limits with reaped-PID checks, failed-publication faults, the two-client exact oracle and,
-with `--benchmark`, 100k nodes / 300k relationships / 10k retained events per domain.
+`graph-proof.py` runs the real binaries and records source/binary/toolchain provenance:
+confinement (sentinel file, loopback listener, canonical-file read/write for both roles,
+leaked descriptors, denied sidecar create), SQLITE_AUTH-only authorizer denials with
+classifier controls, one-shot entry and wrong-thread / post-confinement thread
+negatives, injected SQLite failures at the builder's SAVEPOINT / RELEASE / projection
+write / COMMIT, allocation/result/deadline/cancel/abort limits with reaped-PID checks,
+misbehaving worker executables (`keeper-graph-driver` example `fake_worker`), builder
+admission and retention bounds, a real rename failure, the escaped-parameter frame
+boundary, the two-client exact oracle and, with `--benchmark`, 100k nodes / 300k
+relationships / 10k retained events per domain. On Linux it measures allocation outside
+the charged budget with the measurement-only `scripts/alloc-interposer.c` preload.
+`native_probe read-trace` re-derives the authorizer's read set from a corpus on stdin.
 macOS confinement uses the deprecated, undocumented `sandbox-exec`; it is proof-only and not
 an approved production mechanism.

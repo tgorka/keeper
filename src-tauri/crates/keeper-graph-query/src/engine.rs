@@ -1,14 +1,13 @@
 use keeper_graph_protocol::{admit, AdmittedQuery, MAX_RESULT_BYTES, PROFILE};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::{Arc, Mutex};
 pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
+/// The worker's single entry. Claims allocation-callback permission for the calling
+/// thread exactly once per process (a second claim from any thread exits 73).
 pub fn start(path: &Path, writable: bool) -> Result<Connection> {
-    crate::allocation::mark_main();
+    crate::allocation::enter();
     // Fail closed if the parent passed anything but the fixed non-secret setting.
     if std::env::vars_os().any(|(key, _)| key != "GQL_STMT_CACHE") {
         return Err("worker environment must be cleared".into());
@@ -41,11 +40,21 @@ pub fn start(path: &Path, writable: bool) -> Result<Connection> {
             return Err("memory journal refused".into());
         }
         connection.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN IMMEDIATE;")?;
+        // Checked pinned DDL inside the host transaction; upstream's own unchecked
+        // creation during registration then finds every object already present.
+        crate::schema::create(&connection)?;
     } else {
         connection.execute_batch("PRAGMA query_only=ON;")?;
     }
     crate::native::register(&connection);
-    verify_schema(&connection)?;
+    crate::schema::verify(
+        &connection,
+        if writable {
+            crate::schema::Phase::Graph
+        } else {
+            crate::schema::Phase::Published
+        },
+    )?;
     Ok(connection)
 }
 fn immutable_uri(path: &Path) -> Result<String> {
@@ -62,50 +71,70 @@ fn immutable_uri(path: &Path) -> Result<String> {
     uri.push_str("?mode=ro&immutable=1");
     Ok(uri)
 }
-pub fn verify_schema(connection: &Connection) -> Result<()> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version != 1 {
-        return Err("projection schema version".into());
-    }
-    for table in [
-        "nodes",
-        "edges",
-        "property_keys",
-        "node_labels",
-        "node_props_int",
-        "node_props_real",
-        "node_props_text",
-        "node_props_bool",
-        "node_props_json",
-        "edge_props_int",
-        "edge_props_real",
-        "edge_props_text",
-        "edge_props_bool",
-        "edge_props_json",
-    ] {
-        let sql: String = connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
-            [table],
-            |r| r.get(0),
-        )?;
-        if sql.to_ascii_uppercase().contains("VIRTUAL") {
-            return Err("unexpected virtual schema".into());
-        }
-    }
-    let unexpected: i64 = connection.query_row(
-        "SELECT count(*) FROM sqlite_schema WHERE type IN ('trigger','view')",
-        [],
-        |r| r.get(0),
-    )?;
-    if unexpected != 0 {
-        return Err("unexpected projection executable schema".into());
-    }
-    Ok(())
-}
+/// Exact `(table, column)` reads the native engine performs for the admitted profile,
+/// derived with `native_probe read-trace` over the full positive corpus (oracle,
+/// boundary, limits, benchmark and memory queries). `("nodes", "")` is the rowid
+/// read behind count(*). Re-derive and review if the engine or profile changes.
+/// Anything else, including any column of an unlisted table, is denied.
+const READS: &[(&str, &str)] = &[
+    ("cypher_rows", "row"),
+    ("edge_props_bool", "edge_id"),
+    ("edge_props_bool", "key_id"),
+    ("edge_props_bool", "value"),
+    ("edge_props_int", "edge_id"),
+    ("edge_props_int", "key_id"),
+    ("edge_props_int", "value"),
+    ("edge_props_json", "edge_id"),
+    ("edge_props_json", "key_id"),
+    ("edge_props_json", "value"),
+    ("edge_props_real", "edge_id"),
+    ("edge_props_real", "key_id"),
+    ("edge_props_real", "value"),
+    ("edge_props_text", "edge_id"),
+    ("edge_props_text", "key_id"),
+    ("edge_props_text", "value"),
+    ("edges", "id"),
+    ("edges", "source_id"),
+    ("edges", "target_id"),
+    ("edges", "type"),
+    ("node_labels", "label"),
+    ("node_labels", "node_id"),
+    ("node_props_bool", "key_id"),
+    ("node_props_bool", "node_id"),
+    ("node_props_bool", "value"),
+    ("node_props_int", "key_id"),
+    ("node_props_int", "node_id"),
+    ("node_props_int", "value"),
+    ("node_props_json", "key_id"),
+    ("node_props_json", "node_id"),
+    ("node_props_json", "value"),
+    ("node_props_real", "key_id"),
+    ("node_props_real", "node_id"),
+    ("node_props_real", "value"),
+    ("node_props_text", "key_id"),
+    ("node_props_text", "node_id"),
+    ("node_props_text", "value"),
+    ("nodes", ""),
+    ("nodes", "id"),
+    ("property_keys", "id"),
+    ("property_keys", "key"),
+];
+/// Exact functions the generated SQL calls; every other function is denied.
+const FUNCTIONS: &[&str] = &[
+    "_gql_bool",
+    "_gql_bool_str",
+    "_gql_order_cmp",
+    "_gql_order_key",
+    "_gql_order_rank",
+    "_gql_typetag",
+    "coalesce",
+    "count",
+    "json",
+];
 
 pub struct Reader {
     connection: Connection,
-    denied: Arc<AtomicBool>,
+    denied: Arc<Mutex<Option<String>>>,
 }
 impl Reader {
     pub fn new(connection: Connection) -> Result<Self> {
@@ -121,62 +150,54 @@ impl Reader {
             let mut rows = stmt.query([])?;
             while rows.next()?.is_some() {}
         }
-        let denied = Arc::new(AtomicBool::new(false));
+        let denied = Arc::new(Mutex::new(None));
         let refusal = denied.clone();
         connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
             use rusqlite::hooks::{AuthAction, Authorization};
             let allowed = match context.action {
                 AuthAction::Select | AuthAction::Recursive => true,
-                AuthAction::Read { table_name, .. } => matches!(
+                AuthAction::Read {
                     table_name,
-                    "nodes"
-                        | "edges"
-                        | "property_keys"
-                        | "node_labels"
-                        | "node_props_int"
-                        | "node_props_real"
-                        | "node_props_text"
-                        | "node_props_bool"
-                        | "node_props_json"
-                        | "edge_props_int"
-                        | "edge_props_real"
-                        | "edge_props_text"
-                        | "edge_props_bool"
-                        | "edge_props_json"
-                        | "cypher_rows"
-                        | "sqlite_master"
-                        | "sqlite_schema"
-                ),
-                AuthAction::Function { function_name } => matches!(
-                    function_name,
-                    "count"
-                        | "coalesce"
-                        | "json_extract"
-                        | "json_type"
-                        | "json"
-                        | "typeof"
-                        | "_gql_bool"
-                        | "_gql_bool_str"
-                        | "_gql_typetag"
-                        | "_gql_retag"
-                        | "_gql_cmp"
-                        | "_gql_order_rank"
-                        | "_gql_order_key"
-                        | "_gql_order_cmp"
-                ),
+                    column_name,
+                } => READS.contains(&(table_name, column_name)),
+                AuthAction::Function { function_name } => FUNCTIONS.contains(&function_name),
                 _ => false,
             };
             if allowed {
                 Authorization::Allow
             } else {
-                refusal.store(true, Ordering::Relaxed);
+                if let Ok(mut first) = refusal.lock() {
+                    // Bounded: fixed-format action text, first refusal only.
+                    first.get_or_insert_with(|| {
+                        let mut text = format!("{:?}", context.action);
+                        text.truncate(160);
+                        text
+                    });
+                }
                 Authorization::Deny
             }
         }))?;
         Ok(Self { connection, denied })
     }
+    /// N3 transition proof: `sqlite3_close` (not close_v2) refuses with SQLITE_BUSY
+    /// while any statement prepared during trusted startup is still unfinalized.
+    pub fn close(self) -> Result<()> {
+        self.connection.close().map_err(|(_, e)| e)?;
+        Ok(())
+    }
     pub fn query(&self, query: &AdmittedQuery) -> Result<Vec<serde_json::Value>> {
-        self.denied.store(false, Ordering::Relaxed);
+        if let Ok(mut first) = self.denied.lock() {
+            *first = None;
+        }
+        let result = self.execute(query);
+        match self.denied.lock().ok().and_then(|mut d| d.take()) {
+            // Upstream may ignore an internal preparation error and return empty rows.
+            // A denied nested statement always invalidates the whole result.
+            Some(action) => Err(format!("native internal authorization failure: {action}").into()),
+            None => result,
+        }
+    }
+    fn execute(&self, query: &AdmittedQuery) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self
             .connection
             .prepare("SELECT row FROM cypher_rows(?1, ?2)")?;
@@ -201,11 +222,6 @@ impl Reader {
                 normalized.insert(alias.clone(), serde_json::to_value(scalar)?);
             }
             output.push(serde_json::Value::Object(normalized));
-        }
-        // Upstream may ignore an internal preparation error and return empty rows.
-        // A denied nested statement always invalidates the whole result.
-        if self.denied.load(Ordering::Relaxed) {
-            return Err("native internal authorization failure".into());
         }
         Ok(output)
     }

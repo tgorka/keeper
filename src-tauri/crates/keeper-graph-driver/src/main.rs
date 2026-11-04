@@ -212,12 +212,19 @@ mod proof {
         Ok(pid)
     }
     fn generation_files(root: &Path) -> Result<Vec<String>> {
+        Ok(generation_files_in(&root.join("generations")))
+    }
+    fn generation_files_in(directory: &Path) -> Vec<String> {
         let mut names = Vec::new();
-        for entry in std::fs::read_dir(root.join("generations"))? {
-            names.push(entry?.file_name().to_string_lossy().into_owned());
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // The supervisor's exclusive lock file is not a generation artifact.
+            if !name.starts_with('.') {
+                names.push(name);
+            }
         }
         names.sort();
-        Ok(names)
+        names
     }
     /// Exports that must be refused without publishing anything.
     fn fault_export(path: &Path, domain: &str, kind: &str) -> Result<Manifest> {
@@ -359,6 +366,25 @@ mod proof {
                 .into());
             }
         }
+        // F3: a valid <=64 KiB parameter whose every byte needs JSON escaping must
+        // cross the parent/worker frame and execute natively, not fail transport.
+        let escaped = json!({ "s": "\\".repeat(32_000) }).to_string();
+        let boundary_source = "MATCH (n:Concept) WHERE n.title = $s RETURN n.id AS id LIMIT 1";
+        let boundary = first
+            .query(&generation, boundary_source, escaped.as_bytes(), &cancel)
+            .await?;
+        if !boundary.rows.is_empty() {
+            return Err("escaped boundary parameter matched a node".into());
+        }
+        let over = json!({ "s": "\\".repeat(32_800) }).to_string();
+        if !matches!(
+            first
+                .query(&generation, boundary_source, over.as_bytes(), &cancel)
+                .await,
+            Err(keeper_core::graph::Error::Limit)
+        ) {
+            return Err("parameter beyond 64 KiB normalized bytes was not query_limit".into());
+        }
         // Typed refusals reach no worker.
         for source in [
             "MATCH (n) RETURN n.id AS id LIMIT 1; MATCH (m) DETACH DELETE m",
@@ -450,6 +476,7 @@ mod proof {
         ];
         let mut results = serde_json::Map::new();
         let mut charged = 0;
+        let mut residual = 0;
         let mut worker_rss = 0;
         for (name, query, parameters) in queries {
             let mut times = Vec::new();
@@ -463,7 +490,8 @@ mod proof {
                     times.push(start.elapsed().as_micros());
                 }
                 rows = response.rows.len();
-                charged = charged.max(response.allocated_bytes);
+                charged = charged.max(response.peak_allocated_bytes);
+                residual = residual.max(response.allocated_bytes);
                 worker_rss = worker_rss.max(response.peak_rss_bytes);
             }
             let p95 = percentile(&mut times, 95);
@@ -491,15 +519,16 @@ mod proof {
             "retained_events":10000,"update_archive_tag_events":2000,"export_ms":export_ms,"bootstrap_build_publish_ms":build_ms,
             "export_bytes":std::fs::metadata(&export)?.len(),"latest_generation_bytes":generation_bytes,
             "delta_bytes":{"min":percentile(&mut sizes,0),"p50":percentile(&mut sizes,50),"p95":percentile(&mut sizes,95),"max":percentile(&mut sizes,100)},
-            "warm_queries":results,"max_charged_allocation_bytes":charged,"max_query_worker_peak_rss_bytes":worker_rss,
-            "builder_peak_rss_bytes":generation.build_peak_rss_bytes,"builder_charged_allocation_bytes":generation.build_allocated_bytes,"envelope_pass":pass}),
+            "warm_queries":results,"max_query_peak_charged_bytes":charged,"max_query_residual_charged_bytes_at_exit":residual,"max_query_worker_peak_rss_bytes":worker_rss,
+            "builder_peak_rss_bytes":generation.build_peak_rss_bytes,"builder_peak_charged_bytes":generation.build_peak_allocated_bytes,
+            "builder_residual_charged_bytes_at_exit":generation.build_final_allocated_bytes,"envelope_pass":pass}),
         )?;
         if !pass {
             return Err("performance envelope failed".into());
         }
         Ok(())
     }
-    async fn limits(supervisor: &Supervisor, root: &Path) -> Result<()> {
+    async fn limits(supervisor: &Supervisor, root: &Path, fake: &Path) -> Result<()> {
         let domain = "fixture-limits";
         let export = root.join("limits.ndjson");
         let m = limits_export(&export, domain)?;
@@ -598,6 +627,150 @@ mod proof {
             .into());
         }
         outcomes.push(json!({"case":"admission","requests":18,"refused_query_limit":refused,"completed":completed,"peak_live_workers":supervisor.peak_workers()}));
+        // A worker killed by a signal mid-query is a typed failure, never a result.
+        let crash = supervisor.session("limits", "crash", domain)?;
+        let watcher = supervisor.clone();
+        let start = Instant::now();
+        let (result, signalled) = tokio::join!(
+            crash.query(&generation, fanout, hub.as_bytes(), &cancel),
+            async move {
+                for _ in 0..300 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    if let Some(pid) = watcher.live_workers().first().copied() {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        let sent = std::process::Command::new("kill")
+                            .args(["-ABRT", &pid.to_string()])
+                            .status()
+                            .is_ok_and(|s| s.success());
+                        return sent.then_some(pid);
+                    }
+                }
+                None
+            }
+        );
+        let elapsed = start.elapsed().as_millis();
+        if signalled.is_none()
+            || !matches!(result, Err(keeper_core::graph::Error::Unavailable))
+            || elapsed > 3_500
+        {
+            return Err(format!(
+                "aborted worker not a typed failure: {:?} after {elapsed} ms",
+                result.map(|r| r.rows.len())
+            )
+            .into());
+        }
+        outcomes.push(json!({"case":"abort_mid_query","signal":"SIGABRT","error":"projection_unavailable","elapsed_ms":elapsed,"reaped_pid":absent(supervisor.last_reaped())?}));
+        // Builder admission: concurrent builds beyond MAX_BUILDERS are refused before
+        // any staging file exists; retained generations are bounded.
+        let small = root.join("small.ndjson");
+        let small_m = oracle_export(&small, domain)?;
+        let builds =
+            poll_together((0..3).map(|_| supervisor.build_export(&small, &small_m, &cancel))).await;
+        let started = builds.iter().filter(|r| r.is_ok()).count();
+        let refused = builds
+            .iter()
+            .filter(|r| matches!(r, Err(keeper_core::graph::Error::Limit)))
+            .count();
+        if started != keeper_core::graph::MAX_BUILDERS || refused != 3 - started {
+            return Err(format!("builder admission: started={started} refused={refused}").into());
+        }
+        let retained = builds.into_iter().find_map(|r| r.ok()).ok_or("built")?;
+        // Two referenced (limits + retained): a third publication is refused.
+        let over = supervisor.build_export(&small, &small_m, &cancel).await;
+        if !matches!(over, Err(keeper_core::graph::Error::Limit)) {
+            return Err("retained generation bound not enforced".into());
+        }
+        drop(retained);
+        let mut on_disk = Vec::new();
+        for _ in 0..4 {
+            let next = supervisor.build_export(&small, &small_m, &cancel).await?;
+            let artifacts = supervisor.artifacts()?;
+            if artifacts.len() > keeper_core::graph::MAX_RETAINED_GENERATIONS {
+                return Err(format!("repeated publication grew storage: {artifacts:?}").into());
+            }
+            on_disk.push(artifacts.len());
+            drop(next);
+        }
+        outcomes.push(json!({"case":"builder_and_retention_bounds","concurrent_builds":3,"started":started,"refused_query_limit":refused,
+            "third_retained_refused":true,"artifacts_after_each_of_4_publications":on_disk}));
+        // A real rename failure: the generations directory becomes read-only after the
+        // staging file exists. Nothing is published; the unremovable staging leftover
+        // is reclaimed by the next build.
+        let directory = root.join("generations");
+        let staged = directory.clone();
+        let (built, _) = tokio::join!(supervisor.build_export(&export, &m, &cancel), async move {
+            for _ in 0..4000 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                if generation_files_in(&staged)
+                    .iter()
+                    .any(|n| n.ends_with(".staging"))
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o555));
+                    return;
+                }
+            }
+        });
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let left = generation_files(root)?;
+        if !matches!(built, Err(keeper_core::graph::Error::Storage(_)))
+            || left.iter().filter(|n| n.ends_with(".db")).count() != 1
+        {
+            return Err(
+                format!("rename failure published or was not a storage error: {left:?}").into(),
+            );
+        }
+        let reclaimed = supervisor.build_export(&small, &small_m, &cancel).await?;
+        let after_reclaim = generation_files(root)?;
+        if after_reclaim.iter().any(|n| n.ends_with(".staging")) {
+            return Err("failed-publication leftover was not reclaimed".into());
+        }
+        drop(reclaimed);
+        outcomes.push(json!({"case":"rename_failure","error":"storage_unavailable","left_after_failure":left,"after_next_build":after_reclaim}));
+        // Misbehaving worker executables: malformed, oversized, wrong-PID output, a
+        // process that never answers and an abort. Each is a typed failure, reaped;
+        // the hang is bounded by the deadline counted from spawn.
+        for behaviour in ["malformed", "oversized", "wrong-pid", "hang", "abort"] {
+            let binary = root.join(format!("fake-{behaviour}"));
+            std::fs::copy(fake, &binary)?;
+            let fake_supervisor = Supervisor::new(
+                &binary,
+                &root.join(format!("fake-{behaviour}-generations")),
+                true,
+            )?;
+            let fake_generation = fake_supervisor
+                .build_export(&small, &small_m, &cancel)
+                .await?;
+            let session = fake_supervisor.session("fake", "fake", domain)?;
+            let start = Instant::now();
+            let result = session
+                .query(
+                    &fake_generation,
+                    "MATCH (n) RETURN count(*) AS total LIMIT 1",
+                    b"{}",
+                    &cancel,
+                )
+                .await;
+            let elapsed = start.elapsed().as_millis();
+            let expected = if behaviour == "hang" {
+                matches!(result, Err(keeper_core::graph::Error::Limit)) && elapsed < 3_500
+            } else {
+                matches!(result, Err(keeper_core::graph::Error::Unavailable))
+            };
+            if !expected {
+                return Err(format!(
+                    "fake {behaviour}: {:?} after {elapsed} ms",
+                    result.map(|r| r.rows.len())
+                )
+                .into());
+            }
+            outcomes.push(json!({"case":format!("worker_{behaviour}"),"error":result.err().map(|e| e.to_string()),"elapsed_ms":elapsed,
+                "reaped_pid":absent(fake_supervisor.last_reaped())?}));
+        }
         // Projection intact after every limit fired.
         let after = session
             .query(&generation, control, hub.as_bytes(), &cancel)
@@ -666,7 +839,10 @@ mod proof {
                     benchmark(&supervisor, &root, domain, i == 0).await?;
                 }
             }
-            "limits" => limits(&supervisor, &root).await?,
+            "limits" => {
+                let fake = PathBuf::from(args.get(4).ok_or("fake worker executable required")?);
+                limits(&supervisor, &root, &fake).await?
+            }
             _ => return Err("unknown proof mode".into()),
         }
         emit(json!({"mode":mode,"complete":true,"peak_live_workers":supervisor.peak_workers()}))

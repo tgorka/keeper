@@ -9,9 +9,16 @@ pub const BUDGET: usize = 256 * 1024 * 1024;
 static ALLOCATOR: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, BUDGET);
 thread_local! { static MAIN: Cell<bool> = const { Cell::new(false) }; }
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+static ENTERED: AtomicBool = AtomicBool::new(false);
 
-pub fn mark_main() {
-    // Only the executable entry point calls this; callbacks never grant permission.
+/// Grants allocation-callback permission to the calling thread, once per process.
+/// Any second claim (repeated, or from another thread, concurrently or later)
+/// terminates with 73, so at most one thread can ever hold the permission.
+/// Callbacks and helpers never grant it.
+pub fn enter() {
+    if ENTERED.swap(true, Ordering::SeqCst) {
+        std::process::exit(73);
+    }
     MAIN.with(|flag| flag.set(true));
 }
 pub(crate) fn require_main() {
@@ -245,5 +252,88 @@ extern "C" fn sqlite_shutdown(app_data: *mut c_void) {
     require_main();
     if !app_data.is_null() {
         std::process::exit(73);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CASE: &str = "KG_ALLOCATION_TEST_CASE";
+
+    /// Runs `body` in a fresh copy of this test binary (each case needs a process
+    /// whose one-shot entry is still unclaimed) and returns its exit code.
+    fn isolated(test: &str, case: &str, body: impl FnOnce()) -> Option<i32> {
+        if std::env::var(CASE).as_deref() == Ok(case) {
+            body();
+            std::process::exit(0);
+        }
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CASE, case)
+            .status()
+            .expect("child")
+            .code()
+    }
+
+    #[test]
+    fn safe_sqlite_callbacks_refuse_any_thread_but_the_entered_one() {
+        let test = "allocation::tests::safe_sqlite_callbacks_refuse_any_thread_but_the_entered_one";
+        type Callback = fn();
+        let callbacks: [(&str, Callback); 3] = [
+            ("roundup", || {
+                sqlite_roundup(16);
+            }),
+            ("init", || {
+                sqlite_init(std::ptr::null_mut());
+            }),
+            ("shutdown", || sqlite_shutdown(std::ptr::null_mut())),
+        ];
+        for (name, callback) in callbacks {
+            let code = isolated(test, name, || {
+                enter();
+                let _ = std::thread::spawn(callback).join();
+            });
+            assert_eq!(code, Some(73), "{name} ran on a thread without permission");
+        }
+    }
+
+    #[test]
+    fn entry_is_one_shot_across_threads() {
+        let test = "allocation::tests::entry_is_one_shot_across_threads";
+        assert_eq!(
+            isolated(test, "repeat", || {
+                enter();
+                enter();
+            }),
+            Some(73)
+        );
+        assert_eq!(
+            isolated(test, "other-thread", || {
+                enter();
+                let _ = std::thread::spawn(enter).join();
+            }),
+            Some(73)
+        );
+    }
+
+    #[test]
+    fn entered_thread_gets_positive_sixteen_byte_roundup_and_null_app_data_only() {
+        let test = "allocation::tests::entered_thread_gets_positive_sixteen_byte_roundup_and_null_app_data_only";
+        let ok = isolated(test, "main", || {
+            enter();
+            assert_eq!(sqlite_roundup(0), 16);
+            assert_eq!(sqlite_roundup(1), 16);
+            assert_eq!(sqlite_roundup(17), 32);
+            assert_eq!(sqlite_init(std::ptr::null_mut()), libsqlite3_sys::SQLITE_OK);
+            sqlite_shutdown(std::ptr::null_mut());
+        });
+        assert_eq!(ok, Some(0));
+        let mut marker = 0u8;
+        let foreign = isolated(test, "app-data", move || {
+            enter();
+            sqlite_init(std::ptr::addr_of_mut!(marker).cast());
+        });
+        assert_eq!(foreign, Some(73));
     }
 }

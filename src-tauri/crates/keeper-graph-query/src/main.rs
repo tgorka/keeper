@@ -47,9 +47,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         } else {
             let reader = engine::Reader::new(connection)?;
-            let bytes = builder::frame(&mut input, 8192 + 65536 + 8192)?;
+            let bytes = builder::frame(
+                &mut input,
+                keeper_graph_protocol::wire::MAX_QUERY_FRAME_BYTES,
+            )?;
             let request: QueryRequest = serde_json::from_slice(&bytes)?;
-            reader.admit_and_query(&request.source, request.parameters.as_bytes())?
+            reader.admit_and_query(&request.source, &request.parameters_bytes()?)?
         };
         Response {
             manifest,

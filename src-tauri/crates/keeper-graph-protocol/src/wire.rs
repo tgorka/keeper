@@ -176,11 +176,37 @@ fn decimal(s: &str) -> bool {
     !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Upper bound of one encoded query frame, newline included. Parameters travel as
+/// an embedded JSON object, not a re-escaped string, so their normalized bytes
+/// (<= MAX_PARAMETER_BYTES after admission) appear exactly once. Admitted source is
+/// ASCII without quotes or backslashes; JSON escaping at most doubles its only
+/// escapable bytes (\t \n \x0C \r whitespace). 64 bytes cover keys and punctuation.
+pub const MAX_QUERY_FRAME_BYTES: usize =
+    2 * crate::MAX_SOURCE_BYTES + crate::MAX_PARAMETER_BYTES + 64;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     pub source: String,
-    pub parameters: String,
+    pub parameters: Value,
+}
+impl QueryRequest {
+    /// Encodes an admitted query; refusal here would mean the bound above is wrong.
+    pub fn encode(query: &crate::AdmittedQuery, source: &str) -> Result<Vec<u8>, Refusal> {
+        let request = Self {
+            source: source.to_owned(),
+            parameters: serde_json::from_str(&query.parameters_json()?)
+                .map_err(|_| Refusal::QueryUnsupported)?,
+        };
+        let mut bytes = serde_json::to_vec(&request).map_err(|_| Refusal::QueryUnsupported)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_QUERY_FRAME_BYTES {
+            return Err(Refusal::QueryLimit);
+        }
+        Ok(bytes)
+    }
+    pub fn parameters_bytes(&self) -> Result<Vec<u8>, Refusal> {
+        serde_json::to_vec(&self.parameters).map_err(|_| Refusal::QueryUnsupported)
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
