@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use keeper_core::hq::port::{Link, Replica, ReplicaSpec, Subscription};
+use keeper_core::hq::port::{
+    CommandResult, Link, Replica, ReplicaError, ReplicaSpec, Subscription,
+};
 use keeper_core::hq::syncular::SyncularReplica;
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
@@ -28,7 +30,11 @@ fn number(row: &Row, key: &str) -> Result<u64, String> {
 /// Independently canonicalize native values with the audited RFC 8785
 /// serializer, rather than trusting JSON key order or Rust number formatting.
 fn delta_digest(deltas: &[String]) -> Result<String, String> {
-    let values: Vec<Value> = deltas.iter().map(|encoded| serde_json::from_str(encoded)).collect::<Result<_, _>>().map_err(|error| error.to_string())?;
+    let values: Vec<Value> = deltas
+        .iter()
+        .map(|encoded| serde_json::from_str(encoded))
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
     let bytes = serde_jcs::to_vec(&values).map_err(|error| error.to_string())?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
@@ -140,6 +146,34 @@ fn fixture() -> (Vec<Row>, Vec<Row>) {
         );
     }
     (headers, operations)
+}
+
+/// The shared corpus is consumed unchanged by the HQ server suite. Native
+/// parsing plus serde_jcs must produce each independently stated JCS text.
+#[test]
+fn shared_jcs_vectors_match_native_canonical_bytes() {
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../../syncular/knowledge-graph.vectors.json"
+    ))
+    .expect("vector corpus");
+    let vectors = corpus["vectors"].as_array().expect("vectors");
+    assert!(vectors.len() >= 8);
+    for vector in vectors {
+        let id = vector["id"].as_str().expect("id");
+        let parsed: Value = serde_json::from_str(vector["json"].as_str().expect("json")).expect(id);
+        let bytes = serde_jcs::to_vec(&parsed).expect(id);
+        let text = String::from_utf8(bytes.clone()).expect(id);
+        assert_eq!(
+            text,
+            vector["canonical"].as_str().expect("canonical"),
+            "{id}"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&bytes)),
+            vector["sha256"].as_str().expect("sha"),
+            "{id}"
+        );
+    }
 }
 
 #[test]
@@ -342,6 +376,424 @@ fn two_native_replicas_observe_command_receipts_and_complete_prefixes() {
         )
         .expect("other device receipt scope")
         .is_empty());
+    for replica in replicas {
+        replica.close();
+        replica.join();
+    }
+}
+
+/// What a native graph caller may conclude from one command attempt and the
+/// scoped receipt its replica currently holds. Transport success alone never
+/// means accepted; only `idempotency_mismatch` and graph backstop codes are
+/// terminal refusals. Everything else keeps the same request pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GraphOutcome {
+    Accepted {
+        graph_seq: String,
+        commit_seq: Option<i64>,
+    },
+    Conflict,
+    Rejected(String),
+    PendingVisibility,
+    Pending(String),
+    TechnicalRefusal(String),
+    Mismatch,
+}
+
+fn classify(attempt: &Result<CommandResult, ReplicaError>, receipt: Option<&Row>) -> GraphOutcome {
+    match attempt {
+        Ok(result) => match receipt {
+            None => GraphOutcome::PendingVisibility,
+            Some(row) => {
+                let detail: Value = row
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::from_str(text).ok())
+                    .unwrap_or(Value::Null);
+                match row.get("outcome").and_then(Value::as_str) {
+                    Some("accepted") => GraphOutcome::Accepted {
+                        graph_seq: detail["graph_seq"].as_str().unwrap_or_default().to_owned(),
+                        commit_seq: result.commit_seq,
+                    },
+                    Some("conflict") => GraphOutcome::Conflict,
+                    Some("rejected") => GraphOutcome::Rejected(
+                        detail["code"].as_str().unwrap_or("rejected").to_owned(),
+                    ),
+                    _ => GraphOutcome::Pending("unknown receipt".to_owned()),
+                }
+            }
+        },
+        Err(ReplicaError::Remote { message, .. }) if message == "idempotency_mismatch" => {
+            GraphOutcome::Mismatch
+        }
+        Err(ReplicaError::Remote { code, message, .. })
+            if code.starts_with("kg.") || message.starts_with("kg.") =>
+        {
+            GraphOutcome::TechnicalRefusal(if code.starts_with("kg.") {
+                code.clone()
+            } else {
+                message.clone()
+            })
+        }
+        Err(error) => GraphOutcome::Pending(error.to_string()),
+    }
+}
+
+fn receipt_now(replica: &dyn Replica, request: &str) -> Option<Row> {
+    replica
+        .query(
+            "SELECT * FROM kg_receipts WHERE request_id = ?",
+            &[request.into()],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+}
+
+#[test]
+fn outcome_table_distinguishes_transport_from_graph_acceptance() {
+    let applied = Ok(CommandResult {
+        request_id: "r".into(),
+        commit_seq: Some(9),
+        cached: false,
+    });
+    let receipt = |outcome: &str, detail: Value| {
+        json!({"outcome":outcome,"detail":detail.to_string()})
+            .as_object()
+            .expect("row")
+            .clone()
+    };
+    assert_eq!(
+        classify(
+            &applied,
+            Some(&receipt("accepted", json!({"graph_seq":"4"})))
+        ),
+        GraphOutcome::Accepted {
+            graph_seq: "4".into(),
+            commit_seq: Some(9)
+        }
+    );
+    assert_eq!(
+        classify(&applied, Some(&receipt("conflict", json!({})))),
+        GraphOutcome::Conflict
+    );
+    assert_eq!(
+        classify(
+            &applied,
+            Some(&receipt("rejected", json!({"code":"approval_used"})))
+        ),
+        GraphOutcome::Rejected("approval_used".into())
+    );
+    assert_eq!(classify(&applied, None), GraphOutcome::PendingVisibility);
+    let remote = |code: &str, message: &str| -> Result<CommandResult, ReplicaError> {
+        Err(ReplicaError::Remote {
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+        })
+    };
+    assert_eq!(
+        classify(&remote("operation.forbidden", "idempotency_mismatch"), None),
+        GraphOutcome::Mismatch
+    );
+    assert_eq!(
+        classify(&remote("kg.event_group", "kg.event_group"), None),
+        GraphOutcome::TechnicalRefusal("kg.event_group".into())
+    );
+    // Disclosure/barrier/unresolved refusals never close the request.
+    for message in [
+        "graph_unavailable",
+        "context_revoked",
+        "outcome_unresolved",
+        "technical_unresolved",
+    ] {
+        assert!(matches!(
+            classify(&remote("operation.forbidden", message), None),
+            GraphOutcome::Pending(_)
+        ));
+    }
+    assert!(matches!(
+        classify(
+            &Err(ReplicaError::Unheard {
+                code: "x".into(),
+                message: "y".into(),
+                retryable: true
+            }),
+            None
+        ),
+        GraphOutcome::Pending(_)
+    ));
+}
+
+struct Live {
+    url: String,
+    domain: String,
+    actor: String,
+}
+
+impl Live {
+    fn from_env() -> Live {
+        Live {
+            url: std::env::var("KEEPER_HQ_LIVE_URL").expect("server URL"),
+            domain: std::env::var("KEEPER_HQ_LIVE_DATABASE").expect("domain"),
+            actor: std::env::var("KEEPER_HQ_LIVE_ACTOR").expect("actor"),
+        }
+    }
+    fn open(
+        &self,
+        index: u8,
+        base: &str,
+        path: &std::path::Path,
+        tables: &[&str],
+    ) -> SyncularReplica {
+        let client = std::env::var(format!("KEEPER_HQ_LIVE_CLIENT_{index}")).expect("client");
+        let token = std::env::var(format!("KEEPER_HQ_LIVE_TOKEN_{index}")).expect("token");
+        let scope = format!(
+            "{}:{}{}:{client}",
+            self.actor.len(),
+            self.actor,
+            client.len()
+        );
+        let mut subscriptions: Vec<Subscription> = tables
+            .iter()
+            .map(|table| Subscription {
+                id: (*table).into(),
+                table: (*table).into(),
+                scopes: vec![("kg_graph".into(), vec![self.domain.clone()])],
+            })
+            .collect();
+        subscriptions.push(Subscription {
+            id: "kg_receipts".into(),
+            table: "kg_receipts".into(),
+            scopes: vec![("kg_client".into(), vec![scope])],
+        });
+        SyncularReplica::open(ReplicaSpec {
+            database: self.domain.clone(),
+            path: path.to_path_buf(),
+            client_id: Some(client),
+            link: Some(Link {
+                base_url: format!("{base}/{}", self.domain),
+                token,
+            }),
+            subscriptions,
+            watch_presence: None,
+        })
+        .expect("open real replica")
+    }
+}
+
+#[test]
+#[ignore = "requires the disposable 110.2 server, a dropping relay and issued native credentials"]
+fn native_frames_resolve_through_the_outcome_table() {
+    let live = Live::from_env();
+    let relay = std::env::var("KEEPER_HQ_LIVE_DROP_URL").expect("dropping relay");
+    let technical = std::env::var("KEEPER_HQ_LIVE_TECHNICAL_ID").expect("technical payload id");
+    let scratch = tempfile::tempdir().expect("stores");
+    let all = [
+        "kg_head",
+        "kg_events",
+        "kg_event_ops",
+        "kg_nodes",
+        "kg_edges",
+    ];
+    let own = live.open(1, &live.url, &scratch.path().join("own.sqlite"), &all);
+    let peer = live.open(2, &live.url, &scratch.path().join("peer.sqlite"), &all);
+    let dropping = live.open(1, &relay, &scratch.path().join("relay.sqlite"), &[]);
+    let apply = |replica: &dyn Replica, request: &str, id: &str, expected: &str| {
+        replica.remote_command(
+            "kg.proof.apply",
+            request,
+            json!({"version":1,"context_id":null,"payload":{"id":id,"expected":expected}}),
+        )
+    };
+    let mut seen = Vec::new();
+    // Applied frame, receipt not visible in a replica without this client's receipt scope.
+    let accepted = ulid::Ulid::new().to_string();
+    let attempt = apply(&own, &accepted, &accepted, "0");
+    let invisible = classify(&attempt, receipt_now(&peer, &accepted).as_ref());
+    assert_eq!(invisible, GraphOutcome::PendingVisibility);
+    let resolved = classify(&attempt, Some(&await_receipt(&own, &accepted)));
+    assert!(matches!(resolved, GraphOutcome::Accepted { .. }));
+    seen.push(("applied+receipt-not-visible", format!("{invisible:?}")));
+    seen.push(("applied+accepted", format!("{resolved:?}")));
+    // Applied frame carrying a business conflict.
+    let conflict = ulid::Ulid::new().to_string();
+    let attempt = apply(&own, &conflict, &accepted, "0");
+    let outcome = classify(&attempt, Some(&await_receipt(&own, &conflict)));
+    assert_eq!(outcome, GraphOutcome::Conflict);
+    seen.push(("applied+conflict", format!("{outcome:?}")));
+    // Changed payload under an existing request identity.
+    let outcome = classify(&apply(&own, &accepted, &accepted, "1"), None);
+    assert_eq!(outcome, GraphOutcome::Mismatch);
+    seen.push(("binding+changed-payload", format!("{outcome:?}")));
+    // Backstop validator refusal is terminal and stays terminal on retry.
+    let refused = ulid::Ulid::new().to_string();
+    for _ in 0..2 {
+        let outcome = classify(&apply(&own, &refused, &technical, "0"), None);
+        assert_eq!(
+            outcome,
+            GraphOutcome::TechnicalRefusal("kg.event_group".into())
+        );
+        seen.push(("rejected/technical", format!("{outcome:?}")));
+    }
+    // Response lost after the server committed: pending with the same id, then retry resolves.
+    let lost = ulid::Ulid::new().to_string();
+    let id = ulid::Ulid::new().to_string();
+    let outcome = classify(&apply(&dropping, &lost, &id, "0"), None);
+    assert!(matches!(outcome, GraphOutcome::Pending(_)), "{outcome:?}");
+    seen.push(("disconnect", format!("{outcome:?}")));
+    let retry = apply(&own, &lost, &id, "0");
+    assert!(
+        retry.as_ref().is_ok_and(|result| result.cached),
+        "{retry:?}"
+    );
+    let outcome = classify(&retry, Some(&await_receipt(&own, &lost)));
+    assert!(matches!(outcome, GraphOutcome::Accepted { .. }));
+    seen.push(("cached-after-disconnect", format!("{outcome:?}")));
+    for (row, outcome) in &seen {
+        tracing::info!(row, outcome, "frame");
+        println!("KG1_NATIVE_FRAME {row} => {outcome}");
+    }
+    for replica in [own, peer, dropping] {
+        replica.close();
+        replica.join();
+    }
+}
+
+fn state_digest(state: &BTreeMap<String, Value>) -> String {
+    hex::encode(Sha256::digest(serde_jcs::to_vec(state).expect("state JCS")))
+}
+
+fn manifest(db: &Connection) -> u64 {
+    db.query_row("SELECT graph_seq FROM manifest WHERE id=1", [], |row| {
+        row.get(0)
+    })
+    .unwrap_or(0)
+}
+
+/// Two persistent replicas, each missing different tables at first, publish
+/// only complete prefixes. A parent process kills and restarts this one.
+#[test]
+#[ignore = "driven by the HQ prefix proof, which kills and restarts it"]
+fn native_replicas_publish_only_complete_prefixes() {
+    use std::io::Write;
+    let live = Live::from_env();
+    let dir = std::path::PathBuf::from(std::env::var("KEEPER_HQ_LIVE_STATE_DIR").expect("state"));
+    let target: u64 = std::env::var("KEEPER_HQ_LIVE_TARGET")
+        .expect("target")
+        .parse()
+        .expect("n");
+    let delay: u32 = std::env::var("KEEPER_HQ_LIVE_DELAY")
+        .expect("delay")
+        .parse()
+        .expect("rounds");
+    let staged: [&[&str]; 2] = [
+        &["kg_head", "kg_events", "kg_nodes", "kg_edges"],
+        &["kg_events", "kg_event_ops", "kg_nodes", "kg_edges"],
+    ];
+    let all = [
+        "kg_head",
+        "kg_events",
+        "kg_event_ops",
+        "kg_nodes",
+        "kg_edges",
+    ];
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("published.jsonl"))
+        .expect("log");
+    let full = |index: usize| dir.join(format!("full-{index}"));
+    let mut replicas: Vec<SyncularReplica> = (0..2)
+        .map(|index| {
+            let tables: &[&str] = if full(index).exists() {
+                &all
+            } else {
+                staged[index]
+            };
+            live.open(
+                index as u8 + 1,
+                &live.url,
+                &dir.join(format!("replica-{index}.sqlite")),
+                tables,
+            )
+        })
+        .collect();
+    let mut projections: Vec<Connection> = (0..2)
+        .map(|index| {
+            Connection::open(dir.join(format!("projection-{index}.sqlite"))).expect("projection")
+        })
+        .collect();
+    for db in &projections {
+        db.execute_batch("CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manifest(id INTEGER PRIMARY KEY, graph_seq INTEGER NOT NULL)").expect("schema");
+    }
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let mut round = 0u32;
+    loop {
+        round += 1;
+        let mut done = true;
+        for index in 0..2 {
+            let replica = &replicas[index];
+            replica.sync_now();
+            let rows = |table: &str| {
+                replica
+                    .query(&format!("SELECT * FROM {table}"), &[])
+                    .expect(table)
+            };
+            let head = rows("kg_head")
+                .first()
+                .map(|row| number(row, "graph_seq").expect("head"))
+                .unwrap_or(0);
+            let (at, state) = prefix(head, &rows("kg_events"), &rows("kg_event_ops"))
+                .expect("observed prefix is never corrupt");
+            let published = manifest(&projections[index]);
+            if at > published {
+                publish(&mut projections[index], at, &state, false);
+                writeln!(
+                    log,
+                    "{}",
+                    json!({"replica":index,"n":at,"digest":state_digest(&state)})
+                )
+                .expect("log");
+            } else if head > at || (head == 0 && !full(index).exists()) {
+                writeln!(
+                    log,
+                    "{}",
+                    json!({"replica":index,"stale":true,"head":head,"complete":at})
+                )
+                .expect("log");
+            }
+            done &= manifest(&projections[index]) >= target;
+            if round == delay && !full(index).exists() {
+                std::fs::write(full(index), b"1").expect("marker");
+            }
+        }
+        if round == delay {
+            // Delayed bootstrap of the missing tables: reopen the same persistent files.
+            for replica in replicas.drain(..) {
+                replica.close();
+                replica.join();
+            }
+            replicas = (0..2)
+                .map(|index| {
+                    live.open(
+                        index as u8 + 1,
+                        &live.url,
+                        &dir.join(format!("replica-{index}.sqlite")),
+                        &all,
+                    )
+                })
+                .collect();
+        }
+        if done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replicas did not publish the target prefix"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    projections.clear();
     for replica in replicas {
         replica.close();
         replica.join();
