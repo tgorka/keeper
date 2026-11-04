@@ -70,8 +70,8 @@ def text(path):
 
 def run(*command):
     try:
-        return subprocess.run(command, capture_output=True, text=True).stdout.strip()
-    except OSError:
+        return subprocess.run(command, capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -293,55 +293,75 @@ def jail(*command):
             'sh', '-c', script, 'sh', ROOT, '/usr/bin/env', '-i', PATH, 'HOME=/bundle'] + list(command)
 
 
+def bounded(command, timeout=30, check=True):
+    """Every controller helper is time-bounded; a hang or failure is an error, not a pass."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f'{command} exceeded {timeout}s') from error
+    if check and result.returncode != 0:
+        raise RuntimeError(f'{command} failed ({result.returncode}): {result.stderr.strip()[-300:]}')
+    return result
+
+
+def scope_gone(unit, timeout=30):
+    """Kill a transient scope's whole cgroup and wait until systemd reports it gone."""
+    kill = bounded(['sudo', '-n', 'systemctl', 'kill', '--signal=SIGKILL', f'{unit}.scope'], check=False)
+    end = time.monotonic() + timeout
+    state = None
+    while time.monotonic() < end:
+        state = bounded(['systemctl', 'show', '-p', 'ActiveState', '-p', 'ControlGroup', '--value', f'{unit}.scope'], check=False).stdout.split()
+        if not state or state[0] in ('inactive', 'failed') and len(state) == 1:
+            return {'kill_exit': kill.returncode, 'state': state, 'gone': True}
+        time.sleep(0.5)
+    return {'kill_exit': kill.returncode, 'state': state, 'gone': False}
+
+
 def reference(directory):
+    sys.path.insert(0, HERE)
+    import kg1_reference_monitor as monitor
     os.makedirs(directory, exist_ok=True)
     if preflight(directory) != 0:
         return 3
     unit = f'kg1-1101-reference-{os.getpid()}'
     inside = chrooted(directory)
+    heartbeat = os.path.join(directory, 'heartbeat.json')
     command = ['sudo', '-n', 'systemd-run', '--scope', '--quiet', f'--unit={unit}',
                '-p', 'AllowedCPUs=0-3', '-p', 'CPUQuota=400%', '-p', 'MemoryMax=8G', '-p', 'MemorySwapMax=0', '--'] + \
         jail('/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'inner', inside)
     started = time.time()
-    process = subprocess.run(command)
-    write(os.path.join(directory, 'outer.json'), {'command': command, 'unit': unit, 'exit': process.returncode,
-                                                  'elapsed_s': round(time.time() - started, 1)})
+    process = subprocess.Popen(command, start_new_session=True)
+    # Independent of the monitor inside the scope: a stalled or dead monitor (heartbeat
+    # not advancing for 15 s, longer than its 10 s bounded cleanup) or a signal to this
+    # process kills the whole scope cgroup.
+    events = monitor.watch(process, heartbeat, lambda: scope_gone(unit), stall_s=15.0)
+    after = scope_gone(unit)
+    outer = {'command': command, 'unit': unit, 'exit': process.returncode, 'watchdog_events': events,
+             'scope_after': after, 'elapsed_s': round(time.time() - started, 1)}
+    write(os.path.join(directory, 'outer.json'), outer)
+    if events or not after['gone']:
+        print(json.dumps({'reference': 'MONITOR_INVALID', 'watchdog_events': events, 'scope_after': after}))
+        return 7
     return process.returncode
 
 
 # --------------------------------------------------------- inside the scope and chroot
 
 def scope_topology(cgroup):
-    """The verified dedicated scope and every ancestor's restriction (none tighter)."""
-    problems, ancestors = [], []
+    """The verified dedicated scope and every ancestor's restriction (none tighter, none
+    empty or malformed)."""
+    sys.path.insert(0, HERE)
+    import kg1_reference_monitor as monitor
+    problems = []
     if not os.path.basename(cgroup).startswith('kg1-1101-reference-') or not cgroup.endswith('.scope'):
         problems.append(f'not the dedicated kg1 reference scope: {cgroup}')
-    node = os.path.dirname(cgroup)
-    while node.startswith('/sys/fs/cgroup') and node != '/sys/fs/cgroup':
-        entry = {name: text(os.path.join(node, name)) for name in ('memory.max', 'memory.swap.max', 'cpu.max', 'cpuset.cpus.effective')}
-        ancestors.append({'path': node, **entry})
-        memory = entry['memory.max']
-        if memory != 'max' and (not memory.isdigit() or int(memory) < 8 * 1024 ** 3):
-            problems.append(f'ancestor {node} memory.max {memory} is tighter than 8 GiB')
-        quota = entry['cpu.max'].split()
-        if entry['cpu.max'].startswith('unreadable') or (quota and quota[0] != 'max' and int(quota[0]) * 100000 < 400000 * int(quota[1])):
-            problems.append(f'ancestor {node} cpu.max {entry["cpu.max"]} is tighter than 400%')
-        cpus = entry['cpuset.cpus.effective']
-        if cpus.startswith('unreadable') or not {0, 1, 2, 3} <= expand_cpus(cpus):
-            problems.append(f'ancestor {node} cpuset {cpus} does not include 0-3')
-        node = os.path.dirname(node)
+    try:
+        ancestors = monitor.ancestors(cgroup, read=lambda p: text(p))
+    except monitor.Invalid as error:
+        return [], problems + [f'ancestors unreadable: {error}']
+    for entry in ancestors:
+        problems += monitor.ancestor_problems(entry)
     return ancestors, problems
-
-
-def expand_cpus(spec):
-    cpus = set()
-    for part in spec.split(','):
-        if '-' in part:
-            low, high = part.split('-')
-            cpus.update(range(int(low), int(high) + 1))
-        elif part:
-            cpus.add(int(part))
-    return cpus
 
 
 def auxv():
@@ -396,7 +416,8 @@ def inner(directory):
         result = monitor.run_monitored(
             [sys.executable, os.path.join(BUNDLE, 'scripts', 'graph-proof.py'), os.path.join(BUNDLE, 'target', 'graph-worker'),
              scratch, '--benchmark'], os.path.join(directory, 'samples.jsonl'), lambda: monitor.collect(cgroup),
-            env=env, stdout=stdout, stderr=stderr, preexec_fn=soft_stack, self_pid=os.getpid())
+            env=env, stdout=stdout, stderr=stderr, preexec_fn=soft_stack, self_pid=os.getpid(),
+            members=lambda: monitor.scope_members(cgroup), heartbeat_path=os.path.join(directory, 'heartbeat.json'))
     shutil.rmtree(scratch, ignore_errors=True)
     record['monitor'] = result
     write(os.path.join(directory, 'reference.json'), record)
@@ -411,8 +432,12 @@ STACK_GUARD = 'test "$(ulimit -H -s)" = unlimited || exit 97; ulimit -S -s 8192 
 
 def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120):
     """P6c preload refusal controller. `root`/`driver_command` are overridable only for
-    the local self-test; the real cases use ROOT and the bundled driver."""
-    import selectors
+    the local self-test (the driver then runs as a tracked child of this subreaper); the
+    real cases run the bundled driver inside its own transient systemd scope, so the whole
+    tree, setsid descendants included, is killed and verified gone through its cgroup."""
+    import select
+    sys.path.insert(0, HERE)
+    import kg1_reference_monitor as monitor
     root = root or ROOT
     os.makedirs(directory, exist_ok=True)
     etc = os.path.join(root, 'etc') if in_chroot else '/etc'
@@ -424,11 +449,6 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
     privileged = [] if in_chroot else ['sudo', '-n']
     saved_mode = os.stat(etc).st_mode & 0o7777
 
-    def must(command):
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f'{command} failed: {result.stderr.strip()}')
-
     def absent_and_restored():
         return not os.path.lexists(path) and os.stat(etc).st_mode & 0o7777 == saved_mode
 
@@ -436,54 +456,80 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
         if os.stat(etc).st_mode & 0o7777 != saved_mode:
             os.chmod(etc, saved_mode)
         if os.path.lexists(path):
-            subprocess.run(privileged + ['rm', '-f', path])
-    variants = {'empty-file': lambda: must(privileged + ['install', '-m', '0644', '/dev/null', path]),
-                'dangling-symlink': lambda: must(privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path])}
+            bounded(privileged + ['rm', '-f', path])
+        if not absent_and_restored():
+            raise RuntimeError('restoration not verified')
+    variants = {'empty-file': lambda: bounded(privileged + ['install', '-m', '0644', '/dev/null', path]),
+                'dangling-symlink': lambda: bounded(privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path])}
     if in_chroot:
         # EACCES: remove every search bit from the private rootfs /etc only (never the
         # host /etc); the non-root, capability-free supervisor then fails the lookup.
         variants['unsearchable-etc'] = lambda: os.chmod(etc, saved_mode & ~0o111)
     driver_args = ['preload', os.path.join(BUNDLE, 'feature-off', 'keeper-graph-query'), os.path.join(directory, 'scratch')] + list(variants)
     driver = os.path.join(BUNDLE, 'target', 'graph-worker', 'keeper-graph-driver')
+    unit = None
     if driver_command is not None:
         command = driver_command + list(variants)
-    elif in_chroot:
-        command = ['sudo', '-n'] + jail('sh', '-c', STACK_GUARD, 'sh', chrooted(driver)) + \
-            [chrooted(a) if a.startswith(BUNDLE) else a for a in driver_args]
+        monitor.become_subreaper()
     else:
-        command = ['sh', '-c', STACK_GUARD, 'sh', driver] + driver_args
-    log, failure = [], None
+        unit = f'kg1-1101-preload-{"chroot" if in_chroot else "host"}-{os.getpid()}'
+        scope = ['sudo', '-n', 'systemd-run', '--scope', '--quiet', f'--unit={unit}', '--']
+        if in_chroot:
+            command = scope + jail('sh', '-c', STACK_GUARD, 'sh', chrooted(driver)) + \
+                [chrooted(a) if a.startswith(BUNDLE) else a for a in driver_args]
+        else:
+            command = scope + ['setpriv', f'--reuid={os.getuid()}', f'--regid={os.getgid()}', '--init-groups',
+                               'sh', '-c', STACK_GUARD, 'sh', driver] + driver_args
+    log, failure, restore_failure, cleanup = [], None, None, None
     stderr_file = open(os.path.join(directory, 'driver.stderr'), 'w')
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, text=True,
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file,
                                start_new_session=True)
+    fd = process.stdout.fileno()
+    os.set_blocking(fd, False)
+    buffer = bytearray()
+
+    def next_record(deadline):
+        """One complete newline-framed record by the deadline; a partial line, a stall or
+        EOF mid-record is an error. Never blocks past the deadline."""
+        while b'\n' not in buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'driver record not complete within {timeout_s}s (partial: {bytes(buffer[:80])!r})')
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if buffer:
+                    raise RuntimeError(f'driver closed stdout mid-record: {bytes(buffer[:80])!r}')
+                return None
+            buffer.extend(chunk)
+        line, _, rest = bytes(buffer).partition(b'\n')
+        buffer[:] = rest
+        return line.decode()
 
     def kill_tree():
-        if process.poll() is None:
-            if command[:2] == ['sudo', '-n']:
-                subprocess.run(['sudo', '-n', 'kill', '-KILL', '--', f'-{process.pid}'])
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            pass
+        if unit is not None:
+            state = scope_gone(unit)
+            leftovers = [p for p in monitor.descendants(os.getpid()) if monitor._alive(p)]
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                return {'verified': False, 'scope': state, 'leader': 'not reaped', 'descendants': leftovers}
+            return {'verified': state['gone'] and not leftovers, 'scope': state, 'descendants': leftovers}
+        signalled, errors, remaining = monitor.kill_all(process)
+        return {'verified': not errors and not remaining, 'signalled': signalled, 'errors': errors, 'remaining': remaining}
 
-    def on_signal(*_):
-        raise KeyboardInterrupt('signal')
+    def on_signal(signum, _frame):
+        raise monitor.Stop(f'signal {signum}')
     previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
     try:
-        deadline = time.monotonic() + timeout_s
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not selector.select(timeout=remaining):
-                raise TimeoutError(f'driver handshake exceeded {timeout_s}s')
-            line = process.stdout.readline()
-            if not line:
+            line = next_record(time.monotonic() + timeout_s)
+            if line is None:
                 break
             if not line.startswith('{'):
                 continue
@@ -498,33 +544,350 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
                             'stat': run('stat', '-c', '%F %s %N', path) if variant != 'unsearchable-etc' else None})
             else:
                 restore()
-                if not absent_and_restored():
-                    raise RuntimeError(f'restoration after {variant} not verified')
                 log.append({'runner': 'restored', 'variant': variant, 'absent': True, 'etc_mode': oct(saved_mode)})
-            process.stdin.write('ready\n')
+            process.stdin.write(b'ready\n')
             process.stdin.flush()
-            deadline = time.monotonic() + timeout_s
         process.wait(timeout=timeout_s)
     except BaseException as error:
         failure = repr(error)
     finally:
-        restore()
-        kill_tree()
-        selector.close()
-        stderr_file.close()
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+        for sig in previous:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            try:
+                restore()
+            except BaseException as error:
+                restore_failure = repr(error)
+        finally:
+            try:
+                cleanup = kill_tree()
+            except BaseException as error:
+                cleanup = {'verified': False, 'error': repr(error)}
+            finally:
+                stderr_file.close()
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
     restored = absent_and_restored()
     shutil.rmtree(os.path.join(directory, 'scratch'), ignore_errors=True)
-    ok = failure is None and process.returncode == 0 and restored and any(r.get('complete') for r in log)
+    ok = (failure is None and restore_failure is None and restored and cleanup['verified']
+          and process.returncode == 0 and any(r.get('complete') for r in log))
     write(os.path.join(directory, 'preload.json'), {'where': 'pinned rootfs (chroot)' if in_chroot else 'host /etc (host libc)',
-                                                    'path': path, 'command': command, 'driver_exit': process.returncode,
-                                                    'failure': failure, 'records': log,
+                                                    'path': path, 'command': command, 'unit': unit, 'driver_exit': process.returncode,
+                                                    'failure': failure, 'restore_failure': restore_failure, 'cleanup': cleanup,
+                                                    'records': log,
                                                     'stderr_tail': open(os.path.join(directory, 'driver.stderr')).read()[-800:],
                                                     'preload_absent_and_etc_mode_restored': restored, 'pass': ok})
     print(json.dumps({'preload': 'PASS' if ok else 'FAIL', 'where': path, 'driver_exit': process.returncode,
-                      'failure': failure, 'restored': restored}))
+                      'failure': failure, 'restore_failure': restore_failure, 'cleanup_verified': cleanup['verified'],
+                      'restored': restored}))
     return 0 if ok else 1
+
+OLD_COMMIT = '82d456086939a75a5801f136a4a27387c4624f08'
+
+
+def _live(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
+    except OSError:
+        return False
+
+
+def _kill_pids(pids):
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def round14_gaps(directory, m, base_sample, series, results, fake_driver):
+    """Round-13 review gaps R13-2..R13-5, each with a negative control showing that the
+    round-13 code (commit 82d45608, extracted with git) does not catch it."""
+    import importlib.util
+    old_dir = os.path.join(directory, 'old')
+    os.makedirs(old_dir, exist_ok=True)
+    for name in ('kg1_reference_monitor.py', 'graph-reference-run.py'):
+        with open(os.path.join(old_dir, name), 'w') as f:
+            f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{OLD_COMMIT}:scripts/{name}']).stdout)
+
+    def load(name, path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    old_m = load('old_kg1_monitor', os.path.join(old_dir, 'kg1_reference_monitor.py'))
+
+    def record(name, new_caught, old_caught, **detail):
+        results[f'r14:{name}'] = dict(detail, new_catches=new_caught, old_catches=old_caught,
+                                      pass_=None, **{'pass': bool(new_caught) and not old_caught})
+
+    def old_base(t):
+        s = base_sample(t)
+        s['cpu_stat'] = {'usage_usec': 0}
+        return s
+
+    def feed(predicate_cls, samples):
+        p = predicate_cls(self_pid=100)
+        for s in samples:
+            r = p.observe(s)
+            if r:
+                return r[0]
+        return None
+    # R13-3: the final snapshot goes through the predicate. The mutation applies only to
+    # the final collection: both monitors bind `final = None` just before it, so the
+    # caller's frame tells the final call apart from loop samples.
+    for name, final_mutation, expected in (
+            ('final_snapshot_breach', lambda s: s['events'].update(oom_kill=1), 'MEMORY_STARVED'),
+            ('final_snapshot_gap', lambda s: s.update(t=s['t'] + 2.0), 'MONITOR_INVALID'),
+            ('final_snapshot_regression', lambda s: s['host_stat']['cpu'].__setitem__(0, 0), 'MONITOR_INVALID')):
+        outcome = {}
+        for label, module, mk in (('new', m, base_sample), ('old', old_m, old_base)):
+            state = {'n': 0}
+
+            def collect(mk=mk, state=state):
+                state['n'] += 1
+                s = mk(time.monotonic())
+                s['procs'] = [os.getpid()]
+                for c in s['host_stat']:
+                    s['host_stat'][c] = [state['n'] * 100, 0, 0, state['n'] * 100, 0, 0, 0, 0]
+                if 'final' in sys._getframe(1).f_locals:
+                    final_mutation(s)
+                return s
+            r = module.run_monitored(['sh', '-c', 'exit 0'], os.path.join(directory, f'{name}-{label}.jsonl'), collect,
+                                     baseline_s=0.5, self_pid=os.getpid())
+            outcome[label] = r['verdict']
+        record(name, outcome['new'] == expected, outcome['old'] != 'PASS', outcome=outcome, expected=expected)
+    # R13-5: strict telemetry parsing.
+    parse_cases = (
+        ('psi_nan', lambda mod: mod.parse_psi('some avg10=nan avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n', 'psi')),
+        ('psi_infinite', lambda mod: mod.parse_psi('some avg10=inf avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n', 'psi')),
+        ('psi_negative_total', lambda mod: mod.parse_psi('some avg10=0 avg60=0 avg300=0 total=-5\nfull avg10=0 avg60=0 avg300=0 total=0\n', 'psi')),
+        ('psi_duplicate_line', lambda mod: mod.parse_psi('some avg10=0 avg60=0 avg300=0 total=0\nsome avg10=9 avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n', 'psi')),
+        ('events_negative', lambda mod: mod.parse_keyed('oom -1\noom_kill 0\noom_group_kill 0\nmax 0\nhigh 0\n', 'events', mod.EVENT_KEYS)),
+        ('events_duplicate', lambda mod: mod.parse_keyed('oom 0\noom 3\noom_kill 0\noom_group_kill 0\nmax 0\nhigh 0\n', 'events', mod.EVENT_KEYS)),
+        ('meminfo_wrong_unit', lambda mod: mod.parse_meminfo('MemTotal: 8 MB\nMemAvailable: 3 MB\nSwapFree: 1 MB\n')),
+        ('cpu_stat_missing_throttling', lambda mod: mod.parse_keyed('usage_usec 10\nuser_usec 5\nsystem_usec 5\n', 'cpu.stat',
+                                                                     getattr(mod, 'CPU_STAT_KEYS', ('usage_usec',)))),
+    )
+    for name, call in parse_cases:
+        caught = {}
+        for label, module in (('new', m), ('old', old_m)):
+            try:
+                call(module)
+                caught[label] = False
+            except module.Invalid:
+                caught[label] = True
+        record(name, caught['new'], caught['old'])
+    # R13-5: empty or malformed ancestor cpu.max must not count as verified.
+    old_run = load('old_graph_reference_run', os.path.join(old_dir, 'graph-reference-run.py'))
+    fake = {'/sys/fs/cgroup/system.slice/memory.max': 'max', '/sys/fs/cgroup/system.slice/memory.swap.max': 'max',
+            '/sys/fs/cgroup/system.slice/cpu.max': '', '/sys/fs/cgroup/system.slice/cpuset.cpus.effective': '0-7'}
+    cg = '/sys/fs/cgroup/system.slice/kg1-1101-reference-1.scope'
+    old_text = old_run.text
+    old_run.text = lambda p: fake.get(p, 'unreadable')
+    try:
+        _, old_problems = old_run.scope_topology(cg)
+    finally:
+        old_run.text = old_text
+    new_problems = m.ancestor_problems({'path': '/sys/fs/cgroup/system.slice', **{k.rsplit('/', 1)[1]: v for k, v in fake.items()}})
+    record('ancestor_empty_cpu_max', bool(new_problems), bool(old_problems), new=new_problems, old=old_problems)
+    # R13-5: ongoing topology, membership, fresh local counters and complete counter checks.
+    def mutate_after(fn, after=2.0):
+        def mutate(s, t):
+            if t > after:
+                fn(s)
+        return mutate
+    seq_cases = (
+        ('ancestor_tightened_mid_run', mutate_after(lambda s: s['ancestors'][0].update({'memory.max': str(4 * 1024 ** 3)}))),
+        ('ancestor_changed_mid_run', mutate_after(lambda s: s['ancestors'][0].update({'cpuset.cpus.effective': '0-5'}))),
+        ('affinity_changed_mid_run', mutate_after(lambda s: s.update(affinity=[0, 1]))),
+        ('member_outside_monitored_tree', mutate_after(lambda s: s.update(procs=[100, 555]))),
+        ('initial_local_events_not_fresh', lambda s, t: s['events_local'].update(max=2)),
+        ('throttled_counter_regression', lambda s, t: s['cpu_stat'].update(nr_throttled=5 if t < 2 else 1)),
+        ('memory_peak_regression', lambda s, t: s.update(memory_peak=900 if t < 2 else 800)),
+    )
+    for name, mutation in seq_cases:
+        new_v = feed(m.Predicate, series(4, mutation))
+        old_samples = series(4, mutation)
+        old_v = feed(old_m.Predicate, old_samples)
+        record(name, new_v == 'MONITOR_INVALID', old_v is not None, new=new_v, old=old_v)
+    # R13-4: cleanup when the leader has exited leaving a setsid orphan (fresh processes
+    # so the old run is not helped by this process's subreaper bit).
+    script = os.path.join(directory, 'cleanup_probe.py')
+    with open(script, 'w') as f:
+        f.write(r'''import importlib.util, json, os, signal, sys, threading, time
+path, mode, pids_file, case = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+spec = importlib.util.spec_from_file_location('mon', path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+state = {'n': 0}
+def sample():
+    state['n'] += 1
+    psi = lambda: {'avg10': 0.0, 'avg60': 0.0, 'avg300': 0.0, 'total': 0}
+    s = {'t': time.monotonic(), 'wall': 0, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [os.getpid()], 'descendants': [],
+         'ancestors': [], 'affinity': [0, 1, 2, 3],
+         'events': {k: 0 for k in m.EVENT_KEYS}, 'events_local': {k: 0 for k in m.EVENT_KEYS},
+         'swap_current': 0, 'swap_peak': 0, 'swap_events': {k: 0 for k in m.SWAP_EVENT_KEYS}, 'memory_current': 1, 'memory_peak': 1,
+         'scope_mem_psi': {'some': psi(), 'full': psi()}, 'scope_cpu_psi': {'some': psi()},
+         'cpu_stat': {k: 0 for k in getattr(m, 'CPU_STAT_KEYS', ('usage_usec',))}, 'host_mem_available': 3 << 30, 'host_swap_free': 1,
+         'host_mem_psi': {'some': psi(), 'full': psi()}, 'host_io_psi': {'some': psi(), 'full': psi()}, 'host_cpu_psi': {'some': psi()},
+         'host_stat': {c: [state['n'] * 100, 0, 0, state['n'] * 100, 0, 0, 0, 0] for c in ('cpu',) + m.ASSIGNED_CPUS},
+         'host_pswpin': 0, 'host_pswpout': 0}
+    if case in ('orphan', 'detached', 'permission') and state['n'] > 12:
+        s['events']['oom_kill'] = 1
+    if case == 'detached' and state['n'] > 8:
+        raise m.Invalid('memory.pressure: empty')
+    return s
+detached = []
+if case == 'detached':
+    # A member not descended from this process: double fork via a fresh session.
+    os.system(f'setsid sh -c "sleep 300 & echo \\$! >> {pids_file}" < /dev/null > /dev/null 2>&1')
+    time.sleep(0.3)
+    detached = [int(x) for x in open(pids_file).read().split()]
+if case == 'orphan':
+    proof = ['sh', '-c', f'setsid sleep 300 & echo $! >> {pids_file}; exit 0']
+else:
+    proof = ['sleep', '300']
+if case == 'signal':
+    threading.Timer(2.0, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    proof = ['sh', '-c', f'sleep 300 & echo $! >> {pids_file}; wait']
+kwargs = dict(baseline_s=0.5, self_pid=os.getpid())
+if mode == 'new':
+    kwargs['members'] = (lambda: detached)
+    if case == 'permission':
+        kwargs['members'] = (lambda: [1])
+r = m.run_monitored(proof, pids_file + '.jsonl', sample, **kwargs)
+print(json.dumps({'verdict': r['verdict'], 'cleanup': r.get('cleanup'), 'latched': r.get('latched')}), flush=True)
+''')
+    new_path = os.path.join(HERE, 'kg1_reference_monitor.py')
+    old_path = os.path.join(old_dir, 'kg1_reference_monitor.py')
+    for case in ('orphan', 'detached', 'signal', 'permission'):
+        observed = {}
+        for label, path in (('new', new_path), ('old', old_path)):
+            pids_file = os.path.join(directory, f'{case}-{label}.pids')
+            open(pids_file, 'w').close()
+            try:
+                proc = subprocess.run([sys.executable, script, path, label, pids_file, case], capture_output=True, text=True,
+                                      timeout=60, start_new_session=True)
+                out = [json.loads(l) for l in proc.stdout.splitlines() if l.startswith('{')]
+                verdict_out = out[-1] if out else {'exit': proc.returncode, 'stderr': proc.stderr[-300:]}
+            except subprocess.TimeoutExpired:
+                verdict_out = {'timeout': True}
+            time.sleep(0.3)
+            pids = [int(x) for x in open(pids_file).read().split()]
+            alive = [p for p in pids if _live(p)]
+            _kill_pids(alive)
+            observed[label] = {'result': verdict_out, 'spawned': pids, 'alive_after': alive}
+        new = observed['new']
+        if case == 'permission':
+            # A member that cannot be removed (pid 1: EPERM, or ignored SIGKILL inside a pid
+            # namespace): the new monitor enforces absence and reports unverified cleanup;
+            # the old one reported nothing about cleanup.
+            cleanup_report = new['result'].get('cleanup') or {}
+            new_ok = new['result'].get('verdict') == 'MEMORY_STARVED' and cleanup_report.get('verified') is False \
+                and (1 in cleanup_report.get('remaining', []) or any('kill 1' in e for e in cleanup_report.get('errors', []))) \
+                and new['result']['latched'].get('cleanup_unverified')
+            old_ok = bool((observed['old']['result'].get('cleanup') or {}).get('errors'))
+        elif case == 'signal':
+            new_ok = new['result'].get('verdict') == 'MONITOR_INVALID' and new['spawned'] and not new['alive_after'] \
+                and new['result']['cleanup']['verified']
+            old_ok = bool(observed['old']['result'].get('verdict')) and not observed['old']['alive_after']
+        else:
+            new_ok = new['result'].get('verdict') in ('MEMORY_STARVED', 'MONITOR_INVALID') and new['spawned'] \
+                and not new['alive_after'] and new['result']['cleanup']['verified']
+            old_ok = bool(observed['old']['spawned']) and not observed['old']['alive_after']
+        record(f'cleanup_{case}', new_ok, old_ok, observed=observed)
+    # R13-4: independent watchdog kills a stalled monitor; a live one is left alone.
+    fake_inner = os.path.join(directory, 'fake_inner.py')
+    with open(fake_inner, 'w') as f:
+        f.write('import json, os, sys, time\nhb, beats = sys.argv[1], int(sys.argv[2])\n'
+                'for n in range(beats):\n'
+                '    open(hb + ".tmp", "w").write(json.dumps({"seq": n + 1})); os.replace(hb + ".tmp", hb); time.sleep(0.2)\n'
+                'time.sleep(300 if beats < 20 else 0)\n')
+    for label, beats, expect_kill in (('stalled_monitor_killed', 5, True), ('live_monitor_left_alone', 20, False)):
+        hb = os.path.join(directory, f'{label}.heartbeat')
+        p = subprocess.Popen([sys.executable, fake_inner, hb, str(beats)], start_new_session=True)
+        started = time.monotonic()
+        events = m.watch(p, hb, lambda p=p: (os.killpg(p.pid, signal.SIGKILL), 'killed')[1], stall_s=1.5, poll_s=0.2)
+        killed = any(e['event'] == 'watchdog_kill' for e in events)
+        results[f'r14:watchdog_{label}'] = {'events': events, 'elapsed_s': round(time.monotonic() - started, 1),
+                                            'pass': killed == expect_kill and p.poll() is not None,
+                                            'old': 'round-13 reference() had no watchdog (blocking subprocess.run)'}
+    # R13-2: controller failure paths, new versus old preload.
+    driver = os.path.join(directory, 'fault_driver.py')
+    with open(driver, 'w') as f:
+        f.write(r'''import json, os, subprocess, sys, time
+etc, mode, pids = sys.argv[1], sys.argv[2], sys.argv[3]
+open(pids, 'a').write('%d\n' % os.getpid())
+if mode == 'partial':
+    sys.stdout.write('{"await": "pres'); sys.stdout.flush(); time.sleep(300)
+if mode == 'orphan':
+    c = subprocess.Popen(['setsid', 'sleep', '300']); open(pids, 'a').write('%d\n' % c.pid)
+    print(json.dumps({'await': 'present', 'variant': 'empty-file'}), flush=True); time.sleep(0.5); sys.exit(5)
+if mode == 'restore':
+    print(json.dumps({'await': 'present', 'variant': 'unsearchable-etc'}), flush=True)
+    sys.stdin.readline()
+    print(json.dumps({'await': 'absent', 'variant': 'unsearchable-etc'}), flush=True)
+    time.sleep(300)
+''')
+    harness = os.path.join(directory, 'controller_probe.py')
+    with open(harness, 'w') as f:
+        f.write(r'''import importlib.util, json, os, sys
+runner, root, out, mode, pids, fault = sys.argv[1:7]
+spec = importlib.util.spec_from_file_location('runner', runner); r = importlib.util.module_from_spec(spec); spec.loader.exec_module(r)
+etc = os.path.join(root, 'etc')
+if fault == 'chmod':
+    real = os.chmod; calls = {'n': 0}
+    def failing(path, mode_, *a, **k):
+        calls['n'] += 1
+        if calls['n'] > 1 and os.path.abspath(path) == os.path.abspath(etc):
+            raise PermissionError('injected restore failure')
+        return real(path, mode_, *a, **k)
+    os.chmod = failing
+code = r.preload(out, True, root=root, driver_command=[sys.executable, sys.argv[7], etc, mode, pids], timeout_s=3)
+print(json.dumps({'exit': code}), flush=True)
+''')
+    old_runner = os.path.join(old_dir, 'graph-reference-run.py')
+    for case, mode, fault in (('partial_line_stall', 'partial', 'none'), ('restore_exception', 'restore', 'chmod'),
+                              ('exited_leader_setsid_orphan', 'orphan', 'none')):
+        observed = {}
+        for label, runner_path in (('new', os.path.abspath(__file__)), ('old', old_runner)):
+            root = os.path.join(directory, f'ctl-{case}-{label}')
+            os.makedirs(os.path.join(root, 'etc'))
+            os.chmod(os.path.join(root, 'etc'), 0o755)
+            pids = os.path.join(directory, f'ctl-{case}-{label}.pids')
+            open(pids, 'w').close()
+            out_dir = os.path.join(directory, f'ctl-{case}-{label}-out')
+            started = time.monotonic()
+            try:
+                proc = subprocess.run([sys.executable, harness, runner_path, root, out_dir, mode, pids, fault, driver],
+                                      capture_output=True, text=True, timeout=25, start_new_session=True)
+                finished = {'exit': proc.returncode, 'stdout': proc.stdout[-300:]}
+            except subprocess.TimeoutExpired:
+                finished = {'timeout_after_s': 25}
+            elapsed = round(time.monotonic() - started, 1)
+            time.sleep(0.3)
+            spawned = [int(x) for x in open(pids).read().split()]
+            alive = [p for p in spawned if _live(p)]
+            _kill_pids(alive)
+            etc = os.path.join(root, 'etc')
+            mode_after = oct(os.stat(etc).st_mode & 0o7777)
+            os.chmod(etc, 0o755)
+            record_path = os.path.join(out_dir, 'preload.json')
+            rec = json.load(open(record_path)) if os.path.exists(record_path) else None
+            observed[label] = {'finished': finished, 'elapsed_s': elapsed, 'spawned': spawned, 'alive_after': alive,
+                               'etc_mode_after': mode_after,
+                               'record': {k: rec.get(k) for k in ('failure', 'restore_failure', 'cleanup', 'pass')} if rec else None}
+            shutil.rmtree(root)
+        new = observed['new']
+        new_ok = 'exit' in new['finished'] and new['record'] is not None and new['record']['pass'] is False \
+            and not new['alive_after'] and new['record']['cleanup'] and new['record']['cleanup'].get('verified') \
+            and (new['etc_mode_after'] == '0o755' or case == 'restore_exception')
+        if case == 'restore_exception':
+            new_ok = new_ok and bool(new['record']['restore_failure'])
+        old = observed['old']
+        old_ok = 'exit' in old['finished'] and not old['alive_after']
+        record(case, new_ok, old_ok, observed=observed)
+
 
 # ------------------------------------------------------------------ local self-test
 
@@ -540,12 +903,14 @@ def selftest(directory):
 
     def base_sample(t):
         psi = lambda: {'avg10': 0.0, 'avg60': 0.0, 'avg300': 0.0, 'total': 0}
-        return {'t': t, 'wall': t, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [100],
+        return {'t': t, 'wall': t, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [100], 'descendants': [],
+                'ancestors': [{'path': '/sys/fs/cgroup/system.slice', 'memory.max': 'max', 'memory.swap.max': 'max',
+                               'cpu.max': 'max 100000', 'cpuset.cpus.effective': '0-7'}], 'affinity': [0, 1, 2, 3],
                 'events': {k: 0 for k in m.EVENT_KEYS + ('low',)}, 'events_local': {k: 0 for k in m.EVENT_KEYS + ('low',)},
                 'swap_current': 0, 'swap_peak': 0, 'swap_events': {k: 0 for k in m.SWAP_EVENT_KEYS},
                 'memory_current': 1, 'memory_peak': 1,
                 'scope_mem_psi': {'some': psi(), 'full': psi()}, 'scope_cpu_psi': {'some': psi(), 'full': psi()},
-                'cpu_stat': {'usage_usec': 0}, 'host_mem_available': 3 * 1024 ** 3, 'host_swap_free': 1,
+                'cpu_stat': {k: 0 for k in m.CPU_STAT_KEYS}, 'host_mem_available': 3 * 1024 ** 3, 'host_swap_free': 1,
                 'host_mem_psi': {'some': psi(), 'full': psi()}, 'host_io_psi': {'some': psi(), 'full': psi()},
                 'host_cpu_psi': {'some': psi(), 'full': psi()},
                 'host_stat': {c: [0] * 8 for c in ('cpu',) + m.ASSIGNED_CPUS}, 'host_pswpin': 0, 'host_pswpout': 0}
@@ -679,9 +1044,9 @@ def selftest(directory):
             return False
     alive = [p for p in spawned if live(p)]
     results['cleanup:breach_kills_tree'] = {'verdict': r['verdict'], 'latched': r['latched'], 'spawned': spawned,
-                                            'alive_after': alive, 'leftover': r['leftover_descendants'],
+                                            'alive_after': alive, 'cleanup': r['cleanup'],
                                             'pass': r['verdict'] == 'MEMORY_STARVED' and len(spawned) == 3 and not alive
-                                            and not r['leftover_descendants']}
+                                            and r['cleanup']['verified']}
     calls = {'n': 0}
 
     def failing_collect():
@@ -692,8 +1057,8 @@ def selftest(directory):
     clock.update(n=0, breach_after=0)
     r = m.run_monitored(['sleep', '300'], os.path.join(directory, 'invalid.jsonl'), failing_collect, baseline_s=0.5,
                         self_pid=os.getpid())
-    results['cleanup:telemetry_loss_stops'] = {'verdict': r['verdict'], 'latched': r['latched'], 'leftover': r['leftover_descendants'],
-                                               'pass': r['verdict'] == 'MONITOR_INVALID' and not r['leftover_descendants']}
+    results['cleanup:telemetry_loss_stops'] = {'verdict': r['verdict'], 'latched': r['latched'], 'cleanup': r['cleanup'],
+                                               'pass': r['verdict'] == 'MONITOR_INVALID' and r['cleanup']['verified']}
     clock.update(n=0, breach_after=0)
     r = m.run_monitored(['sh', '-c', 'exit 0'], os.path.join(directory, 'pass.jsonl'), fake_collect, baseline_s=0.5, self_pid=os.getpid())
     results['cleanup:clean_run_passes'] = {'verdict': r['verdict'], 'pass': r['verdict'] == 'PASS'}
@@ -766,6 +1131,7 @@ print(json.dumps({'complete': True}), flush=True)
     changed = sorted(k for k in before if before[k] != after.get(k))
     results['topology:link_target_and_mode_drift_detected'] = {'changed': changed, 'pass': changed == ['lib', 'usr/lib/ld.so']}
     shutil.rmtree(root)
+    round14_gaps(directory, m, base_sample, series, results, fake_driver)
     failed = [k for k, v in results.items() if not v['pass']]
     write(os.path.join(directory, 'selftest.json'), {'predicate_version': m.PREDICATE_VERSION,
                                                      'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
