@@ -37,6 +37,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             keeper_graph_query::proof::enter();
             return Err("repeated entry survived".into());
         }
+        "panic-aborts" | "panic-unwinds" => {
+            // The worker's first statement, then a panic inside engine work: with the
+            // hook it must abort with no unwinding and no default-hook message; the
+            // `panic-unwinds` negative control omits the hook.
+            if mode == "panic-aborts" {
+                engine::abort_on_panic();
+            }
+            let _connection = engine::start(
+                std::path::Path::new(args.get(2).ok_or("projection path required")?),
+                false,
+            )?;
+            panic!("probe panic after engine start");
+        }
         "concurrent-entry" => {
             keeper_graph_query::proof::enter();
             let result = std::thread::spawn(keeper_graph_query::proof::enter).join();

@@ -137,6 +137,15 @@ case('missing_statement_cache_refused_every_role', refusals,
      all(v['exit'] != 0 and v['named'] for k, v in refusals.items() if k.startswith('probe_'))
      and all(v['exit'] == 74 and v['stdout_bytes'] == 0 for k, v in refusals.items() if k.startswith('worker_'))
      and refusals['worker_build']['db_bytes'] == 0)
+# The worker's first statement makes any panic abort from the hook: no unwinding
+# (libgcc never runs), no default-hook message or backtrace formatting. After Linux
+# confinement seccomp denies tgkill (EPERM), so glibc 2.43 abort() falls through to its
+# ABORT_INSTRUCTION (x86_64 hlt) and the kernel kills with SIGSEGV; macOS raises SIGABRT.
+r = run(['panic-aborts', generation], generation)
+unwound = run(['panic-unwinds', generation], generation)
+case('panic_aborts_without_unwinding', {'with_hook': r, 'without_hook_control': unwound},
+     r['exit'] == (-6 if mac else -11) and r['stderr'] == '' and r['stdout'] == ''
+     and unwound['exit'] == 101 and 'panicked' in unwound['stderr'])
 r = run(['wrong-thread'])
 case('wrong_thread_sqlite_callback_exit_73', r, r['exit'] == 73)
 r = run(['wrong-thread-native'])

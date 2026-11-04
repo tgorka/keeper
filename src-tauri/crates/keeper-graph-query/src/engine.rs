@@ -4,6 +4,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
+/// First statement of the worker's `main`: any panic aborts from the hook, before
+/// `__rust_start_panic`, so no unwinding runs and libgcc's unwinder, its FDE lookup and
+/// the default hook's message/backtrace formatting are never reached. std materializes
+/// a formatted payload (`payload.get()`) before calling any hook; that `String` is an
+/// ordinary Cap-charged allocation. The boxed closure is zero-sized, so installing the
+/// hook does not allocate.
+pub fn abort_on_panic() {
+    std::panic::set_hook(Box::new(|_| std::process::abort()));
+}
 /// The worker's single entry. Claims allocation-callback permission for the calling
 /// thread exactly once per process (a second claim from any thread exits 73).
 pub fn start(path: &Path, writable: bool) -> Result<Connection> {

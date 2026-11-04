@@ -84,6 +84,7 @@ fn peak_rss() -> Result<u64, Box<dyn std::error::Error>> {
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
+    keeper_graph_query::engine::abort_on_panic();
     match run() {
         Ok(()) => {}
         // 75: bounded result/row limit; 72 stays reserved for allocation budget exits.
