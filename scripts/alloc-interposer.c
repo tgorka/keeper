@@ -13,24 +13,24 @@
 //    completed interposed call: allocation (success or failure), free, and every
 //    realloc outcome. Allocations and frees completed inside one libc call are not
 //    observed.
-// Charge semantics are a quiescent logical model of Cap: alloc adds the request, free
-// removes it, and a successful libc realloc replaces the old request by the new one,
-// never counting both. Cap itself refunds a shrink only after System returns, so the
-// model describes the state after each Rust-level operation, not Cap's counter at the
-// libc instruction.
-// std's System realloc takes `realloc_fallback` (alloc new, copy, dealloc old) exactly
-// when it would not call libc realloc, and that fallback always allocates through
-// aligned_malloc -> posix_memalign (std/src/sys/alloc/unix.rs). So the sample after an
-// executable aligned allocation is deferred: if the next interposed call is an
-// executable free (the fallback's dealloc, or a plain free), only the post-free state
-// is sampled, where the model again equals Cap's delta charge; otherwise the deferred
-// sample is taken on entry to that next call, before it changes any state. The skipped
-// instant is the in-flight overlap bounded analytically (design X), never measured.
-// Old+new overlap of a moving libc realloc is likewise a separate reconstructed
-// diagnostic, never mixed into the model charge.
-// Per-sample envelope check (design D1): in_use - 2*charged - 64*small32 - library
-// chunk bytes, maximised over samples, must not exceed the allocator in-use already
-// present (untracked) when the observer published its table.
+// Model: `charged` is the sum of the requested sizes of the executable's live blocks as
+// seen through the exported symbols (alloc adds, free removes, a successful libc
+// realloc replaces old by new). This is exactly the per-live-block quantity the D1
+// chunk-cost bound is stated over, so the D1 check below needs no Cap ordering. It is
+// NOT an instantaneous reading of Cap's counter; they differ only inside one Rust
+// operation: during a libc shrink Cap still charges the old size until System returns,
+// and during std's System `realloc_fallback` (alloc new via posix_memalign, copy,
+// dealloc old; std/src/sys/alloc/unix.rs) the model holds old+new while Cap charges the
+// delta. Those windows are the design's analytic X term; their count is reported as
+// `executable_aligned_calls` (every fallback allocates through an aligned entry point),
+// and the peaks are compared with Cap's own high-water mark only at the end.
+// Old+new overlap of a moving libc realloc is a separate reconstructed diagnostic,
+// never mixed into the model.
+// Per-sample D1 check: in_use - 2*charged - 64*small32 - library chunk bytes, maximised
+// over all samples, must not exceed the allocator in-use already present (untracked)
+// when the observer published its table. Internal transients completed inside one libc
+// call (e.g. _int_memalign's padded request, a realloc's malloc-copy-free) are not
+// observable here; the design bounds them analytically.
 // Heap chunk cost uses glibc 2.43's model (malloc_usable_size + 8); mmapped chunks are
 // visible in the allocator-wide view (hblkhd). The observer's own table is a direct
 // mmap and appears in neither view. Results go to fd 2 at exit.
@@ -58,8 +58,7 @@ static long long peak_remainder, peak_lib, peak_overhead, peak_charged, peak_act
 static long long peak_count_exe, peak_small_exe, peak_small32_exe, overflow, wide_aligned, max_moved_old;
 static long long max_realloc_old, peak_reconstructed_overlap, peak_mmapped, bootstrap_refused;
 static long long peak_in_use, peak_in_use_remainder, samples, untracked_start;
-static long long peak_excess = -(1LL << 62), aligned_exe, deferred_by_free;
-static int deferred;
+static long long peak_excess = -(1LL << 62), aligned_exe;
 static void *(*real_malloc)(size_t);
 static void (*real_free)(void *);
 static void *(*real_calloc)(size_t, size_t);
@@ -122,19 +121,10 @@ static void sample(void) {
     long long excess = in_use - 2 * charged - 64 * count_small32_exe - actual_lib;
     if (excess > peak_excess) peak_excess = excess;
 }
-// Entry of every interposed call: a deferred post-aligned-allocation sample is taken
-// now, before this call changes state, unless this call is an executable free.
-static void enter(int executable_free) {
-    if (!deferred) return;
-    deferred = 0;
-    if (executable_free) deferred_by_free++;
-    else sample();
-}
 // Exit of every completed interposed call.
-static void post(int defer) {
+static void post(void) {
     attributed_peaks();
-    if (defer && table) deferred = 1;
-    else sample();
+    sample();
 }
 static void track(void *p, size_t size, int library) {
     if (!p || !table) return;
@@ -241,12 +231,12 @@ __attribute__((destructor)) static void finish(void) {
         "\"peak_reconstructed_overlap_bytes\":%lld,\"peak_mmapped_bytes\":%lld,"
         "\"bootstrap_refused\":%lld,\"bootstrap_used_bytes\":%lld,"
         "\"untracked_in_use_at_start_bytes\":%lld,\"peak_envelope_excess_bytes\":%lld,"
-        "\"executable_aligned_calls\":%lld,\"deferred_samples_closed_by_free\":%lld}\n",
+        "\"executable_aligned_calls\":%lld}\n",
         peak_remainder, peak_lib, peak_overhead, peak_charged, peak_actual, peak_count_exe,
         peak_small_exe, peak_in_use, peak_in_use_remainder, samples, max_moved_old,
         wide_aligned, overflow, peak_small32_exe, max_realloc_old, peak_reconstructed_overlap,
         peak_mmapped, bootstrap_refused, (long long)bootstrap_used, untracked_start,
-        samples ? peak_excess : 0, aligned_exe, deferred_by_free);
+        samples ? peak_excess : 0, aligned_exe);
     unlock();
     if (n > 0) (void)!write(2, line, (size_t)n);
 }
@@ -257,13 +247,10 @@ void *malloc(size_t size) {
         if (!real_malloc) return NULL;
     }
     int library = from_library(__builtin_return_address(0));
-    lock();
-    enter(0);
-    unlock();
     void *p = real_malloc(size);
     lock();
     track(p, size, library);
-    post(0);
+    post();
     unlock();
     return p;
 }
@@ -274,27 +261,22 @@ void *calloc(size_t count, size_t size) {
         return bootstrap_alloc(count * size);
     }
     int library = from_library(__builtin_return_address(0));
-    lock();
-    enter(0);
-    unlock();
     void *p = real_calloc(count, size);
     lock();
     // Overflow: libc refuses and returns NULL, so nothing is recorded.
     if (p) track(p, count * size, library);
-    post(0);
+    post();
     unlock();
     return p;
 }
 void free(void *p) {
     if (!p || in_bootstrap(p)) return;
-    int library = from_library(__builtin_return_address(0));
     lock();
-    enter(!library);
     untrack(p);
     unlock();
     real_free(p);
     lock();
-    post(0);
+    post();
     unlock();
 }
 // realloc: the old record stays until realloc returns (a failed nonzero realloc
@@ -310,9 +292,6 @@ void *realloc(void *old, size_t size) {
         return p;
     }
     int library = from_library(__builtin_return_address(0));
-    lock();
-    enter(0);
-    unlock();
     void *p = real_realloc(old, size);
     lock();
     long found = find(old);
@@ -329,7 +308,7 @@ void *realloc(void *old, size_t size) {
         untrack(old);
         track(p, size, library);
     }
-    post(0);
+    post();
     unlock();
     return p;
 }
@@ -337,14 +316,10 @@ static void aligned_done(void *p, size_t alignment, size_t size, int library) {
     if (alignment > 16) wide_aligned++;
     if (!library) aligned_exe++;
     track(p, size, library);
-    // A possible System realloc_fallback allocation: defer its sample (see header).
-    post(p && !library);
+    post();
 }
 int posix_memalign(void **out, size_t alignment, size_t size) {
     int library = from_library(__builtin_return_address(0));
-    lock();
-    enter(0);
-    unlock();
     int rc = real_posix_memalign(out, alignment, size);
     lock();
     aligned_done(rc == 0 ? *out : NULL, alignment, size, library);
@@ -353,9 +328,6 @@ int posix_memalign(void **out, size_t alignment, size_t size) {
 }
 void *aligned_alloc(size_t alignment, size_t size) {
     int library = from_library(__builtin_return_address(0));
-    lock();
-    enter(0);
-    unlock();
     void *p = real_aligned_alloc(alignment, size);
     lock();
     aligned_done(p, alignment, size, library);
@@ -364,9 +336,6 @@ void *aligned_alloc(size_t alignment, size_t size) {
 }
 void *memalign(size_t alignment, size_t size) {
     int library = from_library(__builtin_return_address(0));
-    lock();
-    enter(0);
-    unlock();
     void *p = real_memalign(alignment, size);
     lock();
     aligned_done(p, alignment, size, library);
@@ -424,30 +393,28 @@ int main(void) {
     int sampled_null_realloc = null_realloc && samples == s0 + 1 && find(null_realloc) >= 0;
     free(null_realloc);
     free(held);
-    // An executable aligned allocation defers its sample; an executable free closes it
-    // with only the post-free sample, any other call takes it on entry.
+    // Aligned allocations and their frees are sampled like any other call.
     void *x = NULL;
     s0 = samples;
-    long long closed = deferred_by_free;
-    int deferred_ok = posix_memalign(&x, 16, 48) == 0 && samples == s0 && deferred;
+    int aligned_sampled = posix_memalign(&x, 16, 48) == 0 && samples == s0 + 1 && find(x) >= 0;
     free(x);
-    deferred_ok = deferred_ok && samples == s0 + 1 && deferred_by_free == closed + 1 && !deferred;
+    aligned_sampled = aligned_sampled && samples == s0 + 2;
     s0 = samples;
     x = aligned_alloc(16, 64);
-    void *y = malloc(8);
-    int deferred_entry_ok = x && y && samples == s0 + 2 && !deferred;
+    void *y = memalign(16, 24);
+    int aligned_entries_sampled = x && y && samples == s0 + 2;
     free(y);
     free(x);
-    int envelope_ok = peak_excess <= untracked_start && aligned_exe == 2;
+    int envelope_ok = peak_excess <= untracked_start && aligned_exe == 3;
     printf("{\"aligned\":%d,\"extent\":%d,\"zeroed\":%d,\"membership\":%d,\"refuses_overflow\":%d,"
            "\"refuses_huge\":%d,\"exhausts_within_buffer\":%d,\"realloc_copies_min\":%d,"
            "\"realloc_grow_stops_at_old_extent\":%d,\"realloc_shrink_preserves\":%d,"
            "\"sampled_after_free\":%d,\"sampled_after_failed_realloc\":%d,"
-           "\"sampled_after_null_realloc\":%d,\"deferred_closed_by_free\":%d,"
-           "\"deferred_taken_on_entry\":%d,\"envelope_within_untracked\":%d}\n",
+           "\"sampled_after_null_realloc\":%d,\"sampled_after_posix_memalign_and_free\":%d,"
+           "\"sampled_after_aligned_alloc_and_memalign\":%d,\"envelope_within_untracked\":%d}\n",
            aligned, extent, zeroed, membership, refuses_overflow, refuses_huge, exhausts, copied,
            copy_stops_at_old, shrink_ok, sampled_free, sampled_failed_realloc, sampled_null_realloc,
-           deferred_ok, deferred_entry_ok, envelope_ok);
+           aligned_sampled, aligned_entries_sampled, envelope_ok);
     return 0;
 }
 #endif

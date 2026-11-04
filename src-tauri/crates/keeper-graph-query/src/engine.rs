@@ -8,18 +8,21 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 /// thread exactly once per process (a second claim from any thread exits 73).
 pub fn start(path: &Path, writable: bool) -> Result<Connection> {
     crate::allocation::enter();
-    // Fail closed unless the environment is exactly the fixed non-secret settings. On
-    // Linux that includes the glibc tunables (read by ld.so before `main`), so a worker
-    // started without them never reaches the engine.
+    // Fail closed unless the environment is exactly the fixed non-secret settings, for
+    // every role: `GQL_STMT_CACHE=0` always, plus on Linux the glibc tunables (read by
+    // ld.so before `main`), so a worker started without them never reaches the engine.
     let tunables = cfg!(target_os = "linux")
         .then_some(keeper_graph_protocol::wire::LINUX_WORKER_GLIBC_TUNABLES);
-    let mut seen_tunables = false;
+    let (mut seen_cache, mut seen_tunables) = (false, false);
     for (key, value) in std::env::vars_os() {
         match (key.to_str(), tunables) {
-            (Some("GQL_STMT_CACHE"), _) if value == "0" => {}
+            (Some("GQL_STMT_CACHE"), _) if value == "0" => seen_cache = true,
             (Some("GLIBC_TUNABLES"), Some(expected)) if value == expected => seen_tunables = true,
             _ => return Err("worker environment must be exactly the fixed settings".into()),
         }
+    }
+    if !seen_cache {
+        return Err("worker environment must disable the statement cache".into());
     }
     if tunables.is_some() && !seen_tunables {
         return Err("worker environment must carry the fixed allocator tunables".into());

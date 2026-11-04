@@ -119,6 +119,24 @@ if not mac:
     process = subprocess.run([probe, 'query', generation], input='', env={'GQL_STMT_CACHE': '0'}, capture_output=True, text=True, timeout=10)
     case('missing_allocator_tunables_refused', {'exit': process.returncode, 'stderr': process.stderr.strip()[-200:]},
          process.returncode != 0 and 'allocator tunables' in process.stderr)
+# Every role requires GQL_STMT_CACHE=0 at the common entry (with the fixed tunables on
+# Linux present): the probe names the refusal, the production worker exits 74 for all
+# three roles before reading any frame or writing any result.
+no_cache = {k: v for k, v in env.items() if k != 'GQL_STMT_CACHE'}
+refusals = {}
+for role in ('build', 'query'):
+    db = fresh('no-cache-' + role + '.db') if role == 'build' else generation
+    process = subprocess.run([probe, role, db], input='', env=no_cache, capture_output=True, text=True, timeout=10)
+    refusals['probe_' + role] = {'exit': process.returncode, 'named': 'statement cache' in process.stderr}
+for role in ('build', 'query', 'inspect'):
+    db = fresh('no-cache-worker-' + role + '.db') if role == 'build' else generation
+    process = subprocess.run([worker, role, db], input='', env=no_cache, capture_output=True, text=True, timeout=10)
+    refusals['worker_' + role] = {'exit': process.returncode, 'stdout_bytes': len(process.stdout),
+                                  'db_bytes': os.path.getsize(db) if role == 'build' else None}
+case('missing_statement_cache_refused_every_role', refusals,
+     all(v['exit'] != 0 and v['named'] for k, v in refusals.items() if k.startswith('probe_'))
+     and all(v['exit'] == 74 and v['stdout_bytes'] == 0 for k, v in refusals.items() if k.startswith('worker_'))
+     and refusals['worker_build']['db_bytes'] == 0)
 r = run(['wrong-thread'])
 case('wrong_thread_sqlite_callback_exit_73', r, r['exit'] == 73)
 r = run(['wrong-thread-native'])
@@ -347,8 +365,8 @@ else:
             continue
         with open(export, 'rb') as f:
             stream = f.read()
-        target = fresh('observed-build-' + label.replace(os.sep, '-') + '.db')
-        build_samples.append(observed([worker, 'build', target], stream, 'build:' + label))
+        staged = fresh('observed-build-' + label.replace(os.sep, '-') + '.db')
+        build_samples.append(observed([worker, 'build', staged], stream, 'build:' + label))
     every = samples + build_samples
     valid = all(s['exit'] == 0 and 'peak_uncharged_remainder_bytes' in s and s['table_overflow'] == 0 for s in every)
     remainder = [s.get('peak_uncharged_remainder_bytes', 0) for s in samples]

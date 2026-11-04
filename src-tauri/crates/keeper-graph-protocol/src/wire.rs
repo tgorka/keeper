@@ -117,9 +117,10 @@ impl Event {
 ///
 /// The bytes are produced by serializing the parsed operations straight through JCS
 /// (no intermediate `serde_json::Value` copy; JCS canonicalizes member order).
-/// Acceptance is unchanged: the whole-array tree validation that `canonical_bytes`
-/// applied to `to_value(operations)` is reproduced exactly by
-/// [`validate_operation_tree`], and the final encoded-size cap still applies.
+/// Acceptance and typed-refusal precedence are unchanged: the whole-array tree
+/// validation that `canonical_bytes` applied to `to_value(operations)` is reproduced
+/// exactly, in the same order, by [`validate_operation_tree`], and the final
+/// encoded-size cap still applies.
 pub fn operation_digest(operations: &[Operation]) -> Result<String, Refusal> {
     if operations.len() > 128 {
         return Err(Refusal::QueryLimit);
@@ -137,21 +138,24 @@ pub fn operation_digest(operations: &[Operation]) -> Result<String, Refusal> {
     }
     Ok(out)
 }
-/// `validate_value(&to_value(operations), 0)` without building that tree: the array is
-/// depth 0 (≤ 8192 elements), each operation object depth 1 (six members, keys < 8192
-/// bytes), and every member value depth 2. Scalars: `ordinal` is a u32 (finite, below
-/// MAX_NUMBER), `entity_type`/`operation` are fixed short strings, `entity_id` is
-/// checked against the 65536-byte string limit, `before`/`after` (or null) recurse.
+/// `validate_value(&to_value(operations), 0)` without building that tree, visiting what
+/// that tree visits in the same order, so the first refusal is the same. The array is
+/// depth 0 (≤ 8192 elements, in order). Each operation object is depth 1: six members
+/// whose keys are short, visited in `serde_json::Map` (BTreeMap) key order — `after`,
+/// `before`, `entity_id`, `entity_type`, `operation`, `ordinal` — each value at depth 2.
+/// `after`/`before` recurse (absent is `null`, accepted); `entity_id` meets the
+/// 65536-byte string limit; `entity_type`/`operation` are short fixed strings and
+/// `ordinal` a u32 (finite, below MAX_NUMBER), none of which can be refused.
 pub fn validate_operation_tree(operations: &[Operation]) -> Result<(), Refusal> {
     if operations.len() > 8192 {
         return Err(Refusal::QueryLimit);
     }
     for op in operations {
+        for value in [&op.after, &op.before].into_iter().flatten() {
+            validate_value(value, 2)?;
+        }
         if op.entity_id.len() > 65536 {
             return Err(Refusal::QueryLimit);
-        }
-        for value in [&op.before, &op.after].into_iter().flatten() {
-            validate_value(value, 2)?;
         }
     }
     Ok(())
