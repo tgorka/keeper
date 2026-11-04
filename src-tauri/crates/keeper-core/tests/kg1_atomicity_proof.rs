@@ -214,16 +214,36 @@ fn await_rows(replica: &dyn Replica, table: &str, count: usize) -> Vec<Row> {
     }
 }
 
+fn await_receipt(replica: &dyn Replica, request: &str) -> Row {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows = replica
+            .query(
+                "SELECT * FROM kg_receipts WHERE request_id = ?",
+                &[request.into()],
+            )
+            .expect("own receipt");
+        if let Some(row) = rows.into_iter().next() {
+            return row;
+        }
+        assert!(Instant::now() < deadline, "receipt not visible");
+        replica.sync_now();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
 #[test]
 #[ignore = "requires the disposable 110.2 server and two issued native credentials"]
 fn two_native_replicas_observe_command_receipts_and_complete_prefixes() {
     let url = std::env::var("KEEPER_HQ_LIVE_URL").expect("server URL");
     let domain = std::env::var("KEEPER_HQ_LIVE_DATABASE").expect("domain");
+    let actor = std::env::var("KEEPER_HQ_LIVE_ACTOR").expect("actor");
     let scratch = tempfile::tempdir().expect("persistent stores");
     let mut replicas = Vec::new();
     for index in 1..=2 {
         let client = std::env::var(format!("KEEPER_HQ_LIVE_CLIENT_{index}")).expect("client");
         let token = std::env::var(format!("KEEPER_HQ_LIVE_TOKEN_{index}")).expect("token");
+        let client_scope = format!("{}:{actor}{}:{client}", actor.len(), client.len());
         let spec = ReplicaSpec {
             database: domain.clone(),
             path: scratch.path().join(format!("{index}.sqlite")),
@@ -245,6 +265,11 @@ fn two_native_replicas_observe_command_receipts_and_complete_prefixes() {
                 table: table.into(),
                 scopes: vec![("kg_graph".into(), vec![domain.clone()])],
             })
+            .chain(std::iter::once(Subscription {
+                id: "kg_receipts".into(),
+                table: "kg_receipts".into(),
+                scopes: vec![("kg_client".into(), vec![client_scope])],
+            }))
             .collect(),
             watch_presence: None,
         };
@@ -257,14 +282,42 @@ fn two_native_replicas_observe_command_receipts_and_complete_prefixes() {
         .expect("command");
     assert!(first.commit_seq.is_some_and(|seq| seq > 0));
     let replay = replicas[0]
-        .remote_command("kg.proof.apply", &request, params)
+        .remote_command("kg.proof.apply", &request, params.clone())
         .expect("replay");
     assert_eq!(first.commit_seq, replay.commit_seq);
     assert!(replay.cached);
+    let receipt = await_receipt(&replicas[0], &request);
+    assert_eq!(receipt["outcome"], "accepted");
+    let detail: Value = serde_json::from_str(text(&receipt, "detail").expect("receipt detail"))
+        .expect("receipt JSON");
+    assert_eq!(detail["event_id"], request);
+    let accepted_sequence: u64 = detail["graph_seq"]
+        .as_str()
+        .expect("accepted sequence")
+        .parse()
+        .expect("sequence integer");
+    let conflict_id = ulid::Ulid::new().to_string();
+    let transported = replicas[0]
+        .remote_command("kg.proof.apply", &conflict_id, params)
+        .expect("conflict transported");
+    assert!(transported.commit_seq > first.commit_seq);
+    assert_eq!(
+        await_receipt(&replicas[0], &conflict_id)["outcome"],
+        "conflict"
+    );
     let mut states = Vec::new();
     for replica in &replicas {
-        let heads = await_rows(replica, "kg_head", 1);
-        let at = number(&heads[0], "graph_seq").expect("head sequence");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let at = loop {
+            let heads = await_rows(replica, "kg_head", 1);
+            let at = number(&heads[0], "graph_seq").expect("head sequence");
+            if at >= accepted_sequence {
+                break at;
+            }
+            assert!(Instant::now() < deadline, "accepted head did not catch up");
+            replica.sync_now();
+            std::thread::sleep(Duration::from_millis(30));
+        };
         let headers = await_rows(replica, "kg_events", at as usize);
         let operations = await_rows(
             replica,
@@ -276,9 +329,17 @@ fn two_native_replicas_observe_command_receipts_and_complete_prefixes() {
         );
         let (through, state) = prefix(at, &headers, &operations).expect("prefix");
         assert_eq!(through, at);
+        assert!(state.contains_key(&format!("node:{request}")));
         states.push(state);
     }
     assert_eq!(states[0], states[1]);
+    assert!(replicas[1]
+        .query(
+            "SELECT * FROM kg_receipts WHERE request_id = ?",
+            &[request.into()]
+        )
+        .expect("other device receipt scope")
+        .is_empty());
     for replica in replicas {
         replica.close();
         replica.join();
