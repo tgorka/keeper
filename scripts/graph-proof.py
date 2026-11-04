@@ -61,8 +61,13 @@ evidence['provenance'] = {
     'rustc': tool('rustc', '+stable', '--version'), 'cargo': tool('cargo', '+stable', '--version'), 'cc': tool('cc', '--version'),
     # Not exhaustive build provenance: compiler/link flags and the bundled SQLite
     # object are not captured here.
-    'build_commands': ['cargo +stable build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-query --bins --examples --features proof-executables',
-                       'cargo +stable build --release --manifest-path src-tauri/Cargo.toml -p keeper-graph-driver --bins --examples'],
+    # The recipe that produced `target`: its directory name is the cargo profile. The
+    # worker artifact must come from the reviewed panic=abort `graph-worker` profile.
+    'build_profile': os.path.basename(os.path.normpath(target)),
+    'build_commands': ['cargo +stable build --manifest-path src-tauri/Cargo.toml '
+                       + ('--release' if os.path.basename(os.path.normpath(target)) == 'release'
+                          else '--profile ' + os.path.basename(os.path.normpath(target)))
+                       + ' -p keeper-graph-query -p keeper-graph-driver --features keeper-graph-query/proof-executables --bins --examples'],
     'binaries': {name: sha256(path) for name, path in (
         ('keeper-graph-query', os.path.join(target, 'keeper-graph-query')), ('keeper-graph-driver', os.path.join(target, 'keeper-graph-driver')),
         ('native_probe', os.path.join(target, 'examples', 'native_probe')), ('fake_worker', os.path.join(target, 'examples', 'fake_worker')),
@@ -176,23 +181,42 @@ if not mac:
              for v in structure.values()))
     # Pre-main: drive std's signal-stack mmap into failure with a tight inherited
     # RLIMIT_AS. Under panic=abort the init panic prints std's message and aborts
-    # (SIGABRT, before confinement) with no caught unwind ("initialization or cleanup
-    # bug" is printed only by rt's handler after an unwind).
+    # (SIGABRT, before confinement) with no caught unwind. "initialization or cleanup
+    # bug" is printed only by rt's handler after an unwind, and is recorded for every
+    # outcome independently of the primary failure (an unwind build prints the
+    # alt-stack panic AND that marker). Guard-page mprotect failure is classified but
+    # has no positive control; it is not claimed as exercised unless hit.
     import resource
-    outcomes = {}
-    for kib in range(2048, 16384, 4):
-        def tight(limit=kib * 1024):
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-        process = subprocess.run([worker, 'query', generation], input=b'', env=env, capture_output=True,
-                                 timeout=10, preexec_fn=tight)
-        stderr = process.stderr.decode(errors='replace')
-        key = ('alt_stack' if 'alternative stack' in stderr else 'guard_page' if 'stack guard page' in stderr
-               else 'rt_unwind_caught' if 'initialization or cleanup bug' in stderr else 'other')
-        outcomes.setdefault(key, {}).setdefault(process.returncode, []).append(kib)
-    hits = outcomes.get('alt_stack', {})
-    case('premain_init_panic_aborts_without_unwinding',
-         {k: {code: [min(v), max(v), len(v)] for code, v in m.items()} for k, m in outcomes.items()},
-         hits and set(hits) == {-6} and 'rt_unwind_caught' not in outcomes)
+    def premain_sweep(binary):
+        outcomes, samples = {}, {}
+        for kib in range(2048, 16384, 4):
+            def tight(limit=kib * 1024):
+                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+            process = subprocess.run([binary, 'query', generation], input=b'', env=env, capture_output=True,
+                                     timeout=10, preexec_fn=tight)
+            stderr = process.stderr.decode(errors='replace')
+            primary = ('alt_stack' if 'alternative stack' in stderr and 'guard page' not in stderr
+                       else 'guard_page' if 'stack guard page' in stderr else 'other')
+            caught = 'initialization or cleanup bug' in stderr
+            key = primary + ('+caught_unwind' if caught else '')
+            outcomes.setdefault(key, {}).setdefault(process.returncode, []).append(kib)
+            if primary != 'other' or caught:
+                samples.setdefault(key, stderr[-400:])
+        summary = {k: {code: [min(v), max(v), len(v)] for code, v in m.items()} for k, m in outcomes.items()}
+        startup_hits = {k: m for k, m in outcomes.items() if not k.startswith('other') or k.endswith('+caught_unwind')}
+        ok = ('alt_stack' in outcomes and all(not k.endswith('+caught_unwind') for k in outcomes)
+              and all(set(m) == {-6} for m in startup_hits.values()))
+        return ok, {'outcomes': summary, 'stderr_samples': samples}
+    ok, detail = premain_sweep(worker)
+    # Optional discriminating control: the same assertion over a panic-unwind build of
+    # the same worker (KG1_UNWIND_CONTROL_WORKER) must FAIL.
+    control = os.environ.get('KG1_UNWIND_CONTROL_WORKER')
+    if control:
+        control_ok, control_detail = premain_sweep(control)
+        detail['unwind_control'] = {'binary': control, 'sha256': sha256(control), 'assertion_passed': control_ok,
+                                    **control_detail}
+    case('premain_init_panic_aborts_without_unwinding', detail,
+         ok and (not control or detail['unwind_control']['assertion_passed'] is False))
 r = run(['wrong-thread'])
 case('wrong_thread_sqlite_callback_exit_73', r, r['exit'] == 73)
 r = run(['wrong-thread-native'])
