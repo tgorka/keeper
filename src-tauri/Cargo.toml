@@ -48,6 +48,8 @@ tauri-plugin-process = "2"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# RFC 8785, MIT OR Apache-2.0; safe API used by the disposable 110.2 proof.
+serde_jcs = "=0.2.0"
 ts-rs = "12"
 # Async runtime + observability
 # `fs` was added for the folder-sync phase: the LFS transfer path streams

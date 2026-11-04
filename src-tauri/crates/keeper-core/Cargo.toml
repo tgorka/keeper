@@ -144,6 +144,7 @@ tracing-subscriber = { workspace = true }
 syncular-client = { workspace = true }
 
 [dev-dependencies]
+serde_jcs = { workspace = true }
 # The privacy lifecycle tests observe real localhost connection/cancellation;
 # the display-name bound is measured on tokio's paused clock.
 tokio = { workspace = true, features = ["net", "test-util"] }

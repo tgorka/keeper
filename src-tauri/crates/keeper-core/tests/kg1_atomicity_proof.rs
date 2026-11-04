@@ -25,10 +25,12 @@ fn number(row: &Row, key: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid {key}"))
 }
 
-/// The event delta column retains the server's canonical JSON text. Hash that
-/// exact ordered array; never reserialize its numbers with a different formatter.
-fn delta_digest(deltas: &[String]) -> String {
-    hex::encode(Sha256::digest(format!("[{}]", deltas.join(",")).as_bytes()))
+/// Independently canonicalize native values with the audited RFC 8785
+/// serializer, rather than trusting JSON key order or Rust number formatting.
+fn delta_digest(deltas: &[String]) -> Result<String, String> {
+    let values: Vec<Value> = deltas.iter().map(|encoded| serde_json::from_str(encoded)).collect::<Result<_, _>>().map_err(|error| error.to_string())?;
+    let bytes = serde_jcs::to_vec(&values).map_err(|error| error.to_string())?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn prefix(
@@ -74,7 +76,7 @@ fn prefix(
             break;
         }
         let deltas: Vec<_> = group.into_values().collect();
-        if delta_digest(&deltas) != text(header, "delta_digest")? {
+        if delta_digest(&deltas)? != text(header, "delta_digest")? {
             return Err("delta digest mismatch".into());
         }
         for (ordinal, encoded) in deltas.iter().enumerate() {
@@ -129,7 +131,7 @@ fn fixture() -> (Vec<Row>, Vec<Row>) {
     let mut operations = Vec::new();
     for (index, delta) in [first, second].into_iter().enumerate() {
         let id = format!("event-{index}");
-        headers.push(json!({"id":id, "graph_seq":(index+1).to_string(), "op_count":1, "delta_digest":delta_digest(std::slice::from_ref(&delta))}).as_object().expect("header").clone());
+        headers.push(json!({"id":id, "graph_seq":(index+1).to_string(), "op_count":1, "delta_digest":delta_digest(std::slice::from_ref(&delta)).expect("fixture JCS")}).as_object().expect("header").clone());
         operations.push(
             json!({"event_id":id,"ordinal":0,"delta":delta})
                 .as_object()

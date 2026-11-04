@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "id": "utf16-and-integer-like-keys",
+      "json": "{\"2\":2,\"10\":1,\"€\":3,\"\\r\":4,\"😀\":5,\"�\":6}",
+      "canonical": "{\"\\r\":4,\"10\":1,\"2\":2,\"€\":3,\"😀\":5,\"�\":6}",
+      "sha256": "23c7fdfa779083760ae9db5a1d4b899b4b595642888e78f5e0c080a2bed42820",
+      "kg_allowed": true
+    },
+    {
+      "id": "ecmascript-number-format",
+      "json": "[1,1.0,-0,1e-7,0.000001,333333333.33333329]",
+      "canonical": "[1,1,0,1e-7,0.000001,333333333.3333333]",
+      "sha256": "12c855c146f3dccd813fd640b0ca67263366224689d7a143f067a0d9163823f8",
+      "kg_allowed": true
+    },
+    {
+      "id": "smallest-subnormal",
+      "json": "[5e-324,-5e-324]",
+      "canonical": "[5e-324,-5e-324]",
+      "sha256": "39cd7d1a8ced55e3c0f57779c09f31a0e7bf7f973e75e57b7b6bef623da6d2c2",
+      "kg_allowed": true
+    },
+    {
+      "id": "exact-application-boundary",
+      "json": "[9007199254740991,-9007199254740991]",
+      "canonical": "[9007199254740991,-9007199254740991]",
+      "sha256": "84bad60c1793654a7cdca854230af90af531ecc8f7656e2c7b2bd91890017b37",
+      "kg_allowed": true
+    },
+    {
+      "id": "outside-application-boundary",
+      "json": "[9007199254740992]",
+      "canonical": "[9007199254740992]",
+      "sha256": "5dc10964d69741c9924433db7b0e8fe5b0ac6fac6a5dd6d142b8c4e05e2162c3",
+      "kg_allowed": false
+    },
+    {
+      "id": "appendix-b-largest-finite",
+      "json": "[1.7976931348623157e308]",
+      "canonical": "[1.7976931348623157e+308]",
+      "sha256": "dabeb6b2980d2d512888b69d2576387da2a30109b9308eb6674ea6c24fbc8dad",
+      "kg_allowed": false
+    },
+    {
+      "id": "approval-envelope",
+      "json": "{\"version\":1,\"target\":\"domain-a\",\"payload\":{\"expected\":\"0\",\"id\":\"A\"},\"descriptor\":\"graph.apply\",\"context_id\":null}",
+      "canonical": "{\"context_id\":null,\"descriptor\":\"graph.apply\",\"payload\":{\"expected\":\"0\",\"id\":\"A\"},\"target\":\"domain-a\",\"version\":1}",
+      "sha256": "7a365da6cacb80e37c6614d1d0e66fd2b7c3f3faa3aea22e17599038ed9843bd",
+      "kg_allowed": true
+    },
+    {
+      "id": "ordered-operation-delta",
+      "json": "[{\"ordinal\":0,\"entity_type\":\"node\",\"entity_id\":\"a\",\"before\":null,\"after\":{\"revision\":\"1\",\"value\":1.0}},{\"ordinal\":1,\"entity_type\":\"edge\",\"entity_id\":\"e\",\"before\":null,\"after\":{\"live\":true}}]",
+      "canonical": "[{\"after\":{\"revision\":\"1\",\"value\":1},\"before\":null,\"entity_id\":\"a\",\"entity_type\":\"node\",\"ordinal\":0},{\"after\":{\"live\":true},\"before\":null,\"entity_id\":\"e\",\"entity_type\":\"edge\",\"ordinal\":1}]",
+      "sha256": "4cdf1bd9792fd7540dc699a454dff71337de5339b07b0e8fc59c6a496a5dc8d1",
+      "kg_allowed": true
+    }
+  ]
+}
