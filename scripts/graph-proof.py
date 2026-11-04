@@ -296,7 +296,16 @@ if mac:
     case('memory_uncharged_remainder', {'owed': 'macOS system-zone transient accounting', 'mechanism': None}, False, fatal=False)
 else:
     library = os.path.join(scratch, 'alloc-interposer.so')
-    subprocess.run(['cc', '-O2', '-shared', '-fPIC', '-o', library, os.path.join(root, 'scripts', 'alloc-interposer.c'), '-ldl'], check=True)
+    source = os.path.join(root, 'scripts', 'alloc-interposer.c')
+    subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', '-o', library, source, '-ldl'], check=True)
+    # Observer self-test: bootstrap alignment, extent, zeroing, overflow/exhaustion
+    # refusal and min(old,new) realloc copy (a branch a normal preload cannot reach).
+    selftest = os.path.join(scratch, 'alloc-interposer-selftest')
+    subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-DKG_INTERPOSER_SELFTEST', '-o', selftest, source, '-ldl'], check=True)
+    process = subprocess.run([selftest], capture_output=True, text=True, timeout=30)
+    controls = json.loads(process.stdout) if process.returncode == 0 else {}
+    case('observer_bootstrap_self_test', {'exit': process.returncode, 'controls': controls},
+         process.returncode == 0 and controls and all(v == 1 for v in controls.values()))
     samples = []
     for name, query, params in corpus:
         process = subprocess.run([worker, 'query', limits_db], input=json.dumps({'source': query, 'parameters': params}) + '\n',
@@ -315,7 +324,13 @@ else:
               'remainder_spread_bytes': max(remainder) - min(remainder),
               'library_bypass_spread_bytes': max(library_bytes) - min(library_bytes),
               'allocator_wide_remainder_spread_bytes': max(allocator_remainder) - min(allocator_remainder),
-              'alignment_above_16_calls': sum(s.get('alignment_above_16_calls', 0) for s in samples)}
+              'alignment_above_16_calls': sum(s.get('alignment_above_16_calls', 0) for s in samples),
+              # Separate series, never compared with each other (design v2 §1).
+              'max_live_below_32': max(s.get('peak_live_executable_allocations_below_32', 0) for s in samples),
+              'max_realloc_old_bytes': max(s.get('max_realloc_old_bytes', 0) for s in samples),
+              'max_reconstructed_overlap_bytes': max(s.get('peak_reconstructed_overlap_bytes', 0) for s in samples),
+              'max_mmapped_bytes': max(s.get('peak_mmapped_bytes', 0) for s in samples),
+              'bootstrap_refused': sum(s.get('bootstrap_refused', 0) for s in samples)}
     # No acceptance window: until the reviewed accounted-cost envelope (R1) replaces
     # this assertion, any input-dependent uncharged remainder fails the proof.
     ok = (valid and agree and result['remainder_spread_bytes'] == 0 and result['library_bypass_spread_bytes'] == 0

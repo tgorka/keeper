@@ -8,9 +8,15 @@
 //    address to the worker executable (Cap-charged Rust allocator; GraphQLite/SQLite
 //    reach libc only through it) or to a shared library (libc-internal or loader).
 //    This sees only calls routed through those exported symbols.
-//  * Allocator-wide view: at every interposed call, mallinfo2() in-use bytes
-//    (uordblks + hblkhd) for every arena block and mmapped chunk, whatever entry point
-//    created it (internal or hidden callers included), sampled at those instants only.
+//  * Allocator-wide view: after every interposed allocation call has completed,
+//    mallinfo2() in-use bytes (uordblks + hblkhd) for every arena block and mmapped
+//    chunk, whatever entry point created it, sampled at those post-call instants only.
+//    Allocations and frees completed inside one libc call are not observed.
+// Charge semantics mirror Cap exactly (model charge): alloc adds the request, free
+// removes it, and realloc replaces the old request by the new one with no instant at
+// which both are counted. The post-call mallinfo2 sample is compared with that model
+// charge at the same instant. Old+new overlap of a moving realloc is reported only as a
+// separate reconstructed diagnostic, never mixed into the model charge.
 // Heap chunk cost uses glibc 2.43's model (malloc_usable_size + 8); mmapped chunks are
 // visible in the allocator-wide view (hblkhd). The observer's own table is a direct
 // mmap and appears in neither view. Results go to fd 2 at exit.
@@ -33,9 +39,10 @@ struct slot { uintptr_t key; uint64_t value; long long chunk; };
 static struct slot *table;
 static uintptr_t exe_lo, exe_hi;
 static atomic_flag guard = ATOMIC_FLAG_INIT;
-static long long charged, actual_exe, actual_lib, count_exe, count_lib, count_small_exe;
+static long long charged, actual_exe, actual_lib, count_exe, count_lib, count_small_exe, count_small32_exe;
 static long long peak_remainder, peak_lib, peak_overhead, peak_charged, peak_actual;
-static long long peak_count_exe, peak_small_exe, overflow, wide_aligned, max_moved_old;
+static long long peak_count_exe, peak_small_exe, peak_small32_exe, overflow, wide_aligned, max_moved_old;
+static long long max_realloc_old, peak_reconstructed_overlap, peak_mmapped, bootstrap_refused;
 static long long peak_in_use, peak_in_use_remainder, samples;
 static void *(*real_malloc)(size_t);
 static void (*real_free)(void *);
@@ -44,14 +51,31 @@ static void *(*real_realloc)(void *, size_t);
 static int (*real_posix_memalign)(void **, size_t, size_t);
 static void *(*real_aligned_alloc)(size_t, size_t);
 static void *(*real_memalign)(size_t, size_t);
-static char bootstrap[4096];
+// Bootstrap arena for dlsym's own calloc before resolution: 16-byte aligned blocks,
+// each preceded by a 16-byte header recording its usable size.
+static _Alignas(16) unsigned char bootstrap[16384];
 static size_t bootstrap_used;
 
 static void lock(void) { while (atomic_flag_test_and_set(&guard)) {} }
 static void unlock(void) { atomic_flag_clear(&guard); }
 static uint64_t hash(uintptr_t p) { return (p >> 4) * 0x9E3779B97F4A7C15ull; }
 static int in_bootstrap(void *p) {
-    return (char *)p >= bootstrap && (char *)p < bootstrap + sizeof bootstrap;
+    return (unsigned char *)p >= bootstrap && (unsigned char *)p < bootstrap + sizeof bootstrap;
+}
+static void *bootstrap_alloc(size_t size) {
+    if (size > sizeof bootstrap) { bootstrap_refused++; return NULL; }
+    size_t rounded = (size + 15) & ~(size_t)15;
+    if (rounded < size || 16 + rounded > sizeof bootstrap - bootstrap_used) { bootstrap_refused++; return NULL; }
+    unsigned char *block = bootstrap + bootstrap_used;
+    memcpy(block, &size, sizeof size);
+    bootstrap_used += 16 + rounded;
+    memset(block + 16, 0, rounded);
+    return block + 16;
+}
+static size_t bootstrap_size(void *p) {
+    size_t size;
+    memcpy(&size, (unsigned char *)p - 16, sizeof size);
+    return size;
 }
 
 static void peaks(void) {
@@ -63,14 +87,16 @@ static void peaks(void) {
     if (actual > peak_actual) peak_actual = actual;
     if (count_exe > peak_count_exe) peak_count_exe = count_exe;
     if (count_small_exe > peak_small_exe) peak_small_exe = count_small_exe;
+    if (count_small32_exe > peak_small32_exe) peak_small32_exe = count_small32_exe;
     if (!table) return;
     struct mallinfo2 mi = mallinfo2();
     long long in_use = (long long)(mi.uordblks + mi.hblkhd);
+    if ((long long)mi.hblkhd > peak_mmapped) peak_mmapped = (long long)mi.hblkhd;
     samples++;
     if (in_use > peak_in_use) peak_in_use = in_use;
     if (in_use - charged > peak_in_use_remainder) peak_in_use_remainder = in_use - charged;
 }
-static void track(void *p, size_t size, int library) {
+static void track_quiet(void *p, size_t size, int library, int sample) {
     if (!p || !table) return;
     long long chunk = (long long)malloc_usable_size(p) + 8;
     uint64_t i = hash((uintptr_t)p) & (SLOTS - 1);
@@ -83,13 +109,15 @@ static void track(void *p, size_t size, int library) {
             else {
                 charged += (long long)size; actual_exe += chunk; count_exe++;
                 if (size < 16) count_small_exe++;
+                if (size < 32) count_small32_exe++;
             }
-            peaks();
+            if (sample) peaks();
             return;
         }
     }
     overflow++;
 }
+static void track(void *p, size_t size, int library) { track_quiet(p, size, library, 1); }
 static long find(void *p) {
     if (!p || !table) return -1;
     uint64_t i = hash((uintptr_t)p) & (SLOTS - 1);
@@ -109,6 +137,7 @@ static void untrack(void *p) {
     else {
         charged -= (long long)(value >> 1); actual_exe -= chunk; count_exe--;
         if ((value >> 1) < 16) count_small_exe--;
+        if ((value >> 1) < 32) count_small32_exe--;
     }
     uint64_t hole = i;
     for (uint64_t j = (i + 1) & (SLOTS - 1); table[j].key; j = (j + 1) & (SLOTS - 1)) {
@@ -159,7 +188,7 @@ __attribute__((constructor)) static void start(void) {
     unlock();
 }
 __attribute__((destructor)) static void finish(void) {
-    char line[1024];
+    char line[1536];
     lock();
     int n = snprintf(line, sizeof line,
         "KG_ALLOC {\"peak_uncharged_remainder_bytes\":%lld,\"peak_library_bytes\":%lld,"
@@ -168,10 +197,14 @@ __attribute__((destructor)) static void finish(void) {
         "\"peak_live_executable_allocations_below_16\":%lld,"
         "\"peak_allocator_in_use_bytes\":%lld,\"peak_allocator_in_use_minus_charged_bytes\":%lld,"
         "\"allocator_samples\":%lld,\"max_moved_realloc_old_bytes\":%lld,"
-        "\"alignment_above_16_calls\":%lld,\"table_overflow\":%lld}\n",
+        "\"alignment_above_16_calls\":%lld,\"table_overflow\":%lld,"
+        "\"peak_live_executable_allocations_below_32\":%lld,\"max_realloc_old_bytes\":%lld,"
+        "\"peak_reconstructed_overlap_bytes\":%lld,\"peak_mmapped_bytes\":%lld,"
+        "\"bootstrap_refused\":%lld,\"bootstrap_used_bytes\":%lld}\n",
         peak_remainder, peak_lib, peak_overhead, peak_charged, peak_actual, peak_count_exe,
         peak_small_exe, peak_in_use, peak_in_use_remainder, samples, max_moved_old,
-        wide_aligned, overflow);
+        wide_aligned, overflow, peak_small32_exe, max_realloc_old, peak_reconstructed_overlap,
+        peak_mmapped, bootstrap_refused, (long long)bootstrap_used);
     unlock();
     if (n > 0) (void)!write(2, line, (size_t)n);
 }
@@ -193,12 +226,8 @@ void *calloc(size_t count, size_t size) {
         return real_calloc ? real_calloc(count, size) : NULL;
     }
     if (!real_calloc) {
-        // dlsym itself may calloc before resolution completes.
-        size_t want = (count * size + 15) & ~(size_t)15;
-        if (bootstrap_used + want > sizeof bootstrap) return NULL;
-        void *p = bootstrap + bootstrap_used;
-        bootstrap_used += want;
-        return p;
+        // dlsym itself may calloc before resolution completes (zeroed, checked).
+        return bootstrap_alloc(count * size);
     }
     void *p = real_calloc(count, size);
     lock();
@@ -213,32 +242,34 @@ void free(void *p) {
     unlock();
     real_free(p);
 }
-// The old block stays recorded until realloc returns. A move is recorded with old and
-// new simultaneously live (the copy overlap) before the old one is released; a failed
-// nonzero realloc leaves the old block live and recorded; realloc(p, 0) returning NULL
-// released p.
+// realloc: the old record stays until realloc returns (a failed nonzero realloc
+// leaves it live and recorded; realloc(p, 0) returning NULL released it). On success
+// the old record is removed before the new one is added, mirroring Cap's delta charge,
+// so the single post-call sample never counts old and new requests together. The
+// old+new overlap of a moving call is recorded separately as a reconstructed diagnostic.
 void *realloc(void *old, size_t size) {
     if (old && in_bootstrap(old)) {
+        size_t old_size = bootstrap_size(old);
         void *p = malloc(size);
-        if (p) memcpy(p, old, size < sizeof bootstrap ? size : sizeof bootstrap);
+        if (p) memcpy(p, old, old_size < size ? old_size : size);
         return p;
     }
     int library = from_library(__builtin_return_address(0));
     void *p = real_realloc(old, size);
     lock();
+    long found = find(old);
+    long long old_size = found >= 0 ? (long long)(table[found].value >> 1) : 0;
+    if (found >= 0 && !(table[found].value & 1) && old_size > max_realloc_old) max_realloc_old = old_size;
     if (!p) {
         if (old && size == 0) untrack(old);
-    } else if (p == old) {
-        untrack(old);
-        track(p, size, library);
     } else {
-        long found = find(old);
-        if (found >= 0) {
-            long long old_size = (long long)(table[found].value >> 1);
+        if (p != old && found >= 0) {
+            long long overlap = actual_exe + actual_lib + (long long)malloc_usable_size(p) + 8;
+            if (overlap > peak_reconstructed_overlap) peak_reconstructed_overlap = overlap;
             if (old_size > max_moved_old) max_moved_old = old_size;
         }
-        track(p, size, library);
         untrack(old);
+        track(p, size, library);
     }
     unlock();
     return p;
@@ -272,3 +303,38 @@ void *memalign(size_t alignment, size_t size) {
     unlock();
     return p;
 }
+
+#ifdef KG_INTERPOSER_SELFTEST
+// Positive controls for the bootstrap branch, which only runs while dlsym resolves
+// the real allocator and so cannot be reached through a normal preload. Built as a
+// standalone executable by graph-proof.py; prints one JSON line.
+int main(void) {
+    bootstrap_used = 0;
+    unsigned char *a = bootstrap_alloc(5);
+    unsigned char *b = bootstrap_alloc(40);
+    int aligned = a && b && ((uintptr_t)a % 16 == 0) && ((uintptr_t)b % 16 == 0);
+    int extent = a && b && bootstrap_size(a) == 5 && bootstrap_size(b) == 40 && b >= a + 16;
+    int zeroed = 1;
+    for (int i = 0; b && i < 40; i++) zeroed &= b[i] == 0;
+    long long before = bootstrap_refused;
+    int refuses_huge = bootstrap_alloc((size_t)-1) == NULL && bootstrap_alloc(sizeof bootstrap) == NULL;
+    int refuses_overflow = bootstrap_refused == before + 2;
+    size_t used = bootstrap_used;
+    while (bootstrap_alloc(1024)) {}
+    int exhausts = bootstrap_used <= sizeof bootstrap && bootstrap_used > used;
+    // realloc of a bootstrap block copies min(old, new) bytes, never past its extent.
+    memcpy(a, "abcde", 5);
+    unsigned char *grown = realloc(a, 64);
+    int copied = grown && memcmp(grown, "abcde", 5) == 0;
+    unsigned char *shrunk = realloc(b, 3);
+    int shrink_ok = shrunk != NULL;
+    free(grown);
+    free(shrunk);
+    free(bootstrap_alloc(8));  // bootstrap blocks are never passed to the real free
+    printf("{\"aligned\":%d,\"extent\":%d,\"zeroed\":%d,\"refuses_overflow\":%d,"
+           "\"refuses_huge\":%d,\"exhausts_within_buffer\":%d,\"realloc_copies_min\":%d,"
+           "\"realloc_shrink\":%d}\n", aligned, extent, zeroed, refuses_overflow, refuses_huge,
+           exhausts, copied, shrink_ok);
+    return 0;
+}
+#endif

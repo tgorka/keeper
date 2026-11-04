@@ -151,8 +151,13 @@ fn exercise_allocator_case(case: Case) -> Result<serde_json::Value, String> {
             let mut check = |name: &str, ok: bool| {
                 report.insert(name.into(), serde_json::Value::Bool(ok));
             };
+            // Two simultaneously live zero-size blocks must be distinct, non-null, aligned.
             let zero = keeper_graph_malloc(0);
-            check("malloc_zero_unique_aligned", aligned(zero));
+            let zero_second = keeper_graph_malloc(0);
+            check(
+                "malloc_zero_unique_aligned",
+                aligned(zero) && aligned(zero_second) && zero != zero_second,
+            );
             let calloc_a = keeper_graph_calloc(0, 7);
             let calloc_b = keeper_graph_calloc(7, 0);
             check(
@@ -193,6 +198,7 @@ fn exercise_allocator_case(case: Case) -> Result<serde_json::Value, String> {
             check(
                 "strndup_bounded_terminated",
                 aligned(bounded.cast())
+                    && aligned(short.cast())
                     && CStr::from_ptr(bounded).to_bytes() == b"kee"
                     && CStr::from_ptr(short).to_bytes() == b"ab",
             );
@@ -226,6 +232,7 @@ fn exercise_allocator_case(case: Case) -> Result<serde_json::Value, String> {
             );
             for pointer in [
                 zero,
+                zero_second,
                 calloc_a,
                 calloc_b,
                 realloc_null_zero,

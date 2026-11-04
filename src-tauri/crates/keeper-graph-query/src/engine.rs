@@ -290,6 +290,19 @@ mod tests {
         }))
         .expect("authorizer");
     }
+    /// Re-preparation under the final policy fails with SQLITE_AUTH ("not authorized"),
+    /// not with some unrelated error that would also satisfy `is_err`.
+    fn authorization_denied<T>(result: &rusqlite::Result<T>) -> bool {
+        match result {
+            Err(rusqlite::Error::SqliteFailure(e, _)) => {
+                e.code == rusqlite::ErrorCode::AuthorizationForStatementDenied
+            }
+            Err(rusqlite::Error::SqlInputError { error, .. }) => {
+                error.code == rusqlite::ErrorCode::AuthorizationForStatementDenied
+            }
+            _ => false,
+        }
+    }
 
     #[test]
     fn inactive_statements_prepared_before_the_final_policy_are_reauthorized() {
@@ -314,10 +327,13 @@ mod tests {
             .query_row("SELECT count(*) FROM secret", [], |r| r.get(0))
             .expect("count");
         assert!(
-            write_result.is_err(),
-            "privileged write ran: {write_result:?}"
+            authorization_denied(&write_result),
+            "privileged write was not an authorization denial: {write_result:?}"
         );
-        assert!(hidden_result.is_err(), "denied read ran: {hidden_result:?}");
+        assert!(
+            authorization_denied(&hidden_result),
+            "denied read was not an authorization denial: {hidden_result:?}"
+        );
         assert_eq!(written, 0, "denied write had an effect");
         assert_eq!(rows, vec![1, 2]);
     }
