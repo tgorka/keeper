@@ -285,9 +285,13 @@ impl Supervisor {
             return Err(Error::Cancelled);
         }
         let mut command = worker_command(&self.0.worker, path, role)?;
+        command.env_clear().env("GQL_STMT_CACHE", "0");
+        #[cfg(target_os = "linux")]
+        command.env(
+            "GLIBC_TUNABLES",
+            keeper_graph_protocol::wire::LINUX_WORKER_GLIBC_TUNABLES,
+        );
         command
-            .env_clear()
-            .env("GQL_STMT_CACHE", "0")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

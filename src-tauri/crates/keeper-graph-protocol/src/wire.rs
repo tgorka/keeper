@@ -8,8 +8,11 @@ pub const MAX_ROW_BYTES: usize = 128 * 1024;
 pub const MAX_EXPORT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_EVENTS: u64 = 100_000;
 pub const MAX_ENTITIES: u64 = 1_000_000;
-pub const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const ENGINE: &str = "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629";
+/// Fixed, non-secret allocator configuration the supervisor sets on every Linux worker
+/// child (after `env_clear`, before exec); the worker refuses any other value. No mmapped
+/// chunks (no page rounding, no persistent shrink after failed mremap) and no tcache.
+pub const LINUX_WORKER_GLIBC_TUNABLES: &str = "glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -110,12 +113,19 @@ impl Event {
         Ok(())
     }
 }
+/// Event digest: SHA-256 of the JCS bytes of the operation array.
+///
+/// The bytes are produced by serializing the parsed operations straight through JCS
+/// (no intermediate `serde_json::Value` copy; JCS canonicalizes member order).
+/// Acceptance is unchanged: the whole-array tree validation that `canonical_bytes`
+/// applied to `to_value(operations)` is reproduced exactly by
+/// [`validate_operation_tree`], and the final encoded-size cap still applies.
 pub fn operation_digest(operations: &[Operation]) -> Result<String, Refusal> {
     if operations.len() > 128 {
         return Err(Refusal::QueryLimit);
     }
-    let value = serde_json::to_value(operations).map_err(|_| Refusal::QueryUnsupported)?;
-    let bytes = canonical_bytes(&value)?;
+    validate_operation_tree(operations)?;
+    let bytes = serde_jcs::to_vec(operations).map_err(|_| Refusal::QueryUnsupported)?;
     if bytes.len() > MAX_EVENT_BYTES {
         return Err(Refusal::QueryLimit);
     }
@@ -126,6 +136,25 @@ pub fn operation_digest(operations: &[Operation]) -> Result<String, Refusal> {
         write!(out, "{byte:02x}").map_err(|_| Refusal::QueryUnsupported)?;
     }
     Ok(out)
+}
+/// `validate_value(&to_value(operations), 0)` without building that tree: the array is
+/// depth 0 (≤ 8192 elements), each operation object depth 1 (six members, keys < 8192
+/// bytes), and every member value depth 2. Scalars: `ordinal` is a u32 (finite, below
+/// MAX_NUMBER), `entity_type`/`operation` are fixed short strings, `entity_id` is
+/// checked against the 65536-byte string limit, `before`/`after` (or null) recurse.
+pub fn validate_operation_tree(operations: &[Operation]) -> Result<(), Refusal> {
+    if operations.len() > 8192 {
+        return Err(Refusal::QueryLimit);
+    }
+    for op in operations {
+        if op.entity_id.len() > 65536 {
+            return Err(Refusal::QueryLimit);
+        }
+        for value in [&op.before, &op.after].into_iter().flatten() {
+            validate_value(value, 2)?;
+        }
+    }
+    Ok(())
 }
 pub fn canonical_bytes(value: &Value) -> Result<Vec<u8>, Refusal> {
     validate_value(value, 0)?;

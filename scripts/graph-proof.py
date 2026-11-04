@@ -21,6 +21,10 @@ worker = os.path.realpath(os.path.join(target, 'keeper-graph-query'))
 driver = os.path.realpath(os.path.join(target, 'keeper-graph-driver'))
 mac = platform.system() == 'Darwin'
 env = {'GQL_STMT_CACHE': '0'}
+if not mac:
+    # P1: the supervisor's fixed Linux allocator setting; the worker requires it exactly.
+    tunables = 'glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0'
+    env['GLIBC_TUNABLES'] = tunables
 evidence = {'platform': platform.platform(), 'machine': platform.machine(), 'command': sys.argv, 'cases': {}}
 
 def sha256(path):
@@ -109,6 +113,12 @@ case('confined_query_parallel_edges', r, rows == [{'node': '0' * 25 + '1', 'edge
      and json.loads(r['stdout'])['pid'] == r['parent_pid'])
 r = run(['query', generation, 'MATCH (n) RETURN count(*) AS total LIMIT 1'], generation, extra_env={'KEEPER_FAKE_TOKEN': 'synthetic'})
 case('inherited_environment_refused', r, r['exit'] != 0)
+if not mac:
+    r = run(['query', generation, 'MATCH (n) RETURN count(*) AS total LIMIT 1'], generation, extra_env={'GLIBC_TUNABLES': tunables + ':glibc.malloc.arena_max=2'})
+    case('altered_allocator_tunables_refused', r, r['exit'] != 0 and 'fixed settings' in r['stderr'])
+    process = subprocess.run([probe, 'query', generation], input='', env={'GQL_STMT_CACHE': '0'}, capture_output=True, text=True, timeout=10)
+    case('missing_allocator_tunables_refused', {'exit': process.returncode, 'stderr': process.stderr.strip()[-200:]},
+         process.returncode != 0 and 'allocator tunables' in process.stderr)
 r = run(['wrong-thread'])
 case('wrong_thread_sqlite_callback_exit_73', r, r['exit'] == 73)
 r = run(['wrong-thread-native'])
@@ -298,44 +308,83 @@ else:
     library = os.path.join(scratch, 'alloc-interposer.so')
     source = os.path.join(root, 'scripts', 'alloc-interposer.c')
     subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', '-o', library, source, '-ldl'], check=True)
-    # Observer self-test: bootstrap alignment, extent, zeroing, overflow/exhaustion
-    # refusal and min(old,new) realloc copy (a branch a normal preload cannot reach).
+    # Observer self-test (built without builtin malloc/free assumptions so the sample
+    # counters are re-read across calls): bootstrap alignment/extent/zeroing/membership,
+    # overflow/exhaustion refusal, realloc copy boundaries, post-call samples after free
+    # and every realloc outcome, and the deferred aligned-allocation sample. Under P1 the
+    # D1 envelope holds; without it tcache-held chunks break it (negative control).
     selftest = os.path.join(scratch, 'alloc-interposer-selftest')
-    subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-DKG_INTERPOSER_SELFTEST', '-o', selftest, source, '-ldl'], check=True)
-    process = subprocess.run([selftest], capture_output=True, text=True, timeout=30)
+    subprocess.run(['cc', '-O2', '-fno-builtin', '-Wall', '-Wextra', '-Werror', '-DKG_INTERPOSER_SELFTEST', '-o', selftest, source, '-ldl'], check=True)
+    process = subprocess.run([selftest], env={'GLIBC_TUNABLES': tunables}, capture_output=True, text=True, timeout=30)
     controls = json.loads(process.stdout) if process.returncode == 0 else {}
-    case('observer_bootstrap_self_test', {'exit': process.returncode, 'controls': controls},
-         process.returncode == 0 and controls and all(v == 1 for v in controls.values()))
-    samples = []
-    for name, query, params in corpus:
-        process = subprocess.run([worker, 'query', limits_db], input=json.dumps({'source': query, 'parameters': params}) + '\n',
-                                 env=dict(env, LD_PRELOAD=library), capture_output=True, text=True, timeout=30)
-        report = [json.loads(l[len('KG_ALLOC '):]) for l in process.stderr.splitlines() if l.startswith('KG_ALLOC ')]
+    unfixed = subprocess.run([selftest], env={}, capture_output=True, text=True, timeout=30)
+    unfixed_controls = json.loads(unfixed.stdout) if unfixed.returncode == 0 else {}
+    case('observer_bootstrap_self_test', {'exit': process.returncode, 'controls': controls,
+                                          'without_p1_controls': unfixed_controls},
+         process.returncode == 0 and controls and all(v == 1 for v in controls.values())
+         and unfixed_controls.get('envelope_within_untracked') == 0
+         and all(v == 1 for k, v in unfixed_controls.items() if k != 'envelope_within_untracked'))
+    def observed(command, stdin_bytes, label):
+        process = subprocess.run(command, input=stdin_bytes, env=dict(env, LD_PRELOAD=library),
+                                 capture_output=True, timeout=600)
+        stderr = process.stderr.decode(errors='replace')
+        report = [json.loads(l[len('KG_ALLOC '):]) for l in stderr.splitlines() if l.startswith('KG_ALLOC ')]
         response = json.loads(process.stdout) if process.returncode == 0 else {}
-        samples.append(dict(report[0] if report else {}, query=name, exit=process.returncode, rows=len(response.get('rows', [])),
-                            worker_peak_charged_bytes=response.get('peak_allocated_bytes')))
-    valid = all(s['exit'] == 0 and 'peak_uncharged_remainder_bytes' in s and s['table_overflow'] == 0 for s in samples)
+        return dict(report[0] if report else {}, query=label, exit=process.returncode, rows=len(response.get('rows', [])),
+                    worker_peak_charged_bytes=response.get('peak_allocated_bytes'))
+    samples = [observed([worker, 'query', limits_db], (json.dumps({'source': query, 'parameters': params}) + '\n').encode(), name)
+               for name, query, params in corpus]
+    # Builder role over the accepted exports the driver already built and published
+    # (the deliberately faulted exports are refused by design and are not measured).
+    faults = ('-truncated', '-digest', '-before-image', '-dangling', '-gap', '-trailing')
+    exports = sorted(os.path.join(dirpath, n) for dirpath, _, names in os.walk(scratch) for n in names
+                     if n.endswith('.ndjson') and not n[:-len('.ndjson')].endswith(faults))
+    build_samples, skipped_exports = [], []
+    for export in exports:
+        label = os.path.relpath(export, scratch)
+        if os.path.getsize(export) > 128 * 1024 * 1024:
+            skipped_exports.append(label)
+            continue
+        with open(export, 'rb') as f:
+            stream = f.read()
+        target = fresh('observed-build-' + label.replace(os.sep, '-') + '.db')
+        build_samples.append(observed([worker, 'build', target], stream, 'build:' + label))
+    every = samples + build_samples
+    valid = all(s['exit'] == 0 and 'peak_uncharged_remainder_bytes' in s and s['table_overflow'] == 0 for s in every)
     remainder = [s.get('peak_uncharged_remainder_bytes', 0) for s in samples]
     library_bytes = [s.get('peak_library_bytes', 0) for s in samples]
     allocator_remainder = [s.get('peak_allocator_in_use_minus_charged_bytes', 0) for s in samples]
     # The interposer's charged peak must match Cap's own high-water mark: same domain.
-    agree = all(s.get('peak_charged_bytes') == s.get('worker_peak_charged_bytes') for s in samples)
-    result = {'samples': samples, 'charged_accounting_agrees_with_cap': agree,
+    agree = all(s.get('peak_charged_bytes') == s.get('worker_peak_charged_bytes') for s in every)
+    result = {'samples': samples, 'build_samples': build_samples, 'charged_accounting_agrees_with_cap': agree,
               'remainder_spread_bytes': max(remainder) - min(remainder),
               'library_bypass_spread_bytes': max(library_bytes) - min(library_bytes),
               'allocator_wide_remainder_spread_bytes': max(allocator_remainder) - min(allocator_remainder),
-              'alignment_above_16_calls': sum(s.get('alignment_above_16_calls', 0) for s in samples),
-              # Separate series, never compared with each other (design v2 §1).
-              'max_live_below_32': max(s.get('peak_live_executable_allocations_below_32', 0) for s in samples),
-              'max_realloc_old_bytes': max(s.get('max_realloc_old_bytes', 0) for s in samples),
-              'max_reconstructed_overlap_bytes': max(s.get('peak_reconstructed_overlap_bytes', 0) for s in samples),
-              'max_mmapped_bytes': max(s.get('peak_mmapped_bytes', 0) for s in samples),
-              'bootstrap_refused': sum(s.get('bootstrap_refused', 0) for s in samples)}
+              'alignment_above_16_calls': sum(s.get('alignment_above_16_calls', 0) for s in every),
+              # Separate series, never compared with each other (design §1).
+              'max_live_below_32': max(s.get('peak_live_executable_allocations_below_32', 0) for s in every),
+              'max_realloc_old_bytes': max(s.get('max_realloc_old_bytes', 0) for s in every),
+              'max_reconstructed_overlap_bytes': max(s.get('peak_reconstructed_overlap_bytes', 0) for s in every),
+              'max_mmapped_bytes': max(s.get('peak_mmapped_bytes', 0) for s in every),
+              'bootstrap_refused': sum(s.get('bootstrap_refused', 0) for s in every)}
     # No acceptance window: until the reviewed accounted-cost envelope (R1) replaces
     # this assertion, any input-dependent uncharged remainder fails the proof.
     ok = (valid and agree and result['remainder_spread_bytes'] == 0 and result['library_bypass_spread_bytes'] == 0
           and result['allocator_wide_remainder_spread_bytes'] == 0 and result['alignment_above_16_calls'] == 0)
     case('memory_uncharged_remainder', result, ok, fatal=False)
+    # Mechanism falsifier (design v3 D1 under P1), not the R1 bound: at every post-call
+    # sample, allocator in-use <= 2*charged + 64*small32 + library chunks + untracked
+    # pre-observer bytes; no mmapped chunk; no wide alignment; and no executable aligned
+    # entry, so std's System realloc_fallback was never reached in these runs.
+    d1 = {s['query']: {k: s.get(k) for k in ('peak_envelope_excess_bytes', 'untracked_in_use_at_start_bytes',
+                                              'peak_mmapped_bytes', 'alignment_above_16_calls',
+                                              'executable_aligned_calls', 'allocator_samples')} for s in every}
+    case('d1_heap_envelope_under_p1', {'runs': d1, 'build_runs': len(build_samples), 'skipped_exports_over_128_mib': skipped_exports},
+         valid and build_samples and all(
+             v['peak_envelope_excess_bytes'] is not None
+             and v['peak_envelope_excess_bytes'] <= v['untracked_in_use_at_start_bytes']
+             and v['peak_mmapped_bytes'] == 0 and v['alignment_above_16_calls'] == 0
+             and v['executable_aligned_calls'] == 0 for v in d1.values()), fatal=False)
 print(json.dumps(evidence, indent=1))
 failed = [name for name, result in evidence['cases'].items() if not result['pass']]
 if failed:

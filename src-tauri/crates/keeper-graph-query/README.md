@@ -21,7 +21,9 @@ redirects the C allocation family into the audited Rust allocation domain.
 replays it in one checked host transaction (MEMORY journal, EXCLUSIVE lock, no WAL).
 `query <generation>` and `inspect <generation>` open the immutable generation
 (`mode=ro&immutable=1`, `query_only`, default-deny authorizer) and answer one framed request.
-The worker refuses any inherited environment except `GQL_STMT_CACHE=0`, closes inherited
+The worker requires exactly the supervisor's fixed environment — `GQL_STMT_CACHE=0`, plus on
+Linux `GLIBC_TUNABLES=glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0` (no mmapped
+chunks, no tcache; `wire::LINUX_WORKER_GLIBC_TUNABLES`) — and refuses anything else, closes inherited
 descriptors, then confines itself (Linux: Landlock ABI 6 hard requirement, seccomp,
 `RLIMIT_AS` 512 MiB; macOS: the parent's constant `sandbox-exec` profile).
 
