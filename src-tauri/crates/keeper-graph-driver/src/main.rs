@@ -967,6 +967,117 @@ mod proof {
         names.sort();
         names
     }
+    /// P6c system-preload refusal through the real supervisor, for a privileged runner.
+    /// The driver itself never touches `/etc`: for each named variant it prints
+    /// `{"await":"present",...}` and waits for one stdin line while the runner creates
+    /// `/etc/ld.so.preload` (an empty file, or a dangling symlink), then requires the
+    /// same no-side-effect refusal as the stack case (writerless FIFO input never
+    /// opened, planted reclaimable artifact kept, directory mtime/ctime unchanged, no
+    /// reaped or live child, typed `Unavailable` for build/query/inspect). It then
+    /// prints `{"await":"absent",...}`, waits for removal and requires the prior
+    /// generation to answer unchanged. A final real build reclaims the planted
+    /// artifact (detector control).
+    #[cfg(target_os = "linux")]
+    async fn preload(supervisor: &Supervisor, root: &Path, variants: &[String]) -> Result<()> {
+        use std::io::BufRead;
+        let preload_path = Path::new("/etc/ld.so.preload");
+        let state = || match std::fs::symlink_metadata(preload_path) {
+            Ok(m) if m.file_type().is_symlink() => "symlink".to_owned(),
+            Ok(m) => format!("file:{}", m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
+            Err(e) => format!("error:{e}"),
+        };
+        let mut stdin = std::io::stdin().lock();
+        let mut wait = |phase: &str, variant: &str| -> Result<()> {
+            emit(json!({"await":phase,"variant":variant}))?;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            stdin.read_line(&mut line)?;
+            if line.trim() != "ready" {
+                return Err(format!("runner did not confirm {phase} for {variant}").into());
+            }
+            Ok(())
+        };
+        if state() != "absent" {
+            return Err("system preload must be absent before the case".into());
+        }
+        let domain = "fixture-preload";
+        let export = root.join("preload.ndjson");
+        let m = oracle_export(&export, domain)?;
+        let cancel = Cancellation::default();
+        let generation = supervisor.build_export(&export, &m, &cancel).await?;
+        let session = supervisor.session("preload", "preload", domain)?;
+        let control = "MATCH (n:Concept) RETURN count(*) AS total LIMIT 1";
+        let baseline = session
+            .query(&generation, control, b"{}", &cancel)
+            .await?
+            .rows;
+        let published = generation_files(root)?;
+        let directory = root.join("generations");
+        let planted = directory.join(format!("{}.staging", ulid_text()));
+        std::fs::write(&planted, b"")?;
+        let fifo = root.join("preload.fifo");
+        if !std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()?
+            .success()
+        {
+            return Err("mkfifo failed".into());
+        }
+        let stamp = || -> Result<(i64, i64, i64, i64)> {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(&directory)?;
+            Ok((m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+        };
+        let mut outcomes = vec![json!({"preload":"absent","build":"ok","query_rows":baseline})];
+        for variant in variants {
+            wait("present", variant)?;
+            let observed = state();
+            let reaped = supervisor.last_reaped();
+            let before = stamp()?;
+            let build = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                supervisor.build_export(&fifo, &m, &cancel),
+            )
+            .await;
+            let Ok(build) = build else {
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                return Err(format!("preload {variant}: the build input was opened").into());
+            };
+            let query = session.query(&generation, control, b"{}", &cancel).await;
+            let inspect = session.inspect(&generation, &id(1), false, &cancel).await;
+            let typed = matches!(build, Err(keeper_core::graph::Error::Unavailable))
+                && matches!(query, Err(keeper_core::graph::Error::Unavailable))
+                && matches!(inspect, Err(keeper_core::graph::Error::Unavailable));
+            let no_child =
+                supervisor.last_reaped() == reaped && supervisor.live_workers().is_empty();
+            let unchanged = generation_files(root)? == published_with(&published, &planted);
+            let untouched = stamp()? == before && planted.exists();
+            wait("absent", variant)?;
+            let after_state = state();
+            let rows = session
+                .query(&generation, control, b"{}", &cancel)
+                .await?
+                .rows;
+            if observed == "absent"
+                || after_state != "absent"
+                || !(typed && no_child && unchanged && untouched)
+                || rows != baseline
+            {
+                return Err(format!("preload {variant} did not refuse cleanly: observed={observed} after={after_state} typed={typed} no_child={no_child} unchanged={unchanged} untouched={untouched} rows_unchanged={}", rows == baseline).into());
+            }
+            outcomes.push(json!({"variant":variant,"observed":observed,"build":"projection_unavailable","query":"projection_unavailable","inspect":"projection_unavailable","no_child":true,"input_never_opened":true,"planted_artifact_kept":true,"directory_mtime_ctime_unchanged":true,"after_removal":after_state,"prior_generation_rows_unchanged":true}));
+        }
+        let before = stamp()?;
+        let second = supervisor.build_export(&export, &m, &cancel).await?;
+        let controls = json!({"real_build_reclaims_planted":!planted.exists(),"real_build_changes_directory":stamp()? != before});
+        drop(second);
+        if planted.exists() {
+            return Err(format!("preload detector control failed: {controls}").into());
+        }
+        outcomes.push(json!({"preload":"absent","controls":controls}));
+        emit(json!({"mode":"preload","outcomes":outcomes}))
+    }
     /// B0 through the real supervisor: `worker` is a test-only wrapper that execs the
     /// real worker with a measurement preload whose variant the driver selects through
     /// `control` before each call (a real brk-heap inflation, or a replaced
@@ -1089,6 +1200,8 @@ mod proof {
                 let control = PathBuf::from(args.get(4).ok_or("variant control file required")?);
                 boundary(&supervisor, &root, &control).await?
             }
+            #[cfg(target_os = "linux")]
+            "preload" => preload(&supervisor, &root, &args[4..]).await?,
             _ => return Err("unknown proof mode".into()),
         }
         emit(json!({"mode":mode,"complete":true,"peak_live_workers":supervisor.peak_workers()}))

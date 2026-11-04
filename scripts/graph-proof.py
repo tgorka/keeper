@@ -41,6 +41,38 @@ def tool(*command):
     except (OSError, IndexError):
         return None
 
+# Measurement-only native helpers (observer, B0 preloads). `KG1_NATIVE_EXPORT=<dir>`
+# copies each compiled object there with a manifest keyed by the exact flags and source
+# bytes; `KG1_NATIVE_PREBUILT=<dir>` on a host without a compiler takes the object from
+# such a manifest only if that key matches this harness's source and flags exactly.
+native_record = {}
+def native_cc(flags, output, sources, libs=()):
+    import hashlib, shutil
+    key = hashlib.sha256(json.dumps([flags, list(libs), [open(s, 'rb').read().hex() for s in sources]]).encode()).hexdigest()
+    name = os.path.basename(output)
+    prebuilt = os.environ.get('KG1_NATIVE_PREBUILT')
+    if prebuilt:
+        with open(os.path.join(prebuilt, 'manifest.json')) as f:
+            entry = json.load(f).get(name, {})
+        if entry.get('key') != key or sha256(os.path.join(prebuilt, name)) != entry.get('sha256'):
+            sys.exit(f'prebuilt native object {name} does not match this harness source/flags')
+        shutil.copy(os.path.join(prebuilt, name), output)
+        os.chmod(output, 0o755)
+        native_record[name] = {'mode': 'prebuilt', 'key': key, 'sha256': entry['sha256']}
+        return
+    subprocess.run(['cc'] + flags + ['-o', output] + sources + list(libs), check=True)
+    native_record[name] = {'mode': 'compiled', 'key': key, 'sha256': sha256(output)}
+    export = os.environ.get('KG1_NATIVE_EXPORT')
+    if export:
+        os.makedirs(export, exist_ok=True)
+        shutil.copy(output, os.path.join(export, name))
+        manifest_path = os.path.join(export, 'manifest.json')
+        manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else {}
+        manifest[name] = {'key': key, 'sha256': native_record[name]['sha256'], 'flags': flags, 'libs': list(libs)}
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=1)
+evidence['native_helpers'] = native_record
+
 # Provenance: which source and binaries produced this evidence. The Mac copy has no
 # .git, so first-party sources are hashed individually on every platform.
 sources = {}
@@ -178,15 +210,30 @@ if not mac:
         slots = [int(s, 16) for s in re.findall(r'call\s+\*0x[0-9a-f]+\(%rip\)\s+# ([0-9a-f]+)', body.group(1))] if body else []
         direct = re.findall(r'call\s+[0-9a-f]+ <([^>]+)>', body.group(1)) if body else []
         return [names.get(relative.get(s), hex(s)) for s in slots] + direct
-    structure = {}
-    for label, binary in (('worker', worker), ('probe', probe)):
-        imports = subprocess.run(['nm', '-D', '--undefined-only', binary], capture_output=True, text=True).stdout
-        targets = start_panic_target(binary)
-        structure[label] = {'unwinder_entry_imports': [s for s in ('_Unwind_RaiseException', '_Unwind_ForcedUnwind', '_Unwind_Resume_or_Rethrow') if s in imports],
-                            'start_panic_calls': targets}
+    # On a host without binutils the same static result may come from a JSON computed
+    # off-host for byte-identical binaries (`KG1_STATIC_PRECOMPUTED`): it is accepted
+    # only if its recorded sha256s equal the binaries under proof here.
+    precomputed = os.environ.get('KG1_STATIC_PRECOMPUTED')
+    if precomputed:
+        with open(precomputed) as f:
+            structure = json.load(f)
+        matches = all(structure.get(label, {}).get('sha256') == sha256(binary) for label, binary in (('worker', worker), ('probe', probe)))
+        structure = dict(structure, computed_off_host=True, sha256_matches_binaries_under_proof=matches)
+    else:
+        structure = {}
+        for label, binary in (('worker', worker), ('probe', probe)):
+            imports = subprocess.run(['nm', '-D', '--undefined-only', binary], capture_output=True, text=True).stdout
+            targets = start_panic_target(binary)
+            structure[label] = {'sha256': sha256(binary),
+                                'unwinder_entry_imports': [s for s in ('_Unwind_RaiseException', '_Unwind_ForcedUnwind', '_Unwind_Resume_or_Rethrow') if s in imports],
+                                'start_panic_calls': targets}
+        matches = True
+        if os.environ.get('KG1_STATIC_EXPORT'):
+            with open(os.environ['KG1_STATIC_EXPORT'], 'w') as f:
+                json.dump(structure, f, indent=1)
     case('artifact_cannot_unwind', structure,
-         all(not v['unwinder_entry_imports'] and v['start_panic_calls'] and all('abort' in t for t in v['start_panic_calls'])
-             for v in structure.values()))
+         matches and all(not structure[k]['unwinder_entry_imports'] and structure[k]['start_panic_calls']
+                         and all('abort' in t for t in structure[k]['start_panic_calls']) for k in ('worker', 'probe')))
     # Pre-main: drive std's signal-stack mmap into failure with a tight inherited
     # RLIMIT_AS. Under panic=abort the init panic prints std's message and aborts
     # (SIGABRT, before confinement) with no caught unwind. "initialization or cleanup
@@ -498,7 +545,7 @@ if not mac:
     b0 = {}
     for label, size in (('over_h0', 2 * 1024 * 1024), ('control_small', 16 * 1024)):
         library = os.path.join(scratch, f'b0-inflate-{label}.so')
-        subprocess.run(['cc', '-O2', '-Wall', '-Werror', '-shared', '-fPIC', f'-DINFLATE_BYTES={size}', '-o', library, inflate_source], check=True)
+        native_cc(['-O2', '-Wall', '-Werror', '-shared', '-fPIC', f'-DINFLATE_BYTES={size}'], library, [inflate_source])
         staged = fresh(f'b0-{label}-build.db')
         with open(oracle_export, 'rb') as f:
             export_bytes = f.read()
@@ -534,11 +581,13 @@ if not mac:
 static char variant[64];
 void *volatile kg_b0_inflation;
 __attribute__((constructor)) static void init(void) {
-  int fd = open(CONTROL, O_RDONLY);
+  const char *control = getenv("KG1_B0_CONTROL");
+  int fd = control ? open(control, O_RDONLY) : -1;
   if (fd >= 0) { ssize_t n = read(fd, variant, sizeof variant - 1); if (n > 0) variant[n] = 0; close(fd); }
   size_t bytes = !strcmp(variant, "heap_2_mib") ? 2u << 20 : !strcmp(variant, "heap_16_kib") ? 16u << 10 : 0;
   if (bytes) { char *p = malloc(bytes); if (p) memset(p, 1, bytes); kg_b0_inflation = p; }
   unsetenv("LD_PRELOAD");
+  unsetenv("KG1_B0_CONTROL");
 }
 static const char *status(void) {
   if (!strcmp(variant, "exact_h0_1024_kb")) return "Name:\tw\nVmPeak:\t9000 kB\nVmData:\t1024 kB\n";
@@ -564,12 +613,11 @@ int open64(const char *path, int flags, ...) {
 }
 ''')
     variant_library = os.path.join(scratch, 'b0-variant.so')
-    subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', f'-DCONTROL="{control_file}"',
-                    '-o', variant_library, variant_source, '-ldl'], check=True)
+    native_cc(['-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC'], variant_library, [variant_source], ['-ldl'])
     wrapper = os.path.join(scratch, 'b0-wrapper-worker')
     with open(wrapper, 'w') as f:
         f.write('#!/bin/sh\nexec /usr/bin/env -i GQL_STMT_CACHE="$GQL_STMT_CACHE" GLIBC_TUNABLES="$GLIBC_TUNABLES" '
-                f'LD_PRELOAD={variant_library} {worker} "$@"\n')
+                f'KG1_B0_CONTROL={control_file} LD_PRELOAD={variant_library} {worker} "$@"\n')
     os.chmod(wrapper, 0o755)
     process = subprocess.run([driver, 'boundary', wrapper, os.path.join(scratch, 'driver-boundary'), control_file],
                              capture_output=True, text=True, timeout=600)
@@ -610,14 +658,14 @@ if mac:
 else:
     library = os.path.join(scratch, 'alloc-interposer.so')
     source = os.path.join(root, 'scripts', 'alloc-interposer.c')
-    subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', '-o', library, source, '-ldl'], check=True)
+    native_cc(['-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC'], library, [source], ['-ldl'])
     # Observer self-test (built without builtin malloc/free assumptions so the sample
     # counters are re-read across calls): bootstrap alignment/extent/zeroing/membership,
     # overflow/exhaustion refusal, realloc copy boundaries, post-call samples after free
     # and every realloc outcome, and the deferred aligned-allocation sample. Under P1 the
     # D1 envelope holds; without it tcache-held chunks break it (negative control).
     selftest = os.path.join(scratch, 'alloc-interposer-selftest')
-    subprocess.run(['cc', '-O2', '-fno-builtin', '-Wall', '-Wextra', '-Werror', '-DKG_INTERPOSER_SELFTEST', '-o', selftest, source, '-ldl'], check=True)
+    native_cc(['-O2', '-fno-builtin', '-Wall', '-Wextra', '-Werror', '-DKG_INTERPOSER_SELFTEST'], selftest, [source], ['-ldl'])
     process = subprocess.run([selftest], env={'GLIBC_TUNABLES': tunables}, capture_output=True, text=True, timeout=30)
     controls = json.loads(process.stdout) if process.returncode == 0 else {}
     unfixed = subprocess.run([selftest], env={}, capture_output=True, text=True, timeout=30)
