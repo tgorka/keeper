@@ -496,7 +496,9 @@ mod proof {
             }
             let p95 = percentile(&mut times, 95);
             let p50 = percentile(&mut times, 50);
-            let budget = if name.starts_with("traversal") {
+            // Spec targets: indexed lookups and 1-hop <= 250 ms; the bounded 2-hop
+            // traversal <= 1 s (owner ruling 2026-11-05: 1-hop is 250 ms, not 1 s).
+            let budget = if name == "traversal_2hop" {
                 1_000_000
             } else {
                 250_000

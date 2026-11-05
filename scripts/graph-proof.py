@@ -651,10 +651,245 @@ corpus = (
     ('blob_sort_1000_wide_4', 'MATCH (n:Concept) WHERE n.P_626c6f62 IS NOT NULL RETURN ' + ', '.join(f'n.P_626c6f62 AS b{i}' for i in range(4)) + ' ORDER BY b0 DESC LIMIT 4', {}),
 )
 if mac:
-    # SIP strips DYLD_* variables through /usr/bin/sandbox-exec, so no preload can
-    # reach the confined worker; system-zone accounting on macOS needs another
-    # reviewed mechanism. Recorded as an unproved obligation, never a pass.
-    case('memory_uncharged_remainder', {'owed': 'macOS system-zone transient accounting', 'mechanism': None}, False, fatal=False)
+    # Darwin memory (owner-approved criterion amendment, 2026-11-05 addendum, Option A).
+    # SIP strips DYLD_* through /usr/bin/sandbox-exec, so the Linux observer cannot run.
+    # Judged on the TESTED runs only: the kernel's lifetime-maximum physical footprint of
+    # each confined worker run <= the Linux envelope, Cap <= R, and the expected exit.
+    # NOT claimed: any every-input bound, allocator-owned/retained bytes, library-bypass
+    # attribution, a production ceiling or equivalence with the Linux accounted-cost proof
+    # (the historical Darwin memory_uncharged_remainder FAIL stays on record).
+    R, ENVELOPE = 28 * 1024 * 1024, 261_357_632
+    helper_source = os.path.join(root, 'scripts', 'kg1-darwin-footprint.c')
+    helper = os.path.join(scratch, 'kg1-darwin-footprint')
+    helper_flags = ['-O2', '-Wall', '-Wextra', '-Werror']
+    native_cc(helper_flags, helper, [helper_source])
+    darwin_build = tool('sw_vers', '-buildVersion')
+    pinned = darwin_build == '26A428' and platform.machine() == 'arm64'
+    def macho_uuid(path):
+        found = re.findall(r'\buuid ([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})',
+                           subprocess.run(['otool', '-l', path], capture_output=True, text=True).stdout)
+        return found[0].replace('-', '').lower() if len(found) == 1 else None
+    worker_uuid, helper_uuid = macho_uuid(worker), macho_uuid(helper)
+    FIELDS = {'helper': str, 'rusage_version': int, 'pid': int, 'waitid_pid': int, 'reaped_pid': int, 'exit': int,
+              'signal': int, 'lifetime_max_phys_footprint': int, 'phys_footprint_at_read': int, 'ru_maxrss': int,
+              'read_delay_ms': int, 'uuid': str}
+    # Runs with no Cap response by design, each named: the worker's typed refusals, and
+    # helper calibration probes (not the worker).
+    NO_CAP = {'adversarial_build_frame', 'adversarial_query_frame', 'native_materialization_exit_72', 'calibration'}
+    def parse_record(stdout):
+        lines = stdout.splitlines()
+        if len(lines) != 1:
+            return None
+        try:
+            value = json.loads(lines[0])
+        except ValueError:
+            return None
+        return value if isinstance(value, dict) else None
+    def darwin_accept(sample, expect):
+        """The single acceptance predicate for every worker run and every control."""
+        rec = sample.get('record')
+        if sample.get('helper_exit') != 0 or not isinstance(rec, dict):
+            return False, 'helper_failed_or_unparsable'
+        if set(rec) != set(FIELDS) or any(type(rec[k]) is not t for k, t in FIELDS.items()):
+            return False, 'schema'
+        if rec['helper'] != 'kg1-darwin-footprint' or rec['rusage_version'] != 6:
+            return False, 'helper_or_rusage_version'
+        if not (rec['pid'] > 0 and rec['pid'] == rec['waitid_pid'] == rec['reaped_pid']):
+            return False, 'identity_pid'
+        if not re.fullmatch(r'[0-9a-f]{32}', rec['uuid']) or rec['uuid'] != expect['uuid']:
+            return False, 'identity_image_uuid'
+        if rec['signal'] != 0:
+            return False, 'signal'
+        if rec['exit'] != expect['exit']:
+            return False, 'exit'
+        fp = rec['lifetime_max_phys_footprint']
+        if fp <= 0:
+            return False, 'footprint_missing_or_zero'
+        if fp > ENVELOPE:
+            return False, 'footprint_above_envelope'
+        cap = sample.get('cap', 'missing')
+        if expect['name'] in NO_CAP:
+            if cap is not None:
+                return False, 'cap_unexpected'
+        elif type(cap) is not int or not 0 < cap <= R:
+            return False, 'cap_missing_or_above_r'
+        return True, 'accepted'
+    def measure(command, stdin_path, name, options=(), env_args=None):
+        safe = re.sub(r'[^A-Za-z0-9_.-]', '-', name)
+        out, err = fresh('fp-' + safe + '.out'), fresh('fp-' + safe + '.err')
+        env_args = ['GQL_STMT_CACHE=0'] if env_args is None else env_args
+        p = subprocess.run([helper, 'measure', '--timeout-ms', '1800000', *options, stdin_path, out, err, *env_args, '--', *command],
+                           capture_output=True, text=True, timeout=1900)
+        with open(out, 'rb') as f:
+            stdout_bytes = f.read()
+        return {'name': name, 'helper_exit': p.returncode, 'helper_stdout': p.stdout[-600:], 'record': parse_record(p.stdout),
+                'child_stdout_bytes': len(stdout_bytes), 'child_stdout': stdout_bytes}
+    def worker_sample(role, db, stdin_bytes, name, expected_exit):
+        stdin_path = fresh('fp-' + re.sub(r'[^A-Za-z0-9_.-]', '-', name) + '.in')
+        with open(stdin_path, 'wb') as f:
+            f.write(stdin_bytes)
+        command = ['/usr/bin/sandbox-exec', '-p', profiles['BUILD' if role == 'build' else 'READ'], '-D', 'WORKER=' + worker,
+                   '-D', 'DB=' + db, worker, role, db]
+        s = measure(command, stdin_path, name)
+        raw = s.pop('child_stdout')
+        if name in NO_CAP:
+            s['cap'] = None if not raw else 'unexpected_output'
+        else:
+            try:
+                s['cap'] = json.loads(raw).get('peak_allocated_bytes')
+            except (ValueError, AttributeError):
+                s['cap'] = 'unparsable_response'
+        s['expect'] = {'name': name, 'exit': expected_exit, 'uuid': worker_uuid}
+        s['accepted'], s['reason'] = darwin_accept(s, s['expect'])
+        return s
+    runs = []
+    for name, query, params in corpus:
+        runs.append(worker_sample('query', limits_db, (json.dumps({'source': query, 'parameters': params}) + '\n').encode(), name, 0))
+    faults = ('-truncated', '-digest', '-before-image', '-dangling', '-gap', '-trailing')
+    exports = sorted(os.path.join(dirpath, n) for dirpath, _, names in os.walk(scratch) for n in names
+                     if n.endswith('.ndjson') and not n[:-len('.ndjson')].endswith(faults))
+    export_labels = [os.path.relpath(e, scratch) for e in exports]
+    EXPECTED_EXPORTS = ['driver-limits/limits.ndjson', 'driver-limits/small.ndjson',
+                        'driver-oracle/fixture-personal.ndjson', 'driver-oracle/fixture-shared.ndjson']
+    for export, label in zip(exports, export_labels):
+        with open(export, 'rb') as f:
+            stream = f.read()
+        runs.append(worker_sample('build', fresh('footprint-build-' + label.replace(os.sep, '-') + '.db'), stream, 'build:' + label, 0))
+    runs.append(worker_sample('build', fresh('footprint-adversarial-build.db'), adversarial_build_frame, 'adversarial_build_frame', 75))
+    runs.append(worker_sample('query', limits_db, adversarial_query_frame, 'adversarial_query_frame', 74))
+    runs.append(worker_sample('query', limits_db, (json.dumps({'source': f'MATCH (n:Concept) WHERE n.P_626c6f62 IS NOT NULL RETURN {wide} LIMIT 1000', 'parameters': {}}) + '\n').encode(),
+                              'native_materialization_exit_72', 72))
+    expected_names = ([n for n, _, _ in corpus] + ['build:' + l for l in EXPECTED_EXPORTS]
+                      + ['adversarial_build_frame', 'adversarial_query_frame', 'native_materialization_exit_72'])
+    coverage_ok = export_labels == EXPECTED_EXPORTS and [r['name'] for r in runs] == expected_names
+
+    # ---- calibration and discriminating controls, all through darwin_accept ----
+    empty = fresh('fp-empty.in')
+    def calibration(name, args, options=(), expect_exit=0, launcher=()):
+        s = measure([*launcher, helper, 'probe', *args], empty, name, options)
+        raw = s.pop('child_stdout')
+        try:
+            s['probe'] = json.loads(raw) if raw else None
+        except ValueError:
+            s['probe'] = 'unparsable'
+        s['cap'] = None
+        s['expect'] = {'name': 'calibration', 'exit': expect_exit, 'uuid': helper_uuid}
+        s['accepted'], s['reason'] = darwin_accept(s, s['expect'])
+        return s
+    def fp(s):
+        return (s.get('record') or {}).get('lifetime_max_phys_footprint', 0)
+    def touched(s):
+        return s['probe'].get('touched_bytes', -1) if isinstance(s.get('probe'), dict) else -1
+    MiB = 1 << 20
+    c0 = calibration('cal_touch_0', ['touch', '0', '65536'])
+    c8 = calibration('cal_touch_8', ['touch', '8', '65536'])
+    c32 = calibration('cal_touch_32', ['touch', '32', '65536'])
+    c200 = calibration('cal_touch_200_within', ['touch', '200', '65536'])
+    over_mib = ENVELOPE // MiB + 16
+    cover = calibration('cal_touch_above_envelope', ['touch', str(over_mib), '65536'])
+    cdelay = calibration('cal_touch_32_delayed_read', ['touch', '32', '65536'], options=('--read-delay-ms', '1000'))
+    ckill = calibration('cal_kill_after_touch_8', ['kill', '8', '65536'])
+    csandbox = calibration('cal_sandbox_exec_chain', ['touch', '8', '65536'], launcher=('/usr/bin/sandbox-exec', '-p', '(version 1)(allow default)'))
+    shell = measure(['/bin/sh', '-c', '"$0" probe touch 8 65536; exit 0', helper], empty, 'cal_shell_non_exec_launcher')
+    shell.pop('child_stdout')
+    shell['cap'] = None
+    shell['expect'] = {'name': 'calibration', 'exit': 0, 'uuid': helper_uuid}
+    shell['accepted'], shell['reason'] = darwin_accept(shell, shell['expect'])
+    cuntouched = calibration('cal_untouched_64', ['untouched', '64', str(64 * MiB)])
+    mapped = os.path.join(scratch, 'fp-mapfile.bin')
+    with open(mapped, 'wb') as f:
+        f.write(os.urandom(32 * MiB))
+    cmap = calibration('cal_clean_file_backed_32', ['mapfile', mapped])
+    timeout = measure([helper, 'probe', 'sleep', '0', '16'], empty, 'cal_timeout', options=('--timeout-ms', '500'))
+    timeout.pop('child_stdout')
+    leftover_sleep = [l for l in subprocess.run(['ps', '-axo', 'stat=,args='], capture_output=True, text=True).stdout.splitlines()
+                      if 'probe sleep' in l and helper in l]
+    failures = {
+        'nonexistent_executable': measure([os.path.join(scratch, 'no-such-binary')], empty, 'fail_noexec'),
+        'unopenable_stdin': measure([helper, 'probe', 'touch', '0', '65536'], os.path.join(scratch, 'no-such-dir', 'in'), 'fail_stdin'),
+        'relative_command': measure(['kg1-darwin-footprint', 'probe', 'touch', '0', '65536'], empty, 'fail_relative'),
+        'malformed_env': measure([helper, 'probe', 'touch', '0', '65536'], empty, 'fail_env', env_args=['NOEQUALS']),
+    }
+    for f_ in failures.values():
+        f_.pop('child_stdout')
+        f_['cap'] = None
+        f_['expect'] = {'name': 'calibration', 'exit': 0, 'uuid': helper_uuid}
+        f_['accepted'], f_['reason'] = darwin_accept(f_, f_['expect'])
+    # Mutations of a real accepted worker run and a real accepted calibration record.
+    base_worker = next((r for r in runs if r['accepted'] and r['expect']['name'] not in NO_CAP), None)
+    def mutate(sample, change=None, record=None, drop=None):
+        s = json.loads(json.dumps({k: v for k, v in sample.items() if k not in ('accepted', 'reason')}))
+        if isinstance(s.get('record'), dict):
+            s['record'].update(record or {})
+            if drop:
+                s['record'].pop(drop, None)
+        s.update(change or {})
+        return darwin_accept(s, s['expect'])
+    mutations = {}
+    if base_worker:
+        bw = base_worker
+        mutations = {
+            'footprint_at_envelope_accepted': mutate(bw, record={'lifetime_max_phys_footprint': ENVELOPE}) == (True, 'accepted'),
+            'footprint_just_over_envelope_rejected': mutate(bw, record={'lifetime_max_phys_footprint': ENVELOPE + 1}) == (False, 'footprint_above_envelope'),
+            'cap_at_r_accepted': mutate(bw, change={'cap': R}) == (True, 'accepted'),
+            'cap_just_over_r_rejected': mutate(bw, change={'cap': R + 1}) == (False, 'cap_missing_or_above_r'),
+            'cap_missing_rejected': mutate(bw, change={'cap': None}) == (False, 'cap_missing_or_above_r'),
+            'cap_string_rejected': mutate(bw, change={'cap': '1'})[0] is False,
+            'wrong_exit_rejected': mutate(bw, record={'exit': 1}) == (False, 'exit'),
+            'signal_rejected': mutate(bw, record={'signal': 9, 'exit': -1}) == (False, 'signal'),
+            'wrong_image_uuid_rejected': mutate(bw, record={'uuid': helper_uuid}) == (False, 'identity_image_uuid'),
+            'pid_mismatch_rejected': mutate(bw, record={'waitid_pid': bw['record']['pid'] + 1}) == (False, 'identity_pid'),
+            'helper_failure_rejected': mutate(bw, change={'helper_exit': 2}) == (False, 'helper_failed_or_unparsable'),
+            'rusage_version_rejected': mutate(bw, record={'rusage_version': 5}) == (False, 'helper_or_rusage_version'),
+            'missing_footprint_rejected': mutate(bw, drop='lifetime_max_phys_footprint') == (False, 'schema'),
+            'zero_footprint_rejected': mutate(bw, record={'lifetime_max_phys_footprint': 0}) == (False, 'footprint_missing_or_zero'),
+            'negative_footprint_rejected': mutate(bw, record={'lifetime_max_phys_footprint': -5})[0] is False,
+            'string_footprint_rejected': mutate(bw, record={'lifetime_max_phys_footprint': '5'}) == (False, 'schema'),
+            'bool_footprint_rejected': mutate(bw, record={'lifetime_max_phys_footprint': True}) == (False, 'schema'),
+            'float_footprint_rejected': mutate(bw, record={'lifetime_max_phys_footprint': 5.0}) == (False, 'schema'),
+            'extra_field_rejected': mutate(bw, record={'x': 1}) == (False, 'schema'),
+            'refusal_with_output_rejected': darwin_accept(dict(bw, cap='unexpected_output'), dict(bw['expect'], name='adversarial_query_frame')) == (False, 'cap_unexpected'),
+            'duplicate_record_rejected': parse_record('{"a":1}\n{"a":1}\n') is None,
+            'truncated_record_rejected': parse_record('{"helper":"kg1-darw') is None,
+            'empty_record_rejected': parse_record('') is None,
+        }
+    cal_ok = {
+        'calibration_probes_allocated_and_accepted': all(s['accepted'] and touched(s) == mib * MiB for s, mib in ((c0, 0), (c8, 8), (c32, 32), (c200, 200))),
+        'sensitivity_8': fp(c8) - fp(c0) >= touched(c8),
+        'sensitivity_32': fp(c32) - fp(c0) >= touched(c32),
+        'real_above_envelope_allocated_and_rejected': touched(cover) == over_mib * MiB and cover['helper_exit'] == 0 and cover['reason'] == 'footprint_above_envelope',
+        'within_envelope_200_accepted': c200['accepted'],
+        'delayed_zombie_read_retains_peak': cdelay['accepted'] and fp(cdelay) - fp(c0) >= touched(cdelay),
+        'signal_exit_reported_and_rejected': ckill['helper_exit'] == 0 and (ckill['record'] or {}).get('signal') == 9 and ckill['reason'] == 'signal'
+                                             and fp(ckill) - fp(c0) >= 8 * MiB,
+        'sandbox_exec_chain_measures_exec_image': csandbox['accepted'] and fp(csandbox) - fp(c0) >= 8 * MiB,
+        'non_exec_launcher_rejected_by_identity': shell['helper_exit'] == 0 and shell['reason'] == 'identity_image_uuid',
+        'exclusion_untouched_allocation_not_charged': cuntouched['accepted'] and fp(cuntouched) - fp(c0) < 32 * MiB,
+        'exclusion_clean_file_backed_not_charged': cmap['accepted'] and fp(cmap) - fp(c0) < 16 * MiB,
+        'timeout_kills_reaps_and_fails': timeout['helper_exit'] == 2 and 'timeout' in timeout['helper_stdout'] and not leftover_sleep,
+        'helper_failures_never_accepted': all(f_['helper_exit'] == 2 and not f_['accepted'] for f_ in failures.values()),
+    }
+    worker_ok = bool(runs) and all(r['accepted'] for r in runs)
+    result = {
+        'criterion': 'owner-approved Darwin amendment (2026-11-05 addendum, Option A): tested runs only; '
+                     'kernel lifetime phys_footprint <= 261,357,632 B, Cap <= 29,360,128 B, expected exit',
+        'not_claimed': ['every-input bound', 'allocator-owned or retained bytes', 'library-bypass attribution',
+                        'production memory ceiling', 'equivalence with the Linux accounted-cost proof'],
+        'historical': 'Darwin memory_uncharged_remainder FAIL (rounds 11 and 27) preserved; not re-labelled',
+        'pinned_darwin': {'build': darwin_build, 'machine': platform.machine(), 'supported': pinned},
+        'helper': {'source': 'scripts/kg1-darwin-footprint.c', 'source_sha256': sha256(helper_source),
+                   'binary_sha256': sha256(helper), 'uuid': helper_uuid, 'cc': tool('cc', '--version'),
+                   'build_command': ['cc'] + helper_flags + ['-o', helper, helper_source]},
+        'worker': {'path': worker, 'sha256': sha256(worker), 'uuid': worker_uuid},
+        'envelope_bytes': ENVELOPE, 'r_bytes': R,
+        'coverage': {'ok': coverage_ok, 'exports': export_labels, 'runs': [r['name'] for r in runs]},
+        'runs': runs, 'max_footprint_bytes': max((fp(r) for r in runs), default=None),
+        'calibration': {s['name']: s for s in (c0, c8, c32, c200, cover, cdelay, ckill, csandbox, shell, cuntouched, cmap, timeout)},
+        'helper_failures': failures, 'controls': dict(cal_ok, **{'mutation:' + k: v for k, v in mutations.items()}),
+    }
+    ok = (pinned and worker_uuid and helper_uuid and worker_uuid != helper_uuid and coverage_ok and worker_ok
+          and base_worker is not None and all(cal_ok.values()) and mutations and all(mutations.values()))
+    case('darwin_footprint_envelope', result, ok, fatal=False)
 else:
     library = os.path.join(scratch, 'alloc-interposer.so')
     source = os.path.join(root, 'scripts', 'alloc-interposer.c')
