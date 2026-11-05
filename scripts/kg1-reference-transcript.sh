@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Story 110.1 reference-run outer transcript, run ON delectra inside the shipped bundle:
-#   bash <rootfs>/bundle/scripts/kg1-reference-transcript.sh <rootfs>
+#   bash <rootfs>/bundle/scripts/kg1-reference-transcript.sh <rootfs> [rehearsal]
+# `rehearsal` runs only preflight and the rehearsal stage (the reference scope, launcher
+# and monitor around a trivial command; no preload entry) under the same envelope.
 # Proof-only; never shipped.
 #
 # - Refuses, before creating anything, if a host or private ld.so.preload exists in any
@@ -21,7 +23,9 @@
 # KG1_TEST_HOST_ETC exists only for the local self-test; real evidence records host_etc=/etc.
 set -euo pipefail
 
-B=$(cd "${1:?usage: kg1-reference-transcript.sh <rootfs>}" && pwd -P)
+B=$(cd "${1:?usage: kg1-reference-transcript.sh <rootfs> [rehearsal]}" && pwd -P)
+MODE=${2:-full}
+case "$MODE" in full|rehearsal) ;; *) echo "unknown mode $MODE" >&2; exit 2;; esac
 cd /  # no shell of this transcript keeps a cwd inside the bundle
 HOST_ETC=${KG1_TEST_HOST_ETC:-/etc}
 OUT=$B/bundle/out
@@ -30,7 +34,7 @@ LOG=$OUT/transcript.log
 R=$B/bundle/scripts/graph-reference-run.py
 HOST_PRELOAD=$HOST_ETC/ld.so.preload
 PRIVATE_PRELOAD=$B/etc/ld.so.preload
-UNIT_RE='^kg1-1101-(reference|preload-host|preload-chroot)-[0-9]+$'
+UNIT_RE='^kg1-1101-(reference|rehearsal|preload-host|preload-chroot)-[0-9]+$'
 
 refuse() { printf 'TRANSCRIPT result=REFUSED reason=%s\n' "$1" >&2; exit 3; }
 
@@ -246,7 +250,7 @@ trap 'on_signal TERM 15' TERM
 trap 'on_signal HUP 1' HUP
 [ -z "$(ls -A "$OUT")" ]
 : >"$LEDGER"
-log "TRANSCRIPT start host_etc=$HOST_ETC rootfs=$B mounts=$mounts_before etc_mode=$etc_mode tree=$tree_before"
+log "TRANSCRIPT start mode=$MODE host_etc=$HOST_ETC rootfs=$B mounts=$mounts_before etc_mode=$etc_mode tree=$tree_before"
 
 stage() {
   local name=$1
@@ -263,6 +267,10 @@ stage() {
 }
 
 stage preflight
-stage preload-chroot
-stage preload-host
-stage reference
+if [ "$MODE" = rehearsal ]; then
+  stage rehearsal
+else
+  stage preload-chroot
+  stage preload-host
+  stage reference
+fi

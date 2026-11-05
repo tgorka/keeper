@@ -414,20 +414,26 @@ def register_unit(unit):
     owned('unit', unit)
 
 
-def reference(directory):
+def reference(directory, rehearsal=False):
+    """The measured reference run, or (`rehearsal`) the same scope, limits, launcher and
+    monitor with a trivial monitored command: the launcher resolves the bare `sh`, the
+    stack guard execs the pinned interpreter, and the real monitor samples membership and
+    telemetry. No preload entry is created in either mode."""
     sys.path.insert(0, HERE)
     import kg1_reference_monitor as monitor
-    if not require_ledger('reference'):
+    mode = 'rehearsal' if rehearsal else 'reference'
+    if not require_ledger(mode):
         return 3
     os.makedirs(directory, exist_ok=True)
     if preflight(directory) != 0:
         return 3
-    unit = f'kg1-1101-reference-{os.getpid()}'
+    unit = f'kg1-1101-{mode}-{os.getpid()}'
     inside = chrooted(directory)
     heartbeat = os.path.join(directory, 'heartbeat.json')
+    jailed = (jail('sh', '-c', STACK_GUARD, 'sh', '/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'rehearse-inner', inside)
+              if rehearsal else jail('/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'inner', inside))
     command = ['sudo', '-n', 'systemd-run', '--scope', '--quiet', f'--unit={unit}',
-               '-p', 'AllowedCPUs=0-3', '-p', 'CPUQuota=400%', '-p', 'MemoryMax=8G', '-p', 'MemorySwapMax=0', '--'] + \
-        jail('/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'inner', inside)
+               '-p', 'AllowedCPUs=0-3', '-p', 'CPUQuota=400%', '-p', 'MemoryMax=8G', '-p', 'MemorySwapMax=0', '--'] + jailed
     register_unit(unit)
     started = time.time()
     process = subprocess.Popen(command, start_new_session=True)
@@ -456,14 +462,14 @@ def reference(directory):
 
 # --------------------------------------------------------- inside the scope and chroot
 
-def scope_topology(cgroup):
+def scope_topology(cgroup, prefix='kg1-1101-reference-'):
     """The verified dedicated scope and every ancestor's restriction (none tighter, none
     empty or malformed)."""
     sys.path.insert(0, HERE)
     import kg1_reference_monitor as monitor
     problems = []
-    if not os.path.basename(cgroup).startswith('kg1-1101-reference-') or not cgroup.endswith('.scope'):
-        problems.append(f'not the dedicated kg1 reference scope: {cgroup}')
+    if not os.path.basename(cgroup).startswith(prefix) or not cgroup.endswith('.scope'):
+        problems.append(f'not the dedicated kg1 {prefix} scope: {cgroup}')
     try:
         ancestors = monitor.ancestors(cgroup, read=lambda p: text(p))
     except monitor.Invalid as error:
@@ -485,7 +491,10 @@ def auxv():
     return values
 
 
-def inner(directory):
+REHEARSAL_COMMAND_S = 5
+
+
+def inner(directory, rehearsal=False):
     import resource
     os.makedirs(directory, exist_ok=True)
     sys.path.insert(0, HERE)
@@ -493,7 +502,7 @@ def inner(directory):
     cgroup = '/sys/fs/cgroup' + text('/proc/self/cgroup').split('::', 1)[-1]
     effective = {name: text(os.path.join(cgroup, name)) for name in LIMITS}
     affinity = sorted(os.sched_getaffinity(0))
-    ancestors, problems = scope_topology(cgroup)
+    ancestors, problems = scope_topology(cgroup, 'kg1-1101-rehearsal-' if rehearsal else 'kg1-1101-reference-')
     soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
     if effective != LIMITS or affinity != [0, 1, 2, 3]:
         problems.append('effective scope limits or affinity not verified')
@@ -502,7 +511,8 @@ def inner(directory):
     diagnostics = subprocess.run(['/lib64/ld-linux-x86-64.so.2', '--list-diagnostics'], env={}, capture_output=True, text=True)
     with open(os.path.join(directory, 'ld-so-diagnostics.txt'), 'w') as f:
         f.write(diagnostics.stdout)
-    record = {'predicate_version': monitor.PREDICATE_VERSION, 'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
+    record = {'mode': 'rehearsal' if rehearsal else 'reference',
+              'predicate_version': monitor.PREDICATE_VERSION, 'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
               'runner_sha256': sha256(os.path.abspath(__file__)), 'cgroup': cgroup, 'expected': LIMITS, 'effective': effective,
               'affinity': affinity, 'ancestors': ancestors, 'stack_rlimit_inherited': {'soft': soft, 'hard': 'unlimited' if hard == resource.RLIM_INFINITY else hard},
               'auxv': auxv(), 'ld_so_diagnostics_sha256': sha256(os.path.join(directory, 'ld-so-diagnostics.txt')),
@@ -521,10 +531,14 @@ def inner(directory):
     def soft_stack():
         # Soft 8 MiB only; the hard limit stays unlimited so P6c's case can raise it.
         resource.setrlimit(resource.RLIMIT_STACK, (8 * 1024 * 1024, resource.RLIM_INFINITY))
+    # Rehearsal: the same registered monitor (default baseline, interval, thresholds)
+    # around a trivial command in the pinned interpreter; no proof, no benchmark.
+    proof = ([sys.executable, '-c', f'import time; time.sleep({REHEARSAL_COMMAND_S})'] if rehearsal else
+             [sys.executable, os.path.join(BUNDLE, 'scripts', 'graph-proof.py'), os.path.join(BUNDLE, 'target', 'graph-worker'),
+              scratch, '--benchmark'])
     with open(os.path.join(directory, 'proof.json'), 'w') as stdout, open(os.path.join(directory, 'proof.err'), 'w') as stderr:
         result = monitor.run_monitored(
-            [sys.executable, os.path.join(BUNDLE, 'scripts', 'graph-proof.py'), os.path.join(BUNDLE, 'target', 'graph-worker'),
-             scratch, '--benchmark'], os.path.join(directory, 'samples.jsonl'), lambda: monitor.collect(cgroup),
+            proof, os.path.join(directory, 'samples.jsonl'), lambda: monitor.collect(cgroup),
             env=env, stdout=stdout, stderr=stderr, preexec_fn=soft_stack, self_pid=os.getpid(),
             members=lambda: monitor.scope_members(cgroup), heartbeat_path=os.path.join(directory, 'heartbeat.json'))
     shutil.rmtree(scratch, ignore_errors=True)
@@ -1062,6 +1076,7 @@ ROUND14_COMMIT = 'fa4cf120'
 ROUND15_COMMIT = 'fad43562'
 ROUND16_COMMIT = 'd6c9c326'
 ROUND17_COMMIT = '970018e9'
+ROUND19_COMMIT = '059ab19c'
 
 # The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
 # verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
@@ -1342,9 +1357,9 @@ def round15_gaps(directory, m, base_sample, results):
         return dict(paths, w=w, rootfs=rootfs, env=env, out=os.path.join(rootfs, 'bundle', 'out'),
                     host=os.path.join(paths['hostetc'], 'ld.so.preload'))
 
-    def go(w, script, signal_after=None, timeout=150):  # above the transcript's 60 s unit deadline
+    def go(w, script, signal_after=None, timeout=150, args=()):  # above the transcript's 60 s unit deadline
         started = time.monotonic()
-        p = subprocess.Popen(['bash', script, w['rootfs']], env=w['env'], stdout=subprocess.PIPE,
+        p = subprocess.Popen(['bash', script, w['rootfs'], *args], env=w['env'], stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
         if signal_after is not None:
             marker = os.path.join(w['out'], signal_after, 'ran')
@@ -1364,7 +1379,7 @@ def round15_gaps(directory, m, base_sample, results):
         log = os.path.join(w['out'], 'transcript.log')
         return {'rc': p.returncode, 'elapsed': round(time.monotonic() - started, 2), 'output': out[-1500:],
                 'log': open(log).read() if os.path.exists(log) else '',
-                'ran': sorted(s for s in ('preflight', 'preload-chroot', 'preload-host', 'reference')
+                'ran': sorted(s for s in ('preflight', 'preload-chroot', 'preload-host', 'reference', 'rehearsal')
                               if os.path.exists(os.path.join(w['out'], s, 'ran')))}
 
     def both(name, plan, setup=lambda w: None, **kw):
@@ -1415,7 +1430,7 @@ def round15_gaps(directory, m, base_sample, results):
                new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'output')})
     # Collection: evidence is copied and verified before anything on delectra is removed.
 
-    def orchestrate(name, plan, old=False, script_path=None):
+    def orchestrate(name, plan, old=False, script_path=None, args=()):
         w = world(name, plan)
         home = os.path.join(w['w'], 'remote-home')
         os.makedirs(home)
@@ -1429,7 +1444,7 @@ def round15_gaps(directory, m, base_sample, results):
                       f'bash $DIR/rootfs/bundle/scripts/kg1-reference-transcript.sh $(cd $DIR/rootfs && pwd -P); ' + ROUND14_COLLECT)
             p = subprocess.run(['bash', '-c', script], cwd=home, env=env, capture_output=True, text=True, timeout=120)
         else:
-            p = subprocess.run(['bash', script_path or orchestrator, w['rootfs'], evid], cwd=home, env=env,
+            p = subprocess.run(['bash', script_path or orchestrator, w['rootfs'], evid, *args], cwd=home, env=env,
                                capture_output=True, text=True, timeout=120)
         remote_dir = os.path.join(home, 'kg1-1101-ref')
         kept = os.path.exists(remote_dir)
@@ -1558,6 +1573,25 @@ def round15_gaps(directory, m, base_sample, results):
     record16('failed_gate_keeps_remote', new['rc'] == 8 and new['remote_kept'] and 'COLLECT verify=PASS' in new['stdout']
              and 'reason=resource-gate-FAIL' in new['stdout'], old['remote_kept'], new=new, old=old)
 
+    # Round 21 REHEARSAL envelope: the transcript in `rehearsal` mode runs exactly
+    # preflight and rehearsal (no preload stage, so no preload entry can be made), keeps
+    # every gate, and the orchestrator passes the mode and still verifies before removal.
+    w = world('r21-rehearsal-transcript', {'rehearsal': {'units': [['kg1-1101-rehearsal-1', False]]}})
+    x = go(w, transcript, args=('rehearsal',))
+    results['r21:rehearsal_transcript_envelope'] = {
+        'rc': x['rc'], 'ran': x['ran'], 'log': x['log'][-1500:],
+        'pass': x['rc'] == 0 and x['ran'] == ['preflight', 'rehearsal'] and 'mode=rehearsal' in x['log']
+        and 'OWNED unit=kg1-1101-rehearsal-1 gone=yes' in x['log'] and 'TRANSCRIPT result=PASS rc=0 gate=PASS' in x['log']}
+    w = world('r21-rehearsal-fails', {'rehearsal': {'exit': 7}})
+    x = go(w, transcript, args=('rehearsal',))
+    results['r21:rehearsal_failure_stops_and_fails'] = {
+        'rc': x['rc'], 'ran': x['ran'], 'pass': x['rc'] == 7 and x['ran'] == ['preflight', 'rehearsal']
+        and 'TRANSCRIPT result=FAIL rc=7 gate=PASS' in x['log']}
+    ok = orchestrate('r21-rehearsal-orchestrated', {}, args=('rehearsal',))
+    results['r21:rehearsal_orchestrated_verified_then_removed'] = {
+        **ok, 'pass': ok['rc'] == 0 and not ok['remote_kept'] and 'RUN mode=rehearsal transcript_exit=0' in ok['stdout']
+        and 'COLLECT verify=PASS' in ok['stdout'] and 'mode=rehearsal' in ok['evidence_log']}
+
     # ================= Round-16 review R16-1..R16-3, old = checkpoint d6c9c326 ==========
     old17_dir = os.path.join(directory, 'old17')
     os.makedirs(old17_dir, exist_ok=True)
@@ -1659,23 +1693,39 @@ print(json.dumps({'pid': me, 'ppid': os.getppid(), 'sid': sid, 'members': sorted
 
 # Real launcher, privileged syscalls stubbed: this container's AppArmor policy denies
 # mount namespaces to unprivileged user namespaces, so unshare/mount/chroot (and an
-# unneeded setgroups) are recorded instead of performed. execve, chdir, setgid/setuid
-# and the identity verification are real.
-LAUNCHER_STUB = r'''import ctypes, json, os, runpy, sys
+# unneeded setgroups) are recorded instead of performed. chdir, setgid/setuid, the
+# identity verification and execve are real. The stubbed chroot takes away what a real
+# one takes from the host interpreter (round 20): its standard library. sys.path and the
+# importer cache are cleared and every module a bare `-I -S` launcher would not already
+# hold (its own `ctypes, os, sys` closure) is dropped, so any post-chroot import fails
+# exactly as on delectra. The stub records calls with builtins only.
+LAUNCHER_STUB = r'''import sys
+import ctypes, os
+held = set(sys.modules)  # what the launcher process itself holds when it reaches chroot
+import runpy
 calls_path = sys.argv.pop(1)
 sys.argv.pop(0)  # argv[0] is now the real launcher, exactly as when it runs directly
 calls = []
+def dump():
+    fd = os.open(calls_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.write(fd, repr(calls).encode()); os.close(fd)
 class Libc:
     def mount(self, source, target, fstype, flags, data):
         calls.append(['mount', source.decode() if source else None, target.decode(), flags]); return 0
 ctypes.CDLL = lambda *a, **k: Libc()
 os.unshare = lambda flags: calls.append(['unshare', flags])
-os.chroot = lambda path: calls.append(['chroot', path])
+def chroot(path):
+    calls.append(['chroot', path])
+    sys.path.clear(); sys.path_importer_cache.clear()
+    for name in [n for n in sys.modules if n not in held and n != '__main__']:
+        del sys.modules[name]
+    dump()
+os.chroot = chroot
 os.setgroups = lambda groups: calls.append(['setgroups', groups])
-real_exec = os.execvpe
-def execvpe(file, args, env):
-    calls.append(['execvpe', file]); open(calls_path, 'w').write(json.dumps(calls)); real_exec(file, args, env)
-os.execvpe = execvpe
+for name in ('execve', 'execvpe'):
+    def wrapped(file, args, env, real=getattr(os, name), name=name):
+        calls.append([name, file]); dump(); return real(file, args, env)
+    setattr(os, name, wrapped)
 runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
@@ -1714,6 +1764,12 @@ def round19_chain(directory, results):
         with open(path, 'w') as f:
             f.write(body)
     root = os.path.join(base, 'rootfs')
+    # The launcher resolves the command against ROOT before chroot: give the stand-in
+    # rootfs the one executable path the (stubbed, so host-side) exec will use.
+    os.makedirs(os.path.join(root, 'usr', 'bin'), exist_ok=True)
+    with open(os.path.join(root, 'usr', 'bin', 'python3'), 'w') as f:
+        f.write('#!/bin/false\n')
+    os.chmod(os.path.join(root, 'usr', 'bin', 'python3'), 0o755)
     target = ['/usr/bin/python3', probe, HERE]
     env = dict(os.environ, PATH=shims + ':' + os.environ['PATH'])
 
@@ -1731,16 +1787,25 @@ def round19_chain(directory, results):
         return (observed is not None and observed['pid'] == pid and observed['sid'] == pid and observed['ppid'] == os.getpid()
                 and observed['members'] and not observed['outside'])
     calls_path = os.path.join(base, 'calls.json')
-    new_cmd = jail(*target, root=root)
-    launcher_at = new_cmd.index(JAIL_EXEC)
-    new_cmd = new_cmd[:launcher_at] + [stub, calls_path] + new_cmd[launcher_at:]
+
+    def stubbed(command, launcher=JAIL_EXEC):
+        at = command.index(JAIL_EXEC)
+        return command[:at] + [stub, calls_path, launcher] + command[at + 1:]
+
+    def read_calls():
+        import ast
+        calls = ast.literal_eval(open(calls_path).read()) if os.path.exists(calls_path) else []
+        if os.path.exists(calls_path):
+            os.remove(calls_path)
+        return calls
+    new_cmd = stubbed(jail(*target, root=root))
     new_pid, new_rc, new_obs, new_err = launch(new_cmd)
+    calls = read_calls()
     old_pid, old_rc, old_obs, old_err = launch(old_r.jail(*target))
-    calls = json.load(open(calls_path)) if os.path.exists(calls_path) else []
     expected_calls = ([['unshare', os.CLONE_NEWNS], ['mount', None, '/', 0x4000 | (1 << 18)]]
                       + [c for d in ('proc', 'sys', 'dev') for c in (['mount', '/' + d, os.path.join(root, d), 0x1000 | 0x4000],
                                                                     ['mount', None, os.path.join(root, d), 0x4000 | (1 << 19)])]
-                      + [['chroot', root], ['execvpe', '/usr/bin/python3']])
+                      + [['chroot', root], ['execve', '/usr/bin/python3']])
     new_ok = (new_rc == 0 and related(new_pid, new_obs) and calls == expected_calls and new_obs['cwd'] == '/'
               and new_obs['env'] == {'PATH': '/usr/bin:/bin', 'HOME': '/bundle', 'PYTHONDONTWRITEBYTECODE': '1'})
     results['r19:jail_chain_leaves_only_the_monitor_tree_in_scope'] = {
@@ -1755,6 +1820,38 @@ def round19_chain(directory, results):
     results['r19:launcher_fails_closed_without_privilege'] = {
         'rc': rc, 'stderr': err, 'command_ran': os.path.exists(marker),
         'pass': rc != 0 and not os.path.exists(marker) and 'Operation not permitted' in err}
+    # R20: nothing after chroot may need the host standard library. Both launchers get a
+    # bare command name (`python3`, as the preload stage passes `sh`) under the
+    # chroot-faithful stub. The round-19 launcher (059ab19c) must fail with round 20's
+    # ModuleNotFoundError; the fixed one resolves before chroot and execs.
+    old_launcher = os.path.join(base, 'old-kg1-jail-exec.py')
+    with open(old_launcher, 'w') as f:
+        f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND19_COMMIT}:scripts/kg1-jail-exec.py']).stdout)
+    bare = ['python3', probe, HERE]
+    runs = {}
+    for label, launcher in (('new', JAIL_EXEC), ('old', old_launcher)):
+        pid, rc, observed, err = launch(stubbed(jail(*bare, root=root), launcher))
+        runs[label] = {'popen_pid': pid, 'rc': rc, 'observed': observed, 'stderr': err, 'calls': read_calls()}
+    n, o = runs['new'], runs['old']
+    new_ok = (n['rc'] == 0 and related(n['popen_pid'], n['observed']) and n['calls'] and n['calls'][-1] == ['execve', '/usr/bin/python3']
+              and ['chroot', root] in n['calls'])
+    old_same_failure = o['rc'] != 0 and o['observed'] is None and "No module named 'warnings'" in o['stderr']
+    results['r21:no_stdlib_after_chroot_bare_command'] = dict(runs, new_catches=new_ok, old_catches=not old_same_failure,
+                                                              **{'pass': new_ok and old_same_failure})
+    # Post-chroot failures are reported with builtins only and fail closed: a command whose
+    # in-root path exists but cannot be exec'd after chroot (here: the stand-in `#!/bin/false`
+    # is resolved, but the stub keeps the host root, so give it a path absent on the host).
+    ghost = os.path.join(root, 'usr', 'bin', 'kg1-ghost')
+    with open(ghost, 'w') as f:
+        f.write('#!/bin/false\n')
+    os.chmod(ghost, 0o755)
+    marker2 = os.path.join(base, 'ghost-ran')
+    pid, rc, observed, err = launch(stubbed(jail('kg1-ghost', marker2, root=root)))
+    calls = read_calls()
+    results['r21:post_chroot_exec_failure_fails_closed'] = {
+        'rc': rc, 'stderr': err, 'calls': calls,
+        'pass': rc == 126 and 'kg1-jail-exec: FileNotFoundError' in err and not os.path.exists(marker2)
+        and calls[-1] == ['execve', '/usr/bin/kg1-ghost']}
 
 
 # ------------------------------------------------------------------ local self-test
@@ -2014,6 +2111,7 @@ print(json.dumps({'complete': True}), flush=True)
 
 if __name__ == '__main__':
     commands = {'bundle': bundle, 'preflight': preflight, 'reference': reference, 'inner': inner,
+                'rehearsal': lambda d: reference(d, rehearsal=True), 'rehearse-inner': lambda d: inner(d, rehearsal=True),
                 'preload-chroot': lambda d: preload(d, True), 'preload-host': lambda d: preload(d, False),
                 'selftest': selftest}
     if len(sys.argv) != 3 or sys.argv[1] not in commands:

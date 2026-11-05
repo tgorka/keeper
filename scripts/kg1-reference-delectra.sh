@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Story 110.1 reference run, driven from superset-host (proof-only; never shipped):
-#   scripts/kg1-reference-delectra.sh <local bundle rootfs> <new local evidence dir>
+#   scripts/kg1-reference-delectra.sh <local bundle rootfs> <new local evidence dir> [rehearsal]
 # 1. ship: refuse an existing remote directory; create it, record its identity, unpack and
 #    verify the bundle's SHA256SUMS against the local copy.
 # 2. run: the remote kg1-reference-transcript.sh (its exit is the run's verdict).
@@ -13,7 +13,9 @@
 set -euo pipefail
 
 SRC=$(cd "${1:?usage: kg1-reference-delectra.sh <bundle rootfs> <evidence dir>}" && pwd -P)
-EVID=${2:?usage: kg1-reference-delectra.sh <bundle rootfs> <evidence dir>}
+EVID=${2:?usage: kg1-reference-delectra.sh <bundle rootfs> <evidence dir> [rehearsal]}
+MODE=${3:-full}
+case "$MODE" in full|rehearsal) ;; *) echo "unknown mode $MODE" >&2; exit 2;; esac
 read -r -a REMOTE <<<"${KG1_REMOTE:-ssh delectra}"
 DIR=${KG1_REMOTE_DIR:-kg1-1101-ref}
 [[ $DIR =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad remote dir $DIR" >&2; exit 2; }
@@ -39,8 +41,8 @@ note "SHIP verify=PASS sums=${shipped%% *}"
 
 # 2. run
 status=0
-remote "bash $DIR/rootfs/bundle/scripts/kg1-reference-transcript.sh \"\$(cd $DIR/rootfs && pwd -P)\"" || status=$?
-note "RUN transcript_exit=$status"
+remote "bash $DIR/rootfs/bundle/scripts/kg1-reference-transcript.sh \"\$(cd $DIR/rootfs && pwd -P)\" $MODE" || status=$?
+note "RUN mode=$MODE transcript_exit=$status"
 
 # 3. collect and verify
 collected=FAIL
