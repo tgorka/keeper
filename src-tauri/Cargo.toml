@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol"]
 
 [workspace.package]
 version = "0.10.6"
@@ -45,6 +45,12 @@ tauri-plugin-autostart = "2"
 # Both are MIT/Apache — pass `cargo deny check`.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# RFC 8785 JSON canonicalization for the knowledge graph's digests
+# (`keeper-graph-protocol`): request, event-delta and vector digests are
+# SHA-256 over these bytes, and keeper-hq's server computes the same bytes in
+# TypeScript against `syncular/knowledge-graph.vectors.json`. Safe Rust over
+# serde_json and ryu-js. MIT OR Apache-2.0 — passes `cargo deny check`.
+serde_jcs = "=0.2.0"
 # Serialization + IPC bindings
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

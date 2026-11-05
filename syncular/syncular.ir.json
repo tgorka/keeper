@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "schemaVersions": [
     {
       "version": 1,
@@ -30,6 +30,12 @@
       "version": 5,
       "migrations": [
         "0005_session_drive_ticks"
+      ]
+    },
+    {
+      "version": 6,
+      "migrations": [
+        "0006_knowledge_graph"
       ]
     }
   ],
@@ -1562,6 +1568,780 @@
         }
       ],
       "extensions": {}
+    },
+    {
+      "name": "kg_events",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph_seq",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "descriptor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "client_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "origin_class",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "origin_actor",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "context_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "approval_basis",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "reverses_event_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "event_time_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "recorded_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "op_count",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "delta_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "kg_events_graph_seq",
+          "columns": [
+            "graph",
+            "graph_seq"
+          ],
+          "unique": true
+        },
+        {
+          "name": "kg_events_request",
+          "columns": [
+            "request_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_events_reverses",
+          "columns": [
+            "reverses_event_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_event_ops",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "entity_type",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "entity_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "operation",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "before_revision",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "after_revision",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "before_value",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "after_value",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "event_id",
+          "parentTable": "kg_events",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_event_ops_event_id_ref",
+          "columns": [
+            "event_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_event_ops_event_ordinal",
+          "columns": [
+            "event_id",
+            "ordinal"
+          ],
+          "unique": true
+        },
+        {
+          "name": "kg_event_ops_entity",
+          "columns": [
+            "entity_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_head",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph_seq",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "event_id",
+          "parentTable": "kg_events",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_head_event_id_ref",
+          "columns": [
+            "event_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_nodes",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "description_source_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "properties",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "lifecycle",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "merged_into_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "lifecycle_revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "kg_nodes_kind",
+          "columns": [
+            "kind"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_nodes_merged_into_id",
+          "columns": [
+            "merged_into_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_edges",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "from_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "to_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "type",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "properties",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "lifecycle",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "from_id",
+          "parentTable": "kg_nodes",
+          "onDelete": "RESTRICT"
+        },
+        {
+          "column": "to_id",
+          "parentTable": "kg_nodes",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_edges_from_id_ref",
+          "columns": [
+            "from_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_kg_edges_to_id_ref",
+          "columns": [
+            "to_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_edges_from",
+          "columns": [
+            "from_id",
+            "type"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_edges_to",
+          "columns": [
+            "to_id",
+            "type"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_tags",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "label",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "kg_tags_text",
+          "columns": [
+            "graph",
+            "text"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_node_tags",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "node_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "tag_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "node_id",
+          "parentTable": "kg_nodes",
+          "onDelete": "RESTRICT"
+        },
+        {
+          "column": "tag_id",
+          "parentTable": "kg_tags",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_node_tags_node_id_ref",
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_kg_node_tags_tag_id_ref",
+          "columns": [
+            "tag_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_node_tags_node_id",
+          "columns": [
+            "node_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_node_tags_tag_id",
+          "columns": [
+            "tag_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_receipts",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "client_scope",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "descriptor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "request_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "outcome",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "event_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "graph_seq",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "detail",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "recorded_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_client:{kg_client}",
+          "variable": "kg_client",
+          "column": "client_scope"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "kg_receipts_request_id",
+          "columns": [
+            "request_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
     }
   ],
   "subscriptions": [
@@ -1860,6 +2640,126 @@
             {
               "kind": "parameter",
               "name": "family"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgEvents",
+      "table": "kg_events",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgEventOps",
+      "table": "kg_event_ops",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgHead",
+      "table": "kg_head",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgNodes",
+      "table": "kg_nodes",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgEdges",
+      "table": "kg_edges",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgTags",
+      "table": "kg_tags",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgNodeTags",
+      "table": "kg_node_tags",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgReceipts",
+      "table": "kg_receipts",
+      "scopes": [
+        {
+          "variable": "kg_client",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "clientScope"
             }
           ]
         }

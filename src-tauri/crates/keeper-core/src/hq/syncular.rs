@@ -2110,7 +2110,7 @@ impl Replica for SyncularReplica {
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<(), ReplicaError> {
+    ) -> Result<super::port::CommandResult, ReplicaError> {
         let Some(remote) = &self.remote else {
             return Err(ReplicaError::NotSyncing);
         };
@@ -2130,29 +2130,47 @@ impl Replica for SyncularReplica {
         transport.inner.shutdown();
         let answer = answer.map_err(|error| command_error(error, transport.reached))?;
         // `cached`: this request id was applied before and its first answer
-        // is replayed (a retry whose earlier answer was lost) — a success.
-        if answer.status == "rejected" {
-            let refusal = answer.results.iter().find_map(|result| {
-                let code = result.get("code").and_then(Value::as_str)?;
-                let message = result
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or(code);
-                Some((code.to_owned(), message.to_owned()))
-            });
-            let (code, message) = refusal.unwrap_or_else(|| {
-                (
-                    "operation.rejected".to_owned(),
-                    Value::from(answer.results).to_string(),
-                )
-            });
-            return Err(ReplicaError::Remote {
-                code,
-                message,
-                retryable: false,
-            });
-        }
-        Ok(())
+        // is replayed (a retry whose earlier answer was lost) — a success,
+        // carrying the first answer's commit.
+        let cached = match answer.status.as_str() {
+            "applied" => false,
+            "cached" => true,
+            "rejected" => {
+                let refusal = answer.results.iter().find_map(|result| {
+                    let code = result.get("code").and_then(Value::as_str)?;
+                    let message = result
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or(code);
+                    Some((code.to_owned(), message.to_owned()))
+                });
+                let (code, message) = refusal.unwrap_or_else(|| {
+                    (
+                        "operation.rejected".to_owned(),
+                        Value::from(answer.results).to_string(),
+                    )
+                });
+                return Err(ReplicaError::Remote {
+                    code,
+                    message,
+                    retryable: false,
+                });
+            }
+            // The client admits only the three statuses; an answer naming
+            // another says nothing about whether the command ran.
+            _ => {
+                return Err(ReplicaError::Unheard {
+                    code: UNREADABLE.to_owned(),
+                    message: "unknown command acknowledgement".to_owned(),
+                    retryable: false,
+                })
+            }
+        };
+        Ok(super::port::CommandResult {
+            request_id: answer.request_id,
+            commit_seq: answer.commit_seq,
+            cached,
+        })
     }
 
     fn sync_now(&self) {

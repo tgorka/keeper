@@ -16,7 +16,12 @@
 //     key outside the actor's scopes is refused;
 //   - an agent instance's two memory subscriptions, as the generated
 //     templates request them, receive its own rows and its family peers'
-//     rows and never another family's.
+//     rows and never another family's;
+//   - the graph subscriptions, as the generated templates request them,
+//     receive one graph's rows only under that graph's `kg_graph` value and
+//     a client's receipts only under its own `kg_client` value, and a
+//     caller holding every conversation scope but no graph scope receives
+//     no graph row at all.
 //
 // Point it at a fresh, throwaway database: a schema that already holds
 // tables is refused.
@@ -45,6 +50,14 @@ import {
   agentMemoryFamilySubscription,
   agentMemoryOwnSubscription,
   schema as generatedSchema,
+  kgEdgesSubscription,
+  kgEventOpsSubscription,
+  kgEventsSubscription,
+  kgHeadSubscription,
+  kgNodesSubscription,
+  kgNodeTagsSubscription,
+  kgReceiptsSubscription,
+  kgTagsSubscription,
 } from "../syncular/syncular.generated.ts";
 import { sessionPageQuery } from "../syncular/syncular.queries.ts";
 
@@ -65,6 +78,24 @@ const PEER = `peer-${RUN}`;
 const STRANGER = `stranger-${RUN}`;
 const FAMILY = `family-${RUN}`;
 const OTHER_FAMILY = `other-family-${RUN}`;
+// The graph fixture: two graphs, and receipts of two clients of one actor.
+// Client scopes follow the contract's `<a>:<actor><c>:<client>` byte lengths.
+const GRAPH = `graph-${RUN}`;
+const OTHER_GRAPH = `other-graph-${RUN}`;
+const clientScope = (actor: string, client: string) =>
+  `${Buffer.byteLength(actor)}:${actor}${Buffer.byteLength(client)}:${client}`;
+const OWN_RECEIPTS = clientScope(ACTOR, CLIENT);
+const OTHER_RECEIPTS = clientScope(ACTOR, `${CLIENT}-2`);
+const CONVERSATION_SCOPES = {
+  dir: [PARTITION],
+  session: [SESSION],
+  member: [ACTOR],
+  page: [PAGE],
+  trace: [PAGE],
+  actor: [ACTOR],
+  agent: [AGENT],
+  family: [FAMILY],
+};
 
 function fail(message: string): never {
   console.error(`check-syncular-live: ${message}`);
@@ -94,7 +125,12 @@ function config(sql: SQL): SyncServerConfig {
     segments: new MemorySegmentStore(),
     resolveScopes: ({ actorId }) =>
       actorId === SERVICE
-        ? { agent: [AGENT, PEER, STRANGER], family: [FAMILY, OTHER_FAMILY] }
+        ? {
+            agent: [AGENT, PEER, STRANGER],
+            family: [FAMILY, OTHER_FAMILY],
+            kg_graph: [GRAPH, OTHER_GRAPH],
+            kg_client: [OWN_RECEIPTS, OTHER_RECEIPTS],
+          }
         : { session: [SESSION], member: [ACTOR], page: [PAGE], trace: [PAGE], actor: [ACTOR] },
   };
 }
@@ -145,21 +181,108 @@ async function runSessionPage(
   return decodeRemoteOperationResponse(bytes);
 }
 
-/** The agent_memory rows a subscription receives, through the server's own matching. */
-async function memoryRowsFor(
+/** The rows of `table` a subscription receives, through the server's own matching. */
+async function rowsFor(
   server: SyncServerConfig,
+  table: string,
   requested: ScopeMap,
   allowed: ScopeMap,
 ): Promise<string[]> {
   const outcome = computeEffective(requested, { ok: true, allowed });
   if (outcome.status !== "active") return [];
   const rows = await server.storage.scanRows(PARTITION, {
-    table: "agent_memory",
+    table,
     scopeFilter: outcome.effective,
     afterRowId: null,
     limit: 100,
   });
   return rows.map((row) => row.rowId).sort();
+}
+
+/** One graph's worth of every graph table, written in one commit. */
+function graphRows(graph: string, now: number) {
+  const id = (table: string) => `${table}-${graph}`;
+  const stamp = { graph, author_actor: SERVICE, author_client: SERVICE };
+  const event = id("event");
+  const made = { created_event_id: event, updated_event_id: event };
+  const rows: Record<string, Record<string, unknown>> = {
+    kg_events: {
+      graph_seq: "1",
+      descriptor: "graph.apply",
+      request_id: id("request"),
+      request_digest: "0".repeat(64),
+      actor_id: ACTOR,
+      client_id: CLIENT,
+      origin_class: "human",
+      recorded_at_ms: now,
+      op_count: 1,
+      delta_digest: "0".repeat(64),
+    },
+    kg_event_ops: {
+      event_id: event,
+      ordinal: 0,
+      entity_type: "node",
+      entity_id: id("node"),
+      operation: "create",
+      after_revision: "1",
+      after_value: "{}",
+    },
+    kg_head: { graph_seq: "1", event_id: event },
+    kg_nodes: {
+      kind: "Concept",
+      title: "live check",
+      properties: "{}",
+      lifecycle: "active",
+      revision: "1",
+      lifecycle_revision: "1",
+      ...made,
+    },
+    kg_edges: {
+      from_id: id("node"),
+      to_id: id("node"),
+      type: "sources",
+      properties: "{}",
+      lifecycle: "active",
+      revision: "1",
+      ...made,
+    },
+    kg_tags: { text: "live-check", revision: "1", ...made },
+    kg_node_tags: { node_id: id("node"), tag_id: id("tag"), created_event_id: event },
+  };
+  const ids: Record<string, string> = {
+    kg_events: event,
+    kg_event_ops: `${event}/0`,
+    kg_head: graph,
+    kg_nodes: id("node"),
+    kg_edges: id("edge"),
+    kg_tags: id("tag"),
+    kg_node_tags: id("node_tag"),
+  };
+  return Object.entries(rows).map(([table, values]) => ({
+    table,
+    op: "upsert" as const,
+    values: { id: ids[table], ...values, ...stamp },
+  }));
+}
+
+function receipt(scope: string, now: number) {
+  return {
+    table: "kg_receipts",
+    op: "upsert" as const,
+    values: {
+      id: `graph.apply/request-${RUN}/${scope}`,
+      client_scope: scope,
+      descriptor: "graph.apply",
+      request_id: `request-${RUN}`,
+      request_digest: "0".repeat(64),
+      outcome: "rejected",
+      reason: "invalid_change",
+      detail: "{}",
+      recorded_at_ms: now,
+      author_actor: SERVICE,
+      author_client: SERVICE,
+    },
+  };
 }
 
 async function checkOne(url: string): Promise<void> {
@@ -296,18 +419,21 @@ async function checkOne(url: string): Promise<void> {
 
   // What resolveScopes grants an agent instance: itself and its own family.
   const instance = { agent: [AGENT], family: [FAMILY] };
-  const own = await memoryRowsFor(
+  const own = await rowsFor(
     first,
+    "agent_memory",
     agentMemoryOwnSubscription.scopes({ agentActor: AGENT }),
     instance,
   );
-  const family = await memoryRowsFor(
+  const family = await rowsFor(
     first,
+    "agent_memory",
     agentMemoryFamilySubscription.scopes({ family: FAMILY }),
     instance,
   );
-  const foreign = await memoryRowsFor(
+  const foreign = await rowsFor(
     first,
+    "agent_memory",
     agentMemoryFamilySubscription.scopes({ family: OTHER_FAMILY }),
     instance,
   );
@@ -321,12 +447,86 @@ async function checkOne(url: string): Promise<void> {
     fail(`${role}: another family's memory reached the agent: ${JSON.stringify(foreign)}`);
   }
 
+  // The graph: two graphs and two clients' receipts, then each subscription
+  // template under what a graph reader, a reader of the other graph, a
+  // conversation-only caller and each client hold.
+  await seedMutations(
+    first,
+    { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `graph-${RUN}` },
+    graphRows(GRAPH, now),
+  );
+  await seedMutations(
+    first,
+    { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `other-graph-${RUN}` },
+    graphRows(OTHER_GRAPH, now),
+  );
+  await seedMutations(
+    first,
+    { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `receipts-${RUN}` },
+    [receipt(OWN_RECEIPTS, now), receipt(OTHER_RECEIPTS, now)],
+  );
+  const graphSubscriptions = [
+    kgEventsSubscription,
+    kgEventOpsSubscription,
+    kgHeadSubscription,
+    kgNodesSubscription,
+    kgEdgesSubscription,
+    kgTagsSubscription,
+    kgNodeTagsSubscription,
+  ];
+  for (const subscription of graphSubscriptions) {
+    const { table } = subscription;
+    const reader = await rowsFor(first, table, subscription.scopes({ database: GRAPH }), {
+      kg_graph: [GRAPH],
+    });
+    const otherReader = await rowsFor(first, table, subscription.scopes({ database: GRAPH }), {
+      kg_graph: [OTHER_GRAPH],
+    });
+    const conversationOnly = await rowsFor(
+      first,
+      table,
+      subscription.scopes({ database: GRAPH }),
+      CONVERSATION_SCOPES,
+    );
+    if (reader.length !== 1 || !reader[0]?.includes(GRAPH) || reader[0]?.includes(OTHER_GRAPH)) {
+      fail(`${role}: ${table} for its graph's reader received ${JSON.stringify(reader)}`);
+    }
+    if (otherReader.length !== 0 || conversationOnly.length !== 0) {
+      fail(
+        `${role}: ${table} reached a caller without its graph: ` +
+          `${JSON.stringify({ otherReader, conversationOnly })}`,
+      );
+    }
+  }
+  const ownReceipts = await rowsFor(
+    first,
+    "kg_receipts",
+    kgReceiptsSubscription.scopes({ clientScope: OWN_RECEIPTS }),
+    { kg_client: [OWN_RECEIPTS], kg_graph: [GRAPH, OTHER_GRAPH] },
+  );
+  const otherClients = await rowsFor(
+    first,
+    "kg_receipts",
+    kgReceiptsSubscription.scopes({ clientScope: OTHER_RECEIPTS }),
+    { kg_client: [OWN_RECEIPTS], kg_graph: [GRAPH, OTHER_GRAPH] },
+  );
+  if (
+    JSON.stringify(ownReceipts) !== JSON.stringify([`graph.apply/request-${RUN}/${OWN_RECEIPTS}`])
+  ) {
+    fail(`${role}: own receipts received ${JSON.stringify(ownReceipts)}`);
+  }
+  if (otherClients.length !== 0) {
+    fail(`${role}: another client's receipt reached this one: ${JSON.stringify(otherClients)}`);
+  }
+
   await sql.end();
   console.log(
     `${role} → ${schemaName}: empty before, ${contract.length} tables there and none in public, ` +
       `second start a no-op, this run's commits ${commits}, sessionPage paged ` +
       `${ids1.length}+${ids2.length} fresh rows, foreign page refused, memory: own ${own.length}, ` +
-      `family ${family.length} (with the peer), other family ${foreign.length}`,
+      `family ${family.length} (with the peer), other family ${foreign.length}, graph: ` +
+      `${graphSubscriptions.length} tables one graph each, none without kg_graph, ` +
+      `receipts own ${ownReceipts.length} other client ${otherClients.length}`,
   );
 }
 

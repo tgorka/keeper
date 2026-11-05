@@ -1216,9 +1216,13 @@ impl crate::hq::port::Replica for Staged {
         id: &str,
         request: &str,
         params: Value,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    ) -> Result<crate::hq::port::CommandResult, crate::hq::port::ReplicaError> {
         if let Some(server) = self.server.lock().expect("server").as_mut() {
-            return server(id, request, &params);
+            return server(id, request, &params).map(|()| crate::hq::port::CommandResult {
+                request_id: request.to_owned(),
+                commit_seq: None,
+                cached: false,
+            });
         }
         self.inner.remote_command(id, request, params)
     }
