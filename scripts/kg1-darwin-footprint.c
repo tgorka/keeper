@@ -8,17 +8,22 @@
  *   measure [--timeout-ms N] [--read-delay-ms N] STDIN STDOUT STDERR [NAME=VALUE...] -- PATH ARG...
  *     Spawns PATH (no PATH search) with exactly NAME=VALUE as its environment, fd 0/1/2
  *     opened from STDIN/STDOUT/STDERR and every other descriptor closed
- *     (POSIX_SPAWN_CLOEXEC_DEFAULT). Waits for termination without reaping (WNOWAIT),
- *     reads RUSAGE_INFO_V6 of the zombie, reaps exactly that child and checks the reap
- *     against the wait. Prints one JSON record on stdout and exits 0 only if every step
- *     succeeded; otherwise prints {"error":...} and exits 2. A timeout SIGKILLs and reaps
- *     the child and is an error. The record never defaults a missing value to zero.
+ *     (POSIX_SPAWN_CLOEXEC_DEFAULT). Blocks in waitid(WEXITED|WNOWAIT) for termination
+ *     without reaping, reads RUSAGE_INFO_V6 of the zombie, reaps exactly that child with
+ *     wait4 and checks the reap against the wait. Both waits retry on EINTR. SIGUSR1 is
+ *     caught (no SA_RESTART) and only counted, so a delivered SIGUSR1 interrupts the
+ *     blocking wait; the record reports `wait_eintr` (EINTR returns of either wait) and
+ *     `sigusr1_received`. The timeout is a one-shot ITIMER_REAL (SIGALRM, no SA_RESTART).
+ *     Prints one JSON record on stdout and exits 0 only if every step succeeded;
+ *     otherwise prints {"error":...} and exits 2. A timeout SIGKILLs and reaps the child
+ *     and is an error. The record never defaults a missing value to zero.
  *   probe MODE MIB CHUNK
- *     Calibration target (run under `measure`): MODE touch | untouched | kill | sleep.
+ *     Calibration target (run under `measure`): MODE touch | untouched | kill | sleep | hold.
  *     Allocates MIB MiB in CHUNK-byte blocks with every malloc checked, touches every byte
- *     (touch/kill), reads it back into a printed checksum so the writes cannot be elided,
- *     frees everything and reports the exact bytes allocated and touched. `kill` raises
- *     SIGKILL after touching; `sleep` blocks for the timeout control.
+ *     (touch/kill/hold), reads it back into a printed checksum so the writes cannot be
+ *     elided, frees everything and reports the exact bytes allocated and touched. `kill`
+ *     raises SIGKILL after touching; `hold` stays alive 3 s after touching (the
+ *     interrupted-wait control); `sleep` blocks for the timeout control.
  *   probe mapfile PATH
  *     Maps PATH read-only and reads every page (clean file-backed pages).
  */
@@ -34,9 +39,14 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t usr1_count = 0, alarm_fired = 0;
+static void on_usr1(int sig) { (void)sig; usr1_count++; }
+static void on_alarm(int sig) { (void)sig; alarm_fired = 1; }
 
 static int fail(const char *what, int code) {
     printf("{\"error\":\"%s\",\"errno\":%d}\n", what, code);
@@ -60,12 +70,6 @@ static void sleep_ms(long ms) {
     }
 }
 
-static long elapsed_ms(const struct timespec *start) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (now.tv_sec - start->tv_sec) * 1000L + (now.tv_nsec - start->tv_nsec) / 1000000L;
-}
-
 /* Kill and reap the child on an error path; never leaves a zombie or a live child. */
 static void discard(pid_t pid) {
     kill(pid, SIGKILL);
@@ -75,7 +79,7 @@ static void discard(pid_t pid) {
 }
 
 static int measure(int argc, char **argv) {
-    unsigned long long timeout_ms = 600000, delay_ms = 0;
+    unsigned long long timeout_ms = 600000, delay_ms = 0, wait_eintr = 0;
     int i = 2;
     while (i < argc && strncmp(argv[i], "--", 2) == 0 && strcmp(argv[i], "--") != 0) {
         if (i + 1 >= argc) return fail("usage", 0);
@@ -103,6 +107,16 @@ static int measure(int argc, char **argv) {
         if (!eq || eq == a) return fail("usage_env", 0);
         envp[j] = argv[i + 3 + j];
     }
+    /* Handlers are installed before the child exists; neither uses SA_RESTART, so each
+     * delivery interrupts a blocking wait with EINTR. Caught dispositions reset to default
+     * in the child at exec. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = on_usr1;
+    if (sigaction(SIGUSR1, &sa, NULL) != 0) { free(envp); return fail("sigaction_usr1", errno); }
+    sa.sa_handler = on_alarm;
+    if (sigaction(SIGALRM, &sa, NULL) != 0) { free(envp); return fail("sigaction_alrm", errno); }
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attr;
     int rc = posix_spawn_file_actions_init(&actions);
@@ -124,22 +138,23 @@ static int measure(int argc, char **argv) {
     free(envp);
     if (rc || pid <= 0) return fail("spawn", rc);
 
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    struct itimerval timer;
+    memset(&timer, 0, sizeof timer);
+    timer.it_value.tv_sec = (time_t)(timeout_ms / 1000);
+    timer.it_value.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+    if (setitimer(ITIMER_REAL, &timer, NULL) != 0) { int e = errno; discard(pid); return fail("setitimer", e); }
     siginfo_t info;
     for (;;) {
         memset(&info, 0, sizeof info);
-        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) != 0) {
-            if (errno == EINTR) continue;
-            int e = errno;
-            discard(pid);
-            return fail("waitid", e);
-        }
-        if (info.si_pid == pid) break;
-        if (info.si_pid != 0) { discard(pid); return fail("waitid_foreign_pid", 0); }
-        if ((unsigned long long)elapsed_ms(&start) >= timeout_ms) { discard(pid); return fail("timeout", 0); }
-        sleep_ms(5);
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT) == 0) break;
+        int e = errno;
+        if (e != EINTR) { discard(pid); return fail("waitid", e); }
+        wait_eintr++;
+        if (alarm_fired) { discard(pid); return fail("timeout", 0); }
     }
+    memset(&timer, 0, sizeof timer);
+    if (setitimer(ITIMER_REAL, &timer, NULL) != 0) { int e = errno; discard(pid); return fail("setitimer_cancel", e); }
+    if (info.si_pid != pid) { discard(pid); return fail("waitid_foreign_pid", (int)info.si_pid); }
     if (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED && info.si_code != CLD_DUMPED) {
         discard(pid);
         return fail("waitid_not_terminal", info.si_code);
@@ -152,9 +167,11 @@ static int measure(int argc, char **argv) {
     int status = 0;
     struct rusage ru;
     pid_t reaped;
-    do {
+    for (;;) {
         reaped = wait4(pid, &status, 0, &ru);
-    } while (reaped < 0 && errno == EINTR);
+        if (reaped >= 0 || errno != EINTR) break;
+        wait_eintr++;
+    }
     if (reaped != pid) return fail("wait4", reaped < 0 ? errno : 0);
     if (rr != 0) return fail("proc_pid_rusage", rusage_errno);
     int exited = WIFEXITED(status), signalled = WIFSIGNALED(status);
@@ -163,10 +180,10 @@ static int measure(int argc, char **argv) {
     if (!consistent) return fail("wait_status_inconsistent", status);
     printf("{\"helper\":\"kg1-darwin-footprint\",\"rusage_version\":6,\"pid\":%d,\"waitid_pid\":%d,\"reaped_pid\":%d,"
            "\"exit\":%d,\"signal\":%d,\"lifetime_max_phys_footprint\":%llu,\"phys_footprint_at_read\":%llu,"
-           "\"ru_maxrss\":%ld,\"read_delay_ms\":%llu,\"uuid\":\"",
+           "\"ru_maxrss\":%ld,\"read_delay_ms\":%llu,\"wait_eintr\":%llu,\"sigusr1_received\":%d,\"uuid\":\"",
            pid, info.si_pid, reaped, exited ? WEXITSTATUS(status) : -1, signalled ? WTERMSIG(status) : 0,
            (unsigned long long)ri.ri_lifetime_max_phys_footprint, (unsigned long long)ri.ri_phys_footprint,
-           (long)ru.ru_maxrss, delay_ms);
+           (long)ru.ru_maxrss, delay_ms, wait_eintr, (int)usr1_count);
     for (int b = 0; b < 16; b++) printf("%02x", ri.ri_uuid[b]);
     printf("\"}\n");
     fflush(stdout);
@@ -190,7 +207,8 @@ static int probe(int argc, char **argv) {
     unsigned long long mib, chunk;
     if (argc != 5 || !parse_u64(argv[3], 4096, &mib) || !parse_u64(argv[4], 1ULL << 30, &chunk) || chunk < 16) return 64;
     const char *mode = argv[2];
-    int touch = strcmp(mode, "touch") == 0 || strcmp(mode, "kill") == 0;
+    int hold = strcmp(mode, "hold") == 0;
+    int touch = strcmp(mode, "touch") == 0 || strcmp(mode, "kill") == 0 || hold;
     if (!touch && strcmp(mode, "untouched") != 0 && strcmp(mode, "sleep") != 0) return 64;
     if (strcmp(mode, "sleep") == 0) { sleep_ms(600000); return 0; }
     unsigned long long total = mib << 20, n = total / chunk, remainder = total % chunk;
@@ -210,6 +228,7 @@ static int probe(int argc, char **argv) {
         for (unsigned long long k = 0; k < n; k++)
             for (unsigned long long off = 0; off < chunk; off += 4096) sum += blocks[k][off];
     if (strcmp(mode, "kill") == 0) { fflush(stdout); raise(SIGKILL); }
+    if (hold) sleep_ms(3000);
     for (unsigned long long k = 0; k < n; k++) free((void *)blocks[k]);
     free((void *)blocks);
     printf("{\"mode\":\"%s\",\"allocated_bytes\":%llu,\"touched_bytes\":%llu,\"chunks\":%llu,\"chunk_bytes\":%llu,"
