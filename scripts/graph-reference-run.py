@@ -109,6 +109,7 @@ def bundle(dest):
                 'src-tauri/crates/keeper-graph-query/native-allocation.h', 'src-tauri/crates/keeper-graph-driver',
                 'src-tauri/crates/keeper-core/src/graph', 'scripts/graph-proof.py', 'scripts/alloc-interposer.c',
                 'scripts/graph-reference-run.py', 'scripts/kg1_reference_monitor.py', 'scripts/kg1-reference-transcript.sh',
+                'scripts/kg1-jail-exec.py',
                 'src-tauri/Cargo.lock',
                 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/source-sha256.json',
                 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/generated-provenance.json'):
@@ -232,7 +233,8 @@ def host_snapshot(where):
 
 def preflight(directory):
     os.makedirs(directory, exist_ok=True)
-    tools = {t: shutil.which(t) for t in ('sudo', 'systemd-run', 'unshare', 'chroot', 'mount', 'dpkg-query')}
+    tools = {t: shutil.which(t) for t in ('sudo', 'systemd-run', 'dpkg-query')}
+    tools['python3'] = HOST_PYTHON if os.access(HOST_PYTHON, os.X_OK) else None
     manifest = json.load(open(os.path.join(BUNDLE, 'rootfs-manifest.json')))
     sums = subprocess.run(['sha256sum', '-c', '--quiet', 'bundle/SHA256SUMS'], cwd=ROOT, capture_output=True, text=True)
     lsm = text('/sys/kernel/security/lsm')
@@ -285,14 +287,18 @@ def preflight(directory):
     return 0 if not problems else 3
 
 
-def jail(*command):
+HOST_PYTHON = '/usr/bin/python3'
+JAIL_EXEC = os.path.join(HERE, 'kg1-jail-exec.py')
+
+
+def jail(*command, root=None, uid=None, gid=None, launcher=JAIL_EXEC):
     """Root: private mount namespace, the pinned rootfs's /proc /sys /dev bound from the
-    host, then chroot as the invoking user. The namespace (and every mount) ends with
-    the command; nothing is mounted on the host."""
-    script = ('set -e; for d in proc sys dev; do mount --rbind /$d "$1/$d"; mount --make-rslave "$1/$d"; done; '
-              'root="$1"; shift; exec chroot --userspec="$KG1_UID:$KG1_GID" "$root" "$@"')
-    return ['unshare', '-m', '--propagation', 'private', 'env', f'KG1_UID={os.getuid()}', f'KG1_GID={os.getgid()}',
-            'sh', '-c', script, 'sh', ROOT, '/usr/bin/env', '-i', PATH, 'HOME=/bundle', 'PYTHONDONTWRITEBYTECODE=1'] + list(command)
+    host, then chroot as the invoking user, all inside one process that ends in execve
+    (`kg1-jail-exec.py`), so the command keeps the scope leader's pid and no launcher
+    stays in the scope. The namespace (and every mount) ends with the command; nothing
+    is mounted on the host. `root`/`uid`/`gid` are overridable only for the self-test."""
+    return [HOST_PYTHON, '-I', '-S', launcher, root or ROOT, str(os.getuid() if uid is None else uid),
+            str(os.getgid() if gid is None else gid), PATH, 'HOME=/bundle', 'PYTHONDONTWRITEBYTECODE=1', '--'] + list(command)
 
 
 def bounded(command, timeout=30, check=True):
@@ -1055,6 +1061,7 @@ print(json.dumps({'exit': code}), flush=True)
 ROUND14_COMMIT = 'fa4cf120'
 ROUND15_COMMIT = 'fad43562'
 ROUND16_COMMIT = 'd6c9c326'
+ROUND17_COMMIT = '970018e9'
 
 # The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
 # verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
@@ -1626,6 +1633,130 @@ def round15_gaps(directory, m, base_sample, results):
              new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'log')})
 
 
+# The jailed probe: it is the monitor's stand-in. The emulated scope is its session (the
+# chain is started with start_new_session, so every launched process inherits it); the
+# registered relation is that every member is the probe itself or its descendant.
+TREE_PROBE = r'''import json, os, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import kg1_reference_monitor as m
+child = subprocess.Popen(['/usr/bin/sleep', '30'])
+me, sid = os.getpid(), os.getsid(0)
+members = []
+for entry in os.listdir('/proc'):
+    if entry.isdigit():
+        try:
+            fields = open(f'/proc/{entry}/stat').read().rsplit(')', 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[3]) == sid and fields[0] != 'Z':
+            members.append(int(entry))
+outside = sorted(set(members) - {me} - set(m.descendants(me)))
+child.kill(); child.wait()
+print(json.dumps({'pid': me, 'ppid': os.getppid(), 'sid': sid, 'members': sorted(members), 'outside': outside,
+                  'cwd': os.getcwd(),  # the execve environment, before Python's own locale coercion
+                  'env': dict(e.split('=', 1) for e in open('/proc/self/environ').read().split('\0') if e)}))
+'''
+
+# Real launcher, privileged syscalls stubbed: this container's AppArmor policy denies
+# mount namespaces to unprivileged user namespaces, so unshare/mount/chroot (and an
+# unneeded setgroups) are recorded instead of performed. execve, chdir, setgid/setuid
+# and the identity verification are real.
+LAUNCHER_STUB = r'''import ctypes, json, os, runpy, sys
+calls_path = sys.argv.pop(1)
+sys.argv.pop(0)  # argv[0] is now the real launcher, exactly as when it runs directly
+calls = []
+class Libc:
+    def mount(self, source, target, fstype, flags, data):
+        calls.append(['mount', source.decode() if source else None, target.decode(), flags]); return 0
+ctypes.CDLL = lambda *a, **k: Libc()
+os.unshare = lambda flags: calls.append(['unshare', flags])
+os.chroot = lambda path: calls.append(['chroot', path])
+os.setgroups = lambda groups: calls.append(['setgroups', groups])
+real_exec = os.execvpe
+def execvpe(file, args, env):
+    calls.append(['execvpe', file]); open(calls_path, 'w').write(json.dumps(calls)); real_exec(file, args, env)
+os.execvpe = execvpe
+runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+
+# The round-18 failure mode: uutils coreutils 0.2.2 `chroot` runs the command with
+# process::Command::status() (spawn and wait) instead of exec'ing it.
+CHAIN_SHIMS = {
+    'unshare': '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do [ "$1" = --propagation ] && shift; shift; done\nexec "$@"\n',
+    'mount': '#!/bin/sh\nexit 0\n',
+    'chroot': '#!/usr/bin/python3\nimport subprocess, sys\na = sys.argv[1:]\nwhile a[0].startswith("--"):\n    a = a[1:]\n'
+              'sys.exit(subprocess.run(a[1:]).returncode)\n',
+}
+
+
+def round19_chain(directory, results):
+    """R18: the jail launch chain leaves no process outside the monitored tree. The new
+    chain runs the real launcher; the old chain (commit 970018e9) runs with a forking
+    chroot shim modelled on uutils 0.2.2. Same probe, same emulated scope."""
+    import importlib.util
+    base = os.path.join(directory, 'r19')
+    os.makedirs(base, exist_ok=True)
+    old_path = os.path.join(base, 'old-graph-reference-run.py')
+    with open(old_path, 'w') as f:
+        f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND17_COMMIT}:scripts/graph-reference-run.py']).stdout)
+    spec = importlib.util.spec_from_file_location('old19_runner', old_path)
+    old_r = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old_r)
+    shims = os.path.join(base, 'shims')
+    os.makedirs(shims, exist_ok=True)
+    for name, body in CHAIN_SHIMS.items():
+        with open(os.path.join(shims, name), 'w') as f:
+            f.write(body)
+        os.chmod(os.path.join(shims, name), 0o755)
+    probe = os.path.join(base, 'probe.py')
+    stub = os.path.join(base, 'launcher-stub.py')
+    for path, body in ((probe, TREE_PROBE), (stub, LAUNCHER_STUB)):
+        with open(path, 'w') as f:
+            f.write(body)
+    root = os.path.join(base, 'rootfs')
+    target = ['/usr/bin/python3', probe, HERE]
+    env = dict(os.environ, PATH=shims + ':' + os.environ['PATH'])
+
+    def launch(command):
+        p = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
+        line = out.strip().splitlines()[-1] if out.strip() else ''
+        return p.pid, p.returncode, (json.loads(line) if line.startswith('{') else None), err[-600:]
+
+    def related(pid, observed):
+        return (observed is not None and observed['pid'] == pid and observed['sid'] == pid and observed['ppid'] == os.getpid()
+                and observed['members'] and not observed['outside'])
+    calls_path = os.path.join(base, 'calls.json')
+    new_cmd = jail(*target, root=root)
+    launcher_at = new_cmd.index(JAIL_EXEC)
+    new_cmd = new_cmd[:launcher_at] + [stub, calls_path] + new_cmd[launcher_at:]
+    new_pid, new_rc, new_obs, new_err = launch(new_cmd)
+    old_pid, old_rc, old_obs, old_err = launch(old_r.jail(*target))
+    calls = json.load(open(calls_path)) if os.path.exists(calls_path) else []
+    expected_calls = ([['unshare', os.CLONE_NEWNS], ['mount', None, '/', 0x4000 | (1 << 18)]]
+                      + [c for d in ('proc', 'sys', 'dev') for c in (['mount', '/' + d, os.path.join(root, d), 0x1000 | 0x4000],
+                                                                    ['mount', None, os.path.join(root, d), 0x4000 | (1 << 19)])]
+                      + [['chroot', root], ['execvpe', '/usr/bin/python3']])
+    new_ok = (new_rc == 0 and related(new_pid, new_obs) and calls == expected_calls and new_obs['cwd'] == '/'
+              and new_obs['env'] == {'PATH': '/usr/bin:/bin', 'HOME': '/bundle', 'PYTHONDONTWRITEBYTECODE': '1'})
+    results['r19:jail_chain_leaves_only_the_monitor_tree_in_scope'] = {
+        'new': {'popen_pid': new_pid, 'rc': new_rc, 'observed': new_obs, 'calls': calls, 'stderr': new_err},
+        'old': {'popen_pid': old_pid, 'rc': old_rc, 'observed': old_obs, 'stderr': old_err},
+        'new_catches': new_ok, 'old_catches': related(old_pid, old_obs),
+        'pass': new_ok and old_obs is not None and bool(old_obs['outside']) and not related(old_pid, old_obs)}
+    # Unstubbed, the real launcher fails closed here (no mount namespace for this user):
+    # nonzero before the command runs, and nothing is mounted.
+    marker = os.path.join(base, 'ran')
+    pid, rc, observed, err = launch(jail('/usr/bin/python3', '-c', f'open({marker!r}, "w")', root=root))
+    results['r19:launcher_fails_closed_without_privilege'] = {
+        'rc': rc, 'stderr': err, 'command_ran': os.path.exists(marker),
+        'pass': rc != 0 and not os.path.exists(marker) and 'Operation not permitted' in err}
+
+
 # ------------------------------------------------------------------ local self-test
 
 def selftest(directory):
@@ -1870,6 +2001,7 @@ print(json.dumps({'complete': True}), flush=True)
     shutil.rmtree(root)
     round14_gaps(directory, m, base_sample, series, results, fake_driver)
     round15_gaps(directory, m, base_sample, results)
+    round19_chain(directory, results)
     failed = [k for k, v in results.items() if not v['pass']]
     write(os.path.join(directory, 'selftest.json'), {'predicate_version': m.PREDICATE_VERSION,
                                                      'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
