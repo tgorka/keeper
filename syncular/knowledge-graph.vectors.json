@@ -841,6 +841,54 @@
       "refusal": "invalid_change"
     },
     {
+      "id": "create-null-after-image",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": null,
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "after-image-not-object",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": 1,
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "before-image-not-object",
+      "ops": [
+        {
+          "before_revision": "1",
+          "after_revision": "2",
+          "before_value": [],
+          "after_value": {},
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "update"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
       "id": "create-with-before",
       "ops": [
         {

@@ -42,10 +42,17 @@ impl Op {
     /// revisions, and the images its operation implies. A create has no
     /// before-image; a removal has no after-image and is only ever of a tag
     /// membership; every other operation has both. A tag membership carries
-    /// no revision.
+    /// no revision. An image is an entity's JSON object: an absent image is
+    /// `None` and serialises as `null`, so `Some(null)` (which would read
+    /// back as absent) and any other non-object image refuse, and a native
+    /// operation and its wire form are judged alike.
     fn check(&self) -> Result<(), Refusal> {
         let revisions = [&self.before_revision, &self.after_revision];
+        let images_are_objects = [&self.before_value, &self.after_value]
+            .iter()
+            .all(|image| image.as_ref().is_none_or(Value::is_object));
         if !is_ulid(&self.entity_id)
+            || !images_are_objects
             || revisions
                 .iter()
                 .any(|revision| revision.as_deref().is_some_and(|r| !is_decimal(r)))

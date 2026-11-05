@@ -23,7 +23,7 @@
     },
     {
       "name": "0006_knowledge_graph",
-      "sha256": "6bcc127c24558622961558417de22c0ff72673d47a08a4969dea90e450a97e1d"
+      "sha256": "5a227272f5124d5dd80936d6c05d9e2b198f41dd2192d8859d8512ffdc7d1c7c"
     }
   ],
   "head": {
@@ -700,6 +700,11 @@
           {
             "name": "origin_actor",
             "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "origin_chain",
+            "type": "json",
             "nullable": true
           },
           {

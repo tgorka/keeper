@@ -20,6 +20,7 @@ CREATE TABLE kg_events (
   client_id TEXT NOT NULL,
   origin_class TEXT NOT NULL,
   origin_actor TEXT,
+  origin_chain JSON,
   context_id TEXT,
   approval_basis JSON,
   reverses_event_id TEXT,

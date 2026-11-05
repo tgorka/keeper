@@ -288,6 +288,14 @@ pub enum ReplicaError {
         message: String,
         retryable: bool,
     },
+    /// The server ran a command and answered it with a rejected result
+    /// (`status: "rejected"`): the commit it built was refused, so the
+    /// command made no change and this request will not make one. Its
+    /// result's code (`operation.rejected` when it named none) and message.
+    /// Unlike [`ReplicaError::Remote`], which may also refuse a command
+    /// before it runs, this is always the command's own definite outcome.
+    #[error("{code}: {message}")]
+    Rejected { code: String, message: String },
     /// A command was sent and no answer keeper can trust came back — the
     /// connection failed, or the answer could not be read — so whether the
     /// server made it is not known. Asking again under the same request id

@@ -514,7 +514,9 @@ property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes.
 - **`kg_events`** — one accepted change: `graph_seq` (1, 2, … per graph), `descriptor`,
   `request_id`, `request_digest`, `actor_id` and `client_id` of the request, `origin_class`
   (`human` | `agent`, from the credential and context, never from the payload), `origin_actor`
-  (the person an agent acted for, or null), `context_id`, `approval_basis` (JSON, or null),
+  (the person an agent acted for, or null), `origin_chain` (JSON, or null: the delegation chain
+  from that person to the acting context, server-derived from canonical parent sessions),
+  `context_id`, `approval_basis` (JSON, or null),
   `reverses_event_id`, `event_time_ms` (the source's time, or null), `recorded_at_ms`, `op_count`
   and `delta_digest`. Never changed or deleted.
 - **`kg_event_ops`** — its operations, `id` `<event_id>/<ordinal>`: `ordinal` (0 to
@@ -548,10 +550,14 @@ exactly `op_count` operations whose digest is `delta_digest`.
 
 **Outcomes.** A command's `applied` or `cached` answer is a transport acknowledgement whose
 `commitSeq` bounds when the client's replica will see the receipt; it is never acceptance by
-itself. A client concludes from its receipt (or the `graph.outcome` query): a receipt for another
-digest is `idempotency_mismatch`; a refusal `idempotency_mismatch` or `unsupported_version` is
-terminal, as is a server fault (`kg.` code); every other refusal, and an answer lost or unread,
-leaves the request pending under the same id until a receipt resolves it.
+itself, and it lends its commit only to the request id it names. A client concludes from its
+receipt (or the `graph.outcome` query), and only from the receipt whose id is its own
+`<descriptor>/<request_id>/<client_scope>`: a request's receipt for another digest is
+`idempotency_mismatch`. Without one, a `rejected` answer (the command ran and its commit was
+refused) is terminal whatever its code; so is a refusal `idempotency_mismatch` or
+`unsupported_version` (the stable code is the `operation.forbidden` message), and a server
+fault (`kg.` code). Every other refusal, which may come before the command runs, and an answer
+lost or unread, leaves the request pending under the same id until a receipt resolves it.
 
 ## The live check
 

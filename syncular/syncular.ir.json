@@ -1624,6 +1624,11 @@
           "nullable": true
         },
         {
+          "name": "origin_chain",
+          "type": "json",
+          "nullable": true
+        },
+        {
           "name": "context_id",
           "type": "string",
           "nullable": true

@@ -1854,6 +1854,27 @@ fn command_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaErro
     }
 }
 
+/// A command answered `rejected`: definite, whatever its results say. The
+/// first result naming a `code` gives the code and message; none gives
+/// `operation.rejected` and the results as they came.
+fn rejection(results: Vec<Value>) -> ReplicaError {
+    let refusal = results.iter().find_map(|result| {
+        let code = result.get("code").and_then(Value::as_str)?;
+        let message = result
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(code);
+        Some((code.to_owned(), message.to_owned()))
+    });
+    let (code, message) = refusal.unwrap_or_else(|| {
+        (
+            "operation.rejected".to_owned(),
+            Value::from(results).to_string(),
+        )
+    });
+    ReplicaError::Rejected { code, message }
+}
+
 impl Replica for SyncularReplica {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
         self.mutate_superseding(ops, Vec::new())
@@ -2135,27 +2156,7 @@ impl Replica for SyncularReplica {
         let cached = match answer.status.as_str() {
             "applied" => false,
             "cached" => true,
-            "rejected" => {
-                let refusal = answer.results.iter().find_map(|result| {
-                    let code = result.get("code").and_then(Value::as_str)?;
-                    let message = result
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or(code);
-                    Some((code.to_owned(), message.to_owned()))
-                });
-                let (code, message) = refusal.unwrap_or_else(|| {
-                    (
-                        "operation.rejected".to_owned(),
-                        Value::from(answer.results).to_string(),
-                    )
-                });
-                return Err(ReplicaError::Remote {
-                    code,
-                    message,
-                    retryable: false,
-                });
-            }
+            "rejected" => return Err(rejection(answer.results)),
             // The client admits only the three statuses; an answer naming
             // another says nothing about whether the command ran.
             _ => {
@@ -3675,6 +3676,36 @@ pub(crate) mod tests {
             puts(&seen, &sha(&kept), 200),
             1,
             "the waiting message's file still goes"
+        );
+    }
+
+    /// A `rejected` answer stays a definite rejection whatever code it
+    /// carries, and never reads as a pre-dispatch refusal.
+    #[test]
+    fn a_rejected_command_result_keeps_its_rejection_class() {
+        assert_eq!(
+            super::rejection(vec![
+                json!({"ok": false}),
+                json!({"code": "kg.command_only", "message": "kg.command_only"})
+            ]),
+            ReplicaError::Rejected {
+                code: "kg.command_only".into(),
+                message: "kg.command_only".into()
+            }
+        );
+        assert_eq!(
+            super::rejection(vec![json!({"code": "hq.v19"})]),
+            ReplicaError::Rejected {
+                code: "hq.v19".into(),
+                message: "hq.v19".into()
+            }
+        );
+        assert_eq!(
+            super::rejection(Vec::new()),
+            ReplicaError::Rejected {
+                code: "operation.rejected".into(),
+                message: "[]".into()
+            }
         );
     }
 }
