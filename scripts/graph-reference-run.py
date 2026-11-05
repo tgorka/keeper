@@ -33,6 +33,7 @@ import os
 import platform
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -532,6 +533,19 @@ def inner(directory):
 STACK_GUARD = 'test "$(ulimit -H -s)" = unlimited || exit 97; ulimit -S -s 8192 && exec "$@"'
 
 
+PRELOAD_LINK_TARGET = '/nonexistent/kg1-1101-preload-target'
+# O_CREAT|O_EXCL: fails on any existing entry, a symlink included; never follows or truncates.
+EXCLUSIVE_CREATE = 'import os, sys; os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))'
+
+
+def preload_signature(path):
+    """The exact entry a case creates: an empty regular file, or our dangling link."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        return os.readlink(path) == PRELOAD_LINK_TARGET
+    return stat.S_ISREG(st.st_mode) and st.st_size == 0
+
+
 def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120):
     """P6c preload refusal controller. `root`/`driver_command` are overridable only for
     the local self-test (the driver then runs as a tracked child of this subreaper); the
@@ -553,7 +567,7 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
     privileged = [] if in_chroot else ['sudo', '-n']
     saved_mode = os.stat(etc).st_mode & 0o7777
 
-    created = {}  # the lstat identity of the file this case itself made, if any
+    created = {}  # intent registered before the effect, then the lstat identity of what we made
 
     def absent_and_restored():
         return not os.path.lexists(path) and os.stat(etc).st_mode & 0o7777 == saved_mode
@@ -563,20 +577,33 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
             os.chmod(etc, saved_mode)
         if os.path.lexists(path):
             st = os.lstat(path)
-            if created.get('identity') != (st.st_dev, st.st_ino):
+            ours = created.get('identity') == (st.st_dev, st.st_ino)
+            # Interrupted between the exclusive creation and the identity record: the path
+            # was absent at preflight and creation is exclusive, so an intent plus our exact
+            # signature (an empty regular file or our dangling link) is ours.
+            if not ours and created.get('identity') is None and created.get('intent') and preload_signature(path):
+                ours = True
+            if not ours:
                 raise RuntimeError(f'{path} is not the file this case created; not removed')
             bounded(privileged + ['rm', '-f', path])
         if not absent_and_restored():
             raise RuntimeError('restoration not verified')
+        created.clear()
 
     def make(create):
+        # Ownership is registered (durably, for the outer trap) BEFORE the effect; the
+        # creation itself is exclusive, so it can never adopt a foreign entry.
+        created.clear()
+        created['intent'] = True
+        if driver_command is None:
+            owned('intent', path)
         create()
         st = os.lstat(path)
         created['identity'] = (st.st_dev, st.st_ino)
         if driver_command is None:
             owned('file', st.st_dev, st.st_ino, path)
-    variants = {'empty-file': lambda: make(lambda: bounded(privileged + ['install', '-m', '0644', '/dev/null', path])),
-                'dangling-symlink': lambda: make(lambda: bounded(privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path]))}
+    variants = {'empty-file': lambda: make(lambda: bounded(privileged + ['python3', '-c', EXCLUSIVE_CREATE, path])),
+                'dangling-symlink': lambda: make(lambda: bounded(privileged + ['ln', '-s', PRELOAD_LINK_TARGET, path]))}
     if in_chroot:
         # EACCES: remove every search bit from the private rootfs /etc only (never the
         # host /etc); the non-root, capability-free supervisor then fails the lookup.
@@ -1008,6 +1035,7 @@ print(json.dumps({'exit': code}), flush=True)
         record(case, new_ok, old_ok, observed=observed)
 
 ROUND14_COMMIT = 'fa4cf120'
+ROUND15_COMMIT = 'fad43562'
 
 # The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
 # verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
@@ -1073,15 +1101,34 @@ if plan.get('unreadable'):
     path = os.path.join(d, 'secret')
     open(path, 'w').write('x')
     os.chmod(path, 0)
+if plan.get('unreadable_orphan'):
+    open(os.path.join(os.environ['FAKE_SYSTEMD'], 'unreadable_pid'), 'w').write(str(p.pid))
+for marker in ('hang', 'census_fail'):
+    if plan.get(marker):
+        open(os.path.join(os.environ['FAKE_SYSTEMD'], marker), 'w').close()
+for which, content, die in plan.get('intent_files', []):
+    # Intent registered, then the exclusive publication; `die` = SIGKILL before the
+    # identity record, the window a controller interruption can hit.
+    path = host if which == 'host' else private
+    own('intent', path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    os.write(fd, content.encode())
+    os.close(fd)
+    if die:
+        os.kill(os.getpid(), 9)
 time.sleep(plan.get('sleep', 0))
 sys.exit(plan.get('exit', 0))
 '''
 
 FAKE_BIN = {
-    'sudo': '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n',
+    'sudo': '#!/bin/sh\n[ "$1" = -n ] && shift\n'
+            '[ "$1" = sh ] && [ -e "$FAKE_SYSTEMD/census_fail" ] && { echo "sudo: refused" >&2; exit 1; }\nexec "$@"\n',
     'findmnt': '#!/bin/sh\ncat "$FAKE_MOUNTS"\n',
+    'readlink': '#!/bin/sh\nif [ -e "$FAKE_SYSTEMD/unreadable_pid" ]; then\n'
+                '  case "$1" in "/proc/$(cat "$FAKE_SYSTEMD/unreadable_pid")/"*) exit 1;; esac\nfi\nexec "$REAL_READLINK" "$@"\n',
     'systemctl': r'''#!/bin/sh
 S=$FAKE_SYSTEMD
+[ -e "$S/hang" ] && exec sleep 3600
 [ -e "$S/fail" ] && exit 1
 case "$1" in
   list-units) for f in "$S"/units/*; do [ -e "$f" ] && echo "$(basename "$f").scope loaded active running fake"; done; exit 0;;
@@ -1239,11 +1286,11 @@ def round15_gaps(directory, m, base_sample, results):
         env = dict(os.environ, PATH=paths['bin'] + ':' + os.environ['PATH'], FAKE_SYSTEMD=paths['systemd'],
                    FAKE_MOUNTS=os.path.join(w, 'mounts'), FAKE_PLAN=os.path.join(w, 'plan.json'),
                    FAKE_ROOTFS=rootfs, FAKE_ORPHAN=os.path.join(w, 'orphan.pid'),
-                   KG1_TEST_HOST_ETC=paths['hostetc'], HOST_ETC=paths['hostetc'])
+                   KG1_TEST_HOST_ETC=paths['hostetc'], HOST_ETC=paths['hostetc'], REAL_READLINK=shutil.which('readlink'))
         return dict(paths, w=w, rootfs=rootfs, env=env, out=os.path.join(rootfs, 'bundle', 'out'),
                     host=os.path.join(paths['hostetc'], 'ld.so.preload'))
 
-    def go(w, script, signal_after=None, timeout=60):
+    def go(w, script, signal_after=None, timeout=150):  # above the transcript's 60 s unit deadline
         started = time.monotonic()
         p = subprocess.Popen(['bash', script, w['rootfs']], env=w['env'], stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -1316,7 +1363,7 @@ def round15_gaps(directory, m, base_sample, results):
                new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'output')})
     # Collection: evidence is copied and verified before anything on delectra is removed.
 
-    def orchestrate(name, plan, old=False):
+    def orchestrate(name, plan, old=False, script_path=None):
         w = world(name, plan)
         home = os.path.join(w['w'], 'remote-home')
         os.makedirs(home)
@@ -1330,7 +1377,8 @@ def round15_gaps(directory, m, base_sample, results):
                       f'bash $DIR/rootfs/bundle/scripts/kg1-reference-transcript.sh $(cd $DIR/rootfs && pwd -P); ' + ROUND14_COLLECT)
             p = subprocess.run(['bash', '-c', script], cwd=home, env=env, capture_output=True, text=True, timeout=120)
         else:
-            p = subprocess.run(['bash', orchestrator, w['rootfs'], evid], cwd=home, env=env, capture_output=True, text=True, timeout=120)
+            p = subprocess.run(['bash', script_path or orchestrator, w['rootfs'], evid], cwd=home, env=env,
+                               capture_output=True, text=True, timeout=120)
         remote_dir = os.path.join(home, 'kg1-1101-ref')
         kept = os.path.exists(remote_dir)
         if kept:
@@ -1345,6 +1393,116 @@ def round15_gaps(directory, m, base_sample, results):
     old = orchestrate('collect-unreadable-old', {'reference': {'unreadable': True}}, old=True)
     record('unverified_collection_keeps_remote', new['rc'] == 9 and new['remote_kept'] and 'removed=no' in new['stdout'],
            old['remote_kept'], new=new, old=old)
+
+    # ================= Round-15 review R15-1..R15-4, old = checkpoint fad43562 ==========
+    import tempfile
+    old16_dir = os.path.join(directory, 'old16')
+    os.makedirs(old16_dir, exist_ok=True)
+    for name in ('graph-reference-run.py', 'kg1-reference-transcript.sh', 'kg1-reference-delectra.sh'):
+        with open(os.path.join(old16_dir, name), 'w') as f:
+            f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND15_COMMIT}:scripts/{name}']).stdout)
+    old16_r = load('old16_runner', os.path.join(old16_dir, 'graph-reference-run.py'))
+    old16_transcript = os.path.join(old16_dir, 'kg1-reference-transcript.sh')
+    old16_orchestrator = os.path.join(old16_dir, 'kg1-reference-delectra.sh')
+
+    def record16(name, new_caught, old_caught, **detail):
+        results[f'r16:{name}'] = dict(detail, new_catches=bool(new_caught), old_catches=bool(old_caught),
+                                      **{'pass': bool(new_caught) and not old_caught})
+
+    def pair(name, plan, timeout=(60, 60)):
+        runs = {}
+        for (label, script), limit in zip((('new', transcript), ('old', old16_transcript)), timeout):
+            w = world(f'r16-{name}-{label}', plan)
+            runs[label] = dict(go(w, script, timeout=limit), world=w)
+        return runs
+
+    # R15-1 (controller): a signal lands after the exclusive publication, before the
+    # identity is recorded. The runner's own restoration must still remove our entry.
+    fake_driver = os.path.join(directory, 'fake_driver.py')
+    outcome = {}
+    for label, module in (('new', sys.modules[__name__]), ('old', old16_r)):
+        root = tempfile.mkdtemp(prefix=f'kg1-r16-publish-{label}-', dir=directory)
+        etc = os.path.join(root, 'etc')
+        os.makedirs(etc)
+        target = os.path.join(etc, 'ld.so.preload')
+        real = module.bounded
+        fired = []
+
+        def interrupting(command, timeout=30, check=True, real=real, target=target, fired=fired):
+            result = real(command, timeout, check)
+            if not fired and 'rm' not in command and os.path.lexists(target):
+                fired.append(command)
+                raise m.Stop('signal 15 after publication, before registration')
+            return result
+        module.bounded = interrupting
+        try:
+            module.preload(os.path.join(directory, f'r16-publish-{label}'), True, root=root,
+                           driver_command=[sys.executable, fake_driver, etc, 'ok'], timeout_s=10)
+        finally:
+            module.bounded = real
+        rec = json.load(open(os.path.join(directory, f'r16-publish-{label}', 'preload.json')))
+        outcome[label] = {'fired': bool(fired), 'left': os.path.lexists(target), 'restore_failure': rec['restore_failure']}
+        if os.path.lexists(target):
+            os.remove(target)
+        shutil.rmtree(root)
+    record16('controller_interrupted_after_publication', outcome['new']['fired'] and not outcome['new']['left']
+             and outcome['new']['restore_failure'] is None, outcome['old']['fired'] and not outcome['old']['left'], outcome=outcome)
+    # R15-1 (outer trap): the controller is SIGKILLed after publication, before the
+    # identity record; only the fsynced intent exists.
+    r = pair('intent_then_killed', {'preload-host': {'intent_files': [['host', '', True]]}})
+    record16('trap_removes_intent_registered_entry', r['new']['rc'] == 137 and not os.path.lexists(r['new']['world']['host'])
+             and 'via=intent removed=yes' in r['new']['log'], not os.path.lexists(r['old']['world']['host']),
+             new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'log')})
+    w = world('r16-intent-foreign', {'preload-host': {'intent_files': [['host', 'foreign', False]]}})
+    x = go(w, transcript)
+    record16('positive:intent_without_our_signature_is_kept', x['rc'] == 8 and os.path.exists(w['host'])
+             and 'intent_signature=FAIL' in x['log'], False, new={k: x[k] for k in ('rc', 'log')})
+    # R15-2: every systemd helper hangs during cleanup, and a TERM arrives mid-cleanup.
+    # Files are restored first, every helper is killed at its deadline, the gate fails,
+    # and the cleanup still completes.
+    runs = {}
+    for label, script, limit in (('new', transcript, 180), ('old', old16_transcript, 45)):
+        w = world(f'r16-hang-{label}', {'preload-host': {'units': [['kg1-1101-preload-host-1', False]], 'files': ['host'],
+                                                         'hang': True}})
+        started = time.monotonic()
+        p = subprocess.Popen(['bash', script, w['rootfs']], env=w['env'], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        log_path = os.path.join(w['out'], 'transcript.log')
+        termed = False
+        while time.monotonic() - started < 30 and p.poll() is None:
+            if os.path.exists(log_path) and 'STAGE reference exit=' in open(log_path).read():
+                time.sleep(3)
+                p.send_signal(signal.SIGTERM)
+                termed = True
+                break
+            time.sleep(0.1)
+        try:
+            p.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.communicate()
+        log = open(log_path).read() if os.path.exists(log_path) else ''
+        runs[label] = {'rc': p.returncode, 'termed': termed, 'elapsed': round(time.monotonic() - started, 1),
+                       'host_left': os.path.lexists(w['host']), 'completed': 'TRANSCRIPT result=' in log, 'log': log[-1500:]}
+        if os.path.lexists(w['host']):
+            os.remove(w['host'])
+    n, o = runs['new'], runs['old']
+    record16('cleanup_bounded_files_first_signal_ignored', n['termed'] and n['completed'] and not n['host_left'] and n['rc'] == 8
+             and 'unit_gone=FAIL' in n['log'] and 'no_kg1_units=FAIL query-failed' in n['log'],
+             o['completed'] and not o['host_left'], runs=runs)
+    # R15-3: a failed census, and a live owned process that cannot be inspected.
+    for name, plan, needle in (('census_failure_is_not_absence', {'reference': {'orphan': True, 'census_fail': True}},
+                                'no_owned_processes=FAIL census-failed'),
+                               ('unreadable_live_process_is_not_absence', {'reference': {'orphan': True, 'unreadable_orphan': True}},
+                                'UNREADABLE')):
+        r = pair(name, plan)
+        record16(name, r['new']['rc'] == 8 and needle in r['new']['log'], r['old']['rc'] != 0,
+                 new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'log')})
+    # R15-4: the gate fails (a kg1 unit survives) but the evidence collects cleanly.
+    new = orchestrate('r16-gate-failed-new', {'reference': {'unregistered_unit': True}})
+    old = orchestrate('r16-gate-failed-old', {'reference': {'unregistered_unit': True}}, script_path=old16_orchestrator)
+    record16('failed_gate_keeps_remote', new['rc'] == 8 and new['remote_kept'] and 'COLLECT verify=PASS' in new['stdout']
+             and 'reason=resource-gate-FAIL' in new['stdout'], old['remote_kept'], new=new, old=old)
 
 
 # ------------------------------------------------------------------ local self-test

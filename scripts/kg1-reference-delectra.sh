@@ -5,7 +5,9 @@
 #    verify the bundle's SHA256SUMS against the local copy.
 # 2. run: the remote kg1-reference-transcript.sh (its exit is the run's verdict).
 # 3. collect: hash the remote evidence remotely, copy it back, verify every hash locally.
-# 4. remove: only after a verified collection, and only the directory recorded in step 1.
+# 4. remove: only after a verified collection AND a transcript whose owned-resource gate
+#    passed (read from the locally verified log), and only the directory recorded in step 1.
+#    A failed or unverified gate keeps the bundle for recovery and names the outstanding state.
 # A signal stops here; nothing resumes and nothing on delectra is removed.
 # KG1_REMOTE (default `ssh delectra`) and KG1_REMOTE_DIR exist for the local self-test.
 set -euo pipefail
@@ -53,17 +55,31 @@ fi
 note "COLLECT verify=$collected files=$(wc -l <"$EVID/remote.sha256")"
 (cd "$EVID" && find . -type f ! -name orchestrator.log -print0 | sort -z | xargs -0 sha256sum) >"$EVID/LOCAL.sha256"
 
-# 4. remove, only after a verified copy, only the directory recorded at ship time
-if [ "$collected" = PASS ]; then
-  if remote "test \"\$(stat -c '%d %i' $DIR)\" = '$identity' && rm -rf $DIR && test ! -e $DIR"; then
-    note "REMOVE remote_dir=$DIR removed=yes"
-  else
-    note "REMOVE remote_dir=$DIR removed=no reason=identity-or-removal-failed"
-    [ "$status" -ne 0 ] || status=10
-  fi
-else
+# The owned-resource gate, from the locally verified copy of the transcript log: its last
+# line must be the transcript's final record with gate=PASS. A failed gate, or a run that
+# never reached its trap, keeps the bundle (a surviving process may still use it).
+gate=UNVERIFIED
+if [ "$collected" = PASS ] && [ -f "$EVID/out/transcript.log" ]; then
+  last=$(tail -n 1 "$EVID/out/transcript.log")
+  case "$last" in
+    'TRANSCRIPT result='*' gate=PASS') gate=PASS;;
+    'TRANSCRIPT result='*' gate=FAIL') gate=FAIL;;
+  esac
+  note "GATE transcript_gate=$gate outstanding=$(grep '=FAIL' "$EVID/out/transcript.log" | grep '^GATE' | tr '\n' ';')"
+fi
+
+# 4. remove, only after a verified copy and a passed gate, only the directory recorded at ship time
+if [ "$collected" != PASS ]; then
   note "REMOVE remote_dir=$DIR removed=no reason=collection-not-verified"
   [ "$status" -ne 0 ] || status=9
+elif [ "$gate" != PASS ]; then
+  note "REMOVE remote_dir=$DIR removed=no reason=resource-gate-$gate state=kept-for-recovery"
+  [ "$status" -ne 0 ] || status=11
+elif remote "test \"\$(stat -c '%d %i' $DIR)\" = '$identity' && rm -rf $DIR && test ! -e $DIR"; then
+  note "REMOVE remote_dir=$DIR removed=yes"
+else
+  note "REMOVE remote_dir=$DIR removed=no reason=identity-or-removal-failed"
+  [ "$status" -ne 0 ] || status=10
 fi
 note "ORCHESTRATOR exit=$status"
 exit "$status"
