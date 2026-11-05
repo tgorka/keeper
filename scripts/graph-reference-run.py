@@ -107,7 +107,8 @@ def bundle(dest):
                 'src-tauri/crates/keeper-graph-query/Cargo.toml', 'src-tauri/Cargo.toml', 'rust-toolchain.toml',
                 'src-tauri/crates/keeper-graph-query/native-allocation.h', 'src-tauri/crates/keeper-graph-driver',
                 'src-tauri/crates/keeper-core/src/graph', 'scripts/graph-proof.py', 'scripts/alloc-interposer.c',
-                'scripts/graph-reference-run.py', 'scripts/kg1_reference_monitor.py', 'src-tauri/Cargo.lock',
+                'scripts/graph-reference-run.py', 'scripts/kg1_reference_monitor.py', 'scripts/kg1-reference-transcript.sh',
+                'src-tauri/Cargo.lock',
                 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/source-sha256.json',
                 'src-tauri/crates/keeper-graph-query/vendor/graphqlite/generated-provenance.json'):
         source, copy = os.path.join(repo, rel), os.path.join(staged, rel)
@@ -290,7 +291,7 @@ def jail(*command):
     script = ('set -e; for d in proc sys dev; do mount --rbind /$d "$1/$d"; mount --make-rslave "$1/$d"; done; '
               'root="$1"; shift; exec chroot --userspec="$KG1_UID:$KG1_GID" "$root" "$@"')
     return ['unshare', '-m', '--propagation', 'private', 'env', f'KG1_UID={os.getuid()}', f'KG1_GID={os.getgid()}',
-            'sh', '-c', script, 'sh', ROOT, '/usr/bin/env', '-i', PATH, 'HOME=/bundle'] + list(command)
+            'sh', '-c', script, 'sh', ROOT, '/usr/bin/env', '-i', PATH, 'HOME=/bundle', 'PYTHONDONTWRITEBYTECODE=1'] + list(command)
 
 
 def bounded(command, timeout=30, check=True):
@@ -304,22 +305,113 @@ def bounded(command, timeout=30, check=True):
     return result
 
 
-def scope_gone(unit, timeout=30):
-    """Kill a transient scope's whole cgroup and wait until systemd reports it gone."""
-    kill = bounded(['sudo', '-n', 'systemctl', 'kill', '--signal=SIGKILL', f'{unit}.scope'], check=False)
+SCOPE_PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'ControlGroup')
+
+
+def scope_state(unit, query=bounded):
+    """Named systemd properties of the scope from a successful query, or (None, reason).
+    A failed, empty or incomplete response is never read as absence."""
+    try:
+        result = query(['systemctl', 'show'] + [a for p in SCOPE_PROPERTIES for a in ('-p', p)] + [f'{unit}.scope'], check=False)
+    except Exception as error:
+        return None, f'show failed: {error!r}'
+    if result.returncode != 0:
+        return None, f'show exit {result.returncode}'
+    props = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition('=')
+        if not sep or key in props:
+            return None, f'malformed show line {line!r}'
+        props[key] = value
+    if set(props) != set(SCOPE_PROPERTIES):
+        return None, f'show returned {sorted(props)}'
+    return props, None
+
+
+def cgroup_empty_or_gone(cgroup, root='/sys/fs/cgroup'):
+    """True only on a positive observation: the scope's recorded cgroup directory is gone,
+    or its recursive membership is readable and empty. Unknown identity is not gone."""
+    sys.path.insert(0, HERE)
+    import kg1_reference_monitor as monitor
+    if not cgroup:
+        return False, 'scope cgroup identity was never established'
+    path = root + cgroup
+    if not os.path.lexists(path):
+        return True, 'cgroup directory gone'
+    try:
+        members = monitor.scope_members(path)
+    except monitor.Invalid as error:
+        if not os.path.lexists(path):
+            return True, 'cgroup directory removed during the walk'
+        return False, f'cgroup unreadable: {error}'
+    return (not members), f'members {members}'
+
+
+def establish_scope(unit, query=bounded, timeout=30, sleep=time.sleep):
+    """The scope's cgroup, from a successful query that shows it active; None otherwise."""
     end = time.monotonic() + timeout
-    state = None
     while time.monotonic() < end:
-        state = bounded(['systemctl', 'show', '-p', 'ActiveState', '-p', 'ControlGroup', '--value', f'{unit}.scope'], check=False).stdout.split()
-        if not state or state[0] in ('inactive', 'failed') and len(state) == 1:
-            return {'kill_exit': kill.returncode, 'state': state, 'gone': True}
-        time.sleep(0.5)
-    return {'kill_exit': kill.returncode, 'state': state, 'gone': False}
+        props, _ = scope_state(unit, query)
+        if props and props['ActiveState'] == 'active' and props['ControlGroup'].startswith('/'):
+            return props['ControlGroup']
+        sleep(0.2)
+    return None
+
+
+def scope_gone(unit, cgroup, query=bounded, timeout=30, sleep=time.sleep, kill=True, cgroup_root='/sys/fs/cgroup'):
+    """Kill the scope's whole cgroup and positively verify that it is gone: a successful
+    systemd query shows the unit unloaded (or inactive with no cgroup) AND the recorded
+    cgroup is gone or empty. Every failure is recorded and leaves gone=False; nothing
+    raises."""
+    record = {'unit': unit, 'cgroup': cgroup, 'attempts': []}
+    if kill:
+        try:
+            record['kill_exit'] = query(['sudo', '-n', 'systemctl', 'kill', '--signal=SIGKILL', f'{unit}.scope'], check=False).returncode
+        except Exception as error:
+            record['kill_error'] = repr(error)
+    end = time.monotonic() + timeout
+    while True:
+        props, reason = scope_state(unit, query)
+        empty, detail = cgroup_empty_or_gone(cgroup, cgroup_root)
+        unit_gone = props is not None and (props['LoadState'] == 'not-found' or
+                                           (props['ActiveState'] in ('inactive', 'failed') and props['ControlGroup'] == ''))
+        record['attempts'].append({'props': props, 'query_failure': reason, 'cgroup': detail, 'unit_gone': unit_gone})
+        if unit_gone and empty:
+            record['gone'] = True
+            return record
+        if time.monotonic() >= end:
+            record['gone'] = False
+            return record
+        sleep(0.5)
+
+
+def owned(kind, *fields):
+    """Append one created resource (exact unit name, or path with its lstat identity) to
+    the outer transcript's ledger, so its trap and gate act only on what this run made."""
+    with open(os.environ['KG1_OWNED_LEDGER'], 'a') as f:
+        f.write(' '.join([kind] + [str(x) for x in fields]) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def require_ledger(what):
+    """Real (scope-creating) runs refuse to start outside the outer transcript."""
+    if not os.environ.get('KG1_OWNED_LEDGER'):
+        print(json.dumps({what: 'refused', 'reason': 'KG1_OWNED_LEDGER not set; run through kg1-reference-transcript.sh'}))
+        return False
+    return True
+
+
+def register_unit(unit):
+    """Recorded BEFORE systemd-run, so a unit can never exist unrecorded."""
+    owned('unit', unit)
 
 
 def reference(directory):
     sys.path.insert(0, HERE)
     import kg1_reference_monitor as monitor
+    if not require_ledger('reference'):
+        return 3
     os.makedirs(directory, exist_ok=True)
     if preflight(directory) != 0:
         return 3
@@ -329,18 +421,28 @@ def reference(directory):
     command = ['sudo', '-n', 'systemd-run', '--scope', '--quiet', f'--unit={unit}',
                '-p', 'AllowedCPUs=0-3', '-p', 'CPUQuota=400%', '-p', 'MemoryMax=8G', '-p', 'MemorySwapMax=0', '--'] + \
         jail('/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'inner', inside)
+    register_unit(unit)
     started = time.time()
     process = subprocess.Popen(command, start_new_session=True)
-    # Independent of the monitor inside the scope: a stalled or dead monitor (heartbeat
-    # not advancing for 15 s, longer than its 10 s bounded cleanup) or a signal to this
-    # process kills the whole scope cgroup.
-    events = monitor.watch(process, heartbeat, lambda: scope_gone(unit), stall_s=15.0)
-    after = scope_gone(unit)
-    outer = {'command': command, 'unit': unit, 'exit': process.returncode, 'watchdog_events': events,
-             'scope_after': after, 'elapsed_s': round(time.time() - started, 1)}
+    identity = {'cgroup': establish_scope(unit)}
+    events = []
+    if identity['cgroup'] is None:
+        events.append({'event': 'scope_identity_not_established'})
+    else:
+        # Independent of the monitor inside the scope: a stalled or dead monitor (heartbeat
+        # not advancing for 15 s, longer than its 10 s bounded cleanup) or a signal to this
+        # process kills the whole scope cgroup. watch() never lets a cleanup error escape.
+        events = monitor.watch(process, heartbeat, lambda: scope_gone(unit, identity['cgroup']), stall_s=15.0)
+    after = scope_gone(unit, identity['cgroup'])
+    try:
+        process.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        events.append({'event': 'scope_process_not_reaped'})
+    outer = {'command': command, 'unit': unit, 'scope_cgroup': identity['cgroup'], 'exit': process.returncode,
+             'watchdog_events': events, 'scope_after': after, 'elapsed_s': round(time.time() - started, 1)}
     write(os.path.join(directory, 'outer.json'), outer)
     if events or not after['gone']:
-        print(json.dumps({'reference': 'MONITOR_INVALID', 'watchdog_events': events, 'scope_after': after}))
+        print(json.dumps({'reference': 'MONITOR_INVALID', 'watchdog_events': events, 'scope_gone': after['gone']}))
         return 7
     return process.returncode
 
@@ -439,6 +541,8 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
     sys.path.insert(0, HERE)
     import kg1_reference_monitor as monitor
     root = root or ROOT
+    if driver_command is None and not require_ledger('preload'):
+        return 3
     os.makedirs(directory, exist_ok=True)
     etc = os.path.join(root, 'etc') if in_chroot else '/etc'
     path = os.path.join(etc, 'ld.so.preload')
@@ -449,6 +553,8 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
     privileged = [] if in_chroot else ['sudo', '-n']
     saved_mode = os.stat(etc).st_mode & 0o7777
 
+    created = {}  # the lstat identity of the file this case itself made, if any
+
     def absent_and_restored():
         return not os.path.lexists(path) and os.stat(etc).st_mode & 0o7777 == saved_mode
 
@@ -456,11 +562,21 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
         if os.stat(etc).st_mode & 0o7777 != saved_mode:
             os.chmod(etc, saved_mode)
         if os.path.lexists(path):
+            st = os.lstat(path)
+            if created.get('identity') != (st.st_dev, st.st_ino):
+                raise RuntimeError(f'{path} is not the file this case created; not removed')
             bounded(privileged + ['rm', '-f', path])
         if not absent_and_restored():
             raise RuntimeError('restoration not verified')
-    variants = {'empty-file': lambda: bounded(privileged + ['install', '-m', '0644', '/dev/null', path]),
-                'dangling-symlink': lambda: bounded(privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path])}
+
+    def make(create):
+        create()
+        st = os.lstat(path)
+        created['identity'] = (st.st_dev, st.st_ino)
+        if driver_command is None:
+            owned('file', st.st_dev, st.st_ino, path)
+    variants = {'empty-file': lambda: make(lambda: bounded(privileged + ['install', '-m', '0644', '/dev/null', path])),
+                'dangling-symlink': lambda: make(lambda: bounded(privileged + ['ln', '-s', '/nonexistent/kg1-1101-preload-target', path]))}
     if in_chroot:
         # EACCES: remove every search bit from the private rootfs /etc only (never the
         # host /etc); the non-root, capability-free supervisor then fails the lookup.
@@ -482,8 +598,11 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
                                'sh', '-c', STACK_GUARD, 'sh', driver] + driver_args
     log, failure, restore_failure, cleanup = [], None, None, None
     stderr_file = open(os.path.join(directory, 'driver.stderr'), 'w')
+    if unit is not None:
+        register_unit(unit)
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file,
                                start_new_session=True)
+    scope_cgroup = establish_scope(unit) if unit is not None else None
     fd = process.stdout.fileno()
     os.set_blocking(fd, False)
     buffer = bytearray()
@@ -513,7 +632,7 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
 
     def kill_tree():
         if unit is not None:
-            state = scope_gone(unit)
+            state = scope_gone(unit, scope_cgroup)
             leftovers = [p for p in monitor.descendants(os.getpid()) if monitor._alive(p)]
             try:
                 process.wait(timeout=30)
@@ -723,7 +842,7 @@ state = {'n': 0}
 def sample():
     state['n'] += 1
     psi = lambda: {'avg10': 0.0, 'avg60': 0.0, 'avg300': 0.0, 'total': 0}
-    s = {'t': time.monotonic(), 'wall': 0, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [os.getpid()], 'descendants': [],
+    s = {'t': time.monotonic(), 'wall': 0, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [os.getpid()], 'descendants': [], 'descendants_outside': [],
          'ancestors': [], 'affinity': [0, 1, 2, 3],
          'events': {k: 0 for k in m.EVENT_KEYS}, 'events_local': {k: 0 for k in m.EVENT_KEYS},
          'swap_current': 0, 'swap_peak': 0, 'swap_events': {k: 0 for k in m.SWAP_EVENT_KEYS}, 'memory_current': 1, 'memory_peak': 1,
@@ -888,6 +1007,345 @@ print(json.dumps({'exit': code}), flush=True)
         old_ok = 'exit' in old['finished'] and not old['alive_after']
         record(case, new_ok, old_ok, observed=observed)
 
+ROUND14_COMMIT = 'fa4cf120'
+
+# The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
+# verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
+ROUND14_TRANSCRIPT = r'''set -u
+B=$1
+OUT=$B/bundle/out
+R=$B/bundle/scripts/graph-reference-run.py
+before_df=$(df -B1 / | tail -1); before_mounts=$(findmnt -rn | sort | sha256sum); before_units=$(systemctl list-units --all --no-legend 'kg1-*' | wc -l)
+test ! -e /etc/ld.so.preload || { echo HOST_PRELOAD_PRESENT; exit 3; }
+saved_etc_mode=$(stat -c %a $B/etc)
+# outer trap: independent of the runner, restores host and private preload state on any exit
+trap 'sudo -n rm -f /etc/ld.so.preload; chmod $saved_etc_mode $B/etc; rm -f $B/etc/ld.so.preload;
+      for u in $(systemctl list-units --all --no-legend --plain "kg1-1101-*" | cut -d" " -f1); do sudo -n systemctl kill --signal=SIGKILL "$u"; done;
+      test ! -e /etc/ld.so.preload && echo HOST_PRELOAD_ABSENT || echo HOST_PRELOAD_LEFT' EXIT INT TERM HUP
+cd $B
+python3 $R preflight       $OUT/preflight        ; echo preflight=$?
+python3 $R preload-chroot  $OUT/preload-chroot   ; echo preload_chroot=$?   # empty-file, dangling-symlink, unsearchable-etc
+python3 $R preload-host    $OUT/preload-host     ; echo preload_host=$?     # empty-file, dangling-symlink
+python3 $R reference       $OUT/reference        ; echo reference=$?        # 0 PASS, 1 PROOF_FAILED, 5/6/7 STARVED/CONTENDED/INVALID; no retry
+echo "$before_df"; df -B1 / | tail -1
+test "$(findmnt -rn | sort | sha256sum)" = "$before_mounts" && echo MOUNTS_UNCHANGED || echo MOUNTS_CHANGED
+echo units_after=$(systemctl list-units --all --no-legend 'kg1-*' | wc -l)
+test "$(stat -c %a $B/etc)" = "$saved_etc_mode" && echo PRIVATE_ETC_MODE_RESTORED
+'''.replace('$B/etc/ld.so.preload', '@PRIVATE@').replace('/etc/ld.so.preload', '$HOST_ETC/ld.so.preload').replace('@PRIVATE@', '$B/etc/ld.so.preload')
+
+# The round-14 collection and removal steps, with `ssh delectra` as $REMOTE.
+ROUND14_COLLECT = r'''$REMOTE "cd $DIR/rootfs/bundle && tar -cf - out rootfs-manifest.json SHA256SUMS TOPOLOGY.json" | tar -C "$EVID" -xf -
+$REMOTE "rm -rf $DIR; test ! -e $DIR && echo BUNDLE_REMOVED"
+'''
+
+FAKE_RUNNER = r'''import json, os, subprocess, sys, time
+stage, d = sys.argv[1], sys.argv[2]
+os.makedirs(d, exist_ok=True)
+open(os.path.join(d, 'ran'), 'w').close()
+plan = json.load(open(os.environ['FAKE_PLAN'])).get(stage, {})
+ledger = os.environ.get('KG1_OWNED_LEDGER')
+def own(*fields):
+    if ledger:
+        with open(ledger, 'a') as f:
+            f.write(' '.join(map(str, fields)) + '\n')
+host = os.path.join(os.environ['KG1_TEST_HOST_ETC'], 'ld.so.preload')
+private = os.path.join(os.environ['FAKE_ROOTFS'], 'etc', 'ld.so.preload')
+units = os.path.join(os.environ['FAKE_SYSTEMD'], 'units')
+for name, sticky in plan.get('units', []):
+    own('unit', name)
+    open(os.path.join(units, name), 'w').write('sticky' if sticky else '')
+for which in plan.get('files', []):
+    path = host if which == 'host' else private
+    open(path, 'w').close()
+    st = os.lstat(path)
+    own('file', st.st_dev, st.st_ino, path)
+if plan.get('replace_host'):
+    open(host + '.new', 'w').write('foreign')
+    os.replace(host + '.new', host)
+if plan.get('stray'):
+    open(os.path.join(os.environ['FAKE_ROOTFS'], 'bundle', 'stray'), 'w').close()
+if plan.get('unregistered_unit'):
+    open(os.path.join(units, 'kg1-1101-reference-999'), 'w').close()
+if plan.get('orphan'):
+    p = subprocess.Popen(['sleep', '60'], cwd=os.environ['FAKE_ROOTFS'], start_new_session=True)
+    open(os.environ['FAKE_ORPHAN'], 'w').write(str(p.pid))
+if plan.get('unreadable'):
+    path = os.path.join(d, 'secret')
+    open(path, 'w').write('x')
+    os.chmod(path, 0)
+time.sleep(plan.get('sleep', 0))
+sys.exit(plan.get('exit', 0))
+'''
+
+FAKE_BIN = {
+    'sudo': '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n',
+    'findmnt': '#!/bin/sh\ncat "$FAKE_MOUNTS"\n',
+    'systemctl': r'''#!/bin/sh
+S=$FAKE_SYSTEMD
+[ -e "$S/fail" ] && exit 1
+case "$1" in
+  list-units) for f in "$S"/units/*; do [ -e "$f" ] && echo "$(basename "$f").scope loaded active running fake"; done; exit 0;;
+  kill) u=$(basename "${3%.scope}"); f="$S/units/$u"; [ -e "$f" ] && [ "$(cat "$f")" != sticky ] && rm -f "$f"; exit 0;;
+  show) u=$(basename "${5%.scope}"); [ -e "$S/units/$u" ] && echo loaded || echo not-found; exit 0;;
+esac
+exit 1
+''',
+}
+
+
+def round15_gaps(directory, m, base_sample, results):
+    """Round-14 review blockers R14-1..R14-3, each with a negative control showing that
+    the round-14 code (commit fa4cf120, extracted with git; the transcript and collection
+    steps from the round-14 report) does not catch it."""
+    import importlib.util
+    old_dir = os.path.join(directory, 'old15')
+    os.makedirs(old_dir, exist_ok=True)
+    for name in ('kg1_reference_monitor.py', 'graph-reference-run.py'):
+        with open(os.path.join(old_dir, name), 'w') as f:
+            f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND14_COMMIT}:scripts/{name}']).stdout)
+
+    def load(name, path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    old_m = load('old15_monitor', os.path.join(old_dir, 'kg1_reference_monitor.py'))
+    old_r = load('old15_runner', os.path.join(old_dir, 'graph-reference-run.py'))
+
+    def record(name, new_caught, old_caught, **detail):
+        results[f'r15:{name}'] = dict(detail, new_catches=bool(new_caught), old_catches=bool(old_caught),
+                                      **{'pass': bool(new_caught) and not old_caught})
+
+    class Result:
+        def __init__(self, returncode, stdout=''):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, ''
+
+    def show(props):
+        return '\n'.join(f'{k}={v}' for k, v in props.items()) + '\n'
+
+    # ---- R14-1: scope absence is a positive observation, never a failed/empty query.
+    cg_root = os.path.join(directory, 'cgroupfs')
+    live = os.path.join(cg_root, 'system.slice', 'u.scope')
+    os.makedirs(live, exist_ok=True)
+    with open(os.path.join(live, 'cgroup.procs'), 'w') as f:
+        f.write('4242\n')
+    nosleep = lambda _s: None
+    for name, new_reply, old_reply, cgroup in (
+            ('show_failed_is_not_gone', Result(1), Result(1), '/system.slice/u.scope'),
+            ('show_empty_is_not_gone', Result(0, ''), Result(0, ''), '/system.slice/u.scope'),
+            ('unit_unloaded_but_cgroup_populated', Result(0, show({'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'ControlGroup': ''})),
+             Result(0, 'inactive\n'), '/system.slice/u.scope'),
+            ('identity_never_established', Result(0, show({'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'ControlGroup': ''})),
+             Result(0, 'inactive\n'), None)):
+        new = scope_gone('u', cgroup, query=lambda c, check=True, r=new_reply: r, timeout=0, sleep=nosleep, cgroup_root=cg_root)
+        saved = old_r.bounded
+        old_r.bounded = lambda c, timeout=30, check=True, r=old_reply: r
+        try:
+            old = old_r.scope_gone('u', timeout=5)
+        finally:
+            old_r.bounded = saved
+        record(name, new['gone'] is False, old['gone'] is False, new=new['gone'], old=old['gone'])
+    gone = scope_gone('u', '/system.slice/absent.scope',
+                      query=lambda c, check=True: Result(0, show({'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'ControlGroup': ''})),
+                      timeout=0, sleep=nosleep, cgroup_root=cg_root)
+    record('positive:unloaded_and_cgroup_gone_is_gone', gone['gone'] is True, False, new=gone['gone'])
+
+    def raises():
+        raise RuntimeError("['systemctl', 'show'] exceeded 30s")
+    outcome = {}
+    for label, module in (('new', m), ('old', old_m)):
+        process = subprocess.Popen(['sleep', '1'])
+        try:
+            outcome[label] = {'events': module.watch(process, os.path.join(directory, 'no-heartbeat.json'), raises,
+                                                     first_beat_s=0.2, poll_s=0.05)}
+        except BaseException as error:
+            outcome[label] = {'escaped': repr(error)}
+        finally:
+            process.kill()
+            process.wait()
+    new_ev = [e['event'] for e in outcome['new'].get('events', [])]
+    record('cleanup_timeout_stays_under_watchdog', 'escaped' not in outcome['new'] and 'kill_scope_failed' in new_ev,
+           'escaped' not in outcome['old'], outcome=outcome)
+
+    # ---- R14-2: descendants must be inside the scope; an unreadable subtree is invalid.
+    s = base_sample(1.0)
+    s['descendants'] = [200]
+    s['descendants_outside'] = m.outside_scope('/system.slice/u.scope', [200], read=lambda pid: '0::/user.slice/elsewhere\n')
+    new_v = m.Predicate(self_pid=100).observe(s)
+    old_v = old_m.Predicate(self_pid=100).observe(s)
+    record('descendant_outside_scope', new_v and new_v[0] == 'MONITOR_INVALID', old_v is not None, new=new_v, old=old_v)
+    inside = m.outside_scope('/system.slice/u.scope', [200], read=lambda pid: '0::/system.slice/u.scope/child\n')
+    record('positive:descendant_in_child_cgroup_is_inside', inside == [], False, new=inside)
+    for name, build in (('unlistable_subtree', lambda t: os.chmod(os.path.join(t, 'child'), 0)),
+                        ('cgroup_dir_without_procs', lambda t: os.remove(os.path.join(t, 'child', 'cgroup.procs')))):
+        tree = os.path.join(directory, name)
+        os.makedirs(os.path.join(tree, 'child'), exist_ok=True)
+        for d in (tree, os.path.join(tree, 'child')):
+            with open(os.path.join(d, 'cgroup.procs'), 'w') as f:
+                f.write('')
+        build(tree)
+        caught = {}
+        for label, module in (('new', m), ('old', old_m)):
+            try:
+                caught[label] = f'members {module.scope_members(tree)}'
+            except module.Invalid as error:
+                caught[label] = f'Invalid: {error}'
+        os.chmod(os.path.join(tree, 'child'), 0o755)
+        record(name, caught['new'].startswith('Invalid'), caught['old'].startswith('Invalid'), observed=caught)
+    try:
+        m.outside_scope('/s', [os.getpid()], read=lambda pid: (_ for _ in ()).throw(PermissionError('denied')))
+        unreadable = 'not raised'
+    except m.Invalid as error:
+        unreadable = f'Invalid: {error}'
+    record('descendant_cgroup_unreadable', unreadable.startswith('Invalid'), hasattr(old_m, 'outside_scope'), new=unreadable)
+
+    # ---- R14-3: the outer transcript and collection.
+    transcript = os.path.join(HERE, 'kg1-reference-transcript.sh')
+    orchestrator = os.path.join(HERE, 'kg1-reference-delectra.sh')
+    old_transcript = os.path.join(directory, 'round14-transcript.sh')
+    with open(old_transcript, 'w') as f:
+        f.write(ROUND14_TRANSCRIPT)
+
+    def world(name, plan):
+        w = os.path.join(directory, 'transcript', name)
+        shutil.rmtree(w, ignore_errors=True)
+        paths = {k: os.path.join(w, k) for k in ('bin', 'hostetc', 'systemd', 'src')}
+        for p in paths.values():
+            os.makedirs(p)
+        os.makedirs(os.path.join(paths['systemd'], 'units'))
+        rootfs = os.path.join(paths['src'], 'rootfs')
+        os.makedirs(os.path.join(rootfs, 'etc'))
+        os.makedirs(os.path.join(rootfs, 'bundle', 'scripts'))
+        os.makedirs(os.path.join(rootfs, 'bundle', 'out'))  # shipped empty, as `bundle` makes it
+        shutil.copy2(transcript, os.path.join(rootfs, 'bundle', 'scripts', 'kg1-reference-transcript.sh'))
+        with open(os.path.join(rootfs, 'bundle', 'scripts', 'graph-reference-run.py'), 'w') as f:
+            f.write(FAKE_RUNNER)
+        for name_, content in (('TOPOLOGY.json', '{}'), ('rootfs-manifest.json', '{}')):
+            with open(os.path.join(rootfs, 'bundle', name_), 'w') as f:
+                f.write(content)
+        # Rootfs-relative, exactly as `bundle` writes SHA256SUMS.
+        sums = bounded(['sh', '-c', 'cd "$1" && sha256sum bundle/scripts/* bundle/TOPOLOGY.json bundle/rootfs-manifest.json', 'sh',
+                        rootfs]).stdout
+        with open(os.path.join(rootfs, 'bundle', 'SHA256SUMS'), 'w') as f:
+            f.write(sums)
+        for tool, body in FAKE_BIN.items():
+            with open(os.path.join(paths['bin'], tool), 'w') as f:
+                f.write(body)
+            os.chmod(os.path.join(paths['bin'], tool), 0o755)
+        with open(os.path.join(w, 'mounts'), 'w') as f:
+            f.write('/ /dev/root ext4 rw\n')
+        with open(os.path.join(w, 'plan.json'), 'w') as f:
+            json.dump(plan, f)
+        env = dict(os.environ, PATH=paths['bin'] + ':' + os.environ['PATH'], FAKE_SYSTEMD=paths['systemd'],
+                   FAKE_MOUNTS=os.path.join(w, 'mounts'), FAKE_PLAN=os.path.join(w, 'plan.json'),
+                   FAKE_ROOTFS=rootfs, FAKE_ORPHAN=os.path.join(w, 'orphan.pid'),
+                   KG1_TEST_HOST_ETC=paths['hostetc'], HOST_ETC=paths['hostetc'])
+        return dict(paths, w=w, rootfs=rootfs, env=env, out=os.path.join(rootfs, 'bundle', 'out'),
+                    host=os.path.join(paths['hostetc'], 'ld.so.preload'))
+
+    def go(w, script, signal_after=None, timeout=60):
+        started = time.monotonic()
+        p = subprocess.Popen(['bash', script, w['rootfs']], env=w['env'], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        if signal_after is not None:
+            marker = os.path.join(w['out'], signal_after, 'ran')
+            while not os.path.exists(marker) and time.monotonic() - started < 20:
+                time.sleep(0.05)
+            time.sleep(0.2)
+            p.send_signal(signal.SIGTERM)
+        try:
+            out, _ = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out, _ = p.communicate()
+        orphan = os.path.join(w['w'], 'orphan.pid')
+        if os.path.exists(orphan):
+            _kill_pids([int(open(orphan).read())])
+            os.remove(orphan)
+        log = os.path.join(w['out'], 'transcript.log')
+        return {'rc': p.returncode, 'elapsed': round(time.monotonic() - started, 2), 'output': out[-1500:],
+                'log': open(log).read() if os.path.exists(log) else '',
+                'ran': sorted(s for s in ('preflight', 'preload-chroot', 'preload-host', 'reference')
+                              if os.path.exists(os.path.join(w['out'], s, 'ran')))}
+
+    def both(name, plan, setup=lambda w: None, **kw):
+        runs = {}
+        for label, script in (('new', transcript), ('old', old_transcript)):
+            w = world(f'{name}-{label}', plan)
+            setup(w)
+            runs[label] = dict(go(w, script, **kw), world=w)
+        return runs
+
+    all_stages = ['preflight', 'preload-chroot', 'preload-host', 'reference']
+    # Clean run: every stage, every gate passes (positive control).
+    r = both('clean', {'preload-host': {'units': [['kg1-1101-preload-host-1', False]], 'files': ['host']}})
+    record('positive:clean_run_passes_and_removes_owned', r['new']['rc'] == 0 and r['new']['ran'] == all_stages
+           and 'TRANSCRIPT result=PASS' in r['new']['log'] and not os.path.lexists(r['new']['world']['host']), False,
+           new={k: r['new'][k] for k in ('rc', 'ran', 'log')})
+    # A preexisting dangling symlink: refused before anything is created, and left alone.
+    r = both('dangling', {}, setup=lambda w: os.symlink('/nonexistent/user-preload', w['host']))
+
+    def refused_untouched(x):
+        return x['rc'] == 3 and not x['ran'] and not os.listdir(x['world']['out']) and os.path.islink(x['world']['host'])
+    record('preexisting_dangling_preload_refused_before_creating', refused_untouched(r['new']), refused_untouched(r['old']),
+           new={k: r['new'][k] for k in ('rc', 'ran', 'output')}, old={k: r['old'][k] for k in ('rc', 'ran')},
+           old_symlink_kept=os.path.islink(r['old']['world']['host']))
+    # A stage that fails stops the transcript.
+    r = both('stage_fails', {'preflight': {'exit': 3}})
+    record('first_failed_stage_stops', r['new']['rc'] == 3 and r['new']['ran'] == ['preflight'], r['old']['ran'] == ['preflight'],
+           new={k: r['new'][k] for k in ('rc', 'ran')}, old={k: r['old'][k] for k in ('rc', 'ran')})
+    # A signal during a stage stops it promptly and nothing after it runs.
+    r = both('signal', {'preload-chroot': {'sleep': 3}}, signal_after='preload-chroot')
+    record('signal_stops_without_resuming', r['new']['rc'] == 143 and r['new']['ran'] == ['preflight', 'preload-chroot']
+           and r['new']['elapsed'] < 3 and 'resumed=no' in r['new']['log'],
+           r['old']['ran'] == ['preflight', 'preload-chroot'],
+           new={k: r['new'][k] for k in ('rc', 'ran', 'elapsed')}, old={k: r['old'][k] for k in ('rc', 'ran', 'elapsed')})
+    # The trap removes only what the run created: a replaced (foreign) host preload stays.
+    r = both('foreign', {'preload-host': {'files': ['host'], 'replace_host': True}})
+    record('trap_keeps_file_with_other_identity', r['new']['rc'] == 8 and os.path.exists(r['new']['world']['host'])
+           and 'file_identity=FAIL' in r['new']['log'], os.path.exists(r['old']['world']['host']),
+           new={k: r['new'][k] for k in ('rc', 'log')}, old_removed=not os.path.exists(r['old']['world']['host']))
+    # Owned-resource gates.
+    for name, plan, needle in (
+            ('gate_registered_unit_not_gone', {'reference': {'units': [['kg1-1101-reference-7', True]]}}, 'unit_gone=FAIL'),
+            ('gate_unregistered_unit', {'reference': {'unregistered_unit': True}}, 'no_kg1_units=FAIL'),
+            ('gate_rootfs_changed_outside_out', {'reference': {'stray': True}}, 'rootfs_unchanged_outside_out=FAIL'),
+            ('gate_owned_process_left', {'reference': {'orphan': True}}, 'no_owned_processes=FAIL')):
+        r = both(name, plan)
+        record(name, r['new']['rc'] == 8 and needle in r['new']['log'], r['old']['rc'] != 0,
+               new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'output')})
+    # Collection: evidence is copied and verified before anything on delectra is removed.
+
+    def orchestrate(name, plan, old=False):
+        w = world(name, plan)
+        home = os.path.join(w['w'], 'remote-home')
+        os.makedirs(home)
+        evid = os.path.join(w['w'], 'evidence')
+        env = dict(w['env'], KG1_REMOTE='sh -c', KG1_REMOTE_DIR='kg1-1101-ref')
+        if old:
+            # The round-14 plan: ship, run, then copy back and remove unconditionally.
+            os.makedirs(evid)
+            script = (f'set -u; REMOTE="sh -c"; DIR=kg1-1101-ref; EVID={evid}; mkdir $DIR; '
+                      f'tar -C {w["src"]} -cf - rootfs | tar -C $DIR -xpf -; '
+                      f'bash $DIR/rootfs/bundle/scripts/kg1-reference-transcript.sh $(cd $DIR/rootfs && pwd -P); ' + ROUND14_COLLECT)
+            p = subprocess.run(['bash', '-c', script], cwd=home, env=env, capture_output=True, text=True, timeout=120)
+        else:
+            p = subprocess.run(['bash', orchestrator, w['rootfs'], evid], cwd=home, env=env, capture_output=True, text=True, timeout=120)
+        remote_dir = os.path.join(home, 'kg1-1101-ref')
+        kept = os.path.exists(remote_dir)
+        if kept:
+            bounded(['chmod', '-R', 'u+rwX', remote_dir])
+        return {'rc': p.returncode, 'remote_kept': kept, 'stdout': p.stdout[-1200:], 'stderr': p.stderr[-600:],
+                'evidence_log': open(os.path.join(evid, 'out', 'transcript.log')).read()
+                if os.path.exists(os.path.join(evid, 'out', 'transcript.log')) else ''}
+    ok = orchestrate('collect-clean', {})
+    record('positive:collect_verified_then_removed', ok['rc'] == 0 and not ok['remote_kept']
+           and 'TRANSCRIPT result=PASS' in ok['evidence_log'] and 'COLLECT verify=PASS' in ok['stdout'], False, new=ok)
+    new = orchestrate('collect-unreadable-new', {'reference': {'unreadable': True}})
+    old = orchestrate('collect-unreadable-old', {'reference': {'unreadable': True}}, old=True)
+    record('unverified_collection_keeps_remote', new['rc'] == 9 and new['remote_kept'] and 'removed=no' in new['stdout'],
+           old['remote_kept'], new=new, old=old)
+
 
 # ------------------------------------------------------------------ local self-test
 
@@ -903,7 +1361,7 @@ def selftest(directory):
 
     def base_sample(t):
         psi = lambda: {'avg10': 0.0, 'avg60': 0.0, 'avg300': 0.0, 'total': 0}
-        return {'t': t, 'wall': t, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [100], 'descendants': [],
+        return {'t': t, 'wall': t, 'limits': dict(m.EXPECTED_LIMITS), 'procs': [100], 'descendants': [], 'descendants_outside': [],
                 'ancestors': [{'path': '/sys/fs/cgroup/system.slice', 'memory.max': 'max', 'memory.swap.max': 'max',
                                'cpu.max': 'max 100000', 'cpuset.cpus.effective': '0-7'}], 'affinity': [0, 1, 2, 3],
                 'events': {k: 0 for k in m.EVENT_KEYS + ('low',)}, 'events_local': {k: 0 for k in m.EVENT_KEYS + ('low',)},
@@ -1132,6 +1590,7 @@ print(json.dumps({'complete': True}), flush=True)
     results['topology:link_target_and_mode_drift_detected'] = {'changed': changed, 'pass': changed == ['lib', 'usr/lib/ld.so']}
     shutil.rmtree(root)
     round14_gaps(directory, m, base_sample, series, results, fake_driver)
+    round15_gaps(directory, m, base_sample, results)
     failed = [k for k, v in results.items() if not v['pass']]
     write(os.path.join(directory, 'selftest.json'), {'predicate_version': m.PREDICATE_VERSION,
                                                      'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),

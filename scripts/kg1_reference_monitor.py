@@ -165,12 +165,16 @@ def parse_meminfo(text):
 
 
 def scope_members(cgroup):
-    """Every pid in the scope cgroup and all of its child cgroups. An unreadable or
-    malformed membership file is Invalid; an empty child cgroup is legitimately empty."""
+    """Every pid in the scope cgroup and all of its child cgroups. A directory that cannot
+    be listed, a cgroup directory without `cgroup.procs`, or an unreadable or malformed
+    membership file is Invalid (never an empty subtree)."""
     pids = set()
-    for directory, _, files in os.walk(cgroup):
+
+    def failed(error):
+        raise Invalid(f'cgroup walk: {error}')
+    for directory, _, files in os.walk(cgroup, onerror=failed):
         if 'cgroup.procs' not in files:
-            continue
+            raise Invalid(f'{directory}: no cgroup.procs')
         try:
             with open(os.path.join(directory, 'cgroup.procs')) as f:
                 content = f.read()
@@ -178,6 +182,28 @@ def scope_members(cgroup):
             raise Invalid(f'{directory}/cgroup.procs: {error}') from error
         pids.update(_int(p, 'cgroup.procs') for p in content.split())
     return sorted(pids)
+
+
+def outside_scope(scope_rel, pids, read=lambda pid: open(f'/proc/{pid}/cgroup').read()):
+    """Live descendants whose cgroup v2 path is not the scope or below it. A pid that has
+    exited (its /proc entry is gone) is skipped; any other read failure is Invalid."""
+    outside = []
+    for pid in pids:
+        try:
+            content = read(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            if os.path.exists(f'/proc/{pid}'):
+                raise Invalid(f'/proc/{pid}/cgroup unreadable while the process exists')
+            continue
+        except OSError as error:
+            raise Invalid(f'/proc/{pid}/cgroup: {error}') from error
+        lines = [l for l in content.splitlines() if l.startswith('0::')]
+        if len(lines) != 1:
+            raise Invalid(f'/proc/{pid}/cgroup: no single cgroup v2 line: {content!r}')
+        path = lines[0][3:]
+        if path != scope_rel and not path.startswith(scope_rel.rstrip('/') + '/'):
+            outside.append({'pid': pid, 'cgroup': path})
+    return outside
 
 
 def expand_cpus(spec):
@@ -235,6 +261,9 @@ def collect(cgroup, t=None):
     sample['descendants'] = descendants(os.getpid())
     # A member that exited between the two reads is not "outside"; a live one is kept.
     sample['procs'] = [p for p in procs if p == os.getpid() or p in sample['descendants'] or _alive(p)]
+    # The converse: every live descendant of the monitor must be inside the measured scope.
+    sample['descendants_outside'] = outside_scope(cgroup[len('/sys/fs/cgroup'):] or '/',
+                                                  [p for p in sample['descendants'] if _alive(p)])
     sample['events'] = parse_keyed(_read(j('memory.events')), 'memory.events', EVENT_KEYS)
     sample['events_local'] = parse_keyed(_read(j('memory.events.local')), 'memory.events.local', EVENT_KEYS)
     sample['swap_current'] = _int(_read(j('memory.swap.current')).strip(), 'memory.swap.current')
@@ -305,6 +334,8 @@ class Predicate:
             outside = sorted(set(s['procs']) - {self.self_pid} - set(s['descendants']))
             if outside:
                 return 'MONITOR_INVALID', f'scope members outside the monitored process tree: {outside}'
+        if s['descendants_outside']:
+            return 'MONITOR_INVALID', f'monitored descendants outside the measured scope: {s["descendants_outside"]}'
         if prev is not None:
             gap = s['t'] - prev['t']
             if gap > MAX_GAP_S or gap <= 0:
@@ -625,6 +656,13 @@ def watch(process, heartbeat_path, kill_scope, *, stall_s=5.0, first_beat_s=120.
     def stop(signum, _frame):
         raise Stop(f'signal {signum}')
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    def kill(reason):
+        events.append({'event': 'watchdog_kill', 'reason': reason, 'last_seq': last_seq,
+                       'since_last_beat_s': round(time.monotonic() - last_change, 2)})
+        try:
+            events.append({'event': 'kill_scope', 'result': kill_scope()})
+        except BaseException as error:  # a helper timeout must not escape the watchdog
+            events.append({'event': 'kill_scope_failed', 'error': repr(error)})
     try:
         while process.poll() is None:
             try:
@@ -637,14 +675,14 @@ def watch(process, heartbeat_path, kill_scope, *, stall_s=5.0, first_beat_s=120.
                 last_seq, last_change = seq, now
             stalled = (last_seq is None and now - begun > first_beat_s) or (last_seq is not None and now - last_change > stall_s)
             if stalled or now - begun > max_s:
-                events.append({'event': 'watchdog_kill', 'reason': 'stall' if stalled else 'deadline', 'last_seq': last_seq,
-                               'since_last_beat_s': round(now - last_change, 2)})
-                events.append({'event': 'kill_scope', 'result': kill_scope()})
+                kill('stall' if stalled else 'deadline')
                 break
             time.sleep(poll_s)
     except Stop as error:
+        for sig in previous:
+            signal.signal(sig, signal.SIG_IGN)
         events.append({'event': 'watchdog_signal', 'reason': str(error)})
-        events.append({'event': 'kill_scope', 'result': kill_scope()})
+        kill('signal')
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
@@ -652,4 +690,8 @@ def watch(process, heartbeat_path, kill_scope, *, stall_s=5.0, first_beat_s=120.
         process.wait(timeout=60)
     except subprocess.TimeoutExpired:
         events.append({'event': 'scope_process_not_reaped'})
+        try:
+            events.append({'event': 'kill_scope', 'result': kill_scope()})
+        except BaseException as error:
+            events.append({'event': 'kill_scope_failed', 'error': repr(error)})
     return events
