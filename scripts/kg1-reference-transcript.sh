@@ -8,12 +8,12 @@
 #   loaded, or the bundle does not match its SHA256SUMS.
 # - Stops at the first failed stage (set -e). A signal stops the running stage and the
 #   transcript; nothing resumes.
-# - The EXIT trap acts only on resources registered in the run's ledger. A preload path is
-#   registered (`intent`) before its exclusive creation and then by lstat identity
-#   (`file`); units by exact name before systemd-run. A path with another identity, or
-#   with only an intent and not our exact signature, is left alone and fails the gate.
-# - Cleanup ignores further signals, restores files before touching units, and runs every
-#   helper under a SIGKILL deadline.
+# - The EXIT trap acts only on resources registered in the run's ledger, by identity: a
+#   preload entry is published from an owned staging inode whose (dev, ino) is fsynced to
+#   the ledger before publication; units by exact name before systemd-run. A path with
+#   another or an unrecorded identity is left alone and fails the gate.
+# - Cleanup ignores further signals, restores files (host first) before anything else,
+#   and runs every external helper under a SIGKILL deadline.
 # - The owned-resource gate checks the exact allowed set at the end; any leftover,
 #   foreign or unrecorded resource, or a failed observation (census, unit query, mounts,
 #   rootfs digest), fails the transcript.
@@ -31,7 +31,6 @@ R=$B/bundle/scripts/graph-reference-run.py
 HOST_PRELOAD=$HOST_ETC/ld.so.preload
 PRIVATE_PRELOAD=$B/etc/ld.so.preload
 UNIT_RE='^kg1-1101-(reference|preload-host|preload-chroot)-[0-9]+$'
-LINK_TARGET=/nonexistent/kg1-1101-preload-target
 
 refuse() { printf 'TRANSCRIPT result=REFUSED reason=%s\n' "$1" >&2; exit 3; }
 
@@ -55,7 +54,7 @@ tree_digest() {
 }
 
 # ---------------------------------------------------------------- preflight (creates nothing)
-for p in "$HOST_PRELOAD" "$PRIVATE_PRELOAD"; do
+for p in "$HOST_PRELOAD" "$PRIVATE_PRELOAD" "$HOST_ETC"/.kg1-1101-preload-stage-* "$B"/etc/.kg1-1101-preload-stage-*; do
   if [ -e "$p" ] || [ -L "$p" ]; then refuse "preexisting:$p"; fi
 done
 # The bundle ships bundle/out as an empty directory; anything else is a previous run.
@@ -91,10 +90,15 @@ census() {
   t 60 sudo -n sh -c 'bundle=$1; cd / || exit 1
     for d in /proc/[0-9]*; do
       p=${d#/proc/}
-      st=$(cat "$d/stat" 2>/dev/null) || continue
-      [ -n "$st" ] || continue
+      # A failed or empty stat read is absence only if /proc/<pid> is gone on recheck.
+      if ! st=$(cat "$d/stat" 2>/dev/null) || [ -z "$st" ]; then
+        if [ -e "$d" ]; then echo "UNREADABLE $p stat"; fi
+        continue
+      fi
       # shellcheck disable=SC2086
       set -- ${st##*) }
+      case "$1" in [RSDZTtWXxKPI]) ;; *) echo "UNREADABLE $p stat-state"; continue;; esac
+      case "$7" in ""|*[!0-9]*) echo "UNREADABLE $p stat-flags"; continue;; esac
       [ "$1" = Z ] && continue
       kthread=$(( $7 & 0x200000 ))
       for l in root exe cwd; do
@@ -128,53 +132,65 @@ process_gate() {
   log 'GATE no_owned_processes=PASS'
 }
 
-is_signature() {
-  # The exact entry a case creates: an empty regular file, or our dangling link.
-  if [ -L "$1" ]; then [ "$(readlink "$1")" = "$LINK_TARGET" ]; else [ -f "$1" ] && [ ! -s "$1" ]; fi
+is_stage_path() {
+  case "$1" in "$HOST_ETC"/.kg1-1101-preload-stage-*|"$B"/etc/.kg1-1101-preload-stage-*) ;; *) return 1;; esac
+  [[ ${1##*-} =~ ^[0-9]+$ ]]
 }
 
 remove_owned() {
-  if [ "$1" = "$HOST_PRELOAD" ]; then t 30 sudo -n rm -f "$1"; else rm -f "$1"; fi
+  case "$1" in "$HOST_ETC"/*) t 30 sudo -n rm -f "$1";; *) t 10 rm -f "$1";; esac
 }
 
 cleanup() {
-  local status=$? gate=PASS kind f1 f2 f3 id now listing f deadline u
-  local -a units=()
+  local status=$? gate=PASS kind f1 f2 f3 id now listing f deadline u mode
+  local -a units=() paths=()
   local -A last_kind=() last_id=()
   set +e
   trap '' INT TERM HUP  # cleanup always runs to its end; further signals are ignored
   [ "$rc" -ne 0 ] || rc=$status
   [ -z "$signalled" ] || log "SIGNAL $signalled stage_stopped=yes resumed=no"
-  [ "$(stat -c %a "$B/etc")" = "$etc_mode" ] || { chmod "$etc_mode" "$B/etc"; log "RESTORE private_etc_mode=$etc_mode"; }
-  # Ledger: what this run registered, and nothing else, is acted upon. Per path, the last
-  # entry wins: `intent` (registered before the exclusive creation) or `file` (identity).
-  touch "$LEDGER"
-  while read -r kind f1 f2 f3; do
-    case "$kind" in
-      unit)
-        if [[ $f1 =~ $UNIT_RE ]]; then units+=("$f1"); else log "GATE ledger_unit_name=FAIL $f1"; gate=FAIL; fi;;
-      intent|file)
-        f=$f1; [ "$kind" = file ] && f=$f3
-        if [ "$f" != "$HOST_PRELOAD" ] && [ "$f" != "$PRIVATE_PRELOAD" ]; then log "GATE ledger_path_allowed=FAIL $f"; gate=FAIL; continue; fi
-        last_kind[$f]=$kind; last_id[$f]="$f1 $f2";;
-      *) log "GATE ledger_line=FAIL $kind $f1 $f2 $f3"; gate=FAIL;;
-    esac
-  done <"$LEDGER"
-  # 1. Host and private files FIRST, so no unit helper can block their restoration.
-  for f in "${!last_kind[@]}"; do
-    [ -e "$f" ] || [ -L "$f" ] || continue
-    if [ "${last_kind[$f]}" = file ]; then
-      id=$(stat -c '%d %i' "$f")
+  # Ledger (shell builtins only, so nothing can stall before restoration). Per path the
+  # last entry wins. Ownership is identity only: `file` (preload path) and `stage`
+  # (staging path) carry the inode recorded before publication; `intent` (staging path)
+  # proves nothing, so an intent-only entry that exists is kept and fails the gate.
+  if [ -f "$LEDGER" ]; then
+    while read -r kind f1 f2 f3; do
+      case "$kind" in
+        unit)
+          if [[ $f1 =~ $UNIT_RE ]]; then units+=("$f1"); else log "GATE ledger_unit_name=FAIL $f1"; gate=FAIL; fi;;
+        intent)
+          if is_stage_path "$f1"; then [ -n "${last_kind[$f1]+x}" ] || paths+=("$f1"); last_kind[$f1]=intent; last_id[$f1]=
+          else log "GATE ledger_path_allowed=FAIL intent $f1"; gate=FAIL; fi;;
+        file|stage)
+          if { [ "$kind" = file ] && { [ "$f3" = "$HOST_PRELOAD" ] || [ "$f3" = "$PRIVATE_PRELOAD" ]; }; } ||
+             { [ "$kind" = stage ] && is_stage_path "$f3"; }; then
+            [ -n "${last_kind[$f3]+x}" ] || paths+=("$f3"); last_kind[$f3]=$kind; last_id[$f3]="$f1 $f2"
+          else log "GATE ledger_path_allowed=FAIL $kind $f3"; gate=FAIL; fi;;
+        *) log "GATE ledger_line=FAIL $kind $f1 $f2 $f3"; gate=FAIL;;
+      esac
+    done <"$LEDGER"
+  fi
+  # 1. Files FIRST, host before private, every helper bounded.
+  for pass in host private; do
+    for f in "${paths[@]}"; do
+      case "$f" in "$HOST_ETC"/*) [ "$pass" = host ] || continue;; *) [ "$pass" = private ] || continue;; esac
+      [ -e "$f" ] || [ -L "$f" ] || continue
+      if [ "${last_kind[$f]}" = intent ]; then log "GATE identity_unrecorded=FAIL $f kept=yes"; gate=FAIL; continue; fi
+      if ! id=$(t 10 stat -c '%d %i' "$f"); then log "GATE file_identity=FAIL $f stat-failed kept=yes"; gate=FAIL; continue; fi
       if [ "$id" != "${last_id[$f]}" ]; then log "GATE file_identity=FAIL $f recorded=${last_id[$f]/ /:} now=${id/ /:} kept=yes"; gate=FAIL; continue; fi
-    elif ! is_signature "$f"; then
-      # Registered intent, no identity yet: absent at preflight and created exclusively,
-      # so only our exact signature is ours.
-      log "GATE intent_signature=FAIL $f kept=yes"; gate=FAIL; continue
-    fi
-    if remove_owned "$f" && [ ! -e "$f" ] && [ ! -L "$f" ]; then log "OWNED file=$f via=${last_kind[$f]} removed=yes"
-    else log "GATE file_removed=FAIL $f"; gate=FAIL; fi
+      if remove_owned "$f" && [ ! -e "$f" ] && [ ! -L "$f" ]; then log "OWNED ${last_kind[$f]}=$f removed=yes"
+      else log "GATE file_removed=FAIL $f"; gate=FAIL; fi
+    done
   done
-  # 2. Units, each helper bounded, all of them within one 60 s deadline.
+  # 2. The private /etc mode, bounded.
+  if mode=$(t 10 stat -c %a "$B/etc"); then
+    if [ "$mode" != "$etc_mode" ]; then
+      if t 10 chmod "$etc_mode" "$B/etc"; then log "RESTORE private_etc_mode=$etc_mode"; else log 'GATE private_etc_restore=FAIL'; gate=FAIL; fi
+    fi
+  else
+    log 'GATE private_etc_mode=FAIL stat-failed'; gate=FAIL
+  fi
+  # 3. Units, each helper bounded, all of them within one 60 s deadline.
   deadline=$((SECONDS + 60))
   for u in "${units[@]}"; do
     t 10 sudo -n systemctl kill --signal=SIGKILL "$u.scope" >/dev/null 2>&1
@@ -186,10 +202,11 @@ cleanup() {
     done
     if [ "$now" = not-found ]; then log "OWNED unit=$u gone=yes"; else log "GATE unit_gone=FAIL $u state=${now:-query-failed-or-deadline}"; gate=FAIL; fi
   done
-  # 3. Owned-resource gate: the exact allowed set is the evidence directory; every
+  # 4. Owned-resource gate: the exact allowed set is the evidence directory; every
   # transient resource must be gone and nothing else may have changed.
-  for f in "$HOST_PRELOAD" "$PRIVATE_PRELOAD"; do
-    if [ -e "$f" ] || [ -L "$f" ]; then log "GATE preload_absent=FAIL $f"; gate=FAIL; else log "GATE preload_absent=PASS $f"; fi
+  for f in "$HOST_PRELOAD" "$PRIVATE_PRELOAD" "${paths[@]}" "$HOST_ETC"/.kg1-1101-preload-stage-* "$B"/etc/.kg1-1101-preload-stage-*; do
+    if [ -e "$f" ] || [ -L "$f" ]; then log "GATE preload_absent=FAIL $f"; gate=FAIL
+    elif [ "$f" = "$HOST_PRELOAD" ] || [ "$f" = "$PRIVATE_PRELOAD" ]; then log "GATE preload_absent=PASS $f"; fi
   done
   if listing=$(kg1_units); then
     if [ -z "$listing" ]; then log 'GATE no_kg1_units=PASS'; else log "GATE no_kg1_units=FAIL $(printf '%s' "$listing" | tr '\n' ,)"; gate=FAIL; fi
@@ -197,7 +214,7 @@ cleanup() {
     log 'GATE no_kg1_units=FAIL query-failed'; gate=FAIL
   fi
   process_gate || gate=FAIL
-  if [ "$(stat -c %a "$B/etc")" = "$etc_mode" ]; then log 'GATE private_etc_mode=PASS'; else log 'GATE private_etc_mode=FAIL'; gate=FAIL; fi
+  if mode=$(t 10 stat -c %a "$B/etc") && [ "$mode" = "$etc_mode" ]; then log 'GATE private_etc_mode=PASS'; else log 'GATE private_etc_mode=FAIL'; gate=FAIL; fi
   if now=$(t 30 findmnt -rn) && [ "$(printf '%s\n' "$now" | sort | sha256sum | cut -d' ' -f1)" = "$mounts_before" ]; then log 'GATE mounts_unchanged=PASS'
   else log 'GATE mounts_unchanged=FAIL'; gate=FAIL; fi
   if now=$(tree_digest) && [ "$now" = "$tree_before" ]; then log 'GATE rootfs_unchanged_outside_out=PASS'

@@ -386,10 +386,10 @@ def scope_gone(unit, cgroup, query=bounded, timeout=30, sleep=time.sleep, kill=T
         sleep(0.5)
 
 
-def owned(kind, *fields):
+def owned(kind, *fields, ledger=None):
     """Append one created resource (exact unit name, or path with its lstat identity) to
     the outer transcript's ledger, so its trap and gate act only on what this run made."""
-    with open(os.environ['KG1_OWNED_LEDGER'], 'a') as f:
+    with open(ledger or os.environ['KG1_OWNED_LEDGER'], 'a') as f:
         f.write(' '.join([kind] + [str(x) for x in fields]) + '\n')
         f.flush()
         os.fsync(f.fileno())
@@ -534,16 +534,39 @@ STACK_GUARD = 'test "$(ulimit -H -s)" = unlimited || exit 97; ulimit -S -s 8192 
 
 
 PRELOAD_LINK_TARGET = '/nonexistent/kg1-1101-preload-target'
-# O_CREAT|O_EXCL: fails on any existing entry, a symlink included; never follows or truncates.
-EXCLUSIVE_CREATE = 'import os, sys; os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))'
+# Publication through an owned staging inode. The staging entry is created exclusively
+# (O_EXCL / symlink), its identity is appended and fsynced to the ledger as both the
+# staging and the preload record, and only then is that same inode published at the
+# preload path with link(2), which fails on any existing entry. So the preload path is
+# only ever ours by recorded identity; a foreign entry (EEXIST) is never adopted.
+EXCLUSIVE_PUBLISH = r'''import os, sys
+kind, stage, path, ledger = sys.argv[1:5]
+if kind == 'file':
+    fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    st = os.fstat(fd)
+    os.close(fd)
+else:
+    os.symlink(sys.argv[5], stage)
+    st = os.lstat(stage)
+with open(ledger, 'a') as f:
+    f.write(f'stage {st.st_dev} {st.st_ino} {stage}\nfile {st.st_dev} {st.st_ino} {path}\n')
+    f.flush()
+    os.fsync(f.fileno())
+os.link(stage, path, follow_symlinks=False)
+os.unlink(stage)
+'''
 
 
-def preload_signature(path):
-    """The exact entry a case creates: an empty regular file, or our dangling link."""
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode):
-        return os.readlink(path) == PRELOAD_LINK_TARGET
-    return stat.S_ISREG(st.st_mode) and st.st_size == 0
+def ledger_identities(ledger):
+    """The last recorded (dev, ino) per path from `file`/`stage` ledger entries."""
+    ids = {}
+    if os.path.exists(ledger):
+        with open(ledger) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 4 and parts[0] in ('file', 'stage'):
+                    ids[parts[3]] = (int(parts[1]), int(parts[2]))
+    return ids
 
 
 def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120):
@@ -560,50 +583,45 @@ def preload(directory, in_chroot, root=None, driver_command=None, timeout_s=120)
     os.makedirs(directory, exist_ok=True)
     etc = os.path.join(root, 'etc') if in_chroot else '/etc'
     path = os.path.join(etc, 'ld.so.preload')
-    if os.path.lexists(path):
-        print(json.dumps({'preload': 'refused', 'reason': f'{path} exists before the case'}))
-        return 3
+    stage = os.path.join(etc, f'.kg1-1101-preload-stage-{os.getpid()}')
+    for entry in (path, stage):
+        if os.path.lexists(entry):
+            print(json.dumps({'preload': 'refused', 'reason': f'{entry} exists before the case'}))
+            return 3
     # The rootfs /etc belongs to the invoking user; the host /etc needs sudo.
     privileged = [] if in_chroot else ['sudo', '-n']
     saved_mode = os.stat(etc).st_mode & 0o7777
 
-    created = {}  # intent registered before the effect, then the lstat identity of what we made
+    # Real runs share the transcript's ledger; the local self-test keeps a private one.
+    ledger = os.environ.get('KG1_OWNED_LEDGER') if driver_command is None else os.path.join(directory, 'owned.ledger')
 
     def absent_and_restored():
-        return not os.path.lexists(path) and os.stat(etc).st_mode & 0o7777 == saved_mode
+        return (not os.path.lexists(path) and not os.path.lexists(stage)
+                and os.stat(etc).st_mode & 0o7777 == saved_mode)
 
     def restore():
         if os.stat(etc).st_mode & 0o7777 != saved_mode:
             os.chmod(etc, saved_mode)
-        if os.path.lexists(path):
-            st = os.lstat(path)
-            ours = created.get('identity') == (st.st_dev, st.st_ino)
-            # Interrupted between the exclusive creation and the identity record: the path
-            # was absent at preflight and creation is exclusive, so an intent plus our exact
-            # signature (an empty regular file or our dangling link) is ours.
-            if not ours and created.get('identity') is None and created.get('intent') and preload_signature(path):
-                ours = True
-            if not ours:
-                raise RuntimeError(f'{path} is not the file this case created; not removed')
-            bounded(privileged + ['rm', '-f', path])
+        # Ownership is identity only: an entry is removed only if its (dev, ino) is the one
+        # recorded before publication. Anything else (a foreign entry after EEXIST, or a
+        # staging entry whose identity never reached the ledger) is kept and fails.
+        ids, kept = ledger_identities(ledger), []
+        for entry in (path, stage):
+            if os.path.lexists(entry):
+                st = os.lstat(entry)
+                if ids.get(entry) != (st.st_dev, st.st_ino):
+                    kept.append(entry)
+                    continue
+                bounded(privileged + ['rm', '-f', entry])
+        if kept:
+            raise RuntimeError(f'{kept} not created by this case (identity unrecorded or different); not removed')
         if not absent_and_restored():
             raise RuntimeError('restoration not verified')
-        created.clear()
 
-    def make(create):
-        # Ownership is registered (durably, for the outer trap) BEFORE the effect; the
-        # creation itself is exclusive, so it can never adopt a foreign entry.
-        created.clear()
-        created['intent'] = True
-        if driver_command is None:
-            owned('intent', path)
-        create()
-        st = os.lstat(path)
-        created['identity'] = (st.st_dev, st.st_ino)
-        if driver_command is None:
-            owned('file', st.st_dev, st.st_ino, path)
-    variants = {'empty-file': lambda: make(lambda: bounded(privileged + ['python3', '-c', EXCLUSIVE_CREATE, path])),
-                'dangling-symlink': lambda: make(lambda: bounded(privileged + ['ln', '-s', PRELOAD_LINK_TARGET, path]))}
+    def make(kind):
+        owned('intent', stage, ledger=ledger)  # before the staging entry can exist
+        bounded(privileged + ['python3', '-c', EXCLUSIVE_PUBLISH, kind, stage, path, ledger, PRELOAD_LINK_TARGET])
+    variants = {'empty-file': lambda: make('file'), 'dangling-symlink': lambda: make('link')}
     if in_chroot:
         # EACCES: remove every search bit from the private rootfs /etc only (never the
         # host /etc); the non-root, capability-free supervisor then fails the lookup.
@@ -1036,6 +1054,7 @@ print(json.dumps({'exit': code}), flush=True)
 
 ROUND14_COMMIT = 'fa4cf120'
 ROUND15_COMMIT = 'fad43562'
+ROUND16_COMMIT = 'd6c9c326'
 
 # The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
 # verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
@@ -1076,6 +1095,8 @@ def own(*fields):
     if ledger:
         with open(ledger, 'a') as f:
             f.write(' '.join(map(str, fields)) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
 host = os.path.join(os.environ['KG1_TEST_HOST_ETC'], 'ld.so.preload')
 private = os.path.join(os.environ['FAKE_ROOTFS'], 'etc', 'ld.so.preload')
 units = os.path.join(os.environ['FAKE_SYSTEMD'], 'units')
@@ -1103,9 +1124,26 @@ if plan.get('unreadable'):
     os.chmod(path, 0)
 if plan.get('unreadable_orphan'):
     open(os.path.join(os.environ['FAKE_SYSTEMD'], 'unreadable_pid'), 'w').write(str(p.pid))
-for marker in ('hang', 'census_fail'):
+if plan.get('unreadable_stat_orphan'):
+    open(os.path.join(os.environ['FAKE_SYSTEMD'], 'unreadable_stat_pid'), 'w').write(str(p.pid))
+for marker in ('hang', 'census_fail', 'stat_hang'):
     if plan.get(marker):
         open(os.path.join(os.environ['FAKE_SYSTEMD'], marker), 'w').close()
+for which, kind, mode in plan.get('publish', []):
+    # The runner's real publication protocol (EXCLUSIVE_PUBLISH): intent for the staging
+    # path, then the helper. mode: 'die' = SIGKILL right after publication; 'foreign' =
+    # a foreign empty entry appears at the preload path first (EEXIST).
+    etc = os.environ['KG1_TEST_HOST_ETC'] if which == 'host' else os.path.join(os.environ['FAKE_ROOTFS'], 'etc')
+    path, staging = os.path.join(etc, 'ld.so.preload'), os.path.join(etc, f'.kg1-1101-preload-stage-{os.getpid()}')
+    own('intent', staging)
+    if mode == 'foreign':
+        open(path, 'w').close()
+    r = subprocess.run([sys.executable, os.environ['FAKE_PUBLISH'], kind, staging, path, ledger,
+                        '/nonexistent/kg1-1101-preload-target'])
+    if mode == 'die':
+        os.kill(os.getpid(), 9)
+    if r.returncode != 0:
+        sys.exit(1)
 for which, content, die in plan.get('intent_files', []):
     # Intent registered, then the exclusive publication; `die` = SIGKILL before the
     # identity record, the window a controller interruption can hit.
@@ -1126,6 +1164,10 @@ FAKE_BIN = {
     'findmnt': '#!/bin/sh\ncat "$FAKE_MOUNTS"\n',
     'readlink': '#!/bin/sh\nif [ -e "$FAKE_SYSTEMD/unreadable_pid" ]; then\n'
                 '  case "$1" in "/proc/$(cat "$FAKE_SYSTEMD/unreadable_pid")/"*) exit 1;; esac\nfi\nexec "$REAL_READLINK" "$@"\n',
+    'cat': '#!/bin/sh\nif [ -e "$FAKE_SYSTEMD/unreadable_stat_pid" ] && '
+           '[ "$1" = "/proc/$("$REAL_CAT" "$FAKE_SYSTEMD/unreadable_stat_pid")/stat" ]; then exit 1; fi\nexec "$REAL_CAT" "$@"\n',
+    'stat': '#!/bin/sh\nif [ -e "$FAKE_SYSTEMD/stat_hang" ] && [ "$1" = -c ] && [ "$2" = %a ]; then exec sleep 3600; fi\n'
+            'exec "$REAL_STAT" "$@"\n',
     'systemctl': r'''#!/bin/sh
 S=$FAKE_SYSTEMD
 [ -e "$S/hang" ] && exec sleep 3600
@@ -1286,7 +1328,10 @@ def round15_gaps(directory, m, base_sample, results):
         env = dict(os.environ, PATH=paths['bin'] + ':' + os.environ['PATH'], FAKE_SYSTEMD=paths['systemd'],
                    FAKE_MOUNTS=os.path.join(w, 'mounts'), FAKE_PLAN=os.path.join(w, 'plan.json'),
                    FAKE_ROOTFS=rootfs, FAKE_ORPHAN=os.path.join(w, 'orphan.pid'),
-                   KG1_TEST_HOST_ETC=paths['hostetc'], HOST_ETC=paths['hostetc'], REAL_READLINK=shutil.which('readlink'))
+                   KG1_TEST_HOST_ETC=paths['hostetc'], HOST_ETC=paths['hostetc'], REAL_READLINK=shutil.which('readlink'),
+                   REAL_STAT=shutil.which('stat'), REAL_CAT=shutil.which('cat'), FAKE_PUBLISH=os.path.join(w, 'publish.py'))
+        with open(os.path.join(w, 'publish.py'), 'w') as f:
+            f.write(EXCLUSIVE_PUBLISH)
         return dict(paths, w=w, rootfs=rootfs, env=env, out=os.path.join(rootfs, 'bundle', 'out'),
                     host=os.path.join(paths['hostetc'], 'ld.so.preload'))
 
@@ -1447,16 +1492,18 @@ def round15_gaps(directory, m, base_sample, results):
         shutil.rmtree(root)
     record16('controller_interrupted_after_publication', outcome['new']['fired'] and not outcome['new']['left']
              and outcome['new']['restore_failure'] is None, outcome['old']['fired'] and not outcome['old']['left'], outcome=outcome)
-    # R15-1 (outer trap): the controller is SIGKILLed after publication, before the
-    # identity record; only the fsynced intent exists.
-    r = pair('intent_then_killed', {'preload-host': {'intent_files': [['host', '', True]]}})
-    record16('trap_removes_intent_registered_entry', r['new']['rc'] == 137 and not os.path.lexists(r['new']['world']['host'])
-             and 'via=intent removed=yes' in r['new']['log'], not os.path.lexists(r['old']['world']['host']),
-             new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'log')})
+    # R15-1 (outer trap), superseded in round 17: intent-only recovery was the R16-1
+    # defect. With staged publication the identity is durable before publication, so a
+    # controller SIGKILLed right after publication is recovered by identity (positive).
+    w = world('r16-publish-killed', {'preload-host': {'publish': [['host', 'file', 'die']]}})
+    x = go(w, transcript)
+    record16('positive:trap_recovers_controller_killed_after_publication', x['rc'] == 137 and not os.path.lexists(w['host'])
+             and 'OWNED file=' in x['log'] and 'TRANSCRIPT result=FAIL rc=137 gate=PASS' in x['log'],
+             False, new={k: x[k] for k in ('rc', 'log')})
     w = world('r16-intent-foreign', {'preload-host': {'intent_files': [['host', 'foreign', False]]}})
     x = go(w, transcript)
     record16('positive:intent_without_our_signature_is_kept', x['rc'] == 8 and os.path.exists(w['host'])
-             and 'intent_signature=FAIL' in x['log'], False, new={k: x[k] for k in ('rc', 'log')})
+             and 'ledger_path_allowed=FAIL intent' in x['log'], False, new={k: x[k] for k in ('rc', 'log')})
     # R15-2: every systemd helper hangs during cleanup, and a TERM arrives mid-cleanup.
     # Files are restored first, every helper is killed at its deadline, the gate fails,
     # and the cleanup still completes.
@@ -1503,6 +1550,80 @@ def round15_gaps(directory, m, base_sample, results):
     old = orchestrate('r16-gate-failed-old', {'reference': {'unregistered_unit': True}}, script_path=old16_orchestrator)
     record16('failed_gate_keeps_remote', new['rc'] == 8 and new['remote_kept'] and 'COLLECT verify=PASS' in new['stdout']
              and 'reason=resource-gate-FAIL' in new['stdout'], old['remote_kept'], new=new, old=old)
+
+    # ================= Round-16 review R16-1..R16-3, old = checkpoint d6c9c326 ==========
+    old17_dir = os.path.join(directory, 'old17')
+    os.makedirs(old17_dir, exist_ok=True)
+    for name in ('graph-reference-run.py', 'kg1-reference-transcript.sh'):
+        with open(os.path.join(old17_dir, name), 'w') as f:
+            f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND16_COMMIT}:scripts/{name}']).stdout)
+    old17_r = load('old17_runner', os.path.join(old17_dir, 'graph-reference-run.py'))
+    old17_transcript = os.path.join(old17_dir, 'kg1-reference-transcript.sh')
+
+    def record17(name, new_caught, old_caught, **detail):
+        results[f'r17:{name}'] = dict(detail, new_catches=bool(new_caught), old_catches=bool(old_caught),
+                                      **{'pass': bool(new_caught) and not old_caught})
+
+    def pair17(name, plan, timeout=(60, 60)):
+        runs = {}
+        for (label, script), limit in zip((('new', transcript), ('old', old17_transcript)), timeout):
+            w = world(f'r17-{name}-{label}', plan)
+            runs[label] = dict(go(w, script, timeout=limit), world=w)
+        return runs
+
+    # R16-1 (controller): a foreign empty preload appears after the intent and before the
+    # exclusive creation, which therefore fails with EEXIST. The foreign inode must survive.
+    outcome = {}
+    for label, module in (('new', sys.modules[__name__]), ('old', old17_r)):
+        root = tempfile.mkdtemp(prefix=f'kg1-r17-foreign-{label}-', dir=directory)
+        etc = os.path.join(root, 'etc')
+        os.makedirs(etc)
+        target = os.path.join(etc, 'ld.so.preload')
+        real = module.bounded
+        planted = {}
+
+        def foreign_first(command, timeout=30, check=True, real=real, target=target, planted=planted):
+            if not planted and 'python3' in command:
+                os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+                planted['ino'] = os.lstat(target).st_ino
+            return real(command, timeout, check)
+        module.bounded = foreign_first
+        try:
+            code = module.preload(os.path.join(directory, f'r17-foreign-{label}'), True, root=root,
+                                  driver_command=[sys.executable, fake_driver, etc, 'ok'], timeout_s=10)
+        finally:
+            module.bounded = real
+        kept = os.path.lexists(target) and os.lstat(target).st_ino == planted.get('ino')
+        leftovers = sorted(n for n in os.listdir(etc) if n.startswith('.kg1-1101-preload-stage-'))
+        outcome[label] = {'exit': code, 'planted': bool(planted), 'foreign_kept': kept, 'staging_left': leftovers}
+        shutil.rmtree(root)
+    record17('controller_never_adopts_foreign_entry_after_eexist', outcome['new']['planted'] and outcome['new']['foreign_kept']
+             and outcome['new']['exit'] != 0 and not outcome['new']['staging_left'],
+             outcome['old']['planted'] and outcome['old']['foreign_kept'], outcome=outcome)
+    # R16-1 (outer trap): same input to both, an intent-only ledger and an empty entry at
+    # the preload path (indistinguishable from a foreign one after EEXIST).
+    r = pair17('intent_only_empty_entry', {'preload-host': {'intent_files': [['host', '', False]]}})
+    record17('trap_never_adopts_intent_only_entry', r['new']['rc'] == 8 and os.path.lexists(r['new']['world']['host']),
+             os.path.lexists(r['old']['world']['host']),
+             new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'log')})
+    w = world('r17-publish-foreign', {'preload-host': {'publish': [['host', 'file', 'foreign']]}})
+    x = go(w, transcript)
+    record17('positive:publish_eexist_keeps_foreign_removes_staging', x['rc'] == 1 and os.path.lexists(w['host'])
+             and 'file_identity=FAIL' in x['log'] and 'OWNED stage=' in x['log']
+             and not [n for n in os.listdir(w['hostetc']) if n.startswith('.kg1-1101-preload-stage-')], False,
+             new={k: x[k] for k in ('rc', 'log')})
+    # R16-2: the private /etc mode stat stalls. Host restoration must come first and every
+    # helper before it must be bounded.
+    r = pair17('private_mode_stat_stalls', {'preload-host': {'files': ['host'], 'stat_hang': True}}, timeout=(120, 45))
+    record17('host_restored_before_stalled_helper', r['new']['rc'] == 8 and not os.path.lexists(r['new']['world']['host'])
+             and 'private_etc_mode=FAIL' in r['new']['log'] and 'TRANSCRIPT result=' in r['new']['log'],
+             not os.path.lexists(r['old']['world']['host']),
+             new={k: r['new'][k] for k in ('rc', 'log', 'elapsed')}, old={k: r['old'][k] for k in ('rc', 'elapsed')})
+    # R16-3: the owned orphan's /proc/<pid>/stat cannot be read while it is alive.
+    r = pair17('unreadable_live_stat', {'reference': {'orphan': True, 'unreadable_stat_orphan': True}})
+    record17('unreadable_live_stat_is_not_absence', r['new']['rc'] == 8 and 'UNREADABLE' in r['new']['log'],
+             r['old']['rc'] != 0,
+             new={k: r['new'][k] for k in ('rc', 'log')}, old={k: r['old'][k] for k in ('rc', 'log')})
 
 
 # ------------------------------------------------------------------ local self-test
