@@ -8,9 +8,11 @@
 //! [`protocol`] (`keeper-graph-protocol`). A tag's canonical text is
 //! [`crate::notes::tags::normalise`]'s answer, the one tag policy keeper has.
 //!
-//! [`outcome`] turns a command's transport acknowledgement and the client's
-//! scoped receipt into what the client may conclude, by the contract's
-//! outcome table: an acknowledgement alone never means accepted.
+//! [`outcome::GraphRequests`] is one database's owner of this device's
+//! graph requests: it mints their keys, sends them, reads their receipts
+//! from that database's own replica and turns them into what the client may
+//! conclude, by the contract's outcome table. An acknowledgement alone never
+//! means accepted, and nothing of another database speaks for a request.
 
 pub use keeper_graph_protocol as protocol;
 
@@ -18,3 +20,5 @@ pub mod outcome;
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod outcome_tests;

@@ -82,6 +82,11 @@ const OTHER_FAMILY = `other-family-${RUN}`;
 // Client scopes follow the contract's `<a>:<actor><c>:<client>` byte lengths.
 const GRAPH = `graph-${RUN}`;
 const OTHER_GRAPH = `other-graph-${RUN}`;
+// A delegation chain one graph's event carries; the other graph's has none.
+const ORIGIN_CHAIN = [
+  { session: `${CLIENT}.1`, actor: ACTOR },
+  { session: `${CLIENT}.2`, actor: AGENT, context: "01JD000000000000000000000C" },
+];
 const clientScope = (actor: string, client: string) =>
   `${Buffer.byteLength(actor)}:${actor}${Buffer.byteLength(client)}:${client}`;
 const OWN_RECEIPTS = clientScope(ACTOR, CLIENT);
@@ -199,8 +204,9 @@ async function rowsFor(
   return rows.map((row) => row.rowId).sort();
 }
 
-/** One graph's worth of every graph table, written in one commit. */
-function graphRows(graph: string, now: number) {
+/** One graph's worth of every graph table, written in one commit; its event
+ * carries `originChain` as `origin_chain` when given, and no chain otherwise. */
+function graphRows(graph: string, now: number, originChain?: unknown) {
   const id = (table: string) => `${table}-${graph}`;
   const stamp = { graph, author_actor: SERVICE, author_client: SERVICE };
   const event = id("event");
@@ -214,6 +220,7 @@ function graphRows(graph: string, now: number) {
       actor_id: ACTOR,
       client_id: CLIENT,
       origin_class: "human",
+      ...(originChain === undefined ? {} : { origin_chain: JSON.stringify(originChain) }),
       recorded_at_ms: now,
       op_count: 1,
       delta_digest: "0".repeat(64),
@@ -453,7 +460,7 @@ async function checkOne(url: string): Promise<void> {
   await seedMutations(
     first,
     { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `graph-${RUN}` },
-    graphRows(GRAPH, now),
+    graphRows(GRAPH, now, ORIGIN_CHAIN),
   );
   await seedMutations(
     first,
@@ -518,6 +525,27 @@ async function checkOne(url: string): Promise<void> {
   if (otherClients.length !== 0) {
     fail(`${role}: another client's receipt reached this one: ${JSON.stringify(otherClients)}`);
   }
+  // `kg_events.origin_chain` (schema 6): a nullable JSON column that keeps a
+  // delegation chain as written and stays null on an event without one.
+  const [chainColumn] = await sql`
+    SELECT data_type, is_nullable FROM information_schema.columns
+     WHERE table_schema = ${schemaName} AND table_name = 'kg_events'
+       AND column_name = 'origin_chain'`;
+  if (chainColumn?.is_nullable !== "YES" || !/json/.test(chainColumn.data_type)) {
+    fail(`${role}: kg_events.origin_chain is ${JSON.stringify(chainColumn ?? null)}`);
+  }
+  const chains = await sql`
+    SELECT graph, origin_chain FROM kg_events WHERE graph IN ${sql([GRAPH, OTHER_GRAPH])}`;
+  const chainOf = (graph: string) => {
+    const stored = chains.find((row: { graph: string }) => row.graph === graph)?.origin_chain;
+    return typeof stored === "string" ? JSON.parse(stored) : stored;
+  };
+  if (JSON.stringify(chainOf(GRAPH)) !== JSON.stringify(ORIGIN_CHAIN)) {
+    fail(`${role}: a written origin_chain came back as ${JSON.stringify(chainOf(GRAPH))}`);
+  }
+  if (chainOf(OTHER_GRAPH) !== null || chains.length !== 2) {
+    fail(`${role}: an event without a chain holds ${JSON.stringify(chainOf(OTHER_GRAPH))}`);
+  }
 
   await sql.end();
   console.log(
@@ -526,7 +554,8 @@ async function checkOne(url: string): Promise<void> {
       `${ids1.length}+${ids2.length} fresh rows, foreign page refused, memory: own ${own.length}, ` +
       `family ${family.length} (with the peer), other family ${foreign.length}, graph: ` +
       `${graphSubscriptions.length} tables one graph each, none without kg_graph, ` +
-      `receipts own ${ownReceipts.length} other client ${otherClients.length}`,
+      `receipts own ${ownReceipts.length} other client ${otherClients.length}, ` +
+      `origin_chain ${chainColumn.data_type} nullable, written chain kept, absent chain null`,
   );
 }
 
