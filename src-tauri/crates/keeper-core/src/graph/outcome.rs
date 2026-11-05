@@ -34,14 +34,24 @@ use super::protocol::{is_decimal, is_ulid, value, Refusal, CONTRACT_VERSION};
 use crate::hq::port::{CommandResult, ReplicaError};
 use crate::hq::sessions::Source;
 
-/// The identity of one graph request in one database. Minted only by that
-/// database's [`GraphRequests::key`].
+/// Which request this is: its database, descriptor, request id and client
+/// scope, compared only as a whole. Two requests with equal identities are
+/// the same request, whatever their payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequestKey {
+struct RequestIdentity {
     domain: String,
     descriptor: String,
     request_id: String,
     client_scope: String,
+}
+
+/// One graph request in one database: its identity and the digest that
+/// binds its payload. Minted only by that database's [`GraphRequests::key`].
+/// Requests are associated only by whole-key equality: the key's parts can
+/// be read, never compared one by one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestKey {
+    identity: RequestIdentity,
     request_digest: String,
 }
 
@@ -49,51 +59,47 @@ impl RequestKey {
     /// The database the request belongs to.
     #[must_use]
     pub fn domain(&self) -> &str {
-        &self.domain
+        &self.identity.domain
     }
     #[must_use]
     pub fn descriptor(&self) -> &str {
-        &self.descriptor
+        &self.identity.descriptor
     }
     #[must_use]
     pub fn request_id(&self) -> &str {
-        &self.request_id
+        &self.identity.request_id
     }
     #[must_use]
     pub fn client_scope(&self) -> &str {
-        &self.client_scope
+        &self.identity.client_scope
     }
     /// [`request::digest`] of the request.
     #[must_use]
     pub fn request_digest(&self) -> &str {
         &self.request_digest
     }
-
-    /// Same request, whatever its payload.
-    fn same_request(&self, other: &Self) -> bool {
-        self.domain == other.domain
-            && self.descriptor == other.descriptor
-            && self.request_id == other.request_id
-            && self.client_scope == other.client_scope
-    }
 }
 
 /// One send of a request and what the transport answered, bound to the
-/// database and request it was sent for. Made only by [`GraphRequests::submit`].
+/// whole key it was sent under. Made only by [`GraphRequests::submit`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Attempt {
-    domain: String,
-    request_id: String,
+    key: RequestKey,
     result: Result<CommandResult, ReplicaError>,
 }
 
 impl Attempt {
     pub(crate) fn new(key: &RequestKey, result: Result<CommandResult, ReplicaError>) -> Self {
         Self {
-            domain: key.domain.clone(),
-            request_id: key.request_id.clone(),
+            key: key.clone(),
             result,
         }
+    }
+
+    /// The request this attempt sent.
+    #[must_use]
+    pub fn key(&self) -> &RequestKey {
+        &self.key
     }
 
     /// What the transport answered.
@@ -142,17 +148,19 @@ impl Receipt {
         };
         let required = |key: &str| text(key)?.ok_or(Refusal::UnsupportedVersion);
         let key = RequestKey {
-            domain: domain.to_owned(),
-            descriptor: required("descriptor")?,
-            request_id: required("request_id")?,
-            client_scope: required("client_scope")?,
+            identity: RequestIdentity {
+                domain: domain.to_owned(),
+                descriptor: required("descriptor")?,
+                request_id: required("request_id")?,
+                client_scope: required("client_scope")?,
+            },
             request_digest: required("request_digest")?,
         };
-        if !is_descriptor(&key.descriptor)
-            || !is_ulid(&key.request_id)
-            || key.client_scope.is_empty()
-            || !is_digest(&key.request_digest)
-            || required("id")? != receipt_id(&key.descriptor, &key.request_id, &key.client_scope)
+        if !is_descriptor(key.descriptor())
+            || !is_ulid(key.request_id())
+            || key.client_scope().is_empty()
+            || !is_digest(key.request_digest())
+            || required("id")? != receipt_id(key.descriptor(), key.request_id(), key.client_scope())
         {
             return Err(Refusal::UnsupportedVersion);
         }
@@ -299,12 +307,22 @@ impl GraphRequests {
     /// digest computed here.
     pub fn key(&self, descriptor: &str, request: &Request) -> Result<RequestKey, Refusal> {
         Ok(RequestKey {
-            domain: self.source.database.clone(),
-            descriptor: descriptor.to_owned(),
-            request_id: request.request_id.clone(),
-            client_scope: self.client_scope.clone(),
+            identity: RequestIdentity {
+                domain: self.source.database.clone(),
+                descriptor: descriptor.to_owned(),
+                request_id: request.request_id.clone(),
+                client_scope: self.client_scope.clone(),
+            },
             request_digest: request::digest(descriptor, request)?,
         })
+    }
+
+    /// Whether `key` is one this owner mints: its database and this
+    /// device's client scope. Ownership, not association: two requests are
+    /// associated only by whole-key equality.
+    fn owns(&self, key: &RequestKey) -> bool {
+        key.identity.domain == self.source.database
+            && key.identity.client_scope == self.client_scope
     }
 
     /// Send `request` under `key` through this database's replica. The key
@@ -332,10 +350,10 @@ impl GraphRequests {
 
     /// The receipt this database's replica holds for `key`, if any.
     pub fn receipt(&self, key: &RequestKey) -> Result<Option<Receipt>, GraphRequestError> {
-        if key.domain != self.source.database || key.client_scope != self.client_scope {
+        if !self.owns(key) {
             return Err(GraphRequestError::ForeignRequest);
         }
-        let id = receipt_id(&key.descriptor, &key.request_id, &key.client_scope);
+        let id = receipt_id(key.descriptor(), key.request_id(), key.client_scope());
         let rows = self.source.replica.query(
             "SELECT * FROM kg_receipts WHERE id = ?",
             &[Value::from(id.as_str())],
@@ -351,9 +369,11 @@ impl GraphRequests {
         Ok(None)
     }
 
-    /// Resolve `key` from one `attempt` at it and the `receipt` this
-    /// database holds for it, if any. Only this database's key resolves;
-    /// an attempt or receipt of another request or database is ignored.
+    /// Resolve `key` from one `attempt` and the `receipt` this database
+    /// holds, if any. Only a key this owner mints resolves. An attempt
+    /// speaks for the request only when it was sent under the whole same
+    /// key, and a receipt only when its identity is the request's (with
+    /// another digest it is `idempotency_mismatch`, never an outcome).
     #[must_use]
     pub fn resolve(
         &self,
@@ -361,20 +381,19 @@ impl GraphRequests {
         attempt: &Attempt,
         receipt: Option<&Receipt>,
     ) -> GraphOutcome {
-        if key.domain != self.source.database {
+        if !self.owns(key) {
             return GraphOutcome::Pending {
-                reason: "another database's request".to_owned(),
+                reason: "another database's or client's request".to_owned(),
             };
         }
-        let attempt = (attempt.domain == key.domain && attempt.request_id == key.request_id)
-            .then_some(&attempt.result);
-        // An acknowledgement of another request id says nothing about this one.
+        let attempt = (attempt.key == *key).then_some(&attempt.result);
+        // The acknowledgement must name the request it was sent as.
         let own_commit = match attempt {
-            Some(Ok(result)) if result.request_id == key.request_id => Some(result.commit_seq),
+            Some(Ok(result)) if result.request_id == key.request_id() => Some(result.commit_seq),
             _ => None,
         };
-        if let Some(receipt) = receipt.filter(|receipt| receipt.key.same_request(key)) {
-            if receipt.key.request_digest != key.request_digest {
+        if let Some(receipt) = receipt.filter(|receipt| receipt.key.identity == key.identity) {
+            if receipt.key != *key {
                 return GraphOutcome::IdempotencyMismatch;
             }
             let detail = receipt.detail.clone();

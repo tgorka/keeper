@@ -572,3 +572,162 @@ fn a_rejected_command_result_is_terminal() {
         }
     ));
 }
+
+/// Each dimension of a request's key on its own: a receipt, an
+/// acknowledgement or a rejection of a key differing in that one dimension
+/// never speaks for the request. The unchanged key is the control.
+#[test]
+fn every_key_dimension_separates_requests() {
+    let (held, tgdrive) = owner("tgdrive");
+    let mine = key(&tgdrive, REQUEST);
+    let (neura_held, neuradrive) = owner("neuradrive");
+    let (other_held, other_device) = owner_as("tgdrive", "device-2");
+    let variant = |owner: &GraphRequests, descriptor: &str, request_id: &str, n: u32| {
+        owner.key(descriptor, &request(request_id, n)).expect("key")
+    };
+    // (dimension, key differing from `mine` in it alone, the replica its
+    // receipt lives in, that replica's owner)
+    let variants = [
+        (
+            "domain",
+            variant(&neuradrive, "graph.apply", REQUEST, 1),
+            &neura_held,
+            &neuradrive,
+        ),
+        (
+            "descriptor",
+            variant(&tgdrive, "graph.propose", REQUEST, 1),
+            &held,
+            &tgdrive,
+        ),
+        (
+            "request_id",
+            variant(&tgdrive, "graph.apply", OTHER_REQUEST, 1),
+            &held,
+            &tgdrive,
+        ),
+        (
+            "client",
+            variant(&other_device, "graph.apply", REQUEST, 1),
+            &other_held,
+            &other_device,
+        ),
+        (
+            "digest",
+            variant(&tgdrive, "graph.apply", REQUEST, 2),
+            &held,
+            &tgdrive,
+        ),
+    ];
+    // Each variant differs from `mine` in its named dimension and no other,
+    // read part by part, so this precondition does not rest on the equality
+    // the test exercises. The one exception is structural: the digest binds
+    // the descriptor (`request::digest`), so no key a database mints differs
+    // in descriptor alone.
+    let parts = |key: &RequestKey| {
+        [
+            ("domain", key.domain().to_owned()),
+            ("descriptor", key.descriptor().to_owned()),
+            ("request_id", key.request_id().to_owned()),
+            ("client", key.client_scope().to_owned()),
+            ("digest", key.request_digest().to_owned()),
+        ]
+    };
+    for (dimension, other, _, _) in &variants {
+        let differing: Vec<&str> = parts(other)
+            .iter()
+            .zip(parts(&mine).iter())
+            .filter(|(a, b)| a.1 != b.1)
+            .map(|(a, _)| a.0)
+            .collect();
+        let expected = if *dimension == "descriptor" {
+            vec!["descriptor", "digest"]
+        } else {
+            vec![*dimension]
+        };
+        assert_eq!(differing, expected, "{dimension}");
+    }
+    let ack = |key: &RequestKey| acknowledged(key, key.request_id(), 77);
+    let reject = |key: &RequestKey| rejected(key, "kg.command_only", "kg.command_only");
+    let receipts: Vec<(&str, RequestKey, Receipt)> = variants
+        .iter()
+        .map(|(dimension, other, replica, owner)| {
+            let receipt = held_receipt(
+                replica,
+                owner,
+                other,
+                vec![row_for(other, "accepted", accepted(OTHER_EVENT))],
+            );
+            (*dimension, other.clone(), receipt)
+        })
+        .collect();
+    let own_receipt = held_receipt(
+        &held,
+        &tgdrive,
+        &mine,
+        vec![row_for(&mine, "accepted", accepted(EVENT))],
+    );
+
+    // Control: the same key associates every way.
+    assert!(matches!(
+        tgdrive.resolve(&mine, &ack(&mine), Some(&own_receipt)),
+        GraphOutcome::Accepted { ref event_id, commit_seq: Some(77), .. } if event_id == EVENT
+    ));
+    assert_eq!(
+        tgdrive.resolve(&mine, &ack(&mine), None),
+        GraphOutcome::PendingVisibility {
+            commit_seq: Some(77)
+        }
+    );
+    assert_eq!(
+        tgdrive.resolve(&mine, &reject(&mine), None),
+        GraphOutcome::TechnicalRefusal {
+            code: "kg.command_only".into()
+        }
+    );
+
+    for (dimension, other, receipt) in &receipts {
+        // Its receipt, beside this request's lost attempt: never this
+        // request's outcome. The same request under another digest is the
+        // contract's idempotency mismatch.
+        let by_receipt = tgdrive.resolve(&mine, &lost(&mine), Some(receipt));
+        if *dimension == "digest" {
+            assert_eq!(by_receipt, GraphOutcome::IdempotencyMismatch, "{dimension}");
+        } else {
+            assert!(
+                matches!(by_receipt, GraphOutcome::Pending { .. }),
+                "{dimension} receipt: {by_receipt:?}"
+            );
+        }
+        // Its acknowledgement lends no commit and makes nothing visible.
+        let acked = tgdrive.resolve(&mine, &ack(other), Some(&own_receipt));
+        assert!(
+            matches!(
+                acked,
+                GraphOutcome::Accepted {
+                    commit_seq: None,
+                    ..
+                }
+            ),
+            "{dimension} acknowledgement with own receipt: {acked:?}"
+        );
+        let acked = tgdrive.resolve(&mine, &ack(other), None);
+        assert!(
+            matches!(acked, GraphOutcome::Pending { .. }),
+            "{dimension} acknowledgement: {acked:?}"
+        );
+        // Its rejection does not end this request.
+        let refused = tgdrive.resolve(&mine, &reject(other), None);
+        assert!(
+            matches!(refused, GraphOutcome::Pending { .. }),
+            "{dimension} rejection: {refused:?}"
+        );
+        // And this owner resolves only its own keys.
+        if matches!(*dimension, "domain" | "client") {
+            assert!(matches!(
+                tgdrive.resolve(other, &ack(other), Some(receipt)),
+                GraphOutcome::Pending { .. }
+            ));
+        }
+    }
+}
