@@ -5,18 +5,30 @@
  * the kernel task ledger's lifetime-maximum physical footprint of the measured process.
  * This is an empirical per-run measurement, not the Linux accounted-cost proof.
  *
- *   measure [--timeout-ms N] [--read-delay-ms N] STDIN STDOUT STDERR [NAME=VALUE...] -- PATH ARG...
+ *   measure [--timeout-ms N] [--read-delay-ms N] [--pre-wait-delay-ms N] STDIN STDOUT STDERR
+ *           [NAME=VALUE...] -- PATH ARG...
  *     Spawns PATH (no PATH search) with exactly NAME=VALUE as its environment, fd 0/1/2
  *     opened from STDIN/STDOUT/STDERR and every other descriptor closed
- *     (POSIX_SPAWN_CLOEXEC_DEFAULT). Blocks in waitid(WEXITED|WNOWAIT) for termination
- *     without reaping, reads RUSAGE_INFO_V6 of the zombie, reaps exactly that child with
- *     wait4 and checks the reap against the wait. Both waits retry on EINTR. SIGUSR1 is
- *     caught (no SA_RESTART) and only counted, so a delivered SIGUSR1 interrupts the
- *     blocking wait; the record reports `wait_eintr` (EINTR returns of either wait) and
- *     `sigusr1_received`. The timeout is a one-shot ITIMER_REAL (SIGALRM, no SA_RESTART).
- *     Prints one JSON record on stdout and exits 0 only if every step succeeded;
- *     otherwise prints {"error":...} and exits 2. A timeout SIGKILLs and reaps the child
- *     and is an error. The record never defaults a missing value to zero.
+ *     (POSIX_SPAWN_CLOEXEC_DEFAULT). Waits for termination without reaping, reads
+ *     RUSAGE_INFO_V6 of the zombie, reaps exactly that child with wait4 and checks the
+ *     reap against the wait. Prints one JSON record on stdout and exits 0 only if every
+ *     step succeeded; otherwise prints {"error":...} and exits 2. The record never
+ *     defaults a missing value to zero.
+ *
+ *     Deadline (race-safe): an absolute CLOCK_MONOTONIC deadline fixed right after the
+ *     spawn. The wait loop checks it at the top of every iteration and again after the
+ *     successful termination observation, polls waitid(WEXITED|WNOHANG|WNOWAIT), and
+ *     blocks only in kevent() on EVFILT_PROC/NOTE_EXIT with a relative timeout recomputed
+ *     from the deadline. No signal carries the deadline, so its enforcement does not
+ *     depend on when any signal arrives. Past the deadline the child is SIGKILLed and
+ *     reaped and the run fails closed ("timeout"), even if it has already exited.
+ *     SIGUSR1 is caught (no SA_RESTART) and only counted: a delivery during kevent() is an
+ *     EINTR return, counted in `wait_eintr` and retried, as is EINTR from wait4.
+ *     `--pre-wait-delay-ms` (test-only, default 0) sleeps between spawn and the wait, so a
+ *     control can make the deadline expire before the blocking call starts.
+ *     Built with -DKG1_LEGACY_ALARM_WAIT, the ROUND 29 wait (one-shot SIGALRM checked only
+ *     on an EINTR of a blocking waitid) is compiled instead; that binary exists only as the
+ *     negative control demonstrating the overrun and is never used for a measurement.
  *   probe MODE MIB CHUNK
  *     Calibration target (run under `measure`): MODE touch | untouched | kill | sleep | hold.
  *     Allocates MIB MiB in CHUNK-byte blocks with every malloc checked, touches every byte
@@ -41,12 +53,16 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/event.h>
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t usr1_count = 0, alarm_fired = 0;
+static volatile sig_atomic_t usr1_count = 0;
 static void on_usr1(int sig) { (void)sig; usr1_count++; }
+#ifdef KG1_LEGACY_ALARM_WAIT
+static volatile sig_atomic_t alarm_fired = 0;
 static void on_alarm(int sig) { (void)sig; alarm_fired = 1; }
+#endif
 
 static int fail(const char *what, int code) {
     printf("{\"error\":\"%s\",\"errno\":%d}\n", what, code);
@@ -78,8 +94,16 @@ static void discard(pid_t pid) {
     }
 }
 
+#ifndef KG1_LEGACY_ALARM_WAIT
+static long long now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+#endif
+
 static int measure(int argc, char **argv) {
-    unsigned long long timeout_ms = 600000, delay_ms = 0, wait_eintr = 0;
+    unsigned long long timeout_ms = 600000, delay_ms = 0, pre_wait_ms = 0, wait_eintr = 0;
     int i = 2;
     while (i < argc && strncmp(argv[i], "--", 2) == 0 && strcmp(argv[i], "--") != 0) {
         if (i + 1 >= argc) return fail("usage", 0);
@@ -87,6 +111,8 @@ static int measure(int argc, char **argv) {
             if (!parse_u64(argv[i + 1], 86400000ULL, &timeout_ms) || !timeout_ms) return fail("usage_timeout", 0);
         } else if (strcmp(argv[i], "--read-delay-ms") == 0) {
             if (!parse_u64(argv[i + 1], 60000ULL, &delay_ms)) return fail("usage_delay", 0);
+        } else if (strcmp(argv[i], "--pre-wait-delay-ms") == 0) {
+            if (!parse_u64(argv[i + 1], 60000ULL, &pre_wait_ms)) return fail("usage_pre_wait", 0);
         } else {
             return fail("usage_option", 0);
         }
@@ -107,16 +133,17 @@ static int measure(int argc, char **argv) {
         if (!eq || eq == a) return fail("usage_env", 0);
         envp[j] = argv[i + 3 + j];
     }
-    /* Handlers are installed before the child exists; neither uses SA_RESTART, so each
-     * delivery interrupts a blocking wait with EINTR. Caught dispositions reset to default
-     * in the child at exec. */
+    /* Installed before the child exists; no SA_RESTART, so a delivery interrupts a
+     * blocking wait with EINTR. Caught dispositions reset to default in the child at exec. */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = on_usr1;
     if (sigaction(SIGUSR1, &sa, NULL) != 0) { free(envp); return fail("sigaction_usr1", errno); }
+#ifdef KG1_LEGACY_ALARM_WAIT
     sa.sa_handler = on_alarm;
     if (sigaction(SIGALRM, &sa, NULL) != 0) { free(envp); return fail("sigaction_alrm", errno); }
+#endif
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attr;
     int rc = posix_spawn_file_actions_init(&actions);
@@ -137,13 +164,14 @@ static int measure(int argc, char **argv) {
     posix_spawnattr_destroy(&attr);
     free(envp);
     if (rc || pid <= 0) return fail("spawn", rc);
-
+    siginfo_t info;
+#ifdef KG1_LEGACY_ALARM_WAIT
     struct itimerval timer;
     memset(&timer, 0, sizeof timer);
     timer.it_value.tv_sec = (time_t)(timeout_ms / 1000);
     timer.it_value.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
     if (setitimer(ITIMER_REAL, &timer, NULL) != 0) { int e = errno; discard(pid); return fail("setitimer", e); }
-    siginfo_t info;
+    if (pre_wait_ms) sleep_ms((long)pre_wait_ms);
     for (;;) {
         memset(&info, 0, sizeof info);
         if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT) == 0) break;
@@ -154,6 +182,52 @@ static int measure(int argc, char **argv) {
     }
     memset(&timer, 0, sizeof timer);
     if (setitimer(ITIMER_REAL, &timer, NULL) != 0) { int e = errno; discard(pid); return fail("setitimer_cancel", e); }
+#else
+    const long long deadline = now_ns() + (long long)timeout_ms * 1000000LL;
+    if (pre_wait_ms) sleep_ms((long)pre_wait_ms);
+    int kq = kqueue();
+    if (kq < 0) { int e = errno; discard(pid); return fail("kqueue", e); }
+    struct kevent change;
+    EV_SET(&change, (uintptr_t)pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
+    /* ESRCH: the child already exited; the waitid poll below observes the zombie. */
+    int registered = kevent(kq, &change, 1, NULL, 0, NULL) == 0;
+    int register_errno = registered ? 0 : errno;
+    for (;;) {
+        if (now_ns() >= deadline) { close(kq); discard(pid); return fail("timeout", 0); }
+        memset(&info, 0, sizeof info);
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) != 0) {
+            int e = errno;
+            if (e == EINTR) { wait_eintr++; continue; }
+            close(kq);
+            discard(pid);
+            return fail("waitid", e);
+        }
+        if (info.si_pid == pid) {
+            if (now_ns() >= deadline) { close(kq); discard(pid); return fail("timeout", 0); }
+            break;
+        }
+        if (info.si_pid != 0) { close(kq); discard(pid); return fail("waitid_foreign_pid", (int)info.si_pid); }
+        if (!registered) { close(kq); discard(pid); return fail("kevent_register", register_errno); }
+        long long left = deadline - now_ns();
+        if (left <= 0) continue;
+        struct timespec ts = {(time_t)(left / 1000000000LL), (long)(left % 1000000000LL)};
+        struct kevent event;
+        int n = kevent(kq, NULL, 0, &event, 1, &ts);
+        if (n < 0) {
+            int e = errno;
+            if (e == EINTR) { wait_eintr++; continue; }
+            close(kq);
+            discard(pid);
+            return fail("kevent", e);
+        }
+        if (n == 1 && (event.flags & EV_ERROR)) {
+            close(kq);
+            discard(pid);
+            return fail("kevent_event", (int)event.data);
+        }
+    }
+    close(kq);
+#endif
     if (info.si_pid != pid) { discard(pid); return fail("waitid_foreign_pid", (int)info.si_pid); }
     if (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED && info.si_code != CLD_DUMPED) {
         discard(pid);

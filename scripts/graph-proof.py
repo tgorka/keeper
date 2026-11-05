@@ -663,6 +663,10 @@ if mac:
     helper = os.path.join(scratch, 'kg1-darwin-footprint')
     helper_flags = ['-O2', '-Wall', '-Wextra', '-Werror']
     native_cc(helper_flags, helper, [helper_source])
+    # Negative-control-only build of the ROUND 29 alarm wait (never used for a measurement).
+    legacy_helper = os.path.join(scratch, 'kg1-darwin-footprint-legacy-alarm-wait')
+    legacy_flags = helper_flags + ['-DKG1_LEGACY_ALARM_WAIT']
+    native_cc(legacy_flags, legacy_helper, [helper_source])
     darwin_build = tool('sw_vers', '-buildVersion')
     pinned = darwin_build == '26A428' and platform.machine() == 'arm64'
     def macho_uuid(path):
@@ -673,7 +677,7 @@ if mac:
     FIELDS = {'helper': str, 'rusage_version': int, 'pid': int, 'waitid_pid': int, 'reaped_pid': int, 'exit': int,
               'signal': int, 'lifetime_max_phys_footprint': int, 'phys_footprint_at_read': int, 'ru_maxrss': int,
               'read_delay_ms': int, 'wait_eintr': int, 'sigusr1_received': int, 'uuid': str}
-    U63 = 1 << 63
+    U63, PID_MAX = 1 << 63, (1 << 31) - 1
     # Runs with no Cap response by design, each named: the worker's typed refusals, and
     # helper calibration probes (not the worker).
     NO_CAP = {'adversarial_build_frame', 'adversarial_query_frame', 'native_materialization_exit_72', 'calibration'}
@@ -696,10 +700,13 @@ if mac:
         return value if isinstance(value, dict) else None
     def domain_reason(rec, expect):
         """Domain of every numeric field; None when every value is possible for a real run."""
-        counters = ('pid', 'waitid_pid', 'reaped_pid', 'lifetime_max_phys_footprint', 'phys_footprint_at_read',
+        counters = ('lifetime_max_phys_footprint', 'phys_footprint_at_read',
                     'ru_maxrss', 'read_delay_ms', 'wait_eintr', 'sigusr1_received')
         if any(not 0 <= rec[k] < U63 for k in counters):
             return 'domain_range'
+        # Darwin pid_t is a signed 32-bit integer and real pids are positive.
+        if any(not 1 <= rec[k] <= PID_MAX for k in ('pid', 'waitid_pid', 'reaped_pid')):
+            return 'domain_pid'
         if rec['lifetime_max_phys_footprint'] == 0:
             return 'footprint_missing_or_zero'
         if rec['phys_footprint_at_read'] > rec['lifetime_max_phys_footprint']:
@@ -744,20 +751,22 @@ if mac:
         elif type(cap) is not int or not 0 < cap <= R:
             return False, 'cap_missing_or_above_r'
         return True, 'accepted'
-    def measure(command, stdin_path, name, options=(), env_args=None, out=None, err=None):
+    def measure(command, stdin_path, name, options=(), env_args=None, out=None, err=None, measurer=None):
         safe = re.sub(r'[^A-Za-z0-9_.-]', '-', name)
         out = out or fresh('fp-' + safe + '.out')
         err = err or fresh('fp-' + safe + '.err')
         env_args = ['GQL_STMT_CACHE=0'] if env_args is None else env_args
-        p = subprocess.run([helper, 'measure', '--timeout-ms', '1800000', *options, stdin_path, out, err, *env_args, '--', *command],
+        started = time.monotonic()
+        p = subprocess.run([measurer or helper, 'measure', '--timeout-ms', '1800000', *options, stdin_path, out, err, *env_args, '--', *command],
                            capture_output=True, text=True, timeout=1900)
+        elapsed = round(time.monotonic() - started, 3)
         try:
             with open(out, 'rb') as f:
                 stdout_bytes = f.read()
         except OSError:
             stdout_bytes = b''
         return {'name': name, 'helper_exit': p.returncode, 'helper_stdout': p.stdout[-600:], 'record': parse_record(p.stdout),
-                'child_stdout_bytes': len(stdout_bytes), 'child_stdout': stdout_bytes}
+                'elapsed_s': elapsed, 'child_stdout_bytes': len(stdout_bytes), 'child_stdout': stdout_bytes}
     def worker_sample(role, db, stdin_bytes, name, expected_exit):
         stdin_path = fresh('fp-' + re.sub(r'[^A-Za-z0-9_.-]', '-', name) + '.in')
         with open(stdin_path, 'wb') as f:
@@ -877,6 +886,28 @@ if mac:
         s['child_alive_after'] = subprocess.run(['ps', '-p', str(child)], capture_output=True).returncode == 0 if child else None
         return s
     cint = interrupted_wait()
+    # Race-safe deadline: the deadline expires during a pre-wait sleep, i.e. BEFORE the
+    # blocking call starts. The fixed helper must still fail closed ("timeout") and kill the
+    # child before it completes; the ROUND 29 alarm wait (negative control, same source
+    # built with -DKG1_LEGACY_ALARM_WAIT) lets its one-shot SIGALRM land in the sleep, then
+    # blocks in waitid until the child finishes and reports success: the overrun.
+    late = ('--timeout-ms', '200', '--pre-wait-delay-ms', '800')
+    hold8 = [helper, 'probe', 'hold', '8', '65536']
+    deadline_hold = measure(hold8, empty, 'cal_deadline_expired_before_wait', options=late)
+    deadline_exited = measure([helper, 'probe', 'touch', '0', '65536'], empty, 'cal_deadline_expired_child_already_exited',
+                              options=('--timeout-ms', '100', '--pre-wait-delay-ms', '600'))
+    legacy_overrun = measure(hold8, empty, 'negative_legacy_alarm_wait_overrun', options=late, measurer=legacy_helper)
+    for s in (deadline_hold, deadline_exited, legacy_overrun):
+        raw = s.pop('child_stdout')
+        try:
+            s['probe'] = json.loads(raw) if raw else None
+        except ValueError:
+            s['probe'] = 'unparsable'
+        s['cap'] = None
+        s['expect'] = {'name': 'calibration', 'exit': 0, 'uuid': helper_uuid}
+        s['accepted'], s['reason'] = darwin_accept(s, s['expect'])
+    leftover_hold = [l for l in subprocess.run(['ps', '-axo', 'stat=,args='], capture_output=True, text=True).stdout.splitlines()
+                     if 'probe hold' in l and helper in l]
     failures = {
         'nonexistent_executable': measure([os.path.join(scratch, 'no-such-binary')], empty, 'fail_noexec'),
         'unopenable_stdin': measure([helper, 'probe', 'touch', '0', '65536'], os.path.join(scratch, 'no-such-dir', 'in'), 'fail_stdin'),
@@ -934,14 +965,26 @@ if mac:
                 json.dumps(bw['record'])[:-1] + ',"lifetime_max_phys_footprint":1}')), bw['expect']) == (False, 'helper_failed_or_unparsable'),
             'duplicate_member_low_first_rejected': darwin_accept(dict(bw, record=parse_record(
                 '{"lifetime_max_phys_footprint":1,' + json.dumps(bw['record'])[1:])), bw['expect']) == (False, 'helper_failed_or_unparsable'),
-            'nan_constant_rejected': parse_record('{"lifetime_max_phys_footprint":NaN}') is None,
+            # Each non-finite form, inside an otherwise real record: plain json.loads accepts
+            # it (so the rejection is parse_constant's), the predicate refuses it.
+            **{f'non_finite_{label}_rejected': (
+                json.loads(line := json.dumps(bw['record']).replace(
+                    f'"lifetime_max_phys_footprint": {bw["record"]["lifetime_max_phys_footprint"]}',
+                    f'"lifetime_max_phys_footprint": {form}')) is not None
+                and form in line and parse_record(line) is None
+                and darwin_accept(dict(bw, record=parse_record(line)), bw['expect']) == (False, 'helper_failed_or_unparsable'))
+               for label, form in (('nan', 'NaN'), ('infinity', 'Infinity'), ('negative_infinity', '-Infinity'))},
             'current_above_peak_rejected': mutate(bw, record={'phys_footprint_at_read': bw['record']['lifetime_max_phys_footprint'] + 1}) == (False, 'domain_current_above_peak'),
             'current_equal_peak_accepted': mutate(bw, record={'phys_footprint_at_read': bw['record']['lifetime_max_phys_footprint']}) == (True, 'accepted'),
             'negative_footprint_domain': mutate(bw, record={'lifetime_max_phys_footprint': -5}) == (False, 'domain_range'),
             'huge_footprint_domain': mutate(bw, record={'lifetime_max_phys_footprint': 1 << 63}) == (False, 'domain_range'),
             'negative_current_rejected': mutate(bw, record={'phys_footprint_at_read': -1}) == (False, 'domain_range'),
             'negative_ru_maxrss_rejected': mutate(bw, record={'ru_maxrss': -1}) == (False, 'domain_range'),
-            'negative_pid_rejected': mutate(bw, record={'pid': -1, 'waitid_pid': -1, 'reaped_pid': -1}) == (False, 'domain_range'),
+            'negative_pid_rejected': mutate(bw, record={'pid': -1, 'waitid_pid': -1, 'reaped_pid': -1}) == (False, 'domain_pid'),
+            'zero_pid_rejected': mutate(bw, record={'pid': 0, 'waitid_pid': 0, 'reaped_pid': 0}) == (False, 'domain_pid'),
+            'pid_2_40_rejected': mutate(bw, record={'pid': 1 << 40, 'waitid_pid': 1 << 40, 'reaped_pid': 1 << 40}) == (False, 'domain_pid'),
+            'pid_2_31_rejected': mutate(bw, record={'pid': 1 << 31, 'waitid_pid': 1 << 31, 'reaped_pid': 1 << 31}) == (False, 'domain_pid'),
+            'pid_max_in_domain': mutate(bw, record={'pid': PID_MAX, 'waitid_pid': PID_MAX, 'reaped_pid': PID_MAX}) == (True, 'accepted'),
             'negative_wait_eintr_rejected': mutate(bw, record={'wait_eintr': -1}) == (False, 'domain_range'),
             'negative_read_delay_rejected': mutate(bw, record={'read_delay_ms': -1}) == (False, 'domain_range'),
             'read_delay_mismatch_rejected': mutate(bw, record={'read_delay_ms': 1000}) == (False, 'domain_read_delay'),
@@ -966,6 +1009,14 @@ if mac:
         'exclusion_untouched_allocation_not_charged': cuntouched['accepted'] and fp(cuntouched) - fp(c0) < 32 * MiB,
         'exclusion_clean_file_backed_not_charged': cmap['accepted'] and fp(cmap) - fp(c0) < 16 * MiB,
         'timeout_kills_reaps_and_fails': timeout['helper_exit'] == 2 and 'timeout' in timeout['helper_stdout'] and not leftover_sleep,
+        'deadline_expired_before_wait_fails_closed': deadline_hold['helper_exit'] == 2 and '"timeout"' in deadline_hold['helper_stdout']
+            and deadline_hold['reason'] == 'helper_failed_or_unparsable' and deadline_hold['probe'] is None and not leftover_hold,
+        'deadline_expired_child_exited_fails_closed': deadline_exited['helper_exit'] == 2 and '"timeout"' in deadline_exited['helper_stdout']
+            and deadline_exited['reason'] == 'helper_failed_or_unparsable',
+        # The negative control must show the old wait's overrun: the child ran its full 3 s
+        # hold past a 200 ms timeout and the old helper reported an accepted record.
+        'legacy_alarm_wait_overrun_demonstrated': legacy_overrun['helper_exit'] == 0 and legacy_overrun['accepted']
+            and touched(legacy_overrun) == 8 * MiB and legacy_overrun['elapsed_s'] >= 3.0,
         # Standard signals coalesce while pending, so received may be below sent, never above.
         'interrupted_wait_retries_and_reaps_exact_child': cint['accepted'] and cint['sigusr1_sent'] >= 1
             and 1 <= cint['record']['sigusr1_received'] <= cint['sigusr1_sent'] and cint['record']['wait_eintr'] >= 1
@@ -987,11 +1038,15 @@ if mac:
         'helper': {'source': 'scripts/kg1-darwin-footprint.c', 'source_sha256': sha256(helper_source),
                    'binary_sha256': sha256(helper), 'uuid': helper_uuid, 'cc': tool('cc', '--version'),
                    'build_command': ['cc'] + helper_flags + ['-o', helper, helper_source]},
+        'negative_control_legacy_helper': {'binary_sha256': sha256(legacy_helper), 'uuid': macho_uuid(legacy_helper),
+                                           'build_command': ['cc'] + legacy_flags + ['-o', legacy_helper, helper_source],
+                                           'use': 'negative control only; never measures'},
         'worker': {'path': worker, 'sha256': sha256(worker), 'uuid': worker_uuid},
         'envelope_bytes': ENVELOPE, 'r_bytes': R,
         'coverage': {'ok': coverage_ok, 'exports': export_labels, 'runs': [r['name'] for r in runs]},
         'runs': runs, 'max_footprint_bytes': max((fp(r) for r in runs), default=None),
-        'calibration': {s['name']: s for s in (c0, c8, c32, c200, cover, cdelay, ckill, csandbox, shell, cuntouched, cmap, timeout, cint)},
+        'calibration': {s['name']: s for s in (c0, c8, c32, c200, cover, cdelay, ckill, csandbox, shell, cuntouched, cmap, timeout, cint,
+                                               deadline_hold, deadline_exited, legacy_overrun)},
         'helper_failures': failures, 'controls': dict(cal_ok, **{'mutation:' + k: v for k, v in mutations.items()}),
     }
     ok = (pinned and worker_uuid and helper_uuid and worker_uuid != helper_uuid and coverage_ok and worker_ok
