@@ -17,17 +17,64 @@ needs is decided before chroot: COMMAND is resolved to an absolute in-root execu
 (PATH searched against ROOT), the argv and environment are built, and after chroot only
 posix builtins run (chdir, set*id, get*id, execve, write, _exit). Any failure exits
 nonzero before COMMAND runs; nothing is mounted on the host.
+
+Before chroot no path is resolved in the host namespace (round 24): COMMAND's in-root
+path is resolved by `in_root` (links re-rooted at ROOT, bounded, no escape), and the
+/proc /sys /dev mount points must be real directories directly under ROOT.
 """
 import ctypes
 import os
 import sys
 
 MS_BIND, MS_REC, MS_PRIVATE, MS_SLAVE = 0x1000, 0x4000, 1 << 18, 1 << 19
+S_IFMT, S_IFLNK, S_IFREG, S_IFDIR = 0o170000, 0o120000, 0o100000, 0o040000
+MAX_HOPS = 40
+
+
+class Unresolvable(Exception):
+    """A path that cannot be resolved inside ROOT: missing, a loop, or an escape."""
+
+
+def in_root(root, path):
+    """PATH (absolute, as seen inside ROOT) with every symlink resolved inside ROOT: an
+    absolute link target is re-rooted at ROOT, a relative one is followed from its own
+    directory, at most MAX_HOPS links are followed, and `..` above ROOT is refused.
+    Only lstat/readlink are used, on ROOT-prefixed paths whose every component is already
+    resolved, so no link is ever followed in the host namespace (round 24)."""
+    root = root.rstrip('/')
+    pending = [c for c in path.split('/') if c]
+    done, hops = [], 0
+    while pending:
+        part = pending.pop(0)
+        if part == '.':
+            continue
+        if part == '..':
+            if not done:
+                raise Unresolvable(f'{path}: escapes ROOT')
+            done.pop()
+            continue
+        here = root + '/' + '/'.join(done + [part])
+        try:
+            st = os.lstat(here)
+        except OSError as error:
+            raise Unresolvable(f'{path}: /{"/".join(done + [part])}: {error.strerror}') from None
+        if st.st_mode & S_IFMT == S_IFLNK:
+            hops += 1
+            if hops > MAX_HOPS:
+                raise Unresolvable(f'{path}: more than {MAX_HOPS} links (loop)')
+            target = os.readlink(here)
+            if target.startswith('/'):
+                done = []
+            pending = [c for c in target.split('/') if c] + pending
+        else:
+            done.append(part)
+    return '/' + '/'.join(done)
 
 
 def resolve(root, command, path):
-    """The absolute in-root path that execve will run, decided against ROOT before chroot.
-    The kernel still resolves it inside the chroot; a mismatch fails the execve."""
+    """The absolute in-root path that execve will run, decided inside ROOT before chroot
+    (the kernel then resolves the same path inside the chroot). A bare name is searched
+    along PATH; a missing candidate moves on, a loop or an escape refuses outright."""
     if '/' in command:
         if not command.startswith('/'):
             raise SystemExit(f'relative command path refused: {command}')
@@ -35,10 +82,32 @@ def resolve(root, command, path):
     else:
         candidates = [d.rstrip('/') + '/' + command for d in path.split(':') if d.startswith('/')]
     for candidate in candidates:
-        inside = root.rstrip('/') + candidate
-        if os.path.isfile(inside) and os.access(inside, os.X_OK):
+        try:
+            real = in_root(root, candidate)
+        except Unresolvable as error:
+            if 'escapes ROOT' in str(error) or '(loop)' in str(error):
+                raise SystemExit(f'{command}: refused: {error}') from None
+            continue
+        st = os.lstat(root.rstrip('/') + real)  # no link component remains
+        if st.st_mode & S_IFMT == S_IFREG and st.st_mode & 0o111:
             return candidate
     raise SystemExit(f'{command}: no executable under {root} on PATH={path}')
+
+
+def mount_targets(root):
+    """The in-root /proc /sys /dev mount points. mount(2) follows a symlinked target in the
+    host namespace, so each must be a real directory directly under ROOT."""
+    targets = []
+    for name in ('proc', 'sys', 'dev'):
+        target = root.rstrip('/') + '/' + name
+        try:
+            mode = os.lstat(target).st_mode
+        except OSError as error:
+            raise SystemExit(f'mount target {target}: {error.strerror}') from None
+        if mode & S_IFMT != S_IFDIR:
+            raise SystemExit(f'mount target {target} is not a real directory in ROOT')
+        targets.append((name, target))
+    return targets
 
 
 def fail(message):
@@ -56,6 +125,7 @@ def main(argv):
     uid, gid = int(uid), int(gid)
     env = dict(a.split('=', 1) for a in assignments)
     executable = resolve(root, command[0], env.get('PATH', ''))
+    targets = mount_targets(root)
     libc = ctypes.CDLL(None, use_errno=True)
 
     def mount(source, target, flags):
@@ -64,8 +134,7 @@ def main(argv):
             raise OSError(errno, f'mount {source} {target}: {os.strerror(errno)}')
     os.unshare(os.CLONE_NEWNS)
     mount(None, '/', MS_REC | MS_PRIVATE)
-    for name in ('proc', 'sys', 'dev'):
-        target = os.path.join(root, name)
+    for name, target in targets:
         mount('/' + name, target, MS_BIND | MS_REC)
         mount(None, target, MS_REC | MS_SLAVE)
     os.chroot(root)

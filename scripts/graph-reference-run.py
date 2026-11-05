@@ -416,9 +416,10 @@ def register_unit(unit):
 
 def reference(directory, rehearsal=False):
     """The measured reference run, or (`rehearsal`) the same scope, limits, launcher and
-    monitor with a trivial monitored command: the launcher resolves the bare `sh`, the
-    stack guard execs the pinned interpreter, and the real monitor samples membership and
-    telemetry. No preload entry is created in either mode."""
+    monitor with a trivial monitored command. The scope command is identical in both modes
+    up to the payload selector (`inner` / `rehearse-inner`) and the unit name: the same
+    first exec (`/usr/bin/python3`) and the same in-root path resolution (round 24). No
+    preload entry is created in either mode."""
     sys.path.insert(0, HERE)
     import kg1_reference_monitor as monitor
     mode = 'rehearsal' if rehearsal else 'reference'
@@ -430,8 +431,7 @@ def reference(directory, rehearsal=False):
     unit = f'kg1-1101-{mode}-{os.getpid()}'
     inside = chrooted(directory)
     heartbeat = os.path.join(directory, 'heartbeat.json')
-    jailed = (jail('sh', '-c', STACK_GUARD, 'sh', '/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'rehearse-inner', inside)
-              if rehearsal else jail('/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'inner', inside))
+    jailed = jail('/usr/bin/python3', chrooted(os.path.abspath(__file__)), 'rehearse-inner' if rehearsal else 'inner', inside)
     command = ['sudo', '-n', 'systemd-run', '--scope', '--quiet', f'--unit={unit}',
                '-p', 'AllowedCPUs=0-3', '-p', 'CPUQuota=400%', '-p', 'MemoryMax=8G', '-p', 'MemorySwapMax=0', '--'] + jailed
     register_unit(unit)
@@ -1080,6 +1080,7 @@ ROUND16_COMMIT = 'd6c9c326'
 ROUND17_COMMIT = '970018e9'
 ROUND19_COMMIT = '059ab19c'
 ROUND21_COMMIT = 'c62eb0dc'
+ROUND23_COMMIT = 'ee178809'
 
 # The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
 # verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
@@ -1770,6 +1771,8 @@ def round19_chain(directory, results):
     # The launcher resolves the command against ROOT before chroot: give the stand-in
     # rootfs the one executable path the (stubbed, so host-side) exec will use.
     os.makedirs(os.path.join(root, 'usr', 'bin'), exist_ok=True)
+    for name in ('proc', 'sys', 'dev'):  # the launcher requires real in-root mount points
+        os.makedirs(os.path.join(root, name), exist_ok=True)
     with open(os.path.join(root, 'usr', 'bin', 'python3'), 'w') as f:
         f.write('#!/bin/false\n')
     os.chmod(os.path.join(root, 'usr', 'bin', 'python3'), 0o755)
@@ -1855,6 +1858,130 @@ def round19_chain(directory, results):
         'rc': rc, 'stderr': err, 'calls': calls,
         'pass': rc == 126 and 'kg1-jail-exec: FileNotFoundError' in err and not os.path.exists(marker2)
         and calls[-1] == ['execve', '/usr/bin/kg1-ghost']}
+
+
+def round25_resolution(directory, results):
+    """R24: no host-namespace path resolution before chroot, and the rehearsal launches
+    exactly like the reference. New launcher/runner versus ee178809, same inputs."""
+    import importlib.util
+    base = os.path.join(directory, 'r25')
+    os.makedirs(base, exist_ok=True)
+
+    def load_old(path, name):
+        target = os.path.join(base, f'old-{os.path.basename(path)}')
+        with open(target, 'w') as f:
+            f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND23_COMMIT}:scripts/{path}']).stdout)
+        spec = importlib.util.spec_from_file_location(name, target)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module, target
+    spec = importlib.util.spec_from_file_location('new25_launcher', JAIL_EXEC)
+    new_l = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(new_l)
+    old_l, old_launcher = load_old('kg1-jail-exec.py', 'old25_launcher')
+    # A rootfs whose links behave as the pinned one does, with an absolute link target that
+    # exists only inside the rootfs (the delectra /etc/alternatives case, made host-absent).
+    root = os.path.join(base, 'rootfs')
+    for d in ('usr/bin', 'etc/alternatives', 'proc', 'sys', 'dev'):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    for name in ('python3.14', 'dash'):
+        with open(os.path.join(root, 'usr', 'bin', name), 'w') as f:
+            f.write('#!/bin/false\n')
+        os.chmod(os.path.join(root, 'usr', 'bin', name), 0o755)
+    alt = '/etc/alternatives/kg1-r25-absent-on-host'
+    links = {'usr/bin/python3': alt, alt.lstrip('/'): '/usr/bin/python3.14', 'usr/bin/sh': 'dash', 'bin': 'usr/bin',
+             'usr/bin/loop-a': 'loop-b', 'usr/bin/loop-b': 'loop-a', 'usr/bin/escape': '../' * 40 + 'usr/bin/true'}
+    for rel, target in links.items():
+        path = os.path.join(root, rel)
+        if os.path.lexists(path):
+            os.remove(path)
+        os.symlink(target, path)
+    host_absent = not os.path.lexists(alt)
+
+    def outcome(module, command):
+        try:
+            return 'ok', module.resolve(root, command, '/usr/bin:/bin')
+        except SystemExit as error:
+            return 'refused', str(error)
+    cases = {
+        'absolute_inroot_link_host_absent': ('/usr/bin/python3', ('ok', '/usr/bin/python3'), True),
+        'bare_name_via_absolute_link': ('python3', ('ok', '/usr/bin/python3'), True),
+        'relative_link': ('sh', ('ok', '/usr/bin/sh'), False),
+        'link_in_directory_component': ('/bin/sh', ('ok', '/bin/sh'), False),
+        'link_loop': ('/usr/bin/loop-a', ('refused', 'loop'), False),
+        'escaping_link': ('/usr/bin/escape', ('refused', 'escapes ROOT'), True),
+    }
+    for name, (command, want, discriminating) in cases.items():
+        new, old = outcome(new_l, command), outcome(old_l, command)
+        new_ok = new[0] == want[0] and want[1] in new[1]
+        entry = {'command': command, 'new': new, 'old': old, 'new_catches': new_ok, 'host_absent': host_absent}
+        if discriminating:
+            # Old code: the absolute target is followed on the host (refused here, as on
+            # delectra) and the escape lands on host /usr/bin/true (accepted).
+            old_wrong = (old[0] == 'refused') if want[0] == 'ok' else (old[0] == 'ok')
+            entry['old_catches'] = not old_wrong
+            entry['pass'] = host_absent and new_ok and old_wrong
+        else:
+            entry['old_catches'] = None
+            entry['pass'] = new_ok
+        results[f'r25:resolve_{name}'] = entry
+    # mount(2) would follow a symlinked mount point in the host namespace: the launcher must
+    # refuse before unshare. The old one goes on to unshare (EPERM here, a mount on delectra).
+    root2 = os.path.join(base, 'rootfs-linked-proc')
+    os.makedirs(os.path.join(root2, 'usr', 'bin'), exist_ok=True)
+    shutil.copy2(os.path.join(root, 'usr', 'bin', 'dash'), os.path.join(root2, 'usr', 'bin', 'dash'))
+    for name, target in (('proc', '/proc'), ('sys', None), ('dev', None)):
+        p = os.path.join(root2, name)
+        if not os.path.lexists(p):
+            os.symlink(target, p) if target else os.makedirs(p)
+    runs = {}
+    for label, launcher in (('new', JAIL_EXEC), ('old', old_launcher)):
+        r = subprocess.run([HOST_PYTHON, '-I', '-S', launcher, root2, str(os.getuid()), str(os.getgid()), PATH, '--', '/usr/bin/dash'],
+                           capture_output=True, text=True, timeout=30)
+        runs[label] = {'rc': r.returncode, 'stderr': r.stderr[-400:]}
+    results['r25:symlinked_mount_target_refused_before_unshare'] = dict(
+        runs, new_catches='not a real directory in ROOT' in runs['new']['stderr'],
+        old_catches='not a real directory' in runs['old']['stderr'],
+        **{'pass': runs['new']['rc'] != 0 and 'not a real directory in ROOT' in runs['new']['stderr']
+           and 'unshare' in runs['old']['stderr']})
+    # The rehearsal's scope command equals the reference's except for the unit name and
+    # the payload selector. Captured from the real reference() of both codes.
+    old_r, _ = load_old('graph-reference-run.py', 'old25_runner')
+
+    class Captured(Exception):
+        pass
+
+    def scope_command(module, rehearsal):
+        saved = (module.require_ledger, module.preflight, module.register_unit, subprocess.Popen)
+        captured = {}
+
+        def popen(command, **kw):
+            captured['command'] = command
+            raise Captured()
+        module.require_ledger, module.preflight, module.register_unit = (lambda w: True), (lambda d: 0), (lambda u: None)
+        subprocess.Popen = popen
+        try:
+            module.reference(os.path.join(base, f'{module.__name__}-scope'), rehearsal=rehearsal)  # same dir in both modes
+        except Captured:
+            pass
+        finally:
+            module.require_ledger, module.preflight, module.register_unit, subprocess.Popen = saved
+        return captured.get('command')
+    argv = {}
+    for label, module in (('new', sys.modules[__name__]), ('old', old_r)):
+        full, rehearsal = scope_command(module, False), scope_command(module, True)
+        diff = ([i for i in range(len(full)) if full[i] != rehearsal[i]] if full and rehearsal and len(full) == len(rehearsal)
+                else None)
+        allowed = (diff is not None and len(diff) == 2 and full[diff[0]].startswith('--unit=kg1-1101-reference-')
+                   and rehearsal[diff[0]].startswith('--unit=kg1-1101-rehearsal-')
+                   and (full[diff[1]], rehearsal[diff[1]]) == ('inner', 'rehearse-inner'))
+        argv[label] = {'full': full, 'rehearsal': rehearsal, 'diff_positions': diff, 'only_unit_and_payload': allowed}
+    n, o = argv['new'], argv['old']
+    jailed = n['full'][n['full'].index('--') + 1:] if n['full'] else []
+    results['r25:rehearsal_launch_equals_reference_but_payload'] = {
+        'new': n, 'old': o, 'new_catches': n['only_unit_and_payload'], 'old_catches': o['only_unit_and_payload'],
+        'pass': bool(n['only_unit_and_payload']) and not o['only_unit_and_payload']
+        and jailed[:4] == [HOST_PYTHON, '-I', '-S', JAIL_EXEC] and jailed[jailed.index('--') + 1] == '/usr/bin/python3'}
 
 
 def round23_monitored_env(directory, m, results):
@@ -2166,6 +2293,7 @@ print(json.dumps({'complete': True}), flush=True)
     round15_gaps(directory, m, base_sample, results)
     round19_chain(directory, results)
     round23_monitored_env(directory, m, results)
+    round25_resolution(directory, results)
     failed = [k for k, v in results.items() if not v['pass']]
     write(os.path.join(directory, 'selftest.json'), {'predicate_version': m.PREDICATE_VERSION,
                                                      'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
