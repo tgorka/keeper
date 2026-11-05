@@ -524,9 +524,11 @@ def inner(directory, rehearsal=False):
         print(json.dumps({'reference': 'refused', 'problems': problems}))
         return 4
     scratch = os.path.join(directory, 'scratch')
+    # The monitored child (rehearsal payload or graph-proof.py) is the pinned interpreter:
+    # without PYTHONDONTWRITEBYTECODE it writes stdlib bytecode into the rootfs (round 22).
     env = {'PATH': '/usr/bin:/bin', 'HOME': '/bundle', 'KG1_WORKER': os.path.join(BUNDLE, 'feature-off', 'keeper-graph-query'),
            'KG1_UNWIND_CONTROL_WORKER': os.path.join(BUNDLE, 'release', 'keeper-graph-query'),
-           'KG1_NATIVE_PREBUILT': os.path.join(BUNDLE, 'native')}
+           'KG1_NATIVE_PREBUILT': os.path.join(BUNDLE, 'native'), 'PYTHONDONTWRITEBYTECODE': '1'}
 
     def soft_stack():
         # Soft 8 MiB only; the hard limit stays unlimited so P6c's case can raise it.
@@ -1077,6 +1079,7 @@ ROUND15_COMMIT = 'fad43562'
 ROUND16_COMMIT = 'd6c9c326'
 ROUND17_COMMIT = '970018e9'
 ROUND19_COMMIT = '059ab19c'
+ROUND21_COMMIT = 'c62eb0dc'
 
 # The round-14 submitted transcript (report ROUND 14, "Exact rerun transcript plan"),
 # verbatim except that its rootfs comes from $1 and its host /etc from $HOST_ETC.
@@ -1854,6 +1857,69 @@ def round19_chain(directory, results):
         and calls[-1] == ['execve', '/usr/bin/kg1-ghost']}
 
 
+def round23_monitored_env(directory, m, results):
+    """R22: the monitored child (rehearsal payload and the full graph-proof child) must not
+    write bytecode into the pinned rootfs. Real inner() from this code and from c62eb0dc,
+    both modes; only the scope/cgroup reads and run_monitored are captured. The captured
+    environment is asserted exactly and then used to run a real interpreter child that
+    imports a fresh module, showing whether bytecode is written."""
+    import importlib.util
+    import resource
+    import tempfile
+    base = os.path.join(directory, 'r23')
+    old_dir = os.path.join(base, 'old')
+    os.makedirs(old_dir, exist_ok=True)
+    with open(os.path.join(old_dir, 'graph-reference-run.py'), 'w') as f:
+        f.write(bounded(['git', '-C', os.path.dirname(HERE), 'show', f'{ROUND21_COMMIT}:scripts/graph-reference-run.py']).stdout)
+    shutil.copy2(os.path.join(HERE, 'kg1_reference_monitor.py'), old_dir)
+    spec = importlib.util.spec_from_file_location('old23_runner', os.path.join(old_dir, 'graph-reference-run.py'))
+    old_r = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old_r)
+    expected = {'PATH': '/usr/bin:/bin', 'HOME': '/bundle', 'KG1_WORKER': os.path.join(BUNDLE, 'feature-off', 'keeper-graph-query'),
+                'KG1_UNWIND_CONTROL_WORKER': os.path.join(BUNDLE, 'release', 'keeper-graph-query'),
+                'KG1_NATIVE_PREBUILT': os.path.join(BUNDLE, 'native'), 'PYTHONDONTWRITEBYTECODE': '1'}
+
+    def capture(module, rehearsal):
+        prefix = 'kg1-1101-rehearsal-1' if rehearsal else 'kg1-1101-reference-1'
+        captured = {}
+        saved = (module.text, module.scope_topology, os.sched_getaffinity, resource.getrlimit, m.run_monitored)
+        module.text = lambda p: (f'0::/system.slice/{prefix}.scope\n' if p == '/proc/self/cgroup' else module.LIMITS[os.path.basename(p)])
+        module.scope_topology = lambda cgroup, *a: ([], [])
+        os.sched_getaffinity = lambda pid: {0, 1, 2, 3}
+        resource.getrlimit = lambda which: (8 * 1024 * 1024, resource.RLIM_INFINITY)
+
+        def run_monitored(command, samples, collect, **kw):
+            captured.update(command=command, env=kw.get('env'))
+            return {'verdict': 'PASS', 'latched': None, 'proof_exit': 0}
+        m.run_monitored = run_monitored
+        try:
+            code = module.inner(os.path.join(base, f'{module.__name__}-{prefix}'), rehearsal=rehearsal)
+        finally:
+            module.text, module.scope_topology, os.sched_getaffinity, resource.getrlimit, m.run_monitored = saved
+        return code, captured
+
+    def writes_bytecode(env):
+        work = tempfile.mkdtemp(prefix='kg1-r23-pyc-', dir=base)
+        with open(os.path.join(work, 'kg1_r23_probe_mod.py'), 'w') as f:
+            f.write('VALUE = 1\n')
+        r = subprocess.run([sys.executable, '-c', 'import kg1_r23_probe_mod'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
+        return r.returncode, os.path.isdir(os.path.join(work, '__pycache__'))
+    for mode, rehearsal in (('rehearsal', True), ('full', False)):
+        runs = {}
+        for label, module in (('new', sys.modules[__name__]), ('old', old_r)):
+            code, captured = capture(module, rehearsal)
+            env = captured.get('env') or {}
+            rc, pyc = writes_bytecode(env)
+            runs[label] = {'inner_exit': code, 'command': captured.get('command'), 'env': env, 'child_rc': rc, 'bytecode_written': pyc}
+        n, o = runs['new'], runs['old']
+        payload_ok = bool(n['command']) and n['command'][0] == sys.executable and (
+            n['command'][1] == '-c' if rehearsal else n['command'][1].endswith('graph-proof.py'))
+        new_ok = n['inner_exit'] == 0 and payload_ok and n['env'] == expected and n['child_rc'] == 0 and not n['bytecode_written']
+        old_ok = o['env'] == expected or (o['child_rc'] == 0 and not o['bytecode_written'])
+        results[f'r23:monitored_env_no_bytecode_{mode}'] = dict(runs, new_catches=new_ok, old_catches=old_ok,
+                                                                 **{'pass': new_ok and not old_ok and o['bytecode_written']})
+
+
 # ------------------------------------------------------------------ local self-test
 
 def selftest(directory):
@@ -2099,6 +2165,7 @@ print(json.dumps({'complete': True}), flush=True)
     round14_gaps(directory, m, base_sample, series, results, fake_driver)
     round15_gaps(directory, m, base_sample, results)
     round19_chain(directory, results)
+    round23_monitored_env(directory, m, results)
     failed = [k for k, v in results.items() if not v['pass']]
     write(os.path.join(directory, 'selftest.json'), {'predicate_version': m.PREDICATE_VERSION,
                                                      'monitor_sha256': sha256(os.path.join(HERE, 'kg1_reference_monitor.py')),
