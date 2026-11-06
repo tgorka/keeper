@@ -32,7 +32,10 @@ fn worker(no_new_privs: bool, extra: Option<(&str, &str)>) -> (Option<i32>, Stri
         command.env(key, value);
     }
     let out = command.output().expect("the worker runs");
-    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
 #[test]
@@ -55,5 +58,8 @@ fn an_extra_variable_is_refused_before_the_class_check() {
 fn an_admitted_exec_passes_startup_and_fails_only_at_the_missing_generation() {
     let (code, out) = worker(true, None);
     assert_eq!(code, Some(74));
-    assert_eq!(out, "", "no class or platform label: the class was admitted");
+    assert_eq!(
+        out, "",
+        "no class or platform label: the class was admitted"
+    );
 }
