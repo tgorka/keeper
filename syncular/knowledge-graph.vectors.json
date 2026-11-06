@@ -1,5 +1,5 @@
 {
-  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times.",
+  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times. queries[]: a KG-Cypher/1 source with its parameters (json text) and optional profile (default KG-Cypher/1); fill replaces the one \"{FILL}\" in its source, else in its parameters. Admitted entries give the engine text, the normalised parameters (when listed), the aliases and the limit; refused ones the code. prefix_chains[]: the chained prefix digest of events [graph_seq, delta_digest] from prefix_genesis. manifests[]: a generation manifest a worker reads, or the code it refuses with. worker: the engine, projection version, Linux worker allocator tunables and prefix genesis every consumer and worker share.",
   "contract_version": 1,
   "schema_version": 6,
   "profile": "KG-Cypher/1",
@@ -160,6 +160,11 @@
       "id": "too-deep",
       "json": "[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]",
       "refusal": "change_limit"
+    },
+    {
+      "id": "own-key-proto-duplicate",
+      "json": "{\"__proto__\":1,\"__proto__\":2}",
+      "refusal": "invalid_change"
     }
   ],
   "properties": [
@@ -1324,6 +1329,24 @@
       "id": "properties-too-deep",
       "json": "{\"ops\":[{\"description\":null,\"id\":\"01JE0000000000000000000001\",\"kind\":\"Concept\",\"op\":\"create_node\",\"properties\":{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":{\"g\":{\"h\":{\"i\":1}}}}}}}}},\"title\":\"N\"}]}",
       "refusal": "change_limit"
+    },
+    {
+      "id": "own-key-proto-and-constructor",
+      "json": "{\"ops\":[{\"description\":null,\"id\":\"01JE0000000000000000000001\",\"kind\":\"Concept\",\"op\":\"create_node\",\"properties\":{\"__proto__\":{\"polluted\":true},\"constructor\":\"c\",\"prototype\":1},\"title\":\"N\"}]}"
+    },
+    {
+      "id": "own-key-proto-set-and-remove",
+      "json": "{\"ops\":[{\"expected_revision\":\"1\",\"id\":\"01JE0000000000000000000001\",\"op\":\"update_node\",\"remove_properties\":[\"__proto__\"],\"set_properties\":{\"__proto__\":1}}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "own-key-constructor-removed-twice",
+      "json": "{\"ops\":[{\"expected_revision\":\"1\",\"id\":\"01JE0000000000000000000001\",\"op\":\"update_node\",\"remove_properties\":[\"constructor\",\"constructor\"]}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "own-key-proto-set",
+      "json": "{\"ops\":[{\"expected_revision\":\"1\",\"id\":\"01JE0000000000000000000001\",\"op\":\"update_node\",\"set_properties\":{\"__proto__\":{\"x\":1},\"constructor\":{\"prototype\":2}}}]}"
     }
   ],
   "algebra": [
@@ -12380,5 +12403,764 @@
       "refusal": "change_limit",
       "fills": { "F1": { "text": "\\", "count": 32768 }, "F2": { "text": "\"", "count": 32560 } }
     }
-  ]
+  ],
+  "queries": [
+    {
+      "id": "parameters-are-data",
+      "source": "MATCH (MATCH:Concept) WHERE MATCH.title = $title RETURN MATCH.id AS DELETE LIMIT 2",
+      "parameters": "{\"title\":\"x') DELETE n; LOAD CSV FROM 'file:///secret'\"}",
+      "engine": "MATCH (v0:Concept) WHERE v0.title = $title RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 2",
+      "aliases": ["DELETE"],
+      "limit": 2,
+      "normalized": "{\"title\":\"x') DELETE n; LOAD CSV FROM 'file:///secret'\"}"
+    },
+    {
+      "id": "tags-incoming-and-ties",
+      "source": "MATCH (a:Concept)-[r:HAS_TAG]->(t:Tag)<-[:HAS_TAG]-(b) WHERE t.text = $title AND r.revision >= $p RETURN a.id AS id, r.id AS edge, b.title AS title ORDER BY title DESC, id LIMIT 1000",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0:Concept)-[v1:HAS_TAG]->(v2:Tag)<-[v3:HAS_TAG]-(v4) WHERE v2.text = $title AND v1.revision >= $p RETURN v0.id AS a0, v1.id AS a1, v4.title AS a2 ORDER BY a2 DESC, a0 ASC, v0.id ASC, v1.id ASC, v2.id ASC, v3.id ASC, v4.id ASC LIMIT 1000",
+      "aliases": ["id", "edge", "title"],
+      "limit": 1000
+    },
+    {
+      "id": "renderer-tag-join",
+      "source": "MATCH (n:Concept)-[e:HAS_TAG]->(t:Tag) WHERE t.text = $title RETURN n.id AS node, e.id AS edge ORDER BY node LIMIT 10",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0:Concept)-[v1:HAS_TAG]->(v2:Tag) WHERE v2.text = $title RETURN v0.id AS a0, v1.id AS a1 ORDER BY a0 ASC, v0.id ASC, v1.id ASC, v2.id ASC LIMIT 10"
+    },
+    {
+      "id": "count-and-null",
+      "source": "MATCH (a) WHERE a.description IS NULL AND a.merged_into_id IS NOT NULL RETURN count(a) AS total ORDER BY total DESC LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.description IS NULL AND v0.merged_into_id IS NOT NULL RETURN count(v0) AS a0 ORDER BY a0 DESC LIMIT 1",
+      "aliases": ["total"]
+    },
+    {
+      "id": "count-star-case-insensitive",
+      "source": "match (a) return COUNT(*) limit 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) RETURN count(*) AS a0 LIMIT 1",
+      "aliases": ["count"]
+    },
+    {
+      "id": "compare-eq",
+      "source": "MATCH (a) WHERE a.revision = $p RETURN a.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "compare-ne",
+      "source": "MATCH (a) WHERE a.revision <> $p RETURN a.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.revision <> $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "compare-lt",
+      "source": "MATCH (a) WHERE a.revision < $p RETURN a.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.revision < $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "compare-le",
+      "source": "MATCH (a) WHERE a.revision <= $p RETURN a.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.revision <= $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "compare-gt",
+      "source": "MATCH (a) WHERE a.revision > $p RETURN a.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.revision > $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "compare-ge",
+      "source": "MATCH (a) WHERE a.revision >= $p RETURN a.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) WHERE v0.revision >= $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "custom-label-type-property",
+      "source": "MATCH (n:K_776f726b3a5461736b)-[d:R_776f726b3a646570656e64735f6f6e]->(m:K_776f726b3ac5bcc3b3c582c487) WHERE n.P_726174696e67 = $p RETURN n.P_726174696e67 AS rating, d.id AS dep LIMIT 5",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0:K_776f726b3a5461736b)-[v1:R_776f726b3a646570656e64735f6f6e]->(v2:K_776f726b3ac5bcc3b3c582c487) WHERE v0.P_726174696e67 = $p RETURN v0.P_726174696e67 AS a0, v1.id AS a1 ORDER BY v0.id ASC, v1.id ASC, v2.id ASC LIMIT 5"
+    },
+    {
+      "id": "parallel-anonymous-edges-get-bindings",
+      "source": "MATCH (a)-[:contains]->(b)-[:sources]->(c) RETURN c.id AS id LIMIT 3",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0)-[v1:contains]->(v2)-[v3:sources]->(v4) RETURN v4.id AS a0 ORDER BY v0.id ASC, v1.id ASC, v2.id ASC, v3.id ASC, v4.id ASC LIMIT 3"
+    },
+    {
+      "id": "repeated-order-alias",
+      "source": "MATCH (n) RETURN n.id AS id ORDER BY id ASC, id DESC LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0) RETURN v0.id AS a0 ORDER BY a0 ASC, a0 DESC, v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "tag-text-on-node-binding",
+      "source": "MATCH (t:Tag) RETURN t.text AS text LIMIT 1",
+      "parameters": "{\"p\":1,\"title\":\"hello\"}",
+      "engine": "MATCH (v0:Tag) RETURN v0.text AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "parameters-number-one",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":1.0}"
+    },
+    {
+      "id": "parameters-number-one-point-zero",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1.0}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":1.0}"
+    },
+    {
+      "id": "parameters-number-negative-zero",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":-0.0}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":0.0}"
+    },
+    {
+      "id": "parameters-number-max",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":9007199254740991}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":9007199254740991.0}"
+    },
+    {
+      "id": "parameters-null",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":null}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":null}"
+    },
+    {
+      "id": "parameters-bool",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":true}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":true}"
+    },
+    {
+      "id": "parameters-string-digit",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":\"1\"}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":\"1\"}"
+    },
+    {
+      "id": "parameters-keys-ascending",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"q\":1,\"p\":2}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "normalized": "{\"p\":2.0,\"q\":1.0}"
+    },
+    {
+      "id": "parameters-number-over-max",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":9007199254740992}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-number-under-min",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":-9007199254740992}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-number-overflow",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1e400}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-nan",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":NaN}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-duplicate",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1,\"p\":2}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-array",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":[]}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-object",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":{}}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-bad-name",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p;DELETE\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-two-documents",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{} {}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "parameters-not-object",
+      "source": "MATCH (n) WHERE n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "[1]",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-00",
+      "source": "LOAD CSV FROM $p AS x RETURN x LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-01",
+      "source": "MATCH (n) CALL { DELETE n } RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-02",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1; DELETE n",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-03",
+      "source": "MATCH (n) /* comment */ RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-04",
+      "source": "MATCH (n) // comment\nRETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-05",
+      "source": "MATCH (`n`) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-06",
+      "source": "MATCH (n:Unknown) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-07",
+      "source": "MATCH (n), (m) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-08",
+      "source": "MATCH (n)-[:contains*1..8]->(m) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-09",
+      "source": "MATCH (n)-[:contains]-(m) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-10",
+      "source": "MATCH (n) WHERE n.title = 'x' RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-11",
+      "source": "MATCH (n) WHERE n.title = $p OR n.id = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-12",
+      "source": "MATCH (n) WHERE n.title = $missing RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-13",
+      "source": "MATCH (n) RETURN n AS n LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-14",
+      "source": "MATCH (n) RETURN n.id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-15",
+      "source": "MATCH (n) RETURN count(*), n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-16",
+      "source": "MATCH (n) RETURN n.id AS id ORDER BY n.id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-17",
+      "source": "MATCH (n) RETURN n.id AS id SKIP 1 LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-18",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT $p",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-19",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1 UNION MATCH (m) RETURN m.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-20",
+      "source": "MATCH (n) RETURN n.id AS id, n.title AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-21",
+      "source": "MATCH (n)-[n:contains]->(m) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-22",
+      "source": "MATCH (n) RETURN n.from_id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-23",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1 trailing",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-24",
+      "source": "MATCH (n)-é RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-25",
+      "source": "OPTIONAL MATCH (n) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-26",
+      "source": "MATCH (n) WITH n RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-27",
+      "source": "MATCH (n) UNWIND $p AS x RETURN x AS x LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-28",
+      "source": "MATCH (n) SET n.title = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-29",
+      "source": "MATCH (n) RETURN toUpper(n.title) AS t LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-30",
+      "source": "MATCH (n) RETURN n.id AS id",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-31",
+      "source": "MATCH (n)-[e:contains]->(m) RETURN e.title AS t LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-32",
+      "source": "MATCH (n) RETURN n.P_ AS x LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-33",
+      "source": "MATCH (n) RETURN n.P_6964 AS x LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-34",
+      "source": "MATCH (n) RETURN n.P_7265766973696f6e AS x LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-35",
+      "source": "MATCH (n:K_666f6f) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-36",
+      "source": "MATCH (n:K_776f726b3A5461736b) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "unsupported-37",
+      "source": "MATCH (n)-[:R_123]->(m) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "profile-other",
+      "source": "MATCH (n) RETURN count(*) LIMIT 1",
+      "parameters": "{}",
+      "refusal": "query_unsupported",
+      "profile": "Cypher"
+    },
+    {
+      "id": "source-at-limit",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1{FILL}",
+      "parameters": "{}",
+      "engine": "MATCH (v0) RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "fill": { "text": " ", "count": 8157 }
+    },
+    {
+      "id": "source-over-limit",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1{FILL}",
+      "parameters": "{}",
+      "refusal": "query_limit",
+      "fill": { "text": " ", "count": 8158 }
+    },
+    {
+      "id": "parameters-at-limit",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":\"{FILL}\"}",
+      "engine": "MATCH (v0) RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1",
+      "fill": { "text": "x", "count": 65528 }
+    },
+    {
+      "id": "parameters-over-limit",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":\"{FILL}\"} ",
+      "refusal": "query_limit",
+      "fill": { "text": "x", "count": 65528 }
+    },
+    {
+      "id": "parameters-normalised-over-limit",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"x\":\"{FILL}\",\"p\":1e3}",
+      "refusal": "query_limit",
+      "fill": { "text": "x", "count": 65520 }
+    },
+    {
+      "id": "parameter-count-32",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p0\":0,\"p1\":1,\"p2\":2,\"p3\":3,\"p4\":4,\"p5\":5,\"p6\":6,\"p7\":7,\"p8\":8,\"p9\":9,\"p10\":10,\"p11\":11,\"p12\":12,\"p13\":13,\"p14\":14,\"p15\":15,\"p16\":16,\"p17\":17,\"p18\":18,\"p19\":19,\"p20\":20,\"p21\":21,\"p22\":22,\"p23\":23,\"p24\":24,\"p25\":25,\"p26\":26,\"p27\":27,\"p28\":28,\"p29\":29,\"p30\":30,\"p31\":31}",
+      "engine": "MATCH (v0) RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "parameter-count-33",
+      "source": "MATCH (n) RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p0\":0,\"p1\":1,\"p2\":2,\"p3\":3,\"p4\":4,\"p5\":5,\"p6\":6,\"p7\":7,\"p8\":8,\"p9\":9,\"p10\":10,\"p11\":11,\"p12\":12,\"p13\":13,\"p14\":14,\"p15\":15,\"p16\":16,\"p17\":17,\"p18\":18,\"p19\":19,\"p20\":20,\"p21\":21,\"p22\":22,\"p23\":23,\"p24\":24,\"p25\":25,\"p26\":26,\"p27\":27,\"p28\":28,\"p29\":29,\"p30\":30,\"p31\":31,\"p32\":32}",
+      "refusal": "query_limit"
+    },
+    {
+      "id": "limit-0",
+      "source": "MATCH (n) RETURN count(*) LIMIT 0",
+      "parameters": "{}",
+      "refusal": "query_limit"
+    },
+    {
+      "id": "limit-1",
+      "source": "MATCH (n) RETURN count(*) LIMIT 1",
+      "parameters": "{}",
+      "engine": "MATCH (v0) RETURN count(*) AS a0 LIMIT 1",
+      "limit": 1
+    },
+    {
+      "id": "limit-1000",
+      "source": "MATCH (n) RETURN count(*) LIMIT 1000",
+      "parameters": "{}",
+      "engine": "MATCH (v0) RETURN count(*) AS a0 LIMIT 1000",
+      "limit": 1000
+    },
+    {
+      "id": "limit-1001",
+      "source": "MATCH (n) RETURN count(*) LIMIT 1001",
+      "parameters": "{}",
+      "refusal": "query_limit"
+    },
+    {
+      "id": "segments-8",
+      "source": "MATCH (n0)-[:contains]->(n1)-[:contains]->(n2)-[:contains]->(n3)-[:contains]->(n4)-[:contains]->(n5)-[:contains]->(n6)-[:contains]->(n7)-[:contains]->(n8) RETURN n0.id AS id LIMIT 1",
+      "parameters": "{}",
+      "engine": "MATCH (v0)-[v1:contains]->(v2)-[v3:contains]->(v4)-[v5:contains]->(v6)-[v7:contains]->(v8)-[v9:contains]->(v10)-[v11:contains]->(v12)-[v13:contains]->(v14)-[v15:contains]->(v16) RETURN v0.id AS a0 ORDER BY v0.id ASC, v1.id ASC, v2.id ASC, v3.id ASC, v4.id ASC, v5.id ASC, v6.id ASC, v7.id ASC, v8.id ASC, v9.id ASC, v10.id ASC, v11.id ASC, v12.id ASC, v13.id ASC, v14.id ASC, v15.id ASC, v16.id ASC LIMIT 1"
+    },
+    {
+      "id": "segments-9",
+      "source": "MATCH (n0)-[:contains]->(n1)-[:contains]->(n2)-[:contains]->(n3)-[:contains]->(n4)-[:contains]->(n5)-[:contains]->(n6)-[:contains]->(n7)-[:contains]->(n8)-[:contains]->(n9) RETURN n0.id AS id LIMIT 1",
+      "parameters": "{}",
+      "refusal": "query_limit"
+    },
+    {
+      "id": "returns-16",
+      "source": "MATCH (n) RETURN n.id AS a0, n.id AS a1, n.id AS a2, n.id AS a3, n.id AS a4, n.id AS a5, n.id AS a6, n.id AS a7, n.id AS a8, n.id AS a9, n.id AS a10, n.id AS a11, n.id AS a12, n.id AS a13, n.id AS a14, n.id AS a15 LIMIT 1",
+      "parameters": "{}",
+      "engine": "MATCH (v0) RETURN v0.id AS a0, v0.id AS a1, v0.id AS a2, v0.id AS a3, v0.id AS a4, v0.id AS a5, v0.id AS a6, v0.id AS a7, v0.id AS a8, v0.id AS a9, v0.id AS a10, v0.id AS a11, v0.id AS a12, v0.id AS a13, v0.id AS a14, v0.id AS a15 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "returns-17",
+      "source": "MATCH (n) RETURN n.id AS a0, n.id AS a1, n.id AS a2, n.id AS a3, n.id AS a4, n.id AS a5, n.id AS a6, n.id AS a7, n.id AS a8, n.id AS a9, n.id AS a10, n.id AS a11, n.id AS a12, n.id AS a13, n.id AS a14, n.id AS a15, n.id AS a16 LIMIT 1",
+      "parameters": "{}",
+      "refusal": "query_limit"
+    },
+    {
+      "id": "predicates-32",
+      "source": "MATCH (n) WHERE n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "engine": "MATCH (v0) WHERE v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p AND v0.revision = $p RETURN v0.id AS a0 ORDER BY v0.id ASC LIMIT 1"
+    },
+    {
+      "id": "predicates-33",
+      "source": "MATCH (n) WHERE n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"p\":1}",
+      "refusal": "query_limit"
+    }
+  ],
+  "prefix_chains": [
+    {
+      "id": "empty",
+      "events": [],
+      "prefix_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "events-1-1",
+      "events": [[1, "04e2b76fbcbde52deb674c34b5329a13b6e21b89fab859cd310f675364bf4ff2"]],
+      "prefix_digest": "c5ab1bfd0ea42a1ad3dd817995c3e8d86ed7f9683809235d93a48b65b6268d6f"
+    },
+    {
+      "id": "events-1-2",
+      "events": [
+        [1, "04e2b76fbcbde52deb674c34b5329a13b6e21b89fab859cd310f675364bf4ff2"],
+        [2, "2b408fdb2f98bddee70cd2f97fd65ab90e95775891516f7851f70887b052c3b7"]
+      ],
+      "prefix_digest": "a3fe22705a438ec67a3e373aed7fd5e955e384e1c83c6fe3db440f60b0e6bd33"
+    },
+    {
+      "id": "events-1-3",
+      "events": [
+        [1, "04e2b76fbcbde52deb674c34b5329a13b6e21b89fab859cd310f675364bf4ff2"],
+        [2, "2b408fdb2f98bddee70cd2f97fd65ab90e95775891516f7851f70887b052c3b7"],
+        [3, "a381cf0e6586ed4c7a7f8e5889f4f1827c2d96d26e9a7a70dce440196536f355"]
+      ],
+      "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1"
+    }
+  ],
+  "manifests": [
+    {
+      "id": "valid",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      }
+    },
+    {
+      "id": "empty-prefix",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 0,
+        "prefix_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      }
+    },
+    {
+      "id": "schema-5",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 5,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "projection-2",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 2,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "engine-other",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.1"
+      },
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "head-over-limit",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 100001,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "epoch-not-decimal",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "07",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "digest-uppercase",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "prefix-short",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "ab",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "domain-empty",
+      "manifest": {
+        "domain": "",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "42",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "checkpoint-negative",
+      "manifest": {
+        "domain": "work",
+        "authority_epoch": "7",
+        "authority_digest": "abababababababababababababababababababababababababababababababab",
+        "accepted_head": 3,
+        "prefix_digest": "b476c8a88b99924f31479518e307623f3617cd64dc60b2d925196c0327486ae1",
+        "sync_checkpoint": "-1",
+        "contract_schema": 6,
+        "projection_version": 1,
+        "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629"
+      },
+      "refusal": "invalid_change"
+    }
+  ],
+  "worker": {
+    "engine": "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629",
+    "projection_version": 1,
+    "linux_glibc_tunables": "glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912:glibc.malloc.arena_max=1",
+    "prefix_genesis": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
 }

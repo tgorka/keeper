@@ -659,6 +659,51 @@ its first event, and every event in it, the first included, is within the row bo
 *Tables* (its header at most 128 KiB, its operations as for the event); a client refuses a page
 outside these bounds, or an image outside its entity's shape. History is the retained events, never the pruned transport log.
 
+**Read authority.** A graph read is exposed only under an authority the server answered for now,
+through registered queries whose params carry `version` (1):
+
+| query | params | rows |
+| --- | --- | --- |
+| `graph.admit_read` | `context`, `domain` | `[{context, session, permitted, sources, expires_at_ms, authority}]` |
+| `graph.refresh_context` | `context` | the same row |
+| `graph.read_status` | `domain` | `[{domain, authority}]`, for a person's device |
+
+`authority` is `{"epoch": <decimal>, "digest": <lowercase SHA-256 hex>}`: the server's graph-read
+authority epoch and its `(domain, principal)` digest. An agent's reader calls `graph.admit_read`
+before it reads anything of a domain and `graph.refresh_context` again before it delivers a
+result; a person's reader calls `graph.read_status`. A refusal (`operation.forbidden`, collapsed
+for a caller who may not read), a domain missing from `sources`, or an authority other than the
+one the result was computed under suppresses the result.
+
+**Queries (`KG-Cypher/1`).** A native reader answers a bounded read-only Cypher subset from a
+local projection of a complete accepted prefix, never from the server and never from the current
+rows: one `MATCH` of one connected chain of at most 8 typed directed relationship segments; an
+optional `WHERE` of at most 32 `AND`-ed comparisons of a property with a named parameter (`=`,
+`<>`, `<`, `<=`, `>`, `>=`) or `IS [NOT] NULL`; `RETURN` of at most 16 aliased properties or one
+`count(*)`/`count(variable)`; an optional `ORDER BY` of returned aliases; a literal `LIMIT`
+1–1,000. Source at most 8 KiB; parameters a JSON object of at most 32 scalars and 64 KiB, numbers
+normalised as values are. Labels, relationship types and property keys are reserved names or
+their `K_`/`R_`/`P_` symbols; a node binding reads a node's structural fields or a tag's `id` and
+`text`, an edge binding an edge's. Anything else is `query_unsupported`, any bound exceeded
+`query_limit`. The renderer adds every binding's `id` ascending as the final sort keys, so ties
+never depend on the engine. Only active nodes, tags, and active edges between active nodes are
+visible; a membership is a `HAS_TAG` relationship to a `Tag` node. Archived entities are read
+through the typed `get_node`/`get_edge` lookups, locally the same as the server's. A result names
+its domain, the prefix length N, the Syncular checkpoint, the schema, projection and engine
+versions and whether the prefix is still the replica's whole history (`current`) or behind it
+(`stale`). `queries[]` in the vectors pins the grammar and the renderer.
+
+**The worker frames.** The query projection is built and read by a separate single-use worker
+(`keeper-graph-query`). Its builder reads one manifest frame — domain, authority, N,
+`prefix_digest`, Syncular checkpoint, `contract_schema` 6, projection version and engine — and
+then exactly N event frames: `{graph_seq, event_id, op_count, delta_digest, ops}`, each op its
+row without the before-image (the consumer has already verified every event's digest and
+before-images against its own replay). `prefix_digest` chains from 64 zeros: each event's is the
+SHA-256 hex of the previous digest, `graph_seq` and `delta_digest`, newline-separated. A frame is
+at most 2 MiB, a prefix at most 100,000 events. Every Linux worker runs with exactly
+`GQL_STMT_CACHE=0` and `GLIBC_TUNABLES` equal to `worker.linux_glibc_tunables` in the vectors.
+`prefix_chains[]`, `manifests[]` and `worker` pin these.
+
 ## The live check
 
 `bun run check:syncular:live` runs a server's startup — `PostgresServerStorage.migrate()` and

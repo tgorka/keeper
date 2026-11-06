@@ -6,7 +6,9 @@
 //! ([`request`]), the `graph.apply` payload ([`change`]) and what it does to
 //! a graph ([`candidate`]), stable content's revision rule ([`content`]),
 //! event-operation digests ([`delta`]), the scope and key values of the
-//! graph tables ([`scope`]) and the reads' shapes ([`wire`]).
+//! graph tables ([`scope`]), the reads' shapes ([`wire`]), the closed query
+//! profile `KG-Cypher/1` ([`profile`]) and the frames a native consumer
+//! exchanges with its separate graph worker ([`worker`]).
 //! `syncular/knowledge-graph.vectors.json` pins every rule here; keeper-hq's
 //! TypeScript validator reproduces the same vectors.
 //!
@@ -17,12 +19,14 @@ pub mod candidate;
 pub mod change;
 pub mod content;
 pub mod delta;
+pub mod profile;
 pub mod request;
 pub mod scope;
 pub mod symbol;
 pub mod value;
 pub mod vocabulary;
 pub mod wire;
+pub mod worker;
 
 use std::fmt;
 
@@ -30,7 +34,7 @@ use std::fmt;
 pub const CONTRACT_VERSION: u32 = 1;
 /// The first Syncular schema version that holds the graph tables.
 pub const SCHEMA_VERSION: u32 = 6;
-/// The query profile whose symbols [`symbol`] maps.
+/// The query profile [`profile`] admits and whose symbols [`symbol`] maps.
 pub const PROFILE: &str = "KG-Cypher/1";
 
 /// Why the contract refuses an input: the stable error codes of the
@@ -45,6 +49,11 @@ pub enum Refusal {
     InvalidChange,
     /// A size, count or nesting bound exceeded.
     ChangeLimit,
+    /// A query outside the closed profile `KG-Cypher/1`.
+    QueryUnsupported,
+    /// A query over a profile bound (source, parameters, segments,
+    /// predicates, aliases, rows or result bytes).
+    QueryLimit,
 }
 
 impl Refusal {
@@ -55,6 +64,8 @@ impl Refusal {
             Self::UnsupportedVersion => "unsupported_version",
             Self::InvalidChange => "invalid_change",
             Self::ChangeLimit => "change_limit",
+            Self::QueryUnsupported => "query_unsupported",
+            Self::QueryLimit => "query_limit",
         }
     }
 }
