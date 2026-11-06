@@ -11,6 +11,10 @@
 //! whole: it names the content's own id and owner (both fixed for good — a
 //! change of either refuses), its revision moves by exactly one, and nothing
 //! else moves: not the owner node's revision, which content has its own of.
+//! The update's one operation must fit an event row
+//! ([`crate::delta::MAX_OPERATION_BYTES`], before-image included): two bodies
+//! within 32 KiB of UTF-8 can still encode past it (escaped characters), and
+//! such an update refuses `change_limit`.
 
 use serde_json::{json, Map, Value};
 
@@ -113,7 +117,7 @@ pub fn revise(before: &Map<String, Value>, update: &Map<String, Value>) -> Revis
     let mut after = before.clone();
     after.insert("revision".into(), json!(next));
     after.insert("body".into(), body.clone());
-    Revision::Accepted(Op {
+    let op = Op {
         ordinal: 0,
         entity_type: EntityType::Content,
         entity_id: id.to_owned(),
@@ -122,5 +126,12 @@ pub fn revise(before: &Map<String, Value>, update: &Map<String, Value>) -> Revis
         after_revision: Some(next),
         before_value: Some(Value::Object(before.clone())),
         after_value: Some(Value::Object(after)),
-    })
+    };
+    // The operation is an event row: its encoded bytes, before-image
+    // included, stay within the row and event bounds, however the two
+    // 32 KiB bodies encode.
+    match crate::delta::digest(std::slice::from_ref(&op)) {
+        Ok(_) => Revision::Accepted(op),
+        Err(refusal) => Revision::Refused(refusal),
+    }
 }
