@@ -561,11 +561,19 @@ fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
     close(source);
 }
 
+/// The refusal a caller without graph read authority gets from every graph
+/// read: `operation.forbidden` with the stable code `forbidden`, as the
+/// native client surfaces it.
+const FORBIDDEN: &str = "operation.forbidden: forbidden";
+
 /// A database the person holds no graph role in: nothing is accepted, and
-/// what is retained there — a node, another person's accepted request —
-/// reads exactly like what does not exist, through inspection, outcome and
-/// history, on the raw server answers. An unlinked replica refuses before
-/// sending.
+/// the native client sees the same forbidden refusal for what is retained
+/// there — a node, another person's accepted request — as for what does not
+/// exist, through inspection, outcome and history. Any other answer (a
+/// transport error, `NotSyncing`, rows) fails the case. This is what the
+/// native client receives; equality of the complete server responses
+/// (status and body) is keeper-hq's own control (`graph-apply.test.ts`).
+/// An unlinked replica refuses before sending.
 #[test]
 #[ignore = "driven by keeper-hq's native graph harness"]
 fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
@@ -578,64 +586,47 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
     let retained = env("KEEPER_HQ_LIVE_FORBIDDEN_NODE");
     let retained_request = env("KEEPER_HQ_LIVE_FORBIDDEN_REQUEST");
     let (absent, absent_request) = (ulid(), ulid());
-    // The server's own answers, not what the client makes of them.
-    let raw = |operation: &str, params: Value| {
-        format!("{:?}", forbidden.replica.remote_query(operation, params))
+    let refused = |what: &str, operation: &str, params: Value| match forbidden
+        .replica
+        .remote_query(operation, params)
+    {
+        Err(ReplicaError::Client(text)) if text == FORBIDDEN => {}
+        other => panic!("{what}: not the forbidden refusal: {other:?}"),
     };
-    let collapsed = |what: &str, known: String, unknown: String, ids: &[&str]| {
-        assert!(known.starts_with("Err("), "{what}: {known}");
-        assert_eq!(known, unknown, "{what}: the retained one reads differently");
-        for id in ids {
-            assert!(!known.contains(id), "{what} discloses {id}: {known}");
-        }
-        for detail in ["graph_seq", "revision", "event_id"] {
-            assert!(
-                !known.contains(detail),
-                "{what} discloses {detail}: {known}"
+    for (what, request) in [
+        ("retained outcome", &retained_request),
+        ("absent outcome", &absent_request),
+    ] {
+        refused(what, wire::OUTCOME, wire::outcome_params(None, request));
+    }
+    let filter = |entity: &str| HistoryFilter {
+        entity_id: Some(entity.to_owned()),
+        ..HistoryFilter::default()
+    };
+    for (what, id) in [("retained", &retained), ("absent", &absent)] {
+        for archived in [false, true] {
+            refused(what, wire::GET_NODE, wire::get_params(None, id, archived));
+            assert_eq!(
+                client.get_node(id, archived),
+                Err(GraphClientError::Replica(ReplicaError::Client(
+                    FORBIDDEN.to_owned()
+                ))),
+                "{what} node through the client"
             );
         }
-        known
-    };
-    let outcome = collapsed(
-        "outcome",
-        raw(wire::OUTCOME, wire::outcome_params(None, &retained_request)),
-        raw(wire::OUTCOME, wire::outcome_params(None, &absent_request)),
-        &[&retained_request],
-    );
-    for archived in [false, true] {
-        collapsed(
-            "get_node",
-            raw(wire::GET_NODE, wire::get_params(None, &retained, archived)),
-            raw(wire::GET_NODE, wire::get_params(None, &absent, archived)),
-            &[&retained],
-        );
-        let probe = |id: &str| format!("{:?}", client.get_node(id, archived));
-        assert_eq!(probe(&retained), probe(&absent));
-    }
-    let filtered = |entity: &str| {
-        raw(
+        refused(
+            what,
             wire::HISTORY,
-            wire::history_params(
-                None,
-                "0",
-                10,
-                &HistoryFilter {
-                    entity_id: Some(entity.to_owned()),
-                    ..HistoryFilter::default()
-                },
-            )
-            .expect("params"),
-        )
-    };
-    collapsed(
-        "history",
-        filtered(&retained),
-        filtered(&absent),
-        &[&retained],
+            wire::history_params(None, "0", 10, &filter(id)).expect("params"),
+        );
+    }
+    assert_eq!(
+        client.history("0", 10, &HistoryFilter::default()),
+        Err(GraphClientError::Replica(ReplicaError::Client(
+            FORBIDDEN.to_owned()
+        )))
     );
-    let history = client.history("0", 10, &HistoryFilter::default());
-    assert!(history.is_err(), "{history:?}");
-    report("forbidden-reads", &json!({"outcome": outcome}));
+    report("forbidden-reads", &json!({"refusal": FORBIDDEN}));
 
     let change = client
         .change(vec![create_node(&ulid(), "Probe", json!({}))], None)
