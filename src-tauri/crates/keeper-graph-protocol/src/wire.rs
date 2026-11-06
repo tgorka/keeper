@@ -27,12 +27,17 @@
 //! canonical event bytes, always at least one whole event when one matches.
 //! `filter` holds any of `entity_id` (an operation's entity), `actor_id`
 //! and `origin_class`, each matching exactly.
+//!
+//! The native decoders hold the server to these shapes: an image outside
+//! its entity's rules, or a page outside the bounds above, is refused as
+//! an answer this build does not read, never presented as a typed result.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::delta::{self, Op};
-use crate::vocabulary::OriginClass;
+use crate::value::{canonical, check_properties};
+use crate::vocabulary::{stored_edge_type, stored_node_kind, OriginClass};
 use crate::{is_decimal, is_ulid, Refusal, CONTRACT_VERSION};
 
 pub const OUTCOME: &str = "graph.outcome";
@@ -130,20 +135,80 @@ fn single(rows: Vec<Map<String, Value>>) -> Result<Option<Map<String, Value>>, R
     }
 }
 
-/// Whether `image` has exactly `fields`, a ULID id and decimal revisions.
-fn image_ok(image: &Map<String, Value>, fields: &[&str], id: &str) -> bool {
-    image.len() == fields.len()
-        && fields.iter().all(|field| image.contains_key(*field))
-        && image.get("id").and_then(Value::as_str) == Some(id)
-        && image.get("properties").is_some_and(Value::is_object)
-        && ["revision", "lifecycle_revision"].iter().all(|field| {
-            image
-                .get(*field)
-                .is_none_or(|v| v.as_str().is_some_and(is_decimal))
-        })
+fn ulid_or_null(image: &Map<String, Value>, field: &str) -> bool {
+    match image.get(field) {
+        Some(Value::Null) => true,
+        Some(Value::String(id)) => is_ulid(id),
+        _ => false,
+    }
 }
 
-/// Decode [`GET_NODE`]'s answer for node `id`.
+fn positive(image: &Map<String, Value>, field: &str) -> bool {
+    image
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|r| is_decimal(r) && r != "0")
+}
+
+fn lifecycle(image: &Map<String, Value>) -> bool {
+    matches!(
+        image.get("lifecycle").and_then(Value::as_str),
+        Some("active" | "archived")
+    )
+}
+
+fn properties(image: &Map<String, Value>) -> bool {
+    image
+        .get("properties")
+        .is_some_and(|p| check_properties(p).is_ok())
+}
+
+/// Whether `image` is node `id` as the contract holds one: exactly the
+/// node fields, each of its type and within its rules.
+fn node_ok(image: &Map<String, Value>, id: &str) -> bool {
+    image.len() == NODE_IMAGE.len()
+        && NODE_IMAGE.iter().all(|field| image.contains_key(*field))
+        && image.get("id").and_then(Value::as_str) == Some(id)
+        && image
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| stored_node_kind(kind).is_ok())
+        && image
+            .get("title")
+            .and_then(Value::as_str)
+            .is_some_and(|title| !title.is_empty())
+        && matches!(
+            image.get("description"),
+            Some(Value::Null | Value::String(_))
+        )
+        && ulid_or_null(image, "description_source_id")
+        && ulid_or_null(image, "merged_into_id")
+        && properties(image)
+        && lifecycle(image)
+        && positive(image, "revision")
+        && positive(image, "lifecycle_revision")
+}
+
+/// Whether `image` is edge `id` as the contract holds one.
+fn edge_ok(image: &Map<String, Value>, id: &str) -> bool {
+    image.len() == EDGE_IMAGE.len()
+        && EDGE_IMAGE.iter().all(|field| image.contains_key(*field))
+        && image.get("id").and_then(Value::as_str) == Some(id)
+        && ["from_id", "to_id"]
+            .iter()
+            .all(|end| image.get(*end).and_then(Value::as_str).is_some_and(is_ulid))
+        && image
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| stored_edge_type(kind).is_ok())
+        && properties(image)
+        && lifecycle(image)
+        && positive(image, "revision")
+}
+
+/// Decode [`GET_NODE`]'s answer for node `id`. An image outside the node
+/// shape, or tags that are not distinct non-empty texts in ascending order,
+/// refuse `unsupported_version` rather than read as an inspected node.
 pub fn decode_node(id: &str, rows: Vec<Map<String, Value>>) -> Result<Option<NodeView>, Refusal> {
     let Some(mut row) = single(rows)? else {
         return Ok(None);
@@ -152,26 +217,27 @@ pub fn decode_node(id: &str, rows: Vec<Map<String, Value>>) -> Result<Option<Nod
         Some(Value::Array(tags)) => tags
             .into_iter()
             .map(|tag| match tag {
-                Value::String(tag) => Ok(tag),
+                Value::String(tag) if !tag.is_empty() => Ok(tag),
                 _ => Err(Refusal::UnsupportedVersion),
             })
             .collect::<Result<Vec<_>, _>>()?,
         _ => return Err(Refusal::UnsupportedVersion),
     };
-    if !image_ok(&row, &NODE_IMAGE, id) {
+    if !node_ok(&row, id) || tags.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(Refusal::UnsupportedVersion);
     }
     Ok(Some(NodeView { image: row, tags }))
 }
 
-/// Decode [`GET_EDGE`]'s answer for edge `id`.
+/// Decode [`GET_EDGE`]'s answer for edge `id`; an image outside the edge
+/// shape refuses `unsupported_version`.
 pub fn decode_edge(
     id: &str,
     rows: Vec<Map<String, Value>>,
 ) -> Result<Option<Map<String, Value>>, Refusal> {
     match single(rows)? {
         None => Ok(None),
-        Some(row) if image_ok(&row, &EDGE_IMAGE, id) => Ok(Some(row)),
+        Some(row) if edge_ok(&row, id) => Ok(Some(row)),
         Some(_) => Err(Refusal::UnsupportedVersion),
     }
 }
@@ -244,17 +310,47 @@ pub struct HistoryPage {
     pub scanned_through: String,
 }
 
-/// Decode [`HISTORY`]'s answer to a page after `after`: every event whole
-/// and checked, positions ascending within `(after, scanned_through]`.
-pub fn decode_history(after: &str, rows: Vec<Map<String, Value>>) -> Result<HistoryPage, Refusal> {
+/// Decode [`HISTORY`]'s answer to a page of at most `limit` events after
+/// `after`, refusing (`unsupported_version`) anything the page bounds rule
+/// out before reading its events: more than `limit` events, more than
+/// [`MAX_HISTORY_SCAN`] positions scanned, or more than
+/// [`MAX_HISTORY_PAGE_BYTES`] of canonical event bytes beyond the first
+/// event. Then every event must be whole and checked, positions ascending
+/// within `(after, scanned_through]`.
+pub fn decode_history(
+    after: &str,
+    limit: u32,
+    rows: Vec<Map<String, Value>>,
+) -> Result<HistoryPage, Refusal> {
     let row = single(rows)?.ok_or(Refusal::UnsupportedVersion)?;
-    let page: HistoryPage =
-        serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
     let parse = |s: &str| s.parse::<u128>().ok().filter(|_| is_decimal(s));
-    let (Some(after), Some(through)) = (parse(after), parse(&page.scanned_through)) else {
+    let through = row
+        .get("scanned_through")
+        .and_then(Value::as_str)
+        .and_then(parse);
+    let (Some(start), Some(through)) = (parse(after), through) else {
         return Err(Refusal::UnsupportedVersion);
     };
-    let mut last = after;
+    let events = match row.get("events") {
+        Some(Value::Array(events)) => events,
+        _ => return Err(Refusal::UnsupportedVersion),
+    };
+    let limit = usize::try_from(limit.min(MAX_HISTORY_LIMIT)).unwrap_or(0);
+    if through < start || through - start > u128::from(MAX_HISTORY_SCAN) || events.len() > limit {
+        return Err(Refusal::UnsupportedVersion);
+    }
+    let mut bytes = 0usize;
+    for event in events.iter().skip(1) {
+        bytes += canonical(event)
+            .map_err(|_| Refusal::UnsupportedVersion)?
+            .len();
+        if bytes > MAX_HISTORY_PAGE_BYTES {
+            return Err(Refusal::UnsupportedVersion);
+        }
+    }
+    let page: HistoryPage =
+        serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
+    let mut last = start;
     for event in &page.events {
         event.check()?;
         let at = event.position();
@@ -262,9 +358,6 @@ pub fn decode_history(after: &str, rows: Vec<Map<String, Value>>) -> Result<Hist
             return Err(Refusal::UnsupportedVersion);
         }
         last = at;
-    }
-    if through < after {
-        return Err(Refusal::UnsupportedVersion);
     }
     Ok(page)
 }

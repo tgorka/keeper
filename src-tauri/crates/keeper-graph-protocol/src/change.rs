@@ -272,6 +272,8 @@ struct Entity {
     /// A node's precondition as its operations named it so far: `None`
     /// until one names it, `Some(None)` for a node created here.
     revision: Option<Option<String>>,
+    /// A node's lifecycle precondition as edges named it so far.
+    lifecycle: Option<String>,
 }
 
 impl Seen {
@@ -433,12 +435,13 @@ impl Seen {
                         created: create,
                         explicit: true,
                         revision: node.then(|| expected.cloned()),
+                        lifecycle: None,
                     },
                 );
                 Ok(())
             }
-            // Only tag operations came before: this operation must repeat
-            // the precondition they named.
+            // Only tag operations or edges named it before: this operation
+            // must agree with what they named.
             Some(entity) if entity.node && node && !entity.explicit && !create => {
                 self.named(id, expected, true)
             }
@@ -447,8 +450,9 @@ impl Seen {
     }
 
     /// Node `id` named under precondition `revision` by a tag operation (or,
-    /// `explicit`, by the explicit operation following tag operations): every
-    /// operation of the change naming the node names the same.
+    /// `explicit`, by the explicit operation following earlier mentions):
+    /// every operation of the change naming the node names the same, `null`
+    /// exactly when this change created it earlier.
     fn named(
         &mut self,
         id: &str,
@@ -470,11 +474,25 @@ impl Seen {
                         created: false,
                         explicit,
                         revision: Some(revision.cloned()),
+                        lifecycle: None,
                     },
                 );
                 Ok(())
             }
-            Some(entity) if entity.node && entity.revision == Some(revision.cloned()) => {
+            Some(entity) if entity.node => {
+                let agrees = match (&entity.revision, entity.created) {
+                    (_, true) => revision.is_none(),
+                    // Only edges named it so far: this names its revision.
+                    (None, false) if revision.is_some() => {
+                        entity.revision = Some(revision.cloned());
+                        true
+                    }
+                    (Some(named), false) => revision.is_some() && named.as_ref() == revision,
+                    (None, false) => false,
+                };
+                if !agrees {
+                    return Err(Refusal::InvalidChange);
+                }
                 entity.explicit |= explicit;
                 Ok(())
             }
@@ -483,24 +501,43 @@ impl Seen {
     }
 
     /// An edge endpoint: `null` names a node created earlier in this change,
-    /// a revision a node that is not.
-    fn endpoint(&self, id: &str, revision: Option<&String>) -> Result<(), Refusal> {
+    /// a lifecycle revision a node this change does not create — not later
+    /// either: the endpoint is recorded, so a create of it afterwards
+    /// refuses, and every edge naming it must name the same lifecycle
+    /// revision.
+    fn endpoint(&mut self, id: &str, revision: Option<&String>) -> Result<(), Refusal> {
         if !is_ulid(id) {
             return Err(Refusal::InvalidChange);
         }
-        let entity = self.entities.get(id);
-        match revision {
-            None => match entity {
+        let Some(revision) = revision else {
+            return match self.entities.get(id) {
                 Some(entity) if entity.node && entity.created => Ok(()),
                 _ => Err(Refusal::InvalidChange),
-            },
-            Some(revision) => {
-                revision_ok(revision)?;
-                match entity {
-                    Some(entity) if !entity.node || entity.created => Err(Refusal::InvalidChange),
-                    _ => Ok(()),
-                }
+            };
+        };
+        revision_ok(revision)?;
+        match self.entities.get_mut(id) {
+            None => {
+                self.entities.insert(
+                    id.to_owned(),
+                    Entity {
+                        node: true,
+                        created: false,
+                        explicit: false,
+                        revision: None,
+                        lifecycle: Some(revision.clone()),
+                    },
+                );
+                Ok(())
             }
+            Some(entity) if entity.node && !entity.created => match &entity.lifecycle {
+                Some(named) if named != revision => Err(Refusal::InvalidChange),
+                _ => {
+                    entity.lifecycle = Some(revision.clone());
+                    Ok(())
+                }
+            },
+            Some(_) => Err(Refusal::InvalidChange),
         }
     }
 }
@@ -580,7 +617,7 @@ fn read_op(value: &Value) -> Result<ChangeOp, Refusal> {
         _ => return Err(Refusal::InvalidChange),
     };
     let r = Reader { fields };
-    r.members(required, optional)?;
+    r.members(required, optional, true)?;
     Ok(match op {
         "create_node" => ChangeOp::CreateNode {
             id: r.text("id")?,
@@ -658,7 +695,7 @@ fn node_fields(set: &Value) -> Result<NodeFields, Refusal> {
         return Err(Refusal::InvalidChange);
     }
     let r = Reader { fields };
-    r.members(&[], &["title", "description"])?;
+    r.members(&[], &["title", "description"], false)?;
     Ok(NodeFields {
         title: match fields.get("title") {
             None => None,
@@ -677,9 +714,10 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     /// Every `required` member present, nothing outside `required`,
-    /// `optional` and `op`.
-    fn members(&self, required: &[&str], optional: &[&str]) -> Result<(), Refusal> {
-        let known = |key: &str| key == "op" || required.contains(&key) || optional.contains(&key);
+    /// `optional` and, for an operation object (`op`), its discriminator.
+    fn members(&self, required: &[&str], optional: &[&str], op: bool) -> Result<(), Refusal> {
+        let known =
+            |key: &str| (op && key == "op") || required.contains(&key) || optional.contains(&key);
         if required.iter().all(|key| self.fields.contains_key(*key))
             && self.fields.keys().all(|key| known(key))
         {

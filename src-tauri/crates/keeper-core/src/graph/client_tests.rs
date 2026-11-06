@@ -69,7 +69,7 @@ impl State for Nodes {
     fn membership(&self, _: &str, _: &str) -> Option<Map<String, Value>> {
         None
     }
-    fn contains_into(&self, _: &[String]) -> Vec<Map<String, Value>> {
+    fn contains_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
         Vec::new()
     }
 }

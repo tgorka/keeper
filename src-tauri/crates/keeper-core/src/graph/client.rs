@@ -246,6 +246,6 @@ impl GraphClient {
         let params =
             wire::history_params(None, after, limit, filter).map_err(GraphClientError::Refused)?;
         let rows = self.read(wire::HISTORY, params)?;
-        decode_history(after, rows).map_err(GraphClientError::Unreadable)
+        decode_history(after, limit, rows).map_err(GraphClientError::Unreadable)
     }
 }

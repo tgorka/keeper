@@ -82,15 +82,19 @@ impl State for Images {
             .find(|row| row["node_id"] == node_id && row["tag_id"] == tag_id)
             .cloned()
     }
-    fn contains_into(&self, to_ids: &[String]) -> Vec<Map<String, Value>> {
-        self.rows("edges")
+    fn contains_into(&self, to_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        let mut edges: Vec<_> = self
+            .rows("edges")
             .filter(|row| {
                 row["type"] == "contains"
                     && row["lifecycle"] == "active"
                     && to_ids.iter().any(|id| row["to_id"] == id.as_str())
             })
             .cloned()
-            .collect()
+            .collect();
+        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        edges.truncate(limit);
+        edges
     }
 }
 
@@ -113,6 +117,36 @@ fn change_vectors_parse_or_refuse() {
                     "{id}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn content_vectors_reproduce() {
+    use super::protocol::content::{revise, Revision};
+    for entry in entries("contents") {
+        let id = entry["id"].as_str().expect("id");
+        let before = entry["before"].as_object().expect("before");
+        let revision = revise(before, entry["update"].as_object().expect("update"));
+        if let Some(code) = entry.get("refusal").and_then(Value::as_str) {
+            assert_eq!(
+                revision,
+                Revision::Refused(match code {
+                    "change_limit" => super::protocol::Refusal::ChangeLimit,
+                    _ => super::protocol::Refusal::InvalidChange,
+                }),
+                "{id}"
+            );
+        } else if let Some(detail) = entry.get("conflict") {
+            assert_eq!(revision, Revision::Conflict(detail.clone()), "{id}");
+        } else {
+            let op: Op = serde_json::from_value(entry["op"].clone()).expect("op");
+            assert_eq!(revision, Revision::Accepted(op.clone()), "{id}");
+            assert_eq!(
+                super::protocol::delta::digest(std::slice::from_ref(&op)).expect("digest"),
+                entry["delta_digest"],
+                "{id}"
+            );
         }
     }
 }

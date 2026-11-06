@@ -14,10 +14,13 @@
 //!
 //! Checks run in this order, the first failure deciding: each operation in
 //! turn (its preconditions, then what it does); then every typed reference
-//! written; then the endpoints of every edge left active that this change
-//! created, unarchived or updated; then containment for every `contains`
-//! edge created or unarchived; then the event's bounds
-//! ([`crate::delta::digest`]).
+//! written; then every edge left active that this change created,
+//! unarchived or updated (both endpoints active, and a `guidance_scope`
+//! edge starting at a `Guidance` node); then containment for every
+//! `contains` edge created or unarchived; then the event's bounds
+//! ([`crate::delta::digest`]). The receipt's `affected` lists nodes, edges
+//! and new tags in order of their first touch by the change, which may
+//! differ from the order of their event operations.
 //!
 //! **Revisions.** A created node or edge starts at revision 1 (a node also at
 //! lifecycle revision 1, active); a new tag at revision 1. A node touched by
@@ -48,7 +51,9 @@
 //! [`MAX_CONTAINMENT_DEPTH`], or more than [`MAX_CONTAINMENT_EDGES`] edges
 //! read by all walks of the change together, refuses `change_limit`; a level
 //! holding an edge from `C` (or `P` = `C`) refuses `invalid_change`; the
-//! frontier is then the level's new `from` nodes.
+//! frontier is then the level's new `from` nodes. Reads are bounded as they
+//! are made: a level is fetched with a limit of one more edge than the
+//! budget still allows ([`State::contains_into`]), never whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -76,8 +81,12 @@ pub trait State {
     fn tag(&self, text: &str) -> Option<Map<String, Value>>;
     /// The membership of node `node_id` in tag `tag_id`.
     fn membership(&self, node_id: &str, tag_id: &str) -> Option<Map<String, Value>>;
-    /// Every active `contains` edge whose `to_id` is one of `to_ids`.
-    fn contains_into(&self, to_ids: &[String]) -> Vec<Map<String, Value>>;
+    /// The accepted active `contains` edges whose `to_id` is one of `to_ids`,
+    /// ascending by id, **at most `limit`** of them. The walk asks for one
+    /// more edge than it may still read (plus any it will replace with this
+    /// change's own), so a full answer proves the budget exceeded without
+    /// reading the rest.
+    fn contains_into(&self, to_ids: &[String], limit: usize) -> Vec<Map<String, Value>>;
 }
 
 /// What the change does.
@@ -165,6 +174,9 @@ struct Candidate<'a> {
     /// `contains` edges to walk, in order.
     containment: Vec<String>,
     slots: Vec<Slot>,
+    /// Nodes, edges and new tags (by text) in order of first touch: the
+    /// receipt's `affected` order.
+    order: Vec<(&'static str, String)>,
 }
 
 fn text(image: &Image, key: &str) -> String {
@@ -222,6 +234,7 @@ impl<'a> Candidate<'a> {
             endpoint_checks: Vec::new(),
             containment: Vec::new(),
             slots: Vec::new(),
+            order: Vec::new(),
         }
     }
 
@@ -273,25 +286,33 @@ impl<'a> Candidate<'a> {
         self.edges.get_mut(id)
     }
 
+    /// Record the first touch of an entity, for `affected`.
+    fn first(&mut self, kind: &'static str, id: &str) {
+        if !self.order.iter().any(|(k, i)| *k == kind && i == id) {
+            self.order.push((kind, id.to_owned()));
+        }
+    }
+
     /// Node `id` under precondition `expected` (`None`: created earlier in
     /// this change); moves its revision once.
     fn touch_node(&mut self, id: &str, expected: Option<&String>) -> Result<(), Stop> {
         let Some(expected) = expected else {
+            self.first("node", id);
             return Ok(());
         };
         let Some(entry) = self.node(id) else {
             return Err(conflict("node", id, "revision", None));
         };
-        if entry.touched {
-            return Ok(());
+        if !entry.touched {
+            let before = entry.before.as_ref().map(|b| text(b, "revision"));
+            if before.as_ref() != Some(expected) {
+                return Err(conflict("node", id, "revision", before));
+            }
+            let revision = next(expected)?;
+            entry.after.insert("revision".into(), json!(revision));
+            entry.touched = true;
         }
-        let before = entry.before.as_ref().map(|b| text(b, "revision"));
-        if before.as_ref() != Some(expected) {
-            return Err(conflict("node", id, "revision", before));
-        }
-        let revision = next(expected)?;
-        entry.after.insert("revision".into(), json!(revision));
-        entry.touched = true;
+        self.first("node", id);
         Ok(())
     }
 
@@ -329,6 +350,7 @@ impl<'a> Candidate<'a> {
         entry.after.insert("revision".into(), json!(revision));
         entry.touched = true;
         let (from, to) = (text(&entry.after, "from_id"), text(&entry.after, "to_id"));
+        self.first("edge", id);
         self.endpoint(&from, Some(&from_lifecycle.to_owned()))?;
         self.endpoint(&to, Some(&to_lifecycle.to_owned()))
     }
@@ -386,6 +408,7 @@ impl<'a> Candidate<'a> {
                     },
                 );
                 self.slots.push(Slot::Node(id.clone(), Operation::Create));
+                self.first("node", id);
             }
             ChangeOp::UpdateNode {
                 id,
@@ -471,6 +494,7 @@ impl<'a> Candidate<'a> {
                     self.containment.push(id.clone());
                 }
                 self.slots.push(Slot::Edge(id.clone(), Operation::Create));
+                self.first("edge", id);
             }
             ChangeOp::UpdateEdge {
                 id,
@@ -581,6 +605,7 @@ impl<'a> Candidate<'a> {
             let image = object(json!({"id": id, "text": tag, "label": null, "revision": "1"}));
             self.tags.insert(tag.to_owned(), image);
             self.slots.push(Slot::Tag(tag.to_owned()));
+            self.first("tag", tag);
             id
         };
         let image = object(json!({"id": mint(), "node_id": node_id, "tag_id": tag_id}));
@@ -635,7 +660,8 @@ impl<'a> Candidate<'a> {
         }
     }
 
-    /// An edge left active by this change has both endpoints active.
+    /// An edge left active by this change has both endpoints active, and a
+    /// `guidance_scope` edge starts at a `Guidance` node (contract §3).
     fn endpoints_active(&self, id: &str) -> Result<(), Stop> {
         let Some(edge) = self.edges.get(id) else {
             return Ok(());
@@ -644,20 +670,38 @@ impl<'a> Candidate<'a> {
             return Ok(());
         }
         for end in ["from_id", "to_id"] {
-            let active = self
-                .final_node(&text(&edge.after, end))
-                .is_some_and(|node| text(&node, "lifecycle") == "active");
-            if !active {
+            let node = self.final_node(&text(&edge.after, end));
+            let active = node
+                .as_ref()
+                .is_some_and(|node| text(node, "lifecycle") == "active");
+            let guidance = end != "from_id"
+                || text(&edge.after, "type") != "guidance_scope"
+                || node.is_some_and(|node| text(&node, "kind") == "Guidance");
+            if !active || !guidance {
                 return Err(Refusal::InvalidChange.into());
             }
         }
         Ok(())
     }
 
-    /// The active `contains` edges of the final candidate into `frontier`.
-    fn level(&self, frontier: &[String]) -> Vec<Image> {
+    /// The active `contains` edges of the final candidate into `frontier`,
+    /// reading at most `remaining + 1` of them (beyond those this change
+    /// replaces): more than `remaining` means the budget is exceeded.
+    fn level(&self, frontier: &[String], remaining: usize) -> Vec<Image> {
+        let replaced = self
+            .edges
+            .values()
+            .filter(|entry| {
+                entry.before.as_ref().is_some_and(|before| {
+                    text(before, "type") == "contains" && text(before, "lifecycle") == "active"
+                })
+            })
+            .count();
         let mut level: BTreeMap<String, Image> = BTreeMap::new();
-        for edge in self.state.contains_into(frontier) {
+        for edge in self
+            .state
+            .contains_into(frontier, remaining.saturating_add(1 + replaced))
+        {
             let id = text(&edge, "id");
             if !self.edges.contains_key(&id) {
                 level.insert(id, edge);
@@ -690,7 +734,7 @@ impl<'a> Candidate<'a> {
         let mut frontier = vec![parent];
         let mut depth = 0;
         loop {
-            let level = self.level(&frontier);
+            let level = self.level(&frontier, MAX_CONTAINMENT_EDGES.saturating_sub(*budget));
             if level.is_empty() {
                 return Ok(());
             }
@@ -715,16 +759,10 @@ impl<'a> Candidate<'a> {
 
     fn effects(&self) -> Result<Effects, Stop> {
         let mut ops = Vec::with_capacity(self.slots.len());
-        let mut affected = Vec::new();
         for slot in &self.slots {
             let (entity_type, operation, before, after) = match slot {
                 Slot::Node(id, operation) => {
                     let entry = self.nodes.get(id).ok_or(Refusal::InvalidChange)?;
-                    affected.push(json!({
-                        "entity_type": "node", "id": id,
-                        "revision": entry.after.get("revision"),
-                        "lifecycle_revision": entry.after.get("lifecycle_revision"),
-                    }));
                     (
                         EntityType::Node,
                         *operation,
@@ -734,10 +772,6 @@ impl<'a> Candidate<'a> {
                 }
                 Slot::Edge(id, operation) => {
                     let entry = self.edges.get(id).ok_or(Refusal::InvalidChange)?;
-                    affected.push(json!({
-                        "entity_type": "edge", "id": id,
-                        "revision": entry.after.get("revision"),
-                    }));
                     (
                         EntityType::Edge,
                         *operation,
@@ -747,9 +781,6 @@ impl<'a> Candidate<'a> {
                 }
                 Slot::Tag(tag) => {
                     let image = self.tags.get(tag).ok_or(Refusal::InvalidChange)?;
-                    affected.push(json!({
-                        "entity_type": "tag", "id": image.get("id"), "revision": "1",
-                    }));
                     (
                         EntityType::Tag,
                         Operation::Create,
@@ -795,8 +826,32 @@ impl<'a> Candidate<'a> {
         Ok(Effects {
             ops,
             delta_digest,
-            affected,
+            affected: self.affected()?,
         })
+    }
+
+    /// The receipt's `affected`, in order of first touch.
+    fn affected(&self) -> Result<Vec<Value>, Stop> {
+        self.order
+            .iter()
+            .map(|(kind, key)| {
+                Ok(match *kind {
+                    "node" => {
+                        let after = &self.nodes.get(key).ok_or(Refusal::InvalidChange)?.after;
+                        json!({"entity_type": "node", "id": key, "revision": after.get("revision"),
+                               "lifecycle_revision": after.get("lifecycle_revision")})
+                    }
+                    "edge" => {
+                        let after = &self.edges.get(key).ok_or(Refusal::InvalidChange)?.after;
+                        json!({"entity_type": "edge", "id": key, "revision": after.get("revision")})
+                    }
+                    _ => {
+                        let tag = self.tags.get(key).ok_or(Refusal::InvalidChange)?;
+                        json!({"entity_type": "tag", "id": tag.get("id"), "revision": "1"})
+                    }
+                })
+            })
+            .collect()
     }
 }
 
