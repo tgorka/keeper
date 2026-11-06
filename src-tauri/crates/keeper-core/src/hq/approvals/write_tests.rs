@@ -997,22 +997,34 @@ fn a_write_is_approved_only_through_its_card() {
     assert!(w.server.ops().is_empty());
 }
 
-/// DF-110-4 (P4's shape): an approval of one session naming a call another
-/// session made is no write of this one. Allow refuses and nothing is
-/// decided, consumed or written, though the approval, its digest and the
-/// call's args are otherwise exactly a write this device would make.
-#[test]
-fn an_approval_naming_another_sessions_call_writes_nothing() {
-    let w = world();
-    let digest = w.digest();
+/// The approval's call, as the server's rows hold it, moved to another
+/// session (P4's shape: an approval of this session naming a call of
+/// another), optionally renamed.
+fn call_of_another_session(w: &World, name: Option<&str>) {
+    let mut values = json!({"id": CALL_ID, "session_id": "dev1.other"});
+    if let Some(name) = name {
+        values["name"] = json!(name);
+    }
     w.server
         .inner
         .mutate(vec![RowOp::Patch {
             table: "tool_calls".to_owned(),
-            values: object(json!({"id": CALL_ID, "session_id": "dev1.other"})),
+            values: object(values),
             base_version: None,
         }])
         .expect("the call moves to another session");
+}
+
+/// DF-110-4, the write path: an approval naming another session's
+/// drive_write call is no write of this session. Allow refuses, and so does
+/// any decision that would approve it; nothing is decided, consumed or
+/// written, though the approval, its digest and the call's args are
+/// otherwise exactly a write this device would make.
+#[test]
+fn an_approval_naming_another_sessions_call_writes_nothing() {
+    let w = world();
+    let digest = w.digest();
+    call_of_another_session(&w, None);
     assert!(
         w.card().write.is_none(),
         "no write card for another session's call"
@@ -1026,8 +1038,6 @@ fn an_approval_naming_another_sessions_call_writes_nothing() {
         sessions::now_ms(),
     );
     assert!(refused.is_err(), "{refused:?}");
-    // Still a write, so a bare decision is refused as for any write: the
-    // approval cannot be approved as if it were some other request.
     let bare = approvals::decide(
         &w.ana,
         &w.decisions,
@@ -1036,11 +1046,55 @@ fn an_approval_naming_another_sessions_call_writes_nothing() {
         &digest,
         true,
         sessions::now_ms(),
-    )
-    .expect_err("refused");
-    assert_eq!(bare.0, ON_ITS_CARD);
+    );
+    assert!(bare.is_err(), "{bare:?}");
     assert!(w.server.ops().is_empty());
     assert_eq!(w.applied(), None);
+}
+
+/// DF-110-4, the card: another session's call — its args, its tool — never
+/// reaches this session's card, and the card offers no approval of it.
+#[test]
+fn an_approval_card_never_shows_another_sessions_call() {
+    let w = world();
+    call_of_another_session(&w, None);
+    let card = w.card();
+    assert_eq!(card.action, None);
+    assert!(!card.can_decide);
+    assert!(!card.actions.contains(&AgentApprovalActionVm::AllowOnce));
+    assert_ne!(card.tool_name, drive_write::TOOL);
+    let shown = serde_json::to_string(&card).expect("card");
+    assert!(!shown.contains(BEFORE_BLOB), "{shown}");
+}
+
+/// DF-110-4, ordinary decisions: an approval naming another session's call
+/// of any other tool is not approved here, and nothing is written.
+#[test]
+fn an_ordinary_approval_naming_another_sessions_call_is_not_approved() {
+    let w = world();
+    let digest = w.digest();
+    call_of_another_session(&w, Some("web_fetch"));
+    let approved = approvals::decide(
+        &w.ana,
+        &w.decisions,
+        SESSION,
+        APPROVAL,
+        &digest,
+        true,
+        sessions::now_ms(),
+    );
+    assert!(approved.is_err(), "{approved:?}");
+    assert!(w.server.ops().is_empty());
+}
+
+/// DF-110-4, classification: whether an approval is a write is read from
+/// its own session's call only.
+#[test]
+fn an_approval_is_a_write_only_by_its_own_sessions_call() {
+    let w = world();
+    assert!(Writes::is_write(&w.ana, APPROVAL));
+    call_of_another_session(&w, None);
+    assert!(!Writes::is_write(&w.ana, APPROVAL));
 }
 
 // ─── What the server answers later, and recovery ─────────────────────────────

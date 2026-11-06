@@ -206,12 +206,17 @@ pub struct AgentDecisionOutcomeVm {
     pub sentence: String,
 }
 
+/// An approval and its call. The call joins only from the approval's own
+/// session: another session's call is never shown, classified or decided
+/// under this approval, so an approval naming one reads as holding no action
+/// and is never approved here.
 const SELECT: &str = "SELECT a.id AS id, a.session_id AS session_id, a.tier AS tier, \
      a.binding_digest AS binding_digest, a.summary AS summary, a.approvers AS approvers, \
      a.state AS state, a.decided_by_actor AS decided_by_actor, a.decided_by_client AS decided_by_client, a.expires_at_ms AS expires_at_ms, \
      a.created_at_ms AS created_at_ms, a.grant_id AS grant_id, a._sync_version AS version, \
      t.id AS call_id, t.name AS tool_name, t.args AS args, t.turn_id AS turn_id \
-     FROM approvals a LEFT JOIN tool_calls t ON t.id = a.tool_call_id";
+     FROM approvals a LEFT JOIN tool_calls t \
+     ON t.id = a.tool_call_id AND t.session_id = a.session_id";
 
 fn state_of(row: &Map<String, Value>, now_ms: i64) -> AgentApprovalStateVm {
     match text(row, "state") {

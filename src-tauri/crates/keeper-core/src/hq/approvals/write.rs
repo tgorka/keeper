@@ -1482,11 +1482,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Writes {
-    /// Whether `approval` is a `drive_write` request, by its call here.
+    /// Whether `approval` is a `drive_write` request, by its own session's
+    /// call here.
     pub fn is_write(source: &Source, approval: &str) -> bool {
         !read(
             source,
-            "SELECT 1 AS one FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
+            "SELECT 1 AS one FROM approvals a JOIN tool_calls t \
+             ON t.id = a.tool_call_id AND t.session_id = a.session_id \
              WHERE a.id = ?1 AND t.name = ?2",
             &[Value::from(approval), Value::from(drive_write::TOOL)],
         )

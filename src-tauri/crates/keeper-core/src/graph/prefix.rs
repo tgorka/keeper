@@ -130,10 +130,19 @@ fn group(
             .map_err(|_| corrupt(after + 1, "graph position"))?;
         let group = by_event.remove(&header.id).unwrap_or_default();
         let count = u64::from(header.op_count);
+        // What no arriving row could make valid is corruption now: a count
+        // outside 1..=128, an ordinal at or past the count, more rows than
+        // the count. Only a group that may still complete is lag.
+        let bound = super::protocol::delta::MAX_OPERATIONS as u64;
+        if count == 0
+            || count > bound
+            || group.keys().any(|ordinal| *ordinal >= count)
+            || group.len() as u64 > count
+        {
+            return Err(corrupt(at, "operation set"));
+        }
         let event = if (group.len() as u64) < count {
             None
-        } else if (group.len() as u64) > count || group.keys().copied().ne(0..count) {
-            return Err(corrupt(at, "operation set"));
         } else {
             Some(Event {
                 event: header,
