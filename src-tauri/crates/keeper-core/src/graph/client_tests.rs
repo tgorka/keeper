@@ -457,8 +457,10 @@ mod answering {
         fn window_state(&self, base: &WindowBase) -> Result<WindowState, ReplicaError> {
             self.inner.window_state(base)
         }
-        fn set_presence(&self, scope_key: &str, doc: Option<Value>) -> Result<(), ReplicaError> {
-            self.inner.set_presence(scope_key, doc)
+        /// Presence stays withheld outside `hq` (`signals` guard): never
+        /// forwarded.
+        fn set_presence(&self, _: &str, _: Option<Value>) -> Result<(), ReplicaError> {
+            Err(ReplicaError::NotSyncing)
         }
         fn presence(&self, scope_key: &str) -> Result<Vec<Peer>, ReplicaError> {
             self.inner.presence(scope_key)
