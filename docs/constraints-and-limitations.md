@@ -313,11 +313,22 @@ against the sole `libsqlite3-sys`. The builder runs the pinned upstream schema D
 inside its host transaction; both roles verify the complete `sqlite_schema`. The query
 authorizer allows exactly the 41 `(table, column)` reads and 9 functions of the reviewed
 corpus; a retained statement re-prepares under that exact policy, and a denial fails the
-query. Process-wide admission (`keeper_core::graph::admission`): 4 query workers per agentd
-(2 headless), 2 per agent, 1 per context, one builder, at most 16 waiting, 3 s to admit.
-Query and inspection deadlines (3 s) and the build deadline (180 s) run from before spawn
-through exit and reap. A prefix longer than 100,000 events or an export over 1 GiB is an R1
-limit: `projection_unavailable`.
+query. Process-wide admission (`keeper_core::graph::admission`, one per process through
+`Admission::process`): 4 query workers per agentd (2 headless), 2 per agent, 1 per context
+whatever domain it reads, one builder, at most 16 waiting, 3 s to admit. A projection root
+keeps at most two published generations alive (`MAX_RETAINED_GENERATIONS`); a build is
+refused while two are referenced. A selected generation a worker refuses as unreadable is
+unselected and rebuilt from the accepted history on the next refresh. Query and inspection
+deadlines (3 s) and the build deadline (180 s) run from before spawn through exit and reap. A
+prefix longer than 100,000 events or an export over 1 GiB is an R1 limit:
+`projection_unavailable`.
+
+**Worker value admission (R6).** The builder admits every after-image with the reviewed 110.1
+rule, unchanged: nesting at most 16, finite numbers within ±2^53−1, strings at most 65,536
+bytes, arrays/objects at most 8,192 entries, keys at most 8,192 bytes, at most 128 KiB of
+canonical bytes per image; canonical bytes are serialized from the borrowed value (no
+normalized copy). A value the server accepted beyond these (e.g. a title over 64 KiB) makes
+the projection `projection_unavailable`: an R1 limit.
 
 ### Existing platform exceptions
 

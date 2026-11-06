@@ -222,6 +222,20 @@ fn runtime_ledger_fixture() {
     );
 }
 
+/// LOW-2: a cache entry naming another link of the verified inode (here a
+/// hard link in a world-writable directory) is refused.
+#[test]
+fn a_cache_entry_must_be_the_verified_path_itself() {
+    let f = Fixture::new();
+    let dir = f.at("/opt/w");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    std::fs::hard_link(f.at(&format!("{LIB}/libc.so.6")), dir.join("libc.so.6")).expect("link");
+    let mut ledger = f.ledger.clone();
+    ledger["ld_so_cache"]["entries"]["libc.so.6"] = json!("/opt/w/libc.so.6");
+    assert_eq!(f.verify(&ledger), Err("rootfs.cache_entry"));
+}
+
 #[test]
 fn a_parent_directory_writable_by_its_group_refuses() {
     let f = Fixture::new();

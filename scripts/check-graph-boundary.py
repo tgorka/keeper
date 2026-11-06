@@ -32,6 +32,17 @@ for target in ['aarch64-apple-ios', 'aarch64-linux-android']:
     reject(tree('keeper-graph-query', target), r'(rusqlite|libsqlite3-sys|cap|nix|rustix|landlock|seccompiler)')
 
 CRATES = ROOT / 'src-tauri/crates'
+# A person's graph reader (`human-reads`) is compiled only for keeper's own headless driver:
+# never a keeper-core default, and no other crate enables it (the agent runtime must never
+# obtain a HumanReader).
+core_manifest = (CRATES / 'keeper-core/Cargo.toml').read_text()
+defaults = re.search(r'^\[features\][^\[]*?^default\s*=\s*\[([^\]]*)\]', core_manifest, re.M | re.S)
+if defaults and 'human-reads' in defaults.group(1):
+    raise SystemExit('keeper-core enables human-reads by default')
+enablers = sorted(p.parent.name for p in CRATES.glob('*/Cargo.toml')
+                  if p.parent.name != 'keeper-core' and 'human-reads' in p.read_text())
+if enablers != ['keeper-graph-driver']:
+    raise SystemExit(f'human-reads enabled outside the headless driver: {enablers}')
 INVENTORY = {
     'keeper-graph-query/src/native.rs': {'register'},
     'keeper-graph-query/src/allocation.rs': {'install_sqlite', 'native_malloc', 'native_free', 'native_calloc',

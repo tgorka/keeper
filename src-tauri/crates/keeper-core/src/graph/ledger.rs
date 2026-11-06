@@ -323,6 +323,12 @@ impl Ledger {
             let soname = o.soname.as_deref().ok_or("ledger.objects")?;
             let entry = cache.entries.get(soname).ok_or("rootfs.cache_entry")?;
             let at = resolve(root, entry, &d.symlinks).map_err(|_| "rootfs.cache_entry")?;
+            // The path ld.so opens must be the verified object's own path
+            // (whose every parent is held to the ownership rule), not merely
+            // another name of its inode.
+            if at != o.resolved {
+                return Err("rootfs.cache_entry");
+            }
             let held = files
                 .iter()
                 .find(|f| f.resolved == o.resolved)

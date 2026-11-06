@@ -978,7 +978,32 @@ async fn revocation_before_delivery_suppresses_the_result() {
         before + 1,
         "the gate asked after the worker answered"
     );
-    // An epoch change between computation and delivery is not delivered either.
+    // MED-1: the refusal invalidated the reader: its next call is refused
+    // before any work, and no worker is spawned for it.
+    let peak = rig.admission.stats().peak_workers;
+    let asked = rig.server.refreshed.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        assert_eq!(
+            reader
+                .query(q, b"{}", Freshness::Current, &Cancellation::default())
+                .await
+                .err(),
+            Some(QueryError::Forbidden)
+        );
+    }
+    assert_eq!(
+        reader.refresh(&Cancellation::default()).await.err(),
+        Some(QueryError::Forbidden)
+    );
+    assert_eq!(rig.admission.stats().peak_workers, peak);
+    assert_eq!(
+        rig.server.refreshed.load(Ordering::SeqCst),
+        asked,
+        "nothing asked the server either"
+    );
+    // A new admission is a new reader; an epoch change between computation
+    // and delivery is not delivered by it either.
+    let reader = rig.reader();
     *rig.server.epoch.lock().expect("epoch") = "2".into();
     assert_eq!(
         reader
@@ -1155,4 +1180,44 @@ fn checkpoint_rows_decide_the_scope() {
     let mut first = all("active", true);
     first[0] = row("kg_events", "active", -1, true);
     assert_eq!(checkpoint_of(&first).scope, ScopeState::Pending);
+}
+
+/// B2: a selected generation a worker refuses as unreadable (here its
+/// `nodes` table is gone) is unselected, and the next refresh rebuilds it
+/// from the accepted history with exact rows.
+#[tokio::test(flavor = "current_thread")]
+async fn a_corrupt_selected_generation_is_rebuilt() {
+    let mut rig = Rig::new();
+    rig.world
+        .accept(vec![node(&ulid(1), "Concept", "kept", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    let q = "MATCH (n) RETURN n.title AS t LIMIT 1";
+    assert_eq!(rig.rows(&reader, q, "{}").await[0]["t"], json!("kept"));
+    let generation = std::fs::read_dir(&rig.root)
+        .expect("dir")
+        .map(|e| e.expect("e").path())
+        .find(|p| p.extension().is_some_and(|e| e == "db"))
+        .expect("generation");
+    let db = rusqlite::Connection::open(&generation).expect("open");
+    db.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE nodes;")
+        .expect("corrupt");
+    drop(db);
+    assert_eq!(
+        reader
+            .query(q, b"{}", Freshness::Current, &Cancellation::default())
+            .await
+            .err(),
+        Some(QueryError::Unavailable("worker.refused"))
+    );
+    let rebuilt = reader
+        .refresh(&Cancellation::default())
+        .await
+        .expect("rebuilt");
+    assert!(
+        rebuilt.built,
+        "the refused generation is not kept by the no-change shortcut"
+    );
+    assert_eq!(rig.rows(&reader, q, "{}").await[0]["t"], json!("kept"));
 }
