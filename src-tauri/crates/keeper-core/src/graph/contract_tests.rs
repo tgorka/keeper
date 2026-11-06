@@ -1,12 +1,157 @@
 //! The graph contract as keeper compiles it: the shared tag vectors under
-//! keeper's one tag policy, and the schema IR's graph scopes.
+//! keeper's one tag policy, the `graph.apply` payload rules and acceptance
+//! algebra (whose tags are canonical under that policy), and the schema
+//! IR's graph scopes.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
+use super::protocol::candidate::{self, State, Verdict};
+use super::protocol::change;
+use super::protocol::delta::Op;
 use super::protocol::scope::{CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, RECEIPT_TABLE};
 use super::protocol::SCHEMA_VERSION;
+use crate::notes::tags::normalise;
 
 const CORPUS: &str = include_str!("../../../../../syncular/knowledge-graph.vectors.json");
+
+/// `value` with every `{NAME}` of the entry's `fills` expanded.
+fn expand(value: &Value, fills: &Map<String, Value>) -> Value {
+    match value {
+        Value::String(text) => {
+            let mut text = text.clone();
+            for (name, fill) in fills {
+                let piece = fill["text"].as_str().expect("fill text").repeat(
+                    usize::try_from(fill["count"].as_u64().expect("count")).expect("count"),
+                );
+                text = text.replace(&format!("{{{name}}}"), &piece);
+            }
+            Value::String(text)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|i| expand(i, fills)).collect()),
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(k, v)| (k.clone(), expand(v, fills)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn entries(key: &str) -> Vec<Value> {
+    let corpus: Value = serde_json::from_str(CORPUS).expect("vectors");
+    let entries = corpus[key].as_array().expect(key).clone();
+    assert!(!entries.is_empty(), "{key}");
+    entries
+        .iter()
+        .map(|entry| match entry.get("fills") {
+            Some(Value::Object(fills)) => expand(entry, fills),
+            _ => entry.clone(),
+        })
+        .collect()
+}
+
+/// An accepted graph held as the vector's images.
+struct Images(Value);
+
+impl Images {
+    fn rows(&self, table: &str) -> impl Iterator<Item = &Map<String, Value>> {
+        self.0[table]
+            .as_array()
+            .expect(table)
+            .iter()
+            .map(|row| row.as_object().expect("image"))
+    }
+    fn find(&self, table: &str, key: &str, value: &str) -> Option<Map<String, Value>> {
+        self.rows(table).find(|row| row[key] == value).cloned()
+    }
+}
+
+impl State for Images {
+    fn node(&self, id: &str) -> Option<Map<String, Value>> {
+        self.find("nodes", "id", id)
+    }
+    fn edge(&self, id: &str) -> Option<Map<String, Value>> {
+        self.find("edges", "id", id)
+    }
+    fn tag(&self, text: &str) -> Option<Map<String, Value>> {
+        self.find("tags", "text", text)
+    }
+    fn membership(&self, node_id: &str, tag_id: &str) -> Option<Map<String, Value>> {
+        self.rows("node_tags")
+            .find(|row| row["node_id"] == node_id && row["tag_id"] == tag_id)
+            .cloned()
+    }
+    fn contains_into(&self, to_ids: &[String]) -> Vec<Map<String, Value>> {
+        self.rows("edges")
+            .filter(|row| {
+                row["type"] == "contains"
+                    && row["lifecycle"] == "active"
+                    && to_ids.iter().any(|id| row["to_id"] == id.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[test]
+fn change_vectors_parse_or_refuse() {
+    for entry in entries("changes") {
+        let id = entry["id"].as_str().expect("id");
+        let payload =
+            super::protocol::value::parse(entry["json"].as_str().expect("json").as_bytes())
+                .expect("payload JSON");
+        let parsed = change::parse(&payload, normalise);
+        match entry.get("refusal").and_then(Value::as_str) {
+            Some(code) => assert_eq!(parsed.map(|_| ()).map_err(|r| r.code()), Err(code), "{id}"),
+            None => {
+                let change = parsed.unwrap_or_else(|r| panic!("{id}: {r}"));
+                // What a client builds is what the server reads back.
+                assert_eq!(
+                    change::parse(&change.payload(), normalise),
+                    Ok(change),
+                    "{id}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn algebra_vectors_reproduce() {
+    for entry in entries("algebra") {
+        let id = entry["id"].as_str().expect("id");
+        let change = change::parse(&entry["payload"], normalise)
+            .unwrap_or_else(|r| panic!("{id}: payload {r}"));
+        let mut minted = entry["mint"]
+            .as_array()
+            .expect("mint")
+            .iter()
+            .map(|m| m.as_str().expect("minted id").to_owned());
+        let mut mint = || minted.next().expect("enough minted ids");
+        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &mut mint);
+        if let Some(code) = entry.get("refusal").and_then(Value::as_str) {
+            assert_eq!(
+                match verdict {
+                    Verdict::Refused(r) => Some(r.code()),
+                    _ => None,
+                },
+                Some(code),
+                "{id}"
+            );
+        } else if let Some(detail) = entry.get("conflict") {
+            assert_eq!(verdict, Verdict::Conflict(detail.clone()), "{id}");
+        } else {
+            let Verdict::Accepted(effects) = verdict else {
+                panic!("{id}: {verdict:?}");
+            };
+            let ops: Vec<Op> = serde_json::from_value(entry["ops"].clone()).expect("ops");
+            assert_eq!(effects.ops, ops, "{id}");
+            assert_eq!(effects.delta_digest, entry["delta_digest"], "{id}");
+            assert_eq!(Value::Array(effects.affected), entry["affected"], "{id}");
+        }
+    }
+}
 
 #[test]
 fn shared_tag_vectors_hold_under_the_notes_policy() {
