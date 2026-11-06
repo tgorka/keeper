@@ -303,6 +303,11 @@ impl GraphRequests {
         &self.source.database
     }
 
+    /// The replica boundary these requests go through.
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+
     /// The key of `request` sent to `descriptor` from this device, its
     /// digest computed here.
     pub fn key(&self, descriptor: &str, request: &Request) -> Result<RequestKey, Refusal> {
@@ -358,8 +363,38 @@ impl GraphRequests {
             "SELECT * FROM kg_receipts WHERE id = ?",
             &[Value::from(id.as_str())],
         )?;
+        self.own_receipt(&id, rows)
+    }
+
+    /// The receipt the server holds for `key`, asked through `graph.outcome`
+    /// (fresh authorisation first, on the server): for a request whose
+    /// receipt has not replicated, or after a restart. `context_id` is the
+    /// request's (null for a person's device).
+    pub fn remote_receipt(
+        &self,
+        key: &RequestKey,
+        context_id: Option<&str>,
+    ) -> Result<Option<Receipt>, GraphRequestError> {
+        if !self.owns(key) {
+            return Err(GraphRequestError::ForeignRequest);
+        }
+        let id = receipt_id(key.descriptor(), key.request_id(), key.client_scope());
+        let rows = self.source.replica.remote_query(
+            super::protocol::wire::OUTCOME,
+            super::protocol::wire::outcome_params(context_id, key.request_id()),
+        )?;
+        self.own_receipt(&id, rows)
+    }
+
+    /// The row whose id is `id` among `rows`, decoded under this database;
+    /// every other row is ignored.
+    fn own_receipt(
+        &self,
+        id: &str,
+        rows: Vec<Map<String, Value>>,
+    ) -> Result<Option<Receipt>, GraphRequestError> {
         for row in rows {
-            if row.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+            if row.get("id").and_then(Value::as_str) != Some(id) {
                 continue;
             }
             return Receipt::from_row(&self.source.database, &row)
@@ -381,12 +416,31 @@ impl GraphRequests {
         attempt: &Attempt,
         receipt: Option<&Receipt>,
     ) -> GraphOutcome {
+        self.decide(key, Some(attempt), receipt)
+    }
+
+    /// Resolve `key` from its `receipt` alone, with no attempt in hand (a
+    /// request sent before a restart): the receipt decides, and without one
+    /// the request stays pending under its id.
+    #[must_use]
+    pub fn settle(&self, key: &RequestKey, receipt: Option<&Receipt>) -> GraphOutcome {
+        self.decide(key, None, receipt)
+    }
+
+    fn decide(
+        &self,
+        key: &RequestKey,
+        attempt: Option<&Attempt>,
+        receipt: Option<&Receipt>,
+    ) -> GraphOutcome {
         if !self.owns(key) {
             return GraphOutcome::Pending {
                 reason: "another database's or client's request".to_owned(),
             };
         }
-        let attempt = (attempt.key == *key).then_some(&attempt.result);
+        let attempt = attempt
+            .filter(|attempt| attempt.key == *key)
+            .map(|attempt| &attempt.result);
         // The acknowledgement must name the request it was sent as.
         let own_commit = match attempt {
             Some(Ok(result)) if result.request_id == key.request_id() => Some(result.commit_seq),

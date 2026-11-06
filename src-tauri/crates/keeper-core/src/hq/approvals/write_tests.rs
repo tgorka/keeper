@@ -997,6 +997,52 @@ fn a_write_is_approved_only_through_its_card() {
     assert!(w.server.ops().is_empty());
 }
 
+/// DF-110-4 (P4's shape): an approval of one session naming a call another
+/// session made is no write of this one. Allow refuses and nothing is
+/// decided, consumed or written, though the approval, its digest and the
+/// call's args are otherwise exactly a write this device would make.
+#[test]
+fn an_approval_naming_another_sessions_call_writes_nothing() {
+    let w = world();
+    let digest = w.digest();
+    w.server
+        .inner
+        .mutate(vec![RowOp::Patch {
+            table: "tool_calls".to_owned(),
+            values: object(json!({"id": CALL_ID, "session_id": "dev1.other"})),
+            base_version: None,
+        }])
+        .expect("the call moves to another session");
+    assert!(
+        w.card().write.is_none(),
+        "no write card for another session's call"
+    );
+    let refused = w.writes.allow(
+        &w.ana,
+        &w.decisions,
+        SESSION,
+        APPROVAL,
+        &digest,
+        sessions::now_ms(),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    // Still a write, so a bare decision is refused as for any write: the
+    // approval cannot be approved as if it were some other request.
+    let bare = approvals::decide(
+        &w.ana,
+        &w.decisions,
+        SESSION,
+        APPROVAL,
+        &digest,
+        true,
+        sessions::now_ms(),
+    )
+    .expect_err("refused");
+    assert_eq!(bare.0, ON_ITS_CARD);
+    assert!(w.server.ops().is_empty());
+    assert_eq!(w.applied(), None);
+}
+
 // ─── What the server answers later, and recovery ─────────────────────────────
 
 /// The server answers neither the decision nor the consume in the wait:

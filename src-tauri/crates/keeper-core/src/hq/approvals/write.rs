@@ -927,12 +927,14 @@ struct Call {
     untrusted: bool,
 }
 
+/// An approval joins only a call of its own session: a call another session
+/// made is never carried out under this approval, whatever its id.
 const CALL: &str = "SELECT a.id AS id, a.session_id AS session_id, a.binding_digest AS digest, \
      a.state AS state, a.decided_by_client AS decided_by_client, \
      a.consumed_by_client AS consumed_by_client, \
      a._sync_version AS version, t.id AS call_id, t.turn_id AS turn_id, t.args AS args, \
      s.agent_actor AS agent_actor, s.trust AS trust, a.summary AS summary \
-     FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id \
+     FROM approvals a JOIN tool_calls t ON t.id = a.tool_call_id AND t.session_id = a.session_id \
      JOIN sessions s ON s.id = a.session_id";
 
 impl Call {
