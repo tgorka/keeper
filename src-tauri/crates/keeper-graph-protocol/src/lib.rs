@@ -4,16 +4,18 @@
 //! vocabulary ([`vocabulary`]), the reversible query symbols ([`symbol`]),
 //! canonical JSON values and typed references ([`value`]), request digests
 //! ([`request`]), the `graph.apply` payload ([`change`]) and what it does to
-//! a graph ([`candidate`]), event-operation digests ([`delta`]), the scope
-//! and key values of the graph tables ([`scope`]) and the reads' shapes
-//! ([`wire`]). `syncular/knowledge-graph.vectors.json` pins every rule here;
-//! keeper-hq's TypeScript validator reproduces the same vectors.
+//! a graph ([`candidate`]), stable content's revision rule ([`content`]),
+//! event-operation digests ([`delta`]), the scope and key values of the
+//! graph tables ([`scope`]) and the reads' shapes ([`wire`]).
+//! `syncular/knowledge-graph.vectors.json` pins every rule here; keeper-hq's
+//! TypeScript validator reproduces the same vectors.
 //!
 //! This crate owns no storage, transport or native code, and accepts nothing:
 //! acceptance is the server's graph command.
 
 pub mod candidate;
 pub mod change;
+pub mod content;
 pub mod delta;
 pub mod request;
 pub mod scope;

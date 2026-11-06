@@ -1,5 +1,5 @@
 {
-  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times.",
+  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1. changes[]: a graph.apply payload (json text) the change rules accept, or refuse with a code. algebra[]: an accepted pre-change state (images), a payload and the ids the server mints in order; the event's operations, delta_digest and the receipt's affected list, or the conflict detail, or a refusal. contents[]: stable content's revision rule at the type level: a content image, an update, and its one update operation with delta_digest, or the conflict detail, or a refusal. An entry with fills {NAME: {text,count}} replaces every \"{NAME}\" inside any of its strings with text repeated count times.",
   "contract_version": 1,
   "schema_version": 6,
   "profile": "KG-Cypher/1",
@@ -1285,6 +1285,25 @@
       "id": "tag-revision-on-created-node",
       "json": "{\"ops\":[{\"description\":null,\"id\":\"01JE0000000000000000000001\",\"kind\":\"Concept\",\"op\":\"create_node\",\"properties\":{},\"title\":\"N\"},{\"expected_revision\":\"1\",\"node_id\":\"01JE0000000000000000000001\",\"op\":\"add_tag\",\"tag\":\"a\"}]}",
       "refusal": "invalid_change"
+    },
+    {
+      "id": "update-set-extra-member",
+      "json": "{\"ops\":[{\"expected_revision\":\"1\",\"id\":\"01JE0000000000000000000001\",\"op\":\"update_node\",\"set\":{\"op\":\"unexpected\",\"title\":\"x\"}}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "edge-before-endpoints-created",
+      "json": "{\"ops\":[{\"from_id\":\"01JE0000000000000000000001\",\"from_lifecycle_revision\":\"1\",\"id\":\"01JE0000000000000000000003\",\"op\":\"create_edge\",\"properties\":{},\"to_id\":\"01JE0000000000000000000002\",\"to_lifecycle_revision\":\"1\",\"type\":\"test:rel\"},{\"description\":null,\"id\":\"01JE0000000000000000000001\",\"kind\":\"Concept\",\"op\":\"create_node\",\"properties\":{},\"title\":\"N\"},{\"description\":null,\"id\":\"01JE0000000000000000000002\",\"kind\":\"Concept\",\"op\":\"create_node\",\"properties\":{},\"title\":\"N\"}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "edges-disagree-on-endpoint-lifecycle",
+      "json": "{\"ops\":[{\"from_id\":\"01JE0000000000000000000001\",\"from_lifecycle_revision\":\"1\",\"id\":\"01JE0000000000000000000003\",\"op\":\"create_edge\",\"properties\":{},\"to_id\":\"01JE0000000000000000000002\",\"to_lifecycle_revision\":\"1\",\"type\":\"test:rel\"},{\"from_id\":\"01JE0000000000000000000001\",\"from_lifecycle_revision\":\"2\",\"id\":\"01JE0000000000000000000004\",\"op\":\"create_edge\",\"properties\":{},\"to_id\":\"01JE0000000000000000000002\",\"to_lifecycle_revision\":\"1\",\"type\":\"test:rel\"}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "edges-agree-on-endpoint-lifecycle",
+      "json": "{\"ops\":[{\"from_id\":\"01JE0000000000000000000001\",\"from_lifecycle_revision\":\"2\",\"id\":\"01JE0000000000000000000003\",\"op\":\"create_edge\",\"properties\":{},\"to_id\":\"01JE0000000000000000000002\",\"to_lifecycle_revision\":\"1\",\"type\":\"test:rel\"},{\"from_id\":\"01JE0000000000000000000001\",\"from_lifecycle_revision\":\"2\",\"id\":\"01JE0000000000000000000004\",\"op\":\"create_edge\",\"properties\":{},\"to_id\":\"01JE0000000000000000000002\",\"to_lifecycle_revision\":\"1\",\"type\":\"test:rel\"},{\"expected_revision\":\"5\",\"id\":\"01JE0000000000000000000001\",\"op\":\"update_node\",\"set\":{\"title\":\"x\"}}]}"
     },
     {
       "id": "approval-id-empty",
@@ -9495,6 +9514,18 @@
             "title": "T",
             "description": null,
             "description_source_id": null,
+            "properties": { "big": "{F1}" },
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          },
+          {
+            "id": "01JE0000000000000000007034",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "description_source_id": null,
             "properties": { "big": "{F2}" },
             "lifecycle": "active",
             "merged_into_id": null,
@@ -9710,6 +9741,12 @@
           {
             "op": "update_node",
             "id": "01JE0000000000000000007033",
+            "expected_revision": "1",
+            "set_properties": { "big": 0 }
+          },
+          {
+            "op": "update_node",
+            "id": "01JE0000000000000000007034",
             "expected_revision": "1",
             "set_properties": { "big": 0 }
           }
@@ -10785,7 +10822,7 @@
             "title": "T",
             "description": null,
             "description_source_id": null,
-            "properties": { "big": "{F2}" },
+            "properties": { "big": "{F1}" },
             "lifecycle": "active",
             "merged_into_id": null,
             "revision": "1",
@@ -10803,9 +10840,41 @@
             "revision": "2",
             "lifecycle_revision": "1"
           }
+        },
+        {
+          "ordinal": 34,
+          "entity_type": "node",
+          "entity_id": "01JE0000000000000000007034",
+          "operation": "update",
+          "before_revision": "1",
+          "after_revision": "2",
+          "before_value": {
+            "id": "01JE0000000000000000007034",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "description_source_id": null,
+            "properties": { "big": "{F2}" },
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          },
+          "after_value": {
+            "id": "01JE0000000000000000007034",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "description_source_id": null,
+            "properties": { "big": 0 },
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "2",
+            "lifecycle_revision": "1"
+          }
         }
       ],
-      "delta_digest": "14015165c22daf1cd0277ea38cbfbd309aed5d810d003419cf0aa6d02b5e9966",
+      "delta_digest": "14cf827b34bb1c3e50f5f8a62a136a7d559be539ecd2b2384bff12c5acae12f0",
       "affected": [
         {
           "entity_type": "node",
@@ -11010,9 +11079,15 @@
           "id": "01JE0000000000000000007033",
           "revision": "2",
           "lifecycle_revision": "1"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JE0000000000000000007034",
+          "revision": "2",
+          "lifecycle_revision": "1"
         }
       ],
-      "fills": { "F1": { "text": "a", "count": 60000 }, "F2": { "text": "a", "count": 96455 } }
+      "fills": { "F1": { "text": "a", "count": 60000 }, "F2": { "text": "a", "count": 35846 } }
     },
     {
       "id": "delta-over-2-mib",
@@ -11420,6 +11495,18 @@
             "title": "T",
             "description": null,
             "description_source_id": null,
+            "properties": { "big": "{F1}" },
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          },
+          {
+            "id": "01JE0000000000000000007034",
+            "kind": "Concept",
+            "title": "T",
+            "description": null,
+            "description_source_id": null,
             "properties": { "big": "{F2}" },
             "lifecycle": "active",
             "merged_into_id": null,
@@ -11637,11 +11724,17 @@
             "id": "01JE0000000000000000007033",
             "expected_revision": "1",
             "set_properties": { "big": 0 }
+          },
+          {
+            "op": "update_node",
+            "id": "01JE0000000000000000007034",
+            "expected_revision": "1",
+            "set_properties": { "big": 0 }
           }
         ]
       },
       "refusal": "change_limit",
-      "fills": { "F1": { "text": "a", "count": 60000 }, "F2": { "text": "a", "count": 96456 } }
+      "fills": { "F1": { "text": "a", "count": 60000 }, "F2": { "text": "a", "count": 35847 } }
     },
     {
       "id": "merged-properties-at-64-kib",
@@ -11754,6 +11847,484 @@
       },
       "refusal": "change_limit",
       "fills": { "F1": { "text": "o", "count": 40000 }, "F2": { "text": "n", "count": 25518 } }
+    },
+    {
+      "id": "guidance-scope-from-concept",
+      "state": {
+        "nodes": [
+          {
+            "id": "01JE0000000000000000009000",
+            "kind": "Concept",
+            "title": "Not guidance",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          },
+          {
+            "id": "01JE0000000000000000009001",
+            "kind": "Concept",
+            "title": "Subject",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          }
+        ],
+        "edges": [],
+        "tags": [],
+        "node_tags": []
+      },
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "op": "create_edge",
+            "id": "01JE0000000000000000009002",
+            "from_id": "01JE0000000000000000009000",
+            "to_id": "01JE0000000000000000009001",
+            "type": "guidance_scope",
+            "properties": {},
+            "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"
+          }
+        ]
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "guidance-scope-from-guidance",
+      "state": {
+        "nodes": [
+          {
+            "id": "01JE0000000000000000009000",
+            "kind": "Guidance",
+            "title": "Guide",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          },
+          {
+            "id": "01JE0000000000000000009001",
+            "kind": "Concept",
+            "title": "Subject",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "1",
+            "lifecycle_revision": "1"
+          }
+        ],
+        "edges": [],
+        "tags": [],
+        "node_tags": []
+      },
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "op": "create_edge",
+            "id": "01JE0000000000000000009002",
+            "from_id": "01JE0000000000000000009000",
+            "to_id": "01JE0000000000000000009001",
+            "type": "guidance_scope",
+            "properties": {},
+            "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"
+          }
+        ]
+      },
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "edge",
+          "entity_id": "01JE0000000000000000009002",
+          "operation": "create",
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "id": "01JE0000000000000000009002",
+            "from_id": "01JE0000000000000000009000",
+            "to_id": "01JE0000000000000000009001",
+            "type": "guidance_scope",
+            "properties": {},
+            "lifecycle": "active",
+            "revision": "1"
+          }
+        }
+      ],
+      "delta_digest": "0edcbe1d15a893ea7995bc2eadf1747cc91c60cd553d84fb5c9c3b6b792f4999",
+      "affected": [{ "entity_type": "edge", "id": "01JE0000000000000000009002", "revision": "1" }]
+    },
+    {
+      "id": "tag-before-explicit-update",
+      "state": {
+        "nodes": [
+          {
+            "id": "01JE0000000000000000009100",
+            "kind": "Concept",
+            "title": "Before",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "2",
+            "lifecycle_revision": "1"
+          }
+        ],
+        "edges": [],
+        "tags": [],
+        "node_tags": []
+      },
+      "mint": ["01JE0000000000000000009101", "01JE0000000000000000009102"],
+      "payload": {
+        "ops": [
+          {
+            "op": "add_tag",
+            "node_id": "01JE0000000000000000009100",
+            "tag": "beta",
+            "expected_revision": "2"
+          },
+          {
+            "op": "update_node",
+            "id": "01JE0000000000000000009100",
+            "expected_revision": "2",
+            "set": { "title": "After" }
+          }
+        ]
+      },
+      "ops": [
+        {
+          "ordinal": 0,
+          "entity_type": "tag",
+          "entity_id": "01JE0000000000000000009101",
+          "operation": "create",
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "id": "01JE0000000000000000009101",
+            "text": "beta",
+            "label": null,
+            "revision": "1"
+          }
+        },
+        {
+          "ordinal": 1,
+          "entity_type": "node_tag",
+          "entity_id": "01JE0000000000000000009102",
+          "operation": "create",
+          "before_revision": null,
+          "after_revision": null,
+          "before_value": null,
+          "after_value": {
+            "id": "01JE0000000000000000009102",
+            "node_id": "01JE0000000000000000009100",
+            "tag_id": "01JE0000000000000000009101"
+          }
+        },
+        {
+          "ordinal": 2,
+          "entity_type": "node",
+          "entity_id": "01JE0000000000000000009100",
+          "operation": "update",
+          "before_revision": "2",
+          "after_revision": "3",
+          "before_value": {
+            "id": "01JE0000000000000000009100",
+            "kind": "Concept",
+            "title": "Before",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "2",
+            "lifecycle_revision": "1"
+          },
+          "after_value": {
+            "id": "01JE0000000000000000009100",
+            "kind": "Concept",
+            "title": "After",
+            "description": null,
+            "description_source_id": null,
+            "properties": {},
+            "lifecycle": "active",
+            "merged_into_id": null,
+            "revision": "3",
+            "lifecycle_revision": "1"
+          }
+        }
+      ],
+      "delta_digest": "fc78eba6c1c3c406e948548180bbb2ae4599561377a290cfea41d7965b6a1743",
+      "affected": [
+        {
+          "entity_type": "node",
+          "id": "01JE0000000000000000009100",
+          "revision": "3",
+          "lifecycle_revision": "1"
+        },
+        { "entity_type": "tag", "id": "01JE0000000000000000009101", "revision": "1" }
+      ]
+    }
+  ],
+  "contents": [
+    {
+      "id": "inline-update",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": { "inline_text": "new" }
+      },
+      "op": {
+        "ordinal": 0,
+        "entity_type": "content",
+        "entity_id": "01JE0000000000000000009500",
+        "operation": "update",
+        "before_revision": "4",
+        "after_revision": "5",
+        "before_value": {
+          "id": "01JE0000000000000000009500",
+          "owner_node_id": "01JE0000000000000000009501",
+          "revision": "4",
+          "body": { "inline_text": "old" }
+        },
+        "after_value": {
+          "id": "01JE0000000000000000009500",
+          "owner_node_id": "01JE0000000000000000009501",
+          "revision": "5",
+          "body": { "inline_text": "new" }
+        }
+      },
+      "delta_digest": "58dc2bba4268d34927a696563c5ea254a94da200bbdf31b61357609888635b1d"
+    },
+    {
+      "id": "inline-to-reference",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": {
+          "reference": {
+            "resource_node_id": "01JE0000000000000000009502",
+            "observed_revision": "7"
+          }
+        }
+      },
+      "op": {
+        "ordinal": 0,
+        "entity_type": "content",
+        "entity_id": "01JE0000000000000000009500",
+        "operation": "update",
+        "before_revision": "4",
+        "after_revision": "5",
+        "before_value": {
+          "id": "01JE0000000000000000009500",
+          "owner_node_id": "01JE0000000000000000009501",
+          "revision": "4",
+          "body": { "inline_text": "old" }
+        },
+        "after_value": {
+          "id": "01JE0000000000000000009500",
+          "owner_node_id": "01JE0000000000000000009501",
+          "revision": "5",
+          "body": {
+            "reference": {
+              "resource_node_id": "01JE0000000000000000009502",
+              "observed_revision": "7"
+            }
+          }
+        }
+      },
+      "delta_digest": "1eb5c9e101fb8b6a3cd2452c8df48482d8195a074a76d484a148fac7bdf0a6b3"
+    },
+    {
+      "id": "stale-revision",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "3",
+        "body": { "inline_text": "new" }
+      },
+      "conflict": {
+        "entity": { "entity_type": "content", "id": "01JE0000000000000000009500" },
+        "precondition": "revision",
+        "current_revision": "4"
+      }
+    },
+    {
+      "id": "owner-changes",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009503",
+        "expected_revision": "4",
+        "body": { "inline_text": "new" }
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "id-changes",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009504",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": { "inline_text": "new" }
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "two-bodies",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": {
+          "inline_text": "a",
+          "reference": {
+            "resource_node_id": "01JE0000000000000000009502",
+            "observed_revision": null
+          }
+        }
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "reference-bad-node",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": { "reference": { "resource_node_id": "x", "observed_revision": null } }
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "extra-member",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": { "inline_text": "a" },
+        "revision": "9"
+      },
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "inline-at-32-kib",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": { "inline_text": "{F1}" }
+      },
+      "op": {
+        "ordinal": 0,
+        "entity_type": "content",
+        "entity_id": "01JE0000000000000000009500",
+        "operation": "update",
+        "before_revision": "4",
+        "after_revision": "5",
+        "before_value": {
+          "id": "01JE0000000000000000009500",
+          "owner_node_id": "01JE0000000000000000009501",
+          "revision": "4",
+          "body": { "inline_text": "old" }
+        },
+        "after_value": {
+          "id": "01JE0000000000000000009500",
+          "owner_node_id": "01JE0000000000000000009501",
+          "revision": "5",
+          "body": { "inline_text": "{F1}" }
+        }
+      },
+      "delta_digest": "43a87fc9c88fe0d86fecbba0ae1d01a8012c9ca9c4c9178ad939b3149ad3ada4",
+      "fills": { "F1": { "text": "x", "count": 32768 } }
+    },
+    {
+      "id": "inline-over-32-kib",
+      "before": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "revision": "4",
+        "body": { "inline_text": "old" }
+      },
+      "update": {
+        "id": "01JE0000000000000000009500",
+        "owner_node_id": "01JE0000000000000000009501",
+        "expected_revision": "4",
+        "body": { "inline_text": "{F1}" }
+      },
+      "refusal": "change_limit",
+      "fills": { "F1": { "text": "x", "count": 32769 } }
     }
   ]
 }
