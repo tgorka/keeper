@@ -1,0 +1,31 @@
+[package]
+name = "keeper-graph-query"
+description = "The separate single-use confined graph worker: builds and queries immutable GraphQLite generations"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+keeper-graph-protocol = { path = "../keeper-graph-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled"] }
+# `stats` only adds relaxed counters (max/total) inside the same audited alloc paths.
+cap = { version = "=0.1.2", features = ["stats"] }
+nix = { version = "=0.31.3", default-features = false, features = ["resource"] }
+# `thread`, `stdio`: the execution-class self-check reads `no_new_privs` (prctl)
+# and writes its fixed refusal label without allocating (OD-A delta §4.4 step 8).
+rustix = { version = "=1.1.4", features = ["process", "fs", "thread", "stdio"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
+
+[build-dependencies]
+cc = "1"
