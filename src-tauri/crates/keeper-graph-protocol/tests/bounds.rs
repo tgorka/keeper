@@ -207,6 +207,11 @@ fn a_history_page_outside_its_bounds_is_refused_before_its_events_are_read() {
 /// One whole valid event at position 1 whose header's `origin_chain` holds
 /// `pad` bytes of text, and its `ops` repeated `copies` times (renumbered).
 fn event(pad: usize, copies: usize) -> Value {
+    event_at(1, pad, copies)
+}
+
+/// [`event`] at graph position `seq`.
+fn event_at(seq: u64, pad: usize, copies: usize) -> Value {
     use keeper_graph_protocol::delta::{digest, Op};
     use keeper_graph_protocol::vocabulary::{EntityType, Operation};
     let ops: Vec<Op> = (0..copies)
@@ -224,7 +229,7 @@ fn event(pad: usize, copies: usize) -> Value {
     let delta = digest(&ops[..ops.len().min(128)]).unwrap_or_default();
     json!({
         "event": {
-            "id": P, "graph_seq": "1", "descriptor": "graph.apply", "request_id": X,
+            "id": P, "graph_seq": seq.to_string(), "descriptor": "graph.apply", "request_id": X,
             "request_digest": "0".repeat(64), "actor_id": "ana", "client_id": "dev1",
             "origin_class": "agent", "origin_actor": "ana",
             "origin_chain": [{"session_id": "x".repeat(pad), "agent_actor": "nixi"}],
@@ -275,4 +280,55 @@ fn the_first_event_of_a_page_is_held_to_its_row_and_group_bounds() {
         decode_history("0", 1, one_event_page(event(0, 129))),
         Err(Refusal::UnsupportedVersion)
     );
+}
+
+fn entry_bytes(event: &Value) -> usize {
+    keeper_graph_protocol::value::canonical(event)
+        .map(|b| b.len())
+        .unwrap_or(0)
+}
+
+/// A page whose events after the first total exactly 4 MiB plus `over`
+/// bytes, each counted as the server counts it: the canonical bytes of the
+/// whole `{"event":…,"ops":…}` entry.
+fn page_over(over: usize) -> (Vec<Map<String, Value>>, usize) {
+    use keeper_graph_protocol::wire::MAX_HISTORY_PAGE_BYTES;
+    let mut events = vec![event_at(1, 0, 1)];
+    let (mut total, mut seq) = (0usize, 2u64);
+    loop {
+        let full = event_at(seq, 120_000, 1);
+        let size = entry_bytes(&full);
+        // Leave room for a last event of at least its bare size.
+        if total + size + entry_bytes(&event_at(seq + 1, 0, 1)) + over > MAX_HISTORY_PAGE_BYTES {
+            break;
+        }
+        total += size;
+        events.push(full);
+        seq += 1;
+    }
+    let bare = entry_bytes(&event_at(seq, 0, 1));
+    let last = event_at(seq, MAX_HISTORY_PAGE_BYTES - total - bare + over, 1);
+    total += entry_bytes(&last);
+    events.push(last);
+    let row = json!({"events": events, "scanned_through": seq.to_string()});
+    (vec![row.as_object().cloned().unwrap_or_default()], total)
+}
+
+#[test]
+fn the_page_budget_counts_each_whole_entry_after_the_first() {
+    use keeper_graph_protocol::wire::MAX_HISTORY_PAGE_BYTES;
+    let (page, total) = page_over(0);
+    assert_eq!(total, MAX_HISTORY_PAGE_BYTES);
+    assert!(decode_history("0", 100, page).is_ok());
+    // One byte over, and 34 over: the two 17-byte entry wrappers a count of
+    // header and operations alone would miss.
+    for over in [1, 34] {
+        let (page, total) = page_over(over);
+        assert_eq!(total, MAX_HISTORY_PAGE_BYTES + over);
+        assert_eq!(
+            decode_history("0", 100, page),
+            Err(Refusal::UnsupportedVersion),
+            "{over}"
+        );
+    }
 }

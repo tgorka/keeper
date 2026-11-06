@@ -318,7 +318,9 @@ pub const MAX_EVENT_HEADER_BYTES: usize = delta::MAX_OPERATION_BYTES;
 /// and nothing else, a header within [`MAX_EVENT_HEADER_BYTES`], 1 to
 /// [`delta::MAX_OPERATIONS`] operations each within
 /// [`delta::MAX_OPERATION_BYTES`] and together within
-/// [`delta::MAX_DELTA_BYTES`]. Its canonical bytes.
+/// [`delta::MAX_DELTA_BYTES`]. Its size for the page budget: the canonical
+/// bytes of the whole entry, `{"event":…,"ops":…}` wrapper included, as the
+/// server counts it.
 fn raw_event(event: &Value) -> Result<usize, Refusal> {
     let refuse = || Refusal::UnsupportedVersion;
     let fields = event.as_object().ok_or_else(refuse)?;
@@ -330,8 +332,7 @@ fn raw_event(event: &Value) -> Result<usize, Refusal> {
     if !header.is_object() || ops.is_empty() || ops.len() > delta::MAX_OPERATIONS {
         return Err(refuse());
     }
-    let header = canonical(header).map_err(|_| refuse())?.len();
-    if header > MAX_EVENT_HEADER_BYTES {
+    if canonical(header).map_err(|_| refuse())?.len() > MAX_EVENT_HEADER_BYTES {
         return Err(refuse());
     }
     let mut delta = 2 + ops.len() - 1;
@@ -342,7 +343,7 @@ fn raw_event(event: &Value) -> Result<usize, Refusal> {
             return Err(refuse());
         }
     }
-    Ok(header + delta)
+    Ok(canonical(event).map_err(|_| refuse())?.len())
 }
 
 /// Decode [`HISTORY`]'s answer to a page of at most `limit` events after
