@@ -494,14 +494,16 @@ fn command(source: &Source, operation: &str, session_id: &str, actor: &str) -> R
                 },
             );
         }
-        // The server's answer: applied, replayed or refused.
-        Ok(_) | Err(ReplicaError::Remote { .. }) => {
+        // The server's answer: applied, replayed, refused or rejected.
+        Ok(_) | Err(ReplicaError::Remote { .. } | ReplicaError::Rejected { .. }) => {
             lock(&UNHEARD).remove(&key);
         }
         // Nothing was sent: an earlier unheard request stays as it was.
         Err(ReplicaError::NotSyncing | ReplicaError::Closed | ReplicaError::Client(_)) => {}
     }
-    answer.map_err(|error| command_sentence(&source.database, &error))
+    answer
+        .map(|_| ())
+        .map_err(|error| command_sentence(&source.database, &error))
 }
 
 /// Why a command failed, by the server's stable code (and, for
@@ -521,7 +523,9 @@ fn command_sentence(database: &str, error: &ReplicaError) -> String {
         ReplicaError::Unheard { code, message, .. } => format!(
             "keeper could not read {database}'s answer ({code}: {message}), so it does not know whether the change was made, and it will not ask again by itself. Once keeper and the server understand each other again (an update of either), asking again asks about this same change, which the server never makes twice."
         ),
-        ReplicaError::Remote { code, message, .. } if code == "operation.forbidden" => {
+        ReplicaError::Remote { code, message, .. } | ReplicaError::Rejected { code, message }
+            if code == "operation.forbidden" =>
+        {
             match message.as_str() {
                 "hq.remove_member.not_owner" => {
                     "The server refused: only the session's owner changes who is in it.".to_owned()

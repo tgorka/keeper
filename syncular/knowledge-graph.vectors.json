@@ -1,0 +1,1118 @@
+{
+  "about": "Keeper's knowledge-graph contract vectors (syncular/README.md, The knowledge graph). Every implementation must reproduce each entry. Expansion: an entry with fill {text,count} replaces the one \"{FILL}\" in its json text (or in a string of its ops) with text repeated count times; an entry with repeat n uses n copies of its single op, with ordinals 0..n-1.",
+  "contract_version": 1,
+  "schema_version": 6,
+  "profile": "KG-Cypher/1",
+  "vocabulary": {
+    "kinds": ["Concept", "Collection", "Resource", "Tag", "Guidance"],
+    "relations": ["HAS_TAG", "contains", "guidance_scope", "sources"],
+    "node_fields": [
+      "id",
+      "kind",
+      "title",
+      "description",
+      "description_source_id",
+      "lifecycle",
+      "lifecycle_revision",
+      "revision",
+      "merged_into_id"
+    ],
+    "edge_fields": ["id", "from_id", "to_id", "type", "lifecycle", "revision"],
+    "tag_fields": ["id", "text"],
+    "lifecycles": ["active", "archived"],
+    "entity_types": ["node", "edge", "tag", "node_tag", "content", "review"],
+    "operations": ["create", "update", "archive", "unarchive", "remove"],
+    "origin_classes": ["human", "agent"],
+    "outcomes": ["accepted", "proposed", "conflict", "rejected"],
+    "errors": [
+      "unauthorised",
+      "forbidden",
+      "unsupported_version",
+      "invalid_change",
+      "change_limit",
+      "revision_conflict",
+      "idempotency_mismatch",
+      "proposal_stale",
+      "reversal_conflict",
+      "query_unsupported",
+      "query_limit",
+      "query_cancelled",
+      "projection_unavailable",
+      "projection_stale",
+      "sync_pending",
+      "storage_unavailable"
+    ]
+  },
+  "scopes": {
+    "graph_variable": "kg_graph",
+    "client_variable": "kg_client",
+    "graph_tables": [
+      "kg_events",
+      "kg_event_ops",
+      "kg_head",
+      "kg_nodes",
+      "kg_edges",
+      "kg_tags",
+      "kg_node_tags"
+    ],
+    "receipt_table": "kg_receipts"
+  },
+  "values": [
+    {
+      "id": "utf16-key-order",
+      "json": "{\"2\":2,\"10\":1,\"€\":3,\"\\r\":4,\"😀\":5,\"דּ\":6,\"\\u0080\":7,\"ö\":8}",
+      "canonical": "{\"\\r\":4,\"10\":1,\"2\":2,\"\":7,\"ö\":8,\"€\":3,\"😀\":5,\"דּ\":6}",
+      "sha256": "d70b12050bcbba7d7f50d7bf41137194f320e26a165920a4eacf39f92832987b"
+    },
+    {
+      "id": "number-equivalence",
+      "json": "[1,1.0,1e0,10e-1,-0,-0.0,0e5]",
+      "canonical": "[1,1,1,1,0,0,0]",
+      "sha256": "a1a537fbf7f83a9fee9ab9131af5f7c30fc263f43cce11e2fdb645861a622f9c"
+    },
+    {
+      "id": "ecmascript-number-format",
+      "json": "[1e-7,0.000001,333333333.33333329,1e15,123456789012.5,-1.5e-10,4.35]",
+      "canonical": "[1e-7,0.000001,333333333.3333333,1000000000000000,123456789012.5,-1.5e-10,4.35]",
+      "sha256": "1e61c710e09e2dabfaa394278cb133ecd6225b2b4d27aace49311830783ba1ed"
+    },
+    {
+      "id": "ecmascript-exponent-beyond-boundary",
+      "json": "[1e21]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "smallest-subnormal",
+      "json": "[5e-324,-5e-324]",
+      "canonical": "[5e-324,-5e-324]",
+      "sha256": "39cd7d1a8ced55e3c0f57779c09f31a0e7bf7f973e75e57b7b6bef623da6d2c2"
+    },
+    {
+      "id": "exact-application-boundary",
+      "json": "[9007199254740991,-9007199254740991,9007199254740991.0]",
+      "canonical": "[9007199254740991,-9007199254740991,9007199254740991]",
+      "sha256": "503c60bc73dd46849464f6a7d987d0388f9c3bf535cb1e28361762bde4483c17"
+    },
+    {
+      "id": "string-escapes",
+      "json": "[\"\\u0000\\u001f\\b\\t\\n\\f\\r\\\"\\\\/\",\"\\u2028\",\"é\"]",
+      "canonical": "[\"\\u0000\\u001f\\b\\t\\n\\f\\r\\\"\\\\/\",\" \",\"é\"]",
+      "sha256": "7e02257417f10c8a47cbd872ea4f5e0f4a8c3d0d1759e06bf891fa524979c28d"
+    },
+    {
+      "id": "deepest-document",
+      "json": "[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]",
+      "canonical": "[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]",
+      "sha256": "9b2a8ab6a59558df94b6e6f4553b85707915a5d96a03a4ae749f05fd4cea2ef2"
+    },
+    {
+      "id": "nested-mixed",
+      "json": "{\"b\":[true,false,null,{\"y\":\"1\",\"x\":[]}],\"a\":{}}",
+      "canonical": "{\"a\":{},\"b\":[true,false,null,{\"x\":[],\"y\":\"1\"}]}",
+      "sha256": "3055222a5e358d938d694e9a51828e8bf9bf40724635703fbbb0ff6c19954f3a"
+    },
+    {
+      "id": "outside-application-boundary",
+      "json": "[9007199254740992]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "outside-application-boundary-negative",
+      "json": "[-9007199254740992]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "outside-application-boundary-float",
+      "json": "[1.7976931348623157e308]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "not-an-integer-boundary",
+      "json": "[9007199254740991.5]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "duplicate-key",
+      "json": "{\"a\":1,\"a\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "nested-duplicate-key",
+      "json": "{\"a\":{\"b\":1,\"b\":2}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "lone-surrogate",
+      "json": "[\"\\ud800\"]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "trailing-garbage",
+      "json": "{\"a\":1} x",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "nan-literal",
+      "json": "[NaN]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "too-deep",
+      "json": "[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]",
+      "refusal": "change_limit"
+    }
+  ],
+  "properties": [
+    {
+      "id": "empty",
+      "json": "{}"
+    },
+    {
+      "id": "custom-keys",
+      "json": "{\"score\":1.0,\"score.α\":\"x\",\"work:due\":null,\"tags\":[\"a\"]}"
+    },
+    {
+      "id": "nesting-eight",
+      "json": "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":[]}}}}}}}"
+    },
+    {
+      "id": "typed-ref-node",
+      "json": "{\"see\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01JD0000000000000000000001\",\"revision\":\"3\"}}}"
+    },
+    {
+      "id": "typed-ref-content-any-revision",
+      "json": "{\"body\":{\"$ref\":{\"entity_type\":\"content\",\"id\":\"01JD0000000000000000000002\",\"revision\":null}}}"
+    },
+    {
+      "id": "not-an-object",
+      "json": "[]",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "nesting-nine",
+      "json": "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":[]}}}}}}}}",
+      "refusal": "change_limit"
+    },
+    {
+      "id": "shadows-id",
+      "json": "{\"id\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-kind",
+      "json": "{\"kind\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-title",
+      "json": "{\"title\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-description",
+      "json": "{\"description\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-description_source_id",
+      "json": "{\"description_source_id\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-lifecycle",
+      "json": "{\"lifecycle\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-lifecycle_revision",
+      "json": "{\"lifecycle_revision\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-revision",
+      "json": "{\"revision\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-merged_into_id",
+      "json": "{\"merged_into_id\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-from_id",
+      "json": "{\"from_id\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-to_id",
+      "json": "{\"to_id\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-type",
+      "json": "{\"type\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-text",
+      "json": "{\"text\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "empty-key",
+      "json": "{\"\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "control-key",
+      "json": "{\"a\\u0001\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dollar-key",
+      "json": "{\"$syncular.bytes\":\"AA==\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "nested-dollar-key",
+      "json": "{\"a\":{\"$Ref\":1}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-reserved-blob",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"blob\",\"id\":\"01JD0000000000000000000001\",\"revision\":null}}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-reserved-resource-revision",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"resource_revision\",\"id\":\"01JD0000000000000000000001\",\"revision\":\"1\"}}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-extra-member",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01JD0000000000000000000001\",\"revision\":null},\"x\":1}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-missing-revision",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01JD0000000000000000000001\"}}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-bad-id",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01jd0000000000000000000001\",\"revision\":null}}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-numeric-revision",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01JD0000000000000000000001\",\"revision\":3}}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ref-leading-zero-revision",
+      "json": "{\"a\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01JD0000000000000000000001\",\"revision\":\"03\"}}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "number-out-of-range",
+      "json": "{\"a\":9007199254740992}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "oversized",
+      "json": "{\"a\":\"{FILL}\"}",
+      "fill": {
+        "text": "x",
+        "count": 65536
+      },
+      "refusal": "change_limit"
+    }
+  ],
+  "tags": [
+    {
+      "input": "Client/Acme ",
+      "canonical": "client/acme"
+    },
+    {
+      "input": "#project",
+      "canonical": "project"
+    },
+    {
+      "input": "##x",
+      "canonical": "x"
+    },
+    {
+      "input": "my tag",
+      "canonical": "my-tag"
+    },
+    {
+      "input": "a / b",
+      "canonical": "a/b"
+    },
+    {
+      "input": "/a//b/",
+      "canonical": "a/b"
+    },
+    {
+      "input": "Żółć/Ćma",
+      "canonical": "żółć/ćma"
+    },
+    {
+      "input": "#---",
+      "canonical": null
+    },
+    {
+      "input": "",
+      "canonical": null
+    },
+    {
+      "input": "   ",
+      "canonical": null
+    },
+    {
+      "input": "//",
+      "canonical": null
+    }
+  ],
+  "symbols": [
+    {
+      "kind": "node",
+      "name": "Concept",
+      "symbol": "Concept"
+    },
+    {
+      "kind": "node",
+      "name": "Collection",
+      "symbol": "Collection"
+    },
+    {
+      "kind": "node",
+      "name": "Resource",
+      "symbol": "Resource"
+    },
+    {
+      "kind": "node",
+      "name": "Tag",
+      "symbol": "Tag"
+    },
+    {
+      "kind": "node",
+      "name": "Guidance",
+      "symbol": "Guidance"
+    },
+    {
+      "kind": "edge",
+      "name": "HAS_TAG",
+      "symbol": "HAS_TAG"
+    },
+    {
+      "kind": "edge",
+      "name": "contains",
+      "symbol": "contains"
+    },
+    {
+      "kind": "edge",
+      "name": "guidance_scope",
+      "symbol": "guidance_scope"
+    },
+    {
+      "kind": "edge",
+      "name": "sources",
+      "symbol": "sources"
+    },
+    {
+      "kind": "node",
+      "name": "work:Item",
+      "symbol": "K_776f726b3a4974656d"
+    },
+    {
+      "kind": "node",
+      "name": "work:żółć",
+      "symbol": "K_776f726b3ac5bcc3b3c582c487"
+    },
+    {
+      "kind": "node",
+      "name": "work:Concept",
+      "symbol": "K_776f726b3a436f6e63657074"
+    },
+    {
+      "kind": "edge",
+      "name": "work:depends_on",
+      "symbol": "R_776f726b3a646570656e64735f6f6e"
+    },
+    {
+      "kind": "edge",
+      "name": "a:contains",
+      "symbol": "R_613a636f6e7461696e73"
+    },
+    {
+      "kind": "property",
+      "name": "score",
+      "symbol": "P_73636f7265"
+    },
+    {
+      "kind": "property",
+      "name": "score.α",
+      "symbol": "P_73636f72652eceb1"
+    },
+    {
+      "kind": "property",
+      "name": "work:due",
+      "symbol": "P_776f726b3a647565"
+    },
+    {
+      "kind": "property",
+      "name": "Id",
+      "symbol": "P_4964"
+    }
+  ],
+  "symbol_refusals": [
+    {
+      "kind": "node",
+      "name": "Item"
+    },
+    {
+      "kind": "node",
+      "name": "concept"
+    },
+    {
+      "kind": "node",
+      "name": ":Item"
+    },
+    {
+      "kind": "node",
+      "name": "work:"
+    },
+    {
+      "kind": "edge",
+      "name": "depends_on"
+    },
+    {
+      "kind": "edge",
+      "name": "CONTAINS"
+    },
+    {
+      "kind": "property",
+      "name": ""
+    },
+    {
+      "kind": "property",
+      "name": "id"
+    },
+    {
+      "kind": "property",
+      "name": "text"
+    },
+    {
+      "kind": "property",
+      "name": "from_id"
+    },
+    {
+      "kind": "node",
+      "name": "ns:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+  ],
+  "decode_refusals": [
+    {
+      "kind": "node",
+      "symbol": "K_"
+    },
+    {
+      "kind": "node",
+      "symbol": "K_776F726B3A4974656D"
+    },
+    {
+      "kind": "node",
+      "symbol": "K_4974656d"
+    },
+    {
+      "kind": "node",
+      "symbol": "K_776f726b3a4974656"
+    },
+    {
+      "kind": "node",
+      "symbol": "R_776f726b3a4974656d"
+    },
+    {
+      "kind": "node",
+      "symbol": "K_ff"
+    },
+    {
+      "kind": "edge",
+      "symbol": "R_6465"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_6964"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_74657874"
+    },
+    {
+      "kind": "property",
+      "symbol": "score"
+    }
+  ],
+  "stored_kinds": {
+    "node_accepted": ["Concept", "Collection", "Resource", "Guidance", "work:Item"],
+    "node_refused": ["Tag", "Item", "", "a:\u0007"],
+    "edge_accepted": ["contains", "guidance_scope", "sources", "work:depends_on"],
+    "edge_refused": ["HAS_TAG", "depends_on", ""]
+  },
+  "client_scopes": [
+    {
+      "actor": "tgorka",
+      "client": "device-1",
+      "scope": "6:tgorka8:device-1",
+      "receipt_id": "graph.apply/01JD0000000000000000000009/6:tgorka8:device-1"
+    },
+    {
+      "actor": "a",
+      "client": "bc",
+      "scope": "1:a2:bc",
+      "receipt_id": "graph.apply/01JD0000000000000000000009/1:a2:bc"
+    },
+    {
+      "actor": "ab",
+      "client": "c",
+      "scope": "2:ab1:c",
+      "receipt_id": "graph.apply/01JD0000000000000000000009/2:ab1:c"
+    },
+    {
+      "actor": "żółw",
+      "client": "κ:1/2",
+      "scope": "7:żółw6:κ:1/2",
+      "receipt_id": "graph.apply/01JD0000000000000000000009/7:żółw6:κ:1/2"
+    }
+  ],
+  "requests": [
+    {
+      "id": "human-null-context",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{\"operations\":[{\"op\":\"create_node\",\"id\":\"01JD0000000000000000000001\",\"properties\":{\"n\":1.0}}]}}",
+      "canonical": "{\"context_id\":null,\"descriptor\":\"graph.apply\",\"payload\":{\"operations\":[{\"id\":\"01JD0000000000000000000001\",\"op\":\"create_node\",\"properties\":{\"n\":1}}]},\"version\":1}",
+      "sha256": "6425e12b959f89ab71bb721cab246f5e4e276c981ea93e4f4b6809ddf5780588"
+    },
+    {
+      "id": "agent-context",
+      "descriptor": "graph.apply",
+      "envelope": "{\"payload\":{\"b\":-0,\"a\":\"€\"},\"context_id\":\"01JD000000000000000000000C\",\"request_id\":\"01JD0000000000000000000009\",\"version\":1.0}",
+      "canonical": "{\"context_id\":\"01JD000000000000000000000C\",\"descriptor\":\"graph.apply\",\"payload\":{\"a\":\"€\",\"b\":0},\"version\":1}",
+      "sha256": "0767ecc1a6170596e31c35ed301c5f3d4cc57ded86b9c52624e2fd314b6347ad"
+    },
+    {
+      "id": "same-request-other-descriptor",
+      "descriptor": "graph.propose",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{\"operations\":[{\"op\":\"create_node\",\"id\":\"01JD0000000000000000000001\",\"properties\":{\"n\":1.0}}]}}",
+      "canonical": "{\"context_id\":null,\"descriptor\":\"graph.propose\",\"payload\":{\"operations\":[{\"id\":\"01JD0000000000000000000001\",\"op\":\"create_node\",\"properties\":{\"n\":1}}]},\"version\":1}",
+      "sha256": "19da0072a971b8607535fffd2784f9041d6581022569731c800ccd5f9d995832"
+    },
+    {
+      "id": "version-two",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":2,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{}}",
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "version-zero-extra-field",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":0,\"x\":1}",
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "version-missing",
+      "descriptor": "graph.apply",
+      "envelope": "{\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "version-string",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":\"1\",\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "extra-field",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{},\"origin\":\"human\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "missing-context",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"payload\":{},\"x\":null}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "bad-request-id",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"r1\",\"context_id\":null,\"payload\":{}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "bad-context-id",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":\"\",\"payload\":{}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "payload-not-object",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":[]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "duplicate-member",
+      "descriptor": "graph.apply",
+      "envelope": "{\"version\":1,\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{}}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "descriptor-not-graph",
+      "descriptor": "kg.proof.apply",
+      "envelope": "{\"version\":1,\"request_id\":\"01JD0000000000000000000009\",\"context_id\":null,\"payload\":{}}",
+      "refusal": "invalid_change"
+    }
+  ],
+  "deltas": [
+    {
+      "id": "create-node-tag-membership",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        },
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "text": "project",
+            "label": null
+          },
+          "ordinal": 1,
+          "entity_type": "tag",
+          "entity_id": "01JD0000000000000000000003",
+          "operation": "create"
+        },
+        {
+          "before_revision": null,
+          "after_revision": null,
+          "before_value": null,
+          "after_value": {
+            "node_id": "01JD0000000000000000000001",
+            "tag_id": "01JD0000000000000000000003"
+          },
+          "ordinal": 2,
+          "entity_type": "node_tag",
+          "entity_id": "01JD0000000000000000000004",
+          "operation": "create"
+        }
+      ],
+      "canonical": "[{\"after_revision\":\"1\",\"after_value\":{\"kind\":\"Concept\",\"properties\":{\"score\":1},\"title\":\"A\"},\"before_revision\":null,\"before_value\":null,\"entity_id\":\"01JD0000000000000000000001\",\"entity_type\":\"node\",\"operation\":\"create\",\"ordinal\":0},{\"after_revision\":\"1\",\"after_value\":{\"label\":null,\"text\":\"project\"},\"before_revision\":null,\"before_value\":null,\"entity_id\":\"01JD0000000000000000000003\",\"entity_type\":\"tag\",\"operation\":\"create\",\"ordinal\":1},{\"after_revision\":null,\"after_value\":{\"node_id\":\"01JD0000000000000000000001\",\"tag_id\":\"01JD0000000000000000000003\"},\"before_revision\":null,\"before_value\":null,\"entity_id\":\"01JD0000000000000000000004\",\"entity_type\":\"node_tag\",\"operation\":\"create\",\"ordinal\":2}]",
+      "sha256": "ccb4c07532a59b29ecb23ca4d61b57a2b1a4d7f21832096ac88f0b4a9d66e311"
+    },
+    {
+      "id": "update-archive-remove",
+      "ops": [
+        {
+          "before_revision": "1",
+          "after_revision": "2",
+          "before_value": {
+            "lifecycle": "active"
+          },
+          "after_value": {
+            "lifecycle": "archived"
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "archive"
+        },
+        {
+          "before_revision": "9",
+          "after_revision": "10",
+          "before_value": {
+            "properties": {}
+          },
+          "after_value": {
+            "properties": {
+              "w": 0
+            }
+          },
+          "ordinal": 1,
+          "entity_type": "edge",
+          "entity_id": "01JD0000000000000000000002",
+          "operation": "update"
+        },
+        {
+          "before_revision": null,
+          "after_revision": null,
+          "before_value": {
+            "node_id": "01JD0000000000000000000001",
+            "tag_id": "01JD0000000000000000000003"
+          },
+          "after_value": null,
+          "ordinal": 2,
+          "entity_type": "node_tag",
+          "entity_id": "01JD0000000000000000000004",
+          "operation": "remove"
+        }
+      ],
+      "canonical": "[{\"after_revision\":\"2\",\"after_value\":{\"lifecycle\":\"archived\"},\"before_revision\":\"1\",\"before_value\":{\"lifecycle\":\"active\"},\"entity_id\":\"01JD0000000000000000000001\",\"entity_type\":\"node\",\"operation\":\"archive\",\"ordinal\":0},{\"after_revision\":\"10\",\"after_value\":{\"properties\":{\"w\":0}},\"before_revision\":\"9\",\"before_value\":{\"properties\":{}},\"entity_id\":\"01JD0000000000000000000002\",\"entity_type\":\"edge\",\"operation\":\"update\",\"ordinal\":1},{\"after_revision\":null,\"after_value\":null,\"before_revision\":null,\"before_value\":{\"node_id\":\"01JD0000000000000000000001\",\"tag_id\":\"01JD0000000000000000000003\"},\"entity_id\":\"01JD0000000000000000000004\",\"entity_type\":\"node_tag\",\"operation\":\"remove\",\"ordinal\":2}]",
+      "sha256": "3a41aaca9308f7cd086b66498eaf3162b82e1fbef786fe9692096eea906e4f0c"
+    },
+    {
+      "id": "empty",
+      "ops": [],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ordinal-gap",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 1,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "ordinal-reordered",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 1,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        },
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000002",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "create-null-after-image",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": null,
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "after-image-not-object",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": 1,
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "before-image-not-object",
+      "ops": [
+        {
+          "before_revision": "1",
+          "after_revision": "2",
+          "before_value": [],
+          "after_value": {},
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "update"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "create-with-before",
+      "ops": [
+        {
+          "before_revision": "0",
+          "after_revision": "1",
+          "before_value": {},
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "remove-node",
+      "ops": [
+        {
+          "before_revision": "1",
+          "after_revision": null,
+          "before_value": {},
+          "after_value": null,
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "remove"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "update-without-revision",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": null,
+          "before_value": {},
+          "after_value": {},
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "update"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "node-tag-with-revision",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {},
+          "ordinal": 0,
+          "entity_type": "node_tag",
+          "entity_id": "01JD0000000000000000000004",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "revision-leading-zero",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "01",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "entity-not-ulid",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "n1",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "unknown-entity-type",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "proposal",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "unknown-operation",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "put"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "unknown-member",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create",
+          "digest": "x"
+        }
+      ],
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "too-many-operations",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "kind": "Concept",
+            "title": "A",
+            "properties": {
+              "score": 1
+            }
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "repeat": 129,
+      "refusal": "change_limit"
+    },
+    {
+      "id": "operation-too-large",
+      "ops": [
+        {
+          "before_revision": null,
+          "after_revision": "1",
+          "before_value": null,
+          "after_value": {
+            "x": "{FILL}"
+          },
+          "ordinal": 0,
+          "entity_type": "node",
+          "entity_id": "01JD0000000000000000000001",
+          "operation": "create"
+        }
+      ],
+      "fill": {
+        "text": "y",
+        "count": 131072
+      },
+      "refusal": "change_limit"
+    }
+  ]
+}

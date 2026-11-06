@@ -242,7 +242,12 @@ impl Replica for Server {
     ) -> Result<Vec<Map<String, Value>>, ReplicaError> {
         self.inner.remote_query(id, params)
     }
-    fn remote_command(&self, id: &str, request: &str, params: Value) -> Result<(), ReplicaError> {
+    fn remote_command(
+        &self,
+        id: &str,
+        request: &str,
+        params: Value,
+    ) -> Result<crate::hq::port::CommandResult, ReplicaError> {
         self.inner.remote_command(id, request, params)
     }
     fn sync_now(&self) {}

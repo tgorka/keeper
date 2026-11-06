@@ -14,7 +14,8 @@
     { "version": 2, "through": "0002_session_trust" },
     { "version": 3, "through": "0003_agent_profile_tools" },
     { "version": 4, "through": "0004_grants_settings_drives" },
-    { "version": 5, "through": "0005_session_drive_ticks" }
+    { "version": 5, "through": "0005_session_drive_ticks" },
+    { "version": 6, "through": "0006_knowledge_graph" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -70,6 +71,17 @@
         { "pattern": "agent:{agent}", "column": "agent_actor" },
         { "pattern": "family:{family}", "column": "family" }
       ]
+    },
+    { "name": "kg_events", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_event_ops", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_head", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_nodes", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_edges", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_node_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    {
+      "name": "kg_receipts",
+      "scopes": [{ "pattern": "kg_client:{kg_client}", "column": "client_scope" }]
     }
   ],
   "subscriptions": [
@@ -140,6 +152,14 @@
       "name": "agentMemoryFamily",
       "table": "agent_memory",
       "scopes": { "family": ["{family}"] }
-    }
+    },
+    { "name": "kgEvents", "table": "kg_events", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgEventOps", "table": "kg_event_ops", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgHead", "table": "kg_head", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgNodes", "table": "kg_nodes", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgEdges", "table": "kg_edges", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgTags", "table": "kg_tags", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgNodeTags", "table": "kg_node_tags", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgReceipts", "table": "kg_receipts", "scopes": { "kg_client": ["{clientScope}"] } }
   ]
 }

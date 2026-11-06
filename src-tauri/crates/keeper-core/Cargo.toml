@@ -18,6 +18,9 @@ ts-rs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# The knowledge graph's shared contract (`keeper_core::graph`): vocabulary,
+# canonical values and digests. Safe and lean; nothing native.
+keeper-graph-protocol = { path = "../keeper-graph-protocol" }
 # Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
 matrix-sdk = { workspace = true }
 matrix-sdk-ui = { workspace = true }

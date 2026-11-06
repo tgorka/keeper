@@ -20,6 +20,7 @@ keeper ships no server URL).
 | `syncular.queries.ir.json`, `syncular.queries.ts` | the analysed queries and their descriptors, with the relation plans a server registers (generated) |
 | `limits.json` | the bounds both sides read: `attachmentMaxBytes`, the most bytes one attachment's blob may have (26,214,400); hand-written, never generated |
 | `vocabulary.json` | the closed word sets both sides read: `efforts` (the reasoning efforts a session may name), `grantTiers` (the tiers a standing grant may cover), `handle` (the word lists a session's handle is made of, with examples) and `personAgentKey` (examples of the person-agent key); hand-written, never generated |
+| `knowledge-graph.vectors.json` | the knowledge graph's shared vectors (*The knowledge graph*): its fixed vocabulary, canonical values and their digests, typed references, tag canonicalisation, query symbols, client scopes, request digests and event-operation digests, each accepted or refused with a stable code; hand-written, never generated, and reproduced by every implementation (keeper's in `keeper-graph-protocol` and keeper-core tests) |
 
 Everything generated comes from `@syncular/typegen` 0.32.1 (Apache-2.0), pinned in keeper's
 `package.json`, with `naming: "preserve"`: every surface uses the SQL column names.
@@ -52,6 +53,14 @@ device's clock can repeat it. Clearing the map makes every legacy tick unacknowl
 schema-5 client explicitly acknowledges it. Contract adoption, version-window projection and
 legacy-write invalidation need keeper-hq verification; client-only checks do not establish them.
 
+### Schema 6 release prerequisite
+
+Schema 6 adds the knowledge-graph tables and nothing else. The server adopts it, serves schemas 3
+through 5 beside it with the graph tables omitted from their projections (and schema 4's
+`tick_ids` invalidation unchanged), and starts with the graph disabled until it enforces the
+graph rules below; only then may a schema-6 keeper ship. A server that has migrated to schema 6
+is never rolled back to a binary that predates it.
+
 
 ## Scopes
 
@@ -71,6 +80,8 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `agent` | an agent's actor id | the agents of this database that serve the person | itself | `agent_memory` |
 | `family` | a family name | the families of this database that serve the person | its own family | `agent_memory` |
 | `person_agent` | a person-agent key (*Ids*) | the key of (itself, agent) for each agent of this database that serves the person | the key of (person, itself) for each person of this database it serves | `standing_grants` |
+| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags` |
+| `kg_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `kg_receipts` |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
@@ -102,6 +113,11 @@ Every id a client creates can be minted offline:
   without leading zeros: `6:tgorka/nixi`. The length decides where the person ends, so two
   different (person, agent) pairs never share a key, whatever the ids hold; `vocabulary.json`'s
   `personAgentKey.examples` holds keys every implementation must reproduce.
+- a **client scope** (`kg_receipts.client_scope`, the `kg_client` scope) is
+  `<a>:<actor_id><c>:<client_id>`, `a` and `c` the number of UTF-8 bytes of each id in decimal:
+  `6:tgorka8:device-1`. As with the person-agent key, the lengths decide where each id ends;
+  `knowledge-graph.vectors.json`'s `client_scopes` holds values every implementation must
+  reproduce.
 
 ## Page keys
 
@@ -397,6 +413,11 @@ rule broken refuses the whole commit.
     written once and never changed, by the device that decided the approval, and it says
     `applied` or `unchanged` only once that device consumed the approval (`applied` naming the
     commit), or `not_applied` with a reason once the approval was decided.
+19. **V19 — the knowledge graph.** The `kg_*` tables are written only inside the server's own
+    graph commands (*The knowledge graph*): a commit from any client, the service client
+    included, that writes one of them is refused, and so is a graph command's commit that breaks
+    the rules of that section. A graph row's `graph` is the database's name, a receipt's
+    `client_scope` the client scope of the request's actor and client.
 
 A server that does not enforce one of these rules yet refuses every write the rule governs: a
 table it does not serve under its rule is written by nobody, and an approval naming a grant is
@@ -448,6 +469,95 @@ request of its own; a new decision is a person's new action, under a new `reques
 membership shown then. Only an answer it can read (applied, cached, rejected, or an `error`)
 settles the request. keeper asks again under the same id only about the same membership: one whose
 `added_at_ms`, `added_by_actor` and `role` (immutable, V4) are unchanged.
+
+## The knowledge graph
+
+Each database holds one graph (its domain); nothing in one database's graph names a node of
+another's. The graph is written only through registered graph commands, never by a row write or a
+query, and a database whose operator has not given an actor a graph role gives that actor no
+graph at all. This section is the shape both sides share; `knowledge-graph.vectors.json` pins
+every rule in it that a client and a server compute, and `keeper-graph-protocol` is keeper's
+implementation of them.
+
+**Requests.** A graph command's `params` is the envelope
+`{"version": 1, "request_id": <ULID>, "context_id": <ULID> | null, "payload": {…}}` and nothing
+else. A `version` other than 1 is refused `unsupported_version` before anything else is read. A
+person's device sends `context_id: null`; an agent sends the context the server issued and
+admitted it under. The request's digest is the SHA-256 of the canonical bytes of
+`{"version", "descriptor", "context_id", "payload"}`, `descriptor` the command's id
+(`graph.<name>`); the actor, client, database and `request_id` are where it is looked up, not
+part of it. A request id once bound to a digest is bound for good: the same id with another
+digest is refused `idempotency_mismatch`.
+
+**Values.** JSON with one number type: finite, at most 9,007,199,254,740,991 in magnitude, with
+`1` and `1.0` one value and `-0` the value `0`; a larger exact integer is a string. No duplicate
+key, ill-formed Unicode, NaN or infinity. Canonical bytes are RFC 8785 (JCS). Properties are an
+object of at most 64 KiB canonical bytes, nested at most 8 deep; their keys never name a
+structural field (below) and never start with `$`, except the typed reference
+`{"$ref": {"entity_type": "node" | "content", "id": <ULID>, "revision": <decimal> | null}}`
+(`resource_revision` and `blob` are reserved and refused until storage implements them).
+
+**Vocabulary.** The reserved node kinds are `Concept`, `Collection`, `Resource`, `Tag` and
+`Guidance`; the reserved relationship types `HAS_TAG`, `contains`, `guidance_scope` and `sources`.
+A tag is a `kg_tags` row and a tag membership a `kg_node_tags` row, so `Tag` and `HAS_TAG` are
+never a node's kind or an edge's type; they are how a query sees tags. Any other kind or type is
+a custom name, `<namespace>:<name>`, which can therefore never spell a reserved one. A node's
+structural fields are `id`, `kind`, `title`, `description`, `description_source_id`,
+`lifecycle`, `lifecycle_revision`, `revision` and `merged_into_id`; an edge's `id`, `from_id`,
+`to_id`, `type`, `lifecycle` and `revision`; a tag's `id` and `text`. A tag's `text` is the
+canonical form keeper's tag policy gives (`tags` in the vectors). In the query profile
+`KG-Cypher/1` a reserved name is its own symbol, and a custom kind, relationship type or
+property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes.
+
+**Tables.** Ids are ULIDs; revisions and graph sequences are decimal strings the server assigns.
+
+- **`kg_events`** — one accepted change: `graph_seq` (1, 2, … per graph), `descriptor`,
+  `request_id`, `request_digest`, `actor_id` and `client_id` of the request, `origin_class`
+  (`human` | `agent`, from the credential and context, never from the payload), `origin_actor`
+  (the person an agent acted for, or null), `origin_chain` (JSON, or null: the delegation chain
+  from that person to the acting context, server-derived from canonical parent sessions),
+  `context_id`, `approval_basis` (JSON, or null),
+  `reverses_event_id`, `event_time_ms` (the source's time, or null), `recorded_at_ms`, `op_count`
+  and `delta_digest`. Never changed or deleted.
+- **`kg_event_ops`** — its operations, `id` `<event_id>/<ordinal>`: `ordinal` (0 to
+  `op_count` − 1), `entity_type` (`node` | `edge` | `tag` | `node_tag`; `content` and `review` are
+  reserved), `entity_id`, `operation` (`create` | `update` | `archive` | `unarchive` | `remove`,
+  the last only of a `node_tag`), `before_revision`, `after_revision`, `before_value`,
+  `after_value`. An event's `delta_digest` is the SHA-256 of the canonical bytes of the array of
+  its operations in ordinal order, each an object of exactly those eight members (absent as
+  `null`). At most 128 operations, 128 KiB per operation and 2 MiB per event.
+- **`kg_head`** — one row, `id` the database's name: `graph_seq` and `event_id` of the newest
+  event.
+- **`kg_nodes`** — `kind`, `title`, `description`, `description_source_id`, `properties`,
+  `lifecycle` (`active` | `archived`), `merged_into_id`, `revision`, `lifecycle_revision`,
+  `created_event_id`, `updated_event_id`.
+- **`kg_edges`** — `from_id`, `to_id`, `type`, `properties`, `lifecycle`, `revision`,
+  `created_event_id`, `updated_event_id`.
+- **`kg_tags`** — `text` (unique in its graph), `label` (a display label, or null), `revision`,
+  `created_event_id`, `updated_event_id`.
+- **`kg_node_tags`** — `node_id`, `tag_id`, `created_event_id`; the one graph row ever deleted,
+  by a `remove` operation.
+- **`kg_receipts`** — the outcome of one request, `id` `<descriptor>/<request_id>/<client_scope>`:
+  `descriptor`, `request_id`, `request_digest`, `outcome` (`accepted` | `proposed` | `conflict` |
+  `rejected`; never `pending`), `reason` (a `rejected` receipt's stable code), `event_id` and
+  `graph_seq` (an `accepted` receipt's, and only its), `detail` (bounded, safe JSON),
+  `recorded_at_ms`.
+
+An accepted change writes its entity rows, its event, every one of its operations, the head and
+its receipt in one commit; a change refused for a business reason writes only its receipt. A
+client replays a graph only from a complete prefix: events 1 to N with no gap, each with
+exactly `op_count` operations whose digest is `delta_digest`.
+
+**Outcomes.** A command's `applied` or `cached` answer is a transport acknowledgement whose
+`commitSeq` bounds when the client's replica will see the receipt; it is never acceptance by
+itself, and it lends its commit only to the request id it names. A client concludes from its
+receipt (or the `graph.outcome` query), and only from the receipt whose id is its own
+`<descriptor>/<request_id>/<client_scope>`: a request's receipt for another digest is
+`idempotency_mismatch`. Without one, a `rejected` answer (the command ran and its commit was
+refused) is terminal whatever its code; so is a refusal `idempotency_mismatch` or
+`unsupported_version` (the stable code is the `operation.forbidden` message), and a server
+fault (`kg.` code). Every other refusal, which may come before the command runs, and an answer
+lost or unread, leaves the request pending under the same id until a receipt resolves it.
 
 ## The live check
 

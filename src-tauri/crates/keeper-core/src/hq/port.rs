@@ -259,6 +259,20 @@ pub struct UploadRefusal {
     pub commit_rows: Vec<String>,
 }
 
+/// What the server answered a registered command that it did not refuse: a
+/// transport acknowledgement, never an application acceptance. `commit_seq`
+/// is the commit the command landed as, a visibility bound for its writes
+/// (absent when it wrote nothing); a `cached` answer replays the first
+/// answer to the same `request_id`, its `commit_seq` included. A caller whose
+/// command records its own outcome (a graph command's scoped receipt) reads
+/// that outcome before it reports the change as accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+    pub request_id: String,
+    pub commit_seq: Option<i64>,
+    pub cached: bool,
+}
+
 /// Why a replica call failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicaError {
@@ -274,6 +288,14 @@ pub enum ReplicaError {
         message: String,
         retryable: bool,
     },
+    /// The server ran a command and answered it with a rejected result
+    /// (`status: "rejected"`): the commit it built was refused, so the
+    /// command made no change and this request will not make one. Its
+    /// result's code (`operation.rejected` when it named none) and message.
+    /// Unlike [`ReplicaError::Remote`], which may also refuse a command
+    /// before it runs, this is always the command's own definite outcome.
+    #[error("{code}: {message}")]
+    Rejected { code: String, message: String },
     /// A command was sent and no answer keeper can trust came back — the
     /// connection failed, or the answer could not be read — so whether the
     /// server made it is not known. Asking again under the same request id
@@ -394,7 +416,8 @@ pub trait Replica: Send + Sync {
     ) -> Result<Vec<Map<String, Value>>, ReplicaError>;
     /// Run the server's registered command `operation_id` with `params`
     /// under `request_id` (a retry with the same id is answered from the
-    /// server's cache): its writes reach the replica by sync, never here.
+    /// server's cache): its writes reach the replica by sync, never here;
+    /// the answer is the transport acknowledgement ([`CommandResult`]).
     /// Like [`Replica::remote_query`], off the owner thread and refused
     /// while the replica does not sync.
     fn remote_command(
@@ -402,7 +425,7 @@ pub trait Replica: Send + Sync {
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<(), ReplicaError>;
+    ) -> Result<CommandResult, ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
     /// The state its owner last published.
@@ -632,7 +655,12 @@ pub(crate) mod fake {
         fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
-        fn remote_command(&self, _: &str, _: &str, _: Value) -> Result<(), ReplicaError> {
+        fn remote_command(
+            &self,
+            _: &str,
+            _: &str,
+            _: Value,
+        ) -> Result<CommandResult, ReplicaError> {
             Err(ReplicaError::NotSyncing)
         }
         fn sync_now(&self) {}

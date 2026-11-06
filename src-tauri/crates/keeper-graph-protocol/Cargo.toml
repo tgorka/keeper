@@ -1,0 +1,19 @@
+[package]
+name = "keeper-graph-protocol"
+description = "The knowledge graph's shared contract: vocabulary, canonical values, digests and scope values"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# Lean by rule (`bun run check:graph-protocol-lean`): no storage, transport,
+# Matrix, Syncular, SQLite, Tauri, network or native code.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+sha2 = { workspace = true }
