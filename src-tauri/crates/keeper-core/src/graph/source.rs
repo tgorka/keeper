@@ -37,6 +37,95 @@ pub trait GraphSource: Send + Sync {
     /// One snapshot: the head plus the events and operations with graph
     /// position in `(after, after + limit]`.
     fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError>;
+    /// The graph subscriptions' state now: whether the server grants this
+    /// replica the domain's graph, and the Syncular commit checkpoint they
+    /// have pulled to (a transport visibility bound, never graph order).
+    fn checkpoint(&self) -> Result<Checkpoint, SourceError>;
+}
+
+/// What the server answered this replica's graph subscriptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeState {
+    /// Every history subscription is active and holds the domain.
+    Granted,
+    /// The server revoked a history subscription.
+    Revoked,
+    /// A subscription has not completed its first pull yet.
+    Pending,
+}
+
+/// [`GraphSource::checkpoint`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub scope: ScopeState,
+    /// The lowest commit cursor of the history subscriptions, while granted.
+    pub cursor: Option<i64>,
+}
+
+/// The subscriptions a projection reads from: the events, their operations
+/// and the head.
+pub const HISTORY_TABLES: [&str; 3] = ["kg_events", "kg_event_ops", "kg_head"];
+
+/// The state of every history subscription of the replica: its table,
+/// status, cursor and whether its effective `kg_graph` scope holds `?1`.
+pub(crate) const SUBSCRIPTIONS: &str = "SELECT s.tbl AS tbl, \
+    json_extract(s.state_json, '$.status') AS status, \
+    json_extract(s.state_json, '$.cursor') AS cursor, \
+    EXISTS (SELECT 1 FROM json_each(json_extract(s.state_json, '$.effectiveScopes.kg_graph')) v \
+      WHERE v.value = ?1) AS holds \
+  FROM _syncular_subscriptions s WHERE s.tbl IN ('kg_events', 'kg_event_ops', 'kg_head')";
+
+/// The checkpoint of rows of [`SUBSCRIPTIONS`]: revoked when any history
+/// subscription is revoked (or no longer holds the domain once pulled),
+/// pending until each of the three is active with a cursor, granted with
+/// the lowest cursor otherwise.
+pub(crate) fn checkpoint_of(rows: &[Map<String, Value>]) -> Checkpoint {
+    let mut lowest: Option<i64> = None;
+    let mut pending = false;
+    for table in HISTORY_TABLES {
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get("tbl").and_then(Value::as_str) == Some(table))
+            .collect();
+        if mine.is_empty() {
+            pending = true;
+        }
+        for row in mine {
+            let status = row.get("status").and_then(Value::as_str);
+            let cursor = row.get("cursor").and_then(Value::as_i64);
+            let holds = matches!(row.get("holds"), Some(Value::Bool(true)))
+                || row.get("holds").and_then(Value::as_i64) == Some(1);
+            match (status, cursor) {
+                (Some("revoked"), _) => {
+                    return Checkpoint {
+                        scope: ScopeState::Revoked,
+                        cursor: None,
+                    }
+                }
+                (Some("active"), Some(c)) if c >= 0 => {
+                    if !holds {
+                        return Checkpoint {
+                            scope: ScopeState::Revoked,
+                            cursor: None,
+                        };
+                    }
+                    lowest = Some(lowest.map_or(c, |l| l.min(c)));
+                }
+                _ => pending = true,
+            }
+        }
+    }
+    if pending {
+        Checkpoint {
+            scope: ScopeState::Pending,
+            cursor: None,
+        }
+    } else {
+        Checkpoint {
+            scope: ScopeState::Granted,
+            cursor: lowest,
+        }
+    }
 }
 
 /// The most positions one [`Source`] batch reads, whatever is asked.
@@ -71,6 +160,13 @@ pub(crate) const BATCH: &str = "SELECT json_object(\
 impl GraphSource for Source {
     fn domain(&self) -> &str {
         &self.database
+    }
+
+    fn checkpoint(&self) -> Result<Checkpoint, SourceError> {
+        let rows = self
+            .replica
+            .query(SUBSCRIPTIONS, &[Value::from(self.database.as_str())])?;
+        Ok(checkpoint_of(&rows))
     }
 
     fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError> {
