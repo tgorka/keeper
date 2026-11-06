@@ -78,13 +78,23 @@ fn runtime() -> Arc<Runtime> {
     }
 }
 
-fn reader(source: &Source, index: u8, admission: Arc<Admission>, runtime: Arc<Runtime>) -> HumanReader {
+fn reader(
+    source: &Source,
+    index: u8,
+    admission: Arc<Admission>,
+    runtime: Arc<Runtime>,
+) -> HumanReader {
     let root = PathBuf::from(env("KEEPER_HQ_LIVE_STATE_DIR"))
         .join(format!("query-{}-{index}.projection", source.database));
-    GraphReads::open(Arc::new(source.clone()) as Arc<dyn GraphSource>, &root, admission, runtime)
-        .expect("reads")
-        .human(source)
-        .expect("this device's reader")
+    GraphReads::open(
+        Arc::new(source.clone()) as Arc<dyn GraphSource>,
+        &root,
+        admission,
+        runtime,
+    )
+    .expect("reads")
+    .human(source)
+    .expect("this device's reader")
 }
 
 fn report(case: &str, value: Value) {
@@ -99,7 +109,10 @@ async fn caught_up(source: &Source, head: u64) {
         if scope == ScopeState::Granted && batch.head.unwrap_or(0) >= head {
             return;
         }
-        assert!(started.elapsed() < Duration::from_secs(60), "replica did not catch up to {head}");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "replica did not catch up to {head}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -122,25 +135,81 @@ fn apply_fixture(client: &GraphClient) -> u64 {
         }
     };
     send(vec![
-        ChangeOp::CreateNode { id: ulid(1), kind: "Concept".into(), title: "Alpha".into(), description: None, properties: props(json!({"score": 1, "gone": true})) },
-        ChangeOp::CreateNode { id: ulid(2), kind: "work:Task".into(), title: "Beta".into(), description: None, properties: props(json!({"score": 2.5})) },
-        ChangeOp::CreateNode { id: ulid(3), kind: "Concept".into(), title: "Gamma".into(), description: None, properties: props(json!({})) },
-        ChangeOp::AddTag { node_id: ulid(1), tag: "#Project".into(), expected_revision: None },
-        ChangeOp::AddTag { node_id: ulid(2), tag: "#Project".into(), expected_revision: None },
+        ChangeOp::CreateNode {
+            id: ulid(1),
+            kind: "Concept".into(),
+            title: "Alpha".into(),
+            description: None,
+            properties: props(json!({"score": 1, "gone": true})),
+        },
+        ChangeOp::CreateNode {
+            id: ulid(2),
+            kind: "work:Task".into(),
+            title: "Beta".into(),
+            description: None,
+            properties: props(json!({"score": 2.5})),
+        },
+        ChangeOp::CreateNode {
+            id: ulid(3),
+            kind: "Concept".into(),
+            title: "Gamma".into(),
+            description: None,
+            properties: props(json!({})),
+        },
+        ChangeOp::AddTag {
+            node_id: ulid(1),
+            tag: "#Project".into(),
+            expected_revision: None,
+        },
+        ChangeOp::AddTag {
+            node_id: ulid(2),
+            tag: "#Project".into(),
+            expected_revision: None,
+        },
     ]);
     send(vec![
-        ChangeOp::CreateEdge { id: ulid(10), from_id: ulid(1), to_id: ulid(2), edge_type: "work:depends_on".into(), properties: props(json!({"weight": 1})), from_lifecycle_revision: Some("1".into()), to_lifecycle_revision: Some("1".into()) },
-        ChangeOp::CreateEdge { id: ulid(11), from_id: ulid(1), to_id: ulid(2), edge_type: "work:depends_on".into(), properties: props(json!({"weight": 2})), from_lifecycle_revision: Some("1".into()), to_lifecycle_revision: Some("1".into()) },
-        ChangeOp::CreateEdge { id: ulid(12), from_id: ulid(1), to_id: ulid(3), edge_type: "contains".into(), properties: props(json!({})), from_lifecycle_revision: Some("1".into()), to_lifecycle_revision: Some("1".into()) },
+        ChangeOp::CreateEdge {
+            id: ulid(10),
+            from_id: ulid(1),
+            to_id: ulid(2),
+            edge_type: "work:depends_on".into(),
+            properties: props(json!({"weight": 1})),
+            from_lifecycle_revision: Some("1".into()),
+            to_lifecycle_revision: Some("1".into()),
+        },
+        ChangeOp::CreateEdge {
+            id: ulid(11),
+            from_id: ulid(1),
+            to_id: ulid(2),
+            edge_type: "work:depends_on".into(),
+            properties: props(json!({"weight": 2})),
+            from_lifecycle_revision: Some("1".into()),
+            to_lifecycle_revision: Some("1".into()),
+        },
+        ChangeOp::CreateEdge {
+            id: ulid(12),
+            from_id: ulid(1),
+            to_id: ulid(3),
+            edge_type: "contains".into(),
+            properties: props(json!({})),
+            from_lifecycle_revision: Some("1".into()),
+            to_lifecycle_revision: Some("1".into()),
+        },
     ]);
     send(vec![ChangeOp::UpdateNode {
         id: ulid(1),
         expected_revision: "2".into(),
-        set: NodeFields { title: Some("Alpha 2".into()), description: None },
+        set: NodeFields {
+            title: Some("Alpha 2".into()),
+            description: None,
+        },
         set_properties: Map::new(),
         remove_properties: vec!["gone".into()],
     }]);
-    send(vec![ChangeOp::ArchiveNode { id: ulid(3), expected_revision: "1".into() }]);
+    send(vec![ChangeOp::ArchiveNode {
+        id: ulid(3),
+        expected_revision: "1".into(),
+    }]);
     head
 }
 
@@ -163,26 +232,44 @@ async fn graph_query_live_two_devices_answer_the_same() {
     let (one, two) = (device(1, &database), device(2, &database));
     let client = GraphClient::new(one.clone());
     caught_up(&one, 0).await;
-    let head = tokio::task::spawn_blocking(move || apply_fixture(&client)).await.expect("applied");
+    let head = tokio::task::spawn_blocking(move || apply_fixture(&client))
+        .await
+        .expect("applied");
     caught_up(&one, head).await;
     caught_up(&two, head).await;
     let (admission, runtime) = (Admission::new(Process::Headless), runtime());
-    let readers = [reader(&one, 1, admission.clone(), runtime.clone()), reader(&two, 2, admission, runtime)];
+    let readers = [
+        reader(&one, 1, admission.clone(), runtime.clone()),
+        reader(&two, 2, admission, runtime),
+    ];
     let mut answers = Vec::new();
     for r in &readers {
         let refreshed = r.refresh(&Cancellation::default()).await.expect("refresh");
         assert_eq!(refreshed.graph_seq, head);
         let mut rows = Vec::new();
         for (source, params) in CORPUS {
-            let result = r.query(source, params.as_bytes(), Freshness::Current, &Cancellation::default()).await.expect(source);
+            let result = r
+                .query(
+                    source,
+                    params.as_bytes(),
+                    Freshness::Current,
+                    &Cancellation::default(),
+                )
+                .await
+                .expect(source);
             assert_eq!(result.graph_seq, head);
-            rows.push(json!({"rows": result.rows, "checkpoint_known": !result.checkpoint.is_empty(),
-                             "engine": result.engine, "projection": result.projection_version}));
+            rows.push(
+                json!({"rows": result.rows, "checkpoint_known": !result.checkpoint.is_empty(),
+                             "engine": result.engine, "projection": result.projection_version}),
+            );
         }
         answers.push(rows);
     }
     report("two_devices", json!({"head": head, "answers": answers[0]}));
-    assert_eq!(answers[0], answers[1], "two devices answer the same accepted graph identically");
+    assert_eq!(
+        answers[0], answers[1],
+        "two devices answer the same accepted graph identically"
+    );
     let gone = &answers[0][3]["rows"];
     assert_eq!(gone, &json!([]), "a removed property is gone");
 }
@@ -195,8 +282,21 @@ async fn graph_query_live_a_forbidden_domain_reads_nothing() {
     let source = device(1, &database);
     let r = reader(&source, 1, Admission::new(Process::Headless), runtime());
     let refused = r.refresh(&Cancellation::default()).await.err();
-    report("forbidden", json!({"refresh": refused.as_ref().map(QueryError::code)}));
-    assert!(matches!(refused, Some(QueryError::Forbidden | QueryError::SyncPending)));
-    let queried = r.query("MATCH (n) RETURN n.id AS id LIMIT 1", b"{}", Freshness::AllowStale, &Cancellation::default()).await;
+    report(
+        "forbidden",
+        json!({"refresh": refused.as_ref().map(QueryError::code)}),
+    );
+    assert!(matches!(
+        refused,
+        Some(QueryError::Forbidden | QueryError::SyncPending)
+    ));
+    let queried = r
+        .query(
+            "MATCH (n) RETURN n.id AS id LIMIT 1",
+            b"{}",
+            Freshness::AllowStale,
+            &Cancellation::default(),
+        )
+        .await;
     assert!(queried.is_err());
 }
