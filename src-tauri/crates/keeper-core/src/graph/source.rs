@@ -157,60 +157,87 @@ pub(crate) const BATCH: &str = "SELECT json_object(\
         WHERE graph = ?1 AND graph_seq IN (SELECT value FROM json_each(?2)))) o)\
   ) AS batch";
 
+/// One read of a replica's file: `sql` with `params`, its rows. keeper's is
+/// [`crate::hq::port::Replica::query`]; keeper-hq's is its own replica's
+/// fallible query channel. Both answer from the same Syncular tables.
+pub trait Query: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError> {}
+impl<F: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError>> Query for F {}
+
+/// [`GraphSource::checkpoint`] of `domain` over any replica `query`: the
+/// state of its history subscriptions ([`checkpoint_of`]).
+pub fn checkpoint_with(domain: &str, query: impl Query) -> Result<Checkpoint, SourceError> {
+    let rows = query(SUBSCRIPTIONS, &[Value::from(domain)])?;
+    Ok(checkpoint_of(&rows))
+}
+
+/// [`GraphSource::prefix_batch`] of `domain` over any replica `query`: one
+/// statement, so one snapshot, of the head and the events and operations
+/// at positions `after + 1 ..= after + limit` (at most
+/// [`MAX_BATCH_EVENTS`]).
+pub fn prefix_batch_with(
+    domain: &str,
+    after: u64,
+    limit: usize,
+    query: impl Query,
+) -> Result<PrefixBatch, SourceError> {
+    let limit = limit.min(MAX_BATCH_EVENTS);
+    let upto = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
+    let positions: Vec<String> = (after.saturating_add(1)..=upto)
+        .map(|n| n.to_string())
+        .collect();
+    let rows = query(
+        BATCH,
+        &[
+            Value::from(domain),
+            Value::from(serde_json::to_string(&positions).unwrap_or_default()),
+        ],
+    )?;
+    let unreadable = |what: &str| SourceError::Unreadable(what.to_owned());
+    let batch = rows
+        .into_iter()
+        .next()
+        .and_then(|mut row| row.remove("batch"))
+        .ok_or_else(|| unreadable("no batch"))?;
+    let batch: Value = match batch {
+        Value::String(text) => serde_json::from_str(&text).map_err(|_| unreadable("batch"))?,
+        other => other,
+    };
+    let head = match &batch["head"] {
+        Value::Null => None,
+        Value::String(seq) => Some(seq.parse().map_err(|_| unreadable("head"))?),
+        _ => return Err(unreadable("head")),
+    };
+    let rows = |key: &str| -> Result<Vec<Map<String, Value>>, SourceError> {
+        match &batch[key] {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_object().cloned().ok_or_else(|| unreadable(key)))
+                .collect(),
+            _ => Err(unreadable(key)),
+        }
+    };
+    Ok(PrefixBatch {
+        head,
+        events: rows("events")?,
+        ops: rows("ops")?,
+    })
+}
+
 impl GraphSource for Source {
     fn domain(&self) -> &str {
         &self.database
     }
 
     fn checkpoint(&self) -> Result<Checkpoint, SourceError> {
-        let rows = self
-            .replica
-            .query(SUBSCRIPTIONS, &[Value::from(self.database.as_str())])?;
-        Ok(checkpoint_of(&rows))
+        checkpoint_with(&self.database, |sql, params| {
+            Ok(self.replica.query(sql, params)?)
+        })
     }
 
     fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError> {
-        let limit = limit.min(MAX_BATCH_EVENTS);
-        let upto = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
-        let positions: Vec<String> = (after.saturating_add(1)..=upto)
-            .map(|n| n.to_string())
-            .collect();
-        let rows = self.replica.query(
-            BATCH,
-            &[
-                Value::from(self.database.as_str()),
-                Value::from(serde_json::to_string(&positions).unwrap_or_default()),
-            ],
-        )?;
-        let unreadable = |what: &str| SourceError::Unreadable(what.to_owned());
-        let batch = rows
-            .into_iter()
-            .next()
-            .and_then(|mut row| row.remove("batch"))
-            .ok_or_else(|| unreadable("no batch"))?;
-        let batch: Value = match batch {
-            Value::String(text) => serde_json::from_str(&text).map_err(|_| unreadable("batch"))?,
-            other => other,
-        };
-        let head = match &batch["head"] {
-            Value::Null => None,
-            Value::String(seq) => Some(seq.parse().map_err(|_| unreadable("head"))?),
-            _ => return Err(unreadable("head")),
-        };
-        let rows = |key: &str| -> Result<Vec<Map<String, Value>>, SourceError> {
-            match &batch[key] {
-                Value::Null => Ok(Vec::new()),
-                Value::Array(items) => items
-                    .iter()
-                    .map(|item| item.as_object().cloned().ok_or_else(|| unreadable(key)))
-                    .collect(),
-                _ => Err(unreadable(key)),
-            }
-        };
-        Ok(PrefixBatch {
-            head,
-            events: rows("events")?,
-            ops: rows("ops")?,
+        prefix_batch_with(&self.database, after, limit, |sql, params| {
+            Ok(self.replica.query(sql, params)?)
         })
     }
 }

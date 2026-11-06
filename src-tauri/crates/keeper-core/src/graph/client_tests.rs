@@ -572,3 +572,61 @@ fn a_sent_change_keeps_its_request_when_its_outcome_cannot_be_read() {
         applied.prepared.request().request_id
     );
 }
+
+/// The query-agnostic helpers keeper-hq's replica uses are the one
+/// implementation: over the same replica they answer exactly what the
+/// `Source` port does, a failing query fails them, and an answer that is
+/// not a batch is unreadable, never an empty prefix.
+#[test]
+fn the_source_helpers_answer_over_any_query_channel() {
+    use super::source::{checkpoint_with, prefix_batch_with, GraphSource, ScopeState, SourceError};
+    let dir = tempfile::tempdir().expect("dir");
+    let source = open(dir.path());
+    let (first, second) = two_events();
+    let mut rows = event_rows(1, &first, None);
+    rows.extend(event_rows(2, &second, None));
+    rows.push(head(2));
+    source.replica.mutate(rows).expect("seeded");
+    let replica = source.replica.clone();
+    let query = |sql: &str, params: &[Value]| Ok(replica.query(sql, params)?);
+    for (after, limit) in [(0, 1), (0, 2), (1, 5), (2, 1)] {
+        let via = prefix_batch_with(DB, after, limit, query).expect("batch");
+        assert_eq!(via, source.prefix_batch(after, limit).expect("port"));
+    }
+    let both = prefix_batch_with(DB, 0, 10, query).expect("batch");
+    assert_eq!(
+        (both.head, both.events.len(), both.ops.len()),
+        (Some(2), 2, first.len() + second.len())
+    );
+    assert_eq!(
+        checkpoint_with(DB, query).expect("checkpoint"),
+        source.checkpoint().expect("port")
+    );
+    // No graph subscription has pulled on this local replica.
+    assert_eq!(
+        checkpoint_with(DB, query).expect("checkpoint").scope,
+        ScopeState::Pending
+    );
+
+    let failing = |_: &str, _: &[Value]| -> Result<Vec<Map<String, Value>>, SourceError> {
+        Err(SourceError::Unreadable("channel".into()))
+    };
+    assert!(prefix_batch_with(DB, 0, 1, failing).is_err());
+    assert!(checkpoint_with(DB, failing).is_err());
+    let nothing =
+        |_: &str, _: &[Value]| -> Result<Vec<Map<String, Value>>, SourceError> { Ok(Vec::new()) };
+    assert_eq!(
+        prefix_batch_with(DB, 0, 1, nothing),
+        Err(SourceError::Unreadable("no batch".into()))
+    );
+    let bad_head = |_: &str, _: &[Value]| -> Result<Vec<Map<String, Value>>, SourceError> {
+        Ok(vec![json!({"batch": {"head": 7, "events": [], "ops": []}})
+            .as_object()
+            .expect("row")
+            .clone()])
+    };
+    assert_eq!(
+        prefix_batch_with(DB, 0, 1, bad_head),
+        Err(SourceError::Unreadable("head".into()))
+    );
+}
