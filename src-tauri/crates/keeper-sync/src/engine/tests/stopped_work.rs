@@ -1,8 +1,9 @@
 //! Stopped work that ends when its cause does (Story 102.2, R467): the
 //! credential's return re-arms what it stopped, a held push says why, a merge
 //! owes the uploads its pointers need, and a download the server cannot answer
-//! is healed from history or stops once — the owner's tgdrive and neuradrive
-//! of 2026-10-19, rebuilt over a fixture LFS server.
+//! is healed from history or waits, once, for its upload to land — the
+//! owner's tgdrive and neuradrive of 2026-10-19, rebuilt over a fixture LFS
+//! server.
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -117,6 +118,11 @@ impl LfsServer {
     /// The bytes the server holds for `oid`, if it holds them.
     fn holds(&self, oid: &str) -> Option<Vec<u8>> {
         Engine::lock(&self.objects).get(oid).cloned()
+    }
+
+    /// Another device's upload of `bytes` lands.
+    fn receive(&self, oid: &str, bytes: &[u8]) {
+        Engine::lock(&self.objects).insert(oid.to_owned(), bytes.to_vec());
     }
 
     /// Run `hook` during the next object download ([`Barrier`]).
@@ -650,11 +656,11 @@ async fn a_missing_object_is_restored_from_history_and_its_upload_queued() {
 }
 
 #[tokio::test]
-async fn a_missing_object_with_no_history_names_the_file_and_its_device_and_is_not_queued_again() {
+async fn a_missing_object_with_no_history_names_the_file_and_waits_once_for_its_upload() {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = LfsServer::start(Vec::new());
     let platform = Arc::new(TestPlatform::new(dir.path()));
-    let Some((engine, p)) = engine_with_server(dir.path(), platform, &server) else {
+    let Some((engine, p)) = engine_with_server(dir.path(), platform.clone(), &server) else {
         return;
     };
     let (oid, size, copy) = missing_object_folder(&p, false);
@@ -664,18 +670,25 @@ async fn a_missing_object_with_no_history_names_the_file_and_its_device_and_is_n
         .await
         .expect("drain");
 
-    let parked = engine
+    // Not stopped: the download waits for the bytes, and its row says whose.
+    assert!(engine
         .with_db(|conn| db::list_parked(conn, &p.id))
-        .expect("parked");
-    assert_eq!(parked.len(), 1);
-    let error = parked[0].last_error.clone().expect("a sentence");
+        .expect("parked")
+        .is_empty());
+    assert_eq!(journal_rows(&engine, &p.id).len(), 1);
+    let error = waiting_download_error(&engine, &p).expect("a sentence");
     assert!(
         error.contains(&copy) && error.contains("martas-air") && error.starts_with("127.0.0.1 "),
         "names the server, the file and the device that has the bytes: {error}"
     );
+    assert_ne!(
+        engine.status(&p.id).expect("status").state,
+        ProfileState::NeedsAttention,
+        "one late object is not a folder that needs a person"
+    );
 
-    // Every scan pass runs the sweep; none of them queues the doomed download
-    // again while its stopped row stands, so the server is asked once.
+    // Every scan pass runs the sweep; the waiting row covers the work, and
+    // its backoff keeps the server from being asked again within the minute.
     let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
     for _ in 0..3 {
         engine.materialize_pending(&p, &store).expect("sweep");
@@ -686,6 +699,17 @@ async fn a_missing_object_with_no_history_names_the_file_and_its_device_and_is_n
     }
     assert_eq!(journal_rows(&engine, &p.id).len(), 1);
     assert_eq!(server.batches(), vec![format!("download {oid}")]);
+
+    // maczek's upload lands; the next due attempt finishes with nobody's Retry.
+    server.receive(&oid, MEETING);
+    platform.advance_ms(MISSING_OBJECT_BACKOFF.max.as_millis() as i64);
+    engine
+        .drain_kind(&p, WorkKind::LFS_DOWNLOAD, SyncSource::Watch)
+        .await
+        .expect("drain");
+    assert!(store.contains(&oid, size), "the bytes arrived");
+    assert!(journal_rows(&engine, &p.id).is_empty());
+    assert_eq!(server.batches().len(), 2);
 }
 
 /// Run `sql` on the engine's own connection — where a `TEMP` trigger lives,
@@ -895,15 +919,25 @@ async fn a_blob_of_the_same_length_with_another_hash_is_not_taken_for_the_missin
         .expect("drain");
     let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
     assert!(!store.contains(&oid, size));
-    let parked = engine
-        .with_db(|conn| db::list_parked(conn, &p.id))
-        .expect("parked");
-    assert_eq!(parked.len(), 1);
-    let error = parked[0].last_error.clone().expect("a sentence");
+    let error = waiting_download_error(&engine, &p).expect("a sentence");
     assert!(
         error.contains(&moved) && error.contains("history does not hold it"),
         "{error}"
     );
+}
+
+/// The sentence on the one download still waiting for the server's object.
+fn waiting_download_error(engine: &Engine, p: &SyncProfile) -> Option<String> {
+    engine
+        .with_db(|conn| {
+            Ok(conn.query_row(
+                "SELECT last_error FROM journal
+                  WHERE profile_id = ?1 AND kind = ?2 AND state = 'pending'",
+                (&p.id, WorkKind::LFS_DOWNLOAD),
+                |r| r.get(0),
+            )?)
+        })
+        .expect("one waiting download")
 }
 
 /// [`git::history::HISTORY_SEARCH_OBJECTS`]'s resumption: with a bound of

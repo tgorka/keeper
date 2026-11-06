@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::backoff::{jitter_sample, Backoff, RETRY_BACKOFF_MAX};
+use crate::backoff::{jitter_sample, Backoff, MISSING_OBJECT_BACKOFF, RETRY_BACKOFF_MAX};
 use crate::credential::{challenge_accepts_basic, AccessToken};
 use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
@@ -8186,10 +8186,16 @@ impl Engine {
     ) -> Result<()> {
         let now = self.platform.now_ms();
         let (state, not_before) = match err.retriability() {
-            Retriability::Transient => (
-                WorkState::Pending,
-                Backoff::default().not_before_ms(now, attempts, jitter_sample()),
-            ),
+            Retriability::Transient => {
+                let backoff = match err {
+                    SyncError::LfsObjectMissing { .. } => MISSING_OBJECT_BACKOFF,
+                    _ => Backoff::default(),
+                };
+                (
+                    WorkState::Pending,
+                    backoff.not_before_ms(now, attempts, jitter_sample()),
+                )
+            }
             // Deferred work waits on a condition, not a clock — parking it at
             // `now` would make it spin every tick against an absent volume.
             Retriability::Deferred => (WorkState::Deferred, now),
@@ -8352,8 +8358,8 @@ impl Engine {
     /// it as "reachable" would take that folder out of `offline` on each pass
     /// and put it back on the next upload, flapping the word and the log. The
     /// variants here are the ones a server produces: it refused, it rejected,
-    /// it ran out of room, it holds history this copy does not, or it sent
-    /// bytes that did not verify.
+    /// it ran out of room, it holds history this copy does not, it sent
+    /// bytes that did not verify, or it does not hold an object yet.
     fn remote_answered(err: &SyncError) -> bool {
         matches!(
             err,
@@ -8363,6 +8369,7 @@ impl Engine {
                 | SyncError::Diverged { .. }
                 | SyncError::RemoteMoved { .. }
                 | SyncError::Integrity { .. }
+                | SyncError::LfsObjectMissing { .. }
         )
     }
 
