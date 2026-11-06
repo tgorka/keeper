@@ -337,3 +337,236 @@ fn a_restored_request_must_still_be_a_persons_change() {
     assert!(client.prepared(request(Some(ulid(4)), change)).is_err());
     assert!(client.prepared(request(None, json!({"ops": []}))).is_err());
 }
+
+/// Event 1, then event 2's header with its operation rows replaced by
+/// `ops` and its `op_count` set to `count`.
+fn second_with(ops: &[Op], count: usize) -> Vec<RowOp> {
+    let mut rows = event_rows(2, ops, Some(&"0".repeat(64)));
+    if let Some(RowOp::Upsert { values, .. }) = rows.first_mut() {
+        values.insert("op_count".into(), json!(count));
+    }
+    rows
+}
+
+#[test]
+fn an_impossible_partial_group_is_corruption_not_lag() {
+    let (first, second) = two_events();
+    let mut past = second[0].clone();
+    past.ordinal = 2;
+    // Count 2 holding ordinal 2, which no arriving row can fix; a count past
+    // the 128-operation cap; and, as the control, count 2 holding ordinal 0
+    // only, which a later row can still complete.
+    for (ops, count, corrupt) in [
+        (vec![past], 2, true),
+        (second.clone(), 129, true),
+        (second.clone(), 2, false),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let source = open(dir.path());
+        let mut rows = event_rows(1, &first, None);
+        rows.extend(second_with(&ops, count));
+        rows.push(head(2));
+        source.replica.mutate(rows).expect("seeded");
+        let read = prefix::complete(&source);
+        if corrupt {
+            assert!(
+                matches!(read, Err(PrefixError::Corrupt { at: 2, .. })),
+                "{count}: {read:?}"
+            );
+        } else {
+            let prefix = read.expect("stale prefix");
+            assert_eq!((prefix.n, prefix.is_complete()), (1, false));
+        }
+    }
+}
+
+/// A batch seeks every position on the `(graph, graph_seq)` index and the
+/// operations on `(event_id, ordinal)`: it never scans the graph's history.
+#[test]
+fn a_prefix_batch_seeks_exact_positions() {
+    let dir = tempfile::tempdir().expect("dir");
+    let source = open(dir.path());
+    let plan = source
+        .replica
+        .query(
+            &format!("EXPLAIN QUERY PLAN {}", super::source::BATCH),
+            &[Value::from(DB), Value::from("[\"1\",\"2\"]")],
+        )
+        .expect("plan");
+    let steps: Vec<String> = plan
+        .iter()
+        .filter_map(|row| row.get("detail").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.contains("kg_events_graph_seq (graph=? AND graph_seq=?)")),
+        "{steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.contains("kg_event_ops_event_ordinal (event_id=?)")),
+        "{steps:?}"
+    );
+    assert!(
+        !steps
+            .iter()
+            .any(|s| s.starts_with("SCAN kg_events") || s.starts_with("SCAN p")),
+        "{steps:?}"
+    );
+}
+
+/// A replica that accepts every command and cannot read its own rows: what
+/// a send followed by a failing receipt read looks like.
+struct Answering {
+    inner: Arc<dyn crate::hq::port::Replica>,
+}
+
+mod answering {
+    use super::Answering;
+    use crate::hq::port::{
+        BlobBody, CommandResult, Covered, Delivery, LinkState, Peer, RefusedCommit, Replica,
+        ReplicaError, ReplicaState, RowOp, RowWrites, Subscription, UploadRefusal, WindowBase,
+        WindowState,
+    };
+    use serde_json::{Map, Value};
+
+    impl Replica for Answering {
+        fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
+            self.inner.mutate(ops)
+        }
+        fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            Err(ReplicaError::Closed)
+        }
+        fn query_covered(
+            &self,
+            sql: &str,
+            params: &[Value],
+            base: &WindowBase,
+            units: &[String],
+        ) -> Result<Covered, ReplicaError> {
+            self.inner.query_covered(sql, params, base, units)
+        }
+        fn subscribe(&self, subscription: Subscription) -> Result<(), ReplicaError> {
+            self.inner.subscribe(subscription)
+        }
+        fn set_window(&self, base: &WindowBase, units: &[String]) -> Result<(), ReplicaError> {
+            self.inner.set_window(base, units)
+        }
+        fn window_state(&self, base: &WindowBase) -> Result<WindowState, ReplicaError> {
+            self.inner.window_state(base)
+        }
+        fn set_presence(&self, scope_key: &str, doc: Option<Value>) -> Result<(), ReplicaError> {
+            self.inner.set_presence(scope_key, doc)
+        }
+        fn presence(&self, scope_key: &str) -> Result<Vec<Peer>, ReplicaError> {
+            self.inner.presence(scope_key)
+        }
+        fn commit_with_blobs(
+            &self,
+            blobs: Vec<BlobBody>,
+            ops: Vec<RowOp>,
+        ) -> Result<String, ReplicaError> {
+            self.inner.commit_with_blobs(blobs, ops)
+        }
+        fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+            self.inner.fetch_blob(blob)
+        }
+        fn cached_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+            self.inner.cached_blob(blob)
+        }
+        fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError> {
+            self.inner.delivery(commit_id)
+        }
+        fn row_writes(
+            &self,
+            table: &str,
+            row_id: &str,
+            field: Option<&str>,
+        ) -> Result<RowWrites, ReplicaError> {
+            self.inner.row_writes(table, row_id, field)
+        }
+        fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
+            self.inner.refused_commits(table)
+        }
+        fn granted(&self, table: &str, variable: &str) -> Result<Vec<String>, ReplicaError> {
+            self.inner.granted(table, variable)
+        }
+        fn revoked_units(&self, table: &str) -> Result<Vec<String>, ReplicaError> {
+            self.inner.revoked_units(table)
+        }
+        fn upload_refusals(&self) -> Vec<UploadRefusal> {
+            self.inner.upload_refusals()
+        }
+        fn blob_cache_bytes(&self) -> Result<u64, ReplicaError> {
+            self.inner.blob_cache_bytes()
+        }
+        fn mutate_superseding(
+            &self,
+            ops: Vec<RowOp>,
+            earlier: Vec<String>,
+        ) -> Result<String, ReplicaError> {
+            self.inner.mutate_superseding(ops, earlier)
+        }
+        fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            Err(ReplicaError::Closed)
+        }
+        fn remote_command(
+            &self,
+            _: &str,
+            request_id: &str,
+            _: Value,
+        ) -> Result<CommandResult, ReplicaError> {
+            Ok(CommandResult {
+                request_id: request_id.to_owned(),
+                commit_seq: Some(41),
+                cached: false,
+            })
+        }
+        fn sync_now(&self) {}
+        fn state(&self) -> ReplicaState {
+            ReplicaState {
+                link: LinkState::Connected,
+                ..self.inner.state()
+            }
+        }
+        fn watch(&self) -> tokio::sync::watch::Receiver<ReplicaState> {
+            self.inner.watch()
+        }
+        fn close(&self) {
+            self.inner.close();
+        }
+        fn join(&self) {
+            self.inner.join();
+        }
+    }
+}
+
+/// The command was sent and answered; reading its outcome then fails. The
+/// caller still holds the request, and the attempt, to ask again.
+#[test]
+fn a_sent_change_keeps_its_request_when_its_outcome_cannot_be_read() {
+    let dir = tempfile::tempdir().expect("dir");
+    let local = open(dir.path());
+    let source = Source {
+        replica: Arc::new(Answering {
+            inner: Arc::clone(&local.replica),
+        }),
+        ..local.clone()
+    };
+    let client = GraphClient::new(source);
+    let change = client.change(vec![create(&ulid(1))], None).expect("change");
+    let applied = client.apply(&change).expect("a request id was minted");
+    assert!(applied.outcome.is_err(), "{:?}", applied.outcome);
+    let attempt = applied.attempt.as_ref().expect("the attempt");
+    assert_eq!(
+        attempt.result().as_ref().map(|r| r.commit_seq),
+        Ok(Some(41))
+    );
+    assert_eq!(attempt.key(), applied.prepared.key());
+    assert_eq!(
+        attempt.key().request_id(),
+        applied.prepared.request().request_id
+    );
+}

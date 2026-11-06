@@ -84,6 +84,17 @@ impl Prepared {
     }
 }
 
+/// A change [`GraphClient::apply`] gave a request id: the request, the
+/// attempt when one was made, and what can be concluded so far (or why that
+/// could not be read). Ask again with [`GraphClient::outcome`] while it is
+/// pending or unreadable.
+#[derive(Debug, PartialEq)]
+pub struct Applied {
+    pub prepared: Prepared,
+    pub attempt: Option<Attempt>,
+    pub outcome: Result<GraphOutcome, GraphClientError>,
+}
+
 /// Why a graph call did not happen or could not be read.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum GraphClientError {
@@ -195,15 +206,30 @@ impl GraphClient {
         })
     }
 
-    /// Mint, send and resolve `change` once. The prepared request is
-    /// returned with the outcome, so a pending one can be asked about again
-    /// under the same id.
-    pub fn apply(&self, change: &Change) -> Result<(Prepared, GraphOutcome), GraphClientError> {
+    /// Mint, send and resolve `change` once. Refused (`Err`) only before a
+    /// request id exists — no link, or a change outside the contract. From
+    /// then on the answer is [`Applied`], which always carries the request
+    /// (and the attempt, once one was made), whatever failed after: the
+    /// command may have committed, so the same id must stay askable.
+    pub fn apply(&self, change: &Change) -> Result<Applied, GraphClientError> {
         self.online()?;
         let prepared = self.mint(change).map_err(GraphClientError::Refused)?;
-        let attempt = self.send(&prepared)?;
-        let outcome = self.outcome(&prepared, Some(&attempt))?;
-        Ok((prepared, outcome))
+        let attempt = match self.send(&prepared) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Ok(Applied {
+                    prepared,
+                    attempt: None,
+                    outcome: Err(error),
+                })
+            }
+        };
+        let outcome = self.outcome(&prepared, Some(&attempt));
+        Ok(Applied {
+            prepared,
+            attempt: Some(attempt),
+            outcome,
+        })
     }
 
     fn read(
