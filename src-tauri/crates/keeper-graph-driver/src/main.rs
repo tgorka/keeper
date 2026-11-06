@@ -194,7 +194,7 @@ mod driver {
         let reads = GraphReads::open(
             Arc::new(source.clone()) as Arc<dyn GraphSource>,
             &root,
-            Admission::new(Process::Headless),
+            Admission::process(Process::Headless)?,
             runtime,
         )?;
         reads.human(source).ok_or(QueryError::Forbidden)

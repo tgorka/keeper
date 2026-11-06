@@ -263,6 +263,7 @@ impl GraphReads {
             reads: self.clone(),
             remote,
             read,
+            invalidated: Cancellation::default(),
         })
     }
 
@@ -274,6 +275,7 @@ impl GraphReads {
             reads: self.clone(),
             remote: Arc::new(source.clone()),
             actor: source.actor.clone(),
+            invalidated: Cancellation::default(),
         })
     }
 
@@ -295,7 +297,10 @@ impl GraphReads {
     /// After a call has left: a domain revoked during it is purged now.
     async fn settle<T>(&self, result: Result<T, QueryError>) -> Result<T, QueryError> {
         if self.is_revoked() {
+            // Nothing is released once the domain is revoked, whatever the
+            // call produced.
             self.revoke().await?;
+            return Err(QueryError::Forbidden);
         }
         result
     }
@@ -309,8 +314,8 @@ impl GraphReads {
         Ok(guard)
     }
 
-    fn stops(&self, cancel: &Cancellation) -> Stops {
-        Stops::new(cancel, self.0.revoked.subscribe())
+    fn stops(&self, cancel: &Cancellation, reader: &Cancellation) -> Stops {
+        Stops::new(cancel, reader, self.0.revoked.subscribe())
     }
 
     /// The replica's scope: a revocation kills the domain.
@@ -339,6 +344,7 @@ impl GraphReads {
         &self,
         authority: &Authority,
         cancel: &Cancellation,
+        reader: &Cancellation,
     ) -> Result<Refreshed, QueryError> {
         let _inflight = self.enter()?;
         let checkpoint = self.scope()?;
@@ -400,7 +406,7 @@ impl GraphReads {
             staged.path()?,
             stream,
             BUILD_DEADLINE,
-            self.stops(cancel),
+            self.stops(cancel, reader),
         )
         .await?;
         if response.manifest != manifest || !response.rows.is_empty() {
@@ -432,6 +438,9 @@ impl GraphReads {
             .store
             .current()
             .ok_or(QueryError::Unavailable("projection.none"))?;
+        if generation.manifest.domain != self.domain() {
+            return Err(QueryError::Unavailable("generation.domain"));
+        }
         if generation.manifest.authority_epoch != authority.epoch
             || generation.manifest.authority_digest != authority.digest
         {
@@ -475,14 +484,15 @@ impl GraphReads {
         role: &str,
         bytes: Vec<u8>,
         cancel: &Cancellation,
+        reader: &Cancellation,
     ) -> Result<Response, QueryError> {
-        let stops = self.stops(cancel);
+        let stops = self.stops(cancel, reader);
         if let Some(stop) = stops.stopped() {
             return Err(stop);
         }
-        let mut waiting = self.stops(cancel);
+        let mut waiting = self.stops(cancel, reader);
         let _permit = tokio::select! {
-            permit = self.0.admission.query(principal, self.domain()) => permit?,
+            permit = self.0.admission.query(principal) => permit?,
             stop = waiting.changed() => return Err(stop),
         };
         let response = supervisor::run(
@@ -494,7 +504,18 @@ impl GraphReads {
             QUERY_DEADLINE,
             stops,
         )
-        .await?;
+        .await
+        .inspect_err(|error| {
+            // A worker that refused the selected generation itself (exit 74
+            // without a startup label: unreadable, not a limit, cancel or
+            // class refusal) leaves it unselected, so the next refresh
+            // rebuilds it from the accepted history.
+            if *error == QueryError::Unavailable("worker.refused") {
+                if let Err(discard) = self.0.store.discard(generation) {
+                    tracing::warn!(%discard, "graph generation not discarded");
+                }
+            }
+        })?;
         if response.manifest != generation.manifest {
             return Err(QueryError::Unavailable("generation.answer"));
         }
@@ -535,6 +556,7 @@ impl GraphReads {
             authority,
             freshness,
             cancel,
+            reader,
         } = ask;
         let _inflight = self.enter()?;
         let admitted = admit(PROFILE, source, parameters)?;
@@ -543,7 +565,7 @@ impl GraphReads {
         self.scope()?;
         let (generation, completeness) = self.select(authority, freshness)?;
         let response = self
-            .request(principal, &generation, "query", bytes, cancel)
+            .request(principal, &generation, "query", bytes, cancel, reader)
             .await?;
         if response.rows.len() > admitted.limit().min(MAX_ROWS) {
             return Err(QueryError::Unavailable("generation.answer"));
@@ -580,6 +602,7 @@ impl GraphReads {
             authority,
             freshness,
             cancel,
+            reader,
         } = ask;
         let _inflight = self.enter()?;
         let bytes = InspectRequest {
@@ -592,7 +615,7 @@ impl GraphReads {
         self.scope()?;
         let (generation, completeness) = self.select(authority, freshness)?;
         let response = self
-            .request(principal, &generation, "inspect", bytes, cancel)
+            .request(principal, &generation, "inspect", bytes, cancel, reader)
             .await?;
         let rows: Vec<Map<String, Value>> = response
             .rows
@@ -612,6 +635,19 @@ impl GraphReads {
     }
 }
 
+/// A reader's end of a call: a `forbidden` answer — a refusal from the
+/// server (at the start or at delivery), or the domain's kill — invalidates
+/// the reader for good and stops its other runs.
+fn invalidate_on_refusal<T>(
+    invalidated: &Cancellation,
+    result: Result<T, QueryError>,
+) -> Result<T, QueryError> {
+    if matches!(result, Err(QueryError::Forbidden)) {
+        invalidated.cancel();
+    }
+    result
+}
+
 /// Who asks, under which authority, for which generation, cancellable by
 /// what.
 struct Ask<'a> {
@@ -619,6 +655,7 @@ struct Ask<'a> {
     authority: &'a Authority,
     freshness: Freshness,
     cancel: &'a Cancellation,
+    reader: &'a Cancellation,
 }
 
 impl GraphReads {
@@ -725,6 +762,9 @@ pub struct AgentReader {
     reads: GraphReads,
     remote: Arc<dyn GraphRemote>,
     read: AdmittedRead,
+    /// Fired, for good, the first time the server refuses this reader: its
+    /// in-flight runs stop and every later call is refused before any work.
+    invalidated: Cancellation,
 }
 
 impl AgentReader {
@@ -751,7 +791,7 @@ impl AgentReader {
     }
 
     fn check(&self) -> Result<(), QueryError> {
-        if self.read.expires_at_ms <= now_ms() {
+        if self.invalidated.is_cancelled() || self.read.expires_at_ms <= now_ms() {
             return Err(QueryError::Forbidden);
         }
         Ok(())
@@ -766,12 +806,19 @@ impl AgentReader {
     /// authority.
     pub async fn refresh(&self, cancel: &Cancellation) -> Result<Refreshed, QueryError> {
         self.check()?;
-        let authority = Self::fresh(self.remote.clone(), self.read.clone()).await?;
-        if authority != self.read.authority {
-            return Err(QueryError::Forbidden);
+        let result = async {
+            let authority = Self::fresh(self.remote.clone(), self.read.clone()).await?;
+            if authority != self.read.authority {
+                return Err(QueryError::Forbidden);
+            }
+            let result = self
+                .reads
+                .refresh(&authority, cancel, &self.invalidated)
+                .await;
+            self.reads.settle(result).await
         }
-        let result = self.reads.refresh(&authority, cancel).await;
-        self.reads.settle(result).await
+        .await;
+        invalidate_on_refusal(&self.invalidated, result)
     }
 
     /// One `KG-Cypher/1` query.
@@ -792,13 +839,15 @@ impl AgentReader {
                     authority: &self.read.authority,
                     freshness,
                     cancel,
+                    reader: &self.invalidated,
                 },
                 source,
                 parameters,
                 deliver,
             )
             .await;
-        self.reads.settle(result).await
+        let result = self.reads.settle(result).await;
+        invalidate_on_refusal(&self.invalidated, result)
     }
 
     /// The typed node or edge lookup (`include_archived` for archived ones).
@@ -820,6 +869,7 @@ impl AgentReader {
                     authority: &self.read.authority,
                     freshness,
                     cancel,
+                    reader: &self.invalidated,
                 },
                 entity,
                 id,
@@ -827,7 +877,8 @@ impl AgentReader {
                 deliver,
             )
             .await;
-        self.reads.settle(result).await
+        let result = self.reads.settle(result).await;
+        invalidate_on_refusal(&self.invalidated, result)
     }
 }
 
@@ -837,6 +888,7 @@ pub struct HumanReader {
     reads: GraphReads,
     remote: Arc<dyn GraphRemote>,
     actor: String,
+    invalidated: Cancellation,
 }
 
 #[cfg(feature = "human-reads")]
@@ -862,9 +914,24 @@ impl HumanReader {
     /// Build or extend the domain's projection under the person's current
     /// read authority.
     pub async fn refresh(&self, cancel: &Cancellation) -> Result<Refreshed, QueryError> {
-        let authority = Self::fresh(self.remote.clone(), self.domain()).await?;
-        let result = self.reads.refresh(&authority, cancel).await;
-        self.reads.settle(result).await
+        self.check()?;
+        let result = async {
+            let authority = Self::fresh(self.remote.clone(), self.domain()).await?;
+            let result = self
+                .reads
+                .refresh(&authority, cancel, &self.invalidated)
+                .await;
+            self.reads.settle(result).await
+        }
+        .await;
+        invalidate_on_refusal(&self.invalidated, result)
+    }
+
+    fn check(&self) -> Result<(), QueryError> {
+        if self.invalidated.is_cancelled() {
+            return Err(QueryError::Forbidden);
+        }
+        Ok(())
     }
 
     /// One `KG-Cypher/1` query.
@@ -875,7 +942,11 @@ impl HumanReader {
         freshness: Freshness,
         cancel: &Cancellation,
     ) -> Result<QueryResult<Vec<Map<String, Value>>>, QueryError> {
-        let authority = Self::fresh(self.remote.clone(), self.domain()).await?;
+        self.check()?;
+        let authority = invalidate_on_refusal(
+            &self.invalidated,
+            Self::fresh(self.remote.clone(), self.domain()).await,
+        )?;
         let deliver = Self::fresh(self.remote.clone(), self.domain());
         let result = self
             .reads
@@ -885,13 +956,15 @@ impl HumanReader {
                     authority: &authority,
                     freshness,
                     cancel,
+                    reader: &self.invalidated,
                 },
                 source,
                 parameters,
                 deliver,
             )
             .await;
-        self.reads.settle(result).await
+        let result = self.reads.settle(result).await;
+        invalidate_on_refusal(&self.invalidated, result)
     }
 
     /// The typed node or edge lookup.
@@ -903,7 +976,11 @@ impl HumanReader {
         freshness: Freshness,
         cancel: &Cancellation,
     ) -> Result<QueryResult<Option<Inspected>>, QueryError> {
-        let authority = Self::fresh(self.remote.clone(), self.domain()).await?;
+        self.check()?;
+        let authority = invalidate_on_refusal(
+            &self.invalidated,
+            Self::fresh(self.remote.clone(), self.domain()).await,
+        )?;
         let deliver = Self::fresh(self.remote.clone(), self.domain());
         let result = self
             .reads
@@ -913,6 +990,7 @@ impl HumanReader {
                     authority: &authority,
                     freshness,
                     cancel,
+                    reader: &self.invalidated,
                 },
                 entity,
                 id,
@@ -920,7 +998,8 @@ impl HumanReader {
                 deliver,
             )
             .await;
-        self.reads.settle(result).await
+        let result = self.reads.settle(result).await;
+        invalidate_on_refusal(&self.invalidated, result)
     }
 }
 

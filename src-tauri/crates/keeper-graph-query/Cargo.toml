@@ -14,6 +14,8 @@ workspace = true
 keeper-graph-protocol = { path = "../keeper-graph-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The reviewed worker's canonical bytes: JCS serialized from the borrowed tree.
+serde_jcs = { workspace = true }
 rusqlite = { workspace = true, features = ["hooks", "limits"] }
 libsqlite3-sys = { version = "=0.38.2", features = ["bundled"] }
 # `stats` only adds relaxed counters (max/total) inside the same audited alloc paths.

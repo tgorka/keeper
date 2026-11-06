@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -53,7 +53,7 @@ pub(crate) struct Principal {
 #[derive(Default)]
 struct Keys {
     agents: BTreeMap<String, Weak<Semaphore>>,
-    contexts: BTreeMap<(String, String, String), Weak<Semaphore>>,
+    contexts: BTreeMap<(String, String), Weak<Semaphore>>,
 }
 
 /// The process's worker admission.
@@ -105,9 +105,24 @@ fn shared<K: Ord + Clone>(
     fresh
 }
 
+/// The process's one admission, once chosen.
+static PROCESS: OnceLock<(Process, Arc<Admission>)> = OnceLock::new();
+
 impl Admission {
+    /// The process's admission (R15): created on first use for `process`,
+    /// the same instance on every later call; a different `Process` asked
+    /// for later is refused, so no consumer can build a second set of
+    /// bounds.
+    pub fn process(process: Process) -> Result<Arc<Self>, QueryError> {
+        let (held, admission) = PROCESS.get_or_init(|| (process, Self::new(process)));
+        if *held != process {
+            return Err(QueryError::Unavailable("admission.process"));
+        }
+        Ok(admission.clone())
+    }
+
     #[must_use]
-    pub fn new(process: Process) -> Arc<Self> {
+    pub(crate) fn new(process: Process) -> Arc<Self> {
         Arc::new(Self {
             global: Arc::new(Semaphore::new(match process {
                 Process::Agentd => AGENTD_WORKERS,
@@ -129,14 +144,10 @@ impl Admission {
         }
     }
 
-    /// Admit one query worker for `principal` over `domain`: its context,
+    /// Admit one query worker for `principal`: its context,
     /// then its agent, then the process, in FIFO order each, within
     /// [`ADMISSION_DEADLINE`].
-    pub(crate) async fn query(
-        &self,
-        principal: &Principal,
-        domain: &str,
-    ) -> Result<QueryPermit, QueryError> {
+    pub(crate) async fn query(&self, principal: &Principal) -> Result<QueryPermit, QueryError> {
         let _waiting = self
             .queued
             .clone()
@@ -149,11 +160,9 @@ impl Admission {
                 .map_err(|_| QueryError::Unavailable("admission"))?;
             keys.agents.retain(|_, w| w.strong_count() > 0);
             keys.contexts.retain(|_, w| w.strong_count() > 0);
-            let key = (
-                principal.agent.clone(),
-                principal.context.clone(),
-                domain.to_owned(),
-            );
+            // One per context, whatever domain it reads: a context may hold
+            // several admitted source domains.
+            let key = (principal.agent.clone(), principal.context.clone());
             if !keys.contexts.contains_key(&key) && keys.contexts.len() >= MAX_CONTEXTS {
                 return Err(QueryError::Limit);
             }
@@ -214,50 +223,78 @@ mod tests {
     async fn the_process_bound_holds_across_domains() {
         let admission = Admission::new(Process::Agentd);
         let mut held = Vec::new();
-        for (i, domain) in ["a", "b", "c", "d"].iter().enumerate() {
+        for (i, context) in ["a", "b", "c", "d"].iter().enumerate() {
             held.push(
                 admission
-                    .query(&who(&format!("agent-{i}"), "ctx"), domain)
+                    .query(&who(&format!("agent-{i}"), context))
                     .await
                     .expect("within the process bound"),
             );
         }
         // A fifth worker of a fifth agent on a fifth domain waits, then is refused.
         assert!(matches!(
-            admission.query(&who("agent-9", "ctx"), "e").await,
+            admission.query(&who("agent-9", "ctx")).await,
             Err(QueryError::Limit)
         ));
         held.pop();
-        assert!(admission.query(&who("agent-9", "ctx"), "e").await.is_ok());
+        assert!(admission.query(&who("agent-9", "ctx")).await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]
     async fn per_agent_and_per_context_bounds_hold() {
         let admission = Admission::new(Process::Agentd);
-        let first = admission.query(&who("a", "c1"), "d").await.expect("first");
+        let first = admission.query(&who("a", "c1")).await.expect("first");
         assert!(matches!(
-            admission.query(&who("a", "c1"), "d").await,
+            admission.query(&who("a", "c1")).await,
             Err(QueryError::Limit)
         ));
         let _second = admission
-            .query(&who("a", "c2"), "d")
+            .query(&who("a", "c2"))
             .await
             .expect("other context");
         assert!(matches!(
-            admission.query(&who("a", "c3"), "d").await,
+            admission.query(&who("a", "c3")).await,
             Err(QueryError::Limit)
         ));
         drop(first);
-        assert!(admission.query(&who("a", "c1"), "d").await.is_ok());
+        assert!(admission.query(&who("a", "c1")).await.is_ok());
+    }
+
+    /// One per context, not per context and domain: a context admitted to a
+    /// second domain waits for its first query (the key holds no domain).
+    #[tokio::test(start_paused = true)]
+    async fn a_second_domain_in_the_same_context_waits() {
+        let admission = Admission::new(Process::Agentd);
+        let work = admission
+            .query(&who("a", "ctx"))
+            .await
+            .expect("work domain");
+        assert!(matches!(
+            admission.query(&who("a", "ctx")).await,
+            Err(QueryError::Limit)
+        ));
+        drop(work);
+        assert!(admission.query(&who("a", "ctx")).await.is_ok());
+    }
+
+    #[test]
+    fn the_process_admission_is_one_instance_of_one_kind() {
+        let first = Admission::process(Process::Headless).expect("first");
+        let again = Admission::process(Process::Headless).expect("same kind");
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(matches!(
+            Admission::process(Process::Agentd),
+            Err(QueryError::Unavailable("admission.process"))
+        ));
     }
 
     #[tokio::test(start_paused = true)]
     async fn headless_holds_two_and_one_builder() {
         let admission = Admission::new(Process::Headless);
-        let _a = admission.query(&who("p", "x"), "d1").await.expect("a");
-        let _b = admission.query(&who("q", "x"), "d2").await.expect("b");
+        let _a = admission.query(&who("p", "x")).await.expect("a");
+        let _b = admission.query(&who("q", "x")).await.expect("b");
         assert!(matches!(
-            admission.query(&who("r", "x"), "d3").await,
+            admission.query(&who("r", "x")).await,
             Err(QueryError::Limit)
         ));
         let build = admission.build().expect("builder");
@@ -273,7 +310,7 @@ mod tests {
         let admission = Admission::new(Process::Agentd);
         for i in 0..(MAX_CONTEXTS * 3) {
             let permit = admission
-                .query(&who(&format!("agent-{}", i % 3), &format!("ctx-{i}")), "d")
+                .query(&who(&format!("agent-{}", i % 3), &format!("ctx-{i}")))
                 .await
                 .expect("a released context frees its slot");
             drop(permit);

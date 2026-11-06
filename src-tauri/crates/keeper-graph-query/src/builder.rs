@@ -17,13 +17,13 @@
 
 use crate::engine::Result;
 use keeper_graph_protocol::symbol::{encode, SymbolKind};
-use keeper_graph_protocol::value::canonical;
+use keeper_graph_protocol::value::MAX_NUMBER;
 use keeper_graph_protocol::vocabulary::{
     EntityType, Operation, EDGE_FIELDS, NODE_FIELDS, TAG_FIELDS,
 };
 use keeper_graph_protocol::worker::{
     chain, EventFrame, Manifest, GENESIS, MAX_ENTITIES, MAX_EVENT_BYTES, MAX_EXPORT_BYTES,
-    MAX_MANIFEST_BYTES,
+    MAX_MANIFEST_BYTES, MAX_ROW_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -68,7 +68,7 @@ pub fn build<R: BufRead>(connection: Connection, reader: &mut R) -> Result<Manif
             return Err("export byte limit".into());
         }
         let event: EventFrame = serde_json::from_slice(&bytes)?;
-        event.check(sequence)?;
+        check(&event, sequence)?;
         digest = chain(&digest, sequence, &event.delta_digest);
         connection.execute_batch("SAVEPOINT accepted_event")?;
         for op in &event.ops {
@@ -112,6 +112,179 @@ pub fn build<R: BufRead>(connection: Connection, reader: &mut R) -> Result<Manif
     Ok(manifest)
 }
 
+/// The reviewed 110.1 worker value admission (inventory round 10,
+/// invariant 5), unchanged: nesting at most 16, every number finite and
+/// within ±2^53−1, every string at most 65,536 bytes, every array or object
+/// at most 8,192 entries and every key at most 8,192 bytes. A value outside
+/// it refuses the whole export (`projection_unavailable` at the consumer):
+/// an R1 limit, even where the server's own rules accepted the value.
+pub fn validate_value(value: &Value, depth: usize) -> Result<()> {
+    if depth > 16 {
+        return Err("value nesting limit".into());
+    }
+    match value {
+        Value::Number(n) => {
+            let f = n.as_f64().ok_or("invalid number")?;
+            if !f.is_finite() || f.abs() > MAX_NUMBER {
+                return Err("number range".into());
+            }
+        }
+        Value::String(s) if s.len() > 65536 => return Err("string byte limit".into()),
+        Value::Array(values) => {
+            if values.len() > 8192 {
+                return Err("array length limit".into());
+            }
+            for v in values {
+                validate_value(v, depth + 1)?;
+            }
+        }
+        Value::Object(values) => {
+            if values.len() > 8192 {
+                return Err("object size limit".into());
+            }
+            for (k, v) in values {
+                if k.len() > 8192 {
+                    return Err("key byte limit".into());
+                }
+                validate_value(v, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The canonical (JCS) bytes of an admitted value, serialized from the
+/// borrowed tree as the reviewed worker did: no normalized copy.
+pub fn canonical_bytes(value: &Value) -> Result<Vec<u8>> {
+    validate_value(value, 0)?;
+    Ok(serde_jcs::to_vec(value)?)
+}
+
+/// One event frame's shape at position `expected`, checked in the worker
+/// without the shared value code (no normalized copy): the position, a
+/// ULID event and entities, a digest, 1..=128 operations agreeing with
+/// `op_count` in ordinal order, schema 6 entity types, the revision and
+/// after-image each operation implies, each after-image admitted by
+/// [`validate_value`] within [`MAX_ROW_BYTES`] canonical bytes and of its
+/// entity's shape.
+fn check(event: &EventFrame, expected: u64) -> Result<()> {
+    let count = event.ops.len();
+    if event.graph_seq != expected
+        || !keeper_graph_protocol::is_ulid(&event.event_id)
+        || !keeper_graph_protocol::worker::is_hex_digest(&event.delta_digest)
+        || count == 0
+        || count > 128
+        || usize::try_from(event.op_count).ok() != Some(count)
+    {
+        return Err("event frame refused".into());
+    }
+    for (ordinal, op) in event.ops.iter().enumerate() {
+        if usize::try_from(op.ordinal).ok() != Some(ordinal)
+            || !keeper_graph_protocol::is_ulid(&op.entity_id)
+        {
+            return Err("operation refused".into());
+        }
+        let membership = match op.entity_type {
+            EntityType::NodeTag => true,
+            EntityType::Node | EntityType::Edge | EntityType::Tag => false,
+            EntityType::Content | EntityType::Review => {
+                return Err("entity type outside schema 6".into())
+            }
+        };
+        let revised = match &op.after_revision {
+            Some(revision) => !membership && keeper_graph_protocol::is_decimal(revision),
+            None => membership,
+        };
+        match (&op.operation, &op.after_value) {
+            (Operation::Remove, None) if membership && revised => {}
+            (Operation::Remove, _) | (_, None) => return Err("operation image refused".into()),
+            (_, Some(after)) => {
+                if !revised {
+                    return Err("operation revision refused".into());
+                }
+                validate_value(after, 0)?;
+                if serde_jcs::to_vec(after)?.len() > MAX_ROW_BYTES {
+                    return Err("after-image byte limit".into());
+                }
+                validate_entity(op.entity_type, &op.entity_id, after)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_entity(kind: EntityType, id: &str, value: &Value) -> Result<()> {
+    let object = value.as_object().ok_or("entity must be object")?;
+    if object.get("id").and_then(Value::as_str) != Some(id) {
+        return Err("canonical identity mismatch".into());
+    }
+    if let Some(properties) = object.get("properties") {
+        let properties = properties.as_object().ok_or("properties must be object")?;
+        if serde_json::to_vec(properties)?.len() > 65536 {
+            return Err("property byte limit".into());
+        }
+        for (key, value) in properties {
+            encode(SymbolKind::Property, key)?;
+            property_depth(value, 0)?;
+        }
+    }
+    match kind {
+        EntityType::Node | EntityType::Edge => {
+            if !matches!(text(object, "lifecycle")?, "active" | "archived") {
+                return Err("invalid lifecycle".into());
+            }
+            if !keeper_graph_protocol::is_decimal(text(object, "revision")?) {
+                return Err("invalid revision".into());
+            }
+            if kind == EntityType::Node {
+                mapped(SymbolKind::Node, text(object, "kind")?)?;
+            } else {
+                mapped(SymbolKind::Edge, text(object, "type")?)?;
+                for key in ["from_id", "to_id"] {
+                    if !keeper_graph_protocol::is_ulid(text(object, key)?) {
+                        return Err("invalid endpoint".into());
+                    }
+                }
+            }
+        }
+        EntityType::Tag => {
+            text(object, "text")?;
+        }
+        EntityType::NodeTag => {
+            for key in ["node_id", "tag_id"] {
+                if !keeper_graph_protocol::is_ulid(text(object, key)?) {
+                    return Err("invalid membership endpoint".into());
+                }
+            }
+        }
+        EntityType::Content | EntityType::Review => {
+            return Err("entity type outside schema 6".into())
+        }
+    }
+    Ok(())
+}
+
+fn property_depth(value: &Value, depth: usize) -> Result<()> {
+    if depth > 8 {
+        return Err("property nesting limit".into());
+    }
+    match value {
+        Value::Array(a) => {
+            for v in a {
+                property_depth(v, depth + 1)?;
+            }
+        }
+        Value::Object(o) => {
+            for v in o.values() {
+                property_depth(v, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Apply one checked operation's after-image to `_kg_entities`.
 fn replay(connection: &Connection, op: &keeper_graph_protocol::worker::FrameOp) -> Result<()> {
     let kind = entity_type(op.entity_type)?;
@@ -132,7 +305,7 @@ fn replay(connection: &Connection, op: &keeper_graph_protocol::worker::FrameOp) 
         return Err("accepted operation on an entity in the wrong state".into());
     }
     let after = match &op.after_value {
-        Some(value) => Some(String::from_utf8(canonical(value)?)?),
+        Some(value) => Some(String::from_utf8(canonical_bytes(value)?)?),
         None => None,
     };
     connection.execute(
@@ -337,7 +510,7 @@ fn put_property(
         Value::String(s) => ("text", rusqlite::types::Value::Text(s.clone())),
         _ => (
             "json",
-            rusqlite::types::Value::Text(String::from_utf8(canonical(value)?)?),
+            rusqlite::types::Value::Text(String::from_utf8(canonical_bytes(value)?)?),
         ),
     };
     let (prefix, field) = if edge {
@@ -409,4 +582,76 @@ pub fn inspect(
         );
     }
     Ok(vec![Value::Object(image)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keeper_graph_protocol::worker::FrameOp;
+    use serde_json::json;
+
+    fn frame(title: &str) -> EventFrame {
+        EventFrame {
+            graph_seq: 1,
+            event_id: "01JK0000000000000000000001".into(),
+            op_count: 1,
+            delta_digest: "ab".repeat(32),
+            ops: vec![FrameOp {
+                ordinal: 0,
+                entity_type: EntityType::Node,
+                entity_id: "01JK0000000000000000000002".into(),
+                operation: Operation::Create,
+                after_revision: Some("1".into()),
+                after_value: Some(json!({
+                    "id": "01JK0000000000000000000002", "kind": "Concept", "title": title,
+                    "description": null, "description_source_id": null, "properties": {},
+                    "lifecycle": "active", "merged_into_id": null, "revision": "1",
+                    "lifecycle_revision": "1"
+                })),
+            }],
+        }
+    }
+
+    /// B6/R6: the reviewed value admission holds unchanged — a string of
+    /// 65,536 bytes is admitted, one byte more refuses the frame.
+    #[test]
+    fn the_reviewed_value_limits_hold_at_ingestion() {
+        assert!(check(&frame(&"x".repeat(65_536)), 1).is_ok());
+        assert_eq!(
+            check(&frame(&"x".repeat(65_537)), 1)
+                .err()
+                .map(|e| e.to_string()),
+            Some("string byte limit".to_owned())
+        );
+        let mut wide = json!({});
+        for i in 0..8_193 {
+            wide[format!("k{i}")] = json!(0);
+        }
+        assert!(validate_value(&wide, 0).is_err());
+        assert!(validate_value(&json!({"x".repeat(8_193): 0}), 0).is_err());
+        let mut deep = json!(0);
+        for _ in 0..17 {
+            deep = json!([deep]);
+        }
+        assert!(validate_value(&deep, 0).is_err());
+        assert!(validate_value(&json!(9_007_199_254_740_992u64), 0).is_err());
+        assert_eq!(
+            canonical_bytes(&json!({"b": 1.0, "a": [true, null]})).expect("jcs"),
+            br#"{"a":[true,null],"b":1}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn a_frame_out_of_shape_is_refused() {
+        assert!(check(&frame("t"), 2).is_err());
+        let mut f = frame("t");
+        f.op_count = 2;
+        assert!(check(&f, 1).is_err());
+        let mut f = frame("t");
+        f.ops[0].after_value = Some(json!({"id": "01JK0000000000000000000009"}));
+        assert!(check(&f, 1).is_err());
+        let mut f = frame("t");
+        f.ops[0].entity_type = EntityType::Content;
+        assert!(check(&f, 1).is_err());
+    }
 }

@@ -60,21 +60,29 @@ impl Cancellation {
 /// the domain's kill switch (`true` once revoked).
 pub(crate) struct Stops {
     cancel: watch::Receiver<bool>,
+    reader: watch::Receiver<bool>,
     revoked: watch::Receiver<bool>,
-    open: (bool, bool),
+    open: [bool; 3],
 }
 
 impl Stops {
-    pub(crate) fn new(cancel: &Cancellation, revoked: watch::Receiver<bool>) -> Self {
+    /// The caller's `cancel`, its reader's own cancellation (fired when the
+    /// reader is invalidated) and the domain's kill switch.
+    pub(crate) fn new(
+        cancel: &Cancellation,
+        reader: &Cancellation,
+        revoked: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             cancel: cancel.subscribe(),
+            reader: reader.subscribe(),
             revoked,
-            open: (true, true),
+            open: [true; 3],
         }
     }
 
     pub(crate) fn stopped(&self) -> Option<QueryError> {
-        if *self.revoked.borrow() {
+        if *self.revoked.borrow() || *self.reader.borrow() {
             Some(QueryError::Forbidden)
         } else if *self.cancel.borrow() {
             Some(QueryError::Cancelled)
@@ -86,8 +94,9 @@ impl Stops {
     pub(crate) async fn changed(&mut self) -> QueryError {
         loop {
             tokio::select! {
-                r = self.cancel.changed(), if self.open.0 => self.open.0 = r.is_ok(),
-                r = self.revoked.changed(), if self.open.1 => self.open.1 = r.is_ok(),
+                r = self.cancel.changed(), if self.open[0] => self.open[0] = r.is_ok(),
+                r = self.reader.changed(), if self.open[1] => self.open[1] = r.is_ok(),
+                r = self.revoked.changed(), if self.open[2] => self.open[2] = r.is_ok(),
                 else => std::future::pending::<()>().await,
             }
             if let Some(stop) = self.stopped() {
