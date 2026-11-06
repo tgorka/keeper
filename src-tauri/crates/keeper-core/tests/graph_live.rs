@@ -11,11 +11,14 @@
 //!   the command reaches the server and its answer is lost),
 //!   `KEEPER_HQ_LIVE_PHASE` (`send` | `resume`),
 //!   `KEEPER_HQ_LIVE_FORBIDDEN_DATABASE` (one the person holds no graph role
-//!   in) and `KEEPER_HQ_LIVE_FORBIDDEN_NODE` (a node retained there).
+//!   in), `KEEPER_HQ_LIVE_FORBIDDEN_NODE` (a node retained there) and
+//!   `KEEPER_HQ_LIVE_FORBIDDEN_REQUEST` (the request id of an accepted change
+//!   another person made there).
 //!
-//! Every claim is asserted here; each case also prints `KG1_LIVE <case>
-//! <json>` lines the harness checks against the server's authoritative
-//! rows. Credentials are transient environment inputs and are never
+//! Every claim is asserted here; each case also prints the `KG1_LIVE <case>
+//! <json>` lines the harness checks against the server's authoritative rows.
+//! Their names and shapes are the harness's interface: change neither
+//! without it. Credentials are transient environment inputs and are never
 //! printed.
 
 use std::path::PathBuf;
@@ -27,7 +30,7 @@ use keeper_core::graph::outcome::GraphOutcome;
 use keeper_core::graph::prefix::{self, Prefix};
 use keeper_core::graph::protocol::change::{Change, ChangeOp, NodeFields};
 use keeper_core::graph::protocol::request::Request;
-use keeper_core::graph::protocol::wire::HistoryFilter;
+use keeper_core::graph::protocol::wire::{self, HistoryFilter};
 use keeper_core::hq::port::{Link, ReplicaError, ReplicaSpec};
 use keeper_core::hq::sessions::Source;
 use keeper_core::hq::syncular::SyncularReplica;
@@ -238,8 +241,14 @@ fn graph_live_two_devices_accept_replicate_inspect_and_race() {
 
     // The same request again: the server's record answers, no second event.
     let replay = first.send(&prepared).expect("replayed");
-    assert_eq!(replay.result().as_ref().map(|r| r.cached), Ok(true));
-    assert_eq!(settled(&first, &one, &prepared), outcome);
+    let cached = replay.result().as_ref().map(|r| r.cached);
+    assert_eq!(cached, Ok(true));
+    let replayed = settled(&first, &one, &prepared);
+    assert_eq!(replayed, outcome);
+    report(
+        "replay",
+        &json!({"cached": cached.ok(), "outcome": outcome_json(&replayed)}),
+    );
 
     // Both devices hold the event in a complete prefix, not merely equal rows.
     for (name, source) in [("one", &one), ("two", &two)] {
@@ -250,16 +259,17 @@ fn graph_live_two_devices_accept_replicate_inspect_and_race() {
             node["properties"],
             json!({"n": 1, "nothing": null, "big": "9007199254740993"})
         );
-        for id in [&e1, &e2] {
-            assert!(prefix.state.contains_key(&("edge".to_owned(), id.clone())));
-        }
+        let edges =
+            [&e1, &e2].map(|id| prefix.state.contains_key(&("edge".to_owned(), id.clone())));
+        assert_eq!(edges, [true, true]);
         report(
             &format!("prefix-{name}"),
-            &json!({"n": prefix.n, "head": prefix.head}),
+            &json!({"n": prefix.n, "head": prefix.head, "edges": edges}),
         );
     }
     let view = second.get_node(&a, false).expect("read").expect("the node");
     assert_eq!(view.tags, ["my-tag"]);
+    report("get_node", &json!({"image": view.image, "tags": view.tags}));
     for id in [&e1, &e2] {
         assert!(second.get_edge(id, false).expect("read").is_some());
     }
@@ -327,14 +337,22 @@ fn graph_live_two_devices_accept_replicate_inspect_and_race() {
         .expect("archive");
     let (_, archived) = applied(&first, &one, &archive);
     let (_, last) = accepted(&archived);
-    assert!(first.get_node(&b, false).expect("read").is_none());
+    let shown = first.get_node(&b, false).expect("read").is_some();
     let hidden = first
         .get_node(&b, true)
         .expect("read")
         .expect("archived node");
+    assert!(!shown);
     assert_eq!(hidden.image["lifecycle"], "archived");
-    assert!(first.get_edge(&e1, false).expect("read").is_none());
-    assert!(first.get_edge(&e1, true).expect("read").is_some());
+    let edge_shown = first.get_edge(&e1, false).expect("read").is_some();
+    let edge_hidden = first.get_edge(&e1, true).expect("read");
+    assert!(!edge_shown);
+    assert!(edge_hidden.is_some());
+    report(
+        "archived-view",
+        &json!({"node": shown, "node_archived": hidden.image, "edge": edge_shown,
+                "edge_archived": edge_hidden}),
+    );
 
     // History filtered to the node: whole groups, a cursor that moves.
     let page = first
@@ -359,9 +377,18 @@ fn graph_live_two_devices_accept_replicate_inspect_and_race() {
         .events
         .iter()
         .all(|e| e.ops.iter().any(|op| op.entity_id == a)));
+    report(
+        "history",
+        &json!({"scanned_through": page.scanned_through,
+                "events": page.events.iter().map(|e| json!({"seq": e.event.graph_seq,
+                    "ops": e.ops.len(), "origin_class": e.event.origin_class,
+                    "approval_basis": e.event.approval_basis})).collect::<Vec<_>>()}),
+    );
 
-    // A replica opened only now bootstraps every graph table at once (skewed,
-    // foreign keys and all) and still reaches the same complete prefix.
+    // A replica opened only now bootstraps every graph table from scratch and
+    // reaches the same complete prefix. This is a fresh late bootstrap, not a
+    // controlled skewed-delivery proof: nothing here withholds a table or an
+    // operation (the local missing/partial-group tests are that evidence).
     let reference = prefix_at(&one, last);
     close(two);
     let late = open_at(
@@ -439,10 +466,12 @@ fn graph_live_a_lost_answer_resolves_by_outcome() {
     close(direct);
 }
 
-/// Phase `send` mints, persists and sends, then the harness kills or ends
-/// the process; phase `resume` reopens the same replica file and resolves
-/// the persisted request with no attempt in hand, then pages history from a
-/// persisted cursor.
+/// Phase `send` mints and persists a request, sends it and waits until it
+/// is accepted (receipt and event), recording that, then the process ends.
+/// Phase `resume` reopens the same replica file and first resolves the
+/// persisted request with no attempt in hand and **no resend** — the
+/// original acceptance, recovered — then proves the cached replay
+/// separately, then pages history from the persisted cursor.
 #[test]
 #[ignore = "driven by keeper-hq's native graph harness"]
 fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
@@ -459,23 +488,29 @@ fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
                 )
                 .expect("change");
             let prepared = client.mint(&change).expect("minted");
-            // Persisted before the first send.
-            std::fs::write(
-                &pending,
-                json!({"request_id": prepared.request().request_id,
-                       "payload": prepared.request().payload})
-                .to_string(),
-            )
-            .expect("persisted");
             let page = client
                 .history("0", 100, &HistoryFilter::default())
                 .expect("history");
             std::fs::write(&cursor, &page.scanned_through).expect("cursor");
-            let sent = client.send(&prepared).map(|a| a.result().is_ok());
+            // Persisted before the first send.
+            let mut saved = json!({"request_id": prepared.request().request_id,
+                                   "payload": prepared.request().payload});
+            std::fs::write(&pending, saved.to_string()).expect("persisted");
+            let attempt = client.send(&prepared).expect("sent");
+            assert!(attempt.result().is_ok(), "{:?}", attempt.result());
+            // The original acceptance, established before this process ends.
+            let outcome = settled(&client, &source, &prepared);
+            let (event_id, seq) = accepted(&outcome);
+            assert_eq!(
+                events_of(&prefix_at(&source, seq), &prepared.request().request_id),
+                1
+            );
+            saved["event_id"] = json!(event_id);
+            std::fs::write(&pending, saved.to_string()).expect("recorded");
             report(
                 "sent",
-                &json!({"request_id": prepared.request().request_id,
-                        "cursor": page.scanned_through, "transport": format!("{sent:?}")}),
+                &json!({"request_id": prepared.request().request_id, "event_id": event_id,
+                        "graph_seq": seq.to_string(), "cursor": page.scanned_through}),
             );
         }
         "resume" => {
@@ -489,10 +524,17 @@ fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
                     payload: saved["payload"].clone(),
                 })
                 .expect("restored");
-            // The same id is sent again: the server answers from its record.
-            let _ = client.send(&prepared);
-            let outcome = settled(&client, &source, &prepared);
-            let (_, seq) = accepted(&outcome);
+            // Resolved before anything is sent again: the persisted identity
+            // finds the original receipt.
+            let recovered = settled(&client, &source, &prepared);
+            let (event_id, seq) = accepted(&recovered);
+            assert_eq!(saved["event_id"], event_id.as_str());
+            // Then the same id sent again: the server's record answers, and
+            // nothing new is accepted.
+            let replay = client.send(&prepared).expect("resent");
+            let cached = replay.result().as_ref().map(|r| r.cached);
+            assert_eq!(cached, Ok(true));
+            assert_eq!(settled(&client, &source, &prepared), recovered);
             assert_eq!(
                 events_of(&prefix_at(&source, seq), &prepared.request().request_id),
                 1
@@ -501,14 +543,17 @@ fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
             let page = client
                 .history(after.trim(), 100, &HistoryFilter::default())
                 .expect("history");
-            assert!(page
+            let events: Vec<String> = page
                 .events
                 .iter()
-                .any(|e| e.event.request_id == prepared.request().request_id));
+                .map(|e| e.event.request_id.clone())
+                .collect();
+            assert!(events.contains(&prepared.request().request_id));
             report(
                 "resumed",
-                &json!({"outcome": outcome_json(&outcome), "cursor": after.trim(),
-                        "scanned_through": page.scanned_through}),
+                &json!({"outcome": outcome_json(&recovered), "cached": cached.ok(),
+                        "cursor": after.trim(), "scanned_through": page.scanned_through,
+                        "events": events}),
             );
         }
         phase => panic!("unknown phase {phase}"),
@@ -516,9 +561,10 @@ fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
     close(source);
 }
 
-/// A database the person holds no graph role in: nothing is accepted, and a
-/// node retained there reads exactly like one that does not exist — through
-/// inspection, history and outcome. An unlinked replica refuses before
+/// A database the person holds no graph role in: nothing is accepted, and
+/// what is retained there — a node, another person's accepted request —
+/// reads exactly like what does not exist, through inspection, outcome and
+/// history, on the raw server answers. An unlinked replica refuses before
 /// sending.
 #[test]
 #[ignore = "driven by keeper-hq's native graph harness"]
@@ -530,18 +576,66 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
     );
     let client = GraphClient::new(forbidden.clone());
     let retained = env("KEEPER_HQ_LIVE_FORBIDDEN_NODE");
-    let absent = ulid();
-    let probe = |id: &str, archived: bool| format!("{:?}", client.get_node(id, archived));
+    let retained_request = env("KEEPER_HQ_LIVE_FORBIDDEN_REQUEST");
+    let (absent, absent_request) = (ulid(), ulid());
+    // The server's own answers, not what the client makes of them.
+    let raw = |operation: &str, params: Value| {
+        format!("{:?}", forbidden.replica.remote_query(operation, params))
+    };
+    let collapsed = |what: &str, known: String, unknown: String, ids: &[&str]| {
+        assert!(known.starts_with("Err("), "{what}: {known}");
+        assert_eq!(known, unknown, "{what}: the retained one reads differently");
+        for id in ids {
+            assert!(!known.contains(id), "{what} discloses {id}: {known}");
+        }
+        for detail in ["graph_seq", "revision", "event_id"] {
+            assert!(
+                !known.contains(detail),
+                "{what} discloses {detail}: {known}"
+            );
+        }
+        known
+    };
+    let outcome = collapsed(
+        "outcome",
+        raw(wire::OUTCOME, wire::outcome_params(None, &retained_request)),
+        raw(wire::OUTCOME, wire::outcome_params(None, &absent_request)),
+        &[&retained_request],
+    );
     for archived in [false, true] {
-        let (known, unknown) = (probe(&retained, archived), probe(&absent, archived));
-        assert!(known.starts_with("Err("), "{known}");
-        assert_eq!(
-            known, unknown,
-            "a retained node reads differently from an absent one"
+        collapsed(
+            "get_node",
+            raw(wire::GET_NODE, wire::get_params(None, &retained, archived)),
+            raw(wire::GET_NODE, wire::get_params(None, &absent, archived)),
+            &[&retained],
         );
+        let probe = |id: &str| format!("{:?}", client.get_node(id, archived));
+        assert_eq!(probe(&retained), probe(&absent));
     }
+    let filtered = |entity: &str| {
+        raw(
+            wire::HISTORY,
+            wire::history_params(
+                None,
+                "0",
+                10,
+                &HistoryFilter {
+                    entity_id: Some(entity.to_owned()),
+                    ..HistoryFilter::default()
+                },
+            )
+            .expect("params"),
+        )
+    };
+    collapsed(
+        "history",
+        filtered(&retained),
+        filtered(&absent),
+        &[&retained],
+    );
     let history = client.history("0", 10, &HistoryFilter::default());
     assert!(history.is_err(), "{history:?}");
+    report("forbidden-reads", &json!({"outcome": outcome}));
 
     let change = client
         .change(vec![create_node(&ulid(), "Probe", json!({}))], None)
