@@ -203,3 +203,76 @@ fn a_history_page_outside_its_bounds_is_refused_before_its_events_are_read() {
         Err(Refusal::UnsupportedVersion)
     );
 }
+
+/// One whole valid event at position 1 whose header's `origin_chain` holds
+/// `pad` bytes of text, and its `ops` repeated `copies` times (renumbered).
+fn event(pad: usize, copies: usize) -> Value {
+    use keeper_graph_protocol::delta::{digest, Op};
+    use keeper_graph_protocol::vocabulary::{EntityType, Operation};
+    let ops: Vec<Op> = (0..copies)
+        .map(|n| Op {
+            ordinal: u32::try_from(n).unwrap_or(u32::MAX),
+            entity_type: EntityType::Node,
+            entity_id: X.into(),
+            operation: Operation::Create,
+            before_revision: None,
+            after_revision: Some("1".into()),
+            before_value: None,
+            after_value: Some(json!({"title": "x"})),
+        })
+        .collect();
+    let delta = digest(&ops[..ops.len().min(128)]).unwrap_or_default();
+    json!({
+        "event": {
+            "id": P, "graph_seq": "1", "descriptor": "graph.apply", "request_id": X,
+            "request_digest": "0".repeat(64), "actor_id": "ana", "client_id": "dev1",
+            "origin_class": "agent", "origin_actor": "ana",
+            "origin_chain": [{"session_id": "x".repeat(pad), "agent_actor": "nixi"}],
+            "context_id": null, "approval_basis": {"basis": "direct"},
+            "reverses_event_id": null, "event_time_ms": null, "recorded_at_ms": 1,
+            "op_count": copies, "delta_digest": delta,
+        },
+        "ops": ops,
+    })
+}
+
+fn header_bytes(event: &Value) -> usize {
+    keeper_graph_protocol::value::canonical(&event["event"])
+        .map(|b| b.len())
+        .unwrap_or(0)
+}
+
+fn one_event_page(event: Value) -> Vec<Map<String, Value>> {
+    vec![json!({"events": [event], "scanned_through": "1"})
+        .as_object()
+        .cloned()
+        .unwrap_or_default()]
+}
+
+#[test]
+fn the_first_event_of_a_page_is_held_to_its_row_and_group_bounds() {
+    use keeper_graph_protocol::wire::MAX_EVENT_HEADER_BYTES;
+    // A header of exactly 128 KiB is read; one byte more is refused, first
+    // event or not.
+    let base = header_bytes(&event(0, 1));
+    let at = event(MAX_EVENT_HEADER_BYTES - base, 1);
+    assert_eq!(header_bytes(&at), MAX_EVENT_HEADER_BYTES);
+    assert!(decode_history("0", 1, one_event_page(at)).is_ok());
+    let over = event(MAX_EVENT_HEADER_BYTES - base + 1, 1);
+    assert_eq!(header_bytes(&over), MAX_EVENT_HEADER_BYTES + 1);
+    assert_eq!(
+        decode_history("0", 1, one_event_page(over)),
+        Err(Refusal::UnsupportedVersion)
+    );
+    // The reviewer's 5 MB header.
+    assert_eq!(
+        decode_history("0", 1, one_event_page(event(5 * 1024 * 1024, 1))),
+        Err(Refusal::UnsupportedVersion)
+    );
+    // 128 operations are a group; 129 refuse before any is decoded.
+    assert!(decode_history("0", 1, one_event_page(event(0, 128))).is_ok());
+    assert_eq!(
+        decode_history("0", 1, one_event_page(event(0, 129))),
+        Err(Refusal::UnsupportedVersion)
+    );
+}

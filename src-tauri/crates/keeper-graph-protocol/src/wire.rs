@@ -310,13 +310,52 @@ pub struct HistoryPage {
     pub scanned_through: String,
 }
 
+/// The most canonical bytes one event header may have: an event row, like
+/// every graph row, is at most [`delta::MAX_OPERATION_BYTES`].
+pub const MAX_EVENT_HEADER_BYTES: usize = delta::MAX_OPERATION_BYTES;
+
+/// One raw event of a page, checked before it is decoded: `{event, ops}`
+/// and nothing else, a header within [`MAX_EVENT_HEADER_BYTES`], 1 to
+/// [`delta::MAX_OPERATIONS`] operations each within
+/// [`delta::MAX_OPERATION_BYTES`] and together within
+/// [`delta::MAX_DELTA_BYTES`]. Its canonical bytes.
+fn raw_event(event: &Value) -> Result<usize, Refusal> {
+    let refuse = || Refusal::UnsupportedVersion;
+    let fields = event.as_object().ok_or_else(refuse)?;
+    let (Some(header), Some(Value::Array(ops)), 2) =
+        (fields.get("event"), fields.get("ops"), fields.len())
+    else {
+        return Err(refuse());
+    };
+    if !header.is_object() || ops.is_empty() || ops.len() > delta::MAX_OPERATIONS {
+        return Err(refuse());
+    }
+    let header = canonical(header).map_err(|_| refuse())?.len();
+    if header > MAX_EVENT_HEADER_BYTES {
+        return Err(refuse());
+    }
+    let mut delta = 2 + ops.len() - 1;
+    for op in ops {
+        let op = canonical(op).map_err(|_| refuse())?.len();
+        delta += op;
+        if op > delta::MAX_OPERATION_BYTES || delta > delta::MAX_DELTA_BYTES {
+            return Err(refuse());
+        }
+    }
+    Ok(header + delta)
+}
+
 /// Decode [`HISTORY`]'s answer to a page of at most `limit` events after
 /// `after`, refusing (`unsupported_version`) anything the page bounds rule
-/// out before reading its events: more than `limit` events, more than
-/// [`MAX_HISTORY_SCAN`] positions scanned, or more than
+/// out before any event is decoded: more than `limit` events, more than
+/// [`MAX_HISTORY_SCAN`] positions scanned, any event — the first included —
+/// outside its row and group bounds (a header within
+/// [`MAX_EVENT_HEADER_BYTES`], 1 to 128 operations within their row and
+/// delta bounds), or more than
 /// [`MAX_HISTORY_PAGE_BYTES`] of canonical event bytes beyond the first
-/// event. Then every event must be whole and checked, positions ascending
-/// within `(after, scanned_through]`.
+/// event (the one bound the first whole event is exempt from). Then every
+/// event must be whole and checked, positions ascending within
+/// `(after, scanned_through]`.
 pub fn decode_history(
     after: &str,
     limit: u32,
@@ -340,12 +379,13 @@ pub fn decode_history(
         return Err(Refusal::UnsupportedVersion);
     }
     let mut bytes = 0usize;
-    for event in events.iter().skip(1) {
-        bytes += canonical(event)
-            .map_err(|_| Refusal::UnsupportedVersion)?
-            .len();
-        if bytes > MAX_HISTORY_PAGE_BYTES {
-            return Err(Refusal::UnsupportedVersion);
+    for (index, event) in events.iter().enumerate() {
+        let size = raw_event(event)?;
+        if index > 0 {
+            bytes += size;
+            if bytes > MAX_HISTORY_PAGE_BYTES {
+                return Err(Refusal::UnsupportedVersion);
+            }
         }
     }
     let page: HistoryPage =

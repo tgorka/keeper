@@ -655,8 +655,9 @@ JSON decoded. Every event in `(after, scanned_through]` that matches the filter 
 whole and ascending; `scanned_through` is the last position examined, matching or not, so an
 empty or filtered page still moves the cursor and no later match is skipped. A page examines at
 most 1,000 positions and holds at most `limit` events and 4 MiB of canonical event bytes beyond
-its first event; a client refuses a page outside these bounds, or an image outside its entity's
-shape. History is the retained events, never the pruned transport log.
+its first event, and every event in it, the first included, is within the row bounds of
+*Tables* (its header at most 128 KiB, its operations as for the event); a client refuses a page
+outside these bounds, or an image outside its entity's shape. History is the retained events, never the pruned transport log.
 
 ## The live check
 
