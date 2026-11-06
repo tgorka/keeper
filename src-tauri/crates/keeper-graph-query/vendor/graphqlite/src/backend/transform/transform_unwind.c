@@ -1,0 +1,608 @@
+/*
+ * UNWIND Clause Transformation
+ * Converts UNWIND clauses that expand lists into rows
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "transform/cypher_transform.h"
+#include "transform/transform_helpers.h"
+#include "transform/sql_builder.h"
+#include "parser/cypher_debug.h"
+
+/* GQLITE-A-0007: the type tag column of an UNWIND CTE. json_each.value
+ * gives a JSON boolean as 1/0 and a list as text; the tag keeps the type
+ * so a read of the variable restores it (_gql_retag). */
+#define UNWIND_TAG_COL "value__gqlt"
+#define UNWIND_JSON_EACH_TAG \
+    ", (CASE json_each.type WHEN 'true' THEN 'bool' WHEN 'false' THEN 'bool' " \
+    "WHEN 'array' THEN 'json' WHEN 'object' THEN 'json' WHEN 'text' THEN 'text' END) AS " UNWIND_TAG_COL
+
+/* Declared in executor/executor_internal.h. Re-declared here to avoid a
+ * cross-layer include from transform → executor internals. */
+extern char *serialize_ast_to_json(ast_node *expr);
+
+/**
+ * Transform UNWIND clause - expands list into rows
+ *
+ * UNWIND [1, 2, 3] AS x RETURN x
+ * ->
+ * WITH _unwind_0 AS (SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3)
+ * SELECT _unwind_0.value AS x FROM _unwind_0
+ */
+int transform_unwind_clause(cypher_transform_context *ctx, cypher_unwind *unwind)
+{
+    CYPHER_DEBUG("Transforming UNWIND clause");
+
+    if (!ctx || !unwind || !unwind->alias) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("UNWIND requires expression and alias");
+        return -1;
+    }
+
+    /* Generate unique CTE name */
+    char cte_name[32];
+    snprintf(cte_name, sizeof(cte_name), "_unwind_%d", ctx->unwind_cte_counter++);
+
+    /* GQLITE-T-0228 family: capture projected variables that are currently
+     * in scope so we can carry them through the UNWIND CTE. Without this,
+     * `WITH 1 AS a UNWIND [1,2] AS x RETURN a, x` errors out because the
+     * UNWIND drops `a` from the var context. */
+    /* T-0333 (Unwind1 [12]): if UNWIND source is an identifier referencing
+     * a list-of-nodes/edges (e.g. `collect(n)`), capture the inner kind
+     * before the var-ctx reset so we can rebind the unwound alias with the
+     * proper kind. */
+    var_kind unwind_inner_kind = VAR_KIND_PROJECTED;
+    if (unwind->expr && unwind->expr->type == AST_NODE_IDENTIFIER) {
+        cypher_identifier *id = (cypher_identifier*)unwind->expr;
+        transform_var *src = transform_var_lookup(ctx->var_ctx, id->name);
+        if (src && (src->list_inner_kind == VAR_KIND_NODE ||
+                    src->list_inner_kind == VAR_KIND_EDGE)) {
+            unwind_inner_kind = src->list_inner_kind;
+        }
+    }
+
+    char *carry_names[64];
+    char *carry_aliases[64];
+    var_kind carry_kinds[64];
+    char *carry_tags[64];    /* GQLITE-A-0007: tag column of a carried value */
+    bool carry_splice_only[64]; /* a MATCH-bound entity: carried by id only
+                                 * where the MATCH tables are spliced in */
+    bool used_splice = false;
+    int carry_count = 0;
+    {
+        int n = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < n && carry_count < 64; i++) {
+            transform_var *v = transform_var_at(ctx->var_ctx, i);
+            if (!v || !v->name) continue;
+            if (!v->is_visible) continue;
+            /* T-0333 (Unwind1 [12]): carry projected vars and post-WITH
+             * node/edge vars. Post-WITH node/edge variables hold an
+             * `<cte>.<col>` reference (alias IS the id), so they thread
+             * through identically to a projected scalar. */
+            if (v->kind != VAR_KIND_PROJECTED &&
+                v->kind != VAR_KIND_NODE &&
+                v->kind != VAR_KIND_EDGE) continue;
+            const char *alias = v->source_expr ? v->source_expr : v->table_alias;
+            if (!alias) continue;
+            /* For post-WITH node/edge vars, table_alias is the id column
+             * reference (alias_is_id is true). For pre-WITH node/edge
+             * vars (just-emitted MATCH), table_alias is the SQL table
+             * alias and we can't carry those through an UNWIND CTE —
+             * skip them. */
+            bool splice_only = false;
+            char id_ref[300];
+            if ((v->kind == VAR_KIND_NODE || v->kind == VAR_KIND_EDGE) && !v->alias_is_id) {
+                /* GQLITE-T-0416: a named MATCH entity is carried by its id
+                 * when the MATCH tables are spliced into the UNWIND CTE
+                 * (MATCH (n) UNWIND n.l AS x RETURN n.id, x). */
+                if (strncmp(v->name, "_gql_default_alias_", 19) == 0 ||
+                    strncmp(v->name, "__unnamed", 9) == 0 || v->cte_name) continue;
+                snprintf(id_ref, sizeof(id_ref), "%s.id", alias);
+                alias = id_ref;
+                splice_only = true;
+            }
+            carry_splice_only[carry_count] = splice_only;
+            carry_names[carry_count]   = strdup(v->name);
+            carry_aliases[carry_count] = strdup(alias);
+            carry_kinds[carry_count]   = v->kind;
+            carry_tags[carry_count]    = (v->kind == VAR_KIND_PROJECTED && v->tag_expr)
+                                         ? strdup(v->tag_expr) : NULL;
+            carry_count++;
+        }
+    }
+
+    /*
+     * Build inner SQL from builder state directly.
+     * This avoids the SELECT * pattern - we explicitly build the subquery.
+     */
+    char *inner_sql = NULL;
+    char *saved_cte = NULL;
+    int saved_cte_count = 0;
+
+    if (ctx->unified_builder && sql_builder_has_from(ctx->unified_builder)) {
+        /* Extract builder state */
+        const char *from_clause = sql_builder_get_from(ctx->unified_builder);
+        const char *joins_clause = sql_builder_get_joins(ctx->unified_builder);
+        const char *where_clause = sql_builder_get_where(ctx->unified_builder);
+
+        /* Build subquery: SELECT * FROM <from><joins> WHERE <where> */
+        dynamic_buffer subquery;
+        dbuf_init(&subquery);
+
+        dbuf_append(&subquery, "SELECT * FROM ");
+        dbuf_append(&subquery, from_clause);
+
+        if (joins_clause) {
+            dbuf_append(&subquery, joins_clause);
+        }
+
+        if (where_clause) {
+            dbuf_append(&subquery, " WHERE ");
+            dbuf_append(&subquery, where_clause);
+        }
+
+        inner_sql = dbuf_finish(&subquery);
+
+        /* Save CTE buffer before reset */
+        if (!dbuf_is_empty(&ctx->unified_builder->cte)) {
+            saved_cte = strdup(dbuf_get(&ctx->unified_builder->cte));
+            saved_cte_count = ctx->unified_builder->cte_count;
+        }
+
+        sql_builder_reset(ctx->unified_builder);
+
+        /* Restore CTE buffer after reset */
+        if (saved_cte) {
+            dbuf_append(&ctx->unified_builder->cte, saved_cte);
+            ctx->unified_builder->cte_count = saved_cte_count;
+            free(saved_cte);
+        }
+    }
+
+    /* Build CTE query in a local buffer */
+    dynamic_buffer cte_query;
+    dbuf_init(&cte_query);
+
+    /* Pre-build a "_prev carry projection" snippet to splice into each
+     * UNION arm when prior projected variables exist. Looks like:
+     *   ", _prev.a AS a, _prev.b AS b"
+     * Without prior projected vars OR an inner_sql to source them from,
+     * this stays empty and behavior is unchanged. */
+    dynamic_buffer carry_cols;
+    dbuf_init(&carry_cols);
+    /* Alternate carry-cols form for the function-call / subscript /
+     * binary-op branch, which splices the inner FROM tables directly
+     * (so var refs in the unwound expression stay in scope) and thus
+     * cannot reference `_prev` — uses the original `<table>.<col>`
+     * alias instead. T-0305. */
+    dynamic_buffer carry_cols_orig;
+    dbuf_init(&carry_cols_orig);
+    bool has_carry = (carry_count > 0 && inner_sql && strlen(inner_sql) > 0);
+    if (has_carry) {
+        for (int i = 0; i < carry_count; i++) {
+            /* Projected variables' table_alias is typically `<cte>.<col>`;
+             * we just need the column name when sourcing from _prev. */
+            const char *col = sql_ref_column(carry_aliases[i]);
+            if (!carry_splice_only[i]) {
+              char _ib2[128];
+              dbuf_appendf(&carry_cols, ", _prev.%s AS %s", col,
+                           sql_ident(_ib2, sizeof(_ib2), carry_names[i])); }
+            { char _ib2[128];
+              dbuf_appendf(&carry_cols_orig, ", %s AS %s",
+                           carry_aliases[i],
+                           sql_ident(_ib2, sizeof(_ib2), carry_names[i])); }
+            if (carry_tags[i]) {
+                char tn[256], _ib3[300];
+                snprintf(tn, sizeof(tn), "%s__gqlt", carry_names[i]);
+                sql_ident(_ib3, sizeof(_ib3), tn);
+                dbuf_appendf(&carry_cols, ", _prev.%s AS %s", sql_ref_column(carry_tags[i]), _ib3);
+                dbuf_appendf(&carry_cols_orig, ", %s AS %s", carry_tags[i], _ib3);
+            }
+        }
+    }
+
+    /* UNWIND null AS x → zero rows (openCypher spec). Emit an empty
+     * CTE; the common tail below handles var registration and FROM. */
+    if (unwind->expr->type == AST_NODE_LITERAL &&
+        ((cypher_literal *)unwind->expr)->literal_type == LITERAL_NULL) {
+        dbuf_append(&cte_query, "SELECT NULL AS value, NULL AS " UNWIND_TAG_COL);
+        if (has_carry) dbuf_append(&cte_query, dbuf_get(&carry_cols));
+        dbuf_append(&cte_query, " WHERE 0");
+    } else if (unwind->expr->type == AST_NODE_LIST) {
+        /* List literal: use UNION ALL approach */
+        cypher_list *list = (cypher_list*)unwind->expr;
+
+        /* When the list elements reference bound MATCH variables (e.g.
+         * `UNWIND [n, r, p, ...]` — ReturnOrderBy1 [11], Comparison2 [3]),
+         * each UNION arm must splice the prior MATCH's FROM tables so those
+         * aliases stay in scope (and so cardinality matches the surrounding
+         * scope). Mirrors the function-call branch's splice handling. */
+        bool list_splicable = (inner_sql && strlen(inner_sql) > 0 &&
+                               strncmp(inner_sql, "SELECT * FROM ", 14) == 0);
+        const char *list_where = list_splicable ? strstr(inner_sql, " WHERE ") : NULL;
+
+        if (!list->items || list->items->count == 0) {
+            /* Empty list: return no rows using impossible condition */
+            dbuf_append(&cte_query, "SELECT NULL AS value, NULL AS " UNWIND_TAG_COL);
+            if (has_carry) dbuf_append(&cte_query, dbuf_get(&carry_cols));
+            dbuf_append(&cte_query, " WHERE 0");
+        } else {
+            for (int i = 0; i < list->items->count; i++) {
+                if (i > 0) {
+                    dbuf_append(&cte_query, " UNION ALL ");
+                }
+                dbuf_append(&cte_query, "SELECT ");
+
+                /* Transform the expression to get its SQL value */
+                ast_node *item = list->items->items[i];
+                char *item_sql = NULL;  /* SQL of a general expression item */
+                if (item->type == AST_NODE_LITERAL) {
+                    cypher_literal *lit = (cypher_literal*)item;
+                    switch (lit->literal_type) {
+                        case LITERAL_INTEGER:
+                            dbuf_appendf(&cte_query, "%lld", (long long)lit->value.integer);
+                            break;
+                        case LITERAL_DECIMAL:
+                            { char fb[40]; dbuf_append(&cte_query, gql_format_double(fb, sizeof(fb), lit->value.decimal)); }
+                            break;
+                        case LITERAL_STRING:
+                            { char *esc = escape_sql_string(lit->value.string ? lit->value.string : "");
+                              dbuf_appendf(&cte_query, "'%s'", esc ? esc : "");
+                              free(esc); }
+                            break;
+                        case LITERAL_BOOLEAN:
+                            /* Emit as 'true'/'false' string so downstream
+                             * output formatting renders JSON booleans
+                             * (matches the convention used by boolean
+                             * property access). */
+                            dbuf_append(&cte_query, lit->value.boolean ? "'true'" : "'false'");
+                            break;
+                        case LITERAL_NULL:
+                            dbuf_append(&cte_query, "NULL");
+                            break;
+                    }
+                } else if (item->type == AST_NODE_MAP || item->type == AST_NODE_LIST) {
+                    /* Nested map/list item — serialize to JSON and emit as a
+                     * JSON literal so downstream property access can use
+                     * json_extract(_unwind_N.value, '$.key') (GQLITE-T-0185). */
+                    char *json_str = serialize_ast_to_json(item);
+                    if (json_str) {
+                        dbuf_append(&cte_query, "json('");
+                        for (const char *p = json_str; *p; p++) {
+                            if (*p == '\'') dbuf_append(&cte_query, "''");
+                            else dbuf_appendf(&cte_query, "%c", *p);
+                        }
+                        dbuf_append(&cte_query, "')");
+                        free(json_str);
+                    } else {
+                        dbuf_append(&cte_query, "NULL");
+                    }
+                } else {
+                    /* General expression (function call, identifier, etc.) —
+                     * transform to SQL and emit inline. */
+                    char *saved_buffer = ctx->sql_buffer;
+                    size_t saved_size = ctx->sql_size;
+                    size_t saved_capacity = ctx->sql_capacity;
+                    size_t temp_capacity = 4096;
+                    char *temp_buffer = malloc(temp_capacity);
+                    bool ok = false;
+                    if (temp_buffer) {
+                        temp_buffer[0] = '\0';
+                        ctx->sql_buffer = temp_buffer;
+                        ctx->sql_size = 0;
+                        ctx->sql_capacity = temp_capacity;
+                        /* A path variable as a list element must materialize as
+                         * a self-contained {nodes,rels} object — the executor's
+                         * elem_ids post-hydration only reaches top-level RETURN
+                         * columns, not values buried in an UNWIND row. (T-0340 sub-C) */
+                        bool saved_ehp = ctx->emit_hydrated_path;
+                        ctx->emit_hydrated_path = true;
+                        if (transform_expression(ctx, item) == 0 && ctx->sql_buffer[0]) {
+                            dbuf_appendf(&cte_query, "(%s)", ctx->sql_buffer);
+                            item_sql = strdup(ctx->sql_buffer);
+                            ok = true;
+                        }
+                        ctx->emit_hydrated_path = saved_ehp;
+                        /* append_sql may realloc; free what ctx->sql_buffer
+                         * now points to, not the original temp_buffer. */
+                        free(ctx->sql_buffer);
+                        ctx->sql_buffer = saved_buffer;
+                        ctx->sql_size = saved_size;
+                        ctx->sql_capacity = saved_capacity;
+                    }
+                    if (!ok) dbuf_append(&cte_query, "NULL");
+                }
+                dbuf_append(&cte_query, " AS value");
+                {
+                    /* Tag of this element (GQLITE-A-0007). */
+                    const char *tag = "NULL";
+                    if (item->type == AST_NODE_LITERAL &&
+                        ((cypher_literal *)item)->literal_type == LITERAL_BOOLEAN) {
+                        tag = "'bool'";
+                    } else if (item->type == AST_NODE_MAP || item->type == AST_NODE_LIST) {
+                        tag = "'json'";
+                    } else if (item->type == AST_NODE_LITERAL &&
+                               ((cypher_literal *)item)->literal_type == LITERAL_STRING) {
+                        tag = "'text'";
+                    }
+                    char *dyn_tag = NULL;
+                    if (item_sql) {
+                        /* An expression item: its tag while the subtype is
+                         * still there (a property read: two key probes). */
+                        if (item->type == AST_NODE_PROPERTY) {
+                            dyn_tag = transform_property_tag_sql(ctx, (cypher_property *)item);
+                        }
+                        if (!dyn_tag) {
+                            size_t n = strlen(item_sql) + 32;
+                            dyn_tag = malloc(n);
+                            if (dyn_tag) snprintf(dyn_tag, n, "_gql_typetag((%s))", item_sql);
+                        }
+                        free(item_sql);
+                    }
+                    dbuf_appendf(&cte_query, ", %s AS " UNWIND_TAG_COL, dyn_tag ? dyn_tag : tag);
+                    free(dyn_tag);
+                }
+                if (list_splicable) {
+                    used_splice = true;
+                    /* Element exprs reference the original MATCH aliases, so
+                     * splice the FROM tables directly (not wrapped as _prev). */
+                    if (has_carry) dbuf_append(&cte_query, dbuf_get(&carry_cols_orig));
+                    dbuf_append(&cte_query, " FROM ");
+                    if (list_where) {
+                        size_t tlen = (size_t)(list_where - (inner_sql + 14));
+                        dbuf_appendf(&cte_query, "%.*s", (int)tlen, inner_sql + 14);
+                        dbuf_append(&cte_query, list_where);  /* re-attach WHERE */
+                    } else {
+                        dbuf_append(&cte_query, inner_sql + 14);
+                    }
+                } else if (has_carry) {
+                    dbuf_append(&cte_query, dbuf_get(&carry_cols));
+                    dbuf_appendf(&cte_query, " FROM (%s) AS _prev", inner_sql);
+                }
+            }
+        }
+    } else if (unwind->expr->type == AST_NODE_IDENTIFIER) {
+        /* Variable reference - assume it's a list variable from previous clause */
+        cypher_identifier *id = (cypher_identifier*)unwind->expr;
+        const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+
+        dbuf_append(&cte_query, "SELECT json_each.value AS value" UNWIND_JSON_EACH_TAG);
+        if (has_carry) dbuf_append(&cte_query, dbuf_get(&carry_cols));
+        dbuf_append(&cte_query, " FROM ");
+
+        /* When the unwound variable IS a carried-through projection, source
+         * it from `_prev` (the subquery alias) rather than its original CTE
+         * alias — the original CTE isn't in the new FROM clause directly. */
+        const char *json_each_arg = alias ? alias : id->name;
+        char prev_arg[128];
+        if (has_carry && alias) {
+            const char *col = sql_ref_column(alias);
+            if (col != alias) {
+                snprintf(prev_arg, sizeof(prev_arg), "_prev.%s", col);
+                json_each_arg = prev_arg;
+            }
+        }
+
+        if (inner_sql && strlen(inner_sql) > 0) {
+            dbuf_appendf(&cte_query, "(%s) AS _prev, ", inner_sql);
+        }
+
+        dbuf_appendf(&cte_query, "json_each(%s)", json_each_arg);
+    } else if (unwind->expr->type == AST_NODE_FUNCTION_CALL ||
+               unwind->expr->type == AST_NODE_SUBSCRIPT ||
+               unwind->expr->type == AST_NODE_BINARY_OP ||
+               unwind->expr->type == AST_NODE_PROPERTY ||
+               (unwind->expr->type == AST_NODE_PARAMETER &&
+                ((cypher_parameter *)unwind->expr)->name)) {
+        /* #136: a parameter takes this branch too. Its own branch wrapped a
+         * MATCH prefix as _prev without the spliced variables, so
+         * `MATCH (n) UNWIND $rows AS row ... n` failed with
+         * "no such column: n". */
+        /* Function call that returns a list (e.g., range(), keys(), etc.),
+         * subscript expression (qrows[p]), binary op (list concat), or a
+         * property (GQLITE-T-0416: its own branch read only the text table
+         * through an alias out of scope, so `MATCH (n) UNWIND n.l` failed). */
+        /* Transform the function expression to SQL, then use json_each on the result */
+
+        /* Save current SQL buffer state */
+        char *saved_buffer = ctx->sql_buffer;
+        size_t saved_size = ctx->sql_size;
+        size_t saved_capacity = ctx->sql_capacity;
+
+        /* Allocate temporary buffer for expression transformation */
+        size_t temp_capacity = 4096;
+        char *temp_buffer = malloc(temp_capacity);
+        if (!temp_buffer) {
+            ctx->has_error = true;
+            ctx->error_message = strdup("Memory allocation failed in UNWIND");
+            dbuf_free(&cte_query);
+            free(inner_sql);
+            return -1;
+        }
+        temp_buffer[0] = '\0';
+
+        /* Switch to temporary buffer */
+        ctx->sql_buffer = temp_buffer;
+        ctx->sql_size = 0;
+        ctx->sql_capacity = temp_capacity;
+
+        /* Transform the function call expression */
+        if (transform_expression(ctx, unwind->expr) < 0) {
+            free(temp_buffer);
+            ctx->sql_buffer = saved_buffer;
+            ctx->sql_size = saved_size;
+            ctx->sql_capacity = saved_capacity;
+            dbuf_free(&cte_query);
+            free(inner_sql);
+            return -1;
+        }
+
+        /* Capture the transformed function SQL */
+        char *func_sql = strdup(ctx->sql_buffer);
+
+        /* Restore original buffer */
+        free(temp_buffer);
+        ctx->sql_buffer = saved_buffer;
+        ctx->sql_size = saved_size;
+        ctx->sql_capacity = saved_capacity;
+
+        /* Build json_each query on the function result. T-0305: when
+         * inner_sql is splice-able (`SELECT * FROM <tables>`), the
+         * outer FROM uses original aliases (no _prev wrapping), so
+         * the carry-cols must reference those original aliases too. */
+        bool splicable = (inner_sql && strlen(inner_sql) > 0 &&
+            strncmp(inner_sql, "SELECT * FROM ", 14) == 0);
+        /* When inner_sql has a WHERE clause, we need to splice the FROM
+         * tables BEFORE the comma + json_each(...) and emit the WHERE
+         * AFTER the join. Reproducer: Graph8 [5]
+         *   MATCH ()-[r:KNOWS]-() UNWIND keys(r) AS x ...
+         * Previously emitted `... WHERE <conds>, json_each(...)` which
+         * misplaces the comma. */
+        const char *where_in_inner = NULL;
+        if (splicable) {
+            where_in_inner = strstr(inner_sql, " WHERE ");
+        }
+        dbuf_append(&cte_query, "SELECT json_each.value AS value" UNWIND_JSON_EACH_TAG);
+        if (splicable) used_splice = true;
+        if (has_carry) {
+            dbuf_append(&cte_query,
+                splicable ? dbuf_get(&carry_cols_orig) : dbuf_get(&carry_cols));
+        }
+        dbuf_append(&cte_query, " FROM ");
+
+        if (inner_sql && strlen(inner_sql) > 0) {
+            if (splicable) {
+                if (where_in_inner) {
+                    /* Emit just the FROM tables (between "SELECT * FROM "
+                     * and the " WHERE "), then the json_each, then re-attach
+                     * WHERE afterwards. */
+                    size_t tables_len = (size_t)(where_in_inner - (inner_sql + 14));
+                    dbuf_appendf(&cte_query, "%.*s, ", (int)tables_len, inner_sql + 14);
+                } else {
+                    dbuf_appendf(&cte_query, "%s, ", inner_sql + 14);
+                }
+            } else {
+                dbuf_appendf(&cte_query, "(%s) AS _prev, ", inner_sql);
+            }
+        }
+
+        dbuf_appendf(&cte_query, "json_each(%s)", func_sql);
+        if (splicable && where_in_inner) {
+            /* WHERE keyword is included in where_in_inner (" WHERE ..."). */
+            dbuf_append(&cte_query, where_in_inner);
+        }
+        free(func_sql);
+    } else if (unwind->expr->type == AST_NODE_PARAMETER) {
+        /* Parameter reference: use json_each on the bound parameter value.
+         * Parameters become SQLite named parameters (:name), and json_each()
+         * can iterate over JSON array text directly. */
+        cypher_parameter *param = (cypher_parameter*)unwind->expr;
+        if (!param->name) {
+            ctx->has_error = true;
+            ctx->error_message = strdup("UNWIND parameter must be named");
+            dbuf_free(&cte_query);
+            free(inner_sql);
+            return -1;
+        }
+
+        register_parameter(ctx, param->name);
+
+        dbuf_append(&cte_query, "SELECT json_each.value AS value" UNWIND_JSON_EACH_TAG);
+        if (has_carry) dbuf_append(&cte_query, dbuf_get(&carry_cols));
+        dbuf_append(&cte_query, " FROM ");
+
+        if (inner_sql && strlen(inner_sql) > 0) {
+            dbuf_appendf(&cte_query, "(%s) AS _prev, ", inner_sql);
+        }
+
+        dbuf_appendf(&cte_query, "json_each(:%s)", param->name);
+    } else {
+        ctx->has_error = true;
+        ctx->error_message = strdup("UNWIND requires list literal, property access, variable, function call, or parameter");
+        dbuf_free(&cte_query);
+        free(inner_sql);
+        return -1;
+    }
+
+    /* Add CTE to unified builder */
+    sql_cte(ctx->unified_builder, cte_name, dbuf_get(&cte_query), false);
+    dbuf_free(&cte_query);
+    ctx->cte_count++;
+
+    /* Clear old variables - UNWIND creates a new scope */
+    transform_var_ctx_reset(ctx->var_ctx);
+
+    /* Restore the carried variables we captured pre-reset, now pointing
+     * at the new UNWIND CTE's columns. Preserve original kind so post-UNWIND
+     * code paths see nodes/edges as nodes/edges (json-object projection,
+     * property access via id) rather than scalars. */
+    for (int i = 0; i < carry_count; i++) {
+        if (has_carry) {
+            char src[256], _ib[128];
+            snprintf(src, sizeof(src), "%s.%s", cte_name,
+                     sql_ident(_ib, sizeof(_ib), carry_names[i]));
+            if (carry_splice_only[i] && !used_splice) {
+                /* Not carried by this branch: out of scope, as before. */
+            } else if (carry_kinds[i] == VAR_KIND_NODE) {
+                transform_var_register_node(ctx->var_ctx, carry_names[i], src, NULL);
+                transform_var_set_alias_is_id(ctx->var_ctx, carry_names[i], true);
+            } else if (carry_kinds[i] == VAR_KIND_EDGE) {
+                transform_var_register_edge(ctx->var_ctx, carry_names[i], src, NULL);
+                transform_var_set_alias_is_id(ctx->var_ctx, carry_names[i], true);
+            } else {
+                transform_var_register_projected(ctx->var_ctx, carry_names[i], src);
+                if (carry_tags[i]) {
+                    char tn[256], tb[300], tag_ref[400];
+                    snprintf(tn, sizeof(tn), "%s__gqlt", carry_names[i]);
+                    snprintf(tag_ref, sizeof(tag_ref), "%s.%s", cte_name,
+                             sql_ident(tb, sizeof(tb), tn));
+                    transform_var_set_tag(ctx->var_ctx, carry_names[i], tag_ref);
+                }
+            }
+        }
+        free(carry_names[i]);
+        free(carry_aliases[i]);
+        free(carry_tags[i]);
+    }
+    dbuf_free(&carry_cols);
+    dbuf_free(&carry_cols_orig);
+
+    /* Register the unwound variable. When the source was a tagged
+     * list-of-nodes/edges, rebind as that kind with alias_is_id so
+     * post-UNWIND MATCH/RETURN treat it as a bound entity (T-0333). */
+    char unwind_source[256];
+    snprintf(unwind_source, sizeof(unwind_source), "%s.value", cte_name);
+    if (unwind_inner_kind == VAR_KIND_NODE || unwind_inner_kind == VAR_KIND_EDGE) {
+        /* collect() hydrates each element to a full JSON object
+         * ({id,labels,properties}), so the unwound value is an object, not a
+         * raw id. Bind the entity's alias to json_extract(value,'$.id') so it
+         * behaves like any other post-WITH alias_is_id entity: edge joins
+         * constrain on the id, RETURN re-hydrates from the DB by id, and
+         * property access resolves through the id. */
+        char id_source[300];
+        snprintf(id_source, sizeof(id_source),
+                 "json_extract(%s.value, '$.id')", cte_name);
+        if (unwind_inner_kind == VAR_KIND_NODE) {
+            transform_var_register_node(ctx->var_ctx, unwind->alias, id_source, NULL);
+        } else {
+            transform_var_register_edge(ctx->var_ctx, unwind->alias, id_source, NULL);
+        }
+        transform_var_set_alias_is_id(ctx->var_ctx, unwind->alias, true);
+    } else {
+        transform_var_register_projected(ctx->var_ctx, unwind->alias, unwind_source);
+        char tag_ref[300];
+        snprintf(tag_ref, sizeof(tag_ref), "%s." UNWIND_TAG_COL, cte_name);
+        transform_var_set_tag(ctx->var_ctx, unwind->alias, tag_ref);
+    }
+
+    /* Set up FROM for the outer query — SELECT columns are added by RETURN clause */
+    sql_from(ctx->unified_builder, cte_name, NULL);
+
+    free(inner_sql);
+    CYPHER_DEBUG("UNWIND clause generated CTE via unified builder: %s", cte_name);
+    return 0;
+}

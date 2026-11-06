@@ -1,0 +1,1427 @@
+/*
+ * SET Clause Execution
+ * Handles MATCH+SET query execution and property/label updates
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "executor/executor_internal.h"
+#include "transform/transform_helpers.h"
+#include "runtime/gql_error.h"
+#include "executor/cypher_executor.h"
+#include "parser/cypher_debug.h"
+#include "transform/transform_variables.h"
+#include "transform/sql_builder.h"
+
+/* Evaluate a function call that references node/edge properties.
+ * Uses the var_map to build a FROM clause so property lookups resolve.
+ * Returns 0 on success, -1 on error, -2 for NULL result. */
+/* Evaluate an arbitrary expression AST against the var_map by emitting
+ * a SELECT … FROM nodes WHERE id=… SQL query and reading the result.
+ * Used by SET to handle any RHS shape beyond bare literals/params/funcs
+ * (e.g. 'SET n.num = n.num + 1' where the RHS is a BINARY_OP). */
+/* Is text a valid JSON document? A string such as '[draft]' is not. */
+static bool text_is_json(sqlite3 *db, const char *text)
+{
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(db, "SELECT json_valid(?)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, text, -1, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1;
+        sqlite3_finalize(st);
+    }
+    return ok;
+}
+
+/* Register the current UNWIND/FOREACH values as scalar variables, so an
+ * expression such as toString(i) or row.a * 2 can read them (#124).
+ * A variable that var_map binds to an entity wins. */
+void executor_register_foreach_values(cypher_transform_context *ctx)
+{
+    if (!g_foreach_ctx) return;
+    for (int i = 0; i < g_foreach_ctx->count; i++) {
+        foreach_binding *b = &g_foreach_ctx->bindings[i];
+        if (transform_var_lookup(ctx->var_ctx, b->variable)) continue;
+        char *lit = NULL;
+        switch (b->literal_type) {
+            case LITERAL_INTEGER: lit = sqlite3_mprintf("%lld", (long long)b->value.integer); break;
+            case LITERAL_DECIMAL: lit = sqlite3_mprintf("%!.17g", b->value.decimal); break;
+            case LITERAL_BOOLEAN: lit = sqlite3_mprintf("_gql_bool_str(%d)", b->value.boolean ? 1 : 0); break;
+            case LITERAL_STRING:
+                if (!b->value.string) lit = sqlite3_mprintf("NULL");
+                else if (b->is_json) lit = sqlite3_mprintf("json(%Q)", b->value.string);
+                else lit = sqlite3_mprintf("%Q", b->value.string);
+                break;
+            default: lit = sqlite3_mprintf("NULL"); break;
+        }
+        if (!lit) continue;
+        transform_var_register_projected(ctx->var_ctx, b->variable, lit);
+        transform_var_set_bound(ctx->var_ctx, b->variable, true);
+        transform_var_set_scalar_value(ctx->var_ctx, b->variable, true);
+        sqlite3_free(lit);
+    }
+}
+
+/* A list or map literal whose elements are all literals (so it can be
+ * serialized from the AST). One that reads a property or a variable is
+ * evaluated in SQL instead; serializing it stored null for those
+ * elements (GQLITE-T-0407). */
+static bool ast_is_constant(const ast_node *expr)
+{
+    if (!expr) return true;
+    switch (expr->type) {
+        case AST_NODE_LITERAL:
+            return true;
+        case AST_NODE_LIST: {
+            const cypher_list *l = (const cypher_list *)expr;
+            for (int i = 0; l->items && i < l->items->count; i++)
+                if (!ast_is_constant(l->items->items[i])) return false;
+            return true;
+        }
+        case AST_NODE_MAP: {
+            const cypher_map *m = (const cypher_map *)expr;
+            for (int i = 0; m->pairs && i < m->pairs->count; i++) {
+                const cypher_map_pair *p = (const cypher_map_pair *)m->pairs->items[i];
+                if (p && !ast_is_constant(p->value)) return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+static int evaluate_ast_with_context_raw(
+    cypher_executor *executor,
+    ast_node *expr,
+    variable_map *var_map,
+    property_type *out_type,
+    property_value *out_value);
+
+/* evaluate_ast_with_context_raw, with the 1/0 result of a boolean-shaped
+ * expression reported as a boolean, so CREATE / SET store
+ * {t: NOT false} as true, not 1 (GQLITE-T-0387). */
+static int evaluate_ast_with_context(
+    cypher_executor *executor,
+    ast_node *expr,
+    variable_map *var_map,
+    property_type *out_type,
+    property_value *out_value)
+{
+    int rc = evaluate_ast_with_context_raw(executor, expr, var_map, out_type, out_value);
+    if (rc == 0 && *out_type == PROP_TYPE_INTEGER && ast_is_boolean_expr(expr) &&
+        (out_value->as_int == 0 || out_value->as_int == 1)) {
+        int b = (int)out_value->as_int;
+        *out_type = PROP_TYPE_BOOLEAN;
+        out_value->as_bool = b;
+    } else if (rc == 0 && *out_type == PROP_TYPE_TEXT && ast_is_boolean_expr(expr) && out_value->as_str &&
+               (strcmp(out_value->as_str, "true") == 0 || strcmp(out_value->as_str, "false") == 0)) {
+        int b = out_value->as_str[0] == 't';
+        free(out_value->as_str);
+        out_value->as_str = NULL;
+        out_value->as_str_len = 0;
+        *out_type = PROP_TYPE_BOOLEAN;
+        out_value->as_bool = b;
+    }
+    return rc;
+}
+
+static int evaluate_ast_with_context_raw(
+    cypher_executor *executor,
+    ast_node *expr,
+    variable_map *var_map,
+    property_type *out_type,
+    property_value *out_value)
+{
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) return -1;
+
+    /* Register variables from var_map so property lookups can resolve.
+     * T-0314: also register edge variables (was nodes-only). Without
+     * this, MATCH+SET on relationships couldn't evaluate r.num+1 —
+     * the executor's per-row SET path fell over for any edge
+     * arithmetic. */
+    bool added_from = false;
+    for (int i = 0; i < var_map->count; i++) {
+        variable_mapping *m = &var_map->mappings[i];
+        char alias[64];
+        snprintf(alias, sizeof(alias), "_gql_var_%d", i);
+        char where_cond[128];
+        snprintf(where_cond, sizeof(where_cond), "%s.id = %d", alias, m->entity_id);
+        if (m->type == VAR_MAP_TYPE_NODE) {
+            transform_var_register_node(ctx->var_ctx, m->variable, alias, NULL);
+            transform_var_set_bound(ctx->var_ctx, m->variable, true);
+            if (!added_from) {
+                sql_from(ctx->unified_builder, "nodes", alias);
+                added_from = true;
+            } else {
+                sql_join(ctx->unified_builder, SQL_JOIN_CROSS, "nodes", alias, NULL);
+            }
+            sql_where(ctx->unified_builder, where_cond);
+        } else if (m->type == VAR_MAP_TYPE_EDGE) {
+            transform_var_register_edge(ctx->var_ctx, m->variable, alias, NULL);
+            transform_var_set_bound(ctx->var_ctx, m->variable, true);
+            if (!added_from) {
+                sql_from(ctx->unified_builder, "edges", alias);
+                added_from = true;
+            } else {
+                sql_join(ctx->unified_builder, SQL_JOIN_CROSS, "edges", alias, NULL);
+            }
+            sql_where(ctx->unified_builder, where_cond);
+        }
+    }
+    executor_register_foreach_values(ctx);
+
+    /* Transform the expression to SQL. T-0314: pick the type-preserving
+     * (in_comparison) branch so property lookups stay typed — without
+     * this, `r.num + 1` becomes text "1" || "1" = "11" instead of 2. */
+    /* A list or map keeps the types of its elements (a boolean stays a
+     * JSON boolean) in value mode (GQLITE-T-0407). */
+    ctx->in_comparison = !(expr->type == AST_NODE_LIST || expr->type == AST_NODE_MAP);
+    append_sql(ctx, "SELECT ");
+    if (transform_expression(ctx, expr) < 0) {
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Build full SQL: SELECT func(...) FROM nodes AS n_0 WHERE n_0.id = X */
+    const char *from_str = sql_builder_get_from(ctx->unified_builder);
+    const char *joins_str = sql_builder_get_joins(ctx->unified_builder);
+    const char *where_str = sql_builder_get_where(ctx->unified_builder);
+
+    bool has_from = from_str && from_str[0], has_joins = joins_str && joins_str[0],
+         has_where = where_str && where_str[0];
+    char *full_sql = sqlite3_mprintf("%s%s%s%s%s%s%s", ctx->sql_buffer,
+                                     has_from ? " FROM " : "", has_from ? from_str : "",
+                                     has_joins ? " " : "", has_joins ? joins_str : "",
+                                     has_where ? " WHERE " : "", has_where ? where_str : "");
+
+    CYPHER_DEBUG("evaluate_function_with_context SQL: %s", full_sql ? full_sql : "(oom)");
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = full_sql ? sqlite3_prepare_v2(executor->db, full_sql, -1, &stmt, NULL) : SQLITE_NOMEM;
+    sqlite3_free(full_sql);
+    cypher_transform_free_context(ctx);
+    if (rc != SQLITE_OK) return -1;
+
+    if (executor->params_json) {
+        if (bind_params_from_json(stmt, executor->params_json) < 0) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -2;
+    }
+
+    int col_type = sqlite3_column_type(stmt, 0);
+    sqlite3_value *cv0 = sqlite3_column_value(stmt, 0);
+    bool json_sub = cv0 && sqlite3_value_subtype(cv0) == GQL_SUBTYPE_JSON;
+    switch (col_type) {
+        case SQLITE_INTEGER:
+            *out_type = PROP_TYPE_INTEGER;
+            out_value->as_int = sqlite3_column_int64(stmt, 0);
+            break;
+        case SQLITE_FLOAT:
+            *out_type = PROP_TYPE_REAL;
+            out_value->as_real = sqlite3_column_double(stmt, 0);
+            break;
+        case SQLITE_TEXT: {
+            const char *text = (const char*)sqlite3_column_text(stmt, 0);
+            /* A list or map (JSON subtype) is stored as JSON (GQLITE-T-0407). */
+            *out_type = json_sub ? PROP_TYPE_JSON : PROP_TYPE_TEXT;
+            out_value->as_str = text ? strdup(text) : strdup("");
+            out_value->as_str_len = text ? strlen(text) : 0;
+            break;
+        }
+        case SQLITE_NULL:
+            sqlite3_finalize(stmt);
+            return -2;
+        default:
+            sqlite3_finalize(stmt);
+            return -1;
+    }
+
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+/* T-0328: evaluate `expr` as a boolean predicate against `var_map`.
+ * Public wrapper around the static evaluate_ast_with_context above.
+ * Returns 1 (truthy / pass), 0 (falsy / NULL / drop), or -1 on
+ * transform error. Used by write-path dispatch handlers
+ * (handle_unwind_create_return etc.) to filter the created-row set
+ * by an intermediate WHERE clause. */
+int executor_eval_predicate(cypher_executor *executor,
+                             ast_node *expr,
+                             variable_map *var_map)
+{
+    property_type t;
+    property_value v;
+    int rc = evaluate_ast_with_context(executor, expr, var_map, &t, &v);
+    if (rc < 0) {
+        /* -2 means NULL result — treat as falsy per Cypher
+         * three-valued logic. -1 is a real error. */
+        if (rc == -2) return 0;
+        return -1;
+    }
+    /* Coerce result to bool. Cypher booleans land as INTEGER 0/1
+     * via _gql_bool; integer/real non-zero is truthy; non-empty
+     * text is truthy. */
+    switch (t) {
+        case PROP_TYPE_BOOLEAN: return v.as_bool ? 1 : 0;
+        case PROP_TYPE_INTEGER: return v.as_int != 0 ? 1 : 0;
+        case PROP_TYPE_REAL:    return v.as_real != 0.0 ? 1 : 0;
+        case PROP_TYPE_TEXT: {
+            int truth = (v.as_str && v.as_str[0]) ? 1 : 0;
+            free(v.as_str);
+            return truth;
+        }
+        default: return 0;
+    }
+}
+
+/* Public value-returning evaluator: evaluate `expr` against `var_map` and
+ * return its value via out params. Returns 0 (value), -1 (error), -2 (NULL).
+ * Used by CREATE+RETURN to project general expressions. */
+int executor_eval_value(cypher_executor *executor, ast_node *expr,
+                        variable_map *var_map, property_type *out_type,
+                        property_value *out_value) {
+    return evaluate_ast_with_context(executor, expr, var_map, out_type, out_value);
+}
+
+/* Evaluate a function call by transforming to SQL and executing via SQLite.
+ * Returns 0 on success, -1 on error, -2 for NULL result. */
+int evaluate_function_call_via_sqlite(
+    cypher_executor *executor,
+    cypher_function_call *func_call,
+    property_type *out_type,
+    property_value *out_value)
+{
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) return -1;
+    executor_register_foreach_values(ctx);
+
+    append_sql(ctx, "SELECT ");
+    if (transform_expression(ctx, (ast_node*)func_call) < 0) {
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
+    cypher_transform_free_context(ctx);
+    if (rc != SQLITE_OK) return -1;
+
+    if (executor->params_json) {
+        if (bind_params_from_json(stmt, executor->params_json) < 0) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+
+    int col_type = sqlite3_column_type(stmt, 0);
+    switch (col_type) {
+        case SQLITE_INTEGER:
+            *out_type = PROP_TYPE_INTEGER;
+            out_value->as_int = sqlite3_column_int64(stmt, 0);
+            break;
+        case SQLITE_FLOAT:
+            *out_type = PROP_TYPE_REAL;
+            out_value->as_real = sqlite3_column_double(stmt, 0);
+            break;
+        case SQLITE_TEXT: {
+            const char *text = (const char*)sqlite3_column_text(stmt, 0);
+            if (text && (*text == '{' || *text == '[') && text_is_json(executor->db, text)) {
+                *out_type = PROP_TYPE_JSON;
+            } else {
+                *out_type = PROP_TYPE_TEXT;
+            }
+            if (text) {
+                out_value->as_str = strdup(text);
+                out_value->as_str_len = strlen(text);
+            } else {
+                out_value->as_str = strdup("");
+                out_value->as_str_len = 0;
+            }
+            break;
+        }
+        case SQLITE_NULL:
+            sqlite3_finalize(stmt);
+            return -2;
+        default:
+            sqlite3_finalize(stmt);
+            return -1;
+    }
+
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+/* Parse a JSON object string and set each key-value pair as a property.
+ * Follows the same hand-rolled JSON parsing pattern as get_param_value(). */
+static int set_properties_from_json_object(
+    cypher_executor *executor,
+    int entity_id,
+    bool is_edge,
+    const char *json_str,
+    cypher_result *result)
+{
+    const char *p = json_str;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+
+    if (*p != '{') {
+        set_result_error(result, "Bulk SET parameter must be a JSON object");
+        return -1;
+    }
+    p++;
+
+    while (*p) {
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        if (*p == '}') break;
+        if (*p == ',') { p++; continue; }
+
+        /* Parse key */
+        if (*p != '"') {
+            set_result_error(result, "Invalid JSON in bulk SET parameter");
+            return -1;
+        }
+        p++;
+        const char *key_start = p;
+        while (*p && *p != '"') p++;
+        if (!*p) {
+            set_result_error(result, "Unterminated string in bulk SET parameter");
+            return -1;
+        }
+        size_t key_len = p - key_start;
+        char key[256];
+        if (key_len >= sizeof(key)) key_len = sizeof(key) - 1;
+        memcpy(key, key_start, key_len);
+        key[key_len] = '\0';
+        p++; /* closing quote */
+
+        while (*p && *p != ':') p++;
+        if (!*p) break;
+        p++; /* colon */
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+
+        /* Parse value */
+        property_type pt;
+        char *dyn_str = NULL;  /* Dynamically allocated for string/JSON values */
+        const void *pv = NULL;
+        int64_t json_int_buf;
+        double json_real_buf;
+        int json_bool_buf;
+
+        if (*p == '"') {
+            /* String — scan for length, then allocate */
+            p++;
+            const char *scan = p;
+            size_t raw_len = 0;
+            while (*scan && *scan != '"') {
+                if (*scan == '\\' && *(scan+1)) scan++;
+                scan++;
+                raw_len++;
+            }
+            dyn_str = malloc(raw_len + 1);
+            if (!dyn_str) {
+                set_result_error(result, "Memory allocation failed in bulk SET");
+                return -1;
+            }
+            size_t i = 0;
+            while (*p && *p != '"') {
+                if (*p == '\\' && *(p+1)) {
+                    p++;
+                    i += (size_t)gql_json_decode_escape(&p, dyn_str + i);
+                } else {
+                    dyn_str[i++] = *p++;
+                }
+            }
+            dyn_str[i] = '\0';
+            if (*p == '"') p++;
+            pt = PROP_TYPE_TEXT;
+            pv = dyn_str;
+        } else if (*p == 't') {
+            pt = PROP_TYPE_BOOLEAN;
+            json_bool_buf = 1;
+            pv = &json_bool_buf;
+            while (*p && *p != ',' && *p != '}') p++;
+        } else if (*p == 'f') {
+            pt = PROP_TYPE_BOOLEAN;
+            json_bool_buf = 0;
+            pv = &json_bool_buf;
+            while (*p && *p != ',' && *p != '}') p++;
+        } else if (*p == 'n') {
+            /* null — skip this property */
+            p += 4;
+            continue;
+        } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
+            const char *num_start = p;
+            bool is_float = false;
+            if (*p == '-') p++;
+            while (*p >= '0' && *p <= '9') p++;
+            if (*p == '.') { is_float = true; p++; while (*p >= '0' && *p <= '9') p++; }
+            if (*p == 'e' || *p == 'E') { is_float = true; p++; if (*p == '+' || *p == '-') p++; while (*p >= '0' && *p <= '9') p++; }
+            if (is_float) {
+                pt = PROP_TYPE_REAL;
+                json_real_buf = strtod(num_start, NULL);
+                pv = &json_real_buf;
+            } else {
+                pt = PROP_TYPE_INTEGER;
+                json_int_buf = strtoll(num_start, NULL, 10);
+                pv = &json_int_buf;
+            }
+        } else if (*p == '{' || *p == '[') {
+            /* Nested object/array — store as JSON */
+            const char *json_start = p;
+            int depth = 1;
+            p++;
+            while (*p && depth > 0) {
+                if (*p == '{' || *p == '[') depth++;
+                else if (*p == '}' || *p == ']') depth--;
+                else if (*p == '"') {
+                    p++;
+                    while (*p && *p != '"') {
+                        if (*p == '\\' && *(p+1)) p++;
+                        p++;
+                    }
+                }
+                if (*p) p++;
+            }
+            size_t json_len = p - json_start;
+            dyn_str = malloc(json_len + 1);
+            if (!dyn_str) {
+                set_result_error(result, "Memory allocation failed in bulk SET");
+                return -1;
+            }
+            memcpy(dyn_str, json_start, json_len);
+            dyn_str[json_len] = '\0';
+            pt = PROP_TYPE_JSON;
+            pv = dyn_str;
+        } else {
+            /* Skip unknown value types */
+            while (*p && *p != ',' && *p != '}') p++;
+            continue;
+        }
+
+        int rc;
+        if (is_edge) {
+            rc = cypher_schema_set_edge_property(executor->schema_mgr, entity_id, key, pt, pv);
+        } else {
+            rc = cypher_schema_set_node_property(executor->schema_mgr, entity_id, key, pt, pv);
+        }
+        free(dyn_str);  /* Safe even if NULL */
+        if (rc == 0) {
+            result->properties_set++;
+        }
+    }
+
+    return 0;
+}
+
+/* Execute SET items from a list (used for ON CREATE/ON MATCH) */
+int execute_set_items(cypher_executor *executor, ast_list *items, variable_map *var_map, cypher_result *result)
+{
+    if (!executor || !items || !var_map || !result) {
+        return -1;
+    }
+
+    /* Create a temporary cypher_set to reuse execute_set_operations */
+    cypher_set temp_set;
+    temp_set.base.type = AST_NODE_SET;
+    temp_set.items = items;
+
+    return execute_set_operations(executor, &temp_set, var_map, result);
+}
+
+/* Execute MATCH+SET query combination */
+int execute_match_set_query(cypher_executor *executor, cypher_match *match, cypher_set *set, cypher_result *result)
+{
+    if (!executor || !match || !set || !result) {
+        return -1;
+    }
+
+    CYPHER_DEBUG("Executing MATCH+SET query");
+
+    /* Transform MATCH clause to get bound variables */
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) {
+        set_result_error(result, "Failed to create transform context");
+        return -1;
+    }
+
+    if (transform_match_clause(ctx, match) < 0) {
+        set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform MATCH clause");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Finalize to assemble unified builder content into sql_buffer */
+    if (finalize_sql_generation(ctx) < 0) {
+        set_result_error(result, "Failed to finalize SQL generation");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Add SELECT to get matched node and edge IDs */
+    char *select_pos = strstr(ctx->sql_buffer, "SELECT *");
+    if (select_pos) {
+        /* Replace SELECT * with specific node/edge ID selection */
+        char *after_star = select_pos + strlen("SELECT *");
+        char *temp = strdup(after_star);
+
+        ctx->sql_size = select_pos + strlen("SELECT ") - ctx->sql_buffer;
+        ctx->sql_buffer[ctx->sql_size] = '\0';
+
+        /* Select all node and edge variables found in the MATCH */
+        bool first = true;
+        int var_count = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < var_count; i++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, i);
+            if (var && var->kind == VAR_KIND_NODE) {
+                if (!first) append_sql(ctx, ", ");
+                append_sql(ctx, "%s.id AS \"%s_id\"", var->table_alias, var->name);
+                first = false;
+            } else if (var && var->kind == VAR_KIND_EDGE) {
+                if (!first) append_sql(ctx, ", ");
+                append_sql(ctx, "%s.id AS \"%s_id\"", var->table_alias, var->name);
+                first = false;
+            }
+        }
+
+        if (first) append_sql(ctx, "1");   /* no named variable: `MATCH () CREATE ()` */
+        append_sql(ctx, " %s", temp);
+        free(temp);
+    }
+
+    CYPHER_DEBUG("Generated MATCH SQL: %s", ctx->sql_buffer);
+
+    /* Execute the MATCH query to get node IDs */
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        char error[512];
+        snprintf(error, sizeof(error), "MATCH SQL prepare failed: %s", sqlite3_errmsg(executor->db));
+        set_result_error(result, error);
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Bind parameters if provided */
+    if (executor->params_json) {
+        if (bind_params_from_json(stmt, executor->params_json) < 0) {
+            set_result_error(result, "Failed to bind query parameters");
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            return -1;
+        }
+    }
+
+    /* Process each matched row and apply SET operations */
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        /* Create variable map from MATCH results */
+        variable_map *var_map = create_variable_map();
+        if (!var_map) {
+            set_result_error(result, "Failed to create variable map");
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            return -1;
+        }
+
+        /* Bind variables to matched node and edge IDs */
+        int col = 0;
+        int var_count2 = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < var_count2; i++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, i);
+            if (var && var->kind == VAR_KIND_NODE) {
+                int64_t node_id = sqlite3_column_int64(stmt, col);
+                /* an OPTIONAL MATCH miss stays unbound, not id 0 */
+                set_variable_node_id(var_map, var->name,
+                                     sqlite3_column_type(stmt, col) == SQLITE_NULL ? GQL_NULL_ENTITY_ID : (int)node_id);
+                CYPHER_DEBUG("Bound variable '%s' to node %lld", var->name, (long long)node_id);
+                col++;
+            } else if (var && var->kind == VAR_KIND_EDGE) {
+                int64_t edge_id = sqlite3_column_int64(stmt, col);
+                /* an OPTIONAL MATCH miss stays unbound, not id 0 */
+                set_variable_edge_id(var_map, var->name,
+                                     sqlite3_column_type(stmt, col) == SQLITE_NULL ? GQL_NULL_ENTITY_ID : (int)edge_id);
+                CYPHER_DEBUG("Bound variable '%s' to edge %lld", var->name, (long long)edge_id);
+                col++;
+            }
+        }
+
+        /* Execute SET operations for this matched row */
+        if (execute_set_operations(executor, set, var_map, result) < 0) {
+            free_variable_map(var_map);
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            return -1;
+        }
+
+        free_variable_map(var_map);
+    }
+
+    sqlite3_finalize(stmt);
+    cypher_transform_free_context(ctx);
+    return 0;
+}
+
+/* Execute standalone SET clause */
+int execute_set_clause(cypher_executor *executor, cypher_set *set, cypher_result *result)
+{
+    if (!executor || !set || !result) {
+        return -1;
+    }
+
+    CYPHER_DEBUG("Executing standalone SET clause");
+
+    /* For standalone SET, we don't have any bound variables
+     * This would typically be an error in real Cypher, but for
+     * testing purposes we'll allow it */
+
+    set_result_error(result, "SET clause requires MATCH to bind variables");
+    return -1;
+}
+
+/* Copy all properties from a source entity (node or edge) onto a destination
+ * entity. Implements the entity RHS of bulk SET — `SET r = a` / `SET r += a`
+ * (Merge6 [6], Merge7 [4], Merge8 [1], Merge9 [3]). Reads each of the five
+ * property-type tables for the source and re-sets them on the destination via
+ * the typed schema setters, incrementing result->properties_set per copy. */
+static int copy_entity_properties(cypher_executor *executor,
+                                  int src_id, bool src_is_edge,
+                                  int dst_id, bool dst_is_edge,
+                                  cypher_result *result)
+{
+    const char *node_tbls[] = {"node_props_text", "node_props_int",
+                               "node_props_real", "node_props_bool",
+                               "node_props_json"};
+    const char *edge_tbls[] = {"edge_props_text", "edge_props_int",
+                               "edge_props_real", "edge_props_bool",
+                               "edge_props_json"};
+    const property_type types[] = {PROP_TYPE_TEXT, PROP_TYPE_INTEGER,
+                                   PROP_TYPE_REAL, PROP_TYPE_BOOLEAN,
+                                   PROP_TYPE_JSON};
+    const char **tbls = src_is_edge ? edge_tbls : node_tbls;
+    const char *idcol = src_is_edge ? "edge_id" : "node_id";
+
+    for (int t = 0; t < 5; t++) {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+            "SELECT pk.key, p.value FROM %s p "
+            "JOIN property_keys pk ON p.key_id = pk.id WHERE p.%s = %d",
+            tbls[t], idcol, src_id);
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(executor->db, sql, -1, &st, NULL) != SQLITE_OK) continue;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *key = (const char*)sqlite3_column_text(st, 0);
+            if (!key) continue;
+            property_type pt = types[t];
+            const void *pv = NULL;
+            int64_t ival = 0; double rval = 0; int bval = 0;
+            switch (pt) {
+                case PROP_TYPE_TEXT:
+                case PROP_TYPE_JSON:
+                    pv = (const char*)sqlite3_column_text(st, 1);
+                    break;
+                case PROP_TYPE_INTEGER:
+                    ival = sqlite3_column_int64(st, 1); pv = &ival; break;
+                case PROP_TYPE_REAL:
+                    rval = sqlite3_column_double(st, 1); pv = &rval; break;
+                case PROP_TYPE_BOOLEAN:
+                    bval = sqlite3_column_int(st, 1); pv = &bval; break;
+            }
+            if (!pv) continue;
+            int rc = dst_is_edge
+                ? cypher_schema_set_edge_property(executor->schema_mgr, dst_id, key, pt, pv)
+                : cypher_schema_set_node_property(executor->schema_mgr, dst_id, key, pt, pv);
+            if (rc == 0) result->properties_set++;
+        }
+        sqlite3_finalize(st);
+    }
+    return 0;
+}
+
+/* #136: is `expr` a FOREACH/UNWIND binding `x`, or `x.key` on one? */
+static bool set_value_is_foreach_binding(ast_node *expr)
+{
+    if (!expr || !g_foreach_ctx) return false;
+    if (expr->type == AST_NODE_PROPERTY) expr = ((cypher_property *)expr)->expr;
+    if (!expr || expr->type != AST_NODE_IDENTIFIER) return false;
+    return get_foreach_binding(g_foreach_ctx, ((cypher_identifier *)expr)->name) != NULL;
+}
+
+static const char *set_value_base_name(ast_node *expr)
+{
+    if (expr && expr->type == AST_NODE_PROPERTY) expr = ((cypher_property *)expr)->expr;
+    if (expr && expr->type == AST_NODE_IDENTIFIER) return ((cypher_identifier *)expr)->name;
+    return "?";
+}
+
+/* SET n.x = null: remove the property. */
+static void set_remove_property(cypher_executor *executor, bool is_edge, int entity_id,
+                                const char *key, cypher_result *result)
+{
+    int rc = is_edge
+        ? cypher_schema_delete_edge_property(executor->schema_mgr, entity_id, key)
+        : cypher_schema_delete_node_property(executor->schema_mgr, entity_id, key);
+    if (rc == 0) result->properties_set++;
+}
+
+/* Execute SET operations with variable bindings */
+int execute_set_operations(cypher_executor *executor, cypher_set *set, variable_map *var_map, cypher_result *result)
+{
+    if (!executor || !set || !var_map || !result) {
+        return -1;
+    }
+
+    CYPHER_DEBUG("Executing SET operations");
+
+    /* Process each SET item */
+    for (int i = 0; i < set->items->count; i++) {
+        cypher_set_item *item = (cypher_set_item*)set->items->items[i];
+
+        if (!item->property) {
+            set_result_error(result, "Invalid SET item");
+            return -1;
+        }
+
+        /* Handle label assignment (SET n:Label) */
+        if (item->property->type == AST_NODE_LABEL_EXPR) {
+            cypher_label_expr *label_expr = (cypher_label_expr*)item->property;
+
+            if (!label_expr->expr || label_expr->expr->type != AST_NODE_IDENTIFIER) {
+                set_result_error(result, "SET label must be on a variable");
+                return -1;
+            }
+
+            cypher_identifier *var_id = (cypher_identifier*)label_expr->expr;
+
+            /* Get the node ID for this variable */
+            int node_id = get_variable_node_id(var_map, var_id->name);
+            if (node_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+            if (node_id < 0) {
+                char error[256];
+                snprintf(error, sizeof(error), "Unbound variable in SET label: %s", var_id->name);
+                set_result_error(result, error);
+                return -1;
+            }
+
+            /* Add the label to the node */
+            if (cypher_schema_add_node_label(executor->schema_mgr, node_id, label_expr->label_name) == 0) {
+                result->properties_set++; /* We use properties_set counter for labels too */
+                CYPHER_DEBUG("Added label '%s' to node %d", label_expr->label_name, node_id);
+            } else {
+                char error[512];
+                snprintf(error, sizeof(error), "Failed to add label '%s' to node %d", label_expr->label_name, node_id);
+                set_result_error(result, error);
+                return -1;
+            }
+            continue;
+        }
+
+        /* Handle bulk SET (SET n = {map} or SET n += {map}) */
+        if (item->property->type == AST_NODE_IDENTIFIER) {
+            cypher_identifier *var_id = (cypher_identifier*)item->property;
+
+            if (!item->expr) {
+                set_result_error(result, "Bulk SET requires a value expression");
+                return -1;
+            }
+
+            /* Resolve the map expression — map literal, parameter, or an
+             * entity identifier (SET r = a copies a's properties). */
+            cypher_map *map = NULL;
+            char *resolved_json = NULL;
+            cypher_identifier *src_entity = NULL;  /* non-NULL => entity-copy RHS */
+            property_value param_pv;
+            property_value_init(&param_pv);
+
+            if (item->expr->type == AST_NODE_IDENTIFIER) {
+                /* SET <entity> = <entity> / += <entity> — copy all properties
+                 * from the source entity (Merge6 [6] etc.). Handled after the
+                 * destination entity id and replace-mode delete are resolved. */
+                src_entity = (cypher_identifier*)item->expr;
+            } else if (item->expr->type == AST_NODE_MAP) {
+                map = (cypher_map*)item->expr;
+            } else if (item->expr->type == AST_NODE_PARAMETER && executor->params_json) {
+                cypher_parameter *param = (cypher_parameter*)item->expr;
+                property_type pt;
+                int rc = get_param_value(executor->params_json, param->name,
+                                         &pt, &param_pv);
+                if (rc == -2) {
+                    /* null parameter — fall through with resolved_json = NULL */
+                } else if (rc < 0) {
+                    char error[256];
+                    snprintf(error, sizeof(error), "Parameter '%s' not found for bulk SET", param->name);
+                    set_result_error(result, error);
+                    property_value_free(&param_pv);
+                    return -1;
+                } else if (pt != PROP_TYPE_JSON) {
+                    set_result_error(result, "Bulk SET parameter must be a JSON object");
+                    property_value_free(&param_pv);
+                    return -1;
+                } else {
+                    resolved_json = param_pv.as_str;
+                }
+            } else {
+                set_result_error(result, "Bulk SET value must be a map literal or parameter");
+                return -1;
+            }
+
+            /* Determine if node or edge */
+            bool is_edge = is_variable_edge(var_map, var_id->name);
+            int entity_id;
+
+            if (is_edge) {
+                entity_id = get_variable_edge_id(var_map, var_id->name);
+                if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+                if (entity_id < 0) {
+                    char error[256];
+                    snprintf(error, sizeof(error), "Unbound edge variable in bulk SET: %s", var_id->name);
+                    set_result_error(result, error);
+                    return -1;
+                }
+            } else {
+                entity_id = get_variable_node_id(var_map, var_id->name);
+                if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+                if (entity_id < 0) {
+                    char error[256];
+                    snprintf(error, sizeof(error), "Unbound variable in bulk SET: %s", var_id->name);
+                    set_result_error(result, error);
+                    return -1;
+                }
+            }
+
+            /* For replace mode (=), delete all existing properties first */
+            if (!item->is_merge) {
+                if (is_edge) {
+                    cypher_schema_delete_all_edge_properties(executor->schema_mgr, entity_id);
+                } else {
+                    cypher_schema_delete_all_node_properties(executor->schema_mgr, entity_id);
+                }
+            }
+
+            /* Entity-copy RHS: SET <dst> = <src> / += <src>. The replace-mode
+             * delete above already cleared dst for `=`; now copy src's props. */
+            if (src_entity) {
+                bool src_is_edge = is_variable_edge(var_map, src_entity->name);
+                int src_id = src_is_edge
+                    ? get_variable_edge_id(var_map, src_entity->name)
+                    : get_variable_node_id(var_map, src_entity->name);
+                if (src_id < 0) {
+                    char error[256];
+                    snprintf(error, sizeof(error),
+                             "Unbound source variable in bulk SET copy: %s", src_entity->name);
+                    set_result_error(result, error);
+                    property_value_free(&param_pv);
+                    return -1;
+                }
+                copy_entity_properties(executor, src_id, src_is_edge,
+                                       entity_id, is_edge, result);
+                property_value_free(&param_pv);
+                continue;
+            }
+
+            /* Set each property from the map */
+            if (map && map->pairs) {
+                for (int j = 0; j < map->pairs->count; j++) {
+                    cypher_map_pair *pair = (cypher_map_pair*)map->pairs->items[j];
+                    if (!pair || !pair->key || !pair->value) continue;
+
+                    property_type pt = PROP_TYPE_TEXT;
+                    const void *pv = NULL;
+                    char *bulk_json_str = NULL;  /* Dynamically allocated for JSON values */
+
+                    if (pair->value->type == AST_NODE_LITERAL) {
+                        cypher_literal *lit = (cypher_literal*)pair->value;
+                        switch (lit->literal_type) {
+                            case LITERAL_STRING:
+                                pt = PROP_TYPE_TEXT;
+                                pv = lit->value.string;
+                                break;
+                            case LITERAL_INTEGER:
+                                pt = PROP_TYPE_INTEGER;
+                                pv = &lit->value.integer;
+                                break;
+                            case LITERAL_DECIMAL:
+                                pt = PROP_TYPE_REAL;
+                                pv = &lit->value.decimal;
+                                break;
+                            case LITERAL_BOOLEAN:
+                                pt = PROP_TYPE_BOOLEAN;
+                                pv = &lit->value.boolean;
+                                break;
+                            case LITERAL_NULL: {
+                                /* SET n += {k: null} removes property k.
+                                 * In replace mode (SET n = {...}) the
+                                 * earlier delete_all step already handled
+                                 * it, so skip there. */
+                                if (item->is_merge) {
+                                    int removed = 0;
+                                    if (is_edge) {
+                                        removed = (cypher_schema_delete_edge_property(
+                                            executor->schema_mgr, entity_id, pair->key) == 0);
+                                    } else {
+                                        removed = (cypher_schema_delete_node_property(
+                                            executor->schema_mgr, entity_id, pair->key) == 0);
+                                    }
+                                    if (removed) result->properties_set++;
+                                }
+                                continue;
+                            }
+                        }
+                    } else if (pair->value->type == AST_NODE_MAP || pair->value->type == AST_NODE_LIST) {
+                        bulk_json_str = serialize_ast_to_json(pair->value);
+                        if (!bulk_json_str) {
+                            set_result_error(result, "Failed to serialize map/list value in bulk SET");
+                            return -1;
+                        }
+                        pt = PROP_TYPE_JSON;
+                        pv = bulk_json_str;
+                    } else {
+                        continue; /* Skip unsupported value types */
+                    }
+
+                    int rc;
+                    if (is_edge) {
+                        rc = cypher_schema_set_edge_property(executor->schema_mgr, entity_id, pair->key, pt, pv);
+                    } else {
+                        rc = cypher_schema_set_node_property(executor->schema_mgr, entity_id, pair->key, pt, pv);
+                    }
+                    free(bulk_json_str);  /* Safe even if NULL */
+                    if (rc == 0) {
+                        result->properties_set++;
+                    }
+                }
+            }
+
+            /* Set properties from resolved JSON parameter */
+            if (resolved_json) {
+                if (set_properties_from_json_object(executor, entity_id, is_edge,
+                                                     resolved_json, result) < 0) {
+                    property_value_free(&param_pv);
+                    return -1;
+                }
+            }
+
+            property_value_free(&param_pv);
+            continue;
+        }
+
+        /* Handle property assignment (SET n.prop = value) */
+        if (item->property->type != AST_NODE_PROPERTY) {
+            set_result_error(result, "SET target must be a property or label");
+            return -1;
+        }
+
+        cypher_property *prop = (cypher_property*)item->property;
+        if (!prop->expr || prop->expr->type != AST_NODE_IDENTIFIER) {
+            set_result_error(result, "SET property must be on a variable");
+            return -1;
+        }
+
+        cypher_identifier *var_id = (cypher_identifier*)prop->expr;
+
+        /* Check if this is a node or edge variable */
+        bool is_edge = is_variable_edge(var_map, var_id->name);
+        int entity_id;
+
+        if (is_edge) {
+            entity_id = get_variable_edge_id(var_map, var_id->name);
+            if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+            if (entity_id < 0) {
+                char error[256];
+                snprintf(error, sizeof(error), "Unbound edge variable in SET: %s", var_id->name);
+                set_result_error(result, error);
+                return -1;
+            }
+        } else {
+            entity_id = get_variable_node_id(var_map, var_id->name);
+            if (entity_id == GQL_NULL_ENTITY_ID) continue;   /* SET on null does nothing */
+            if (entity_id < 0) {
+                char error[256];
+                snprintf(error, sizeof(error), "Unbound variable in SET: %s", var_id->name);
+                set_result_error(result, error);
+                return -1;
+            }
+        }
+
+        /* Evaluate the value expression */
+        property_type prop_type = PROP_TYPE_TEXT;
+        const void *prop_value = NULL;
+        property_value set_pv;
+        property_value_init(&set_pv);
+        static int64_t set_int_buf;
+        static double set_real_buf;
+        static int set_bool_buf;
+
+        if (!item->expr) {
+            set_result_error(result, "SET value is missing");
+            property_value_free(&set_pv);
+            return -1;
+        }
+
+        if (item->expr->type == AST_NODE_LITERAL) {
+            cypher_literal *lit = (cypher_literal*)item->expr;
+
+            switch (lit->literal_type) {
+                case LITERAL_STRING:
+                    prop_type = PROP_TYPE_TEXT;
+                    prop_value = lit->value.string;
+                    break;
+                case LITERAL_INTEGER:
+                    prop_type = PROP_TYPE_INTEGER;
+                    prop_value = &lit->value.integer;
+                    break;
+                case LITERAL_DECIMAL:
+                    prop_type = PROP_TYPE_REAL;
+                    prop_value = &lit->value.decimal;
+                    break;
+                case LITERAL_BOOLEAN:
+                    prop_type = PROP_TYPE_BOOLEAN;
+                    prop_value = &lit->value.boolean;
+                    break;
+                case LITERAL_NULL: {
+                    /* SET n.x = null removes the property per Cypher spec. */
+                    int removed = 0;
+                    if (is_edge) {
+                        removed = (cypher_schema_delete_edge_property(executor->schema_mgr,
+                                       entity_id, prop->property_name) == 0);
+                    } else {
+                        removed = (cypher_schema_delete_node_property(executor->schema_mgr,
+                                       entity_id, prop->property_name) == 0);
+                    }
+                    if (removed) result->properties_set++;
+                    continue;
+                }
+            }
+        } else if ((item->expr->type == AST_NODE_MAP || item->expr->type == AST_NODE_LIST) &&
+                   (!var_map || ast_is_constant(item->expr))) {
+            /* Map or list literal - serialize to JSON and store as JSON type */
+            char *json_str = serialize_ast_to_json(item->expr);
+            if (!json_str) {
+                set_result_error(result, "Failed to serialize map/list to JSON");
+                return -1;
+            }
+            prop_type = PROP_TYPE_JSON;
+            prop_value = json_str;
+
+            /* Set property and free json_str immediately */
+            if (is_edge) {
+                if (cypher_schema_set_edge_property(executor->schema_mgr, entity_id, prop->property_name, prop_type, prop_value) == 0) {
+                    result->properties_set++;
+                    CYPHER_DEBUG("Set JSON property '%s' on edge %d", prop->property_name, entity_id);
+                } else {
+                    free(json_str);
+                    char error[512];
+                    snprintf(error, sizeof(error), "Failed to set JSON property '%s' on edge %d", prop->property_name, entity_id);
+                    set_result_error(result, error);
+                    property_value_free(&set_pv);
+                    return -1;
+                }
+            } else {
+                if (cypher_schema_set_node_property(executor->schema_mgr, entity_id, prop->property_name, prop_type, prop_value) == 0) {
+                    result->properties_set++;
+                    CYPHER_DEBUG("Set JSON property '%s' on node %d", prop->property_name, entity_id);
+                } else {
+                    free(json_str);
+                    char error[512];
+                    snprintf(error, sizeof(error), "Failed to set JSON property '%s' on node %d", prop->property_name, entity_id);
+                    set_result_error(result, error);
+                    property_value_free(&set_pv);
+                    return -1;
+                }
+            }
+            free(json_str);
+            continue;
+        } else if (item->expr->type == AST_NODE_PARAMETER && executor->params_json) {
+            /* Handle parameter substitution */
+            cypher_parameter *param = (cypher_parameter*)item->expr;
+
+            int rc = get_param_value(executor->params_json, param->name, &prop_type, &set_pv);
+            if (rc == -2) {
+                /* A null parameter removes the property (#136). */
+                set_remove_property(executor, is_edge, entity_id, prop->property_name, result);
+                property_value_free(&set_pv);
+                continue;
+            } else if (rc == 0) {
+                if (prop_type == PROP_TYPE_TEXT) {
+                    prop_value = set_pv.as_str;
+                } else if (prop_type == PROP_TYPE_INTEGER) {
+                    set_int_buf = set_pv.as_int;
+                    prop_value = &set_int_buf;
+                } else if (prop_type == PROP_TYPE_REAL) {
+                    set_real_buf = set_pv.as_real;
+                    prop_value = &set_real_buf;
+                } else if (prop_type == PROP_TYPE_BOOLEAN) {
+                    set_bool_buf = set_pv.as_bool;
+                    prop_value = &set_bool_buf;
+                } else if (prop_type == PROP_TYPE_JSON) {
+                    prop_value = set_pv.as_str;
+                }
+            } else {
+                char error[256];
+                snprintf(error, sizeof(error), "Parameter '%s' not found in params_json", param->name);
+                set_result_error(result, error);
+                property_value_free(&set_pv);
+                return -1;
+            }
+        } else if (item->expr->type == AST_NODE_FUNCTION_CALL) {
+            cypher_function_call *func = (cypher_function_call*)item->expr;
+
+            /* Check if function args reference node properties (e.g., trim(n.name)).
+             * If so, build SQL with FROM clause so properties can resolve. */
+            bool has_prop_arg = false;
+            if (func->args) {
+                for (int fa = 0; fa < func->args->count; fa++) {
+                    if (func->args->items[fa] && func->args->items[fa]->type == AST_NODE_PROPERTY) {
+                        has_prop_arg = true;
+                        break;
+                    }
+                }
+            }
+
+            int rc;
+            if (has_prop_arg && var_map) {
+                /* Build SQL with FROM clause for property resolution */
+                rc = evaluate_ast_with_context(executor, (ast_node *)func, var_map,
+                                               &prop_type, &set_pv);
+            } else {
+                rc = evaluate_function_call_via_sqlite(executor, func, &prop_type, &set_pv);
+            }
+
+            if (rc == -2) {
+                /* A null result removes the property. */
+                set_remove_property(executor, is_edge, entity_id, prop->property_name, result);
+                property_value_free(&set_pv);
+                continue;
+            } else if (rc < 0) {
+                char error[256];
+                snprintf(error, sizeof(error), "Failed to evaluate function '%s' in SET",
+                         func->function_name ? func->function_name : "unknown");
+                set_result_error(result, error);
+                property_value_free(&set_pv);
+                return -1;
+            }
+            if (prop_type == PROP_TYPE_TEXT) {
+                prop_value = set_pv.as_str;
+            } else if (prop_type == PROP_TYPE_INTEGER) {
+                set_int_buf = set_pv.as_int;
+                prop_value = &set_int_buf;
+            } else if (prop_type == PROP_TYPE_REAL) {
+                set_real_buf = set_pv.as_real;
+                prop_value = &set_real_buf;
+            } else if (prop_type == PROP_TYPE_BOOLEAN) {
+                set_bool_buf = set_pv.as_bool;
+                prop_value = &set_bool_buf;
+            }
+        } else if (g_foreach_ctx && set_value_is_foreach_binding(item->expr)) {
+            /* `SET n.x = item` or `SET n.x = row.key` where item/row is an
+             * UNWIND/FOREACH binding. The value keeps its type: a list or a
+             * map is stored as JSON, a boolean as a boolean (#136). A null
+             * or missing key removes the property. */
+            int frc = foreach_value(executor->db, g_foreach_ctx, item->expr, &prop_type, &set_pv);
+            if (frc == -2) {
+                set_remove_property(executor, is_edge, entity_id, prop->property_name, result);
+                property_value_free(&set_pv);
+                continue;
+            } else if (frc < 0) {
+                char error[256];
+                snprintf(error, sizeof(error), "Unbound variable in SET value: %s",
+                         set_value_base_name(item->expr));
+                set_result_error(result, error);
+                property_value_free(&set_pv);
+                return -1;
+            }
+            if (prop_type == PROP_TYPE_INTEGER) {
+                set_int_buf = set_pv.as_int;
+                prop_value = &set_int_buf;
+            } else if (prop_type == PROP_TYPE_REAL) {
+                set_real_buf = set_pv.as_real;
+                prop_value = &set_real_buf;
+            } else if (prop_type == PROP_TYPE_BOOLEAN) {
+                set_bool_buf = set_pv.as_bool;
+                prop_value = &set_bool_buf;
+            } else {
+                prop_value = set_pv.as_str;
+            }
+        } else if (item->expr->type == AST_NODE_PROPERTY && var_map) {
+            /* SET n.x = other.k where `other` is a bound node/edge in the
+             * var_map. Look up the source property by querying the
+             * appropriate node_props_* or edge_props_* table. */
+            cypher_property *src_prop = (cypher_property *)item->expr;
+            if (!src_prop->expr || src_prop->expr->type != AST_NODE_IDENTIFIER) {
+                set_result_error(result, "SET value property access requires a variable base");
+                property_value_free(&set_pv);
+                return -1;
+            }
+            cypher_identifier *src_id = (cypher_identifier *)src_prop->expr;
+            int src_node = get_variable_node_id(var_map, src_id->name);
+            int src_edge = (src_node < 0) ? get_variable_edge_id(var_map, src_id->name) : -1;
+            bool src_is_edge = (src_node < 0 && src_edge >= 0);
+            int src_id_val = src_is_edge ? src_edge : src_node;
+            if (src_id_val < 0) {
+                char error[256];
+                snprintf(error, sizeof(error),
+                         "SET value references unbound variable: %s", src_id->name);
+                set_result_error(result, error);
+                property_value_free(&set_pv);
+                return -1;
+            }
+            /* Probe property tables (text, int, real, bool, json) for the
+             * value; a list was not looked for and was lost (GQLITE-T-0407). */
+            const char *id_col = src_is_edge ? "edge_id" : "node_id";
+            const char *tables[][2] = {
+                {src_is_edge ? "edge_props_text" : "node_props_text", "text"},
+                {src_is_edge ? "edge_props_int"  : "node_props_int",  "int"},
+                {src_is_edge ? "edge_props_real" : "node_props_real", "real"},
+                {src_is_edge ? "edge_props_bool" : "node_props_bool", "bool"},
+                {src_is_edge ? "edge_props_json" : "node_props_json", "json"},
+                {NULL, NULL}
+            };
+            bool found = false;
+            for (int t = 0; tables[t][0] && !found; t++) {
+                char sql[512];
+                snprintf(sql, sizeof(sql),
+                    "SELECT value FROM %s WHERE %s = %d AND key_id = "
+                    "(SELECT id FROM property_keys WHERE key = ?)",
+                    tables[t][0], id_col, src_id_val);
+                sqlite3_stmt *jstmt;
+                if (sqlite3_prepare_v2(executor->db, sql, -1, &jstmt, NULL) != SQLITE_OK)
+                    continue;
+                sqlite3_bind_text(jstmt, 1, src_prop->property_name, -1, SQLITE_STATIC);
+                if (sqlite3_step(jstmt) == SQLITE_ROW) {
+                    const char *tname = tables[t][1];
+                    if (strcmp(tname, "text") == 0) {
+                        prop_type = PROP_TYPE_TEXT;
+                        set_pv.as_str = strdup((const char*)sqlite3_column_text(jstmt, 0));
+                        prop_value = set_pv.as_str;
+                    } else if (strcmp(tname, "int") == 0) {
+                        prop_type = PROP_TYPE_INTEGER;
+                        set_int_buf = sqlite3_column_int64(jstmt, 0);
+                        prop_value = &set_int_buf;
+                    } else if (strcmp(tname, "real") == 0) {
+                        prop_type = PROP_TYPE_REAL;
+                        set_real_buf = sqlite3_column_double(jstmt, 0);
+                        prop_value = &set_real_buf;
+                    } else if (strcmp(tname, "bool") == 0) {
+                        prop_type = PROP_TYPE_BOOLEAN;
+                        set_bool_buf = sqlite3_column_int(jstmt, 0);
+                        prop_value = &set_bool_buf;
+                    } else if (strcmp(tname, "json") == 0) {
+                        prop_type = PROP_TYPE_JSON;
+                        set_pv.as_str = strdup((const char*)sqlite3_column_text(jstmt, 0));
+                        prop_value = set_pv.as_str;
+                    }
+                    found = true;
+                }
+                sqlite3_finalize(jstmt);
+            }
+            if (!found) {
+                /* Source property doesn't exist → treat as SET to null
+                 * (remove target property). */
+                if (is_edge) {
+                    if (cypher_schema_delete_edge_property(executor->schema_mgr,
+                            entity_id, prop->property_name) == 0)
+                        result->properties_set++;
+                } else {
+                    if (cypher_schema_delete_node_property(executor->schema_mgr,
+                            entity_id, prop->property_name) == 0)
+                        result->properties_set++;
+                }
+                property_value_free(&set_pv);
+                continue;
+            }
+        } else if (var_map &&
+                   (item->expr->type == AST_NODE_BINARY_OP ||
+                    item->expr->type == AST_NODE_NOT_EXPR ||
+                    item->expr->type == AST_NODE_NULL_CHECK ||
+                    item->expr->type == AST_NODE_SUBSCRIPT ||
+                    item->expr->type == AST_NODE_LIST ||
+                    item->expr->type == AST_NODE_MAP)) {
+            /* Arbitrary expression RHS: SET n.num = n.num + 1, etc.
+             * Evaluate via SQL with the var_map's nodes joined in. */
+            int rc = evaluate_ast_with_context(executor, item->expr, var_map,
+                                               &prop_type, &set_pv);
+            if (rc == -2) {
+                /* NULL result → remove property. */
+                if (is_edge) {
+                    if (cypher_schema_delete_edge_property(executor->schema_mgr,
+                            entity_id, prop->property_name) == 0)
+                        result->properties_set++;
+                } else {
+                    if (cypher_schema_delete_node_property(executor->schema_mgr,
+                            entity_id, prop->property_name) == 0)
+                        result->properties_set++;
+                }
+                property_value_free(&set_pv);
+                continue;
+            } else if (rc < 0) {
+                set_result_error(result, "Failed to evaluate SET expression");
+                property_value_free(&set_pv);
+                return -1;
+            }
+            static int64_t set_expr_int_buf;
+            static double  set_expr_real_buf;
+            static int     set_expr_bool_buf;
+            if (prop_type == PROP_TYPE_INTEGER) {
+                set_expr_int_buf = set_pv.as_int;
+                prop_value = &set_expr_int_buf;
+            } else if (prop_type == PROP_TYPE_REAL) {
+                set_expr_real_buf = set_pv.as_real;
+                prop_value = &set_expr_real_buf;
+            } else if (prop_type == PROP_TYPE_BOOLEAN) {
+                set_expr_bool_buf = set_pv.as_bool;
+                prop_value = &set_expr_bool_buf;
+            } else if (prop_type == PROP_TYPE_TEXT || prop_type == PROP_TYPE_JSON) {
+                prop_value = set_pv.as_str;
+            }
+        } else {
+            set_result_error(result, "SET value must be a literal, map, list, parameter, or function call");
+            property_value_free(&set_pv);
+            return -1;
+        }
+
+        /* Set the property on the node or edge */
+        if (prop_value) {
+            if (is_edge) {
+                if (cypher_schema_set_edge_property(executor->schema_mgr, entity_id, prop->property_name, prop_type, prop_value) == 0) {
+                    result->properties_set++;
+                    CYPHER_DEBUG("Set property '%s' = value on edge %d", prop->property_name, entity_id);
+                } else {
+                    char error[512];
+                    snprintf(error, sizeof(error), "Failed to set property '%s' on edge %d", prop->property_name, entity_id);
+                    set_result_error(result, error);
+                    property_value_free(&set_pv);
+                    return -1;
+                }
+            } else {
+                if (cypher_schema_set_node_property(executor->schema_mgr, entity_id, prop->property_name, prop_type, prop_value) == 0) {
+                    result->properties_set++;
+                    CYPHER_DEBUG("Set property '%s' = value on node %d", prop->property_name, entity_id);
+                } else {
+                    char error[512];
+                    snprintf(error, sizeof(error), "Failed to set property '%s' on node %d", prop->property_name, entity_id);
+                    set_result_error(result, error);
+                    property_value_free(&set_pv);
+                    return -1;
+                }
+            }
+        }
+        property_value_free(&set_pv);
+    }
+
+    return 0;
+}
