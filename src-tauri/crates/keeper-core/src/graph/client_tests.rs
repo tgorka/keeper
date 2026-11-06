@@ -1,0 +1,339 @@
+//! The complete-prefix reader and the online-only client over real on-disk
+//! replicas seeded through `mutate` (no server): whole events replay, a
+//! missing or partial event ends the prefix as stale, a present wrong one is
+//! corruption; a change is never sent without a link, its request id
+//! survives a restart, and a receipt alone resolves it afterwards.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use serde_json::{json, Map, Value};
+
+use super::client::{GraphClient, GraphClientError};
+use super::outcome::GraphOutcome;
+use super::prefix::{self, PrefixError};
+use super::protocol::candidate::{self, State, Verdict};
+use super::protocol::change::{Change, ChangeOp};
+use super::protocol::delta::Op;
+use super::protocol::scope::{client_scope, event_op_id, receipt_id};
+use crate::hq::port::{ReplicaSpec, RowOp};
+use crate::hq::sessions::Source;
+use crate::hq::syncular::SyncularReplica;
+use crate::notes::tags::normalise;
+
+const DB: &str = "tgdrive";
+
+fn open(dir: &Path) -> Source {
+    let replica = SyncularReplica::open(ReplicaSpec {
+        database: DB.to_owned(),
+        path: dir.join("graph.sqlite"),
+        client_id: Some("dev1".to_owned()),
+        link: None,
+        subscriptions: Vec::new(),
+        watch_presence: None,
+    })
+    .expect("opens");
+    Source {
+        database: DB.to_owned(),
+        replica: Arc::new(replica),
+        actor: "ana".to_owned(),
+        client: "dev1".to_owned(),
+    }
+}
+
+fn ulid(n: u32) -> String {
+    format!("01JF{n:022}")
+}
+
+fn upsert(table: &str, values: Value) -> RowOp {
+    RowOp::Upsert {
+        table: table.to_owned(),
+        values: values.as_object().expect("row").clone(),
+        base_version: None,
+    }
+}
+
+/// An empty accepted graph, or one holding the given node images.
+struct Nodes(Vec<Map<String, Value>>);
+
+impl State for Nodes {
+    fn node(&self, id: &str) -> Option<Map<String, Value>> {
+        self.0.iter().find(|n| n["id"] == id).cloned()
+    }
+    fn edge(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
+    fn tag(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
+    fn membership(&self, _: &str, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
+    fn contains_into(&self, _: &[String]) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+}
+
+/// The operations the shared algebra gives `ops` over `state`.
+fn accepted(state: &Nodes, ops: Vec<ChangeOp>, minted: u32) -> Vec<Op> {
+    let change = Change::new(ops, None, None, normalise).expect("change");
+    let mut next = minted;
+    let mut mint = || {
+        next += 1;
+        ulid(next)
+    };
+    match candidate::apply(state, &change, &mut mint) {
+        Verdict::Accepted(effects) => effects.ops,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The replica rows of event `seq` holding `ops`, as the server writes them
+/// (JSON columns as text), with its digest unless `digest` overrides it.
+fn event_rows(seq: u64, ops: &[Op], digest: Option<&str>) -> Vec<RowOp> {
+    let event = ulid(1_000 + u32::try_from(seq).expect("seq"));
+    let digest = digest.map_or_else(
+        || super::protocol::delta::digest(ops).expect("digest"),
+        str::to_owned,
+    );
+    let text = |v: &Option<Value>| v.as_ref().map(|v| Value::from(v.to_string()));
+    let mut rows = vec![upsert(
+        "kg_events",
+        json!({
+            "id": event, "graph": DB, "graph_seq": seq.to_string(), "descriptor": "graph.apply",
+            "request_id": ulid(2_000 + u32::try_from(seq).expect("seq")), "request_digest": "0".repeat(64),
+            "actor_id": "ana", "client_id": "dev1", "origin_class": "human", "origin_actor": null,
+            "origin_chain": null, "context_id": null, "approval_basis": "{\"basis\":\"direct\"}",
+            "reverses_event_id": null, "event_time_ms": null, "recorded_at_ms": 1,
+            "op_count": ops.len(), "delta_digest": digest,
+            "author_actor": "server", "author_client": "server",
+        }),
+    )];
+    for op in ops {
+        rows.push(upsert(
+            "kg_event_ops",
+            json!({
+                "id": event_op_id(&event, op.ordinal), "graph": DB, "event_id": event,
+                "ordinal": op.ordinal, "entity_type": op.entity_type, "entity_id": op.entity_id,
+                "operation": op.operation, "before_revision": op.before_revision,
+                "after_revision": op.after_revision, "before_value": text(&op.before_value),
+                "after_value": text(&op.after_value),
+                "author_actor": "server", "author_client": "server",
+            }),
+        ));
+    }
+    rows
+}
+
+fn head(seq: u64) -> RowOp {
+    upsert(
+        "kg_head",
+        json!({"id": DB, "graph": DB, "graph_seq": seq.to_string(),
+               "event_id": ulid(1_000 + u32::try_from(seq).expect("seq")),
+               "author_actor": "server", "author_client": "server"}),
+    )
+}
+
+fn create(id: &str) -> ChangeOp {
+    ChangeOp::CreateNode {
+        id: id.to_owned(),
+        kind: "Concept".into(),
+        title: "N".into(),
+        description: None,
+        properties: Map::new(),
+    }
+}
+
+/// Event 1 creates a node and tags it; event 2 renames it.
+fn two_events() -> (Vec<Op>, Vec<Op>) {
+    let node = ulid(1);
+    let first = accepted(
+        &Nodes(Vec::new()),
+        vec![
+            create(&node),
+            ChangeOp::AddTag {
+                node_id: node.clone(),
+                tag: "#Project".into(),
+                expected_revision: None,
+            },
+        ],
+        100,
+    );
+    let created = first[0].after_value.clone().expect("image");
+    let second = accepted(
+        &Nodes(vec![created.as_object().expect("image").clone()]),
+        vec![ChangeOp::UpdateNode {
+            id: node,
+            expected_revision: "1".into(),
+            set: super::protocol::change::NodeFields {
+                title: Some("Renamed".into()),
+                description: None,
+            },
+            set_properties: Map::new(),
+            remove_properties: Vec::new(),
+        }],
+        200,
+    );
+    (first, second)
+}
+
+#[test]
+fn a_prefix_replays_whole_events_from_the_replica() {
+    let dir = tempfile::tempdir().expect("dir");
+    let source = open(dir.path());
+    let (first, second) = two_events();
+    let mut rows = event_rows(1, &first, None);
+    rows.extend(event_rows(2, &second, None));
+    rows.push(head(2));
+    source.replica.mutate(rows).expect("seeded");
+
+    let prefix = prefix::complete(&source).expect("prefix");
+    assert_eq!((prefix.head, prefix.n), (2, 2));
+    assert!(prefix.is_complete());
+    assert_eq!(prefix.events[1].ops, second);
+    let node = &prefix.state[&("node".to_owned(), ulid(1))];
+    assert_eq!(
+        (node["title"].clone(), node["revision"].clone()),
+        (json!("Renamed"), json!("2"))
+    );
+    assert_eq!(
+        prefix.state[&("tag".to_owned(), ulid(101))]["text"],
+        "project"
+    );
+}
+
+#[test]
+fn a_missing_or_partial_event_ends_the_prefix_stale() {
+    let (first, second) = two_events();
+    // Head 3 with event 3 absent; then event 2 holding one of its operations.
+    for (rows_of_second, expected) in [(second.len(), 2), (0, 1)] {
+        let dir = tempfile::tempdir().expect("dir");
+        let source = open(dir.path());
+        let mut rows = event_rows(1, &first, None);
+        let mut second_rows = event_rows(2, &second, None);
+        if rows_of_second == 0 {
+            // The header arrived, its only operation did not.
+            second_rows.truncate(1);
+        }
+        rows.extend(second_rows);
+        rows.push(head(3));
+        source.replica.mutate(rows).expect("seeded");
+        let prefix = prefix::complete(&source).expect("prefix");
+        assert_eq!((prefix.head, prefix.n), (3, expected));
+        assert!(!prefix.is_complete());
+    }
+}
+
+#[test]
+fn a_present_wrong_event_is_corruption_not_a_shorter_prefix() {
+    let (first, second) = two_events();
+    // A digest that does not match, and a before-image the replay disagrees with.
+    let mut wrong_image = second.clone();
+    if let Some(Value::Object(before)) = wrong_image[0].before_value.as_mut() {
+        before.insert("title".into(), json!("Not what event 1 wrote"));
+    }
+    for (ops, digest) in [(second.clone(), Some("f".repeat(64))), (wrong_image, None)] {
+        let dir = tempfile::tempdir().expect("dir");
+        let source = open(dir.path());
+        let mut rows = event_rows(1, &first, None);
+        rows.extend(event_rows(2, &ops, digest.as_deref()));
+        rows.push(head(2));
+        source.replica.mutate(rows).expect("seeded");
+        assert!(matches!(
+            prefix::complete(&source),
+            Err(PrefixError::Corrupt { at: 2, .. })
+        ));
+    }
+}
+
+#[test]
+fn a_prefix_spans_snapshot_batches() {
+    let dir = tempfile::tempdir().expect("dir");
+    let source = open(dir.path());
+    let count = u32::try_from(prefix::BATCH_EVENTS).expect("batch") + 44;
+    let mut rows = Vec::new();
+    for n in 1..=count {
+        let ops = accepted(&Nodes(Vec::new()), vec![create(&ulid(5_000 + n))], 0);
+        rows.extend(event_rows(u64::from(n), &ops, None));
+    }
+    rows.push(head(u64::from(count)));
+    source.replica.mutate(rows).expect("seeded");
+    let prefix = prefix::complete(&source).expect("prefix");
+    assert_eq!(prefix.n, u64::from(count));
+    assert_eq!(prefix.state.len(), usize::try_from(count).expect("count"));
+}
+
+#[test]
+fn a_change_is_never_sent_without_a_link_and_its_id_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("dir");
+    let source = open(dir.path());
+    let client = GraphClient::new(source.clone());
+    let change = client.change(vec![create(&ulid(1))], None).expect("change");
+    assert_eq!(client.apply(&change), Err(GraphClientError::Offline));
+
+    // Minted once and persisted; restored after a restart under the same key.
+    let prepared = client.mint(&change).expect("minted");
+    assert_eq!(client.send(&prepared), Err(GraphClientError::Offline));
+    let persisted = serde_json::to_string(&json!({
+        "request_id": prepared.request().request_id,
+        "payload": prepared.request().payload,
+    }))
+    .expect("persisted");
+    drop(client);
+    let client = GraphClient::new(source.clone());
+    let saved: Value = serde_json::from_str(&persisted).expect("read back");
+    let restored = client
+        .prepared(super::protocol::request::Request {
+            request_id: saved["request_id"].as_str().expect("id").to_owned(),
+            context_id: None,
+            payload: saved["payload"].clone(),
+        })
+        .expect("restored");
+    assert_eq!(restored.key(), prepared.key());
+
+    // Without an attempt in hand, only the request's own receipt settles it.
+    assert!(matches!(
+        client.outcome(&restored, None),
+        Ok(GraphOutcome::Pending { .. })
+    ));
+    let scope = client_scope("ana", "dev1");
+    let key = restored.key();
+    source
+        .replica
+        .mutate(vec![upsert(
+            "kg_receipts",
+            json!({
+                "id": receipt_id(key.descriptor(), key.request_id(), &scope),
+                "client_scope": scope, "descriptor": key.descriptor(),
+                "request_id": key.request_id(), "request_digest": key.request_digest(),
+                "outcome": "accepted", "reason": null, "event_id": ulid(900), "graph_seq": "7",
+                "detail": "{\"affected\":[]}", "recorded_at_ms": 1,
+                "author_actor": "server", "author_client": "server",
+            }),
+        )])
+        .expect("receipt");
+    assert_eq!(
+        client.outcome(&restored, None),
+        Ok(GraphOutcome::Accepted {
+            event_id: ulid(900),
+            graph_seq: "7".into(),
+            commit_seq: None,
+            detail: json!({"affected": []}).as_object().expect("detail").clone(),
+        })
+    );
+}
+
+#[test]
+fn a_restored_request_must_still_be_a_persons_change() {
+    let dir = tempfile::tempdir().expect("dir");
+    let client = GraphClient::new(open(dir.path()));
+    let request = |context: Option<String>, payload: Value| super::protocol::request::Request {
+        request_id: ulid(3),
+        context_id: context,
+        payload,
+    };
+    let change = json!({"ops": [{"op": "archive_node", "id": ulid(1), "expected_revision": "1"}]});
+    assert!(client.prepared(request(None, change.clone())).is_ok());
+    assert!(client.prepared(request(Some(ulid(4)), change)).is_err());
+    assert!(client.prepared(request(None, json!({"ops": []}))).is_err());
+}
