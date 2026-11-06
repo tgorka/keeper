@@ -196,11 +196,130 @@ why (`docs/android.md` has the whole list):
   covers groups, not single artifacts: a new artifact in a listed group passes unread
   (DW-1290).
 
-## Audited `unsafe` FFI inventory (shell crate only)
+## Audited `unsafe` FFI inventory
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
 carry function-level, audited `#[allow(unsafe_code)]` exceptions for platform FFI with no
-safe binding. Current inventory:
+safe binding. The graph worker `keeper-graph-query` carries exactly the eleven below (OD-1).
+Current inventory:
+
+### Graph worker `keeper-graph-query` (OD-1; story 110.5)
+
+The separate, single-use graph worker executable may carry exactly eleven function-level
+allowances, never a crate/module allowance or a first-party unsafe impl. `allocation.rs`
+and `native.rs` are byte-identical to the independently reviewed 110.1 sources (accepted
+head `56196413`); `scripts/check-graph-boundary.py` pins their SHA-256, so any edit reopens
+the inventory review.
+
+| ID | `keeper-graph-query` function | Boundary |
+|---|---|---|
+| U01 | `native::register` | Guarded connection handle/statement inspection and pinned static registration |
+| U02 | `allocation::install_sqlite` | Pre-initialization SQLite allocator/mmap/journal-spill configuration |
+| U03 | `allocation::native_malloc` | Checked charged positive allocation, export `keeper_graph_malloc` |
+| U04 | `allocation::native_free` | Owned-header deallocation, also SQLite xFree, export `keeper_graph_free` |
+| U05 | `allocation::native_calloc` | Checked multiplication/zeroing, export `keeper_graph_calloc` |
+| U06 | `allocation::native_realloc` | Charged replacement/copy/free, export `keeper_graph_realloc` |
+| U07 | `allocation::native_strdup` | Valid C-string copy, export `keeper_graph_strdup` |
+| U08 | `allocation::native_strndup` | Bounded C-string copy, export `keeper_graph_strndup` |
+| U09 | `allocation::sqlite_malloc` | Exact xMalloc ABI adapter |
+| U10 | `allocation::sqlite_realloc` | Exact xRealloc ABI adapter |
+| U11 | `allocation::sqlite_size` | Exact xSize ABI and owned-header read |
+
+The six exports live inside U03–U08. `sqlite_roundup`, `sqlite_init` and `sqlite_shutdown`
+are safe, unexported C-ABI callbacks without allowances. The 110.1 proof's test-only row T12
+(`examples/allocation_probe.rs`, behind the removed `proof-executables` feature) does not
+ship; its evidence stands against the byte-identical `allocation.rs`. The measurement-only
+interposer M1 stays in the 110.1 evidence bundle and is never linked into, shipped with or
+loaded by the worker. `keeper-core`, `keeper-graph-protocol` and `keeper-graph-driver` carry
+no `unsafe`, and Linux confinement (Landlock, seccomp, rlimits) and every launch check use
+safe bindings (`landlock`, `seccompiler`, `rustix`).
+
+Every callback checks a const-TLS main-thread flag before allocation or pointer access. The
+flag is granted only by the crate-private `allocation::enter`, a process-wide one-shot claim
+made by the worker's sole entry `engine::start`; a repeated or second-thread claim exits 73.
+Allocating callbacks never return NULL, including zero-size requests, and return
+16-byte-aligned pointers; exhaustion exits 72 without unwinding. Registration rejects live
+statements before entering upstream code, whose `create_function_v2` failure path otherwise
+double-frees its cache. The guard enforces the inventory lexically over every first-party
+Rust file of the graph crates: every `unsafe` token and export attribute lies inside one of
+the eleven functions, no other `unsafe_code` attribute form exists, the three safe callbacks
+stay safe and unexported, the redirect header holds no function body, and the worker has no
+cargo feature and no example.
+
+**`cap` 0.1.2.** Its `unsafe impl GlobalAlloc` (crate SHA-256
+`6f125eb85b84a24c36b02ed1d22c9dd8632f53b3cde6e4d23512f94021030003`) is an audited
+dependency row. Concurrent allocation failure can permanently defeat its counter, so the
+worker is single-threaded by construction: the const-TLS callback guard, exit 73 on a second
+thread's claim, and process-wide seccomp `KillProcess` on `clone`/`clone3`/`fork`/`vfork`.
+No `set_limit`. It is not a multithreaded allocator guarantee.
+
+**Accounted-cost conversion (Linux).** glibc's per-chunk overhead on charged allocations is
+not charged, so the charge is a conservative conversion of the unchanged 256 MiB
+real-allocation budget: **R = 28 MiB**, with `H0 + 4R + 64·N_max + 64 + 8 MiB stack =
+261,357,632 B` (H0 = 1 MiB, N_max = 2,101,248 live allocations under 32 bytes). Its premises
+are enforced, not assumed:
+
+- **P1′** — the supervisor sets exactly `GQL_STMT_CACHE=0` and
+  `GLIBC_TUNABLES=glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912:glibc.malloc.arena_max=1`
+  (`keeper_graph_protocol::worker::LINUX_WORKER_GLIBC_TUNABLES`; OD-A appends one arena)
+  after `env_clear`, and the worker refuses any other environment;
+- **P6/B0** — the worker checks its own `VmData` against H0 at the input boundary (after
+  confinement, before any input) and exits 74 above it;
+- **P6b** — the schema check refuses a repeated object name;
+- **P6c** — before every Linux spawn the supervisor refuses (no child) unless its inherited
+  soft `RLIMIT_STACK` is finite and at most 8 MiB and `/etc/ld.so.preload` is absent;
+- **execution class** (OD-A r6 step 8) — before closing any descriptor the worker requires
+  exactly one each of `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE`, `AT_SECURE` 0, equal
+  uid/euid and gid/egid and an inherited `no_new_privs`, then `AT_PAGESZ` 4096 and
+  `AT_MINSIGSTKSZ` in 1..=12288; otherwise it writes `execution class refused: <label>` or
+  `platform prerequisite refused` and exits 74, before B0.
+
+`RLIMIT_AS` 512 MiB stays an independent backstop.
+
+**Supported Linux runtime class (R1, OD-A/Q6).** Exactly one: `agent-image/linux-amd64/trixie/r1`,
+defined by keeper-hq's reviewed runtime DSO ledger (`agent/graph-runtime-ledger.json`, schema
+`keeper-graph-runtime-ledger/3`) embedded into the spawning binary at build time. A Linux
+worker is spawned only when the binary is `linux`/`x86_64`, a ledger is embedded, the
+worker's digest is the ledger's, and `keeper_core::graph::ledger` verifies the tree (every
+ledger object resolved in-root through exactly the ledger's symlinks, root-owned with no
+group/other write bit, no set-id or sticky bit, no `security.capability`, every parent
+root-owned, its SHA-256, each `ld.so.cache` entry reaching the same inode, the absent paths
+absent, the ELF facts — DT_NEEDED, PT_INTERP, PT_TLS, writable load pages, BIND_NOW, highest
+GLIBC version need, build-id, and no RPATH/RUNPATH/AUDIT) and the process (no mount at or
+above a ledger path, a genuine `/proc`, page size 4096, `AT_MINSIGSTKSZ` 1..=12288, Landlock
+ABI ≥ 6, seccomp filters). Before every spawn it re-resolves every path and requires the same
+identity, then, last, on the spawning thread with nothing awaited between it and the spawn:
+`no_new_privs`, equal real/effective/saved/filesystem ids, a non-root euid and no permitted,
+effective or ambient capability (ambient read from the thread's `CapAmb`; `capget` does not
+return it). Any other tuple — an arm64 image (no worker, OD-B), a host-native keeper-built
+worker, a dev host — is `projection_unavailable` before any child exists.
+
+**Abort profile and binding (§10).** The worker artifact is built only with
+`--profile graph-worker` (`panic = "abort"`) by `scripts/build-graph-worker.sh`, which
+checks that no unwinder entry is imported and writes the digest the driver embeds; a worker
+rebuilt with plain `--release` has another digest and is refused. There is no search path
+and no fallback: `VerifiedWorker::open` takes an absolute path and the expected digest.
+
+**macOS.** The worker runs only under the deprecated, undocumented `/usr/bin/sandbox-exec`
+SBPL profile (dyld's libignition needs `/` readable; worker/generation ancestors need
+metadata), and only through the explicit `Runtime::macos_evidence` path
+(`keeper-graph-driver --macos-evidence`). It is evidence only (OD-C): nothing shipped
+enables it; macOS has no accounted-cost mechanism of its own and its benchmark is deferred
+(DW-KG1-1101-MACBENCH). iOS and Android have no graph worker (`graph::available()` is false;
+CI's iOS check excludes the worker and driver; `check:android-graph` rejects them).
+
+GraphQLite is source-built MIT v0.12.0 commit `995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629`
+against the sole `libsqlite3-sys`. The builder runs the pinned upstream schema DDL itself
+inside its host transaction; both roles verify the complete `sqlite_schema`. The query
+authorizer allows exactly the 41 `(table, column)` reads and 9 functions of the reviewed
+corpus; a retained statement re-prepares under that exact policy, and a denial fails the
+query. Process-wide admission (`keeper_core::graph::admission`): 4 query workers per agentd
+(2 headless), 2 per agent, 1 per context, one builder, at most 16 waiting, 3 s to admit.
+Query and inspection deadlines (3 s) and the build deadline (180 s) run from before spawn
+through exit and reap. A prefix longer than 100,000 events or an export over 1 GiB is an R1
+limit: `projection_unavailable`.
+
+### Existing platform exceptions
 
 - iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via
   objc2-foundation, behind `Platform::exclude_from_backup` — the single function-level

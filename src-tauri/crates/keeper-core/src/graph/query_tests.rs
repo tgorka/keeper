@@ -1,0 +1,1158 @@
+//! The query path end to end on this host: real on-disk replicas seeded with
+//! accepted events (the shared algebra's), the real export and the real
+//! worker (`--profile graph-worker`, built once by cargo) as builder, query
+//! and inspect processes, real publication and recovery. The runtime class
+//! is the test class: a dev host is never the measured Linux class (Q6),
+//! which `runtime`'s and `ledger`'s guards cover.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+
+use serde_json::{json, Map, Value};
+
+use super::*;
+use crate::graph::admission::Process;
+use crate::graph::protocol::candidate::{self, State, Verdict};
+use crate::graph::protocol::change::{Change, ChangeOp, NodeFields};
+use crate::graph::protocol::delta::Op;
+use crate::graph::protocol::scope::event_op_id;
+use crate::graph::protocol::worker::InspectEntity;
+use crate::graph::runtime::VerifiedWorker;
+use crate::graph::source::{Checkpoint, PrefixBatch, SourceError};
+use crate::hq::port::{ReplicaSpec, RowOp};
+use crate::hq::sessions::Source;
+use crate::hq::syncular::SyncularReplica;
+use crate::notes::tags::normalise;
+
+const DB: &str = "work";
+
+static WORKER: LazyLock<PathBuf> = LazyLock::new(|| {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let status = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "--quiet",
+            "--profile",
+            "graph-worker",
+            "-p",
+            "keeper-graph-query",
+            "--bins",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "the graph worker builds");
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/graph-worker/keeper-graph-query")
+        .canonicalize()
+        .expect("worker built")
+});
+
+/// The worker as shipped: `cargo build --profile graph-worker -p
+/// keeper-graph-query --bins`, once per test process (cargo serialises
+/// concurrent builds itself).
+fn worker() -> Arc<Runtime> {
+    let path: &Path = &WORKER;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).expect("worker bytes");
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    // The worker corroborates `no_new_privs` itself (its execution-class
+    // check), so the spawning test thread carries it, as agentd's do.
+    #[cfg(target_os = "linux")]
+    rustix::thread::set_no_new_privs(true).expect("no_new_privs");
+    Arc::new(Runtime::for_tests(
+        VerifiedWorker::open(path, Some(&digest)).expect("verified worker"),
+    ))
+}
+
+fn ulid(n: u32) -> String {
+    format!("01JG{n:022}")
+}
+
+/// The accepted graph's images, as the server's algebra sees them.
+#[derive(Default)]
+struct Graph {
+    nodes: BTreeMap<String, Map<String, Value>>,
+    edges: BTreeMap<String, Map<String, Value>>,
+    tags: BTreeMap<String, Map<String, Value>>,
+    memberships: BTreeMap<String, Map<String, Value>>,
+}
+
+impl State for Graph {
+    fn node(&self, id: &str) -> Option<Map<String, Value>> {
+        self.nodes.get(id).cloned()
+    }
+    fn edge(&self, id: &str) -> Option<Map<String, Value>> {
+        self.edges.get(id).cloned()
+    }
+    fn tag(&self, text: &str) -> Option<Map<String, Value>> {
+        self.tags.values().find(|t| t["text"] == text).cloned()
+    }
+    fn membership(&self, node: &str, tag: &str) -> Option<Map<String, Value>> {
+        self.memberships
+            .values()
+            .find(|m| m["node_id"] == node && m["tag_id"] == tag)
+            .cloned()
+    }
+    fn contains_into(&self, to: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.edges
+            .values()
+            .filter(|e| e["type"] == "contains" && e["lifecycle"] == "active")
+            .filter(|e| to.iter().any(|t| e["to_id"] == t.as_str()))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+/// A domain's server: the algebra over a graph, writing accepted events
+/// into a real replica as the server's sync would.
+struct World {
+    graph: Graph,
+    events: Vec<Vec<Op>>,
+    minted: u32,
+    source: Source,
+}
+
+fn upsert(table: &str, values: Value) -> RowOp {
+    RowOp::Upsert {
+        table: table.to_owned(),
+        values: values.as_object().expect("row").clone(),
+        base_version: None,
+    }
+}
+
+impl World {
+    fn new(dir: &Path) -> Self {
+        let replica = SyncularReplica::open(ReplicaSpec {
+            database: DB.to_owned(),
+            path: dir.join("replica.sqlite"),
+            client_id: Some("dev1".to_owned()),
+            link: None,
+            subscriptions: Vec::new(),
+            watch_presence: None,
+        })
+        .expect("replica");
+        Self {
+            graph: Graph::default(),
+            events: Vec::new(),
+            minted: 5_000,
+            source: Source {
+                database: DB.to_owned(),
+                replica: Arc::new(replica),
+                actor: "ana".to_owned(),
+                client: "dev1".to_owned(),
+            },
+        }
+    }
+
+    /// Accept `ops` as the next event; its operations.
+    fn accept(&mut self, ops: Vec<ChangeOp>) -> Vec<Op> {
+        let change = Change::new(ops, None, None, normalise).expect("change");
+        let mut minted = self.minted;
+        let verdict = candidate::apply(&self.graph, &change, &mut || {
+            minted += 1;
+            ulid(minted)
+        });
+        self.minted = minted;
+        let Verdict::Accepted(effects) = verdict else {
+            panic!("{verdict:?}");
+        };
+        for op in &effects.ops {
+            let map = match op.entity_type {
+                crate::graph::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
+                crate::graph::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
+                crate::graph::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
+                _ => &mut self.graph.memberships,
+            };
+            match &op.after_value {
+                Some(Value::Object(after)) => {
+                    map.insert(op.entity_id.clone(), after.clone());
+                }
+                _ => {
+                    map.remove(&op.entity_id);
+                }
+            }
+        }
+        self.events.push(effects.ops.clone());
+        effects.ops
+    }
+
+    fn event_id(seq: u64) -> String {
+        ulid(1_000_000 + u32::try_from(seq).expect("seq"))
+    }
+
+    /// Replicate events `from..=to` (all their operations unless `drop`
+    /// names an ordinal to withhold from the last one) and the head `head`.
+    fn replicate(&self, from: u64, to: u64, head: u64, drop: Option<u32>) {
+        let text = |v: &Option<Value>| v.as_ref().map(|v| Value::from(v.to_string()));
+        let mut rows = Vec::new();
+        for seq in from..=to {
+            let ops = &self.events[usize::try_from(seq - 1).expect("seq")];
+            let event = Self::event_id(seq);
+            rows.push(upsert(
+                "kg_events",
+                json!({
+                    "id": event, "graph": DB, "graph_seq": seq.to_string(), "descriptor": "graph.apply",
+                    "request_id": ulid(2_000_000 + u32::try_from(seq).expect("seq")), "request_digest": "0".repeat(64),
+                    "actor_id": "ana", "client_id": "dev1", "origin_class": "human", "origin_actor": null,
+                    "origin_chain": null, "context_id": null, "approval_basis": "{\"basis\":\"direct\"}",
+                    "reverses_event_id": null, "event_time_ms": null, "recorded_at_ms": 1,
+                    "op_count": ops.len(), "delta_digest": crate::graph::protocol::delta::digest(ops).expect("digest"),
+                    "author_actor": "server", "author_client": "server",
+                }),
+            ));
+            for op in ops {
+                if seq == to && drop == Some(op.ordinal) {
+                    continue;
+                }
+                rows.push(upsert(
+                    "kg_event_ops",
+                    json!({
+                        "id": event_op_id(&event, op.ordinal), "graph": DB, "event_id": event,
+                        "ordinal": op.ordinal, "entity_type": op.entity_type, "entity_id": op.entity_id,
+                        "operation": op.operation, "before_revision": op.before_revision,
+                        "after_revision": op.after_revision, "before_value": text(&op.before_value),
+                        "after_value": text(&op.after_value),
+                        "author_actor": "server", "author_client": "server",
+                    }),
+                ));
+            }
+        }
+        rows.push(upsert(
+            "kg_head",
+            json!({"id": DB, "graph": DB, "graph_seq": head.to_string(), "event_id": Self::event_id(head),
+                   "author_actor": "server", "author_client": "server"}),
+        ));
+        self.source.replica.mutate(rows).expect("replicated");
+    }
+
+    fn rev(&self, id: &str) -> String {
+        self.graph.nodes[id]["revision"]
+            .as_str()
+            .expect("rev")
+            .to_owned()
+    }
+    fn life(&self, id: &str) -> Option<String> {
+        self.graph.nodes[id]["lifecycle_revision"]
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+
+fn node(id: &str, kind: &str, title: &str, properties: Value) -> ChangeOp {
+    ChangeOp::CreateNode {
+        id: id.to_owned(),
+        kind: kind.to_owned(),
+        title: title.to_owned(),
+        description: None,
+        properties: properties.as_object().expect("props").clone(),
+    }
+}
+
+fn edge(w: &World, id: &str, from: &str, to: &str, kind: &str, properties: Value) -> ChangeOp {
+    let life = |n: &str| w.graph.nodes.get(n).and_then(|_| w.life(n));
+    ChangeOp::CreateEdge {
+        id: id.to_owned(),
+        from_id: from.to_owned(),
+        to_id: to.to_owned(),
+        edge_type: kind.to_owned(),
+        properties: properties.as_object().expect("props").clone(),
+        from_lifecycle_revision: life(from),
+        to_lifecycle_revision: life(to),
+    }
+}
+
+/// The source the reads see: the real replica's history, its scope as the
+/// test sets it.
+struct Replicated {
+    source: Source,
+    scope: Mutex<Checkpoint>,
+}
+
+impl GraphSource for Replicated {
+    fn domain(&self) -> &str {
+        &self.source.database
+    }
+    fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError> {
+        self.source.prefix_batch(after, limit)
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, SourceError> {
+        Ok(*self.scope.lock().expect("scope"))
+    }
+}
+
+fn granted() -> Checkpoint {
+    Checkpoint {
+        scope: ScopeState::Granted,
+        cursor: Some(42),
+    }
+}
+
+fn authority(epoch: &str) -> Authority {
+    Authority {
+        epoch: epoch.to_owned(),
+        digest: "ab".repeat(32),
+    }
+}
+
+/// The server's context operations for one agent session, as the test
+/// scripts them: each `refresh_context` answers the next scripted step.
+struct Server {
+    session: String,
+    sources: Vec<String>,
+    epoch: Mutex<String>,
+    refusals: Mutex<Vec<Option<QueryError>>>,
+    refreshed: AtomicU32,
+}
+
+impl Server {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            session: "s1".into(),
+            sources: vec![DB.to_owned()],
+            epoch: Mutex::new("1".into()),
+            refusals: Mutex::new(Vec::new()),
+            refreshed: AtomicU32::new(0),
+        })
+    }
+    fn row(&self, context: &str) -> ContextRow {
+        ContextRow {
+            context: context.to_owned(),
+            session: self.session.clone(),
+            permitted: self.sources.clone(),
+            sources: self.sources.clone(),
+            expires_at_ms: u64::MAX / 2,
+            authority: authority(&self.epoch.lock().expect("epoch")),
+        }
+    }
+}
+
+impl GraphRemote for Server {
+    fn admit_read(&self, context: &str, domain: &str) -> Result<ContextRow, QueryError> {
+        if !self.sources.iter().any(|d| d == domain) {
+            return Err(QueryError::Forbidden);
+        }
+        Ok(self.row(context))
+    }
+    fn refresh_context(&self, context: &str) -> Result<ContextRow, QueryError> {
+        self.refreshed.fetch_add(1, Ordering::SeqCst);
+        let next = {
+            let mut steps = self.refusals.lock().expect("steps");
+            if steps.is_empty() {
+                None
+            } else {
+                steps.remove(0)
+            }
+        };
+        match next {
+            Some(error) => Err(error),
+            None => Ok(self.row(context)),
+        }
+    }
+    fn read_status(&self, _: &str) -> Result<ReadStatus, QueryError> {
+        Err(QueryError::Forbidden)
+    }
+}
+
+const CONTEXT: &str = "01JG0000000000000000000099";
+
+struct Rig {
+    _dir: tempfile::TempDir,
+    world: World,
+    source: Arc<Replicated>,
+    reads: GraphReads,
+    server: Arc<Server>,
+    root: PathBuf,
+    admission: Arc<Admission>,
+}
+
+impl Rig {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("dir");
+        let world = World::new(dir.path());
+        let source = Arc::new(Replicated {
+            source: world.source.clone(),
+            scope: Mutex::new(granted()),
+        });
+        let root = dir.path().join("projection");
+        let admission = Admission::new(Process::Agentd);
+        let reads =
+            GraphReads::open(source.clone(), &root, admission.clone(), worker()).expect("reads");
+        Self {
+            _dir: dir,
+            world,
+            source,
+            reads,
+            server: Server::new(),
+            root,
+            admission,
+        }
+    }
+
+    fn reader(&self) -> AgentReader {
+        let read = AdmittedRead::admit(self.server.as_ref(), "agent-1", "s1", CONTEXT, DB)
+            .expect("admitted");
+        self.reads.agent(self.server.clone(), read).expect("reader")
+    }
+
+    async fn rows(
+        &self,
+        reader: &AgentReader,
+        source: &str,
+        params: &str,
+    ) -> Vec<Map<String, Value>> {
+        reader
+            .query(
+                source,
+                params.as_bytes(),
+                Freshness::Current,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{source}: {e}"))
+            .rows
+    }
+}
+
+fn is_ulid_text(v: &Value) -> bool {
+    v.as_str().is_some_and(crate::graph::protocol::is_ulid)
+}
+
+/// AC1/AC3: an accepted graph with custom kinds, properties, tags and
+/// parallel edges answers exactly, names its prefix, and every id is a
+/// canonical ULID, never an engine integer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_prefix_answers_the_profile_exactly() {
+    let mut rig = Rig::new();
+    let (a, b, c) = (ulid(1), ulid(2), ulid(3));
+    let w = &mut rig.world;
+    w.accept(vec![
+        node(&a, "Concept", "Alpha", json!({"score": 1, "note": "x"})),
+        node(&b, "work:Task", "Beta", json!({"score": 2.5})),
+        node(&c, "Concept", "Gamma", json!({})),
+        ChangeOp::AddTag {
+            node_id: a.clone(),
+            tag: "#Project".into(),
+            expected_revision: None,
+        },
+        ChangeOp::AddTag {
+            node_id: b.clone(),
+            tag: "#Project".into(),
+            expected_revision: None,
+        },
+    ]);
+    let ops = vec![
+        edge(
+            w,
+            &ulid(10),
+            &a,
+            &b,
+            "work:depends_on",
+            json!({"weight": 1}),
+        ),
+        edge(
+            w,
+            &ulid(11),
+            &a,
+            &b,
+            "work:depends_on",
+            json!({"weight": 2}),
+        ),
+        edge(w, &ulid(12), &a, &c, "contains", json!({})),
+    ];
+    w.accept(ops);
+    w.replicate(1, 2, 2, None);
+    let reader = rig.reader();
+    let refreshed = reader
+        .refresh(&Cancellation::default())
+        .await
+        .expect("refresh");
+    assert_eq!(
+        (refreshed.graph_seq, refreshed.built, refreshed.completeness),
+        (2, true, Completeness::Current)
+    );
+
+    let task = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Node,
+        "work:Task",
+    )
+    .expect("sym");
+    let dep = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Edge,
+        "work:depends_on",
+    )
+    .expect("sym");
+    let weight = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Property,
+        "weight",
+    )
+    .expect("sym");
+    let result = reader
+        .query(
+            &format!("MATCH (a:Concept)-[d:{dep}]->(b:{task}) RETURN a.title AS from, d.{weight} AS w, d.id AS id ORDER BY w DESC LIMIT 10"),
+            b"{}",
+            Freshness::Current,
+            &Cancellation::default(),
+        )
+        .await
+        .expect("parallel edges");
+    assert_eq!(
+        (
+            result.domain.as_str(),
+            result.graph_seq,
+            result.checkpoint.as_str(),
+            result.completeness
+        ),
+        (DB, 2, "42", Completeness::Current)
+    );
+    assert_eq!(result.rows.len(), 2, "parallel edges stay independent");
+    assert_eq!(result.rows[0]["w"], json!(2.0));
+    assert_eq!(result.rows[0]["id"], json!(ulid(11)));
+    assert!(result.rows.iter().all(|r| is_ulid_text(&r["id"])));
+
+    let tagged = rig
+        .rows(&reader, "MATCH (n)-[:HAS_TAG]->(t:Tag) WHERE t.text = $t RETURN n.id AS id, t.text AS tag ORDER BY id LIMIT 10", r#"{"t":"project"}"#)
+        .await;
+    assert_eq!(
+        tagged,
+        vec![
+            json!({"id": a, "tag": "project"})
+                .as_object()
+                .expect("row")
+                .clone(),
+            json!({"id": b, "tag": "project"})
+                .as_object()
+                .expect("row")
+                .clone(),
+        ]
+    );
+    let count = rig
+        .rows(
+            &reader,
+            "MATCH (n) WHERE n.kind = $k RETURN count(n) AS n LIMIT 1",
+            r#"{"k":"Concept"}"#,
+        )
+        .await;
+    assert_eq!(count[0]["n"], json!(2.0));
+    let null = rig
+        .rows(
+            &reader,
+            "MATCH (n:Concept) WHERE n.description IS NULL RETURN n.id AS id ORDER BY id LIMIT 5",
+            "{}",
+        )
+        .await;
+    assert_eq!(null.len(), 2);
+
+    let inspected = reader
+        .inspect(
+            InspectEntity::Node,
+            &a,
+            false,
+            Freshness::Current,
+            &Cancellation::default(),
+        )
+        .await
+        .expect("inspect");
+    let Some(Inspected::Node(view)) = inspected.rows else {
+        panic!("node")
+    };
+    assert_eq!(view.tags, vec!["project".to_owned()]);
+    assert_eq!(view.image["title"], "Alpha");
+    assert_eq!(
+        rig.admission.stats().live_workers,
+        0,
+        "every worker was reaped"
+    );
+}
+
+/// AC3: a new generation is the accepted state exactly — a removed
+/// property is gone, a changed value's type changes, an archived endpoint
+/// hides its retained edge and its unarchive brings it back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_generation_leaves_no_stale_value() {
+    let mut rig = Rig::new();
+    let (a, b) = (ulid(1), ulid(2));
+    rig.world.accept(vec![
+        node(&a, "Concept", "A", json!({"gone": 1, "kind_of": 5})),
+        node(&b, "Concept", "B", json!({})),
+    ]);
+    let ops = vec![edge(&rig.world, &ulid(10), &a, &b, "contains", json!({}))];
+    rig.world.accept(ops);
+    rig.world.replicate(1, 2, 2, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    let gone = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Property,
+        "gone",
+    )
+    .expect("sym");
+    let kind_of = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Property,
+        "kind_of",
+    )
+    .expect("sym");
+    let probe =
+        format!("MATCH (n) WHERE n.id = $id RETURN n.{gone} AS gone, n.{kind_of} AS k LIMIT 1");
+    let params = format!(r#"{{"id":"{a}"}}"#);
+    assert_eq!(
+        rig.rows(&reader, &probe, &params).await[0]["gone"],
+        json!(1.0)
+    );
+
+    let rev = rig.world.rev(&a);
+    rig.world.accept(vec![ChangeOp::UpdateNode {
+        id: a.clone(),
+        expected_revision: rev,
+        set: NodeFields::default(),
+        set_properties: json!({"kind_of": "five"}).as_object().expect("p").clone(),
+        remove_properties: vec!["gone".into()],
+    }]);
+    let rev = rig.world.rev(&b);
+    rig.world.accept(vec![ChangeOp::ArchiveNode {
+        id: b.clone(),
+        expected_revision: rev,
+    }]);
+    rig.world.replicate(3, 4, 4, None);
+    assert!(
+        reader
+            .refresh(&Cancellation::default())
+            .await
+            .expect("g2")
+            .built
+    );
+    let row = &rig.rows(&reader, &probe, &params).await[0];
+    assert_eq!(
+        (row["gone"].clone(), row["k"].clone()),
+        (Value::Null, json!("five"))
+    );
+    let hop = "MATCH (a)-[e:contains]->(b) RETURN e.id AS id LIMIT 5";
+    assert!(
+        rig.rows(&reader, hop, "{}").await.is_empty(),
+        "an archived endpoint hides the edge"
+    );
+    let archived = reader
+        .inspect(
+            InspectEntity::Node,
+            &b,
+            false,
+            Freshness::Current,
+            &Cancellation::default(),
+        )
+        .await
+        .expect("inspect");
+    assert_eq!(archived.rows, None);
+    let shown = reader
+        .inspect(
+            InspectEntity::Node,
+            &b,
+            true,
+            Freshness::Current,
+            &Cancellation::default(),
+        )
+        .await
+        .expect("inspect");
+    assert!(matches!(&shown.rows, Some(Inspected::Node(v)) if v.image["lifecycle"] == "archived"));
+
+    let rev = rig.world.rev(&b);
+    rig.world.accept(vec![ChangeOp::UnarchiveNode {
+        id: b.clone(),
+        expected_revision: rev,
+    }]);
+    rig.world.replicate(5, 5, 5, None);
+    reader.refresh(&Cancellation::default()).await.expect("g3");
+    assert_eq!(
+        rig.rows(&reader, hop, "{}").await[0]["id"],
+        json!(ulid(10)),
+        "unarchive re-exposes the retained edge"
+    );
+}
+
+/// AC2: a missing operation row ends the prefix early — the older complete
+/// generation is served only as explicitly stale — and a present event that
+/// does not verify is refused, never served shortened.
+#[tokio::test(flavor = "current_thread")]
+async fn a_partial_or_corrupt_history_is_stale_or_refused() {
+    let mut rig = Rig::new();
+    let a = ulid(1);
+    rig.world.accept(vec![node(&a, "Concept", "A", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    let rev = rig.world.rev(&a);
+    rig.world.accept(vec![
+        ChangeOp::UpdateNode {
+            id: a.clone(),
+            expected_revision: rev,
+            set: NodeFields {
+                title: Some("B".into()),
+                description: None,
+            },
+            set_properties: Map::new(),
+            remove_properties: Vec::new(),
+        },
+        ChangeOp::AddTag {
+            node_id: a.clone(),
+            tag: "#x".into(),
+            expected_revision: Some("1".into()),
+        },
+    ]);
+    // Event 2 arrives without its operation 1.
+    rig.world.replicate(2, 2, 2, Some(1));
+    let refreshed = reader
+        .refresh(&Cancellation::default())
+        .await
+        .expect("stays at 1");
+    assert_eq!(
+        (refreshed.graph_seq, refreshed.built, refreshed.completeness),
+        (1, false, Completeness::Stale)
+    );
+    let q = "MATCH (n) RETURN n.title AS t LIMIT 1";
+    assert_eq!(
+        reader
+            .query(q, b"{}", Freshness::Current, &Cancellation::default())
+            .await
+            .err(),
+        Some(QueryError::Stale)
+    );
+    let stale = reader
+        .query(q, b"{}", Freshness::AllowStale, &Cancellation::default())
+        .await
+        .expect("stale");
+    assert_eq!(
+        (
+            stale.completeness,
+            stale.graph_seq,
+            stale.rows[0]["t"].clone()
+        ),
+        (Completeness::Stale, 1, json!("A"))
+    );
+    // The missing row arrives; the prefix completes.
+    rig.world.replicate(2, 2, 2, None);
+    assert_eq!(
+        reader
+            .refresh(&Cancellation::default())
+            .await
+            .expect("g2")
+            .graph_seq,
+        2
+    );
+    assert_eq!(rig.rows(&reader, q, "{}").await[0]["t"], json!("B"));
+
+    // Event 3 is present with a wrong before-image: refused, and the
+    // complete generation 2 is never replaced by a shorter one.
+    let rev = rig.world.rev(&a);
+    rig.world.accept(vec![ChangeOp::ArchiveNode {
+        id: a.clone(),
+        expected_revision: rev,
+    }]);
+    rig.world.events[2][0]
+        .before_value
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("image")
+        .insert("title".into(), json!("forged"));
+    rig.world.replicate(3, 3, 3, None);
+    assert_eq!(
+        reader.refresh(&Cancellation::default()).await.err(),
+        Some(QueryError::Unavailable("prefix.corrupt"))
+    );
+    let still = reader
+        .query(q, b"{}", Freshness::AllowStale, &Cancellation::default())
+        .await
+        .expect("g2 stale");
+    assert_eq!(
+        (still.graph_seq, still.completeness),
+        (2, Completeness::Stale)
+    );
+}
+
+/// AC2: every crash window recovers to the last selected complete
+/// generation (or none), discarding only disposable output.
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_keeps_only_the_selected_generation() {
+    let mut rig = Rig::new();
+    rig.world
+        .accept(vec![node(&ulid(1), "Concept", "A", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    let selected: Vec<_> = std::fs::read_dir(&rig.root)
+        .expect("dir")
+        .map(|e| e.expect("e").file_name())
+        .collect();
+    // Leftovers of each window: a builder that never committed, a renamed
+    // but unselected generation, a half-written selection.
+    for name in [
+        "01JG000000000000000000000S.staging",
+        "01JG000000000000000000000V.db",
+        "current.tmp",
+        "01JG000000000000000000000V.db-journal",
+    ] {
+        std::fs::write(rig.root.join(name), b"partial").expect("leftover");
+    }
+    let source = rig.source.clone();
+    drop(reader);
+    // Release this root: the instance holding it is replaced by one elsewhere.
+    let elsewhere = GraphReads::open(
+        source.clone(),
+        &rig.dir_root(),
+        rig.admission.clone(),
+        worker(),
+    )
+    .expect("other root");
+    drop(std::mem::replace(&mut rig.reads, elsewhere));
+    let reads = GraphReads::open(source.clone(), &rig.root, rig.admission.clone(), worker())
+        .expect("reopened");
+    let mut after: Vec<_> = std::fs::read_dir(&rig.root)
+        .expect("dir")
+        .map(|e| e.expect("e").file_name())
+        .collect();
+    // The export is disposable too: a reopened instance replays from genesis.
+    let mut before: Vec<_> = selected
+        .into_iter()
+        .filter(|n| n != "prefix.export")
+        .collect();
+    before.sort();
+    after.sort();
+    assert_eq!(
+        after, before,
+        "only the selected generation, its selection and the lock remain"
+    );
+    let read =
+        AdmittedRead::admit(rig.server.as_ref(), "agent-1", "s1", CONTEXT, DB).expect("admitted");
+    let reader = reads.agent(rig.server.clone(), read).expect("reader");
+    let rows = reader
+        .query(
+            "MATCH (n) RETURN n.title AS t LIMIT 1",
+            b"{}",
+            Freshness::Current,
+            &Cancellation::default(),
+        )
+        .await
+        .expect("served after recovery");
+    assert_eq!(rows.rows[0]["t"], json!("A"));
+
+    // A selection naming a generation that is gone selects nothing.
+    drop(reader);
+    drop(reads);
+    for entry in std::fs::read_dir(&rig.root).expect("dir") {
+        let path = entry.expect("e").path();
+        if path.extension().is_some_and(|e| e == "db") {
+            std::fs::remove_file(path).expect("rm");
+        }
+    }
+    let reads =
+        GraphReads::open(source, &rig.root, rig.admission.clone(), worker()).expect("reopened");
+    let read =
+        AdmittedRead::admit(rig.server.as_ref(), "agent-1", "s1", CONTEXT, DB).expect("admitted");
+    let reader = reads.agent(rig.server.clone(), read).expect("reader");
+    assert_eq!(
+        reader
+            .query(
+                "MATCH (n) RETURN n.id AS i LIMIT 1",
+                b"{}",
+                Freshness::AllowStale,
+                &Cancellation::default()
+            )
+            .await
+            .err(),
+        Some(QueryError::Unavailable("projection.none"))
+    );
+    assert!(!rig.root.join("current").exists());
+}
+
+impl Rig {
+    fn dir_root(&self) -> PathBuf {
+        self.root.with_file_name("elsewhere")
+    }
+}
+
+/// AC4: unsupported grammar and bounds refuse before any worker; a
+/// high-cardinality small-LIMIT query is `query_limit`, never a truncated
+/// success; another domain or a non-admitted context gets nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn grammar_limits_and_domains_are_enforced_through_the_reader() {
+    let mut rig = Rig::new();
+    let ops: Vec<ChangeOp> = (1..=20)
+        .map(|i| node(&ulid(i), "Concept", "N", json!({})))
+        .collect();
+    rig.world.accept(ops);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    for (source, error) in [
+        (
+            "MATCH (n) DETACH DELETE n RETURN n.id AS i LIMIT 1",
+            QueryError::Unsupported,
+        ),
+        ("MATCH (n) RETURN n.id AS i LIMIT 1001", QueryError::Limit),
+        (
+            "CALL db.labels() YIELD label RETURN label LIMIT 1",
+            QueryError::Unsupported,
+        ),
+    ] {
+        assert_eq!(
+            reader
+                .query(source, b"{}", Freshness::Current, &Cancellation::default())
+                .await
+                .err(),
+            Some(error)
+        );
+    }
+    // A caller path, URI or domain in parameters is data, never a selector.
+    let rows = rig
+        .rows(
+            &reader,
+            "MATCH (n) WHERE n.title = $p RETURN n.id AS i LIMIT 5",
+            r#"{"p":"file:/etc/passwd?mode=ro&domain=other"}"#,
+        )
+        .await;
+    assert!(rows.is_empty());
+    let all = rig
+        .rows(&reader, "MATCH (n) RETURN n.id AS i LIMIT 20", "{}")
+        .await;
+    assert_eq!(all.len(), 20);
+    // A LIMIT is the query's own bound: exactly the first rows by id.
+    let first = rig
+        .rows(&reader, "MATCH (n) RETURN n.id AS i LIMIT 19", "{}")
+        .await;
+    assert_eq!(first.len(), 19);
+    assert_eq!(first[..], all[..19]);
+    // A reader admitted for another domain is refused by these reads.
+    let other = Arc::new(Server {
+        sources: vec!["other".into()],
+        ..Arc::try_unwrap(Server::new()).ok().expect("fresh")
+    });
+    let read = AdmittedRead::admit(other.as_ref(), "agent-1", "s1", CONTEXT, "other")
+        .expect("other domain");
+    assert!(matches!(
+        rig.reads.agent(other.clone(), read),
+        Err(QueryError::Forbidden)
+    ));
+    // A context the server did not admit for this domain gets nothing.
+    assert!(matches!(
+        AdmittedRead::admit(other.as_ref(), "agent-1", "s1", CONTEXT, DB),
+        Err(QueryError::Forbidden)
+    ));
+    // A session other than the context's is refused at admission.
+    assert!(matches!(
+        AdmittedRead::admit(rig.server.as_ref(), "agent-1", "s2", CONTEXT, DB),
+        Err(QueryError::Forbidden)
+    ));
+}
+
+/// AC4 / I-3: a result whose authority is revoked or changed between the
+/// native completion and delivery is suppressed.
+#[tokio::test(flavor = "current_thread")]
+async fn revocation_before_delivery_suppresses_the_result() {
+    let mut rig = Rig::new();
+    rig.world
+        .accept(vec![node(&ulid(1), "Concept", "secret-title", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    let q = "MATCH (n) RETURN n.title AS t LIMIT 1";
+    // The worker answers; the delivery gate's refresh is refused.
+    rig.server
+        .refusals
+        .lock()
+        .expect("steps")
+        .push(Some(QueryError::Forbidden));
+    let before = rig.server.refreshed.load(Ordering::SeqCst);
+    let refused = reader
+        .query(q, b"{}", Freshness::Current, &Cancellation::default())
+        .await;
+    assert_eq!(refused.err(), Some(QueryError::Forbidden));
+    assert_eq!(
+        rig.server.refreshed.load(Ordering::SeqCst),
+        before + 1,
+        "the gate asked after the worker answered"
+    );
+    // An epoch change between computation and delivery is not delivered either.
+    *rig.server.epoch.lock().expect("epoch") = "2".into();
+    assert_eq!(
+        reader
+            .query(q, b"{}", Freshness::Current, &Cancellation::default())
+            .await
+            .err(),
+        Some(QueryError::Stale)
+    );
+    assert_eq!(rig.admission.stats().live_workers, 0);
+}
+
+/// D12: the kill switch kills and reaps a running worker, delivers
+/// nothing, purges the projection and leaves the instance refused.
+#[tokio::test(flavor = "current_thread")]
+async fn revoking_the_domain_kills_running_work_and_purges() {
+    let mut rig = Rig::new();
+    let n = 120u32;
+    let ops: Vec<ChangeOp> = (1..=n)
+        .map(|i| node(&ulid(i), "Concept", "N", json!({})))
+        .collect();
+    rig.world.accept(ops);
+    let mut edges = Vec::new();
+    let mut next = 10_000;
+    for i in 1..=n {
+        for j in (i + 1)..=n.min(i + 40) {
+            next += 1;
+            edges.push(edge(
+                &rig.world,
+                &ulid(next),
+                &ulid(i),
+                &ulid(j),
+                "sources",
+                json!({}),
+            ));
+        }
+    }
+    for chunk in edges.chunks(128) {
+        rig.world.accept(chunk.to_vec());
+    }
+    let head = rig.world.events.len() as u64;
+    rig.world.replicate(1, head, head, None);
+    let reader = Arc::new(rig.reader());
+    reader
+        .refresh(&Cancellation::default())
+        .await
+        .expect("built");
+    let running = {
+        let reader = reader.clone();
+        tokio::spawn(async move {
+            reader
+                .query(
+                    "MATCH (a)-[:sources]->(b)-[:sources]->(c)-[:sources]->(d)-[:sources]->(e) RETURN count(*) AS n LIMIT 1",
+                    b"{}",
+                    Freshness::Current,
+                    &Cancellation::default(),
+                )
+                .await
+        })
+    };
+    let started = std::time::Instant::now();
+    while rig.admission.stats().live_workers == 0
+        && started.elapsed() < std::time::Duration::from_secs(5)
+    {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        rig.admission.stats().live_workers,
+        1,
+        "the query worker is running"
+    );
+    rig.reads.revoke().await.expect("revoked");
+    let outcome = running.await.expect("joined");
+    assert_eq!(outcome.err(), Some(QueryError::Forbidden));
+    assert_eq!(
+        rig.admission.stats().live_workers,
+        0,
+        "the worker was killed and reaped"
+    );
+    let left: Vec<_> = std::fs::read_dir(&rig.root)
+        .expect("dir")
+        .map(|e| e.expect("e").file_name())
+        .collect();
+    assert_eq!(
+        left,
+        vec![std::ffi::OsString::from(".projection.lock")],
+        "the projection is purged"
+    );
+    assert_eq!(
+        reader
+            .query(
+                "MATCH (n) RETURN n.id AS i LIMIT 1",
+                b"{}",
+                Freshness::AllowStale,
+                &Cancellation::default()
+            )
+            .await
+            .err(),
+        Some(QueryError::Forbidden)
+    );
+}
+
+/// A replica whose scope the server revoked kills the domain on the next
+/// read, and a cancelled read is reaped as cancelled.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revoked_scope_or_a_cancellation_stops_reads() {
+    let mut rig = Rig::new();
+    rig.world
+        .accept(vec![node(&ulid(1), "Concept", "A", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = rig.reader();
+    let cancel = Cancellation::default();
+    cancel.cancel();
+    assert_eq!(
+        reader.refresh(&cancel).await.err(),
+        Some(QueryError::Cancelled)
+    );
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    *rig.source.scope.lock().expect("scope") = Checkpoint {
+        scope: ScopeState::Revoked,
+        cursor: None,
+    };
+    assert_eq!(
+        reader
+            .query(
+                "MATCH (n) RETURN n.id AS i LIMIT 1",
+                b"{}",
+                Freshness::AllowStale,
+                &Cancellation::default()
+            )
+            .await
+            .err(),
+        Some(QueryError::Forbidden)
+    );
+    assert!(rig.reads.is_revoked());
+    assert!(!rig.root.join("current").exists());
+}
+
+#[test]
+fn checkpoint_rows_decide_the_scope() {
+    use crate::graph::source::checkpoint_of;
+    let row = |tbl: &str, status: &str, cursor: i64, holds: bool| {
+        json!({"tbl": tbl, "status": status, "cursor": cursor, "holds": holds})
+            .as_object()
+            .expect("row")
+            .clone()
+    };
+    let all = |status: &str, holds: bool| {
+        vec![
+            row("kg_events", status, 7, holds),
+            row("kg_event_ops", status, 5, holds),
+            row("kg_head", status, 9, holds),
+        ]
+    };
+    assert_eq!(
+        checkpoint_of(&all("active", true)),
+        Checkpoint {
+            scope: ScopeState::Granted,
+            cursor: Some(5)
+        }
+    );
+    assert_eq!(
+        checkpoint_of(&all("active", false)).scope,
+        ScopeState::Revoked
+    );
+    assert_eq!(
+        checkpoint_of(&all("revoked", true)).scope,
+        ScopeState::Revoked
+    );
+    assert_eq!(
+        checkpoint_of(&all("active", true)[..2]).scope,
+        ScopeState::Pending
+    );
+    let mut first = all("active", true);
+    first[0] = row("kg_events", "active", -1, true);
+    assert_eq!(checkpoint_of(&first).scope, ScopeState::Pending);
+}

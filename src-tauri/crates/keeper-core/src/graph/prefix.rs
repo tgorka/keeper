@@ -57,7 +57,7 @@ pub enum PrefixError {
     Corrupt { at: u64, reason: &'static str },
 }
 
-fn corrupt(at: u64, reason: &'static str) -> PrefixError {
+pub(crate) fn corrupt(at: u64, reason: &'static str) -> PrefixError {
     PrefixError::Corrupt { at, reason }
 }
 
@@ -99,7 +99,7 @@ pub fn complete(source: &dyn GraphSource) -> Result<Prefix, PrefixError> {
 
 /// The batch's events by position; `None` for an event whose operations
 /// have not all replicated.
-fn group(
+pub(crate) fn group(
     after: u64,
     headers: &[Map<String, Value>],
     ops: &[Map<String, Value>],

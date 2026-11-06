@@ -93,6 +93,16 @@ pub fn replica(data_dir: &Path, server: &ServerUrl, database: &str, actor: &str)
         .join(format!("{actor}.sqlite"))
 }
 
+/// The graph query projection of one database's replica of `actor`: beside
+/// the replica, under the same trusted server/database/actor identity, never
+/// a caller-chosen path and never inside Syncular's own file. Forgetting the
+/// server removes it with the replicas.
+pub fn projection(data_dir: &Path, server: &ServerUrl, database: &str, actor: &str) -> PathBuf {
+    server_dir(data_dir, server)
+        .join(database)
+        .join(format!("{actor}.projection"))
+}
+
 /// The databases of `server` this device already holds a replica of for
 /// `actor`, by name.
 pub fn held(data_dir: &Path, server: &ServerUrl, actor: &str) -> Vec<String> {
