@@ -266,6 +266,42 @@ pub struct Resolution {
     pub code: Option<String>,
 }
 
+/// The terminal state and receipt summary a definite outcome persists, or
+/// `None` while the request is not resolved (`pending_visibility`, or
+/// `pending`, which leaves the entry where it is under its own id). A
+/// receipt's detail is never kept.
+#[must_use]
+pub fn terminal(outcome: &super::outcome::GraphOutcome) -> Option<(State, Resolution)> {
+    use super::outcome::GraphOutcome;
+    let only = |code: Option<String>| Resolution {
+        code,
+        ..Resolution::default()
+    };
+    Some(match outcome {
+        GraphOutcome::Accepted {
+            event_id,
+            graph_seq,
+            ..
+        } => (
+            State::Accepted,
+            Resolution {
+                event_id: Some(event_id.clone()),
+                graph_seq: Some(graph_seq.clone()),
+                code: None,
+            },
+        ),
+        GraphOutcome::Proposed { .. } => (State::Proposed, only(None)),
+        GraphOutcome::Conflict { .. } => (State::Conflict, only(None)),
+        GraphOutcome::Rejected { reason, .. } => (State::Rejected, only(Some(reason.clone()))),
+        GraphOutcome::TechnicalRefusal { code } => {
+            (State::TechnicalRefusal, only(Some(code.clone())))
+        }
+        GraphOutcome::IdempotencyMismatch => (State::IdempotencyMismatch, only(None)),
+        GraphOutcome::Unsupported => (State::Unsupported, only(None)),
+        GraphOutcome::PendingVisibility { .. } | GraphOutcome::Pending { .. } => return None,
+    })
+}
+
 /// One entry as a listing shows it: domain-safe metadata only, never the
 /// payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
