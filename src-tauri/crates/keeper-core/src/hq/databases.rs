@@ -103,6 +103,20 @@ pub fn projection(data_dir: &Path, server: &ServerUrl, database: &str, actor: &s
         .join(format!("{actor}.projection"))
 }
 
+/// The graph intent queue of one database's replica of `actor` (112.1): the
+/// device-local changes not yet resolved, the revocation fence and the last
+/// read authority, beside the replica under the same trusted
+/// server/database/actor identity. Never synced and never inside
+/// Syncular's own file; forgetting the server removes it with the replicas.
+pub fn graph_queue(data_dir: &Path, server: &ServerUrl, database: &str, actor: &str) -> PathBuf {
+    server_dir(data_dir, server)
+        .join(database)
+        .join(format!("{actor}.{GRAPH_QUEUE_EXTENSION}"))
+}
+
+/// The extension of every [`graph_queue`] file.
+pub const GRAPH_QUEUE_EXTENSION: &str = "graph-queue";
+
 /// The databases of `server` this device already holds a replica of for
 /// `actor`, by name.
 pub fn held(data_dir: &Path, server: &ServerUrl, actor: &str) -> Vec<String> {

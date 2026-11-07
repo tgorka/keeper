@@ -30,6 +30,7 @@ pub use keeper_graph_protocol as protocol;
 pub mod client;
 pub mod outcome;
 pub mod prefix;
+pub mod queue;
 pub mod source;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
