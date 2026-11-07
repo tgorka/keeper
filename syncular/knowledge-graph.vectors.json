@@ -40586,6 +40586,583 @@
           "01JN0000000000000000000004": 2
         }
       }
+    },
+    {
+      "actor": "person-reverser",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "b69362d0109673f3fa85ed1ebae976fb92ac121e608549e140282be22cac5d0e",
+          "descriptor": "graph.apply",
+          "event_time_ms": null,
+          "graph_seq": "1",
+          "id": "01JN0000000000000000000012",
+          "op_count": 2,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1001,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000013",
+          "reverses_event_id": null
+        },
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "2",
+              "title": "M2"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "1",
+              "title": "M"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "update",
+            "ordinal": 0
+          },
+          {
+            "after_revision": "1",
+            "after_value": {
+              "body": {
+                "inline_text": "t"
+              },
+              "id": "01JN0000000000000000000003",
+              "owner_node_id": "01JN0000000000000000000001",
+              "revision": "1"
+            },
+            "before_revision": null,
+            "before_value": null,
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "content",
+            "operation": "create",
+            "ordinal": 1
+          }
+        ]
+      },
+      "id": "content-create-on-existing-owner-beside-an-edit",
+      "preview": {
+        "detail": null,
+        "outcome": "rejected",
+        "reason": "invalid_change"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "t"
+            },
+            "id": "01JN0000000000000000000003",
+            "owner_node_id": "01JN0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "N"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "2",
+            "title": "M2"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 1,
+          "01JN0000000000000000000003": 1
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "1be7e87b938c699fbe84fff9cf0c23dda62c8d5b481997f710c099df33115e9a",
+          "descriptor": "graph.acknowledge",
+          "event_time_ms": null,
+          "graph_seq": "1",
+          "id": "01JN0000000000000000000010",
+          "op_count": 1,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1001,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000011",
+          "reverses_event_id": null
+        },
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000001",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "2",
+              "title": "M"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000001",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "1",
+              "title": "N"
+            },
+            "entity_id": "01JN0000000000000000000001",
+            "entity_type": "node",
+            "operation": "update",
+            "ordinal": 0
+          }
+        ]
+      },
+      "id": "acknowledge-descriptor-not-reversible",
+      "preview": {
+        "detail": null,
+        "outcome": "rejected",
+        "reason": "invalid_change"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "2",
+            "title": "M"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 1
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "conflict": {
+        "current_revision": "3",
+        "entity": {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000001"
+        },
+        "precondition": "revision"
+      },
+      "id": "forged-membership-absent",
+      "mint": [
+        "01JN0000000000000000901431",
+        "01JN0000000000000000901432",
+        "01JN0000000000000000901433",
+        "01JN0000000000000000901434"
+      ],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": null,
+            "after_value": null,
+            "before_revision": null,
+            "before_value": {
+              "id": "01JN0000000000000000000003",
+              "node_id": "01JN0000000000000000000001",
+              "tag_id": "01JN0000000000000000000002"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "node_tag",
+            "operation": "remove"
+          }
+        ],
+        "retained": [
+          {
+            "id": "01JN0000000000000000000002",
+            "label": null,
+            "revision": "1",
+            "text": "alpha"
+          }
+        ],
+        "target_delta_digest": "6312d5537d3eae5a5744a490866a48a3be6e53a5d6ddc25a5d403b97c60d6999",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "1"
+      },
+      "state": {
+        "contents": [],
+        "edges": [],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "3",
+            "title": "N"
+          }
+        ],
+        "tags": [
+          {
+            "id": "01JN0000000000000000000002",
+            "label": null,
+            "revision": "1",
+            "text": "alpha"
+          }
+        ],
+        "written": {
+          "01JN0000000000000000000001": 2
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "conflict": {
+        "current_revision": "4",
+        "entity": {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000001"
+        },
+        "precondition": "revision"
+      },
+      "id": "forged-membership-present",
+      "mint": [
+        "01JN0000000000000000901531",
+        "01JN0000000000000000901532",
+        "01JN0000000000000000901533",
+        "01JN0000000000000000901534"
+      ],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": null,
+            "after_value": {
+              "id": null,
+              "node_id": "01JN0000000000000000000001",
+              "tag_id": "01JN0000000000000000000002"
+            },
+            "before_revision": null,
+            "before_value": null,
+            "entity_id": null,
+            "entity_type": "node_tag",
+            "operation": "create"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "563c7298a6daf71a208b033cd2e00ea1750cb424cd232bb3dbceb5bff05a15e1",
+        "target_event_id": "01JN0000000000000000000020",
+        "target_graph_seq": "2"
+      },
+      "state": {
+        "contents": [],
+        "edges": [],
+        "node_tags": [
+          {
+            "id": "01JN0000000000000000000022",
+            "node_id": "01JN0000000000000000000001",
+            "tag_id": "01JN0000000000000000000002"
+          }
+        ],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "N"
+          }
+        ],
+        "tags": [
+          {
+            "id": "01JN0000000000000000000002",
+            "label": null,
+            "revision": "1",
+            "text": "alpha"
+          }
+        ],
+        "written": {
+          "01JN0000000000000000000001": 3
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "conflict": {
+        "current_revision": "3",
+        "entity": {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002"
+        },
+        "precondition": "dependency"
+      },
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "d9956ec6ea6ecd257c92ab2862004685282e68a29989b59cac78604517073e50",
+          "descriptor": "graph.reverse",
+          "event_time_ms": null,
+          "graph_seq": "2",
+          "id": "01JN0000000000000000000144",
+          "op_count": 2,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1002,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000145",
+          "reverses_event_id": "01JN0000000000000000000012"
+        },
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "B"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "B"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "unarchive",
+            "ordinal": 0
+          },
+          {
+            "after_revision": "1",
+            "after_value": {
+              "id": "01JN0000000000000000000014",
+              "kind": "reversal",
+              "reviewer_actor": "person-reverser",
+              "revision": "1",
+              "target_delta_digest": "f611b3e6924494f6002ce51740818d8a602467e768cc2add5717852223e2e5f7",
+              "target_event_id": "01JN0000000000000000000012"
+            },
+            "before_revision": null,
+            "before_value": null,
+            "entity_id": "01JN0000000000000000000014",
+            "entity_type": "review",
+            "operation": "create",
+            "ordinal": 1
+          }
+        ]
+      },
+      "expected": [
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002",
+          "lifecycle_revision": "3",
+          "revision": "3"
+        }
+      ],
+      "id": "re-merge-blocked-by-any-incident-edge",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "4",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "4",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "4",
+              "title": "B"
+            },
+            "before_revision": "3",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "B"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "archive"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "d9956ec6ea6ecd257c92ab2862004685282e68a29989b59cac78604517073e50",
+        "target_event_id": "01JN0000000000000000000144",
+        "target_graph_seq": "2"
+      },
+      "preview": {
+        "detail": {
+          "current_revision": "3",
+          "entity": {
+            "entity_type": "node",
+            "id": "01JN0000000000000000000002"
+          },
+          "precondition": "dependency"
+        },
+        "outcome": "conflict",
+        "reason": null
+      },
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000002",
+            "id": "01JN0000000000000000000146",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "1",
+            "to_id": "01JN0000000000000000000003",
+            "type": "ex:rel"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "3",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "3",
+            "title": "B"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000003",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "O"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 2,
+          "01JN0000000000000000000003": 1,
+          "01JN0000000000000000000146": 0
+        }
+      }
     }
   ],
   "reversals": [

@@ -7,7 +7,9 @@ use keeper_graph_protocol::delta::Op;
 use keeper_graph_protocol::inverse::{self, Plan};
 use keeper_graph_protocol::review::{self, Target};
 use keeper_graph_protocol::value::typed_ref;
+use keeper_graph_protocol::vocabulary::{EntityType, Operation};
 use keeper_graph_protocol::wire::Event;
+use keeper_graph_protocol::worker::{EventFrame, FrameOp};
 use keeper_graph_protocol::{proposal, Refusal};
 use serde_json::{Map, Value};
 
@@ -270,11 +272,26 @@ fn reviews_are_one_shape() {
                 }
             }
         } else if let Some(image) = entry.get("image") {
-            let ok = review::image_ok(
-                entry["entity_id"].as_str().expect("entity"),
-                image.as_object().expect("image"),
-            );
+            let entity = entry["entity_id"].as_str().expect("entity");
+            let ok = review::image_ok(entity, image.as_object().expect("image"));
             assert_eq!(Some(ok), entry["valid"].as_bool(), "{name}");
+            // The worker reads a review operation as the same shape: a
+            // projection-3 frame holding it is checked, not refused.
+            let frame = EventFrame {
+                graph_seq: 1,
+                event_id: "01JN0000000000000000000099".into(),
+                op_count: 1,
+                delta_digest: "ab".repeat(32),
+                ops: vec![FrameOp {
+                    ordinal: 0,
+                    entity_type: EntityType::Review,
+                    entity_id: entity.to_owned(),
+                    operation: Operation::Create,
+                    after_revision: Some("1".into()),
+                    after_value: Some(image.clone()),
+                }],
+            };
+            assert_eq!(frame.check(1).is_ok(), ok, "{name}: frame");
         } else {
             let target = Target::new(
                 entry["target_event_id"].as_str().expect("t"),
