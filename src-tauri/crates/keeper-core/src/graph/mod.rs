@@ -13,11 +13,20 @@
 //! from that database's own replica and turns them into what the client may
 //! conclude, by the contract's outcome table. An acknowledgement alone never
 //! means accepted, and nothing of another database speaks for a request.
+//! [`client::GraphClient`] is a person's device's use of one database's
+//! graph over it: changes through `graph.apply`, outcomes, typed reads.
+//! [`prefix::complete`] reads the complete accepted prefix of a domain's
+//! replicated history through the narrow [`source::GraphSource`] port.
 
 pub use keeper_graph_protocol as protocol;
 
+pub mod client;
 pub mod outcome;
+pub mod prefix;
+pub mod source;
 
+#[cfg(test)]
+mod client_tests;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]

@@ -559,6 +559,106 @@ refused) is terminal whatever its code; so is a refusal `idempotency_mismatch` o
 fault (`kg.` code). Every other refusal, which may come before the command runs, and an answer
 lost or unread, leaves the request pending under the same id until a receipt resolves it.
 
+**Changes (`graph.apply`).** The payload is `{"ops": [<op>, …], "approval_id"?: <string>,
+"event_time_ms"?: <integer> | null}`, 1 to 128 operations applied in order; every object is
+closed (an unknown member is `invalid_change`). The operations, every member required unless
+marked `?`:
+
+| `op` | members |
+| --- | --- |
+| `create_node` | `id`, `kind`, `title` (non-empty), `description` (string or null), `properties` |
+| `update_node` | `id`, `expected_revision`, `set`? (`{title?, description?}`), `set_properties`?, `remove_properties`? (at least one; none empty) |
+| `archive_node`, `unarchive_node` | `id`, `expected_revision` |
+| `create_edge` | `id`, `from_id`, `to_id`, `type`, `properties`, `from_lifecycle_revision`, `to_lifecycle_revision` |
+| `update_edge` | `id`, `expected_revision`, `set_properties`?, `remove_properties`? (at least one), `from_lifecycle_revision`, `to_lifecycle_revision` |
+| `archive_edge`, `unarchive_edge` | `id`, `expected_revision`, `from_lifecycle_revision`, `to_lifecycle_revision` |
+| `add_tag`, `remove_tag` | `node_id`, `tag`, `expected_revision` |
+
+The caller mints the ids of the nodes and edges it creates; a node's `kind` is fixed at creation.
+A tag is named by its text, made canonical by keeper's tag policy (`tags` in the vectors); the
+server reuses the graph's tag of that text or creates one (label null) and gives tags and
+memberships their ids. Every precondition is the accepted state before the change:
+`expected_revision` the entity's revision (a tag operation's, its node's), an edge's
+`*_lifecycle_revision` its endpoint's `lifecycle_revision`; `null` (only where a node is named)
+means the node is created by an earlier operation of the same change. `approval_id` is the
+approval an agent acts under; the server derives every attribution. `event_time_ms` is the
+source's time.
+
+A change with more than one create or explicit field/lifecycle operation for one entity, the same
+canonical tag membership changed twice, a key both set and removed, a reference (an edge
+endpoint or a tag operation, whatever precondition it names) to a node created only later, or
+preconditions for one node that disagree (its revision across its operations, its lifecycle
+revision across the edges naming it) is `invalid_change` from its payload alone. Against the graph
+it is then, the first failure deciding:
+
+1. each operation in order: a precondition the graph no longer holds — another revision, an
+   entity it lacks, or a create of an id it has — is a `conflict`, whose `detail` is
+   `{"entity": {"entity_type", "id"}, "precondition": "revision" | "lifecycle_revision",
+   "current_revision": <decimal> | null}` (collapsed for a caller who may not read the graph);
+   archiving what is archived, unarchiving what is active (or merged), removing a property or
+   membership that is absent and adding a membership that exists are `invalid_change`; a node's
+   or edge's final `properties` must still obey *Values*;
+2. every typed reference written must name a node of the final graph at a revision it has had
+   (a `content` reference refuses until content exists);
+3. an edge this change creates, unarchives or updates and leaves active needs both endpoints
+   active in the final graph, so an edge to an archived node is accepted only when the same
+   change unarchives it; a `guidance_scope` edge must start at a `Guidance` node;
+4. the active `contains` edges stay acyclic: for each `contains` edge `P → C` created or
+   unarchived, a walk climbs from `P` a level at a time (a level: every active `contains` edge of
+   the final graph into the frontier); past 64 levels, or past 10,000 edges read by all the
+   change's walks together, it is `change_limit`, and a level with an edge from `C` (or `P` =
+   `C`) is `invalid_change`. A level is read with a limit of one edge more than the budget still
+   allows, never whole. Other relationship types may form cycles;
+5. the event must fit its bounds (*Tables*), before-images included: `change_limit`.
+
+A refused or conflicting change writes only its receipt. An accepted one: a created node or edge
+starts at revision 1 (a node at lifecycle revision 1, active), a new tag at revision 1; a node
+touched in any way — fields, memberships, lifecycle — moves its revision exactly once, an archive
+or unarchive also its lifecycle revision; an edge operation moves only the edge's revision. Its
+event's operations follow the change's order: one node or edge operation of the same name per
+node or edge operation; for a node only tag operations touch, one node `update` before its first
+membership; for `add_tag` a tag `create` when the text is new, then the membership `create`;
+for `remove_tag` the membership `remove`. Each image is the whole entity before the change and
+after all of it: a node `{id, kind, title, description, description_source_id, properties,
+lifecycle, merged_into_id, revision, lifecycle_revision}`, an edge `{id, from_id, to_id, type,
+properties, lifecycle, revision}`, a tag `{id, text, label, revision}`, a membership `{id,
+node_id, tag_id}`; an entity's row is its after-image. The accepted receipt's `detail` is
+`{"affected": [{entity_type, id, revision, lifecycle_revision (nodes)}, …]}`, one per node,
+edge and new tag in order of the change's first touch of each (which may differ from the
+event's order). `algebra` in the vectors pins all of this.
+
+**Content.** Stable content (a later schema's `kg_contents`) has one revision rule, pinned now by
+`contents` in the vectors though no content is stored or changed yet: an update names the
+content's id and owner node, both fixed for good, and its expected revision; it replaces the
+body whole (`{"inline_text"}` of at most 32 KiB, or `{"reference": {resource_node_id,
+observed_revision}}`), moves the content's own revision by exactly one, and moves nothing else —
+not the owner node's revision.
+
+An agent's event carries `context_id`, `origin_actor` (the person whose session the chain
+starts from), `origin_chain` `[{"session_id", "agent_actor"}, …]` from that root session down
+to the acting one, and `approval_basis` `{"basis": "approval", "approval_id", "grant_id",
+"origin"}`; a person's has `origin_chain` null and `approval_basis` `{"basis": "direct"}`.
+
+**Reads.** Registered queries whose params carry `version` (1) and `context_id` (null for a
+person's device); a caller who may not read the graph is refused alike whatever exists:
+
+| query | params | rows |
+| --- | --- | --- |
+| `graph.outcome` | `request_id` | `[]` or the caller's own `kg_receipts` row for it |
+| `graph.get_node` | `id`, `include_archived` | `[]` or `[{<node image>, "tags": [<canonical text>…]}]` |
+| `graph.get_edge` | `id`, `include_archived` | `[]` or `[<edge image>]` |
+| `graph.history` | `after` (decimal, `"0"` first), `limit` (1–100), `filter` `{entity_id?, actor_id?, origin_class?}` | `[{"events": [{"event": <header>, "ops": [<op>…]}], "scanned_through": <decimal>}]` |
+
+Without `include_archived` a node is answered only while active, an edge only while it and both
+its endpoints are. A history header is the event's row without `graph` and the author columns,
+JSON decoded. Every event in `(after, scanned_through]` that matches the filter is in `events`,
+whole and ascending; `scanned_through` is the last position examined, matching or not, so an
+empty or filtered page still moves the cursor and no later match is skipped. A page examines at
+most 1,000 positions and holds at most `limit` events and 4 MiB of canonical event bytes beyond
+its first event, and every event in it, the first included, is within the row bounds of
+*Tables* (its header at most 128 KiB, its operations as for the event); a client refuses a page
+outside these bounds, or an image outside its entity's shape. History is the retained events, never the pruned transport log.
+
 ## The live check
 
 `bun run check:syncular:live` runs a server's startup — `PostgresServerStorage.migrate()` and
