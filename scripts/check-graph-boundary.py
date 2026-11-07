@@ -6,9 +6,12 @@ The graph worker `keeper-graph-query` carries exactly the eleven audited allowan
 stay byte-identical to the reviewed 110.1 sources. Core, protocol and driver carry no unsafe.
 """
 import hashlib
+import json
 import pathlib
 import re
+import signal
 import subprocess
+import sys
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -87,13 +90,24 @@ def human_reads_violations(root_doc, members):
 
 
 ROOT_TEXT = MANIFEST.read_text()
-MEMBER_TEXT = {p.parent.name: p.read_text() for p in CRATES.glob('*/Cargo.toml')}
+LOCK = MANIFEST.parent / 'Cargo.lock'
+
+
+def members():
+    """Every workspace member, from cargo itself, by package name: wherever it lives."""
+    meta = json.loads(subprocess.check_output(
+        ['cargo', 'metadata', '--no-deps', '--format-version', '1', '--manifest-path', str(MANIFEST)],
+        text=True))
+    return {p['name']: pathlib.Path(p['manifest_path']) for p in meta['packages']
+            if p['id'] in meta['workspace_members']}
 
 
 def parsed(root_text, member_text):
     return tomllib.loads(root_text), {n: tomllib.loads(t) for n, t in member_text.items()}
 
 
+MEMBER_PATH = members()
+MEMBER_TEXT = {n: p.read_text() for n, p in MEMBER_PATH.items()}
 violations = human_reads_violations(*parsed(ROOT_TEXT, MEMBER_TEXT))
 if violations:
     raise SystemExit('; '.join(violations))
@@ -115,6 +129,8 @@ MUTANTS = {
 for label, (root_text, member_text) in MUTANTS.items():
     if not human_reads_violations(*parsed(root_text, member_text)):
         raise SystemExit(f'human-reads guard self-test not caught: {label}')
+
+
 # The resolved graph, over every target, every feature and every edge kind (normal, build,
 # dev): no member but the driver can compile keeper-core with human-reads. keeper-core
 # itself is the default-closure check above (`--all-features` would trivially enable it).
@@ -130,49 +146,109 @@ def resolves_human_reads(member):
     return f'keeper-core feature "{HUMAN}"' in run.stdout
 
 
-def resolved_violations():
+def resolved_violations(names):
     return [f'{member} resolves keeper-core human-reads: {enabled}'
-            for member in sorted(MEMBER_TEXT) if member != 'keeper-core'
+            for member in sorted(names) if member != 'keeper-core'
             for enabled in [resolves_human_reads(member)]
             if enabled != (member == 'keeper-graph-driver')]
 
 
-found = resolved_violations()
+def all_violations():
+    """Both layers over the members cargo enumerates now (used by the on-disk self-tests)."""
+    path = members()
+    text = {n: p.read_text() for n, p in path.items()}
+    return (human_reads_violations(*parsed(MANIFEST.read_text(), text))
+            + resolved_violations(path))
+
+
+found = resolved_violations(MEMBER_PATH)
 if found:
     raise SystemExit('; '.join(found))
 
-# Self-tests of the resolved layer (r3 review N8, N11): an indirect keeper-core feature that
-# implies human-reads, enabled from a macOS-only table (N8) or from a non-default member
-# feature (N11). Neither is visible to the manifest scan; each must fail the resolved check.
-# The manifests are mutated in place and restored byte for byte, the lock file included.
+
+class Mutation:
+    """On-disk self-test edits, undone byte for byte on every exit path: normal return, an
+    exception, SIGINT, SIGTERM or SIGHUP (then exit 128 + n). The lock file is always restored."""
+
+    def __init__(self):
+        self.saved = {LOCK: LOCK.read_bytes()}
+        self.created = []
+
+    def write(self, path, text):
+        if path not in self.saved:
+            if path.exists():
+                self.saved[path] = path.read_bytes()
+            else:
+                self.created.append(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def restore(self):
+        for path, data in self.saved.items():
+            path.write_bytes(data)
+        for path in reversed(self.created):
+            path.unlink(missing_ok=True)
+        for path in reversed(self.created):
+            for parent in path.parents:
+                if parent == MANIFEST.parent:
+                    break
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+        self.saved, self.created = {}, []
+
+    def __enter__(self):
+        self.previous = {}
+
+        def stop(number, _frame):
+            self.restore()
+            sys.exit(128 + number)
+
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            self.previous[number] = signal.signal(number, stop)
+        return self
+
+    def __exit__(self, *_):
+        try:
+            self.restore()
+        finally:
+            for number, handler in self.previous.items():
+                signal.signal(number, handler)
+
+
+# Self-tests on disk, each of which must fail the guard:
+# - N8 / N11 (r3 review): an indirect keeper-core feature implying human-reads, enabled from a
+#   macOS-only table or from a non-default member feature; invisible to the manifest scan,
+#   caught by the resolved check;
+# - X3 (r4 review): a new workspace member outside `crates/` enabling human-reads, which pins
+#   the enumeration of members by cargo rather than by directory.
 MACOS = "[target.'cfg(target_os = \"macos\")'.dependencies]\n"
 FULL = 'human-reads = []\nfull = ["human-reads"]\n'
-N_MUTANTS = {
-    'N8 indirect feature from a macOS table': {
-        'keeper-core': lambda t: t.replace('human-reads = []\n', FULL),
-        'keeper': lambda t: t.replace(
-            MACOS, MACOS + 'keeper-core = { path = "../keeper-core", features = ["full"] }\n'),
-    },
-    'N11 indirect feature from a non-default member feature': {
-        'keeper-core': lambda t: t.replace('human-reads = []\n', FULL),
-        'keeper-agent': lambda t: t + '\n[features]\npeople = ["keeper-core/full"]\n',
-    },
+OUTSIDE = MANIFEST.parent / 'kg1-guard-selftest/people'
+SELF_TESTS = {
+    'N8 indirect feature from a macOS table': lambda m: (
+        m.write(MEMBER_PATH['keeper-core'], CORE.replace('human-reads = []\n', FULL)),
+        m.write(MEMBER_PATH['keeper'], MEMBER_TEXT['keeper'].replace(
+            MACOS, MACOS + 'keeper-core = { path = "../keeper-core", features = ["full"] }\n'))),
+    'N11 indirect feature from a non-default member feature': lambda m: (
+        m.write(MEMBER_PATH['keeper-core'], CORE.replace('human-reads = []\n', FULL)),
+        m.write(MEMBER_PATH['keeper-agent'],
+                MEMBER_TEXT['keeper-agent'] + '\n[features]\npeople = ["keeper-core/full"]\n')),
+    'X3 a member outside crates/': lambda m: (
+        m.write(MANIFEST, ROOT_TEXT.replace(
+            'members = [', 'members = ["kg1-guard-selftest/people", ', 1)),
+        m.write(OUTSIDE / 'Cargo.toml',
+                '[package]\nname = "people"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n'
+                '[dependencies]\nkeeper-core = { path = "../../crates/keeper-core", features = ["human-reads"] }\n'),
+        m.write(OUTSIDE / 'src/lib.rs', '')),
 }
-LOCK = MANIFEST.parent / 'Cargo.lock'
-for label, edits in N_MUTANTS.items():
-    saved = {name: MEMBER_TEXT[name] for name in edits}
-    lock = LOCK.read_bytes()
-    try:
-        for name, edit in edits.items():
-            mutated = edit(saved[name])
-            if mutated == saved[name]:
-                raise SystemExit(f'guard self-test anchor missing: {label} ({name})')
-            (CRATES / name / 'Cargo.toml').write_text(mutated)
-        caught = bool(resolved_violations())
-    finally:
-        for name, text in saved.items():
-            (CRATES / name / 'Cargo.toml').write_text(text)
-        LOCK.write_bytes(lock)
+if FULL in CORE or 'members = [' not in ROOT_TEXT or MACOS not in MEMBER_TEXT['keeper'] or OUTSIDE.exists():
+    raise SystemExit('guard self-test anchors missing')
+for label, apply in SELF_TESTS.items():
+    with Mutation() as mutation:
+        apply(mutation)
+        caught = bool(all_violations())
     if not caught:
         raise SystemExit(f'human-reads guard self-test not caught: {label}')
 INVENTORY = {
