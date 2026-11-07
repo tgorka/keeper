@@ -256,7 +256,7 @@ impl GraphReads {
         remote: Arc<dyn GraphRemote>,
         read: AdmittedRead,
     ) -> Result<AgentReader, QueryError> {
-        if read.domain != self.domain() || self.is_revoked() {
+        if read.domain() != self.domain() || self.is_revoked() {
             return Err(QueryError::Forbidden);
         }
         Ok(AgentReader {
@@ -557,7 +557,9 @@ impl GraphReads {
             freshness,
             cancel,
             reader,
-        } = ask;
+            ..
+        } = &ask;
+        let (freshness, cancel, reader) = (*freshness, *cancel, *reader);
         let _inflight = self.enter()?;
         let admitted = admit(PROFILE, source, parameters)?;
         let bytes = QueryRequest::encode(&admitted, source)
@@ -582,7 +584,7 @@ impl GraphReads {
                 _ => return Err(QueryError::Unavailable("generation.answer")),
             }
         }
-        self.gate(authority, &generation, deliver).await?;
+        self.gate(&ask, &generation, deliver).await?;
         Ok(self.result(rows, &generation, completeness))
     }
 
@@ -603,7 +605,9 @@ impl GraphReads {
             freshness,
             cancel,
             reader,
-        } = ask;
+            ..
+        } = &ask;
+        let (freshness, cancel, reader) = (*freshness, *cancel, *reader);
         let _inflight = self.enter()?;
         let bytes = InspectRequest {
             entity,
@@ -630,7 +634,7 @@ impl GraphReads {
             InspectEntity::Edge => decode_edge(id, rows).map(|e| e.map(Inspected::Edge)),
         }
         .map_err(|_| QueryError::Unavailable("generation.answer"))?;
-        self.gate(authority, &generation, deliver).await?;
+        self.gate(&ask, &generation, deliver).await?;
         Ok(self.result(found, &generation, completeness))
     }
 }
@@ -656,6 +660,11 @@ struct Ask<'a> {
     freshness: Freshness,
     cancel: &'a Cancellation,
     reader: &'a Cancellation,
+    /// What a fresh authority other than `authority` at delivery is: for
+    /// an agent's admitted context, `forbidden` (its admission can never
+    /// become valid again, so the reader is invalidated); for a person's
+    /// device, whose authority is read anew on every call, `projection_stale`.
+    mismatch: QueryError,
 }
 
 impl GraphReads {
@@ -663,24 +672,26 @@ impl GraphReads {
     /// one the result was computed under, then the kill switch again.
     async fn gate<F>(
         &self,
-        authority: &Authority,
+        ask: &Ask<'_>,
         generation: &Generation,
         fresh: F,
     ) -> Result<(), QueryError>
     where
         F: Future<Output = Result<Authority, QueryError>>,
     {
-        if self.is_revoked() {
+        if self.is_revoked() || ask.reader.is_cancelled() {
             return Err(QueryError::Forbidden);
         }
         let now = fresh.await?;
-        if now != *authority
+        if now != *ask.authority
             || generation.manifest.authority_epoch != now.epoch
             || generation.manifest.authority_digest != now.digest
         {
-            return Err(QueryError::Stale);
+            return Err(ask.mismatch.clone());
         }
-        if self.is_revoked() {
+        // A sibling call may have invalidated the reader, or the domain may
+        // have been revoked, while the server was being asked.
+        if self.is_revoked() || ask.reader.is_cancelled() {
             return Err(QueryError::Forbidden);
         }
         Ok(())
@@ -689,15 +700,22 @@ impl GraphReads {
 
 /// An agent context's admission of one domain: `graph.admit_read`'s
 /// answer, bound to the agent, session, context and domain. No other
-/// constructor exists.
-#[derive(Clone, Debug)]
+/// constructor exists, and it is not `Clone`: a reader is never rebuilt
+/// without asking the server again.
+#[derive(Debug)]
 pub struct AdmittedRead {
     agent: String,
+    scope: Arc<Scope>,
+    authority: Authority,
+    expires_at_ms: u64,
+}
+
+/// What every delivery re-check asks the server about.
+#[derive(Debug)]
+struct Scope {
     session: String,
     context: String,
     domain: String,
-    authority: Authority,
-    expires_at_ms: u64,
 }
 
 fn now_ms() -> u64 {
@@ -731,9 +749,11 @@ impl AdmittedRead {
         admitted(&row, session, domain)?;
         Ok(Self {
             agent: agent.to_owned(),
-            session: session.to_owned(),
-            context: context.to_owned(),
-            domain: domain.to_owned(),
+            scope: Arc::new(Scope {
+                session: session.to_owned(),
+                context: context.to_owned(),
+                domain: domain.to_owned(),
+            }),
             authority: row.authority,
             expires_at_ms: row.expires_at_ms,
         })
@@ -741,15 +761,15 @@ impl AdmittedRead {
 
     #[must_use]
     pub fn domain(&self) -> &str {
-        &self.domain
+        &self.scope.domain
     }
     #[must_use]
     pub fn session(&self) -> &str {
-        &self.session
+        &self.scope.session
     }
     #[must_use]
     pub fn context(&self) -> &str {
-        &self.context
+        &self.scope.context
     }
     #[must_use]
     pub fn expires_at_ms(&self) -> u64 {
@@ -771,19 +791,19 @@ impl AgentReader {
     fn principal(&self) -> Principal {
         Principal {
             agent: self.read.agent.clone(),
-            context: self.read.context.clone(),
+            context: self.read.scope.context.clone(),
         }
     }
 
     /// The context's authority now, refreshed through the server.
     async fn fresh(
         remote: Arc<dyn GraphRemote>,
-        read: AdmittedRead,
+        scope: Arc<Scope>,
     ) -> Result<Authority, QueryError> {
         let row = tokio::task::spawn_blocking(move || {
             remote
-                .refresh_context(&read.context)
-                .and_then(|row| admitted(&row, &read.session, &read.domain).map(|()| row))
+                .refresh_context(&scope.context)
+                .and_then(|row| admitted(&row, &scope.session, &scope.domain).map(|()| row))
         })
         .await
         .map_err(|_| QueryError::SyncPending)??;
@@ -807,7 +827,7 @@ impl AgentReader {
     pub async fn refresh(&self, cancel: &Cancellation) -> Result<Refreshed, QueryError> {
         self.check()?;
         let result = async {
-            let authority = Self::fresh(self.remote.clone(), self.read.clone()).await?;
+            let authority = Self::fresh(self.remote.clone(), self.read.scope.clone()).await?;
             if authority != self.read.authority {
                 return Err(QueryError::Forbidden);
             }
@@ -830,7 +850,7 @@ impl AgentReader {
         cancel: &Cancellation,
     ) -> Result<QueryResult<Vec<Map<String, Value>>>, QueryError> {
         self.check()?;
-        let deliver = Self::fresh(self.remote.clone(), self.read.clone());
+        let deliver = Self::fresh(self.remote.clone(), self.read.scope.clone());
         let result = self
             .reads
             .query(
@@ -840,6 +860,7 @@ impl AgentReader {
                     freshness,
                     cancel,
                     reader: &self.invalidated,
+                    mismatch: QueryError::Forbidden,
                 },
                 source,
                 parameters,
@@ -860,7 +881,7 @@ impl AgentReader {
         cancel: &Cancellation,
     ) -> Result<QueryResult<Option<Inspected>>, QueryError> {
         self.check()?;
-        let deliver = Self::fresh(self.remote.clone(), self.read.clone());
+        let deliver = Self::fresh(self.remote.clone(), self.read.scope.clone());
         let result = self
             .reads
             .inspect(
@@ -870,6 +891,7 @@ impl AgentReader {
                     freshness,
                     cancel,
                     reader: &self.invalidated,
+                    mismatch: QueryError::Forbidden,
                 },
                 entity,
                 id,
@@ -957,6 +979,7 @@ impl HumanReader {
                     freshness,
                     cancel,
                     reader: &self.invalidated,
+                    mismatch: QueryError::Stale,
                 },
                 source,
                 parameters,
@@ -991,6 +1014,7 @@ impl HumanReader {
                     freshness,
                     cancel,
                     reader: &self.invalidated,
+                    mismatch: QueryError::Stale,
                 },
                 entity,
                 id,
