@@ -1200,6 +1200,42 @@ fn checkpoint_rows_decide_the_scope() {
     assert_eq!(checkpoint_of(&first).scope, ScopeState::Pending);
 }
 
+/// CC-6: only an unheard authority read (it left and its transport failed)
+/// is `Unreachable`; a server's answer is `Forbidden`; every local, closed or
+/// unreadable failure is `SyncPending`. All three non-refusals keep the
+/// `sync_pending` code.
+#[test]
+fn a_native_authority_failure_is_typed_by_its_cause() {
+    use crate::hq::port::ReplicaError;
+    let unheard = ReplicaError::Unheard {
+        code: "transport.failed".to_owned(),
+        message: "m".to_owned(),
+        retryable: true,
+    };
+    assert_eq!(remote_error(unheard), QueryError::Unreachable);
+    for refusal in [
+        ReplicaError::Remote {
+            code: "kg.forbidden".to_owned(),
+            message: "m".to_owned(),
+            retryable: false,
+        },
+        ReplicaError::Rejected {
+            code: "kg.forbidden".to_owned(),
+            message: "m".to_owned(),
+        },
+    ] {
+        assert_eq!(remote_error(refusal), QueryError::Forbidden);
+    }
+    for local in [
+        ReplicaError::Client("client.invalid_host_response".to_owned()),
+        ReplicaError::NotSyncing,
+        ReplicaError::Closed,
+    ] {
+        assert_eq!(remote_error(local), QueryError::SyncPending);
+    }
+    assert_eq!(QueryError::Unreachable.code(), "sync_pending");
+}
+
 /// B2: a selected generation a worker refuses as unreadable (here its
 /// `nodes` table is gone) is unselected, and the next refresh rebuilds it
 /// from the accepted history with exact rows.

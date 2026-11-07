@@ -1854,6 +1854,32 @@ fn command_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaErro
     }
 }
 
+/// What a failed query means, by how far it got (`reached`, from the gate),
+/// as [`command_error`] reads a command: never sent is the client's own
+/// refusal (or a closed network); sent with no answer back is
+/// [`ReplicaError::Unheard`], the only outcome that means the server could
+/// not be reached; an answer that came back but could not be read is the
+/// client's refusal, not an outage; an answer the server gave is its
+/// refusal ([`ReplicaError::Remote`]). A query changes nothing, so unlike a
+/// command an unreadable answer leaves nothing to resolve.
+fn query_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaError {
+    match reached {
+        None if error.code == CLOSED => ReplicaError::Closed,
+        None => ReplicaError::Client(error.to_string()),
+        Some(false) => ReplicaError::Unheard {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+        Some(true) if error.code == UNREADABLE => ReplicaError::Client(error.to_string()),
+        Some(true) => ReplicaError::Remote {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+    }
+}
+
 /// A command answered `rejected`: definite, whatever its results say. The
 /// first result naming a `code` gives the code and message; none gives
 /// `operation.rejected` and the results as they came.
@@ -2119,11 +2145,12 @@ impl Replica for SyncularReplica {
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
-        let answer = client
-            .query::<_, Value, Map<String, Value>>(&mut transport, operation_id, &params)
-            .map_err(|error| ReplicaError::Client(error.to_string()));
+        let answer =
+            client.query::<_, Value, Map<String, Value>>(&mut transport, operation_id, &params);
         transport.inner.shutdown();
-        Ok(answer?.rows)
+        Ok(answer
+            .map_err(|error| query_error(error, transport.reached))?
+            .rows)
     }
 
     fn remote_command(
@@ -2235,6 +2262,35 @@ pub(crate) mod tests {
             message: "m".to_owned(),
             details: status.map(|status| json!({ "causeKind": "status", "httpStatus": status })),
         }
+    }
+
+    /// Only a query that left the gate and whose transport failed is an
+    /// unreachable server; a closed gate, a local refusal and an unreadable
+    /// answer are not, and an answer the server gave is its refusal.
+    #[test]
+    fn a_failed_query_is_classified_by_how_far_it_got() {
+        let error = |code: &str| RemoteClientError {
+            code: code.to_owned(),
+            message: "m".to_owned(),
+            retryable: true,
+        };
+        assert_eq!(query_error(error(CLOSED), None), ReplicaError::Closed);
+        assert!(matches!(
+            query_error(error("client.invalid_request"), None),
+            ReplicaError::Client(_)
+        ));
+        assert!(matches!(
+            query_error(error("transport.failed"), Some(false)),
+            ReplicaError::Unheard { code, .. } if code == "transport.failed"
+        ));
+        assert!(matches!(
+            query_error(error(UNREADABLE), Some(true)),
+            ReplicaError::Client(_)
+        ));
+        assert!(matches!(
+            query_error(error("kg.forbidden"), Some(true)),
+            ReplicaError::Remote { code, .. } if code == "kg.forbidden"
+        ));
     }
 
     #[test]

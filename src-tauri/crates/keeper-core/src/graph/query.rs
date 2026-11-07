@@ -63,9 +63,17 @@ pub enum QueryError {
     #[error("projection_stale")]
     Stale,
     /// The replica has not pulled the domain's history yet, or the server
-    /// could not be asked.
+    /// could not be asked (a local refusal, a closed or non-syncing replica,
+    /// an unreadable answer, a failed join).
     #[error("sync_pending")]
     SyncPending,
+    /// The server could not be reached: the request left this device and
+    /// its transport failed ([`crate::hq::port::ReplicaError::Unheard`] of a
+    /// remote query). Made only by a native remote's authority read, never
+    /// from any other failure; its stable code is `sync_pending`, so callers
+    /// that do not need the cause read it as one.
+    #[error("sync_pending")]
+    Unreachable,
     #[error("storage_unavailable: {0}")]
     Storage(&'static str),
     /// Collapsed: the caller may not read this domain now.
@@ -83,7 +91,7 @@ impl QueryError {
             Self::Cancelled => "query_cancelled",
             Self::Unavailable(_) => "projection_unavailable",
             Self::Stale => "projection_stale",
-            Self::SyncPending => "sync_pending",
+            Self::SyncPending | Self::Unreachable => "sync_pending",
             Self::Storage(_) => "storage_unavailable",
             Self::Forbidden => "forbidden",
         }
@@ -108,12 +116,16 @@ pub trait GraphRemote: Send + Sync {
     fn read_status(&self, domain: &str) -> Result<ReadStatus, QueryError>;
 }
 
-/// A refusal is collapsed to `forbidden`; an unreachable server is
-/// `sync_pending` (nothing is delivered without a fresh answer).
+/// A refusal is collapsed to `forbidden`; a server that could not be reached
+/// (the query left and its transport failed) is [`QueryError::Unreachable`];
+/// every other failure — a local refusal, an unreadable answer, a closed or
+/// non-syncing replica — is `sync_pending`. Nothing is delivered without a
+/// fresh answer.
 fn remote_error(error: crate::hq::port::ReplicaError) -> QueryError {
     use crate::hq::port::ReplicaError;
     match error {
         ReplicaError::Remote { .. } | ReplicaError::Rejected { .. } => QueryError::Forbidden,
+        ReplicaError::Unheard { .. } => QueryError::Unreachable,
         _ => QueryError::SyncPending,
     }
 }
