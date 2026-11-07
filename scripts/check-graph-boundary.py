@@ -385,18 +385,28 @@ if re.findall(r'--exclude\s+(\S+)', line) != ['keeper-graph-query','keeper-graph
     raise SystemExit('iOS workspace exclusion drift')
 # P1 measurement tooling (110.5). What this checks, and only this: the keeper-graph-*
 # crates' examples directories hold exactly these two files; the protocol and driver
-# manifests declare no `[[example]]`/`[[bin]]` target and name no `examples/` path; and no
-# file under those two crates' `src/` names the tooling. Other crates' manifests, packaging
-# and build scripts are not inspected here.
+# manifests, parsed as TOML, declare no `bin` or `example` target and hold no string value
+# naming an `examples` path component; and no file under those two crates' `src/` names the
+# tooling. Other crates' manifests, packaging and build scripts are not inspected here.
 MEASUREMENT = {'keeper-graph-protocol/examples/rc_corpus.rs', 'keeper-graph-driver/examples/rc_spawner.rs'}
 examples = {str(p.relative_to(CRATES)) for p in CRATES.glob('*/examples/*') if p.parent.parent.name.startswith('keeper-graph')}
 if examples != MEASUREMENT:
     raise SystemExit(f'graph example drift: {sorted(examples)}')
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from strings(v)
 for crate in ['keeper-graph-protocol', 'keeper-graph-driver']:
-    manifest = (CRATES / crate / 'Cargo.toml').read_text()
-    if re.search(r'^\[\[(example|bin)\]\]', manifest, re.M) or 'examples/' in manifest:
+    manifest = tomllib.loads((CRATES / crate / 'Cargo.toml').read_text())
+    if 'bin' in manifest or 'example' in manifest or any(
+            'examples' in pathlib.PurePosixPath(s.replace('\\', '/')).parts for s in strings(manifest)):
         raise SystemExit(f'{crate} declares an example or bin target')
-    for path in (CRATES / crate / 'src').rglob('*.rs'):
-        if re.search(r'examples/|rc_corpus|rc_spawner', path.read_text()):
+    for path in (CRATES / crate / 'src').rglob('*'):
+        if path.is_file() and re.search(rb'examples/|rc_corpus|rc_spawner', path.read_bytes()):
             raise SystemExit(f'shipped source refers to measurement tooling: {path}')
 print('graph protocol/worker/core/mobile dependency boundaries and exact 11/6 unsafe inventory passed')

@@ -7,9 +7,10 @@
 //! comes from a local stub of `graph.admit_read` / `graph.refresh_context`.
 //!
 //! ```sh
-//! rc_spawner [observe --] --worker <abs path> --worker-sha256 <hex> [--ledger <file>] \
+//! rc_spawner --worker <abs path> --worker-sha256 <hex> [--ledger <file>] \
 //!            [--macos-evidence] --root <projection dir> --mode admit|run
-//! rc_spawner [observe --] control reaped|live|exec-failure|none
+//! rc_spawner control none|reaped|live|exec-failure|vfork|double-fork|setsid-grandchild|pthread
+//! rc_spawner observe -- PROGRAM ARGS…          # Linux; PROGRAM is usually rc_spawner itself
 //! ```
 //!
 //! It prints one JSON line:
@@ -23,21 +24,21 @@
 //! - `telemetry` (peak/live workers, `RUSAGE_CHILDREN` max RSS): observations only, never a
 //!   creation count (a live or unwaited child leaves max RSS 0).
 //!
-//! `observe --` (Linux) runs the same invocation as a child seized with ptrace
-//! (`PTRACE_O_TRACEFORK|TRACEVFORK|TRACECLONE`, the child held until seized) and adds
-//! `observed`: every task the child or its threads created, classified by the new task's own
-//! `/proc/<tid>/status` `Tgid` (a new process is its own thread-group leader), each new
-//! process detached at its first stop. This does not depend on the spawn accounting; the
-//! `control` invocations calibrate it (a reaped child, a live unwaited child and a failed
-//! exec each count one process; `none` counts zero).
+//! `observe -- PROGRAM ARGS…` (Linux, module `observer`) traces PROGRAM from before its exec
+//! — loader and constructors included — and every descendant until it exits, and adds
+//! `observed` to PROGRAM's report: the processes and threads created, by creation event, and
+//! `errors` (any uncertainty, which makes it exit 3). It does not depend on the spawn
+//! accounting; the `control` kinds and `observer-controls.sh` (a pre-main constructor child)
+//! calibrate it.
 //!
 //! Predicates: an NC zero-children row is `admitted == false`, its label,
-//! `children.spawn_attempts == 0` and `observed.processes_created == 0`. NC-9 is
-//! `mode == "run"`, `admitted == true`, `nc9.pass == true` and, observed,
+//! `children.spawn_attempts == 0`, `observed.processes_created == 0` and
+//! `observed.errors == []`. NC-9 is `mode == "run"`, `admitted == true`, `nc9.pass == true`
+//! and, observed, `observed.errors == []` and
 //! `observed.processes_created == children.spawn_attempts == 3`. Exit status: 2 for a usage
 //! error; in mode `run` 0 only when `nc9.pass`, else 1; in mode `admit` and for controls 0
-//! once the report is written; `observe` exits with the child's status, or 3 when it could
-//! not observe.
+//! once the report is written; `observe` exits with PROGRAM's status, or 3 when its
+//! observation is incomplete.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod spawner {
@@ -363,9 +364,13 @@ mod spawner {
         Ok((report, ok))
     }
 
-    /// The observer's calibration: one child created in each way the review names, or none.
+    /// The observer's calibration controls: processes created in each way the reviews name.
+    /// Expected `observed.processes_created`: none 0, reaped 1, live 1, exec-failure 1,
+    /// vfork 1, double-fork 2, setsid-grandchild 2, pthread 0 (one thread). The pre-main
+    /// constructor control needs a C shared object and is run by `observer-controls.sh`.
     fn control(kind: &str) -> Result<Value> {
         use std::process::Command;
+        let me = std::env::current_exe()?;
         let result = match kind {
             "reaped" => json!({"status": Command::new("/bin/true").status()?.code()}),
             "live" => {
@@ -377,42 +382,72 @@ mod spawner {
             "exec-failure" => {
                 json!({"spawn_error": Command::new("/dev/null").spawn().err().map(|e| e.to_string())})
             }
+            // std spawns through posix_spawn: clone(CLONE_VM | CLONE_VFORK).
+            "vfork" => json!({"status": Command::new("/bin/true").status()?.code()}),
+            // A child that leaves an orphaned grandchild behind and exits.
+            "double-fork" => {
+                json!({"status": Command::new(&me).args(["control-helper", "orphan"]).status()?.code()})
+            }
+            // A child that starts a new session, then creates and reaps a grandchild.
+            "setsid-grandchild" => {
+                json!({"status": Command::new(&me).args(["control-helper", "setsid"]).status()?.code()})
+            }
+            "pthread" => {
+                let joined = std::thread::spawn(|| 7)
+                    .join()
+                    .map_err(|_| "thread panicked")?;
+                json!({"joined": joined})
+            }
             "none" => json!(null),
             other => return Err(format!("unknown control {other}").into()),
         };
         Ok(json!({"tool": "rc_spawner", "control": kind, "result": result}))
     }
 
+    /// The second level of `double-fork` and `setsid-grandchild`.
+    fn control_helper(kind: Option<&str>) -> std::process::ExitCode {
+        use std::process::{Command, ExitCode};
+        let done = match kind {
+            Some("orphan") => Command::new("/bin/sleep").arg("1").spawn().is_ok(),
+            #[cfg(target_os = "linux")]
+            Some("setsid") => {
+                nix::unistd::setsid().is_ok()
+                    && Command::new("/bin/true")
+                        .status()
+                        .is_ok_and(|s| s.success())
+            }
+            _ => false,
+        };
+        if done {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }
+    }
+
     pub fn main() -> std::process::ExitCode {
         use std::process::ExitCode;
-        let mut args: Vec<String> = std::env::args().skip(1).collect();
-        if args.first().map(String::as_str) == Some("observe") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match args.first().map(String::as_str) {
             #[cfg(target_os = "linux")]
-            return super::observer::main(
-                args.split_off(2.min(args.len())),
-                args.get(1).map(String::as_str) == Some("--"),
-            );
+            Some("observe") => return super::observer::main(&args[1..]),
+            #[cfg(target_os = "linux")]
+            Some(super::observer::STUB) => return super::observer::stub(&args[1..]),
             #[cfg(not(target_os = "linux"))]
-            {
+            Some("observe") => {
                 println!(
                     "{}",
                     json!({"tool": "rc_spawner", "error": "observe is Linux only"})
                 );
                 return ExitCode::from(2);
             }
-        }
-        // Under `observe`, wait until the observer has seized this process.
-        if args.first().map(String::as_str) == Some(super::AWAIT_GO) {
-            args.remove(0);
-            let mut go = [0u8; 1];
-            if std::io::Read::read_exact(&mut std::io::stdin(), &mut go).is_err() {
-                return ExitCode::from(3);
-            }
+            Some("control-helper") => return control_helper(args.get(1).map(String::as_str)),
+            _ => {}
         }
         let outcome = if args.first().map(String::as_str) == Some("control") {
             match args.get(1) {
                 Some(kind) => control(kind).map(|r| (r, true)),
-                None => Err("control reaped|live|exec-failure|none".into()),
+                None => Err("control <kind>".into()),
             }
         } else {
             match tokio::runtime::Builder::new_current_thread()
@@ -443,23 +478,39 @@ mod spawner {
     }
 }
 
-/// The first argument of a child the observer holds until it has seized it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const AWAIT_GO: &str = "--await-observer";
-
-/// The independent creation observation: ptrace, seizing the measured process before it
-/// runs any of its own code, with fork, vfork and clone events of every thread.
+/// The independent creation observation (Linux): the measured program is traced from before
+/// its exec, so its loader, constructors and every instruction after are traced, and every
+/// descendant task stays traced until it exits.
+///
+/// `rc_spawner observe -- PROGRAM ARGS…` starts this binary as a stub with an empty
+/// environment; the stub calls `PTRACE_TRACEME`, stops itself with `SIGSTOP` and, once the
+/// observer has set `TRACEFORK|TRACEVFORK|TRACECLONE|TRACEEXEC|EXITKILL`, `execve`s PROGRAM
+/// with the observer's own environment. The observer is a child subreaper, so orphaned
+/// descendants are reparented to it, and it waits until no task is left.
+///
+/// Creation is counted from the fork/vfork/clone events: fork and vfork always create a
+/// process; a clone event creates a process when the new task is its own thread-group leader
+/// (`/proc/<tid>/status` `Tgid`, read while it is stopped at creation), else a thread. Every
+/// exit the observer reaps is checked against the tasks it knows. Any uncertainty — an
+/// unreadable status, a ptrace error other than a vanished task, a task that stopped without
+/// a creation event, an exit of an unknown process, or a program that never reached its exec —
+/// is listed under `observed.errors`, and the observer exits 3.
 #[cfg(target_os = "linux")]
 mod observer {
-    use std::collections::BTreeSet;
-    use std::io::{Read, Write};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::CString;
+    use std::io::Read;
     use std::process::{Command, ExitCode, Stdio};
 
     use nix::errno::Errno;
-    use nix::sys::ptrace::{self, Options};
+    use nix::sys::ptrace::{self, Event, Options};
+    use nix::sys::signal::{raise, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
     use serde_json::{json, Value};
+
+    /// The first argument of the traced stub.
+    pub const STUB: &str = "--observe-stub";
 
     /// The thread group of `tid`, from its own status file.
     fn tgid(tid: Pid) -> Option<i32> {
@@ -475,33 +526,67 @@ mod observer {
         ExitCode::from(3)
     }
 
-    pub fn main(inner: Vec<String>, separated: bool) -> ExitCode {
-        if !separated || inner.is_empty() {
-            return fail("usage: observe -- <rc_spawner arguments>".into());
+    /// The stub: become traced, stop, then exec the measured program with the observer's
+    /// environment (`/proc/<parent>/environ`). It has no environment of its own, so nothing
+    /// is preloaded into it.
+    pub fn stub(program: &[String]) -> ExitCode {
+        let parent = nix::unistd::getppid();
+        let env: Vec<CString> = match std::fs::read(format!("/proc/{parent}/environ")) {
+            Ok(bytes) => bytes
+                .split(|b| *b == 0)
+                .filter(|v| !v.is_empty())
+                .filter_map(|v| CString::new(v).ok())
+                .collect(),
+            Err(_) => return ExitCode::from(126),
+        };
+        let argv: Vec<CString> = match program.iter().map(|a| CString::new(a.as_str())).collect() {
+            Ok(argv) => argv,
+            Err(_) => return ExitCode::from(126),
+        };
+        let Some(path) = argv.first() else {
+            return ExitCode::from(126);
+        };
+        if ptrace::traceme().is_err() || raise(Signal::SIGSTOP).is_err() {
+            return ExitCode::from(126);
+        }
+        let _ = nix::unistd::execve(path, &argv, &env);
+        ExitCode::from(127)
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        processes: Vec<i32>,
+        threads: Vec<i32>,
+        events: BTreeMap<&'static str, usize>,
+        reaped: usize,
+        vanished: usize,
+        errors: Vec<String>,
+    }
+
+    pub fn main(args: &[String]) -> ExitCode {
+        let program = match args.split_first() {
+            Some((sep, program)) if sep == "--" && !program.is_empty() => program,
+            _ => return fail("usage: observe -- PROGRAM ARGS…".into()),
+        };
+        if let Err(e) = nix::sys::prctl::set_child_subreaper(true) {
+            return fail(format!("PR_SET_CHILD_SUBREAPER: {e}"));
         }
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => return fail(e.to_string()),
         };
         let mut child = match Command::new(exe)
-            .arg(super::AWAIT_GO)
-            .args(&inner)
-            .stdin(Stdio::piped())
+            .arg(STUB)
+            .args(program)
+            .env_clear()
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
             Err(e) => return fail(e.to_string()),
         };
-        let root = Pid::from_raw(child.id() as i32);
-        let options = Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE
-            | Options::PTRACE_O_EXITKILL;
-        if let Err(e) = ptrace::seize(root, options) {
-            let _ = child.kill();
-            return fail(format!("ptrace seize: {e}"));
-        }
+        let root = Pid::from_raw(i32::try_from(child.id()).unwrap_or(-1));
         let mut stdout = child.stdout.take();
         let reader = std::thread::spawn(move || {
             let mut text = String::new();
@@ -510,83 +595,180 @@ mod observer {
             }
             text
         });
-        // Release the child only now that every task it creates is reported.
-        let released = child.stdin.take().map(|mut go| go.write_all(b"g"));
-        if !matches!(released, Some(Ok(()))) {
-            let _ = child.kill();
-            return fail("could not release the observed process".into());
-        }
-        let mut known: BTreeSet<i32> = BTreeSet::from([root.as_raw()]);
-        let mut processes: Vec<i32> = Vec::new();
-        let mut threads = 0usize;
-        let mut events = 0usize;
-        let mut inner_exit: Option<i32> = None;
-        loop {
-            let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
-                Ok(status) => status,
-                Err(Errno::ECHILD) => break,
-                Err(Errno::EINTR) => continue,
-                Err(e) => return fail(format!("waitpid: {e}")),
-            };
-            let Some(pid) = status.pid() else { continue };
-            if !matches!(status, WaitStatus::Exited(..) | WaitStatus::Signaled(..))
-                && known.insert(pid.as_raw())
-            {
-                // A task seen for the first time: auto-attached at creation, now stopped.
-                if tgid(pid) == Some(pid.as_raw()) {
-                    processes.push(pid.as_raw());
-                    let _ = ptrace::detach(pid, None);
-                } else {
-                    threads += 1;
-                    let _ = ptrace::cont(pid, None);
-                }
-                continue;
-            }
-            match status {
-                WaitStatus::Exited(p, code) if p == root => inner_exit = Some(code),
-                WaitStatus::Signaled(p, signal, _) if p == root => {
-                    inner_exit = Some(128 + signal as i32);
-                }
-                WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {}
-                WaitStatus::PtraceEvent(p, _, event) => {
-                    if event != libc_event_stop() {
-                        events += 1;
-                    }
-                    let _ = ptrace::cont(p, None);
-                }
-                WaitStatus::Stopped(p, signal) => {
-                    let _ = ptrace::cont(p, Some(signal));
-                }
-                other => {
-                    if let Some(p) = other.pid() {
-                        let _ = ptrace::cont(p, None);
-                    }
-                }
-            }
-        }
+        let tally = observe(root);
         let text = reader.join().unwrap_or_default();
-        let mut report: Value = match text.lines().last().map(serde_json::from_str) {
-            Some(Ok(report)) => report,
-            _ => return fail(format!("the observed process printed no report: {text:?}")),
+        let (exit, tally) = match tally {
+            Ok(done) => done,
+            Err(why) => return fail(why),
+        };
+        let mut report = match text.lines().last().map(serde_json::from_str::<Value>) {
+            Some(Ok(report)) if report.is_object() => report,
+            _ => {
+                json!({"stdout_tail": text.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()})
+            }
         };
         report["observed"] = json!({
-            "method": "ptrace seize (TRACEFORK|TRACEVFORK|TRACECLONE) before the process runs; each new task classified by /proc/<tid>/status Tgid",
-            "processes_created": processes.len(),
-            "process_pids": processes,
-            "threads_created": threads,
-            "creation_events": events,
-            "exit": inner_exit,
+            "method": "PTRACE_TRACEME before exec (TRACEFORK|TRACEVFORK|TRACECLONE|TRACEEXEC|EXITKILL); every descendant traced to exit; observer is a child subreaper",
+            "program": program,
+            "processes_created": tally.processes.len(),
+            "process_pids": tally.processes,
+            "threads_created": tally.threads.len(),
+            "events": tally.events,
+            "processes_reaped": tally.reaped,
+            "vanished_on_ptrace": tally.vanished,
+            "errors": tally.errors,
+            "exit": exit,
         });
         println!("{report}");
-        match inner_exit {
+        match exit {
+            Some(_) if !tally.errors.is_empty() => ExitCode::from(3),
             Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             None => ExitCode::from(3),
         }
     }
 
-    /// `PTRACE_EVENT_STOP`: a seized task's group-stop or initial stop, not a creation.
-    const fn libc_event_stop() -> i32 {
-        128
+    /// Continue `pid`, recording a ptrace failure: a task that vanished (`ESRCH`, e.g.
+    /// killed) is counted; anything else is an error.
+    fn resume(tally: &mut Tally, pid: Pid, signal: Option<Signal>) {
+        match ptrace::cont(pid, signal) {
+            Ok(()) => {}
+            Err(Errno::ESRCH) => tally.vanished += 1,
+            Err(e) => tally.errors.push(format!("cont {pid}: {e}")),
+        }
+    }
+
+    /// Trace `root` (stopped by its own `SIGSTOP` after `PTRACE_TRACEME`) and every task it
+    /// creates until no task is left; the root's exit status and the tally.
+    fn observe(root: Pid) -> Result<(Option<i32>, Tally), String> {
+        match waitpid(root, Some(WaitPidFlag::__WALL)) {
+            Ok(WaitStatus::Stopped(_, Signal::SIGSTOP)) => {}
+            other => return Err(format!("the stub did not stop for tracing: {other:?}")),
+        }
+        let options = Options::PTRACE_O_TRACEFORK
+            | Options::PTRACE_O_TRACEVFORK
+            | Options::PTRACE_O_TRACECLONE
+            | Options::PTRACE_O_TRACEEXEC
+            | Options::PTRACE_O_EXITKILL;
+        ptrace::setoptions(root, options).map_err(|e| format!("setoptions: {e}"))?;
+        let mut tally = Tally::default();
+        // Every task the observer knows: the root, then each one a creation event announced.
+        let mut processes: BTreeSet<i32> = BTreeSet::from([root.as_raw()]);
+        let mut threads: BTreeSet<i32> = BTreeSet::new();
+        // New tasks start with SIGSTOP; that one stop is suppressed, whichever of the
+        // creation event and the stop the observer sees first.
+        let mut announced: BTreeSet<i32> = BTreeSet::new();
+        let mut stopped_unannounced: BTreeSet<i32> = BTreeSet::new();
+        let mut root_exec = false;
+        let mut exit = None;
+        resume(&mut tally, root, None);
+        loop {
+            let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
+                Ok(status) => status,
+                Err(Errno::ECHILD) => break,
+                Err(Errno::EINTR) => continue,
+                Err(e) => return Err(format!("waitpid: {e}")),
+            };
+            match status {
+                WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
+                    let raw = pid.as_raw();
+                    if pid == root {
+                        exit = Some(match status {
+                            WaitStatus::Exited(_, code) => code,
+                            WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
+                            _ => -1,
+                        });
+                    }
+                    if processes.contains(&raw) {
+                        tally.reaped += 1;
+                    } else if !threads.contains(&raw) {
+                        tally.errors.push(format!("reaped unknown task {raw}"));
+                    }
+                }
+                WaitStatus::PtraceEvent(pid, _, event) => {
+                    let kind = match event {
+                        e if e == Event::PTRACE_EVENT_FORK as i32 => Some("fork"),
+                        e if e == Event::PTRACE_EVENT_VFORK as i32 => Some("vfork"),
+                        e if e == Event::PTRACE_EVENT_CLONE as i32 => Some("clone"),
+                        e if e == Event::PTRACE_EVENT_EXEC as i32 => {
+                            if pid == root {
+                                root_exec = true;
+                            }
+                            *tally.events.entry("exec").or_default() += 1;
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        match ptrace::getevent(pid).map(|n| i32::try_from(n).unwrap_or(-1)) {
+                            Ok(new) if new > 0 => {
+                                let process = match kind {
+                                    "clone" => match tgid(Pid::from_raw(new)) {
+                                        Some(group) => group == new,
+                                        None => {
+                                            tally.errors.push(format!(
+                                                "unreadable status of new task {new}"
+                                            ));
+                                            true
+                                        }
+                                    },
+                                    _ => true,
+                                };
+                                let label = match (kind, process) {
+                                    ("clone", true) => "clone_process",
+                                    ("clone", false) => "clone_thread",
+                                    (other, _) => other,
+                                };
+                                *tally.events.entry(label).or_default() += 1;
+                                if process {
+                                    processes.insert(new);
+                                    tally.processes.push(new);
+                                } else {
+                                    threads.insert(new);
+                                    tally.threads.push(new);
+                                }
+                                if stopped_unannounced.remove(&new) {
+                                    resume(&mut tally, Pid::from_raw(new), None);
+                                } else {
+                                    announced.insert(new);
+                                }
+                            }
+                            other => tally
+                                .errors
+                                .push(format!("{kind} event of {pid}: new task {other:?}")),
+                        }
+                    }
+                    resume(&mut tally, pid, None);
+                }
+                WaitStatus::Stopped(pid, signal) => {
+                    let raw = pid.as_raw();
+                    let known = processes.contains(&raw) || threads.contains(&raw);
+                    if signal == Signal::SIGSTOP && announced.remove(&raw) {
+                        resume(&mut tally, pid, None);
+                    } else if signal == Signal::SIGSTOP && !known {
+                        // Its creation event is still to come.
+                        stopped_unannounced.insert(raw);
+                    } else {
+                        resume(&mut tally, pid, Some(signal));
+                    }
+                }
+                other => {
+                    if let Some(pid) = other.pid() {
+                        resume(&mut tally, pid, None);
+                    }
+                }
+            }
+        }
+        if !root_exec {
+            tally
+                .errors
+                .push("the measured program was never exec'd under trace".into());
+        }
+        if !stopped_unannounced.is_empty() {
+            tally.errors.push(format!(
+                "tasks stopped without a creation event: {stopped_unannounced:?}"
+            ));
+        }
+        Ok((exit, tally))
     }
 }
 
