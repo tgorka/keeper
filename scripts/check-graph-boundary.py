@@ -383,4 +383,18 @@ ci = (ROOT/'.github/workflows/ci.yml').read_text()
 line = next(line for line in ci.splitlines() if 'cargo check --workspace' in line and 'aarch64-apple-ios' in line)
 if re.findall(r'--exclude\s+(\S+)', line) != ['keeper-graph-query','keeper-graph-driver']:
     raise SystemExit('iOS workspace exclusion drift')
+# P1 measurement tooling (110.5): exactly these two cargo examples, which no `--bins`
+# build, no bundle and no image compiles. No manifest may declare an example or a bin
+# that points into an examples directory, and no shipped source may include one.
+MEASUREMENT = {'keeper-graph-protocol/examples/rc_corpus.rs', 'keeper-graph-driver/examples/rc_spawner.rs'}
+examples = {str(p.relative_to(CRATES)) for p in CRATES.glob('*/examples/*') if p.parent.parent.name.startswith('keeper-graph')}
+if examples != MEASUREMENT:
+    raise SystemExit(f'graph example drift: {sorted(examples)}')
+for crate in ['keeper-graph-protocol', 'keeper-graph-driver']:
+    manifest = (CRATES / crate / 'Cargo.toml').read_text()
+    if re.search(r'^\[\[(example|bin)\]\]', manifest, re.M) or 'examples/' in manifest:
+        raise SystemExit(f'{crate} declares an example or bin target')
+    for path in (CRATES / crate / 'src').rglob('*.rs'):
+        if re.search(r'examples/|rc_corpus|rc_spawner', path.read_text()):
+            raise SystemExit(f'shipped source refers to measurement tooling: {path}')
 print('graph protocol/worker/core/mobile dependency boundaries and exact 11/6 unsafe inventory passed')

@@ -4681,7 +4681,9 @@ version = "0.10.6"
 dependencies = [
  "clap",
  "keeper-core",
+ "nix",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 
