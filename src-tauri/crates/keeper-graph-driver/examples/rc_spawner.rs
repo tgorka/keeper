@@ -24,12 +24,14 @@
 //! - `telemetry` (peak/live workers, `RUSAGE_CHILDREN` max RSS): observations only, never a
 //!   creation count (a live or unwaited child leaves max RSS 0).
 //!
-//! `observe -- PROGRAM ARGS…` (Linux, module `observer`) traces PROGRAM from before its exec
-//! — loader and constructors included — and every descendant until it exits, and adds
-//! `observed` to PROGRAM's report: the processes and threads created, by creation event, and
-//! `errors` (any uncertainty, which makes it exit 3). It does not depend on the spawn
-//! accounting; the `control` kinds and `observer-controls.sh` (a pre-main constructor child)
-//! calibrate it.
+//! `observe -- PROGRAM ARGS…` (Linux x86_64, module `observer`) counts every creation
+//! attempt at the syscall (an inherited seccomp `RET_TRACE` filter on `clone`, `clone3`,
+//! `fork`, `vfork`; `CLONE_UNTRACED` stripped; any `ptrace` denied and reported), traces
+//! PROGRAM from before its exec — loader and constructors included — and every descendant
+//! until it exits, and adds `observed` to PROGRAM's report: attempts, failed attempts, the
+//! processes and threads created, and `errors` (any disagreement or uncertainty, which makes
+//! it exit 3). It does not depend on the spawn accounting; the `control` kinds and
+//! `observer-controls.sh` (C controls: constructors, raw and untraced clones) calibrate it.
 //!
 //! Predicates: an NC zero-children row is `admitted == false`, its label,
 //! `children.spawn_attempts == 0`, `observed.processes_created == 0` and
@@ -429,15 +431,15 @@ mod spawner {
         use std::process::ExitCode;
         let args: Vec<String> = std::env::args().skip(1).collect();
         match args.first().map(String::as_str) {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Some("observe") => return super::observer::main(&args[1..]),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Some(super::observer::STUB) => return super::observer::stub(&args[1..]),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
             Some("observe") => {
                 println!(
                     "{}",
-                    json!({"tool": "rc_spawner", "error": "observe is Linux only"})
+                    json!({"tool": "rc_spawner", "error": "observe is Linux x86_64 only"})
                 );
                 return ExitCode::from(2);
             }
@@ -478,24 +480,37 @@ mod spawner {
     }
 }
 
-/// The independent creation observation (Linux): the measured program is traced from before
-/// its exec, so its loader, constructors and every instruction after are traced, and every
-/// descendant task stays traced until it exits.
+/// The independent creation observation (Linux x86_64). Creation is counted twice, by two
+/// mechanisms that must agree:
 ///
-/// `rc_spawner observe -- PROGRAM ARGS…` starts this binary as a stub with an empty
-/// environment; the stub calls `PTRACE_TRACEME`, stops itself with `SIGSTOP` and, once the
-/// observer has set `TRACEFORK|TRACEVFORK|TRACECLONE|TRACEEXEC|EXITKILL`, `execve`s PROGRAM
-/// with the observer's own environment. The observer is a child subreaper, so orphaned
-/// descendants are reparented to it, and it waits until no task is left.
+/// 1. **Attempts, at the syscall.** The stub installs a seccomp filter returning
+///    `SECCOMP_RET_TRACE` for `clone`, `clone3`, `fork`, `vfork` and `ptrace` (setting
+///    `NO_NEW_PRIVS` first, as `seccompiler::apply_filter` does — the production exec class
+///    runs under `NO_NEW_PRIVS` too). The filter is inherited by every descendant and cannot
+///    be removed, so every creation attempt by any task stops the observer
+///    (`PTRACE_O_TRACESECCOMP`) whatever its flags. The observer reads the flags (the `clone`
+///    register, or `clone_args.flags` in tracee memory for `clone3`), classifies the attempt
+///    as a process or a thread (`CLONE_THREAD`), and follows the call to its syscall exit:
+///    a negative return is a failed attempt, otherwise the return is the new task's id.
+///    `CLONE_UNTRACED` is **stripped** before the call proceeds, so the child is auto-attached
+///    like any other; each strip is reported (`untraced_stripped`). If the flags cannot be
+///    read or rewritten the call is denied (`-EPERM`) and an error recorded. Any `ptrace`
+///    call by a measured task (e.g. `PTRACE_TRACEME`) is denied with `-EPERM` and recorded
+///    as an error: measured software must not trace or detach.
+/// 2. **Creations, by tracing.** The measured program is traced from before its exec (the
+///    stub: `PTRACE_TRACEME`, filter, `SIGSTOP`, then `execve` with the observer's
+///    environment), so its loader and constructors run traced, and every descendant stays
+///    traced (`TRACEFORK|TRACEVFORK|TRACECLONE|TRACEEXEC|EXITKILL`) until it exits; the
+///    observer is a child subreaper and waits until no task is left. A creation event
+///    creates a process when the new task is its own thread-group leader (`/proc` `Tgid`).
 ///
-/// Creation is counted from the fork/vfork/clone events: fork and vfork always create a
-/// process; a clone event creates a process when the new task is its own thread-group leader
-/// (`/proc/<tid>/status` `Tgid`, read while it is stopped at creation), else a thread. Every
-/// exit the observer reaps is checked against the tasks it knows. Any uncertainty — an
-/// unreadable status, a ptrace error other than a vanished task, a task that stopped without
-/// a creation event, an exit of an unknown process, or a program that never reached its exec —
-/// is listed under `observed.errors`, and the observer exits 3.
-#[cfg(target_os = "linux")]
+/// Every successful attempt's new task must be a traced creation of the same kind, and
+/// every traced creation must come from a successful attempt. Any disagreement or
+/// uncertainty — an unreadable status or register set, a ptrace error other than a vanished
+/// task, a task that stopped without a creation event, an exit of an unknown process, an
+/// attempt whose outcome was never seen, a measured `ptrace`, or a program that never
+/// reached its exec — is listed under `observed.errors`, and the observer exits 3.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod observer {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
@@ -503,6 +518,7 @@ mod observer {
     use std::process::{Command, ExitCode, Stdio};
 
     use nix::errno::Errno;
+    use nix::libc;
     use nix::sys::ptrace::{self, Event, Options};
     use nix::sys::signal::{raise, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -511,6 +527,17 @@ mod observer {
 
     /// The first argument of the traced stub.
     pub const STUB: &str = "--observe-stub";
+
+    /// The syscalls the stub's filter hands to the observer.
+    const TRACED: [i64; 5] = [
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_ptrace,
+    ];
+    const CLONE_THREAD: u64 = libc::CLONE_THREAD as u64;
+    const CLONE_UNTRACED: u64 = libc::CLONE_UNTRACED as u64;
 
     /// The thread group of `tid`, from its own status file.
     fn tgid(tid: Pid) -> Option<i32> {
@@ -526,9 +553,22 @@ mod observer {
         ExitCode::from(3)
     }
 
-    /// The stub: become traced, stop, then exec the measured program with the observer's
-    /// environment (`/proc/<parent>/environ`). It has no environment of its own, so nothing
-    /// is preloaded into it.
+    /// The filter: trace the creation and ptrace syscalls, allow everything else.
+    fn filter() -> Result<seccompiler::BpfProgram, Box<dyn std::error::Error>> {
+        let rules = TRACED.iter().map(|n| (*n, Vec::new())).collect();
+        Ok(seccompiler::SeccompFilter::new(
+            rules,
+            seccompiler::SeccompAction::Allow,
+            seccompiler::SeccompAction::Trace(0),
+            std::env::consts::ARCH.try_into()?,
+        )?
+        .try_into()?)
+    }
+
+    /// The stub: become traced, install the filter, stop, then exec the measured program with
+    /// the observer's environment (`/proc/<parent>/environ`). It has no environment of its
+    /// own, so nothing is preloaded into it. Each failure exits with its own status, which the
+    /// observer reports: 124 filter, 125 traceme, 126 setup.
     pub fn stub(program: &[String]) -> ExitCode {
         let parent = nix::unistd::getppid();
         let env: Vec<CString> = match std::fs::read(format!("/proc/{parent}/environ")) {
@@ -546,11 +586,35 @@ mod observer {
         let Some(path) = argv.first() else {
             return ExitCode::from(126);
         };
-        if ptrace::traceme().is_err() || raise(Signal::SIGSTOP).is_err() {
+        let Ok(filter) = filter() else {
+            return ExitCode::from(124);
+        };
+        if ptrace::traceme().is_err() {
+            return ExitCode::from(125);
+        }
+        if seccompiler::apply_filter(&filter).is_err() {
+            return ExitCode::from(124);
+        }
+        if raise(Signal::SIGSTOP).is_err() {
             return ExitCode::from(126);
         }
         let _ = nix::unistd::execve(path, &argv, &env);
         ExitCode::from(127)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Process,
+        Thread,
+    }
+
+    impl Kind {
+        fn name(self) -> &'static str {
+            match self {
+                Kind::Process => "process",
+                Kind::Thread => "thread",
+            }
+        }
     }
 
     #[derive(Default)]
@@ -558,6 +622,9 @@ mod observer {
         processes: Vec<i32>,
         threads: Vec<i32>,
         events: BTreeMap<&'static str, usize>,
+        attempts: BTreeMap<&'static str, usize>,
+        failed_attempts: usize,
+        untraced_stripped: usize,
         reaped: usize,
         vanished: usize,
         errors: Vec<String>,
@@ -608,8 +675,11 @@ mod observer {
             }
         };
         report["observed"] = json!({
-            "method": "PTRACE_TRACEME before exec (TRACEFORK|TRACEVFORK|TRACECLONE|TRACEEXEC|EXITKILL); every descendant traced to exit; observer is a child subreaper",
+            "method": "seccomp RET_TRACE on clone/clone3/fork/vfork/ptrace (attempts, CLONE_UNTRACED stripped) + PTRACE_TRACEME before exec, every descendant traced to exit, child subreaper (creations)",
             "program": program,
+            "creation_attempts": tally.attempts,
+            "failed_attempts": tally.failed_attempts,
+            "untraced_stripped": tally.untraced_stripped,
             "processes_created": tally.processes.len(),
             "process_pids": tally.processes,
             "threads_created": tally.threads.len(),
@@ -627,40 +697,259 @@ mod observer {
         }
     }
 
-    /// Continue `pid`, recording a ptrace failure: a task that vanished (`ESRCH`, e.g.
-    /// killed) is counted; anything else is an error.
-    fn resume(tally: &mut Tally, pid: Pid, signal: Option<Signal>) {
-        match ptrace::cont(pid, signal) {
-            Ok(()) => {}
-            Err(Errno::ESRCH) => tally.vanished += 1,
-            Err(e) => tally.errors.push(format!("cont {pid}: {e}")),
+    /// A pending creation attempt of one task: its kind and, once its creation event was
+    /// seen, the new task.
+    struct Attempt {
+        kind: Kind,
+        created: Option<i32>,
+    }
+
+    struct State {
+        tally: Tally,
+        processes: BTreeSet<i32>,
+        threads: BTreeSet<i32>,
+        /// Created tasks whose first `SIGSTOP` is still to come.
+        announced: BTreeSet<i32>,
+        /// Tasks that stopped before their creation event.
+        stopped_unannounced: BTreeSet<i32>,
+        /// Tasks inside a traced creation syscall, followed to its exit.
+        pending: BTreeMap<i32, Attempt>,
+        /// New tasks of successful attempts, by kind.
+        succeeded: Vec<(Kind, i32)>,
+    }
+
+    impl State {
+        /// Continue `pid` (to its syscall exit while an attempt is pending), recording a
+        /// ptrace failure: a vanished task (`ESRCH`) is counted, anything else is an error.
+        fn resume(&mut self, pid: Pid, signal: Option<Signal>) {
+            let result = if self.pending.contains_key(&pid.as_raw()) {
+                ptrace::syscall(pid, signal)
+            } else {
+                ptrace::cont(pid, signal)
+            };
+            match result {
+                Ok(()) => {}
+                Err(Errno::ESRCH) => self.tally.vanished += 1,
+                Err(e) => self.tally.errors.push(format!("resume {pid}: {e}")),
+            }
+        }
+
+        /// Deny the syscall at a seccomp stop: skip it and return `-EPERM`.
+        fn deny(&mut self, pid: Pid, mut regs: libc::user_regs_struct) {
+            regs.orig_rax = u64::MAX;
+            regs.rax = (-i64::from(libc::EPERM)) as u64;
+            if let Err(e) = ptrace::setregs(pid, regs) {
+                self.tally.errors.push(format!("deny at {pid}: {e}"));
+            }
+        }
+
+        /// A seccomp stop: one traced syscall of `pid`, before it runs.
+        fn seccomp(&mut self, pid: Pid) {
+            let mut regs = match ptrace::getregs(pid) {
+                Ok(regs) => regs,
+                Err(e) => {
+                    self.tally.errors.push(format!("registers of {pid}: {e}"));
+                    return;
+                }
+            };
+            let nr = regs.orig_rax as i64;
+            let flags = match nr {
+                n if n == libc::SYS_fork || n == libc::SYS_vfork => Some(0),
+                n if n == libc::SYS_clone => {
+                    let flags = regs.rdi;
+                    if flags & CLONE_UNTRACED != 0 {
+                        regs.rdi &= !CLONE_UNTRACED;
+                        match ptrace::setregs(pid, regs) {
+                            Ok(()) => self.tally.untraced_stripped += 1,
+                            Err(e) => {
+                                self.tally
+                                    .errors
+                                    .push(format!("strip CLONE_UNTRACED at {pid}: {e}"));
+                                self.deny(pid, regs);
+                                return;
+                            }
+                        }
+                    }
+                    Some(flags)
+                }
+                n if n == libc::SYS_clone3 => {
+                    let at = regs.rdi as ptrace::AddressType;
+                    match ptrace::read(pid, at) {
+                        Ok(word) => {
+                            let flags = word as u64;
+                            if flags & CLONE_UNTRACED != 0 {
+                                let stripped = (flags & !CLONE_UNTRACED) as libc::c_long;
+                                match ptrace::write(pid, at, stripped) {
+                                    Ok(()) => self.tally.untraced_stripped += 1,
+                                    Err(e) => {
+                                        self.tally.errors.push(format!(
+                                            "strip clone3 CLONE_UNTRACED at {pid}: {e}"
+                                        ));
+                                        self.deny(pid, regs);
+                                        return;
+                                    }
+                                }
+                            }
+                            Some(flags)
+                        }
+                        Err(e) => {
+                            self.tally
+                                .errors
+                                .push(format!("clone3 flags of {pid}: {e}"));
+                            self.deny(pid, regs);
+                            return;
+                        }
+                    }
+                }
+                n if n == libc::SYS_ptrace => {
+                    self.tally.errors.push(format!(
+                        "measured task {pid} called ptrace(request {}): denied",
+                        regs.rdi as i64
+                    ));
+                    self.deny(pid, regs);
+                    return;
+                }
+                other => {
+                    self.tally
+                        .errors
+                        .push(format!("unexpected seccomp stop of {pid}: syscall {other}"));
+                    return;
+                }
+            };
+            let kind = match flags {
+                Some(f) if f & CLONE_THREAD != 0 => Kind::Thread,
+                _ => Kind::Process,
+            };
+            *self.tally.attempts.entry(kind.name()).or_default() += 1;
+            if self
+                .pending
+                .insert(
+                    pid.as_raw(),
+                    Attempt {
+                        kind,
+                        created: None,
+                    },
+                )
+                .is_some()
+            {
+                self.tally
+                    .errors
+                    .push(format!("{pid} entered a creation syscall inside another"));
+            }
+        }
+
+        /// A syscall stop: the exit of `pid`'s pending creation syscall.
+        fn syscall_exit(&mut self, pid: Pid) {
+            let Some(attempt) = self.pending.remove(&pid.as_raw()) else {
+                self.tally
+                    .errors
+                    .push(format!("unexpected syscall stop of {pid}"));
+                return;
+            };
+            match ptrace::getregs(pid) {
+                Ok(regs) if (regs.rax as i64) < 0 => self.tally.failed_attempts += 1,
+                Ok(regs) => {
+                    let new = i32::try_from(regs.rax).unwrap_or(-1);
+                    if attempt.created.is_some_and(|c| c != new) {
+                        self.tally.errors.push(format!(
+                            "{pid}: creation event {:?} but syscall returned {new}",
+                            attempt.created
+                        ));
+                    }
+                    self.succeeded.push((attempt.kind, new));
+                }
+                Err(e) => self.tally.errors.push(format!("return of {pid}: {e}")),
+            }
+        }
+
+        /// A fork/vfork/clone event of `pid`: the new task, classified by its own `Tgid`.
+        fn created(&mut self, pid: Pid, label: &'static str) {
+            let new = match ptrace::getevent(pid).map(|n| i32::try_from(n).unwrap_or(-1)) {
+                Ok(new) if new > 0 => new,
+                other => {
+                    self.tally
+                        .errors
+                        .push(format!("{label} event of {pid}: new task {other:?}"));
+                    return;
+                }
+            };
+            let process = match label {
+                "clone" => match tgid(Pid::from_raw(new)) {
+                    Some(group) => group == new,
+                    None => {
+                        self.tally
+                            .errors
+                            .push(format!("unreadable status of new task {new}"));
+                        true
+                    }
+                },
+                _ => true,
+            };
+            let label = match (label, process) {
+                ("clone", true) => "clone_process",
+                ("clone", false) => "clone_thread",
+                (other, _) => other,
+            };
+            *self.tally.events.entry(label).or_default() += 1;
+            if process {
+                self.processes.insert(new);
+                self.tally.processes.push(new);
+            } else {
+                self.threads.insert(new);
+                self.tally.threads.push(new);
+            }
+            match self.pending.get_mut(&pid.as_raw()) {
+                Some(attempt) => attempt.created = Some(new),
+                None => self
+                    .tally
+                    .errors
+                    .push(format!("{label} event of {pid} without a traced attempt")),
+            }
+            if self.stopped_unannounced.remove(&new) {
+                self.resume(Pid::from_raw(new), None);
+            } else {
+                self.announced.insert(new);
+            }
         }
     }
 
-    /// Trace `root` (stopped by its own `SIGSTOP` after `PTRACE_TRACEME`) and every task it
-    /// creates until no task is left; the root's exit status and the tally.
+    /// Trace `root` (stopped by its own `SIGSTOP` after `PTRACE_TRACEME` and the filter) and
+    /// every task it creates until no task is left; the root's exit status and the tally.
     fn observe(root: Pid) -> Result<(Option<i32>, Tally), String> {
         match waitpid(root, Some(WaitPidFlag::__WALL)) {
             Ok(WaitStatus::Stopped(_, Signal::SIGSTOP)) => {}
+            Ok(WaitStatus::Exited(_, code)) => {
+                return Err(format!(
+                    "the stub could not set up tracing (exit {code}: {})",
+                    match code {
+                        124 => "seccomp filter",
+                        125 => "PTRACE_TRACEME refused",
+                        _ => "setup",
+                    }
+                ))
+            }
             other => return Err(format!("the stub did not stop for tracing: {other:?}")),
         }
         let options = Options::PTRACE_O_TRACEFORK
             | Options::PTRACE_O_TRACEVFORK
             | Options::PTRACE_O_TRACECLONE
             | Options::PTRACE_O_TRACEEXEC
+            | Options::PTRACE_O_TRACESECCOMP
+            | Options::PTRACE_O_TRACESYSGOOD
             | Options::PTRACE_O_EXITKILL;
         ptrace::setoptions(root, options).map_err(|e| format!("setoptions: {e}"))?;
-        let mut tally = Tally::default();
-        // Every task the observer knows: the root, then each one a creation event announced.
-        let mut processes: BTreeSet<i32> = BTreeSet::from([root.as_raw()]);
-        let mut threads: BTreeSet<i32> = BTreeSet::new();
-        // New tasks start with SIGSTOP; that one stop is suppressed, whichever of the
-        // creation event and the stop the observer sees first.
-        let mut announced: BTreeSet<i32> = BTreeSet::new();
-        let mut stopped_unannounced: BTreeSet<i32> = BTreeSet::new();
+        let mut s = State {
+            tally: Tally::default(),
+            processes: BTreeSet::from([root.as_raw()]),
+            threads: BTreeSet::new(),
+            announced: BTreeSet::new(),
+            stopped_unannounced: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            succeeded: Vec::new(),
+        };
         let mut root_exec = false;
         let mut exit = None;
-        resume(&mut tally, root, None);
+        s.resume(root, None);
         loop {
             let status = match waitpid(None, Some(WaitPidFlag::__WALL)) {
                 Ok(status) => status,
@@ -678,97 +967,99 @@ mod observer {
                             _ => -1,
                         });
                     }
-                    if processes.contains(&raw) {
-                        tally.reaped += 1;
-                    } else if !threads.contains(&raw) {
-                        tally.errors.push(format!("reaped unknown task {raw}"));
+                    if let Some(attempt) = s.pending.remove(&raw) {
+                        // Killed inside the syscall: its outcome is its creation event.
+                        match attempt.created {
+                            Some(new) => s.succeeded.push((attempt.kind, new)),
+                            None => s.tally.errors.push(format!(
+                                "{raw} exited inside a creation syscall with no outcome"
+                            )),
+                        }
+                    }
+                    if s.processes.contains(&raw) {
+                        s.tally.reaped += 1;
+                    } else if !s.threads.contains(&raw) {
+                        s.tally.errors.push(format!("reaped unknown task {raw}"));
                     }
                 }
+                WaitStatus::PtraceSyscall(pid) => {
+                    s.syscall_exit(pid);
+                    s.resume(pid, None);
+                }
                 WaitStatus::PtraceEvent(pid, _, event) => {
-                    let kind = match event {
-                        e if e == Event::PTRACE_EVENT_FORK as i32 => Some("fork"),
-                        e if e == Event::PTRACE_EVENT_VFORK as i32 => Some("vfork"),
-                        e if e == Event::PTRACE_EVENT_CLONE as i32 => Some("clone"),
+                    match event {
+                        e if e == Event::PTRACE_EVENT_SECCOMP as i32 => s.seccomp(pid),
+                        e if e == Event::PTRACE_EVENT_FORK as i32 => s.created(pid, "fork"),
+                        e if e == Event::PTRACE_EVENT_VFORK as i32 => s.created(pid, "vfork"),
+                        e if e == Event::PTRACE_EVENT_CLONE as i32 => s.created(pid, "clone"),
                         e if e == Event::PTRACE_EVENT_EXEC as i32 => {
                             if pid == root {
                                 root_exec = true;
                             }
-                            *tally.events.entry("exec").or_default() += 1;
-                            None
+                            *s.tally.events.entry("exec").or_default() += 1;
                         }
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        match ptrace::getevent(pid).map(|n| i32::try_from(n).unwrap_or(-1)) {
-                            Ok(new) if new > 0 => {
-                                let process = match kind {
-                                    "clone" => match tgid(Pid::from_raw(new)) {
-                                        Some(group) => group == new,
-                                        None => {
-                                            tally.errors.push(format!(
-                                                "unreadable status of new task {new}"
-                                            ));
-                                            true
-                                        }
-                                    },
-                                    _ => true,
-                                };
-                                let label = match (kind, process) {
-                                    ("clone", true) => "clone_process",
-                                    ("clone", false) => "clone_thread",
-                                    (other, _) => other,
-                                };
-                                *tally.events.entry(label).or_default() += 1;
-                                if process {
-                                    processes.insert(new);
-                                    tally.processes.push(new);
-                                } else {
-                                    threads.insert(new);
-                                    tally.threads.push(new);
-                                }
-                                if stopped_unannounced.remove(&new) {
-                                    resume(&mut tally, Pid::from_raw(new), None);
-                                } else {
-                                    announced.insert(new);
-                                }
-                            }
-                            other => tally
-                                .errors
-                                .push(format!("{kind} event of {pid}: new task {other:?}")),
-                        }
+                        _ => {}
                     }
-                    resume(&mut tally, pid, None);
+                    s.resume(pid, None);
                 }
                 WaitStatus::Stopped(pid, signal) => {
                     let raw = pid.as_raw();
-                    let known = processes.contains(&raw) || threads.contains(&raw);
-                    if signal == Signal::SIGSTOP && announced.remove(&raw) {
-                        resume(&mut tally, pid, None);
+                    let known = s.processes.contains(&raw) || s.threads.contains(&raw);
+                    if signal == Signal::SIGSTOP && s.announced.remove(&raw) {
+                        s.resume(pid, None);
                     } else if signal == Signal::SIGSTOP && !known {
                         // Its creation event is still to come.
-                        stopped_unannounced.insert(raw);
+                        s.stopped_unannounced.insert(raw);
                     } else {
-                        resume(&mut tally, pid, Some(signal));
+                        s.resume(pid, Some(signal));
                     }
                 }
                 other => {
                     if let Some(pid) = other.pid() {
-                        resume(&mut tally, pid, None);
+                        s.resume(pid, None);
                     }
                 }
             }
         }
         if !root_exec {
-            tally
+            s.tally
                 .errors
                 .push("the measured program was never exec'd under trace".into());
         }
-        if !stopped_unannounced.is_empty() {
-            tally.errors.push(format!(
-                "tasks stopped without a creation event: {stopped_unannounced:?}"
+        if !s.stopped_unannounced.is_empty() {
+            let left = std::mem::take(&mut s.stopped_unannounced);
+            s.tally
+                .errors
+                .push(format!("tasks stopped without a creation event: {left:?}"));
+        }
+        if !s.pending.is_empty() {
+            let left: Vec<i32> = s.pending.keys().copied().collect();
+            s.tally
+                .errors
+                .push(format!("creation attempts never completed: {left:?}"));
+        }
+        // The two counts must agree: each successful attempt is one traced creation of its
+        // kind, and each traced creation came from a successful attempt.
+        let traced: BTreeSet<(bool, i32)> = s
+            .tally
+            .processes
+            .iter()
+            .map(|p| (true, *p))
+            .chain(s.tally.threads.iter().map(|t| (false, *t)))
+            .collect();
+        let attempted: BTreeSet<(bool, i32)> = s
+            .succeeded
+            .iter()
+            .map(|(kind, new)| (*kind == Kind::Process, *new))
+            .collect();
+        if traced != attempted || attempted.len() != s.succeeded.len() {
+            s.tally.errors.push(format!(
+                "attempts and creations disagree: only attempted {:?}, only traced {:?}",
+                attempted.difference(&traced).collect::<Vec<_>>(),
+                traced.difference(&attempted).collect::<Vec<_>>()
             ));
         }
-        Ok((exit, tally))
+        Ok((exit, s.tally))
     }
 }
 

@@ -20,3 +20,6 @@ tokio = { workspace = true }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["resource", "ptrace", "signal"] }
 sha2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+seccompiler = "=0.5.0"
