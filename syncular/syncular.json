@@ -16,7 +16,8 @@
     { "version": 4, "through": "0004_grants_settings_drives" },
     { "version": 5, "through": "0005_session_drive_ticks" },
     { "version": 6, "through": "0006_knowledge_graph" },
-    { "version": 7, "through": "0007_knowledge_graph_contents" }
+    { "version": 7, "through": "0007_knowledge_graph_contents" },
+    { "version": 8, "through": "0008_knowledge_graph_review" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -81,6 +82,11 @@
     { "name": "kg_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_node_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_contents", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_reviews", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    {
+      "name": "kg_proposals",
+      "scopes": [{ "pattern": "kg_proposal:{kg_proposal}", "column": "proposer_actor" }]
+    },
     {
       "name": "kg_receipts",
       "scopes": [{ "pattern": "kg_client:{kg_client}", "column": "client_scope" }]
@@ -163,6 +169,12 @@
     { "name": "kgTags", "table": "kg_tags", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgNodeTags", "table": "kg_node_tags", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgContents", "table": "kg_contents", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgReviews", "table": "kg_reviews", "scopes": { "kg_graph": ["{database}"] } },
+    {
+      "name": "kgProposals",
+      "table": "kg_proposals",
+      "scopes": { "kg_proposal": ["{actorId}"] }
+    },
     { "name": "kgReceipts", "table": "kg_receipts", "scopes": { "kg_client": ["{clientScope}"] } }
   ]
 }

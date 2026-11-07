@@ -15,6 +15,13 @@
 //!   `KEEPER_HQ_LIVE_FORBIDDEN_REQUEST` (the request id of an accepted change
 //!   another person made there).
 //!
+//! - 112 review cases (story 111.2): `KEEPER_HQ_LIVE_REVIEWER_ACTOR`,
+//!   `KEEPER_HQ_LIVE_REVIEWER_CLIENT` and `KEEPER_HQ_LIVE_REVIEWER_TOKEN`, a
+//!   second person holding the graph reviewer role, and
+//!   `KEEPER_HQ_LIVE_AGENT_EVENT`, the event id of an agent-origin
+//!   `graph.apply` (an approved create) the harness seeded and nobody has
+//!   reviewed.
+//!
 //! Every claim is asserted here; each case also prints the `KG1_LIVE <case>
 //! <json>` lines the harness checks against the server's authoritative rows.
 //! Their names and shapes are the harness's interface: change neither
@@ -28,8 +35,11 @@ use std::time::{Duration, Instant};
 use keeper_core::graph::client::{subscriptions, GraphClient, GraphClientError, Prepared};
 use keeper_core::graph::outcome::GraphOutcome;
 use keeper_core::graph::prefix::{self, Prefix};
-use keeper_core::graph::protocol::change::{Change, ChangeOp, NodeFields};
+use keeper_core::graph::protocol::change::{Change, ChangeOp, NodeFields, DESCRIPTOR};
+use keeper_core::graph::protocol::inverse::{Preview, Reverse};
+use keeper_core::graph::protocol::proposal::{self, Decision, Proposal, Verdict};
 use keeper_core::graph::protocol::request::Request;
+use keeper_core::graph::protocol::review::Target;
 use keeper_core::graph::protocol::wire::{self, HistoryFilter};
 use keeper_core::hq::port::{Link, ReplicaError, ReplicaSpec};
 use keeper_core::hq::sessions::Source;
@@ -456,7 +466,7 @@ fn graph_live_a_lost_answer_resolves_by_outcome() {
         "{first:?}"
     );
     let restored = client
-        .prepared(prepared.request().clone())
+        .prepared(DESCRIPTOR, prepared.request().clone())
         .expect("same request");
     assert_eq!(restored.key(), prepared.key());
     let outcome = settled(&client, &direct, &restored);
@@ -520,11 +530,14 @@ fn graph_live_a_restart_resumes_the_same_request_and_cursor() {
                 serde_json::from_str(&std::fs::read_to_string(&pending).expect("persisted"))
                     .expect("json");
             let prepared = client
-                .prepared(Request {
-                    request_id: saved["request_id"].as_str().expect("id").to_owned(),
-                    context_id: None,
-                    payload: saved["payload"].clone(),
-                })
+                .prepared(
+                    DESCRIPTOR,
+                    Request {
+                        request_id: saved["request_id"].as_str().expect("id").to_owned(),
+                        context_id: None,
+                        payload: saved["payload"].clone(),
+                    },
+                )
                 .expect("restored");
             // Resolved before anything is sent again: the persisted identity
             // finds the original receipt.
@@ -975,4 +988,432 @@ fn graph_live_111_collections_content_merge_and_verification() {
     );
     close(one);
     close(two);
+}
+
+/// The reviewer's device: the second person's replica of the database.
+fn reviewer() -> Source {
+    let database = env("KEEPER_HQ_LIVE_DATABASE");
+    let actor = env("KEEPER_HQ_LIVE_REVIEWER_ACTOR");
+    let client = env("KEEPER_HQ_LIVE_REVIEWER_CLIENT");
+    let replica = SyncularReplica::open(ReplicaSpec {
+        database: database.clone(),
+        path: state_dir().join(format!("{database}-reviewer.sqlite")),
+        client_id: Some(client.clone()),
+        link: Some(Link {
+            base_url: format!("{}/{database}", env("KEEPER_HQ_LIVE_URL")),
+            token: env("KEEPER_HQ_LIVE_REVIEWER_TOKEN"),
+        }),
+        subscriptions: subscriptions(&database, &actor, &client),
+        watch_presence: None,
+    })
+    .expect("opens a real replica");
+    Source {
+        database,
+        replica: Arc::new(replica),
+        actor,
+        client,
+    }
+}
+
+/// Send one command and wait for its terminal outcome.
+fn commanded(
+    client: &GraphClient,
+    source: &Source,
+    applied: Result<keeper_core::graph::client::Applied, GraphClientError>,
+) -> (Prepared, GraphOutcome) {
+    let applied = applied.expect("a request id");
+    let outcome = settled(client, source, &applied.prepared);
+    (applied.prepared, outcome)
+}
+
+/// Preview `event_id`'s reversal (it must be ready) and reverse it under
+/// exactly the previewed revisions.
+fn reversed(client: &GraphClient, source: &Source, event_id: &str) -> (Preview, GraphOutcome) {
+    let preview = client.preview_reversal(event_id).expect("preview");
+    assert_eq!(preview.outcome, "ready", "{preview:?}");
+    let reverse = Reverse::of(preview.plan.as_ref().expect("plan"), None, None).expect("reverse");
+    let (_, outcome) = commanded(client, source, client.reverse(&reverse));
+    (preview, outcome)
+}
+
+fn node_at(prefix: &Prefix, id: &str) -> Value {
+    Value::Object(prefix.state[&("node".to_owned(), id.to_owned())].clone())
+}
+
+fn digest_of(prefix: &Prefix, event_id: &str) -> String {
+    prefix
+        .events
+        .iter()
+        .find(|e| e.event.id == event_id)
+        .map(|e| e.event.delta_digest.clone())
+        .expect("event retained")
+}
+
+/// Story 111.2 on two devices of an editor reversing their own effects: a
+/// merge (two parallel edges) reversed — restore-merged and
+/// restore-endpoints — then the reversal reversed (a re-merge) and that one
+/// reversed (depth 3), each a new event with the original delta unchanged
+/// across a restart; an edit of a verified assertion reversed, restoring
+/// its fields but never its verification; and a reversal raced by a later
+/// edit, which conflicts (`reversal_conflict`) with no event.
+#[test]
+#[ignore = "driven by keeper-hq's native graph harness (111.2 server)"]
+#[allow(clippy::too_many_lines)]
+fn graph_live_112_reversal_of_merge_to_depth_3_and_verification() {
+    let (one, two) = (device(1), device(2));
+    let (first, second) = (GraphClient::new(one.clone()), GraphClient::new(two.clone()));
+    let [t, b, o, e1, e2, claim, res, src] = std::array::from_fn(|_| ulid());
+    let edge = |id: &str| ChangeOp::CreateEdge {
+        id: id.to_owned(),
+        from_id: o.clone(),
+        to_id: b.clone(),
+        edge_type: "ex:rel".to_owned(),
+        properties: Map::new(),
+        from_lifecycle_revision: None,
+        to_lifecycle_revision: None,
+    };
+    let assertion = json!({"generated_at": null, "observed_at": 1, "verified_at": null,
+                           "verified_by": null, "stale_after": null, "status": "unverified"});
+    let setup = first
+        .change(
+            vec![
+                create_node(&t, "Survivor", json!({})),
+                create_node(&b, "Absorbed", json!({})),
+                create_node(&o, "Other", json!({})),
+                edge(&e1),
+                edge(&e2),
+                ChangeOp::CreateNode {
+                    id: res.clone(),
+                    kind: "Resource".to_owned(),
+                    title: "Source".to_owned(),
+                    description: None,
+                    properties: Map::new(),
+                },
+                create_node(&claim, "Claim", json!({"$assertion": assertion})),
+                ChangeOp::CreateEdge {
+                    id: src.clone(),
+                    from_id: claim.clone(),
+                    to_id: res.clone(),
+                    edge_type: "sources".to_owned(),
+                    properties: json!({"source": {"$ref": {"entity_type": "node", "id": res, "revision": "1"}}})
+                        .as_object()
+                        .expect("p")
+                        .clone(),
+                    from_lifecycle_revision: None,
+                    to_lifecycle_revision: None,
+                },
+            ],
+            None,
+        )
+        .expect("setup");
+    accepted(&applied(&first, &one, &setup).1);
+
+    // Merge B into T, rewriting both parallel edges.
+    let merge_edge = |id: &str| keeper_core::graph::protocol::change::MergeEdge {
+        id: id.to_owned(),
+        expected_revision: "1".into(),
+        from_lifecycle_revision: "1".into(),
+        to_lifecycle_revision: "1".into(),
+    };
+    let merge = first
+        .change(
+            vec![ChangeOp::MergeNodes {
+                target_id: t.clone(),
+                target_revision: "1".into(),
+                absorbed: vec![keeper_core::graph::protocol::change::Absorbed {
+                    id: b.clone(),
+                    expected_revision: "1".into(),
+                }],
+                edges: vec![merge_edge(&e1), merge_edge(&e2)],
+            }],
+            None,
+        )
+        .expect("merge");
+    let (m, merged_at) = accepted(&applied(&first, &one, &merge).1);
+    let merged_digest = digest_of(&prefix_at(&two, merged_at), &m);
+
+    // Reversal (device two, the same person): B active again, both edges
+    // back on B, no redirect; the original merge event unchanged.
+    let (preview, outcome) = reversed(&second, &two, &m);
+    let (r1, seq) = accepted(&outcome);
+    let prefix = prefix_at(&one, seq);
+    let restored = node_at(&prefix, &b);
+    assert_eq!(
+        (
+            restored["lifecycle"].clone(),
+            restored["merged_into_id"].clone()
+        ),
+        (json!("active"), Value::Null)
+    );
+    for id in [&e1, &e2] {
+        assert_eq!(
+            prefix.state[&("edge".to_owned(), id.clone())]["to_id"],
+            b.as_str()
+        );
+    }
+    assert_eq!(first.redirects(&b).expect("read"), Some(Vec::new()));
+    assert_eq!(digest_of(&prefix, &m), merged_digest);
+    let event = prefix
+        .events
+        .iter()
+        .find(|e| e.event.id == r1)
+        .expect("reversal");
+    assert_eq!(event.event.reverses_event_id.as_deref(), Some(m.as_str()));
+    report(
+        "112-merge-reversed",
+        &json!({"preview": preview, "outcome": outcome_json(&outcome), "node": restored}),
+    );
+
+    // Reversal of the reversal re-merges; its reversal restores (depth 3).
+    let (_, outcome) = reversed(&first, &one, &r1);
+    let (r2, seq) = accepted(&outcome);
+    assert_eq!(
+        node_at(&prefix_at(&two, seq), &b)["merged_into_id"],
+        t.as_str()
+    );
+    assert_eq!(second.redirects(&b).expect("read"), Some(vec![t.clone()]));
+    let (_, outcome) = reversed(&second, &two, &r2);
+    let (_, seq) = accepted(&outcome);
+    let prefix = prefix_at(&one, seq);
+    assert_eq!(node_at(&prefix, &b)["lifecycle"], "active");
+    report("112-depth-3", &json!({"node": node_at(&prefix, &b)}));
+
+    // A verified assertion's edit reversed: fields restored, never the
+    // verification.
+    let verify = second
+        .change(
+            vec![ChangeOp::VerifyAssertion {
+                id: claim.clone(),
+                expected_revision: "1".into(),
+                sources: vec![keeper_core::graph::protocol::change::CheckedSource {
+                    edge_id: src.clone(),
+                    edge_revision: "1".into(),
+                    ref_id: res.clone(),
+                    ref_revision: "1".into(),
+                }],
+                contents: Vec::new(),
+            }],
+            None,
+        )
+        .expect("verify");
+    accepted(&applied(&second, &two, &verify).1);
+    let edit = first
+        .change(vec![retitle(&claim, "2", "Edited claim")], None)
+        .expect("edit");
+    let (edited, _) = accepted(&applied(&first, &one, &edit).1);
+    let (_, outcome) = reversed(&first, &one, &edited);
+    let (r_edit, seq) = accepted(&outcome);
+    let prefix = prefix_at(&two, seq);
+    let node = node_at(&prefix, &claim);
+    let stamped = &node["properties"]["$assertion"];
+    assert_eq!(node["title"], "Claim");
+    assert_eq!(
+        (
+            stamped["status"].clone(),
+            stamped["verified_at"].clone(),
+            stamped["verified_by"].clone()
+        ),
+        (json!("unverified"), Value::Null, Value::Null)
+    );
+    report("112-verified-edit-reversed", &json!({"node": node}));
+
+    // A reversal raced by a later edit: conflict, no event, no change.
+    let preview = second.preview_reversal(&r_edit).expect("preview");
+    assert_eq!(preview.outcome, "ready");
+    let reverse = Reverse::of(preview.plan.as_ref().expect("plan"), None, None).expect("reverse");
+    let revision = node["revision"].as_str().expect("revision").to_owned();
+    accepted(
+        &applied(
+            &first,
+            &one,
+            &first
+                .change(vec![retitle(&claim, &revision, "Later")], None)
+                .expect("later"),
+        )
+        .1,
+    );
+    let head = prefix::complete(&one).expect("prefix").n;
+    let (prepared, outcome) = commanded(&second, &two, second.reverse(&reverse));
+    assert!(
+        matches!(outcome, GraphOutcome::Conflict { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code(prepared.key()), Some("reversal_conflict"));
+    assert_eq!(
+        prefix::complete(&one).expect("prefix").n,
+        head,
+        "no reversal event"
+    );
+    report("112-reversal-raced", &outcome_json(&outcome));
+
+    // The retained original deltas survive a restart unchanged.
+    close(one);
+    let one = device(1);
+    let prefix = prefix_at(&one, head);
+    assert_eq!(digest_of(&prefix, &m), merged_digest);
+    close(one);
+    close(two);
+}
+
+/// Story 111.2 with a reviewer: a proposal synced to its proposer only,
+/// read by its enumerated reviewer and approved into an accepted event; a
+/// superseded revision's approval refused `proposal_stale`; the seeded
+/// agent event in the unreviewed feed, acknowledged once (a second
+/// acknowledgement and a reversal of the acknowledgement refused), still
+/// reversible after it, and reversed by the reviewer (another's effect).
+#[test]
+#[ignore = "driven by keeper-hq's native graph harness (111.2 server)"]
+#[allow(clippy::too_many_lines)]
+fn graph_live_112_proposal_acknowledgement_and_unreviewed() {
+    let one = device(1);
+    let first = GraphClient::new(one.clone());
+    let review = reviewer();
+    let checker = GraphClient::new(review.clone());
+    let reviewer_actor = env("KEEPER_HQ_LIVE_REVIEWER_ACTOR");
+    let graph = env("KEEPER_HQ_LIVE_DATABASE");
+    let [p1, p2, n1, n2] = std::array::from_fn(|_| ulid());
+    let propose = |id: &str, node: &str, base: Option<&str>, title: &str| {
+        Proposal::new(
+            id.to_owned(),
+            base.map(str::to_owned),
+            first
+                .change(vec![create_node(node, title, json!({}))], None)
+                .expect("change"),
+            vec![reviewer_actor.clone()],
+            None,
+        )
+        .expect("proposal")
+    };
+    let proposal_one = propose(&p1, &n1, None, "Proposed");
+    let (_, outcome) = commanded(&first, &one, first.propose(&proposal_one));
+    let digest = proposal::digest(&graph, &proposal_one).expect("digest");
+    match &outcome {
+        GraphOutcome::Proposed { detail } => assert_eq!(
+            Value::Object(detail.clone()),
+            proposal::proposed_detail(&p1, "1", &digest)
+        ),
+        other => panic!("not proposed: {other:?}"),
+    }
+    // The proposer's own replica holds it; the reviewer reads it per call.
+    until(&one, "the proposal row", || {
+        let rows = one
+            .replica
+            .query(
+                "SELECT * FROM kg_proposals WHERE proposal_id = ?",
+                &[Value::from(p1.as_str())],
+            )
+            .expect("query");
+        (!rows.is_empty()).then_some(())
+    });
+    let held = review
+        .replica
+        .query("SELECT * FROM kg_proposals", &[])
+        .expect("query");
+    assert!(
+        held.is_empty(),
+        "a reviewer never syncs another's proposals"
+    );
+    let revisions = checker.proposal(&p1).expect("read");
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(
+        (revisions[0].status.as_str(), revisions[0].digest.as_str()),
+        ("open", digest.as_str())
+    );
+    let decision = |id: &str, revision: &str, digest: &str| Decision {
+        proposal_id: id.to_owned(),
+        proposal_revision: revision.to_owned(),
+        proposal_digest: digest.to_owned(),
+        verdict: Verdict::Approve,
+    };
+    let (_, outcome) = commanded(
+        &checker,
+        &review,
+        checker.decide(&decision(&p1, "1", &digest)),
+    );
+    let (approved, seq) = accepted(&outcome);
+    let prefix = prefix_at(&review, seq);
+    let event = prefix
+        .events
+        .iter()
+        .find(|e| e.event.id == approved)
+        .expect("event");
+    assert_eq!(
+        event.event.approval_basis.as_ref().expect("basis")["basis"],
+        "proposal"
+    );
+    report(
+        "112-proposal-approved",
+        &json!({"outcome": outcome_json(&outcome), "header": event.event}),
+    );
+
+    // A superseded revision cannot be approved.
+    let first_revision = propose(&p2, &n2, None, "Draft");
+    commanded(&first, &one, first.propose(&first_revision));
+    let stale_digest = proposal::digest(&graph, &first_revision).expect("digest");
+    commanded(
+        &first,
+        &one,
+        first.propose(&propose(&p2, &n2, Some("1"), "Edited draft")),
+    );
+    let head = prefix::complete(&review).expect("prefix").n;
+    let (prepared, outcome) = commanded(
+        &checker,
+        &review,
+        checker.decide(&decision(&p2, "1", &stale_digest)),
+    );
+    assert_eq!(
+        rejected_reason(&outcome),
+        Some("proposal_stale"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code(prepared.key()), Some("proposal_stale"));
+    assert_eq!(
+        prefix::complete(&review).expect("prefix").n,
+        head,
+        "no event"
+    );
+    report("112-proposal-stale", &outcome_json(&outcome));
+
+    // The seeded agent event is unreviewed until a reviewer acknowledges it.
+    let agent_event = env("KEEPER_HQ_LIVE_AGENT_EVENT");
+    let in_feed = |client: &GraphClient| {
+        let mut after = "0".to_owned();
+        loop {
+            let page = client.unreviewed(&after, 100).expect("feed");
+            if page.events.iter().any(|e| e.event.id == agent_event) {
+                return true;
+            }
+            if page.scanned_through == after {
+                return false;
+            }
+            after = page.scanned_through;
+        }
+    };
+    assert!(in_feed(&checker));
+    let prefix = prefix_at(&review, prefix::complete(&review).expect("prefix").n);
+    let original = digest_of(&prefix, &agent_event);
+    let target = Target::new(&agent_event, &original).expect("target");
+    let (_, outcome) = commanded(&checker, &review, checker.acknowledge(&target));
+    let (ack, seq) = accepted(&outcome);
+    assert!(!in_feed(&checker), "acknowledged events leave the feed");
+    let (_, again) = commanded(&checker, &review, checker.acknowledge(&target));
+    assert_eq!(rejected_reason(&again), Some("invalid_change"), "{again:?}");
+    let ack_preview = checker.preview_reversal(&ack).expect("preview");
+    assert_eq!(
+        (ack_preview.outcome.as_str(), ack_preview.reason.as_deref()),
+        ("rejected", Some("invalid_change"))
+    );
+    assert_eq!(digest_of(&prefix_at(&review, seq), &agent_event), original);
+    report(
+        "112-acknowledged",
+        &json!({"outcome": outcome_json(&outcome), "again": outcome_json(&again), "preview": ack_preview}),
+    );
+
+    // Acknowledgement leaves it reversible: the reviewer reverses another's
+    // effect.
+    let (_, outcome) = reversed(&checker, &review, &agent_event);
+    accepted(&outcome);
+    report("112-agent-event-reversed", &outcome_json(&outcome));
+    close(one);
+    close(review);
 }

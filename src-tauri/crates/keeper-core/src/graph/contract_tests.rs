@@ -8,7 +8,9 @@ use serde_json::{Map, Value};
 use super::protocol::candidate::{self, State, Verdict};
 use super::protocol::change;
 use super::protocol::delta::Op;
-use super::protocol::scope::{CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, RECEIPT_TABLE};
+use super::protocol::scope::{
+    CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE,
+};
 use super::protocol::SCHEMA_VERSION;
 use crate::notes::tags::normalise;
 
@@ -245,8 +247,9 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
 }
 
 /// Every graph table carries exactly one scope variable, `kg_graph` on the
-/// graph's rows and `kg_client` on receipts; no other table carries either,
-/// and no subscription reaches a graph table through any other variable.
+/// graph's rows, `kg_client` on receipts and `kg_proposal` on proposals;
+/// no other table carries any of them, and no subscription reaches a graph
+/// table through any other variable.
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
     let ir = crate::hq::syncular::schema().expect("schema");
@@ -280,11 +283,15 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
         scopes(RECEIPT_TABLE),
         [(CLIENT_VARIABLE.to_owned(), "client_scope".to_owned())]
     );
+    assert_eq!(
+        scopes(PROPOSAL_TABLE),
+        [(PROPOSAL_VARIABLE.to_owned(), "proposer_actor".to_owned())]
+    );
     for table in tables {
         let name = table["name"].as_str().expect("name");
         if name.starts_with("kg_") {
             assert!(
-                GRAPH_TABLES.contains(&name) || name == RECEIPT_TABLE,
+                GRAPH_TABLES.contains(&name) || name == RECEIPT_TABLE || name == PROPOSAL_TABLE,
                 "{name}"
             );
             continue;
@@ -304,10 +311,10 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
             .iter()
             .map(|scope| scope["variable"].as_str().expect("variable"))
             .collect();
-        let expected = if table == RECEIPT_TABLE {
-            CLIENT_VARIABLE
-        } else {
-            GRAPH_VARIABLE
+        let expected = match table {
+            RECEIPT_TABLE => CLIENT_VARIABLE,
+            PROPOSAL_TABLE => PROPOSAL_VARIABLE,
+            _ => GRAPH_VARIABLE,
         };
         assert_eq!(requested, [expected], "{table}");
     }

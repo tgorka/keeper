@@ -13,6 +13,17 @@
 //!   lookup over the projection (a content only while its owner is active,
 //!   unless archived ones are included);
 //! - `history [--after <n>] [--limit <n>]` — one page of retained history;
+//! - `unreviewed [--after <n>] [--limit <n>]` — one page of the unreviewed
+//!   feed (a reviewer's);
+//! - `propose <payload.json>` / `decide <payload.json>` — a `graph.propose`
+//!   or `graph.decide` payload and its outcome;
+//! - `proposal <proposal_id>` — the proposal's revisions as its enumerated
+//!   reviewer reads them;
+//! - `acknowledge <event_id> <delta_digest>` — a human review of one event;
+//! - `preview-reversal <event_id>` — the inverse and what it requires now;
+//! - `reverse <event_id>` — preview, then reverse under exactly the
+//!   previewed revisions (refused without a send unless the preview is
+//!   ready);
 //! - `status` — the replica's head and checkpoint and the projection's
 //!   runtime admission.
 //!
@@ -30,11 +41,13 @@ mod driver {
 
     use clap::{Parser, Subcommand};
     use keeper_core::graph::admission::{Admission, Process};
-    use keeper_core::graph::client::{subscriptions, GraphClient};
+    use keeper_core::graph::client::{subscriptions, Applied, GraphClient, GraphClientError};
     use keeper_core::graph::outcome::GraphOutcome;
-    use keeper_core::graph::protocol::change;
+    use keeper_core::graph::protocol::inverse::Reverse;
+    use keeper_core::graph::protocol::review::Target;
     use keeper_core::graph::protocol::wire::HistoryFilter;
     use keeper_core::graph::protocol::worker::InspectEntity;
+    use keeper_core::graph::protocol::{change, proposal};
     use keeper_core::graph::query::{
         Freshness, GraphReads, HumanReader, Inspected, QueryError, QueryResult,
     };
@@ -108,6 +121,31 @@ mod driver {
             #[arg(long, default_value_t = 100)]
             limit: u32,
         },
+        Unreviewed {
+            #[arg(long, default_value = "0")]
+            after: String,
+            #[arg(long, default_value_t = 100)]
+            limit: u32,
+        },
+        Propose {
+            payload: PathBuf,
+        },
+        Decide {
+            payload: PathBuf,
+        },
+        Proposal {
+            proposal_id: String,
+        },
+        Acknowledge {
+            event_id: String,
+            delta_digest: String,
+        },
+        PreviewReversal {
+            event_id: String,
+        },
+        Reverse {
+            event_id: String,
+        },
         Status,
     }
 
@@ -150,6 +188,45 @@ mod driver {
             }
             other => json!({"outcome": "pending", "state": format!("{other:?}")}),
         }
+    }
+
+    /// A command's answer: its request id, outcome and the stable code a
+    /// caller reports for it.
+    fn applied(answer: Result<Applied, GraphClientError>) -> Value {
+        match answer {
+            Ok(applied) => json!({
+                "ok": true,
+                "request_id": applied.prepared.request().request_id,
+                "descriptor": applied.prepared.key().descriptor(),
+                "outcome": match &applied.outcome {
+                    Ok(o) => {
+                        let mut v = outcome(o);
+                        v["code"] = json!(o.code(applied.prepared.key()));
+                        v
+                    }
+                    Err(e) => fail("pending", &e.to_string()),
+                },
+            }),
+            Err(e) => fail("refused", &e.to_string()),
+        }
+    }
+
+    fn payload(path: &PathBuf) -> Result<Value, Value> {
+        let text = std::fs::read(path).map_err(|e| fail("invalid_change", &e.to_string()))?;
+        keeper_core::graph::protocol::value::parse(&text).map_err(|r| fail(r.code(), "payload"))
+    }
+
+    /// Run `call` on a blocking thread once the replica's first round is
+    /// done.
+    async fn blocking(
+        source: &Source,
+        call: impl FnOnce(GraphClient) -> Value + Send + 'static,
+    ) -> Value {
+        let client = GraphClient::new(source.clone());
+        wait(source, Duration::from_secs(30), |_| true).await;
+        tokio::task::spawn_blocking(move || call(client))
+            .await
+            .unwrap_or_else(|e| fail("storage_unavailable", &e.to_string()))
     }
 
     fn result<T>(r: &QueryResult<T>, rows: Value) -> Value {
@@ -229,21 +306,7 @@ mod driver {
                     Ok(change) => change,
                     Err(refusal) => return fail(refusal.code(), "payload"),
                 };
-                let client = GraphClient::new(source.clone());
-                // The replica's first round must finish before a send.
-                wait(&source, Duration::from_secs(30), |_| true).await;
-                match tokio::task::spawn_blocking(move || client.apply(&change)).await {
-                    Ok(Ok(applied)) => json!({
-                        "ok": true,
-                        "request_id": applied.prepared.request().request_id,
-                        "outcome": match &applied.outcome {
-                            Ok(o) => outcome(o),
-                            Err(e) => fail("pending", &e.to_string()),
-                        },
-                    }),
-                    Ok(Err(e)) => fail("refused", &e.to_string()),
-                    Err(e) => fail("storage_unavailable", &e.to_string()),
-                }
+                blocking(&source, move |client| applied(client.apply(&change))).await
             }
             Command::Sync { wait_secs } => {
                 // Until the scope is settled either way, as 112.1's driver
@@ -345,6 +408,78 @@ mod driver {
                     Ok(Err(e)) => fail("refused", &e.to_string()),
                     Err(e) => fail("storage_unavailable", &e.to_string()),
                 }
+            }
+            Command::Unreviewed { after, limit } => {
+                let (after, limit) = (after.clone(), *limit);
+                blocking(&source, move |client| {
+                    match client.unreviewed(&after, limit) {
+                        Ok(page) => json!({"ok": true, "page": page}),
+                        Err(e) => fail("refused", &e.to_string()),
+                    }
+                })
+                .await
+            }
+            Command::Propose { payload: path } => {
+                let proposal = match payload(path).and_then(|v| {
+                    proposal::parse(&v, normalise).map_err(|r| fail(r.code(), "payload"))
+                }) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                blocking(&source, move |client| applied(client.propose(&proposal))).await
+            }
+            Command::Decide { payload: path } => {
+                let decision = match payload(path)
+                    .and_then(|v| proposal::parse_decide(&v).map_err(|r| fail(r.code(), "payload")))
+                {
+                    Ok(d) => d,
+                    Err(e) => return e,
+                };
+                blocking(&source, move |client| applied(client.decide(&decision))).await
+            }
+            Command::Proposal { proposal_id } => {
+                let id = proposal_id.clone();
+                blocking(&source, move |client| match client.proposal(&id) {
+                    Ok(rows) => json!({"ok": true, "revisions": rows}),
+                    Err(e) => fail("refused", &e.to_string()),
+                })
+                .await
+            }
+            Command::Acknowledge {
+                event_id,
+                delta_digest,
+            } => {
+                let target = match Target::new(event_id, delta_digest) {
+                    Ok(t) => t,
+                    Err(r) => return fail(r.code(), "target"),
+                };
+                blocking(&source, move |client| applied(client.acknowledge(&target))).await
+            }
+            Command::PreviewReversal { event_id } => {
+                let id = event_id.clone();
+                blocking(&source, move |client| match client.preview_reversal(&id) {
+                    Ok(preview) => json!({"ok": true, "preview": preview}),
+                    Err(e) => fail("refused", &e.to_string()),
+                })
+                .await
+            }
+            Command::Reverse { event_id } => {
+                let id = event_id.clone();
+                blocking(&source, move |client| {
+                    let preview = match client.preview_reversal(&id) {
+                        Ok(p) => p,
+                        Err(e) => return fail("refused", &e.to_string()),
+                    };
+                    let ready = preview.outcome == "ready";
+                    match preview.plan.as_ref().filter(|_| ready) {
+                        Some(plan) => match Reverse::of(plan, None, None) {
+                            Ok(reverse) => applied(client.reverse(&reverse)),
+                            Err(r) => fail(r.code(), "reverse"),
+                        },
+                        None => json!({"ok": false, "error": "not_ready", "preview": preview}),
+                    }
+                })
+                .await
             }
             Command::Status => {
                 let head = source.prefix_batch(0, 0).map(|b| b.head);

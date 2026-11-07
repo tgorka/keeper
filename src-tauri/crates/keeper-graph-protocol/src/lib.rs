@@ -22,9 +22,12 @@ pub mod candidate;
 pub mod change;
 pub mod content;
 pub mod delta;
+pub mod inverse;
 pub mod locator;
 pub mod profile;
+pub mod proposal;
 pub mod request;
+pub mod review;
 pub mod scope;
 pub mod symbol;
 pub mod value;
@@ -37,8 +40,9 @@ use std::fmt;
 /// The graph contract's version: a request envelope's `version`.
 pub const CONTRACT_VERSION: u32 = 1;
 /// The Syncular schema version of the graph tables a build reads and
-/// writes: 6 added the graph, 7 its stable content (`kg_contents`).
-pub const SCHEMA_VERSION: u32 = 7;
+/// writes: 6 added the graph, 7 its stable content (`kg_contents`), 8 its
+/// proposals and reviews (`kg_proposals`, `kg_reviews`).
+pub const SCHEMA_VERSION: u32 = 8;
 /// The query profile [`profile`] admits and whose symbols [`symbol`] maps.
 pub const PROFILE: &str = "KG-Cypher/1";
 

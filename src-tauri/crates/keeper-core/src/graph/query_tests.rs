@@ -155,6 +155,17 @@ impl State for Graph {
     }
 }
 
+/// A reversal's extra reads: every row was last written before any event
+/// a test reverses, and nothing references another node.
+impl candidate::Retained for Graph {
+    fn written_at(&self, _: &str) -> Option<u64> {
+        Some(0)
+    }
+    fn referrers(&self, _: &str, _: usize) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// A domain's server: the algebra over a graph, writing accepted events
 /// into a real replica as the server's sync would.
 struct World {
@@ -235,6 +246,47 @@ impl World {
         }
         self.events.push(effects.ops.clone());
         effects.ops
+    }
+
+    /// Accept already-judged event operations (a review, a reversal) as
+    /// the next event.
+    fn push(&mut self, ops: Vec<Op>) {
+        for op in &ops {
+            let map = match op.entity_type {
+                crate::graph::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
+                crate::graph::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
+                crate::graph::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
+                crate::graph::protocol::vocabulary::EntityType::Content => &mut self.graph.contents,
+                crate::graph::protocol::vocabulary::EntityType::Review => continue,
+                crate::graph::protocol::vocabulary::EntityType::NodeTag => {
+                    &mut self.graph.memberships
+                }
+            };
+            match &op.after_value {
+                Some(Value::Object(after)) => {
+                    map.insert(op.entity_id.clone(), after.clone());
+                }
+                _ => {
+                    map.remove(&op.entity_id);
+                }
+            }
+        }
+        self.events.push(ops);
+    }
+
+    /// Event `seq` as the server retains it (its header as [`Self::replicate`] writes it).
+    fn retained(&self, seq: u64) -> crate::graph::protocol::wire::Event {
+        let ops = self.events[usize::try_from(seq - 1).expect("seq")].clone();
+        serde_json::from_value(json!({
+            "event": {"id": Self::event_id(seq), "graph_seq": seq.to_string(), "descriptor": "graph.apply",
+                "request_id": ulid(2_000_000 + u32::try_from(seq).expect("seq")), "request_digest": "0".repeat(64),
+                "actor_id": "ana", "client_id": "dev1", "origin_class": "human", "origin_actor": null,
+                "origin_chain": null, "context_id": null, "approval_basis": {"basis": "direct"},
+                "reverses_event_id": null, "event_time_ms": null, "recorded_at_ms": 1,
+                "op_count": ops.len(), "delta_digest": crate::graph::protocol::delta::digest(&ops).expect("digest")},
+            "ops": ops,
+        }))
+        .expect("event")
     }
 
     fn event_id(seq: u64) -> String {
@@ -1560,4 +1612,87 @@ async fn projection_two_exposes_assertions_contents_and_merges() {
         json!(target),
         "reported, not substituted"
     );
+}
+
+/// Projection version 3: an acknowledgement's `review` operation is
+/// accepted and skipped (no entity, no symbol), and a merge's reversal
+/// re-projects the cleared redirect and the restored endpoint.
+#[tokio::test]
+async fn projection_three_skips_reviews_and_reprojects_a_reversed_merge() {
+    use crate::graph::protocol::{inverse, review};
+    let mut rig = Rig::new();
+    let (target, x, y) = (ulid(1), ulid(2), ulid(3));
+    rig.world.accept(vec![
+        node(&target, "Concept", "Target", json!({})),
+        node(&x, "Concept", "X", json!({})),
+        node(&y, "Concept", "Y", json!({})),
+    ]);
+    let ops = vec![edge(&rig.world, &ulid(10), &x, &y, "ex:rel", json!({}))];
+    rig.world.accept(ops);
+    let (x_rev, t_rev) = (rig.world.rev(&x), rig.world.rev(&target));
+    rig.world.accept(vec![ChangeOp::MergeNodes {
+        target_id: target.clone(),
+        target_revision: t_rev,
+        absorbed: vec![crate::graph::protocol::change::Absorbed {
+            id: x.clone(),
+            expected_revision: x_rev,
+        }],
+        edges: vec![crate::graph::protocol::change::MergeEdge {
+            id: ulid(10),
+            expected_revision: "1".into(),
+            from_lifecycle_revision: "1".into(),
+            to_lifecycle_revision: "1".into(),
+        }],
+    }]);
+    let merge = rig.world.retained(3);
+    let target_of =
+        review::Target::new(&merge.event.id, &merge.event.delta_digest).expect("target");
+    let ack = review::acknowledgement(&ulid(20), &target_of, "reviewer").expect("ack");
+    rig.world.push(ack.ops);
+    let plan = inverse::plan(&merge).expect("plan");
+    let stamp = candidate::Stamp {
+        time_ms: 2,
+        actor_id: "ana",
+    };
+    let Verdict::Accepted(reversal) =
+        candidate::apply_inverse(&rig.world.graph, &plan, &stamp, &mut || ulid(21))
+    else {
+        panic!("reversal");
+    };
+    rig.world.push(reversal.ops);
+    rig.world.replicate(1, 5, 5, None);
+    let reader = rig.reader();
+    let built = reader
+        .refresh(&Cancellation::default())
+        .await
+        .expect("generation");
+    assert_eq!(built.graph_seq, 5);
+    let rel = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Edge,
+        "ex:rel",
+    )
+    .expect("sym");
+    let hop =
+        format!("MATCH (a)-[e:{rel}]->(b) WHERE e.id = $e RETURN a.id AS from, b.id AS to LIMIT 1");
+    let rows = rig
+        .rows(&reader, &hop, &format!(r#"{{"e":"{}"}}"#, ulid(10)))
+        .await;
+    assert_eq!(
+        (rows[0]["from"].clone(), rows[0]["to"].clone()),
+        (json!(x), json!(y)),
+        "the restored endpoint is re-projected"
+    );
+    let visible = "MATCH (n) WHERE n.id = $id RETURN n.id AS id, n.merged_into_id AS m LIMIT 1";
+    let rows = rig
+        .rows(&reader, visible, &format!(r#"{{"id":"{x}"}}"#))
+        .await;
+    assert_eq!(
+        (rows[0]["id"].clone(), rows[0]["m"].clone()),
+        (json!(x), Value::Null)
+    );
+    let review_node = "MATCH (n) WHERE n.id = $id RETURN n.id AS id LIMIT 1";
+    assert!(rig
+        .rows(&reader, review_node, &format!(r#"{{"id":"{}"}}"#, ulid(20)))
+        .await
+        .is_empty());
 }

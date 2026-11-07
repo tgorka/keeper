@@ -42,8 +42,11 @@ pub const ENGINE: &str = "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb23
 /// active-only view. A generation of another version is rebuilt. Version 2
 /// replays `content` operations (kept for typed inspection, never projected
 /// as query symbols) and exposes the six assertion fields as structural
-/// keys of a node binding.
-pub const PROJECTION_VERSION: u32 = 2;
+/// keys of a node binding. Version 3 accepts `review` operations (schema 8)
+/// and skips them: a review is never an entity of a generation, and a
+/// reversal's node and edge operations replace their entities' images like
+/// any other.
+pub const PROJECTION_VERSION: u32 = 3;
 /// The most canonical bytes one frame may have, newline excluded.
 pub const MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
 /// The most canonical bytes one operation's after-image may have.
@@ -205,9 +208,9 @@ impl EventFrame {
     /// The frame's shape at position `expected`: the position, a ULID
     /// event, a digest, 1..=128 operations in ordinal order agreeing with
     /// `op_count`, and each operation's after-image as its operation
-    /// implies — its entity's whole image ([`image_ok`]) for everything but
-    /// a membership's removal, which has none. Schema 7 holds no `review`
-    /// entity.
+    /// implies — its entity's whole image ([`image_ok`], a review's
+    /// [`crate::review::image_ok`]) for everything but a membership's
+    /// removal, which has none; a review is only ever created.
     pub fn check(&self, expected: u64) -> Result<(), Refusal> {
         let count = self.ops.len();
         if self.graph_seq != expected
@@ -224,7 +227,14 @@ impl EventFrame {
                 return Err(Refusal::InvalidChange);
             }
             if op.entity_type == EntityType::Review {
-                return Err(Refusal::UnsupportedVersion);
+                let review = matches!(&op.after_value, Some(Value::Object(after))
+                    if op.operation == Operation::Create
+                        && op.after_revision.as_deref() == Some("1")
+                        && crate::review::image_ok(&op.entity_id, after));
+                if !review {
+                    return Err(Refusal::InvalidChange);
+                }
+                continue;
             }
             let membership = op.entity_type == EntityType::NodeTag;
             let revised = match &op.after_revision {

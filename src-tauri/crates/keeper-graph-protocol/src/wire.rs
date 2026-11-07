@@ -13,6 +13,9 @@
 //! | [`GET_EDGE`] | `id`, `include_archived` | `[]` or `[<edge image>]` |
 //! | [`GET_CONTENT`] | `id`, `include_archived` | `[]` or `[<content image>]` |
 //! | [`HISTORY`] | `after`, `limit`, `filter` | `[{"events": [{"event": <header>, "ops": [<op>…]}], "scanned_through": <decimal>}]` |
+//! | [`UNREVIEWED`] | `after`, `limit` | a [`HISTORY`] page of the unreviewed agent-origin events |
+//! | [`PREVIEW_REVERSAL`] | `event_id` | `[<preview>]` ([`crate::inverse::Preview`]) |
+//! | [`PROPOSAL`] | `proposal_id` | the proposal's revisions the caller reviews, ascending ([`ProposalRow`]) |
 //!
 //! Without `include_archived` a node is answered only while active, an
 //! edge only while it and both its endpoints are, and a content (which has
@@ -48,6 +51,18 @@ pub const GET_NODE: &str = "graph.get_node";
 pub const GET_EDGE: &str = "graph.get_edge";
 pub const GET_CONTENT: &str = "graph.get_content";
 pub const HISTORY: &str = "graph.history";
+/// The unreviewed feed (schema 8): every accepted event of `origin_class`
+/// `agent` whose descriptor is `graph.apply` or `graph.reverse` and that no
+/// `kg_reviews` row targets, paged exactly as [`HISTORY`] (same bounds,
+/// same `scanned_through` rule, decoded by [`decode_history`]). Readable by
+/// persons with the reviewer role only.
+pub const UNREVIEWED: &str = "graph.unreviewed";
+/// A reversal's inspection: the retained event's inverse and what it
+/// requires now. Inspection only — neither an approval nor a reservation.
+pub const PREVIEW_REVERSAL: &str = "graph.preview_reversal";
+/// A proposal's revisions as an enumerated reviewer reads them,
+/// re-authorised per call.
+pub const PROPOSAL: &str = "graph.proposal";
 
 /// The most events one history page may ask for.
 pub const MAX_HISTORY_LIMIT: u32 = 100;
@@ -99,6 +114,94 @@ pub fn history_params(
         "version": CONTRACT_VERSION, "context_id": context_id,
         "after": after, "limit": limit, "filter": filter,
     }))
+}
+
+/// [`UNREVIEWED`]'s params: the feed after graph position `after`, at most
+/// `limit` events.
+pub fn unreviewed_params(
+    context_id: Option<&str>,
+    after: &str,
+    limit: u32,
+) -> Result<Value, Refusal> {
+    if !is_decimal(after) || !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
+        return Err(Refusal::InvalidChange);
+    }
+    Ok(json!({
+        "version": CONTRACT_VERSION, "context_id": context_id, "after": after, "limit": limit,
+    }))
+}
+
+/// [`PREVIEW_REVERSAL`]'s params.
+pub fn preview_params(context_id: Option<&str>, event_id: &str) -> Result<Value, Refusal> {
+    if !is_ulid(event_id) {
+        return Err(Refusal::InvalidChange);
+    }
+    Ok(json!({ "version": CONTRACT_VERSION, "context_id": context_id, "event_id": event_id }))
+}
+
+/// [`PROPOSAL`]'s params.
+pub fn proposal_params(context_id: Option<&str>, proposal_id: &str) -> Result<Value, Refusal> {
+    if !is_ulid(proposal_id) {
+        return Err(Refusal::InvalidChange);
+    }
+    Ok(json!({ "version": CONTRACT_VERSION, "context_id": context_id, "proposal_id": proposal_id }))
+}
+
+/// One proposal revision as [`PROPOSAL`] answers it: the `kg_proposals`
+/// row without its scope, author and the proposer's private columns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalRow {
+    /// `<proposal_id>/<revision>`.
+    pub id: String,
+    pub proposal_id: String,
+    pub revision: String,
+    /// One of [`crate::proposal::STATUSES`].
+    pub status: String,
+    pub reason: Option<String>,
+    pub digest: String,
+    pub change: Value,
+    pub reviewers: Vec<String>,
+    pub expires_at_ms: Option<u64>,
+    pub proposer_actor: String,
+    pub created_at_ms: u64,
+    pub decided_at_ms: Option<u64>,
+    pub decided_by: Option<String>,
+    pub decided_event_id: Option<String>,
+}
+
+/// Decode [`PROPOSAL`]'s answer for `proposal_id`: every row that
+/// proposal's, ids `<proposal_id>/<revision>`, revisions strictly
+/// ascending, statuses known, digests hex. Anything else refuses
+/// `unsupported_version`.
+pub fn decode_proposals(
+    proposal_id: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<Vec<ProposalRow>, Refusal> {
+    let mut out: Vec<ProposalRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row: ProposalRow =
+            serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
+        let revision = row
+            .revision
+            .parse::<u128>()
+            .ok()
+            .filter(|_| is_decimal(&row.revision));
+        let after = out
+            .last()
+            .and_then(|last| last.revision.parse::<u128>().ok());
+        let ok = row.proposal_id == proposal_id
+            && row.id == format!("{proposal_id}/{}", row.revision)
+            && revision.is_some_and(|r| r > 0 && after.is_none_or(|a| r > a))
+            && crate::proposal::STATUSES.contains(&row.status.as_str())
+            && crate::worker::is_hex_digest(&row.digest)
+            && row.change.is_object();
+        if !ok {
+            return Err(Refusal::UnsupportedVersion);
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// An inspected node: its image and its tags' canonical texts.
@@ -240,8 +343,9 @@ fn content_ok(image: &Map<String, Value>, id: &str) -> bool {
 /// lifecycle_revision}`, an edge `{id, from_id, to_id, type, properties,
 /// lifecycle, revision}`, a tag `{id, text, label, revision}` or a
 /// membership `{id, node_id, tag_id}` or a content `{id, owner_node_id,
-/// revision, body}`, each field within its rules. Schema 7 holds no
-/// `review` image.
+/// revision, body}`, each field within its rules. A `review` image is
+/// never an entity a read answers: it is checked as an event operation's
+/// alone ([`crate::review::image_ok`]).
 #[must_use]
 pub fn image_ok(entity_type: EntityType, id: &str, image: &Map<String, Value>) -> bool {
     match entity_type {

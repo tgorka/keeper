@@ -2,10 +2,12 @@
 //!
 //! | tables | scope variable | value |
 //! | --- | --- | --- |
-//! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents` | `kg_graph` | the database's (domain's) name |
+//! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`, `kg_reviews` | `kg_graph` | the database's (domain's) name |
 //! | `kg_receipts` | `kg_client` | [`client_scope`] of the requesting actor and client |
+//! | `kg_proposals` | `kg_proposal` | the proposer's actor id: a replica subscribes to its own actor's only |
 //!
-//! No other variable reaches these tables. Bindings, contexts, session
+//! No other variable reaches these tables. An enumerated reviewer reads a
+//! proposal through an authorised remote query, never through `kg_proposal`. Bindings, contexts, session
 //! sources, authority epochs and reference indexes are the server's own
 //! tables and have no scope at all.
 
@@ -14,8 +16,11 @@ pub const GRAPH_VARIABLE: &str = "kg_graph";
 /// The `kg_client` scope variable.
 pub const CLIENT_VARIABLE: &str = "kg_client";
 
+/// The `kg_proposal` scope variable.
+pub const PROPOSAL_VARIABLE: &str = "kg_proposal";
+
 /// The tables scoped by `kg_graph`, in bootstrap order.
-pub const GRAPH_TABLES: [&str; 8] = [
+pub const GRAPH_TABLES: [&str; 9] = [
     "kg_events",
     "kg_event_ops",
     "kg_head",
@@ -24,9 +29,12 @@ pub const GRAPH_TABLES: [&str; 8] = [
     "kg_tags",
     "kg_node_tags",
     "kg_contents",
+    "kg_reviews",
 ];
 /// The table scoped by `kg_client`.
 pub const RECEIPT_TABLE: &str = "kg_receipts";
+/// The table scoped by `kg_proposal`.
+pub const PROPOSAL_TABLE: &str = "kg_proposals";
 
 /// The `kg_client` value of one actor's client:
 /// `<a>:<actor_id><c>:<client_id>`, `a` and `c` the UTF-8 byte lengths of

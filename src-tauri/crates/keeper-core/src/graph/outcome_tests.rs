@@ -731,3 +731,33 @@ fn every_key_dimension_separates_requests() {
         }
     }
 }
+
+/// The shared `outcomes` vectors: the code a caller reports for a receipt
+/// outcome depends on the request's descriptor (a reversal's conflict is
+/// `reversal_conflict`), never on a receipt field a conflict lacks.
+#[test]
+fn outcome_codes_follow_the_shared_vectors() {
+    const CORPUS: &str = include_str!("../../../../../syncular/knowledge-graph.vectors.json");
+    let corpus: Value = serde_json::from_str(CORPUS).expect("vectors");
+    let (_, owner) = owner("work");
+    for entry in corpus["outcomes"].as_array().expect("outcomes") {
+        let descriptor = entry["descriptor"].as_str().expect("descriptor");
+        let key = owner.key(descriptor, &request(REQUEST, 1)).expect("key");
+        let detail = Map::new();
+        let outcome = match entry["outcome"].as_str().expect("outcome") {
+            "conflict" => GraphOutcome::Conflict { detail },
+            "rejected" => GraphOutcome::Rejected {
+                reason: entry["reason"].as_str().expect("reason").to_owned(),
+                detail,
+            },
+            "proposed" => GraphOutcome::Proposed { detail },
+            _ => GraphOutcome::Accepted {
+                event_id: EVENT.into(),
+                graph_seq: "1".into(),
+                commit_seq: None,
+                detail,
+            },
+        };
+        assert_eq!(outcome.code(&key), entry["code"].as_str(), "{entry}");
+    }
+}

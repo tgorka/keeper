@@ -70,6 +70,15 @@ before the server release that first accepts a content operation or a reserved `
 version-1 worker answers `unsupported_version` (fails closed) on such an event until it is
 upgraded.
 
+### Schema 8 release prerequisite
+
+Schema 8 (`0008_knowledge_graph_review`) adds `kg_proposals`, `kg_reviews` and the bounded
+owner read index `kg_contents_owner_id`, and nothing else; 0006 and 0007 are unchanged. The
+server serves schemas 3 through 7 beside it with `kg_proposals` and `kg_reviews` omitted (and
+`kg_contents` below 7, as before). A keeper whose graph worker reads projection version 3 ships
+with or before the server release that first accepts a review or a reversal event: a version-2
+worker refuses a `review` operation (fails closed) until it is upgraded.
+
 
 ## Scopes
 
@@ -89,8 +98,9 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `agent` | an agent's actor id | the agents of this database that serve the person | itself | `agent_memory` |
 | `family` | a family name | the families of this database that serve the person | its own family | `agent_memory` |
 | `person_agent` | a person-agent key (*Ids*) | the key of (itself, agent) for each agent of this database that serves the person | the key of (person, itself) for each person of this database it serves | `standing_grants` |
-| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents` |
+| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`, `kg_reviews` |
 | `kg_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `kg_receipts` |
+| `kg_proposal` | a proposer's actor id | itself | itself | `kg_proposals` |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
@@ -591,6 +601,14 @@ an edge's never does, and no member is a query symbol:
   by a `remove` operation.
 - **`kg_contents`** (schema 7) — `owner_node_id` (fixed for good), `revision`, `body`,
   `created_event_id`, `updated_event_id`. A content has no lifecycle: its owner node's governs it.
+- **`kg_proposals`** (schema 8) — one immutable proposal revision, `id`
+  `<proposal_id>/<revision>`: `status` (`open` | `approved` | `rejected` | `expired` |
+  `superseded`), `reason`, `digest`, `change` (the `graph.apply` payload), `reviewers`,
+  `expires_at_ms`, the proposer's actor, client, context, origin and source labels, and the
+  decision's time, person and event. Private: synced to its proposer only; never replayed.
+- **`kg_reviews`** (schema 8) — one review of an accepted event, equal to its `review`
+  operation's after-image: `target_event_id`, `target_delta_digest`, `kind` (`acknowledgement` |
+  `reversal`), `reviewer_actor`, `revision` `1`, `created_event_id`. Never updated or deleted.
 - **`kg_receipts`** — the outcome of one request, `id` `<descriptor>/<request_id>/<client_scope>`:
   `descriptor`, `request_id`, `request_digest`, `outcome` (`accepted` | `proposed` | `conflict` |
   `rejected`; never `pending`), `reason` (a `rejected` receipt's stable code), `event_id` and
@@ -808,7 +826,7 @@ versions and whether the prefix is still the replica's whole history (`current`)
 
 **The worker frames.** The query projection is built and read by a separate single-use worker
 (`keeper-graph-query`). Its builder reads one manifest frame — domain, authority, N,
-`prefix_digest`, Syncular checkpoint, `contract_schema` 7, projection version (2) and engine —
+`prefix_digest`, Syncular checkpoint, `contract_schema` 8, projection version (3) and engine —
 and
 then exactly N event frames: `{graph_seq, event_id, op_count, delta_digest, ops}`, each op its
 row without the before-image (the consumer has already verified every event's digest and
@@ -816,7 +834,42 @@ before-images against its own replay). `prefix_digest` chains from 64 zeros: eac
 SHA-256 hex of the previous digest, `graph_seq` and `delta_digest`, newline-separated. A frame is
 at most 2 MiB, a prefix at most 100,000 events. Every Linux worker runs with exactly
 `GQL_STMT_CACHE=0` and `GLIBC_TUNABLES` equal to `worker.linux_glibc_tunables` in the vectors.
-`prefix_chains[]`, `manifests[]` and `worker` pin these.
+`prefix_chains[]`, `manifests[]` and `worker` pin these. A `review` operation is checked and
+skipped: no review is an entity of a generation (projection version 3).
+
+**Proposals and decisions** (story 111.2, `keeper-graph-protocol::proposal`). `graph.propose`'s
+payload is exactly `{proposal_id, base_revision, change, reviewers, expires_at_ms}`: a new
+proposal (`base_revision` null, revision 1) or the next revision of an open one, a `graph.apply`
+payload without `approval_id` validated as a write is, 1 to 16 ascending distinct reviewer actor
+ids, and an optional expiry. Its receipt is `proposed` with `{proposal_id, proposal_revision,
+proposal_digest}`; the digest is the SHA-256 of the JCS of `{version, graph, proposal_id,
+revision, change, reviewers, expires_at_ms}`. `graph.decide` (`{proposal_id, proposal_revision,
+proposal_digest, decision}`, `approve` | `reject`) is a person's who is enumerated on that
+revision: an approval is the proposal's accepted event (the decider's request, actor, client and
+origin class, context null, the proposer's origin, `approval_basis {basis: "proposal",
+proposal_id, proposal_revision, proposal_digest, proposer_actor, proposer_client,
+proposer_context}`) or terminally `rejected proposal_stale`; a rejection is `proposed` with the
+revision's new `status`. A reviewer reads a proposal through `graph.proposal`, authorised per
+call.
+
+**Reviews and reversals** (`review`, `inverse`). `graph.acknowledge` (`{target_event_id,
+target_delta_digest}`, a person with the reviewer role) adds one event of one `review` creation
+(kind `acknowledgement`) and its `kg_reviews` row; the acknowledged event never changes and stays
+reversible; a second acknowledgement is refused `invalid_change`. `graph.unreviewed` pages the
+agent-origin `graph.apply`/`graph.reverse` events no review targets, as `graph.history` pages.
+`graph.preview_reversal` answers one event's server-derived inverse (its planned operations, a
+restored membership's id null), the `expected` revisions and whether it applies now (`ready`,
+`conflict` or `rejected`). `graph.reverse` (`{target_event_id, target_delta_digest, expected,
+approval_id?, event_time_ms?}`, never operations) re-derives the inverse, requires the current
+graph to be exactly the target's after-images and `expected` exactly the plan's, and adds one
+event: the inverse operations and one `review` creation of kind `reversal`, with
+`reverses_event_id` set. An update restores the before-image, a create is archived, a merge is
+restored (redirect cleared, endpoints put back) and its reversal re-merges; every revision moves
+forward, no id is reused, and verification is never restored (always `unverified`). A later
+dependent of a node the reversal archives (an active edge, an owned content, a domain-visible
+reference written after the target) is a `conflict` whose precondition is `dependency`; a
+`graph.reverse` conflict is reported as `reversal_conflict`. `inverses[]`, `reversals[]`,
+`reviews[]`, `proposals[]` and `outcomes[]` pin these.
 
 ## The live check
 

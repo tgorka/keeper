@@ -99,6 +99,12 @@
 //! content one of its checked `sources` references (another verification
 //! included): that verification would be stale on acceptance, so the
 //! change refuses `invalid_change`.
+//!
+//! **Reversal.** [`apply_inverse`] is the second entry point: it judges a
+//! server-derived inverse ([`crate::inverse`]) through the same per-entity
+//! preconditions and whole-candidate checks, plus the reversal-only
+//! dependency rule and its `dependency` conflict precondition. Nothing a
+//! [`Change`] can name reaches it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -244,6 +250,7 @@ enum Slot {
     Tag(String),
     Membership(Operation, Image),
     Content(String, Operation),
+    Review(Image),
 }
 
 struct Candidate<'a> {
@@ -429,31 +436,34 @@ pub fn redirect_chain(state: &dyn State, id: &str) -> Result<Vec<String>, Refusa
 
 impl<'a> Candidate<'a> {
     fn new(state: &'a dyn State, change: &Change) -> Self {
-        let mut explicit = BTreeSet::new();
-        let mut updated = BTreeSet::new();
+        let mut candidate = Self::empty(state);
         for op in change.ops() {
             match op {
                 ChangeOp::UpdateNode { id, .. } => {
-                    explicit.insert(id.clone());
-                    updated.insert(id.clone());
+                    candidate.explicit.insert(id.clone());
+                    candidate.updated.insert(id.clone());
                 }
                 ChangeOp::CreateNode { id, .. }
                 | ChangeOp::ArchiveNode { id, .. }
                 | ChangeOp::UnarchiveNode { id, .. }
                 | ChangeOp::VerifyAssertion { id, .. } => {
-                    explicit.insert(id.clone());
+                    candidate.explicit.insert(id.clone());
                 }
                 _ => {}
             }
         }
+        candidate
+    }
+
+    fn empty(state: &'a dyn State) -> Self {
         Self {
             state,
             nodes: BTreeMap::new(),
             edges: BTreeMap::new(),
             contents: BTreeMap::new(),
             tags: BTreeMap::new(),
-            explicit,
-            updated,
+            explicit: BTreeSet::new(),
+            updated: BTreeSet::new(),
             emitted: BTreeSet::new(),
             verified: BTreeSet::new(),
             checked_targets: Vec::new(),
@@ -1427,6 +1437,12 @@ impl<'a> Candidate<'a> {
                 Slot::Membership(operation, image) => {
                     (EntityType::NodeTag, *operation, None, Some(image.clone()))
                 }
+                Slot::Review(image) => (
+                    EntityType::Review,
+                    Operation::Create,
+                    None,
+                    Some(image.clone()),
+                ),
             };
             let revision = |image: &Option<Image>| {
                 image
@@ -1479,6 +1495,7 @@ impl<'a> Candidate<'a> {
                         let after = &self.contents.get(key).ok_or(Refusal::InvalidChange)?.after;
                         json!({"entity_type": "content", "id": key, "revision": after.get("revision")})
                     }
+                    "review" => json!({"entity_type": "review", "id": key, "revision": "1"}),
                     _ => {
                         let tag = self.tags.get(key).ok_or(Refusal::InvalidChange)?;
                         json!({"entity_type": "tag", "id": tag.get("id"), "revision": "1"})
@@ -1535,4 +1552,441 @@ fn edit_properties(
     }
     image.insert("properties".into(), properties);
     Ok(())
+}
+
+/// What a reversal reads beyond a change's [`State`]: when a current row
+/// was last written, and who references a node. Both answer the current
+/// graph only.
+pub trait Retained: State {
+    /// The graph position of the event that last wrote the node, edge or
+    /// content `id` (`None` when there is no such row).
+    fn written_at(&self, id: &str) -> Option<u64>;
+    /// The nodes, edges and contents whose current row holds a typed
+    /// reference to node `node_id` that the domain may see (a `state:`
+    /// source of `domain` visibility: never a proposal's, an event's or a
+    /// receipt's), ascending by id, at most `limit`.
+    fn referrers(&self, node_id: &str, limit: usize) -> Vec<String>;
+}
+
+/// The most dependents (incident edges, owned contents and referrers) the
+/// dependency checks of one reversal may read.
+pub const MAX_DEPENDENCY_READS: usize = 10_000;
+
+/// Judge the reversal `plan` ([`crate::inverse::plan`]) against `state`, by
+/// `stamp`'s actor. The same machinery as [`apply`], in this order, the
+/// first failure deciding:
+///
+/// 1. the plan's own shape (`invalid_change`): each operation as
+///    [`crate::inverse`] maps it — ids, kinds, types and owners kept,
+///    `revision` one more than its before-image's, a node's
+///    `lifecycle_revision` one more exactly when its lifecycle changes, the
+///    operation the lifecycle transition names, images within their rules —
+///    no entity twice, and no node after-image `verified` or with a non-null
+///    `verified_at`/`verified_by` (X29: only `verify_assertion` verifies);
+/// 2. each operation's precondition, in order: the entity exactly its
+///    planned before-image now (else a conflict on its `revision`, or its
+///    `lifecycle_revision` when only that moved); a membership to remove
+///    present, one to restore absent (else a conflict on its node);
+/// 3. for each node the reversal archives, in plan order: a re-merge's
+///    target active and unmerged in the final candidate (else a
+///    `lifecycle_revision` conflict on the target), its redirect chain
+///    within [`MAX_REDIRECT_HOPS`] (`change_limit`; a cycle
+///    `invalid_change`) and no active edge left incident to it; for every
+///    archived node, no current-state dependent written after the target
+///    event ([`Retained`]: an active incident edge, an owned content, a
+///    domain-visible referrer). A blocked node is a conflict whose
+///    precondition is `dependency`, naming the node (never the dependent)
+///    at its current revision. More than [`MAX_DEPENDENCY_READS`] refuses
+///    `change_limit`;
+/// 4. typed references written, edges left active (endpoints active, a
+///    `guidance_scope` edge from a `Guidance` node), containment, node
+///    members by kind, content owners and reference bodies — as [`apply`];
+/// 5. verification: a `sources` edge (its from-node before or after) or a
+///    content of an assertion `verified` now refuses `invalid_change`
+///    unless the plan also holds an operation on that assertion;
+/// 6. the event: the planned operations, then one `review` creation of
+///    kind `reversal` naming the target, within [`crate::delta::digest`]'s
+///    bounds. Restored memberships and the review take ids from `mint`, in
+///    that order; `affected` ends with the review.
+pub fn apply_inverse(
+    state: &dyn Retained,
+    plan: &crate::inverse::Plan,
+    stamp: &Stamp<'_>,
+    mint: &mut dyn FnMut() -> String,
+) -> Verdict {
+    let mut candidate = Candidate::empty(state);
+    match candidate.inverse(state, plan, stamp, mint) {
+        Ok(effects) => Verdict::Accepted(effects),
+        Err(Stop::Conflict(detail)) => Verdict::Conflict(detail),
+        Err(Stop::Refused(refusal)) => Verdict::Refused(refusal),
+    }
+}
+
+/// Whether a node image carries any verification: `verified`, or a
+/// non-null `verified_at`/`verified_by`.
+fn carries_verification(node: &Image) -> bool {
+    assertion::is_verified(node)
+        || assertion::of(node).is_some_and(|a| {
+            !a.get("verified_at").is_none_or(Value::is_null)
+                || !a.get("verified_by").is_none_or(Value::is_null)
+        })
+}
+
+/// One planned operation's shape (step 1 of [`apply_inverse`]).
+fn planned_ok(op: &crate::inverse::PlannedOp) -> Result<(), Refusal> {
+    use crate::inverse::{next, transition};
+    use crate::wire::image_ok;
+    let image = |v: &Option<Value>| v.as_ref().and_then(Value::as_object).cloned();
+    let (before, after) = (image(&op.before_value), image(&op.after_value));
+    let ok = match (op.entity_type, op.operation) {
+        (EntityType::NodeTag, Operation::Remove) => before.as_ref().is_some_and(|b| {
+            op.after_value.is_none()
+                && op.entity_id.as_deref() == Some(text(b, "id").as_str())
+                && image_ok(EntityType::NodeTag, &text(b, "id"), b)
+        }),
+        (EntityType::NodeTag, Operation::Create) => after.as_ref().is_some_and(|a| {
+            op.before_value.is_none()
+                && op.entity_id.is_none()
+                && a.len() == 3
+                && a.get("id").is_some_and(Value::is_null)
+                && ["node_id", "tag_id"].iter().all(|k| {
+                    a.get(*k)
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::is_ulid)
+                })
+        }),
+        (EntityType::NodeTag, _) => false,
+        (EntityType::Node | EntityType::Edge | EntityType::Content, operation) => {
+            let (Some(b), Some(a), Some(id)) = (&before, &after, op.entity_id.as_deref()) else {
+                return Err(Refusal::InvalidChange);
+            };
+            let node = op.entity_type == EntityType::Node;
+            let fixed = match op.entity_type {
+                EntityType::Node => "kind",
+                EntityType::Edge => "type",
+                _ => "owner_node_id",
+            };
+            let lifecycle_ok = match op.entity_type {
+                EntityType::Content => operation == Operation::Update,
+                _ => operation == transition(&text(b, "lifecycle"), &text(a, "lifecycle")),
+            };
+            let lifecycle_revision_ok = !node || {
+                let current = text(b, "lifecycle_revision");
+                let moved = text(b, "lifecycle") != text(a, "lifecycle");
+                let want = if moved {
+                    next(&current).ok()
+                } else {
+                    Some(current)
+                };
+                want.as_deref() == Some(text(a, "lifecycle_revision").as_str())
+            };
+            image_ok(op.entity_type, id, b)
+                && image_ok(op.entity_type, id, a)
+                && b.get(fixed) == a.get(fixed)
+                && lifecycle_ok
+                && lifecycle_revision_ok
+                && next(&text(b, "revision")).ok().as_deref() == Some(text(a, "revision").as_str())
+                && op.before_revision.as_deref() == Some(text(b, "revision").as_str())
+                && op.after_revision.as_deref() == Some(text(a, "revision").as_str())
+                && !(node && carries_verification(a))
+        }
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Refusal::InvalidChange)
+    }
+}
+
+/// The conflict of an entity that is not exactly `expected` now.
+fn moved(entity_type: &str, id: &str, current: Option<&Image>, expected: &Image) -> Stop {
+    let Some(current) = current else {
+        return conflict(entity_type, id, "revision", None);
+    };
+    if entity_type == "node"
+        && text(current, "revision") == text(expected, "revision")
+        && text(current, "lifecycle_revision") != text(expected, "lifecycle_revision")
+    {
+        return conflict(
+            entity_type,
+            id,
+            "lifecycle_revision",
+            Some(text(current, "lifecycle_revision")),
+        );
+    }
+    conflict(entity_type, id, "revision", Some(text(current, "revision")))
+}
+
+impl Candidate<'_> {
+    fn inverse(
+        &mut self,
+        retained: &dyn Retained,
+        plan: &crate::inverse::Plan,
+        stamp: &Stamp<'_>,
+        mint: &mut dyn FnMut() -> String,
+    ) -> Result<Effects, Stop> {
+        let target = plan.target()?;
+        let after_seq: u64 = plan
+            .target_graph_seq
+            .parse()
+            .ok()
+            .filter(|_| crate::is_decimal(&plan.target_graph_seq))
+            .ok_or(Refusal::InvalidChange)?;
+        let mut entities = BTreeSet::new();
+        for op in &plan.ops {
+            planned_ok(op)?;
+            if let Some(id) = &op.entity_id {
+                if !entities.insert(id.clone()) {
+                    return Err(Refusal::InvalidChange.into());
+                }
+            }
+        }
+        for op in &plan.ops {
+            self.inverse_op(op, mint)?;
+            if let Some(id) = &op.entity_id {
+                if op.entity_type == EntityType::Node {
+                    self.updated.insert(id.clone());
+                }
+            }
+        }
+        for op in &plan.ops {
+            if op.entity_type == EntityType::Node {
+                let id = op.entity_id.as_deref().unwrap_or_default();
+                self.dependencies(retained, id, after_seq, &entities)?;
+            }
+        }
+        for value in std::mem::take(&mut self.written) {
+            self.references(&value)?;
+        }
+        for id in std::mem::take(&mut self.endpoint_checks) {
+            self.endpoints_active(&id)?;
+        }
+        let mut budget = 0;
+        for id in std::mem::take(&mut self.containment) {
+            self.acyclic(&id, &mut budget)?;
+        }
+        self.finish_inverse()?;
+        let id = mint();
+        let image = crate::review::image(&id, &target, crate::review::REVERSAL, stamp.actor_id)?;
+        self.slots.push(Slot::Review(image));
+        self.first("review", &id);
+        self.effects()
+    }
+
+    /// Step 2 of [`apply_inverse`] for one planned operation.
+    fn inverse_op(
+        &mut self,
+        op: &crate::inverse::PlannedOp,
+        mint: &mut dyn FnMut() -> String,
+    ) -> Result<(), Stop> {
+        let image = |v: &Option<Value>| -> Result<Image, Stop> {
+            Ok(v.as_ref()
+                .and_then(Value::as_object)
+                .cloned()
+                .ok_or(Refusal::InvalidChange)?)
+        };
+        let id = op.entity_id.clone().unwrap_or_default();
+        match op.entity_type {
+            EntityType::Node | EntityType::Edge | EntityType::Content => {
+                let (before, after) = (image(&op.before_value)?, image(&op.after_value)?);
+                let (name, current) = match op.entity_type {
+                    EntityType::Node => ("node", self.state.node(&id)),
+                    EntityType::Edge => ("edge", self.state.edge(&id)),
+                    _ => ("content", self.state.content(&id)),
+                };
+                if current.as_ref() != Some(&before) {
+                    return Err(moved(name, &id, current.as_ref(), &before));
+                }
+                let entry = Entry {
+                    before: Some(before.clone()),
+                    after: after.clone(),
+                    touched: true,
+                };
+                match op.entity_type {
+                    EntityType::Node => {
+                        self.written
+                            .push(after.get("properties").cloned().unwrap_or(Value::Null));
+                        self.nodes.insert(id.clone(), entry);
+                        self.slots.push(Slot::Node(id.clone(), op.operation));
+                        self.first("node", &id);
+                    }
+                    EntityType::Edge => {
+                        self.written
+                            .push(after.get("properties").cloned().unwrap_or(Value::Null));
+                        let active = text(&after, "lifecycle") == "active";
+                        let rewired = text(&before, "lifecycle") != "active"
+                            || text(&before, "from_id") != text(&after, "from_id")
+                            || text(&before, "to_id") != text(&after, "to_id");
+                        if active {
+                            self.endpoint_checks.push(id.clone());
+                            if rewired && text(&after, "type") == "contains" {
+                                self.containment.push(id.clone());
+                            }
+                        }
+                        self.edges.insert(id.clone(), entry);
+                        self.slots.push(Slot::Edge(id.clone(), op.operation));
+                        self.first("edge", &id);
+                    }
+                    _ => {
+                        self.contents.insert(id.clone(), entry);
+                        self.slots.push(Slot::Content(id.clone(), op.operation));
+                        self.first("content", &id);
+                    }
+                }
+            }
+            EntityType::NodeTag => {
+                let membership = match op.operation {
+                    Operation::Remove => image(&op.before_value)?,
+                    _ => image(&op.after_value)?,
+                };
+                let node_id = text(&membership, "node_id");
+                let current = self
+                    .state
+                    .membership(&node_id, &text(&membership, "tag_id"));
+                let holds = match op.operation {
+                    Operation::Remove => current.as_ref() == Some(&membership),
+                    _ => current.is_none(),
+                };
+                if !holds {
+                    let revision = self.state.node(&node_id).map(|n| text(&n, "revision"));
+                    return Err(conflict("node", &node_id, "revision", revision));
+                }
+                if op.operation == Operation::Remove {
+                    self.slots
+                        .push(Slot::Membership(Operation::Remove, membership));
+                } else {
+                    let mut restored = membership;
+                    restored.insert("id".into(), json!(mint()));
+                    self.slots
+                        .push(Slot::Membership(Operation::Create, restored));
+                }
+            }
+            _ => return Err(Refusal::InvalidChange.into()),
+        }
+        Ok(())
+    }
+
+    /// Step 3 of [`apply_inverse`] for node `id`, when the reversal
+    /// archives it.
+    fn dependencies(
+        &self,
+        retained: &dyn Retained,
+        id: &str,
+        after_seq: u64,
+        planned: &BTreeSet<String>,
+    ) -> Result<(), Stop> {
+        let Some(entry) = self.nodes.get(id) else {
+            return Ok(());
+        };
+        let before = entry.before.as_ref().ok_or(Refusal::InvalidChange)?;
+        if text(before, "lifecycle") != "active" || text(&entry.after, "lifecycle") != "archived" {
+            return Ok(());
+        }
+        let blocked = || conflict("node", id, "dependency", Some(text(before, "revision")));
+        let remerge = entry
+            .after
+            .get("merged_into_id")
+            .and_then(Value::as_str)
+            .filter(|_| before.get("merged_into_id").is_none_or(Value::is_null));
+        if let Some(into) = remerge {
+            let survivor = self.final_node(into);
+            let usable = survivor.as_ref().is_some_and(|s| {
+                text(s, "lifecycle") == "active"
+                    && s.get("merged_into_id").is_none_or(Value::is_null)
+            });
+            if into == id || !usable {
+                let current = survivor.map(|s| text(&s, "lifecycle_revision"));
+                return Err(conflict("node", into, "lifecycle_revision", current));
+            }
+            redirect_bound(self.state, &[id.to_owned()])?;
+        }
+        let later = |other: &str| {
+            !planned.contains(other) && retained.written_at(other).is_none_or(|at| at > after_seq)
+        };
+        let mut reads = 0usize;
+        let mut read = |count: usize| -> Result<usize, Stop> {
+            reads += count;
+            if reads > MAX_DEPENDENCY_READS {
+                return Err(Refusal::ChangeLimit.into());
+            }
+            Ok(MAX_DEPENDENCY_READS - reads + 1)
+        };
+        let ids = [id.to_owned()];
+        let found = self.state.incident_active(&ids, read(0)?);
+        read(found.len())?;
+        let mut edges: BTreeMap<String, Image> =
+            found.into_iter().map(|e| (text(&e, "id"), e)).collect();
+        for (edge_id, edge) in &self.edges {
+            edges.insert(edge_id.clone(), edge.after.clone());
+        }
+        for (edge_id, edge) in &edges {
+            let incident = text(edge, "from_id") == id || text(edge, "to_id") == id;
+            if incident
+                && text(edge, "lifecycle") == "active"
+                && (remerge.is_some() || later(edge_id))
+            {
+                return Err(blocked());
+            }
+        }
+        let owned = retained.contents_of(id, read(0)?);
+        read(owned.len())?;
+        if owned.iter().any(|c| later(&text(c, "id"))) {
+            return Err(blocked());
+        }
+        let referrers = retained.referrers(id, read(0)?);
+        read(referrers.len())?;
+        if referrers.iter().any(|r| later(r)) {
+            return Err(blocked());
+        }
+        Ok(())
+    }
+
+    /// Steps 4 (node members, contents) and 5 of [`apply_inverse`].
+    fn finish_inverse(&self) -> Result<(), Stop> {
+        for entry in self.nodes.values() {
+            let kind = text(&entry.after, "kind");
+            let properties = entry
+                .after
+                .get("properties")
+                .ok_or(Refusal::InvalidChange)?;
+            check_node_properties(Some(&kind), properties)?;
+        }
+        for entry in self.contents.values() {
+            if self
+                .final_node(&text(&entry.after, "owner_node_id"))
+                .is_none()
+            {
+                return Err(Refusal::InvalidChange.into());
+            }
+            if let Some(reference) = entry.after.get("body").and_then(|b| b.get("reference")) {
+                let resource = reference
+                    .get("resource_node_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.final_node(id));
+                if !resource.is_some_and(|r| text(&r, "kind") == "Resource") {
+                    return Err(Refusal::InvalidChange.into());
+                }
+            }
+        }
+        let guarded = |owner: &str| -> Result<(), Stop> {
+            if self.verified_before(owner) && !self.updated.contains(owner) {
+                return Err(Refusal::InvalidChange.into());
+            }
+            Ok(())
+        };
+        for entry in self.edges.values() {
+            if text(&entry.after, "type") != "sources" {
+                continue;
+            }
+            guarded(&text(&entry.after, "from_id"))?;
+            if let Some(before) = &entry.before {
+                guarded(&text(before, "from_id"))?;
+            }
+        }
+        for entry in self.contents.values() {
+            guarded(&text(&entry.after, "owner_node_id"))?;
+        }
+        Ok(())
+    }
 }

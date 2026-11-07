@@ -265,6 +265,34 @@ pub enum GraphOutcome {
     },
 }
 
+impl GraphOutcome {
+    /// The contract's stable error code (§7) a caller reports for this
+    /// outcome of `key`'s request, when it has one: a conflict of a
+    /// `graph.reverse` request is `reversal_conflict` and any other
+    /// conflict `revision_conflict` (a conflict receipt carries no reason;
+    /// its descriptor tells them apart, CC-X5); a rejection its reason
+    /// (`proposal_stale` for a stale approval); a mismatch, an unsupported
+    /// version and a technical refusal their codes. Accepted, proposed and
+    /// unresolved outcomes have none.
+    #[must_use]
+    pub fn code(&self, key: &RequestKey) -> Option<&str> {
+        match self {
+            Self::Conflict { .. } if key.descriptor() == super::protocol::inverse::REVERSE => {
+                Some("reversal_conflict")
+            }
+            Self::Conflict { .. } => Some("revision_conflict"),
+            Self::Rejected { reason, .. } => Some(reason),
+            Self::IdempotencyMismatch => Some("idempotency_mismatch"),
+            Self::Unsupported => Some("unsupported_version"),
+            Self::TechnicalRefusal { code } => Some(code),
+            Self::Accepted { .. }
+            | Self::Proposed { .. }
+            | Self::PendingVisibility { .. }
+            | Self::Pending { .. } => None,
+        }
+    }
+}
+
 /// Why a send or a receipt lookup did not happen.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum GraphRequestError {

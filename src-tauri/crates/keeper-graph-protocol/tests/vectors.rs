@@ -117,6 +117,8 @@ fn versions_and_vocabulary_agree() {
     assert_eq!(s["client_variable"], scope::CLIENT_VARIABLE);
     assert_eq!(s["graph_tables"], names(&scope::GRAPH_TABLES));
     assert_eq!(s["receipt_table"], scope::RECEIPT_TABLE);
+    assert_eq!(s["proposal_variable"], scope::PROPOSAL_VARIABLE);
+    assert_eq!(s["proposal_table"], scope::PROPOSAL_TABLE);
 }
 
 #[test]

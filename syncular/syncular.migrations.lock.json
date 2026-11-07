@@ -28,6 +28,10 @@
     {
       "name": "0007_knowledge_graph_contents",
       "sha256": "08ddca222e8214cd2d2eb6132b20d1cbdb69ab0a0ffc36f2bb8b1d330ed355bf"
+    },
+    {
+      "name": "0008_knowledge_graph_review",
+      "sha256": "8da0350aa0e8277211ccdf717df39aee06e43e326e9a0dee733948280219d267"
     }
   ],
   "head": {
@@ -968,6 +972,122 @@
         ]
       },
       {
+        "name": "kg_proposals",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "graph",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "proposal_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "status",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "reason",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "change",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "reviewers",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "expires_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "proposer_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "proposer_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "proposer_context",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "origin_actor",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "origin_chain",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "source_labels",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "decided_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "decided_by",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "decided_event_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
         "name": "kg_receipts",
         "primaryKey": "id",
         "columns": [
@@ -1024,6 +1144,62 @@
           {
             "name": "recorded_at_ms",
             "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "kg_reviews",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "graph",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "target_event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "target_delta_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "reviewer_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_event_id",
+            "type": "string",
             "nullable": false
           },
           {

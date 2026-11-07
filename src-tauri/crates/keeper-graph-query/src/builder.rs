@@ -16,7 +16,11 @@
 //! independent. Contents are replayed for typed inspection and never
 //! projected; a node's reserved `$` members are never property symbols,
 //! and its `$assertion` fields are projected under their own names
-//! (projection version 2).
+//! (projection version 2). A `review` operation (schema 8) is checked and
+//! skipped: a review is never an entity of a generation, and a reversal's
+//! node and edge operations replace their entities' images like any other,
+//! so a cleared or restored `merged_into_id` and restored endpoints are
+//! re-projected from the final images (projection version 3).
 
 use crate::engine::Result;
 use keeper_graph_protocol::symbol::{encode, SymbolKind};
@@ -49,7 +53,7 @@ fn entity_type(kind: EntityType) -> Result<&'static str> {
         EntityType::Tag => "tag",
         EntityType::NodeTag => "node_tag",
         EntityType::Content => "content",
-        EntityType::Review => return Err("entity type outside schema 7".into()),
+        EntityType::Review => return Err("a review is never replayed".into()),
     })
 }
 
@@ -73,7 +77,11 @@ pub fn build<R: BufRead>(connection: Connection, reader: &mut R) -> Result<Manif
         check(&event, sequence)?;
         digest = chain(&digest, sequence, &event.delta_digest);
         connection.execute_batch("SAVEPOINT accepted_event")?;
-        for op in &event.ops {
+        for op in event
+            .ops
+            .iter()
+            .filter(|op| op.entity_type != EntityType::Review)
+        {
             replay(&connection, op)?;
         }
         connection.execute(
@@ -166,10 +174,11 @@ pub fn canonical_bytes(value: &Value) -> Result<Vec<u8>> {
 /// One event frame's shape at position `expected`, checked in the worker
 /// without the shared value code (no normalized copy): the position, a
 /// ULID event and entities, a digest, 1..=128 operations agreeing with
-/// `op_count` in ordinal order, schema 7 entity types, the revision and
+/// `op_count` in ordinal order, schema 8 entity types, the revision and
 /// after-image each operation implies, each after-image admitted by
 /// [`validate_value`] within [`MAX_ROW_BYTES`] canonical bytes and of its
-/// entity's shape.
+/// entity's shape (a review's: a `create` at revision 1 of the review
+/// image).
 fn check(event: &EventFrame, expected: u64) -> Result<()> {
     let count = event.ops.len();
     if event.graph_seq != expected
@@ -190,7 +199,10 @@ fn check(event: &EventFrame, expected: u64) -> Result<()> {
         let membership = match op.entity_type {
             EntityType::NodeTag => true,
             EntityType::Node | EntityType::Edge | EntityType::Tag | EntityType::Content => false,
-            EntityType::Review => return Err("entity type outside schema 7".into()),
+            EntityType::Review => {
+                review(op)?;
+                continue;
+            }
         };
         let revised = match &op.after_revision {
             Some(revision) => !membership && keeper_graph_protocol::is_decimal(revision),
@@ -269,7 +281,21 @@ fn validate_entity(kind: EntityType, id: &str, value: &Value) -> Result<()> {
                 return Err("invalid content".into());
             }
         }
-        EntityType::Review => return Err("entity type outside schema 7".into()),
+        EntityType::Review => return Err("a review is checked as an operation".into()),
+    }
+    Ok(())
+}
+
+/// A review operation's shape: a `create` at revision 1 whose after-image
+/// is a review image within [`validate_value`].
+fn review(op: &keeper_graph_protocol::worker::FrameOp) -> Result<()> {
+    let image = match (&op.operation, &op.after_revision, &op.after_value) {
+        (Operation::Create, Some(revision), Some(Value::Object(image))) if revision == "1" => image,
+        _ => return Err("review operation refused".into()),
+    };
+    validate_value(op.after_value.as_ref().unwrap_or(&Value::Null), 0)?;
+    if !keeper_graph_protocol::review::image_ok(&op.entity_id, image) {
+        return Err("review image refused".into());
     }
     Ok(())
 }

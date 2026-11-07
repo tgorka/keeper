@@ -13,7 +13,7 @@ use super::client::{GraphClient, GraphClientError};
 use super::outcome::GraphOutcome;
 use super::prefix::{self, PrefixError};
 use super::protocol::candidate::{self, State, Verdict};
-use super::protocol::change::{Change, ChangeOp};
+use super::protocol::change::{Change, ChangeOp, DESCRIPTOR};
 use super::protocol::delta::Op;
 use super::protocol::scope::{client_scope, event_op_id, receipt_id};
 use crate::hq::port::{ReplicaSpec, RowOp};
@@ -303,11 +303,14 @@ fn a_change_is_never_sent_without_a_link_and_its_id_survives_a_restart() {
     let client = GraphClient::new(source.clone());
     let saved: Value = serde_json::from_str(&persisted).expect("read back");
     let restored = client
-        .prepared(super::protocol::request::Request {
-            request_id: saved["request_id"].as_str().expect("id").to_owned(),
-            context_id: None,
-            payload: saved["payload"].clone(),
-        })
+        .prepared(
+            super::protocol::change::DESCRIPTOR,
+            super::protocol::request::Request {
+                request_id: saved["request_id"].as_str().expect("id").to_owned(),
+                context_id: None,
+                payload: saved["payload"].clone(),
+            },
+        )
         .expect("restored");
     assert_eq!(restored.key(), prepared.key());
 
@@ -353,9 +356,29 @@ fn a_restored_request_must_still_be_a_persons_change() {
         payload,
     };
     let change = json!({"ops": [{"op": "archive_node", "id": ulid(1), "expected_revision": "1"}]});
-    assert!(client.prepared(request(None, change.clone())).is_ok());
-    assert!(client.prepared(request(Some(ulid(4)), change)).is_err());
-    assert!(client.prepared(request(None, json!({"ops": []}))).is_err());
+    assert!(client
+        .prepared(DESCRIPTOR, request(None, change.clone()))
+        .is_ok());
+    assert!(client
+        .prepared(DESCRIPTOR, request(Some(ulid(4)), change.clone()))
+        .is_err());
+    assert!(client
+        .prepared(DESCRIPTOR, request(None, json!({"ops": []})))
+        .is_err());
+    // A payload is restored only as the command it is: a change is not a
+    // reversal, and no descriptor outside the client's commands restores.
+    assert!(client
+        .prepared("graph.reverse", request(None, change.clone()))
+        .is_err());
+    assert!(client
+        .prepared("graph.outcome", request(None, change.clone()))
+        .is_err());
+    let reverse = json!({"target_event_id": ulid(5), "target_delta_digest": "ab".repeat(32),
+        "expected": [{"entity_type": "node", "id": ulid(1), "revision": "2", "lifecycle_revision": "1"}]});
+    assert!(client
+        .prepared("graph.reverse", request(None, reverse.clone()))
+        .is_ok());
+    assert!(client.prepared(DESCRIPTOR, request(None, reverse)).is_err());
 }
 
 /// Event 1, then event 2's header with its operation rows replaced by
