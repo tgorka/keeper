@@ -345,6 +345,59 @@ canonical bytes per image; canonical bytes are serialized from the borrowed valu
 normalized copy). A value the server accepted beyond these (e.g. a title over 64 KiB) makes
 the projection `projection_unavailable`: an R1 limit.
 
+### Graph intents, revocation and offline reads (story 112.1)
+
+**Queued changes are local intent, never graph data.** A person's graph change can be
+persisted before it is sent (`keeper_core::graph::queue`, `keeper-graph-driver enqueue`) in
+`<actor>.graph-queue` beside the replica: one SQLite file per server, domain and actor,
+never synced. It holds the whole request identity, the request's canonical bytes and their
+digest, and the entry's state. Queries never see it: the default query answers the accepted
+graph only, and there is no provisional view. A restored entry is rebuilt from its own
+bytes. One whose bytes no longer match its digest is refused and kept as it was; one whose
+identity is not the opened one (another server, account, device or domain) is `suspended`
+and never sent. A terminal outcome is persisted first, and the payload is deleted after;
+terminal records stay until acknowledged or until the server is forgotten. `forget` deletes
+the queue files with the server's replicas and logs how many entries in each state it
+dropped. Agent writes are online-only: keeper keeps no offline agent queue.
+
+**Revocation locks first and cleans up after.** On a revocation signal (a refused link, a
+revoked graph subscription, or the server's refusal of a read), the domain is fenced: the
+in-memory gate closes, a `graph_fence` row is committed in the queue file, every open entry
+becomes `disabled` (identity and payload kept, never sent again), and in-flight workers are
+killed and the projection purged. Reads, results, receipts, history and the queue listing
+refuse from the first step; a crash at any step restarts locked. The replica's own graph rows
+are purged only by the server's scope revocation, which the Syncular client applies
+atomically. keeper never deletes them itself. The fence records `purged` only once a history
+subscription reads revoked, and unlocks only after fresh authority (a successful
+`read_status`, granted subscriptions and a new projection instance). A refusal learned before
+the server's revoke frame keeps the domain locked. After a regrant a disabled entry stays
+disabled: it can be discarded or resolved by its own receipt, never resent.
+
+**What keeper does not claim.** Revocation stops this device from serving graph data from the
+moment it learns of it. It does not erase anything remotely, and it cannot recall bytes
+already delivered to a reader. Until the device learns of a revocation, a person may read
+what was last authorised (below). The purge of the receipts table and of tables added after
+110.5 is not yet observed by the fence; it depends on the server revoking those scopes too.
+
+**Last-authorised offline reads (people only).** A person's query or inspect may be served
+while the server cannot be reached only when all of these hold:
+- the server's `read_status` failed because the request left the device and its transport
+  failed (`QueryError::Unreachable`). Any other failure never serves: a local refusal, a
+  closed replica, an unreadable answer, a failed task, a storage error. A refusal fences;
+- no fence stands;
+- the graph subscriptions are granted and the link is not refused;
+- the caller asked for it (`Freshness::AllowStale`, the driver's `--allow-stale`);
+- the generation was built under the authority the last successful online `read_status`
+  answered;
+- that answer is not from the future and is at most `OFFLINE_READ_LIMIT` (24 h, inclusive)
+  old on the device's clock.
+
+Everything is checked again at delivery against a fresh clock. The result is always
+`stale`. Offline, nothing builds or extends a projection. The first successful `read_status`
+after reconnecting replaces the kept authority. Agents read nothing offline: an agent's
+reader refuses whenever its context cannot be refreshed, so offline it is exposed to no
+graph domain.
+
 ### Existing platform exceptions
 
 - iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via
