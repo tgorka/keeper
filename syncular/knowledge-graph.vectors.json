@@ -19,6 +19,14 @@
     ],
     "edge_fields": ["id", "from_id", "to_id", "type", "lifecycle", "revision"],
     "tag_fields": ["id", "text"],
+    "assertion_fields": [
+      "generated_at",
+      "observed_at",
+      "verified_at",
+      "verified_by",
+      "stale_after",
+      "status"
+    ],
     "lifecycles": ["active", "archived"],
     "entity_types": ["node", "edge", "tag", "node_tag", "content", "review"],
     "operations": ["create", "update", "archive", "unarchive", "remove"],
@@ -241,6 +249,36 @@
     {
       "id": "shadows-merged_into_id",
       "json": "{\"merged_into_id\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-generated_at",
+      "json": "{\"generated_at\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-observed_at",
+      "json": "{\"observed_at\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-verified_at",
+      "json": "{\"verified_at\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-verified_by",
+      "json": "{\"verified_by\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-stale_after",
+      "json": "{\"stale_after\":1}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "shadows-status",
+      "json": "{\"status\":1}",
       "refusal": "invalid_change"
     },
     {
@@ -515,6 +553,30 @@
     {
       "kind": "node",
       "name": "ns:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "kind": "property",
+      "name": "generated_at"
+    },
+    {
+      "kind": "property",
+      "name": "observed_at"
+    },
+    {
+      "kind": "property",
+      "name": "verified_at"
+    },
+    {
+      "kind": "property",
+      "name": "verified_by"
+    },
+    {
+      "kind": "property",
+      "name": "stale_after"
+    },
+    {
+      "kind": "property",
+      "name": "status"
     }
   ],
   "decode_refusals": [
@@ -557,6 +619,30 @@
     {
       "kind": "property",
       "symbol": "score"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_67656e6572617465645f6174"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_6f627365727665645f6174"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_76657269666965645f6174"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_76657269666965645f6279"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_7374616c655f6166746572"
+    },
+    {
+      "kind": "property",
+      "symbol": "P_737461747573"
     }
   ],
   "stored_kinds": {
@@ -12961,6 +13047,18 @@
       "source": "MATCH (n) WHERE n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p AND n.revision = $p RETURN n.id AS id LIMIT 1",
       "parameters": "{\"p\":1}",
       "refusal": "query_limit"
+    },
+    {
+      "id": "assertion-field-bare",
+      "source": "MATCH (n:Concept) WHERE n.stale_after <= $t RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"t\":1}",
+      "refusal": "query_unsupported"
+    },
+    {
+      "id": "assertion-field-symbol",
+      "source": "MATCH (n:Concept) WHERE n.P_7374616c655f6166746572 <= $t RETURN n.id AS id LIMIT 1",
+      "parameters": "{\"t\":1}",
+      "refusal": "query_unsupported"
     }
   ],
   "prefix_chains": [

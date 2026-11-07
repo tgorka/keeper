@@ -504,7 +504,10 @@ never a node's kind or an edge's type; they are how a query sees tags. Any other
 a custom name, `<namespace>:<name>`, which can therefore never spell a reserved one. A node's
 structural fields are `id`, `kind`, `title`, `description`, `description_source_id`,
 `lifecycle`, `lifecycle_revision`, `revision` and `merged_into_id`; an edge's `id`, `from_id`,
-`to_id`, `type`, `lifecycle` and `revision`; a tag's `id` and `text`. A tag's `text` is the
+`to_id`, `type`, `lifecycle` and `revision`; a tag's `id` and `text`. The assertion names
+`generated_at`, `observed_at`, `verified_at`, `verified_by`, `stale_after` and `status` are
+reserved: no property may use them, and `KG-Cypher/1` has no symbol for them, until the
+assertion story stores and exposes them (`vocabulary.assertion_fields` in the vectors). A tag's `text` is the
 canonical form keeper's tag policy gives (`tags` in the vectors). In the query profile
 `KG-Cypher/1` a reserved name is its own symbol, and a custom kind, relationship type or
 property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes.

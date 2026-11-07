@@ -27,6 +27,18 @@ pub const NODE_FIELDS: [&str; 9] = [
 pub const EDGE_FIELDS: [&str; 6] = ["id", "from_id", "to_id", "type", "lifecycle", "revision"];
 /// A projected Tag node's fields: its id and its canonical text.
 pub const TAG_FIELDS: [&str; 2] = ["id", "text"];
+/// Assertion metadata names (contract §3), reserved before any query: no
+/// custom property may use one. Schema 6 stores none of them and
+/// `KG-Cypher/1` exposes none; the story that stores assertions decides
+/// where they live and exposes them under a new projection version.
+pub const ASSERTION_FIELDS: [&str; 6] = [
+    "generated_at",
+    "observed_at",
+    "verified_at",
+    "verified_by",
+    "stale_after",
+    "status",
+];
 /// The bytes a custom (namespaced) kind, type or property key may hold.
 pub const MAX_NAME_BYTES: usize = 256;
 
@@ -133,8 +145,11 @@ pub fn stored_edge_type(kind: &str) -> Result<(), Refusal> {
 }
 
 /// Whether a custom property key would shadow a structural field of a node,
-/// an edge or a projected tag.
+/// an edge or a projected tag, or a reserved assertion field.
 #[must_use]
 pub fn is_structural_field(key: &str) -> bool {
-    NODE_FIELDS.contains(&key) || EDGE_FIELDS.contains(&key) || TAG_FIELDS.contains(&key)
+    NODE_FIELDS.contains(&key)
+        || EDGE_FIELDS.contains(&key)
+        || TAG_FIELDS.contains(&key)
+        || ASSERTION_FIELDS.contains(&key)
 }

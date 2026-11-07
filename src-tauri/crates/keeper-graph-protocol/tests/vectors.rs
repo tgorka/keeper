@@ -63,6 +63,7 @@ fn versions_and_vocabulary_agree() {
     assert_eq!(w["node_fields"], names(&vocabulary::NODE_FIELDS));
     assert_eq!(w["edge_fields"], names(&vocabulary::EDGE_FIELDS));
     assert_eq!(w["tag_fields"], names(&vocabulary::TAG_FIELDS));
+    assert_eq!(w["assertion_fields"], names(&vocabulary::ASSERTION_FIELDS));
     assert_eq!(
         w["lifecycles"],
         names(&[Lifecycle::Active, Lifecycle::Archived])
