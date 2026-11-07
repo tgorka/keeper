@@ -672,3 +672,301 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
         &json!({"refused": format!("{:?}", refused.err())}),
     );
 }
+
+fn rejected_reason(outcome: &GraphOutcome) -> Option<&str> {
+    match outcome {
+        GraphOutcome::Rejected { reason, .. } => Some(reason.as_str()),
+        _ => None,
+    }
+}
+
+/// Story 111.1 on two devices of an editor: a collection with two parents
+/// (add, reorder, remove), persisted content across a restart and its
+/// stale-revision conflict, a merge whose redirect is reported and whose
+/// content stays with the absorbed identity, a person's verification bound
+/// to the checked state (and its stale-state conflict), and refusals with
+/// no effect: a credential-bearing locator (refused by the client before it
+/// is sent) and a
+/// `Vocabulary` node, which an editor may not write (owner only).
+#[test]
+#[ignore = "driven by keeper-hq's native graph harness (111.1 server)"]
+#[allow(clippy::too_many_lines)]
+fn graph_live_111_collections_content_merge_and_verification() {
+    let (one, two) = (device(1), device(2));
+    let (first, second) = (GraphClient::new(one.clone()), GraphClient::new(two.clone()));
+    let [p1, p2, k, c, x, t, claim, res, e1, e2, e3, e4, src] = std::array::from_fn(|_| ulid());
+    let contains = |id: &str, from: &str, key: &str| ChangeOp::CreateEdge {
+        id: id.to_owned(),
+        from_id: from.to_owned(),
+        to_id: k.clone(),
+        edge_type: "contains".to_owned(),
+        properties: json!({"order_key": key}).as_object().expect("p").clone(),
+        from_lifecycle_revision: None,
+        to_lifecycle_revision: None,
+    };
+    let collection = |id: &str| ChangeOp::CreateNode {
+        id: id.to_owned(),
+        kind: "Collection".to_owned(),
+        title: "C".to_owned(),
+        description: None,
+        properties: Map::new(),
+    };
+    let assertion = json!({"generated_at": null, "observed_at": 1, "verified_at": null,
+                           "verified_by": null, "stale_after": null, "status": "unverified"});
+    let setup = first
+        .change(
+            vec![
+                collection(&p1),
+                collection(&p2),
+                create_node(&k, "Member", json!({})),
+                contains(&e1, &p1, "b"),
+                contains(&e2, &p2, "a"),
+                create_node(&x, "Absorbed", json!({})),
+                create_node(&t, "Survivor", json!({})),
+                ChangeOp::CreateContent {
+                    id: c.clone(),
+                    owner_node_id: x.clone(),
+                    body: json!({"inline_text": "v1"}),
+                },
+                ChangeOp::CreateNode {
+                    id: res.clone(),
+                    kind: "Resource".to_owned(),
+                    title: "Source".to_owned(),
+                    description: None,
+                    properties: Map::new(),
+                },
+                create_node(&claim, "Claim", json!({"$assertion": assertion})),
+                ChangeOp::CreateEdge {
+                    id: src.clone(),
+                    from_id: claim.clone(),
+                    to_id: res.clone(),
+                    edge_type: "sources".to_owned(),
+                    properties: json!({"source": {"$ref": {"entity_type": "node", "id": res, "revision": "1"}}})
+                        .as_object()
+                        .expect("p")
+                        .clone(),
+                    from_lifecycle_revision: None,
+                    to_lifecycle_revision: None,
+                },
+            ],
+            None,
+        )
+        .expect("setup");
+    let (_, outcome) = applied(&first, &one, &setup);
+    let (_, seq) = accepted(&outcome);
+    report("111-setup", &outcome_json(&outcome));
+    for source in [&one, &two] {
+        let prefix = prefix_at(source, seq);
+        let content = &prefix.state[&("content".to_owned(), c.clone())];
+        assert_eq!(
+            (
+                content["owner_node_id"].as_str(),
+                content["revision"].as_str()
+            ),
+            (Some(x.as_str()), Some("1"))
+        );
+    }
+
+    // Reorder is a property edit of one membership; remove archives it.
+    let reorder = second
+        .change(
+            vec![ChangeOp::UpdateEdge {
+                id: e1.clone(),
+                expected_revision: "1".into(),
+                set_properties: json!({"order_key": "0"}).as_object().expect("p").clone(),
+                remove_properties: Vec::new(),
+                from_lifecycle_revision: "1".into(),
+                to_lifecycle_revision: "1".into(),
+            }],
+            None,
+        )
+        .expect("reorder");
+    accepted(&applied(&second, &two, &reorder).1);
+    let remove = first
+        .change(
+            vec![ChangeOp::ArchiveEdge {
+                id: e2.clone(),
+                expected_revision: "1".into(),
+                from_lifecycle_revision: "1".into(),
+                to_lifecycle_revision: "1".into(),
+            }],
+            None,
+        )
+        .expect("remove");
+    let (_, removed) = applied(&first, &one, &remove);
+    let (_, seq) = accepted(&removed);
+    let prefix = prefix_at(&two, seq);
+    let edge = |id: &String| prefix.state[&("edge".to_owned(), id.clone())].clone();
+    assert_eq!(
+        (
+            edge(&e1)["properties"]["order_key"].clone(),
+            edge(&e2)["lifecycle"].clone()
+        ),
+        (json!("0"), json!("archived"))
+    );
+    report("111-collection", &json!({"e1": edge(&e1), "e2": edge(&e2)}));
+
+    // Content survives a restart; its update moves only its own revision; a
+    // stale update conflicts and writes nothing.
+    close(one);
+    let one = device(1);
+    let first = GraphClient::new(one.clone());
+    let before = first.get_node(&x, false).expect("read").expect("owner");
+    let update = |expected: &str, text: &str| {
+        first
+            .change(
+                vec![ChangeOp::UpdateContent {
+                    id: c.clone(),
+                    owner_node_id: x.clone(),
+                    expected_revision: expected.to_owned(),
+                    body: json!({"inline_text": text}),
+                }],
+                None,
+            )
+            .expect("content update")
+    };
+    accepted(&applied(&first, &one, &update("1", "v2")).1);
+    let (_, stale) = applied(&first, &one, &update("1", "v3"));
+    assert!(matches!(stale, GraphOutcome::Conflict { .. }), "{stale:?}");
+    let content = first
+        .get_content(&c, false)
+        .expect("read")
+        .expect("content");
+    let after = first.get_node(&x, false).expect("read").expect("owner");
+    assert_eq!(
+        (
+            content["revision"].clone(),
+            content["body"]["inline_text"].clone()
+        ),
+        (json!("2"), json!("v2"))
+    );
+    assert_eq!(
+        (
+            after.image["revision"].clone(),
+            after.image["lifecycle_revision"].clone()
+        ),
+        (
+            before.image["revision"].clone(),
+            before.image["lifecycle_revision"].clone()
+        )
+    );
+    report(
+        "111-content",
+        &json!({"content": content, "stale": outcome_json(&stale)}),
+    );
+
+    // Merge: the redirect is reported, never substituted; the content stays.
+    let merge = first
+        .change(
+            vec![ChangeOp::MergeNodes {
+                target_id: t.clone(),
+                target_revision: "1".into(),
+                absorbed: vec![keeper_core::graph::protocol::change::Absorbed {
+                    id: x.clone(),
+                    expected_revision: revision(&after.image, "revision"),
+                }],
+                edges: Vec::new(),
+            }],
+            None,
+        )
+        .expect("merge");
+    accepted(&applied(&first, &one, &merge).1);
+    assert_eq!(second.redirects(&x).expect("read"), Some(vec![t.clone()]));
+    let absorbed = second.get_node(&x, true).expect("read").expect("absorbed");
+    assert_eq!(absorbed.image["id"], x.as_str());
+    let kept = second
+        .get_content(&c, true)
+        .expect("read")
+        .expect("content");
+    assert_eq!(
+        (kept["owner_node_id"].clone(), kept["revision"].clone()),
+        (json!(x), json!("2"))
+    );
+    report(
+        "111-merge",
+        &json!({"absorbed": absorbed.image, "content": kept}),
+    );
+
+    // Verification by the person, bound to the checked state.
+    let verify = |expected: &str| {
+        second
+            .change(
+                vec![ChangeOp::VerifyAssertion {
+                    id: claim.clone(),
+                    expected_revision: expected.to_owned(),
+                    sources: vec![keeper_core::graph::protocol::change::CheckedSource {
+                        edge_id: src.clone(),
+                        edge_revision: "1".into(),
+                        ref_id: res.clone(),
+                        ref_revision: "1".into(),
+                    }],
+                    contents: Vec::new(),
+                }],
+                None,
+            )
+            .expect("verify")
+    };
+    let (_, stale) = applied(&second, &two, &verify("2"));
+    assert!(matches!(stale, GraphOutcome::Conflict { .. }), "{stale:?}");
+    accepted(&applied(&second, &two, &verify("1")).1);
+    let verified = second
+        .get_node(&claim, false)
+        .expect("read")
+        .expect("claim");
+    let stamped = &verified.image["properties"]["$assertion"];
+    assert_eq!(
+        (stamped["status"].clone(), stamped["verified_by"].clone()),
+        (json!("verified"), json!(env("KEEPER_HQ_LIVE_ACTOR")))
+    );
+    assert!(stamped["verified_at"].is_u64());
+    report(
+        "111-verify",
+        &json!({"assertion": stamped, "stale": outcome_json(&stale)}),
+    );
+
+    // Refusals with no effect.
+    let head = prefix::complete(&one).expect("prefix").n;
+    let refusals = [
+        ("locator-userinfo", ChangeOp::CreateNode {
+            id: e3.clone(),
+            kind: "Resource".into(),
+            title: "R".into(),
+            description: None,
+            properties: json!({"$locator": {"kind": "https", "management": "external",
+                "locator": "https://user:pw@example.com/a", "selector": null, "version": null, "format": null}})
+                .as_object()
+                .expect("p")
+                .clone(),
+        }),
+        ("vocabulary-by-editor", ChangeOp::CreateNode {
+            id: e4.clone(),
+            kind: "Vocabulary".into(),
+            title: "V".into(),
+            description: None,
+            properties: json!({"$definition": {"defines": "ex:Thing", "of": "kind", "status": "active"}})
+                .as_object()
+                .expect("p")
+                .clone(),
+        }),
+    ];
+    for (name, op) in refusals {
+        // A change the client refuses itself never reaches the server.
+        let Ok(change) = first.change(vec![op], None) else {
+            report(
+                &format!("111-refused-{name}"),
+                &json!({"refused": "client"}),
+            );
+            continue;
+        };
+        let (_, outcome) = applied(&first, &one, &change);
+        assert!(rejected_reason(&outcome).is_some(), "{name}: {outcome:?}");
+        report(&format!("111-refused-{name}"), &outcome_json(&outcome));
+    }
+    assert_eq!(
+        prefix::complete(&one).expect("prefix").n,
+        head,
+        "no refused event"
+    );
+    close(one);
+    close(two);
+}
