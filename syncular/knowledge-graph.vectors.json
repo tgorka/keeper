@@ -26171,6 +26171,248 @@
     {
       "id": "url-harmless-path-at",
       "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/docs/@scope/a.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "dsn-quoted-adjacent-password",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host='db'password=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-empty-quoted-adjacent-password",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=''password=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-quoted-adjacent-sslpassword",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db application_name='a b'sslpassword=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-quoted-adjacent-in-selector",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com/notes\",\"selector\":\"host='db'password=synthetic\",\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-quoted-adjacent-harmless-key",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host='db'port=5432\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-escaped-space-in-value",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=a\\\\ password=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-empty-value-swallows-pair",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host= password=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-unterminated-quote",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host='db\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-trailing-backslash",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db\\\\\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-unknown-key",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db options=-csearch_path\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-oauth-client-secret",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db oauth_client_secret=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-duplicate-key",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=a host=b\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-key-wrong-case",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"Host=db\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-nested-uri-value",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"dbname=postgres://u:synthetic@db.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-tab-separator",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db\\tport=5432\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-value-at",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db user=app@corp\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-harmless-quoted",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db application_name='keeper notes' dbname='notes'\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "dsn-harmless-hostaddr",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"hostaddr=192.0.2.1 port=5432 dbname=notes sslmode=verify-full\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-userinfo-space",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://u s:synthetic@host.example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-userinfo-nbsp",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://u\\u00a0s:synthetic@host.example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-authority-percent",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://u%40s.example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-triple-slash-userinfo",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https:///u:synthetic@host.example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-at-userinfo",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com?u:synthetic@evil.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-fragment-at-userinfo",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com#u:synthetic@evil.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-value-at-userinfo",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com?x=u:synthetic@evil.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-fragment-value-at-userinfo",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com#x=u:synthetic@evil.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-backslash-authority",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://host.example.com\\\\@evil.example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-unknown-scheme",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"ftp://example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-http-scheme",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"http://example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-scheme-relative",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"//example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-plus-key",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a?password+=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-double-encoded",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a?%2570assword=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-semicolon-key",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a?x=1;password=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-api-key",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a?api_key=synthetic\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-invalid-escape",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a?x=%zz\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-port-not-numeric",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com:abc/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-whitespace-path",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a b.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-non-ascii-host",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://ex\\u00e4mple.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-ipv6-harmless",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://[2001:db8::1]:8443/a.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-file-harmless",
+      "json": "{\"kind\":\"local_fs\",\"management\":\"managed\",\"locator\":\"file:///Users/me/notes/a.md\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-ssh-harmless",
+      "json": "{\"kind\":\"ssh_fs\",\"management\":\"external\",\"locator\":\"ssh://host.example.com:2222/srv/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-upper-scheme-harmless",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"HTTPS://example.com/a.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-git-harmless",
+      "json": "{\"kind\":\"git\",\"management\":\"external\",\"locator\":\"git://example.com/org/repo.git\",\"selector\":\"docs/sub-dir/a_b.md\",\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-s3-query-harmless",
+      "json": "{\"kind\":\"s3\",\"management\":\"external\",\"locator\":\"s3://bucket/key.parquet?versionId=3\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "reference-space",
+      "json": "{\"kind\":\"local_fs\",\"management\":\"managed\",\"locator\":\"/Users/me/My Notes/a.md\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "reference-non-ascii",
+      "json": "{\"kind\":\"local_fs\",\"management\":\"managed\",\"locator\":\"/Users/me/notatki/za\\u017c\\u00f3\\u0142\\u0107.md\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "reference-scp-user",
+      "json": "{\"kind\":\"ssh_fs\",\"management\":\"external\",\"locator\":\"git@example.com:org/repo.git\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "reference-percent",
+      "json": "{\"kind\":\"local_fs\",\"management\":\"managed\",\"locator\":\"/srv/a%40b.md\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "reference-double-slash",
+      "json": "{\"kind\":\"local_fs\",\"management\":\"managed\",\"locator\":\"/srv//a.md\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "credential-ref-userinfo",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/a.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\",\"credential_ref\":\"https://u:synthetic@vault.example.com/x\"}",
+      "refusal": "invalid_change"
     }
   ],
   "assertion_currency": [

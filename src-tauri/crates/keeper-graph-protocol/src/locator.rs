@@ -11,23 +11,38 @@
 //!  "capabilities"?: [<string>…], "credential_ref"?: <string>, "extensions"?: {…}}
 //! ```
 //!
-//! Credentials never reach an accepted event or a replica row: [`check`]
-//! refuses, before persistence,
+//! Credentials never reach an accepted event or a replica row. [`check`]
+//! admits `locator`, `selector` and `credential_ref` only when the text
+//! matches one of three allowlist grammars ([`check_text`]), and refuses
+//! everything else before persistence:
 //!
-//! - URL userinfo (`//user[:password]@host…`, after any scheme, nested
-//!   ones such as `jdbc:postgresql:` included, or none) in `locator` or
-//!   `selector`;
-//! - a query or fragment parameter of [`CREDENTIAL_PARAMETERS`] or
-//!   [`DSN_PASSWORD_KEYS`] (compared case-insensitively after
-//!   percent-decoding, surrounding whitespace ignored);
-//! - a DSN `key=value` pair (libpq, ODBC, JDBC keyword forms) whose key is
-//!   one of [`DSN_PASSWORD_KEYS`]: every key position is read, with
-//!   whitespace allowed around `=` and pairs separated by whitespace or
-//!   `;`; a key is compared ASCII-case-insensitively with quotes, `_` and
-//!   `-` removed. Quoting is deliberately not honoured, so a quoted value
-//!   can never hide a pair (at worst a quoted value is refused);
-//! - anywhere in the envelope, an object key named like a credential
-//!   ([`credential_named`]) other than the top-level `credential_ref`.
+//! - **URL** (the text holds `://` or starts with `//`): `scheme://authority
+//!   path [?query] [#fragment]`, printable ASCII only. The scheme is one of
+//!   [`URL_SCHEMES`] (any case). The authority is `host[:port]` and nothing
+//!   else: no `@` (so no userinfo at all), no `%`, a host of unreserved
+//!   characters or a bracketed IPv6 literal, and empty only for `file`.
+//!   Path, query and fragment use RFC 3986 characters; the query and
+//!   fragment hold no `@` (libpq reads userinfo up to the first `@`, past a
+//!   `?` or `#`). Every query and fragment key (`&`/`;` separated),
+//!   percent-decoded once, must be unreserved characters and, ASCII-folded,
+//!   must be neither in [`CREDENTIAL_PARAMETERS`] or [`DSN_PASSWORD_KEYS`]
+//!   nor [`credential_named`];
+//! - **libpq keyword DSN** (otherwise, the text holds `=`): tokenised
+//!   exactly as libpq's `conninfo_parse` does (spaces around `=`, quoted
+//!   values, backslash escapes in and out of quotes), printable ASCII only,
+//!   but stricter: every key is one of [`DSN_KEYS`] (exact, as libpq), no
+//!   key repeats, a value is followed by the end or a space (libpq also
+//!   accepts a key straight after a closing quote), and a value, unescaped,
+//!   holds only plain-reference characters and spaces (no `=`, `@`, `'`,
+//!   `\`);
+//! - **plain reference** (otherwise): a path or opaque name (`/srv/a.md`,
+//!   `host:/srv/notes`, `keeper:drive/notes`, `public.notes`) of unreserved
+//!   characters, `/`, `:`, `+` and `,`, with no `//`.
+//!
+//! Whitespace and non-ASCII are refused in URLs and references (a path with
+//! a space is refused, not guessed at). Anywhere in the envelope, an object
+//! key named like a credential ([`credential_named`]) other than the
+//! top-level `credential_ref` is refused too.
 //!
 //! `credential_ref` is an opaque handle: it names a credential held
 //! elsewhere and grants no access. `capabilities` are stored observations,
@@ -67,8 +82,34 @@ pub const CREDENTIAL_PARAMETERS: [&str; 10] = [
     "x-amz-security-token",
     "x-goog-signature",
 ];
-/// DSN keywords (folded as the module says) that carry a password.
+/// Keys (ASCII-folded) that carry a password; refused as URL query and
+/// fragment keys.
 pub const DSN_PASSWORD_KEYS: [&str; 4] = ["password", "pwd", "passwd", "sslpassword"];
+/// URL schemes a locator may use (compared ASCII-case-insensitively): what
+/// the seven kinds need (`https`, `git`, `ssh`/`sftp`, `s3`, libpq's
+/// `postgres`/`postgresql`, `file`). Every other scheme is refused.
+pub const URL_SCHEMES: [&str; 8] = [
+    "https",
+    "git",
+    "ssh",
+    "sftp",
+    "s3",
+    "postgres",
+    "postgresql",
+    "file",
+];
+/// The libpq keywords a keyword-form DSN may hold (exact, as libpq compares
+/// them). Every other key, a password-carrying one included, is refused.
+pub const DSN_KEYS: [&str; 8] = [
+    "host",
+    "hostaddr",
+    "port",
+    "dbname",
+    "user",
+    "passfile",
+    "sslmode",
+    "application_name",
+];
 /// Key names (lowercased, `_`/`-` removed) that name a credential, exactly
 /// or as a suffix.
 pub const CREDENTIAL_KEYS: [&str; 13] = [
@@ -128,111 +169,256 @@ pub fn credential_named(key: &str) -> bool {
     CREDENTIAL_KEYS.iter().any(|k| folded.ends_with(k))
 }
 
-/// Percent-decode ASCII (an invalid escape stays as written).
-fn decoded(s: &str) -> String {
+/// RFC 3986 unreserved: `A-Z a-z 0-9 - . _ ~`.
+fn unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// A plain reference's characters (also a DSN value's, besides spaces).
+fn reference_byte(b: u8) -> bool {
+    unreserved(b) || matches!(b, b'/' | b':' | b'+' | b',')
+}
+
+/// A URL path's characters besides `%HH` (RFC 3986 `pchar` and `/`, less
+/// `;` and `=`).
+fn path_byte(b: u8) -> bool {
+    unreserved(b)
+        || matches!(
+            b,
+            b'/' | b':' | b'@' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b','
+        )
+}
+
+/// A URL query's or fragment's characters besides `%HH` (RFC 3986, less
+/// `@`).
+fn query_byte(b: u8) -> bool {
+    unreserved(b)
+        || matches!(
+            b,
+            b'/' | b'?'
+                | b':'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+        )
+}
+
+/// Whether every byte of `s` is `%HH` or satisfies `allowed`.
+fn escaped(s: &str, allowed: fn(u8) -> bool) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            match (bytes.get(i + 1), bytes.get(i + 2)) {
+                (Some(h), Some(l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => i += 3,
+                _ => return false,
+            }
+        } else if allowed(b) {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Percent-decode `s` once (its escapes already checked by [`escaped`]).
+fn decoded(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        let hex = |b: u8| char::from(b).to_digit(16);
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+    while let Some(&b) = bytes.get(i) {
+        let hex = |at: usize| bytes.get(at).and_then(|h| char::from(*h).to_digit(16));
+        match (b, hex(i + 1), hex(i + 2)) {
+            (b'%', Some(h), Some(l)) => {
                 #[allow(clippy::cast_possible_truncation)]
                 out.push((h * 16 + l) as u8);
                 i += 3;
-                continue;
+            }
+            _ => {
+                out.push(b);
+                i += 1;
             }
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
-/// Whether `key`, folded (ASCII-lowercased, quotes, braces, `_` and `-`
-/// removed), is one of [`DSN_PASSWORD_KEYS`].
-fn dsn_password_key(key: &str) -> bool {
-    let folded: String = key
-        .chars()
-        .filter(|c| !matches!(c, '_' | '-' | '\'' | '"' | '{' | '}'))
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    DSN_PASSWORD_KEYS.contains(&folded.as_str())
+/// `host[:port]`: a non-empty unreserved host or a bracketed IPv6 literal,
+/// and an optional 1–5 digit port. Nothing else (no `@`, no `%`).
+fn authority(text: &str) -> bool {
+    let (host, port) = match text.strip_prefix('[') {
+        Some(literal) => match literal.split_once(']') {
+            Some((ip, rest)) => {
+                let ip_ok = !ip.is_empty()
+                    && ip
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+                if !ip_ok {
+                    return false;
+                }
+                (ip, rest)
+            }
+            None => return false,
+        },
+        None => match text.find(':') {
+            Some(colon) => (&text[..colon], &text[colon..]),
+            None => (text, ""),
+        },
+    };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|digits| {
+            (1..=5).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        });
+    !host.is_empty() && (text.starts_with('[') || host.bytes().all(unreserved)) && port_ok
 }
 
-/// Whether `text` holds a DSN pair with a password key. Every key
-/// position is read: a key runs to whitespace, `;` or `=`, whitespace may
-/// surround `=`, and a value runs to whitespace or `;` (quotes are not
-/// honoured, so a value can only end early, never swallow a later pair).
-fn dsn_password(text: &str) -> bool {
-    let separator = |c: char| c.is_whitespace() || c == ';';
-    let mut rest = text;
-    loop {
-        rest = rest.trim_start_matches(separator);
-        if rest.is_empty() {
+/// A query's or fragment's parameters: RFC 3986 characters without `@`,
+/// and every key, decoded once, of unreserved characters only and,
+/// ASCII-folded, naming no credential.
+fn parameters(text: &str) -> bool {
+    escaped(text, query_byte)
+        && text.split(['&', ';']).all(|pair| {
+            let key = decoded(pair.split('=').next().unwrap_or_default());
+            if !key.iter().all(|b| unreserved(*b)) {
+                return false;
+            }
+            let key = String::from_utf8_lossy(&key).to_ascii_lowercase();
+            !CREDENTIAL_PARAMETERS.contains(&key.as_str())
+                && !DSN_PASSWORD_KEYS.contains(&key.as_str())
+                && !credential_named(&key)
+        })
+}
+
+/// The URL grammar (module docs).
+fn url(text: &str) -> bool {
+    let Some((scheme, rest)) = text.split_once("://") else {
+        return false;
+    };
+    let Some(scheme) = URL_SCHEMES.iter().find(|s| s.eq_ignore_ascii_case(scheme)) else {
+        return false;
+    };
+    let (rest, fragment) = match rest.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (rest, None),
+    };
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, query)) => (rest, Some(query)),
+        None => (rest, None),
+    };
+    let (host, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+    let host_ok = if host.is_empty() {
+        *scheme == "file"
+    } else {
+        authority(host)
+    };
+    host_ok
+        && escaped(path, path_byte)
+        && query.is_none_or(parameters)
+        && fragment.is_none_or(parameters)
+}
+
+/// The libpq keyword grammar (module docs): libpq's own tokenisation, with
+/// an allowlist of keys and values, and a space required between pairs.
+fn dsn(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if !bytes.iter().all(|b| (b' '..=b'~').contains(b)) {
+        return false;
+    }
+    let spaces = |mut i: usize| {
+        while bytes.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        i
+    };
+    let mut seen: Vec<&str> = Vec::with_capacity(DSN_KEYS.len());
+    let mut value = Vec::new();
+    let mut i = spaces(0);
+    if i == bytes.len() {
+        return false;
+    }
+    while i < bytes.len() {
+        let start = i;
+        while bytes.get(i).is_some_and(|b| *b != b'=' && *b != b' ') {
+            i += 1;
+        }
+        let key = &text[start..i];
+        i = spaces(i);
+        if bytes.get(i) != Some(&b'=') || !DSN_KEYS.contains(&key) || seen.contains(&key) {
             return false;
         }
-        let end = rest
-            .find(|c: char| separator(c) || c == '=')
-            .unwrap_or(rest.len());
-        let key = &rest[..end];
-        let after = rest[end..].trim_start_matches(char::is_whitespace);
-        match after.strip_prefix('=') {
-            Some(value) => {
-                if dsn_password_key(key) {
-                    return true;
+        seen.push(key);
+        i = spaces(i + 1);
+        value.clear();
+        let quoted = bytes.get(i) == Some(&b'\'');
+        if quoted {
+            i += 1;
+        }
+        loop {
+            match bytes.get(i) {
+                None if quoted => return false,
+                None => break,
+                Some(b'\'') if quoted => {
+                    i += 1;
+                    break;
                 }
-                let value = value.trim_start_matches(char::is_whitespace);
-                let end = value.find(separator).unwrap_or(value.len());
-                rest = &value[end..];
+                Some(b' ') if !quoted => break,
+                Some(b'\\') => match bytes.get(i + 1) {
+                    Some(b) => {
+                        value.push(*b);
+                        i += 2;
+                    }
+                    None => return false,
+                },
+                Some(b) => {
+                    value.push(*b);
+                    i += 1;
+                }
             }
-            // A bare word: `end` is past at least one character, since
-            // `rest` starts with neither a separator nor `=`.
-            None => rest = &rest[end..],
+        }
+        if (!quoted && value.is_empty()) || !value.iter().all(|b| *b == b' ' || reference_byte(*b))
+        {
+            return false;
+        }
+        match bytes.get(i) {
+            None => {}
+            Some(b' ') => i = spaces(i),
+            Some(_) => return false,
         }
     }
+    true
 }
 
-/// Refuse a credential carried by a locator string: URL userinfo, a
-/// credential query/fragment parameter, or a DSN password pair.
+/// The plain-reference grammar (module docs).
+fn reference(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(reference_byte) && !text.contains("//")
+}
+
+/// Admit a locator string only if it matches one of the module's three
+/// grammars: a URL when it holds `://` or starts with `//`, else a libpq
+/// keyword DSN when it holds `=`, else a plain reference. Anything else,
+/// and anything that fails its grammar, is refused.
 pub fn check_text(text: &str) -> Result<(), Refusal> {
-    // URL userinfo: an authority holding `@`, wherever a `//` begins one:
-    // after a `:` (any scheme, a nested one such as `jdbc:postgresql:`
-    // included) or at the start (scheme-relative).
-    let mut from = 0;
-    while let Some(at) = text[from..].find("//") {
-        let slashes = from + at;
-        let start = slashes + 2;
-        if slashes == 0 || text[..slashes].ends_with(':') {
-            let authority = text[start..]
-                .split(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-                .next()
-                .unwrap_or_default();
-            if authority.contains('@') {
-                return Err(Refusal::InvalidChange);
-            }
-        }
-        from = start;
+    let admitted = if text.starts_with("//") || text.contains("://") {
+        url(text)
+    } else if text.contains('=') {
+        dsn(text)
+    } else {
+        reference(text)
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(Refusal::InvalidChange)
     }
-    // Query and fragment parameters.
-    let parameters = text
-        .split_once('?')
-        .map(|(_, q)| q)
-        .into_iter()
-        .chain(text.split_once('#').map(|(_, f)| f));
-    for part in parameters {
-        for pair in part.split(['&', ';', '#', '?']) {
-            let key = decoded(pair.split('=').next().unwrap_or_default()).to_ascii_lowercase();
-            let key = key.trim();
-            if CREDENTIAL_PARAMETERS.contains(&key) || dsn_password_key(key) {
-                return Err(Refusal::InvalidChange);
-            }
-        }
-    }
-    if dsn_password(text) {
-        return Err(Refusal::InvalidChange);
-    }
-    Ok(())
 }
 
 /// Refuse any object key named like a credential, at any depth.

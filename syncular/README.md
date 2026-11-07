@@ -539,16 +539,27 @@ an edge's never does, and no member is a query symbol:
   fields are structural keys of a node binding (null when absent).
 - `$locator` — a `Resource` only: `{kind: internal|git|s3|relational|https|ssh_fs|local_fs,
   management: managed|external, locator, selector, version, format, capabilities?,
-  credential_ref?, extensions?}`. Refused before anything is stored: URL userinfo (an authority
-  after any `scheme://`, nested schemes such as `jdbc:postgresql://` and scheme-relative `//`
-  included); a credential query or fragment parameter (case-insensitive, percent-decoded,
-  `password`/`pwd`/`passwd`/`sslpassword` among them); a DSN `key=value` pair (libpq, ODBC, JDBC
-  keyword forms) whose key, ASCII-lowercased with quotes, braces, `_` and `-` removed, is
-  `password`, `pwd`, `passwd` or `sslpassword`, with whitespace allowed around `=` and every key
-  position read (quoting is not honoured, so a quoted value can never hide a pair); and any key
-  named like a credential. `credential_ref` is an opaque handle that grants nothing,
-  `capabilities` are observations, and no resolver is implemented. An envelope is read through
-  `graph.get_node`, never queried.
+  credential_ref?, extensions?}`. `locator`, `selector` and `credential_ref` are admitted only
+  when they match an allowlist grammar; everything else is refused before anything is stored.
+  A **URL** (the text holds `://` or starts with `//`) is printable ASCII, its scheme one of
+  `https`, `git`, `ssh`, `sftp`, `s3`, `postgres`, `postgresql`, `file` (any case), its
+  authority exactly `host[:port]` (no `@` at all, no `%`; a host of unreserved characters or a
+  bracketed IPv6 literal; empty only for `file`), its query and fragment free of `@`, and every
+  `&`/`;` query or fragment key, decoded once, of unreserved characters and, ASCII-folded, neither
+  a credential parameter (`token`, `access_token`, `password`, `secret`, `sig`, `signature`, the
+  four `x-amz-*`/`x-goog-*` signatures, `pwd`, `passwd`, `sslpassword`) nor named like a
+  credential. Otherwise a text holding `=` is a **libpq keyword DSN**, tokenised as libpq does
+  (spaces around `=`, quoted values, backslash escapes) but stricter: printable ASCII, keys only
+  `host`, `hostaddr`, `port`, `dbname`, `user`, `passfile`, `sslmode`, `application_name` (exact,
+  no repeats), a space or the end after every value (libpq also takes a key straight after a
+  closing quote), and unescaped values of unreserved characters, `/`, `:`, `+`, `,` and spaces.
+  Anything else is a **plain reference** (`/srv/a.md`, `host:/srv/notes`, `keeper:drive/notes`):
+  unreserved characters, `/`, `:`, `+`, `,`, and no `//`, so a path with a space or non-ASCII is
+  refused. Any object key named like a credential is refused too. `scripts/check-locator-parsers.py`
+  holds every `locators[]` vector to libpq's `PQconninfoParse` and Node's `URL`: an admitted vector
+  yields no credential in either, and each pinned bypass vector does. `credential_ref` is an
+  opaque handle that grants nothing, `capabilities` are observations, and no resolver is
+  implemented. An envelope is read through `graph.get_node`, never queried.
 
 **Tables.** Ids are ULIDs; revisions and graph sequences are decimal strings the server assigns.
 
