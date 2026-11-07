@@ -988,7 +988,7 @@ async fn revocation_before_delivery_suppresses_the_result() {
     );
     // MED-1: the refusal invalidated the reader: its next call is refused
     // before any work, and no worker is spawned for it.
-    let peak = rig.admission.stats().peak_workers;
+    let spawned = rig.admission.stats().spawn_attempts;
     let asked = rig.server.refreshed.load(Ordering::SeqCst);
     for _ in 0..3 {
         assert_eq!(
@@ -1003,7 +1003,7 @@ async fn revocation_before_delivery_suppresses_the_result() {
         reader.refresh(&Cancellation::default()).await.err(),
         Some(QueryError::Forbidden)
     );
-    assert_eq!(rig.admission.stats().peak_workers, peak);
+    assert_eq!(rig.admission.stats().spawn_attempts, spawned);
     assert_eq!(
         rig.server.refreshed.load(Ordering::SeqCst),
         asked,
@@ -1021,7 +1021,7 @@ async fn revocation_before_delivery_suppresses_the_result() {
             .err(),
         Some(QueryError::Forbidden)
     );
-    let peak = rig.admission.stats().peak_workers;
+    let spawned = rig.admission.stats().spawn_attempts;
     assert_eq!(
         reader
             .query(q, b"{}", Freshness::Current, &Cancellation::default())
@@ -1029,7 +1029,7 @@ async fn revocation_before_delivery_suppresses_the_result() {
             .err(),
         Some(QueryError::Forbidden)
     );
-    assert_eq!(rig.admission.stats().peak_workers, peak);
+    assert_eq!(rig.admission.stats().spawn_attempts, spawned);
     assert_eq!(rig.admission.stats().live_workers, 0);
 }
 

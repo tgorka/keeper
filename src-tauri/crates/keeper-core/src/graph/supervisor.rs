@@ -145,6 +145,7 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
     }
     runtime.before_spawn()?;
     let mut command = runtime.command(role, path)?;
+    admission.attempt();
     let mut child = runtime.spawn(&mut command)?;
     let _live = admission.live();
     let Some(pid) = child.id() else {

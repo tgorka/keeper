@@ -64,13 +64,19 @@ pub struct Admission {
     keys: Mutex<Keys>,
     live: AtomicUsize,
     peak: AtomicUsize,
+    attempts: AtomicUsize,
 }
 
-/// Counters of live workers: observations, never enforcement.
+/// Counters of workers: observations, never enforcement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionStats {
+    /// Workers alive now.
     pub live_workers: usize,
+    /// The most workers alive at once (a high-water mark, not a count).
     pub peak_workers: usize,
+    /// Every worker spawn attempted, counted before the attempt whether or
+    /// not it succeeds: zero means no worker was ever started.
+    pub spawn_attempts: usize,
 }
 
 /// A query worker's admission, held until the worker is reaped.
@@ -133,6 +139,7 @@ impl Admission {
             keys: Mutex::new(Keys::default()),
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
         })
     }
 
@@ -141,6 +148,7 @@ impl Admission {
         AdmissionStats {
             live_workers: self.live.load(Ordering::SeqCst),
             peak_workers: self.peak.load(Ordering::SeqCst),
+            spawn_attempts: self.attempts.load(Ordering::SeqCst),
         }
     }
 
@@ -196,6 +204,11 @@ impl Admission {
             .try_acquire_owned()
             .map(BuildPermit)
             .map_err(|_| QueryError::Limit)
+    }
+
+    /// Count one spawn attempt; called immediately before the spawn.
+    pub(crate) fn attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Count one live worker until the guard drops.

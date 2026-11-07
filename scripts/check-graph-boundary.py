@@ -383,9 +383,11 @@ ci = (ROOT/'.github/workflows/ci.yml').read_text()
 line = next(line for line in ci.splitlines() if 'cargo check --workspace' in line and 'aarch64-apple-ios' in line)
 if re.findall(r'--exclude\s+(\S+)', line) != ['keeper-graph-query','keeper-graph-driver']:
     raise SystemExit('iOS workspace exclusion drift')
-# P1 measurement tooling (110.5): exactly these two cargo examples, which no `--bins`
-# build, no bundle and no image compiles. No manifest may declare an example or a bin
-# that points into an examples directory, and no shipped source may include one.
+# P1 measurement tooling (110.5). What this checks, and only this: the keeper-graph-*
+# crates' examples directories hold exactly these two files; the protocol and driver
+# manifests declare no `[[example]]`/`[[bin]]` target and name no `examples/` path; and no
+# file under those two crates' `src/` names the tooling. Other crates' manifests, packaging
+# and build scripts are not inspected here.
 MEASUREMENT = {'keeper-graph-protocol/examples/rc_corpus.rs', 'keeper-graph-driver/examples/rc_spawner.rs'}
 examples = {str(p.relative_to(CRATES)) for p in CRATES.glob('*/examples/*') if p.parent.parent.name.startswith('keeper-graph')}
 if examples != MEASUREMENT:
