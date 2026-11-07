@@ -115,18 +115,66 @@ MUTANTS = {
 for label, (root_text, member_text) in MUTANTS.items():
     if not human_reads_violations(*parsed(root_text, member_text)):
         raise SystemExit(f'human-reads guard self-test not caught: {label}')
-# The resolved graph: no member but the driver compiles keeper-core with human-reads.
-for member in sorted(MEMBER_TEXT):
+# The resolved graph, over every target, every feature and every edge kind (normal, build,
+# dev): no member but the driver can compile keeper-core with human-reads. keeper-core
+# itself is the default-closure check above (`--all-features` would trivially enable it).
+def resolves_human_reads(member):
     run = subprocess.run(
-        ['cargo', 'tree', '--manifest-path', str(MANIFEST), '-p', member, '-e', 'features',
+        ['cargo', 'tree', '--manifest-path', str(MANIFEST), '-p', member,
+         '-e', 'normal,build,dev,features', '--all-features', '--target', 'all',
          '-i', 'keeper-core', '--prefix', 'none'], text=True, capture_output=True)
     if run.returncode != 0:
         if 'did not match any packages' in run.stderr:
-            continue  # the member does not depend on keeper-core
+            return False  # the member does not depend on keeper-core
         raise SystemExit(f'cargo tree failed for {member}: {run.stderr.strip()}')
-    enabled = f'keeper-core feature "{HUMAN}"' in run.stdout
-    if enabled != (member == 'keeper-graph-driver'):
-        raise SystemExit(f'{member} resolves keeper-core human-reads: {enabled}')
+    return f'keeper-core feature "{HUMAN}"' in run.stdout
+
+
+def resolved_violations():
+    return [f'{member} resolves keeper-core human-reads: {enabled}'
+            for member in sorted(MEMBER_TEXT) if member != 'keeper-core'
+            for enabled in [resolves_human_reads(member)]
+            if enabled != (member == 'keeper-graph-driver')]
+
+
+found = resolved_violations()
+if found:
+    raise SystemExit('; '.join(found))
+
+# Self-tests of the resolved layer (r3 review N8, N11): an indirect keeper-core feature that
+# implies human-reads, enabled from a macOS-only table (N8) or from a non-default member
+# feature (N11). Neither is visible to the manifest scan; each must fail the resolved check.
+# The manifests are mutated in place and restored byte for byte, the lock file included.
+MACOS = "[target.'cfg(target_os = \"macos\")'.dependencies]\n"
+FULL = 'human-reads = []\nfull = ["human-reads"]\n'
+N_MUTANTS = {
+    'N8 indirect feature from a macOS table': {
+        'keeper-core': lambda t: t.replace('human-reads = []\n', FULL),
+        'keeper': lambda t: t.replace(
+            MACOS, MACOS + 'keeper-core = { path = "../keeper-core", features = ["full"] }\n'),
+    },
+    'N11 indirect feature from a non-default member feature': {
+        'keeper-core': lambda t: t.replace('human-reads = []\n', FULL),
+        'keeper-agent': lambda t: t + '\n[features]\npeople = ["keeper-core/full"]\n',
+    },
+}
+LOCK = MANIFEST.parent / 'Cargo.lock'
+for label, edits in N_MUTANTS.items():
+    saved = {name: MEMBER_TEXT[name] for name in edits}
+    lock = LOCK.read_bytes()
+    try:
+        for name, edit in edits.items():
+            mutated = edit(saved[name])
+            if mutated == saved[name]:
+                raise SystemExit(f'guard self-test anchor missing: {label} ({name})')
+            (CRATES / name / 'Cargo.toml').write_text(mutated)
+        caught = bool(resolved_violations())
+    finally:
+        for name, text in saved.items():
+            (CRATES / name / 'Cargo.toml').write_text(text)
+        LOCK.write_bytes(lock)
+    if not caught:
+        raise SystemExit(f'human-reads guard self-test not caught: {label}')
 INVENTORY = {
     'keeper-graph-query/src/native.rs': {'register'},
     'keeper-graph-query/src/allocation.rs': {'install_sqlite', 'native_malloc', 'native_free', 'native_calloc',
