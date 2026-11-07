@@ -1655,6 +1655,25 @@
       "id": "verify-revision-zero",
       "json": "{\"ops\":[{\"op\":\"verify_assertion\",\"id\":\"01JM0000000000000000000001\",\"expected_revision\":\"1\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"1\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"0\"}],\"contents\":[]}]}",
       "refusal": "invalid_change"
+    },
+    {
+      "id": "verify-two-first-source-create",
+      "json": "{\"ops\":[{\"contents\":[{\"id\":\"01JM0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JM0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"4\"}]},{\"contents\":[{\"id\":\"01JN0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JN0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JN0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JN0000000000000000000020\",\"ref_revision\":\"4\"}]},{\"from_id\":\"01JM0000000000000000000001\",\"from_lifecycle_revision\":\"1\",\"id\":\"01JM0000000000000000000025\",\"op\":\"create_edge\",\"properties\":{\"source\":{\"$ref\":{\"entity_type\":\"node\",\"id\":\"01JM0000000000000000000020\",\"revision\":\"4\"}}},\"to_id\":\"01JM0000000000000000000020\",\"to_lifecycle_revision\":\"1\",\"type\":\"sources\"}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "verify-same-assertion-twice",
+      "json": "{\"ops\":[{\"contents\":[{\"id\":\"01JM0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JM0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"4\"}]},{\"contents\":[{\"id\":\"01JM0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JM0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"4\"}]}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "verify-two-share-source-edge",
+      "json": "{\"ops\":[{\"contents\":[{\"id\":\"01JM0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JM0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"4\"}]},{\"contents\":[],\"expected_revision\":\"7\",\"id\":\"01JM0000000000000000000009\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"4\"}]}]}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "verify-two-disjoint",
+      "json": "{\"ops\":[{\"contents\":[{\"id\":\"01JM0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JM0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JM0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JM0000000000000000000020\",\"ref_revision\":\"4\"}]},{\"contents\":[{\"id\":\"01JN0000000000000000000003\",\"revision\":\"1\"}],\"expected_revision\":\"7\",\"id\":\"01JN0000000000000000000001\",\"op\":\"verify_assertion\",\"sources\":[{\"edge_id\":\"01JN0000000000000000000021\",\"edge_revision\":\"2\",\"ref_id\":\"01JN0000000000000000000020\",\"ref_revision\":\"4\"}]}]}"
     }
   ],
   "algebra": [
@@ -22902,6 +22921,1694 @@
             "merged_into_id": null,
             "properties": {},
             "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "affected": [
+        {
+          "entity_type": "node",
+          "id": "01JM0000000000000000000001",
+          "lifecycle_revision": "1",
+          "revision": "8"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000001",
+          "lifecycle_revision": "1",
+          "revision": "8"
+        }
+      ],
+      "delta_digest": "99ff4eb00ca19647352fd0a44c2bb8bdd7cdc6d92f3ba537be3edb570bca4521",
+      "id": "verify-two-disjoint",
+      "mint": [],
+      "ops": [
+        {
+          "after_revision": "8",
+          "after_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "verified",
+                "verified_at": 1700000900000,
+                "verified_by": "tgorka"
+              }
+            },
+            "revision": "8",
+            "title": "T"
+          },
+          "before_revision": "7",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          "entity_id": "01JM0000000000000000000001",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 0
+        },
+        {
+          "after_revision": "8",
+          "after_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "verified",
+                "verified_at": 1700000900000,
+                "verified_by": "tgorka"
+              }
+            },
+            "revision": "8",
+            "title": "T"
+          },
+          "before_revision": "7",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          "entity_id": "01JN0000000000000000000001",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 1
+        }
+      ],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "contents": [
+              {
+                "id": "01JN0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JN0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JN0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JN0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          }
+        ]
+      },
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JN0000000000000000000003",
+            "owner_node_id": "01JN0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          },
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JN0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "affected": [
+        {
+          "entity_type": "node",
+          "id": "01JM0000000000000000000001",
+          "lifecycle_revision": "1",
+          "revision": "8"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000001",
+          "lifecycle_revision": "1",
+          "revision": "8"
+        }
+      ],
+      "delta_digest": "99ff4eb00ca19647352fd0a44c2bb8bdd7cdc6d92f3ba537be3edb570bca4521",
+      "id": "verify-two-node-and-content-reference",
+      "mint": [],
+      "ops": [
+        {
+          "after_revision": "8",
+          "after_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "verified",
+                "verified_at": 1700000900000,
+                "verified_by": "tgorka"
+              }
+            },
+            "revision": "8",
+            "title": "T"
+          },
+          "before_revision": "7",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          "entity_id": "01JM0000000000000000000001",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 0
+        },
+        {
+          "after_revision": "8",
+          "after_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "verified",
+                "verified_at": 1700000900000,
+                "verified_by": "tgorka"
+              }
+            },
+            "revision": "8",
+            "title": "T"
+          },
+          "before_revision": "7",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          "entity_id": "01JN0000000000000000000001",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 1
+        }
+      ],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "contents": [
+              {
+                "id": "01JN0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JN0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JN0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JN0000000000000000000023",
+                "ref_revision": "3"
+              }
+            ]
+          }
+        ]
+      },
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JN0000000000000000000003",
+            "owner_node_id": "01JN0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "source"
+            },
+            "id": "01JN0000000000000000000023",
+            "owner_node_id": "01JN0000000000000000000020",
+            "revision": "3"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          },
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "content",
+                  "id": "01JN0000000000000000000023",
+                  "revision": "3"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "conflict": {
+        "current_revision": "7",
+        "entity": {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000001"
+        },
+        "precondition": "revision"
+      },
+      "id": "verify-two-second-moved",
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "contents": [
+              {
+                "id": "01JN0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "6",
+            "id": "01JN0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JN0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JN0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          }
+        ]
+      },
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JN0000000000000000000003",
+            "owner_node_id": "01JN0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          },
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JN0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "id": "verify-two-first-content-write",
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "contents": [
+              {
+                "id": "01JN0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JN0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JN0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JN0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "body": {
+              "inline_text": "late"
+            },
+            "id": "01JM0000000000000000000005",
+            "op": "create_content",
+            "owner_node_id": "01JM0000000000000000000001"
+          }
+        ]
+      },
+      "refusal": "invalid_change",
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JN0000000000000000000003",
+            "owner_node_id": "01JN0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          },
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JN0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "id": "verify-two-source-is-other-assertion",
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "contents": [
+              {
+                "id": "01JN0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JN0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JN0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000001",
+                "ref_revision": "7"
+              }
+            ]
+          }
+        ]
+      },
+      "refusal": "invalid_change",
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JN0000000000000000000003",
+            "owner_node_id": "01JN0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          },
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000001",
+                  "revision": "7"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000001",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "id": "verify-source-target-updated",
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "expected_revision": "4",
+            "id": "01JM0000000000000000000020",
+            "op": "update_node",
+            "set": {
+              "title": "U"
+            }
+          }
+        ]
+      },
+      "refusal": "invalid_change",
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "id": "verify-source-target-archived",
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "expected_revision": "4",
+            "id": "01JM0000000000000000000020",
+            "op": "archive_node"
+          }
+        ]
+      },
+      "refusal": "invalid_change",
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "id": "verify-source-target-content-updated",
+      "mint": [],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000023",
+                "ref_revision": "3"
+              }
+            ]
+          },
+          {
+            "body": {
+              "inline_text": "moved"
+            },
+            "expected_revision": "3",
+            "id": "01JM0000000000000000000023",
+            "op": "update_content",
+            "owner_node_id": "01JM0000000000000000000020"
+          }
+        ]
+      },
+      "refusal": "invalid_change",
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          },
+          {
+            "body": {
+              "inline_text": "source"
+            },
+            "id": "01JM0000000000000000000023",
+            "owner_node_id": "01JM0000000000000000000020",
+            "revision": "3"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "content",
+                  "id": "01JM0000000000000000000023",
+                  "revision": "3"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          }
+        ],
+        "tags": []
+      }
+    },
+    {
+      "affected": [
+        {
+          "entity_type": "node",
+          "id": "01JM0000000000000000000001",
+          "lifecycle_revision": "1",
+          "revision": "8"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JM0000000000000000000030",
+          "lifecycle_revision": "1",
+          "revision": "3"
+        }
+      ],
+      "delta_digest": "33374469b9b49155d8a5a086dc8eb375a411e4610881b1a217f2335abe7fe3b7",
+      "id": "verify-beside-unrelated-update",
+      "mint": [],
+      "ops": [
+        {
+          "after_revision": "8",
+          "after_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "verified",
+                "verified_at": 1700000900000,
+                "verified_by": "tgorka"
+              }
+            },
+            "revision": "8",
+            "title": "T"
+          },
+          "before_revision": "7",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          "entity_id": "01JM0000000000000000000001",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 0
+        },
+        {
+          "after_revision": "3",
+          "after_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000030",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "3",
+            "title": "U"
+          },
+          "before_revision": "2",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000030",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "2",
+            "title": "T"
+          },
+          "entity_id": "01JM0000000000000000000030",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 1
+        }
+      ],
+      "payload": {
+        "ops": [
+          {
+            "contents": [
+              {
+                "id": "01JM0000000000000000000003",
+                "revision": "1"
+              }
+            ],
+            "expected_revision": "7",
+            "id": "01JM0000000000000000000001",
+            "op": "verify_assertion",
+            "sources": [
+              {
+                "edge_id": "01JM0000000000000000000021",
+                "edge_revision": "2",
+                "ref_id": "01JM0000000000000000000020",
+                "ref_revision": "4"
+              }
+            ]
+          },
+          {
+            "expected_revision": "2",
+            "id": "01JM0000000000000000000030",
+            "op": "update_node",
+            "set": {
+              "title": "U"
+            }
+          }
+        ]
+      },
+      "stamp": {
+        "actor_id": "tgorka",
+        "time_ms": 1700000900000
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "claim"
+            },
+            "id": "01JM0000000000000000000003",
+            "owner_node_id": "01JM0000000000000000000001",
+            "revision": "1"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JM0000000000000000000001",
+            "id": "01JM0000000000000000000021",
+            "lifecycle": "active",
+            "properties": {
+              "source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JM0000000000000000000020",
+                  "revision": "4"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JM0000000000000000000020",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": 1700000000000,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "7",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000020",
+            "kind": "Resource",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "4",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JM0000000000000000000030",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "2",
             "title": "T"
           }
         ],

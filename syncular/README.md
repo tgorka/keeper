@@ -688,7 +688,11 @@ the contents it owns (through `kg_contents_owner`), each at its revision. A diff
 resolve, an archived node or source target is `invalid_change`; more than 64 of either is
 `change_limit`, read with a limit of 65. It writes one node `update` whose after-image differs
 only in `status: verified`, `verified_at` (the server's acceptance time) and `verified_by` (the
-authenticated person), never taken from the payload. After it, every other write to a node
+authenticated person), never taken from the payload. A change may verify several assertions
+(disjoint, since each locks what it names); each ends `verified`. A change that verifies may not
+write any node or content one of its checked `sources` references — another assertion it
+verifies included — because that verification would be stale on acceptance: `invalid_change`.
+After it, every other write to a node
 verified before the change — an update of any kind, a tag, an archive or unarchive — leaves it
 `unverified` with null `verified_*` in that same operation, and a change to its `sources` edges
 or contents is refused unless the same change holds an `update_node` of it; the content keeps its

@@ -94,7 +94,11 @@
 //! a write to such a node's `sources` edges or contents refuses unless the
 //! same change holds an `update_node` of it; and the verification is the
 //! only operation of its change touching the node, its contents or its
-//! outgoing `sources` edges.
+//! outgoing `sources` edges. A change may verify several assertions; each
+//! ends verified. No operation of a verifying change may write a node or
+//! content one of its checked `sources` references (another verification
+//! included): that verification would be stale on acceptance, so the
+//! change refuses `invalid_change`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -255,8 +259,10 @@ struct Candidate<'a> {
     updated: BTreeSet<String>,
     /// Nodes whose tag-only `update` has been emitted.
     emitted: BTreeSet<String>,
-    /// The node a `verify_assertion` verifies.
-    verified: Option<String>,
+    /// The nodes the change's `verify_assertion`s verify.
+    verified: BTreeSet<String>,
+    /// The entities the verified assertions' checked `sources` reference.
+    checked_targets: Vec<(RefType, String)>,
     /// Values written, to check their typed references.
     written: Vec<Value>,
     /// Edges whose endpoints must be active (if the edge is), in order.
@@ -449,7 +455,8 @@ impl<'a> Candidate<'a> {
             explicit,
             updated,
             emitted: BTreeSet::new(),
-            verified: None,
+            verified: BTreeSet::new(),
+            checked_targets: Vec::new(),
             written: Vec::new(),
             endpoint_checks: Vec::new(),
             containment: Vec::new(),
@@ -1070,6 +1077,8 @@ impl<'a> Candidate<'a> {
             if !to.is_some_and(|to| text(&to, "lifecycle") == "active") {
                 return Err(Refusal::InvalidChange.into());
             }
+            self.checked_targets
+                .push((reference.entity_type, reference.id.clone()));
         }
         let owned = self.state.contents_of(id, MAX_CHECKED_CONTENTS + 1);
         if owned.len() > MAX_CHECKED_CONTENTS {
@@ -1097,7 +1106,7 @@ impl<'a> Candidate<'a> {
         self.touch_node(id, Some(&expected.to_owned()))?;
         let entry = self.nodes.get_mut(id).ok_or(Refusal::InvalidChange)?;
         assertion::verify(&mut entry.after, stamp.time_ms, stamp.actor_id)?;
-        self.verified = Some(id.to_owned());
+        self.verified.insert(id.to_owned());
         self.slots
             .push(Slot::Node(id.to_owned(), Operation::Update));
         Ok(())
@@ -1327,11 +1336,22 @@ impl<'a> Candidate<'a> {
                 }
             }
         }
-        let verified = self.verified.clone();
+        // A verification stays bound to its checked state: no write of this
+        // change may move an entity one of its `sources` references.
+        for (entity_type, target) in &self.checked_targets {
+            let written = match entity_type {
+                RefType::Node => self.nodes.get(target).is_some_and(|e| e.touched),
+                RefType::Content => self.contents.contains_key(target),
+            };
+            if written {
+                return Err(Refusal::InvalidChange.into());
+            }
+        }
+        let verified = &self.verified;
         // Writes to a checked state: refused while it is verified unless the
         // same change clears it, and never beside its own verification.
         let guarded = |owner: &str| -> Result<(), Stop> {
-            if verified.as_deref() == Some(owner)
+            if verified.contains(owner)
                 || (self.verified_before(owner) && !self.updated.contains(owner))
             {
                 return Err(Refusal::InvalidChange.into());
@@ -1351,7 +1371,7 @@ impl<'a> Candidate<'a> {
             guarded(&text(&entry.after, "owner_node_id"))?;
         }
         for (id, entry) in &mut self.nodes {
-            if entry.touched && entry.before.is_some() && verified.as_deref() != Some(id) {
+            if entry.touched && entry.before.is_some() && !self.verified.contains(id) {
                 assertion::clear(&mut entry.after);
             }
         }
