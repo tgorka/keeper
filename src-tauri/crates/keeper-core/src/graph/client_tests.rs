@@ -673,3 +673,32 @@ fn the_source_helpers_answer_over_any_query_channel() {
         Err(SourceError::Unreadable("head".into()))
     );
 }
+
+/// CC-8 (112.1): a server's scope revocation is purged by the Syncular
+/// client itself (`purge_scope_rows`, in the transaction that records the
+/// subscription `revoked`), and that purge fails closed — the revocation is
+/// not applied — for a table whose schema maps no column to the revoked
+/// scope variable. Every subscription the graph takes (each graph table
+/// under `kg_graph`, the receipts under `kg_client`) therefore needs that
+/// mapping in the contract's schema, or a revocation would leave its rows.
+#[test]
+fn every_graph_subscription_has_a_purgeable_scope_column() {
+    let schema = syncular_client::parse_schema_json(
+        crate::hq::syncular::schema().expect("the contract's schema"),
+    )
+    .expect("compiles");
+    let taken = super::client::subscriptions(DB, "ana", "dev1");
+    assert_eq!(taken.len(), 8, "seven graph tables and the receipts");
+    for subscription in taken {
+        let table = schema
+            .table(&subscription.table)
+            .unwrap_or_else(|| panic!("{} is in the schema", subscription.table));
+        for (variable, _) in &subscription.scopes {
+            assert!(
+                table.scope_column(variable).is_some(),
+                "{} maps no column to {variable}: a revocation could not purge it",
+                subscription.table
+            );
+        }
+    }
+}
