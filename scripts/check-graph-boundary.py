@@ -9,6 +9,7 @@ import hashlib
 import pathlib
 import re
 import subprocess
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / 'src-tauri/Cargo.toml'
@@ -33,16 +34,99 @@ for target in ['aarch64-apple-ios', 'aarch64-linux-android']:
 
 CRATES = ROOT / 'src-tauri/crates'
 # A person's graph reader (`human-reads`) is compiled only for keeper's own headless driver:
-# never a keeper-core default, and no other crate enables it (the agent runtime must never
-# obtain a HumanReader).
-core_manifest = (CRATES / 'keeper-core/Cargo.toml').read_text()
-defaults = re.search(r'^\[features\][^\[]*?^default\s*=\s*\[([^\]]*)\]', core_manifest, re.M | re.S)
-if defaults and 'human-reads' in defaults.group(1):
-    raise SystemExit('keeper-core enables human-reads by default')
-enablers = sorted(p.parent.name for p in CRATES.glob('*/Cargo.toml')
-                  if p.parent.name != 'keeper-core' and 'human-reads' in p.read_text())
-if enablers != ['keeper-graph-driver']:
-    raise SystemExit(f'human-reads enabled outside the headless driver: {enablers}')
+# not in keeper-core's default closure, not enabled through `[workspace.dependencies]`, and
+# enabled by no workspace member but keeper-graph-driver (the agent runtime must never obtain
+# a HumanReader). Checked on the parsed manifests, then on cargo's resolved feature graph.
+HUMAN = 'human-reads'
+
+
+def default_closure(features):
+    seen, todo = set(), list(features.get('default', []))
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        todo.extend(features.get(name, []))
+    return seen
+
+
+def dependency_tables(doc):
+    for key in ('dependencies', 'dev-dependencies', 'build-dependencies'):
+        yield doc.get(key, {})
+    for target in doc.get('target', {}).values():
+        for key in ('dependencies', 'dev-dependencies', 'build-dependencies'):
+            yield target.get(key, {})
+
+
+def enables_human_reads(doc, inherited):
+    """Whether a member manifest enables keeper-core's human-reads."""
+    for table in dependency_tables(doc):
+        dep = table.get('keeper-core')
+        if isinstance(dep, dict):
+            if HUMAN in dep.get('features', []) or (dep.get('workspace') is True and inherited):
+                return True
+    return any(v in ('keeper-core/' + HUMAN, 'keeper-core?/' + HUMAN)
+               for values in doc.get('features', {}).values() for v in values)
+
+
+def human_reads_violations(root_doc, members):
+    """`members`: {crate name: parsed manifest}. Every way human-reads reaches a non-driver."""
+    found = []
+    if HUMAN in default_closure(members['keeper-core'].get('features', {})):
+        found.append('keeper-core enables human-reads by default')
+    root_core = root_doc.get('workspace', {}).get('dependencies', {}).get('keeper-core')
+    inherited = isinstance(root_core, dict) and HUMAN in root_core.get('features', [])
+    if inherited:
+        found.append('[workspace.dependencies] keeper-core enables human-reads')
+    enablers = sorted(name for name, doc in members.items()
+                      if name != 'keeper-core' and enables_human_reads(doc, inherited))
+    if enablers != ['keeper-graph-driver']:
+        found.append(f'human-reads enabled outside the headless driver: {enablers}')
+    return found
+
+
+ROOT_TEXT = MANIFEST.read_text()
+MEMBER_TEXT = {p.parent.name: p.read_text() for p in CRATES.glob('*/Cargo.toml')}
+
+
+def parsed(root_text, member_text):
+    return tomllib.loads(root_text), {n: tomllib.loads(t) for n, t in member_text.items()}
+
+
+violations = human_reads_violations(*parsed(ROOT_TEXT, MEMBER_TEXT))
+if violations:
+    raise SystemExit('; '.join(violations))
+# Self-tests: each mutation of the (passing) real manifests must fail the guard (r2 review
+# M1, M3, M5).
+CORE = MEMBER_TEXT['keeper-core']
+if 'human-reads = []\n' not in CORE or '[workspace.dependencies]\n' not in ROOT_TEXT:
+    raise SystemExit('guard self-test anchors missing')
+MUTANTS = {
+    'M1 default after the feature': (ROOT_TEXT, {**MEMBER_TEXT, 'keeper-core': CORE.replace(
+        'human-reads = []\n', 'human-reads = []\ndefault = ["human-reads"]\n')}),
+    'M3 transitive default': (ROOT_TEXT, {**MEMBER_TEXT, 'keeper-core': CORE.replace(
+        'human-reads = []\n', 'human-reads = []\ndefault = ["people"]\npeople = ["human-reads"]\n')}),
+    'M5 workspace dependency': (ROOT_TEXT.replace(
+        '[workspace.dependencies]\n',
+        '[workspace.dependencies]\nkeeper-core = { path = "crates/keeper-core", features = ["human-reads"] }\n'),
+        MEMBER_TEXT),
+}
+for label, (root_text, member_text) in MUTANTS.items():
+    if not human_reads_violations(*parsed(root_text, member_text)):
+        raise SystemExit(f'human-reads guard self-test not caught: {label}')
+# The resolved graph: no member but the driver compiles keeper-core with human-reads.
+for member in sorted(MEMBER_TEXT):
+    run = subprocess.run(
+        ['cargo', 'tree', '--manifest-path', str(MANIFEST), '-p', member, '-e', 'features',
+         '-i', 'keeper-core', '--prefix', 'none'], text=True, capture_output=True)
+    if run.returncode != 0:
+        if 'did not match any packages' in run.stderr:
+            continue  # the member does not depend on keeper-core
+        raise SystemExit(f'cargo tree failed for {member}: {run.stderr.strip()}')
+    enabled = f'keeper-core feature "{HUMAN}"' in run.stdout
+    if enabled != (member == 'keeper-graph-driver'):
+        raise SystemExit(f'{member} resolves keeper-core human-reads: {enabled}')
 INVENTORY = {
     'keeper-graph-query/src/native.rs': {'register'},
     'keeper-graph-query/src/allocation.rs': {'install_sqlite', 'native_malloc', 'native_free', 'native_calloc',

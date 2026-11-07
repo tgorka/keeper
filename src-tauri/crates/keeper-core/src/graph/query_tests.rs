@@ -313,6 +313,8 @@ struct Server {
     epoch: Mutex<String>,
     refusals: Mutex<Vec<Option<QueryError>>>,
     refreshed: AtomicU32,
+    /// When set, the next `refresh_context` answers only once released.
+    hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl Server {
@@ -323,6 +325,7 @@ impl Server {
             epoch: Mutex::new("1".into()),
             refusals: Mutex::new(Vec::new()),
             refreshed: AtomicU32::new(0),
+            hold: Mutex::new(None),
         })
     }
     fn row(&self, context: &str) -> ContextRow {
@@ -354,10 +357,15 @@ impl GraphRemote for Server {
                 steps.remove(0)
             }
         };
-        match next {
+        let row = match next {
             Some(error) => Err(error),
             None => Ok(self.row(context)),
+        };
+        let held = self.hold.lock().expect("hold").take();
+        if let Some(release) = held {
+            let _ = release.recv();
         }
+        row
     }
     fn read_status(&self, _: &str) -> Result<ReadStatus, QueryError> {
         Err(QueryError::Forbidden)
@@ -1001,8 +1009,9 @@ async fn revocation_before_delivery_suppresses_the_result() {
         asked,
         "nothing asked the server either"
     );
-    // A new admission is a new reader; an epoch change between computation
-    // and delivery is not delivered by it either.
+    // LOW-6: a new admission is a new reader; an authority other than its
+    // admitted one at delivery is `forbidden` and invalidates it, so the
+    // next call spawns nothing.
     let reader = rig.reader();
     *rig.server.epoch.lock().expect("epoch") = "2".into();
     assert_eq!(
@@ -1010,8 +1019,17 @@ async fn revocation_before_delivery_suppresses_the_result() {
             .query(q, b"{}", Freshness::Current, &Cancellation::default())
             .await
             .err(),
-        Some(QueryError::Stale)
+        Some(QueryError::Forbidden)
     );
+    let peak = rig.admission.stats().peak_workers;
+    assert_eq!(
+        reader
+            .query(q, b"{}", Freshness::Current, &Cancellation::default())
+            .await
+            .err(),
+        Some(QueryError::Forbidden)
+    );
+    assert_eq!(rig.admission.stats().peak_workers, peak);
     assert_eq!(rig.admission.stats().live_workers, 0);
 }
 
@@ -1220,4 +1238,51 @@ async fn a_corrupt_selected_generation_is_rebuilt() {
         "the refused generation is not kept by the no-change shortcut"
     );
     assert_eq!(rig.rows(&reader, q, "{}").await[0]["t"], json!("kept"));
+}
+
+/// LOW-5: a call whose delivery check the server answered just before a
+/// sibling call invalidated the reader releases nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn an_invalidation_during_the_delivery_check_suppresses_the_result() {
+    let mut rig = Rig::new();
+    rig.world
+        .accept(vec![node(&ulid(1), "Concept", "secret", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    let reader = Arc::new(rig.reader());
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+    let (release, held) = std::sync::mpsc::channel();
+    *rig.server.hold.lock().expect("hold") = Some(held);
+    let before = rig.server.refreshed.load(Ordering::SeqCst);
+    let pending = {
+        let reader = reader.clone();
+        tokio::spawn(async move {
+            reader
+                .query(
+                    "MATCH (n) RETURN n.title AS t LIMIT 1",
+                    b"{}",
+                    Freshness::Current,
+                    &Cancellation::default(),
+                )
+                .await
+        })
+    };
+    // The query is at its delivery check; the server has answered it OK
+    // and holds the answer.
+    while rig.server.refreshed.load(Ordering::SeqCst) == before {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    rig.server
+        .refusals
+        .lock()
+        .expect("steps")
+        .push(Some(QueryError::Forbidden));
+    assert_eq!(
+        reader.refresh(&Cancellation::default()).await.err(),
+        Some(QueryError::Forbidden)
+    );
+    release.send(()).expect("release");
+    assert_eq!(
+        pending.await.expect("joined").err(),
+        Some(QueryError::Forbidden)
+    );
 }
