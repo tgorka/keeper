@@ -155,9 +155,10 @@ rustix = { workspace = true, features = ["thread", "param"] }
 landlock = "=0.4.7"
 
 [features]
-# A person's graph reader (`graph::query::HumanReader`). keeper's own app
-# and headless driver enable it; the agent runtime never does, so no agent
-# tool can obtain one.
+# A person's graph reader (`graph::query::HumanReader`). Only keeper's
+# headless driver (`keeper-graph-driver`) enables it; no other crate and no
+# default does (`scripts/check-graph-boundary.py`), so no agent tool can
+# obtain one.
 human-reads = []
 
 [dev-dependencies]
