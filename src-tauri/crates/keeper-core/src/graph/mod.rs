@@ -38,6 +38,8 @@ pub mod admission;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod ledger;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod lifecycle;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod projection;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod query;
