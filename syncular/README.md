@@ -539,10 +539,16 @@ an edge's never does, and no member is a query symbol:
   fields are structural keys of a node binding (null when absent).
 - `$locator` — a `Resource` only: `{kind: internal|git|s3|relational|https|ssh_fs|local_fs,
   management: managed|external, locator, selector, version, format, capabilities?,
-  credential_ref?, extensions?}`. URL userinfo, a credential query or fragment parameter, a DSN
-  password pair and any key named like a credential are refused before anything is stored;
-  `credential_ref` is an opaque handle that grants nothing, `capabilities` are observations,
-  and no resolver is implemented. An envelope is read through `graph.get_node`, never queried.
+  credential_ref?, extensions?}`. Refused before anything is stored: URL userinfo (an authority
+  after any `scheme://`, nested schemes such as `jdbc:postgresql://` and scheme-relative `//`
+  included); a credential query or fragment parameter (case-insensitive, percent-decoded,
+  `password`/`pwd`/`passwd`/`sslpassword` among them); a DSN `key=value` pair (libpq, ODBC, JDBC
+  keyword forms) whose key, ASCII-lowercased with quotes, braces, `_` and `-` removed, is
+  `password`, `pwd`, `passwd` or `sslpassword`, with whitespace allowed around `=` and every key
+  position read (quoting is not honoured, so a quoted value can never hide a pair); and any key
+  named like a credential. `credential_ref` is an opaque handle that grants nothing,
+  `capabilities` are observations, and no resolver is implemented. An envelope is read through
+  `graph.get_node`, never queried.
 
 **Tables.** Ids are ULIDs; revisions and graph sequences are decimal strings the server assigns.
 

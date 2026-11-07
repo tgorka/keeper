@@ -26034,6 +26034,143 @@
       "id": "locator-empty",
       "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
       "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-spaced",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db password = pw dbname=notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-space-before",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db password =pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-space-after",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db password= pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-first",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"password = pw host=db\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-upper",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"HOST=db PASSWORD=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-mixed-case-spaced",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db PassWord  =  pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-quoted-value",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db password='p w'\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-after-quoted-value",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db application_name='a b' password = pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-inside-quoted-value",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db options='-c password=pw'\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-quoted-key",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db 'password'=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-nbsp",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db password\\u00a0=\\u00a0pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-sslpassword",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db sslpassword=pw sslkey=/k.pem\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-passwd",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db passwd=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-password-in-selector",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com/notes\",\"selector\":\"user=app password = pw\",\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "odbc-pwd-spaced",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"Server=db; Uid=app; Pwd = pw;\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "odbc-password-braced",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"Driver={PostgreSQL};Server=db;Password={p;w}\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "odbc-pwd-upper-no-trailing",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"SERVER=db;UID=app;PWD=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "jdbc-keyword-password",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"jdbc:sqlserver://db:1433;user=app;password=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-password-upper",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com/notes?PASSWORD=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-password-spaced",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com/notes?sslmode=require&password = pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-sslpassword",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgresql://db.example.com/notes?sslpassword=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-query-pwd-encoded",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"postgres://db.example.com/notes?%50wd=pw\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-nested-scheme-userinfo",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"jdbc:postgresql://app:pw@db.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-scheme-relative-userinfo",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"//user:pw@example.com/a\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "url-upper-scheme-userinfo",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"POSTGRES://app:pw@db.example.com/notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}",
+      "refusal": "invalid_change"
+    },
+    {
+      "id": "dsn-harmless",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host=db port=5432 user=app dbname=notes sslmode=require passfile=/k/.pgpass\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "dsn-harmless-spaced",
+      "json": "{\"kind\":\"relational\",\"management\":\"external\",\"locator\":\"host = db dbname = notes\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
+    },
+    {
+      "id": "url-harmless-path-at",
+      "json": "{\"kind\":\"https\",\"management\":\"external\",\"locator\":\"https://example.com/docs/@scope/a.pdf\",\"selector\":null,\"version\":null,\"format\":\"application/pdf\"}"
     }
   ],
   "assertion_currency": [
