@@ -924,10 +924,12 @@ fn graph_live_111_collections_content_merge_and_verification() {
         &json!({"assertion": stamped, "stale": outcome_json(&stale)}),
     );
 
-    // Refusals with no effect.
+    // Refusals with no effect, each at its exact point and code: the
+    // locator never leaves the client (`invalid_change`), the Vocabulary
+    // node reaches the server and is rejected `forbidden` (owner only).
     let head = prefix::complete(&one).expect("prefix").n;
     let refusals = [
-        ("locator-userinfo", ChangeOp::CreateNode {
+        ("locator-userinfo", "client", "invalid_change", ChangeOp::CreateNode {
             id: e3.clone(),
             kind: "Resource".into(),
             title: "R".into(),
@@ -938,7 +940,7 @@ fn graph_live_111_collections_content_merge_and_verification() {
                 .expect("p")
                 .clone(),
         }),
-        ("vocabulary-by-editor", ChangeOp::CreateNode {
+        ("vocabulary-by-editor", "server", "forbidden", ChangeOp::CreateNode {
             id: e4.clone(),
             kind: "Vocabulary".into(),
             title: "V".into(),
@@ -949,18 +951,22 @@ fn graph_live_111_collections_content_merge_and_verification() {
                 .clone(),
         }),
     ];
-    for (name, op) in refusals {
-        // A change the client refuses itself never reaches the server.
-        let Ok(change) = first.change(vec![op], None) else {
-            report(
-                &format!("111-refused-{name}"),
-                &json!({"refused": "client"}),
-            );
-            continue;
-        };
-        let (_, outcome) = applied(&first, &one, &change);
-        assert!(rejected_reason(&outcome).is_some(), "{name}: {outcome:?}");
-        report(&format!("111-refused-{name}"), &outcome_json(&outcome));
+    for (name, at, code, op) in refusals {
+        match (at, first.change(vec![op], None)) {
+            ("client", Err(refusal)) => {
+                assert_eq!(refusal.code(), code, "{name}");
+                report(
+                    &format!("111-refused-{name}"),
+                    &json!({"refused": "client", "code": refusal.code()}),
+                );
+            }
+            ("server", Ok(change)) => {
+                let (_, outcome) = applied(&first, &one, &change);
+                assert_eq!(rejected_reason(&outcome), Some(code), "{name}: {outcome:?}");
+                report(&format!("111-refused-{name}"), &outcome_json(&outcome));
+            }
+            (_, other) => panic!("{name}: expected a {at} refusal {code}, got {other:?}"),
+        }
     }
     assert_eq!(
         prefix::complete(&one).expect("prefix").n,
