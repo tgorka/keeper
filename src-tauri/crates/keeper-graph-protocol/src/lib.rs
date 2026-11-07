@@ -2,23 +2,27 @@
 //!
 //! What a native client and the server must compute identically: the fixed
 //! vocabulary ([`vocabulary`]), the reversible query symbols ([`symbol`]),
-//! canonical JSON values and typed references ([`value`]), request digests
-//! ([`request`]), the `graph.apply` payload ([`change`]) and what it does to
-//! a graph ([`candidate`]), stable content's revision rule ([`content`]),
-//! event-operation digests ([`delta`]), the scope and key values of the
-//! graph tables ([`scope`]), the reads' shapes ([`wire`]), the closed query
-//! profile `KG-Cypher/1` ([`profile`]) and the frames a native consumer
-//! exchanges with its separate graph worker ([`worker`]).
+//! canonical JSON values, typed references and a node's reserved members
+//! ([`value`]: `$definition`, `$assertion` ([`assertion`]), `$locator`
+//! ([`locator`])), request digests ([`request`]), the `graph.apply` payload
+//! ([`change`]) and what it does to a graph ([`candidate`]), stable
+//! content's revision rule ([`content`]), event-operation digests
+//! ([`delta`]), the scope and key values of the graph tables ([`scope`]),
+//! the reads' shapes ([`wire`]), the closed query profile `KG-Cypher/1`
+//! ([`profile`]) and the frames a native consumer exchanges with its
+//! separate graph worker ([`worker`]).
 //! `syncular/knowledge-graph.vectors.json` pins every rule here; keeper-hq's
 //! TypeScript validator reproduces the same vectors.
 //!
 //! This crate owns no storage, transport or native code, and accepts nothing:
 //! acceptance is the server's graph command.
 
+pub mod assertion;
 pub mod candidate;
 pub mod change;
 pub mod content;
 pub mod delta;
+pub mod locator;
 pub mod profile;
 pub mod request;
 pub mod scope;
@@ -32,8 +36,9 @@ use std::fmt;
 
 /// The graph contract's version: a request envelope's `version`.
 pub const CONTRACT_VERSION: u32 = 1;
-/// The first Syncular schema version that holds the graph tables.
-pub const SCHEMA_VERSION: u32 = 6;
+/// The Syncular schema version of the graph tables a build reads and
+/// writes: 6 added the graph, 7 its stable content (`kg_contents`).
+pub const SCHEMA_VERSION: u32 = 7;
 /// The query profile [`profile`] admits and whose symbols [`symbol`] maps.
 pub const PROFILE: &str = "KG-Cypher/1";
 

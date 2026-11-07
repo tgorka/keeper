@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 
-use keeper_graph_protocol::candidate::{apply, State, Verdict, MAX_CONTAINMENT_EDGES};
+use keeper_graph_protocol::candidate::{apply, Stamp, State, Verdict, MAX_CONTAINMENT_EDGES};
 use keeper_graph_protocol::change::{Change, ChangeOp};
 use keeper_graph_protocol::wire::{decode_edge, decode_history, decode_node};
 use keeper_graph_protocol::Refusal;
@@ -64,6 +64,21 @@ impl State for Wide {
         self.returned.set(self.returned.get().max(edges.len()));
         edges
     }
+    fn content(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
+    fn contents_of(&self, _: &str, _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn sources_from(&self, _: &str, _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn incident_active(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn merged_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
 }
 
 fn contain_new_child(parents: usize) -> (Verdict, usize, usize) {
@@ -96,7 +111,13 @@ fn contain_new_child(parents: usize) -> (Verdict, usize, usize) {
         asked: Cell::new(0),
         returned: Cell::new(0),
     };
-    let verdict = apply(&state, &change, &mut || unreachable!("nothing minted"));
+    let stamp = Stamp {
+        time_ms: 1,
+        actor_id: "person",
+    };
+    let verdict = apply(&state, &change, &stamp, &mut || {
+        unreachable!("nothing minted")
+    });
     (verdict, state.asked.get(), state.returned.get())
 }
 

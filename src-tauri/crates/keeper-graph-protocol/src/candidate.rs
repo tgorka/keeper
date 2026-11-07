@@ -1,7 +1,9 @@
 //! What one change set does to a graph: the shared acceptance algebra
 //! (contract §4, §9.5, §9.6). Pure: the graph is read through [`State`]
 //! (the accepted, pre-change state), nothing is written, and ids the server
-//! mints (tags, memberships) come from the caller's `mint`.
+//! mints (tags, memberships) come from the caller's `mint`; the acceptance
+//! time and the authenticated actor a verification is stamped with come
+//! from the caller's [`Stamp`].
 //!
 //! Operations apply in order to a candidate; then the whole final candidate
 //! is validated. The verdict is exactly one of:
@@ -17,51 +19,92 @@
 //! written; then every edge left active that this change created,
 //! unarchived or updated (both endpoints active, and a `guidance_scope`
 //! edge starting at a `Guidance` node); then containment for every
-//! `contains` edge created or unarchived; then the event's bounds
-//! ([`crate::delta::digest`]). The receipt's `affected` lists nodes, edges
-//! and new tags in order of their first touch by the change, which may
-//! differ from the order of their event operations.
+//! `contains` edge created, unarchived or rewritten by a merge; then the
+//! final candidate ([`Candidate::finish`]: every node written within its
+//! kind's reserved-member rules, description provenance, content owners
+//! and reference bodies, and the verification rules); then the event's
+//! bounds ([`crate::delta::digest`]). The receipt's `affected` lists nodes,
+//! edges, new tags and contents in order of their first touch by the
+//! change, which may differ from the order of their event operations.
 //!
 //! **Revisions.** A created node or edge starts at revision 1 (a node also at
-//! lifecycle revision 1, active); a new tag at revision 1. A node touched by
-//! this change in any way — fields, tag memberships, lifecycle — moves its
-//! revision by exactly one; an archive or unarchive also moves its lifecycle
-//! revision by one. An edge operation moves the edge's revision by one and
-//! never its endpoints'.
+//! lifecycle revision 1, active); a new tag or content at revision 1. A node
+//! touched by this change in any way — fields, tag memberships, lifecycle,
+//! a merge absorbing it, its verification — moves its revision by exactly
+//! one; an archive or unarchive (and a merge's archive) also moves its
+//! lifecycle revision by one. An edge operation moves the edge's revision by
+//! one and never its endpoints'. A content update moves only the content's
+//! revision (never its owner's).
 //!
 //! **Event operations,** one or more per change operation, in its order:
 //! `create_node`, `update_node`, `archive_node`, `unarchive_node` give one
-//! node operation of that name; the first tag operation of a node that no
-//! explicit operation of this change names gives one node `update` (its
-//! revision move) before its own; `add_tag` gives a tag `create` when no tag
-//! has the text yet, then a membership `create`; `remove_tag` a membership
-//! `remove`; an edge operation one edge operation of its name. A node or
-//! edge image is the entity's whole row as it is before the change and after
-//! all of it (never an intermediate state): node `{id, kind, title,
-//! description, description_source_id, properties, lifecycle,
-//! merged_into_id, revision, lifecycle_revision}`, edge `{id, from_id,
-//! to_id, type, properties, lifecycle, revision}`, tag `{id, text, label,
-//! revision}`, membership `{id, node_id, tag_id}`. A new tag's `label` is
-//! null.
+//! node operation of that name; `verify_assertion` one node `update`; the
+//! first tag operation of a node that no explicit operation of this change
+//! names gives one node `update` (its revision move) before its own;
+//! `add_tag` gives a tag `create` when no tag has the text yet, then a
+//! membership `create`; `remove_tag` a membership `remove`; an edge
+//! operation one edge operation of its name; `create_content` and
+//! `update_content` one content operation of that name; `merge_nodes` one
+//! node `archive` per absorbed node (in its order, `merged_into_id` the
+//! target), then one edge `update` per listed edge (in its order, each
+//! absorbed endpoint rewritten to the target). A node, edge or content image
+//! is the entity's whole row as it is before the change and after all of it
+//! (never an intermediate state): node `{id, kind, title, description,
+//! description_source_id, properties, lifecycle, merged_into_id, revision,
+//! lifecycle_revision}`, edge `{id, from_id, to_id, type, properties,
+//! lifecycle, revision}`, tag `{id, text, label, revision}`, membership
+//! `{id, node_id, tag_id}`, content `{id, owner_node_id, revision, body}`.
+//! A new tag's `label` is null.
 //!
 //! **Containment.** The active `contains` edges of the final candidate stay
-//! acyclic. For each `contains` edge `P → C` created or unarchived, the walk
-//! goes up from `P` one level at a time: a level is every active `contains`
-//! edge of the final candidate into the current frontier; a level past
-//! [`MAX_CONTAINMENT_DEPTH`], or more than [`MAX_CONTAINMENT_EDGES`] edges
-//! read by all walks of the change together, refuses `change_limit`; a level
-//! holding an edge from `C` (or `P` = `C`) refuses `invalid_change`; the
-//! frontier is then the level's new `from` nodes. Reads are bounded as they
-//! are made: a level is fetched with a limit of one more edge than the
-//! budget still allows ([`State::contains_into`]), never whole.
+//! acyclic. For each `contains` edge `P → C` created, unarchived or
+//! rewritten, the walk goes up from `P` one level at a time: a level is
+//! every active `contains` edge of the final candidate into the current
+//! frontier; a level past [`MAX_CONTAINMENT_DEPTH`], or more than
+//! [`MAX_CONTAINMENT_EDGES`] edges read by all walks of the change together,
+//! refuses `change_limit`; a level holding an edge from `C` (or `P` = `C`)
+//! refuses `invalid_change`; the frontier is then the level's new `from`
+//! nodes. Reads are bounded as they are made: a level is fetched with a
+//! limit of one more edge than the budget still allows
+//! ([`State::contains_into`]), never whole.
+//!
+//! **Merge.** The target is active, unmerged and at `target_revision`; each
+//! absorbed node active at its `expected_revision`; `edges` exactly the
+//! active edges incident to any absorbed node ([`exact_incident_edges`]),
+//! each under its `update_edge` preconditions taken from the pre-merge
+//! endpoints — any difference is a conflict. Refused (`invalid_change`): a
+//! `Guidance` or `Vocabulary` target or absorbed node, one carrying
+//! `$assertion`, a rewritten `guidance_scope` edge, a rewrite that would
+//! make a self-loop ([`rewrite_endpoints`]), and a resulting redirect chain
+//! with a cycle ([`redirect_depth`]); over [`MAX_REDIRECT_HOPS`] hops refuses
+//! `change_limit`. Parallel edges keep their ids; archived incident edges,
+//! tag memberships, contents and typed references stay with the absorbed
+//! node.
+//!
+//! **Verification** ([`crate::assertion`]). `verify_assertion` is accepted
+//! only against the exact checked state: the node at `expected_revision`,
+//! active and carrying `$assertion`; `sources` exactly its active outgoing
+//! `sources` edges (each at its revision, its typed reference naming
+//! `ref_id` at `ref_revision`, which is that entity's current revision); and
+//! `contents` exactly the contents it owns (each at its revision). A
+//! difference is a conflict; no active `sources` edge, a reference that is
+//! absent, null-revisioned or does not resolve, an archived target node, or
+//! more than 64 of either refuses. After it, every other write to a node
+//! verified in the pre-state clears its verification in the same operation;
+//! a write to such a node's `sources` edges or contents refuses unless the
+//! same change holds an `update_node` of it; and the verification is the
+//! only operation of its change touching the node, its contents or its
+//! outgoing `sources` edges.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::change::{Change, ChangeOp};
+use crate::assertion::{self, MAX_CHECKED_CONTENTS, MAX_CHECKED_SOURCES};
+use crate::change::{Change, ChangeOp, CheckedContent, CheckedSource, MergeEdge};
+use crate::content::{revise, Revision};
 use crate::delta::{self, Op};
-use crate::value::{check_properties, typed_ref, RefType};
+use crate::value::{check_node_properties, check_properties, typed_ref, RefType};
 use crate::vocabulary::{EntityType, Operation};
 use crate::Refusal;
 
@@ -69,9 +112,15 @@ use crate::Refusal;
 pub const MAX_CONTAINMENT_DEPTH: usize = 64;
 /// The most `contains` edges the containment walks of one change may read.
 pub const MAX_CONTAINMENT_EDGES: usize = 10_000;
+/// The most `merged_into_id` hops a redirect chain may have.
+pub const MAX_REDIRECT_HOPS: usize = 8;
+/// The most redirected nodes the redirect walks of one merge may read.
+pub const MAX_REDIRECT_READS: usize = 10_000;
 
 /// The accepted graph a change is judged against. Every answer is an image
-/// in the shapes above.
+/// in the shapes above; every list is ascending by id and **at most
+/// `limit`** long, so a full answer proves a bound exceeded without reading
+/// the rest.
 pub trait State {
     /// The node with `id`, any lifecycle.
     fn node(&self, id: &str) -> Option<Map<String, Value>>;
@@ -81,12 +130,42 @@ pub trait State {
     fn tag(&self, text: &str) -> Option<Map<String, Value>>;
     /// The membership of node `node_id` in tag `tag_id`.
     fn membership(&self, node_id: &str, tag_id: &str) -> Option<Map<String, Value>>;
-    /// The accepted active `contains` edges whose `to_id` is one of `to_ids`,
-    /// ascending by id, **at most `limit`** of them. The walk asks for one
-    /// more edge than it may still read (plus any it will replace with this
-    /// change's own), so a full answer proves the budget exceeded without
-    /// reading the rest.
+    /// The accepted active `contains` edges whose `to_id` is one of `to_ids`.
+    /// The walk asks for one more edge than it may still read (plus any it
+    /// will replace with this change's own).
     fn contains_into(&self, to_ids: &[String], limit: usize) -> Vec<Map<String, Value>>;
+    /// The content with `id`.
+    fn content(&self, id: &str) -> Option<Map<String, Value>>;
+    /// The contents owned by node `owner_id` (`kg_contents_owner`).
+    fn contents_of(&self, owner_id: &str, limit: usize) -> Vec<Map<String, Value>>;
+    /// The active `sources` edges from node `from_id`
+    /// (`kg_edges_from_active`).
+    fn sources_from(&self, from_id: &str, limit: usize) -> Vec<Map<String, Value>>;
+    /// The active edges with `from_id` or `to_id` one of `node_ids`.
+    fn incident_active(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>>;
+    /// The nodes whose `merged_into_id` is one of `node_ids`
+    /// (`kg_nodes_merged_into_id`).
+    fn merged_into(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>>;
+}
+
+impl<S: State + ?Sized> assertion::Current for S {
+    fn node(&self, id: &str) -> Option<Map<String, Value>> {
+        State::node(self, id)
+    }
+    fn content(&self, id: &str) -> Option<Map<String, Value>> {
+        State::content(self, id)
+    }
+    fn sources_from(&self, id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        State::sources_from(self, id, limit)
+    }
+}
+
+/// What the server stamps a verification with: its acceptance time and the
+/// authenticated actor, never a payload's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp<'a> {
+    pub time_ms: u64,
+    pub actor_id: &'a str,
 }
 
 /// What the change does.
@@ -105,8 +184,8 @@ pub struct Effects {
     pub ops: Vec<Op>,
     pub delta_digest: String,
     /// The receipt's `affected`: `{entity_type, id, revision}` (a node's
-    /// with `lifecycle_revision`) for each node, edge and new tag, in order
-    /// of their first operation.
+    /// with `lifecycle_revision`) for each node, edge, new tag and content,
+    /// in order of their first operation.
     pub affected: Vec<Value>,
 }
 
@@ -119,9 +198,14 @@ impl Effects {
 }
 
 /// Judge `change` against `state`.
-pub fn apply(state: &dyn State, change: &Change, mint: &mut dyn FnMut() -> String) -> Verdict {
+pub fn apply(
+    state: &dyn State,
+    change: &Change,
+    stamp: &Stamp<'_>,
+    mint: &mut dyn FnMut() -> String,
+) -> Verdict {
     let mut candidate = Candidate::new(state, change);
-    match candidate.run(change, mint) {
+    match candidate.run(change, stamp, mint) {
         Ok(effects) => Verdict::Accepted(effects),
         Err(Stop::Conflict(detail)) => Verdict::Conflict(detail),
         Err(Stop::Refused(refusal)) => Verdict::Refused(refusal),
@@ -155,27 +239,35 @@ enum Slot {
     Edge(String, Operation),
     Tag(String),
     Membership(Operation, Image),
+    Content(String, Operation),
 }
 
 struct Candidate<'a> {
     state: &'a dyn State,
     nodes: BTreeMap<String, Entry>,
     edges: BTreeMap<String, Entry>,
+    contents: BTreeMap<String, Entry>,
     /// New tags by canonical text.
     tags: BTreeMap<String, Image>,
     /// Nodes an explicit operation of the change names.
     explicit: BTreeSet<String>,
+    /// Nodes an `update_node` of the change names.
+    updated: BTreeSet<String>,
     /// Nodes whose tag-only `update` has been emitted.
     emitted: BTreeSet<String>,
+    /// The node a `verify_assertion` verifies.
+    verified: Option<String>,
     /// Values written, to check their typed references.
     written: Vec<Value>,
     /// Edges whose endpoints must be active (if the edge is), in order.
     endpoint_checks: Vec<String>,
     /// `contains` edges to walk, in order.
     containment: Vec<String>,
+    /// (node, source) of each generated description.
+    provenance: Vec<(String, String)>,
     slots: Vec<Slot>,
-    /// Nodes, edges and new tags (by text) in order of first touch: the
-    /// receipt's `affected` order.
+    /// Nodes, edges, new tags (by text) and contents in order of first
+    /// touch: the receipt's `affected` order.
     order: Vec<(&'static str, String)>,
 }
 
@@ -199,48 +291,182 @@ fn next(revision: &str) -> Result<String, Stop> {
 }
 
 fn conflict(entity_type: &str, id: &str, precondition: &str, current: Option<String>) -> Stop {
-    Stop::Conflict(json!({
+    Stop::Conflict(conflict_detail(entity_type, id, precondition, current))
+}
+
+fn conflict_detail(
+    entity_type: &str,
+    id: &str,
+    precondition: &str,
+    current: Option<String>,
+) -> Value {
+    json!({
         "entity": { "entity_type": entity_type, "id": id },
         "precondition": precondition,
         "current_revision": current,
-    }))
+    })
 }
 
 fn revision_le(a: &str, b: &str) -> bool {
     matches!((a.parse::<u128>(), b.parse::<u128>()), (Ok(a), Ok(b)) if a <= b)
 }
 
+/// A node kind no merge may absorb or target in R1.
+fn unmergeable(node: &Image) -> bool {
+    matches!(text(node, "kind").as_str(), "Guidance" | "Vocabulary")
+        || assertion::of(node).is_some()
+}
+
+/// Check that `listed` is exactly the active edges incident to `node_ids`
+/// in `state`: the first difference is the conflict detail (an unlisted
+/// edge with its revision, or a listed one that is not an active incident
+/// edge with its revision or null). Reads at most `listed.len() + 1` edges.
+pub fn exact_incident_edges(
+    state: &dyn State,
+    node_ids: &[String],
+    listed: &[String],
+) -> Result<(), Value> {
+    let wanted: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
+    let found = state.incident_active(node_ids, listed.len().saturating_add(1));
+    let mut seen = BTreeSet::new();
+    for edge in &found {
+        let id = text(edge, "id");
+        if !wanted.contains(id.as_str()) {
+            return Err(conflict_detail(
+                "edge",
+                &id,
+                "revision",
+                Some(text(edge, "revision")),
+            ));
+        }
+        seen.insert(id);
+    }
+    for id in listed {
+        if !seen.contains(id) {
+            let current = state.edge(id).map(|e| text(&e, "revision"));
+            return Err(conflict_detail("edge", id, "revision", current));
+        }
+    }
+    Ok(())
+}
+
+/// The edge image with every endpoint in `absorbed` rewritten to `target`;
+/// `None` when the result would be a self-loop.
+#[must_use]
+pub fn rewrite_endpoints(edge: &Image, absorbed: &BTreeSet<String>, target: &str) -> Option<Image> {
+    let mut out = edge.clone();
+    for end in ["from_id", "to_id"] {
+        if absorbed.contains(&text(edge, end)) {
+            out.insert(end.into(), json!(target));
+        }
+    }
+    (text(&out, "from_id") != text(&out, "to_id")).then_some(out)
+}
+
+/// The deepest redirect chain ending at any of `roots`: the most
+/// `merged_into_id` hops from a node into one of them (0 when none
+/// redirects there). Walked a level at a time over
+/// [`State::merged_into`], at most [`MAX_REDIRECT_HOPS`] levels and
+/// [`MAX_REDIRECT_READS`] nodes (`change_limit` past either); a node met
+/// twice is a cycle (`invalid_change`).
+pub fn redirect_depth(state: &dyn State, roots: &[String]) -> Result<usize, Refusal> {
+    let mut seen: BTreeSet<String> = roots.iter().cloned().collect();
+    let mut frontier = roots.to_vec();
+    let mut reads = 0usize;
+    let mut depth = 0;
+    while !frontier.is_empty() {
+        let level = state.merged_into(
+            &frontier,
+            MAX_REDIRECT_READS.saturating_sub(reads).saturating_add(1),
+        );
+        if level.is_empty() {
+            break;
+        }
+        depth += 1;
+        reads += level.len();
+        if depth > MAX_REDIRECT_HOPS || reads > MAX_REDIRECT_READS {
+            return Err(Refusal::ChangeLimit);
+        }
+        frontier = Vec::with_capacity(level.len());
+        for node in level {
+            let id = text(&node, "id");
+            if !seen.insert(id.clone()) {
+                return Err(Refusal::InvalidChange);
+            }
+            frontier.push(id);
+        }
+    }
+    Ok(depth)
+}
+
+/// The redirect chain from node `id`: the ids its `merged_into_id` links
+/// lead through, in order, ending at the first unmerged node. More than
+/// [`MAX_REDIRECT_HOPS`] hops refuses `change_limit`, a cycle or a missing
+/// node `invalid_change`. Inspection reports it; it never substitutes the
+/// survivor for `id`.
+pub fn redirect_chain(state: &dyn State, id: &str) -> Result<Vec<String>, Refusal> {
+    let mut chain = Vec::new();
+    let mut seen = BTreeSet::from([id.to_owned()]);
+    let mut node = state.node(id).ok_or(Refusal::InvalidChange)?;
+    while let Some(next) = node.get("merged_into_id").and_then(Value::as_str) {
+        if chain.len() == MAX_REDIRECT_HOPS {
+            return Err(Refusal::ChangeLimit);
+        }
+        if !seen.insert(next.to_owned()) {
+            return Err(Refusal::InvalidChange);
+        }
+        chain.push(next.to_owned());
+        node = state.node(next).ok_or(Refusal::InvalidChange)?;
+    }
+    Ok(chain)
+}
+
 impl<'a> Candidate<'a> {
     fn new(state: &'a dyn State, change: &Change) -> Self {
-        let explicit = change
-            .ops()
-            .iter()
-            .filter_map(|op| match op {
+        let mut explicit = BTreeSet::new();
+        let mut updated = BTreeSet::new();
+        for op in change.ops() {
+            match op {
+                ChangeOp::UpdateNode { id, .. } => {
+                    explicit.insert(id.clone());
+                    updated.insert(id.clone());
+                }
                 ChangeOp::CreateNode { id, .. }
-                | ChangeOp::UpdateNode { id, .. }
                 | ChangeOp::ArchiveNode { id, .. }
-                | ChangeOp::UnarchiveNode { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
+                | ChangeOp::UnarchiveNode { id, .. }
+                | ChangeOp::VerifyAssertion { id, .. } => {
+                    explicit.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
         Self {
             state,
             nodes: BTreeMap::new(),
             edges: BTreeMap::new(),
+            contents: BTreeMap::new(),
             tags: BTreeMap::new(),
             explicit,
+            updated,
             emitted: BTreeSet::new(),
+            verified: None,
             written: Vec::new(),
             endpoint_checks: Vec::new(),
             containment: Vec::new(),
+            provenance: Vec::new(),
             slots: Vec::new(),
             order: Vec::new(),
         }
     }
 
-    fn run(&mut self, change: &Change, mint: &mut dyn FnMut() -> String) -> Result<Effects, Stop> {
+    fn run(
+        &mut self,
+        change: &Change,
+        stamp: &Stamp<'_>,
+        mint: &mut dyn FnMut() -> String,
+    ) -> Result<Effects, Stop> {
         for (index, op) in change.ops().iter().enumerate() {
-            self.op(op, change.canonical_tag(index), mint)?;
+            self.op(op, change.canonical_tag(index), stamp, mint)?;
         }
         for value in std::mem::take(&mut self.written) {
             self.references(&value)?;
@@ -252,6 +478,7 @@ impl<'a> Candidate<'a> {
         for id in std::mem::take(&mut self.containment) {
             self.acyclic(&id, &mut budget)?;
         }
+        self.finish()?;
         self.effects()
     }
 
@@ -355,7 +582,8 @@ impl<'a> Candidate<'a> {
         self.endpoint(&to, Some(&to_lifecycle.to_owned()))
     }
 
-    /// A create's id must be new to the graph, as a node or an edge.
+    /// A create's id must be new to the graph, as a node, an edge or a
+    /// content.
     fn absent(&self, id: &str) -> Result<(), Stop> {
         if let Some(node) = self.state.node(id) {
             return Err(conflict(
@@ -373,6 +601,14 @@ impl<'a> Candidate<'a> {
                 Some(text(&edge, "revision")),
             ));
         }
+        if let Some(content) = self.state.content(id) {
+            return Err(conflict(
+                "content",
+                id,
+                "revision",
+                Some(text(&content, "revision")),
+            ));
+        }
         Ok(())
     }
 
@@ -381,6 +617,7 @@ impl<'a> Candidate<'a> {
         &mut self,
         op: &ChangeOp,
         tag: Option<&str>,
+        stamp: &Stamp<'_>,
         mint: &mut dyn FnMut() -> String,
     ) -> Result<(), Stop> {
         match op {
@@ -424,9 +661,24 @@ impl<'a> Candidate<'a> {
                 }
                 if let Some(description) = &set.description {
                     entry.after.insert("description".into(), json!(description));
+                    // An authored description has no provenance.
+                    if set.description_source.is_none() {
+                        entry
+                            .after
+                            .insert("description_source_id".into(), Value::Null);
+                    }
+                }
+                if let Some(source) = &set.description_source {
+                    entry
+                        .after
+                        .insert("description_source_id".into(), json!(source));
+                    if let Some(source) = source {
+                        self.provenance.push((id.clone(), source.clone()));
+                    }
                 }
                 if !set_properties.is_empty() || !remove_properties.is_empty() {
-                    edit_properties(&mut entry.after, set_properties, remove_properties)?;
+                    let entry = self.nodes.get_mut(id).ok_or(Refusal::InvalidChange)?;
+                    edit_properties(&mut entry.after, true, set_properties, remove_properties)?;
                     self.written.push(Value::Object(set_properties.clone()));
                 }
                 self.slots.push(Slot::Node(id.clone(), Operation::Update));
@@ -511,7 +763,7 @@ impl<'a> Candidate<'a> {
                     to_lifecycle_revision,
                 )?;
                 let entry = self.edges.get_mut(id).ok_or(Refusal::InvalidChange)?;
-                edit_properties(&mut entry.after, set_properties, remove_properties)?;
+                edit_properties(&mut entry.after, false, set_properties, remove_properties)?;
                 self.written.push(Value::Object(set_properties.clone()));
                 self.endpoint_checks.push(id.clone());
                 self.slots.push(Slot::Edge(id.clone(), Operation::Update));
@@ -582,7 +834,272 @@ impl<'a> Candidate<'a> {
                     self.remove_tag(node_id, &text_)?;
                 }
             }
+            ChangeOp::MergeNodes {
+                target_id,
+                target_revision,
+                absorbed,
+                edges,
+            } => self.merge(target_id, target_revision, absorbed, edges)?,
+            ChangeOp::CreateContent {
+                id,
+                owner_node_id,
+                body,
+            } => {
+                self.absent(id)?;
+                let image = json!({
+                    "id": id, "owner_node_id": owner_node_id, "revision": "1", "body": body,
+                });
+                self.contents.insert(
+                    id.clone(),
+                    Entry {
+                        before: None,
+                        after: object(image),
+                        touched: true,
+                    },
+                );
+                self.slots
+                    .push(Slot::Content(id.clone(), Operation::Create));
+                self.first("content", id);
+            }
+            ChangeOp::UpdateContent {
+                id,
+                owner_node_id,
+                expected_revision,
+                body,
+            } => {
+                let Some(before) = self.state.content(id) else {
+                    return Err(conflict("content", id, "revision", None));
+                };
+                let update = object(json!({
+                    "id": id, "owner_node_id": owner_node_id,
+                    "expected_revision": expected_revision, "body": body,
+                }));
+                let after = match revise(&before, &update) {
+                    Revision::Accepted(op) => match op.after_value {
+                        Some(Value::Object(after)) => after,
+                        _ => return Err(Refusal::InvalidChange.into()),
+                    },
+                    Revision::Conflict(detail) => return Err(Stop::Conflict(detail)),
+                    Revision::Refused(refusal) => return Err(refusal.into()),
+                };
+                self.contents.insert(
+                    id.clone(),
+                    Entry {
+                        before: Some(before),
+                        after,
+                        touched: true,
+                    },
+                );
+                self.slots
+                    .push(Slot::Content(id.clone(), Operation::Update));
+                self.first("content", id);
+            }
+            ChangeOp::VerifyAssertion {
+                id,
+                expected_revision,
+                sources,
+                contents,
+            } => self.verify(id, expected_revision, sources, contents, stamp)?,
         }
+        Ok(())
+    }
+
+    /// `merge_nodes`: its preconditions, its refusals, then its archives
+    /// and rewrites (the module's *Merge*).
+    fn merge(
+        &mut self,
+        target_id: &str,
+        target_revision: &str,
+        absorbed: &[crate::change::Absorbed],
+        edges: &[MergeEdge],
+    ) -> Result<(), Stop> {
+        let Some(target) = self.node(target_id) else {
+            return Err(conflict("node", target_id, "revision", None));
+        };
+        let target = target.before.clone().ok_or(Refusal::InvalidChange)?;
+        if text(&target, "revision") != target_revision {
+            return Err(conflict(
+                "node",
+                target_id,
+                "revision",
+                Some(text(&target, "revision")),
+            ));
+        }
+        for node in absorbed {
+            self.touch_node(&node.id, Some(&node.expected_revision))?;
+        }
+        let ids: Vec<String> = absorbed.iter().map(|n| n.id.clone()).collect();
+        let listed: Vec<String> = edges.iter().map(|e| e.id.clone()).collect();
+        exact_incident_edges(self.state, &ids, &listed).map_err(Stop::Conflict)?;
+        for edge in edges {
+            self.touch_edge(
+                &edge.id,
+                &edge.expected_revision,
+                &edge.from_lifecycle_revision,
+                &edge.to_lifecycle_revision,
+            )?;
+        }
+        if text(&target, "lifecycle") != "active"
+            || !target.get("merged_into_id").is_none_or(Value::is_null)
+            || unmergeable(&target)
+        {
+            return Err(Refusal::InvalidChange.into());
+        }
+        let set: BTreeSet<String> = ids.iter().cloned().collect();
+        for id in &ids {
+            let entry = self.nodes.get_mut(id).ok_or(Refusal::InvalidChange)?;
+            let after = &mut entry.after;
+            if text(after, "lifecycle") != "active"
+                || !after.get("merged_into_id").is_none_or(Value::is_null)
+                || unmergeable(after)
+            {
+                return Err(Refusal::InvalidChange.into());
+            }
+            let lifecycle = next(&text(after, "lifecycle_revision"))?;
+            after.insert("lifecycle".into(), json!("archived"));
+            after.insert("lifecycle_revision".into(), json!(lifecycle));
+            after.insert("merged_into_id".into(), json!(target_id));
+        }
+        for id in &listed {
+            let entry = self.edges.get_mut(id).ok_or(Refusal::InvalidChange)?;
+            if text(&entry.after, "type") == "guidance_scope" {
+                return Err(Refusal::InvalidChange.into());
+            }
+            entry.after =
+                rewrite_endpoints(&entry.after, &set, target_id).ok_or(Refusal::InvalidChange)?;
+            if text(&entry.after, "type") == "contains" {
+                self.containment.push(id.clone());
+            }
+            self.endpoint_checks.push(id.clone());
+        }
+        redirect_bound(self.state, &ids)?;
+        self.slots
+            .extend(ids.into_iter().map(|id| Slot::Node(id, Operation::Archive)));
+        self.slots.extend(
+            listed
+                .into_iter()
+                .map(|id| Slot::Edge(id, Operation::Update)),
+        );
+        Ok(())
+    }
+
+    /// `verify_assertion`: the exact checked state against the pre-state,
+    /// then the one node `update` that verifies (the module's
+    /// *Verification*).
+    fn verify(
+        &mut self,
+        id: &str,
+        expected: &str,
+        sources: &[CheckedSource],
+        contents: &[CheckedContent],
+        stamp: &Stamp<'_>,
+    ) -> Result<(), Stop> {
+        let Some(node) = self.state.node(id) else {
+            return Err(conflict("node", id, "revision", None));
+        };
+        if text(&node, "revision") != expected {
+            return Err(conflict(
+                "node",
+                id,
+                "revision",
+                Some(text(&node, "revision")),
+            ));
+        }
+        if text(&node, "lifecycle") != "active" || assertion::of(&node).is_none() {
+            return Err(Refusal::InvalidChange.into());
+        }
+        let found = self.state.sources_from(id, MAX_CHECKED_SOURCES + 1);
+        if found.len() > MAX_CHECKED_SOURCES {
+            return Err(Refusal::ChangeLimit.into());
+        }
+        if found.is_empty() && sources.is_empty() {
+            return Err(Refusal::InvalidChange.into());
+        }
+        let listed: BTreeMap<&str, &CheckedSource> =
+            sources.iter().map(|s| (s.edge_id.as_str(), s)).collect();
+        for edge in &found {
+            let edge_id = text(edge, "id");
+            if !listed.contains_key(edge_id.as_str()) {
+                return Err(conflict(
+                    "edge",
+                    &edge_id,
+                    "revision",
+                    Some(text(edge, "revision")),
+                ));
+            }
+        }
+        for source in sources {
+            let Some(edge) = found.iter().find(|e| text(e, "id") == source.edge_id) else {
+                let current = self
+                    .state
+                    .edge(&source.edge_id)
+                    .map(|e| text(&e, "revision"));
+                return Err(conflict("edge", &source.edge_id, "revision", current));
+            };
+            let edge_revision = text(edge, "revision");
+            if edge_revision != source.edge_revision {
+                return Err(conflict(
+                    "edge",
+                    &source.edge_id,
+                    "revision",
+                    Some(edge_revision),
+                ));
+            }
+            let reference = assertion::source_ref(edge).ok_or(Refusal::InvalidChange)?;
+            let Some(ref_revision) = &reference.revision else {
+                return Err(Refusal::InvalidChange.into());
+            };
+            if reference.id != source.ref_id || *ref_revision != source.ref_revision {
+                return Err(conflict(
+                    "edge",
+                    &source.edge_id,
+                    "revision",
+                    Some(edge_revision),
+                ));
+            }
+            let current =
+                assertion::resolve(self.state, edge, &reference).ok_or(Refusal::InvalidChange)?;
+            if current != source.ref_revision {
+                let entity = match reference.entity_type {
+                    RefType::Node => "node",
+                    RefType::Content => "content",
+                };
+                return Err(conflict(entity, &reference.id, "revision", Some(current)));
+            }
+            let to = self.state.node(&text(edge, "to_id"));
+            if !to.is_some_and(|to| text(&to, "lifecycle") == "active") {
+                return Err(Refusal::InvalidChange.into());
+            }
+        }
+        let owned = self.state.contents_of(id, MAX_CHECKED_CONTENTS + 1);
+        if owned.len() > MAX_CHECKED_CONTENTS {
+            return Err(Refusal::ChangeLimit.into());
+        }
+        let listed: BTreeMap<&str, &CheckedContent> =
+            contents.iter().map(|c| (c.id.as_str(), c)).collect();
+        for content in &owned {
+            let content_id = text(content, "id");
+            let revision = text(content, "revision");
+            match listed.get(content_id.as_str()) {
+                Some(checked) if checked.revision == revision => {}
+                _ => return Err(conflict("content", &content_id, "revision", Some(revision))),
+            }
+        }
+        for checked in contents {
+            if !owned.iter().any(|c| text(c, "id") == checked.id) {
+                let current = self
+                    .state
+                    .content(&checked.id)
+                    .map(|c| text(&c, "revision"));
+                return Err(conflict("content", &checked.id, "revision", current));
+            }
+        }
+        self.touch_node(id, Some(&expected.to_owned()))?;
+        let entry = self.nodes.get_mut(id).ok_or(Refusal::InvalidChange)?;
+        assertion::verify(&mut entry.after, stamp.time_ms, stamp.actor_id)?;
+        self.verified = Some(id.to_owned());
+        self.slots
+            .push(Slot::Node(id.to_owned(), Operation::Update));
         Ok(())
     }
 
@@ -635,19 +1152,25 @@ impl<'a> Candidate<'a> {
         }
     }
 
-    /// Every typed reference in `value` names a node of the final candidate
-    /// at a revision it has had; content references refuse until content
-    /// exists.
+    /// The final image of content `id`, wherever it is.
+    fn final_content(&self, id: &str) -> Option<Image> {
+        match self.contents.get(id) {
+            Some(entry) => Some(entry.after.clone()),
+            None => self.state.content(id),
+        }
+    }
+
+    /// Every typed reference in `value` names a node or content of the
+    /// final candidate at a revision it has had.
     fn references(&self, value: &Value) -> Result<(), Stop> {
         if let Some(reference) = typed_ref(value)? {
-            if reference.entity_type == RefType::Content {
-                return Err(Refusal::InvalidChange.into());
+            let entity = match reference.entity_type {
+                RefType::Node => self.final_node(&reference.id),
+                RefType::Content => self.final_content(&reference.id),
             }
-            let node = self
-                .final_node(&reference.id)
-                .ok_or(Refusal::InvalidChange)?;
+            .ok_or(Refusal::InvalidChange)?;
             if let Some(revision) = &reference.revision {
-                if revision == "0" || !revision_le(revision, &text(&node, "revision")) {
+                if revision == "0" || !revision_le(revision, &text(&entity, "revision")) {
                     return Err(Refusal::InvalidChange.into());
                 }
             }
@@ -757,6 +1280,84 @@ impl<'a> Candidate<'a> {
         }
     }
 
+    /// Whether node `id` is `verified` in the pre-state.
+    fn verified_before(&self, id: &str) -> bool {
+        self.state
+            .node(id)
+            .is_some_and(|n| assertion::is_verified(&n))
+    }
+
+    /// The final candidate's own rules (the module's order): node members
+    /// by kind, description provenance, content owners and reference
+    /// bodies, then the verification rules, clearing what they clear.
+    fn finish(&mut self) -> Result<(), Stop> {
+        for entry in self.nodes.values().filter(|e| e.touched) {
+            let kind = text(&entry.after, "kind");
+            let properties = entry
+                .after
+                .get("properties")
+                .ok_or(Refusal::InvalidChange)?;
+            check_node_properties(Some(&kind), properties)?;
+        }
+        for (node, source) in &self.provenance {
+            let from_content = self
+                .final_content(source)
+                .is_some_and(|c| text(&c, "owner_node_id") == *node);
+            let from_assertion = self
+                .final_node(source)
+                .is_some_and(|n| assertion::of(&n).is_some());
+            if !from_content && !from_assertion {
+                return Err(Refusal::InvalidChange.into());
+            }
+        }
+        for entry in self.contents.values() {
+            if self
+                .final_node(&text(&entry.after, "owner_node_id"))
+                .is_none()
+            {
+                return Err(Refusal::InvalidChange.into());
+            }
+            if let Some(reference) = entry.after.get("body").and_then(|b| b.get("reference")) {
+                let resource = reference
+                    .get("resource_node_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.final_node(id));
+                if !resource.is_some_and(|r| text(&r, "kind") == "Resource") {
+                    return Err(Refusal::InvalidChange.into());
+                }
+            }
+        }
+        let verified = self.verified.clone();
+        // Writes to a checked state: refused while it is verified unless the
+        // same change clears it, and never beside its own verification.
+        let guarded = |owner: &str| -> Result<(), Stop> {
+            if verified.as_deref() == Some(owner)
+                || (self.verified_before(owner) && !self.updated.contains(owner))
+            {
+                return Err(Refusal::InvalidChange.into());
+            }
+            Ok(())
+        };
+        for entry in self.edges.values().filter(|e| e.touched) {
+            if text(&entry.after, "type") != "sources" {
+                continue;
+            }
+            guarded(&text(&entry.after, "from_id"))?;
+            if let Some(before) = &entry.before {
+                guarded(&text(before, "from_id"))?;
+            }
+        }
+        for entry in self.contents.values() {
+            guarded(&text(&entry.after, "owner_node_id"))?;
+        }
+        for (id, entry) in &mut self.nodes {
+            if entry.touched && entry.before.is_some() && verified.as_deref() != Some(id) {
+                assertion::clear(&mut entry.after);
+            }
+        }
+        Ok(())
+    }
+
     fn effects(&self) -> Result<Effects, Stop> {
         let mut ops = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
@@ -774,6 +1375,15 @@ impl<'a> Candidate<'a> {
                     let entry = self.edges.get(id).ok_or(Refusal::InvalidChange)?;
                     (
                         EntityType::Edge,
+                        *operation,
+                        entry.before.clone(),
+                        Some(entry.after.clone()),
+                    )
+                }
+                Slot::Content(id, operation) => {
+                    let entry = self.contents.get(id).ok_or(Refusal::InvalidChange)?;
+                    (
+                        EntityType::Content,
                         *operation,
                         entry.before.clone(),
                         Some(entry.after.clone()),
@@ -845,6 +1455,10 @@ impl<'a> Candidate<'a> {
                         let after = &self.edges.get(key).ok_or(Refusal::InvalidChange)?.after;
                         json!({"entity_type": "edge", "id": key, "revision": after.get("revision")})
                     }
+                    "content" => {
+                        let after = &self.contents.get(key).ok_or(Refusal::InvalidChange)?.after;
+                        json!({"entity_type": "content", "id": key, "revision": after.get("revision")})
+                    }
                     _ => {
                         let tag = self.tags.get(key).ok_or(Refusal::InvalidChange)?;
                         json!({"entity_type": "tag", "id": tag.get("id"), "revision": "1"})
@@ -855,6 +1469,15 @@ impl<'a> Candidate<'a> {
     }
 }
 
+/// A merge's redirect bound: no chain into an absorbed node may be so deep
+/// that, one hop further to the target, it passes [`MAX_REDIRECT_HOPS`].
+fn redirect_bound(state: &dyn State, absorbed: &[String]) -> Result<(), Refusal> {
+    if redirect_depth(state, absorbed)? + 1 > MAX_REDIRECT_HOPS {
+        return Err(Refusal::ChangeLimit);
+    }
+    Ok(())
+}
+
 fn object(value: Value) -> Image {
     match value {
         Value::Object(map) => map,
@@ -863,9 +1486,12 @@ fn object(value: Value) -> Image {
 }
 
 /// Set and remove properties of an image; removing a key it lacks refuses,
-/// and the result must still be a valid properties object.
+/// and the result must still be a valid properties object (a node's may
+/// hold reserved members, checked against its kind in
+/// [`Candidate::finish`]).
 fn edit_properties(
     image: &mut Image,
+    node: bool,
     set: &Map<String, Value>,
     remove: &[String],
 ) -> Result<(), Stop> {
@@ -882,7 +1508,11 @@ fn edit_properties(
         properties.insert(key.clone(), value.clone());
     }
     let properties = Value::Object(properties);
-    check_properties(&properties)?;
+    if node {
+        check_node_properties(None, &properties)?;
+    } else {
+        check_properties(&properties)?;
+    }
     image.insert("properties".into(), properties);
     Ok(())
 }

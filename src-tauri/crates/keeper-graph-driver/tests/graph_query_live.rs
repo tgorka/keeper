@@ -205,6 +205,7 @@ fn apply_fixture(client: &GraphClient) -> u64 {
         set: NodeFields {
             title: Some("Alpha 2".into()),
             description: None,
+            description_source: None,
         },
         set_properties: Map::new(),
         remove_properties: vec!["gone".into()],

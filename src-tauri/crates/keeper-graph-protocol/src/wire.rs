@@ -11,11 +11,14 @@
 //! | [`OUTCOME`] | `request_id` | `[]` or one `kg_receipts` row of the caller's own client scope |
 //! | [`GET_NODE`] | `id`, `include_archived` | `[]` or `[{<node image>, "tags": [<text>…]}]` |
 //! | [`GET_EDGE`] | `id`, `include_archived` | `[]` or `[<edge image>]` |
+//! | [`GET_CONTENT`] | `id`, `include_archived` | `[]` or `[<content image>]` |
 //! | [`HISTORY`] | `after`, `limit`, `filter` | `[{"events": [{"event": <header>, "ops": [<op>…]}], "scanned_through": <decimal>}]` |
 //!
-//! Without `include_archived` a node is answered only while active and an
-//! edge only while it and both its endpoints are. Images are the shapes of
-//! [`crate::candidate`]; tags are canonical texts in ascending order.
+//! Without `include_archived` a node is answered only while active, an
+//! edge only while it and both its endpoints are, and a content (which has
+//! no lifecycle of its own) only while its owner node is. Images are the
+//! shapes of [`crate::candidate`]; tags are canonical texts in ascending
+//! order.
 //!
 //! **History** pages the retained events, not the transport log: every
 //! event in `(after, scanned_through]` that matches `filter` is in
@@ -36,13 +39,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::delta::{self, Op};
-use crate::value::{canonical, check_properties};
+use crate::value::{canonical, check_node_properties, check_properties};
 use crate::vocabulary::{stored_edge_type, stored_node_kind, EntityType, OriginClass};
 use crate::{is_decimal, is_ulid, Refusal, CONTRACT_VERSION};
 
 pub const OUTCOME: &str = "graph.outcome";
 pub const GET_NODE: &str = "graph.get_node";
 pub const GET_EDGE: &str = "graph.get_edge";
+pub const GET_CONTENT: &str = "graph.get_content";
 pub const HISTORY: &str = "graph.history";
 
 /// The most events one history page may ask for.
@@ -59,7 +63,7 @@ pub fn outcome_params(context_id: Option<&str>, request_id: &str) -> Value {
     json!({ "version": CONTRACT_VERSION, "context_id": context_id, "request_id": request_id })
 }
 
-/// [`GET_NODE`]'s or [`GET_EDGE`]'s params.
+/// [`GET_NODE`]'s, [`GET_EDGE`]'s or [`GET_CONTENT`]'s params.
 #[must_use]
 pub fn get_params(context_id: Option<&str>, id: &str, include_archived: bool) -> Value {
     json!({
@@ -163,6 +167,14 @@ fn properties(image: &Map<String, Value>) -> bool {
         .is_some_and(|p| check_properties(p).is_ok())
 }
 
+/// A node's properties, its reserved members within its kind's rules.
+fn node_properties(image: &Map<String, Value>) -> bool {
+    let kind = image.get("kind").and_then(Value::as_str);
+    image
+        .get("properties")
+        .is_some_and(|p| kind.is_some() && check_node_properties(kind, p).is_ok())
+}
+
 /// Whether `image` is node `id` as the contract holds one: exactly the
 /// node fields, each of its type and within its rules.
 fn node_ok(image: &Map<String, Value>, id: &str) -> bool {
@@ -183,7 +195,7 @@ fn node_ok(image: &Map<String, Value>, id: &str) -> bool {
         )
         && ulid_or_null(image, "description_source_id")
         && ulid_or_null(image, "merged_into_id")
-        && properties(image)
+        && node_properties(image)
         && lifecycle(image)
         && positive(image, "revision")
         && positive(image, "lifecycle_revision")
@@ -206,13 +218,30 @@ fn edge_ok(image: &Map<String, Value>, id: &str) -> bool {
         && positive(image, "revision")
 }
 
+/// Whether `image` is content `id` as the contract holds one: `{id,
+/// owner_node_id, revision, body}`, the body within
+/// [`crate::content::check_body`].
+fn content_ok(image: &Map<String, Value>, id: &str) -> bool {
+    image.len() == 4
+        && image.get("id").and_then(Value::as_str) == Some(id)
+        && image
+            .get("owner_node_id")
+            .and_then(Value::as_str)
+            .is_some_and(is_ulid)
+        && positive(image, "revision")
+        && image
+            .get("body")
+            .is_some_and(|b| crate::content::check_body(b).is_ok())
+}
+
 /// Whether `image` is the after-image of entity `id` of `entity_type` as
 /// the contract writes one: a node `{id, kind, title, description,
 /// description_source_id, properties, lifecycle, merged_into_id, revision,
 /// lifecycle_revision}`, an edge `{id, from_id, to_id, type, properties,
 /// lifecycle, revision}`, a tag `{id, text, label, revision}` or a
-/// membership `{id, node_id, tag_id}`, each field within its rules. Schema
-/// 6 holds no `content` or `review` image.
+/// membership `{id, node_id, tag_id}` or a content `{id, owner_node_id,
+/// revision, body}`, each field within its rules. Schema 7 holds no
+/// `review` image.
 #[must_use]
 pub fn image_ok(entity_type: EntityType, id: &str, image: &Map<String, Value>) -> bool {
     match entity_type {
@@ -235,7 +264,8 @@ pub fn image_ok(entity_type: EntityType, id: &str, image: &Map<String, Value>) -
                     .iter()
                     .all(|end| image.get(*end).and_then(Value::as_str).is_some_and(is_ulid))
         }
-        EntityType::Content | EntityType::Review => false,
+        EntityType::Content => content_ok(image, id),
+        EntityType::Review => false,
     }
 }
 
@@ -271,6 +301,19 @@ pub fn decode_edge(
     match single(rows)? {
         None => Ok(None),
         Some(row) if edge_ok(&row, id) => Ok(Some(row)),
+        Some(_) => Err(Refusal::UnsupportedVersion),
+    }
+}
+
+/// Decode [`GET_CONTENT`]'s answer for content `id`; an image outside the
+/// content shape refuses `unsupported_version`.
+pub fn decode_content(
+    id: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<Option<Map<String, Value>>, Refusal> {
+    match single(rows)? {
+        None => Ok(None),
+        Some(row) if content_ok(&row, id) => Ok(Some(row)),
         Some(_) => Err(Refusal::UnsupportedVersion),
     }
 }

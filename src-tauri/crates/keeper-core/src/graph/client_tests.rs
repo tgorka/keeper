@@ -72,6 +72,21 @@ impl State for Nodes {
     fn contains_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
         Vec::new()
     }
+    fn content(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
+    fn contents_of(&self, _: &str, _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn sources_from(&self, _: &str, _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn incident_active(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn merged_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
 }
 
 /// The operations the shared algebra gives `ops` over `state`.
@@ -82,7 +97,11 @@ fn accepted(state: &Nodes, ops: Vec<ChangeOp>, minted: u32) -> Vec<Op> {
         next += 1;
         ulid(next)
     };
-    match candidate::apply(state, &change, &mut mint) {
+    let stamp = candidate::Stamp {
+        time_ms: 1,
+        actor_id: "ana",
+    };
+    match candidate::apply(state, &change, &stamp, &mut mint) {
         Verdict::Accepted(effects) => effects.ops,
         other => panic!("{other:?}"),
     }
@@ -168,6 +187,7 @@ fn two_events() -> (Vec<Op>, Vec<Op>) {
             set: super::protocol::change::NodeFields {
                 title: Some("Renamed".into()),
                 description: None,
+                description_source: None,
             },
             set_properties: Map::new(),
             remove_properties: Vec::new(),

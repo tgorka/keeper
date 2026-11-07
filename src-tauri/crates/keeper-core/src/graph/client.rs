@@ -16,13 +16,15 @@
 use serde_json::{Map, Value};
 
 use super::outcome::{Attempt, GraphOutcome, GraphRequestError, GraphRequests, RequestKey};
+use super::protocol::candidate::MAX_REDIRECT_HOPS;
 use super::protocol::change::{self, Change, ChangeOp, DESCRIPTOR};
 use super::protocol::request::Request;
 use super::protocol::scope::{
     client_scope, CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, RECEIPT_TABLE,
 };
 use super::protocol::wire::{
-    self, decode_edge, decode_history, decode_node, HistoryFilter, HistoryPage, NodeView,
+    self, decode_content, decode_edge, decode_history, decode_node, HistoryFilter, HistoryPage,
+    NodeView,
 };
 use super::protocol::Refusal;
 use crate::hq::port::{LinkState, ReplicaError, Subscription};
@@ -35,7 +37,7 @@ use crate::notes::tags::normalise;
 /// subscription names.
 #[must_use]
 pub fn subscriptions(database: &str, actor: &str, client: &str) -> Vec<Subscription> {
-    const NAMES: [&str; 7] = [
+    const NAMES: [&str; 8] = [
         "kgEvents",
         "kgEventOps",
         "kgHead",
@@ -43,6 +45,7 @@ pub fn subscriptions(database: &str, actor: &str, client: &str) -> Vec<Subscript
         "kgEdges",
         "kgTags",
         "kgNodeTags",
+        "kgContents",
     ];
     NAMES
         .iter()
@@ -259,6 +262,44 @@ impl GraphClient {
     ) -> Result<Option<Map<String, Value>>, GraphClientError> {
         let rows = self.read(wire::GET_EDGE, wire::get_params(None, id, include_archived))?;
         decode_edge(id, rows).map_err(GraphClientError::Unreadable)
+    }
+
+    /// The content `id`: by default only while its owner node is active (a
+    /// content has no lifecycle of its own).
+    pub fn get_content(
+        &self,
+        id: &str,
+        include_archived: bool,
+    ) -> Result<Option<Map<String, Value>>, GraphClientError> {
+        let rows = self.read(
+            wire::GET_CONTENT,
+            wire::get_params(None, id, include_archived),
+        )?;
+        decode_content(id, rows).map_err(GraphClientError::Unreadable)
+    }
+
+    /// The redirect chain of node `id`: the ids its `merged_into_id` links
+    /// lead through, in order, ending at the first unmerged node (empty for
+    /// a node never merged; `None` when `id` does not exist). The absorbed
+    /// node itself stays what [`Self::get_node`] answers for `id`: the
+    /// survivor is reported, never substituted. A chain longer than the
+    /// contract's [`MAX_REDIRECT_HOPS`], or one that loops or breaks, is an
+    /// answer this build does not read.
+    pub fn redirects(&self, id: &str) -> Result<Option<Vec<String>>, GraphClientError> {
+        let Some(mut node) = self.get_node(id, true)? else {
+            return Ok(None);
+        };
+        let mut chain: Vec<String> = Vec::new();
+        while let Some(next) = node.image.get("merged_into_id").and_then(Value::as_str) {
+            if chain.len() == MAX_REDIRECT_HOPS || next == id || chain.iter().any(|c| c == next) {
+                return Err(GraphClientError::Unreadable(Refusal::UnsupportedVersion));
+            }
+            chain.push(next.to_owned());
+            node = self
+                .get_node(next, true)?
+                .ok_or(GraphClientError::Unreadable(Refusal::UnsupportedVersion))?;
+        }
+        Ok(Some(chain))
     }
 
     /// One page of retained history after graph position `after`; resume

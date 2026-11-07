@@ -34,8 +34,8 @@ pub struct Prefix {
     pub n: u64,
     pub events: Vec<Event>,
     /// Every entity's image after event `n`, keyed by its `entity_type`
-    /// (`node`, `edge`, `tag`, `node_tag`) and id; a removed membership is
-    /// absent.
+    /// (`node`, `edge`, `tag`, `node_tag`, `content`) and id; a removed
+    /// membership is absent.
     pub state: BTreeMap<(String, String), Map<String, Value>>,
 }
 

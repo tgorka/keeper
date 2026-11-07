@@ -15,7 +15,8 @@
     { "version": 3, "through": "0003_agent_profile_tools" },
     { "version": 4, "through": "0004_grants_settings_drives" },
     { "version": 5, "through": "0005_session_drive_ticks" },
-    { "version": 6, "through": "0006_knowledge_graph" }
+    { "version": 6, "through": "0006_knowledge_graph" },
+    { "version": 7, "through": "0007_knowledge_graph_contents" }
   ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
@@ -79,6 +80,7 @@
     { "name": "kg_edges", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     { "name": "kg_node_tags", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
+    { "name": "kg_contents", "scopes": [{ "pattern": "kg_graph:{kg_graph}", "column": "graph" }] },
     {
       "name": "kg_receipts",
       "scopes": [{ "pattern": "kg_client:{kg_client}", "column": "client_scope" }]
@@ -160,6 +162,7 @@
     { "name": "kgEdges", "table": "kg_edges", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgTags", "table": "kg_tags", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgNodeTags", "table": "kg_node_tags", "scopes": { "kg_graph": ["{database}"] } },
+    { "name": "kgContents", "table": "kg_contents", "scopes": { "kg_graph": ["{database}"] } },
     { "name": "kgReceipts", "table": "kg_receipts", "scopes": { "kg_client": ["{clientScope}"] } }
   ]
 }

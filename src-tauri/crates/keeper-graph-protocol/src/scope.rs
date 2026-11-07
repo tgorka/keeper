@@ -2,7 +2,7 @@
 //!
 //! | tables | scope variable | value |
 //! | --- | --- | --- |
-//! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags` | `kg_graph` | the database's (domain's) name |
+//! | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents` | `kg_graph` | the database's (domain's) name |
 //! | `kg_receipts` | `kg_client` | [`client_scope`] of the requesting actor and client |
 //!
 //! No other variable reaches these tables. Bindings, contexts, session
@@ -15,7 +15,7 @@ pub const GRAPH_VARIABLE: &str = "kg_graph";
 pub const CLIENT_VARIABLE: &str = "kg_client";
 
 /// The tables scoped by `kg_graph`, in bootstrap order.
-pub const GRAPH_TABLES: [&str; 7] = [
+pub const GRAPH_TABLES: [&str; 8] = [
     "kg_events",
     "kg_event_ops",
     "kg_head",
@@ -23,6 +23,7 @@ pub const GRAPH_TABLES: [&str; 7] = [
     "kg_edges",
     "kg_tags",
     "kg_node_tags",
+    "kg_contents",
 ];
 /// The table scoped by `kg_client`.
 pub const RECEIPT_TABLE: &str = "kg_receipts";

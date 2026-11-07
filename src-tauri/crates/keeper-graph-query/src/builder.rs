@@ -13,13 +13,16 @@
 //! entities only: active nodes and every tag as nodes, active edges whose
 //! endpoints are both active, and each membership of an active node as a
 //! `HAS_TAG` relationship to its tag; independent edge identities stay
-//! independent.
+//! independent. Contents are replayed for typed inspection and never
+//! projected; a node's reserved `$` members are never property symbols,
+//! and its `$assertion` fields are projected under their own names
+//! (projection version 2).
 
 use crate::engine::Result;
 use keeper_graph_protocol::symbol::{encode, SymbolKind};
-use keeper_graph_protocol::value::MAX_NUMBER;
+use keeper_graph_protocol::value::{MAX_NUMBER, RESERVED_MEMBERS};
 use keeper_graph_protocol::vocabulary::{
-    EntityType, Operation, EDGE_FIELDS, NODE_FIELDS, TAG_FIELDS,
+    EntityType, Operation, ASSERTION_FIELDS, EDGE_FIELDS, NODE_FIELDS, TAG_FIELDS,
 };
 use keeper_graph_protocol::worker::{
     chain, EventFrame, Manifest, GENESIS, MAX_ENTITIES, MAX_EVENT_BYTES, MAX_EXPORT_BYTES,
@@ -45,9 +48,8 @@ fn entity_type(kind: EntityType) -> Result<&'static str> {
         EntityType::Edge => "edge",
         EntityType::Tag => "tag",
         EntityType::NodeTag => "node_tag",
-        EntityType::Content | EntityType::Review => {
-            return Err("entity type outside schema 6".into())
-        }
+        EntityType::Content => "content",
+        EntityType::Review => return Err("entity type outside schema 7".into()),
     })
 }
 
@@ -164,7 +166,7 @@ pub fn canonical_bytes(value: &Value) -> Result<Vec<u8>> {
 /// One event frame's shape at position `expected`, checked in the worker
 /// without the shared value code (no normalized copy): the position, a
 /// ULID event and entities, a digest, 1..=128 operations agreeing with
-/// `op_count` in ordinal order, schema 6 entity types, the revision and
+/// `op_count` in ordinal order, schema 7 entity types, the revision and
 /// after-image each operation implies, each after-image admitted by
 /// [`validate_value`] within [`MAX_ROW_BYTES`] canonical bytes and of its
 /// entity's shape.
@@ -187,10 +189,8 @@ fn check(event: &EventFrame, expected: u64) -> Result<()> {
         }
         let membership = match op.entity_type {
             EntityType::NodeTag => true,
-            EntityType::Node | EntityType::Edge | EntityType::Tag => false,
-            EntityType::Content | EntityType::Review => {
-                return Err("entity type outside schema 6".into())
-            }
+            EntityType::Node | EntityType::Edge | EntityType::Tag | EntityType::Content => false,
+            EntityType::Review => return Err("entity type outside schema 7".into()),
         };
         let revised = match &op.after_revision {
             Some(revision) => !membership && keeper_graph_protocol::is_decimal(revision),
@@ -225,7 +225,10 @@ fn validate_entity(kind: EntityType, id: &str, value: &Value) -> Result<()> {
             return Err("property byte limit".into());
         }
         for (key, value) in properties {
-            encode(SymbolKind::Property, key)?;
+            // A node's reserved members are stored, never symbols.
+            if !(kind == EntityType::Node && RESERVED_MEMBERS.contains(&key.as_str())) {
+                encode(SymbolKind::Property, key)?;
+            }
             property_depth(value, 0)?;
         }
     }
@@ -258,9 +261,15 @@ fn validate_entity(kind: EntityType, id: &str, value: &Value) -> Result<()> {
                 }
             }
         }
-        EntityType::Content | EntityType::Review => {
-            return Err("entity type outside schema 6".into())
+        EntityType::Content => {
+            if !keeper_graph_protocol::is_ulid(text(object, "owner_node_id")?)
+                || !keeper_graph_protocol::is_decimal(text(object, "revision")?)
+                || !object.get("body").is_some_and(Value::is_object)
+            {
+                return Err("invalid content".into());
+            }
         }
+        EntityType::Review => return Err("entity type outside schema 7".into()),
     }
     Ok(())
 }
@@ -449,7 +458,9 @@ fn project(connection: &Connection) -> Result<()> {
 
 /// The structural `fields` of `object` under their names and its custom
 /// `properties` under their `P_` symbols. Nothing else of an image (a
-/// tag's label or revision) enters the view.
+/// tag's label or revision) enters the view. A node's reserved `$` members
+/// never become symbols; its `$assertion` fields are projected under their
+/// own names, the structural keys `KG-Cypher/1` admits for a node.
 fn properties(
     connection: &Connection,
     edge: bool,
@@ -462,15 +473,31 @@ fn properties(
             put_property(connection, edge, id, field, value)?;
         }
     }
-    if let Some(custom) = object.get("properties") {
-        for (key, value) in custom.as_object().ok_or("properties must be object")? {
-            put_property(
-                connection,
-                edge,
-                id,
-                &encode(SymbolKind::Property, key)?,
-                value,
-            )?;
+    let Some(custom) = object.get("properties") else {
+        return Ok(());
+    };
+    let custom = custom.as_object().ok_or("properties must be object")?;
+    for (key, value) in custom {
+        if !edge && RESERVED_MEMBERS.contains(&key.as_str()) {
+            continue;
+        }
+        put_property(
+            connection,
+            edge,
+            id,
+            &encode(SymbolKind::Property, key)?,
+            value,
+        )?;
+    }
+    if edge {
+        return Ok(());
+    }
+    if let Some(assertion) = custom.get(keeper_graph_protocol::assertion::MEMBER) {
+        let assertion = assertion.as_object().ok_or("assertion must be object")?;
+        for field in ASSERTION_FIELDS {
+            if let Some(value) = assertion.get(field) {
+                put_property(connection, false, id, field, value)?;
+            }
         }
     }
     Ok(())
@@ -527,8 +554,9 @@ fn put_property(
     Ok(())
 }
 
-/// The `inspect` role over a published generation: the typed node or edge
-/// lookup, with the server's `graph.get_node` / `graph.get_edge` rules.
+/// The `inspect` role over a published generation: the typed node, edge or
+/// content lookup, with the server's `graph.get_node` / `graph.get_edge` /
+/// `graph.get_content` rules.
 pub fn inspect(
     connection: &Connection,
     request: &keeper_graph_protocol::worker::InspectRequest,
@@ -537,6 +565,7 @@ pub fn inspect(
     let kind = match request.entity {
         InspectEntity::Node => "node",
         InspectEntity::Edge => "edge",
+        InspectEntity::Content => "content",
     };
     let body = |id: &str, kind: &str| -> Result<Option<Map<String, Value>>> {
         let body: Option<String> = connection
@@ -552,11 +581,22 @@ pub fn inspect(
         return Ok(Vec::new());
     };
     if !request.include_archived {
-        let mut ends = vec![image.clone()];
-        if request.entity == InspectEntity::Edge {
-            for end in ["from_id", "to_id"] {
-                ends.push(body(text(&image, end)?, "node")?.ok_or("dangling accepted endpoint")?);
+        // What decides visibility: the entity, an edge's endpoints, and a
+        // content's owner (it has no lifecycle of its own).
+        let mut ends = Vec::new();
+        let ends_of: &[&str] = match request.entity {
+            InspectEntity::Node => {
+                ends.push(image.clone());
+                &[]
             }
+            InspectEntity::Edge => {
+                ends.push(image.clone());
+                &["from_id", "to_id"]
+            }
+            InspectEntity::Content => &["owner_node_id"],
+        };
+        for end in ends_of {
+            ends.push(body(text(&image, end)?, "node")?.ok_or("dangling accepted endpoint")?);
         }
         for entity in &ends {
             if !active(entity)? {
@@ -650,6 +690,10 @@ mod tests {
         let mut f = frame("t");
         f.ops[0].after_value = Some(json!({"id": "01JK0000000000000000000009"}));
         assert!(check(&f, 1).is_err());
+        let mut f = frame("t");
+        f.ops[0].entity_type = EntityType::Review;
+        assert!(check(&f, 1).is_err());
+        // A node image under a content op is not a content image.
         let mut f = frame("t");
         f.ops[0].entity_type = EntityType::Content;
         assert!(check(&f, 1).is_err());

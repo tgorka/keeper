@@ -149,6 +149,7 @@ fn retitle(id: &str, expected: &str, title: &str) -> ChangeOp {
         set: NodeFields {
             title: Some(title.to_owned()),
             description: None,
+            description_source: None,
         },
         set_properties: Map::new(),
         remove_properties: Vec::new(),
@@ -284,6 +285,7 @@ fn graph_live_two_devices_accept_replicate_inspect_and_race() {
                 set: NodeFields {
                     title: Some("Alpha renamed".to_owned()),
                     description: None,
+                    description_source: None,
                 },
                 set_properties: Map::new(),
                 remove_properties: vec!["nothing".to_owned()],

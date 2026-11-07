@@ -85,6 +85,7 @@ struct Graph {
     edges: BTreeMap<String, Map<String, Value>>,
     tags: BTreeMap<String, Map<String, Value>>,
     memberships: BTreeMap<String, Map<String, Value>>,
+    contents: BTreeMap<String, Map<String, Value>>,
 }
 
 impl State for Graph {
@@ -108,6 +109,46 @@ impl State for Graph {
             .values()
             .filter(|e| e["type"] == "contains" && e["lifecycle"] == "active")
             .filter(|e| to.iter().any(|t| e["to_id"] == t.as_str()))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+    fn content(&self, id: &str) -> Option<Map<String, Value>> {
+        self.contents.get(id).cloned()
+    }
+    fn contents_of(&self, owner: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.contents
+            .values()
+            .filter(|c| c["owner_node_id"] == owner)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+    fn sources_from(&self, from: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.edges
+            .values()
+            .filter(|e| e["type"] == "sources" && e["lifecycle"] == "active")
+            .filter(|e| e["from_id"] == from)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+    fn incident_active(&self, ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.edges
+            .values()
+            .filter(|e| e["lifecycle"] == "active")
+            .filter(|e| {
+                ids.iter()
+                    .any(|i| e["from_id"] == i.as_str() || e["to_id"] == i.as_str())
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+    fn merged_into(&self, ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.nodes
+            .values()
+            .filter(|n| ids.iter().any(|i| n["merged_into_id"] == i.as_str()))
             .take(limit)
             .cloned()
             .collect()
@@ -159,10 +200,18 @@ impl World {
     fn accept(&mut self, ops: Vec<ChangeOp>) -> Vec<Op> {
         let change = Change::new(ops, None, None, normalise).expect("change");
         let mut minted = self.minted;
-        let verdict = candidate::apply(&self.graph, &change, &mut || {
-            minted += 1;
-            ulid(minted)
-        });
+        let verdict = candidate::apply(
+            &self.graph,
+            &change,
+            &candidate::Stamp {
+                time_ms: 1,
+                actor_id: "ana",
+            },
+            &mut || {
+                minted += 1;
+                ulid(minted)
+            },
+        );
         self.minted = minted;
         let Verdict::Accepted(effects) = verdict else {
             panic!("{verdict:?}");
@@ -172,6 +221,7 @@ impl World {
                 crate::graph::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
                 crate::graph::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
                 crate::graph::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
+                crate::graph::protocol::vocabulary::EntityType::Content => &mut self.graph.contents,
                 _ => &mut self.graph.memberships,
             };
             match &op.after_value {
@@ -704,6 +754,7 @@ async fn a_partial_or_corrupt_history_is_stale_or_refused() {
             set: NodeFields {
                 title: Some("B".into()),
                 description: None,
+                description_source: None,
             },
             set_properties: Map::new(),
             remove_properties: Vec::new(),
@@ -1369,5 +1420,144 @@ async fn an_invalidation_during_the_delivery_check_suppresses_the_result() {
     assert_eq!(
         pending.await.expect("joined").err(),
         Some(QueryError::Forbidden)
+    );
+}
+
+/// Projection version 2 (111.1): the assertion fields are structural keys
+/// (`stale_after` selected at its boundary with no expiry event), reserved
+/// members never become symbols, a content replays for typed inspection
+/// only while its owner is active, and a merge's endpoint rewrites are
+/// re-projected with the absorbed node out of the view.
+#[tokio::test(flavor = "current_thread")]
+async fn projection_two_exposes_assertions_contents_and_merges() {
+    let mut rig = Rig::new();
+    let (claim, target, x, y, content) = (ulid(1), ulid(2), ulid(3), ulid(4), ulid(5));
+    let t: u64 = 1_800_000_000_000;
+    let assertion = json!({"generated_at": null, "observed_at": 1, "verified_at": null,
+                           "verified_by": null, "stale_after": t, "status": "unverified"});
+    rig.world.accept(vec![
+        node(&claim, "Concept", "Claim", json!({"$assertion": assertion})),
+        node(&target, "Concept", "Target", json!({})),
+        node(&x, "Concept", "X", json!({})),
+        node(&y, "Concept", "Y", json!({})),
+        ChangeOp::CreateContent {
+            id: content.clone(),
+            owner_node_id: x.clone(),
+            body: json!({"inline_text": "body"}),
+        },
+    ]);
+    let ops = vec![edge(&rig.world, &ulid(10), &x, &y, "ex:rel", json!({}))];
+    rig.world.accept(ops);
+    rig.world.replicate(1, 2, 2, None);
+    let reader = rig.reader();
+    reader.refresh(&Cancellation::default()).await.expect("g1");
+
+    let stale = "MATCH (n) WHERE n.stale_after <= $t RETURN n.id AS id, n.status AS status ORDER BY id LIMIT 5";
+    for (at, expected) in [(t - 1, 0), (t, 1), (t + 1, 1)] {
+        let rows = rig.rows(&reader, stale, &format!(r#"{{"t":{at}}}"#)).await;
+        assert_eq!(rows.len(), expected, "stale_after <= {at}");
+        if let Some(row) = rows.first() {
+            assert_eq!(
+                (row["id"].clone(), row["status"].clone()),
+                (json!(claim), json!("unverified"))
+            );
+        }
+    }
+    let member = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Property,
+        "$assertion",
+    );
+    assert!(member.is_err(), "a reserved member is never a symbol");
+
+    let inspect = |entity, id: String, archived| {
+        let reader = &reader;
+        async move {
+            reader
+                .inspect(
+                    entity,
+                    &id,
+                    archived,
+                    Freshness::Current,
+                    &Cancellation::default(),
+                )
+                .await
+                .expect("inspect")
+                .rows
+        }
+    };
+    let Some(Inspected::Content(image)) =
+        inspect(InspectEntity::Content, content.clone(), false).await
+    else {
+        panic!("content")
+    };
+    assert_eq!(
+        (image["owner_node_id"].clone(), image["revision"].clone()),
+        (json!(x), json!("1"))
+    );
+
+    let (x_rev, t_rev) = (rig.world.rev(&x), rig.world.rev(&target));
+    rig.world.accept(vec![ChangeOp::MergeNodes {
+        target_id: target.clone(),
+        target_revision: t_rev,
+        absorbed: vec![crate::graph::protocol::change::Absorbed {
+            id: x.clone(),
+            expected_revision: x_rev,
+        }],
+        edges: vec![crate::graph::protocol::change::MergeEdge {
+            id: ulid(10),
+            expected_revision: "1".into(),
+            from_lifecycle_revision: "1".into(),
+            to_lifecycle_revision: "1".into(),
+        }],
+    }]);
+    rig.world.replicate(3, 3, 3, None);
+    assert!(
+        reader
+            .refresh(&Cancellation::default())
+            .await
+            .expect("g2")
+            .built
+    );
+    let rel = crate::graph::protocol::symbol::encode(
+        crate::graph::protocol::symbol::SymbolKind::Edge,
+        "ex:rel",
+    )
+    .expect("sym");
+    let hop =
+        format!("MATCH (a)-[e:{rel}]->(b) WHERE e.id = $e RETURN a.id AS from, b.id AS to LIMIT 1");
+    let rows = rig
+        .rows(&reader, &hop, &format!(r#"{{"e":"{}"}}"#, ulid(10)))
+        .await;
+    assert_eq!(
+        (rows[0]["from"].clone(), rows[0]["to"].clone()),
+        (json!(target), json!(y)),
+        "the rewritten endpoint is re-projected"
+    );
+    let absorbed = "MATCH (n) WHERE n.id = $id RETURN n.id AS id LIMIT 1";
+    assert!(rig
+        .rows(&reader, absorbed, &format!(r#"{{"id":"{x}"}}"#))
+        .await
+        .is_empty());
+    // The content stays with the absorbed identity: hidden with its owner,
+    // there with archived ones, owner and revision unchanged.
+    assert_eq!(
+        inspect(InspectEntity::Content, content.clone(), false).await,
+        None
+    );
+    let Some(Inspected::Content(image)) = inspect(InspectEntity::Content, content, true).await
+    else {
+        panic!("archived content")
+    };
+    assert_eq!(
+        (image["owner_node_id"].clone(), image["revision"].clone()),
+        (json!(x), json!("1"))
+    );
+    let Some(Inspected::Node(view)) = inspect(InspectEntity::Node, x.clone(), true).await else {
+        panic!("absorbed node")
+    };
+    assert_eq!(
+        view.image["merged_into_id"],
+        json!(target),
+        "reported, not substituted"
     );
 }

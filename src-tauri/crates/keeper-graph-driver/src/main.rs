@@ -9,8 +9,9 @@
 //!   or extend the local query projection;
 //! - `query <source> [--params <json>] [--allow-stale]` — one
 //!   `KG-Cypher/1` query over the projection;
-//! - `inspect node|edge <id> [--include-archived]` — the typed lookup over
-//!   the projection;
+//! - `inspect node|edge|content <id> [--include-archived]` — the typed
+//!   lookup over the projection (a content only while its owner is active,
+//!   unless archived ones are included);
 //! - `history [--after <n>] [--limit <n>]` — one page of retained history;
 //! - `status` — the replica's head and checkpoint and the projection's
 //!   runtime admission.
@@ -303,7 +304,8 @@ mod driver {
                 let entity = match entity.as_str() {
                     "node" => InspectEntity::Node,
                     "edge" => InspectEntity::Edge,
-                    _ => return fail("query_unsupported", "entity is node or edge"),
+                    "content" => InspectEntity::Content,
+                    _ => return fail("query_unsupported", "entity is node, edge or content"),
                 };
                 let freshness = if *allow_stale {
                     Freshness::AllowStale
@@ -321,7 +323,7 @@ mod driver {
                                 Some(Inspected::Node(v)) => {
                                     json!({"image": v.image, "tags": v.tags})
                                 }
-                                Some(Inspected::Edge(e)) => json!(e),
+                                Some(Inspected::Edge(e) | Inspected::Content(e)) => json!(e),
                             };
                             result(&r, rows)
                         }

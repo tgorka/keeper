@@ -24,6 +24,10 @@
     {
       "name": "0006_knowledge_graph",
       "sha256": "5a227272f5124d5dd80936d6c05d9e2b198f41dd2192d8859d8512ffdc7d1c7c"
+    },
+    {
+      "name": "0007_knowledge_graph_contents",
+      "sha256": "08ddca222e8214cd2d2eb6132b20d1cbdb69ab0a0ffc36f2bb8b1d330ed355bf"
     }
   ],
   "head": {
@@ -497,6 +501,57 @@
           {
             "name": "updated_at_ms",
             "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "kg_contents",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "graph",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "owner_node_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "revision",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "body",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "created_event_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "updated_event_id",
+            "type": "string",
             "nullable": false
           },
           {

@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 6,
+  "schemaVersion": 7,
   "schemaVersions": [
     {
       "version": 1,
@@ -36,6 +36,12 @@
       "version": 6,
       "migrations": [
         "0006_knowledge_graph"
+      ]
+    },
+    {
+      "version": 7,
+      "migrations": [
+        "0007_knowledge_graph_contents"
       ]
     }
   ],
@@ -2096,6 +2102,15 @@
             "type"
           ],
           "unique": false
+        },
+        {
+          "name": "kg_edges_from_active",
+          "columns": [
+            "from_id",
+            "type",
+            "lifecycle"
+          ],
+          "unique": false
         }
       ],
       "extensions": {}
@@ -2254,6 +2269,88 @@
           "name": "kg_node_tags_tag_id",
           "columns": [
             "tag_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_contents",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "owner_node_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "body",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "owner_node_id",
+          "parentTable": "kg_nodes",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_contents_owner_node_id_ref",
+          "columns": [
+            "owner_node_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_contents_owner",
+          "columns": [
+            "owner_node_id"
           ],
           "unique": false
         }
@@ -2743,6 +2840,21 @@
     {
       "name": "kgNodeTags",
       "table": "kg_node_tags",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgContents",
+      "table": "kg_contents",
       "scopes": [
         {
           "variable": "kg_graph",

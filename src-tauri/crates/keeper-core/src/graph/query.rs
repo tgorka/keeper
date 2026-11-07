@@ -37,8 +37,9 @@ use super::admission::{Admission, Principal};
 use super::projection::{Exporter, Generation, Store};
 use super::protocol::profile::{admit, MAX_ROWS};
 use super::protocol::wire::{
-    self, admit_read_params, decode_context, decode_edge, decode_node, decode_read_status,
-    read_status_params, refresh_context_params, Authority, ContextRow, NodeView, ReadStatus,
+    self, admit_read_params, decode_content, decode_context, decode_edge, decode_node,
+    decode_read_status, read_status_params, refresh_context_params, Authority, ContextRow,
+    NodeView, ReadStatus,
 };
 use super::protocol::worker::{InspectEntity, InspectRequest, QueryRequest, Response};
 use super::protocol::{Refusal, PROFILE};
@@ -196,6 +197,7 @@ pub struct QueryResult<T> {
 pub enum Inspected {
     Node(NodeView),
     Edge(Map<String, Value>),
+    Content(Map<String, Value>),
 }
 
 /// What a refresh found.
@@ -650,6 +652,7 @@ impl GraphReads {
         let found = match entity {
             InspectEntity::Node => decode_node(id, rows).map(|n| n.map(Inspected::Node)),
             InspectEntity::Edge => decode_edge(id, rows).map(|e| e.map(Inspected::Edge)),
+            InspectEntity::Content => decode_content(id, rows).map(|c| c.map(Inspected::Content)),
         }
         .map_err(|_| QueryError::Unavailable("generation.answer"))?;
         self.gate(&ask, &generation, deliver).await?;

@@ -51,19 +51,32 @@ fn entries(key: &str) -> Vec<Value> {
         .collect()
 }
 
-/// An accepted graph held as the vector's images.
+/// An accepted graph held as the vector's images (`contents` optional).
 struct Images(Value);
 
 impl Images {
     fn rows(&self, table: &str) -> impl Iterator<Item = &Map<String, Value>> {
-        self.0[table]
-            .as_array()
-            .expect(table)
+        self.0
+            .get(table)
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
             .iter()
             .map(|row| row.as_object().expect("image"))
     }
     fn find(&self, table: &str, key: &str, value: &str) -> Option<Map<String, Value>> {
         self.rows(table).find(|row| row[key] == value).cloned()
+    }
+    /// Rows of `table` matching `keep`, ascending by id, at most `limit`.
+    fn select(
+        &self,
+        table: &str,
+        limit: usize,
+        keep: impl Fn(&Map<String, Value>) -> bool,
+    ) -> Vec<Map<String, Value>> {
+        let mut rows: Vec<_> = self.rows(table).filter(|r| keep(r)).cloned().collect();
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        rows.truncate(limit);
+        rows
     }
 }
 
@@ -83,18 +96,37 @@ impl State for Images {
             .cloned()
     }
     fn contains_into(&self, to_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
-        let mut edges: Vec<_> = self
-            .rows("edges")
-            .filter(|row| {
-                row["type"] == "contains"
-                    && row["lifecycle"] == "active"
-                    && to_ids.iter().any(|id| row["to_id"] == id.as_str())
-            })
-            .cloned()
-            .collect();
-        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        edges.truncate(limit);
-        edges
+        self.select("edges", limit, |row| {
+            row["type"] == "contains"
+                && row["lifecycle"] == "active"
+                && to_ids.iter().any(|id| row["to_id"] == id.as_str())
+        })
+    }
+    fn content(&self, id: &str) -> Option<Map<String, Value>> {
+        self.find("contents", "id", id)
+    }
+    fn contents_of(&self, owner_id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.select("contents", limit, |row| row["owner_node_id"] == owner_id)
+    }
+    fn sources_from(&self, from_id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.select("edges", limit, |row| {
+            row["type"] == "sources" && row["lifecycle"] == "active" && row["from_id"] == from_id
+        })
+    }
+    fn incident_active(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.select("edges", limit, |row| {
+            row["lifecycle"] == "active"
+                && node_ids
+                    .iter()
+                    .any(|id| row["from_id"] == id.as_str() || row["to_id"] == id.as_str())
+        })
+    }
+    fn merged_into(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.select("nodes", limit, |row| {
+            node_ids
+                .iter()
+                .any(|id| row["merged_into_id"] == id.as_str())
+        })
     }
 }
 
@@ -163,7 +195,17 @@ fn algebra_vectors_reproduce() {
             .iter()
             .map(|m| m.as_str().expect("minted id").to_owned());
         let mut mint = || minted.next().expect("enough minted ids");
-        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &mut mint);
+        // A vector's `stamp` is the acceptance a verification is stamped
+        // with; without one, a fixed stamp no other vector names.
+        let stamp = entry.get("stamp");
+        let actor = stamp
+            .and_then(|s| s["actor_id"].as_str())
+            .unwrap_or("vector-actor");
+        let stamp = candidate::Stamp {
+            time_ms: stamp.and_then(|s| s["time_ms"].as_u64()).unwrap_or(1),
+            actor_id: actor,
+        };
+        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &stamp, &mut mint);
         if let Some(code) = entry.get("refusal").and_then(Value::as_str) {
             assert_eq!(
                 match verdict {

@@ -27,7 +27,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::symbol::{decode, SymbolKind};
 use crate::value::MAX_NUMBER;
-use crate::vocabulary::{EDGE_FIELDS, NODE_FIELDS, TAG_FIELDS};
+use crate::vocabulary::{ASSERTION_FIELDS, EDGE_FIELDS, NODE_FIELDS, TAG_FIELDS};
 use crate::{Refusal, PROFILE};
 
 /// The most source bytes a query may have.
@@ -575,8 +575,13 @@ impl<'a> Parser<'a> {
         let binding = self.resolve(name)?;
         self.require(".")?;
         let key = self.ident()?.to_owned();
+        // A node binding's structural keys: its fields, a projected tag's,
+        // and (projection version 2) the assertion fields, null when the
+        // node carries no `$assertion`.
         let structural = if self.query.bindings[binding].kind == SymbolKind::Node {
-            NODE_FIELDS.contains(&key.as_str()) || TAG_FIELDS.contains(&key.as_str())
+            NODE_FIELDS.contains(&key.as_str())
+                || TAG_FIELDS.contains(&key.as_str())
+                || ASSERTION_FIELDS.contains(&key.as_str())
         } else {
             EDGE_FIELDS.contains(&key.as_str())
         };

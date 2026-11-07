@@ -4,10 +4,10 @@
 //! The worker is a single-use process with three roles: `build` replays a
 //! verified accepted prefix into a new generation, `query` answers one
 //! admitted `KG-Cypher/1` query from one immutable generation, and
-//! `inspect` answers one typed node or edge lookup from one. The consumer
-//! verified the prefix (every event's operation count, ordinals, delta
-//! digest and before-images, `crate::delta`); the builder receives only
-//! its result:
+//! `inspect` answers one typed node, edge or content lookup from one. The
+//! consumer verified the prefix (every event's operation count, ordinals,
+//! delta digest and before-images, `crate::delta`); the builder receives
+//! only its result:
 //!
 //! 1. one [`Manifest`] frame, naming the prefix's length `accepted_head`
 //!    (N) and its chained digest [`Manifest::prefix_digest`];
@@ -39,8 +39,11 @@ use crate::{is_decimal, is_ulid, sha256_hex, Refusal, SCHEMA_VERSION};
 /// v0.12.0 at its pinned commit, source-built into the worker.
 pub const ENGINE: &str = "graphqlite-0.12.0-995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629";
 /// The projection format a generation holds: its schema, symbol mapping and
-/// active-only view. A generation of another version is rebuilt.
-pub const PROJECTION_VERSION: u32 = 1;
+/// active-only view. A generation of another version is rebuilt. Version 2
+/// replays `content` operations (kept for typed inspection, never projected
+/// as query symbols) and exposes the six assertion fields as structural
+/// keys of a node binding.
+pub const PROJECTION_VERSION: u32 = 2;
 /// The most canonical bytes one frame may have, newline excluded.
 pub const MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
 /// The most canonical bytes one operation's after-image may have.
@@ -203,8 +206,8 @@ impl EventFrame {
     /// event, a digest, 1..=128 operations in ordinal order agreeing with
     /// `op_count`, and each operation's after-image as its operation
     /// implies — its entity's whole image ([`image_ok`]) for everything but
-    /// a membership's removal, which has none. Schema 6 holds no `content`
-    /// or `review` entity.
+    /// a membership's removal, which has none. Schema 7 holds no `review`
+    /// entity.
     pub fn check(&self, expected: u64) -> Result<(), Refusal> {
         let count = self.ops.len();
         if self.graph_seq != expected
@@ -220,7 +223,7 @@ impl EventFrame {
             if usize::try_from(op.ordinal).ok() != Some(ordinal) || !is_ulid(&op.entity_id) {
                 return Err(Refusal::InvalidChange);
             }
-            if matches!(op.entity_type, EntityType::Content | EntityType::Review) {
+            if op.entity_type == EntityType::Review {
                 return Err(Refusal::UnsupportedVersion);
             }
             let membership = op.entity_type == EntityType::NodeTag;
@@ -306,13 +309,14 @@ impl QueryRequest {
 pub enum InspectEntity {
     Node,
     Edge,
+    Content,
 }
 
 /// An `inspect` worker's one request: the typed `graph.get_node` /
-/// `graph.get_edge` read over one generation. Without `include_archived` a
-/// node is answered only while active and an edge only while it and both
-/// its endpoints are; a node's answer carries its tags' canonical texts,
-/// ascending.
+/// `graph.get_edge` / `graph.get_content` read over one generation. Without
+/// `include_archived` a node is answered only while active, an edge only
+/// while it and both its endpoints are, and a content only while its owner
+/// is; a node's answer carries its tags' canonical texts, ascending.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InspectRequest {
