@@ -291,12 +291,18 @@ impl GraphReads {
     #[cfg(feature = "human-reads")]
     #[must_use]
     pub fn human(&self, source: &crate::hq::sessions::Source) -> Option<HumanReader> {
-        (source.database == self.domain()).then(|| HumanReader {
-            reads: self.clone(),
-            remote: Arc::new(source.clone()),
-            actor: source.actor.clone(),
-            invalidated: Cancellation::default(),
-        })
+        (source.database == self.domain())
+            .then(|| HumanReader::new(self.clone(), Arc::new(source.clone()), source))
+    }
+
+    /// A person's reader whose authority reads go to `remote` (tests).
+    #[cfg(all(test, feature = "human-reads"))]
+    pub(crate) fn human_with(
+        &self,
+        source: &crate::hq::sessions::Source,
+        remote: Arc<dyn GraphRemote>,
+    ) -> HumanReader {
+        HumanReader::new(self.clone(), remote, source)
     }
 
     /// The kill (D12): block delivery, kill and reap every in-flight worker
@@ -929,17 +935,105 @@ impl AgentReader {
     }
 }
 
+/// How long after the last successful online `read_status` a person's
+/// device may still serve a last-authorised offline read (CC-22): inclusive,
+/// on the device's wall clock.
+#[cfg(feature = "human-reads")]
+pub const OFFLINE_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+#[cfg(feature = "human-reads")]
+const OFFLINE_READ_LIMIT_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Whether a row observed at `observed_at_ms` may serve at `now_ms`: not
+/// from the future (a clock set back after it was written refuses), and at
+/// most [`OFFLINE_READ_LIMIT`] old, inclusive.
+#[cfg(feature = "human-reads")]
+fn within_offline_limit(observed_at_ms: i64, now_ms: i64) -> bool {
+    observed_at_ms <= now_ms
+        && now_ms
+            .checked_sub(observed_at_ms)
+            .is_some_and(|age| age <= OFFLINE_READ_LIMIT_MS)
+}
+
+/// The device's wall clock, UTC ms.
+#[cfg(feature = "human-reads")]
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 /// A person's reader over their device's own replica of one domain.
+///
+/// Every read asks the server's `read_status` first and again at delivery.
+/// With a [`super::lifecycle::Lifecycle`] attached
+/// ([`HumanReader::with_lifecycle`]) the reader also keeps the domain's
+/// revocation fence and its last-authorised offline mode (112.1, CC-22):
+/// - each successful online `read_status` is kept as the domain's read
+///   authority, with the time it returned;
+/// - a refusal (`forbidden`: the server's answer, a revoked scope, the
+///   domain's kill) or a refused link fences the domain, and a fenced
+///   domain refuses every read;
+/// - a read may be served offline only when the server could not be
+///   reached ([`QueryError::Unreachable`], nothing else), no fence stands,
+///   the scope is granted and the link not refused, the caller allowed
+///   [`Freshness::AllowStale`], the generation's authority is the kept one,
+///   and that one is neither from the future nor older than
+///   [`OFFLINE_READ_LIMIT`]. All of it is checked again at delivery against
+///   a fresh clock, and the result is always [`Completeness::Stale`].
+///
+/// Offline, nothing builds or extends a projection.
 #[cfg(feature = "human-reads")]
 pub struct HumanReader {
     reads: GraphReads,
     remote: Arc<dyn GraphRemote>,
+    replica: Arc<dyn crate::hq::port::Replica>,
     actor: String,
     invalidated: Cancellation,
+    lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 #[cfg(feature = "human-reads")]
 impl HumanReader {
+    fn new(
+        reads: GraphReads,
+        remote: Arc<dyn GraphRemote>,
+        source: &crate::hq::sessions::Source,
+    ) -> Self {
+        Self {
+            reads,
+            remote,
+            replica: source.replica.clone(),
+            actor: source.actor.clone(),
+            invalidated: Cancellation::default(),
+            lifecycle: None,
+            clock: Arc::new(wall_clock_ms),
+        }
+    }
+
+    /// Keep this domain's fence and read authority in `lifecycle` (the
+    /// same server, domain and actor's queue file); refused for another
+    /// domain.
+    pub fn with_lifecycle(
+        mut self,
+        lifecycle: Arc<super::lifecycle::Lifecycle>,
+    ) -> Result<Self, QueryError> {
+        if lifecycle.domain() != self.reads.domain() {
+            return Err(QueryError::Forbidden);
+        }
+        self.lifecycle = Some(lifecycle);
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     fn principal(&self) -> Principal {
         Principal {
             agent: format!("person:{}", self.actor),
@@ -947,23 +1041,136 @@ impl HumanReader {
         }
     }
 
-    async fn fresh(remote: Arc<dyn GraphRemote>, domain: String) -> Result<Authority, QueryError> {
-        let status = tokio::task::spawn_blocking(move || remote.read_status(&domain))
-            .await
-            .map_err(|_| QueryError::SyncPending)??;
-        Ok(status.authority)
-    }
-
     fn domain(&self) -> String {
         self.reads.domain().to_owned()
     }
 
+    fn link_refused(&self) -> bool {
+        self.replica.state().link == crate::hq::port::LinkState::Refused
+    }
+
+    /// The server's read authority now; kept for offline reads when it
+    /// answered.
+    async fn fresh(&self) -> Result<Authority, QueryError> {
+        let (remote, domain) = (self.remote.clone(), self.domain());
+        let status = tokio::task::spawn_blocking(move || remote.read_status(&domain))
+            .await
+            .map_err(|_| QueryError::SyncPending)??;
+        if let Some(lifecycle) = &self.lifecycle {
+            if let Err(error) = lifecycle.record_authority(&status.authority, (self.clock)()) {
+                tracing::warn!(%error, "graph: the read authority could not be kept");
+            }
+        }
+        Ok(status.authority)
+    }
+
+    /// The authority a read runs under, and whether it is the kept one
+    /// (offline). At admission (`admitted_offline: None`) an unreachable
+    /// server may fall back to the kept authority; at delivery only a read
+    /// admitted offline may, and a server that answers takes the normal
+    /// comparison.
+    async fn authority(
+        &self,
+        freshness: Freshness,
+        admitted_offline: Option<bool>,
+    ) -> Result<(Authority, bool), QueryError> {
+        match self.fresh().await {
+            Ok(authority) => Ok((authority, false)),
+            Err(QueryError::Unreachable) if admitted_offline != Some(false) => {
+                self.offline(freshness).map(|authority| (authority, true))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The kept authority, when every offline condition holds; otherwise
+    /// `sync_pending`. The fence is checked first.
+    fn offline(&self, freshness: Freshness) -> Result<Authority, QueryError> {
+        let refused = Err(QueryError::SyncPending);
+        let Some(lifecycle) = &self.lifecycle else {
+            return refused;
+        };
+        if lifecycle.is_locked() || !matches!(lifecycle.fence(), Ok(None)) {
+            return refused;
+        }
+        let granted = matches!(
+            self.reads.0.source.checkpoint(),
+            Ok(super::source::Checkpoint {
+                scope: ScopeState::Granted,
+                ..
+            })
+        );
+        if !granted || self.link_refused() || freshness != Freshness::AllowStale {
+            return refused;
+        }
+        match lifecycle.authority() {
+            Ok(Some(row)) if within_offline_limit(row.observed_at_ms, (self.clock)()) => {
+                Ok(row.authority)
+            }
+            _ => refused,
+        }
+    }
+
+    /// Before any read: a reader invalidated or a domain fenced refuses; a
+    /// refused link fences the domain.
+    async fn check(&self) -> Result<(), QueryError> {
+        if self.invalidated.is_cancelled() {
+            return Err(QueryError::Forbidden);
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.gate()?;
+            if self.link_refused() {
+                self.fence().await;
+                return Err(QueryError::Forbidden);
+            }
+        }
+        Ok(())
+    }
+
+    /// A revocation signal: fence the domain (lock, persist, disable
+    /// queued intents, kill and purge).
+    async fn fence(&self) {
+        self.invalidated.cancel();
+        if let Some(lifecycle) = &self.lifecycle {
+            if let Err(error) = lifecycle.revoke(Some(&self.reads), (self.clock)()).await {
+                tracing::warn!(%error, "graph: the revocation fence is incomplete; the domain stays locked");
+            }
+        }
+    }
+
+    /// A call's end: a refusal (`forbidden`) fences the domain.
+    async fn end<T>(&self, result: Result<T, QueryError>) -> Result<T, QueryError> {
+        if matches!(result, Err(QueryError::Forbidden)) {
+            self.fence().await;
+        }
+        result
+    }
+
+    /// An offline read's result is always `Stale`, and an offline authority
+    /// that no longer matches the generation is `sync_pending`.
+    fn offline_result<T>(
+        offline: bool,
+        result: Result<QueryResult<T>, QueryError>,
+    ) -> Result<QueryResult<T>, QueryError> {
+        if !offline {
+            return result;
+        }
+        match result {
+            Ok(mut result) => {
+                result.completeness = Completeness::Stale;
+                Ok(result)
+            }
+            Err(QueryError::Stale) => Err(QueryError::SyncPending),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Build or extend the domain's projection under the person's current
-    /// read authority.
+    /// read authority (online only).
     pub async fn refresh(&self, cancel: &Cancellation) -> Result<Refreshed, QueryError> {
-        self.check()?;
+        self.check().await?;
         let result = async {
-            let authority = Self::fresh(self.remote.clone(), self.domain()).await?;
+            let authority = self.fresh().await?;
             let result = self
                 .reads
                 .refresh(&authority, cancel, &self.invalidated)
@@ -971,14 +1178,8 @@ impl HumanReader {
             self.reads.settle(result).await
         }
         .await;
-        invalidate_on_refusal(&self.invalidated, result)
-    }
-
-    fn check(&self) -> Result<(), QueryError> {
-        if self.invalidated.is_cancelled() {
-            return Err(QueryError::Forbidden);
-        }
-        Ok(())
+        self.end(invalidate_on_refusal(&self.invalidated, result))
+            .await
     }
 
     /// One `KG-Cypher/1` query.
@@ -989,12 +1190,16 @@ impl HumanReader {
         freshness: Freshness,
         cancel: &Cancellation,
     ) -> Result<QueryResult<Vec<Map<String, Value>>>, QueryError> {
-        self.check()?;
-        let authority = invalidate_on_refusal(
-            &self.invalidated,
-            Self::fresh(self.remote.clone(), self.domain()).await,
-        )?;
-        let deliver = Self::fresh(self.remote.clone(), self.domain());
+        self.check().await?;
+        let (authority, offline) = match self.authority(freshness, None).await {
+            Ok(admitted) => admitted,
+            Err(error) => return self.end(Err(error)).await,
+        };
+        let deliver = async {
+            self.authority(freshness, Some(offline))
+                .await
+                .map(|(authority, _)| authority)
+        };
         let result = self
             .reads
             .query(
@@ -1012,7 +1217,9 @@ impl HumanReader {
             )
             .await;
         let result = self.reads.settle(result).await;
-        invalidate_on_refusal(&self.invalidated, result)
+        let result = Self::offline_result(offline, result);
+        self.end(invalidate_on_refusal(&self.invalidated, result))
+            .await
     }
 
     /// The typed node or edge lookup.
@@ -1024,12 +1231,16 @@ impl HumanReader {
         freshness: Freshness,
         cancel: &Cancellation,
     ) -> Result<QueryResult<Option<Inspected>>, QueryError> {
-        self.check()?;
-        let authority = invalidate_on_refusal(
-            &self.invalidated,
-            Self::fresh(self.remote.clone(), self.domain()).await,
-        )?;
-        let deliver = Self::fresh(self.remote.clone(), self.domain());
+        self.check().await?;
+        let (authority, offline) = match self.authority(freshness, None).await {
+            Ok(admitted) => admitted,
+            Err(error) => return self.end(Err(error)).await,
+        };
+        let deliver = async {
+            self.authority(freshness, Some(offline))
+                .await
+                .map(|(authority, _)| authority)
+        };
         let result = self
             .reads
             .inspect(
@@ -1048,7 +1259,9 @@ impl HumanReader {
             )
             .await;
         let result = self.reads.settle(result).await;
-        invalidate_on_refusal(&self.invalidated, result)
+        let result = Self::offline_result(offline, result);
+        self.end(invalidate_on_refusal(&self.invalidated, result))
+            .await
     }
 }
 

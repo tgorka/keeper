@@ -30,9 +30,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use super::protocol::wire::ReadStatus;
+use super::protocol::wire::{Authority, ReadStatus};
 use super::query::{GraphReads, QueryError};
-use super::queue::{FenceState, GraphQueue, QueueError};
+use super::queue::{AuthorityRow, FenceState, GraphQueue, QueueError};
 use super::source::{Checkpoint, ScopeState};
 
 /// Why a lifecycle step failed. The domain stays locked.
@@ -88,9 +88,39 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// The domain this lifecycle fences.
+    #[must_use]
+    pub fn domain(&self) -> String {
+        self.queue().binding().domain.clone()
+    }
+
+    /// Keep the authority a successful online `read_status` answered at
+    /// `observed_at_ms` (device wall clock, UTC ms): the only writer of the
+    /// row offline reads compare with.
+    pub fn record_authority(
+        &self,
+        authority: &Authority,
+        observed_at_ms: i64,
+    ) -> Result<(), LifecycleError> {
+        Ok(self.queue().record_authority(authority, observed_at_ms)?)
+    }
+
+    /// The last kept read authority.
+    pub fn authority(&self) -> Result<Option<AuthorityRow>, LifecycleError> {
+        Ok(self.queue().authority()?)
+    }
+
     /// The fence's persisted state.
     pub fn fence(&self) -> Result<Option<FenceState>, LifecycleError> {
         Ok(self.queue().fence()?)
+    }
+
+    /// How many queued intents are in each state (domain-safe; allowed
+    /// while locked).
+    pub fn counts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<super::queue::State, usize>, LifecycleError> {
+        Ok(self.queue().counts()?)
     }
 
     /// A revocation signal: lock, persist the fence, lock the queue, then

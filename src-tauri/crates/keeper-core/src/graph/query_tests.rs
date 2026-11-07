@@ -1696,3 +1696,268 @@ async fn projection_three_skips_reviews_and_reprojects_a_reversed_merge() {
         .await
         .is_empty());
 }
+
+/// CC-22: a person's last-authorised offline reads, over the real worker
+/// and projection, with a scripted `read_status` and an injected clock.
+#[cfg(feature = "human-reads")]
+mod offline {
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicI64;
+
+    use super::*;
+    use crate::graph::lifecycle::Lifecycle;
+    use crate::graph::queue::{Binding, FenceState, GraphQueue};
+
+    const T0: i64 = 1_000_000_000_000;
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    const Q: &str = "MATCH (n) RETURN n.title AS t LIMIT 1";
+
+    #[derive(Clone)]
+    enum Step {
+        Answer,
+        Fail(QueryError),
+        Panic,
+    }
+
+    /// The person's server as the test scripts it: each `read_status`
+    /// first moves the clock by `tick`, then answers the next scripted
+    /// step (`then` once the script is spent).
+    struct Person {
+        script: Mutex<VecDeque<Step>>,
+        then: Mutex<Step>,
+        clock: Arc<AtomicI64>,
+        tick: AtomicI64,
+        asked: AtomicU32,
+    }
+
+    impl GraphRemote for Person {
+        fn admit_read(&self, _: &str, _: &str) -> Result<ContextRow, QueryError> {
+            Err(QueryError::Forbidden)
+        }
+        fn refresh_context(&self, _: &str) -> Result<ContextRow, QueryError> {
+            Err(QueryError::Forbidden)
+        }
+        fn read_status(&self, domain: &str) -> Result<ReadStatus, QueryError> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.clock
+                .fetch_add(self.tick.load(Ordering::SeqCst), Ordering::SeqCst);
+            let step = self
+                .script
+                .lock()
+                .expect("script")
+                .pop_front()
+                .unwrap_or_else(|| self.then.lock().expect("then").clone());
+            match step {
+                Step::Answer => Ok(ReadStatus {
+                    domain: domain.to_owned(),
+                    authority: authority("1"),
+                }),
+                Step::Fail(error) => Err(error),
+                Step::Panic => panic!("read_status failed inside the blocking task"),
+            }
+        }
+    }
+
+    struct Offline {
+        _rig: Rig,
+        _dir: tempfile::TempDir,
+        reader: HumanReader,
+        person: Arc<Person>,
+        clock: Arc<AtomicI64>,
+        lifecycle: Arc<Lifecycle>,
+    }
+
+    impl Offline {
+        /// Built online at `T0` (the authority kept then), then the server
+        /// becomes unreachable.
+        async fn new() -> Self {
+            let mut rig = Rig::new();
+            rig.world
+                .accept(vec![node(&ulid(1), "Concept", "kept", json!({}))]);
+            rig.world.replicate(1, 1, 1, None);
+            let clock = Arc::new(AtomicI64::new(T0));
+            let person = Arc::new(Person {
+                script: Mutex::new(VecDeque::new()),
+                then: Mutex::new(Step::Answer),
+                clock: clock.clone(),
+                tick: AtomicI64::new(0),
+                asked: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().expect("dir");
+            let queue = GraphQueue::open(
+                &dir.path().join("ana.graph-queue"),
+                Binding {
+                    server: "https://hq.example".to_owned(),
+                    domain: DB.to_owned(),
+                    actor: "ana".to_owned(),
+                    client: "dev1".to_owned(),
+                },
+            )
+            .expect("queue");
+            let lifecycle = Arc::new(Lifecycle::open(queue).expect("lifecycle"));
+            let now = clock.clone();
+            let reader = rig
+                .reads
+                .human_with(&rig.world.source, person.clone())
+                .with_lifecycle(lifecycle.clone())
+                .expect("same domain")
+                .with_clock(Arc::new(move || now.load(Ordering::SeqCst)));
+            reader
+                .refresh(&Cancellation::default())
+                .await
+                .expect("built online");
+            assert_eq!(
+                lifecycle
+                    .authority()
+                    .expect("row")
+                    .map(|r| r.observed_at_ms),
+                Some(T0)
+            );
+            *person.then.lock().expect("then") = Step::Fail(QueryError::Unreachable);
+            Self {
+                _rig: rig,
+                _dir: dir,
+                reader,
+                person,
+                clock,
+                lifecycle,
+            }
+        }
+
+        fn at(&self, now: i64, tick: i64) {
+            self.clock.store(now, Ordering::SeqCst);
+            self.person.tick.store(tick, Ordering::SeqCst);
+        }
+
+        fn script(&self, steps: Vec<Step>) {
+            *self.person.script.lock().expect("script") = steps.into();
+        }
+
+        async fn query(&self, freshness: Freshness) -> Result<Completeness, QueryError> {
+            self.reader
+                .query(Q, b"{}", freshness, &Cancellation::default())
+                .await
+                .map(|r| {
+                    assert_eq!(r.rows[0]["t"], json!("kept"));
+                    r.completeness
+                })
+        }
+    }
+
+    /// An unreachable server serves the kept authority's generation, only
+    /// with `AllowStale`, always `Stale`; and an inspect alike.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreachable_server_serves_the_last_authorised_generation_stale() {
+        let o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Ok(Completeness::Stale)
+        );
+        assert_eq!(
+            o.query(Freshness::Current).await.map_err(|e| e.code()),
+            Err("sync_pending")
+        );
+        let inspected = o
+            .reader
+            .inspect(
+                InspectEntity::Node,
+                &ulid(1),
+                false,
+                Freshness::AllowStale,
+                &Cancellation::default(),
+            )
+            .await
+            .expect("inspected");
+        assert_eq!(inspected.completeness, Completeness::Stale);
+        // Online again: the same generation is current.
+        *o.person.then.lock().expect("then") = Step::Answer;
+        assert_eq!(o.query(Freshness::Current).await, Ok(Completeness::Current));
+    }
+
+    /// T5 3a: only the typed transport cause serves. A failed join, a local
+    /// or closed failure (`SyncPending`), an unreadable answer and storage
+    /// refuse, at admission and at delivery; nothing of them is offline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_an_unreachable_server_enters_offline_mode() {
+        let o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        let failures = [
+            Step::Panic,
+            Step::Fail(QueryError::SyncPending),
+            Step::Fail(QueryError::Unavailable("authority.answer")),
+            Step::Fail(QueryError::Storage("replica")),
+        ];
+        for failure in failures {
+            o.script(vec![failure.clone()]);
+            assert!(
+                o.query(Freshness::AllowStale).await.is_err(),
+                "refused at admission"
+            );
+            o.script(vec![Step::Fail(QueryError::Unreachable), failure]);
+            assert!(
+                o.query(Freshness::AllowStale).await.is_err(),
+                "refused at delivery"
+            );
+        }
+        // None of them fenced: the next unreachable read still serves.
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Ok(Completeness::Stale)
+        );
+    }
+
+    /// The 24 h bound is inclusive and checked at admission and again at
+    /// delivery against a fresh clock; a row from the future refuses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_offline_window_is_exactly_one_day_at_admission_and_delivery() {
+        let o = Offline::new().await;
+        // Exactly 24 h at both checks: served.
+        o.at(T0 + DAY, 0);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Ok(Completeness::Stale)
+        );
+        // 24 h + 1 ms at admission: refused.
+        o.at(T0 + DAY + 1, 0);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+        // Admitted at 24 h − 1 ms, delivered at 24 h + 1 ms: refused.
+        o.at(T0 + DAY - 3, 2);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+        // Admitted at 24 h − 1 ms, delivered at exactly 24 h: served.
+        o.at(T0 + DAY - 2, 1);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Ok(Completeness::Stale)
+        );
+        // The row is 1 ms in the future at admission: refused.
+        o.at(T0 - 1, 0);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+        // Admitted at the row's own time, the clock set back 1 ms before
+        // delivery: refused.
+        o.at(T0 + 1, -1);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+    }
+
+    /// A server refusal is a revocation: the domain is fenced first, and a
+    /// fenced domain serves nothing offline either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_fences_and_nothing_serves_after_it() {
+        let o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        o.script(vec![Step::Fail(QueryError::Forbidden)]);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Err(QueryError::Forbidden)
+        );
+        assert!(o.lifecycle.is_locked());
+        assert_eq!(o.lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+        let asked = o.person.asked.load(Ordering::SeqCst);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Err(QueryError::Forbidden)
+        );
+        // Refused before the server is even asked.
+        assert_eq!(o.person.asked.load(Ordering::SeqCst), asked);
+    }
+}
