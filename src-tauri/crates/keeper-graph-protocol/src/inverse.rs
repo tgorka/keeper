@@ -558,19 +558,34 @@ pub fn reverse(
     }
 }
 
+/// What a preview says a reversal would do now. Any other `outcome` on the
+/// wire is unreadable ([`decode_preview`] refuses `unsupported_version`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewOutcome {
+    /// The plan applies now.
+    Ready,
+    /// The plan applies now, but this caller, an agent, needs a per-call
+    /// approval to reverse it (keeper-hq's answer only: a person never
+    /// gets it, and [`preview`], which knows no caller, never gives it).
+    ApprovalRequired,
+    /// `detail` is the conflict, as [`apply_inverse`] reports it.
+    Conflict,
+    /// `reason` is the refusal code.
+    Rejected,
+}
+
 /// What a reversal of one retained event would do now: [`crate::wire::PREVIEW_REVERSAL`]'s
-/// one row. `outcome` is `ready` (the plan applies now), `conflict`
-/// (`detail` the conflict, as [`apply_inverse`] reports it) or `rejected`
-/// (`reason` the refusal code); `plan` and `expected` are absent only when
-/// the event is not reversible by shape. The planned operations name a
-/// restored membership with a null id.
+/// one row. `plan` and `expected` are absent only when the event is not
+/// reversible by shape. The planned operations name a restored membership
+/// with a null id.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preview {
     pub target_event_id: String,
     pub plan: Option<Plan>,
     pub expected: Vec<Expected>,
-    pub outcome: String,
+    pub outcome: PreviewOutcome,
     pub reason: Option<String>,
     pub detail: Option<Value>,
 }
@@ -587,7 +602,7 @@ pub fn preview(state: &dyn Retained, event: &Event, stamp: &Stamp<'_>) -> Previe
                 target_event_id,
                 plan: None,
                 expected: Vec::new(),
-                outcome: "rejected".to_owned(),
+                outcome: PreviewOutcome::Rejected,
                 reason: Some(refusal.code().to_owned()),
                 detail: None,
             }
@@ -596,15 +611,19 @@ pub fn preview(state: &dyn Retained, event: &Event, stamp: &Stamp<'_>) -> Previe
     // Nothing is minted for a preview: one fixed placeholder id.
     let mut mint = || "00000000000000000000000000".to_owned();
     let (outcome, reason, detail) = match apply_inverse(state, &plan, stamp, &mut mint) {
-        Verdict::Accepted(_) => ("ready", None, None),
-        Verdict::Conflict(detail) => ("conflict", None, Some(detail)),
-        Verdict::Refused(refusal) => ("rejected", Some(refusal.code().to_owned()), None),
+        Verdict::Accepted(_) => (PreviewOutcome::Ready, None, None),
+        Verdict::Conflict(detail) => (PreviewOutcome::Conflict, None, Some(detail)),
+        Verdict::Refused(refusal) => (
+            PreviewOutcome::Rejected,
+            Some(refusal.code().to_owned()),
+            None,
+        ),
     };
     Preview {
         target_event_id,
         expected: expected(&plan),
         plan: Some(plan),
-        outcome: outcome.to_owned(),
+        outcome,
         reason,
         detail,
     }
@@ -613,7 +632,8 @@ pub fn preview(state: &dyn Retained, event: &Event, stamp: &Stamp<'_>) -> Previe
 /// Decode [`crate::wire::PREVIEW_REVERSAL`]'s answer for `event_id`: exactly
 /// one row naming that event, its `expected` the plan's, and `outcome`,
 /// `reason` and `detail` agreeing (a reason exactly when rejected, a detail
-/// exactly when a conflict, no plan only when rejected). Anything else
+/// exactly when a conflict, a plan whenever ready or approval-required, no
+/// plan only when rejected). Anything else, an unknown outcome included,
 /// refuses `unsupported_version`.
 pub fn decode_preview(event_id: &str, rows: Vec<Map<String, Value>>) -> Result<Preview, Refusal> {
     let mut rows = rows.into_iter();
@@ -622,10 +642,14 @@ pub fn decode_preview(event_id: &str, rows: Vec<Map<String, Value>>) -> Result<P
     };
     let preview: Preview =
         serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
-    let shaped = match (preview.outcome.as_str(), &preview.reason, &preview.detail) {
-        ("ready", None, None) => preview.plan.is_some(),
-        ("conflict", None, Some(Value::Object(_))) => preview.plan.is_some(),
-        ("rejected", Some(reason), None) => crate::vocabulary::ERRORS.contains(&reason.as_str()),
+    let shaped = match (preview.outcome, &preview.reason, &preview.detail) {
+        (PreviewOutcome::Ready | PreviewOutcome::ApprovalRequired, None, None) => {
+            preview.plan.is_some()
+        }
+        (PreviewOutcome::Conflict, None, Some(Value::Object(_))) => preview.plan.is_some(),
+        (PreviewOutcome::Rejected, Some(reason), None) => {
+            crate::vocabulary::ERRORS.contains(&reason.as_str())
+        }
         _ => false,
     };
     let planned = match &preview.plan {

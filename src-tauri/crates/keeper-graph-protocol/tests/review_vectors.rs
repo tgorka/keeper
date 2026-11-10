@@ -185,7 +185,11 @@ fn inverses_plan_and_apply_or_refuse() {
                 let event: Event = serde_json::from_value(event.clone()).expect("event");
                 let preview = inverse::preview(&state, &event, &stamp);
                 let want = &entry["preview"];
-                assert_eq!(preview.outcome, want["outcome"], "{name}");
+                assert_eq!(
+                    serde_json::to_value(preview.outcome).expect("o"),
+                    want["outcome"],
+                    "{name}"
+                );
                 assert_eq!(
                     serde_json::to_value(&preview.reason).expect("r"),
                     want["reason"],
@@ -223,6 +227,27 @@ fn inverses_plan_and_apply_or_refuse() {
             &entry,
             apply_inverse(&state, &plan, &stamp, &mut minted(&entry)),
         );
+    }
+}
+
+/// `graph.preview_reversal` rows decode to their outcome, `approval_required`
+/// (keeper-hq's answer to an agent only) among them, or fail closed.
+#[test]
+fn preview_rows_decode_or_fail_closed() {
+    for entry in entries("previews") {
+        let name = id(&entry);
+        let rows: Vec<Map<String, Value>> =
+            serde_json::from_value(entry["rows"].clone()).expect("rows");
+        let decoded = inverse::decode_preview(entry["event_id"].as_str().expect("event"), rows);
+        match (decoded, entry.get("refusal")) {
+            (Ok(preview), None) => assert_eq!(
+                serde_json::to_value(preview.outcome).expect("o"),
+                entry["outcome"],
+                "{name}"
+            ),
+            (Err(refusal), Some(code)) => assert_eq!(refusal.code(), code, "{name}"),
+            (other, _) => panic!("{name}: {other:?}"),
+        }
     }
 }
 
@@ -373,57 +398,78 @@ fn proposals_and_decisions_digest_or_refuse() {
 
 /// X7d: a reversal is its inverse and one review within one event's 128
 /// operations — an event of `n` creates reverses only while `n + 1` fits.
+/// `inverse_caps[]` holds each case as a generator (an entry would be
+/// ~300 KB): `creates` `create_node`s of `node`, ids `01JQ` + the index
+/// as 22 zero-padded digits, applied forward to an empty graph; that event
+/// (`event` plus `op_count` and the forward `delta_digest`) reversed against
+/// the created nodes, each written at 1.
 #[test]
 fn a_reversal_and_its_review_fit_one_event_or_refuse_change_limit() {
     use keeper_graph_protocol::candidate::apply;
     use keeper_graph_protocol::change;
     use serde_json::json;
-    for (n, refused) in [(127u64, false), (128, true)] {
+    for entry in entries("inverse_caps") {
+        let name = id(&entry);
+        let n = entry["creates"].as_u64().expect("creates");
         let ids: Vec<String> = (0..n).map(|i| format!("01JQ{i:022}")).collect();
-        let payload = json!({"ops": ids.iter().map(|i| json!({"op": "create_node", "id": i,
-            "kind": "Concept", "title": "N", "description": null, "properties": {}})).collect::<Vec<_>>()});
-        let change = change::parse(&payload, |t| Some(t.to_owned())).expect("change");
+        let ops: Vec<Value> = ids
+            .iter()
+            .map(|i| {
+                let mut op = entry["node"].clone();
+                op["op"] = json!("create_node");
+                op["id"] = json!(i);
+                op
+            })
+            .collect();
+        let change = change::parse(&json!({ "ops": ops }), |t| Some(t.to_owned())).expect("change");
         let empty = Images(json!({}));
+        let forward = &entry["forward_stamp"];
         let stamp = Stamp {
-            time_ms: 1,
-            actor_id: "person-editor",
+            time_ms: forward["time_ms"].as_u64().expect("time"),
+            actor_id: forward["actor_id"].as_str().expect("actor"),
         };
         let Verdict::Accepted(effects) = apply(&empty, &change, &stamp, &mut || unreachable!())
         else {
-            panic!("forward {n}");
+            panic!("{name}: forward");
         };
+        assert_eq!(
+            effects.delta_digest, entry["forward_delta_digest"],
+            "{name}"
+        );
         let nodes: Vec<Value> = effects
             .ops
             .iter()
             .filter_map(|op| op.after_value.clone())
             .collect();
-        let written: Map<String, Value> = ids.iter().map(|i| (i.clone(), json!(1))).collect();
+        let written: Map<String, Value> = ids
+            .iter()
+            .map(|i| (i.clone(), entry["written"].clone()))
+            .collect();
         let now = Images(json!({"nodes": nodes, "written": written}));
-        let event: Event = serde_json::from_value(json!({
-            "event": {"id": "01JQ9999999999999999999999", "graph_seq": "1", "descriptor": "graph.apply",
-                "request_id": "01JQ9999999999999999999998", "request_digest": "ab".repeat(32),
-                "actor_id": "person-editor", "client_id": "device", "origin_class": "human",
-                "origin_actor": null, "origin_chain": null, "context_id": null,
-                "approval_basis": {"basis": "direct"}, "reverses_event_id": null, "event_time_ms": null,
-                "recorded_at_ms": 1, "op_count": n, "delta_digest": effects.delta_digest},
-            "ops": effects.ops,
-        }))
-        .expect("event");
+        let mut header = entry["event"].clone();
+        header["op_count"] = json!(n);
+        header["delta_digest"] = json!(effects.delta_digest);
+        let event: Event =
+            serde_json::from_value(json!({"event": header, "ops": effects.ops})).expect("event");
         let plan = inverse::plan(&event).expect("plan");
         let stamp = Stamp {
-            time_ms: 2,
-            actor_id: "person-reviewer",
+            time_ms: entry["time_ms"].as_u64().expect("time"),
+            actor_id: entry["actor"].as_str().expect("actor"),
         };
-        let verdict = apply_inverse(&now, &plan, &stamp, &mut || {
-            "01JQ9999999999999999999997".to_owned()
-        });
-        match verdict {
-            Verdict::Refused(Refusal::ChangeLimit) => assert!(refused, "{n}"),
-            Verdict::Accepted(effects) => {
-                assert!(!refused, "{n}");
-                assert_eq!(effects.ops.len(), 128);
+        match apply_inverse(&now, &plan, &stamp, &mut minted(&entry)) {
+            Verdict::Refused(refusal) => {
+                assert_eq!(Some(refusal.code()), entry["refusal"].as_str(), "{name}");
             }
-            other => panic!("{n}: {other:?}"),
+            Verdict::Accepted(effects) => {
+                assert!(entry.get("refusal").is_none(), "{name}");
+                assert_eq!(
+                    Some(effects.ops.len() as u64),
+                    entry["op_count"].as_u64(),
+                    "{name}"
+                );
+                assert_eq!(effects.delta_digest, entry["delta_digest"], "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
         }
     }
 }

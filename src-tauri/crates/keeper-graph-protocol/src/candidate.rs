@@ -102,9 +102,11 @@
 //!
 //! **Reversal.** [`apply_inverse`] is the second entry point: it judges a
 //! server-derived inverse ([`crate::inverse`]) through the same per-entity
-//! preconditions and whole-candidate checks, plus the reversal-only
-//! dependency rule and its `dependency` conflict precondition. Nothing a
-//! [`Change`] can name reaches it.
+//! preconditions, per-operation refusals and whole-candidate validation
+//! ([`Candidate::whole`]), differing from forward only by the listed
+//! [`Exception`]s, plus the reversal-only dependency rule and its
+//! `dependency` conflict precondition. Nothing a [`Change`] can name
+//! reaches it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -330,6 +332,22 @@ fn unmergeable(node: &Image) -> bool {
         || assertion::of(node).is_some()
 }
 
+/// Whether node `node` may take part in a merge, as its target or an
+/// absorbed node: active, unmerged and not [`unmergeable`]. Forward
+/// `merge_nodes` and a reversal's re-merge judge both nodes by it.
+fn mergeable(node: &Image) -> bool {
+    text(node, "lifecycle") == "active"
+        && node.get("merged_into_id").is_none_or(Value::is_null)
+        && !unmergeable(node)
+}
+
+/// Whether a merge may move an endpoint of an edge of this type: never a
+/// `guidance_scope` edge's. Forward `merge_nodes` and a reversal's
+/// endpoint moves judge it alike.
+fn rewritable(edge: &Image) -> bool {
+    text(edge, "type") != "guidance_scope"
+}
+
 /// Check that `listed` is exactly the active edges incident to `node_ids`
 /// in `state`: the first difference is the conflict detail (an unlisted
 /// edge with its revision, or a listed one that is not an active incident
@@ -485,6 +503,15 @@ impl<'a> Candidate<'a> {
         for (index, op) in change.ops().iter().enumerate() {
             self.op(op, change.canonical_tag(index), stamp, mint)?;
         }
+        self.whole()?;
+        self.effects()
+    }
+
+    /// The whole-candidate validation, after the operations: every typed
+    /// reference written, every edge left active, containment, then
+    /// [`Candidate::finish`]. [`apply`] and [`apply_inverse`] both end in
+    /// it; nothing else validates a final candidate.
+    fn whole(&mut self) -> Result<(), Stop> {
         for value in std::mem::take(&mut self.written) {
             self.references(&value)?;
         }
@@ -495,8 +522,7 @@ impl<'a> Candidate<'a> {
         for id in std::mem::take(&mut self.containment) {
             self.acyclic(&id, &mut budget)?;
         }
-        self.finish()?;
-        self.effects()
+        self.finish()
     }
 
     /// Load node `id` into the candidate; `None` when the graph has none.
@@ -956,20 +982,14 @@ impl<'a> Candidate<'a> {
                 &edge.to_lifecycle_revision,
             )?;
         }
-        if text(&target, "lifecycle") != "active"
-            || !target.get("merged_into_id").is_none_or(Value::is_null)
-            || unmergeable(&target)
-        {
+        if !mergeable(&target) {
             return Err(Refusal::InvalidChange.into());
         }
         let set: BTreeSet<String> = ids.iter().cloned().collect();
         for id in &ids {
             let entry = self.nodes.get_mut(id).ok_or(Refusal::InvalidChange)?;
             let after = &mut entry.after;
-            if text(after, "lifecycle") != "active"
-                || !after.get("merged_into_id").is_none_or(Value::is_null)
-                || unmergeable(after)
-            {
+            if !mergeable(after) {
                 return Err(Refusal::InvalidChange.into());
             }
             let lifecycle = next(&text(after, "lifecycle_revision"))?;
@@ -979,7 +999,7 @@ impl<'a> Candidate<'a> {
         }
         for id in &listed {
             let entry = self.edges.get_mut(id).ok_or(Refusal::InvalidChange)?;
-            if text(&entry.after, "type") == "guidance_scope" {
+            if !rewritable(&entry.after) {
                 return Err(Refusal::InvalidChange.into());
             }
             entry.after =
@@ -1573,38 +1593,42 @@ pub trait Retained: State {
 pub const MAX_DEPENDENCY_READS: usize = 10_000;
 
 /// Judge the reversal `plan` ([`crate::inverse::plan`]) against `state`, by
-/// `stamp`'s actor. The same machinery as [`apply`], in this order, the
-/// first failure deciding:
+/// `stamp`'s actor. The same machinery as [`apply`] — its per-operation
+/// refusals and its whole-candidate validation — with only the listed
+/// [`Exception`]s, in this order, the first failure deciding:
 ///
 /// 1. the plan's own shape (`invalid_change`): each operation as
 ///    [`crate::inverse`] maps it — ids, kinds, types and owners kept,
 ///    `revision` one more than its before-image's, a node's
 ///    `lifecycle_revision` one more exactly when its lifecycle changes, the
 ///    operation the lifecycle transition names, images within their rules —
-///    no entity twice, and no node after-image `verified` or with a non-null
-///    `verified_at`/`verified_by` (X29: only `verify_assertion` verifies);
+///    no entity twice, no node after-image `verified` or with a non-null
+///    `verified_at`/`verified_by` (X29: only `verify_assertion` verifies),
+///    and no redirect or endpoint change outside the [`Exception`]s;
 /// 2. each operation's precondition, in order: the entity exactly its
 ///    planned before-image now (else a conflict on its `revision`, or its
 ///    `lifecycle_revision` when only that moved); a membership to remove
 ///    present, one to restore absent (else a conflict on its node);
 /// 3. for each node the reversal archives, in plan order: a re-merge's
-///    target active and unmerged in the final candidate (else a
-///    `lifecycle_revision` conflict on the target), its redirect chain
-///    within [`MAX_REDIRECT_HOPS`] (`change_limit`; a cycle
-///    `invalid_change`) and no active edge left incident to it; for every
-///    archived node, no current-state dependent written after the target
-///    event ([`Retained`]: an active incident edge, an owned content, a
+///    survivor active and unmerged in the final candidate (else a
+///    `lifecycle_revision` conflict on it), survivor and node
+///    [`mergeable`] (`invalid_change`), its redirect chain within
+///    [`MAX_REDIRECT_HOPS`] (`change_limit`; a cycle `invalid_change`) and
+///    no active edge left incident to it; for every archived node, no
+///    current-state dependent written after the target event
+///    ([`Retained`]: an active incident edge, an owned content, a
 ///    domain-visible referrer). A blocked node is a conflict whose
 ///    precondition is `dependency`, naming the node (never the dependent)
 ///    at its current revision. More than [`MAX_DEPENDENCY_READS`] refuses
 ///    `change_limit`;
-/// 4. typed references written, edges left active (endpoints active, a
-///    `guidance_scope` edge from a `Guidance` node), containment, node
-///    members by kind, content owners and reference bodies — as [`apply`];
-/// 5. verification: a `sources` edge (its from-node before or after) or a
-///    content of an assertion `verified` now refuses `invalid_change`
-///    unless the plan also holds an operation on that assertion;
-/// 6. the event: the planned operations, then one `review` creation of
+/// 4. forward's whole-candidate validation ([`Candidate::whole`]): typed
+///    references written, edges left active, containment, node members by
+///    kind, restored description provenance, content owners and reference
+///    bodies, and verification — a `sources` edge (its from-node before or
+///    after) or a content of an assertion `verified` now refuses
+///    `invalid_change` unless the plan also holds an operation on that
+///    assertion (exception 4);
+/// 5. the event: the planned operations, then one `review` creation of
 ///    kind `reversal` naming the target, within [`crate::delta::digest`]'s
 ///    bounds. Restored memberships and the review take ids from `mint`, in
 ///    that order; `affected` ends with the review.
@@ -1699,6 +1723,117 @@ fn planned_ok(op: &crate::inverse::PlannedOp) -> Result<(), Refusal> {
     }
 }
 
+/// **The inverse exceptions**, the one list of ways a planned operation may
+/// differ from the forward operation of the same name (CC-X27, X29).
+/// Everything else about a reversal runs forward's own code: the same
+/// per-operation refusals ([`mergeable`], [`rewritable`], an `unarchive`
+/// of a merged node refused) and the same whole-candidate validation
+/// ([`Candidate::whole`]: references, endpoints, containment and
+/// [`Candidate::finish`], provenance included).
+///
+/// 1. [`Exception::RestoreMerged`]: a node `unarchive` putting back
+///    `merged_into_id: null`, which forward `unarchive_node` refuses.
+/// 2. [`Exception::ReMerge`]: a node `archive` setting `merged_into_id`,
+///    which only a merge does forward; judged by the merge rules — the
+///    survivor active and unmerged (else a `lifecycle_revision` conflict),
+///    survivor and node [`mergeable`], the redirect bound, and no active
+///    edge left incident to the node.
+/// 3. [`Exception::Endpoints`]: an active edge `update` moving
+///    `from_id`/`to_id`, which only a merge's rewrite does forward; each
+///    moved end follows a redirect the same plan restores (1) or sets (2),
+///    and the edge passes the rewrite refusals ([`rewritable`], no
+///    self-loop).
+/// 4. X29 normalisation (no variant: it is no per-operation shape): every
+///    planned node after-image is unverified, [`planned_ok`] refusing any
+///    that carries verification, and every planned node operation counts
+///    as the `update_node` that clears it, so forward's own clear in
+///    [`Candidate::finish`] has nothing left to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exception {
+    RestoreMerged,
+    ReMerge,
+    Endpoints,
+}
+
+fn merged_into(image: &Image) -> Option<&str> {
+    image.get("merged_into_id").and_then(Value::as_str)
+}
+
+fn images(op: &crate::inverse::PlannedOp) -> Option<(&Image, &Image)> {
+    Some((
+        op.before_value.as_ref()?.as_object()?,
+        op.after_value.as_ref()?.as_object()?,
+    ))
+}
+
+/// Which inverse exception planned operation `op` takes, if any; a
+/// difference from forward that is none of them refuses `invalid_change`.
+fn exception(op: &crate::inverse::PlannedOp) -> Result<Option<Exception>, Refusal> {
+    let Some((before, after)) = images(op) else {
+        return Ok(None);
+    };
+    match op.entity_type {
+        EntityType::Node => match (op.operation, merged_into(before), merged_into(after)) {
+            (Operation::Unarchive, Some(_), Some(_)) => Err(Refusal::InvalidChange),
+            (_, b, a) if b == a => Ok(None),
+            (Operation::Unarchive, Some(_), None) => Ok(Some(Exception::RestoreMerged)),
+            (Operation::Archive, None, Some(_)) => Ok(Some(Exception::ReMerge)),
+            _ => Err(Refusal::InvalidChange),
+        },
+        EntityType::Edge => {
+            let ends = |i: &Image| (text(i, "from_id"), text(i, "to_id"));
+            if ends(before) == ends(after) {
+                return Ok(None);
+            }
+            let rewrite = op.operation == Operation::Update
+                && text(before, "lifecycle") == "active"
+                && text(after, "lifecycle") == "active"
+                && rewritable(after)
+                && text(after, "from_id") != text(after, "to_id");
+            if rewrite {
+                Ok(Some(Exception::Endpoints))
+            } else {
+                Err(Refusal::InvalidChange)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Exception 3: every moved edge end goes from a node to the one it is
+/// merged into by a re-merge of the same plan, or back from it to a node
+/// the same plan restores.
+fn moves_follow_redirects(
+    exceptions: &BTreeMap<String, (Exception, &crate::inverse::PlannedOp)>,
+) -> Result<(), Refusal> {
+    let redirect = |node: &str, kind: Exception| {
+        exceptions
+            .get(node)
+            .filter(|(e, _)| *e == kind)
+            .and_then(|(_, op)| images(op))
+    };
+    for (exception, op) in exceptions.values() {
+        if *exception != Exception::Endpoints {
+            continue;
+        }
+        let (before, after) = images(op).ok_or(Refusal::InvalidChange)?;
+        for end in ["from_id", "to_id"] {
+            let (from, to) = (text(before, end), text(after, end));
+            if from == to {
+                continue;
+            }
+            let restored = redirect(&to, Exception::RestoreMerged)
+                .is_some_and(|(b, _)| merged_into(b) == Some(from.as_str()));
+            let re_merged = redirect(&from, Exception::ReMerge)
+                .is_some_and(|(_, a)| merged_into(a) == Some(to.as_str()));
+            if !restored && !re_merged {
+                return Err(Refusal::InvalidChange);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The conflict of an entity that is not exactly `expected` now.
 fn moved(entity_type: &str, id: &str, current: Option<&Image>, expected: &Image) -> Stop {
     let Some(current) = current else {
@@ -1734,17 +1869,23 @@ impl Candidate<'_> {
             .filter(|_| crate::is_decimal(&plan.target_graph_seq))
             .ok_or(Refusal::InvalidChange)?;
         let mut entities = BTreeSet::new();
+        let mut exceptions = BTreeMap::new();
         for op in &plan.ops {
             planned_ok(op)?;
             if let Some(id) = &op.entity_id {
                 if !entities.insert(id.clone()) {
                     return Err(Refusal::InvalidChange.into());
                 }
+                if let Some(exception) = exception(op)? {
+                    exceptions.insert(id.clone(), (exception, op));
+                }
             }
         }
+        moves_follow_redirects(&exceptions)?;
         for op in &plan.ops {
             self.inverse_op(op, mint)?;
             if let Some(id) = &op.entity_id {
+                // Exception 4: every planned node operation clears.
                 if op.entity_type == EntityType::Node {
                     self.updated.insert(id.clone());
                 }
@@ -1756,17 +1897,7 @@ impl Candidate<'_> {
                 self.dependencies(retained, id, after_seq, &entities)?;
             }
         }
-        for value in std::mem::take(&mut self.written) {
-            self.references(&value)?;
-        }
-        for id in std::mem::take(&mut self.endpoint_checks) {
-            self.endpoints_active(&id)?;
-        }
-        let mut budget = 0;
-        for id in std::mem::take(&mut self.containment) {
-            self.acyclic(&id, &mut budget)?;
-        }
-        self.finish_inverse()?;
+        self.whole()?;
         let id = mint();
         let image = crate::review::image(&id, &target, crate::review::REVERSAL, stamp.actor_id)?;
         self.slots.push(Slot::Review(image));
@@ -1807,6 +1938,14 @@ impl Candidate<'_> {
                     EntityType::Node => {
                         self.written
                             .push(after.get("properties").cloned().unwrap_or(Value::Null));
+                        // A restored provenance is judged as forward's
+                        // `update_node` setting it.
+                        let source = after.get("description_source_id").and_then(Value::as_str);
+                        if let Some(source) = source.filter(|s| {
+                            before.get("description_source_id").and_then(Value::as_str) != Some(s)
+                        }) {
+                            self.provenance.push((id.clone(), source.to_owned()));
+                        }
                         self.nodes.insert(id.clone(), entry);
                         self.slots.push(Slot::Node(id.clone(), op.operation));
                         self.first("node", &id);
@@ -1899,6 +2038,10 @@ impl Candidate<'_> {
                 let current = survivor.map(|s| text(&s, "lifecycle_revision"));
                 return Err(conflict("node", into, "lifecycle_revision", current));
             }
+            // Exception 2: the merge rules, as forward `merge_nodes`.
+            if !survivor.is_some_and(|s| mergeable(&s)) || !mergeable(before) {
+                return Err(Refusal::InvalidChange.into());
+            }
             redirect_bound(self.state, &[id.to_owned()])?;
         }
         let later = |other: &str| {
@@ -1941,52 +2084,7 @@ impl Candidate<'_> {
         }
         Ok(())
     }
-
-    /// Steps 4 (node members, contents) and 5 of [`apply_inverse`].
-    fn finish_inverse(&self) -> Result<(), Stop> {
-        for entry in self.nodes.values() {
-            let kind = text(&entry.after, "kind");
-            let properties = entry
-                .after
-                .get("properties")
-                .ok_or(Refusal::InvalidChange)?;
-            check_node_properties(Some(&kind), properties)?;
-        }
-        for entry in self.contents.values() {
-            if self
-                .final_node(&text(&entry.after, "owner_node_id"))
-                .is_none()
-            {
-                return Err(Refusal::InvalidChange.into());
-            }
-            if let Some(reference) = entry.after.get("body").and_then(|b| b.get("reference")) {
-                let resource = reference
-                    .get("resource_node_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| self.final_node(id));
-                if !resource.is_some_and(|r| text(&r, "kind") == "Resource") {
-                    return Err(Refusal::InvalidChange.into());
-                }
-            }
-        }
-        let guarded = |owner: &str| -> Result<(), Stop> {
-            if self.verified_before(owner) && !self.updated.contains(owner) {
-                return Err(Refusal::InvalidChange.into());
-            }
-            Ok(())
-        };
-        for entry in self.edges.values() {
-            if text(&entry.after, "type") != "sources" {
-                continue;
-            }
-            guarded(&text(&entry.after, "from_id"))?;
-            if let Some(before) = &entry.before {
-                guarded(&text(before, "from_id"))?;
-            }
-        }
-        for entry in self.contents.values() {
-            guarded(&text(&entry.after, "owner_node_id"))?;
-        }
-        Ok(())
-    }
 }
+
+#[cfg(test)]
+mod inverse_property;

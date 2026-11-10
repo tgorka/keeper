@@ -859,17 +859,28 @@ reversible; a second acknowledgement is refused `invalid_change`. `graph.unrevie
 agent-origin `graph.apply`/`graph.reverse` events no review targets, as `graph.history` pages.
 `graph.preview_reversal` answers one event's server-derived inverse (its planned operations, a
 restored membership's id null), the `expected` revisions and whether it applies now (`ready`,
-`conflict` or `rejected`). `graph.reverse` (`{target_event_id, target_delta_digest, expected,
+`approval_required` — ready, but an agent's reversal needs its per-call `approval_id`; a person
+never gets it —, `conflict` or `rejected`; any other outcome is unreadable and fails closed).
+`graph.reverse` (`{target_event_id, target_delta_digest, expected,
 approval_id?, event_time_ms?}`, never operations) re-derives the inverse, requires the current
 graph to be exactly the target's after-images and `expected` exactly the plan's, and adds one
 event: the inverse operations and one `review` creation of kind `reversal`, with
 `reverses_event_id` set. An update restores the before-image, a create is archived, a merge is
 restored (redirect cleared, endpoints put back) and its reversal re-merges; every revision moves
-forward, no id is reused, and verification is never restored (always `unverified`). A later
-dependent of a node the reversal archives (an active edge, an owned content, a domain-visible
-reference written after the target) is a `conflict` whose precondition is `dependency`; a
-`graph.reverse` conflict is reported as `reversal_conflict`. `inverses[]`, `reversals[]`,
-`reviews[]`, `proposals[]` and `outcomes[]` pin these.
+forward, no id is reused, and verification is never restored (always `unverified`). A reversal
+is judged by forward's own per-operation refusals and whole-candidate validation (references,
+endpoints, containment, node members, description provenance, content owners, verification),
+differing only by the four inverse exceptions listed once at `candidate::Exception`:
+restore-merged (an `unarchive` clearing `merged_into_id`), re-merge (an `archive` setting it,
+judged by the merge rules: a survivor that is `Guidance`, `Vocabulary` or carries `$assertion`
+is refused `invalid_change`), endpoint moves (only along a redirect the same reversal restores
+or sets, never on a `guidance_scope` edge or into a self-loop), and the X29 normalisation. A
+later dependent of a node the reversal archives (an active edge, an owned content, a
+domain-visible reference written after the target) is a `conflict` whose precondition is
+`dependency`; a `graph.reverse` conflict is reported as `reversal_conflict`. `inverses[]`,
+`inverse_caps[]` (the 128-operation cap as generators: `creates` node creates, reversed, fit
+with their review at 127 and refuse `change_limit` at 128), `reversals[]`, `reviews[]`,
+`previews[]` (preview rows decoded or refused), `proposals[]` and `outcomes[]` pin these.
 
 ## The live check
 

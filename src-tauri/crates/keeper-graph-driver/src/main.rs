@@ -21,9 +21,10 @@
 //!   reviewer reads them;
 //! - `acknowledge <event_id> <delta_digest>` — a human review of one event;
 //! - `preview-reversal <event_id>` — the inverse and what it requires now;
-//! - `reverse <event_id>` — preview, then reverse under exactly the
-//!   previewed revisions (refused without a send unless the preview is
-//!   ready);
+//! - `reverse <event_id> [--approval-id <id>]` — preview, then reverse under
+//!   exactly the previewed revisions (refused without a send unless the
+//!   preview is ready, or `approval_required` and an approval id is given:
+//!   an agent's per-call approval);
 //! - `status` — the replica's head and checkpoint and the projection's
 //!   runtime admission.
 //!
@@ -43,7 +44,7 @@ mod driver {
     use keeper_core::graph::admission::{Admission, Process};
     use keeper_core::graph::client::{subscriptions, Applied, GraphClient, GraphClientError};
     use keeper_core::graph::outcome::GraphOutcome;
-    use keeper_core::graph::protocol::inverse::Reverse;
+    use keeper_core::graph::protocol::inverse::{PreviewOutcome, Reverse};
     use keeper_core::graph::protocol::review::Target;
     use keeper_core::graph::protocol::wire::HistoryFilter;
     use keeper_core::graph::protocol::worker::InspectEntity;
@@ -145,6 +146,10 @@ mod driver {
         },
         Reverse {
             event_id: String,
+            /// The per-call approval an agent's reversal needs when the
+            /// preview answers `approval_required`.
+            #[arg(long)]
+            approval_id: Option<String>,
         },
         Status,
     }
@@ -463,19 +468,30 @@ mod driver {
                 })
                 .await
             }
-            Command::Reverse { event_id } => {
+            Command::Reverse {
+                event_id,
+                approval_id,
+            } => {
                 let id = event_id.clone();
+                let approval_id = approval_id.clone();
                 blocking(&source, move |client| {
                     let preview = match client.preview_reversal(&id) {
                         Ok(p) => p,
                         Err(e) => return fail("refused", &e.to_string()),
                     };
-                    let ready = preview.outcome == "ready";
+                    let ready = match preview.outcome {
+                        PreviewOutcome::Ready => true,
+                        PreviewOutcome::ApprovalRequired => approval_id.is_some(),
+                        PreviewOutcome::Conflict | PreviewOutcome::Rejected => false,
+                    };
                     match preview.plan.as_ref().filter(|_| ready) {
-                        Some(plan) => match Reverse::of(plan, None, None) {
+                        Some(plan) => match Reverse::of(plan, approval_id, None) {
                             Ok(reverse) => applied(client.reverse(&reverse)),
                             Err(r) => fail(r.code(), "reverse"),
                         },
+                        None if preview.outcome == PreviewOutcome::ApprovalRequired => {
+                            json!({"ok": false, "error": "approval_required", "preview": preview})
+                        }
                         None => json!({"ok": false, "error": "not_ready", "preview": preview}),
                     }
                 })

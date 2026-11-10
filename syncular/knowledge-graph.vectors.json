@@ -41163,6 +41163,2137 @@
           "01JN0000000000000000000146": 0
         }
       }
+    },
+    {
+      "actor": "person-reverser",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "a2abd2bab453a29ced6c299ed6feb4b34c5f4cee8989546be435fc0563a4bded",
+          "descriptor": "graph.reverse",
+          "event_time_ms": null,
+          "graph_seq": "3",
+          "id": "01JN0000000000000000000159",
+          "op_count": 6,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1003,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000160",
+          "reverses_event_id": "01JN0000000000000000000027"
+        },
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000003",
+              "id": "01JN0000000000000000000008",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000004",
+              "type": "ex:rel"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000008",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000004",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000008",
+            "entity_type": "edge",
+            "operation": "update",
+            "ordinal": 0
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000006",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "ex:rel"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000006",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000001",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000006",
+            "entity_type": "edge",
+            "operation": "update",
+            "ordinal": 1
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000005",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "ex:rel"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000005",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000001",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000005",
+            "entity_type": "edge",
+            "operation": "update",
+            "ordinal": 2
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000003",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "B2"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000003",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "B2"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "node",
+            "operation": "unarchive",
+            "ordinal": 3
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "B1"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "B1"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "unarchive",
+            "ordinal": 4
+          },
+          {
+            "after_revision": "1",
+            "after_value": {
+              "id": "01JN0000000000000000000029",
+              "kind": "reversal",
+              "reviewer_actor": "person-reverser",
+              "revision": "1",
+              "target_delta_digest": "9c26932b8d781b7a4fffe5184a8f2f3092ad96eca147bd7fd4c1a70b4272f6a5",
+              "target_event_id": "01JN0000000000000000000027"
+            },
+            "before_revision": null,
+            "before_value": null,
+            "entity_id": "01JN0000000000000000000029",
+            "entity_type": "review",
+            "operation": "create",
+            "ordinal": 5
+          }
+        ]
+      },
+      "expected": [
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000005",
+          "revision": "3"
+        },
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000006",
+          "revision": "3"
+        },
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000008",
+          "revision": "3"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002",
+          "lifecycle_revision": "3",
+          "revision": "3"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000003",
+          "lifecycle_revision": "3",
+          "revision": "3"
+        }
+      ],
+      "id": "re-merge-into-assertion-survivor-refused",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "4",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "4",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "4",
+              "title": "B1"
+            },
+            "before_revision": "3",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "B1"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "archive"
+          },
+          {
+            "after_revision": "4",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000003",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "4",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "4",
+              "title": "B2"
+            },
+            "before_revision": "3",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000003",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "B2"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "node",
+            "operation": "archive"
+          },
+          {
+            "after_revision": "4",
+            "after_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000005",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "4",
+              "to_id": "01JN0000000000000000000001",
+              "type": "ex:rel"
+            },
+            "before_revision": "3",
+            "before_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000005",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000005",
+            "entity_type": "edge",
+            "operation": "update"
+          },
+          {
+            "after_revision": "4",
+            "after_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000006",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "4",
+              "to_id": "01JN0000000000000000000001",
+              "type": "ex:rel"
+            },
+            "before_revision": "3",
+            "before_value": {
+              "from_id": "01JN0000000000000000000004",
+              "id": "01JN0000000000000000000006",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000006",
+            "entity_type": "edge",
+            "operation": "update"
+          },
+          {
+            "after_revision": "4",
+            "after_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000008",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "4",
+              "to_id": "01JN0000000000000000000004",
+              "type": "ex:rel"
+            },
+            "before_revision": "3",
+            "before_value": {
+              "from_id": "01JN0000000000000000000003",
+              "id": "01JN0000000000000000000008",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000004",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000008",
+            "entity_type": "edge",
+            "operation": "update"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "a2abd2bab453a29ced6c299ed6feb4b34c5f4cee8989546be435fc0563a4bded",
+        "target_event_id": "01JN0000000000000000000159",
+        "target_graph_seq": "3"
+      },
+      "preview": {
+        "detail": null,
+        "outcome": "rejected",
+        "reason": "invalid_change"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000004",
+            "id": "01JN0000000000000000000005",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "3",
+            "to_id": "01JN0000000000000000000002",
+            "type": "ex:rel"
+          },
+          {
+            "from_id": "01JN0000000000000000000004",
+            "id": "01JN0000000000000000000006",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "3",
+            "to_id": "01JN0000000000000000000002",
+            "type": "ex:rel"
+          },
+          {
+            "from_id": "01JN0000000000000000000002",
+            "id": "01JN0000000000000000000007",
+            "lifecycle": "archived",
+            "properties": {},
+            "revision": "2",
+            "to_id": "01JN0000000000000000000003",
+            "type": "ex:rel"
+          },
+          {
+            "from_id": "01JN0000000000000000000003",
+            "id": "01JN0000000000000000000008",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "3",
+            "to_id": "01JN0000000000000000000004",
+            "type": "ex:rel"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": null,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "2",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "3",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "3",
+            "title": "B1"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000003",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "3",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "3",
+            "title": "B2"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000004",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "O"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 4,
+          "01JN0000000000000000000002": 3,
+          "01JN0000000000000000000003": 3,
+          "01JN0000000000000000000004": 1,
+          "01JN0000000000000000000005": 3,
+          "01JN0000000000000000000006": 3,
+          "01JN0000000000000000000007": 1,
+          "01JN0000000000000000000008": 3
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "0b026bb89385e0935f73c3600a1b99c316eb2c6e87f80aa8548c79e01d9bba98",
+          "descriptor": "graph.apply",
+          "event_time_ms": null,
+          "graph_seq": "2",
+          "id": "01JN0000000000000000000023",
+          "op_count": 3,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1002,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000024",
+          "reverses_event_id": null
+        },
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {
+                "ex:k": 1
+              },
+              "revision": "2",
+              "title": "N2"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "description": "from S",
+              "description_source_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "1",
+              "title": "N"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "update",
+            "ordinal": 0
+          },
+          {
+            "after_revision": "2",
+            "after_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {
+                "ex:w": 2
+              },
+              "revision": "2",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "1",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "edge",
+            "operation": "update",
+            "ordinal": 1
+          },
+          {
+            "after_revision": "2",
+            "after_value": {
+              "body": {
+                "inline_text": "u"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "2"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "body": {
+                "inline_text": "t"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "1"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "content",
+            "operation": "update",
+            "ordinal": 2
+          }
+        ]
+      },
+      "expected": [
+        {
+          "entity_type": "content",
+          "id": "01JN0000000000000000000004",
+          "revision": "2"
+        },
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000003",
+          "revision": "2"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002",
+          "lifecycle_revision": "1",
+          "revision": "2"
+        }
+      ],
+      "id": "restored-provenance-source-no-assertion-refused",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "body": {
+                "inline_text": "t"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "3"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "body": {
+                "inline_text": "u"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "2"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "content",
+            "operation": "update"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {
+                "ex:w": 2
+              },
+              "revision": "2",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "edge",
+            "operation": "update"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": "from S",
+              "description_source_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "N"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {
+                "ex:k": 1
+              },
+              "revision": "2",
+              "title": "N2"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "update"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "0b026bb89385e0935f73c3600a1b99c316eb2c6e87f80aa8548c79e01d9bba98",
+        "target_event_id": "01JN0000000000000000000023",
+        "target_graph_seq": "2"
+      },
+      "preview": {
+        "detail": null,
+        "outcome": "rejected",
+        "reason": "invalid_change"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "u"
+            },
+            "id": "01JN0000000000000000000004",
+            "owner_node_id": "01JN0000000000000000000002",
+            "revision": "2"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000003",
+            "lifecycle": "active",
+            "properties": {
+              "ex:w": 2
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000002",
+            "type": "contains"
+          }
+        ],
+        "node_tags": [
+          {
+            "id": "01JN0000000000000000000006",
+            "node_id": "01JN0000000000000000000002",
+            "tag_id": "01JN0000000000000000000005"
+          }
+        ],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "M"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "ex:k": 1
+            },
+            "revision": "2",
+            "title": "N2"
+          }
+        ],
+        "tags": [
+          {
+            "id": "01JN0000000000000000000005",
+            "label": null,
+            "revision": "1",
+            "text": "fresh"
+          }
+        ],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 2,
+          "01JN0000000000000000000003": 2,
+          "01JN0000000000000000000004": 2
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "affected": [
+        {
+          "entity_type": "content",
+          "id": "01JN0000000000000000000004",
+          "revision": "3"
+        },
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000003",
+          "revision": "3"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002",
+          "lifecycle_revision": "1",
+          "revision": "3"
+        },
+        {
+          "entity_type": "review",
+          "id": "01JN0000000000000000901901",
+          "revision": "1"
+        }
+      ],
+      "delta_digest": "c94012eee25bc4332fe577642a8b07179e6fbd106bd105b9b0bfa0b3c8ef149d",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "0b026bb89385e0935f73c3600a1b99c316eb2c6e87f80aa8548c79e01d9bba98",
+          "descriptor": "graph.apply",
+          "event_time_ms": null,
+          "graph_seq": "2",
+          "id": "01JN0000000000000000000023",
+          "op_count": 3,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1002,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000024",
+          "reverses_event_id": null
+        },
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {
+                "ex:k": 1
+              },
+              "revision": "2",
+              "title": "N2"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "description": "from S",
+              "description_source_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "1",
+              "title": "N"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "update",
+            "ordinal": 0
+          },
+          {
+            "after_revision": "2",
+            "after_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {
+                "ex:w": 2
+              },
+              "revision": "2",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "1",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "edge",
+            "operation": "update",
+            "ordinal": 1
+          },
+          {
+            "after_revision": "2",
+            "after_value": {
+              "body": {
+                "inline_text": "u"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "2"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "body": {
+                "inline_text": "t"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "1"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "content",
+            "operation": "update",
+            "ordinal": 2
+          }
+        ]
+      },
+      "expected": [
+        {
+          "entity_type": "content",
+          "id": "01JN0000000000000000000004",
+          "revision": "2"
+        },
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000003",
+          "revision": "2"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002",
+          "lifecycle_revision": "1",
+          "revision": "2"
+        }
+      ],
+      "id": "restored-provenance-source-assertion-accepted",
+      "mint": ["01JN0000000000000000901901"],
+      "ops": [
+        {
+          "after_revision": "3",
+          "after_value": {
+            "body": {
+              "inline_text": "t"
+            },
+            "id": "01JN0000000000000000000004",
+            "owner_node_id": "01JN0000000000000000000002",
+            "revision": "3"
+          },
+          "before_revision": "2",
+          "before_value": {
+            "body": {
+              "inline_text": "u"
+            },
+            "id": "01JN0000000000000000000004",
+            "owner_node_id": "01JN0000000000000000000002",
+            "revision": "2"
+          },
+          "entity_id": "01JN0000000000000000000004",
+          "entity_type": "content",
+          "operation": "update",
+          "ordinal": 0
+        },
+        {
+          "after_revision": "3",
+          "after_value": {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000003",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "3",
+            "to_id": "01JN0000000000000000000002",
+            "type": "contains"
+          },
+          "before_revision": "2",
+          "before_value": {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000003",
+            "lifecycle": "active",
+            "properties": {
+              "ex:w": 2
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000002",
+            "type": "contains"
+          },
+          "entity_id": "01JN0000000000000000000003",
+          "entity_type": "edge",
+          "operation": "update",
+          "ordinal": 1
+        },
+        {
+          "after_revision": "3",
+          "after_value": {
+            "description": "from S",
+            "description_source_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "3",
+            "title": "N"
+          },
+          "before_revision": "2",
+          "before_value": {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "ex:k": 1
+            },
+            "revision": "2",
+            "title": "N2"
+          },
+          "entity_id": "01JN0000000000000000000002",
+          "entity_type": "node",
+          "operation": "update",
+          "ordinal": 2
+        },
+        {
+          "after_revision": "1",
+          "after_value": {
+            "id": "01JN0000000000000000901901",
+            "kind": "reversal",
+            "reviewer_actor": "person-reverser",
+            "revision": "1",
+            "target_delta_digest": "0b026bb89385e0935f73c3600a1b99c316eb2c6e87f80aa8548c79e01d9bba98",
+            "target_event_id": "01JN0000000000000000000023"
+          },
+          "before_revision": null,
+          "before_value": null,
+          "entity_id": "01JN0000000000000000901901",
+          "entity_type": "review",
+          "operation": "create",
+          "ordinal": 3
+        }
+      ],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "body": {
+                "inline_text": "t"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "3"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "body": {
+                "inline_text": "u"
+              },
+              "id": "01JN0000000000000000000004",
+              "owner_node_id": "01JN0000000000000000000002",
+              "revision": "2"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "content",
+            "operation": "update"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000003",
+              "lifecycle": "active",
+              "properties": {
+                "ex:w": 2
+              },
+              "revision": "2",
+              "to_id": "01JN0000000000000000000002",
+              "type": "contains"
+            },
+            "entity_id": "01JN0000000000000000000003",
+            "entity_type": "edge",
+            "operation": "update"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": "from S",
+              "description_source_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "N"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {
+                "ex:k": 1
+              },
+              "revision": "2",
+              "title": "N2"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "update"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "0b026bb89385e0935f73c3600a1b99c316eb2c6e87f80aa8548c79e01d9bba98",
+        "target_event_id": "01JN0000000000000000000023",
+        "target_graph_seq": "2"
+      },
+      "preview": {
+        "detail": null,
+        "outcome": "ready",
+        "reason": null
+      },
+      "state": {
+        "contents": [
+          {
+            "body": {
+              "inline_text": "u"
+            },
+            "id": "01JN0000000000000000000004",
+            "owner_node_id": "01JN0000000000000000000002",
+            "revision": "2"
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000003",
+            "lifecycle": "active",
+            "properties": {
+              "ex:w": 2
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000002",
+            "type": "contains"
+          }
+        ],
+        "node_tags": [
+          {
+            "id": "01JN0000000000000000000006",
+            "node_id": "01JN0000000000000000000002",
+            "tag_id": "01JN0000000000000000000005"
+          }
+        ],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": null,
+                "stale_after": null,
+                "status": "unverified",
+                "verified_at": null,
+                "verified_by": null
+              }
+            },
+            "revision": "1",
+            "title": "M"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "ex:k": 1
+            },
+            "revision": "2",
+            "title": "N2"
+          }
+        ],
+        "tags": [
+          {
+            "id": "01JN0000000000000000000005",
+            "label": null,
+            "revision": "1",
+            "text": "fresh"
+          }
+        ],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 2,
+          "01JN0000000000000000000003": 2,
+          "01JN0000000000000000000004": 2
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "dbb9bd7418e7690630f47978f8b4dc9f21b1d26d5c2b7a373abd13c60b38c5df",
+          "descriptor": "graph.apply",
+          "event_time_ms": null,
+          "graph_seq": "2",
+          "id": "01JN0000000000000000000010",
+          "op_count": 2,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1002,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000099",
+          "reverses_event_id": null
+        },
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "X"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "1",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "1",
+              "title": "X"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "archive",
+            "ordinal": 0
+          },
+          {
+            "after_revision": "2",
+            "after_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {
+                "ex:source": {
+                  "$ref": {
+                    "entity_type": "node",
+                    "id": "01JN0000000000000000000003",
+                    "revision": "1"
+                  }
+                }
+              },
+              "revision": "2",
+              "to_id": "01JN0000000000000000000003",
+              "type": "sources"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {
+                "ex:source": {
+                  "$ref": {
+                    "entity_type": "node",
+                    "id": "01JN0000000000000000000003",
+                    "revision": "1"
+                  }
+                }
+              },
+              "revision": "1",
+              "to_id": "01JN0000000000000000000003",
+              "type": "sources"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "update",
+            "ordinal": 1
+          }
+        ]
+      },
+      "expected": [
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000004",
+          "revision": "2"
+        },
+        {
+          "entity_type": "node",
+          "id": "01JN0000000000000000000002",
+          "lifecycle_revision": "2",
+          "revision": "2"
+        }
+      ],
+      "id": "restore-endpoints-off-verified-target-refused",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {
+                "ex:source": {
+                  "$ref": {
+                    "entity_type": "node",
+                    "id": "01JN0000000000000000000003",
+                    "revision": "1"
+                  }
+                }
+              },
+              "revision": "3",
+              "to_id": "01JN0000000000000000000003",
+              "type": "sources"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000001",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {
+                "ex:source": {
+                  "$ref": {
+                    "entity_type": "node",
+                    "id": "01JN0000000000000000000003",
+                    "revision": "1"
+                  }
+                }
+              },
+              "revision": "2",
+              "to_id": "01JN0000000000000000000003",
+              "type": "sources"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "update"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "X"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "X"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "unarchive"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "dbb9bd7418e7690630f47978f8b4dc9f21b1d26d5c2b7a373abd13c60b38c5df",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "2"
+      },
+      "preview": {
+        "detail": null,
+        "outcome": "rejected",
+        "reason": "invalid_change"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000001",
+            "id": "01JN0000000000000000000004",
+            "lifecycle": "active",
+            "properties": {
+              "ex:source": {
+                "$ref": {
+                  "entity_type": "node",
+                  "id": "01JN0000000000000000000003",
+                  "revision": "1"
+                }
+              }
+            },
+            "revision": "2",
+            "to_id": "01JN0000000000000000000003",
+            "type": "sources"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {
+              "$assertion": {
+                "generated_at": null,
+                "observed_at": null,
+                "stale_after": null,
+                "status": "verified",
+                "verified_at": 5000,
+                "verified_by": "person-verifier"
+              }
+            },
+            "revision": "3",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "archived",
+            "lifecycle_revision": "2",
+            "merged_into_id": "01JN0000000000000000000001",
+            "properties": {},
+            "revision": "2",
+            "title": "X"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000003",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "S"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 3,
+          "01JN0000000000000000000002": 2,
+          "01JN0000000000000000000003": 1,
+          "01JN0000000000000000000004": 2
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "event": {
+        "event": {
+          "actor_id": "person-editor",
+          "approval_basis": {
+            "basis": "direct"
+          },
+          "client_id": "device-editor",
+          "context_id": null,
+          "delta_digest": "2175f67350f3c9d3e0dcd8b860e3a9ea3b0d9ef4bdf67bda8e9b08db97b28c3e",
+          "descriptor": "graph.apply",
+          "event_time_ms": null,
+          "graph_seq": "2",
+          "id": "01JN0000000000000000000010",
+          "op_count": 1,
+          "origin_actor": null,
+          "origin_chain": null,
+          "origin_class": "human",
+          "recorded_at_ms": 1002,
+          "request_digest": "abababababababababababababababababababababababababababababababab",
+          "request_id": "01JN0000000000000000000099",
+          "reverses_event_id": null
+        },
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "archived",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000003",
+              "type": "contains"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "1",
+              "to_id": "01JN0000000000000000000003",
+              "type": "contains"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "archive",
+            "ordinal": 0
+          }
+        ]
+      },
+      "expected": [
+        {
+          "entity_type": "edge",
+          "id": "01JN0000000000000000000004",
+          "revision": "2"
+        }
+      ],
+      "id": "restored-contains-closing-a-cycle-refused",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000003",
+              "type": "contains"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "archived",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000003",
+              "type": "contains"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "unarchive"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "2175f67350f3c9d3e0dcd8b860e3a9ea3b0d9ef4bdf67bda8e9b08db97b28c3e",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "2"
+      },
+      "preview": {
+        "detail": null,
+        "outcome": "rejected",
+        "reason": "invalid_change"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000002",
+            "id": "01JN0000000000000000000004",
+            "lifecycle": "archived",
+            "properties": {},
+            "revision": "2",
+            "to_id": "01JN0000000000000000000003",
+            "type": "contains"
+          },
+          {
+            "from_id": "01JN0000000000000000000003",
+            "id": "01JN0000000000000000000005",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "1",
+            "to_id": "01JN0000000000000000000002",
+            "type": "contains"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "A"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000003",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "B"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000002": 1,
+          "01JN0000000000000000000003": 1,
+          "01JN0000000000000000000004": 2,
+          "01JN0000000000000000000005": 3
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "id": "forged-endpoint-move-without-redirect",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "2",
+            "after_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000005",
+              "type": "ex:rel"
+            },
+            "before_revision": "1",
+            "before_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "1",
+              "to_id": "01JN0000000000000000000003",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "update"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "1"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000002",
+            "id": "01JN0000000000000000000004",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "1",
+            "to_id": "01JN0000000000000000000003",
+            "type": "ex:rel"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "X"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000003",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "S"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000005",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "C"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000002": 1,
+          "01JN0000000000000000000003": 1,
+          "01JN0000000000000000000004": 1,
+          "01JN0000000000000000000005": 1
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "id": "forged-guidance-scope-endpoint-moved",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "X"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "X"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "unarchive"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000006",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "guidance_scope"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000006",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000001",
+              "type": "guidance_scope"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "update"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "1"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000006",
+            "id": "01JN0000000000000000000004",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "2",
+            "to_id": "01JN0000000000000000000001",
+            "type": "guidance_scope"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "archived",
+            "lifecycle_revision": "2",
+            "merged_into_id": "01JN0000000000000000000001",
+            "properties": {},
+            "revision": "2",
+            "title": "X"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000006",
+            "kind": "Guidance",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "G"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 1,
+          "01JN0000000000000000000004": 1,
+          "01JN0000000000000000000006": 1
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "id": "forged-endpoint-move-to-a-self-loop",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": null,
+              "properties": {},
+              "revision": "3",
+              "title": "X"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "X"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "unarchive"
+          },
+          {
+            "after_revision": "3",
+            "after_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "3",
+              "to_id": "01JN0000000000000000000002",
+              "type": "ex:rel"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "from_id": "01JN0000000000000000000002",
+              "id": "01JN0000000000000000000004",
+              "lifecycle": "active",
+              "properties": {},
+              "revision": "2",
+              "to_id": "01JN0000000000000000000001",
+              "type": "ex:rel"
+            },
+            "entity_id": "01JN0000000000000000000004",
+            "entity_type": "edge",
+            "operation": "update"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "1"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000002",
+            "id": "01JN0000000000000000000004",
+            "lifecycle": "active",
+            "properties": {},
+            "revision": "2",
+            "to_id": "01JN0000000000000000000001",
+            "type": "ex:rel"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "archived",
+            "lifecycle_revision": "2",
+            "merged_into_id": "01JN0000000000000000000001",
+            "properties": {},
+            "revision": "2",
+            "title": "X"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000006",
+            "kind": "Guidance",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "G"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 1,
+          "01JN0000000000000000000004": 1,
+          "01JN0000000000000000000006": 1
+        }
+      }
+    },
+    {
+      "actor": "person-reverser",
+      "id": "forged-unarchive-keeps-redirect",
+      "mint": [],
+      "plan": {
+        "ops": [
+          {
+            "after_revision": "3",
+            "after_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "active",
+              "lifecycle_revision": "3",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "3",
+              "title": "X"
+            },
+            "before_revision": "2",
+            "before_value": {
+              "description": null,
+              "description_source_id": null,
+              "id": "01JN0000000000000000000002",
+              "kind": "Concept",
+              "lifecycle": "archived",
+              "lifecycle_revision": "2",
+              "merged_into_id": "01JN0000000000000000000001",
+              "properties": {},
+              "revision": "2",
+              "title": "X"
+            },
+            "entity_id": "01JN0000000000000000000002",
+            "entity_type": "node",
+            "operation": "unarchive"
+          }
+        ],
+        "retained": [],
+        "target_delta_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "target_event_id": "01JN0000000000000000000010",
+        "target_graph_seq": "1"
+      },
+      "refusal": "invalid_change",
+      "state": {
+        "contents": [],
+        "edges": [
+          {
+            "from_id": "01JN0000000000000000000006",
+            "id": "01JN0000000000000000000004",
+            "lifecycle": "archived",
+            "properties": {},
+            "revision": "1",
+            "to_id": "01JN0000000000000000000001",
+            "type": "ex:rel"
+          }
+        ],
+        "node_tags": [],
+        "nodes": [
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000001",
+            "kind": "Concept",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "T"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000002",
+            "kind": "Concept",
+            "lifecycle": "archived",
+            "lifecycle_revision": "2",
+            "merged_into_id": "01JN0000000000000000000001",
+            "properties": {},
+            "revision": "2",
+            "title": "X"
+          },
+          {
+            "description": null,
+            "description_source_id": null,
+            "id": "01JN0000000000000000000006",
+            "kind": "Guidance",
+            "lifecycle": "active",
+            "lifecycle_revision": "1",
+            "merged_into_id": null,
+            "properties": {},
+            "revision": "1",
+            "title": "G"
+          }
+        ],
+        "tags": [],
+        "written": {
+          "01JN0000000000000000000001": 1,
+          "01JN0000000000000000000002": 1,
+          "01JN0000000000000000000004": 1,
+          "01JN0000000000000000000006": 1
+        }
+      }
     }
   ],
   "reversals": [
@@ -42877,6 +45008,599 @@
       "descriptor": "graph.acknowledge",
       "outcome": "accepted",
       "code": null
+    }
+  ],
+  "inverse_caps": [
+    {
+      "actor": "person-reviewer",
+      "creates": 127,
+      "delta_digest": "64a4c1b5cbc858a1417d6756b6869551123b5822cba87c35673ee3eb822f5560",
+      "event": {
+        "actor_id": "person-editor",
+        "approval_basis": {
+          "basis": "direct"
+        },
+        "client_id": "device",
+        "context_id": null,
+        "descriptor": "graph.apply",
+        "event_time_ms": null,
+        "graph_seq": "1",
+        "id": "01JQ9999999999999999999999",
+        "origin_actor": null,
+        "origin_chain": null,
+        "origin_class": "human",
+        "recorded_at_ms": 1,
+        "request_digest": "abababababababababababababababababababababababababababababababab",
+        "request_id": "01JQ9999999999999999999998",
+        "reverses_event_id": null
+      },
+      "forward_delta_digest": "2c0a3df3a51caf7aedab55e1c09b99712cb044d044aa607a8f82202a5f6897fd",
+      "forward_stamp": {
+        "actor_id": "person-editor",
+        "time_ms": 1
+      },
+      "id": "creates-127-reversed",
+      "mint": ["01JQ9999999999999999999997"],
+      "node": {
+        "description": null,
+        "kind": "Concept",
+        "properties": {},
+        "title": "N"
+      },
+      "node_id": "01JQ followed by the index 0..creates-1 as 22 zero-padded decimal digits",
+      "op_count": 128,
+      "time_ms": 2,
+      "written": 1
+    },
+    {
+      "actor": "person-reviewer",
+      "creates": 128,
+      "event": {
+        "actor_id": "person-editor",
+        "approval_basis": {
+          "basis": "direct"
+        },
+        "client_id": "device",
+        "context_id": null,
+        "descriptor": "graph.apply",
+        "event_time_ms": null,
+        "graph_seq": "1",
+        "id": "01JQ9999999999999999999999",
+        "origin_actor": null,
+        "origin_chain": null,
+        "origin_class": "human",
+        "recorded_at_ms": 1,
+        "request_digest": "abababababababababababababababababababababababababababababababab",
+        "request_id": "01JQ9999999999999999999998",
+        "reverses_event_id": null
+      },
+      "forward_delta_digest": "1b04abe4681f7e736b72714cfe96f3acd7ac7ffae947b0b39aa74bd3429a8706",
+      "forward_stamp": {
+        "actor_id": "person-editor",
+        "time_ms": 1
+      },
+      "id": "creates-128-reversed",
+      "mint": ["01JQ9999999999999999999997"],
+      "node": {
+        "description": null,
+        "kind": "Concept",
+        "properties": {},
+        "title": "N"
+      },
+      "node_id": "01JQ followed by the index 0..creates-1 as 22 zero-padded decimal digits",
+      "refusal": "change_limit",
+      "time_ms": 2,
+      "written": 1
+    }
+  ],
+  "previews": [
+    {
+      "id": "ready-for-a-person",
+      "caller": "person",
+      "event_id": "01JN0000000000000000000023",
+      "rows": [
+        {
+          "target_event_id": "01JN0000000000000000000023",
+          "plan": {
+            "ops": [
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "body": {
+                    "inline_text": "t"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "3"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "body": {
+                    "inline_text": "u"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "2"
+                },
+                "entity_id": "01JN0000000000000000000004",
+                "entity_type": "content",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {},
+                  "revision": "3",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {
+                    "ex:w": 2
+                  },
+                  "revision": "2",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "entity_id": "01JN0000000000000000000003",
+                "entity_type": "edge",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {},
+                  "revision": "3",
+                  "title": "N"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {
+                    "ex:k": 1
+                  },
+                  "revision": "2",
+                  "title": "N2"
+                },
+                "entity_id": "01JN0000000000000000000002",
+                "entity_type": "node",
+                "operation": "update"
+              }
+            ],
+            "retained": [],
+            "target_delta_digest": "ea1abc86b3767d0d668147ddd3234b4ef0fff16669d08f32b14625e3f64b6cb2",
+            "target_event_id": "01JN0000000000000000000023",
+            "target_graph_seq": "2"
+          },
+          "expected": [
+            {
+              "entity_type": "content",
+              "id": "01JN0000000000000000000004",
+              "revision": "2"
+            },
+            {
+              "entity_type": "edge",
+              "id": "01JN0000000000000000000003",
+              "revision": "2"
+            },
+            {
+              "entity_type": "node",
+              "id": "01JN0000000000000000000002",
+              "lifecycle_revision": "1",
+              "revision": "2"
+            }
+          ],
+          "outcome": "ready",
+          "reason": null,
+          "detail": null
+        }
+      ],
+      "outcome": "ready"
+    },
+    {
+      "id": "approval-required-for-an-agent",
+      "caller": "agent",
+      "event_id": "01JN0000000000000000000023",
+      "rows": [
+        {
+          "target_event_id": "01JN0000000000000000000023",
+          "plan": {
+            "ops": [
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "body": {
+                    "inline_text": "t"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "3"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "body": {
+                    "inline_text": "u"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "2"
+                },
+                "entity_id": "01JN0000000000000000000004",
+                "entity_type": "content",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {},
+                  "revision": "3",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {
+                    "ex:w": 2
+                  },
+                  "revision": "2",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "entity_id": "01JN0000000000000000000003",
+                "entity_type": "edge",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {},
+                  "revision": "3",
+                  "title": "N"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {
+                    "ex:k": 1
+                  },
+                  "revision": "2",
+                  "title": "N2"
+                },
+                "entity_id": "01JN0000000000000000000002",
+                "entity_type": "node",
+                "operation": "update"
+              }
+            ],
+            "retained": [],
+            "target_delta_digest": "ea1abc86b3767d0d668147ddd3234b4ef0fff16669d08f32b14625e3f64b6cb2",
+            "target_event_id": "01JN0000000000000000000023",
+            "target_graph_seq": "2"
+          },
+          "expected": [
+            {
+              "entity_type": "content",
+              "id": "01JN0000000000000000000004",
+              "revision": "2"
+            },
+            {
+              "entity_type": "edge",
+              "id": "01JN0000000000000000000003",
+              "revision": "2"
+            },
+            {
+              "entity_type": "node",
+              "id": "01JN0000000000000000000002",
+              "lifecycle_revision": "1",
+              "revision": "2"
+            }
+          ],
+          "outcome": "approval_required",
+          "reason": null,
+          "detail": null
+        }
+      ],
+      "outcome": "approval_required"
+    },
+    {
+      "id": "unknown-outcome-fails-closed",
+      "caller": "agent",
+      "event_id": "01JN0000000000000000000023",
+      "rows": [
+        {
+          "target_event_id": "01JN0000000000000000000023",
+          "plan": {
+            "ops": [
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "body": {
+                    "inline_text": "t"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "3"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "body": {
+                    "inline_text": "u"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "2"
+                },
+                "entity_id": "01JN0000000000000000000004",
+                "entity_type": "content",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {},
+                  "revision": "3",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {
+                    "ex:w": 2
+                  },
+                  "revision": "2",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "entity_id": "01JN0000000000000000000003",
+                "entity_type": "edge",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {},
+                  "revision": "3",
+                  "title": "N"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {
+                    "ex:k": 1
+                  },
+                  "revision": "2",
+                  "title": "N2"
+                },
+                "entity_id": "01JN0000000000000000000002",
+                "entity_type": "node",
+                "operation": "update"
+              }
+            ],
+            "retained": [],
+            "target_delta_digest": "ea1abc86b3767d0d668147ddd3234b4ef0fff16669d08f32b14625e3f64b6cb2",
+            "target_event_id": "01JN0000000000000000000023",
+            "target_graph_seq": "2"
+          },
+          "expected": [
+            {
+              "entity_type": "content",
+              "id": "01JN0000000000000000000004",
+              "revision": "2"
+            },
+            {
+              "entity_type": "edge",
+              "id": "01JN0000000000000000000003",
+              "revision": "2"
+            },
+            {
+              "entity_type": "node",
+              "id": "01JN0000000000000000000002",
+              "lifecycle_revision": "1",
+              "revision": "2"
+            }
+          ],
+          "outcome": "approval_pending",
+          "reason": null,
+          "detail": null
+        }
+      ],
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "approval-required-with-a-reason",
+      "caller": "agent",
+      "event_id": "01JN0000000000000000000023",
+      "rows": [
+        {
+          "target_event_id": "01JN0000000000000000000023",
+          "plan": {
+            "ops": [
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "body": {
+                    "inline_text": "t"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "3"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "body": {
+                    "inline_text": "u"
+                  },
+                  "id": "01JN0000000000000000000004",
+                  "owner_node_id": "01JN0000000000000000000002",
+                  "revision": "2"
+                },
+                "entity_id": "01JN0000000000000000000004",
+                "entity_type": "content",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {},
+                  "revision": "3",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "from_id": "01JN0000000000000000000001",
+                  "id": "01JN0000000000000000000003",
+                  "lifecycle": "active",
+                  "properties": {
+                    "ex:w": 2
+                  },
+                  "revision": "2",
+                  "to_id": "01JN0000000000000000000002",
+                  "type": "contains"
+                },
+                "entity_id": "01JN0000000000000000000003",
+                "entity_type": "edge",
+                "operation": "update"
+              },
+              {
+                "after_revision": "3",
+                "after_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {},
+                  "revision": "3",
+                  "title": "N"
+                },
+                "before_revision": "2",
+                "before_value": {
+                  "description": null,
+                  "description_source_id": null,
+                  "id": "01JN0000000000000000000002",
+                  "kind": "Concept",
+                  "lifecycle": "active",
+                  "lifecycle_revision": "1",
+                  "merged_into_id": null,
+                  "properties": {
+                    "ex:k": 1
+                  },
+                  "revision": "2",
+                  "title": "N2"
+                },
+                "entity_id": "01JN0000000000000000000002",
+                "entity_type": "node",
+                "operation": "update"
+              }
+            ],
+            "retained": [],
+            "target_delta_digest": "ea1abc86b3767d0d668147ddd3234b4ef0fff16669d08f32b14625e3f64b6cb2",
+            "target_event_id": "01JN0000000000000000000023",
+            "target_graph_seq": "2"
+          },
+          "expected": [
+            {
+              "entity_type": "content",
+              "id": "01JN0000000000000000000004",
+              "revision": "2"
+            },
+            {
+              "entity_type": "edge",
+              "id": "01JN0000000000000000000003",
+              "revision": "2"
+            },
+            {
+              "entity_type": "node",
+              "id": "01JN0000000000000000000002",
+              "lifecycle_revision": "1",
+              "revision": "2"
+            }
+          ],
+          "outcome": "approval_required",
+          "reason": "invalid_change",
+          "detail": null
+        }
+      ],
+      "refusal": "unsupported_version"
+    },
+    {
+      "id": "approval-required-without-a-plan",
+      "caller": "agent",
+      "event_id": "01JN0000000000000000000023",
+      "rows": [
+        {
+          "target_event_id": "01JN0000000000000000000023",
+          "plan": null,
+          "expected": [],
+          "outcome": "approval_required",
+          "reason": null,
+          "detail": null
+        }
+      ],
+      "refusal": "unsupported_version"
     }
   ],
   "worker": {

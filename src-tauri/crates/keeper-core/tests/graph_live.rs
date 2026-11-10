@@ -36,7 +36,7 @@ use keeper_core::graph::client::{subscriptions, GraphClient, GraphClientError, P
 use keeper_core::graph::outcome::GraphOutcome;
 use keeper_core::graph::prefix::{self, Prefix};
 use keeper_core::graph::protocol::change::{Change, ChangeOp, NodeFields, DESCRIPTOR};
-use keeper_core::graph::protocol::inverse::{Preview, Reverse};
+use keeper_core::graph::protocol::inverse::{Preview, PreviewOutcome, Reverse};
 use keeper_core::graph::protocol::proposal::{self, Decision, Proposal, Verdict};
 use keeper_core::graph::protocol::request::Request;
 use keeper_core::graph::protocol::review::Target;
@@ -1030,7 +1030,7 @@ fn commanded(
 /// exactly the previewed revisions.
 fn reversed(client: &GraphClient, source: &Source, event_id: &str) -> (Preview, GraphOutcome) {
     let preview = client.preview_reversal(event_id).expect("preview");
-    assert_eq!(preview.outcome, "ready", "{preview:?}");
+    assert_eq!(preview.outcome, PreviewOutcome::Ready, "{preview:?}");
     let reverse = Reverse::of(preview.plan.as_ref().expect("plan"), None, None).expect("reverse");
     let (_, outcome) = commanded(client, source, client.reverse(&reverse));
     (preview, outcome)
@@ -1219,7 +1219,7 @@ fn graph_live_112_reversal_of_merge_to_depth_3_and_verification() {
 
     // A reversal raced by a later edit: conflict, no event, no change.
     let preview = second.preview_reversal(&r_edit).expect("preview");
-    assert_eq!(preview.outcome, "ready");
+    assert_eq!(preview.outcome, PreviewOutcome::Ready);
     let reverse = Reverse::of(preview.plan.as_ref().expect("plan"), None, None).expect("reverse");
     let revision = node["revision"].as_str().expect("revision").to_owned();
     accepted(
@@ -1400,8 +1400,8 @@ fn graph_live_112_proposal_acknowledgement_and_unreviewed() {
     assert_eq!(rejected_reason(&again), Some("invalid_change"), "{again:?}");
     let ack_preview = checker.preview_reversal(&ack).expect("preview");
     assert_eq!(
-        (ack_preview.outcome.as_str(), ack_preview.reason.as_deref()),
-        ("rejected", Some("invalid_change"))
+        (ack_preview.outcome, ack_preview.reason.as_deref()),
+        (PreviewOutcome::Rejected, Some("invalid_change"))
     );
     assert_eq!(digest_of(&prefix_at(&review, seq), &agent_event), original);
     report(
