@@ -1111,12 +1111,13 @@ impl HumanReader {
             Ok(Some(row)) => {
                 let now = (self.clock)();
                 // A row from the future (the clock was set back after it was
-                // kept) is dropped on sight, so that the clock catching up
-                // never makes it trusted again: only a successful online
-                // `read_status` keeps one again.
-                if row.observed_at_ms > now {
+                // kept) is distrusted and dropped on sight, so that the clock
+                // catching up never makes it trusted again: only a successful
+                // online `read_status` keeps one again. A drop that did not
+                // commit is retried here and the row stays distrusted.
+                if row.observed_at_ms > now || !lifecycle.trusts(row.observed_at_ms) {
                     if let Err(error) = lifecycle.invalidate_authority(row.observed_at_ms) {
-                        tracing::warn!(%error, "graph: a future read authority could not be dropped");
+                        tracing::warn!(%error, "graph: a future read authority could not be dropped; it stays distrusted");
                     }
                     return refused;
                 }

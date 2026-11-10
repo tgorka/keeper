@@ -127,13 +127,14 @@ impl GatedTransport {
 
 /// How far a remote operation got, read at the transport while its details
 /// are still there (the remote client keeps only the code and message). The
-/// rule is whether the server answered, never the error's type: a transport
-/// error that carries an HTTP status is an answer.
+/// rule is whether the server answered, never the error's type: once any
+/// status line came back the request was answered, whatever happened to its
+/// body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reach {
-    /// It went out and nothing came back: the connection failed, was reset
-    /// or timed out. The only reach that means the server could not be
-    /// reached.
+    /// It went out and no status line ever came back: the connection
+    /// failed, was reset or timed out before one. The only reach that means
+    /// the server could not be reached.
     Lost,
     /// The server answered with an operation answer keeper reads: its
     /// result, or its own refusal in the body.
@@ -141,9 +142,17 @@ pub(crate) enum Reach {
     /// The server answered `401` or `403`: it refused this credential.
     Refused,
     /// The server answered, but not with an operation answer: another HTTP
-    /// status, a redirect, a body over the limit or one that broke off.
+    /// status, a redirect, a body over the limit, or a body that broke off
+    /// or stalled after the status line.
     Unusable,
 }
+
+/// The message syncular-client (pinned `=0.32.1`, `native_transport.rs`
+/// `read_body`) gives a timeout while reading a response body: the status
+/// line had come back, but its `transport.timeout` carries no `httpStatus`.
+/// It is the only sign of that phase the error keeps;
+/// `a_status_line_then_a_stalled_body_is_answered` pins it over a socket.
+const BODY_TIMEOUT: &str = "response body read times out";
 
 /// How far the request that failed with `error` got; `None` when the
 /// transport refused it before anything was sent (a request over the limit,
@@ -163,6 +172,9 @@ fn reach(error: &TransportError) -> Option<Reach> {
     match (error.code.as_str(), cause) {
         ("transport.redirect" | "transport.response_too_large", _)
         | ("transport.failed", Some("body" | "protocol")) => Some(Reach::Unusable),
+        ("transport.timeout", Some("timeout")) if error.message == BODY_TIMEOUT => {
+            Some(Reach::Unusable)
+        }
         ("transport.timeout", Some("timeout"))
         | ("transport.failed", Some("connect" | "tls" | "io")) => Some(Reach::Lost),
         _ => None,
@@ -2356,9 +2368,13 @@ pub(crate) mod tests {
     }
 
     /// One remote operation against a loopback server that does `serve` with
-    /// the accepted connection (`None`: nothing listens); the error the real
-    /// gate, transport and remote client give, as a query and as a command.
-    fn over_socket(serve: Option<fn(std::net::TcpStream)>) -> (ReplicaError, ReplicaError) {
+    /// each accepted connection, on its own thread (`None`: nothing
+    /// listens), under `timeout_ms`; the error the real gate, transport and
+    /// remote client give, as a query and as a command.
+    fn over_socket(
+        serve: Option<fn(std::net::TcpStream)>,
+        timeout_ms: u64,
+    ) -> (ReplicaError, ReplicaError) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
         let base = format!("http://{}", listener.local_addr().expect("address"));
         // The server answers every connection (a followed redirect opens
@@ -2367,14 +2383,17 @@ pub(crate) mod tests {
             Some(serve) => {
                 std::thread::spawn(move || {
                     for socket in listener.incoming().flatten() {
-                        serve(socket);
+                        std::thread::spawn(move || serve(socket));
                     }
                 });
             }
             None => drop(listener),
         }
         let transport = || GatedTransport {
-            inner: HostTransport::from_config(&json!({ "baseUrl": base })).expect("transport"),
+            inner: HostTransport::from_config(
+                &json!({ "baseUrl": base, "requestTimeoutMs": timeout_ms }),
+            )
+            .expect("transport"),
             open: Arc::new(AtomicBool::new(true)),
             origin: Some(url::Url::parse(&base).expect("url").origin()),
             reached: None,
@@ -2397,12 +2416,91 @@ pub(crate) mod tests {
         )
     }
 
+    /// Read the whole request (its head and `Content-Length` bytes of body)
+    /// before answering, so that closing never resets a request the client
+    /// is still sending.
+    fn drain(socket: &mut std::net::TcpStream) {
+        let mut seen = Vec::new();
+        let mut chunk = [0; 4096];
+        let head = loop {
+            if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            match socket.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let length = String::from_utf8_lossy(&seen[..head])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let mut body = seen.len() - head;
+        while body < length {
+            match socket.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => body += n,
+            }
+        }
+    }
+
     fn answer<const STATUS: u16>(mut socket: std::net::TcpStream) {
-        let mut bytes = [0; 8192];
-        let _ = socket.read(&mut bytes);
+        drain(&mut socket);
         let _ = write!(
             socket,
             "HTTP/1.1 {STATUS} X\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = socket.flush();
+    }
+
+    /// A `200` status line and the start of a body, then (`STALL`) silence
+    /// past the request timeout, or a close.
+    fn status_then<const STALL: bool>(mut socket: std::net::TcpStream) {
+        drain(&mut socket);
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+        );
+        let _ = socket.flush();
+        if STALL {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    /// The R2-L1 rule: once a status line came back the request was
+    /// answered. A `200` whose body then stalls past the request timeout is
+    /// never offline-eligible (a query's `Client`; a command's outcome
+    /// lookup); so is one whose body broke off. Only a server that never
+    /// sends a status line is unheard (112.1 r2 R2-L1).
+    #[test]
+    fn a_status_line_then_a_stalled_body_is_answered() {
+        for (case, serve) in [
+            ("stalled", status_then::<true> as fn(std::net::TcpStream)),
+            ("broken off", status_then::<false>),
+        ] {
+            let (query, command) = over_socket(Some(serve), 500);
+            assert!(
+                matches!(&query, ReplicaError::Client(_)),
+                "query, body {case}: {query:?}"
+            );
+            assert!(
+                matches!(&command, ReplicaError::Unheard { .. }),
+                "command, body {case}: {command:?}"
+            );
+        }
+        let silent = |mut socket: std::net::TcpStream| {
+            drain(&mut socket);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        };
+        let (query, _) = over_socket(Some(silent as fn(std::net::TcpStream)), 500);
+        assert!(
+            matches!(&query, ReplicaError::Unheard { code, .. } if code == "transport.timeout"),
+            "no status line: {query:?}"
         );
     }
 
@@ -2417,7 +2515,7 @@ pub(crate) mod tests {
             (401, answer::<401> as fn(std::net::TcpStream)),
             (403, answer::<403>),
         ] {
-            let (query, command) = over_socket(Some(serve));
+            let (query, command) = over_socket(Some(serve), 10_000);
             assert!(
                 matches!(
                     &query,
@@ -2444,7 +2542,7 @@ pub(crate) mod tests {
             (404, answer::<404>),
             (302, answer::<302>),
         ] {
-            let (query, command) = over_socket(Some(serve));
+            let (query, command) = over_socket(Some(serve), 10_000);
             assert!(
                 matches!(&query, ReplicaError::Client(_)),
                 "query answered {status}: {query:?}"
@@ -2459,13 +2557,10 @@ pub(crate) mod tests {
         let lost = [
             None,
             Some((|socket| drop(socket)) as fn(std::net::TcpStream)),
-            Some(|mut socket: std::net::TcpStream| {
-                let mut bytes = [0; 8192];
-                let _ = socket.read(&mut bytes);
-            }),
+            Some(|mut socket: std::net::TcpStream| drain(&mut socket)),
         ];
         for (case, serve) in lost.into_iter().enumerate() {
-            let (query, command) = over_socket(serve);
+            let (query, command) = over_socket(serve, 10_000);
             assert!(
                 matches!(&query, ReplicaError::Unheard { .. }),
                 "lost case {case}: {query:?}"

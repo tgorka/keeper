@@ -403,21 +403,25 @@ revoke a scope, its rows stay and the fence stays `revoked` (locked).
 
 **Last-authorised offline reads (people only).** A person's query or inspect may be served
 while the server cannot be reached only when all of these hold:
-- the server's `read_status` failed because the request left the device and nothing came
-  back (`QueryError::Unreachable`). This is decided at the transport while the HTTP details
-  are there: whatever the server answered is never it — a `401`/`403` is its refusal (which
-  fences), any other status, a redirect or a body over the limit is an unusable answer. Any
-  other failure never serves: a local refusal, a closed replica, an unreadable answer, a
-  failed task, a storage error. A refusal fences;
+- the server's `read_status` failed because the request left the device and no status line
+  ever came back (`QueryError::Unreachable`). This is decided at the transport while the
+  HTTP details are there: once any status line has arrived the server answered, and that is
+  never it — a `401`/`403` is its refusal (which fences); any other status, a redirect, a
+  body over the limit, or a body that broke off or stalled past the timeout after the status
+  line is an unusable answer. Any other failure never serves: a local refusal, a closed
+  replica, an unreadable answer, a failed task, a storage error. A refusal fences;
 - no fence stands;
 - the graph subscriptions are granted and the link is not refused;
 - the caller asked for it (`Freshness::AllowStale`, the driver's `--allow-stale`);
 - the generation was built under the authority the last successful online `read_status`
   answered;
 - that answer is not from the future and is at most `OFFLINE_READ_LIMIT` (24 h, inclusive)
-  old on the device's clock. A kept answer found to be from the future is dropped on sight,
-  so it never authorises again when the clock catches up or after a restart: only the next
-  successful online `read_status` keeps one again.
+  old on the device's clock. A kept answer found to be from the future is distrusted in
+  memory and dropped from the queue file on sight, so it never authorises again when the
+  clock catches up: only the next successful online `read_status` keeps one again. If the
+  drop cannot commit (the file is busy), the row stays distrusted for the process and the
+  drop is retried on the next read; a restart before any drop commits would trust it again
+  once the clock has caught up, which needs a storage failure at that moment.
 
 Everything is checked again at delivery against a fresh clock, and a fence — in memory or
 persisted in the queue file by another holder — refuses at every delivery point (each

@@ -2101,4 +2101,116 @@ mod offline {
             Err(QueryError::Forbidden)
         );
     }
+
+    /// The authority-level fence check on its own (112.1 r2 R2-L4, M-auth):
+    /// a lock that lands while the admission authority is taken stops the
+    /// read at admission, `forbidden`, and the server is not asked again
+    /// for delivery (online); `forbidden`, not `sync_pending` (offline).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lock_at_admission_stops_the_read_there() {
+        let mut o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        locking_at(&mut o, 0);
+        o.script(vec![Step::Answer, Step::Answer]);
+        let asked = o.person.asked.load(Ordering::SeqCst);
+        let result = o.query(Freshness::Current).await;
+        assert!(o.lifecycle.is_locked());
+        assert_eq!(result, Err(QueryError::Forbidden), "online admission");
+        assert_eq!(
+            o.person.asked.load(Ordering::SeqCst) - asked,
+            1,
+            "no delivery read_status after the fence"
+        );
+        let mut o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        locking_at(&mut o, 0);
+        let result = o.query(Freshness::AllowStale).await;
+        assert!(o.lifecycle.is_locked());
+        assert_eq!(result, Err(QueryError::Forbidden), "offline admission");
+    }
+
+    /// Locks the domain when woken.
+    struct LockOnWake(Arc<Lifecycle>);
+
+    impl std::task::Wake for LockOnWake {
+        fn wake(self: Arc<Self>) {
+            self.0.lock(T0 + 1).expect("locked");
+        }
+    }
+
+    /// The final-result fence check on its own (112.1 r2 R2-L4, M-final):
+    /// the lock lands synchronously when the worker call's in-flight guard
+    /// drops — after the delivery authority (and its check) returned,
+    /// before the result is handed out — and the result is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lock_after_the_delivery_authority_refuses_the_result() {
+        for inspect in [false, true] {
+            let o = Offline::new().await;
+            o.at(T0 + 60_000, 0);
+            *o.person.then.lock().expect("then") = Step::Answer;
+            let reads = o._rig.reads.clone();
+            let idle = reads.0.idle.notified();
+            let mut idle = std::pin::pin!(idle);
+            let waker = std::task::Waker::from(Arc::new(LockOnWake(o.lifecycle.clone())));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(std::future::Future::poll(idle.as_mut(), &mut cx).is_pending());
+            let result = if inspect {
+                o.reader
+                    .inspect(
+                        InspectEntity::Node,
+                        &ulid(1),
+                        false,
+                        Freshness::Current,
+                        &Cancellation::default(),
+                    )
+                    .await
+                    .map(|r| r.completeness)
+            } else {
+                o.query(Freshness::Current).await
+            };
+            assert!(
+                o.lifecycle.is_locked(),
+                "the lock landed (inspect {inspect})"
+            );
+            assert_eq!(result, Err(QueryError::Forbidden), "inspect {inspect}");
+        }
+    }
+
+    /// A future row whose durable drop failed (another holder write-locks
+    /// the queue file) stays distrusted: the clock catching up does not
+    /// make it trusted, until the server answers online (112.1 r2 R2-L3).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_future_row_that_could_not_be_dropped_stays_untrusted() {
+        let o = Offline::new().await;
+        let blocker =
+            rusqlite::Connection::open(o._dir.path().join("ana.graph-queue")).expect("raw");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("write lock");
+        o.at(T0 - 1, 0);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+        assert!(
+            o.lifecycle.authority().expect("row").is_some(),
+            "the drop failed: the future row survived"
+        );
+        o.at(T0 + 1, 0);
+        let result = o.query(Freshness::AllowStale).await;
+        blocker.execute_batch("ROLLBACK").expect("released");
+        assert!(
+            result.is_err(),
+            "a detected future row regained trust offline: {result:?}"
+        );
+        // Once the file can be written the drop commits; online again, a
+        // fresh answer is kept and trusted.
+        o.at(T0 + 2, 0);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+        assert_eq!(o.lifecycle.authority(), Ok(None));
+        o.script(vec![Step::Answer, Step::Answer]);
+        assert_eq!(o.query(Freshness::Current).await, Ok(Completeness::Current));
+        o.at(T0 + 3, 0);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Ok(Completeness::Stale)
+        );
+    }
 }

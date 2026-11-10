@@ -60,6 +60,10 @@ pub enum LifecycleError {
 pub struct Lifecycle {
     queue: Mutex<GraphQueue>,
     locked: AtomicBool,
+    /// The `observed_at` of a kept authority found to be from the future:
+    /// never trusted again in this process, whether or not its durable
+    /// drop committed, until a successful online `read_status` is kept.
+    distrusted: Mutex<Option<i64>>,
 }
 
 impl Lifecycle {
@@ -69,6 +73,7 @@ impl Lifecycle {
         Ok(Self {
             queue: Mutex::new(queue),
             locked: AtomicBool::new(locked),
+            distrusted: Mutex::new(None),
         })
     }
 
@@ -104,7 +109,12 @@ impl Lifecycle {
         authority: &Authority,
         observed_at_ms: i64,
     ) -> Result<(), LifecycleError> {
-        Ok(self.queue().record_authority(authority, observed_at_ms)?)
+        self.queue().record_authority(authority, observed_at_ms)?;
+        *self
+            .distrusted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        Ok(())
     }
 
     /// The last kept read authority.
@@ -114,9 +124,27 @@ impl Lifecycle {
 
     /// Drop the kept authority observed at `observed_at_ms`: it was found
     /// to be from the future, and only a successful online `read_status`
-    /// keeps one again ([`GraphQueue::invalidate_authority`]).
+    /// keeps one again ([`GraphQueue::invalidate_authority`]). It is
+    /// distrusted first, in memory, so that a drop that fails to commit
+    /// still fails closed ([`Lifecycle::trusts`]).
     pub fn invalidate_authority(&self, observed_at_ms: i64) -> Result<(), LifecycleError> {
+        *self
+            .distrusted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(observed_at_ms);
         Ok(self.queue().invalidate_authority(observed_at_ms)?)
+    }
+
+    /// Whether the kept authority observed at `observed_at_ms` may still
+    /// authorise an offline read: not one found in the future since the last
+    /// successful online `read_status`.
+    #[must_use]
+    pub fn trusts(&self, observed_at_ms: i64) -> bool {
+        *self
+            .distrusted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            != Some(observed_at_ms)
     }
 
     /// The fence's persisted state.
