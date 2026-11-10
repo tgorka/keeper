@@ -494,4 +494,9 @@ fn a_purge_needs_every_subscribed_table_revoked() {
         );
     }
     assert_eq!(revocation_of(&tables, &[]), Revocation::None);
+    // A table held by two subscriptions (a re-subscribe, a second scope):
+    // one still active keeps its rows, so the table is not purged.
+    let mut rows = all("revoked");
+    rows.push(row("kg_receipts", "active"));
+    assert_eq!(revocation_of(&tables, &rows), Revocation::Partial);
 }
