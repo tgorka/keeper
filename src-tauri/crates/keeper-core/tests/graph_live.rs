@@ -148,6 +148,21 @@ fn prefix_at(source: &Source, seq: u64) -> Prefix {
     })
 }
 
+/// The complete prefix once it holds `event_id` (pulling, at most `until`'s
+/// deadline). A replica that has not synced yet is complete at `n = 0`, so
+/// a wait on its own head returns at once: wait for the event itself.
+fn prefix_with(source: &Source, event_id: &str) -> Prefix {
+    until(
+        source,
+        &format!("event {event_id} in the complete prefix"),
+        || {
+            let prefix = prefix::complete(source).expect("no corruption");
+            (prefix.is_complete() && prefix.events.iter().any(|e| e.event.id == event_id))
+                .then_some(prefix)
+        },
+    )
+}
+
 fn create_node(id: &str, title: &str, properties: Value) -> ChangeOp {
     ChangeOp::CreateNode {
         id: id.to_owned(),
@@ -1405,7 +1420,7 @@ fn graph_live_112_proposal_acknowledgement_and_unreviewed() {
         }
     };
     assert!(in_feed(&checker));
-    let prefix = prefix_at(&review, prefix::complete(&review).expect("prefix").n);
+    let prefix = prefix_with(&review, &agent_event);
     let original = digest_of(&prefix, &agent_event);
     let target = Target::new(&agent_event, &original).expect("target");
     let (_, outcome) = commanded(&checker, &review, checker.acknowledge(&target));
@@ -1599,7 +1614,10 @@ fn graph_live_1121_an_offline_intent_survives_a_restart_and_lands_once() {
                 &request,
                 "same identity, payload, preconditions"
             );
+            // Offline, no wait: the prefix as the file holds it. Complete,
+            // and its height is reported, so an empty one is visible.
             let prefix = prefix::complete(&source).expect("no corruption");
+            assert!(prefix.is_complete(), "a complete prefix");
             assert_eq!(
                 events_of(&prefix, &request.request_id),
                 0,
@@ -1608,7 +1626,7 @@ fn graph_live_1121_an_offline_intent_survives_a_restart_and_lands_once() {
             report(
                 "1121-restart",
                 &json!({"request_id": request.request_id, "state": "queued",
-                                          "events": 0}),
+                                          "events": 0, "prefix_n": prefix.n}),
             );
             close(source);
         }
@@ -1937,7 +1955,7 @@ fn graph_live_1121_a_revocation_locks_first_and_purges_every_graph_table() {
                             id: edge,
                             from_id: a.clone(),
                             to_id: b,
-                            edge_type: "related_to".to_owned(),
+                            edge_type: "test:rel".to_owned(),
                             properties: Map::new(),
                             from_lifecycle_revision: None,
                             to_lifecycle_revision: None,
@@ -1981,7 +1999,7 @@ fn graph_live_1121_a_revocation_locks_first_and_purges_every_graph_table() {
             let review = reviewer();
             let checker = GraphClient::new(review.clone());
             let agent_event = env("KEEPER_HQ_LIVE_AGENT_EVENT");
-            let prefix = prefix_at(&review, prefix::complete(&review).expect("prefix").n);
+            let prefix = prefix_with(&review, &agent_event);
             let target =
                 Target::new(&agent_event, &digest_of(&prefix, &agent_event)).expect("target");
             let (_, acknowledged) = commanded(&checker, &review, checker.acknowledge(&target));
