@@ -418,3 +418,270 @@ fn counts_cover_every_queue_file_of_a_server() {
     assert_eq!(counts, BTreeMap::from([(State::Queued, 2)]));
     assert_eq!(unreadable, 0);
 }
+
+const APPROVAL: &str = "01JF00000000000000000000A1";
+const CONTEXT: &str = "01JF00000000000000000000C1";
+
+/// An agent instance's client over `source`'s port, under its context.
+fn agent_client(dir: &Path) -> GraphClient {
+    let source = source(dir, "agent-1", "inst-1");
+    let writer = crate::graph::write::Writer::of(&source);
+    GraphClient::over(
+        std::sync::Arc::new(source),
+        &writer,
+        crate::graph::write::Caller::Agent {
+            context_id: CONTEXT.to_owned(),
+        },
+    )
+}
+
+fn agent_minted(client: &GraphClient, approval: &str) -> Prepared {
+    let change = crate::graph::protocol::change::Change::new(
+        vec![ChangeOp::CreateNode {
+            id: "01JF0000000000000000000002".to_owned(),
+            kind: "Concept".into(),
+            title: "A".into(),
+            description: None,
+            properties: Map::new(),
+        }],
+        Some(approval.to_owned()),
+        None,
+        crate::notes::tags::normalise,
+    )
+    .expect("change");
+    client.mint(&change).expect("minted")
+}
+
+fn agent_queue(dir: &Path) -> GraphQueue {
+    GraphQueue::open(&path(dir), binding(SERVER, "agent-1", "inst-1")).expect("opens")
+}
+
+fn state_of(dir: &Path, request_id: &str) -> String {
+    rusqlite::Connection::open(path(dir))
+        .expect("raw")
+        .query_row(
+            "SELECT state FROM graph_intents WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .expect("row")
+}
+
+/// CC-14: an agent request is only ever persisted bound to the approval it
+/// names, with its context; anything else refuses and persists nothing.
+#[test]
+fn an_agent_request_is_persisted_only_bound_to_its_approval() {
+    let dir = tempfile::tempdir().expect("dir");
+    let client = agent_client(dir.path());
+    let mut queue = agent_queue(dir.path());
+    let prepared = agent_minted(&client, APPROVAL);
+    assert_eq!(
+        queue.enqueue(&prepared, 1),
+        Err(QueueError::Unbound),
+        "a plain enqueue never takes an agent's request"
+    );
+    assert_eq!(
+        queue.enqueue_for_approval(&prepared, "01JF00000000000000000000A9", "row-1", 1),
+        Err(QueueError::Unbound),
+        "another approval than the payload names"
+    );
+    assert_eq!(
+        queue.enqueue_for_approval(&prepared, APPROVAL, "", 1),
+        Err(QueueError::Unbound),
+        "no tool-call row"
+    );
+    let person = GraphClient::new(source(dir.path(), "agent-1", "inst-1"));
+    assert_eq!(
+        queue.enqueue_for_approval(&minted(&person), APPROVAL, "row-1", 1),
+        Err(QueueError::Unbound),
+        "a person's request has no approval to bind"
+    );
+    assert!(queue.entries().expect("listing").is_empty());
+    let args = queue
+        .enqueue_for_approval(&prepared, APPROVAL, "row-1", 1)
+        .expect("bound");
+    assert_eq!(args, bound_args(DB, &prepared).expect("args"));
+    let parsed: serde_json::Value = serde_json::from_str(&args).expect("json");
+    assert_eq!(parsed["domain"], DB);
+    assert_eq!(parsed["request"]["context_id"], CONTEXT);
+    assert_eq!(parsed["request"]["payload"]["approval_id"], APPROVAL);
+    assert_eq!(
+        queue.bound(&prepared.request().request_id).expect("bound"),
+        Some(Bound {
+            approval_id: APPROVAL.to_owned(),
+            tool_call_id: "row-1".to_owned(),
+            bound_args: Some(args),
+        })
+    );
+    assert_eq!(
+        state_of(dir.path(), &prepared.request().request_id),
+        "awaiting_approval"
+    );
+}
+
+/// CC-14 step 5: an approved entry is sent exactly as stored only when the
+/// call's frozen arguments are the bound ones; modified arguments suspend
+/// it, never sent.
+#[test]
+fn an_approval_sends_only_the_frozen_request() {
+    let dir = tempfile::tempdir().expect("dir");
+    let client = agent_client(dir.path());
+    let mut queue = agent_queue(dir.path());
+    let prepared = agent_minted(&client, APPROVAL);
+    let id = prepared.request().request_id.clone();
+    let args = queue
+        .enqueue_for_approval(&prepared, APPROVAL, "row-1", 1)
+        .expect("bound");
+    // The same bytes, reformatted, are the same arguments.
+    let spaced = serde_json::to_string_pretty(
+        &serde_json::from_str::<serde_json::Value>(&args).expect("json"),
+    )
+    .expect("pretty");
+    assert_eq!(
+        queue.approve(&client, &id, &spaced, 2),
+        Ok(Approved::Send(prepared))
+    );
+    assert_eq!(state_of(dir.path(), &id), "submitting");
+    // Approved once: a second approval of it is refused.
+    assert!(matches!(
+        queue.approve(&client, &id, &args, 3),
+        Err(QueueError::Moved { .. })
+    ));
+}
+
+/// Modified frozen arguments (another title, unreadable, another context
+/// or another approval in the row): suspended, never sent, and a suspended
+/// entry is never approved again.
+#[test]
+fn modified_arguments_suspend_the_entry() {
+    let dir = tempfile::tempdir().expect("dir");
+    let client = agent_client(dir.path());
+    let mut queue = agent_queue(dir.path());
+    let mutations: [fn(&str) -> String; 4] = [
+        |args| args.replace("\"title\":\"A\"", "\"title\":\"B\""),
+        |_| "not json".to_owned(),
+        |args| args.replace(CONTEXT, "01JF00000000000000000000C2"),
+        |args| args.replace(APPROVAL, "01JF00000000000000000000A9"),
+    ];
+    for (n, mutate) in mutations.into_iter().enumerate() {
+        let prepared = agent_minted(&client, APPROVAL);
+        let id = prepared.request().request_id.clone();
+        let args = queue
+            .enqueue_for_approval(&prepared, APPROVAL, &format!("row-{n}"), 1)
+            .expect("bound");
+        let frozen = mutate(&args);
+        assert_ne!(frozen, args, "mutation {n}");
+        assert_eq!(
+            queue.approve(&client, &id, &frozen, 2),
+            Ok(Approved::Suspended),
+            "mutation {n}"
+        );
+        assert_eq!(state_of(dir.path(), &id), "suspended");
+        assert!(queue.approve(&client, &id, &args, 3).is_err());
+    }
+}
+
+/// T0-HQ restart: an agent entry never sent ends `refused_locally` (payload
+/// deleted); one that may have been sent becomes `unresolved`, never
+/// refused; a person's entries are untouched.
+#[test]
+fn an_agent_restart_refuses_only_what_was_never_sent() {
+    let dir = tempfile::tempdir().expect("dir");
+    let client = agent_client(dir.path());
+    let mut queue = agent_queue(dir.path());
+    let waiting = agent_minted(&client, APPROVAL);
+    let sent = agent_minted(&client, "01JF00000000000000000000A2");
+    let visible = agent_minted(&client, "01JF00000000000000000000A3");
+    for (prepared, row) in [(&waiting, "r1"), (&sent, "r2"), (&visible, "r3")] {
+        queue
+            .enqueue_for_approval(
+                prepared,
+                prepared.request().payload["approval_id"]
+                    .as_str()
+                    .unwrap_or_default(),
+                row,
+                1,
+            )
+            .expect("bound");
+    }
+    for prepared in [&sent, &visible] {
+        let id = &prepared.request().request_id;
+        let args = queue
+            .bound(id)
+            .expect("bound")
+            .and_then(|b| b.bound_args)
+            .unwrap_or_default();
+        queue.approve(&client, id, &args, 2).expect("approved");
+    }
+    queue
+        .mark(
+            &visible.request().request_id,
+            State::Submitting,
+            State::PendingVisibility,
+            None,
+            3,
+        )
+        .expect("applied");
+    assert_eq!(queue.incarnation_ended(4), Ok((1, 2)));
+    assert_eq!(
+        state_of(dir.path(), &waiting.request().request_id),
+        "refused_locally"
+    );
+    assert_eq!(payload(dir.path(), &waiting.request().request_id), None);
+    for prepared in [&sent, &visible] {
+        assert_eq!(
+            state_of(dir.path(), &prepared.request().request_id),
+            "unresolved"
+        );
+        assert!(payload(dir.path(), &prepared.request().request_id).is_some());
+    }
+    // An entry that may have been sent is never refused on this device.
+    assert!(matches!(
+        queue.refuse_locally(&sent.request().request_id, "context_ended", 5),
+        Err(QueueError::Transition { .. })
+    ));
+}
+
+/// A person's queue is never touched by an agent restart, and a person's
+/// queued entry may be refused locally only while never sent.
+#[test]
+fn a_persons_entries_survive_an_agent_restart() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (_, prepared) = queued(dir.path());
+    let mut queue = reopen(dir.path());
+    assert_eq!(queue.incarnation_ended(5), Ok((0, 0)));
+    assert_eq!(
+        state_of(dir.path(), &prepared.request().request_id),
+        "queued"
+    );
+    queue
+        .refuse_locally(&prepared.request().request_id, "context_ended", 6)
+        .expect("never sent");
+    assert_eq!(payload(dir.path(), &prepared.request().request_id), None);
+}
+
+/// A version-1 file (before the approval binding) opens as version 2 with
+/// its entries kept.
+#[test]
+fn a_version_one_file_is_migrated_in_place() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (_, prepared) = queued(dir.path());
+    raw(
+        dir.path(),
+        "CREATE TABLE v1 AS SELECT request_id, server, domain, actor, client, descriptor, \
+         version, context_id, request_jcs, request_digest, state, attempts, last_cause, \
+         event_id, graph_seq, outcome_code, enqueued_at, updated_at FROM graph_intents; \
+         DROP TABLE graph_intents; ALTER TABLE v1 RENAME TO graph_intents; \
+         PRAGMA user_version = 1;",
+    );
+    let client = GraphClient::new(source(dir.path(), "ana", "dev1"));
+    let mut queue = reopen(dir.path());
+    assert_eq!(
+        queue.restore(&client, 7).expect("restores"),
+        vec![Restored::Ready {
+            prepared: prepared.clone(),
+            state: State::Queued
+        }]
+    );
+    assert_eq!(queue.bound(&prepared.request().request_id), Ok(None));
+}

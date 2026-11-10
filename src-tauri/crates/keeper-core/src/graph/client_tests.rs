@@ -679,8 +679,10 @@ fn the_source_helpers_answer_over_any_query_channel() {
 /// subscription `revoked`), and that purge fails closed — the revocation is
 /// not applied — for a table whose schema maps no column to the revoked
 /// scope variable. Every subscription the graph takes (each graph table
-/// under `kg_graph`, the receipts under `kg_client`) therefore needs that
-/// mapping in the contract's schema, or a revocation would leave its rows.
+/// under `kg_graph`, 111.x's `kg_contents`/`kg_reviews` among them, the
+/// receipts under `kg_client` and the proposals under `kg_proposal`)
+/// therefore needs that mapping in the contract's schema, or a revocation
+/// would leave its rows; and the purge check reads exactly those tables.
 #[test]
 fn every_graph_subscription_has_a_purgeable_scope_column() {
     let schema = syncular_client::parse_schema_json(
@@ -688,7 +690,13 @@ fn every_graph_subscription_has_a_purgeable_scope_column() {
     )
     .expect("compiles");
     let taken = super::client::subscriptions(DB, "ana", "dev1");
-    assert_eq!(taken.len(), 8, "seven graph tables and the receipts");
+    let tables: Vec<&str> = taken.iter().map(|s| s.table.as_str()).collect();
+    assert_eq!(tables, super::client::subscribed_tables());
+    assert_eq!(
+        taken.len(),
+        11,
+        "nine graph tables, the receipts, the proposals"
+    );
     for subscription in taken {
         let table = schema
             .table(&subscription.table)

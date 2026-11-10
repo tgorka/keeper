@@ -3,12 +3,12 @@
 //! A request's identity is its database (the domain), descriptor, request
 //! id and client scope; its payload is bound by its digest. Equal ids in two
 //! databases are two requests. [`GraphRequests`] is one database's owner of
-//! this device's graph requests, built from the [`Source`] that opened the
-//! database's replica: the domain comes from that boundary, never from a
-//! row or a caller. Only it mints a [`RequestKey`], sends a request (an
-//! [`Attempt`]), reads a [`Receipt`] from its own replica and resolves them,
-//! so a key, attempt or receipt of another database never speaks for one of
-//! its requests.
+//! this device's graph requests, built over the database's narrow write
+//! port ([`super::write::GraphWrite`]) and its writer: the domain comes from
+//! that boundary, never from a row or a caller. Only it mints a
+//! [`RequestKey`], sends a request (an [`Attempt`]), reads a [`Receipt`]
+//! and resolves them, so a key, attempt or receipt of another database
+//! never speaks for one of its requests.
 //!
 //! | transport | the request's receipt | outcome |
 //! | --- | --- | --- |
@@ -20,17 +20,21 @@
 //! | refused `idempotency_mismatch` | none | [`GraphOutcome::IdempotencyMismatch`] |
 //! | refused `unsupported_version` | none | [`GraphOutcome::Unsupported`] |
 //! | refused with a `kg.` code | none | [`GraphOutcome::TechnicalRefusal`] |
-//! | any other refusal, a lost or unread answer | none | [`GraphOutcome::Pending`]: keep the same request id and resolve it later |
+//! | any other refusal, a lost or unread answer | none | [`GraphOutcome::Pending`] with its typed [`PendingCause`]: keep the same request id and resolve it later |
 //!
 //! A receipt is the durable record, so it decides whatever the transport
 //! said: an unheard answer whose receipt has since arrived is resolved. An
 //! attempt at another request, or in another database, tells nothing.
+//! [`GraphOutcome::revokes`] says which outcomes are revocation signals.
+
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
 use super::protocol::request::{self, is_descriptor, Request};
 use super::protocol::scope::{client_scope, receipt_id};
 use super::protocol::{is_decimal, is_ulid, value, Refusal, CONTRACT_VERSION};
+use super::write::{GraphWrite, Writer};
 use crate::hq::port::{CommandResult, ReplicaError};
 use crate::hq::sessions::Source;
 
@@ -250,9 +254,10 @@ pub enum GraphOutcome {
     PendingVisibility {
         commit_seq: Option<i64>,
     },
-    /// Unresolved: the same request id is retried or looked up later.
+    /// Unresolved: the same request id is retried or looked up later, as
+    /// its [`PendingCause`] says.
     Pending {
-        reason: String,
+        cause: PendingCause,
     },
     /// The request id is bound to a different request.
     IdempotencyMismatch,
@@ -291,6 +296,140 @@ impl GraphOutcome {
             | Self::Pending { .. } => None,
         }
     }
+
+    /// Whether this outcome is a revocation signal for the domain (112.1
+    /// CC-7): a refused send or `graph.outcome` ([`PendingCause::Refused`]),
+    /// or a `rejected` receipt whose reason is `forbidden` with a code that
+    /// is not one of the request's own terminal refusals
+    /// ([`REQUEST_REFUSALS`]: an approval-class code, or an ended context).
+    /// A forbidden receipt with no code, or with an unknown one, revokes.
+    #[must_use]
+    pub fn revokes(&self) -> bool {
+        match self {
+            Self::Pending {
+                cause: PendingCause::Refused,
+            } => true,
+            Self::Rejected { reason, detail } if reason == "forbidden" => !detail
+                .get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| REQUEST_REFUSALS.contains(&code)),
+            _ => false,
+        }
+    }
+}
+
+/// The `forbidden` receipt codes that end one request and say nothing of
+/// the domain's authority: an agent's approval that does not bind (the
+/// server's `approvalProblem`), a person's change that names an approval,
+/// and an agent context that ended. Never a revocation signal.
+pub const REQUEST_REFUSALS: [&str; 8] = [
+    "approval_required",
+    "approval_binding",
+    "approval_unavailable",
+    "tool_off",
+    "approval_not_applicable",
+    "context_expired",
+    "context_closed",
+    "context_invalid",
+];
+
+/// Why a request is still [`GraphOutcome::Pending`] (112.1 CC-5). The queue
+/// policy keys on this, never on text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingCause {
+    /// No answer this device can trust: the identical request is retried
+    /// under its own id after a back-off.
+    Transport,
+    /// The graph is switched off on the server (`graph_unavailable`): back
+    /// off, then retry the identical request.
+    Unavailable,
+    /// The server cannot say what became of it (`outcome_unresolved`):
+    /// only a same-id replay or `graph.outcome`, never a new id.
+    Unresolved,
+    /// The agent context the request names ended (`context_expired`,
+    /// `context_closed`, `context_invalid`).
+    ContextEnded,
+    /// The server refused the caller (`forbidden`, `context_revoked`,
+    /// `source_audience`, `label_unknown`, or any refusal it does not call
+    /// retryable): a revocation signal.
+    Refused,
+    /// Nothing was sent and no receipt is known: look the receipt up.
+    NoAttempt,
+    /// The key is not this owner's (another database or client): never
+    /// sent under this identity.
+    Foreign,
+}
+
+impl PendingCause {
+    /// The stable, domain-safe name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Unavailable => "graph_unavailable",
+            Self::Unresolved => "outcome_unresolved",
+            Self::ContextEnded => "context_ended",
+            Self::Refused => "refused",
+            Self::NoAttempt => "no_attempt",
+            Self::Foreign => "foreign_request",
+        }
+    }
+
+    /// The cause a failed send or remote lookup gives. A server refusal is
+    /// read by its stable code (the message of `operation.forbidden`, or
+    /// the code itself); an unknown refusal the server does not call
+    /// retryable is [`PendingCause::Refused`] (fail closed). Every
+    /// failure that is not the server's answer is [`PendingCause::Transport`].
+    #[must_use]
+    pub fn of(error: &ReplicaError) -> Self {
+        let (code, message, retryable) = match error {
+            ReplicaError::Remote {
+                code,
+                message,
+                retryable,
+            } => (code.as_str(), message.as_str(), *retryable),
+            ReplicaError::Rejected { code, message } => (code.as_str(), message.as_str(), false),
+            ReplicaError::Client(_)
+            | ReplicaError::Unheard { .. }
+            | ReplicaError::NotSyncing
+            | ReplicaError::Closed => return Self::Transport,
+        };
+        let named = |name: &str| code == name || message == name;
+        if named("graph_unavailable") {
+            Self::Unavailable
+        } else if named("outcome_unresolved") {
+            Self::Unresolved
+        } else if ["context_expired", "context_closed", "context_invalid"]
+            .into_iter()
+            .any(named)
+        {
+            Self::ContextEnded
+        } else if [
+            "forbidden",
+            "context_revoked",
+            "source_audience",
+            "label_unknown",
+        ]
+        .into_iter()
+        .any(named)
+            || !retryable
+        {
+            Self::Refused
+        } else {
+            Self::Transport
+        }
+    }
+}
+
+impl GraphOutcome {
+    /// This outcome's pending cause, when it is pending.
+    #[must_use]
+    pub fn pending_cause(&self) -> Option<PendingCause> {
+        match self {
+            Self::Pending { cause } => Some(*cause),
+            _ => None,
+        }
+    }
 }
 
 /// Why a send or a receipt lookup did not happen.
@@ -309,7 +448,8 @@ pub enum GraphRequestError {
 
 /// This device's graph requests in one database.
 pub struct GraphRequests {
-    source: Source,
+    port: Arc<dyn GraphWrite>,
+    domain: String,
     client_scope: String,
 }
 
@@ -318,22 +458,30 @@ impl GraphRequests {
     /// `source.database`, its client scope this device's actor and client.
     #[must_use]
     pub fn new(source: Source) -> Self {
-        let client_scope = client_scope(&source.actor, &source.client);
+        let writer = Writer::of(&source);
+        Self::over(Arc::new(source), &writer)
+    }
+
+    /// The owner for `writer`'s database behind `port`; its client scope
+    /// is `writer`'s actor and client.
+    #[must_use]
+    pub fn over(port: Arc<dyn GraphWrite>, writer: &Writer) -> Self {
         Self {
-            source,
-            client_scope,
+            port,
+            domain: writer.domain.clone(),
+            client_scope: client_scope(&writer.actor, &writer.client),
         }
     }
 
     /// The database these requests belong to.
     #[must_use]
     pub fn domain(&self) -> &str {
-        &self.source.database
+        &self.domain
     }
 
-    /// The replica boundary these requests go through.
-    pub(crate) fn source(&self) -> &Source {
-        &self.source
+    /// The write boundary these requests go through.
+    pub(crate) fn port(&self) -> &dyn GraphWrite {
+        self.port.as_ref()
     }
 
     /// The key of `request` sent to `descriptor` from this device, its
@@ -341,7 +489,7 @@ impl GraphRequests {
     pub fn key(&self, descriptor: &str, request: &Request) -> Result<RequestKey, Refusal> {
         Ok(RequestKey {
             identity: RequestIdentity {
-                domain: self.source.database.clone(),
+                domain: self.domain.clone(),
                 descriptor: descriptor.to_owned(),
                 request_id: request.request_id.clone(),
                 client_scope: self.client_scope.clone(),
@@ -354,8 +502,7 @@ impl GraphRequests {
     /// device's client scope. Ownership, not association: two requests are
     /// associated only by whole-key equality.
     fn owns(&self, key: &RequestKey) -> bool {
-        key.identity.domain == self.source.database
-            && key.identity.client_scope == self.client_scope
+        key.identity.domain == self.domain && key.identity.client_scope == self.client_scope
     }
 
     /// Send `request` under `key` through this database's replica. The key
@@ -374,10 +521,9 @@ impl GraphRequests {
             "context_id": request.context_id,
             "payload": request.payload,
         });
-        let result =
-            self.source
-                .replica
-                .remote_command(key.descriptor(), key.request_id(), envelope);
+        let result = self
+            .port
+            .command(key.descriptor(), key.request_id(), envelope);
         Ok(Attempt::new(key, result))
     }
 
@@ -387,10 +533,7 @@ impl GraphRequests {
             return Err(GraphRequestError::ForeignRequest);
         }
         let id = receipt_id(key.descriptor(), key.request_id(), key.client_scope());
-        let rows = self.source.replica.query(
-            "SELECT * FROM kg_receipts WHERE id = ?",
-            &[Value::from(id.as_str())],
-        )?;
+        let rows = self.port.receipt(&id)?;
         self.own_receipt(&id, rows)
     }
 
@@ -407,7 +550,7 @@ impl GraphRequests {
             return Err(GraphRequestError::ForeignRequest);
         }
         let id = receipt_id(key.descriptor(), key.request_id(), key.client_scope());
-        let rows = self.source.replica.remote_query(
+        let rows = self.port.remote_query(
             super::protocol::wire::OUTCOME,
             super::protocol::wire::outcome_params(context_id, key.request_id()),
         )?;
@@ -425,7 +568,7 @@ impl GraphRequests {
             if row.get("id").and_then(Value::as_str) != Some(id) {
                 continue;
             }
-            return Receipt::from_row(&self.source.database, &row)
+            return Receipt::from_row(&self.domain, &row)
                 .map(Some)
                 .map_err(GraphRequestError::Unreadable);
         }
@@ -463,7 +606,7 @@ impl GraphRequests {
     ) -> GraphOutcome {
         if !self.owns(key) {
             return GraphOutcome::Pending {
-                reason: "another database's or client's request".to_owned(),
+                cause: PendingCause::Foreign,
             };
         }
         let attempt = attempt
@@ -508,18 +651,20 @@ impl GraphRequests {
         };
         match attempt {
             None => GraphOutcome::Pending {
-                reason: "no attempt at this request".to_owned(),
+                cause: PendingCause::NoAttempt,
             },
             Some(Ok(_)) => match own_commit {
                 Some(commit_seq) => GraphOutcome::PendingVisibility { commit_seq },
+                // An acknowledgement of another id says nothing of this one:
+                // the same request is asked again.
                 None => GraphOutcome::Pending {
-                    reason: "acknowledgement of another request".to_owned(),
+                    cause: PendingCause::Transport,
                 },
             },
             Some(Err(ReplicaError::Rejected { code, message })) => terminal(code, message)
                 .unwrap_or_else(|| GraphOutcome::TechnicalRefusal { code: code.clone() }),
-            Some(Err(ReplicaError::Remote { code, message, .. })) => terminal(code, message)
-                .unwrap_or_else(|| {
+            Some(Err(error @ ReplicaError::Remote { code, message, .. })) => {
+                terminal(code, message).unwrap_or_else(|| {
                     if code.starts_with("kg.") {
                         GraphOutcome::TechnicalRefusal { code: code.clone() }
                     } else if message.starts_with("kg.") {
@@ -528,12 +673,13 @@ impl GraphRequests {
                         }
                     } else {
                         GraphOutcome::Pending {
-                            reason: message.clone(),
+                            cause: PendingCause::of(error),
                         }
                     }
-                }),
+                })
+            }
             Some(Err(error)) => GraphOutcome::Pending {
-                reason: error.to_string(),
+                cause: PendingCause::of(error),
             },
         }
     }

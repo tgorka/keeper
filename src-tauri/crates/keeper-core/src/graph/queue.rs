@@ -42,6 +42,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use serde_json::json;
 
 use super::client::{GraphClient, Prepared};
+use super::outcome::{GraphOutcome, PendingCause};
 use super::protocol::request::{self, Request};
 use super::protocol::scope::client_scope;
 use super::protocol::value::canonical;
@@ -51,13 +52,18 @@ use super::protocol::CONTRACT_VERSION;
 /// How long a contended writer waits for the write lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The file's schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 1;
+/// The file's schema version (`PRAGMA user_version`). Version 2 adds the
+/// agent approval binding (`approval_id`, `tool_call_id`, `bound_args`).
+const SCHEMA_VERSION: i64 = 2;
 
-/// Where an entry stands. The first four are the only ones a send may come
-/// from; the outcome states and the two local terminal states end it.
+/// Where an entry stands. The open states are the ones a send may come
+/// from or lead to; the outcome states and the three local terminal states
+/// end it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum State {
+    /// An agent's `graph_apply`, bound to its approval and waiting for a
+    /// person's decision; never sent yet.
+    AwaitingApproval,
     /// Persisted, not sent yet.
     Queued,
     /// A send was started; the server may have it.
@@ -81,9 +87,13 @@ pub enum State {
     Unsupported,
     /// Discarded by its caller before any outcome; never sent again.
     Withdrawn,
+    /// Ended on this device and never sent: its approval was denied or
+    /// expired, or its agent context ended before the send.
+    RefusedLocally,
 }
 
-const STATES: [State; 14] = [
+const STATES: [State; 16] = [
+    State::AwaitingApproval,
     State::Queued,
     State::Submitting,
     State::PendingVisibility,
@@ -98,6 +108,7 @@ const STATES: [State; 14] = [
     State::IdempotencyMismatch,
     State::Unsupported,
     State::Withdrawn,
+    State::RefusedLocally,
 ];
 
 impl State {
@@ -105,6 +116,7 @@ impl State {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AwaitingApproval => "awaiting_approval",
             Self::Queued => "queued",
             Self::Submitting => "submitting",
             Self::PendingVisibility => "pending_visibility",
@@ -119,6 +131,7 @@ impl State {
             Self::IdempotencyMismatch => "idempotency_mismatch",
             Self::Unsupported => "unsupported",
             Self::Withdrawn => "withdrawn",
+            Self::RefusedLocally => "refused_locally",
         }
     }
 
@@ -140,12 +153,13 @@ impl State {
                 | Self::IdempotencyMismatch
                 | Self::Unsupported
                 | Self::Withdrawn
+                | Self::RefusedLocally
         )
     }
 
-    /// A server outcome (every terminal state but [`State::Withdrawn`]).
+    /// A server outcome (every terminal state but the local ones).
     fn is_outcome(self) -> bool {
-        self.is_terminal() && self != Self::Withdrawn
+        self.is_terminal() && !matches!(self, Self::Withdrawn | Self::RefusedLocally)
     }
 
     /// The states a revocation locks: everything still open.
@@ -153,18 +167,27 @@ impl State {
         !self.is_terminal() && self != Self::Disabled
     }
 
+    /// Never sent: nothing of it can have reached the server.
+    #[must_use]
+    pub fn never_sent(self) -> bool {
+        matches!(self, Self::AwaitingApproval | Self::Queued)
+    }
+
     /// The storage transitions. A revocation locks every open entry and an
     /// identity change suspends it; a locked one is only resolved by its own
-    /// receipt or withdrawn; a suspended one is never sent.
+    /// receipt or withdrawn; a suspended one is never sent. Only an entry
+    /// never sent may end refused on this device.
     fn may_become(self, to: Self) -> bool {
         use State::{
-            Disabled, PendingVisibility, Queued, Submitting, Suspended, Unresolved, Withdrawn,
+            AwaitingApproval, Disabled, PendingVisibility, Queued, RefusedLocally, Submitting,
+            Suspended, Unresolved, Withdrawn,
         };
         if self.is_open() && matches!(to, Disabled | Suspended) && self != to {
             return true;
         }
         match self {
-            Queued => matches!(to, Submitting | Suspended | Withdrawn),
+            AwaitingApproval => matches!(to, Submitting | RefusedLocally),
+            Queued => matches!(to, Submitting | Withdrawn | RefusedLocally),
             Submitting => matches!(to, PendingVisibility | Unresolved) || to.is_outcome(),
             PendingVisibility => to == Unresolved || to.is_outcome(),
             Unresolved => matches!(to, Submitting | PendingVisibility) || to.is_outcome(),
@@ -233,6 +256,10 @@ pub enum QueueError {
     /// Only a terminal entry's record may be acknowledged.
     #[error("{0} is not resolved yet")]
     Open(String),
+    /// An agent entry whose request does not name its approval, carries no
+    /// context, or is not a `graph.apply`.
+    #[error("approval_binding")]
+    Unbound,
     /// A stored value this build cannot read.
     #[error("unreadable queue entry: {0}")]
     Unreadable(String),
@@ -248,6 +275,7 @@ impl QueueError {
             Self::ForeignFile | Self::ForeignRequest => "foreign_request",
             Self::Unknown(_) => "unknown_request",
             Self::Moved { .. } | Self::Transition { .. } | Self::Open(_) => "invalid_transition",
+            Self::Unbound => "approval_binding",
             Self::Unreadable(_) => "unreadable",
         }
     }
@@ -272,7 +300,6 @@ pub struct Resolution {
 /// receipt's detail is never kept.
 #[must_use]
 pub fn terminal(outcome: &super::outcome::GraphOutcome) -> Option<(State, Resolution)> {
-    use super::outcome::GraphOutcome;
     let only = |code: Option<String>| Resolution {
         code,
         ..Resolution::default()
@@ -292,7 +319,19 @@ pub fn terminal(outcome: &super::outcome::GraphOutcome) -> Option<(State, Resolu
         ),
         GraphOutcome::Proposed { .. } => (State::Proposed, only(None)),
         GraphOutcome::Conflict { .. } => (State::Conflict, only(None)),
-        GraphOutcome::Rejected { reason, .. } => (State::Rejected, only(Some(reason.clone()))),
+        // A server refusal keeps its stable code (`forbidden` names the
+        // refusal in its detail), never the detail itself.
+        GraphOutcome::Rejected { reason, detail } => (
+            State::Rejected,
+            only(Some(
+                detail
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|_| reason == "forbidden")
+                    .unwrap_or(reason)
+                    .to_owned(),
+            )),
+        ),
         GraphOutcome::TechnicalRefusal { code } => {
             (State::TechnicalRefusal, only(Some(code.clone())))
         }
@@ -300,6 +339,104 @@ pub fn terminal(outcome: &super::outcome::GraphOutcome) -> Option<(State, Resolu
         GraphOutcome::Unsupported => (State::Unsupported, only(None)),
         GraphOutcome::PendingVisibility { .. } | GraphOutcome::Pending { .. } => return None,
     })
+}
+
+/// What the queue does with an entry in `from` given `outcome` (112.1
+/// CC-5): the one policy, keyed on the outcome and its typed
+/// [`PendingCause`], never on text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Persist this terminal outcome. When `revokes`, the domain is fenced
+    /// too ([`super::outcome::GraphOutcome::revokes`]).
+    Resolve {
+        to: State,
+        resolution: Resolution,
+        revokes: bool,
+    },
+    /// Move to this open state (or stay, when already there).
+    Mark(State),
+    /// End it on this device: it was never sent.
+    RefuseLocally,
+    /// A revocation signal: fence the domain, which locks every open entry.
+    Revoke,
+    /// Keep it; retry the identical request under its own id after a
+    /// back-off.
+    Retry(PendingCause),
+    /// Nothing is known yet: look its receipt up (and send it only if it is
+    /// sendable).
+    Lookup,
+}
+
+/// [`Next`] for an entry in `from` that `outcome` describes.
+///
+/// - a definite outcome resolves it (a revoking one fences too);
+/// - `pending_visibility` waits for the receipt, never sent again;
+/// - `outcome_unresolved` is `unresolved`: same-id replay or
+///   `graph.outcome` only, never a new id (DF-110-8);
+/// - an ended agent context refuses an entry never sent and leaves one
+///   that may have been sent `unresolved`, never refused;
+/// - a refusal revokes; a transport failure or `graph_unavailable` retries
+///   the identical request; a foreign key suspends.
+#[must_use]
+pub fn next(from: State, outcome: &GraphOutcome) -> Next {
+    if let Some((to, resolution)) = terminal(outcome) {
+        return Next::Resolve {
+            to,
+            resolution,
+            revokes: outcome.revokes(),
+        };
+    }
+    match outcome {
+        GraphOutcome::PendingVisibility { .. } => Next::Mark(State::PendingVisibility),
+        GraphOutcome::Pending { cause } => match cause {
+            PendingCause::Transport | PendingCause::Unavailable => Next::Retry(*cause),
+            PendingCause::Unresolved => Next::Mark(State::Unresolved),
+            PendingCause::ContextEnded if from.never_sent() => Next::RefuseLocally,
+            PendingCause::ContextEnded => Next::Mark(State::Unresolved),
+            PendingCause::Refused => Next::Revoke,
+            PendingCause::NoAttempt => Next::Lookup,
+            PendingCause::Foreign => Next::Mark(State::Suspended),
+        },
+        _ => Next::Lookup,
+    }
+}
+
+/// The `graph_apply` call arguments that bind `prepared`: `{domain,
+/// request}`, the request as its version-1 envelope, as canonical JCS text.
+/// The queue stores these bytes and the runtime writes exactly them into
+/// the call's row.
+pub fn bound_args(domain: &str, prepared: &Prepared) -> Result<String, QueueError> {
+    let request = prepared.request();
+    jcs(&json!({
+        "domain": domain,
+        "request": {
+            "version": CONTRACT_VERSION,
+            "request_id": request.request_id,
+            "context_id": request.context_id,
+            "payload": request.payload,
+        },
+    }))
+}
+
+/// An agent's `graph_apply` approval binding, as the queue keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub approval_id: String,
+    pub tool_call_id: String,
+    /// [`bound_args`]' bytes (absent once the entry is terminal).
+    pub bound_args: Option<String>,
+}
+
+/// What an approved agent entry is now.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Approved {
+    /// Its stored bytes match the frozen call: [`State::Submitting`], to be
+    /// sent exactly as `prepared`.
+    Send(Prepared),
+    /// The frozen call's arguments are not the stored ones, or the stored
+    /// request no longer matches its digest: [`State::Suspended`], never
+    /// sent.
+    Suspended,
 }
 
 /// One entry as a listing shows it: domain-safe metadata only, never the
@@ -383,6 +520,9 @@ CREATE TABLE IF NOT EXISTS graph_intents(\
     event_id TEXT, \
     graph_seq TEXT, \
     outcome_code TEXT, \
+    approval_id TEXT, \
+    tool_call_id TEXT, \
+    bound_args TEXT, \
     enqueued_at INTEGER NOT NULL, \
     updated_at INTEGER NOT NULL\
 );\
@@ -432,7 +572,18 @@ impl GraphQueue {
                 "queue schema {version} is newer than this build's {SCHEMA_VERSION}"
             )));
         }
-        conn.execute_batch(SCHEMA).map_err(storage)?;
+        match version {
+            0 => conn.execute_batch(SCHEMA).map_err(storage)?,
+            // Version 1 had no agent approval binding.
+            1 => conn
+                .execute_batch(
+                    "ALTER TABLE graph_intents ADD COLUMN approval_id TEXT; \
+                     ALTER TABLE graph_intents ADD COLUMN tool_call_id TEXT; \
+                     ALTER TABLE graph_intents ADD COLUMN bound_args TEXT;",
+                )
+                .map_err(storage)?,
+            _ => {}
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
         conn.execute(
@@ -475,11 +626,28 @@ impl GraphQueue {
         Ok(())
     }
 
-    /// Persist `prepared` as [`State::Queued`]. It is queued only once this
-    /// returns `Ok`: the commit happened. Its client scope and domain must
-    /// be this queue's.
+    /// Persist a person's `prepared` as [`State::Queued`]. It is queued
+    /// only once this returns `Ok`: the commit happened. Its client scope
+    /// and domain must be this queue's; a request naming an agent context
+    /// is only ever enqueued bound to its approval
+    /// ([`GraphQueue::enqueue_for_approval`]).
     pub fn enqueue(&mut self, prepared: &Prepared, now_ms: i64) -> Result<(), QueueError> {
         self.refuse_fenced()?;
+        if prepared.request().context_id.is_some() {
+            return Err(QueueError::Unbound);
+        }
+        self.insert(prepared, State::Queued, None, now_ms)
+    }
+
+    /// One new entry in `state`, with an agent's approval binding
+    /// `(approval_id, tool_call_id, bound_args)` when it has one.
+    fn insert(
+        &mut self,
+        prepared: &Prepared,
+        state: State,
+        approval: Option<(&str, &str, &str)>,
+        now_ms: i64,
+    ) -> Result<(), QueueError> {
         let key = prepared.key();
         if key.domain() != self.binding.domain
             || key.client_scope() != client_scope(&self.binding.actor, &self.binding.client)
@@ -488,12 +656,18 @@ impl GraphQueue {
         }
         let request = prepared.request();
         let jcs = envelope_jcs(request)?;
+        let (approval_id, tool_call_id, bound) = match approval {
+            Some((approval_id, tool_call_id, bound)) => {
+                (Some(approval_id), Some(tool_call_id), Some(bound))
+            }
+            None => (None, None, None),
+        };
         self.conn
             .execute(
                 "INSERT INTO graph_intents(request_id, server, domain, actor, client, \
                  descriptor, version, context_id, request_jcs, request_digest, state, \
-                 enqueued_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                 enqueued_at, updated_at, approval_id, tool_call_id, bound_args) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15)",
                 params![
                     request.request_id,
                     self.binding.server,
@@ -505,8 +679,11 @@ impl GraphQueue {
                     request.context_id,
                     jcs,
                     key.request_digest(),
-                    State::Queued.as_str(),
+                    state.as_str(),
                     now_ms,
+                    approval_id,
+                    tool_call_id,
+                    bound,
                 ],
             )
             .map_err(storage)?;
@@ -685,19 +862,201 @@ impl GraphQueue {
         Ok(())
     }
 
-    /// The resumable cleanup: delete the payload of every terminal entry.
+    /// The resumable cleanup: delete the payload (the request and an
+    /// agent's bound call arguments) of every terminal entry.
     fn clean_payloads(&self) -> Result<(), QueueError> {
         self.conn
             .execute(
                 &format!(
-                    "UPDATE graph_intents SET request_jcs = NULL \
-                     WHERE request_jcs IS NOT NULL AND state IN ({})",
+                    "UPDATE graph_intents SET request_jcs = NULL, bound_args = NULL \
+                     WHERE (request_jcs IS NOT NULL OR bound_args IS NOT NULL) \
+                     AND state IN ({})",
                     terminal_names()
                 ),
                 [],
             )
             .map_err(storage)?;
         Ok(())
+    }
+
+    /// End an entry never sent on this device ([`State::RefusedLocally`]):
+    /// its approval was denied or expired, or its context ended before the
+    /// send. An entry that may have been sent refuses the move.
+    pub fn refuse_locally(
+        &mut self,
+        request_id: &str,
+        cause: &str,
+        now_ms: i64,
+    ) -> Result<(), QueueError> {
+        let from = self.state_of(request_id)?;
+        self.advance(
+            request_id,
+            from,
+            State::RefusedLocally,
+            now_ms,
+            ", last_cause = ?5",
+            &[&cause],
+        )?;
+        self.clean_payloads()
+    }
+
+    /// Persist an agent's `graph_apply` request, bound to its approval
+    /// before anything is shown to a person: [`State::AwaitingApproval`],
+    /// with the approval id, the call's preallocated row id and the bound
+    /// call arguments ([`bound_args`]), in one transaction. The request must
+    /// carry its agent context, be a `graph.apply` and name `approval_id`.
+    /// Returns the bound arguments the call's row must carry, byte for byte.
+    pub fn enqueue_for_approval(
+        &mut self,
+        prepared: &Prepared,
+        approval_id: &str,
+        tool_call_id: &str,
+        now_ms: i64,
+    ) -> Result<String, QueueError> {
+        self.refuse_fenced()?;
+        let request = prepared.request();
+        let named = request
+            .payload
+            .get("approval_id")
+            .and_then(serde_json::Value::as_str);
+        if request.context_id.is_none()
+            || prepared.key().descriptor() != super::protocol::change::DESCRIPTOR
+            || named != Some(approval_id)
+            || tool_call_id.is_empty()
+        {
+            return Err(QueueError::Unbound);
+        }
+        let args = bound_args(&self.binding.domain, prepared)?;
+        self.insert(
+            prepared,
+            State::AwaitingApproval,
+            Some((approval_id, tool_call_id, &args)),
+            now_ms,
+        )?;
+        Ok(args)
+    }
+
+    /// The approval binding of `request_id`, if it is an agent's.
+    pub fn bound(&self, request_id: &str) -> Result<Option<Bound>, QueueError> {
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT approval_id, tool_call_id, bound_args FROM graph_intents \
+                 WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        match row {
+            None => Err(QueueError::Unknown(request_id.to_owned())),
+            Some((Some(approval_id), Some(tool_call_id), bound_args)) => Ok(Some(Bound {
+                approval_id,
+                tool_call_id,
+                bound_args,
+            })),
+            Some(_) => Ok(None),
+        }
+    }
+
+    /// A person approved `request_id` and the runtime rechecked its
+    /// authority: compare the call's frozen arguments (`frozen_args`, as its
+    /// row holds them) with the bound ones, re-derive the request from the
+    /// stored bytes under `client`, and move it to [`State::Submitting`] to
+    /// be sent exactly once as stored. Any difference suspends it, never
+    /// sent. Refused while fenced.
+    pub fn approve(
+        &mut self,
+        client: &GraphClient,
+        request_id: &str,
+        frozen_args: &str,
+        now_ms: i64,
+    ) -> Result<Approved, QueueError> {
+        self.refuse_fenced()?;
+        let actual = self.state_of(request_id)?;
+        let Some(row) = self
+            .open_rows()?
+            .into_iter()
+            .find(|row| row.request_id == request_id && row.state == State::AwaitingApproval)
+        else {
+            return Err(QueueError::Moved {
+                request_id: request_id.to_owned(),
+                expected: State::AwaitingApproval,
+                actual,
+            });
+        };
+        let frozen = super::protocol::value::parse(frozen_args.as_bytes())
+            .ok()
+            .and_then(|value| jcs(&value).ok());
+        let stored = self.bound(request_id)?.and_then(|bound| bound.bound_args);
+        let prepared = match self.check(client, &row) {
+            Check::Ready(prepared)
+                if frozen.is_some()
+                    && frozen == stored
+                    && bound_args(&self.binding.domain, &prepared).ok() == stored =>
+            {
+                prepared
+            }
+            _ => {
+                self.mark(
+                    request_id,
+                    State::AwaitingApproval,
+                    State::Suspended,
+                    Some("approval_binding"),
+                    now_ms,
+                )?;
+                return Ok(Approved::Suspended);
+            }
+        };
+        self.mark(
+            request_id,
+            State::AwaitingApproval,
+            State::Submitting,
+            Some("approved"),
+            now_ms,
+        )?;
+        Ok(Approved::Send(prepared))
+    }
+
+    /// After an agent runtime restarts, its contexts are gone (they are
+    /// bound to the process incarnation). Every agent entry never sent
+    /// ends [`State::RefusedLocally`]; every one that may have been sent
+    /// (`submitting`, `pending_visibility`) becomes [`State::Unresolved`],
+    /// never refused and never resent until `graph.outcome` resolves it.
+    /// Persons' entries (no context) are untouched. One transaction; the
+    /// counts (refused, unresolved).
+    pub fn incarnation_ended(&mut self, now_ms: i64) -> Result<(usize, usize), QueueError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let refused = tx
+            .execute(
+                "UPDATE graph_intents SET state = ?1, last_cause = 'incarnation_ended', \
+                 updated_at = ?2 WHERE context_id IS NOT NULL AND state IN (?3, ?4)",
+                params![
+                    State::RefusedLocally.as_str(),
+                    now_ms,
+                    State::AwaitingApproval.as_str(),
+                    State::Queued.as_str(),
+                ],
+            )
+            .map_err(storage)?;
+        let unresolved = tx
+            .execute(
+                "UPDATE graph_intents SET state = ?1, last_cause = 'incarnation_ended', \
+                 updated_at = ?2 WHERE context_id IS NOT NULL AND state IN (?3, ?4)",
+                params![
+                    State::Unresolved.as_str(),
+                    now_ms,
+                    State::Submitting.as_str(),
+                    State::PendingVisibility.as_str(),
+                ],
+            )
+            .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        self.clean_payloads()?;
+        Ok((refused, unresolved))
     }
 
     /// Every entry, metadata only, oldest first. Refused while fenced.
@@ -791,12 +1150,13 @@ impl GraphQueue {
             .prepare(
                 "SELECT request_id, server, domain, actor, client, descriptor, version, \
                  context_id, request_jcs, request_digest, state FROM graph_intents \
-                 WHERE state IN (?1, ?2, ?3, ?4) ORDER BY enqueued_at, request_id",
+                 WHERE state IN (?1, ?2, ?3, ?4, ?5) ORDER BY enqueued_at, request_id",
             )
             .map_err(storage)?;
         let rows = statement
             .query_map(
                 params![
+                    State::AwaitingApproval.as_str(),
                     State::Queued.as_str(),
                     State::Submitting.as_str(),
                     State::PendingVisibility.as_str(),
@@ -1003,16 +1363,21 @@ enum Check {
     Differs,
 }
 
+/// The canonical JCS text of `value`.
+fn jcs(value: &serde_json::Value) -> Result<String, QueueError> {
+    let bytes =
+        canonical(value).map_err(|refusal| QueueError::Unreadable(refusal.code().to_owned()))?;
+    String::from_utf8(bytes).map_err(|_| QueueError::Unreadable("envelope.utf8".to_owned()))
+}
+
 /// The canonical JCS text of `request`'s envelope.
 fn envelope_jcs(request: &Request) -> Result<String, QueueError> {
-    let bytes = canonical(&json!({
+    jcs(&json!({
         "version": CONTRACT_VERSION,
         "request_id": request.request_id,
         "context_id": request.context_id,
         "payload": request.payload,
     }))
-    .map_err(|refusal| QueueError::Unreadable(refusal.code().to_owned()))?;
-    String::from_utf8(bytes).map_err(|_| QueueError::Unreadable("envelope.utf8".to_owned()))
 }
 
 fn count_states(conn: &Connection) -> Result<BTreeMap<State, usize>, QueueError> {

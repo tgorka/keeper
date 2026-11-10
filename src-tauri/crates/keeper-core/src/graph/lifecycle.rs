@@ -10,9 +10,10 @@
 //!    identity and payload kept;
 //! 3. [`GraphReads::revoke`] kills and reaps in-flight workers and purges
 //!    the projection store;
-//! 4. once the replica's scope purge is observed (the server's scope
-//!    revocation, which the Syncular client applies atomically), the fence
-//!    records `purged` ([`Lifecycle::observe_purge`]).
+//! 4. once the replica's scope purge is observed for every graph
+//!    subscription (the graph tables, the receipts and the proposals: the
+//!    server's scope revocation, which the Syncular client applies
+//!    atomically), the fence records `purged` ([`Lifecycle::observe_purge`]).
 //!
 //! From step 1 on, [`Lifecycle::gate`] refuses: callers check it before any
 //! read, result, receipt, queue or history disclosure. Steps 2 and 3 are
@@ -30,10 +31,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use super::outcome::GraphOutcome;
 use super::protocol::wire::{Authority, ReadStatus};
 use super::query::{GraphReads, QueryError};
-use super::queue::{AuthorityRow, FenceState, GraphQueue, QueueError};
-use super::source::{Checkpoint, ScopeState};
+use super::queue::{self, AuthorityRow, FenceState, GraphQueue, Next, QueueError, State};
+use super::source::{Checkpoint, Revocation, ScopeState};
 
 /// Why a lifecycle step failed. The domain stays locked.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -131,9 +133,23 @@ impl Lifecycle {
         reads: Option<&GraphReads>,
         now_ms: i64,
     ) -> Result<(), LifecycleError> {
+        self.lock(now_ms)?;
+        if let Some(reads) = reads {
+            reads.revoke().await?;
+        }
+        Ok(())
+    }
+
+    /// The synchronous half of [`Lifecycle::revoke`], for a signal learned
+    /// where no projection is held (a send or a receipt lookup): close the
+    /// gate, persist the fence, lock every open entry. The projection's
+    /// purge is left to the next [`Lifecycle::resume`] (the fence stands
+    /// until then, and a restart starts locked).
+    pub fn lock(&self, now_ms: i64) -> Result<(), LifecycleError> {
         self.locked.store(true, Ordering::SeqCst);
-        self.queue().persist_fence(now_ms)?;
-        self.cleanup(reads, now_ms).await
+        let queue = self.queue();
+        queue.persist_fence(now_ms)?;
+        Self::disable(&queue, now_ms)
     }
 
     /// Run the fence's cleanup again (after a restart, or a failed step):
@@ -147,32 +163,91 @@ impl Lifecycle {
             return Err(LifecycleError::NotFenced);
         }
         self.locked.store(true, Ordering::SeqCst);
-        self.cleanup(reads, now_ms).await
-    }
-
-    async fn cleanup(&self, reads: Option<&GraphReads>, now_ms: i64) -> Result<(), LifecycleError> {
-        let locked = self.queue().disable_open(now_ms)?;
-        if locked > 0 {
-            tracing::info!(locked, "graph: a revocation locked queued intents");
-        }
+        Self::disable(&self.queue(), now_ms)?;
         if let Some(reads) = reads {
             reads.revoke().await?;
         }
         Ok(())
     }
 
-    /// Record the replica's scope purge once its subscriptions read
-    /// revoked (`checkpoint`): whether the fence is now `purged`.
+    fn disable(queue: &GraphQueue, now_ms: i64) -> Result<(), LifecycleError> {
+        let locked = queue.disable_open(now_ms)?;
+        if locked > 0 {
+            tracing::info!(locked, "graph: a revocation locked queued intents");
+        }
+        Ok(())
+    }
+
+    /// Apply what `outcome` means for the entry `request_id` in `from`
+    /// ([`queue::next`], the one policy) and answer the state it is in now.
+    /// A revoking outcome locks the domain first: the fence is persisted and
+    /// every open entry disabled before the outcome itself is recorded. A
+    /// transport failure, `graph_unavailable` or an unknown outcome leaves
+    /// the entry where it is. Allowed while locked: an entry is always
+    /// resolved by its own outcome.
+    pub fn settle(
+        &self,
+        request_id: &str,
+        from: State,
+        outcome: &GraphOutcome,
+        now_ms: i64,
+    ) -> Result<State, LifecycleError> {
+        let next = queue::next(from, outcome);
+        // A locked entry is only resolved by its own outcome (or withdrawn);
+        // nothing else moves it, and a further refusal only re-locks.
+        if from == State::Disabled && !matches!(next, Next::Resolve { .. } | Next::Revoke) {
+            return Ok(from);
+        }
+        match next {
+            Next::Resolve {
+                to,
+                resolution,
+                revokes,
+            } => {
+                let mut from = from;
+                if revokes {
+                    self.lock(now_ms)?;
+                    if from != State::Disabled && !from.is_terminal() {
+                        from = State::Disabled;
+                    }
+                }
+                self.queue()
+                    .resolve(request_id, from, to, &resolution, now_ms)?;
+                Ok(to)
+            }
+            Next::Revoke => {
+                self.lock(now_ms)?;
+                Ok(State::Disabled)
+            }
+            Next::Mark(to) if to == from => Ok(from),
+            Next::Mark(to) => {
+                self.queue()
+                    .mark(request_id, from, to, Some(outcome_cause(outcome)), now_ms)?;
+                Ok(to)
+            }
+            Next::RefuseLocally => {
+                self.queue()
+                    .refuse_locally(request_id, outcome_cause(outcome), now_ms)?;
+                Ok(State::RefusedLocally)
+            }
+            Next::Retry(_) | Next::Lookup => Ok(from),
+        }
+    }
+
+    /// Record the replica's scope purge once every graph subscription it
+    /// holds — the graph tables, the receipts and the proposals — reads
+    /// revoked (`revocation`, [`super::source::revocation_with`]): whether
+    /// the fence is now `purged`. A partial revocation keeps it `revoked`.
     pub fn observe_purge(
         &self,
-        checkpoint: Checkpoint,
+        revocation: Revocation,
         now_ms: i64,
     ) -> Result<bool, LifecycleError> {
         let queue = self.queue();
         match queue.fence()? {
             None => Err(LifecycleError::NotFenced),
             Some(FenceState::Purged) => Ok(true),
-            Some(FenceState::Revoked) if checkpoint.scope == ScopeState::Revoked => {
+            Some(FenceState::Revoked) if revocation == Revocation::Purged => {
                 queue.mark_purged(now_ms)?;
                 Ok(true)
             }
@@ -221,6 +296,14 @@ impl Lifecycle {
     }
 }
 
+/// The domain-safe cause an outcome leaves on an entry it moves.
+fn outcome_cause(outcome: &GraphOutcome) -> &'static str {
+    match outcome {
+        GraphOutcome::Pending { cause } => cause.as_str(),
+        GraphOutcome::PendingVisibility { .. } => "pending_visibility",
+        _ => "outcome",
+    }
+}
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod tests;

@@ -170,6 +170,56 @@ pub fn checkpoint_with(domain: &str, query: impl Query) -> Result<Checkpoint, So
     Ok(checkpoint_of(&rows))
 }
 
+/// The status of every replica subscription on one of the tables `?1` (a
+/// JSON array of table names): its table and status.
+pub(crate) const TABLE_SUBSCRIPTIONS: &str = "SELECT s.tbl AS tbl, \
+    json_extract(s.state_json, '$.status') AS status \
+  FROM _syncular_subscriptions s WHERE s.tbl IN (SELECT value FROM json_each(?1))";
+
+/// How far a server scope revocation reached the replica's graph
+/// subscriptions (112.1 CC-7, CC-8): the Syncular client deletes a revoked
+/// subscription's scope rows in the transaction that records it revoked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Revocation {
+    /// No subscription of these tables is revoked.
+    None,
+    /// Some are revoked: a revocation signal, its purge not complete.
+    Partial,
+    /// Every one of these tables has a subscription, and every one is
+    /// revoked: their rows are purged.
+    Purged,
+}
+
+/// [`Revocation`] of the subscriptions of `tables` over any replica
+/// `query`. A table with no subscription is not purged (fail closed).
+pub fn revocation_with(tables: &[&str], query: impl Query) -> Result<Revocation, SourceError> {
+    let names =
+        serde_json::to_string(tables).map_err(|_| SourceError::Unreadable("tables".into()))?;
+    let rows = query(TABLE_SUBSCRIPTIONS, &[Value::from(names)])?;
+    Ok(revocation_of(tables, &rows))
+}
+
+/// [`Revocation`] of the rows of [`TABLE_SUBSCRIPTIONS`] for `tables`.
+pub(crate) fn revocation_of(tables: &[&str], rows: &[Map<String, Value>]) -> Revocation {
+    let revoked =
+        |row: &Map<String, Value>| row.get("status").and_then(Value::as_str) == Some("revoked");
+    if !rows.iter().any(revoked) {
+        return Revocation::None;
+    }
+    let purged = tables.iter().all(|table| {
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|row| row.get("tbl").and_then(Value::as_str) == Some(table))
+            .collect();
+        !mine.is_empty() && mine.into_iter().all(revoked)
+    });
+    if purged {
+        Revocation::Purged
+    } else {
+        Revocation::Partial
+    }
+}
+
 /// [`GraphSource::prefix_batch`] of `domain` over any replica `query`: one
 /// statement, so one snapshot, of the head and the events and operations
 /// at positions `after + 1 ..= after + limit` (at most
