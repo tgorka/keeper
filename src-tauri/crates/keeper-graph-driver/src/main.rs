@@ -500,6 +500,10 @@ mod driver {
         if let Err(error) = lifecycle.gate() {
             return entry(&id, state, cause, Some(&error.to_string()));
         }
+        // Offline: nothing starts, so the entry is not marked as sent.
+        if let Err(error) = client.online() {
+            return entry(&id, state, cause, Some(&error.to_string()));
+        }
         let moved = match state {
             State::Submitting => lifecycle.with_queue(|q| q.retry(&id, "resent_same_id", now_ms())),
             from => lifecycle

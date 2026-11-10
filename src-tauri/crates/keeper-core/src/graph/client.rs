@@ -256,7 +256,9 @@ impl GraphClient {
         Ok(Prepared { request, key })
     }
 
-    fn online(&self) -> Result<(), GraphClientError> {
+    /// Whether a send may start now: the replica has a link. A queued
+    /// entry is never moved to `submitting` without one.
+    pub fn online(&self) -> Result<(), GraphClientError> {
         match self.requests.port().link() {
             LinkState::Connected | LinkState::Connecting => Ok(()),
             _ => Err(GraphClientError::Offline),

@@ -1483,7 +1483,8 @@ fn resume_all(lifecycle: &Lifecycle, client: &GraphClient) -> Vec<(String, State
             .expect("settled");
         let sendable = matches!(state, State::Queued | State::Submitting | State::Unresolved)
             && looked.pending_cause().is_some()
-            && lifecycle.gate().is_ok();
+            && lifecycle.gate().is_ok()
+            && client.online().is_ok();
         if !sendable {
             states.push((id, state));
             continue;
