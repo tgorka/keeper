@@ -60,10 +60,10 @@ mod driver {
     use clap::{Parser, Subcommand};
     use keeper_core::graph::admission::{Admission, Process};
     use keeper_core::graph::client::{
-        subscriptions, Applied, GraphClient, GraphClientError, Prepared,
+        subscribed_tables, subscriptions, Applied, GraphClient, GraphClientError, Prepared,
     };
     use keeper_core::graph::lifecycle::{Lifecycle, LifecycleError};
-    use keeper_core::graph::outcome::GraphOutcome;
+    use keeper_core::graph::outcome::{GraphOutcome, PendingCause};
     use keeper_core::graph::protocol::change::Change;
     use keeper_core::graph::protocol::inverse::{PreviewOutcome, Reverse};
     use keeper_core::graph::protocol::review::Target;
@@ -73,9 +73,9 @@ mod driver {
     use keeper_core::graph::query::{
         Freshness, GraphReads, GraphRemote, HumanReader, Inspected, QueryError, QueryResult,
     };
-    use keeper_core::graph::queue::{self, Binding, GraphQueue, Restored, State};
+    use keeper_core::graph::queue::{Binding, GraphQueue, Restored, State};
     use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
-    use keeper_core::graph::source::{GraphSource, ScopeState};
+    use keeper_core::graph::source::{revocation_with, GraphSource, Revocation, ScopeState};
     use keeper_core::graph::supervisor::Cancellation;
     use keeper_core::hq::port::{Link, LinkState, ReplicaSpec};
     use keeper_core::hq::server::ServerUrl;
@@ -231,29 +231,39 @@ mod driver {
             GraphOutcome::PendingVisibility { commit_seq } => {
                 json!({"outcome": "pending_visibility", "commit_seq": commit_seq})
             }
+            GraphOutcome::Pending { cause } => {
+                json!({"outcome": "pending", "cause": cause.as_str()})
+            }
             other => json!({"outcome": "pending", "state": format!("{other:?}")}),
         }
     }
 
     /// A command's answer: its request id, outcome and the stable code a
-    /// caller reports for it.
-    fn applied(answer: Result<Applied, GraphClientError>) -> Value {
-        match answer {
-            Ok(applied) => json!({
-                "ok": true,
-                "request_id": applied.prepared.request().request_id,
-                "descriptor": applied.prepared.key().descriptor(),
-                "outcome": match &applied.outcome {
-                    Ok(o) => {
-                        let mut v = outcome(o);
-                        v["code"] = json!(o.code(applied.prepared.key()));
-                        v
-                    }
-                    Err(e) => fail("pending", &e.to_string()),
-                },
-            }),
-            Err(e) => fail("refused", &e.to_string()),
-        }
+    /// caller reports for it. A revoking outcome (a refused send or
+    /// `graph.outcome`, a forbidden receipt) fences the domain before the answer.
+    fn applied(lifecycle: &Lifecycle, answer: Result<Applied, GraphClientError>) -> Value {
+        let applied = match answer {
+            Ok(applied) => applied,
+            Err(e) => return fail("refused", &e.to_string()),
+        };
+        let fenced = match &applied.outcome {
+            Ok(o) if o.revokes() => Some(lifecycle.lock(now_ms()).is_ok()),
+            _ => None,
+        };
+        json!({
+            "ok": true,
+            "request_id": applied.prepared.request().request_id,
+            "descriptor": applied.prepared.key().descriptor(),
+            "outcome": match &applied.outcome {
+                Ok(o) => {
+                    let mut v = outcome(o);
+                    v["code"] = json!(o.code(applied.prepared.key()));
+                    v
+                }
+                Err(e) => fail("pending", &e.to_string()),
+            },
+            "fenced": fenced,
+        })
     }
 
     fn payload(path: &PathBuf) -> Result<Value, Value> {
@@ -267,8 +277,8 @@ mod driver {
     /// or read from.
     async fn blocking(
         source: &Source,
-        lifecycle: &Lifecycle,
-        call: impl FnOnce(GraphClient) -> Value + Send + 'static,
+        lifecycle: &Arc<Lifecycle>,
+        call: impl FnOnce(GraphClient, &Lifecycle) -> Value + Send + 'static,
     ) -> Value {
         let client = GraphClient::new(source.clone());
         wait(source, Duration::from_secs(30), |_| true).await;
@@ -278,7 +288,8 @@ mod driver {
         if let Err(e) = lifecycle.gate() {
             return query_error(&e);
         }
-        tokio::task::spawn_blocking(move || call(client))
+        let lifecycle = Arc::clone(lifecycle);
+        tokio::task::spawn_blocking(move || call(client, &lifecycle))
             .await
             .unwrap_or_else(|e| fail("storage_unavailable", &e.to_string()))
     }
@@ -374,10 +385,11 @@ mod driver {
     }
 
     /// The revocation signals this device can see without asking: a
-    /// refused link (the device was de-authorised) or a revoked graph
-    /// subscription. Either fences the domain (`reads` purged when held);
-    /// a fence that could not be completed is the run's answer (the domain
-    /// stays locked in this process).
+    /// refused link (the device was de-authorised), a revoked graph,
+    /// receipt or proposal subscription, or history subscriptions that no
+    /// longer hold the domain. Each fences the domain (`reads` purged when
+    /// held); a fence that could not be completed is the run's answer (the
+    /// domain stays locked in this process).
     async fn signals(
         lifecycle: &Lifecycle,
         source: &Source,
@@ -386,7 +398,11 @@ mod driver {
         let refused = source.replica.state().link == LinkState::Refused;
         let revoked = source
             .checkpoint()
-            .is_ok_and(|c| c.scope == ScopeState::Revoked);
+            .is_ok_and(|c| c.scope == ScopeState::Revoked)
+            || revocation_with(&subscribed_tables(), |sql, params| {
+                Ok(source.replica.query(sql, params)?)
+            })
+            .is_ok_and(|r| r != Revocation::None);
         if !(refused || revoked) {
             return None;
         }
@@ -418,12 +434,16 @@ mod driver {
             .resume(Some(&held), now_ms())
             .await
             .map_err(|e| lifecycle_error(&e))?;
+        let revocation = revocation_with(&subscribed_tables(), |sql, params| {
+            Ok(source.replica.query(sql, params)?)
+        })
+        .map_err(|e| fail("storage_unavailable", &e.to_string()))?;
+        lifecycle
+            .observe_purge(revocation, now_ms())
+            .map_err(|e| lifecycle_error(&e))?;
         let checkpoint = source
             .checkpoint()
             .map_err(|e| fail("storage_unavailable", &e.to_string()))?;
-        lifecycle
-            .observe_purge(checkpoint, now_ms())
-            .map_err(|e| lifecycle_error(&e))?;
         if checkpoint.scope != ScopeState::Granted {
             return Err(fail(
                 "forbidden",
@@ -449,20 +469,36 @@ mod driver {
     }
 
     /// Resolve or send one restored entry: its receipt first, the
-    /// identical request under its own id only when there is none.
+    /// identical request under its own id only when there is none and the
+    /// domain is not locked. Every answer goes through the one policy
+    /// ([`Lifecycle::settle`]): a revoking one fences the domain before the answer.
     fn resume_one(
         lifecycle: &Lifecycle,
         client: &GraphClient,
         prepared: &Prepared,
-        mut state: State,
+        state: State,
     ) -> Value {
         let id = prepared.request().request_id.clone();
-        if let Some(done) = settle(lifecycle, &id, &mut state, &client.outcome(prepared, None)) {
-            return done;
+        if state == State::AwaitingApproval {
+            // An agent's, waiting for a person: never sent from here.
+            return entry(&id, state, None, None);
         }
-        if state == State::PendingVisibility {
-            // Applied, its receipt not visible yet: never sent again.
-            return entry(&id, state, None);
+        let looked = match client.outcome(prepared, None) {
+            Ok(outcome) => outcome,
+            Err(error) => return entry(&id, state, None, Some(&error.to_string())),
+        };
+        let state = match lifecycle.settle(&id, state, &looked, now_ms()) {
+            Ok(state) => state,
+            Err(error) => return entry(&id, state, None, Some(&error.to_string())),
+        };
+        let cause = looked.pending_cause();
+        if !matches!(state, State::Queued | State::Submitting | State::Unresolved)
+            || looked.pending_cause().is_none()
+        {
+            return entry(&id, state, cause, None);
+        }
+        if let Err(error) = lifecycle.gate() {
+            return entry(&id, state, cause, Some(&error.to_string()));
         }
         let moved = match state {
             State::Submitting => lifecycle.with_queue(|q| q.retry(&id, "resent_same_id", now_ms())),
@@ -470,59 +506,25 @@ mod driver {
                 .with_queue(|q| q.mark(&id, from, State::Submitting, Some("sent"), now_ms())),
         };
         if let Err(error) = moved {
-            return entry(&id, state, Some(&error.to_string()));
+            return entry(&id, state, cause, Some(&error.to_string()));
         }
-        state = State::Submitting;
         let attempt = match client.send(prepared) {
             Ok(attempt) => attempt,
-            Err(error) => return entry(&id, state, Some(&error.to_string())),
+            Err(error) => return entry(&id, State::Submitting, None, Some(&error.to_string())),
         };
-        let outcome = client.outcome(prepared, Some(&attempt));
-        settle(lifecycle, &id, &mut state, &outcome).unwrap_or_else(|| entry(&id, state, None))
-    }
-
-    /// Persist what `outcome` concludes, if anything: `Some` when the entry
-    /// is resolved, its receipt is not visible yet, or the outcome could
-    /// not be read (nothing is sent then); `None` while it stays pending.
-    fn settle(
-        lifecycle: &Lifecycle,
-        id: &str,
-        state: &mut State,
-        outcome: &Result<GraphOutcome, GraphClientError>,
-    ) -> Option<Value> {
-        let outcome = match outcome {
+        let outcome = match client.outcome(prepared, Some(&attempt)) {
             Ok(outcome) => outcome,
-            Err(error) => return Some(entry(id, *state, Some(&error.to_string()))),
+            Err(error) => return entry(&id, State::Submitting, None, Some(&error.to_string())),
         };
-        if let Some((to, resolution)) = queue::terminal(outcome) {
-            return Some(
-                match lifecycle.with_queue(|q| q.resolve(id, *state, to, &resolution, now_ms())) {
-                    Ok(()) => entry(id, to, None),
-                    Err(error) => entry(id, *state, Some(&error.to_string())),
-                },
-            );
+        match lifecycle.settle(&id, State::Submitting, &outcome, now_ms()) {
+            Ok(state) => entry(&id, state, outcome.pending_cause(), None),
+            Err(error) => entry(&id, State::Submitting, None, Some(&error.to_string())),
         }
-        if matches!(outcome, GraphOutcome::PendingVisibility { .. })
-            && *state != State::PendingVisibility
-        {
-            let from = *state;
-            return Some(
-                match lifecycle
-                    .with_queue(|q| q.mark(id, from, State::PendingVisibility, None, now_ms()))
-                {
-                    Ok(()) => {
-                        *state = State::PendingVisibility;
-                        entry(id, *state, None)
-                    }
-                    Err(error) => entry(id, from, Some(&error.to_string())),
-                },
-            );
-        }
-        None
     }
 
-    fn entry(id: &str, state: State, error: Option<&str>) -> Value {
-        json!({"request_id": id, "state": state.as_str(), "error": error})
+    fn entry(id: &str, state: State, cause: Option<PendingCause>, error: Option<&str>) -> Value {
+        json!({"request_id": id, "state": state.as_str(),
+               "cause": cause.map(PendingCause::as_str), "error": error})
     }
 
     fn resume(lifecycle: &Lifecycle, client: &GraphClient) -> Value {
@@ -536,7 +538,9 @@ mod driver {
                 Restored::Ready { prepared, state } => {
                     resume_one(lifecycle, client, &prepared, state)
                 }
-                Restored::Suspended { request_id } => entry(&request_id, State::Suspended, None),
+                Restored::Suspended { request_id } => {
+                    entry(&request_id, State::Suspended, None, None)
+                }
                 Restored::Corrupt { request_id } => json!({
                     "request_id": request_id, "state": "corrupt",
                     "error": "the stored request does not match its digest",
@@ -562,8 +566,8 @@ mod driver {
                     Ok(change) => change,
                     Err(error) => return error,
                 };
-                blocking(&source, &lifecycle, move |client| {
-                    applied(client.apply(&change))
+                blocking(&source, &lifecycle, move |client, lifecycle| {
+                    applied(lifecycle, client.apply(&change))
                 })
                 .await
             }
@@ -755,7 +759,7 @@ mod driver {
             }
             Command::Unreviewed { after, limit } => {
                 let (after, limit) = (after.clone(), *limit);
-                blocking(&source, &lifecycle, move |client| {
+                blocking(&source, &lifecycle, move |client, _| {
                     match client.unreviewed(&after, limit) {
                         Ok(page) => json!({"ok": true, "page": page}),
                         Err(e) => fail("refused", &e.to_string()),
@@ -770,8 +774,8 @@ mod driver {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
-                blocking(&source, &lifecycle, move |client| {
-                    applied(client.propose(&proposal))
+                blocking(&source, &lifecycle, move |client, lifecycle| {
+                    applied(lifecycle, client.propose(&proposal))
                 })
                 .await
             }
@@ -782,14 +786,14 @@ mod driver {
                     Ok(d) => d,
                     Err(e) => return e,
                 };
-                blocking(&source, &lifecycle, move |client| {
-                    applied(client.decide(&decision))
+                blocking(&source, &lifecycle, move |client, lifecycle| {
+                    applied(lifecycle, client.decide(&decision))
                 })
                 .await
             }
             Command::Proposal { proposal_id } => {
                 let id = proposal_id.clone();
-                blocking(&source, &lifecycle, move |client| {
+                blocking(&source, &lifecycle, move |client, _| {
                     match client.proposal(&id) {
                         Ok(rows) => json!({"ok": true, "revisions": rows}),
                         Err(e) => fail("refused", &e.to_string()),
@@ -805,14 +809,14 @@ mod driver {
                     Ok(t) => t,
                     Err(r) => return fail(r.code(), "target"),
                 };
-                blocking(&source, &lifecycle, move |client| {
-                    applied(client.acknowledge(&target))
+                blocking(&source, &lifecycle, move |client, lifecycle| {
+                    applied(lifecycle, client.acknowledge(&target))
                 })
                 .await
             }
             Command::PreviewReversal { event_id } => {
                 let id = event_id.clone();
-                blocking(&source, &lifecycle, move |client| {
+                blocking(&source, &lifecycle, move |client, _| {
                     match client.preview_reversal(&id) {
                         Ok(preview) => json!({"ok": true, "preview": preview}),
                         Err(e) => fail("refused", &e.to_string()),
@@ -826,7 +830,7 @@ mod driver {
             } => {
                 let id = event_id.clone();
                 let approval_id = approval_id.clone();
-                blocking(&source, &lifecycle, move |client| {
+                blocking(&source, &lifecycle, move |client, lifecycle| {
                     let preview = match client.preview_reversal(&id) {
                         Ok(p) => p,
                         Err(e) => return fail("refused", &e.to_string()),
@@ -838,7 +842,7 @@ mod driver {
                     };
                     match preview.plan.as_ref().filter(|_| ready) {
                         Some(plan) => match Reverse::of(plan, approval_id, None) {
-                            Ok(reverse) => applied(client.reverse(&reverse)),
+                            Ok(reverse) => applied(lifecycle, client.reverse(&reverse)),
                             Err(r) => fail(r.code(), "reverse"),
                         },
                         None if preview.outcome == PreviewOutcome::ApprovalRequired => {
