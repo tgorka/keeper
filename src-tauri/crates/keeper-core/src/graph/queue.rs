@@ -401,6 +401,30 @@ pub fn next(from: State, outcome: &GraphOutcome) -> Next {
     }
 }
 
+/// Whether a resume sends the identical request of an entry that was in
+/// `from`, whose receipt lookup answered `looked` and which [`next`] left
+/// in `settled`: only when nothing is known of it (no receipt, or a lookup
+/// the transport lost) and it is still a person's to send, queued or
+/// already submitting under its own id. Never after `outcome_unresolved`
+/// or for an entry in [`State::Unresolved`] (only `graph.outcome` settles
+/// those), never on `graph_unavailable` (it waits its back-off, which a
+/// resume does not keep), and never an agent's request that may have been
+/// sent (it is sent once, on its approval). `agent`: the request names an
+/// agent context.
+#[must_use]
+pub fn resume_sends(from: State, looked: &GraphOutcome, settled: State, agent: bool) -> bool {
+    let unknown = matches!(
+        next(from, looked),
+        Next::Lookup | Next::Retry(PendingCause::Transport)
+    );
+    unknown
+        && match settled {
+            State::Queued => true,
+            State::Submitting => !agent,
+            _ => false,
+        }
+}
+
 /// The `graph_apply` call arguments that bind `prepared`: `{domain,
 /// request}`, the request as its version-1 envelope, as canonical JCS text.
 /// The queue stores these bytes and the runtime writes exactly them into
@@ -539,6 +563,56 @@ CREATE TABLE IF NOT EXISTS graph_authority(\
     observed_at INTEGER NOT NULL\
 );";
 
+/// The columns version 2 added to `graph_intents` (the agent approval
+/// binding).
+const V2_COLUMNS: [&str; 3] = ["approval_id", "tool_call_id", "bound_args"];
+
+/// Bring the file to [`SCHEMA_VERSION`] in one transaction with its
+/// version bump: an interruption leaves the file at the version it had.
+/// A column already there (a file an earlier build left half-migrated, its
+/// `ALTER`s committed one by one) is not added again.
+fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(storage)?;
+    if version > SCHEMA_VERSION {
+        return Err(QueueError::Unreadable(format!(
+            "queue schema {version} is newer than this build's {SCHEMA_VERSION}"
+        )));
+    }
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    // `CREATE … IF NOT EXISTS` leaves a table an older build made as it was,
+    // so the version 2 columns are checked whatever the version said.
+    tx.execute_batch(SCHEMA).map_err(storage)?;
+    let present = {
+        let mut statement = tx
+            .prepare("SELECT name FROM pragma_table_info('graph_intents')")
+            .map_err(storage)?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        names
+    };
+    for column in V2_COLUMNS {
+        if !present.iter().any(|name| name == column) {
+            tx.execute_batch(&format!(
+                "ALTER TABLE graph_intents ADD COLUMN {column} TEXT;"
+            ))
+            .map_err(storage)?;
+        }
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(storage)?;
+    tx.commit().map_err(storage)
+}
+
 /// The SQL list of terminal state names.
 fn terminal_names() -> String {
     STATES
@@ -558,34 +632,13 @@ impl GraphQueue {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| QueueError::Storage(e.to_string()))?;
         }
-        let conn = Connection::open(path).map_err(storage)?;
+        let mut conn = Connection::open(path).map_err(storage)?;
         conn.busy_timeout(BUSY_TIMEOUT).map_err(storage)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(storage)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(storage)?;
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(storage)?;
-        if version > SCHEMA_VERSION {
-            return Err(QueueError::Unreadable(format!(
-                "queue schema {version} is newer than this build's {SCHEMA_VERSION}"
-            )));
-        }
-        match version {
-            0 => conn.execute_batch(SCHEMA).map_err(storage)?,
-            // Version 1 had no agent approval binding.
-            1 => conn
-                .execute_batch(
-                    "ALTER TABLE graph_intents ADD COLUMN approval_id TEXT; \
-                     ALTER TABLE graph_intents ADD COLUMN tool_call_id TEXT; \
-                     ALTER TABLE graph_intents ADD COLUMN bound_args TEXT;",
-                )
-                .map_err(storage)?,
-            _ => {}
-        }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(storage)?;
+        migrate(&mut conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO graph_queue_scope(only, server, domain, actor) \
              VALUES (1, ?1, ?2, ?3)",
@@ -936,8 +989,11 @@ impl GraphQueue {
         Ok(args)
     }
 
-    /// The approval binding of `request_id`, if it is an agent's.
+    /// The approval binding of `request_id`, if it is an agent's. Refused
+    /// while fenced: a fenced queue discloses no frozen request (112.1
+    /// CC-9), whoever opens it.
     pub fn bound(&self, request_id: &str) -> Result<Option<Bound>, QueueError> {
+        self.refuse_fenced()?;
         let row: Option<(Option<String>, Option<String>, Option<String>)> = self
             .conn
             .query_row(
@@ -1320,6 +1376,21 @@ impl GraphQueue {
                  epoch = excluded.epoch, digest = excluded.digest, \
                  observed_at = excluded.observed_at",
                 params![authority.epoch, authority.digest, observed_at_ms],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Drop the kept authority observed at `observed_at_ms`, found to be
+    /// from the future: it never authorises again, across restarts, and
+    /// only the next successful online `read_status`
+    /// ([`GraphQueue::record_authority`]) keeps one again. A newer row
+    /// written meanwhile stays.
+    pub fn invalidate_authority(&self, observed_at_ms: i64) -> Result<(), QueueError> {
+        self.conn
+            .execute(
+                "DELETE FROM graph_authority WHERE only = 1 AND observed_at = ?1",
+                [observed_at_ms],
             )
             .map_err(storage)?;
         Ok(())

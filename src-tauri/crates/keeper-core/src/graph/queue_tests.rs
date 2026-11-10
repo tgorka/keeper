@@ -401,6 +401,31 @@ fn the_read_authority_row_is_replaced_whole() {
     );
 }
 
+/// Dropping a future row drops only that row: an answer kept meanwhile
+/// stays; the dropped one stays dropped across a reopen.
+#[test]
+fn invalidating_drops_only_the_row_found_in_the_future() {
+    let dir = tempfile::tempdir().expect("dir");
+    let queue = reopen(dir.path());
+    let authority = Authority {
+        epoch: "1".to_owned(),
+        digest: "a".repeat(64),
+    };
+    queue.record_authority(&authority, 500).expect("recorded");
+    queue.record_authority(&authority, 600).expect("recorded");
+    queue.invalidate_authority(500).expect("no-op");
+    assert_eq!(
+        queue
+            .authority()
+            .expect("row")
+            .map(|row| row.observed_at_ms),
+        Some(600)
+    );
+    queue.invalidate_authority(600).expect("dropped");
+    drop(queue);
+    assert_eq!(reopen(dir.path()).authority().expect("row"), None);
+}
+
 /// `forget`'s log: counts by state across a server's queue files.
 #[test]
 fn counts_cover_every_queue_file_of_a_server() {
@@ -710,4 +735,118 @@ fn a_version_one_file_is_migrated_in_place() {
         }]
     );
     assert_eq!(queue.bound(&prepared.request().request_id), Ok(None));
+}
+
+/// A fenced queue discloses no frozen request: `bound` refuses, also on a
+/// file reopened after the fence was persisted (112.1 r1 BLOCKING-4).
+#[test]
+fn a_fenced_queue_never_discloses_bound_arguments() {
+    let dir = tempfile::tempdir().expect("dir");
+    let client = agent_client(dir.path());
+    let prepared = agent_minted(&client, APPROVAL);
+    let id = prepared.request().request_id.clone();
+    let mut queue = agent_queue(dir.path());
+    queue
+        .enqueue_for_approval(&prepared, APPROVAL, "row-1", 1)
+        .expect("bound");
+    queue.persist_fence(2).expect("fenced");
+    assert_eq!(queue.bound(&id), Err(QueueError::Fenced));
+    drop(queue);
+    let reopened = agent_queue(dir.path());
+    assert_eq!(reopened.bound(&id), Err(QueueError::Fenced));
+}
+
+/// A version-1 file whose migration was cut after its first `ALTER` (an
+/// earlier build committed them one by one) opens as version 2, its
+/// entries kept; a migration is one transaction with its version bump
+/// (112.1 r1 LOW-1).
+#[test]
+fn an_interrupted_migration_reopens() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (_, prepared) = queued(dir.path());
+    raw(
+        dir.path(),
+        "CREATE TABLE v1 AS SELECT request_id, server, domain, actor, client, descriptor, \
+         version, context_id, request_jcs, request_digest, state, attempts, last_cause, \
+         event_id, graph_seq, outcome_code, enqueued_at, updated_at FROM graph_intents; \
+         DROP TABLE graph_intents; ALTER TABLE v1 RENAME TO graph_intents; \
+         PRAGMA user_version = 1; \
+         ALTER TABLE graph_intents ADD COLUMN approval_id TEXT;",
+    );
+    let client = GraphClient::new(source(dir.path(), "ana", "dev1"));
+    let mut queue = reopen(dir.path());
+    assert_eq!(
+        queue.restore(&client, 7).expect("restores"),
+        vec![Restored::Ready {
+            prepared: prepared.clone(),
+            state: State::Queued
+        }]
+    );
+    assert_eq!(queue.bound(&prepared.request().request_id), Ok(None));
+    drop(queue);
+    reopen(dir.path());
+}
+
+/// A resume sends only what nothing is known of: never after
+/// `outcome_unresolved` or from `unresolved` (lookup only), never on
+/// `graph_unavailable` (its back-off), never an agent's request that may
+/// have been sent (112.1 r1 BLOCKING-3).
+#[test]
+fn a_resume_sends_only_what_nothing_is_known_of() {
+    let pending = |cause| GraphOutcome::Pending { cause };
+    let no_attempt = pending(PendingCause::NoAttempt);
+    let transport = pending(PendingCause::Transport);
+    for (from, looked, settled, agent, sends) in [
+        (State::Queued, &no_attempt, State::Queued, false, true),
+        (State::Queued, &transport, State::Queued, false, true),
+        (
+            State::Submitting,
+            &transport,
+            State::Submitting,
+            false,
+            true,
+        ),
+        (
+            State::Submitting,
+            &no_attempt,
+            State::Submitting,
+            true,
+            false,
+        ),
+        (
+            State::Unresolved,
+            &transport,
+            State::Unresolved,
+            false,
+            false,
+        ),
+        (
+            State::Unresolved,
+            &no_attempt,
+            State::Unresolved,
+            false,
+            false,
+        ),
+        (
+            State::Submitting,
+            &pending(PendingCause::Unresolved),
+            State::Unresolved,
+            false,
+            false,
+        ),
+        (
+            State::Queued,
+            &pending(PendingCause::Unavailable),
+            State::Queued,
+            false,
+            false,
+        ),
+        (State::Disabled, &no_attempt, State::Disabled, false, false),
+    ] {
+        assert_eq!(
+            resume_sends(from, looked, settled, agent),
+            sends,
+            "{from:?} {looked:?} agent {agent}"
+        );
+    }
 }

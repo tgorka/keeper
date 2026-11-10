@@ -112,6 +112,13 @@ impl Lifecycle {
         Ok(self.queue().authority()?)
     }
 
+    /// Drop the kept authority observed at `observed_at_ms`: it was found
+    /// to be from the future, and only a successful online `read_status`
+    /// keeps one again ([`GraphQueue::invalidate_authority`]).
+    pub fn invalidate_authority(&self, observed_at_ms: i64) -> Result<(), LifecycleError> {
+        Ok(self.queue().invalidate_authority(observed_at_ms)?)
+    }
+
     /// The fence's persisted state.
     pub fn fence(&self) -> Result<Option<FenceState>, LifecycleError> {
         Ok(self.queue().fence()?)

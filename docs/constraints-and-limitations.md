@@ -386,7 +386,14 @@ outcome and its typed `PendingCause`, never on text): a receipt resolves it; a t
 failure or `graph_unavailable` keeps it and retries the identical request; `outcome_unresolved`
 makes it `unresolved` (only a same-id replay or `graph.outcome`, never a new id); an ended
 agent context refuses it locally only if it was never sent, otherwise it stays `unresolved`;
-a refusal fences the domain.
+a refusal fences the domain. A resume (`queue::resume_sends`, the driver's and the live
+harness's one rule) sends only an entry nothing is known of — no receipt, or a lookup the
+transport lost — that is queued, or a person's already submitting: never after
+`outcome_unresolved` or from `unresolved` (lookup only), never on `graph_unavailable` (its
+back-off), never an agent's request that may have been sent. A fenced queue discloses no
+frozen request (`GraphQueue::bound` refuses, also after a reopen). The queue file's schema
+migration is one transaction with its version bump, and a column an older build already added
+is not added again.
 
 **What keeper does not claim.** Revocation stops this device from serving graph data from the
 moment it learns of it. It does not erase anything remotely, and it cannot recall bytes
@@ -396,18 +403,25 @@ revoke a scope, its rows stay and the fence stays `revoked` (locked).
 
 **Last-authorised offline reads (people only).** A person's query or inspect may be served
 while the server cannot be reached only when all of these hold:
-- the server's `read_status` failed because the request left the device and its transport
-  failed (`QueryError::Unreachable`). Any other failure never serves: a local refusal, a
-  closed replica, an unreadable answer, a failed task, a storage error. A refusal fences;
+- the server's `read_status` failed because the request left the device and nothing came
+  back (`QueryError::Unreachable`). This is decided at the transport while the HTTP details
+  are there: whatever the server answered is never it — a `401`/`403` is its refusal (which
+  fences), any other status, a redirect or a body over the limit is an unusable answer. Any
+  other failure never serves: a local refusal, a closed replica, an unreadable answer, a
+  failed task, a storage error. A refusal fences;
 - no fence stands;
 - the graph subscriptions are granted and the link is not refused;
 - the caller asked for it (`Freshness::AllowStale`, the driver's `--allow-stale`);
 - the generation was built under the authority the last successful online `read_status`
   answered;
 - that answer is not from the future and is at most `OFFLINE_READ_LIMIT` (24 h, inclusive)
-  old on the device's clock.
+  old on the device's clock. A kept answer found to be from the future is dropped on sight,
+  so it never authorises again when the clock catches up or after a restart: only the next
+  successful online `read_status` keeps one again.
 
-Everything is checked again at delivery against a fresh clock. The result is always
+Everything is checked again at delivery against a fresh clock, and a fence — in memory or
+persisted in the queue file by another holder — refuses at every delivery point (each
+authority answer and the result), whether or not its cleanup has run. The result is always
 `stale`. Offline, nothing builds or extends a projection. The first successful `read_status`
 after reconnecting replaces the kept authority. Agents read nothing offline: an agent's
 reader refuses whenever its context cannot be refreshed, so offline it is exposed to no

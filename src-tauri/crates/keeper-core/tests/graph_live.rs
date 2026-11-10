@@ -44,7 +44,7 @@ use keeper_core::graph::protocol::proposal::{self, Decision, Proposal, Verdict};
 use keeper_core::graph::protocol::request::Request;
 use keeper_core::graph::protocol::review::Target;
 use keeper_core::graph::protocol::wire::{self, HistoryFilter};
-use keeper_core::graph::queue::{Binding, FenceState, GraphQueue, Restored, State};
+use keeper_core::graph::queue::{resume_sends, Binding, FenceState, GraphQueue, Restored, State};
 use keeper_core::graph::source::{revocation_with, Revocation};
 use keeper_core::hq::port::{Link, ReplicaError, ReplicaSpec};
 use keeper_core::hq::server::ServerUrl;
@@ -1459,9 +1459,10 @@ fn lifecycle_at(url: &str, source: &Source) -> Lifecycle {
 }
 
 /// What the driver's `resume` does: restore every entry, look its receipt
-/// up first, and send the identical request under its own id only when
-/// none is known and the domain is not locked; every answer goes through
-/// the one policy. The states each entry ended in.
+/// up first, and send the identical request under its own id only when the
+/// one policy says nothing is known of it ([`resume_sends`]) and the domain
+/// is not locked; every answer goes through the one policy. The states each
+/// entry ended in.
 fn resume_all(lifecycle: &Lifecycle, client: &GraphClient) -> Vec<(String, State)> {
     let restored = lifecycle
         .with_queue(|q| q.restore(client, now_ms()))
@@ -1478,11 +1479,12 @@ fn resume_all(lifecycle: &Lifecycle, client: &GraphClient) -> Vec<(String, State
         };
         let id = prepared.request().request_id.clone();
         let looked = client.outcome(&prepared, None).expect("lookup");
+        let from = state;
         let state = lifecycle
-            .settle(&id, state, &looked, now_ms())
+            .settle(&id, from, &looked, now_ms())
             .expect("settled");
-        let sendable = matches!(state, State::Queued | State::Submitting | State::Unresolved)
-            && looked.pending_cause().is_some()
+        let agent = prepared.request().context_id.is_some();
+        let sendable = resume_sends(from, &looked, state, agent)
             && lifecycle.gate().is_ok()
             && client.online().is_ok();
         if !sendable {
@@ -1857,53 +1859,223 @@ fn rows_in(source: &Source, table: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// S08-AC4 (T5 revocation): phase `before` queues a change and lets the
-/// replica hold the graph; the harness then revokes the person's graph
-/// role. Phase `after` sees the revocation (no reads first): the domain is
-/// locked before anything else, the queue is disabled and discloses
-/// nothing, every subscribed graph, receipt and proposal table is purged by
-/// the server's scope revocation, and the fence records `purged`. The
-/// harness counts the person's conversation rows and attachments around it.
+/// Device `index`'s replica of `database` in file `name`, opened without a
+/// link: it reads the file as the last sync left it and sends nothing, so
+/// no scope revocation can reach it while it is open.
+fn unlinked_at(index: u8, database: &str, name: &str) -> Source {
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let client = env(&format!("KEEPER_HQ_LIVE_CLIENT_{index}"));
+    let replica = SyncularReplica::open(ReplicaSpec {
+        database: database.to_owned(),
+        path: state_dir().join(name),
+        client_id: Some(client.clone()),
+        link: None,
+        subscriptions: subscriptions(database, &actor, &client),
+        watch_presence: None,
+    })
+    .expect("opens the replica unlinked");
+    Source {
+        database: database.to_owned(),
+        replica: Arc::new(replica),
+        actor,
+        client,
+    }
+}
+
+/// S08-AC4 (T5 revocation), lock first and purge after, every table.
+///
+/// Phase `before` seeds a row in every one of the eleven subscribed
+/// tables (the nine graph tables, the receipts and the proposals) and
+/// asserts each holds one; it leaves one entry queued and one submitting.
+/// The harness then revokes the person's graph role, counting the person's
+/// conversation rows and attachments around it (the sentinels that must not
+/// change).
+///
+/// Phase `after`, the barrier: the device's file is opened unlinked, so the
+/// server's scope cleanup cannot reach it. The revocation is learned from
+/// the server (`read_status` refused, on device 2), the domain is fenced,
+/// and the fence is observed while every one of the eleven tables still
+/// holds its rows: the lock came before the purge. Both open entries are
+/// locked, the queue discloses nothing, and a restart while cleanup is
+/// incomplete starts locked and resumes. Only then is the link opened:
+/// the scope cleanup lands, every one of the eleven tables reads empty and
+/// the fence records `purged`.
 #[test]
 #[ignore = "driven by keeper-hq's native graph harness (112.1)"]
 fn graph_live_1121_a_revocation_locks_first_and_purges_every_graph_table() {
     let url = env("KEEPER_HQ_LIVE_URL");
-    let source = device(1);
-    let lifecycle = lifecycle_at(&url, &source);
-    let client = GraphClient::new(source.clone());
+    let database = env("KEEPER_HQ_LIVE_DATABASE");
+    let file = format!("{database}-1.sqlite");
     let tables = subscribed_tables();
-    let counts = |source: &Source| -> Value {
+    assert_eq!(tables.len(), 11, "nine graph tables, receipts, proposals");
+    let counts = |source: &Source| -> Map<String, Value> {
         tables
             .iter()
             .map(|t| ((*t).to_owned(), json!(rows_in(source, t))))
-            .collect::<Map<String, Value>>()
-            .into()
+            .collect()
     };
+    let every_table_holds = |source: &Source| tables.iter().all(|t| rows_in(source, t) > 0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
     match env("KEEPER_HQ_LIVE_PHASE").as_str() {
         "before" => {
-            let (_, outcome) = applied(
-                &client,
-                &source,
-                &client
-                    .change(vec![create_node(&ulid(), "Held", json!({}))], None)
-                    .expect("change"),
-            );
-            let (_, seq) = accepted(&outcome);
-            prefix_at(&source, seq);
-            let queued = client
-                .mint(
-                    &client
-                        .change(vec![create_node(&ulid(), "Pending", json!({}))], None)
-                        .expect("change"),
+            let source = device(1);
+            let lifecycle = lifecycle_at(&url, &source);
+            let client = GraphClient::new(source.clone());
+            // kg_nodes, kg_edges, kg_tags, kg_node_tags, kg_contents and,
+            // through the accepted event, kg_events, kg_event_ops, kg_head
+            // and kg_receipts.
+            let [a, b, edge, content] = std::array::from_fn(|_| ulid());
+            let seed = client
+                .change(
+                    vec![
+                        create_node(&a, "Held", json!({})),
+                        create_node(&b, "Held too", json!({})),
+                        ChangeOp::CreateEdge {
+                            id: edge,
+                            from_id: a.clone(),
+                            to_id: b,
+                            edge_type: "related_to".to_owned(),
+                            properties: Map::new(),
+                            from_lifecycle_revision: None,
+                            to_lifecycle_revision: None,
+                        },
+                        ChangeOp::AddTag {
+                            node_id: a.clone(),
+                            tag: "Held".to_owned(),
+                            expected_revision: None,
+                        },
+                        ChangeOp::CreateContent {
+                            id: content,
+                            owner_node_id: a,
+                            body: json!({"inline_text": "held"}),
+                        },
+                    ],
+                    None,
                 )
-                .expect("minted");
+                .expect("change");
+            let (_, seq) = accepted(&applied(&client, &source, &seed).1);
+            prefix_at(&source, seq);
+            // kg_proposals: the proposer's own replica holds its proposal.
+            let reviewer_actor = env("KEEPER_HQ_LIVE_REVIEWER_ACTOR");
+            let proposal = Proposal::new(
+                ulid(),
+                None,
+                client
+                    .change(vec![create_node(&ulid(), "Proposed", json!({}))], None)
+                    .expect("change"),
+                vec![reviewer_actor],
+                None,
+            )
+            .expect("proposal");
+            let (_, proposed) = commanded(&client, &source, client.propose(&proposal));
+            assert!(
+                matches!(proposed, GraphOutcome::Proposed { .. }),
+                "{proposed:?}"
+            );
+            // kg_reviews: the reviewer acknowledges the seeded agent event
+            // (a second acknowledgement is refused; the first one's row
+            // stands either way).
+            let review = reviewer();
+            let checker = GraphClient::new(review.clone());
+            let agent_event = env("KEEPER_HQ_LIVE_AGENT_EVENT");
+            let prefix = prefix_at(&review, prefix::complete(&review).expect("prefix").n);
+            let target =
+                Target::new(&agent_event, &digest_of(&prefix, &agent_event)).expect("target");
+            let (_, acknowledged) = commanded(&checker, &review, checker.acknowledge(&target));
+            assert!(
+                matches!(acknowledged, GraphOutcome::Accepted { .. })
+                    || rejected_reason(&acknowledged) == Some("invalid_change"),
+                "{acknowledged:?}"
+            );
+            close(review);
+            until(&source, "a row in every subscribed table", || {
+                every_table_holds(&source).then_some(())
+            });
+            // One entry queued, one submitting: both open when the
+            // revocation lands.
+            let mint = |title: &str| {
+                client
+                    .mint(
+                        &client
+                            .change(vec![create_node(&ulid(), title, json!({}))], None)
+                            .expect("change"),
+                    )
+                    .expect("minted")
+            };
+            let (queued, submitting) = (mint("Pending"), mint("Submitting"));
             lifecycle
-                .with_queue(|q| q.enqueue(&queued, now_ms()))
+                .with_queue(|q| {
+                    q.enqueue(&queued, now_ms())?;
+                    q.enqueue(&submitting, now_ms())?;
+                    q.mark(
+                        &submitting.request().request_id,
+                        State::Queued,
+                        State::Submitting,
+                        Some("sent"),
+                        now_ms(),
+                    )
+                })
                 .expect("queued");
-            assert!(rows_in(&source, "kg_events") > 0);
             report("1121-before-revocation", &json!({"rows": counts(&source)}));
+            close(source);
         }
         "after" => {
+            // The barrier: the scope cleanup cannot reach this file.
+            let held = unlinked_at(1, &database, &file);
+            assert!(
+                every_table_holds(&held),
+                "the cleanup reached the file before the barrier: {:?}",
+                counts(&held)
+            );
+            let lifecycle = lifecycle_at(&url, &held);
+            assert!(!lifecycle.is_locked());
+            // The revocation, learned from the server.
+            let probe = open_at(2, &database, &url, &format!("{database}-1121-probe.sqlite"));
+            until(&probe, "the server's refusal", || {
+                match keeper_core::graph::query::GraphRemote::read_status(&probe, &database) {
+                    Err(keeper_core::graph::query::QueryError::Forbidden) => Some(()),
+                    _ => None,
+                }
+            });
+            close(probe);
+            runtime
+                .block_on(lifecycle.revoke(None, now_ms()))
+                .expect("fenced");
+            // Locked, with every table's rows still on this device: the
+            // fence came first.
+            assert!(lifecycle.is_locked());
+            assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+            let still_held = counts(&held);
+            assert!(
+                every_table_holds(&held),
+                "locked before the purge: {still_held:?}"
+            );
+            assert!(lifecycle.gate().is_err());
+            assert!(
+                lifecycle.with_queue(|q| q.entries()).is_err(),
+                "no queue detail"
+            );
+            assert_eq!(
+                lifecycle.counts().expect("counts").get(&State::Disabled),
+                Some(&2),
+                "the queued and the submitting entry are both locked"
+            );
+            // A restart while the cleanup is incomplete (the queue file
+            // reopened) starts locked and resumes it.
+            drop(lifecycle);
+            let lifecycle = lifecycle_at(&url, &held);
+            assert!(lifecycle.is_locked());
+            assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+            runtime
+                .block_on(lifecycle.resume(None, now_ms()))
+                .expect("resumed");
+            assert!(every_table_holds(&held), "still before the purge");
+            close(held);
+            // Now the link opens and the server's scope cleanup lands.
+            let source = device(1);
             let query = |sql: &str, params: &[Value]| Ok(source.replica.query(sql, params)?);
             let revocation =
                 until(
@@ -1914,38 +2086,21 @@ fn graph_live_1121_a_revocation_locks_first_and_purges_every_graph_table() {
                         _ => None,
                     },
                 );
-            // Lock first: no read, receipt or queue detail after this line.
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime")
-                .block_on(lifecycle.revoke(None, now_ms()))
-                .expect("fenced");
-            assert!(lifecycle.gate().is_err());
-            assert!(
-                lifecycle.with_queue(|q| q.entries()).is_err(),
-                "no queue detail"
-            );
-            assert_eq!(
-                lifecycle.counts().expect("counts").get(&State::Disabled),
-                Some(&1)
-            );
             assert!(lifecycle
                 .observe_purge(revocation, now_ms())
                 .expect("observed"));
+            assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Purged)));
             for table in &tables {
                 assert_eq!(rows_in(&source, table), 0, "{table} purged");
             }
-            // A restart starts locked.
-            drop(lifecycle);
-            assert!(lifecycle_at(&url, &source).is_locked());
+            assert!(lifecycle.is_locked(), "purged stays locked");
             report(
                 "1121-after-revocation",
-                &json!({"rows": counts(&source),
-                                                   "fence": "purged", "disabled": 1}),
+                &json!({"locked_with_rows": still_held, "rows": counts(&source),
+                        "fence": "purged", "disabled": 2}),
             );
+            close(source);
         }
         phase => panic!("unknown phase {phase}"),
     }
-    close(source);
 }

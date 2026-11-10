@@ -1960,4 +1960,145 @@ mod offline {
         // Refused before the server is even asked.
         assert_eq!(o.person.asked.load(Ordering::SeqCst), asked);
     }
+
+    /// A kept authority found to be from the future is dropped on sight:
+    /// the clock catching up does not make it trusted again, a restart does
+    /// not bring it back, and only a successful online `read_status` keeps
+    /// one again (112.1 r1 BLOCKING-5).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_future_authority_stays_untrusted_until_the_server_answers() {
+        let o = Offline::new().await;
+        o.at(T0 - 1, 0);
+        assert!(o.query(Freshness::AllowStale).await.is_err());
+        assert_eq!(o.lifecycle.authority(), Ok(None), "dropped, durably");
+        o.at(T0 + 1, 0);
+        assert!(
+            o.query(Freshness::AllowStale).await.is_err(),
+            "the clock caught up; the server was not asked successfully"
+        );
+        // Online again: kept anew, and offline reads serve from it.
+        o.script(vec![Step::Answer, Step::Answer]);
+        assert_eq!(o.query(Freshness::Current).await, Ok(Completeness::Current));
+        assert_eq!(
+            o.lifecycle
+                .authority()
+                .map(|row| row.map(|r| r.observed_at_ms)),
+            Ok(Some(T0 + 1))
+        );
+        o.at(T0 + 2, 0);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Ok(Completeness::Stale)
+        );
+    }
+
+    /// A clock that locks the domain on its `nth` reading, as a revocation
+    /// learned elsewhere (a send, a receipt) would while a read is running.
+    fn locking_at(o: &mut Offline, nth: u32) {
+        let lifecycle = o.lifecycle.clone();
+        let clock = o.clock.clone();
+        let calls = AtomicU32::new(0);
+        let placeholder = o
+            ._rig
+            .reads
+            .human_with(&o._rig.world.source, o.person.clone());
+        let reader = std::mem::replace(&mut o.reader, placeholder);
+        o.reader = reader.with_clock(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == nth {
+                lifecycle.lock(T0 + 1).expect("locked");
+            }
+            clock.load(Ordering::SeqCst)
+        }));
+    }
+
+    /// A fence that stands up after admission, while the delivery authority
+    /// is asked, refuses the result — online or offline at admission, online
+    /// or offline at delivery, query and inspect — though the fence's
+    /// cleanup has not run (112.1 r1 BLOCKING-2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lock_during_delivery_refuses_the_result() {
+        let online = Step::Answer;
+        let offline = Step::Fail(QueryError::Unreachable);
+        for (case, steps, freshness) in [
+            (
+                "online, online",
+                [online.clone(), online.clone()],
+                Freshness::Current,
+            ),
+            (
+                "offline, online",
+                [offline.clone(), online.clone()],
+                Freshness::AllowStale,
+            ),
+            (
+                "offline, offline",
+                [offline.clone(), offline],
+                Freshness::AllowStale,
+            ),
+        ] {
+            for inspect in [false, true] {
+                let mut o = Offline::new().await;
+                o.at(T0 + 60_000, 0);
+                // The clock is read once at admission (keeping an online
+                // authority, or checking the kept one) and once at delivery.
+                locking_at(&mut o, 1);
+                o.script(steps.to_vec());
+                let result = if inspect {
+                    o.reader
+                        .inspect(
+                            InspectEntity::Node,
+                            &ulid(1),
+                            false,
+                            freshness,
+                            &Cancellation::default(),
+                        )
+                        .await
+                        .map(|r| r.completeness)
+                } else {
+                    o.query(freshness).await
+                };
+                assert!(o.lifecycle.is_locked(), "{case}: the lock landed");
+                assert_eq!(
+                    result,
+                    Err(QueryError::Forbidden),
+                    "{case}, inspect {inspect}"
+                );
+            }
+        }
+    }
+
+    /// A refresh whose authority answer lands as the domain locks reports
+    /// a refusal, never a built projection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lock_during_refresh_refuses_it() {
+        let mut o = Offline::new().await;
+        *o.person.then.lock().expect("then") = Step::Answer;
+        locking_at(&mut o, 0);
+        let refreshed = o.reader.refresh(&Cancellation::default()).await;
+        assert!(o.lifecycle.is_locked());
+        assert_eq!(refreshed.err(), Some(QueryError::Forbidden));
+    }
+
+    /// A fence another holder of the queue file persisted refuses this
+    /// reader, though its own lifecycle never saw the lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fence_persisted_by_another_holder_refuses() {
+        let o = Offline::new().await;
+        let other = GraphQueue::open(
+            &o._dir.path().join("ana.graph-queue"),
+            Binding {
+                server: "https://hq.example".to_owned(),
+                domain: DB.to_owned(),
+                actor: "ana".to_owned(),
+                client: "dev1".to_owned(),
+            },
+        )
+        .expect("queue");
+        other.persist_fence(T0 + 1).expect("fenced");
+        assert!(!o.lifecycle.is_locked());
+        assert_eq!(
+            o.query(Freshness::Current).await,
+            Err(QueryError::Forbidden)
+        );
+    }
 }

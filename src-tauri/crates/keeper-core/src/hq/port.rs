@@ -297,12 +297,14 @@ pub enum ReplicaError {
     #[error("{code}: {message}")]
     Rejected { code: String, message: String },
     /// A command or query was sent and no answer keeper can trust came back
-    /// — the connection failed, or (a command's) answer could not be read —
-    /// so whether the server made a command is not known. Asking again under
+    /// — the connection failed, or (a command's) answer said nothing about
+    /// the command (unreadable, another HTTP status, a redirect) — so
+    /// whether the server made a command is not known. Asking again under
     /// the same request id answers it (the server replays a request it
     /// applied). For a query it is the only failure that means the server
-    /// could not be reached: a query answer that came back unreadable is
-    /// [`ReplicaError::Client`]. `retryable` is
+    /// could not be reached, and only when nothing came back: whatever the
+    /// server answered (`401`/`403` is [`ReplicaError::Remote`]; anything
+    /// else unusable is [`ReplicaError::Client`]) is never it. `retryable` is
     /// only the client's word on asking again now: `false` (an answer keeper
     /// could not read) means something must change first, never that the
     /// command was refused.

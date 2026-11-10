@@ -942,7 +942,8 @@ impl AgentReader {
 pub const OFFLINE_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 #[cfg(feature = "human-reads")]
-const OFFLINE_READ_LIMIT_MS: i64 = 24 * 60 * 60 * 1000;
+#[allow(clippy::cast_possible_truncation)] // one day in ms fits an i64
+const OFFLINE_READ_LIMIT_MS: i64 = OFFLINE_READ_LIMIT.as_millis() as i64;
 
 /// Whether a row observed at `observed_at_ms` may serve at `now_ms`: not
 /// from the future (a clock set back after it was written refuses), and at
@@ -1068,19 +1069,22 @@ impl HumanReader {
     /// (offline). At admission (`admitted_offline: None`) an unreachable
     /// server may fall back to the kept authority; at delivery only a read
     /// admitted offline may, and a server that answers takes the normal
-    /// comparison.
+    /// comparison. A fence that stood up while the server was asked
+    /// refuses, whatever it answered.
     async fn authority(
         &self,
         freshness: Freshness,
         admitted_offline: Option<bool>,
     ) -> Result<(Authority, bool), QueryError> {
-        match self.fresh().await {
+        let authority = match self.fresh().await {
             Ok(authority) => Ok((authority, false)),
             Err(QueryError::Unreachable) if admitted_offline != Some(false) => {
                 self.offline(freshness).map(|authority| (authority, true))
             }
             Err(error) => Err(error),
-        }
+        };
+        self.deliverable()?;
+        authority
     }
 
     /// The kept authority, when every offline condition holds; otherwise
@@ -1104,25 +1108,57 @@ impl HumanReader {
             return refused;
         }
         match lifecycle.authority() {
-            Ok(Some(row)) if within_offline_limit(row.observed_at_ms, (self.clock)()) => {
-                Ok(row.authority)
+            Ok(Some(row)) => {
+                let now = (self.clock)();
+                // A row from the future (the clock was set back after it was
+                // kept) is dropped on sight, so that the clock catching up
+                // never makes it trusted again: only a successful online
+                // `read_status` keeps one again.
+                if row.observed_at_ms > now {
+                    if let Err(error) = lifecycle.invalidate_authority(row.observed_at_ms) {
+                        tracing::warn!(%error, "graph: a future read authority could not be dropped");
+                    }
+                    return refused;
+                }
+                if within_offline_limit(row.observed_at_ms, now) {
+                    Ok(row.authority)
+                } else {
+                    refused
+                }
             }
             _ => refused,
         }
     }
 
+    /// Whether a fence stands, held in memory or persisted in the queue file
+    /// (another holder of the file may have written it).
+    fn fenced(&self) -> bool {
+        self.lifecycle.as_ref().is_some_and(|lifecycle| {
+            lifecycle.is_locked() || !matches!(lifecycle.fence(), Ok(None))
+        })
+    }
+
+    /// A delivery point (each answer a read is delivered under, and its
+    /// result): a fence that stood up meanwhile refuses the result and
+    /// cancels the reader's work in flight, whether or not the fence's
+    /// cleanup has run (112.1 r1 BLOCKING-2).
+    fn deliverable(&self) -> Result<(), QueryError> {
+        if self.fenced() {
+            self.invalidated.cancel();
+            return Err(QueryError::Forbidden);
+        }
+        Ok(())
+    }
+
     /// Before any read: a reader invalidated or a domain fenced refuses; a
     /// refused link fences the domain.
     async fn check(&self) -> Result<(), QueryError> {
-        if self.invalidated.is_cancelled() {
+        if self.invalidated.is_cancelled() || self.fenced() {
             return Err(QueryError::Forbidden);
         }
-        if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.gate()?;
-            if self.link_refused() {
-                self.fence().await;
-                return Err(QueryError::Forbidden);
-            }
+        if self.lifecycle.is_some() && self.link_refused() {
+            self.fence().await;
+            return Err(QueryError::Forbidden);
         }
         Ok(())
     }
@@ -1175,7 +1211,9 @@ impl HumanReader {
                 .reads
                 .refresh(&authority, cancel, &self.invalidated)
                 .await;
-            self.reads.settle(result).await
+            let result = self.reads.settle(result).await;
+            self.deliverable()?;
+            result
         }
         .await;
         self.end(invalidate_on_refusal(&self.invalidated, result))
@@ -1217,7 +1255,10 @@ impl HumanReader {
             )
             .await;
         let result = self.reads.settle(result).await;
-        let result = Self::offline_result(offline, result);
+        let result = Self::offline_result(offline, result).and_then(|result| {
+            self.deliverable()?;
+            Ok(result)
+        });
         self.end(invalidate_on_refusal(&self.invalidated, result))
             .await
     }
@@ -1259,7 +1300,10 @@ impl HumanReader {
             )
             .await;
         let result = self.reads.settle(result).await;
-        let result = Self::offline_result(offline, result);
+        let result = Self::offline_result(offline, result).and_then(|result| {
+            self.deliverable()?;
+            Ok(result)
+        });
         self.end(invalidate_on_refusal(&self.invalidated, result))
             .await
     }

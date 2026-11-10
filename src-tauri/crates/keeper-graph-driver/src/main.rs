@@ -73,7 +73,7 @@ mod driver {
     use keeper_core::graph::query::{
         Freshness, GraphReads, GraphRemote, HumanReader, Inspected, QueryError, QueryResult,
     };
-    use keeper_core::graph::queue::{Binding, GraphQueue, Restored, State};
+    use keeper_core::graph::queue::{resume_sends, Binding, GraphQueue, Restored, State};
     use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
     use keeper_core::graph::source::{revocation_with, GraphSource, Revocation, ScopeState};
     use keeper_core::graph::supervisor::Cancellation;
@@ -469,8 +469,10 @@ mod driver {
     }
 
     /// Resolve or send one restored entry: its receipt first, the
-    /// identical request under its own id only when there is none and the
-    /// domain is not locked. Every answer goes through the one policy
+    /// identical request under its own id only when the one policy says
+    /// nothing is known of it ([`resume_sends`]: never after
+    /// `outcome_unresolved`, never on `graph_unavailable`) and the domain is
+    /// not locked. Every answer goes through the one policy
     /// ([`Lifecycle::settle`]): a revoking one fences the domain before the answer.
     fn resume_one(
         lifecycle: &Lifecycle,
@@ -487,14 +489,14 @@ mod driver {
             Ok(outcome) => outcome,
             Err(error) => return entry(&id, state, None, Some(&error.to_string())),
         };
-        let state = match lifecycle.settle(&id, state, &looked, now_ms()) {
+        let from = state;
+        let state = match lifecycle.settle(&id, from, &looked, now_ms()) {
             Ok(state) => state,
-            Err(error) => return entry(&id, state, None, Some(&error.to_string())),
+            Err(error) => return entry(&id, from, None, Some(&error.to_string())),
         };
         let cause = looked.pending_cause();
-        if !matches!(state, State::Queued | State::Submitting | State::Unresolved)
-            || looked.pending_cause().is_none()
-        {
+        let agent = prepared.request().context_id.is_some();
+        if !resume_sends(from, &looked, state, agent) {
             return entry(&id, state, cause, None);
         }
         if let Err(error) = lifecycle.gate() {
@@ -915,6 +917,113 @@ mod driver {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use keeper_core::graph::write::{Caller, GraphWrite, Writer};
+        use keeper_core::hq::port::{CommandResult, ReplicaError};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// A connected server whose every answer about the request is
+        /// `outcome_unresolved`; it counts the commands sent.
+        struct Unresolved(AtomicU32);
+
+        fn unresolved() -> ReplicaError {
+            ReplicaError::Remote {
+                code: "operation.forbidden".into(),
+                message: "outcome_unresolved".into(),
+                retryable: false,
+            }
+        }
+
+        impl GraphWrite for Unresolved {
+            fn command(&self, _: &str, _: &str, _: Value) -> Result<CommandResult, ReplicaError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(unresolved())
+            }
+            fn receipt(
+                &self,
+                _: &str,
+            ) -> Result<Vec<serde_json::Map<String, Value>>, ReplicaError> {
+                Ok(vec![])
+            }
+            fn remote_query(
+                &self,
+                _: &str,
+                _: Value,
+            ) -> Result<Vec<serde_json::Map<String, Value>>, ReplicaError> {
+                Err(unresolved())
+            }
+            fn link(&self) -> LinkState {
+                LinkState::Connected
+            }
+        }
+
+        /// An entry the server cannot resolve is looked up, never sent
+        /// again, whether it was submitting or already unresolved
+        /// (112.1 r1 BLOCKING-3).
+        #[test]
+        fn resume_never_sends_what_the_server_cannot_resolve() {
+            for (n, from) in [State::Submitting, State::Unresolved]
+                .into_iter()
+                .enumerate()
+            {
+                let port = Arc::new(Unresolved(AtomicU32::new(0)));
+                let client = GraphClient::over(
+                    port.clone(),
+                    &Writer {
+                        domain: "work".into(),
+                        actor: "ana".into(),
+                        client: "dev1".into(),
+                    },
+                    Caller::Person,
+                );
+                let change = client
+                    .change(
+                        vec![change::ChangeOp::CreateNode {
+                            id: "01JF0000000000000000000001".into(),
+                            kind: "Concept".into(),
+                            title: "resume".into(),
+                            description: None,
+                            properties: serde_json::Map::new(),
+                        }],
+                        None,
+                    )
+                    .expect("change");
+                let prepared = client.mint(&change).expect("prepared");
+                let dir = std::env::temp_dir()
+                    .join(format!("kg1-driver-resume-{}-{n}", std::process::id()));
+                let mut queue = GraphQueue::open(
+                    &dir.join("queue"),
+                    Binding {
+                        server: "https://hq.example".into(),
+                        domain: "work".into(),
+                        actor: "ana".into(),
+                        client: "dev1".into(),
+                    },
+                )
+                .expect("queue");
+                let id = prepared.request().request_id.clone();
+                queue.enqueue(&prepared, 1).expect("enqueue");
+                queue
+                    .mark(&id, State::Queued, State::Submitting, None, 2)
+                    .expect("sent");
+                if from == State::Unresolved {
+                    queue
+                        .mark(&id, State::Submitting, State::Unresolved, None, 3)
+                        .expect("unresolved");
+                }
+                let lifecycle = Lifecycle::open(queue).expect("lifecycle");
+                let result = resume_one(&lifecycle, &client, &prepared, from);
+                let sends = port.0.load(Ordering::SeqCst);
+                drop(lifecycle);
+                std::fs::remove_dir_all(&dir).expect("cleanup");
+                assert_eq!(sends, 0, "{from:?}: {result}");
+                assert_eq!(result["state"], json!("unresolved"), "{from:?}");
+            }
         }
     }
 }
