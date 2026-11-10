@@ -858,7 +858,7 @@ impl GraphQueue {
         {
             return Check::Differs;
         }
-        let Ok(prepared) = client.prepared(request) else {
+        let Ok(prepared) = client.prepared(&row.descriptor, request) else {
             return Check::Differs;
         };
         let key = prepared.key();
