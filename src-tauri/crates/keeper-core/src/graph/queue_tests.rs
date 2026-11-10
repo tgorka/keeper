@@ -660,6 +660,32 @@ fn a_persons_entries_survive_an_agent_restart() {
     assert_eq!(payload(dir.path(), &prepared.request().request_id), None);
 }
 
+/// An entry that may have been sent (`submitting`, `pending_visibility`,
+/// `unresolved`) is never refused on this device, whatever ended its
+/// context; it stays where it is.
+#[test]
+fn an_entry_that_may_have_been_sent_is_never_refused_locally() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (_, prepared) = queued(dir.path());
+    let id = prepared.request().request_id.clone();
+    let mut queue = reopen(dir.path());
+    for (from, to) in [
+        (State::Queued, State::Submitting),
+        (State::Submitting, State::PendingVisibility),
+        (State::PendingVisibility, State::Unresolved),
+    ] {
+        queue.mark(&id, from, to, None, 2).expect("moved");
+        assert!(
+            matches!(
+                queue.refuse_locally(&id, "context_ended", 3),
+                Err(QueueError::Transition { .. })
+            ),
+            "{to:?}"
+        );
+        assert_eq!(state_of(dir.path(), &id), to.as_str());
+    }
+}
+
 /// A version-1 file (before the approval binding) opens as version 2 with
 /// its entries kept.
 #[test]
