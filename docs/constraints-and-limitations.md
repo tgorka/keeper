@@ -358,26 +358,41 @@ identity is not the opened one (another server, account, device or domain) is `s
 and never sent. A terminal outcome is persisted first, and the payload is deleted after;
 terminal records stay until acknowledged or until the server is forgotten. `forget` deletes
 the queue files with the server's replicas and logs how many entries in each state it
-dropped. Agent writes are online-only: keeper keeps no offline agent queue.
+dropped. Agents keep no offline queue: an agent's `graph_apply` entry is bound to its approval
+(`awaiting_approval`), sent only after a person approves and the call's frozen arguments
+match the stored request, and after an agent runtime restart an entry never sent is
+`refused_locally` while one that may have been sent stays `unresolved` until `graph.outcome`
+answers.
 
-**Revocation locks first and cleans up after.** On a revocation signal (a refused link, a
-revoked graph subscription, or the server's refusal of a read), the domain is fenced: the
-in-memory gate closes, a `graph_fence` row is committed in the queue file, every open entry
-becomes `disabled` (identity and payload kept, never sent again), and in-flight workers are
-killed and the projection purged. Reads, results, receipts, history and the queue listing
-refuse from the first step; a crash at any step restarts locked. The replica's own graph rows
-are purged only by the server's scope revocation, which the Syncular client applies
-atomically. keeper never deletes them itself. The fence records `purged` only once a history
-subscription reads revoked, and unlocks only after fresh authority (a successful
-`read_status`, granted subscriptions and a new projection instance). A refusal learned before
-the server's revoke frame keeps the domain locked. After a regrant a disabled entry stays
-disabled: it can be discarded or resolved by its own receipt, never resent.
+**Revocation locks first and cleans up after.** A revocation signal is a refused link, any
+revoked graph, receipt or proposal subscription, a server refusal of a read, of a command or
+of `graph.outcome`, or a `forbidden` receipt (except the refusals that end one request: an
+agent approval that does not bind, a person's change naming an approval, an ended agent
+context). On a signal the domain is fenced: the in-memory gate closes, a `graph_fence` row is
+committed in the queue file, every open entry becomes `disabled` (identity and payload kept,
+never sent again), and in-flight workers are killed and the projection purged. Reads,
+results, receipts, history and the queue listing refuse from the first step; a crash at any
+step restarts locked. The replica's own graph rows are purged only by the server's scope
+revocation, which the Syncular client applies atomically. keeper never deletes them itself.
+The fence records `purged` only once every subscribed graph table (111.x's contents and
+reviews included), the receipts and the proposals read revoked, and unlocks only after fresh
+authority (a successful `read_status`, granted subscriptions and a new projection instance).
+A refusal learned before the server's revoke frame keeps the domain locked. After a regrant
+a disabled entry stays disabled: it can be discarded or resolved by its own receipt, never
+resent.
+
+**What an answer does to a queued entry** (`keeper_core::graph::queue::next`, keyed on the
+outcome and its typed `PendingCause`, never on text): a receipt resolves it; a transport
+failure or `graph_unavailable` keeps it and retries the identical request; `outcome_unresolved`
+makes it `unresolved` (only a same-id replay or `graph.outcome`, never a new id); an ended
+agent context refuses it locally only if it was never sent, otherwise it stays `unresolved`;
+a refusal fences the domain.
 
 **What keeper does not claim.** Revocation stops this device from serving graph data from the
 moment it learns of it. It does not erase anything remotely, and it cannot recall bytes
 already delivered to a reader. Until the device learns of a revocation, a person may read
-what was last authorised (below). The purge of the receipts table and of tables added after
-110.5 is not yet observed by the fence; it depends on the server revoking those scopes too.
+what was last authorised (below). The replica purge is the server's: if the server does not
+revoke a scope, its rows stay and the fence stays `revoked` (locked).
 
 **Last-authorised offline reads (people only).** A person's query or inspect may be served
 while the server cannot be reached only when all of these hold:
