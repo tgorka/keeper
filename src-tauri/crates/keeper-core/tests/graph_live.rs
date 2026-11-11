@@ -4289,7 +4289,14 @@ fn graph_live_1121_a_result_cache_miss_resolves_from_the_receipt() {
         lifecycle
             .with_queue(|q| q.retry(&id, "resent_same_id", now_ms()))
             .expect("resent");
-        let replay = relay.send(&prepared).expect("sent again");
+        // The lossy replica opened just now and may not be online yet (R3-1).
+        // `Offline` means nothing left this device (no link, or a closed
+        // gate), so waiting it out and sending again cannot send twice.
+        let replay = until(&lossy, "the relay online", || match relay.send(&prepared) {
+            Err(GraphClientError::Offline) => None,
+            other => Some(other),
+        })
+        .expect("sent again");
         assert!(
             matches!(replay.result(), Err(ReplicaError::Unheard { .. })),
             "the cached answer was not lost: {:?}",
