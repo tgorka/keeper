@@ -23,7 +23,8 @@ cap = { version = "=0.1.2", features = ["stats"] }
 nix = { version = "=0.31.3", default-features = false, features = ["resource"] }
 # `thread`, `stdio`: the execution-class self-check reads `no_new_privs` (prctl)
 # and writes its fixed refusal label without allocating (OD-A delta §4.4 step 8).
-rustix = { version = "=1.1.4", features = ["process", "fs", "thread", "stdio"] }
+# 1.1.6: RUSTSEC-2026-0486 (xattr; not reached here) is fixed from 1.1.6.
+rustix = { version = "=1.1.6", features = ["process", "fs", "thread", "stdio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"

@@ -88,6 +88,21 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   publisher is a residual risk, not a claim that the dependency is fixed.
   Follow-up: upgrade `tauri-plugin-updater` when it supports `zip >=9`, then upgrade
   keeper's direct ZIP dependency and remove all three waivers.
+- **ZIP / RUSTSEC-2026-0429** (waived 2026-11-11, **expires 2026-12-31**, owner decision
+  2026-11-11): `keeper -> tauri-plugin-updater 2.10.1 -> zip ^4` (the newest published
+  updater, 3.0.0-alpha.3, still requires `zip ^4`); the fix is only in `zip >=9`. The
+  affected `ZipArchive::extract` symlink path is the same exposure as above: the document
+  reader never extracts, and the updater extracts on Windows only, minisign-verified
+  releases only. Follow-up: the same updater upgrade to `zip >=9`, then remove.
+- **SQLite / RUSTSEC-2026-0459** (waived 2026-11-11, **expires 2026-12-31**, owner decision
+  2026-11-11): `matrix-sdk-sqlite 0.19.1 -> rusqlite ^0.40.2 -> libsqlite3-sys ^0.38`.
+  `libsqlite3-sys` is `links = "sqlite3"`, so the whole graph (keeper-core, keeper-sync,
+  syncular-client, the graph worker) shares that one version; the fix needs
+  `libsqlite3-sys >=0.39`, i.e. `rusqlite >=0.41`. The exposure is a crafted database plus
+  `-wal` pair with mismatched page sizes opened locally. Bump trigger: matrix-rust-sdk main
+  `18757f7e08` (2026-11-09) moved to `rusqlite 0.41.1` but is not yet released. Follow-up:
+  bump `rusqlite`, `libsqlite3-sys` and keeper-graph-query's exact `=0.38.2` pin once a
+  released `matrix-sdk-sqlite` allows it, then remove the waiver.
 
 No unmaintained crate is replaced in this lane. Each follow-up upgrades or replaces
 the dependency that owns it, rather than substituting an incompatible transitive crate:
