@@ -1609,6 +1609,38 @@ fn edge_between(id: &str, from: &str, to: &str) -> ChangeOp {
     }
 }
 
+/// `op`, an edge creation, with each endpoint's lifecycle revision as
+/// `prefix` holds it: the contract lets it be null only for a node the
+/// same change creates (one `prefix` does not hold).
+fn on_existing(prefix: &Prefix, op: ChangeOp) -> ChangeOp {
+    let lifecycle_of = |id: &str| {
+        prefix
+            .state
+            .get(&("node".to_owned(), id.to_owned()))
+            .map(|node| text(node, "lifecycle_revision"))
+    };
+    match op {
+        ChangeOp::CreateEdge {
+            id,
+            from_id,
+            to_id,
+            edge_type,
+            properties,
+            from_lifecycle_revision,
+            to_lifecycle_revision,
+        } => ChangeOp::CreateEdge {
+            from_lifecycle_revision: from_lifecycle_revision.or_else(|| lifecycle_of(&from_id)),
+            to_lifecycle_revision: to_lifecycle_revision.or_else(|| lifecycle_of(&to_id)),
+            id,
+            from_id,
+            to_id,
+            edge_type,
+            properties,
+        },
+        other => other,
+    }
+}
+
 fn describe(id: &str, expected: &str, description: &str) -> ChangeOp {
     ChangeOp::UpdateNode {
         id: id.to_owned(),
@@ -1813,18 +1845,65 @@ fn held_with(sources: &[&Source], event_id: &str) -> Vec<Held> {
         .collect()
 }
 
-/// After a refusal: each of `sources` (pulled again) still holds exactly
-/// what it held `before`. Reported as `case`, with `reads`, the native
-/// reads the harness compares with the server's rows.
-fn unchanged(case: &str, sources: &[&Source], before: &[Held], reads: &Value) {
+/// A pull barrier after a command: a new event written now (a plain
+/// `Barrier` node, by `sources[0]`'s person) and each of `sources` waited
+/// on until its complete prefix holds it. The server orders its commits, so
+/// a replica whose complete prefix holds the barrier has completed a pull
+/// that started after the command and covers anything the command
+/// committed. The barrier's node id, event id and position.
+fn barrier(sources: &[&Source]) -> (String, String, u64) {
+    let writer = GraphClient::new(sources[0].clone());
+    let node = ulid();
+    let (event, seq) = landed(
+        &writer,
+        sources[0],
+        vec![create_node(&node, "Barrier", json!({}))],
+    );
+    for source in sources {
+        prefix_with(source, &event);
+    }
+    (node, event, seq)
+}
+
+/// After a refusal: once a [`barrier`] written after it reached each of
+/// `sources`, each holds exactly what it held `before` plus that barrier —
+/// the barrier is the very next event (nothing landed between), every
+/// earlier event and every other entity's state is as it was, and so are
+/// the review rows. Reported as `case`, with `reads`, the native reads the
+/// harness compares with the server's rows. `before` then holds what each
+/// replica holds now, barrier included, for the next refusal.
+fn unchanged(case: &str, sources: &[&Source], before: &mut [Held], reads: &Value) {
+    let (node, event, seq) = barrier(sources);
     let replicas: Vec<Value> = sources
         .iter()
-        .zip(before)
+        .zip(before.iter_mut())
         .map(|(source, before)| {
-            source.replica.sync_now();
             let now = held(source);
-            assert!(now == *before, "{case}: a refusal changed a replica");
-            json!({"n": now.prefix.n, "head": now.prefix.head, "reviews": now.reviews})
+            assert_eq!(
+                seq,
+                before.prefix.n + 1,
+                "{case}: an event landed between the refusal and the barrier"
+            );
+            assert!(
+                now.prefix.events.get(..before.prefix.events.len())
+                    == Some(before.prefix.events.as_slice()),
+                "{case}: a refusal changed the retained events"
+            );
+            let mut state = now.prefix.state.clone();
+            state.remove(&("node".to_owned(), node.clone()));
+            assert!(
+                state == before.prefix.state,
+                "{case}: a refusal changed an entity"
+            );
+            assert_eq!(
+                now.reviews, before.reviews,
+                "{case}: a refusal changed a review"
+            );
+            let reported = json!({"n": now.prefix.n, "head": now.prefix.head,
+                   "reviews": now.reviews, "before_n": before.prefix.n,
+                   "barrier_event": event, "barrier_seq": seq.to_string()});
+            *before = now;
+            reported
         })
         .collect();
     report(case, &json!({"replicas": replicas, "reads": reads}));
@@ -1867,7 +1946,7 @@ fn conflicted(
     source: &Source,
     event_id: &str,
     sources: &[&Source],
-    before: &[Held],
+    before: &mut [Held],
     case: &str,
 ) -> Value {
     let preview = client.preview_reversal(event_id).expect("preview");
@@ -1935,7 +2014,7 @@ fn graph_live_112_native_transport_refusals() {
                 &one,
                 vec![create_node(&ulid(), "Reviewed", json!({}))],
             );
-            let before = held_with(&both, &event);
+            let mut before = held_with(&both, &event);
             let target =
                 Target::new(&event, &digest_of(&before[0].prefix, &event)).expect("target");
             let propose = |reviewer: String| {
@@ -2015,7 +2094,7 @@ fn graph_live_112_native_transport_refusals() {
             unchanged(
                 "112-forged-human-authority",
                 &both,
-                &before,
+                &mut before,
                 &json!({"client": "invalid_change", "server": forged}),
             );
 
@@ -2035,7 +2114,7 @@ fn graph_live_112_native_transport_refusals() {
             unchanged(
                 "112-editor-reviews",
                 &both,
-                &before,
+                &mut before,
                 &json!({"decide": outcome_json(&decided),
                         "acknowledge": outcome_json(&acknowledged)}),
             );
@@ -2081,7 +2160,7 @@ fn graph_live_112_native_transport_refusals() {
             unchanged(
                 "112-cross-domain-ids",
                 &both,
-                &before,
+                &mut before,
                 &json!({"acknowledge": outcome_json(&inaccessible.0),
                         "decide": outcome_json(&inaccessible.1),
                         "preview": format!("{:?}", inaccessible.2),
@@ -2116,7 +2195,7 @@ fn graph_live_112_native_transport_refusals() {
             let field = |key: &str| kept[key].as_str().expect("saved field").to_owned();
             let event = field("event");
             let target = Target::new(&event, &field("digest")).expect("target");
-            let before = held_with(&both, &event);
+            let mut before = held_with(&both, &event);
             let revoking = person("KEEPER_HQ_LIVE_REVOKED", "revoked");
             let revoked = GraphClient::new(revoking.clone());
             let (_, decided) = refused(
@@ -2147,7 +2226,7 @@ fn graph_live_112_native_transport_refusals() {
             unchanged(
                 "112-revoked-reviewer",
                 &both,
-                &before,
+                &mut before,
                 &json!({"decide": outcome_json(&decided),
                         "acknowledge": outcome_json(&acknowledged),
                         "feed": format!("{feed:?}"), "proposal_rows": format!("{rows:?}")}),
@@ -2185,6 +2264,17 @@ fn graph_live_112_x29_reversal_by_every_role() {
     match env("KEEPER_HQ_LIVE_PHASE").as_str() {
         "seed" => {
             let [a, r, s, contained] = std::array::from_fn(|_| ulid());
+            let root = env("KEEPER_HQ_LIVE_AGENT_ROOT");
+            // The root exists already: its lifecycle revision as this
+            // replica holds it.
+            let rooted = until(&one, "the agent root", || {
+                let prefix = prefix::complete(&one).expect("no corruption");
+                (prefix.is_complete()
+                    && prefix
+                        .state
+                        .contains_key(&("node".to_owned(), root.clone())))
+                .then_some(prefix)
+            });
             let (created, _) = landed(
                 &first,
                 &one,
@@ -2192,15 +2282,18 @@ fn graph_live_112_x29_reversal_by_every_role() {
                     assertion_node(&a, "Claim", Some(original)),
                     resource(&r),
                     sources(&s, &a, &r, "node", &r),
-                    ChangeOp::CreateEdge {
-                        id: contained,
-                        from_id: env("KEEPER_HQ_LIVE_AGENT_ROOT"),
-                        to_id: a.clone(),
-                        edge_type: "contains".to_owned(),
-                        properties: Map::new(),
-                        from_lifecycle_revision: None,
-                        to_lifecycle_revision: None,
-                    },
+                    on_existing(
+                        &rooted,
+                        ChangeOp::CreateEdge {
+                            id: contained,
+                            from_id: root,
+                            to_id: a.clone(),
+                            edge_type: "contains".to_owned(),
+                            properties: Map::new(),
+                            from_lifecycle_revision: None,
+                            to_lifecycle_revision: None,
+                        },
+                    ),
                 ],
             );
             let verify = verified(&second, &two, &a, &created);
@@ -2426,8 +2519,9 @@ fn graph_live_112_x29_merge_restore_with_sources() {
         ],
     );
     let verify = verified(&second, &two, &a, &created);
-    let before = held_with(&both, &verify);
-    let prefix = &before[0].prefix;
+    let mut before = held_with(&both, &verify);
+    let base = before[0].prefix.clone();
+    let prefix = &base;
     let merge = merge_of(prefix, &r2, &[&r1], &[&s]);
     let verified_revision = node_revision(prefix, &a);
 
@@ -2445,7 +2539,7 @@ fn graph_live_112_x29_merge_restore_with_sources() {
     unchanged(
         "112-x29-merge-without-a-refused",
         &both,
-        &before,
+        &mut before,
         &json!({"outcome": outcome_json(&unguarded), "node": node_at(prefix, &a)}),
     );
 
@@ -2509,7 +2603,7 @@ fn graph_live_112_x29_invalidation_then_clear() {
     let [a, r0, r1, r3, r4, s0, s1, s2, s3, c, c4] = std::array::from_fn(|_| ulid());
     // `s3` names a content of `r4`: once a merge moves its end from `r3`
     // to `r4` it resolves, so A can be verified with it.
-    landed(
+    let (setup, _) = landed(
         &first,
         &one,
         vec![
@@ -2533,7 +2627,14 @@ fn graph_live_112_x29_invalidation_then_clear() {
             sources(&s3, &a, &r3, "content", &c4),
         ],
     );
-    let (created_edge, _) = landed(&first, &one, vec![sources(&s1, &a, &r1, "node", &r1)]);
+    let (created_edge, _) = landed(
+        &first,
+        &one,
+        vec![on_existing(
+            &prefix_with(&one, &setup),
+            sources(&s1, &a, &r1, "node", &r1),
+        )],
+    );
     let prefix = prefix_with(&one, &created_edge);
     let edge = edge_image(&prefix, &s2);
     let (archived_edge, _) = landed(
@@ -2574,7 +2675,7 @@ fn graph_live_112_x29_invalidation_then_clear() {
         ("update-content", &updated_content),
     ];
 
-    let before = held_with(&both, &verify);
+    let mut before = held_with(&both, &verify);
     for (name, event) in targets {
         let preview = second.preview_reversal(event).expect("preview");
         assert_eq!(
@@ -2590,12 +2691,13 @@ fn graph_live_112_x29_invalidation_then_clear() {
             Some("invalid_change"),
             "{name}: {outcome:?}"
         );
+        let node = node_at(&before[0].prefix, &a);
         unchanged(
             &format!("112-x29-invalidation-{name}"),
             &both,
-            &before,
+            &mut before,
             &json!({"preview": preview, "outcome": outcome_json(&outcome),
-                    "node": node_at(&before[0].prefix, &a)}),
+                    "node": node}),
         );
     }
 
@@ -2690,7 +2792,14 @@ fn graph_live_112_preview_races() {
             // Each race's own entities: no race moves another's.
             let races = [
                 ("edit", &edited, vec![retitle(&x, "2", "Edited again")]),
-                ("edge", &made_y, vec![edge_between(&edge, &p, &y)]),
+                (
+                    "edge",
+                    &made_y,
+                    vec![on_existing(
+                        &prefix_with(&one, &made_y),
+                        edge_between(&edge, &p, &y),
+                    )],
+                ),
                 (
                     "content",
                     &made_w,
@@ -2726,7 +2835,7 @@ fn graph_live_112_preview_races() {
                 let reverse =
                     Reverse::of(preview.plan.as_ref().expect("plan"), None, None).expect("reverse");
                 let (raced, _) = landed(&first, &one, racing);
-                let before = held_with(&both, &raced);
+                let mut before = held_with(&both, &raced);
                 let (prepared, outcome) = commanded(&second, &two, second.reverse(&reverse));
                 assert_eq!(
                     outcome.code(prepared.key()),
@@ -2738,7 +2847,7 @@ fn graph_live_112_preview_races() {
                 unchanged(
                     &format!("112-race-{name}"),
                     &both,
-                    &before,
+                    &mut before,
                     &json!({"raced": raced, "outcome": outcome_json(&outcome),
                             "preview_after": again}),
                 );
@@ -2753,6 +2862,9 @@ fn graph_live_112_preview_races() {
                 serde_json::from_str(&std::fs::read_to_string(&saved).expect("saved"))
                     .expect("json");
             let refused_request = env("KEEPER_HQ_LIVE_AGENT_REFUSED_REQUEST");
+            // A pull completed after the refused send on both replicas
+            // before anything is compared.
+            let (_, barrier_event, barrier_seq) = barrier(&both);
             for source in both {
                 assert_eq!(
                     retained(source),
@@ -2760,12 +2872,14 @@ fn graph_live_112_preview_races() {
                     "the agent's event and state retained"
                 );
                 let now = held(source);
+                assert!(now.prefix.n >= barrier_seq);
                 assert_eq!(events_of(&now.prefix, &refused_request), 0);
             }
             report(
                 "112-race-agent-revoked",
                 &json!({"retained": recorded, "refused_request": refused_request,
-                        "events": 0}),
+                        "events": 0, "barrier_event": barrier_event,
+                        "barrier_seq": barrier_seq.to_string()}),
             );
         }
         phase => panic!("unknown phase {phase}"),
@@ -2840,19 +2954,21 @@ fn graph_live_112_reversal_matrix_create_update_archive_merge() {
     let (unupdated, _) = accepted(&outcome);
     let (_, outcome) = reversed(&second, &two, &archived);
     let (unarchived, _) = accepted(&outcome);
-    let prefix = prefix_with(&one, &unarchived);
-    prefix_with(&one, &unupdated);
-    let (n2_read, n3_read) = (node_at(&prefix, &n2), node_at(&prefix, &n3));
-    assert_eq!(
-        (n2_read["title"].clone(), n2_read["revision"].clone()),
-        (json!("Before the update"), json!("3"))
-    );
-    assert_eq!(n3_read["lifecycle"], "active");
+    let mut reads = Vec::new();
+    for replica in both {
+        // `unarchived` landed after `unupdated`: its complete prefix holds both.
+        let prefix = prefix_with(replica, &unarchived);
+        assert!(prefix.events.iter().any(|e| e.event.id == unupdated));
+        let (n2_read, n3_read) = (node_at(&prefix, &n2), node_at(&prefix, &n3));
+        assert_eq!(
+            (n2_read["title"].clone(), n2_read["revision"].clone()),
+            (json!("Before the update"), json!("3"))
+        );
+        assert_eq!(n3_read["lifecycle"], "active");
+        reads.push(json!({"updated": n2_read, "archived": n3_read}));
+    }
     assert!(first.get_node(&n3, false).expect("read").is_some());
-    report(
-        "112-matrix-update-archive",
-        &json!({"updated": n2_read, "archived": n3_read}),
-    );
+    report("112-matrix-update-archive", &json!(reads));
 
     // A merge of two absorbed nodes rewriting three edges (two parallel),
     // reversed to depth 3.
@@ -2943,14 +3059,38 @@ fn graph_live_112_reversal_matrix_create_update_archive_merge() {
             .expect("read")
             .expect("the node")
     };
+    // The chain as each persisted replica stores it after `event`: hop i
+    // merged into hop i+1 and archived, for every hop below `merged`.
+    let stored = |event: &str, merged: usize| {
+        for replica in both {
+            let prefix = prefix_with(replica, event);
+            for (i, id) in chain.iter().enumerate() {
+                let node = node_at(&prefix, id);
+                if i < merged {
+                    assert_eq!(
+                        (node["merged_into_id"].clone(), node["lifecycle"].clone()),
+                        (json!(chain[i + 1]), json!("archived")),
+                        "hop {i}"
+                    );
+                } else {
+                    assert_eq!(
+                        (node["merged_into_id"].clone(), node["lifecycle"].clone()),
+                        (Value::Null, json!("active")),
+                        "hop {i}"
+                    );
+                }
+            }
+        }
+    };
+    stored(&last, 8);
     assert_eq!(hops(&second), chain[1..].to_vec());
     let (_, outcome) = reversed(&second, &two, &last);
     let (unmerged, _) = accepted(&outcome);
-    prefix_with(&one, &unmerged);
+    stored(&unmerged, 7);
     assert_eq!(hops(&first), chain[1..8].to_vec());
     let (_, outcome) = reversed(&first, &one, &unmerged);
     let (remerged, _) = accepted(&outcome);
-    prefix_with(&two, &remerged);
+    stored(&remerged, 8);
     assert_eq!(hops(&second), chain[1..].to_vec());
     report(
         "112-matrix-redirect-8-hops",
@@ -2973,14 +3113,21 @@ fn graph_live_112_reversal_matrix_create_update_archive_merge() {
     let (merged, _) = landed(&first, &one, vec![merge]);
     let (_, outcome) = reversed(&second, &two, &merged);
     let (restored, _) = accepted(&outcome);
-    let (incident, _) = landed(&first, &one, vec![edge_between(&e5, &o4, &b4)]);
-    let before = held_with(&both, &incident);
+    let (incident, _) = landed(
+        &first,
+        &one,
+        vec![on_existing(
+            &prefix_with(&one, &restored),
+            edge_between(&e5, &o4, &b4),
+        )],
+    );
+    let mut before = held_with(&both, &incident);
     let detail = conflicted(
         &second,
         &two,
         &restored,
         &both,
-        &before,
+        &mut before,
         "112-matrix-remerge-dependency",
     );
     assert_eq!(
@@ -3007,13 +3154,13 @@ fn graph_live_112_reversal_matrix_create_update_archive_merge() {
     let (restored, _) = accepted(&outcome);
     let expected = node_revision(&prefix_with(&one, &restored), &t5);
     let (gone, _) = landed(&first, &one, vec![lifecycle_op(&t5, &expected, true)]);
-    let before = held_with(&both, &gone);
+    let mut before = held_with(&both, &gone);
     let detail = conflicted(
         &second,
         &two,
         &restored,
         &both,
-        &before,
+        &mut before,
         "112-matrix-remerge-archived-target",
     );
     assert_eq!(
@@ -3037,7 +3184,7 @@ fn graph_live_112_reversal_matrix_create_update_archive_merge() {
             edge_between(&loop_edge, &x1, &x2),
         ],
     );
-    let before = held_with(&both, &setup);
+    let mut before = held_with(&both, &setup);
     let merge = merge_of(&before[0].prefix, &y, &[&x1, &x2], &[&loop_edge]);
     let (_, outcome) = applied(
         &first,
@@ -3049,12 +3196,13 @@ fn graph_live_112_reversal_matrix_create_update_archive_merge() {
         Some("invalid_change"),
         "{outcome:?}"
     );
+    let reads = json!({"outcome": outcome_json(&outcome), "fixture": "self-loop",
+                       "edge": edge_image(&before[0].prefix, &loop_edge)});
     unchanged(
         "112-matrix-both-ends-absorbed-refused",
         &both,
-        &before,
-        &json!({"outcome": outcome_json(&outcome), "fixture": "self-loop",
-                "edge": edge_image(&before[0].prefix, &loop_edge)}),
+        &mut before,
+        &reads,
     );
     close(one);
     close(two);
@@ -3203,14 +3351,22 @@ fn graph_live_111_late_bootstrap_after_content_merge_verify() {
         &env("KEEPER_HQ_LIVE_URL"),
         &format!("late-111-{}.sqlite", ulid()),
     );
+    // The fixture's last event is the verification: the late replica's
+    // complete prefix is the reference's exactly — same height, same head,
+    // same events, same state. (Nothing else writes this database during
+    // the case; a later event would fail this, not be skipped.)
+    assert!(
+        reference.is_complete(),
+        "the reference is a complete prefix"
+    );
     let fresh = prefix_at(&late, reference.n);
     assert_eq!(
-        &fresh.events[..reference.events.len()],
-        &reference.events[..]
+        (fresh.n, fresh.head),
+        (reference.n, reference.head),
+        "the late replica bootstraps to the same height and head"
     );
-    if fresh.n == reference.n {
-        assert_eq!(fresh.state, reference.state);
-    }
+    assert_eq!(fresh.events, reference.events);
+    assert_eq!(fresh.state, reference.state);
     assert_eq!(images(&fresh), images(&reference));
     let (late_claim, held_claim) = (node_at(&fresh, &claim), node_at(&reference, &claim));
     let stamp = &late_claim["properties"]["$assertion"];
