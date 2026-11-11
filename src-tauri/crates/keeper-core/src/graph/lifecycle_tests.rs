@@ -4,20 +4,22 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use serde_json::Map;
+use serde_json::{json, Map};
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::graph::admission::{Admission, Process};
-use crate::graph::client::GraphClient;
+use crate::graph::client::{GraphClient, GraphClientError};
 use crate::graph::outcome::{GraphOutcome, PendingCause, REQUEST_REFUSALS};
 use crate::graph::protocol::change::ChangeOp;
-use crate::graph::protocol::wire::Authority;
-use crate::graph::queue::{Binding, State};
+use crate::graph::protocol::scope::{client_scope, receipt_id};
+use crate::graph::protocol::wire::{self, Authority};
+use crate::graph::queue::{Binding, Restored, State};
 use crate::graph::runtime::{Runtime, VerifiedWorker};
 use crate::graph::source::{GraphSource, PrefixBatch, Revocation, SourceError};
+use crate::graph::write::{Caller, GraphWrite, Writer};
 use crate::hq::port::fake::FakeOpener;
-use crate::hq::port::{Opener, ReplicaSpec};
+use crate::hq::port::{CommandResult, LinkState, Opener, ReplicaError, ReplicaSpec};
 use crate::hq::sessions::Source;
 
 const DB: &str = "work";
@@ -214,6 +216,7 @@ fn only_entry(dir: &Path) -> (String, State) {
             "disabled" => State::Disabled,
             "rejected" => State::Rejected,
             "unresolved" => State::Unresolved,
+            "accepted" => State::Accepted,
             other => panic!("unexpected state {other}"),
         };
         (id, state)
@@ -344,5 +347,193 @@ fn transport_retries_and_unresolved_is_kept() {
         "an entry that may have been sent is never refused locally"
     );
     assert_eq!(only_entry(dir.path()), (id, State::Unresolved));
+    lifecycle.gate().expect("no fence");
+}
+
+/// A person's server after a reconnect, as a resume sees it: the receipt
+/// this replica already holds, a scripted `graph.read_status` answer, and
+/// every remote operation asked, in order. Nothing is ever sent.
+struct Reconnected {
+    receipt: Map<String, serde_json::Value>,
+    status: Result<Vec<Map<String, serde_json::Value>>, ReplicaError>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl GraphWrite for Reconnected {
+    fn command(
+        &self,
+        _: &str,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<CommandResult, ReplicaError> {
+        panic!("a cached receipt is never resent");
+    }
+    fn receipt(&self, _: &str) -> Result<Vec<Map<String, serde_json::Value>>, ReplicaError> {
+        Ok(vec![self.receipt.clone()])
+    }
+    fn remote_query(
+        &self,
+        operation: &str,
+        _: serde_json::Value,
+    ) -> Result<Vec<Map<String, serde_json::Value>>, ReplicaError> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(operation.to_owned());
+        if operation == wire::READ_STATUS {
+            self.status.clone()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    fn link(&self) -> LinkState {
+        LinkState::Connected
+    }
+}
+
+/// One sent change whose answer was lost and whose accepted receipt has
+/// since replicated, resumed as the driver's `resume` does it (restore,
+/// `outcome` without an attempt, `settle`) against a server answering
+/// `read_status` with `status`: the outcome looked up, the state the entry
+/// settled in (or the lookup's error) and the remote operations asked.
+fn resume_cached(
+    dir: &Path,
+    status: Result<Vec<Map<String, serde_json::Value>>, ReplicaError>,
+) -> (
+    Lifecycle,
+    Result<(GraphOutcome, State), GraphClientError>,
+    Vec<String>,
+) {
+    let writer = Writer {
+        domain: DB.to_owned(),
+        actor: "ana".to_owned(),
+        client: "dev1".to_owned(),
+    };
+    let minting = GraphClient::over(
+        Arc::new(Reconnected {
+            receipt: Map::new(),
+            status: Ok(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        }),
+        &writer,
+        Caller::Person,
+    );
+    let change = minting
+        .change(
+            vec![ChangeOp::CreateNode {
+                id: "01JF0000000000000000000001".to_owned(),
+                kind: "Concept".into(),
+                title: "N".into(),
+                description: None,
+                properties: Map::new(),
+            }],
+            None,
+        )
+        .expect("change");
+    let prepared = minting.mint(&change).expect("minted");
+    let mut queue = GraphQueue::open(&queue_path(dir), binding()).expect("opens");
+    queue.enqueue(&prepared, 1).expect("queued");
+    let id = prepared.request().request_id.clone();
+    queue
+        .mark(&id, State::Queued, State::Submitting, Some("sent"), 2)
+        .expect("sent");
+    let lifecycle = Lifecycle::open(queue).expect("lifecycle");
+    let key = prepared.key();
+    let scope = client_scope("ana", "dev1");
+    let receipt = json!({
+        "id": receipt_id(key.descriptor(), key.request_id(), &scope),
+        "client_scope": scope, "descriptor": key.descriptor(),
+        "request_id": key.request_id(), "request_digest": key.request_digest(),
+        "outcome": "accepted", "reason": null,
+        "event_id": "01JF0000000000000000000900", "graph_seq": "7",
+        "detail": "{\"affected\":[]}", "recorded_at_ms": 1,
+        "author_actor": "server", "author_client": "server",
+    });
+    let port = Arc::new(Reconnected {
+        receipt: receipt.as_object().expect("row").clone(),
+        status,
+        asked: Mutex::new(Vec::new()),
+    });
+    let client = GraphClient::over(port.clone(), &writer, Caller::Person);
+    let restored = lifecycle
+        .with_queue(|q| q.restore(&client, 3))
+        .expect("restores");
+    let [Restored::Ready { prepared, state }] = restored.as_slice() else {
+        panic!("one ready entry");
+    };
+    assert_eq!(*state, State::Submitting);
+    let settled = client.outcome(prepared, None).map(|looked| {
+        let state = lifecycle
+            .settle(&id, State::Submitting, &looked, 4)
+            .expect("settled");
+        (looked, state)
+    });
+    let asked = port
+        .asked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    (lifecycle, settled, asked)
+}
+
+/// 112.1 T2.3 (audit G1): on a person's resume after a reconnect, a
+/// receipt already on the replica settles nothing until the server's
+/// current `graph.read_status` answered. A refused status fences the domain
+/// and locks the entry instead of recording the cached outcome; an
+/// unreachable server leaves the entry where it was.
+#[test]
+fn a_cached_receipt_settles_only_after_a_fresh_read_status() {
+    for refusal in [
+        ReplicaError::Remote {
+            code: "operation.forbidden".to_owned(),
+            message: "forbidden".to_owned(),
+            retryable: false,
+        },
+        ReplicaError::Rejected {
+            code: "forbidden".to_owned(),
+            message: "revoked".to_owned(),
+        },
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let (lifecycle, settled, asked) = resume_cached(dir.path(), Err(refusal.clone()));
+        assert_eq!(asked, vec![wire::READ_STATUS.to_owned()], "{refusal:?}");
+        assert_eq!(
+            settled,
+            Ok((
+                GraphOutcome::Pending {
+                    cause: PendingCause::Refused
+                },
+                State::Disabled
+            )),
+            "{refusal:?}"
+        );
+        assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+        assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+        assert_eq!(only_entry(dir.path()).1, State::Disabled, "{refusal:?}");
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, settled, asked) = resume_cached(dir.path(), Err(ReplicaError::Closed));
+    assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    assert_eq!(
+        settled,
+        Err(GraphClientError::Replica(ReplicaError::Closed))
+    );
+    lifecycle.gate().expect("no fence");
+    assert_eq!(only_entry(dir.path()).1, State::Submitting);
+
+    let dir = tempfile::tempdir().expect("dir");
+    let answered = json!({"domain": DB, "authority": {"epoch": "2", "digest": "b".repeat(64)}});
+    let (lifecycle, settled, asked) = resume_cached(
+        dir.path(),
+        Ok(vec![answered.as_object().expect("row").clone()]),
+    );
+    assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    let (looked, state) = settled.expect("looked up");
+    assert!(
+        matches!(looked, GraphOutcome::Accepted { .. }),
+        "{looked:?}"
+    );
+    assert_eq!(state, State::Accepted);
     lifecycle.gate().expect("no fence");
 }

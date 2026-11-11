@@ -2,7 +2,7 @@
 //! replicas seeded through `mutate` (no server): whole events replay, a
 //! missing or partial event ends the prefix as stale, a present wrong one is
 //! corruption; a change is never sent without a link, its request id
-//! survives a restart, and a receipt alone resolves it afterwards.
+//! survives a restart, and its replicated receipt settles nothing offline.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -335,14 +335,11 @@ fn a_change_is_never_sent_without_a_link_and_its_id_survives_a_restart() {
             }),
         )])
         .expect("receipt");
+    // The receipt replicated, but no fresh `read_status` can be asked
+    // without a link: it settles nothing (112.1 T2.3).
     assert_eq!(
         client.outcome(&restored, None),
-        Ok(GraphOutcome::Accepted {
-            event_id: ulid(900),
-            graph_seq: "7".into(),
-            commit_seq: None,
-            detail: json!({"affected": []}).as_object().expect("detail").clone(),
-        })
+        Err(GraphClientError::Offline)
     );
 }
 

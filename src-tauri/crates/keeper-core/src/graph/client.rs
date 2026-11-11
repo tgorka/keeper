@@ -282,12 +282,26 @@ impl GraphClient {
     /// [`PendingCause`]: a revocation signal when [`PendingCause::Refused`]),
     /// never a quiet pending; one that could not be asked leaves the
     /// attempt to speak.
+    ///
+    /// A person's lookup (no `attempt`) settles from a receipt cached on
+    /// this replica only after the server's current `graph.read_status`
+    /// for this domain answered (112.1 T2.3: authority first, receipt
+    /// second, replay last): a refused status is that refusal, never the
+    /// cached outcome; no link is [`GraphClientError::Offline`] and an
+    /// unreachable server its [`GraphClientError::Replica`] error, so the
+    /// entry stays where it is. `graph.outcome` authorises on the server
+    /// itself, and an attempt's answer was authorised at acceptance.
     pub fn outcome(
         &self,
         prepared: &Prepared,
         attempt: Option<&Attempt>,
     ) -> Result<GraphOutcome, GraphClientError> {
         let mut receipt = self.requests.receipt(&prepared.key)?;
+        if receipt.is_some() && attempt.is_none() && self.caller == Caller::Person {
+            if let Some(refused) = self.current_authority()? {
+                return Ok(refused);
+            }
+        }
         if receipt.is_none() && self.online().is_ok() {
             receipt = match self
                 .requests
@@ -308,6 +322,27 @@ impl GraphClient {
                 .resolve(&prepared.key, attempt, receipt.as_ref()),
             None => self.requests.settle(&prepared.key, receipt.as_ref()),
         })
+    }
+
+    /// Ask the server for this person's current read authority over the
+    /// domain: `None` when it answered one, the refusal as a pending outcome
+    /// when it refused, an error when it could not be asked or read.
+    fn current_authority(&self) -> Result<Option<GraphOutcome>, GraphClientError> {
+        self.online()?;
+        let domain = self.requests.domain();
+        match self
+            .requests
+            .port()
+            .remote_query(wire::READ_STATUS, wire::read_status_params(domain))
+        {
+            Ok(rows) => wire::decode_read_status(domain, rows)
+                .map(|_| None)
+                .map_err(GraphClientError::Unreadable),
+            Err(error) => match PendingCause::of(&error) {
+                PendingCause::Transport => Err(error.into()),
+                cause => Ok(Some(GraphOutcome::Pending { cause })),
+            },
+        }
     }
 
     /// Mint, send and resolve `change` once. Refused (`Err`) only before a
