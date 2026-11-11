@@ -283,23 +283,37 @@ impl GraphClient {
     /// never a quiet pending; one that could not be asked leaves the
     /// attempt to speak.
     ///
-    /// A person's lookup (no `attempt`) settles from a receipt cached on
-    /// this replica only after the server's current `graph.read_status`
-    /// for this domain answered (112.1 T2.3: authority first, receipt
-    /// second, replay last): a refused status is that refusal, never the
-    /// cached outcome; no link is [`GraphClientError::Offline`] and an
-    /// unreachable server its [`GraphClientError::Replica`] error, so the
-    /// entry stays where it is. `graph.outcome` authorises on the server
-    /// itself, and an attempt's answer was authorised at acceptance.
+    /// A person's receipt cached on this replica settles nothing on its
+    /// own (112.1 T2.3: authority first, receipt second, replay last). It
+    /// may settle only after the server's current `graph.read_status` for
+    /// this domain answered, or when `attempt` is this request's own fresh
+    /// acknowledgement (the server accepted the command just now, under the
+    /// authority it checks at acceptance; a `cached` replay is not one). A
+    /// refused status is that refusal, never the cached outcome. With no
+    /// current authority (no link, an unreachable server, an unreadable
+    /// answer) the cached receipt is not used: an attempt in hand speaks
+    /// alone (a refused one is its refusal, an unanswered one stays
+    /// pending), and without one the lookup fails
+    /// ([`GraphClientError::Offline`], [`GraphClientError::Replica`]), so
+    /// the entry stays where it is. `graph.outcome` authorises on the
+    /// server itself. An agent replicates no receipts.
     pub fn outcome(
         &self,
         prepared: &Prepared,
         attempt: Option<&Attempt>,
     ) -> Result<GraphOutcome, GraphClientError> {
         let mut receipt = self.requests.receipt(&prepared.key)?;
-        if receipt.is_some() && attempt.is_none() && self.caller == Caller::Person {
-            if let Some(refused) = self.current_authority()? {
-                return Ok(refused);
+        if receipt.is_some()
+            && self.caller == Caller::Person
+            && !attempt.is_some_and(|attempt| Self::acknowledged(attempt, &prepared.key))
+        {
+            match (self.current_authority(), attempt) {
+                (Ok(None), _) => {}
+                (Ok(Some(refused)), _) => return Ok(refused),
+                (Err(_), Some(attempt)) => {
+                    return Ok(self.requests.resolve(&prepared.key, attempt, None));
+                }
+                (Err(error), None) => return Err(error),
             }
         }
         if receipt.is_none() && self.online().is_ok() {
@@ -343,6 +357,15 @@ impl GraphClient {
                 cause => Ok(Some(GraphOutcome::Pending { cause })),
             },
         }
+    }
+
+    /// Whether `attempt` is `key`'s own fresh acknowledgement: sent under
+    /// the whole key, answered for its request id, and not a `cached`
+    /// replay.
+    fn acknowledged(attempt: &Attempt, key: &RequestKey) -> bool {
+        attempt.key() == key
+            && matches!(attempt.result(), Ok(result)
+                if result.request_id == key.request_id() && !result.cached)
     }
 
     /// Mint, send and resolve `change` once. Refused (`Err`) only before a

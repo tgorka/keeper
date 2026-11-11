@@ -351,10 +351,12 @@ fn transport_retries_and_unresolved_is_kept() {
 }
 
 /// A person's server after a reconnect, as a resume sees it: the receipt
-/// this replica already holds, a scripted `graph.read_status` answer, and
-/// every remote operation asked, in order. Nothing is ever sent.
+/// this replica holds (once it replicated), a scripted answer to a same-id
+/// send (none: nothing may be sent) and to `graph.read_status`, and every
+/// remote operation asked, in order.
 struct Reconnected {
-    receipt: Map<String, serde_json::Value>,
+    receipt: Mutex<Option<Map<String, serde_json::Value>>>,
+    command: Option<Result<CommandResult, ReplicaError>>,
     status: Result<Vec<Map<String, serde_json::Value>>, ReplicaError>,
     asked: Mutex<Vec<String>>,
 }
@@ -363,13 +365,26 @@ impl GraphWrite for Reconnected {
     fn command(
         &self,
         _: &str,
-        _: &str,
+        request_id: &str,
         _: serde_json::Value,
     ) -> Result<CommandResult, ReplicaError> {
-        panic!("a cached receipt is never resent");
+        let answer = self
+            .command
+            .clone()
+            .expect("a cached receipt is never resent");
+        answer.map(|mut result| {
+            result.request_id = request_id.to_owned();
+            result
+        })
     }
     fn receipt(&self, _: &str) -> Result<Vec<Map<String, serde_json::Value>>, ReplicaError> {
-        Ok(vec![self.receipt.clone()])
+        Ok(self
+            .receipt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect())
     }
     fn remote_query(
         &self,
@@ -391,13 +406,17 @@ impl GraphWrite for Reconnected {
     }
 }
 
-/// One sent change whose answer was lost and whose accepted receipt has
-/// since replicated, resumed as the driver's `resume` does it (restore,
-/// `outcome` without an attempt, `settle`) against a server answering
-/// `read_status` with `status`: the outcome looked up, the state the entry
-/// settled in (or the lookup's error) and the remote operations asked.
+/// One sent change whose answer was lost and whose accepted receipt
+/// replicates, resumed as the driver's `resume` does it (restore, then
+/// `outcome` and `settle`) against a server answering `read_status` with
+/// `status`. With no `replay` the receipt is already held and the lookup
+/// has no attempt; with one, the same id is sent again, the server answers
+/// `replay`, the receipt replicates meanwhile, and the lookup has that
+/// attempt. The outcome looked up, the state the entry settled in (or the
+/// lookup's error) and the remote operations asked.
 fn resume_cached(
     dir: &Path,
+    replay: Option<Result<CommandResult, ReplicaError>>,
     status: Result<Vec<Map<String, serde_json::Value>>, ReplicaError>,
 ) -> (
     Lifecycle,
@@ -411,7 +430,8 @@ fn resume_cached(
     };
     let minting = GraphClient::over(
         Arc::new(Reconnected {
-            receipt: Map::new(),
+            receipt: Mutex::new(None),
+            command: None,
             status: Ok(Vec::new()),
             asked: Mutex::new(Vec::new()),
         }),
@@ -449,8 +469,10 @@ fn resume_cached(
         "detail": "{\"affected\":[]}", "recorded_at_ms": 1,
         "author_actor": "server", "author_client": "server",
     });
+    let receipt = receipt.as_object().expect("row").clone();
     let port = Arc::new(Reconnected {
-        receipt: receipt.as_object().expect("row").clone(),
+        receipt: Mutex::new(replay.is_none().then(|| receipt.clone())),
+        command: replay.clone(),
         status,
         asked: Mutex::new(Vec::new()),
     });
@@ -462,7 +484,12 @@ fn resume_cached(
         panic!("one ready entry");
     };
     assert_eq!(*state, State::Submitting);
-    let settled = client.outcome(prepared, None).map(|looked| {
+    let attempt = replay.map(|_| {
+        let attempt = client.send(prepared).expect("sent");
+        *port.receipt.lock().unwrap_or_else(PoisonError::into_inner) = Some(receipt);
+        attempt
+    });
+    let settled = client.outcome(prepared, attempt.as_ref()).map(|looked| {
         let state = lifecycle
             .settle(&id, State::Submitting, &looked, 4)
             .expect("settled");
@@ -495,7 +522,7 @@ fn a_cached_receipt_settles_only_after_a_fresh_read_status() {
         },
     ] {
         let dir = tempfile::tempdir().expect("dir");
-        let (lifecycle, settled, asked) = resume_cached(dir.path(), Err(refusal.clone()));
+        let (lifecycle, settled, asked) = resume_cached(dir.path(), None, Err(refusal.clone()));
         assert_eq!(asked, vec![wire::READ_STATUS.to_owned()], "{refusal:?}");
         assert_eq!(
             settled,
@@ -513,7 +540,7 @@ fn a_cached_receipt_settles_only_after_a_fresh_read_status() {
     }
 
     let dir = tempfile::tempdir().expect("dir");
-    let (lifecycle, settled, asked) = resume_cached(dir.path(), Err(ReplicaError::Closed));
+    let (lifecycle, settled, asked) = resume_cached(dir.path(), None, Err(ReplicaError::Closed));
     assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
     assert_eq!(
         settled,
@@ -523,12 +550,141 @@ fn a_cached_receipt_settles_only_after_a_fresh_read_status() {
     assert_eq!(only_entry(dir.path()).1, State::Submitting);
 
     let dir = tempfile::tempdir().expect("dir");
-    let answered = json!({"domain": DB, "authority": {"epoch": "2", "digest": "b".repeat(64)}});
+    let (lifecycle, settled, asked) = resume_cached(dir.path(), None, Ok(vec![answered_status()]));
+    assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    let (looked, state) = settled.expect("looked up");
+    assert!(
+        matches!(looked, GraphOutcome::Accepted { .. }),
+        "{looked:?}"
+    );
+    assert_eq!(state, State::Accepted);
+    lifecycle.gate().expect("no fence");
+}
+
+fn answered_status() -> Map<String, serde_json::Value> {
+    json!({"domain": DB, "authority": {"epoch": "2", "digest": "b".repeat(64)}})
+        .as_object()
+        .expect("row")
+        .clone()
+}
+
+fn forbidden_error() -> ReplicaError {
+    ReplicaError::Remote {
+        code: "operation.forbidden".to_owned(),
+        message: "forbidden".to_owned(),
+        retryable: false,
+    }
+}
+
+fn unheard() -> ReplicaError {
+    ReplicaError::Unheard {
+        code: "transport".to_owned(),
+        message: "response lost".to_owned(),
+        retryable: true,
+    }
+}
+
+/// 112.1 T2.3 (review B1): an attempt in hand is not current authority.
+/// A same-id replay the server refused or never answered, with the
+/// original's accepted receipt replicating meanwhile, settles that receipt
+/// only after a fresh `graph.read_status`: a refused status fences and
+/// locks the entry, and with no authority to be had the attempt speaks
+/// alone (its refusal fences, an unanswered one stays pending). Only this
+/// request's own fresh acknowledgement settles the receipt without asking;
+/// a `cached` acknowledgement asks first.
+#[test]
+fn a_replay_settles_a_cached_receipt_only_under_fresh_authority() {
+    // The reviewer's two probes: refused replay, refused status; unanswered
+    // replay, unanswered status.
+    let dir = tempfile::tempdir().expect("dir");
     let (lifecycle, settled, asked) = resume_cached(
         dir.path(),
-        Ok(vec![answered.as_object().expect("row").clone()]),
+        Some(Err(forbidden_error())),
+        Err(forbidden_error()),
     );
     assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    assert_eq!(
+        settled,
+        Ok((
+            GraphOutcome::Pending {
+                cause: PendingCause::Refused
+            },
+            State::Disabled
+        ))
+    );
+    assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+    assert_eq!(only_entry(dir.path()).1, State::Disabled);
+
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, settled, asked) =
+        resume_cached(dir.path(), Some(Err(unheard())), Err(unheard()));
+    assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    assert_eq!(
+        settled,
+        Ok((
+            GraphOutcome::Pending {
+                cause: PendingCause::Transport
+            },
+            State::Submitting
+        ))
+    );
+    lifecycle.gate().expect("no fence");
+    assert_eq!(only_entry(dir.path()).1, State::Submitting);
+
+    // A refused replay with the server's authority unreachable: the
+    // observed refusal still fences, the cached outcome stays unused.
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, settled, _) =
+        resume_cached(dir.path(), Some(Err(forbidden_error())), Err(unheard()));
+    assert_eq!(
+        settled,
+        Ok((
+            GraphOutcome::Pending {
+                cause: PendingCause::Refused
+            },
+            State::Disabled
+        ))
+    );
+    assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+
+    // A cached acknowledgement is a replay of an earlier answer: the
+    // receipt waits for a fresh status, then settles.
+    let replayed = CommandResult {
+        request_id: String::new(),
+        commit_seq: Some(7),
+        cached: true,
+    };
+    let dir = tempfile::tempdir().expect("dir");
+    let (_, settled, asked) = resume_cached(
+        dir.path(),
+        Some(Ok(replayed.clone())),
+        Err(forbidden_error()),
+    );
+    assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    assert_eq!(
+        settled.map(|(_, state)| state),
+        Ok(State::Disabled),
+        "a cached acknowledgement under a refused status"
+    );
+    let dir = tempfile::tempdir().expect("dir");
+    let (_, settled, asked) =
+        resume_cached(dir.path(), Some(Ok(replayed)), Ok(vec![answered_status()]));
+    assert_eq!(asked, vec![wire::READ_STATUS.to_owned()]);
+    assert_eq!(settled.map(|(_, state)| state), Ok(State::Accepted));
+
+    // The control: this request's own fresh acknowledgement is the server's
+    // authorisation at acceptance; its receipt settles without asking.
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, settled, asked) = resume_cached(
+        dir.path(),
+        Some(Ok(CommandResult {
+            request_id: String::new(),
+            commit_seq: Some(7),
+            cached: false,
+        })),
+        Err(forbidden_error()),
+    );
+    assert!(asked.is_empty(), "{asked:?}");
     let (looked, state) = settled.expect("looked up");
     assert!(
         matches!(looked, GraphOutcome::Accepted { .. }),

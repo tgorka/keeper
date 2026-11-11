@@ -382,10 +382,12 @@ a disabled entry stays disabled: it can be discarded or resolved by its own rece
 resent.
 
 **What an answer does to a queued entry** (`keeper_core::graph::queue::next`, keyed on the
-outcome and its typed `PendingCause`, never on text): a receipt resolves it — but on a
-person's lookup (a resume), a receipt already on the replica settles nothing until the
-server's current `graph.read_status` answers: a refused status fences the domain and disables
-the entry instead, and with no link or an unreachable server the entry stays as it is; a transport
+outcome and its typed `PendingCause`, never on text): a receipt resolves it — but a person's
+receipt already on the replica settles nothing until the server's current `graph.read_status`
+answers, unless the same request's own fresh (not `cached`) acknowledgement is in hand: a
+refused status fences the domain and disables the entry instead; with no link or an
+unreachable server the cached receipt is not used (a refused replay still fences, an
+unanswered one stays as it is); a transport
 failure or `graph_unavailable` keeps it and retries the identical request; `outcome_unresolved`
 makes it `unresolved` (only a same-id replay or `graph.outcome`, never a new id); an ended
 agent context refuses it locally only if it was never sent, otherwise it stays `unresolved`;
