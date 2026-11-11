@@ -63,6 +63,8 @@ pub struct Lifecycle {
     /// The `observed_at` of a kept authority found to be from the future:
     /// never trusted again in this process, whether or not its durable
     /// drop committed, until a successful online `read_status` is kept.
+    /// Not persisted: after a restart only a committed drop keeps it
+    /// untrusted (owner decision 112.1 G3, 2026-11-11).
     distrusted: Mutex<Option<i64>>,
 }
 

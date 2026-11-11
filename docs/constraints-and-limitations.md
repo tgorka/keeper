@@ -420,11 +420,16 @@ while the server cannot be reached only when all of these hold:
   answered;
 - that answer is not from the future and is at most `OFFLINE_READ_LIMIT` (24 h, inclusive)
   old on the device's clock. A kept answer found to be from the future is distrusted in
-  memory and dropped from the queue file on sight, so it never authorises again when the
-  clock catches up: only the next successful online `read_status` keeps one again. If the
-  drop cannot commit (the file is busy), the row stays distrusted for the process and the
-  drop is retried on the next read; a restart before any drop commits would trust it again
-  once the clock has caught up, which needs a storage failure at that moment.
+  memory and dropped from the queue file on sight. Within a process it never authorises
+  again, not even once the clock catches up: only the next successful online `read_status`
+  keeps one again. If the drop cannot commit (the file is busy), the row stays distrusted for
+  the process and the drop is retried on the next read. **Across a restart this holds only
+  if the drop committed.** If it did not, the restarted process trusts the row again once the
+  clock is past its `observed_at` and inside the 24 h window. So an offline stale read can lag
+  a revocation this device has not yet learned online by up to 24 h plus the clock error.
+  What it serves is the same actor's own, already-authorised projection, always `stale`, and
+  a persisted revocation fence still refuses. This bound is an explicit accepted exception
+  (owner decision 112.1 G3, 2026-11-11), not a durable distrust guarantee.
 
 Everything is checked again at delivery against a fresh clock, and a fence — in memory or
 persisted in the queue file by another holder — refuses at every delivery point (each

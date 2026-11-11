@@ -1382,10 +1382,14 @@ impl GraphQueue {
     }
 
     /// Drop the kept authority observed at `observed_at_ms`, found to be
-    /// from the future: it never authorises again, across restarts, and
-    /// only the next successful online `read_status`
-    /// ([`GraphQueue::record_authority`]) keeps one again. A newer row
-    /// written meanwhile stays.
+    /// from the future: once this delete commits, the row never authorises
+    /// again, across restarts, and only the next successful online
+    /// `read_status` ([`GraphQueue::record_authority`]) keeps one again. If
+    /// it does not commit, only the in-memory distrust
+    /// ([`super::lifecycle::Lifecycle::trusts`]) holds, and a restart trusts
+    /// the row again once the clock passes it (owner decision 112.1 G3,
+    /// 2026-11-11: an accepted exception). A newer row written meanwhile
+    /// stays.
     pub fn invalidate_authority(&self, observed_at_ms: i64) -> Result<(), QueueError> {
         self.conn
             .execute(
