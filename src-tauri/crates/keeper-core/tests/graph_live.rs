@@ -73,7 +73,7 @@ use keeper_core::graph::prefix::{self, Prefix};
 use keeper_core::graph::protocol::change::{
     Absorbed, Change, ChangeOp, CheckedContent, CheckedSource, MergeEdge, NodeFields, DESCRIPTOR,
 };
-use keeper_core::graph::protocol::inverse::{Preview, PreviewOutcome, Reverse};
+use keeper_core::graph::protocol::inverse::{Preview, PreviewOutcome, Reverse, REVERSE};
 use keeper_core::graph::protocol::proposal::{self, Decision, Proposal, Verdict, DECIDE};
 use keeper_core::graph::protocol::request::Request;
 use keeper_core::graph::protocol::review::{self, Target, ACKNOWLEDGE};
@@ -4345,4 +4345,254 @@ fn graph_live_1121_a_result_cache_miss_resolves_from_the_receipt() {
                 "attempts": entry.attempts, "state": "accepted", "events": 1}),
     );
     close(fresh);
+}
+
+// ---------------------------------------------------------------------------
+// Story 111.2 G1/T5: process death after a reviewer command is sent. Each
+// case runs twice, as two processes, under `KEEPER_HQ_LIVE_PHASE`:
+// - `send`: a person's `mint_command`, the request persisted to the state
+//   dir, one send, then the marker line `KG1_LIVE <case>-sent {...}` and a
+//   process abort (SIGABRT) before anything records an outcome;
+// - `restart`: a new process restores the persisted request through
+//   `GraphClient::prepared` and resolves it under the same id: one terminal
+//   outcome, exactly one event for that request, and the same id sent with a
+//   changed payload is `idempotency_mismatch` with no further event.
+// Extra input: `KEEPER_HQ_LIVE_CRASH_ACK_EVENT`, an agent-origin accepted
+// event nobody has reviewed (the acknowledge case's target).
+// ---------------------------------------------------------------------------
+
+/// Phase `send`: mint `descriptor` with `payload`, persist the request at
+/// `saved`, send it once, print the marker and abort.
+fn sent_then_aborted(
+    case: &str,
+    client: &GraphClient,
+    descriptor: &str,
+    payload: Value,
+    saved: &std::path::Path,
+) -> ! {
+    let prepared = client.mint_command(descriptor, payload).expect("minted");
+    let request = prepared.request();
+    std::fs::write(
+        saved,
+        json!({"descriptor": descriptor, "request_id": request.request_id,
+               "payload": request.payload})
+        .to_string(),
+    )
+    .expect("persisted before the send");
+    let attempt = client.send(&prepared).expect("sent");
+    report(
+        &format!("{case}-sent"),
+        &json!({"request_id": request.request_id, "descriptor": descriptor,
+                "answered": attempt.result().is_ok()}),
+    );
+    std::io::Write::flush(&mut std::io::stdout()).expect("marker flushed");
+    // The crash: nothing after the send is recorded.
+    std::process::abort();
+}
+
+/// Phase `restart`: restore the request `saved` holds, resolve it under its
+/// own id (terminal, accepted, one event), then send the same id with
+/// `changed`'s payload: `idempotency_mismatch`, still one event. The
+/// accepted event's id, for the case's own checks.
+fn restored_once(
+    case: &str,
+    client: &GraphClient,
+    source: &Source,
+    saved: &std::path::Path,
+    changed: impl FnOnce(&Value) -> Value,
+) -> String {
+    let kept: Value =
+        serde_json::from_str(&std::fs::read_to_string(saved).expect("persisted")).expect("json");
+    let descriptor = kept["descriptor"].as_str().expect("descriptor").to_owned();
+    let request = Request {
+        request_id: kept["request_id"].as_str().expect("id").to_owned(),
+        context_id: None,
+        payload: kept["payload"].clone(),
+    };
+    let prepared = client
+        .prepared(&descriptor, request.clone())
+        .expect("the same request");
+    let outcome = settled(client, source, &prepared);
+    let (event_id, seq) = accepted(&outcome);
+    let prefix = prefix_at(source, seq);
+    assert_eq!(
+        events_of(&prefix, &request.request_id),
+        1,
+        "{case}: one event"
+    );
+
+    let other = client
+        .prepared(
+            &descriptor,
+            Request {
+                payload: changed(&request.payload),
+                ..request.clone()
+            },
+        )
+        .expect("a changed payload under the same id");
+    assert_ne!(other.key(), prepared.key());
+    let attempt = client.send(&other).expect("sent");
+    let mismatch = until(source, "the mismatch", || {
+        match client.outcome(&other, Some(&attempt)) {
+            Ok(GraphOutcome::Pending { .. } | GraphOutcome::PendingVisibility { .. }) => None,
+            Ok(outcome) => Some(outcome),
+            Err(error) => panic!("{case}: {error}"),
+        }
+    });
+    assert_eq!(
+        mismatch.code(other.key()),
+        Some("idempotency_mismatch"),
+        "{case}: {mismatch:?}"
+    );
+    let (_, barrier_event, _) = barrier(&[source]);
+    let after = prefix_with(source, &barrier_event);
+    assert_eq!(
+        events_of(&after, &request.request_id),
+        1,
+        "{case}: the changed payload added no event"
+    );
+    report(
+        &format!("{case}-restarted"),
+        &json!({"request_id": request.request_id, "descriptor": descriptor,
+                "outcome": outcome_json(&outcome), "events": 1,
+                "changed_payload": format!("{:?}", mismatch.code(other.key())),
+                "barrier_event": barrier_event}),
+    );
+    event_id
+}
+
+/// 111.2 G1/T5 (S:45): an approval (`graph.decide`) whose process dies
+/// after the send settles once, under its id, after a restart.
+#[test]
+#[ignore = "driven by keeper-hq's native graph harness (111.2 server)"]
+fn graph_live_112_decide_survives_process_death() {
+    let case = "112-crash-decide";
+    let saved = state_dir().join("crash-112-decide.json");
+    let review = reviewer();
+    let checker = GraphClient::new(review.clone());
+    match env("KEEPER_HQ_LIVE_PHASE").as_str() {
+        "send" => {
+            let one = device(1);
+            let first = GraphClient::new(one.clone());
+            let graph = env("KEEPER_HQ_LIVE_DATABASE");
+            let (p, n) = (ulid(), ulid());
+            let proposal = Proposal::new(
+                p.clone(),
+                None,
+                first
+                    .change(vec![create_node(&n, "Crash-approved", json!({}))], None)
+                    .expect("change"),
+                vec![env("KEEPER_HQ_LIVE_REVIEWER_ACTOR")],
+                None,
+            )
+            .expect("proposal");
+            let (_, proposed) = commanded(&first, &one, first.propose(&proposal));
+            assert!(
+                matches!(proposed, GraphOutcome::Proposed { .. }),
+                "{proposed:?}"
+            );
+            let digest = proposal::digest(&graph, &proposal).expect("digest");
+            let decision = Decision {
+                proposal_id: p,
+                proposal_revision: "1".to_owned(),
+                proposal_digest: digest,
+                verdict: Verdict::Approve,
+            };
+            close(one);
+            sent_then_aborted(case, &checker, DECIDE, decision.payload(), &saved);
+        }
+        "restart" => {
+            restored_once(case, &checker, &review, &saved, |payload| {
+                let mut payload = payload.clone();
+                payload["decision"] = json!("reject");
+                payload
+            });
+        }
+        phase => panic!("unknown phase {phase}"),
+    }
+    close(review);
+}
+
+/// 111.2 G1/T5 (S:45): an acknowledgement whose process dies after the send
+/// settles once, under its id, after a restart: one review of the target.
+#[test]
+#[ignore = "driven by keeper-hq's native graph harness (111.2 server)"]
+fn graph_live_112_acknowledge_survives_process_death() {
+    let case = "112-crash-acknowledge";
+    let saved = state_dir().join("crash-112-acknowledge.json");
+    let review = reviewer();
+    let checker = GraphClient::new(review.clone());
+    let target_event = env("KEEPER_HQ_LIVE_CRASH_ACK_EVENT");
+    match env("KEEPER_HQ_LIVE_PHASE").as_str() {
+        "send" => {
+            let prefix = prefix_with(&review, &target_event);
+            let target =
+                Target::new(&target_event, &digest_of(&prefix, &target_event)).expect("target");
+            sent_then_aborted(
+                case,
+                &checker,
+                ACKNOWLEDGE,
+                review::acknowledge_payload(&target),
+                &saved,
+            );
+        }
+        "restart" => {
+            let ack = restored_once(case, &checker, &review, &saved, |_| {
+                let other = Target::new(&target_event, &"0".repeat(64)).expect("target");
+                review::acknowledge_payload(&other)
+            });
+            let reviews = review
+                .replica
+                .query(
+                    "SELECT COUNT(*) AS n FROM kg_reviews WHERE target_event_id = ?",
+                    &[Value::from(target_event.as_str())],
+                )
+                .expect("count")
+                .first()
+                .and_then(|row| row.get("n"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            assert_eq!(reviews, 1, "exactly one review of the target");
+            report(
+                "112-crash-acknowledge-review",
+                &json!({"target": target_event, "ack_event": ack, "reviews": reviews}),
+            );
+        }
+        phase => panic!("unknown phase {phase}"),
+    }
+    close(review);
+}
+
+/// 111.2 G1/T5 (S:45): a reversal whose process dies after the send
+/// settles once, under its id, after a restart.
+#[test]
+#[ignore = "driven by keeper-hq's native graph harness (111.2 server)"]
+fn graph_live_112_reverse_survives_process_death() {
+    let case = "112-crash-reverse";
+    let saved = state_dir().join("crash-112-reverse.json");
+    let one = device(1);
+    let first = GraphClient::new(one.clone());
+    match env("KEEPER_HQ_LIVE_PHASE").as_str() {
+        "send" => {
+            let (created, _) = landed(
+                &first,
+                &one,
+                vec![create_node(&ulid(), "Crash-reversed", json!({}))],
+            );
+            let preview = first.preview_reversal(&created).expect("preview");
+            assert_eq!(preview.outcome, PreviewOutcome::Ready, "{preview:?}");
+            let reverse =
+                Reverse::of(preview.plan.as_ref().expect("plan"), None, None).expect("reverse");
+            sent_then_aborted(case, &first, REVERSE, reverse.payload(), &saved);
+        }
+        "restart" => {
+            restored_once(case, &first, &one, &saved, |payload| {
+                let mut payload = payload.clone();
+                payload["event_time_ms"] = json!(1);
+                payload
+            });
+        }
+        phase => panic!("unknown phase {phase}"),
+    }
+    close(one);
 }
