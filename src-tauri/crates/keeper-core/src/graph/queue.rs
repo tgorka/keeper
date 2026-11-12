@@ -369,14 +369,18 @@ pub enum Next {
 
 /// [`Next`] for an entry in `from` that `outcome` describes.
 ///
-/// - a definite outcome resolves it (a revoking one fences too);
+/// - a definite outcome resolves it; only a read-level refusal fences
+///   ([`GraphOutcome::revokes`]): a `forbidden` receipt or a command
+///   refused at send ends that request alone;
 /// - `pending_visibility` waits for the receipt, never sent again;
 /// - `outcome_unresolved` is `unresolved`: same-id replay or
 ///   `graph.outcome` only, never a new id (DF-110-8);
 /// - an ended agent context refuses an entry never sent and leaves one
 ///   that may have been sent `unresolved`, never refused;
-/// - a refusal revokes; a transport failure or `graph_unavailable` retries
-///   the identical request; a foreign key suspends.
+/// - a refused lookup revokes; a lookup the server refused as invalid
+///   leaves the entry as it is (nothing resent); a transport failure, a
+///   transient server error or `graph_unavailable` retries the identical
+///   request; a foreign key suspends.
 #[must_use]
 pub fn next(from: State, outcome: &GraphOutcome) -> Next {
     if let Some((to, resolution)) = terminal(outcome) {
@@ -389,7 +393,9 @@ pub fn next(from: State, outcome: &GraphOutcome) -> Next {
     match outcome {
         GraphOutcome::PendingVisibility { .. } => Next::Mark(State::PendingVisibility),
         GraphOutcome::Pending { cause } => match cause {
-            PendingCause::Transport | PendingCause::Unavailable => Next::Retry(*cause),
+            PendingCause::Transport | PendingCause::Unavailable | PendingCause::Invalid => {
+                Next::Retry(*cause)
+            }
             PendingCause::Unresolved => Next::Mark(State::Unresolved),
             PendingCause::ContextEnded if from.never_sent() => Next::RefuseLocally,
             PendingCause::ContextEnded => Next::Mark(State::Unresolved),

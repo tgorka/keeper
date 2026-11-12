@@ -8,7 +8,8 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::outcome::{
-    Attempt, GraphOutcome, GraphRequestError, GraphRequests, Receipt, ReceiptOutcome, RequestKey,
+    Attempt, GraphOutcome, GraphRequestError, GraphRequests, PendingCause, Receipt, ReceiptOutcome,
+    RequestKey,
 };
 use super::protocol::request::{self, Request};
 use super::protocol::scope::receipt_id;
@@ -501,23 +502,64 @@ fn outcome_table_separates_transport_from_acceptance() {
             code: "kg.event_group".into()
         }
     );
+    // What says nothing of the caller, or of this request's end, stays
+    // pending (retried, re-admitted or looked up).
+    for (message, cause) in [
+        ("graph_unavailable", PendingCause::Unavailable),
+        ("context_invalid", PendingCause::ContextEnded),
+        ("context_closed", PendingCause::ContextEnded),
+        ("context_expired", PendingCause::ContextEnded),
+        ("parent_unavailable", PendingCause::ContextEnded),
+        ("context_unbound", PendingCause::ContextEnded),
+        ("outcome_unresolved", PendingCause::Unresolved),
+    ] {
+        assert_eq!(
+            tgdrive.resolve(&mine, &refused(&mine, "operation.forbidden", message), None),
+            GraphOutcome::Pending { cause },
+            "{message}"
+        );
+    }
+    // A command refused at send ends that request: `rejected forbidden`
+    // with the server's name, never a revocation (owner 2026-11-12, CC-7).
     for message in [
-        "graph_unavailable",
         "forbidden",
-        "context_invalid",
         "context_revoked",
-        "context_closed",
-        "context_expired",
         "source_audience",
         "label_unknown",
-        "outcome_unresolved",
+        "an_unnamed_refusal",
     ] {
-        assert!(
-            matches!(
-                tgdrive.resolve(&mine, &refused(&mine, "operation.forbidden", message), None),
-                GraphOutcome::Pending { .. }
-            ),
+        let outcome = tgdrive.resolve(&mine, &refused(&mine, "operation.forbidden", message), None);
+        assert_eq!(
+            outcome,
+            GraphOutcome::Rejected {
+                reason: "forbidden".into(),
+                detail: json!({"code": message})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            },
             "{message}"
+        );
+        assert!(!outcome.revokes(), "{message}");
+    }
+    // A request the server refuses as it is: a technical refusal of it.
+    for (code, message, named) in [
+        (
+            "operation.invalid_request",
+            "m",
+            "operation.invalid_request",
+        ),
+        (
+            "operation.result_too_large",
+            "m",
+            "operation.result_too_large",
+        ),
+        ("operation.forbidden", "change_limit", "change_limit"),
+    ] {
+        assert_eq!(
+            tgdrive.resolve(&mine, &refused(&mine, code, message), None),
+            GraphOutcome::TechnicalRefusal { code: named.into() },
+            "{code} {message}"
         );
     }
 }

@@ -240,16 +240,19 @@ fn forbidden(code: Option<&str>) -> GraphOutcome {
     }
 }
 
-/// CC-7: a forbidden receipt (the caller lost the domain) is a revocation
-/// signal. The fence is persisted and every open entry locked before the
-/// receipt's own outcome is recorded, and the domain stays locked.
+/// Owner decision 2026-11-12 (amending CC-7): a `forbidden` receipt on a
+/// write, review, acknowledgement or decision ends that request alone,
+/// whatever its code. No fence, the gate stays open, and every other entry
+/// is untouched (CC-11 applies only to a real fence).
 #[test]
-fn a_forbidden_receipt_locks_the_domain_before_it_is_recorded() {
+fn a_forbidden_receipt_ends_that_request_alone() {
     for code in [
         None,
         Some("forbidden"),
+        Some("context_revoked"),
         Some("source_audience"),
         Some("label_unknown"),
+        Some("an_unknown_code"),
     ] {
         let dir = tempfile::tempdir().expect("dir");
         let lifecycle = queued(dir.path());
@@ -257,14 +260,117 @@ fn a_forbidden_receipt_locks_the_domain_before_it_is_recorded() {
         lifecycle
             .with_queue(|q| q.mark(&id, State::Queued, State::Submitting, None, 2))
             .expect("sent");
+        let other = enqueue_another(&lifecycle, dir.path());
         assert_eq!(
             lifecycle.settle(&id, State::Submitting, &forbidden(code), 3),
             Ok(State::Rejected),
             "{code:?}"
         );
-        assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden), "{code:?}");
-        assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)), "{code:?}");
-        assert_eq!(only_entry(dir.path()).1, State::Rejected);
+        lifecycle.gate().expect("no fence");
+        assert_eq!(lifecycle.fence(), Ok(None), "{code:?}");
+        assert_eq!(state_of(dir.path(), &id), State::Rejected, "{code:?}");
+        assert_eq!(state_of(dir.path(), &other), State::Queued, "{code:?}");
+    }
+}
+
+/// Queue a second change beside the fixture's one; its request id.
+fn enqueue_another(lifecycle: &Lifecycle, dir: &Path) -> String {
+    let client = GraphClient::new(Source {
+        database: DB.to_owned(),
+        replica: FakeOpener::default()
+            .open(ReplicaSpec {
+                database: DB.to_owned(),
+                path: dir.join("ana-2.sqlite"),
+                client_id: Some("dev1".to_owned()),
+                link: None,
+                subscriptions: Vec::new(),
+                watch_presence: None,
+            })
+            .expect("opens"),
+        actor: "ana".to_owned(),
+        client: "dev1".to_owned(),
+    });
+    let change = client
+        .change(
+            vec![ChangeOp::CreateNode {
+                id: "01JF0000000000000000000002".to_owned(),
+                kind: "Concept".into(),
+                title: "M".into(),
+                description: None,
+                properties: Map::new(),
+            }],
+            None,
+        )
+        .expect("change");
+    let prepared = client.mint(&change).expect("minted");
+    lifecycle
+        .with_queue(|q| q.enqueue(&prepared, 2))
+        .expect("queued");
+    prepared.request().request_id.clone()
+}
+
+/// The state of entry `id` in the queue file.
+fn state_of(dir: &Path, id: &str) -> State {
+    let raw = rusqlite::Connection::open(queue_path(dir)).expect("raw");
+    let state: String = raw
+        .query_row(
+            "SELECT state FROM graph_intents WHERE request_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .expect("entry");
+    match state.as_str() {
+        "queued" => State::Queued,
+        "submitting" => State::Submitting,
+        "disabled" => State::Disabled,
+        "rejected" => State::Rejected,
+        "unresolved" => State::Unresolved,
+        "accepted" => State::Accepted,
+        "refused_locally" => State::RefusedLocally,
+        other => panic!("unexpected state {other}"),
+    }
+}
+
+/// Review BLOCKING-1/B-A/B-B: a transient or lifecycle answer to a sent
+/// request never fences: the server's storage outage, a failed handler, an
+/// unknown code, the graph switched off, an unknown operation, an ended or
+/// unbound context, an invalid request.
+#[test]
+fn a_transient_or_lifecycle_answer_never_fences() {
+    let remote = |code: &str, message: &str, retryable: bool| ReplicaError::Remote {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        retryable,
+    };
+    for error in [
+        remote("sync.internal_error", "storage_unavailable", true),
+        remote("operation.execution_failed", "m", false),
+        remote("operation.query_failed", "m", false),
+        remote("some.new_code", "m", false),
+        remote("operation.forbidden", "graph_unavailable", false),
+        remote("operation.unknown", "m", false),
+        remote("operation.forbidden", "context_expired", false),
+        remote("operation.forbidden", "parent_unavailable", false),
+        remote("operation.forbidden", "context_unbound", false),
+        remote("operation.invalid_request", "m", false),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let lifecycle = queued(dir.path());
+        let (id, _) = only_entry(dir.path());
+        lifecycle
+            .with_queue(|q| q.mark(&id, State::Queued, State::Submitting, None, 2))
+            .expect("sent");
+        let other = enqueue_another(&lifecycle, dir.path());
+        let outcome = GraphOutcome::Pending {
+            cause: PendingCause::of(&error),
+        };
+        lifecycle
+            .settle(&id, State::Submitting, &outcome, 3)
+            .expect("settled");
+        lifecycle.gate().expect("no fence");
+        assert_eq!(lifecycle.fence(), Ok(None), "{error:?}");
+        assert_ne!(state_of(dir.path(), &id), State::Disabled, "{error:?}");
+        assert_eq!(state_of(dir.path(), &other), State::Queued, "{error:?}");
     }
 }
 
@@ -636,21 +742,19 @@ fn a_replay_settles_a_cached_receipt_only_under_fresh_authority() {
     lifecycle.gate().expect("no fence");
     assert_eq!(only_entry(dir.path()).1, State::Submitting);
 
-    // A refused replay with the server's authority unreachable: the
-    // observed refusal still fences, the cached outcome stays unused.
+    // A replay refused at send with the server's authority unreachable: the
+    // cached outcome stays unused, and the command's refusal ends that
+    // request alone (owner 2026-11-12, amending CC-7): no fence.
     let dir = tempfile::tempdir().expect("dir");
     let (lifecycle, settled, _) =
         resume_cached(dir.path(), Some(Err(forbidden_error())), Err(unheard()));
-    assert_eq!(
-        settled,
-        Ok((
-            GraphOutcome::Pending {
-                cause: PendingCause::Refused
-            },
-            State::Disabled
-        ))
+    let (looked, state) = settled.expect("looked up");
+    assert!(
+        matches!(&looked, GraphOutcome::Rejected { reason, .. } if reason == "forbidden"),
+        "{looked:?}"
     );
-    assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+    assert_eq!(state, State::Rejected);
+    assert_eq!(lifecycle.fence(), Ok(None));
 
     // A cached acknowledgement is a replay of an earlier answer: the
     // receipt waits for a fresh status, then settles.
@@ -697,6 +801,105 @@ fn a_replay_settles_a_cached_receipt_only_under_fresh_authority() {
     );
     assert_eq!(state, State::Accepted);
     lifecycle.gate().expect("no fence");
+}
+
+/// A server whose grant is withdrawn: every command is refused
+/// `operation.forbidden`; `graph.outcome` answers nothing until `withdrawn`
+/// is learned at read level, then refuses too.
+struct Withdrawn {
+    reads_refused: std::sync::atomic::AtomicBool,
+}
+
+impl GraphWrite for Withdrawn {
+    fn command(
+        &self,
+        _: &str,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<CommandResult, ReplicaError> {
+        Err(forbidden_error())
+    }
+    fn receipt(&self, _: &str) -> Result<Vec<Map<String, serde_json::Value>>, ReplicaError> {
+        Ok(Vec::new())
+    }
+    fn remote_query(
+        &self,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<Vec<Map<String, serde_json::Value>>, ReplicaError> {
+        if self.reads_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(forbidden_error())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    fn link(&self) -> LinkState {
+        LinkState::Connected
+    }
+}
+
+/// The inverse of the amended CC-7 (owner 2026-11-12): a command refused at
+/// send ends that request alone, but when the grant really was withdrawn
+/// the next read-level call (here the other entry's `graph.outcome` lookup)
+/// still fences the domain and disables what is open.
+#[test]
+fn a_command_refusal_ends_its_request_and_a_read_level_refusal_still_fences() {
+    let dir = tempfile::tempdir().expect("dir");
+    let lifecycle = queued(dir.path());
+    let (sent, _) = only_entry(dir.path());
+    let other = enqueue_another(&lifecycle, dir.path());
+    let port = Arc::new(Withdrawn {
+        reads_refused: std::sync::atomic::AtomicBool::new(false),
+    });
+    let writer = Writer {
+        domain: DB.to_owned(),
+        actor: "ana".to_owned(),
+        client: "dev1".to_owned(),
+    };
+    let client = GraphClient::over(port.clone(), &writer, Caller::Person);
+    let restored = lifecycle
+        .with_queue(|q| q.restore(&client, 3))
+        .expect("restores");
+    let prepared = |id: &str| {
+        restored
+            .iter()
+            .find_map(|r| match r {
+                Restored::Ready { prepared, .. } if prepared.request().request_id == id => {
+                    Some(prepared)
+                }
+                _ => None,
+            })
+            .expect("restored")
+    };
+
+    // The command refused at send: that request ends, nothing is fenced.
+    lifecycle
+        .with_queue(|q| q.mark(&sent, State::Queued, State::Submitting, None, 4))
+        .expect("sending");
+    let attempt = client.send(prepared(&sent)).expect("sent");
+    let outcome = client
+        .outcome(prepared(&sent), Some(&attempt))
+        .expect("outcome");
+    assert_eq!(
+        lifecycle.settle(&sent, State::Submitting, &outcome, 5),
+        Ok(State::Rejected)
+    );
+    assert_eq!(lifecycle.fence(), Ok(None));
+    assert_eq!(state_of(dir.path(), &other), State::Queued);
+
+    // The grant was withdrawn: the next read-level call fences.
+    port.reads_refused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let looked = client.outcome(prepared(&other), None).expect("lookup");
+    assert!(looked.revokes(), "{looked:?}");
+    assert_eq!(
+        lifecycle.settle(&other, State::Queued, &looked, 6),
+        Ok(State::Disabled)
+    );
+    assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+    assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+    assert_eq!(state_of(dir.path(), &other), State::Disabled);
+    assert_eq!(state_of(dir.path(), &sent), State::Rejected);
 }
 
 /// The server's `graph.admit_read` as an agent's regrant sees it: it admits

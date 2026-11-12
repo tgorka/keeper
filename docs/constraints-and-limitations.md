@@ -365,10 +365,20 @@ match the stored request, and after an agent runtime restart an entry never sent
 answers.
 
 **Revocation locks first and cleans up after.** A revocation signal is a refused link, any
-revoked graph, receipt or proposal subscription, a server refusal of a read, of a command or
-of `graph.outcome`, or a `forbidden` receipt (except the refusals that end one request: an
-agent approval that does not bind, a person's change naming an approval, an ended agent
-context). On a signal the domain is fenced: the in-memory gate closes, a `graph_fence` row is
+revoked graph, receipt or proposal subscription, or the server refusing a read-level call: a
+read (`read_status`, `admit_read`, `refresh_context`, a query) or a `graph.outcome` lookup.
+A refusal of one request — a command refused at send, or any `forbidden` receipt, whatever
+its code — ends that request alone (`rejected forbidden`): no fence, and no other entry is
+touched (owner decision 2026-11-12, amending CC-7). Every remote answer is read by one
+classifier (`ReplicaError::class`), by the server's stable names: only a refused credential
+or scope (`401`/`403`, `sync.auth_required`, `sync.forbidden`, `sync.scope_revoked`) or a
+refusal of graph authority (`forbidden`, `context_revoked`, `source_audience`,
+`label_unknown`, or an `operation.forbidden` message keeper does not name) is a refusal. The
+graph switched off (`graph_unavailable`), an unknown operation, an ended or unbound agent
+context (`context_expired`/`closed`/`invalid`, `parent_unavailable`, `context_unbound`), an
+invalid request, a failed handler or query, a storage outage and any code keeper does not
+name are not: a read answers `sync_pending`, a request retries or ends locally, and nothing
+fences. On a signal the domain is fenced: the in-memory gate closes, a `graph_fence` row is
 committed in the queue file, every open entry becomes `disabled` (identity and payload kept,
 never sent again), and in-flight workers are killed and the projection purged. Reads,
 results, receipts, history and the queue listing refuse from the first step; a crash at any
@@ -386,12 +396,13 @@ outcome and its typed `PendingCause`, never on text): a receipt resolves it — 
 receipt already on the replica settles nothing until the server's current `graph.read_status`
 answers, unless the same request's own fresh (not `cached`) acknowledgement is in hand: a
 refused status fences the domain and disables the entry instead; with no link or an
-unreachable server the cached receipt is not used (a refused replay still fences, an
-unanswered one stays as it is); a transport
-failure or `graph_unavailable` keeps it and retries the identical request; `outcome_unresolved`
-makes it `unresolved` (only a same-id replay or `graph.outcome`, never a new id); an ended
-agent context refuses it locally only if it was never sent, otherwise it stays `unresolved`;
-a refusal fences the domain. A resume (`queue::resume_sends`, the driver's and the live
+unreachable server the cached receipt is not used (a replay refused at send ends that request,
+an unanswered one stays as it is); a transport
+failure, a transient server error or `graph_unavailable` keeps it and retries the identical
+request; `outcome_unresolved` makes it `unresolved` (only a same-id replay or `graph.outcome`,
+never a new id); an ended agent context refuses it locally only if it was never sent, otherwise
+it stays `unresolved`; a refused `graph.outcome` lookup fences the domain. A resume
+(`queue::resume_sends`, the driver's and the live
 harness's one rule) sends only an entry nothing is known of — no receipt, or a lookup the
 transport lost — that is queued, or a person's already submitting: never after
 `outcome_unresolved` or from `unresolved` (lookup only), never on `graph_unavailable` (its

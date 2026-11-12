@@ -35,7 +35,7 @@ use super::protocol::request::{self, is_descriptor, Request};
 use super::protocol::scope::{client_scope, receipt_id};
 use super::protocol::{is_decimal, is_ulid, value, Refusal, CONTRACT_VERSION};
 use super::write::{GraphWrite, Writer};
-use crate::hq::port::{CommandResult, ReplicaError};
+use crate::hq::port::{CommandResult, ErrorClass, ReplicaError};
 use crate::hq::sessions::Source;
 
 /// Which request this is: its database, descriptor, request id and client
@@ -297,61 +297,67 @@ impl GraphOutcome {
         }
     }
 
-    /// Whether this outcome is a revocation signal for the domain (112.1
-    /// CC-7): a refused send or `graph.outcome` ([`PendingCause::Refused`]),
-    /// or a `rejected` receipt whose reason is `forbidden` with a code that
-    /// is not one of the request's own terminal refusals
-    /// ([`REQUEST_REFUSALS`]: an approval-class code, or an ended context).
-    /// A forbidden receipt with no code, or with an unknown one, revokes.
+    /// Whether this outcome is a revocation signal for the domain: only a
+    /// refused read-level call ([`PendingCause::Refused`]: a refused
+    /// `graph.read_status` or `graph.outcome`, or a refused credential or
+    /// scope). A `forbidden` receipt or a command refused at send ends that
+    /// one request, whatever its code, and fences nothing (owner decision
+    /// 2026-11-12, amending CC-7: per-request refusals are CC-14's class).
     #[must_use]
     pub fn revokes(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::Pending {
-                cause: PendingCause::Refused,
-            } => true,
-            Self::Rejected { reason, detail } if reason == "forbidden" => !detail
-                .get("code")
-                .and_then(Value::as_str)
-                .is_some_and(|code| REQUEST_REFUSALS.contains(&code)),
-            _ => false,
-        }
+                cause: PendingCause::Refused
+            }
+        )
     }
 }
 
-/// The `forbidden` receipt codes that end one request and say nothing of
-/// the domain's authority: an agent's approval that does not bind (the
-/// server's `approvalProblem`), a person's change that names an approval,
-/// and an agent context that ended. Never a revocation signal.
-pub const REQUEST_REFUSALS: [&str; 8] = [
+/// The `forbidden` codes that end one request because of the request
+/// itself or its context: an agent's approval that does not bind (the
+/// server's `approvalProblem`) or was already used, a person's change that
+/// names an approval, and an agent context that ended or was unbound. Like
+/// every `forbidden` receipt, never a revocation signal ([`GraphOutcome::revokes`]).
+pub const REQUEST_REFUSALS: [&str; 11] = [
     "approval_required",
     "approval_binding",
     "approval_unavailable",
+    "approval_used",
     "tool_off",
     "approval_not_applicable",
     "context_expired",
     "context_closed",
     "context_invalid",
+    "parent_unavailable",
+    "context_unbound",
 ];
 
 /// Why a request is still [`GraphOutcome::Pending`] (112.1 CC-5). The queue
 /// policy keys on this, never on text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingCause {
-    /// No answer this device can trust: the identical request is retried
-    /// under its own id after a back-off.
+    /// No answer this device can trust, or one that says nothing of the
+    /// caller (a failed handler, an internal or storage error, an unknown
+    /// code): the identical request is retried under its own id after a
+    /// back-off.
     Transport,
-    /// The graph is switched off on the server (`graph_unavailable`): back
-    /// off, then retry the identical request.
+    /// The graph is switched off on the server (`graph_unavailable`), or
+    /// the server lacks the operation (`operation.unknown`): back off, then
+    /// retry the identical request.
     Unavailable,
     /// The server cannot say what became of it (`outcome_unresolved`):
     /// only a same-id replay or `graph.outcome`, never a new id.
     Unresolved,
-    /// The agent context the request names ended (`context_expired`,
-    /// `context_closed`, `context_invalid`).
+    /// The agent context the request names ended or was unbound
+    /// ([`crate::hq::port::CONTEXT_ENDED`]).
     ContextEnded,
-    /// The server refused the caller (`forbidden`, `context_revoked`,
-    /// `source_audience`, `label_unknown`, or any refusal it does not call
-    /// retryable): a revocation signal.
+    /// The server refused a lookup as it is (an invalid request, an answer
+    /// over its limit): the entry stays as it is, nothing is resent.
+    Invalid,
+    /// The server refused the caller at read level (a refused credential
+    /// or scope, or `graph.outcome`/`graph.read_status` refused): a
+    /// revocation signal.
     Refused,
     /// Nothing was sent and no receipt is known: look the receipt up.
     NoAttempt,
@@ -369,54 +375,27 @@ impl PendingCause {
             Self::Unavailable => "graph_unavailable",
             Self::Unresolved => "outcome_unresolved",
             Self::ContextEnded => "context_ended",
+            Self::Invalid => "invalid_request",
             Self::Refused => "refused",
             Self::NoAttempt => "no_attempt",
             Self::Foreign => "foreign_request",
         }
     }
 
-    /// The cause a failed send or remote lookup gives. A server refusal is
-    /// read by its stable code (the message of `operation.forbidden`, or
-    /// the code itself); an unknown refusal the server does not call
-    /// retryable is [`PendingCause::Refused`] (fail closed). Every
-    /// failure that is not the server's answer is [`PendingCause::Transport`].
+    /// The cause a failed read-level call (a lookup, an authority read)
+    /// gives, through the one classifier ([`ReplicaError::class`]) the read
+    /// path uses too. Only a refusal of the caller is
+    /// [`PendingCause::Refused`]; whatever says nothing of the caller,
+    /// retryable or not, is never one.
     #[must_use]
     pub fn of(error: &ReplicaError) -> Self {
-        let (code, message, retryable) = match error {
-            ReplicaError::Remote {
-                code,
-                message,
-                retryable,
-            } => (code.as_str(), message.as_str(), *retryable),
-            ReplicaError::Rejected { code, message } => (code.as_str(), message.as_str(), false),
-            ReplicaError::Client(_)
-            | ReplicaError::Unheard { .. }
-            | ReplicaError::NotSyncing
-            | ReplicaError::Closed => return Self::Transport,
-        };
-        let named = |name: &str| code == name || message == name;
-        if named("graph_unavailable") {
-            Self::Unavailable
-        } else if named("outcome_unresolved") {
-            Self::Unresolved
-        } else if ["context_expired", "context_closed", "context_invalid"]
-            .into_iter()
-            .any(named)
-        {
-            Self::ContextEnded
-        } else if [
-            "forbidden",
-            "context_revoked",
-            "source_audience",
-            "label_unknown",
-        ]
-        .into_iter()
-        .any(named)
-            || !retryable
-        {
-            Self::Refused
-        } else {
-            Self::Transport
+        match error.class() {
+            ErrorClass::Revoked | ErrorClass::Forbidden => Self::Refused,
+            ErrorClass::Unavailable => Self::Unavailable,
+            ErrorClass::Unresolved => Self::Unresolved,
+            ErrorClass::ContextEnded => Self::ContextEnded,
+            ErrorClass::Invalid => Self::Invalid,
+            ErrorClass::Transient | ErrorClass::Unanswered => Self::Transport,
         }
     }
 }
@@ -665,6 +644,13 @@ impl GraphRequests {
                 .unwrap_or_else(|| GraphOutcome::TechnicalRefusal { code: code.clone() }),
             Some(Err(error @ ReplicaError::Remote { code, message, .. })) => {
                 terminal(code, message).unwrap_or_else(|| {
+                    // A named code is the code; under `operation.forbidden`
+                    // the server names it in the message.
+                    let named = if code == "operation.forbidden" {
+                        message
+                    } else {
+                        code
+                    };
                     if code.starts_with("kg.") {
                         GraphOutcome::TechnicalRefusal { code: code.clone() }
                     } else if message.starts_with("kg.") {
@@ -672,8 +658,22 @@ impl GraphRequests {
                             code: message.clone(),
                         }
                     } else {
-                        GraphOutcome::Pending {
-                            cause: PendingCause::of(error),
+                        match error.class() {
+                            // The command refused at send: a terminal refusal
+                            // of this request, never the domain's (owner
+                            // decision 2026-11-12, amending CC-7).
+                            ErrorClass::Forbidden => GraphOutcome::Rejected {
+                                reason: "forbidden".to_owned(),
+                                detail: [("code".to_owned(), Value::from(named.clone()))]
+                                    .into_iter()
+                                    .collect(),
+                            },
+                            ErrorClass::Invalid => GraphOutcome::TechnicalRefusal {
+                                code: named.clone(),
+                            },
+                            _ => GraphOutcome::Pending {
+                                cause: PendingCause::of(error),
+                            },
                         }
                     }
                 })

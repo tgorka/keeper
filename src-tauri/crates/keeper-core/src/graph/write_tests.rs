@@ -127,24 +127,75 @@ fn applied() -> Result<CommandResult, ReplicaError> {
     })
 }
 
-/// CC-5: every server refusal code maps to its cause, a refusal the server
-/// does not call retryable is `Refused` (fail closed), and every failure
-/// that is not the server's answer is `Transport`.
+/// CC-5 through the one classifier (review BLOCKING-1, S0, B-A, B-B): every
+/// server answer maps to its cause by its stable name. Only a refused
+/// credential or scope, or a refusal of graph authority (an unnamed
+/// `operation.forbidden` message included), is `Refused`; a non-retryable
+/// answer that says nothing of the caller never is; every failure that is
+/// not the server's answer is `Transport`.
 #[test]
 fn every_failure_has_its_typed_cause() {
+    use crate::hq::port::CREDENTIAL_REFUSED;
     let refusal = |message: &str| remote("operation.forbidden", message, false);
     let cases = [
         (refusal("graph_unavailable"), PendingCause::Unavailable),
+        (
+            remote("operation.unknown", "m", false),
+            PendingCause::Unavailable,
+        ),
         (refusal("outcome_unresolved"), PendingCause::Unresolved),
         (refusal("context_expired"), PendingCause::ContextEnded),
         (refusal("context_closed"), PendingCause::ContextEnded),
         (refusal("context_invalid"), PendingCause::ContextEnded),
+        (refusal("parent_unavailable"), PendingCause::ContextEnded),
+        (refusal("context_unbound"), PendingCause::ContextEnded),
+        (refusal("unsupported_version"), PendingCause::Invalid),
+        (refusal("change_limit"), PendingCause::Invalid),
+        (
+            remote("operation.invalid_request", "m", false),
+            PendingCause::Invalid,
+        ),
+        (
+            remote("operation.result_too_large", "m", false),
+            PendingCause::Invalid,
+        ),
+        (
+            remote("sync.invalid_client_id", "m", false),
+            PendingCause::Invalid,
+        ),
         (refusal("forbidden"), PendingCause::Refused),
         (refusal("context_revoked"), PendingCause::Refused),
         (refusal("source_audience"), PendingCause::Refused),
         (refusal("label_unknown"), PendingCause::Refused),
         (refusal("something_new"), PendingCause::Refused),
         (remote("forbidden", "", true), PendingCause::Refused),
+        (
+            remote(CREDENTIAL_REFUSED, "m", false),
+            PendingCause::Refused,
+        ),
+        (
+            remote("sync.auth_required", "m", false),
+            PendingCause::Refused,
+        ),
+        (remote("sync.forbidden", "m", false), PendingCause::Refused),
+        (
+            remote("sync.scope_revoked", "m", false),
+            PendingCause::Refused,
+        ),
+        // B-A: transient however the server marks it.
+        (
+            remote("operation.execution_failed", "m", false),
+            PendingCause::Transport,
+        ),
+        (
+            remote("operation.query_failed", "m", false),
+            PendingCause::Transport,
+        ),
+        (
+            remote("sync.internal_error", "storage_unavailable", true),
+            PendingCause::Transport,
+        ),
+        (remote("some.new_code", "m", false), PendingCause::Transport),
         (remote("sync.busy", "later", true), PendingCause::Transport),
         (
             ReplicaError::Unheard {
@@ -163,10 +214,11 @@ fn every_failure_has_its_typed_cause() {
     }
 }
 
-/// CC-7: only a refusal or a forbidden receipt outside the request's own
-/// terminal refusals revokes; nothing else does.
+/// Owner decision 2026-11-12 (amending CC-7): only a read-level refusal
+/// (`Pending{Refused}`) revokes. A `forbidden` receipt ends that request
+/// alone, whatever its code, and nothing else revokes either.
 #[test]
-fn only_a_refusal_revokes() {
+fn only_a_read_level_refusal_revokes() {
     let forbidden = |code: Option<&str>| GraphOutcome::Rejected {
         reason: "forbidden".into(),
         detail: code
@@ -177,17 +229,23 @@ fn only_a_refusal_revokes() {
         cause: PendingCause::Refused
     }
     .revokes());
-    assert!(forbidden(None).revokes());
-    assert!(forbidden(Some("forbidden")).revokes());
-    assert!(forbidden(Some("an_unknown_code")).revokes());
-    for code in REQUEST_REFUSALS {
-        assert!(!forbidden(Some(code)).revokes(), "{code}");
+    for code in [
+        None,
+        Some("forbidden"),
+        Some("context_revoked"),
+        Some("an_unknown_code"),
+    ]
+    .into_iter()
+    .chain(REQUEST_REFUSALS.into_iter().map(Some))
+    {
+        assert!(!forbidden(code).revokes(), "{code:?}");
     }
     for cause in [
         PendingCause::Transport,
         PendingCause::Unavailable,
         PendingCause::Unresolved,
         PendingCause::ContextEnded,
+        PendingCause::Invalid,
         PendingCause::NoAttempt,
         PendingCause::Foreign,
     ] {
@@ -212,6 +270,10 @@ fn the_queue_policy_follows_the_cause() {
     assert_eq!(
         next(State::Submitting, &pending(PendingCause::Unavailable)),
         Next::Retry(PendingCause::Unavailable)
+    );
+    assert_eq!(
+        next(State::Submitting, &pending(PendingCause::Invalid)),
+        Next::Retry(PendingCause::Invalid)
     );
     assert_eq!(
         next(State::Submitting, &pending(PendingCause::Unresolved)),
@@ -264,7 +326,7 @@ fn the_queue_policy_follows_the_cause() {
     ) else {
         panic!("a receipt resolves");
     };
-    assert_eq!((to, revokes), (State::Rejected, true));
+    assert_eq!((to, revokes), (State::Rejected, false));
     let Next::Resolve {
         to,
         resolution,
