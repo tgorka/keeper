@@ -13,7 +13,8 @@ use crate::graph::client::{GraphClient, GraphClientError};
 use crate::graph::outcome::{GraphOutcome, PendingCause, REQUEST_REFUSALS};
 use crate::graph::protocol::change::ChangeOp;
 use crate::graph::protocol::scope::{client_scope, receipt_id};
-use crate::graph::protocol::wire::{self, Authority};
+use crate::graph::protocol::wire::{self, Authority, ContextRow};
+use crate::graph::query::GraphRemote;
 use crate::graph::queue::{Binding, Restored, State};
 use crate::graph::runtime::{Runtime, VerifiedWorker};
 use crate::graph::source::{GraphSource, PrefixBatch, Revocation, SourceError};
@@ -24,11 +25,11 @@ use crate::hq::sessions::Source;
 
 const DB: &str = "work";
 
-struct Scope(Mutex<Checkpoint>);
+struct Scope(Mutex<Checkpoint>, &'static str);
 
 impl GraphSource for Scope {
     fn domain(&self) -> &str {
-        DB
+        self.1
     }
     fn prefix_batch(&self, _: u64, _: usize) -> Result<PrefixBatch, SourceError> {
         Err(SourceError::Unreadable(
@@ -48,6 +49,10 @@ fn checkpoint(scope: ScopeState) -> Checkpoint {
 }
 
 fn reads(dir: &Path) -> GraphReads {
+    reads_of(dir, DB)
+}
+
+fn reads_of(dir: &Path, domain: &'static str) -> GraphReads {
     std::fs::create_dir_all(dir).expect("dir");
     let worker = dir.join("worker");
     std::fs::write(&worker, b"stand-in").expect("worker file");
@@ -57,7 +62,7 @@ fn reads(dir: &Path) -> GraphReads {
         .collect();
     let worker = VerifiedWorker::open(&worker, Some(&digest)).expect("worker");
     GraphReads::open(
-        Arc::new(Scope(Mutex::new(checkpoint(ScopeState::Granted)))),
+        Arc::new(Scope(Mutex::new(checkpoint(ScopeState::Granted)), domain)),
         &dir.join("projection"),
         Admission::new(Process::Agentd),
         Arc::new(Runtime::for_tests(worker)),
@@ -692,4 +697,210 @@ fn a_replay_settles_a_cached_receipt_only_under_fresh_authority() {
     );
     assert_eq!(state, State::Accepted);
     lifecycle.gate().expect("no fence");
+}
+
+/// The server's `graph.admit_read` as an agent's regrant sees it: it admits
+/// `domain` into context `C1` of session `S1` until `expires_at_ms`.
+struct Admits {
+    domain: &'static str,
+    expires_at_ms: u64,
+}
+
+impl GraphRemote for Admits {
+    fn admit_read(&self, context: &str, _: &str) -> Result<ContextRow, QueryError> {
+        Ok(ContextRow {
+            context: context.to_owned(),
+            session: "01JF00000000000000000000S1".to_owned(),
+            permitted: vec![self.domain.to_owned()],
+            sources: vec![self.domain.to_owned()],
+            expires_at_ms: self.expires_at_ms,
+            authority: Authority {
+                epoch: "2".to_owned(),
+                digest: "b".repeat(64),
+            },
+        })
+    }
+    fn refresh_context(&self, context: &str) -> Result<ContextRow, QueryError> {
+        self.admit_read(context, self.domain)
+    }
+    fn read_status(&self, _: &str) -> Result<ReadStatus, QueryError> {
+        Err(QueryError::Forbidden)
+    }
+}
+
+/// The far future: an admission that has not expired at any `now` here.
+const LATER: u64 = 4_102_444_800_000;
+
+fn admitted_in(domain: &'static str, expires_at_ms: u64) -> AdmittedRead {
+    AdmittedRead::admit(
+        &Admits {
+            domain,
+            expires_at_ms,
+        },
+        "agent:nixi",
+        "01JF00000000000000000000S1",
+        "01JF00000000000000000000C1",
+        domain,
+    )
+    .expect("admitted")
+}
+
+/// 112.1 CC-9/T3 (R-B6 K2), an agent's regrant: a lifecycle whose one
+/// queued entry a revocation disabled, its revoked reads instance, a new
+/// instance, and (`purged`) the replica's purge observed. Admitting and
+/// opening the new instance happen while it is fenced.
+async fn fenced(dir: &Path, purged: bool) -> (Lifecycle, GraphReads, GraphReads) {
+    let lifecycle = queued(dir);
+    let revoked = reads(dir);
+    lifecycle.revoke(Some(&revoked), 5).await.expect("revoked");
+    if purged {
+        assert_eq!(lifecycle.observe_purge(Revocation::Purged, 6), Ok(true));
+    }
+    let fresh = reads(&dir.join("fresh"));
+    (lifecycle, revoked, fresh)
+}
+
+/// The fence still stands, unchanged, after a refused regrant.
+fn still_fenced(lifecycle: &Lifecycle, fence: FenceState) {
+    assert!(lifecycle.is_locked());
+    assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+    assert_eq!(lifecycle.fence(), Ok(Some(fence)));
+}
+
+/// Everything fresh, from `purged`: the fence clears and the disabled
+/// entry stays disabled (CC-11).
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_clears_a_purged_fence_under_a_fresh_admission() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
+    let read = admitted_in(DB, LATER);
+    lifecycle
+        .regrant_admitted(&read, checkpoint(ScopeState::Granted), &fresh)
+        .expect("regranted");
+    lifecycle.gate().expect("unlocked");
+    assert_eq!(lifecycle.fence(), Ok(None));
+    assert_eq!(only_entry(dir.path()).1, State::Disabled);
+}
+
+/// Still `revoked` (the purge not observed): `PurgePending`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_waits_for_the_purge() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, _revoked, fresh) = fenced(dir.path(), false).await;
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_in(DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &fresh
+        ),
+        Err(LifecycleError::PurgePending)
+    );
+    still_fenced(&lifecycle, FenceState::Revoked);
+}
+
+/// An admission that has expired since `admit_read` answered: `NotFresh`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_an_expired_admission() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
+    let read = admitted_in(DB, now_plus(50));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        lifecycle.regrant_admitted(&read, checkpoint(ScopeState::Granted), &fresh),
+        Err(LifecycleError::NotFresh)
+    );
+    still_fenced(&lifecycle, FenceState::Purged);
+}
+
+/// An admission of another domain: `NotFresh`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_another_domains_admission() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_in("other", LATER),
+            checkpoint(ScopeState::Granted),
+            &fresh
+        ),
+        Err(LifecycleError::NotFresh)
+    );
+    still_fenced(&lifecycle, FenceState::Purged);
+}
+
+/// The revoked instance is no evidence of fresh authority: `NotFresh`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_the_revoked_instance() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, revoked, _fresh) = fenced(dir.path(), true).await;
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_in(DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &revoked
+        ),
+        Err(LifecycleError::NotFresh)
+    );
+    still_fenced(&lifecycle, FenceState::Purged);
+}
+
+/// Subscriptions still pending (or revoked again): `NotFresh`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_subscriptions_not_granted() {
+    for scope in [ScopeState::Pending, ScopeState::Revoked] {
+        let dir = tempfile::tempdir().expect("dir");
+        let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
+        assert_eq!(
+            lifecycle.regrant_admitted(&admitted_in(DB, LATER), checkpoint(scope), &fresh),
+            Err(LifecycleError::NotFresh),
+            "{scope:?}"
+        );
+        still_fenced(&lifecycle, FenceState::Purged);
+    }
+}
+
+/// A new instance of another domain: `NotFresh`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_another_domains_instance() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, _revoked, _fresh) = fenced(dir.path(), true).await;
+    let other = reads_of(&dir.path().join("other"), "other");
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_in(DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &other
+        ),
+        Err(LifecycleError::NotFresh)
+    );
+    still_fenced(&lifecycle, FenceState::Purged);
+}
+
+/// With no fence there is nothing to regrant: `NotFenced`.
+#[test]
+fn an_agent_regrant_needs_a_fence() {
+    let dir = tempfile::tempdir().expect("dir");
+    let lifecycle = queued(dir.path());
+    let fresh = reads(&dir.path().join("fresh"));
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_in(DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &fresh
+        ),
+        Err(LifecycleError::NotFenced)
+    );
+}
+
+/// An admission that expires `ms` from the wall clock now (a real
+/// `admit_read` refuses an already-expired row).
+fn now_plus(ms: u64) -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("ms")
+        + ms
 }

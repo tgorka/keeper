@@ -21,9 +21,11 @@
 //! locked, and [`Lifecycle::resume`] runs them again. A failed step is a
 //! locked failure, never an unlock.
 //!
-//! Only a regrant clears the fence ([`Lifecycle::regrant`]), and only from
-//! `purged`, with a successful read authority for this domain, granted
-//! subscriptions and a new, unrevoked [`GraphReads`]. A fence learned from a
+//! Only a regrant clears the fence ([`Lifecycle::regrant`] for a person,
+//! [`Lifecycle::regrant_admitted`] for an agent), and only from `purged`,
+//! with fresh authority for this domain (a successful `read_status`, or an
+//! unexpired `admit_read`), granted subscriptions and a new, unrevoked
+//! [`GraphReads`]. A fence learned from a
 //! refusal before the server's revoke frame stays `revoked` and never
 //! unlocks. Locked entries stay locked after a regrant: they are never sent
 //! again, only resolved by their own outcome or discarded.
@@ -33,7 +35,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::outcome::GraphOutcome;
 use super::protocol::wire::{Authority, ReadStatus};
-use super::query::{GraphReads, QueryError};
+use super::query::{AdmittedRead, GraphReads, QueryError};
 use super::queue::{self, AuthorityRow, FenceState, GraphQueue, Next, QueueError, State};
 use super::source::{Checkpoint, Revocation, ScopeState};
 
@@ -292,13 +294,60 @@ impl Lifecycle {
         }
     }
 
-    /// A regrant: clear the fence only from `purged`, with `status` a
-    /// successful read authority for this domain, `checkpoint` granted
-    /// subscriptions and `reads` a new, unrevoked instance. Locked entries
-    /// stay locked.
+    /// A person's regrant: clear the fence only from `purged`, with
+    /// `status` a successful read authority for this domain, `checkpoint`
+    /// granted subscriptions and `reads` a new, unrevoked instance. Locked
+    /// entries stay locked.
     pub fn regrant(
         &self,
         status: &ReadStatus,
+        checkpoint: Checkpoint,
+        reads: &GraphReads,
+    ) -> Result<(), LifecycleError> {
+        self.clear(|domain| status.domain == domain, checkpoint, reads)
+    }
+
+    /// An agent's regrant (CC-9: "a successful `read_status`/`admit_read`"):
+    /// an agent's credential is refused `graph.read_status`, so its fresh
+    /// authority is the server's `graph.admit_read` answer, `read`, for this
+    /// domain and not yet expired on this device's clock. Otherwise exactly
+    /// [`Lifecycle::regrant`] (one shared rule): only from `purged`
+    /// ([`LifecycleError::PurgePending`] while `revoked`,
+    /// [`LifecycleError::NotFenced`] with no fence), and
+    /// [`LifecycleError::NotFresh`] unless `checkpoint` is granted
+    /// subscriptions and `reads` a new, unrevoked instance of this domain.
+    /// Locked entries stay locked.
+    ///
+    /// Neither [`AdmittedRead::admit`] nor [`GraphReads::open`] consults the
+    /// lifecycle: both work while the domain is fenced, which is how a caller
+    /// obtains the evidence. The caller re-registers revoked subscriptions
+    /// only after [`Lifecycle::observe_purge`] returned `true` (`purged`):
+    /// re-registered earlier, they read granted before the purge was seen,
+    /// and the fence stays `revoked` for good.
+    pub fn regrant_admitted(
+        &self,
+        read: &AdmittedRead,
+        checkpoint: Checkpoint,
+        reads: &GraphReads,
+    ) -> Result<(), LifecycleError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(u64::MAX, |d| {
+                u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+            });
+        let unexpired = read.expires_at_ms() > now;
+        self.clear(
+            |domain| unexpired && read.domain() == domain,
+            checkpoint,
+            reads,
+        )
+    }
+
+    /// Clear the fence for a regrant whose authority `fresh` accepts for
+    /// this domain (the one rule both forms share).
+    fn clear(
+        &self,
+        fresh: impl FnOnce(&str) -> bool,
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
@@ -309,7 +358,7 @@ impl Lifecycle {
             Some(FenceState::Purged) => {}
         }
         let domain = &queue.binding().domain;
-        if status.domain != *domain
+        if !fresh(domain)
             || reads.domain() != domain
             || reads.is_revoked()
             || checkpoint.scope != ScopeState::Granted
