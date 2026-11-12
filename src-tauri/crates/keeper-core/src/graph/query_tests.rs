@@ -1961,6 +1961,40 @@ mod offline {
         assert_eq!(o.person.asked.load(Ordering::SeqCst), asked);
     }
 
+    /// CC-6 (review BLOCKING-1): an answered server error that is not a
+    /// refusal — keeper-hq's retryable storage outage, a failed handler, an
+    /// unknown operation — is `sync_pending` through the same classifier the
+    /// native remote uses, and never fences: no `graph_fence` row, the
+    /// domain unlocked, and the next healthy answer reads current.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_transient_server_error_never_fences() {
+        use crate::hq::port::ReplicaError;
+        let answered = |code: &str, message: &str, retryable: bool| {
+            Step::Fail(remote_error(ReplicaError::Remote {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                retryable,
+            }))
+        };
+        let o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        for step in [
+            answered("sync.internal_error", "storage_unavailable", true),
+            answered("operation.execution_failed", "m", false),
+            answered("operation.unknown", "graph.read_status", false),
+        ] {
+            o.script(vec![step]);
+            assert_eq!(
+                o.query(Freshness::Current).await,
+                Err(QueryError::SyncPending)
+            );
+            assert!(!o.lifecycle.is_locked());
+            assert_eq!(o.lifecycle.fence(), Ok(None));
+        }
+        *o.person.then.lock().expect("then") = Step::Answer;
+        assert_eq!(o.query(Freshness::Current).await, Ok(Completeness::Current));
+    }
+
     /// A kept authority found to be from the future is dropped on sight:
     /// the clock catching up does not make it trusted again, a restart does
     /// not bring it back, and only a successful online `read_status` keeps

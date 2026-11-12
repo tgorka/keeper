@@ -304,14 +304,17 @@ impl Lifecycle {
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
-        self.clear(|domain| status.domain == domain, checkpoint, reads)
+        self.clear(|domain, _| status.domain == domain, checkpoint, reads)
     }
 
     /// An agent's regrant (CC-9: "a successful `read_status`/`admit_read`"):
     /// an agent's credential is refused `graph.read_status`, so its fresh
-    /// authority is the server's `graph.admit_read` answer, `read`, for this
-    /// domain and not yet expired on this device's clock. Otherwise exactly
-    /// [`Lifecycle::regrant`] (one shared rule): only from `purged`
+    /// authority is the server's `graph.admit_read` answer, `read`: for this
+    /// domain, admitted after the fence was set (an admission held from
+    /// before the revocation, such as `AgentReader::admitted()` of a reader
+    /// already open, is not fresh) and not yet expired, both on this
+    /// device's clock, which fails closed when it cannot be read. Otherwise
+    /// exactly [`Lifecycle::regrant`] (one shared rule): only from `purged`
     /// ([`LifecycleError::PurgePending`] while `revoked`,
     /// [`LifecycleError::NotFenced`] with no fence), and
     /// [`LifecycleError::NotFresh`] unless `checkpoint` is granted
@@ -330,24 +333,40 @@ impl Lifecycle {
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(u64::MAX, |d| {
-                u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-            });
-        let unexpired = read.expires_at_ms() > now;
+        self.regrant_admitted_at(read, checkpoint, reads, super::query::clock_ms())
+    }
+
+    /// [`Lifecycle::regrant_admitted`] with the device clock read as `now`
+    /// (`None`: it could not be read, so nothing is fresh).
+    fn regrant_admitted_at(
+        &self,
+        read: &AdmittedRead,
+        checkpoint: Checkpoint,
+        reads: &GraphReads,
+        now: Option<u64>,
+    ) -> Result<(), LifecycleError> {
+        let unexpired = now.is_some_and(|now| read.expires_at_ms() > now);
         self.clear(
-            |domain| unexpired && read.domain() == domain,
+            |domain, fenced_at| {
+                let after_fence = match (read.admitted_at_ms(), fenced_at) {
+                    (Some(admitted), Some(fenced)) => {
+                        u64::try_from(fenced).is_ok_and(|fenced| admitted > fenced)
+                    }
+                    _ => false,
+                };
+                unexpired && after_fence && read.domain() == domain
+            },
             checkpoint,
             reads,
         )
     }
 
     /// Clear the fence for a regrant whose authority `fresh` accepts for
-    /// this domain (the one rule both forms share).
+    /// this domain and the fence's `fenced_at` (the one rule both forms
+    /// share).
     fn clear(
         &self,
-        fresh: impl FnOnce(&str) -> bool,
+        fresh: impl FnOnce(&str, Option<i64>) -> bool,
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
@@ -358,7 +377,7 @@ impl Lifecycle {
             Some(FenceState::Purged) => {}
         }
         let domain = &queue.binding().domain;
-        if !fresh(domain)
+        if !fresh(domain, queue.fenced_at()?)
             || reads.domain() != domain
             || reads.is_revoked()
             || checkpoint.scope != ScopeState::Granted

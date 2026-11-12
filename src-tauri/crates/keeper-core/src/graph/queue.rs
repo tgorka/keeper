@@ -1308,6 +1308,19 @@ impl GraphQueue {
         })
     }
 
+    /// When the standing fence was set (the caller's clock at the first
+    /// revocation signal), if one stands.
+    pub(crate) fn fenced_at(&self) -> Result<Option<i64>, QueueError> {
+        self.conn
+            .query_row(
+                "SELECT fenced_at FROM graph_fence WHERE only = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)
+    }
+
     /// Persist the fence ([`FenceState::Revoked`]), committed on its own
     /// before anything else of the revocation. Idempotent: an existing
     /// fence stays as it is.

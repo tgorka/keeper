@@ -750,11 +750,19 @@ fn admitted_in(domain: &'static str, expires_at_ms: u64) -> AdmittedRead {
 /// instance, and (`purged`) the replica's purge observed. Admitting and
 /// opening the new instance happen while it is fenced.
 async fn fenced(dir: &Path, purged: bool) -> (Lifecycle, GraphReads, GraphReads) {
+    fenced_at(dir, purged, 5).await
+}
+
+/// [`fenced`], the fence set at `at` (the caller's clock).
+async fn fenced_at(dir: &Path, purged: bool, at: i64) -> (Lifecycle, GraphReads, GraphReads) {
     let lifecycle = queued(dir);
     let revoked = reads(dir);
-    lifecycle.revoke(Some(&revoked), 5).await.expect("revoked");
+    lifecycle.revoke(Some(&revoked), at).await.expect("revoked");
     if purged {
-        assert_eq!(lifecycle.observe_purge(Revocation::Purged, 6), Ok(true));
+        assert_eq!(
+            lifecycle.observe_purge(Revocation::Purged, at + 1),
+            Ok(true)
+        );
     }
     let fresh = reads(&dir.join("fresh"));
     (lifecycle, revoked, fresh)
@@ -803,8 +811,8 @@ async fn an_agent_regrant_waits_for_the_purge() {
 async fn an_agent_regrant_refuses_an_expired_admission() {
     let dir = tempfile::tempdir().expect("dir");
     let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
-    let read = admitted_in(DB, now_plus(50));
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    let read = admitted_in(DB, now_plus(1_000));
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
     assert_eq!(
         lifecycle.regrant_admitted(&read, checkpoint(ScopeState::Granted), &fresh),
         Err(LifecycleError::NotFresh)
@@ -903,4 +911,53 @@ fn now_plus(ms: u64) -> u64 {
     )
     .expect("ms")
         + ms
+}
+
+/// Review MEDIUM-1: an admission from before the fence — still unexpired,
+/// as one an open reader holds (`AgentReader::admitted()`) — is not fresh
+/// authority for a regrant: `NotFresh`. One from the fence's own
+/// millisecond is not after it either; one a millisecond later is.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_an_admission_from_before_the_fence() {
+    let read = admitted_in(DB, LATER);
+    let admitted = i64::try_from(read.admitted_at_ms().expect("clock")).expect("ms");
+    for (fence, outcome) in [
+        (admitted + 60_000, Err(LifecycleError::NotFresh)),
+        (admitted, Err(LifecycleError::NotFresh)),
+        (admitted - 1, Ok(())),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let (lifecycle, _revoked, fresh) = fenced_at(dir.path(), true, fence).await;
+        assert_eq!(
+            lifecycle.regrant_admitted(&read, checkpoint(ScopeState::Granted), &fresh),
+            outcome,
+            "fenced at admission{:+} ms",
+            fence - admitted
+        );
+        if outcome.is_err() {
+            still_fenced(&lifecycle, FenceState::Purged);
+        }
+    }
+}
+
+/// Review LOW-4: the expiry boundary, on an injected clock. An admission
+/// expiring at `now` is expired; a millisecond before, it is not. A clock
+/// that cannot be read makes nothing fresh.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_expires_at_its_millisecond_and_without_a_clock() {
+    let read = admitted_in(DB, LATER);
+    for (now, outcome) in [
+        (Some(LATER), Err(LifecycleError::NotFresh)),
+        (Some(LATER + 1), Err(LifecycleError::NotFresh)),
+        (None, Err(LifecycleError::NotFresh)),
+        (Some(LATER - 1), Ok(())),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
+        assert_eq!(
+            lifecycle.regrant_admitted_at(&read, checkpoint(ScopeState::Granted), &fresh, now),
+            outcome,
+            "now {now:?}"
+        );
+    }
 }

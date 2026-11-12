@@ -735,6 +735,9 @@ pub struct AdmittedRead {
     scope: Arc<Scope>,
     authority: Authority,
     expires_at_ms: u64,
+    /// When the server's answer came back, on this device's clock; `None`
+    /// when the clock could not be read (no later evidence than anything).
+    admitted_at_ms: Option<u64>,
 }
 
 /// What every delivery re-check asks the server about.
@@ -745,15 +748,19 @@ struct Scope {
     domain: String,
 }
 
+/// The device clock (UTC ms); `None` before the epoch.
+pub(crate) fn clock_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// The device clock (UTC ms) an admission's expiry is read against. A clock
 /// before the epoch reads as the end of time, so every admission reads as
 /// expired (fail closed), never as the epoch.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(u64::MAX, |d| {
-            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-        })
+    clock_ms().unwrap_or(u64::MAX)
 }
 
 fn admitted(row: &ContextRow, session: &str, domain: &str) -> Result<(), QueryError> {
@@ -787,6 +794,7 @@ impl AdmittedRead {
             }),
             authority: row.authority,
             expires_at_ms: row.expires_at_ms,
+            admitted_at_ms: clock_ms(),
         })
     }
 
@@ -805,6 +813,12 @@ impl AdmittedRead {
     #[must_use]
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
+    }
+    /// When the server admitted it, on this device's clock (`None`: the
+    /// clock could not be read).
+    #[must_use]
+    pub fn admitted_at_ms(&self) -> Option<u64> {
+        self.admitted_at_ms
     }
 }
 
