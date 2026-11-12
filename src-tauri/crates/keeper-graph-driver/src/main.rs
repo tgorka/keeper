@@ -401,7 +401,7 @@ mod driver {
         source: &Source,
         reads: Option<&GraphReads>,
     ) -> Option<Value> {
-        let refused = source.replica.state().link == LinkState::Refused;
+        let link = source.replica.state().link;
         let revoked = source
             .checkpoint()
             .is_ok_and(|c| c.scope == ScopeState::Revoked)
@@ -409,13 +409,33 @@ mod driver {
                 Ok(source.replica.query(sql, params)?)
             })
             .is_ok_and(|r| r != Revocation::None);
-        let cause = if revoked {
-            FenceCause::Revocation
-        } else if refused {
-            FenceCause::Credential
+        fence_on(lifecycle, link, revoked, reads).await
+    }
+
+    /// The fence a signal sets (owner decision 2026-11-12, H3): a revoked
+    /// subscription is a revocation, a refused link alone (the device's
+    /// credential refused, as after an attestation lapsed) a credential
+    /// fence; a revocation wins when both are seen. `None`: no signal.
+    fn signal_cause(link: LinkState, revoked: bool) -> Option<FenceCause> {
+        if revoked {
+            Some(FenceCause::Revocation)
+        } else if link == LinkState::Refused {
+            Some(FenceCause::Credential)
         } else {
-            return None;
-        };
+            None
+        }
+    }
+
+    /// Fence the domain on the signals `link` and `revoked` show, from
+    /// their cause ([`signal_cause`]); a fence that could not be completed
+    /// is the run's answer.
+    async fn fence_on(
+        lifecycle: &Lifecycle,
+        link: LinkState,
+        revoked: bool,
+        reads: Option<&GraphReads>,
+    ) -> Option<Value> {
+        let cause = signal_cause(link, revoked)?;
         lifecycle
             .revoke(reads, now_ms(), cause)
             .await
@@ -1036,6 +1056,79 @@ mod driver {
                 assert_eq!(sends, 0, "{from:?}: {result}");
                 assert_eq!(result["state"], json!("unresolved"), "{from:?}");
             }
+        }
+
+        /// A lifecycle over a fresh queue file in `dir`.
+        fn fresh_lifecycle(dir: &std::path::Path) -> Lifecycle {
+            let queue = GraphQueue::open(
+                &dir.join("queue"),
+                Binding {
+                    server: "https://hq.example".into(),
+                    domain: "work".into(),
+                    actor: "ana".into(),
+                    client: "dev1".into(),
+                },
+            )
+            .expect("queue");
+            Lifecycle::open(queue).expect("lifecycle")
+        }
+
+        /// H3 (owner decision 2026-11-12): the driver's signals set the
+        /// fence the owner asked for, persisted. A refused link alone (a
+        /// `401` after an attestation lapsed) is a credential fence; a
+        /// revoke frame (a revoked subscription) a revocation fence; both
+        /// at once a revocation; a revoke frame after a credential fence
+        /// escalates it; a live link with nothing revoked sets none.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_signals_fence_from_their_cause() {
+            for (n, (link, revoked, cause)) in [
+                (LinkState::Refused, false, Some(FenceCause::Credential)),
+                (LinkState::Connected, true, Some(FenceCause::Revocation)),
+                (LinkState::Refused, true, Some(FenceCause::Revocation)),
+                (LinkState::Connected, false, None),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let dir = scratch(&format!("case-{n}"));
+                let lifecycle = fresh_lifecycle(&dir);
+                assert_eq!(signal_cause(link, revoked), cause, "case {n}");
+                assert!(fence_on(&lifecycle, link, revoked, None).await.is_none());
+                assert_eq!(lifecycle.fence_cause(), Ok(cause), "case {n}");
+                assert_eq!(lifecycle.is_locked(), cause.is_some(), "case {n}");
+                // The cause survives a restart.
+                drop(lifecycle);
+                let reopened = fresh_lifecycle(&dir);
+                assert_eq!(reopened.fence_cause(), Ok(cause), "case {n} reopened");
+                drop(reopened);
+                std::fs::remove_dir_all(&dir).expect("cleanup");
+            }
+            // A credential fence, then a revoke frame: escalated, never back.
+            let dir = scratch("escalation");
+            let lifecycle = fresh_lifecycle(&dir);
+            assert!(fence_on(&lifecycle, LinkState::Refused, false, None)
+                .await
+                .is_none());
+            assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+            assert!(fence_on(&lifecycle, LinkState::Connected, true, None)
+                .await
+                .is_none());
+            assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
+            assert!(fence_on(&lifecycle, LinkState::Refused, false, None)
+                .await
+                .is_none());
+            assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
+            drop(lifecycle);
+            std::fs::remove_dir_all(&dir).expect("cleanup");
+        }
+
+        /// A new, empty directory for one test case.
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("kg1-driver-signals-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            dir
         }
     }
 }
