@@ -227,22 +227,42 @@ impl Runtime {
         Ok(command)
     }
 
-    /// Step 5 on this thread, then the spawn, synchronously.
+    /// Step 5 on this thread, then the spawn, synchronously. `called` is
+    /// told of the real spawn call: after step 5 passed, immediately before
+    /// `spawn()`, whether the kernel then refuses it or not.
     pub(crate) fn spawn(
         &self,
         command: &mut tokio::process::Command,
+        called: impl FnOnce(),
     ) -> Result<tokio::process::Child, QueryError> {
+        guarded_spawn(|| self.step_five(), called, || command.spawn())
+    }
+
+    /// Step 5 (the spawning thread's check) in the ledger class; a refusal
+    /// invalidates this runtime.
+    fn step_five(&self) -> Result<(), &'static str> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if let Class::Ledger(_) = &self.class {
             if let Err(label) = super::ledger::spawning_thread() {
                 self.invalidated.store(true, Ordering::SeqCst);
-                return Err(QueryError::Unavailable(label));
+                return Err(label);
             }
         }
-        command
-            .spawn()
-            .map_err(|_| QueryError::Unavailable("worker.spawn"))
+        Ok(())
     }
+}
+
+/// The spawn's order, as one rule: `step_five`, then `called` (the real
+/// spawn call counted), then `spawn`. A refused step 5 never reaches the
+/// count or the call.
+fn guarded_spawn<T>(
+    step_five: impl FnOnce() -> Result<(), &'static str>,
+    called: impl FnOnce(),
+    spawn: impl FnOnce() -> std::io::Result<T>,
+) -> Result<T, QueryError> {
+    step_five().map_err(QueryError::Unavailable)?;
+    called();
+    spawn().map_err(|_| QueryError::Unavailable("worker.spawn"))
 }
 
 /// The largest inherited soft `RLIMIT_STACK` the worker's startup
@@ -317,6 +337,44 @@ fn worker_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-C step 5 (review-rc-step5-freeze-inode): `spawn_calls` counts
+    /// only real spawn calls. A step 5 refusal reaches neither the count nor
+    /// the call; once step 5 passed the call is counted before it is made,
+    /// so a spawn the kernel refuses counts as one, as a successful one does.
+    #[test]
+    fn a_spawn_call_is_counted_only_after_step_five() {
+        use std::cell::Cell;
+        for (step, spawned, calls, made) in [
+            (Err("process.threads"), Ok(()), 0, false),
+            (Ok(()), Err(std::io::ErrorKind::PermissionDenied), 1, true),
+            (Ok(()), Ok(()), 1, true),
+        ] {
+            let (counted, called) = (Cell::new(0), Cell::new(false));
+            let result = guarded_spawn(
+                || step,
+                || counted.set(counted.get() + 1),
+                || {
+                    // The count is in before the kernel is asked.
+                    assert_eq!(counted.get(), 1);
+                    called.set(true);
+                    spawned.map_err(std::io::Error::from)
+                },
+            );
+            assert_eq!(
+                (counted.get(), called.get()),
+                (calls, made),
+                "{step:?} {spawned:?}"
+            );
+            match (step, spawned) {
+                (Err(label), _) => assert_eq!(result, Err(QueryError::Unavailable(label))),
+                (Ok(()), Err(_)) => {
+                    assert_eq!(result, Err(QueryError::Unavailable("worker.spawn")));
+                }
+                (Ok(()), Ok(())) => assert_eq!(result, Ok(())),
+            }
+        }
+    }
 
     /// Q6 / OD-B / OD-C guard: only linux/x86_64 with an embedded ledger
     /// may admit a worker; arm64 Linux, macOS without the explicit evidence

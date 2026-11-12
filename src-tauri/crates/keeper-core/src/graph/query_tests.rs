@@ -989,6 +989,9 @@ async fn revocation_before_delivery_suppresses_the_result() {
     // MED-1: the refusal invalidated the reader: its next call is refused
     // before any work, and no worker is spawned for it.
     let spawned = rig.admission.stats().spawn_attempts;
+    // Every attempt so far passed step 5 and was a real spawn call.
+    assert!(spawned > 0);
+    assert_eq!(rig.admission.stats().spawn_calls, spawned);
     let asked = rig.server.refreshed.load(Ordering::SeqCst);
     for _ in 0..3 {
         assert_eq!(
@@ -1004,6 +1007,7 @@ async fn revocation_before_delivery_suppresses_the_result() {
         Some(QueryError::Forbidden)
     );
     assert_eq!(rig.admission.stats().spawn_attempts, spawned);
+    assert_eq!(rig.admission.stats().spawn_calls, spawned);
     assert_eq!(
         rig.server.refreshed.load(Ordering::SeqCst),
         asked,

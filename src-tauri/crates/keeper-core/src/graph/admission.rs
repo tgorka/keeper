@@ -65,6 +65,7 @@ pub struct Admission {
     live: AtomicUsize,
     peak: AtomicUsize,
     attempts: AtomicUsize,
+    calls: AtomicUsize,
 }
 
 /// Counters of workers: observations, never enforcement.
@@ -77,6 +78,12 @@ pub struct AdmissionStats {
     /// Every worker spawn attempted, counted before the attempt whether or
     /// not it succeeds: zero means no worker was ever started.
     pub spawn_attempts: usize,
+    /// Every real `spawn()` call: counted after step 5 (the spawning
+    /// thread's last check) passed and immediately before the call, whether
+    /// the kernel then refuses it or not. Zero means no fork or clone was
+    /// ever asked of the kernel, which an attempt refused at step 5 never
+    /// does.
+    pub spawn_calls: usize,
 }
 
 /// A query worker's admission, held until the worker is reaped.
@@ -140,6 +147,7 @@ impl Admission {
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             attempts: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
         })
     }
 
@@ -149,6 +157,7 @@ impl Admission {
             live_workers: self.live.load(Ordering::SeqCst),
             peak_workers: self.peak.load(Ordering::SeqCst),
             spawn_attempts: self.attempts.load(Ordering::SeqCst),
+            spawn_calls: self.calls.load(Ordering::SeqCst),
         }
     }
 
@@ -209,6 +218,12 @@ impl Admission {
     /// Count one spawn attempt; called immediately before the spawn.
     pub(crate) fn attempt(&self) {
         self.attempts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Count one real spawn call; called by [`super::runtime::Runtime::spawn`]
+    /// after step 5 passed and immediately before `spawn()`.
+    pub(crate) fn call(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Count one live worker until the guard drops.

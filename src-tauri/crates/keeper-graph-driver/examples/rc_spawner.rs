@@ -19,6 +19,11 @@
 //!   and tag) — only a worker that reached B0 and answered produces them;
 //! - `children.spawn_attempts`: the admission's cumulative count, incremented immediately
 //!   before every `runtime.spawn()` whether or not the spawn succeeds;
+//! - `children.spawn_calls`: the cumulative count of real spawn calls, incremented inside
+//!   `Runtime::spawn` after step 5 (`ledger::spawning_thread()`) returned Ok and immediately
+//!   before `command.spawn()`, whether or not the kernel then refuses it. Zero means no fork
+//!   or clone was ever asked of the kernel: unlike a pids count, it cannot read zero because
+//!   an idle blocking thread was retired;
 //! - `telemetry` (peak/live workers, `RUSAGE_CHILDREN` max RSS): observations only, never a
 //!   creation count (a live or unwaited child leaves max RSS 0).
 //!
@@ -27,7 +32,7 @@
 //! `pids.events` `max` counter at 0 (owner decision, 2026-11-07).
 //!
 //! Predicates: an NC zero-children row is `admitted == false`, its label, and
-//! `children.spawn_attempts == 0`. NC-9 is `mode == "run"`, `admitted == true` and
+//! `children.spawn_attempts == 0` and `children.spawn_calls == 0`. NC-9 is `mode == "run"`, `admitted == true` and
 //! `nc9.pass == true`. Exit status: 2 for a usage error; in mode `run` 0 only when
 //! `nc9.pass`, else 1; in mode `admit` 0 once the report is written.
 
@@ -345,7 +350,10 @@ mod spawner {
             true
         };
         let stats = admission.stats();
-        report["children"] = json!({"spawn_attempts": stats.spawn_attempts});
+        report["children"] = json!({
+            "spawn_attempts": stats.spawn_attempts,
+            "spawn_calls": stats.spawn_calls,
+        });
         report["telemetry"] = json!({
             "note": "observations only, never a creation count",
             "peak_workers": stats.peak_workers,
