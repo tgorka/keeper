@@ -44,7 +44,9 @@ use keeper_core::graph::protocol::proposal::{self, Decision, Proposal, Verdict};
 use keeper_core::graph::protocol::request::Request;
 use keeper_core::graph::protocol::review::Target;
 use keeper_core::graph::protocol::wire::{self, HistoryFilter};
-use keeper_core::graph::queue::{resume_sends, Binding, FenceState, GraphQueue, Restored, State};
+use keeper_core::graph::queue::{
+    resume_sends, Binding, FenceCause, FenceState, GraphQueue, Restored, State,
+};
 use keeper_core::graph::source::{revocation_with, Revocation};
 use keeper_core::hq::port::{Link, ReplicaError, ReplicaSpec};
 use keeper_core::hq::server::ServerUrl;
@@ -2060,7 +2062,7 @@ fn graph_live_1121_a_revocation_locks_first_and_purges_every_graph_table() {
             });
             close(probe);
             runtime
-                .block_on(lifecycle.revoke(None, now_ms()))
+                .block_on(lifecycle.revoke(None, now_ms(), FenceCause::Revocation))
                 .expect("fenced");
             // Locked, with every table's rows still on this device: the
             // fence came first.

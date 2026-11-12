@@ -279,7 +279,8 @@ impl GraphClient {
     /// replica, else (online) from `graph.outcome`, with `attempt` lending
     /// its transport answer when there is one. A `graph.outcome` the server
     /// refused is that refusal ([`GraphOutcome::Pending`] with its
-    /// [`PendingCause`]: a revocation signal when [`PendingCause::Refused`]),
+    /// [`PendingCause`]: a revocation signal when [`PendingCause::Refused`]
+    /// or [`PendingCause::CredentialRefused`]),
     /// never a quiet pending; one that could not be asked leaves the
     /// attempt to speak.
     ///

@@ -139,7 +139,10 @@ async fn a_revocation_locks_first_and_survives_a_restart() {
     let lifecycle = queued(dir.path());
     let reads = reads(dir.path());
     lifecycle.gate().expect("open before the signal");
-    lifecycle.revoke(Some(&reads), 5).await.expect("revoked");
+    lifecycle
+        .revoke(Some(&reads), 5, FenceCause::Revocation)
+        .await
+        .expect("revoked");
     assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
     assert!(reads.is_revoked());
     assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
@@ -200,7 +203,10 @@ async fn a_failed_fence_write_stays_locked() {
              BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
         )
         .expect("trigger");
-    let error = lifecycle.revoke(None, 5).await.expect_err("refused");
+    let error = lifecycle
+        .revoke(None, 5, FenceCause::Revocation)
+        .await
+        .expect_err("refused");
     assert!(matches!(
         error,
         LifecycleError::Queue(QueueError::Storage(_))
@@ -958,17 +964,37 @@ async fn fenced(dir: &Path, purged: bool) -> (Lifecycle, GraphReads, GraphReads)
 
 /// [`fenced`], the fence set at `at` (the caller's clock).
 async fn fenced_at(dir: &Path, purged: bool, at: i64) -> (Lifecycle, GraphReads, GraphReads) {
-    let lifecycle = queued(dir);
-    let revoked = reads(dir);
-    lifecycle.revoke(Some(&revoked), at).await.expect("revoked");
+    let (lifecycle, revoked, fresh) = fenced_by(dir, at, FenceCause::Revocation).await;
     if purged {
         assert_eq!(
             lifecycle.observe_purge(Revocation::Purged, at + 1),
             Ok(true)
         );
     }
+    (lifecycle, revoked, fresh)
+}
+
+/// A lifecycle fenced at `at` from `cause` (its one queued entry
+/// disabled), its revoked reads instance and a new one; no purge observed.
+async fn fenced_by(dir: &Path, at: i64, cause: FenceCause) -> (Lifecycle, GraphReads, GraphReads) {
+    let lifecycle = queued(dir);
+    let revoked = reads(dir);
+    lifecycle
+        .revoke(Some(&revoked), at, cause)
+        .await
+        .expect("revoked");
     let fresh = reads(&dir.join("fresh"));
     (lifecycle, revoked, fresh)
+}
+
+/// The lifecycle a restart opens over `dir`'s queue file.
+fn restarted(lifecycle: Lifecycle, dir: &Path) -> Lifecycle {
+    drop(lifecycle);
+    let lifecycle =
+        Lifecycle::open(GraphQueue::open(&queue_path(dir), binding()).expect("reopens"))
+            .expect("lifecycle");
+    assert!(lifecycle.is_locked());
+    lifecycle
 }
 
 /// The fence still stands, unchanged, after a refused regrant.
@@ -1163,4 +1189,172 @@ async fn an_agent_regrant_expires_at_its_millisecond_and_without_a_clock() {
             "now {now:?}"
         );
     }
+}
+
+/// Owner decision 2026-11-12 (H3), a person: a fence learned from a refused
+/// credential (a 401 on an attestation that lapsed while offline) is kept
+/// with its cause across a restart and clears on fresh authority — a
+/// successful `read_status`, granted subscriptions and a new instance —
+/// without the replica's purge, which a refused credential never brings.
+/// Stale evidence still refuses, and the disabled entry stays disabled
+/// (CC-11).
+#[tokio::test(flavor = "current_thread")]
+async fn a_credential_fence_clears_on_fresh_authority_without_the_purge() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, revoked, fresh) = fenced_by(dir.path(), 5, FenceCause::Credential).await;
+    assert!(revoked.is_revoked());
+    assert_eq!(only_entry(dir.path()).1, State::Disabled);
+    let lifecycle = restarted(lifecycle, dir.path());
+    assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+    assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+    lifecycle.resume(None, 6).await.expect("resumed");
+    // No revoke frame: the purge is never observed, and need not be.
+    assert_eq!(lifecycle.observe_purge(Revocation::None, 7), Ok(false));
+    let (answered, other_domain) = (
+        status(),
+        ReadStatus {
+            domain: "other".to_owned(),
+            ..status()
+        },
+    );
+    for (answer, scope, instance) in [
+        (&other_domain, ScopeState::Granted, &fresh),
+        (&answered, ScopeState::Pending, &fresh),
+        (&answered, ScopeState::Granted, &revoked),
+    ] {
+        assert_eq!(
+            lifecycle.regrant(answer, checkpoint(scope), instance),
+            Err(LifecycleError::NotFresh)
+        );
+        still_fenced(&lifecycle, FenceState::Revoked);
+    }
+    lifecycle
+        .regrant(&status(), checkpoint(ScopeState::Granted), &fresh)
+        .expect("regranted");
+    lifecycle.gate().expect("unlocked");
+    assert_eq!(lifecycle.fence(), Ok(None));
+    assert_eq!(only_entry(dir.path()).1, State::Disabled);
+}
+
+/// H3, an agent: a credential fence clears on an `admit_read` from after
+/// it, across a restart, without the purge; an admission from before the
+/// fence is no fresh authority. The disabled entry stays disabled.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_credential_fence_clears_on_a_fresh_admission_without_the_purge() {
+    let read = admitted_in(DB, LATER);
+    let admitted = i64::try_from(read.admitted_at_ms().expect("clock")).expect("ms");
+    for (fence, outcome) in [
+        (admitted + 60_000, Err(LifecycleError::NotFresh)),
+        (admitted - 1, Ok(())),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let (lifecycle, _revoked, fresh) =
+            fenced_by(dir.path(), fence, FenceCause::Credential).await;
+        let lifecycle = restarted(lifecycle, dir.path());
+        assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+        assert_eq!(
+            lifecycle.regrant_admitted(&read, checkpoint(ScopeState::Granted), &fresh),
+            outcome,
+            "fenced at admission{:+} ms",
+            fence - admitted
+        );
+        if outcome.is_ok() {
+            lifecycle.gate().expect("unlocked");
+            assert_eq!(lifecycle.fence(), Ok(None));
+        } else {
+            still_fenced(&lifecycle, FenceState::Revoked);
+        }
+        assert_eq!(only_entry(dir.path()).1, State::Disabled);
+    }
+}
+
+/// H3, the inverse: a refused credential, then a real revocation (a
+/// revoked subscription) escalates the fence to `revocation`, kept across
+/// a restart; a later credential signal never downgrades it. A regrant is
+/// then `PurgePending` until the replica's purge is observed, and clears
+/// only with fresh authority after it; the disabled entry stays disabled.
+#[tokio::test(flavor = "current_thread")]
+async fn a_revocation_after_a_credential_refusal_waits_for_the_purge() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, revoked, fresh) = fenced_by(dir.path(), 5, FenceCause::Credential).await;
+    lifecycle
+        .revoke(Some(&revoked), 6, FenceCause::Revocation)
+        .await
+        .expect("escalated");
+    assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
+    let lifecycle = restarted(lifecycle, dir.path());
+    lifecycle
+        .lock(7, FenceCause::Credential)
+        .expect("locked again");
+    assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
+    assert_eq!(
+        lifecycle.regrant(&status(), checkpoint(ScopeState::Granted), &fresh),
+        Err(LifecycleError::PurgePending)
+    );
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_in(DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &fresh
+        ),
+        Err(LifecycleError::PurgePending)
+    );
+    still_fenced(&lifecycle, FenceState::Revoked);
+    assert_eq!(lifecycle.observe_purge(Revocation::Purged, 8), Ok(true));
+    assert_eq!(
+        lifecycle.regrant(&status(), checkpoint(ScopeState::Pending), &fresh),
+        Err(LifecycleError::NotFresh)
+    );
+    lifecycle
+        .regrant(&status(), checkpoint(ScopeState::Granted), &fresh)
+        .expect("regranted");
+    lifecycle.gate().expect("unlocked");
+    assert_eq!(only_entry(dir.path()).1, State::Disabled);
+}
+
+/// H3: an escalation sets the fence anew, so an agent's admission from
+/// between the credential refusal and the revocation is no fresh authority
+/// for the revocation, even once purged.
+#[tokio::test(flavor = "current_thread")]
+async fn an_admission_from_before_the_escalation_is_not_fresh() {
+    let read = admitted_in(DB, LATER);
+    let admitted = i64::try_from(read.admitted_at_ms().expect("clock")).expect("ms");
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, revoked, fresh) =
+        fenced_by(dir.path(), admitted - 1, FenceCause::Credential).await;
+    lifecycle
+        .revoke(Some(&revoked), admitted + 60_000, FenceCause::Revocation)
+        .await
+        .expect("escalated");
+    assert_eq!(
+        lifecycle.observe_purge(Revocation::Purged, admitted + 60_001),
+        Ok(true)
+    );
+    assert_eq!(
+        lifecycle.regrant_admitted(&read, checkpoint(ScopeState::Granted), &fresh),
+        Err(LifecycleError::NotFresh)
+    );
+    still_fenced(&lifecycle, FenceState::Purged);
+}
+
+/// H3 through the one queue policy: a lookup refused for the credential
+/// fences from that cause; a further read-level refusal of the locked
+/// entry escalates the fence to a revocation.
+#[test]
+fn a_refused_credential_settles_into_a_credential_fence() {
+    let dir = tempfile::tempdir().expect("dir");
+    let lifecycle = queued(dir.path());
+    let (id, from) = only_entry(dir.path());
+    let pending = |cause| GraphOutcome::Pending { cause };
+    assert_eq!(
+        lifecycle.settle(&id, from, &pending(PendingCause::CredentialRefused), 5),
+        Ok(State::Disabled)
+    );
+    assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+    assert_eq!(only_entry(dir.path()).1, State::Disabled);
+    assert_eq!(
+        lifecycle.settle(&id, State::Disabled, &pending(PendingCause::Refused), 6),
+        Ok(State::Disabled)
+    );
+    assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
 }

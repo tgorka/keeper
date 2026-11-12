@@ -73,7 +73,9 @@ mod driver {
     use keeper_core::graph::query::{
         Freshness, GraphReads, GraphRemote, HumanReader, Inspected, QueryError, QueryResult,
     };
-    use keeper_core::graph::queue::{resume_sends, Binding, GraphQueue, Restored, State};
+    use keeper_core::graph::queue::{
+        resume_sends, Binding, FenceCause, GraphQueue, Restored, State,
+    };
     use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
     use keeper_core::graph::source::{revocation_with, GraphSource, Revocation, ScopeState};
     use keeper_core::graph::supervisor::Cancellation;
@@ -239,16 +241,19 @@ mod driver {
     }
 
     /// A command's answer: its request id, outcome and the stable code a
-    /// caller reports for it. A revoking outcome (a refused send or
-    /// `graph.outcome`, a forbidden receipt) fences the domain before the answer.
+    /// caller reports for it. A revoking outcome (a refused `graph.outcome`
+    /// or authority read) fences the domain, from its cause, before the
+    /// answer.
     fn applied(lifecycle: &Lifecycle, answer: Result<Applied, GraphClientError>) -> Value {
         let applied = match answer {
             Ok(applied) => applied,
             Err(e) => return fail("refused", &e.to_string()),
         };
         let fenced = match &applied.outcome {
-            Ok(o) if o.revokes() => Some(lifecycle.lock(now_ms()).is_ok()),
-            _ => None,
+            Ok(o) => o
+                .fence_cause()
+                .map(|cause| lifecycle.lock(now_ms(), cause).is_ok()),
+            Err(_) => None,
         };
         json!({
             "ok": true,
@@ -385,11 +390,12 @@ mod driver {
     }
 
     /// The revocation signals this device can see without asking: a
-    /// refused link (the device was de-authorised), a revoked graph,
-    /// receipt or proposal subscription, or history subscriptions that no
-    /// longer hold the domain. Each fences the domain (`reads` purged when
-    /// held); a fence that could not be completed is the run's answer (the
-    /// domain stays locked in this process).
+    /// refused link (the device's credential was refused: a credential
+    /// fence), a revoked graph, receipt or proposal subscription, or history
+    /// subscriptions that no longer hold the domain (a revocation fence,
+    /// which wins when both are seen). Each fences the domain (`reads`
+    /// purged when held); a fence that could not be completed is the run's
+    /// answer (the domain stays locked in this process).
     async fn signals(
         lifecycle: &Lifecycle,
         source: &Source,
@@ -403,11 +409,15 @@ mod driver {
                 Ok(source.replica.query(sql, params)?)
             })
             .is_ok_and(|r| r != Revocation::None);
-        if !(refused || revoked) {
+        let cause = if revoked {
+            FenceCause::Revocation
+        } else if refused {
+            FenceCause::Credential
+        } else {
             return None;
-        }
+        };
         lifecycle
-            .revoke(reads, now_ms())
+            .revoke(reads, now_ms(), cause)
             .await
             .err()
             .map(|error| lifecycle_error(&error))
@@ -423,6 +433,8 @@ mod driver {
     /// A fenced domain at `sync`: finish the cleanup, record the replica's
     /// purge once seen, and unlock only with fresh authority (a successful
     /// `read_status`, granted subscriptions and a new projection instance).
+    /// A credential fence needs no purge: the purge not yet observed blocks
+    /// only a revocation fence ([`Lifecycle::regrant`]).
     /// The reads to go on with, or why the domain stays locked.
     async fn unfence(
         args: &Args,

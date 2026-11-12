@@ -379,17 +379,39 @@ context (`context_expired`/`closed`/`invalid`, `parent_unavailable`, `context_un
 invalid request, a failed handler or query, a storage outage and any code keeper does not
 name are not: a read answers `sync_pending`, a request retries or ends locally, and nothing
 fences. On a signal the domain is fenced: the in-memory gate closes, a `graph_fence` row is
-committed in the queue file, every open entry becomes `disabled` (identity and payload kept,
-never sent again), and in-flight workers are killed and the projection purged. Reads,
-results, receipts, history and the queue listing refuse from the first step; a crash at any
-step restarts locked. The replica's own graph rows are purged only by the server's scope
-revocation, which the Syncular client applies atomically. keeper never deletes them itself.
-The fence records `purged` only once every subscribed graph table (111.x's contents and
-reviews included), the receipts and the proposals read revoked, and unlocks only after fresh
-authority (a successful `read_status`, granted subscriptions and a new projection instance).
-A refusal learned before the server's revoke frame keeps the domain locked. After a regrant
-a disabled entry stays disabled: it can be discarded or resolved by its own receipt, never
-resent.
+committed in the queue file with the signal's cause, every open entry becomes `disabled`
+(identity and payload kept, never sent again), and in-flight workers are killed and the
+projection purged. Reads, results, receipts, history and the queue listing refuse from the
+first step; a crash at any step restarts locked. The replica's own graph rows are purged only
+by the server's scope revocation, which the Syncular client applies atomically. keeper never
+deletes them itself. The fence records `purged` only once every subscribed graph table
+(111.x's contents and reviews included), the receipts and the proposals read revoked.
+
+**What clears a fence follows from its cause** (owner decision 2026-11-12, H3). The cause is
+persisted in the queue file (`graph_fence.cause`, schema version 3), so a restart keeps it
+and its clearing rule; a fence written by an earlier build reads as `revocation`, the
+stricter. A `credential` fence is one learned from the server refusing this device's
+credential: a refused link, or `401`/`403` (`sync.credential_refused`) or
+`sync.auth_required` on a read-level call, as when a device stayed offline past its
+attestation window. No scope was revoked and no purge will come, so it clears from `revoked`
+on fresh authority alone: a working (re-attested) credential, a successful `read_status` (a
+person) or an unexpired `admit_read` answered after the fence (an agent), granted
+subscriptions and a new projection instance. Every other fence — a revoked subscription or
+scope, a refusal of graph authority — is a `revocation` fence: it unlocks only from
+`purged`, with the same fresh authority, so one learned before the server's revoke frame
+keeps the domain locked. The cause only escalates: a revocation signal while a credential
+fence stands makes it a `revocation` fence, `revoked` again and set anew (an admission from
+before it is not fresh), and a credential signal never downgrades a revocation fence. After
+any regrant a disabled entry stays disabled: it can be discarded or resolved by its own
+receipt, never resent.
+
+**The kill switch purges and fences** (owner ruling 2026-11-12, M4). An operator switching
+the graph off (`KEEPER_HQ_GRAPH=off`) makes the server resolve the graph scopes to nothing,
+so a client sees its graph subscriptions revoked: a `revocation` fence, the projection and
+the replica's graph rows purged, and every queued intent `disabled` for good. CC-5's retry on
+`graph_unavailable` does not outlive it. Once the graph is switched back on and the
+subscriptions are granted again, the purge observed, a normal regrant from fresh authority
+restores reads; the intents queued before the switch stay disabled.
 
 **What an answer does to a queued entry** (`keeper_core::graph::queue::next`, keyed on the
 outcome and its typed `PendingCause`, never on text): a receipt resolves it — but a person's
@@ -415,7 +437,7 @@ is not added again.
 moment it learns of it. It does not erase anything remotely, and it cannot recall bytes
 already delivered to a reader. Until the device learns of a revocation, a person may read
 what was last authorised (below). The replica purge is the server's: if the server does not
-revoke a scope, its rows stay and the fence stays `revoked` (locked).
+revoke a scope, its rows stay and a `revocation` fence stays `revoked` (locked).
 
 **Last-authorised offline reads (people only).** A person's query or inspect may be served
 while the server cannot be reached only when all of these hold:

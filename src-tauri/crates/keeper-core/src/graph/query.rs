@@ -43,6 +43,8 @@ use super::protocol::wire::{
 };
 use super::protocol::worker::{InspectEntity, InspectRequest, QueryRequest, Response};
 use super::protocol::{Refusal, PROFILE};
+#[cfg(feature = "human-reads")]
+use super::queue::FenceCause;
 use super::runtime::Runtime;
 use super::source::{GraphSource, ScopeState};
 use super::supervisor::{self, Cancellation, Stops, BUILD_DEADLINE, QUERY_DEADLINE};
@@ -80,6 +82,13 @@ pub enum QueryError {
     /// Collapsed: the caller may not read this domain now.
     #[error("forbidden")]
     Forbidden,
+    /// The server refused this device's credential (`401`/`403`,
+    /// `sync.auth_required`): no scope was revoked. Made only by a native
+    /// remote's authority read; its stable code is `forbidden`, and every
+    /// reader treats it as one ([`QueryError::is_refusal`]), but a fence it
+    /// sets clears on fresh authority alone ([`super::queue::FenceCause`]).
+    #[error("forbidden")]
+    CredentialRefused,
 }
 
 impl QueryError {
@@ -94,8 +103,14 @@ impl QueryError {
             Self::Stale => "projection_stale",
             Self::SyncPending | Self::Unreachable => "sync_pending",
             Self::Storage(_) => "storage_unavailable",
-            Self::Forbidden => "forbidden",
+            Self::Forbidden | Self::CredentialRefused => "forbidden",
         }
+    }
+
+    /// Whether this is a refusal of the caller (`forbidden`).
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Forbidden | Self::CredentialRefused)
     }
 }
 
@@ -121,16 +136,19 @@ pub trait GraphRemote: Send + Sync {
 /// ([`crate::hq::port::ReplicaError::class`]): only the server refusing the
 /// caller (a refused credential or scope, or a refusal of its graph
 /// authority — an `operation.forbidden` message keeper does not name
-/// included) is `forbidden`; a server that could not be reached (the query
-/// left and its transport failed) is [`QueryError::Unreachable`]; every
-/// other failure — the graph switched off, an unknown operation, an ended
-/// context, an invalid request, an answered internal or storage error,
-/// retryable or not, a local refusal, an unreadable answer, a closed or
-/// non-syncing replica — is `sync_pending`, never a refusal and never
-/// unreachable. Nothing is delivered without a fresh answer.
+/// included) is `forbidden` ([`QueryError::CredentialRefused`] for the
+/// credential, else [`QueryError::Forbidden`]); a server that could not be
+/// reached (the query left and its transport failed) is
+/// [`QueryError::Unreachable`]; every other failure — the graph switched
+/// off, an unknown operation, an ended context, an invalid request, an
+/// answered internal or storage error, retryable or not, a local refusal,
+/// an unreadable answer, a closed or non-syncing replica — is
+/// `sync_pending`, never a refusal and never unreachable. Nothing is
+/// delivered without a fresh answer.
 fn remote_error(error: crate::hq::port::ReplicaError) -> QueryError {
     use crate::hq::port::{ErrorClass, ReplicaError};
     match (&error, error.class()) {
+        (_, ErrorClass::Credential) => QueryError::CredentialRefused,
         (_, ErrorClass::Revoked | ErrorClass::Forbidden) => QueryError::Forbidden,
         (ReplicaError::Unheard { .. }, _) => QueryError::Unreachable,
         _ => QueryError::SyncPending,
@@ -673,7 +691,7 @@ fn invalidate_on_refusal<T>(
     invalidated: &Cancellation,
     result: Result<T, QueryError>,
 ) -> Result<T, QueryError> {
-    if matches!(result, Err(QueryError::Forbidden)) {
+    if result.as_ref().is_err_and(QueryError::is_refusal) {
         invalidated.cancel();
     }
     result
@@ -990,7 +1008,10 @@ fn wall_clock_ms() -> i64 {
 ///   authority, with the time it returned;
 /// - a refusal (`forbidden`: the server's answer, a revoked scope, the
 ///   domain's kill) or a refused link fences the domain, and a fenced
-///   domain refuses every read;
+///   domain refuses every read; a refused credential (a refused link,
+///   [`QueryError::CredentialRefused`]) is a
+///   [`super::queue::FenceCause::Credential`] fence, any other refusal a
+///   [`super::queue::FenceCause::Revocation`];
 /// - a read may be served offline only when the server could not be
 ///   reached ([`QueryError::Unreachable`], nothing else), no fence stands,
 ///   the scope is granted and the link not refused, the caller allowed
@@ -1169,33 +1190,39 @@ impl HumanReader {
     }
 
     /// Before any read: a reader invalidated or a domain fenced refuses; a
-    /// refused link fences the domain.
+    /// refused link fences the domain (its credential refused).
     async fn check(&self) -> Result<(), QueryError> {
         if self.invalidated.is_cancelled() || self.fenced() {
             return Err(QueryError::Forbidden);
         }
         if self.lifecycle.is_some() && self.link_refused() {
-            self.fence().await;
-            return Err(QueryError::Forbidden);
+            self.fence(FenceCause::Credential).await;
+            return Err(QueryError::CredentialRefused);
         }
         Ok(())
     }
 
-    /// A revocation signal: fence the domain (lock, persist, disable
-    /// queued intents, kill and purge).
-    async fn fence(&self) {
+    /// A revocation signal learned from `cause`: fence the domain (lock,
+    /// persist, disable queued intents, kill and purge).
+    async fn fence(&self, cause: FenceCause) {
         self.invalidated.cancel();
         if let Some(lifecycle) = &self.lifecycle {
-            if let Err(error) = lifecycle.revoke(Some(&self.reads), (self.clock)()).await {
+            if let Err(error) = lifecycle
+                .revoke(Some(&self.reads), (self.clock)(), cause)
+                .await
+            {
                 tracing::warn!(%error, "graph: the revocation fence is incomplete; the domain stays locked");
             }
         }
     }
 
-    /// A call's end: a refusal (`forbidden`) fences the domain.
+    /// A call's end: a refusal (`forbidden`) fences the domain, a refused
+    /// credential as a credential fence.
     async fn end<T>(&self, result: Result<T, QueryError>) -> Result<T, QueryError> {
-        if matches!(result, Err(QueryError::Forbidden)) {
-            self.fence().await;
+        match &result {
+            Err(QueryError::CredentialRefused) => self.fence(FenceCause::Credential).await,
+            Err(QueryError::Forbidden) => self.fence(FenceCause::Revocation).await,
+            _ => {}
         }
         result
     }

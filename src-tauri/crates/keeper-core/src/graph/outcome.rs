@@ -34,6 +34,7 @@ use serde_json::{json, Map, Value};
 use super::protocol::request::{self, is_descriptor, Request};
 use super::protocol::scope::{client_scope, receipt_id};
 use super::protocol::{is_decimal, is_ulid, value, Refusal, CONTRACT_VERSION};
+use super::queue::FenceCause;
 use super::write::{GraphWrite, Writer};
 use crate::hq::port::{CommandResult, ErrorClass, ReplicaError};
 use crate::hq::sessions::Source;
@@ -298,19 +299,32 @@ impl GraphOutcome {
     }
 
     /// Whether this outcome is a revocation signal for the domain: only a
-    /// refused read-level call ([`PendingCause::Refused`]: a refused
-    /// `graph.read_status` or `graph.outcome`, or a refused credential or
-    /// scope). A `forbidden` receipt or a command refused at send ends that
-    /// one request, whatever its code, and fences nothing (owner decision
-    /// 2026-11-12, amending CC-7: per-request refusals are CC-14's class).
+    /// refused read-level call ([`PendingCause::Refused`] or
+    /// [`PendingCause::CredentialRefused`]: a refused `graph.read_status` or
+    /// `graph.outcome`, or a refused credential or scope). A `forbidden`
+    /// receipt or a command refused at send ends that one request, whatever
+    /// its code, and fences nothing (owner decision 2026-11-12, amending
+    /// CC-7: per-request refusals are CC-14's class).
     #[must_use]
     pub fn revokes(&self) -> bool {
-        matches!(
-            self,
+        self.fence_cause().is_some()
+    }
+
+    /// The cause of the fence this outcome sets, when it is a revocation
+    /// signal ([`GraphOutcome::revokes`]): a refused credential is a
+    /// [`FenceCause::Credential`] fence, any other refusal a
+    /// [`FenceCause::Revocation`].
+    #[must_use]
+    pub fn fence_cause(&self) -> Option<FenceCause> {
+        match self {
             Self::Pending {
-                cause: PendingCause::Refused
-            }
-        )
+                cause: PendingCause::Refused,
+            } => Some(FenceCause::Revocation),
+            Self::Pending {
+                cause: PendingCause::CredentialRefused,
+            } => Some(FenceCause::Credential),
+            _ => None,
+        }
     }
 }
 
@@ -355,10 +369,14 @@ pub enum PendingCause {
     /// The server refused a lookup as it is (an invalid request, an answer
     /// over its limit): the entry stays as it is, nothing is resent.
     Invalid,
-    /// The server refused the caller at read level (a refused credential
-    /// or scope, or `graph.outcome`/`graph.read_status` refused): a
-    /// revocation signal.
+    /// The server refused the caller at read level (a revoked scope, a
+    /// refusal of its graph authority, or `graph.outcome`/`graph.read_status`
+    /// refused so): a revocation signal.
     Refused,
+    /// The server refused this device's credential at read level
+    /// (`401`/`403`, `sync.auth_required`): a revocation signal whose fence
+    /// clears on fresh authority, without the replica's purge.
+    CredentialRefused,
     /// Nothing was sent and no receipt is known: look the receipt up.
     NoAttempt,
     /// The key is not this owner's (another database or client): never
@@ -377,6 +395,7 @@ impl PendingCause {
             Self::ContextEnded => "context_ended",
             Self::Invalid => "invalid_request",
             Self::Refused => "refused",
+            Self::CredentialRefused => "credential_refused",
             Self::NoAttempt => "no_attempt",
             Self::Foreign => "foreign_request",
         }
@@ -385,11 +404,13 @@ impl PendingCause {
     /// The cause a failed read-level call (a lookup, an authority read)
     /// gives, through the one classifier ([`ReplicaError::class`]) the read
     /// path uses too. Only a refusal of the caller is
-    /// [`PendingCause::Refused`]; whatever says nothing of the caller,
+    /// [`PendingCause::Refused`] (or [`PendingCause::CredentialRefused`],
+    /// its credential refused); whatever says nothing of the caller,
     /// retryable or not, is never one.
     #[must_use]
     pub fn of(error: &ReplicaError) -> Self {
         match error.class() {
+            ErrorClass::Credential => Self::CredentialRefused,
             ErrorClass::Revoked | ErrorClass::Forbidden => Self::Refused,
             ErrorClass::Unavailable => Self::Unavailable,
             ErrorClass::Unresolved => Self::Unresolved,

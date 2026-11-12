@@ -4,7 +4,9 @@
 //!
 //! - The server refusing the caller (`operation.forbidden`/`forbidden`, or
 //!   HTTP `401`/`403` on the credential) is `forbidden`, never
-//!   `sync_pending` (which once hid every refusal).
+//!   `sync_pending` (which once hid every refusal); a refused credential is
+//!   told apart (`CredentialRefused`, code `forbidden`), since the fence it
+//!   sets clears on fresh authority alone (owner decision 2026-11-12, H3).
 //! - Every other answered error — keeper-hq's retryable storage outage
 //!   (`sync.internal_error`/`storage_unavailable`), a failed handler, an
 //!   unknown or invalid operation — is `sync_pending`: never a refusal
@@ -142,14 +144,17 @@ fn a_refused_read_status_is_forbidden_not_sync_pending() {
         Answer::Frame("operation.forbidden", "context_revoked", false),
         // An `operation.forbidden` message keeper does not name: fail closed.
         Answer::Frame("operation.forbidden", "some_new_refusal", false),
-        Answer::Status(401),
-        Answer::Status(403),
     ] {
         assert_eq!(
             read_status(answer),
             Err(QueryError::Forbidden),
             "{answer:?}"
         );
+    }
+    for status in [401, 403] {
+        let refused = read_status(Answer::Status(status));
+        assert_eq!(refused, Err(QueryError::CredentialRefused), "{status}");
+        assert_eq!(refused.map_err(|e| e.code()), Err("forbidden"));
     }
 }
 

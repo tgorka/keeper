@@ -335,9 +335,13 @@ pub const CREDENTIAL_REFUSED: &str = "sync.credential_refused";
 /// `operation.forbidden`, by its message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorClass {
-    /// The server refused this credential or revoked the caller's scope:
-    /// `401`/`403` ([`CREDENTIAL_REFUSED`]), `sync.auth_required`,
-    /// `sync.forbidden`, `sync.scope_revoked`.
+    /// The server refused this device's credential: `401`/`403`
+    /// ([`CREDENTIAL_REFUSED`]) or the client's own `sync.auth_required`.
+    /// No scope was revoked: fresh authority (a re-attested credential)
+    /// restores it.
+    Credential,
+    /// The server revoked the caller's scope: `sync.forbidden`,
+    /// `sync.scope_revoked`.
     Revoked,
     /// The server refused the caller's graph authority for this call:
     /// `forbidden`, `context_revoked`, `source_audience`, `label_unknown`,
@@ -365,13 +369,11 @@ pub enum ErrorClass {
     Unanswered,
 }
 
-/// The codes that refuse the credential or revoke the scope.
-const REVOKING: [&str; 4] = [
-    CREDENTIAL_REFUSED,
-    "sync.auth_required",
-    "sync.forbidden",
-    "sync.scope_revoked",
-];
+/// The codes that refuse this device's credential.
+const CREDENTIAL: [&str; 2] = [CREDENTIAL_REFUSED, "sync.auth_required"];
+
+/// The codes that revoke the caller's scope.
+const REVOKING: [&str; 2] = ["sync.forbidden", "sync.scope_revoked"];
 
 /// The names that refuse the caller's graph authority.
 const AUTHORITY_REFUSALS: [&str; 4] = [
@@ -416,7 +418,9 @@ impl ReplicaError {
             _ => return ErrorClass::Unanswered,
         };
         let named = |name: &&str| code == *name || message == *name;
-        if REVOKING.contains(&code) {
+        if CREDENTIAL.contains(&code) {
+            ErrorClass::Credential
+        } else if REVOKING.contains(&code) {
             ErrorClass::Revoked
         } else if named(&"graph_unavailable") || code == "operation.unknown" {
             ErrorClass::Unavailable

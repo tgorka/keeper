@@ -1334,8 +1334,6 @@ fn a_native_authority_failure_is_typed_by_its_cause() {
         remote("operation.forbidden", "some_new_refusal", false),
         remote("sync.forbidden", "m", false),
         remote("sync.scope_revoked", "m", false),
-        remote(CREDENTIAL_REFUSED, "m", false),
-        remote("sync.auth_required", "m", false),
         remote("source_audience", "m", false),
         ReplicaError::Rejected {
             code: "operation.forbidden".to_owned(),
@@ -1347,6 +1345,16 @@ fn a_native_authority_failure_is_typed_by_its_cause() {
             QueryError::Forbidden,
             "{refusal:?}"
         );
+    }
+    // A refused credential is told apart (H3), under the same stable code.
+    for refusal in [
+        remote(CREDENTIAL_REFUSED, "m", false),
+        remote("sync.auth_required", "m", false),
+    ] {
+        let error = remote_error(refusal.clone());
+        assert_eq!(error, QueryError::CredentialRefused, "{refusal:?}");
+        assert_eq!(error.code(), "forbidden");
+        assert!(error.is_refusal());
     }
     for answered in [
         remote("sync.internal_error", "storage_unavailable", true),
@@ -1705,8 +1713,10 @@ mod offline {
     use std::sync::atomic::AtomicI64;
 
     use super::*;
-    use crate::graph::lifecycle::Lifecycle;
-    use crate::graph::queue::{Binding, FenceState, GraphQueue};
+    use crate::graph::client::GraphClient;
+    use crate::graph::lifecycle::{Lifecycle, LifecycleError};
+    use crate::graph::queue::{Binding, FenceCause, FenceState, GraphQueue, State as QueueState};
+    use crate::graph::source::Revocation;
 
     const T0: i64 = 1_000_000_000_000;
     const DAY: i64 = 24 * 60 * 60 * 1000;
@@ -2039,7 +2049,9 @@ mod offline {
         let reader = std::mem::replace(&mut o.reader, placeholder);
         o.reader = reader.with_clock(Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) == nth {
-                lifecycle.lock(T0 + 1).expect("locked");
+                lifecycle
+                    .lock(T0 + 1, FenceCause::Revocation)
+                    .expect("locked");
             }
             clock.load(Ordering::SeqCst)
         }));
@@ -2128,7 +2140,9 @@ mod offline {
             },
         )
         .expect("queue");
-        other.persist_fence(T0 + 1).expect("fenced");
+        other
+            .persist_fence(T0 + 1, FenceCause::Revocation)
+            .expect("fenced");
         assert!(!o.lifecycle.is_locked());
         assert_eq!(
             o.query(Freshness::Current).await,
@@ -2168,7 +2182,7 @@ mod offline {
 
     impl std::task::Wake for LockOnWake {
         fn wake(self: Arc<Self>) {
-            self.0.lock(T0 + 1).expect("locked");
+            self.0.lock(T0 + 1, FenceCause::Revocation).expect("locked");
         }
     }
 
@@ -2246,5 +2260,130 @@ mod offline {
             o.query(Freshness::AllowStale).await,
             Ok(Completeness::Stale)
         );
+    }
+
+    /// A new projection instance over the rig's replica (a regrant's
+    /// evidence), and a person's reader of it keeping `o`'s fence.
+    fn reopened(o: &Offline) -> (GraphReads, HumanReader) {
+        let fresh = GraphReads::open(
+            o._rig.source.clone(),
+            &o._dir.path().join("regranted"),
+            o._rig.admission.clone(),
+            worker(),
+        )
+        .expect("reads");
+        let reader = fresh
+            .human_with(&o._rig.world.source, o.person.clone())
+            .with_lifecycle(o.lifecycle.clone())
+            .expect("same domain");
+        (fresh, reader)
+    }
+
+    /// Reads serve again through `reader`, current.
+    async fn serves(reader: &HumanReader) {
+        reader
+            .refresh(&Cancellation::default())
+            .await
+            .expect("rebuilt");
+        let result = reader
+            .query(Q, b"{}", Freshness::Current, &Cancellation::default())
+            .await
+            .expect("served");
+        assert_eq!(result.rows[0]["t"], json!("kept"));
+        assert_eq!(result.completeness, Completeness::Current);
+    }
+
+    /// Owner decision 2026-11-12 (H3): a `read_status` refused for the
+    /// credential (a 401 for an attestation that lapsed while offline) is
+    /// `forbidden` and fences the domain as a credential fence; nothing
+    /// serves after it, offline either. Re-attested, the server's answer,
+    /// granted subscriptions and a new instance regrant it with no purge
+    /// (none comes: no scope was revoked), and reads serve again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_credential_fences_until_fresh_authority() {
+        let o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        o.script(vec![Step::Fail(QueryError::CredentialRefused)]);
+        assert_eq!(
+            o.query(Freshness::AllowStale).await.map_err(|e| e.code()),
+            Err("forbidden")
+        );
+        assert!(o.lifecycle.is_locked());
+        assert_eq!(o.lifecycle.fence(), Ok(Some(FenceState::Revoked)));
+        assert_eq!(o.lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+        assert!(o._rig.reads.is_revoked());
+        assert_eq!(
+            o.query(Freshness::AllowStale).await,
+            Err(QueryError::Forbidden)
+        );
+        *o.person.then.lock().expect("then") = Step::Answer;
+        let status = o.person.read_status(DB).expect("re-attested");
+        let (fresh, reader) = reopened(&o);
+        o.lifecycle
+            .regrant(&status, granted(), &fresh)
+            .expect("regranted");
+        o.lifecycle.gate().expect("unlocked");
+        serves(&reader).await;
+    }
+
+    /// Owner ruling 2026-11-12 (M4): the operator's kill switch (the graph
+    /// switched off, so the server resolves the graph scopes to nothing and
+    /// the subscriptions read revoked) purges the projection, fences the
+    /// domain as a revocation and disables the queued intent. Switched back
+    /// on — the subscriptions granted again, the replica's purge observed —
+    /// a normal regrant from fresh authority restores reads; the queued
+    /// intent stays disabled (CC-11).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_return_after_the_kill_switch_but_queued_intents_stay_disabled() {
+        let o = Offline::new().await;
+        *o.person.then.lock().expect("then") = Step::Answer;
+        let client = GraphClient::new(o._rig.world.source.clone());
+        let change = client
+            .change(vec![node(&ulid(9), "Concept", "queued", json!({}))], None)
+            .expect("change");
+        let prepared = client.mint(&change).expect("minted");
+        o.lifecycle
+            .with_queue(|queue| queue.enqueue(&prepared, T0))
+            .expect("queued");
+        // The kill switch.
+        *o._rig.source.scope.lock().expect("scope") = Checkpoint {
+            scope: ScopeState::Revoked,
+            cursor: None,
+        };
+        assert_eq!(
+            o.query(Freshness::Current).await,
+            Err(QueryError::Forbidden)
+        );
+        assert!(o.lifecycle.is_locked());
+        assert_eq!(o.lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
+        assert!(o._rig.reads.is_revoked());
+        assert_eq!(
+            o.lifecycle.counts(),
+            Ok(BTreeMap::from([(QueueState::Disabled, 1)]))
+        );
+        // Switched back on: granted again and answering, the purge not yet
+        // observed.
+        *o._rig.source.scope.lock().expect("scope") = granted();
+        let status = o.person.read_status(DB).expect("answered");
+        let (fresh, reader) = reopened(&o);
+        assert_eq!(
+            o.lifecycle.regrant(&status, granted(), &fresh),
+            Err(LifecycleError::PurgePending)
+        );
+        assert_eq!(
+            o.lifecycle.observe_purge(Revocation::Purged, T0 + 2),
+            Ok(true)
+        );
+        o.lifecycle
+            .regrant(&status, granted(), &fresh)
+            .expect("regranted");
+        o.lifecycle.gate().expect("unlocked");
+        serves(&reader).await;
+        let entries = o
+            .lifecycle
+            .with_queue(|queue| queue.entries())
+            .expect("listing");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, QueueState::Disabled);
     }
 }

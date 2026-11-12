@@ -354,7 +354,9 @@ fn a_fence_locks_open_entries_and_disclosure() {
     let (client, prepared) = queued(dir.path());
     let id = prepared.request().request_id.clone();
     let mut queue = reopen(dir.path());
-    queue.persist_fence(5).expect("fenced");
+    queue
+        .persist_fence(5, FenceCause::Revocation)
+        .expect("fenced");
     assert_eq!(queue.disable_open(5).expect("disabled"), 1);
     assert_eq!(queue.fence().expect("fence"), Some(FenceState::Revoked));
     assert_eq!(queue.entries(), Err(QueueError::Fenced));
@@ -367,7 +369,9 @@ fn a_fence_locks_open_entries_and_disclosure() {
     assert!(payload(dir.path(), &id).is_some());
     queue.mark_purged(7).expect("purged");
     assert_eq!(queue.fence().expect("fence"), Some(FenceState::Purged));
-    queue.clear_fence().expect("cleared");
+    let fence = queue.fence_row().expect("fence").expect("one stands");
+    assert!(queue.clear_fence(&fence).expect("cleared"));
+    assert_eq!(queue.fence().expect("fence"), None);
     assert!(matches!(
         queue.mark(&id, State::Disabled, State::Submitting, None, 8),
         Err(QueueError::Transition { .. })
@@ -749,7 +753,9 @@ fn a_fenced_queue_never_discloses_bound_arguments() {
     queue
         .enqueue_for_approval(&prepared, APPROVAL, "row-1", 1)
         .expect("bound");
-    queue.persist_fence(2).expect("fenced");
+    queue
+        .persist_fence(2, FenceCause::Revocation)
+        .expect("fenced");
     assert_eq!(queue.bound(&id), Err(QueueError::Fenced));
     drop(queue);
     let reopened = agent_queue(dir.path());
@@ -785,6 +791,105 @@ fn an_interrupted_migration_reopens() {
     assert_eq!(queue.bound(&prepared.request().request_id), Ok(None));
     drop(queue);
     reopen(dir.path());
+}
+
+/// A version-2 file's fence (before its cause was kept) reopens as a
+/// `revocation` fence, the stricter cause, with its state and time kept;
+/// a file cut after its `ALTER` but before the version bump reopens too
+/// (owner decision 2026-11-12, H3).
+#[test]
+fn a_version_two_fence_reopens_as_a_revocation() {
+    for half_migrated in [false, true] {
+        let dir = tempfile::tempdir().expect("dir");
+        drop(queued(dir.path()));
+        let cause = if half_migrated {
+            ", cause TEXT NOT NULL DEFAULT 'revocation'"
+        } else {
+            ""
+        };
+        raw(
+            dir.path(),
+            &format!(
+                "DROP TABLE graph_fence; \
+                 CREATE TABLE graph_fence(only INTEGER PRIMARY KEY CHECK (only = 1), \
+                 state TEXT NOT NULL CHECK (state IN ('revoked', 'purged')), \
+                 fenced_at INTEGER NOT NULL, updated_at INTEGER NOT NULL{cause}); \
+                 INSERT INTO graph_fence(only, state, fenced_at, updated_at) \
+                 VALUES (1, 'purged', 5, 6); \
+                 PRAGMA user_version = 2;"
+            ),
+        );
+        let queue = reopen(dir.path());
+        assert_eq!(
+            queue.fence_row().expect("fence"),
+            Some(Fence {
+                state: FenceState::Purged,
+                cause: FenceCause::Revocation,
+                fenced_at: 5,
+            }),
+            "half-migrated {half_migrated}"
+        );
+        drop(queue);
+        assert_eq!(
+            reopen(dir.path()).fence_cause().expect("cause"),
+            Some(FenceCause::Revocation)
+        );
+    }
+}
+
+/// The fence's cause is kept across a restart and only escalates: a
+/// credential signal never downgrades a revocation fence, and a revocation
+/// over a credential fence makes it a revocation fence, `revoked` again
+/// and set anew (owner decision 2026-11-12, H3).
+#[test]
+fn the_fence_cause_survives_a_restart_and_only_escalates() {
+    let dir = tempfile::tempdir().expect("dir");
+    drop(queued(dir.path()));
+    let queue = reopen(dir.path());
+    queue
+        .persist_fence(5, FenceCause::Credential)
+        .expect("fenced");
+    queue
+        .persist_fence(6, FenceCause::Credential)
+        .expect("again");
+    queue.mark_purged(7).expect("purged");
+    drop(queue);
+    let queue = reopen(dir.path());
+    assert_eq!(
+        queue.fence_row().expect("fence"),
+        Some(Fence {
+            state: FenceState::Purged,
+            cause: FenceCause::Credential,
+            fenced_at: 5,
+        })
+    );
+    queue
+        .persist_fence(8, FenceCause::Revocation)
+        .expect("escalated");
+    let escalated = Fence {
+        state: FenceState::Revoked,
+        cause: FenceCause::Revocation,
+        fenced_at: 8,
+    };
+    assert_eq!(queue.fence_row().expect("fence"), Some(escalated));
+    queue
+        .persist_fence(9, FenceCause::Credential)
+        .expect("no downgrade");
+    queue
+        .persist_fence(10, FenceCause::Revocation)
+        .expect("idempotent");
+    drop(queue);
+    let queue = reopen(dir.path());
+    assert_eq!(queue.fence_row().expect("fence"), Some(escalated));
+    // A clear for the fence as it was read before the escalation removes
+    // nothing.
+    let stale = Fence {
+        state: FenceState::Purged,
+        cause: FenceCause::Credential,
+        fenced_at: 5,
+    };
+    assert!(!queue.clear_fence(&stale).expect("cleared nothing"));
+    assert_eq!(queue.fence_row().expect("fence"), Some(escalated));
 }
 
 /// A resume sends only what nothing is known of: never after

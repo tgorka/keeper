@@ -53,8 +53,10 @@ use super::protocol::CONTRACT_VERSION;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The file's schema version (`PRAGMA user_version`). Version 2 adds the
-/// agent approval binding (`approval_id`, `tool_call_id`, `bound_args`).
-const SCHEMA_VERSION: i64 = 2;
+/// agent approval binding (`approval_id`, `tool_call_id`, `bound_args`);
+/// version 3 the fence's cause (`graph_fence.cause`; a fence written before
+/// it reads as `revocation`, the stricter).
+const SCHEMA_VERSION: i64 = 3;
 
 /// Where an entry stands. The open states are the ones a send may come
 /// from or lead to; the outcome states and the three local terminal states
@@ -346,19 +348,20 @@ pub fn terminal(outcome: &super::outcome::GraphOutcome) -> Option<(State, Resolu
 /// [`PendingCause`], never on text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Next {
-    /// Persist this terminal outcome. When `revokes`, the domain is fenced
-    /// too ([`super::outcome::GraphOutcome::revokes`]).
+    /// Persist this terminal outcome. When `fences`, the domain is fenced
+    /// too, from that cause ([`super::outcome::GraphOutcome::fence_cause`]).
     Resolve {
         to: State,
         resolution: Resolution,
-        revokes: bool,
+        fences: Option<FenceCause>,
     },
     /// Move to this open state (or stay, when already there).
     Mark(State),
     /// End it on this device: it was never sent.
     RefuseLocally,
-    /// A revocation signal: fence the domain, which locks every open entry.
-    Revoke,
+    /// A revocation signal: fence the domain from this cause, which locks
+    /// every open entry.
+    Revoke(FenceCause),
     /// Keep it; retry the identical request under its own id after a
     /// back-off.
     Retry(PendingCause),
@@ -377,17 +380,18 @@ pub enum Next {
 ///   `graph.outcome` only, never a new id (DF-110-8);
 /// - an ended agent context refuses an entry never sent and leaves one
 ///   that may have been sent `unresolved`, never refused;
-/// - a refused lookup revokes; a lookup the server refused as invalid
-///   leaves the entry as it is (nothing resent); a transport failure, a
-///   transient server error or `graph_unavailable` retries the identical
-///   request; a foreign key suspends.
+/// - a refused lookup revokes (a refused credential is a credential fence,
+///   any other refusal a revocation); a lookup the server refused as
+///   invalid leaves the entry as it is (nothing resent); a transport
+///   failure, a transient server error or `graph_unavailable` retries the
+///   identical request; a foreign key suspends.
 #[must_use]
 pub fn next(from: State, outcome: &GraphOutcome) -> Next {
     if let Some((to, resolution)) = terminal(outcome) {
         return Next::Resolve {
             to,
             resolution,
-            revokes: outcome.revokes(),
+            fences: outcome.fence_cause(),
         };
     }
     match outcome {
@@ -399,7 +403,8 @@ pub fn next(from: State, outcome: &GraphOutcome) -> Next {
             PendingCause::Unresolved => Next::Mark(State::Unresolved),
             PendingCause::ContextEnded if from.never_sent() => Next::RefuseLocally,
             PendingCause::ContextEnded => Next::Mark(State::Unresolved),
-            PendingCause::Refused => Next::Revoke,
+            PendingCause::Refused => Next::Revoke(FenceCause::Revocation),
+            PendingCause::CredentialRefused => Next::Revoke(FenceCause::Credential),
             PendingCause::NoAttempt => Next::Lookup,
             PendingCause::Foreign => Next::Mark(State::Suspended),
         },
@@ -512,6 +517,39 @@ impl FenceState {
     }
 }
 
+/// What the fence was learned from, which decides what clears it
+/// ([`super::lifecycle`]). Persisted with the fence, so a restart keeps it;
+/// it only ever escalates, never downgrades.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FenceCause {
+    /// The server refused this device's credential (a refused link, a
+    /// `401`/`403`, `sync.auth_required`): no scope was revoked, so fresh
+    /// authority clears it without the replica's purge.
+    Credential,
+    /// A revoked subscription or scope, or a refusal of graph authority:
+    /// cleared only from `purged`, with fresh authority.
+    Revocation,
+}
+
+impl FenceCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::Revocation => "revocation",
+        }
+    }
+}
+
+/// The fence row as one read: what a regrant checks and clears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fence {
+    pub(crate) state: FenceState,
+    pub(crate) cause: FenceCause,
+    /// The caller's clock when the fence was set, or escalated to
+    /// [`FenceCause::Revocation`].
+    pub(crate) fenced_at: i64,
+}
+
 /// The last read authority a successful online `read_status` answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityRow {
@@ -560,7 +598,8 @@ CREATE TABLE IF NOT EXISTS graph_fence(\
     only INTEGER PRIMARY KEY CHECK (only = 1), \
     state TEXT NOT NULL CHECK (state IN ('revoked', 'purged')), \
     fenced_at INTEGER NOT NULL, \
-    updated_at INTEGER NOT NULL\
+    updated_at INTEGER NOT NULL, \
+    cause TEXT NOT NULL DEFAULT 'revocation' CHECK (cause IN ('credential', 'revocation'))\
 );\
 CREATE TABLE IF NOT EXISTS graph_authority(\
     only INTEGER PRIMARY KEY CHECK (only = 1), \
@@ -572,6 +611,11 @@ CREATE TABLE IF NOT EXISTS graph_authority(\
 /// The columns version 2 added to `graph_intents` (the agent approval
 /// binding).
 const V2_COLUMNS: [&str; 3] = ["approval_id", "tool_call_id", "bound_args"];
+
+/// The column version 3 added to `graph_fence`: a fence from before it is a
+/// `revocation` (the stricter cause).
+const V3_FENCE_CAUSE: &str = "cause TEXT NOT NULL DEFAULT 'revocation' \
+     CHECK (cause IN ('credential', 'revocation'))";
 
 /// Bring the file to [`SCHEMA_VERSION`] in one transaction with its
 /// version bump: an interruption leaves the file at the version it had.
@@ -593,30 +637,42 @@ fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
         return Ok(());
     }
     // `CREATE … IF NOT EXISTS` leaves a table an older build made as it was,
-    // so the version 2 columns are checked whatever the version said.
+    // so the version 2 and 3 columns are checked whatever the version said.
     tx.execute_batch(SCHEMA).map_err(storage)?;
-    let present = {
-        let mut statement = tx
-            .prepare("SELECT name FROM pragma_table_info('graph_intents')")
-            .map_err(storage)?;
-        let names = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(storage)?;
-        names
-    };
+    let intents = columns(&tx, "graph_intents")?;
     for column in V2_COLUMNS {
-        if !present.iter().any(|name| name == column) {
+        if !intents.iter().any(|name| name == column) {
             tx.execute_batch(&format!(
                 "ALTER TABLE graph_intents ADD COLUMN {column} TEXT;"
             ))
             .map_err(storage)?;
         }
     }
+    if !columns(&tx, "graph_fence")?
+        .iter()
+        .any(|name| name == "cause")
+    {
+        tx.execute_batch(&format!(
+            "ALTER TABLE graph_fence ADD COLUMN {V3_FENCE_CAUSE};"
+        ))
+        .map_err(storage)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(storage)?;
     tx.commit().map_err(storage)
+}
+
+/// The column names of `table`.
+fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, QueueError> {
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info(?1)")
+        .map_err(storage)?;
+    let names = statement
+        .query_map([table], |row| row.get::<_, String>(0))
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    Ok(names)
 }
 
 /// The SQL list of terminal state names.
@@ -1299,43 +1355,57 @@ impl GraphQueue {
 
     /// The fence, if one was persisted.
     pub fn fence(&self) -> Result<Option<FenceState>, QueueError> {
-        let state: Option<String> = self
-            .conn
-            .query_row("SELECT state FROM graph_fence WHERE only = 1", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(storage)?;
-        Ok(match state.as_deref() {
-            None => None,
-            Some("purged") => Some(FenceState::Purged),
-            // Anything else written there is read as the stricter state.
-            Some(_) => Some(FenceState::Revoked),
-        })
+        Ok(self.fence_row()?.map(|fence| fence.state))
     }
 
-    /// When the standing fence was set (the caller's clock at the first
-    /// revocation signal), if one stands.
-    pub(crate) fn fenced_at(&self) -> Result<Option<i64>, QueueError> {
-        self.conn
+    /// What the standing fence was learned from, if one stands.
+    pub fn fence_cause(&self) -> Result<Option<FenceCause>, QueueError> {
+        Ok(self.fence_row()?.map(|fence| fence.cause))
+    }
+
+    /// The standing fence's state, cause and `fenced_at`, read together.
+    /// Anything else written in `state` or `cause` is read as the stricter
+    /// value.
+    pub(crate) fn fence_row(&self) -> Result<Option<Fence>, QueueError> {
+        let row: Option<(String, String, i64)> = self
+            .conn
             .query_row(
-                "SELECT fenced_at FROM graph_fence WHERE only = 1",
+                "SELECT state, cause, fenced_at FROM graph_fence WHERE only = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(storage)
+            .map_err(storage)?;
+        Ok(row.map(|(state, cause, fenced_at)| Fence {
+            state: if state == FenceState::Purged.as_str() {
+                FenceState::Purged
+            } else {
+                FenceState::Revoked
+            },
+            cause: if cause == FenceCause::Credential.as_str() {
+                FenceCause::Credential
+            } else {
+                FenceCause::Revocation
+            },
+            fenced_at,
+        }))
     }
 
-    /// Persist the fence ([`FenceState::Revoked`]), committed on its own
-    /// before anything else of the revocation. Idempotent: an existing
-    /// fence stays as it is.
-    pub(crate) fn persist_fence(&self, now_ms: i64) -> Result<(), QueueError> {
+    /// Persist the fence ([`FenceState::Revoked`], learned from `cause`),
+    /// committed on its own before anything else of the revocation.
+    /// Idempotent, and the cause only escalates: a revocation over a
+    /// credential fence makes it a `revocation` fence, `revoked` again (its
+    /// purge not yet observed) and set now (an admission from before is no
+    /// fresh authority for it); anything else leaves the fence as it is.
+    pub(crate) fn persist_fence(&self, now_ms: i64, cause: FenceCause) -> Result<(), QueueError> {
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO graph_fence(only, state, fenced_at, updated_at) \
-                 VALUES (1, 'revoked', ?1, ?1)",
-                [now_ms],
+                "INSERT INTO graph_fence(only, state, cause, fenced_at, updated_at) \
+                 VALUES (1, 'revoked', ?2, ?1, ?1) \
+                 ON CONFLICT(only) DO UPDATE SET state = 'revoked', cause = excluded.cause, \
+                 fenced_at = excluded.fenced_at, updated_at = excluded.updated_at \
+                 WHERE excluded.cause = 'revocation' AND graph_fence.cause = 'credential'",
+                params![now_ms, cause.as_str()],
             )
             .map_err(storage)?;
         Ok(())
@@ -1372,12 +1442,19 @@ impl GraphQueue {
         Ok(())
     }
 
-    /// Remove the fence (a regrant, after fresh authority).
-    pub(crate) fn clear_fence(&self) -> Result<(), QueueError> {
-        self.conn
-            .execute("DELETE FROM graph_fence", [])
+    /// Remove the fence `read` (a regrant, after fresh authority): whether
+    /// it was removed. A fence that changed since it was read (escalated, or
+    /// set anew by another holder of the file) stays.
+    pub(crate) fn clear_fence(&self, read: &Fence) -> Result<bool, QueueError> {
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM graph_fence WHERE only = 1 AND state = ?1 AND cause = ?2 \
+                 AND fenced_at = ?3",
+                params![read.state.as_str(), read.cause.as_str(), read.fenced_at],
+            )
             .map_err(storage)?;
-        Ok(())
+        Ok(removed == 1)
     }
 
     /// Persist the authority a successful online `read_status` answered at

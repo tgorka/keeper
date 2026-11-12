@@ -11,7 +11,7 @@ use super::outcome::{GraphOutcome, PendingCause, REQUEST_REFUSALS};
 use super::protocol::change::{Change, ChangeOp, DESCRIPTOR};
 use super::protocol::request::Request;
 use super::protocol::Refusal;
-use super::queue::{next, Next, State};
+use super::queue::{next, FenceCause, Next, State};
 use super::write::{Caller, GraphWrite, Writer};
 use crate::hq::port::{CommandResult, LinkState, ReplicaError};
 use crate::notes::tags::normalise;
@@ -129,10 +129,11 @@ fn applied() -> Result<CommandResult, ReplicaError> {
 
 /// CC-5 through the one classifier (review BLOCKING-1, S0, B-A, B-B): every
 /// server answer maps to its cause by its stable name. Only a refused
-/// credential or scope, or a refusal of graph authority (an unnamed
-/// `operation.forbidden` message included), is `Refused`; a non-retryable
-/// answer that says nothing of the caller never is; every failure that is
-/// not the server's answer is `Transport`.
+/// credential (`CredentialRefused`, owner decision 2026-11-12 H3), a
+/// revoked scope or a refusal of graph authority (an unnamed
+/// `operation.forbidden` message included, `Refused`) refuses; a
+/// non-retryable answer that says nothing of the caller never does; every
+/// failure that is not the server's answer is `Transport`.
 #[test]
 fn every_failure_has_its_typed_cause() {
     use crate::hq::port::CREDENTIAL_REFUSED;
@@ -171,11 +172,11 @@ fn every_failure_has_its_typed_cause() {
         (remote("forbidden", "", true), PendingCause::Refused),
         (
             remote(CREDENTIAL_REFUSED, "m", false),
-            PendingCause::Refused,
+            PendingCause::CredentialRefused,
         ),
         (
             remote("sync.auth_required", "m", false),
-            PendingCause::Refused,
+            PendingCause::CredentialRefused,
         ),
         (remote("sync.forbidden", "m", false), PendingCause::Refused),
         (
@@ -225,10 +226,14 @@ fn only_a_read_level_refusal_revokes() {
             .map(|c| json!({"code": c}).as_object().cloned().unwrap_or_default())
             .unwrap_or_default(),
     };
-    assert!(GraphOutcome::Pending {
-        cause: PendingCause::Refused
+    for (cause, fence) in [
+        (PendingCause::Refused, FenceCause::Revocation),
+        (PendingCause::CredentialRefused, FenceCause::Credential),
+    ] {
+        let refused = GraphOutcome::Pending { cause };
+        assert!(refused.revokes(), "{cause:?}");
+        assert_eq!(refused.fence_cause(), Some(fence));
     }
-    .revokes());
     for code in [
         None,
         Some("forbidden"),
@@ -298,7 +303,11 @@ fn the_queue_policy_follows_the_cause() {
     }
     assert_eq!(
         next(State::Submitting, &pending(PendingCause::Refused)),
-        Next::Revoke
+        Next::Revoke(FenceCause::Revocation)
+    );
+    assert_eq!(
+        next(State::Submitting, &pending(PendingCause::CredentialRefused)),
+        Next::Revoke(FenceCause::Credential)
     );
     assert_eq!(
         next(State::Unresolved, &pending(PendingCause::NoAttempt)),
@@ -317,7 +326,7 @@ fn the_queue_policy_follows_the_cause() {
         ),
         Next::Mark(State::PendingVisibility)
     );
-    let Next::Resolve { to, revokes, .. } = next(
+    let Next::Resolve { to, fences, .. } = next(
         State::Submitting,
         &GraphOutcome::Rejected {
             reason: "forbidden".into(),
@@ -326,11 +335,11 @@ fn the_queue_policy_follows_the_cause() {
     ) else {
         panic!("a receipt resolves");
     };
-    assert_eq!((to, revokes), (State::Rejected, false));
+    assert_eq!((to, fences), (State::Rejected, None));
     let Next::Resolve {
         to,
         resolution,
-        revokes,
+        fences,
     } = next(
         State::Submitting,
         &GraphOutcome::Rejected {
@@ -345,8 +354,8 @@ fn the_queue_policy_follows_the_cause() {
         panic!("a receipt resolves");
     };
     assert_eq!(
-        (to, resolution.code.as_deref(), revokes),
-        (State::Rejected, Some("approval_required"), false)
+        (to, resolution.code.as_deref(), fences),
+        (State::Rejected, Some("approval_required"), None)
     );
 }
 

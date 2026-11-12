@@ -5,7 +5,8 @@
 //!
 //! On a revocation signal ([`Lifecycle::revoke`]), in this order:
 //! 1. the in-memory gate closes and the `graph_fence` row is committed in
-//!    the domain's queue file, before anything else;
+//!    the domain's queue file, with its cause ([`FenceCause`]), before
+//!    anything else;
 //! 2. every open queue entry is locked ([`super::queue::State::Disabled`]),
 //!    identity and payload kept;
 //! 3. [`GraphReads::revoke`] kills and reaps in-flight workers and purges
@@ -22,13 +23,26 @@
 //! locked failure, never an unlock.
 //!
 //! Only a regrant clears the fence ([`Lifecycle::regrant`] for a person,
-//! [`Lifecycle::regrant_admitted`] for an agent), and only from `purged`,
-//! with fresh authority for this domain (a successful `read_status`, or an
-//! unexpired `admit_read`), granted subscriptions and a new, unrevoked
-//! [`GraphReads`]. A fence learned from a
-//! refusal before the server's revoke frame stays `revoked` and never
-//! unlocks. Locked entries stay locked after a regrant: they are never sent
-//! again, only resolved by their own outcome or discarded.
+//! [`Lifecycle::regrant_admitted`] for an agent), with fresh authority for
+//! this domain (a successful `read_status`, or an unexpired `admit_read`
+//! from after the fence), granted subscriptions and a new, unrevoked
+//! [`GraphReads`]. What else it needs follows from the fence's persisted
+//! cause (owner decision 2026-11-12, H3):
+//! - a [`FenceCause::Credential`] fence (a refused link, a `401`/`403`,
+//!   `sync.auth_required`: the server refused this device's credential and
+//!   revoked no scope, as for an attestation that lapsed while offline)
+//!   clears from `revoked` too: the fresh authority is the evidence;
+//! - a [`FenceCause::Revocation`] fence (a revoked subscription or scope,
+//!   the graph switched off, a refusal of graph authority) clears only from
+//!   `purged`: one learned before the server's revoke frame stays `revoked`
+//!   and never unlocks.
+//!
+//! The cause only escalates: a revocation signal over a credential fence
+//! makes it a revocation fence, `revoked` again and set anew; a credential
+//! signal leaves a revocation fence as it is. A fence persisted before the
+//! cause was kept reads as a revocation. Locked entries stay locked after a
+//! regrant: they are never sent again, only resolved by their own outcome
+//! or discarded.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -36,7 +50,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use super::outcome::GraphOutcome;
 use super::protocol::wire::{Authority, ReadStatus};
 use super::query::{AdmittedRead, GraphReads, QueryError};
-use super::queue::{self, AuthorityRow, FenceState, GraphQueue, Next, QueueError, State};
+use super::queue::{
+    self, AuthorityRow, FenceCause, FenceState, GraphQueue, Next, QueueError, State,
+};
 use super::source::{Checkpoint, Revocation, ScopeState};
 
 /// Why a lifecycle step failed. The domain stays locked.
@@ -156,6 +172,11 @@ impl Lifecycle {
         Ok(self.queue().fence()?)
     }
 
+    /// What the standing fence was learned from, as persisted.
+    pub fn fence_cause(&self) -> Result<Option<FenceCause>, LifecycleError> {
+        Ok(self.queue().fence_cause()?)
+    }
+
     /// How many queued intents are in each state (domain-safe; allowed
     /// while locked).
     pub fn counts(
@@ -164,15 +185,17 @@ impl Lifecycle {
         Ok(self.queue().counts()?)
     }
 
-    /// A revocation signal: lock, persist the fence, lock the queue, then
-    /// kill the domain's workers and purge its projection (`reads`, when
-    /// this process holds them). Idempotent.
+    /// A revocation signal learned from `cause`: lock, persist the fence,
+    /// lock the queue, then kill the domain's workers and purge its
+    /// projection (`reads`, when this process holds them). Idempotent; the
+    /// cause only escalates (credential to revocation, never back).
     pub async fn revoke(
         &self,
         reads: Option<&GraphReads>,
         now_ms: i64,
+        cause: FenceCause,
     ) -> Result<(), LifecycleError> {
-        self.lock(now_ms)?;
+        self.lock(now_ms, cause)?;
         if let Some(reads) = reads {
             reads.revoke().await?;
         }
@@ -184,10 +207,10 @@ impl Lifecycle {
     /// gate, persist the fence, lock every open entry. The projection's
     /// purge is left to the next [`Lifecycle::resume`] (the fence stands
     /// until then, and a restart starts locked).
-    pub fn lock(&self, now_ms: i64) -> Result<(), LifecycleError> {
+    pub fn lock(&self, now_ms: i64, cause: FenceCause) -> Result<(), LifecycleError> {
         self.locked.store(true, Ordering::SeqCst);
         let queue = self.queue();
-        queue.persist_fence(now_ms)?;
+        queue.persist_fence(now_ms, cause)?;
         Self::disable(&queue, now_ms)
     }
 
@@ -234,18 +257,18 @@ impl Lifecycle {
         let next = queue::next(from, outcome);
         // A locked entry is only resolved by its own outcome (or withdrawn);
         // nothing else moves it, and a further refusal only re-locks.
-        if from == State::Disabled && !matches!(next, Next::Resolve { .. } | Next::Revoke) {
+        if from == State::Disabled && !matches!(next, Next::Resolve { .. } | Next::Revoke(_)) {
             return Ok(from);
         }
         match next {
             Next::Resolve {
                 to,
                 resolution,
-                revokes,
+                fences,
             } => {
                 let mut from = from;
-                if revokes {
-                    self.lock(now_ms)?;
+                if let Some(cause) = fences {
+                    self.lock(now_ms, cause)?;
                     if from != State::Disabled && !from.is_terminal() {
                         from = State::Disabled;
                     }
@@ -254,8 +277,8 @@ impl Lifecycle {
                     .resolve(request_id, from, to, &resolution, now_ms)?;
                 Ok(to)
             }
-            Next::Revoke => {
-                self.lock(now_ms)?;
+            Next::Revoke(cause) => {
+                self.lock(now_ms, cause)?;
                 Ok(State::Disabled)
             }
             Next::Mark(to) if to == from => Ok(from),
@@ -294,10 +317,11 @@ impl Lifecycle {
         }
     }
 
-    /// A person's regrant: clear the fence only from `purged`, with
-    /// `status` a successful read authority for this domain, `checkpoint`
-    /// granted subscriptions and `reads` a new, unrevoked instance. Locked
-    /// entries stay locked.
+    /// A person's regrant: clear the fence with `status` a successful read
+    /// authority for this domain, `checkpoint` granted subscriptions and
+    /// `reads` a new, unrevoked instance; a revocation fence only from
+    /// `purged`, a credential fence from `revoked` too. Locked entries stay
+    /// locked.
     pub fn regrant(
         &self,
         status: &ReadStatus,
@@ -314,19 +338,21 @@ impl Lifecycle {
     /// before the revocation, such as `AgentReader::admitted()` of a reader
     /// already open, is not fresh) and not yet expired, both on this
     /// device's clock, which fails closed when it cannot be read. Otherwise
-    /// exactly [`Lifecycle::regrant`] (one shared rule): only from `purged`
-    /// ([`LifecycleError::PurgePending`] while `revoked`,
-    /// [`LifecycleError::NotFenced`] with no fence), and
+    /// exactly [`Lifecycle::regrant`] (one shared rule): a revocation fence
+    /// only from `purged` ([`LifecycleError::PurgePending`] while
+    /// `revoked`), a credential fence from `revoked` too,
+    /// [`LifecycleError::NotFenced`] with no fence, and
     /// [`LifecycleError::NotFresh`] unless `checkpoint` is granted
     /// subscriptions and `reads` a new, unrevoked instance of this domain.
     /// Locked entries stay locked.
     ///
     /// Neither [`AdmittedRead::admit`] nor [`GraphReads::open`] consults the
     /// lifecycle: both work while the domain is fenced, which is how a caller
-    /// obtains the evidence. The caller re-registers revoked subscriptions
-    /// only after [`Lifecycle::observe_purge`] returned `true` (`purged`):
-    /// re-registered earlier, they read granted before the purge was seen,
-    /// and the fence stays `revoked` for good.
+    /// obtains the evidence. Under a revocation fence the caller
+    /// re-registers revoked subscriptions only after
+    /// [`Lifecycle::observe_purge`] returned `true` (`purged`): re-registered
+    /// earlier, they read granted before the purge was seen, and the fence
+    /// stays `revoked` for good.
     pub fn regrant_admitted(
         &self,
         read: &AdmittedRead,
@@ -348,12 +374,9 @@ impl Lifecycle {
         let unexpired = now.is_some_and(|now| read.expires_at_ms() > now);
         self.clear(
             |domain, fenced_at| {
-                let after_fence = match (read.admitted_at_ms(), fenced_at) {
-                    (Some(admitted), Some(fenced)) => {
-                        u64::try_from(fenced).is_ok_and(|fenced| admitted > fenced)
-                    }
-                    _ => false,
-                };
+                let after_fence = read.admitted_at_ms().is_some_and(|admitted| {
+                    u64::try_from(fenced_at).is_ok_and(|fenced| admitted > fenced)
+                });
                 unexpired && after_fence && read.domain() == domain
             },
             checkpoint,
@@ -363,28 +386,34 @@ impl Lifecycle {
 
     /// Clear the fence for a regrant whose authority `fresh` accepts for
     /// this domain and the fence's `fenced_at` (the one rule both forms
-    /// share).
+    /// share). A fence that changed after it was read here (another holder
+    /// of the file escalated or set it anew) stays: `NotFresh`.
     fn clear(
         &self,
-        fresh: impl FnOnce(&str, Option<i64>) -> bool,
+        fresh: impl FnOnce(&str, i64) -> bool,
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
         let queue = self.queue();
-        match queue.fence()? {
-            None => return Err(LifecycleError::NotFenced),
-            Some(FenceState::Revoked) => return Err(LifecycleError::PurgePending),
-            Some(FenceState::Purged) => {}
+        let Some(fence) = queue.fence_row()? else {
+            return Err(LifecycleError::NotFenced);
+        };
+        // A refused credential revoked no scope, so there is no purge to
+        // wait for; every other fence waits for the replica's purge.
+        if fence.state == FenceState::Revoked && fence.cause != FenceCause::Credential {
+            return Err(LifecycleError::PurgePending);
         }
         let domain = &queue.binding().domain;
-        if !fresh(domain, queue.fenced_at()?)
+        if !fresh(domain, fence.fenced_at)
             || reads.domain() != domain
             || reads.is_revoked()
             || checkpoint.scope != ScopeState::Granted
         {
             return Err(LifecycleError::NotFresh);
         }
-        queue.clear_fence()?;
+        if !queue.clear_fence(&fence)? {
+            return Err(LifecycleError::NotFresh);
+        }
         self.locked.store(false, Ordering::SeqCst);
         Ok(())
     }
