@@ -586,11 +586,12 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
     let retained = env("KEEPER_HQ_LIVE_FORBIDDEN_NODE");
     let retained_request = env("KEEPER_HQ_LIVE_FORBIDDEN_REQUEST");
     let (absent, absent_request) = (ulid(), ulid());
+    // The server's answer (CC-6): `Remote`, never a client failure.
     let refused = |what: &str, operation: &str, params: Value| match forbidden
         .replica
         .remote_query(operation, params)
     {
-        Err(ReplicaError::Client(text)) if text == FORBIDDEN => {}
+        Err(error @ ReplicaError::Remote { .. }) if error.to_string() == FORBIDDEN => {}
         other => panic!("{what}: not the forbidden refusal: {other:?}"),
     };
     for (what, request) in [
@@ -606,11 +607,11 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
     for (what, id) in [("retained", &retained), ("absent", &absent)] {
         for archived in [false, true] {
             refused(what, wire::GET_NODE, wire::get_params(None, id, archived));
-            assert_eq!(
-                client.get_node(id, archived),
-                Err(GraphClientError::Replica(ReplicaError::Client(
-                    FORBIDDEN.to_owned()
-                ))),
+            assert!(
+                matches!(
+                    &client.get_node(id, archived),
+                    Err(GraphClientError::Replica(e @ ReplicaError::Remote { .. })) if e.to_string() == FORBIDDEN
+                ),
                 "{what} node through the client"
             );
         }
@@ -620,11 +621,12 @@ fn graph_live_a_forbidden_domain_tells_nothing_and_offline_sends_nothing() {
             wire::history_params(None, "0", 10, &filter(id)).expect("params"),
         );
     }
-    assert_eq!(
-        client.history("0", 10, &HistoryFilter::default()),
-        Err(GraphClientError::Replica(ReplicaError::Client(
-            FORBIDDEN.to_owned()
-        )))
+    assert!(
+        matches!(
+            &client.history("0", 10, &HistoryFilter::default()),
+            Err(GraphClientError::Replica(e @ ReplicaError::Remote { .. })) if e.to_string() == FORBIDDEN
+        ),
+        "history through the client"
     );
     report("forbidden-reads", &json!({"refusal": FORBIDDEN}));
 

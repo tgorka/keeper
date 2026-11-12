@@ -38,9 +38,9 @@ mod driver {
         Freshness, GraphReads, HumanReader, Inspected, QueryError, QueryResult,
     };
     use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
-    use keeper_core::graph::source::GraphSource;
+    use keeper_core::graph::source::{GraphSource, ScopeState};
     use keeper_core::graph::supervisor::Cancellation;
-    use keeper_core::hq::port::{Link, ReplicaSpec};
+    use keeper_core::hq::port::{Link, LinkState, ReplicaSpec};
     use keeper_core::hq::sessions::Source;
     use keeper_core::hq::syncular::SyncularReplica;
     use keeper_core::notes::tags::normalise;
@@ -116,6 +116,16 @@ mod driver {
 
     fn query_error(error: &QueryError) -> Value {
         fail(error.code(), &error.to_string())
+    }
+
+    /// The refusal signals this device can see without asking (112.1's
+    /// driver `signals`, without the intent fence this rung has not got): a
+    /// refused link (the device was de-authorised) or a revoked graph
+    /// subscription (no graph role, or one revoked) is `forbidden` (110.5
+    /// AC4), never `sync_pending`.
+    fn refused(link: LinkState, scope: Option<ScopeState>) -> Option<Value> {
+        (link == LinkState::Refused || scope == Some(ScopeState::Revoked))
+            .then(|| fail("forbidden", "this domain is not readable by this person"))
     }
 
     fn outcome(outcome: &GraphOutcome) -> Value {
@@ -235,11 +245,19 @@ mod driver {
                 }
             }
             Command::Sync { wait_secs } => {
+                // Until the scope is settled either way, as 112.1's driver
+                // waits: a scope the server refuses reads `Revoked`, never
+                // `Granted`, and must not time out as `sync_pending`.
                 let ready = wait(&source, Duration::from_secs(*wait_secs), |s| {
-                    s.checkpoint()
-                        .is_ok_and(|c| c.scope == keeper_core::graph::source::ScopeState::Granted)
+                    s.checkpoint().is_ok_and(|c| c.scope != ScopeState::Pending)
                 })
                 .await;
+                if let Some(error) = refused(
+                    source.replica.state().link,
+                    source.checkpoint().ok().map(|c| c.scope),
+                ) {
+                    return error;
+                }
                 if !ready {
                     return fail(
                         "sync_pending",
@@ -373,6 +391,33 @@ mod driver {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::FAILURE
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 110.5 AC4 (R-B6): a revoked graph subscription (a person with no
+        /// graph role) or a refused link is `forbidden`; a granted or still
+        /// pending scope on a live link is no refusal.
+        #[test]
+        fn a_revoked_scope_or_a_refused_link_is_forbidden() {
+            for (link, scope) in [
+                (LinkState::Connected, Some(ScopeState::Revoked)),
+                (LinkState::Refused, Some(ScopeState::Granted)),
+                (LinkState::Refused, None),
+            ] {
+                let answer = refused(link, scope).expect("refused");
+                assert_eq!(
+                    (answer["ok"].clone(), answer["error"].clone()),
+                    (json!(false), json!("forbidden")),
+                    "{link:?} {scope:?}"
+                );
+            }
+            for scope in [Some(ScopeState::Granted), Some(ScopeState::Pending), None] {
+                assert_eq!(refused(LinkState::Connected, scope), None, "{scope:?}");
+            }
         }
     }
 }
