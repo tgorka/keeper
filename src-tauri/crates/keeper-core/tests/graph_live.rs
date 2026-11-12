@@ -2204,10 +2204,15 @@ fn graph_live_112_native_transport_refusals() {
                 revoked.decide(&decision(&field("proposal"), &field("proposal_digest"))),
             );
             let (_, acknowledged) = refused(&revoked, &revoking, revoked.acknowledge(&target));
+            // Owner decision 2026-11-12 (amending CC-7): a decision or an
+            // acknowledgement refused for a withdrawn role ends that request
+            // (`rejected forbidden`) and is no revocation signal; the
+            // reviewer's reads below are refused at read level.
             for outcome in [&decided, &acknowledged] {
-                assert!(
-                    outcome.revokes(),
-                    "not refused as a revocation: {outcome:?}"
+                assert_eq!(
+                    (rejected_reason(outcome), outcome.revokes()),
+                    (Some("forbidden"), false),
+                    "not a terminal refusal of the request: {outcome:?}"
                 );
             }
             let feed = revoked
