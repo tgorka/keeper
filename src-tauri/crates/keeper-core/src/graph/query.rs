@@ -116,15 +116,18 @@ pub trait GraphRemote: Send + Sync {
     fn read_status(&self, domain: &str) -> Result<ReadStatus, QueryError>;
 }
 
-/// A refusal is collapsed to `forbidden`; a server that could not be reached
-/// (the query left and its transport failed) is [`QueryError::Unreachable`];
-/// every other failure — a local refusal, an unreadable answer, a closed or
-/// non-syncing replica — is `sync_pending`. Nothing is delivered without a
-/// fresh answer.
+/// Only the server refusing the caller's authority is `forbidden`
+/// ([`crate::hq::port::ReplicaError::is_refusal`]); a server that could not be
+/// reached (the query left and its transport failed) is
+/// [`QueryError::Unreachable`]; every other failure — an answered internal,
+/// storage, unknown or invalid-operation error, retryable or not, a local
+/// refusal, an unreadable answer, a closed or non-syncing replica — is
+/// `sync_pending`, never a refusal and never unreachable. Nothing is
+/// delivered without a fresh answer.
 fn remote_error(error: crate::hq::port::ReplicaError) -> QueryError {
     use crate::hq::port::ReplicaError;
     match error {
-        ReplicaError::Remote { .. } | ReplicaError::Rejected { .. } => QueryError::Forbidden,
+        error if error.is_refusal() => QueryError::Forbidden,
         ReplicaError::Unheard { .. } => QueryError::Unreachable,
         _ => QueryError::SyncPending,
     }
@@ -730,11 +733,15 @@ struct Scope {
     domain: String,
 }
 
+/// The device clock (UTC ms) an admission's expiry is read against. A clock
+/// before the epoch reads as the end of time, so every admission reads as
+/// expired (fail closed), never as the epoch.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(u64::MAX, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn admitted(row: &ContextRow, session: &str, domain: &str) -> Result<(), QueryError> {

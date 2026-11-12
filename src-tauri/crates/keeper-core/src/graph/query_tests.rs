@@ -1200,13 +1200,20 @@ fn checkpoint_rows_decide_the_scope() {
     assert_eq!(checkpoint_of(&first).scope, ScopeState::Pending);
 }
 
-/// CC-6: only an unheard authority read (it left and its transport failed)
-/// is `Unreachable`; a server's answer is `Forbidden`; every local, closed or
-/// unreadable failure is `SyncPending`. All three non-refusals keep the
-/// `sync_pending` code.
+/// CC-6 (review BLOCKING-1): only an unheard authority read (it left and its
+/// transport failed) is `Unreachable`; only the server refusing the
+/// caller's authority is `Forbidden`; every other answered error (retryable
+/// or not: internal, storage, unknown, invalid, a technical `kg.*`, the
+/// graph switched off) and every local, closed or unreadable failure is
+/// `SyncPending`, never `Unreachable`.
 #[test]
 fn a_native_authority_failure_is_typed_by_its_cause() {
-    use crate::hq::port::ReplicaError;
+    use crate::hq::port::{ReplicaError, CREDENTIAL_REFUSED};
+    let remote = |code: &str, message: &str, retryable: bool| ReplicaError::Remote {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        retryable,
+    };
     let unheard = ReplicaError::Unheard {
         code: "transport.failed".to_owned(),
         message: "m".to_owned(),
@@ -1214,17 +1221,44 @@ fn a_native_authority_failure_is_typed_by_its_cause() {
     };
     assert_eq!(remote_error(unheard), QueryError::Unreachable);
     for refusal in [
-        ReplicaError::Remote {
-            code: "kg.forbidden".to_owned(),
-            message: "m".to_owned(),
-            retryable: false,
-        },
+        remote("operation.forbidden", "forbidden", false),
+        remote("operation.forbidden", "context_revoked", false),
+        remote("operation.forbidden", "context_expired", false),
+        remote("sync.forbidden", "m", false),
+        remote(CREDENTIAL_REFUSED, "m", false),
+        remote("sync.auth_required", "m", false),
+        remote("source_audience", "m", false),
         ReplicaError::Rejected {
-            code: "kg.forbidden".to_owned(),
+            code: "operation.forbidden".to_owned(),
+            message: "label_unknown".to_owned(),
+        },
+    ] {
+        assert_eq!(
+            remote_error(refusal.clone()),
+            QueryError::Forbidden,
+            "{refusal:?}"
+        );
+    }
+    for answered in [
+        remote("sync.internal_error", "storage_unavailable", true),
+        remote("operation.execution_failed", "m", false),
+        remote("operation.unknown", "m", false),
+        remote("operation.invalid_request", "m", false),
+        remote("operation.query_failed", "m", false),
+        remote("sync.invalid_client_id", "m", false),
+        remote("kg.forbidden", "m", false),
+        remote("operation.forbidden", "graph_unavailable", false),
+        remote("operation.forbidden", "unsupported_version", false),
+        ReplicaError::Rejected {
+            code: "operation.rejected".to_owned(),
             message: "m".to_owned(),
         },
     ] {
-        assert_eq!(remote_error(refusal), QueryError::Forbidden);
+        assert_eq!(
+            remote_error(answered.clone()),
+            QueryError::SyncPending,
+            "{answered:?}"
+        );
     }
     for local in [
         ReplicaError::Client("client.invalid_host_response".to_owned()),

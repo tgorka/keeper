@@ -49,7 +49,7 @@ use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, StagedBlob, BLOB_C
 use crate::hq::port::{
     BlobBody, Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection,
     Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription,
-    UploadRefusal, WindowBase, WindowState, CONFLICT,
+    UploadRefusal, WindowBase, WindowState, CONFLICT, CREDENTIAL_REFUSED,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -133,7 +133,22 @@ impl Transport for GatedTransport {
     fn remote_operation(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.check()?;
         let answer = self.inner.remote_operation(request);
-        self.reached = Some(answer.is_ok());
+        // A `401`/`403` is the server's answer (it refused this credential),
+        // not a failed transport: it is told apart by its own code.
+        let answer = answer.map_err(|error| {
+            if matches!(http_status(error.details.as_ref()), Some(401 | 403)) {
+                TransportError {
+                    code: CREDENTIAL_REFUSED.to_owned(),
+                    ..error
+                }
+            } else {
+                error
+            }
+        });
+        self.reached = Some(match &answer {
+            Ok(_) => true,
+            Err(error) => error.code == CREDENTIAL_REFUSED,
+        });
         answer
     }
     fn realtime_sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
@@ -1847,9 +1862,9 @@ fn command_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaErro
             retryable: error.retryable,
         },
         Some(true) => ReplicaError::Remote {
+            retryable: error.retryable && error.code != CREDENTIAL_REFUSED,
             code: error.code,
             message: error.message,
-            retryable: error.retryable,
         },
     }
 }
@@ -1873,9 +1888,9 @@ fn query_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaError 
         },
         Some(true) if error.code == UNREADABLE => ReplicaError::Client(error.to_string()),
         Some(true) => ReplicaError::Remote {
+            retryable: error.retryable && error.code != CREDENTIAL_REFUSED,
             code: error.code,
             message: error.message,
-            retryable: error.retryable,
         },
     }
 }

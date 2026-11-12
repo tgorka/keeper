@@ -321,6 +321,50 @@ pub enum ReplicaError {
     Closed,
 }
 
+/// The code a remote operation the server refused with HTTP `401`/`403`
+/// carries (the server refused this credential before the operation ran);
+/// the transport's own code (`transport.failed`) would hide that.
+pub const CREDENTIAL_REFUSED: &str = "sync.credential_refused";
+
+/// The stable names keeper-hq refuses a caller's graph authority with, as an
+/// operation error's code or, under `operation.forbidden`, its message.
+const AUTHORITY_REFUSALS: [&str; 7] = [
+    "forbidden",
+    "context_revoked",
+    "context_invalid",
+    "context_expired",
+    "context_closed",
+    "source_audience",
+    "label_unknown",
+];
+
+impl ReplicaError {
+    /// Whether this is the server refusing the caller's authority: a refused
+    /// credential ([`CREDENTIAL_REFUSED`], `sync.auth_required`), or an
+    /// answered `operation.forbidden`/`sync.forbidden` or graph refusal
+    /// name — except `graph_unavailable` (the graph switched off) and
+    /// `unsupported_version`, which say nothing about the caller. Every
+    /// other answered error (an internal or storage failure, an unknown or
+    /// invalid operation, a failed handler), retryable or not, is not a
+    /// refusal, and nor is anything that was not the server's answer.
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        let (code, message) = match self {
+            Self::Remote { code, message, .. } | Self::Rejected { code, message } => {
+                (code.as_str(), message.as_str())
+            }
+            _ => return false,
+        };
+        match code {
+            CREDENTIAL_REFUSED | "sync.auth_required" => true,
+            "operation.forbidden" | "sync.forbidden" => {
+                !matches!(message, "graph_unavailable" | "unsupported_version")
+            }
+            code => AUTHORITY_REFUSALS.contains(&code),
+        }
+    }
+}
+
 /// One database's local replica.
 pub trait Replica: Send + Sync {
     /// Commit `ops` locally, in one commit, into the outbox; its id.
