@@ -83,7 +83,7 @@ impl Stops {
 
     pub(crate) fn stopped(&self) -> Option<QueryError> {
         if *self.revoked.borrow() || *self.reader.borrow() {
-            Some(QueryError::Forbidden)
+            Some(QueryError::Fenced)
         } else if *self.cancel.borrow() {
             Some(QueryError::Cancelled)
         } else {

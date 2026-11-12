@@ -110,7 +110,7 @@ impl Lifecycle {
     /// The disclosure gate: `forbidden` while locked.
     pub fn gate(&self) -> Result<(), QueryError> {
         if self.is_locked() {
-            return Err(QueryError::Forbidden);
+            return Err(QueryError::Fenced);
         }
         Ok(())
     }
@@ -207,9 +207,16 @@ impl Lifecycle {
     /// gate, persist the fence, lock every open entry. The projection's
     /// purge is left to the next [`Lifecycle::resume`] (the fence stands
     /// until then, and a restart starts locked).
+    ///
+    /// `now_ms` is the device wall clock in UTC ms, the same clock
+    /// [`AdmittedRead`] stamps its admission with: an agent's regrant needs
+    /// an admission later than the fence it set (review r2 LOW-A).
     pub fn lock(&self, now_ms: i64, cause: FenceCause) -> Result<(), LifecycleError> {
-        self.locked.store(true, Ordering::SeqCst);
+        // The queue's guard is taken first, so a regrant clearing the fence
+        // (which unlocks under the same guard) can never leave this fence
+        // persisted with the in-memory gate open (review r2 LOW-B).
         let queue = self.queue();
+        self.locked.store(true, Ordering::SeqCst);
         queue.persist_fence(now_ms, cause)?;
         Self::disable(&queue, now_ms)
     }
@@ -328,13 +335,18 @@ impl Lifecycle {
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
-        self.clear(|domain, _| status.domain == domain, checkpoint, reads)
+        self.clear(
+            |binding, _| status.domain == binding.domain,
+            checkpoint,
+            reads,
+        )
     }
 
     /// An agent's regrant (CC-9: "a successful `read_status`/`admit_read`"):
     /// an agent's credential is refused `graph.read_status`, so its fresh
     /// authority is the server's `graph.admit_read` answer, `read`: for this
-    /// domain, admitted after the fence was set (an admission held from
+    /// domain and this queue's actor (the agent the admission names is the
+    /// queue binding's actor), admitted after the fence was set (an admission held from
     /// before the revocation, such as `AgentReader::admitted()` of a reader
     /// already open, is not fresh) and not yet expired, both on this
     /// device's clock, which fails closed when it cannot be read. Otherwise
@@ -373,11 +385,14 @@ impl Lifecycle {
     ) -> Result<(), LifecycleError> {
         let unexpired = now.is_some_and(|now| read.expires_at_ms() > now);
         self.clear(
-            |domain, fenced_at| {
+            |binding, fenced_at| {
                 let after_fence = read.admitted_at_ms().is_some_and(|admitted| {
                     u64::try_from(fenced_at).is_ok_and(|fenced| admitted > fenced)
                 });
-                unexpired && after_fence && read.domain() == domain
+                unexpired
+                    && after_fence
+                    && read.domain() == binding.domain
+                    && read.agent() == binding.actor
             },
             checkpoint,
             reads,
@@ -385,12 +400,12 @@ impl Lifecycle {
     }
 
     /// Clear the fence for a regrant whose authority `fresh` accepts for
-    /// this domain and the fence's `fenced_at` (the one rule both forms
+    /// this queue's binding and the fence's `fenced_at` (the one rule both forms
     /// share). A fence that changed after it was read here (another holder
     /// of the file escalated or set it anew) stays: `NotFresh`.
     fn clear(
         &self,
-        fresh: impl FnOnce(&str, i64) -> bool,
+        fresh: impl FnOnce(&queue::Binding, i64) -> bool,
         checkpoint: Checkpoint,
         reads: &GraphReads,
     ) -> Result<(), LifecycleError> {
@@ -404,7 +419,7 @@ impl Lifecycle {
             return Err(LifecycleError::PurgePending);
         }
         let domain = &queue.binding().domain;
-        if !fresh(domain, fence.fenced_at)
+        if !fresh(queue.binding(), fence.fenced_at)
             || reads.domain() != domain
             || reads.is_revoked()
             || checkpoint.scope != ScopeState::Granted

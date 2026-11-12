@@ -143,7 +143,7 @@ async fn a_revocation_locks_first_and_survives_a_restart() {
         .revoke(Some(&reads), 5, FenceCause::Revocation)
         .await
         .expect("revoked");
-    assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+    assert_eq!(lifecycle.gate(), Err(QueryError::Fenced));
     assert!(reads.is_revoked());
     assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
     assert_eq!(
@@ -211,7 +211,7 @@ async fn a_failed_fence_write_stays_locked() {
         error,
         LifecycleError::Queue(QueueError::Storage(_))
     ));
-    assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+    assert_eq!(lifecycle.gate(), Err(QueryError::Fenced));
 }
 
 /// The one entry the queued fixture holds.
@@ -651,7 +651,7 @@ fn a_cached_receipt_settles_only_after_a_fresh_read_status() {
             )),
             "{refusal:?}"
         );
-        assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+        assert_eq!(lifecycle.gate(), Err(QueryError::Fenced));
         assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
         assert_eq!(only_entry(dir.path()).1, State::Disabled, "{refusal:?}");
     }
@@ -903,7 +903,7 @@ fn a_command_refusal_ends_its_request_and_a_read_level_refusal_still_fences() {
         Ok(State::Disabled)
     );
     assert_eq!(lifecycle.fence(), Ok(Some(FenceState::Revoked)));
-    assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+    assert_eq!(lifecycle.gate(), Err(QueryError::Fenced));
     assert_eq!(state_of(dir.path(), &other), State::Disabled);
     assert_eq!(state_of(dir.path(), &sent), State::Rejected);
 }
@@ -941,12 +941,17 @@ impl GraphRemote for Admits {
 const LATER: u64 = 4_102_444_800_000;
 
 fn admitted_in(domain: &'static str, expires_at_ms: u64) -> AdmittedRead {
+    admitted_as("ana", domain, expires_at_ms)
+}
+
+/// An admission for `agent` (this queue's actor is `ana`).
+fn admitted_as(agent: &str, domain: &'static str, expires_at_ms: u64) -> AdmittedRead {
     AdmittedRead::admit(
         &Admits {
             domain,
             expires_at_ms,
         },
-        "agent:nixi",
+        agent,
         "01JF00000000000000000000S1",
         "01JF00000000000000000000C1",
         domain,
@@ -1000,7 +1005,7 @@ fn restarted(lifecycle: Lifecycle, dir: &Path) -> Lifecycle {
 /// The fence still stands, unchanged, after a refused regrant.
 fn still_fenced(lifecycle: &Lifecycle, fence: FenceState) {
     assert!(lifecycle.is_locked());
-    assert_eq!(lifecycle.gate(), Err(QueryError::Forbidden));
+    assert_eq!(lifecycle.gate(), Err(QueryError::Fenced));
     assert_eq!(lifecycle.fence(), Ok(Some(fence)));
 }
 
@@ -1357,4 +1362,28 @@ fn a_refused_credential_settles_into_a_credential_fence() {
         Ok(State::Disabled)
     );
     assert_eq!(lifecycle.fence_cause(), Ok(Some(FenceCause::Revocation)));
+}
+
+/// Review r1 LOW-1: an admission another agent holds is no fresh authority
+/// for this queue's fence: `NotFresh`, and the fence stands.
+#[tokio::test(flavor = "current_thread")]
+async fn an_agent_regrant_refuses_another_agents_admission() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (lifecycle, _revoked, fresh) = fenced(dir.path(), true).await;
+    assert_eq!(
+        lifecycle.regrant_admitted(
+            &admitted_as("dixi", DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &fresh
+        ),
+        Err(LifecycleError::NotFresh)
+    );
+    still_fenced(&lifecycle, FenceState::Purged);
+    lifecycle
+        .regrant_admitted(
+            &admitted_in(DB, LATER),
+            checkpoint(ScopeState::Granted),
+            &fresh,
+        )
+        .expect("this queue's own agent regrants");
 }

@@ -89,6 +89,14 @@ pub enum QueryError {
     /// sets clears on fresh authority alone ([`super::queue::FenceCause`]).
     #[error("forbidden")]
     CredentialRefused,
+    /// This reader or domain is already fenced, killed or invalidated: the
+    /// local echo of a refusal that stands, never a new one. Its stable
+    /// code is `forbidden` and every reader treats it as a refusal
+    /// ([`QueryError::is_refusal`]), but it is never a revocation signal: it
+    /// fences nothing anew and so never changes a standing fence's cause
+    /// (review r2 HIGH-1).
+    #[error("forbidden")]
+    Fenced,
 }
 
 impl QueryError {
@@ -103,13 +111,24 @@ impl QueryError {
             Self::Stale => "projection_stale",
             Self::SyncPending | Self::Unreachable => "sync_pending",
             Self::Storage(_) => "storage_unavailable",
-            Self::Forbidden | Self::CredentialRefused => "forbidden",
+            Self::Forbidden | Self::CredentialRefused | Self::Fenced => "forbidden",
         }
     }
 
     /// Whether this is a refusal of the caller (`forbidden`).
     #[must_use]
     pub fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Forbidden | Self::CredentialRefused | Self::Fenced
+        )
+    }
+
+    /// Whether the server (or the replica's scope) refused the caller now:
+    /// a revocation signal. [`QueryError::Fenced`], the echo of a standing
+    /// refusal, is not one.
+    #[must_use]
+    pub fn is_server_refusal(&self) -> bool {
         matches!(self, Self::Forbidden | Self::CredentialRefused)
     }
 }
@@ -294,8 +313,11 @@ impl GraphReads {
         remote: Arc<dyn GraphRemote>,
         read: AdmittedRead,
     ) -> Result<AgentReader, QueryError> {
-        if read.domain() != self.domain() || self.is_revoked() {
+        if read.domain() != self.domain() {
             return Err(QueryError::Forbidden);
+        }
+        if self.is_revoked() {
+            return Err(QueryError::Fenced);
         }
         Ok(AgentReader {
             reads: self.clone(),
@@ -342,9 +364,14 @@ impl GraphReads {
     async fn settle<T>(&self, result: Result<T, QueryError>) -> Result<T, QueryError> {
         if self.is_revoked() {
             // Nothing is released once the domain is revoked, whatever the
-            // call produced.
+            // call produced. A refusal the call itself got (the replica's
+            // scope revoked) stays that refusal; anything else is the echo
+            // of the kill that stands.
             self.revoke().await?;
-            return Err(QueryError::Forbidden);
+            return Err(match result {
+                Err(error) if error.is_server_refusal() => error,
+                _ => QueryError::Fenced,
+            });
         }
         result
     }
@@ -353,7 +380,7 @@ impl GraphReads {
         self.0.inflight.fetch_add(1, Ordering::SeqCst);
         let guard = Inflight(&self.0);
         if self.is_revoked() {
-            return Err(QueryError::Forbidden);
+            return Err(QueryError::Fenced);
         }
         Ok(guard)
     }
@@ -725,7 +752,7 @@ impl GraphReads {
         F: Future<Output = Result<Authority, QueryError>>,
     {
         if self.is_revoked() || ask.reader.is_cancelled() {
-            return Err(QueryError::Forbidden);
+            return Err(QueryError::Fenced);
         }
         let now = fresh.await?;
         if now != *ask.authority
@@ -737,7 +764,7 @@ impl GraphReads {
         // A sibling call may have invalidated the reader, or the domain may
         // have been revoked, while the server was being asked.
         if self.is_revoked() || ask.reader.is_cancelled() {
-            return Err(QueryError::Forbidden);
+            return Err(QueryError::Fenced);
         }
         Ok(())
     }
@@ -823,6 +850,11 @@ impl AdmittedRead {
     #[must_use]
     pub fn session(&self) -> &str {
         &self.scope.session
+    }
+    /// The agent the admission was made for.
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
     }
     #[must_use]
     pub fn context(&self) -> &str {
@@ -1184,7 +1216,7 @@ impl HumanReader {
     fn deliverable(&self) -> Result<(), QueryError> {
         if self.fenced() {
             self.invalidated.cancel();
-            return Err(QueryError::Forbidden);
+            return Err(QueryError::Fenced);
         }
         Ok(())
     }
@@ -1193,7 +1225,7 @@ impl HumanReader {
     /// refused link fences the domain (its credential refused).
     async fn check(&self) -> Result<(), QueryError> {
         if self.invalidated.is_cancelled() || self.fenced() {
-            return Err(QueryError::Forbidden);
+            return Err(QueryError::Fenced);
         }
         if self.lifecycle.is_some() && self.link_refused() {
             self.fence(FenceCause::Credential).await;
@@ -1216,8 +1248,12 @@ impl HumanReader {
         }
     }
 
-    /// A call's end: a refusal (`forbidden`) fences the domain, a refused
-    /// credential as a credential fence.
+    /// A call's end: a refusal the server gave (`forbidden`, or the
+    /// replica's scope revoked) fences the domain, a refused credential as a
+    /// credential fence. The echo of a fence or kill that already stands
+    /// ([`QueryError::Fenced`]) fences nothing anew: re-fencing it as a
+    /// revocation would escalate a standing credential fence, which then
+    /// could never clear (review r2 HIGH-1).
     async fn end<T>(&self, result: Result<T, QueryError>) -> Result<T, QueryError> {
         match &result {
             Err(QueryError::CredentialRefused) => self.fence(FenceCause::Credential).await,

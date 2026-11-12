@@ -1202,7 +1202,7 @@ async fn revoking_the_domain_kills_running_work_and_purges() {
     );
     rig.reads.revoke().await.expect("revoked");
     let outcome = running.await.expect("joined");
-    assert_eq!(outcome.err(), Some(QueryError::Forbidden));
+    assert_eq!(outcome.err(), Some(QueryError::Fenced));
     assert_eq!(
         rig.admission.stats().live_workers,
         0,
@@ -1479,7 +1479,7 @@ async fn an_invalidation_during_the_delivery_check_suppresses_the_result() {
     release.send(()).expect("release");
     assert_eq!(
         pending.await.expect("joined").err(),
-        Some(QueryError::Forbidden)
+        Some(QueryError::Fenced)
     );
 }
 
@@ -1965,7 +1965,7 @@ mod offline {
         let asked = o.person.asked.load(Ordering::SeqCst);
         assert_eq!(
             o.query(Freshness::AllowStale).await,
-            Err(QueryError::Forbidden)
+            Err(QueryError::Fenced)
         );
         // Refused before the server is even asked.
         assert_eq!(o.person.asked.load(Ordering::SeqCst), asked);
@@ -2104,11 +2104,7 @@ mod offline {
                     o.query(freshness).await
                 };
                 assert!(o.lifecycle.is_locked(), "{case}: the lock landed");
-                assert_eq!(
-                    result,
-                    Err(QueryError::Forbidden),
-                    "{case}, inspect {inspect}"
-                );
+                assert_eq!(result, Err(QueryError::Fenced), "{case}, inspect {inspect}");
             }
         }
     }
@@ -2122,7 +2118,7 @@ mod offline {
         locking_at(&mut o, 0);
         let refreshed = o.reader.refresh(&Cancellation::default()).await;
         assert!(o.lifecycle.is_locked());
-        assert_eq!(refreshed.err(), Some(QueryError::Forbidden));
+        assert_eq!(refreshed.err(), Some(QueryError::Fenced));
     }
 
     /// A fence another holder of the queue file persisted refuses this
@@ -2144,10 +2140,7 @@ mod offline {
             .persist_fence(T0 + 1, FenceCause::Revocation)
             .expect("fenced");
         assert!(!o.lifecycle.is_locked());
-        assert_eq!(
-            o.query(Freshness::Current).await,
-            Err(QueryError::Forbidden)
-        );
+        assert_eq!(o.query(Freshness::Current).await, Err(QueryError::Fenced));
     }
 
     /// The authority-level fence check on its own (112.1 r2 R2-L4, M-auth):
@@ -2163,7 +2156,7 @@ mod offline {
         let asked = o.person.asked.load(Ordering::SeqCst);
         let result = o.query(Freshness::Current).await;
         assert!(o.lifecycle.is_locked());
-        assert_eq!(result, Err(QueryError::Forbidden), "online admission");
+        assert_eq!(result, Err(QueryError::Fenced), "online admission");
         assert_eq!(
             o.person.asked.load(Ordering::SeqCst) - asked,
             1,
@@ -2174,7 +2167,7 @@ mod offline {
         locking_at(&mut o, 0);
         let result = o.query(Freshness::AllowStale).await;
         assert!(o.lifecycle.is_locked());
-        assert_eq!(result, Err(QueryError::Forbidden), "offline admission");
+        assert_eq!(result, Err(QueryError::Fenced), "offline admission");
     }
 
     /// Locks the domain when woken.
@@ -2220,7 +2213,7 @@ mod offline {
                 o.lifecycle.is_locked(),
                 "the lock landed (inspect {inspect})"
             );
-            assert_eq!(result, Err(QueryError::Forbidden), "inspect {inspect}");
+            assert_eq!(result, Err(QueryError::Fenced), "inspect {inspect}");
         }
     }
 
@@ -2314,7 +2307,7 @@ mod offline {
         assert!(o._rig.reads.is_revoked());
         assert_eq!(
             o.query(Freshness::AllowStale).await,
-            Err(QueryError::Forbidden)
+            Err(QueryError::Fenced)
         );
         *o.person.then.lock().expect("then") = Step::Answer;
         let status = o.person.read_status(DB).expect("re-attested");
@@ -2385,5 +2378,111 @@ mod offline {
             .expect("listing");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].state, QueueState::Disabled);
+    }
+
+    /// Review r2 HIGH-1 (P1): a credential fence a sibling read sets while
+    /// this read runs is echoed back by this read as `Fenced`, never
+    /// re-fenced as a revocation: the cause stays `Credential`, and fresh
+    /// authority regrants it without the purge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sibling_credential_fence_is_never_escalated_by_a_read_in_flight() {
+        let mut o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        *o.person.then.lock().expect("then") = Step::Answer;
+        let lifecycle = o.lifecycle.clone();
+        let clock = o.clock.clone();
+        let calls = AtomicU32::new(0);
+        let placeholder = o
+            ._rig
+            .reads
+            .human_with(&o._rig.world.source, o.person.clone());
+        let reader = std::mem::replace(&mut o.reader, placeholder);
+        o.reader = reader.with_clock(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                lifecycle
+                    .lock(T0 + 1, FenceCause::Credential)
+                    .expect("locked");
+            }
+            clock.load(Ordering::SeqCst)
+        }));
+        let result = o.query(Freshness::Current).await;
+        assert!(
+            result.as_ref().is_err_and(QueryError::is_refusal),
+            "{result:?}"
+        );
+        assert_eq!(o.lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+        let status = o.person.read_status(DB).expect("re-attested");
+        let (fresh, _reader) = reopened(&o);
+        assert_eq!(o.lifecycle.regrant(&status, granted(), &fresh), Ok(()));
+    }
+
+    /// Review r2 HIGH-1 (P2): another holder of the queue file (the
+    /// driver's `signals()` on a refused link) persists a credential fence
+    /// while this read runs: the cause stays `Credential` and fresh
+    /// authority regrants it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn another_holders_credential_fence_is_never_escalated_by_a_read_in_flight() {
+        let mut o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        *o.person.then.lock().expect("then") = Step::Answer;
+        let other = Mutex::new(
+            GraphQueue::open(
+                &o._dir.path().join("ana.graph-queue"),
+                Binding {
+                    server: "https://hq.example".to_owned(),
+                    domain: DB.to_owned(),
+                    actor: "ana".to_owned(),
+                    client: "dev1".to_owned(),
+                },
+            )
+            .expect("queue"),
+        );
+        let clock = o.clock.clone();
+        let calls = AtomicU32::new(0);
+        let placeholder = o
+            ._rig
+            .reads
+            .human_with(&o._rig.world.source, o.person.clone());
+        let reader = std::mem::replace(&mut o.reader, placeholder);
+        o.reader = reader.with_clock(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                other
+                    .lock()
+                    .expect("other")
+                    .persist_fence(T0 + 1, FenceCause::Credential)
+                    .expect("fenced");
+            }
+            clock.load(Ordering::SeqCst)
+        }));
+        let result = o.query(Freshness::Current).await;
+        assert!(
+            result.as_ref().is_err_and(QueryError::is_refusal),
+            "{result:?}"
+        );
+        assert_eq!(o.lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+        let status = o.person.read_status(DB).expect("re-attested");
+        let (fresh, _reader) = reopened(&o);
+        assert_eq!(o.lifecycle.regrant(&status, granted(), &fresh), Ok(()));
+    }
+
+    /// Review r2 HIGH-1 (P3, the control): a credential refusal, then a
+    /// second read: the cause stays credential and fresh authority clears it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_credential_fence_and_a_later_read_keep_the_credential_cause() {
+        let o = Offline::new().await;
+        o.at(T0 + 60_000, 0);
+        o.script(vec![Step::Fail(QueryError::CredentialRefused)]);
+        let first = o.query(Freshness::Current).await;
+        assert_eq!(first, Err(QueryError::CredentialRefused));
+        let second = o.query(Freshness::Current).await;
+        assert!(
+            second.as_ref().is_err_and(QueryError::is_refusal),
+            "{second:?}"
+        );
+        assert_eq!(o.lifecycle.fence_cause(), Ok(Some(FenceCause::Credential)));
+        *o.person.then.lock().expect("then") = Step::Answer;
+        let status = o.person.read_status(DB).expect("re-attested");
+        let (fresh, _reader) = reopened(&o);
+        assert_eq!(o.lifecycle.regrant(&status, granted(), &fresh), Ok(()));
     }
 }
