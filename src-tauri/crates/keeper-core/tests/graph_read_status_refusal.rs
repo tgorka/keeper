@@ -139,6 +139,9 @@ fn read_status(answer: Answer) -> Result<(), QueryError> {
 fn a_refused_read_status_is_forbidden_not_sync_pending() {
     for answer in [
         Answer::Frame("operation.forbidden", "forbidden", false),
+        Answer::Frame("operation.forbidden", "context_revoked", false),
+        // An `operation.forbidden` message keeper does not name: fail closed.
+        Answer::Frame("operation.forbidden", "some_new_refusal", false),
         Answer::Status(401),
         Answer::Status(403),
     ] {
@@ -158,6 +161,12 @@ fn a_server_error_is_sync_pending_never_a_refusal_or_an_outage() {
         Answer::Frame("operation.unknown", "graph.read_status", false),
         Answer::Frame("operation.invalid_request", "invalid", false),
         Answer::Frame("operation.forbidden", "graph_unavailable", false),
+        Answer::Frame("operation.forbidden", "unsupported_version", false),
+        Answer::Frame("operation.forbidden", "context_expired", false),
+        Answer::Frame("operation.forbidden", "parent_unavailable", false),
+        Answer::Frame("operation.forbidden", "context_unbound", false),
+        // An unknown code, even non-retryable: transient, never a refusal.
+        Answer::Frame("some.new_code", "m", false),
     ] {
         assert_eq!(
             read_status(answer),

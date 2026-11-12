@@ -116,19 +116,22 @@ pub trait GraphRemote: Send + Sync {
     fn read_status(&self, domain: &str) -> Result<ReadStatus, QueryError>;
 }
 
-/// Only the server refusing the caller's authority is `forbidden`
-/// ([`crate::hq::port::ReplicaError::is_refusal`]); a server that could not be
-/// reached (the query left and its transport failed) is
-/// [`QueryError::Unreachable`]; every other failure — an answered internal,
-/// storage, unknown or invalid-operation error, retryable or not, a local
-/// refusal, an unreadable answer, a closed or non-syncing replica — is
-/// `sync_pending`, never a refusal and never unreachable. Nothing is
-/// delivered without a fresh answer.
+/// A read-level authority answer, through the one classifier
+/// ([`crate::hq::port::ReplicaError::class`]): only the server refusing the
+/// caller (a refused credential or scope, or a refusal of its graph
+/// authority — an `operation.forbidden` message keeper does not name
+/// included) is `forbidden`; a server that could not be reached (the query
+/// left and its transport failed) is [`QueryError::Unreachable`]; every
+/// other failure — the graph switched off, an unknown operation, an ended
+/// context, an invalid request, an answered internal or storage error,
+/// retryable or not, a local refusal, an unreadable answer, a closed or
+/// non-syncing replica — is `sync_pending`, never a refusal and never
+/// unreachable. Nothing is delivered without a fresh answer.
 fn remote_error(error: crate::hq::port::ReplicaError) -> QueryError {
-    use crate::hq::port::ReplicaError;
-    match error {
-        error if error.is_refusal() => QueryError::Forbidden,
-        ReplicaError::Unheard { .. } => QueryError::Unreachable,
+    use crate::hq::port::{ErrorClass, ReplicaError};
+    match (&error, error.class()) {
+        (_, ErrorClass::Revoked | ErrorClass::Forbidden) => QueryError::Forbidden,
+        (ReplicaError::Unheard { .. }, _) => QueryError::Unreachable,
         _ => QueryError::SyncPending,
     }
 }

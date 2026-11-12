@@ -326,41 +326,108 @@ pub enum ReplicaError {
 /// the transport's own code (`transport.failed`) would hide that.
 pub const CREDENTIAL_REFUSED: &str = "sync.credential_refused";
 
-/// The stable names keeper-hq refuses a caller's graph authority with, as an
-/// operation error's code or, under `operation.forbidden`, its message.
-const AUTHORITY_REFUSALS: [&str; 7] = [
+/// What a failed remote call says, read by the server's stable names: the
+/// one classifier every reader of a remote answer uses (the read path's
+/// [`crate::graph::query`] errors and, from 112.1, a request's pending
+/// cause). keeper-hq names a graph refusal by its code or, under
+/// `operation.forbidden`, by its message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The server refused this credential or revoked the caller's scope:
+    /// `401`/`403` ([`CREDENTIAL_REFUSED`]), `sync.auth_required`,
+    /// `sync.forbidden`, `sync.scope_revoked`.
+    Revoked,
+    /// The server refused the caller's graph authority for this call:
+    /// `forbidden`, `context_revoked`, `source_audience`, `label_unknown`,
+    /// or an `operation.forbidden` whose message it does not name (fail
+    /// closed).
+    Forbidden,
+    /// The graph is switched off (`graph_unavailable`), or the server lacks
+    /// the operation (`operation.unknown`, a deploy's version skew).
+    Unavailable,
+    /// The server cannot say what became of a command (`outcome_unresolved`).
+    Unresolved,
+    /// The agent context the call names ended or was unbound
+    /// (`context_expired`, `context_closed`, `context_invalid`,
+    /// `parent_unavailable`, `context_unbound`): re-admit, never a refusal.
+    ContextEnded,
+    /// The server refused this request as it is, saying nothing of the
+    /// caller: an invalid request or client id, an answer or change over
+    /// its limit, an unsupported contract version.
+    Invalid,
+    /// The server answered with a failure that says nothing of the caller:
+    /// a failed handler or query, an internal or storage error, anything
+    /// it calls retryable, any code keeper does not name.
+    Transient,
+    /// Not the server's answer: unheard, local, closed, unreadable.
+    Unanswered,
+}
+
+/// The codes that refuse the credential or revoke the scope.
+const REVOKING: [&str; 4] = [
+    CREDENTIAL_REFUSED,
+    "sync.auth_required",
+    "sync.forbidden",
+    "sync.scope_revoked",
+];
+
+/// The names that refuse the caller's graph authority.
+const AUTHORITY_REFUSALS: [&str; 4] = [
     "forbidden",
     "context_revoked",
-    "context_invalid",
-    "context_expired",
-    "context_closed",
     "source_audience",
     "label_unknown",
 ];
 
+/// The names of an agent context that ended or was unbound.
+pub const CONTEXT_ENDED: [&str; 5] = [
+    "context_expired",
+    "context_closed",
+    "context_invalid",
+    "parent_unavailable",
+    "context_unbound",
+];
+
+/// The names that refuse one request as it is.
+const INVALID: [&str; 7] = [
+    "operation.invalid_request",
+    "operation.result_too_large",
+    "result_too_large",
+    "change_limit",
+    "unsupported_version",
+    "sync.invalid_client_id",
+    "invalid_request",
+];
+
 impl ReplicaError {
-    /// Whether this is the server refusing the caller's authority: a refused
-    /// credential ([`CREDENTIAL_REFUSED`], `sync.auth_required`), or an
-    /// answered `operation.forbidden`/`sync.forbidden` or graph refusal
-    /// name — except `graph_unavailable` (the graph switched off) and
-    /// `unsupported_version`, which say nothing about the caller. Every
-    /// other answered error (an internal or storage failure, an unknown or
-    /// invalid operation, a failed handler), retryable or not, is not a
-    /// refusal, and nor is anything that was not the server's answer.
+    /// This failure's [`ErrorClass`]. Names are matched exactly, as the
+    /// code or the message; precedence runs from the credential down, so a
+    /// named ending or limit under `operation.forbidden` is never read as a
+    /// refusal, while an `operation.forbidden` message keeper does not name
+    /// is one (fail closed). An unknown code is transient.
     #[must_use]
-    pub fn is_refusal(&self) -> bool {
+    pub fn class(&self) -> ErrorClass {
         let (code, message) = match self {
             Self::Remote { code, message, .. } | Self::Rejected { code, message } => {
                 (code.as_str(), message.as_str())
             }
-            _ => return false,
+            _ => return ErrorClass::Unanswered,
         };
-        match code {
-            CREDENTIAL_REFUSED | "sync.auth_required" => true,
-            "operation.forbidden" | "sync.forbidden" => {
-                !matches!(message, "graph_unavailable" | "unsupported_version")
-            }
-            code => AUTHORITY_REFUSALS.contains(&code),
+        let named = |name: &&str| code == *name || message == *name;
+        if REVOKING.contains(&code) {
+            ErrorClass::Revoked
+        } else if named(&"graph_unavailable") || code == "operation.unknown" {
+            ErrorClass::Unavailable
+        } else if named(&"outcome_unresolved") {
+            ErrorClass::Unresolved
+        } else if CONTEXT_ENDED.iter().any(named) {
+            ErrorClass::ContextEnded
+        } else if INVALID.iter().any(named) {
+            ErrorClass::Invalid
+        } else if code == "operation.forbidden" || AUTHORITY_REFUSALS.iter().any(named) {
+            ErrorClass::Forbidden
+        } else {
+            ErrorClass::Transient
         }
     }
 }

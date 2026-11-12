@@ -1223,8 +1223,10 @@ fn a_native_authority_failure_is_typed_by_its_cause() {
     for refusal in [
         remote("operation.forbidden", "forbidden", false),
         remote("operation.forbidden", "context_revoked", false),
-        remote("operation.forbidden", "context_expired", false),
+        // A message keeper does not name, on a read: fail closed (S0).
+        remote("operation.forbidden", "some_new_refusal", false),
         remote("sync.forbidden", "m", false),
+        remote("sync.scope_revoked", "m", false),
         remote(CREDENTIAL_REFUSED, "m", false),
         remote("sync.auth_required", "m", false),
         remote("source_audience", "m", false),
@@ -1245,10 +1247,19 @@ fn a_native_authority_failure_is_typed_by_its_cause() {
         remote("operation.unknown", "m", false),
         remote("operation.invalid_request", "m", false),
         remote("operation.query_failed", "m", false),
+        remote("operation.result_too_large", "m", false),
         remote("sync.invalid_client_id", "m", false),
         remote("kg.forbidden", "m", false),
+        // An unknown code, even non-retryable, is transient (S0).
+        remote("some.new_code", "m", false),
         remote("operation.forbidden", "graph_unavailable", false),
         remote("operation.forbidden", "unsupported_version", false),
+        remote("operation.forbidden", "change_limit", false),
+        remote("operation.forbidden", "context_expired", false),
+        remote("operation.forbidden", "context_closed", false),
+        remote("operation.forbidden", "context_invalid", false),
+        remote("operation.forbidden", "parent_unavailable", false),
+        remote("operation.forbidden", "context_unbound", false),
         ReplicaError::Rejected {
             code: "operation.rejected".to_owned(),
             message: "m".to_owned(),
