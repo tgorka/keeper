@@ -50,10 +50,19 @@
 //! with the digest (`KEEPER_GRAPH_WORKER_SHA256`) and, on Linux, the runtime
 //! ledger (`KEEPER_GRAPH_RUNTIME_LEDGER`) embedded at build time; macOS runs
 //! a worker only with `--macos-evidence` (evidence only, OD-C).
+//!
+//! `sync`, `query` and `inspect` are interruptible: their first SIGINT or
+//! SIGTERM fires the run's cancellation instead of ending the process, so a
+//! running worker is killed and reaped by the cancellation path before the
+//! driver answers `query_cancelled` and exits with 128 + the signal's
+//! number (130, 143). Later signals are taken and ignored. SIGKILL cannot be
+//! taken: it still ends the driver without its worker, which then runs to
+//! its own end (no safe parent-death signal for it; a known limitation).
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod driver {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -286,7 +295,14 @@ mod driver {
         call: impl FnOnce(GraphClient, &Lifecycle) -> Value + Send + 'static,
     ) -> Value {
         let client = GraphClient::new(source.clone());
-        wait(source, Duration::from_secs(30), |_| true).await;
+        // These commands are not interruptible: nothing fires this.
+        wait(
+            source,
+            Duration::from_secs(30),
+            &Cancellation::default(),
+            |_| true,
+        )
+        .await;
         if let Some(error) = signals(lifecycle, source, None).await {
             return error;
         }
@@ -588,6 +604,33 @@ mod driver {
         json!({"ok": true, "entries": entries})
     }
 
+    /// SIGINT and SIGTERM, as numbered on Linux and macOS alike.
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    /// The signal that interrupted this run, 0 when none did.
+    static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
+
+    /// From now on SIGINT and SIGTERM no longer end the process: the first
+    /// of them fires `cancel`, whose run kills and reaps its worker. A
+    /// signal's default action would end the driver with the worker still
+    /// running (`kill_on_drop` acts only on a drop), orphaning it.
+    fn cancel_on_interrupt(cancel: &Cancellation) -> std::io::Result<()> {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let number = tokio::select! {
+                _ = interrupt.recv() => SIGINT,
+                _ = terminate.recv() => SIGTERM,
+            };
+            INTERRUPTED.store(number, Ordering::SeqCst);
+            cancel.cancel();
+        });
+        Ok(())
+    }
+
     async fn run(args: Args) -> Value {
         let source = match open(&args) {
             Ok(source) => source,
@@ -598,6 +641,14 @@ mod driver {
             Err(error) => return error,
         };
         let cancel = Cancellation::default();
+        if matches!(
+            args.command,
+            Command::Sync { .. } | Command::Query { .. } | Command::Inspect { .. }
+        ) {
+            if let Err(error) = cancel_on_interrupt(&cancel) {
+                return fail("projection_unavailable", &format!("signals: {error}"));
+            }
+        }
         match &args.command {
             Command::Apply { payload } => {
                 let change = match parse_change(payload) {
@@ -646,7 +697,7 @@ mod driver {
                 }
             }
             Command::Resume => {
-                wait(&source, Duration::from_secs(30), |_| true).await;
+                wait(&source, Duration::from_secs(30), &cancel, |_| true).await;
                 if let Some(error) = signals(&lifecycle, &source, None).await {
                     return error;
                 }
@@ -668,10 +719,13 @@ mod driver {
                 }
             }
             Command::Sync { wait_secs } => {
-                let ready = wait(&source, Duration::from_secs(*wait_secs), |s| {
+                let ready = wait(&source, Duration::from_secs(*wait_secs), &cancel, |s| {
                     s.checkpoint().is_ok_and(|c| c.scope != ScopeState::Pending)
                 })
                 .await;
+                if cancel.is_cancelled() {
+                    return query_error(&QueryError::Cancelled);
+                }
                 if let Some(error) = signals(&lifecycle, &source, None).await {
                     return error;
                 }
@@ -777,7 +831,7 @@ mod driver {
             }
             Command::History { after, limit } => {
                 let client = GraphClient::new(source.clone());
-                wait(&source, Duration::from_secs(30), |_| true).await;
+                wait(&source, Duration::from_secs(30), &cancel, |_| true).await;
                 if let Some(error) = signals(&lifecycle, &source, None).await {
                     return error;
                 }
@@ -917,8 +971,13 @@ mod driver {
     }
 
     /// Wait until the replica's link has made its first round and `ready`
-    /// holds, at most `limit`.
-    async fn wait(source: &Source, limit: Duration, ready: impl Fn(&Source) -> bool) -> bool {
+    /// holds, at most `limit`, and no longer than `cancel` stays unfired.
+    async fn wait(
+        source: &Source,
+        limit: Duration,
+        cancel: &Cancellation,
+        ready: impl Fn(&Source) -> bool,
+    ) -> bool {
         use keeper_core::hq::port::LinkState;
         let started = Instant::now();
         loop {
@@ -926,7 +985,10 @@ mod driver {
             if matches!(link, LinkState::Connected) && ready(source) {
                 return true;
             }
-            if matches!(link, LinkState::Refused | LinkState::Closed) || started.elapsed() > limit {
+            if cancel.is_cancelled()
+                || matches!(link, LinkState::Refused | LinkState::Closed)
+                || started.elapsed() > limit
+            {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -945,10 +1007,10 @@ mod driver {
         let answer = runtime.block_on(run(args));
         let ok = answer["ok"] == true;
         println!("{answer}");
-        if ok {
-            std::process::ExitCode::SUCCESS
-        } else {
-            std::process::ExitCode::FAILURE
+        match INTERRUPTED.load(Ordering::SeqCst) {
+            _ if ok => std::process::ExitCode::SUCCESS,
+            0 => std::process::ExitCode::FAILURE,
+            signal => std::process::ExitCode::from(u8::try_from(128 + signal).unwrap_or(1)),
         }
     }
 

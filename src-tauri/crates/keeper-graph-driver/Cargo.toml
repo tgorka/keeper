@@ -14,10 +14,12 @@ workspace = true
 keeper-core = { path = "../keeper-core", features = ["human-reads"] }
 clap = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `signal`: `sync`, `query` and `inspect` cancel their run on SIGINT/SIGTERM.
+tokio = { workspace = true, features = ["signal"] }
 
-# Only the P1 measurement example `rc_spawner` (never shipped) uses these; `user` is its
-# test-only `--saved-uid0` drop (`setresuid`).
+# Only the P1 measurement example `rc_spawner` (never shipped) and the interrupt test use
+# these; `user` is the example's test-only `--saved-uid0` drop (`setresuid`), `signal` the
+# test's `kill`.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
-nix = { version = "=0.31.3", default-features = false, features = ["resource", "user"] }
+nix = { version = "=0.31.3", default-features = false, features = ["resource", "user", "signal"] }
 sha2 = { workspace = true }
