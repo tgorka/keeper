@@ -1387,6 +1387,17 @@ impl Hq {
             return Ok(self.status.borrow().clone());
         };
         let dir = databases::server_dir(&data_dir, &server);
+        // The graph intents this deletes, by state (112.1): the person's
+        // explicit erase takes them too, and the log says how many.
+        let (intents, unreadable) = crate::graph::queue::counts_under(&dir);
+        if !intents.is_empty() || unreadable > 0 {
+            let counts = intents
+                .iter()
+                .map(|(state, count)| format!("{state}={count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::info!(%counts, unreadable, "forgetting the server drops its graph intents");
+        }
         let removed = match std::fs::remove_dir_all(&dir) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),

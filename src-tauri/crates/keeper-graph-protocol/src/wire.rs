@@ -11,11 +11,17 @@
 //! | [`OUTCOME`] | `request_id` | `[]` or one `kg_receipts` row of the caller's own client scope |
 //! | [`GET_NODE`] | `id`, `include_archived` | `[]` or `[{<node image>, "tags": [<text>…]}]` |
 //! | [`GET_EDGE`] | `id`, `include_archived` | `[]` or `[<edge image>]` |
+//! | [`GET_CONTENT`] | `id`, `include_archived` | `[]` or `[<content image>]` |
 //! | [`HISTORY`] | `after`, `limit`, `filter` | `[{"events": [{"event": <header>, "ops": [<op>…]}], "scanned_through": <decimal>}]` |
+//! | [`UNREVIEWED`] | `after`, `limit` | a [`HISTORY`] page of the unreviewed agent-origin events |
+//! | [`PREVIEW_REVERSAL`] | `event_id` | `[<preview>]` ([`crate::inverse::Preview`]) |
+//! | [`PROPOSAL`] | `proposal_id` | the proposal's revisions the caller reviews, ascending ([`ProposalRow`]) |
 //!
-//! Without `include_archived` a node is answered only while active and an
-//! edge only while it and both its endpoints are. Images are the shapes of
-//! [`crate::candidate`]; tags are canonical texts in ascending order.
+//! Without `include_archived` a node is answered only while active, an
+//! edge only while it and both its endpoints are, and a content (which has
+//! no lifecycle of its own) only while its owner node is. Images are the
+//! shapes of [`crate::candidate`]; tags are canonical texts in ascending
+//! order.
 //!
 //! **History** pages the retained events, not the transport log: every
 //! event in `(after, scanned_through]` that matches `filter` is in
@@ -36,14 +42,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::delta::{self, Op};
-use crate::value::{canonical, check_properties};
-use crate::vocabulary::{stored_edge_type, stored_node_kind, OriginClass};
+use crate::value::{canonical, check_node_properties, check_properties};
+use crate::vocabulary::{stored_edge_type, stored_node_kind, EntityType, OriginClass};
 use crate::{is_decimal, is_ulid, Refusal, CONTRACT_VERSION};
 
 pub const OUTCOME: &str = "graph.outcome";
 pub const GET_NODE: &str = "graph.get_node";
 pub const GET_EDGE: &str = "graph.get_edge";
+pub const GET_CONTENT: &str = "graph.get_content";
 pub const HISTORY: &str = "graph.history";
+/// The unreviewed feed (schema 8): every accepted event of `origin_class`
+/// `agent` whose descriptor is `graph.apply` or `graph.reverse` and that no
+/// `kg_reviews` row targets, paged exactly as [`HISTORY`] (same bounds,
+/// same `scanned_through` rule, decoded by [`decode_history`]). Readable by
+/// persons with the reviewer role only.
+pub const UNREVIEWED: &str = "graph.unreviewed";
+/// A reversal's inspection: the retained event's inverse and what it
+/// requires now. Inspection only — neither an approval nor a reservation.
+pub const PREVIEW_REVERSAL: &str = "graph.preview_reversal";
+/// A proposal's revisions as an enumerated reviewer reads them,
+/// re-authorised per call.
+pub const PROPOSAL: &str = "graph.proposal";
 
 /// The most events one history page may ask for.
 pub const MAX_HISTORY_LIMIT: u32 = 100;
@@ -59,7 +78,7 @@ pub fn outcome_params(context_id: Option<&str>, request_id: &str) -> Value {
     json!({ "version": CONTRACT_VERSION, "context_id": context_id, "request_id": request_id })
 }
 
-/// [`GET_NODE`]'s or [`GET_EDGE`]'s params.
+/// [`GET_NODE`]'s, [`GET_EDGE`]'s or [`GET_CONTENT`]'s params.
 #[must_use]
 pub fn get_params(context_id: Option<&str>, id: &str, include_archived: bool) -> Value {
     json!({
@@ -95,6 +114,94 @@ pub fn history_params(
         "version": CONTRACT_VERSION, "context_id": context_id,
         "after": after, "limit": limit, "filter": filter,
     }))
+}
+
+/// [`UNREVIEWED`]'s params: the feed after graph position `after`, at most
+/// `limit` events.
+pub fn unreviewed_params(
+    context_id: Option<&str>,
+    after: &str,
+    limit: u32,
+) -> Result<Value, Refusal> {
+    if !is_decimal(after) || !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
+        return Err(Refusal::InvalidChange);
+    }
+    Ok(json!({
+        "version": CONTRACT_VERSION, "context_id": context_id, "after": after, "limit": limit,
+    }))
+}
+
+/// [`PREVIEW_REVERSAL`]'s params.
+pub fn preview_params(context_id: Option<&str>, event_id: &str) -> Result<Value, Refusal> {
+    if !is_ulid(event_id) {
+        return Err(Refusal::InvalidChange);
+    }
+    Ok(json!({ "version": CONTRACT_VERSION, "context_id": context_id, "event_id": event_id }))
+}
+
+/// [`PROPOSAL`]'s params.
+pub fn proposal_params(context_id: Option<&str>, proposal_id: &str) -> Result<Value, Refusal> {
+    if !is_ulid(proposal_id) {
+        return Err(Refusal::InvalidChange);
+    }
+    Ok(json!({ "version": CONTRACT_VERSION, "context_id": context_id, "proposal_id": proposal_id }))
+}
+
+/// One proposal revision as [`PROPOSAL`] answers it: the `kg_proposals`
+/// row without its scope, author and the proposer's private columns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalRow {
+    /// `<proposal_id>/<revision>`.
+    pub id: String,
+    pub proposal_id: String,
+    pub revision: String,
+    /// One of [`crate::proposal::STATUSES`].
+    pub status: String,
+    pub reason: Option<String>,
+    pub digest: String,
+    pub change: Value,
+    pub reviewers: Vec<String>,
+    pub expires_at_ms: Option<u64>,
+    pub proposer_actor: String,
+    pub created_at_ms: u64,
+    pub decided_at_ms: Option<u64>,
+    pub decided_by: Option<String>,
+    pub decided_event_id: Option<String>,
+}
+
+/// Decode [`PROPOSAL`]'s answer for `proposal_id`: every row that
+/// proposal's, ids `<proposal_id>/<revision>`, revisions strictly
+/// ascending, statuses known, digests hex. Anything else refuses
+/// `unsupported_version`.
+pub fn decode_proposals(
+    proposal_id: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<Vec<ProposalRow>, Refusal> {
+    let mut out: Vec<ProposalRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row: ProposalRow =
+            serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
+        let revision = row
+            .revision
+            .parse::<u128>()
+            .ok()
+            .filter(|_| is_decimal(&row.revision));
+        let after = out
+            .last()
+            .and_then(|last| last.revision.parse::<u128>().ok());
+        let ok = row.proposal_id == proposal_id
+            && row.id == format!("{proposal_id}/{}", row.revision)
+            && revision.is_some_and(|r| r > 0 && after.is_none_or(|a| r > a))
+            && crate::proposal::STATUSES.contains(&row.status.as_str())
+            && crate::worker::is_hex_digest(&row.digest)
+            && row.change.is_object();
+        if !ok {
+            return Err(Refusal::UnsupportedVersion);
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// An inspected node: its image and its tags' canonical texts.
@@ -163,6 +270,14 @@ fn properties(image: &Map<String, Value>) -> bool {
         .is_some_and(|p| check_properties(p).is_ok())
 }
 
+/// A node's properties, its reserved members within its kind's rules.
+fn node_properties(image: &Map<String, Value>) -> bool {
+    let kind = image.get("kind").and_then(Value::as_str);
+    image
+        .get("properties")
+        .is_some_and(|p| kind.is_some() && check_node_properties(kind, p).is_ok())
+}
+
 /// Whether `image` is node `id` as the contract holds one: exactly the
 /// node fields, each of its type and within its rules.
 fn node_ok(image: &Map<String, Value>, id: &str) -> bool {
@@ -183,7 +298,7 @@ fn node_ok(image: &Map<String, Value>, id: &str) -> bool {
         )
         && ulid_or_null(image, "description_source_id")
         && ulid_or_null(image, "merged_into_id")
-        && properties(image)
+        && node_properties(image)
         && lifecycle(image)
         && positive(image, "revision")
         && positive(image, "lifecycle_revision")
@@ -204,6 +319,58 @@ fn edge_ok(image: &Map<String, Value>, id: &str) -> bool {
         && properties(image)
         && lifecycle(image)
         && positive(image, "revision")
+}
+
+/// Whether `image` is content `id` as the contract holds one: `{id,
+/// owner_node_id, revision, body}`, the body within
+/// [`crate::content::check_body`].
+fn content_ok(image: &Map<String, Value>, id: &str) -> bool {
+    image.len() == 4
+        && image.get("id").and_then(Value::as_str) == Some(id)
+        && image
+            .get("owner_node_id")
+            .and_then(Value::as_str)
+            .is_some_and(is_ulid)
+        && positive(image, "revision")
+        && image
+            .get("body")
+            .is_some_and(|b| crate::content::check_body(b).is_ok())
+}
+
+/// Whether `image` is the after-image of entity `id` of `entity_type` as
+/// the contract writes one: a node `{id, kind, title, description,
+/// description_source_id, properties, lifecycle, merged_into_id, revision,
+/// lifecycle_revision}`, an edge `{id, from_id, to_id, type, properties,
+/// lifecycle, revision}`, a tag `{id, text, label, revision}` or a
+/// membership `{id, node_id, tag_id}` or a content `{id, owner_node_id,
+/// revision, body}`, each field within its rules. A `review` image is
+/// never an entity a read answers: it is checked as an event operation's
+/// alone ([`crate::review::image_ok`]).
+#[must_use]
+pub fn image_ok(entity_type: EntityType, id: &str, image: &Map<String, Value>) -> bool {
+    match entity_type {
+        EntityType::Node => node_ok(image, id),
+        EntityType::Edge => edge_ok(image, id),
+        EntityType::Tag => {
+            image.len() == 4
+                && image.get("id").and_then(Value::as_str) == Some(id)
+                && image
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                && matches!(image.get("label"), Some(Value::Null | Value::String(_)))
+                && positive(image, "revision")
+        }
+        EntityType::NodeTag => {
+            image.len() == 3
+                && image.get("id").and_then(Value::as_str) == Some(id)
+                && ["node_id", "tag_id"]
+                    .iter()
+                    .all(|end| image.get(*end).and_then(Value::as_str).is_some_and(is_ulid))
+        }
+        EntityType::Content => content_ok(image, id),
+        EntityType::Review => false,
+    }
 }
 
 /// Decode [`GET_NODE`]'s answer for node `id`. An image outside the node
@@ -238,6 +405,19 @@ pub fn decode_edge(
     match single(rows)? {
         None => Ok(None),
         Some(row) if edge_ok(&row, id) => Ok(Some(row)),
+        Some(_) => Err(Refusal::UnsupportedVersion),
+    }
+}
+
+/// Decode [`GET_CONTENT`]'s answer for content `id`; an image outside the
+/// content shape refuses `unsupported_version`.
+pub fn decode_content(
+    id: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<Option<Map<String, Value>>, Refusal> {
+    match single(rows)? {
+        None => Ok(None),
+        Some(row) if content_ok(&row, id) => Ok(Some(row)),
         Some(_) => Err(Refusal::UnsupportedVersion),
     }
 }
@@ -401,4 +581,108 @@ pub fn decode_history(
         last = at;
     }
     Ok(page)
+}
+
+/// The graph-read context operations a native reader runs (contract §9.3;
+/// keeper-hq `server/src/graph/operations.ts`): the agent path admits a
+/// domain into its context and refreshes it before every delivery; the
+/// person's path reads the domain's read status. A refusal is
+/// `operation.forbidden` with a stable code, collapsed for a caller who may
+/// not read: none of them says whether something exists.
+pub const ADMIT_READ: &str = "graph.admit_read";
+pub const REFRESH_CONTEXT: &str = "graph.refresh_context";
+pub const READ_STATUS: &str = "graph.read_status";
+
+/// [`ADMIT_READ`]'s params: add `domain` to `context`'s sources.
+#[must_use]
+pub fn admit_read_params(context: &str, domain: &str) -> Value {
+    json!({ "version": CONTRACT_VERSION, "context": context, "domain": domain })
+}
+
+/// [`REFRESH_CONTEXT`]'s params.
+#[must_use]
+pub fn refresh_context_params(context: &str) -> Value {
+    json!({ "version": CONTRACT_VERSION, "context": context })
+}
+
+/// [`READ_STATUS`]'s params: the person's current read authority over
+/// `domain`.
+#[must_use]
+pub fn read_status_params(domain: &str) -> Value {
+    json!({ "version": CONTRACT_VERSION, "domain": domain })
+}
+
+/// The graph-read authority a reader holds over one domain: the server's
+/// authority epoch and the `(domain, principal)` authority digest. A
+/// generation is built under one and served only while the reader's fresh
+/// authority is the same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Authority {
+    pub epoch: String,
+    pub digest: String,
+}
+
+impl Authority {
+    fn valid(&self) -> bool {
+        is_decimal(&self.epoch) && crate::worker::is_hex_digest(&self.digest)
+    }
+}
+
+/// A context row: what [`ADMIT_READ`] and [`REFRESH_CONTEXT`] answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRow {
+    pub context: String,
+    pub session: String,
+    pub permitted: Vec<String>,
+    pub sources: Vec<String>,
+    pub expires_at_ms: u64,
+    pub authority: Authority,
+}
+
+/// [`READ_STATUS`]'s row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadStatus {
+    pub domain: String,
+    pub authority: Authority,
+}
+
+fn domains_ok(domains: &[String]) -> bool {
+    domains
+        .iter()
+        .all(|d| !d.is_empty() && d.len() <= 128 && !d.chars().any(char::is_control))
+}
+
+/// Decode a context operation's answer for `context`: exactly one closed
+/// row naming that context, a ULID, with valid domains and authority.
+pub fn decode_context(context: &str, rows: Vec<Map<String, Value>>) -> Result<ContextRow, Refusal> {
+    let row = single(rows)?.ok_or(Refusal::UnsupportedVersion)?;
+    let row: ContextRow =
+        serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
+    if row.context != context
+        || !is_ulid(&row.context)
+        || row.session.is_empty()
+        || !domains_ok(&row.permitted)
+        || !domains_ok(&row.sources)
+        || !row.authority.valid()
+    {
+        return Err(Refusal::UnsupportedVersion);
+    }
+    Ok(row)
+}
+
+/// Decode [`READ_STATUS`]'s answer for `domain`.
+pub fn decode_read_status(
+    domain: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<ReadStatus, Refusal> {
+    let row = single(rows)?.ok_or(Refusal::UnsupportedVersion)?;
+    let row: ReadStatus =
+        serde_json::from_value(Value::Object(row)).map_err(|_| Refusal::UnsupportedVersion)?;
+    if row.domain != domain || !row.authority.valid() {
+        return Err(Refusal::UnsupportedVersion);
+    }
+    Ok(row)
 }

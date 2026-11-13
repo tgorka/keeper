@@ -2,7 +2,7 @@
 //! replicas seeded through `mutate` (no server): whole events replay, a
 //! missing or partial event ends the prefix as stale, a present wrong one is
 //! corruption; a change is never sent without a link, its request id
-//! survives a restart, and a receipt alone resolves it afterwards.
+//! survives a restart, and its replicated receipt settles nothing offline.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use super::client::{GraphClient, GraphClientError};
 use super::outcome::GraphOutcome;
 use super::prefix::{self, PrefixError};
 use super::protocol::candidate::{self, State, Verdict};
-use super::protocol::change::{Change, ChangeOp};
+use super::protocol::change::{Change, ChangeOp, DESCRIPTOR};
 use super::protocol::delta::Op;
 use super::protocol::scope::{client_scope, event_op_id, receipt_id};
 use crate::hq::port::{ReplicaSpec, RowOp};
@@ -72,6 +72,21 @@ impl State for Nodes {
     fn contains_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
         Vec::new()
     }
+    fn content(&self, _: &str) -> Option<Map<String, Value>> {
+        None
+    }
+    fn contents_of(&self, _: &str, _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn sources_from(&self, _: &str, _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn incident_active(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
+    fn merged_into(&self, _: &[String], _: usize) -> Vec<Map<String, Value>> {
+        Vec::new()
+    }
 }
 
 /// The operations the shared algebra gives `ops` over `state`.
@@ -82,7 +97,11 @@ fn accepted(state: &Nodes, ops: Vec<ChangeOp>, minted: u32) -> Vec<Op> {
         next += 1;
         ulid(next)
     };
-    match candidate::apply(state, &change, &mut mint) {
+    let stamp = candidate::Stamp {
+        time_ms: 1,
+        actor_id: "ana",
+    };
+    match candidate::apply(state, &change, &stamp, &mut mint) {
         Verdict::Accepted(effects) => effects.ops,
         other => panic!("{other:?}"),
     }
@@ -168,6 +187,7 @@ fn two_events() -> (Vec<Op>, Vec<Op>) {
             set: super::protocol::change::NodeFields {
                 title: Some("Renamed".into()),
                 description: None,
+                description_source: None,
             },
             set_properties: Map::new(),
             remove_properties: Vec::new(),
@@ -283,11 +303,14 @@ fn a_change_is_never_sent_without_a_link_and_its_id_survives_a_restart() {
     let client = GraphClient::new(source.clone());
     let saved: Value = serde_json::from_str(&persisted).expect("read back");
     let restored = client
-        .prepared(super::protocol::request::Request {
-            request_id: saved["request_id"].as_str().expect("id").to_owned(),
-            context_id: None,
-            payload: saved["payload"].clone(),
-        })
+        .prepared(
+            super::protocol::change::DESCRIPTOR,
+            super::protocol::request::Request {
+                request_id: saved["request_id"].as_str().expect("id").to_owned(),
+                context_id: None,
+                payload: saved["payload"].clone(),
+            },
+        )
         .expect("restored");
     assert_eq!(restored.key(), prepared.key());
 
@@ -312,14 +335,11 @@ fn a_change_is_never_sent_without_a_link_and_its_id_survives_a_restart() {
             }),
         )])
         .expect("receipt");
+    // The receipt replicated, but no fresh `read_status` can be asked
+    // without a link: it settles nothing (112.1 T2.3).
     assert_eq!(
         client.outcome(&restored, None),
-        Ok(GraphOutcome::Accepted {
-            event_id: ulid(900),
-            graph_seq: "7".into(),
-            commit_seq: None,
-            detail: json!({"affected": []}).as_object().expect("detail").clone(),
-        })
+        Err(GraphClientError::Offline)
     );
 }
 
@@ -333,9 +353,29 @@ fn a_restored_request_must_still_be_a_persons_change() {
         payload,
     };
     let change = json!({"ops": [{"op": "archive_node", "id": ulid(1), "expected_revision": "1"}]});
-    assert!(client.prepared(request(None, change.clone())).is_ok());
-    assert!(client.prepared(request(Some(ulid(4)), change)).is_err());
-    assert!(client.prepared(request(None, json!({"ops": []}))).is_err());
+    assert!(client
+        .prepared(DESCRIPTOR, request(None, change.clone()))
+        .is_ok());
+    assert!(client
+        .prepared(DESCRIPTOR, request(Some(ulid(4)), change.clone()))
+        .is_err());
+    assert!(client
+        .prepared(DESCRIPTOR, request(None, json!({"ops": []})))
+        .is_err());
+    // A payload is restored only as the command it is: a change is not a
+    // reversal, and no descriptor outside the client's commands restores.
+    assert!(client
+        .prepared("graph.reverse", request(None, change.clone()))
+        .is_err());
+    assert!(client
+        .prepared("graph.outcome", request(None, change.clone()))
+        .is_err());
+    let reverse = json!({"target_event_id": ulid(5), "target_delta_digest": "ab".repeat(32),
+        "expected": [{"entity_type": "node", "id": ulid(1), "revision": "2", "lifecycle_revision": "1"}]});
+    assert!(client
+        .prepared("graph.reverse", request(None, reverse.clone()))
+        .is_ok());
+    assert!(client.prepared(DESCRIPTOR, request(None, reverse)).is_err());
 }
 
 /// Event 1, then event 2's header with its operation rows replaced by
@@ -571,4 +611,99 @@ fn a_sent_change_keeps_its_request_when_its_outcome_cannot_be_read() {
         attempt.key().request_id(),
         applied.prepared.request().request_id
     );
+}
+
+/// The query-agnostic helpers keeper-hq's replica uses are the one
+/// implementation: over the same replica they answer exactly what the
+/// `Source` port does, a failing query fails them, and an answer that is
+/// not a batch is unreadable, never an empty prefix.
+#[test]
+fn the_source_helpers_answer_over_any_query_channel() {
+    use super::source::{checkpoint_with, prefix_batch_with, GraphSource, ScopeState, SourceError};
+    let dir = tempfile::tempdir().expect("dir");
+    let source = open(dir.path());
+    let (first, second) = two_events();
+    let mut rows = event_rows(1, &first, None);
+    rows.extend(event_rows(2, &second, None));
+    rows.push(head(2));
+    source.replica.mutate(rows).expect("seeded");
+    let replica = source.replica.clone();
+    let query = |sql: &str, params: &[Value]| Ok(replica.query(sql, params)?);
+    for (after, limit) in [(0, 1), (0, 2), (1, 5), (2, 1)] {
+        let via = prefix_batch_with(DB, after, limit, query).expect("batch");
+        assert_eq!(via, source.prefix_batch(after, limit).expect("port"));
+    }
+    let both = prefix_batch_with(DB, 0, 10, query).expect("batch");
+    assert_eq!(
+        (both.head, both.events.len(), both.ops.len()),
+        (Some(2), 2, first.len() + second.len())
+    );
+    assert_eq!(
+        checkpoint_with(DB, query).expect("checkpoint"),
+        source.checkpoint().expect("port")
+    );
+    // No graph subscription has pulled on this local replica.
+    assert_eq!(
+        checkpoint_with(DB, query).expect("checkpoint").scope,
+        ScopeState::Pending
+    );
+
+    let failing = |_: &str, _: &[Value]| -> Result<Vec<Map<String, Value>>, SourceError> {
+        Err(SourceError::Unreadable("channel".into()))
+    };
+    assert!(prefix_batch_with(DB, 0, 1, failing).is_err());
+    assert!(checkpoint_with(DB, failing).is_err());
+    let nothing =
+        |_: &str, _: &[Value]| -> Result<Vec<Map<String, Value>>, SourceError> { Ok(Vec::new()) };
+    assert_eq!(
+        prefix_batch_with(DB, 0, 1, nothing),
+        Err(SourceError::Unreadable("no batch".into()))
+    );
+    let bad_head = |_: &str, _: &[Value]| -> Result<Vec<Map<String, Value>>, SourceError> {
+        Ok(vec![json!({"batch": {"head": 7, "events": [], "ops": []}})
+            .as_object()
+            .expect("row")
+            .clone()])
+    };
+    assert_eq!(
+        prefix_batch_with(DB, 0, 1, bad_head),
+        Err(SourceError::Unreadable("head".into()))
+    );
+}
+
+/// CC-8 (112.1): a server's scope revocation is purged by the Syncular
+/// client itself (`purge_scope_rows`, in the transaction that records the
+/// subscription `revoked`), and that purge fails closed — the revocation is
+/// not applied — for a table whose schema maps no column to the revoked
+/// scope variable. Every subscription the graph takes (each graph table
+/// under `kg_graph`, 111.x's `kg_contents`/`kg_reviews` among them, the
+/// receipts under `kg_client` and the proposals under `kg_proposal`)
+/// therefore needs that mapping in the contract's schema, or a revocation
+/// would leave its rows; and the purge check reads exactly those tables.
+#[test]
+fn every_graph_subscription_has_a_purgeable_scope_column() {
+    let schema = syncular_client::parse_schema_json(
+        crate::hq::syncular::schema().expect("the contract's schema"),
+    )
+    .expect("compiles");
+    let taken = super::client::subscriptions(DB, "ana", "dev1");
+    let tables: Vec<&str> = taken.iter().map(|s| s.table.as_str()).collect();
+    assert_eq!(tables, super::client::subscribed_tables());
+    assert_eq!(
+        taken.len(),
+        11,
+        "nine graph tables, the receipts, the proposals"
+    );
+    for subscription in taken {
+        let table = schema
+            .table(&subscription.table)
+            .unwrap_or_else(|| panic!("{} is in the schema", subscription.table));
+        for (variable, _) in &subscription.scopes {
+            assert!(
+                table.scope_column(variable).is_some(),
+                "{} maps no column to {variable}: a revocation could not purge it",
+                subscription.table
+            );
+        }
+    }
 }

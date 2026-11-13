@@ -1,6 +1,6 @@
 {
   "irVersion": 1,
-  "schemaVersion": 6,
+  "schemaVersion": 8,
   "schemaVersions": [
     {
       "version": 1,
@@ -36,6 +36,18 @@
       "version": 6,
       "migrations": [
         "0006_knowledge_graph"
+      ]
+    },
+    {
+      "version": 7,
+      "migrations": [
+        "0007_knowledge_graph_contents"
+      ]
+    },
+    {
+      "version": 8,
+      "migrations": [
+        "0008_knowledge_graph_review"
       ]
     }
   ],
@@ -2096,6 +2108,15 @@
             "type"
           ],
           "unique": false
+        },
+        {
+          "name": "kg_edges_from_active",
+          "columns": [
+            "from_id",
+            "type",
+            "lifecycle"
+          ],
+          "unique": false
         }
       ],
       "extensions": {}
@@ -2254,6 +2275,325 @@
           "name": "kg_node_tags_tag_id",
           "columns": [
             "tag_id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_contents",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "owner_node_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "body",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "updated_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "owner_node_id",
+          "parentTable": "kg_nodes",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_contents_owner_node_id_ref",
+          "columns": [
+            "owner_node_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_contents_owner",
+          "columns": [
+            "owner_node_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_contents_owner_id",
+          "columns": [
+            "owner_node_id",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_reviews",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "target_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "target_delta_digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reviewer_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "created_event_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_graph:{kg_graph}",
+          "variable": "kg_graph",
+          "column": "graph"
+        }
+      ],
+      "references": [
+        {
+          "column": "target_event_id",
+          "parentTable": "kg_events",
+          "onDelete": "RESTRICT"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_kg_reviews_target_event_id_ref",
+          "columns": [
+            "target_event_id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "kg_reviews_target",
+          "columns": [
+            "target_event_id",
+            "kind"
+          ],
+          "unique": false
+        }
+      ],
+      "extensions": {}
+    },
+    {
+      "name": "kg_proposals",
+      "primaryKey": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "graph",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposal_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "digest",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "change",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "reviewers",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "expires_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "proposer_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposer_client",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "proposer_context",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "origin_actor",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "origin_chain",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "source_labels",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "decided_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "decided_by",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "decided_event_id",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "name": "author_actor",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "author_client",
+          "type": "string",
+          "nullable": false
+        }
+      ],
+      "scopes": [
+        {
+          "pattern": "kg_proposal:{kg_proposal}",
+          "variable": "kg_proposal",
+          "column": "proposer_actor"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "kg_proposals_revision",
+          "columns": [
+            "proposal_id",
+            "revision"
+          ],
+          "unique": true
+        },
+        {
+          "name": "kg_proposals_proposer",
+          "columns": [
+            "proposer_actor"
           ],
           "unique": false
         }
@@ -2750,6 +3090,51 @@
             {
               "kind": "parameter",
               "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgContents",
+      "table": "kg_contents",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgReviews",
+      "table": "kg_reviews",
+      "scopes": [
+        {
+          "variable": "kg_graph",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "database"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "kgProposals",
+      "table": "kg_proposals",
+      "scopes": [
+        {
+          "variable": "kg_proposal",
+          "values": [
+            {
+              "kind": "parameter",
+              "name": "actorId"
             }
           ]
         }

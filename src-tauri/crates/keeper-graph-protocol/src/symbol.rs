@@ -39,13 +39,16 @@ impl SymbolKind {
         }
     }
 
-    /// Whether `name` is a custom name of this kind.
+    /// Whether `name` is a custom name of this kind. A `$`-prefixed name is
+    /// never a property symbol: typed references and the reserved members
+    /// (`crate::value::RESERVED_MEMBERS`) are not query-addressable.
     fn custom(self, name: &str) -> bool {
         match self {
             Self::Node | Self::Edge => is_custom_name(name),
             Self::Property => {
                 !name.is_empty()
                     && name.len() <= MAX_NAME_BYTES
+                    && !name.starts_with('$')
                     && !name.chars().any(char::is_control)
                     && !is_structural_field(name)
             }

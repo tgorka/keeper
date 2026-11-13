@@ -1,0 +1,25 @@
+[package]
+name = "keeper-graph-driver"
+description = "The headless app-human consumer of keeper's graph: apply, sync, query, inspect, history and status against a real keeper-hq"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+keeper-core = { path = "../keeper-core", features = ["human-reads"] }
+clap = { workspace = true }
+serde_json = { workspace = true }
+# `signal`: `sync`, `query` and `inspect` cancel their run on SIGINT/SIGTERM.
+tokio = { workspace = true, features = ["signal"] }
+
+# Only the P1 measurement example `rc_spawner` (never shipped) and the interrupt test use
+# these; `user` is the example's test-only `--saved-uid0` drop (`setresuid`), `signal` the
+# test's `kill`.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["resource", "user", "signal"] }
+sha2 = { workspace = true }

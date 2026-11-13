@@ -49,7 +49,7 @@ use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, StagedBlob, BLOB_C
 use crate::hq::port::{
     BlobBody, Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection,
     Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription,
-    UploadRefusal, WindowBase, WindowState, CONFLICT,
+    UploadRefusal, WindowBase, WindowState, CONFLICT, CREDENTIAL_REFUSED,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -86,10 +86,10 @@ pub(crate) struct GatedTransport {
     open: Arc<AtomicBool>,
     /// The replica's server; `None` for a replica that never links.
     origin: Option<url::Origin>,
-    /// What became of the last remote operation: `None` while none passed
-    /// the gate (nothing was sent), `Some(false)` when it went out and its
-    /// transport failed, `Some(true)` when an answer's bytes came back.
-    reached: Option<bool>,
+    /// What became of the last remote operation ([`Reach`]): `None` while
+    /// none left this device (the gate was closed, or the transport refused
+    /// it before sending).
+    reached: Option<Reach>,
     /// The blob whose upload grant or `PUT` was asked for last: a round
     /// that fails on an upload failed on this one.
     upload: Option<String>,
@@ -125,6 +125,62 @@ impl GatedTransport {
     }
 }
 
+/// How far a remote operation got, read at the transport while its details
+/// are still there (the remote client keeps only the code and message). The
+/// rule is whether the server answered, never the error's type: once any
+/// status line came back the request was answered, whatever happened to its
+/// body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// It went out and no status line ever came back: the connection
+    /// failed, was reset or timed out before one. The only reach that means
+    /// the server could not be reached.
+    Lost,
+    /// The server answered with an operation answer keeper reads: its
+    /// result, or its own refusal in the body.
+    Read,
+    /// The server answered `401` or `403`: it refused this credential.
+    Refused,
+    /// The server answered, but not with an operation answer: another HTTP
+    /// status, a redirect, a body over the limit, or a body that broke off
+    /// or stalled after the status line.
+    Unusable,
+}
+
+/// The message syncular-client (pinned `=0.32.1`, `native_transport.rs`
+/// `read_body`) gives a timeout while reading a response body: the status
+/// line had come back, but its `transport.timeout` carries no `httpStatus`.
+/// It is the only sign of that phase the error keeps;
+/// `a_status_line_then_a_stalled_body_is_answered` pins it over a socket.
+const BODY_TIMEOUT: &str = "response body read times out";
+
+/// How far the request that failed with `error` got; `None` when the
+/// transport refused it before anything was sent (a request over the limit,
+/// a malformed request, a spent round deadline) or the failure is not one
+/// the transport names — never read as an outage.
+fn reach(error: &TransportError) -> Option<Reach> {
+    match http_status(error.details.as_ref()) {
+        Some(401 | 403) => return Some(Reach::Refused),
+        Some(_) => return Some(Reach::Unusable),
+        None => {}
+    }
+    let cause = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("causeKind"))
+        .and_then(Value::as_str);
+    match (error.code.as_str(), cause) {
+        ("transport.redirect" | "transport.response_too_large", _)
+        | ("transport.failed", Some("body" | "protocol")) => Some(Reach::Unusable),
+        ("transport.timeout", Some("timeout")) if error.message == BODY_TIMEOUT => {
+            Some(Reach::Unusable)
+        }
+        ("transport.timeout", Some("timeout"))
+        | ("transport.failed", Some("connect" | "tls" | "io")) => Some(Reach::Lost),
+        _ => None,
+    }
+}
+
 impl Transport for GatedTransport {
     fn sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.check()?;
@@ -133,7 +189,10 @@ impl Transport for GatedTransport {
     fn remote_operation(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.check()?;
         let answer = self.inner.remote_operation(request);
-        self.reached = Some(answer.is_ok());
+        self.reached = match &answer {
+            Ok(_) => Some(Reach::Read),
+            Err(error) => reach(error),
+        };
         answer
     }
     fn realtime_sync(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
@@ -1827,26 +1886,67 @@ impl SyncularReplica {
 /// The code the client gives an answer it could not decode or validate.
 const UNREADABLE: &str = "client.invalid_host_response";
 
-/// What a failed command means, by how far it got (`reached`, from the
-/// gate): never sent is the client's own refusal (or a closed network); sent
-/// with no answer back, or with an answer keeper could not read, is
+/// What a failed command means, by how far it got ([`Reach`], from the
+/// gate): never sent is the client's own refusal (or a closed network); a
+/// refused credential (`401`/`403`) is the server's refusal, made before
+/// the command ran; sent with no answer back, or with an answer that says
+/// nothing about the command (unreadable, another status, a redirect), is
 /// [`ReplicaError::Unheard`] — the server may have made it, whatever the
-/// client's `retryable` says; an answer the server gave is its refusal.
-fn command_error(error: RemoteClientError, reached: Option<bool>) -> ReplicaError {
+/// client's `retryable` says, and only the same request id or its outcome
+/// settles it; an operation answer the server gave is its refusal.
+fn command_error(error: RemoteClientError, reached: Option<Reach>) -> ReplicaError {
     match reached {
         None if error.code == CLOSED => ReplicaError::Closed,
         None => ReplicaError::Client(error.to_string()),
-        Some(false) => ReplicaError::Unheard {
+        Some(Reach::Refused) => ReplicaError::Remote {
+            code: CREDENTIAL_REFUSED.to_owned(),
+            message: error.message,
+            retryable: false,
+        },
+        Some(Reach::Lost | Reach::Unusable) => ReplicaError::Unheard {
             code: error.code,
             message: error.message,
             retryable: error.retryable,
         },
-        Some(true) if error.code == UNREADABLE => ReplicaError::Unheard {
+        Some(Reach::Read) if error.code == UNREADABLE => ReplicaError::Unheard {
             code: error.code,
             message: error.message,
             retryable: error.retryable,
         },
-        Some(true) => ReplicaError::Remote {
+        Some(Reach::Read) => ReplicaError::Remote {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+    }
+}
+
+/// What a failed query means, by how far it got ([`Reach`], from the gate):
+/// never sent is the client's own refusal (or a closed network); sent with
+/// no answer back ([`Reach::Lost`]) is [`ReplicaError::Unheard`], the only
+/// outcome that means the server could not be reached; whatever the server
+/// answered is never that. A refused credential (`401`/`403`) is the
+/// server's refusal ([`ReplicaError::Remote`]), as is an operation answer
+/// refusing the query; an answer keeper cannot use (unreadable, another
+/// status, a redirect, too large) is the client's refusal, not an outage.
+/// A query changes nothing, so unlike a command no answer leaves anything
+/// to resolve.
+fn query_error(error: RemoteClientError, reached: Option<Reach>) -> ReplicaError {
+    match reached {
+        None if error.code == CLOSED => ReplicaError::Closed,
+        None | Some(Reach::Unusable) => ReplicaError::Client(error.to_string()),
+        Some(Reach::Lost) => ReplicaError::Unheard {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        },
+        Some(Reach::Refused) => ReplicaError::Remote {
+            code: CREDENTIAL_REFUSED.to_owned(),
+            message: error.message,
+            retryable: false,
+        },
+        Some(Reach::Read) if error.code == UNREADABLE => ReplicaError::Client(error.to_string()),
+        Some(Reach::Read) => ReplicaError::Remote {
             code: error.code,
             message: error.message,
             retryable: error.retryable,
@@ -2119,11 +2219,12 @@ impl Replica for SyncularReplica {
         };
         let client = SyncRemoteClient::for_operations(remote.client_id.clone())
             .map_err(|error| ReplicaError::Client(error.to_string()))?;
-        let answer = client
-            .query::<_, Value, Map<String, Value>>(&mut transport, operation_id, &params)
-            .map_err(|error| ReplicaError::Client(error.to_string()));
+        let answer =
+            client.query::<_, Value, Map<String, Value>>(&mut transport, operation_id, &params);
         transport.inner.shutdown();
-        Ok(answer?.rows)
+        Ok(answer
+            .map_err(|error| query_error(error, transport.reached))?
+            .rows)
     }
 
     fn remote_command(
@@ -2235,6 +2336,276 @@ pub(crate) mod tests {
             message: "m".to_owned(),
             details: status.map(|status| json!({ "causeKind": "status", "httpStatus": status })),
         }
+    }
+
+    /// Only a query that left the gate and whose transport failed is an
+    /// unreachable server; a closed gate, a local refusal and an unreadable
+    /// answer are not, and an answer the server gave is its refusal.
+    #[test]
+    fn a_failed_query_is_classified_by_how_far_it_got() {
+        let error = |code: &str| RemoteClientError {
+            code: code.to_owned(),
+            message: "m".to_owned(),
+            retryable: true,
+        };
+        assert_eq!(query_error(error(CLOSED), None), ReplicaError::Closed);
+        assert!(matches!(
+            query_error(error("client.invalid_request"), None),
+            ReplicaError::Client(_)
+        ));
+        assert!(matches!(
+            query_error(error("transport.failed"), Some(Reach::Lost)),
+            ReplicaError::Unheard { code, .. } if code == "transport.failed"
+        ));
+        assert!(matches!(
+            query_error(error(UNREADABLE), Some(Reach::Read)),
+            ReplicaError::Client(_)
+        ));
+        assert!(matches!(
+            query_error(error("kg.forbidden"), Some(Reach::Read)),
+            ReplicaError::Remote { code, .. } if code == "kg.forbidden"
+        ));
+    }
+
+    /// One remote operation against a loopback server that does `serve` with
+    /// each accepted connection, on its own thread (`None`: nothing
+    /// listens), under `timeout_ms`; the error the real gate, transport and
+    /// remote client give, as a query and as a command.
+    fn over_socket(
+        serve: Option<fn(std::net::TcpStream)>,
+        timeout_ms: u64,
+    ) -> (ReplicaError, ReplicaError) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        // The server answers every connection (a followed redirect opens
+        // another) and ends with the test's process.
+        match serve {
+            Some(serve) => {
+                std::thread::spawn(move || {
+                    for socket in listener.incoming().flatten() {
+                        std::thread::spawn(move || serve(socket));
+                    }
+                });
+            }
+            None => drop(listener),
+        }
+        let transport = || GatedTransport {
+            inner: HostTransport::from_config(
+                &json!({ "baseUrl": base, "requestTimeoutMs": timeout_ms }),
+            )
+            .expect("transport"),
+            open: Arc::new(AtomicBool::new(true)),
+            origin: Some(url::Url::parse(&base).expect("url").origin()),
+            reached: None,
+            upload: None,
+        };
+        let client = SyncRemoteClient::for_operations("c".to_owned()).expect("client");
+        let mut query = transport();
+        let queried = client
+            .query::<_, Value, Map<String, Value>>(&mut query, "graph.read_status", &json!({}))
+            .expect_err("no query answer");
+        query.inner.shutdown();
+        let mut command = transport();
+        let commanded = client
+            .command(&mut command, "graph.apply", "r-1", &json!({}))
+            .expect_err("no command answer");
+        command.inner.shutdown();
+        (
+            query_error(queried, query.reached),
+            command_error(commanded, command.reached),
+        )
+    }
+
+    /// Read the whole request (its head and `Content-Length` bytes of body)
+    /// before answering, so that closing never resets a request the client
+    /// is still sending.
+    fn drain(socket: &mut std::net::TcpStream) {
+        let mut seen = Vec::new();
+        let mut chunk = [0; 4096];
+        let head = loop {
+            if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            match socket.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let length = String::from_utf8_lossy(&seen[..head])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let mut body = seen.len() - head;
+        while body < length {
+            match socket.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => body += n,
+            }
+        }
+    }
+
+    fn answer<const STATUS: u16>(mut socket: std::net::TcpStream) {
+        drain(&mut socket);
+        let _ = write!(
+            socket,
+            "HTTP/1.1 {STATUS} X\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = socket.flush();
+    }
+
+    /// A `200` status line and the start of a body, then (`STALL`) silence
+    /// past the request timeout, or a close.
+    fn status_then<const STALL: bool>(mut socket: std::net::TcpStream) {
+        drain(&mut socket);
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+        );
+        let _ = socket.flush();
+        if STALL {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    /// The R2-L1 rule: once a status line came back the request was
+    /// answered. A `200` whose body then stalls past the request timeout is
+    /// never offline-eligible (a query's `Client`; a command's outcome
+    /// lookup); so is one whose body broke off. Only a server that never
+    /// sends a status line is unheard (112.1 r2 R2-L1).
+    #[test]
+    fn a_status_line_then_a_stalled_body_is_answered() {
+        for (case, serve) in [
+            ("stalled", status_then::<true> as fn(std::net::TcpStream)),
+            ("broken off", status_then::<false>),
+        ] {
+            let (query, command) = over_socket(Some(serve), 500);
+            assert!(
+                matches!(&query, ReplicaError::Client(_)),
+                "query, body {case}: {query:?}"
+            );
+            assert!(
+                matches!(&command, ReplicaError::Unheard { .. }),
+                "command, body {case}: {command:?}"
+            );
+        }
+        let silent = |mut socket: std::net::TcpStream| {
+            drain(&mut socket);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        };
+        let (query, _) = over_socket(Some(silent as fn(std::net::TcpStream)), 500);
+        assert!(
+            matches!(&query, ReplicaError::Unheard { code, .. } if code == "transport.timeout"),
+            "no status line: {query:?}"
+        );
+    }
+
+    /// Whatever the server answered is never an unreachable server (the one
+    /// failure that admits an offline read): a refused credential is its
+    /// refusal, any other status or a redirect is unusable. Only a request
+    /// that went out and got nothing back is unheard. Real sockets, the real
+    /// transport and remote client (112.1 r1 BLOCKING-1).
+    #[test]
+    fn an_answered_operation_is_never_an_unreachable_server() {
+        for (status, serve) in [
+            (401, answer::<401> as fn(std::net::TcpStream)),
+            (403, answer::<403>),
+        ] {
+            let (query, command) = over_socket(Some(serve), 10_000);
+            assert!(
+                matches!(
+                    &query,
+                    ReplicaError::Remote {
+                        retryable: false,
+                        ..
+                    }
+                ),
+                "query answered {status}: {query:?}"
+            );
+            assert!(
+                matches!(
+                    &command,
+                    ReplicaError::Remote {
+                        retryable: false,
+                        ..
+                    }
+                ),
+                "command answered {status}: {command:?}"
+            );
+        }
+        for (status, serve) in [
+            (500, answer::<500> as fn(std::net::TcpStream)),
+            (404, answer::<404>),
+            (302, answer::<302>),
+        ] {
+            let (query, command) = over_socket(Some(serve), 10_000);
+            assert!(
+                matches!(&query, ReplicaError::Client(_)),
+                "query answered {status}: {query:?}"
+            );
+            // A command the server answered without saying what became of
+            // it may have run: only its own id settles it.
+            assert!(
+                matches!(&command, ReplicaError::Unheard { .. }),
+                "command answered {status}: {command:?}"
+            );
+        }
+        let lost = [
+            None,
+            Some((|socket| drop(socket)) as fn(std::net::TcpStream)),
+            Some(|mut socket: std::net::TcpStream| drain(&mut socket)),
+        ];
+        for (case, serve) in lost.into_iter().enumerate() {
+            let (query, command) = over_socket(serve, 10_000);
+            assert!(
+                matches!(&query, ReplicaError::Unheard { .. }),
+                "lost case {case}: {query:?}"
+            );
+            assert!(
+                matches!(&command, ReplicaError::Unheard { .. }),
+                "lost case {case}: {command:?}"
+            );
+        }
+    }
+
+    /// A request the transport refused before sending is never unheard.
+    #[test]
+    fn a_request_never_sent_is_not_an_outage() {
+        let with = |code: &str, details: Value| TransportError {
+            code: code.to_owned(),
+            message: "m".to_owned(),
+            details: Some(details),
+        };
+        for error in [
+            with(
+                "transport.request_too_large",
+                json!({ "limit": 1, "size": 2 }),
+            ),
+            with("transport.failed", json!({ "causeKind": "request" })),
+            with(
+                "transport.timeout",
+                json!({ "causeKind": "round_deadline" }),
+            ),
+            with("transport.failed", json!({ "causeKind": "unknown" })),
+            TransportError::new("transport.unavailable", "m"),
+        ] {
+            assert_eq!(reach(&error), None, "{error:?}");
+        }
+        assert_eq!(
+            reach(&with("transport.response_too_large", json!({ "limit": 1 }))),
+            Some(Reach::Unusable)
+        );
+        assert_eq!(
+            reach(&with(
+                "transport.failed",
+                json!({ "causeKind": "body", "httpStatus": 200 })
+            )),
+            Some(Reach::Unusable)
+        );
     }
 
     #[test]

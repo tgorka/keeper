@@ -1,0 +1,607 @@
+//! Where and how a graph worker may run: the verified worker executable and
+//! the runtime class admitted for it (OD-A Q6, OD-B, OD-C).
+//!
+//! R1 admits exactly one Linux class, `agent-image/linux-amd64/trixie/r1`:
+//! a Linux worker is spawned only when this binary was built for
+//! `linux`/`x86_64`, a runtime ledger was embedded at build time, the
+//! worker's digest is the ledger's, the tree and the process verify against
+//! it ([`super::ledger`]) and the launch prerequisites (P6c) hold.
+//! Otherwise — any other Linux tuple (an arm64 image has no worker; a
+//! host-native build is not the measured class) — graph is
+//! `projection_unavailable` before any child exists. macOS is evidence-only
+//! (OD-C): nothing shipped enables it, and only an explicit
+//! [`Runtime::macos_evidence`] runs a worker there, under the proof's
+//! `sandbox-exec` profile. Every other target has no graph.
+//!
+//! Every spawn rechecks the class first ([`Runtime::before_spawn`]) and runs
+//! the spawning-thread check as the last statement before `spawn`, with
+//! nothing awaited between ([`Runtime::spawn`]). A failed recheck
+//! invalidates the runtime for good: the consumer opens a new one, which
+//! verifies everything again.
+//!
+//! On Linux a worker dies with its parent (`PR_SET_PDEATHSIG`, SIGKILL;
+//! owner amendment 2026-11-13), so a driver or agentd killed outright never
+//! leaves one running. The kernel's parent is the spawning *thread*, so every
+//! Linux worker is spawned, and its spawning-thread check run, on one thread
+//! that lives as long as the process ([`spawner`]): a runtime or blocking
+//! thread that retires never takes a healthy worker with it.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+
+use super::query::QueryError;
+
+/// A worker executable whose bytes are the expected build: an absolute
+/// path and the SHA-256 of its file, fixed when it was opened. There is no
+/// search path and no fallback.
+#[derive(Clone, Debug)]
+pub struct VerifiedWorker {
+    path: PathBuf,
+    sha256: String,
+}
+
+impl VerifiedWorker {
+    /// Open the worker at `path`, whose digest must be `expected` (the
+    /// digest embedded at build time; `None` when none was, which refuses).
+    pub fn open(path: &Path, expected: Option<&str>) -> Result<Self, QueryError> {
+        let expected = expected.ok_or(QueryError::Unavailable("worker.digest"))?;
+        if !path.is_absolute()
+            || path.components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        {
+            return Err(QueryError::Unavailable("worker.path"));
+        }
+        let meta =
+            std::fs::symlink_metadata(path).map_err(|_| QueryError::Unavailable("worker.path"))?;
+        if !meta.is_file() {
+            return Err(QueryError::Unavailable("worker.path"));
+        }
+        let mut file =
+            std::fs::File::open(path).map_err(|_| QueryError::Unavailable("worker.path"))?;
+        let mut hash = Sha256::new();
+        std::io::copy(&mut file, &mut hash).map_err(|_| QueryError::Unavailable("worker.path"))?;
+        let sha256: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        if sha256 != expected {
+            return Err(QueryError::Unavailable("worker.digest"));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            sha256,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+enum Class {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Ledger(super::ledger::Verified),
+    #[cfg(target_os = "macos")]
+    MacosEvidence,
+    /// Unit tests of the supervisor run the real worker without the ledger
+    /// (a dev host is never the measured class); a test may stand in a
+    /// step 5 of its own, run where step 5 runs.
+    #[cfg(test)]
+    Test(Option<StepFive>),
+    /// Keeps the enum inhabited-checkable on targets with no class.
+    #[allow(dead_code)]
+    Never(std::convert::Infallible),
+}
+
+/// A test's step 5, run where the ledger class runs the real one.
+#[cfg(test)]
+type StepFive = std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>;
+
+/// A worker and the runtime class it was admitted in.
+pub struct Runtime {
+    worker: VerifiedWorker,
+    class: Class,
+    invalidated: AtomicBool,
+}
+
+/// Q6 rule 1–2 as a decision: which target may admit a Linux worker at all.
+pub(crate) fn class_decision(os: &str, arch: &str, ledger: bool) -> Result<(), &'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") if ledger => Ok(()),
+        ("linux", "x86_64") => Err("ledger.absent"),
+        ("linux", _) => Err("platform.target"),
+        ("macos", _) => Err("macos.evidence_only"),
+        _ => Err("platform.unsupported"),
+    }
+}
+
+impl Runtime {
+    /// Admit `worker` in R1's Linux class under the embedded `ledger`
+    /// (`None` when none was embedded): the full verification of §4.4
+    /// steps 1–7 and P6c.
+    pub fn admit(worker: VerifiedWorker, ledger: Option<&str>) -> Result<Self, QueryError> {
+        class_decision(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            ledger.is_some(),
+        )
+        .map_err(QueryError::Unavailable)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let ledger = super::ledger::Ledger::parse(ledger.unwrap_or_default())
+                .map_err(QueryError::Unavailable)?;
+            let (path, sha) = ledger.worker();
+            if Path::new(path) != worker.path() || sha != worker.sha256() {
+                return Err(QueryError::Unavailable("worker.ledger"));
+            }
+            let verified = ledger
+                .verify_rootfs(Path::new("/"))
+                .map_err(QueryError::Unavailable)?;
+            ledger.verify_process().map_err(QueryError::Unavailable)?;
+            launch_prerequisites()?;
+            Ok(Self {
+                worker,
+                class: Class::Ledger(verified),
+                invalidated: AtomicBool::new(false),
+            })
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = worker;
+            Err(QueryError::Unavailable("platform.target"))
+        }
+    }
+
+    /// macOS only, evidence only (OD-C): run `worker` under the constant
+    /// `sandbox-exec` profile. Nothing shipped calls this; the headless
+    /// driver does when asked explicitly.
+    #[cfg(target_os = "macos")]
+    pub fn macos_evidence(worker: VerifiedWorker) -> Result<Self, QueryError> {
+        Ok(Self {
+            worker,
+            class: Class::MacosEvidence,
+            invalidated: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(worker: VerifiedWorker) -> Self {
+        Self::for_tests_with_step_five(worker, None)
+    }
+
+    /// The test class, with `step_five` run in step 5's place.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_step_five(
+        worker: VerifiedWorker,
+        step_five: Option<StepFive>,
+    ) -> Self {
+        Self {
+            worker,
+            class: Class::Test(step_five),
+            invalidated: AtomicBool::new(false),
+        }
+    }
+
+    #[must_use]
+    pub fn worker(&self) -> &VerifiedWorker {
+        &self.worker
+    }
+
+    /// Whether a failed recheck invalidated this runtime.
+    #[must_use]
+    pub fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::SeqCst)
+    }
+
+    /// The per-spawn recheck (§4.5) and P6c, before any child, staging file
+    /// or output exists. A failure invalidates the runtime.
+    pub(crate) fn before_spawn(&self) -> Result<(), QueryError> {
+        if self.is_invalidated() {
+            return Err(QueryError::Unavailable("runtime.invalidated"));
+        }
+        let result = match &self.class {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Class::Ledger(verified) => verified
+                .recheck()
+                .map_err(QueryError::Unavailable)
+                .and_then(|()| launch_prerequisites()),
+            #[cfg(target_os = "macos")]
+            Class::MacosEvidence => Ok(()),
+            #[cfg(test)]
+            Class::Test(_) => Ok(()),
+            Class::Never(never) => match *never {},
+        };
+        if result.is_err() {
+            self.invalidated.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// The worker's command for `role` over `path`: the fixed environment
+    /// only, stdin and stdout piped, stderr `/dev/null`, no namespace flag.
+    pub(crate) fn command(
+        &self,
+        role: &str,
+        path: &Path,
+    ) -> Result<tokio::process::Command, QueryError> {
+        let mut command = worker_command(self.worker.path(), path, role)?;
+        command.env_clear().env("GQL_STMT_CACHE", "0");
+        #[cfg(target_os = "linux")]
+        command.env(
+            "GLIBC_TUNABLES",
+            super::protocol::worker::LINUX_WORKER_GLIBC_TUNABLES,
+        );
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        Ok(command)
+    }
+
+    /// Step 5 on the spawning thread, then the spawn, synchronously. On
+    /// Linux the spawning thread is the process-lifetime [`spawner`] thread
+    /// and the child dies with its parent. `called` is told of the real
+    /// spawn call: after step 5 passed, immediately before `spawn()`,
+    /// whether the kernel then refuses it or not.
+    pub(crate) fn spawn(
+        self: &Arc<Self>,
+        mut command: tokio::process::Command,
+        called: impl FnOnce() + Send + 'static,
+    ) -> Result<tokio::process::Child, QueryError> {
+        #[cfg(target_os = "linux")]
+        {
+            let runtime = Arc::clone(self);
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| QueryError::Unavailable("worker.spawner"))?;
+            spawner::run(move || {
+                let _entered = handle.enter();
+                super::parent_death::die_with_parent(&mut command);
+                guarded_spawn(|| runtime.step_five(), called, || command.spawn())
+            })
+            .ok_or(QueryError::Unavailable("worker.spawner"))?
+        }
+        #[cfg(not(target_os = "linux"))]
+        guarded_spawn(|| self.step_five(), called, || command.spawn())
+    }
+
+    /// Step 5 (the spawning thread's check) in the ledger class; a refusal
+    /// invalidates this runtime.
+    fn step_five(&self) -> Result<(), &'static str> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Class::Ledger(_) = &self.class {
+            if let Err(label) = super::ledger::spawning_thread() {
+                self.invalidated.store(true, Ordering::SeqCst);
+                return Err(label);
+            }
+        }
+        #[cfg(test)]
+        if let Class::Test(Some(step_five)) = &self.class {
+            return step_five();
+        }
+        Ok(())
+    }
+}
+
+/// The spawn's order, as one rule: `step_five`, then `called` (the real
+/// spawn call counted), then `spawn`. A refused step 5 never reaches the
+/// count or the call.
+fn guarded_spawn<T>(
+    step_five: impl FnOnce() -> Result<(), &'static str>,
+    called: impl FnOnce(),
+    spawn: impl FnOnce() -> std::io::Result<T>,
+) -> Result<T, QueryError> {
+    step_five().map_err(QueryError::Unavailable)?;
+    called();
+    spawn().map_err(|_| QueryError::Unavailable("worker.spawn"))
+}
+
+/// The one thread every Linux worker is spawned from. It lives as long as
+/// the process: a worker dies with its parent thread, so a spawn from a
+/// thread that may retire (a blocking-pool thread, a runtime's) would kill
+/// a healthy worker when that thread exits.
+///
+/// Invariant (review 623 F2): this thread's per-thread identity
+/// (credentials, `no_new_privs`, capabilities, Landlock, seccomp, signal
+/// mask) is fixed by the thread that makes the process's FIRST spawn, which
+/// starts it, and every worker inherits it. A restriction any other thread
+/// takes on later never reaches a worker. So agentd must make its first
+/// spawn only once its identity is final, and must never change a
+/// per-thread identity afterwards. Step 5 runs here, on the forking thread,
+/// so a worker never exceeds what step 5 saw.
+#[cfg(target_os = "linux")]
+mod spawner {
+    use std::sync::{mpsc, LazyLock};
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// The spawner thread's queue, the thread started by the first spawn
+    /// (inheriting that thread's credentials and `no_new_privs`, as threads
+    /// do); `None` when the thread could not start.
+    static JOBS: LazyLock<Option<mpsc::Sender<Job>>> = LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("keeper-graph-spawner".to_owned())
+            .spawn(move || {
+                for job in receiver {
+                    // A panicking job must not end the thread: every worker
+                    // it spawned would die with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+
+    /// `job`'s answer, run on the spawner thread; `None` when the thread
+    /// could not be started.
+    pub(super) fn run<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (answer, answered) = mpsc::sync_channel(1);
+        JOBS.as_ref()?
+            .send(Box::new(move || {
+                let _ = answer.send(job());
+            }))
+            .ok()?;
+        answered.recv().ok()
+    }
+}
+
+/// The largest inherited soft `RLIMIT_STACK` the worker's startup
+/// accounting admits.
+pub const MAX_INHERITED_STACK: u64 = 8 * 1024 * 1024;
+
+/// P6c: checked before every Linux worker spawn. The child inherits this
+/// process's soft stack limit and runs ld.so with this host's loader
+/// configuration; both are startup premises of the worker's accounting.
+#[cfg(target_os = "linux")]
+fn launch_prerequisites() -> Result<(), QueryError> {
+    let stack = rustix::process::getrlimit(rustix::process::Resource::Stack).current;
+    launch_decision(
+        stack,
+        std::fs::symlink_metadata("/etc/ld.so.preload").map(|_| ()),
+    )
+}
+
+/// The decision alone: a finite soft stack limit of at most 8 MiB (`None`
+/// is infinite), and `/etc/ld.so.preload` positively absent. Any other
+/// lookup outcome, a dangling symlink included, refuses.
+#[cfg(any(target_os = "linux", test))]
+fn launch_decision(
+    stack_soft: Option<u64>,
+    preload: std::io::Result<()>,
+) -> Result<(), QueryError> {
+    match stack_soft {
+        Some(limit) if limit <= MAX_INHERITED_STACK => {}
+        _ => return Err(QueryError::Unavailable("launch.stack")),
+    }
+    match preload {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(QueryError::Unavailable("launch.preload")),
+    }
+}
+
+fn worker_command(
+    worker: &Path,
+    path: &Path,
+    role: &str,
+) -> Result<tokio::process::Command, QueryError> {
+    #[cfg(target_os = "macos")]
+    {
+        // dyld's libignition opens exactly "/" as an openat root. SQLite also
+        // resolves ancestor metadata. Neither rule permits descendant file data.
+        const READ: &str = r#"(version 1)(deny default)(allow process-exec (literal (param "WORKER")))(allow file-read* (subpath "/System/Library") (subpath "/usr/lib") (literal (param "WORKER")) (literal (param "DB")) (literal "/dev/fd") (literal "/"))(allow file-read-metadata file-test-existence (path-ancestors (param "DB")) (path-ancestors (param "WORKER")))(allow sysctl-read)(deny process-fork)"#;
+        const BUILD: &str = r#"(version 1)(deny default)(allow process-exec (literal (param "WORKER")))(allow file-read* (subpath "/System/Library") (subpath "/usr/lib") (literal (param "WORKER")) (literal (param "DB")) (literal "/dev/fd") (literal "/"))(allow file-read-metadata file-test-existence (path-ancestors (param "DB")) (path-ancestors (param "WORKER")))(allow file-write* (literal (param "DB")))(allow sysctl-read)(deny process-fork)"#;
+        let path = path
+            .canonicalize()
+            .map_err(|_| QueryError::Storage("generation path"))?;
+        let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
+        command
+            .arg("-p")
+            .arg(if role == "build" { BUILD } else { READ })
+            .arg("-D")
+            .arg(format!("WORKER={}", worker.display()))
+            .arg("-D")
+            .arg(format!("DB={}", path.display()))
+            .arg(worker)
+            .arg(role)
+            .arg(path);
+        Ok(command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut command = tokio::process::Command::new(worker);
+        command.arg(role).arg(path);
+        Ok(command)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-C step 5 (review-rc-step5-freeze-inode): `spawn_calls` counts
+    /// only real spawn calls. A step 5 refusal reaches neither the count nor
+    /// the call; once step 5 passed the call is counted before it is made,
+    /// so a spawn the kernel refuses counts as one, as a successful one does.
+    #[test]
+    fn a_spawn_call_is_counted_only_after_step_five() {
+        use std::cell::Cell;
+        for (step, spawned, calls, made) in [
+            (Err("process.threads"), Ok(()), 0, false),
+            (Ok(()), Err(std::io::ErrorKind::PermissionDenied), 1, true),
+            (Ok(()), Ok(()), 1, true),
+        ] {
+            let (counted, called) = (Cell::new(0), Cell::new(false));
+            let result = guarded_spawn(
+                || step,
+                || counted.set(counted.get() + 1),
+                || {
+                    // The count is in before the kernel is asked.
+                    assert_eq!(counted.get(), 1);
+                    called.set(true);
+                    spawned.map_err(std::io::Error::from)
+                },
+            );
+            assert_eq!(
+                (counted.get(), called.get()),
+                (calls, made),
+                "{step:?} {spawned:?}"
+            );
+            match (step, spawned) {
+                (Err(label), _) => assert_eq!(result, Err(QueryError::Unavailable(label))),
+                (Ok(()), Err(_)) => {
+                    assert_eq!(result, Err(QueryError::Unavailable("worker.spawn")));
+                }
+                (Ok(()), Ok(())) => assert_eq!(result, Ok(())),
+            }
+        }
+    }
+
+    /// Review 623 F1: step 5 runs on the thread that forks, the spawner
+    /// thread, never on the thread that asked for the spawn: the worker
+    /// inherits the forking thread's identity, so that is the identity step
+    /// 5 must see. (Their identities can differ: a per-thread restriction
+    /// the asking thread took on never reaches the spawner.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn step_five_runs_on_the_thread_that_forks() {
+        use sha2::{Digest, Sha256};
+        use std::sync::Mutex;
+        // Any regular executable serves: only where step 5 runs is observed.
+        let program = std::fs::canonicalize("/bin/true").expect("an executable");
+        let digest: String = Sha256::digest(std::fs::read(&program).expect("its bytes"))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let runtime = Arc::new(Runtime::for_tests_with_step_five(
+            VerifiedWorker::open(&program, Some(&digest)).expect("verified"),
+            Some(Arc::new(move || {
+                record.lock().expect("seen").push(rustix::thread::gettid());
+                Ok(())
+            })),
+        ));
+        let handle = tokio::runtime::Handle::current();
+        let (asker, mut child) = std::thread::spawn(move || {
+            let _entered = handle.enter();
+            let command = runtime.command("query", Path::new("/")).expect("command");
+            let child = runtime.spawn(command, || {}).expect("spawned");
+            (rustix::thread::gettid(), child)
+        })
+        .join()
+        .expect("asked");
+        child.wait().await.expect("reaped");
+        let forker = spawner::run(rustix::thread::gettid).expect("the spawner thread");
+        assert_ne!(asker, forker);
+        assert_eq!(*seen.lock().expect("seen"), vec![forker]);
+    }
+
+    /// Q6 / OD-B / OD-C guard: only linux/x86_64 with an embedded ledger
+    /// may admit a worker; arm64 Linux, macOS without the explicit evidence
+    /// path and every other target are unavailable.
+    #[test]
+    fn only_the_agent_image_class_is_admitted() {
+        assert_eq!(class_decision("linux", "x86_64", true), Ok(()));
+        assert_eq!(
+            class_decision("linux", "x86_64", false),
+            Err("ledger.absent")
+        );
+        assert_eq!(
+            class_decision("linux", "aarch64", true),
+            Err("platform.target")
+        );
+        assert_eq!(
+            class_decision("macos", "aarch64", true),
+            Err("macos.evidence_only")
+        );
+        assert_eq!(
+            class_decision("ios", "aarch64", true),
+            Err("platform.unsupported")
+        );
+        assert_eq!(
+            class_decision("android", "aarch64", true),
+            Err("platform.unsupported")
+        );
+    }
+
+    /// `linux_without_ledger_unavailable`, `dev_host_not_admitted`: this
+    /// host's real worker digest, without a ledger or with one that does not
+    /// name this tree, never admits.
+    #[test]
+    fn a_dev_host_without_or_with_a_foreign_ledger_is_not_admitted() {
+        let exe = std::env::current_exe().expect("exe");
+        let mut hash = Sha256::new();
+        std::io::copy(&mut std::fs::File::open(&exe).expect("open"), &mut hash).expect("hash");
+        let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let worker = || VerifiedWorker::open(&exe, Some(&digest)).expect("verified");
+        assert!(matches!(
+            Runtime::admit(worker(), None),
+            Err(QueryError::Unavailable(_))
+        ));
+        assert!(matches!(
+            Runtime::admit(worker(), Some("{}")),
+            Err(QueryError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn a_wrong_digest_relative_path_or_absent_digest_refuses() {
+        let exe = std::env::current_exe().expect("exe");
+        assert!(matches!(
+            VerifiedWorker::open(&exe, Some(&"0".repeat(64))),
+            Err(QueryError::Unavailable("worker.digest"))
+        ));
+        assert!(matches!(
+            VerifiedWorker::open(&exe, None),
+            Err(QueryError::Unavailable("worker.digest"))
+        ));
+        assert!(matches!(
+            VerifiedWorker::open(
+                Path::new("target/release/keeper-graph-query"),
+                Some(&"0".repeat(64))
+            ),
+            Err(QueryError::Unavailable("worker.path"))
+        ));
+        let dotted = exe.parent().expect("dir").join("..").join("x");
+        assert!(matches!(
+            VerifiedWorker::open(&dotted, Some(&"0".repeat(64))),
+            Err(QueryError::Unavailable("worker.path"))
+        ));
+    }
+
+    #[test]
+    fn launch_is_refused_unless_the_stack_limit_is_finite_and_at_most_8_mib_and_no_preload_exists()
+    {
+        use std::io::{Error as IoError, ErrorKind};
+        let absent = || Err(IoError::from(ErrorKind::NotFound));
+        assert!(launch_decision(Some(MAX_INHERITED_STACK), absent()).is_ok());
+        assert!(launch_decision(Some(4096), absent()).is_ok());
+        for stack in [Some(MAX_INHERITED_STACK + 1), Some(u64::MAX), None] {
+            assert!(matches!(
+                launch_decision(stack, absent()),
+                Err(QueryError::Unavailable("launch.stack"))
+            ));
+        }
+        for preload in [
+            Ok(()),
+            Err(IoError::from(ErrorKind::PermissionDenied)),
+            Err(IoError::other("lookup failed")),
+        ] {
+            assert!(matches!(
+                launch_decision(Some(MAX_INHERITED_STACK), preload),
+                Err(QueryError::Unavailable("launch.preload"))
+            ));
+        }
+    }
+}

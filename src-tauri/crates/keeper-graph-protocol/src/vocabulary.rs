@@ -6,8 +6,16 @@ use crate::Refusal;
 use serde::{Deserialize, Serialize};
 
 /// The reserved node kinds, in the contract's order. `Tag` is a projected
-/// kind only: a tag is a `kg_tags` row, never a `kg_nodes` row.
-pub const RESERVED_KINDS: [&str; 5] = ["Concept", "Collection", "Resource", "Tag", "Guidance"];
+/// kind only: a tag is a `kg_tags` row, never a `kg_nodes` row. A
+/// `Vocabulary` node is one versioned definition ([`check_definition`]).
+pub const RESERVED_KINDS: [&str; 6] = [
+    "Concept",
+    "Collection",
+    "Resource",
+    "Tag",
+    "Guidance",
+    "Vocabulary",
+];
 /// The reserved relationship types. `HAS_TAG` is a projected type only: a
 /// tag membership is a `kg_node_tags` row, never a `kg_edges` row.
 pub const RESERVED_RELATIONS: [&str; 4] = ["HAS_TAG", "contains", "guidance_scope", "sources"];
@@ -27,6 +35,18 @@ pub const NODE_FIELDS: [&str; 9] = [
 pub const EDGE_FIELDS: [&str; 6] = ["id", "from_id", "to_id", "type", "lifecycle", "revision"];
 /// A projected Tag node's fields: its id and its canonical text.
 pub const TAG_FIELDS: [&str; 2] = ["id", "text"];
+/// Assertion metadata names (contract §3): no custom property may use one.
+/// They are stored in a node's reserved `$assertion` member
+/// ([`crate::assertion`]) and, from projection version 2, are structural
+/// keys of a node binding in `KG-Cypher/1` (null when absent).
+pub const ASSERTION_FIELDS: [&str; 6] = [
+    "generated_at",
+    "observed_at",
+    "verified_at",
+    "verified_by",
+    "stale_after",
+    "status",
+];
 /// The bytes a custom (namespaced) kind, type or property key may hold.
 pub const MAX_NAME_BYTES: usize = 256;
 
@@ -38,8 +58,8 @@ pub enum Lifecycle {
     Archived,
 }
 
-/// What an event operation changes. `content` and `review` are reserved for
-/// the stories that add their tables; schema 6 holds no row of either.
+/// What an event operation changes. `content` rows are `kg_contents`
+/// (schema 7); `review` is reserved for the story that adds its table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
@@ -133,8 +153,52 @@ pub fn stored_edge_type(kind: &str) -> Result<(), Refusal> {
 }
 
 /// Whether a custom property key would shadow a structural field of a node,
-/// an edge or a projected tag.
+/// an edge or a projected tag, or a reserved assertion field.
 #[must_use]
 pub fn is_structural_field(key: &str) -> bool {
-    NODE_FIELDS.contains(&key) || EDGE_FIELDS.contains(&key) || TAG_FIELDS.contains(&key)
+    NODE_FIELDS.contains(&key)
+        || EDGE_FIELDS.contains(&key)
+        || TAG_FIELDS.contains(&key)
+        || ASSERTION_FIELDS.contains(&key)
+}
+
+/// The reserved property member a `Vocabulary` node's definition lives in.
+pub const DEFINITION_MEMBER: &str = "$definition";
+/// What a definition defines.
+pub const DEFINITION_OF: [&str; 3] = ["kind", "relation", "property"];
+/// A definition's status: deprecation is metadata only.
+pub const DEFINITION_STATUS: [&str; 2] = ["active", "deprecated"];
+const DEFINITION_FIELDS: [&str; 6] = [
+    "defines",
+    "of",
+    "status",
+    "schema",
+    "index_hints",
+    "extensions",
+];
+
+/// Check a `$definition`'s own fields: `defines` a custom (namespaced)
+/// name, so no reserved name or structural field can be redefined or
+/// shadowed; `of` and `status` from their closed sets; `index_hints`, when
+/// present, an array and `extensions` an object. `schema`, `index_hints`
+/// and `extensions` are stored data, never executed: their values are
+/// checked as property values by [`crate::value`]. No uniqueness rule holds
+/// across definitions.
+pub fn check_definition(value: &serde_json::Value) -> Result<(), Refusal> {
+    use serde_json::Value;
+    let fields = value.as_object().ok_or(Refusal::InvalidChange)?;
+    let text = |key: &str| fields.get(key).and_then(Value::as_str);
+    let shaped = fields
+        .keys()
+        .all(|key| DEFINITION_FIELDS.contains(&key.as_str()))
+        && text("defines").is_some_and(is_custom_name)
+        && text("of").is_some_and(|of| DEFINITION_OF.contains(&of))
+        && text("status").is_some_and(|s| DEFINITION_STATUS.contains(&s))
+        && fields.get("index_hints").is_none_or(Value::is_array)
+        && fields.get("extensions").is_none_or(Value::is_object);
+    if shaped {
+        Ok(())
+    } else {
+        Err(Refusal::InvalidChange)
+    }
 }

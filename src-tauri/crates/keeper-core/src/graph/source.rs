@@ -37,6 +37,95 @@ pub trait GraphSource: Send + Sync {
     /// One snapshot: the head plus the events and operations with graph
     /// position in `(after, after + limit]`.
     fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError>;
+    /// The graph subscriptions' state now: whether the server grants this
+    /// replica the domain's graph, and the Syncular commit checkpoint they
+    /// have pulled to (a transport visibility bound, never graph order).
+    fn checkpoint(&self) -> Result<Checkpoint, SourceError>;
+}
+
+/// What the server answered this replica's graph subscriptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeState {
+    /// Every history subscription is active and holds the domain.
+    Granted,
+    /// The server revoked a history subscription.
+    Revoked,
+    /// A subscription has not completed its first pull yet.
+    Pending,
+}
+
+/// [`GraphSource::checkpoint`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub scope: ScopeState,
+    /// The lowest commit cursor of the history subscriptions, while granted.
+    pub cursor: Option<i64>,
+}
+
+/// The subscriptions a projection reads from: the events, their operations
+/// and the head.
+pub const HISTORY_TABLES: [&str; 3] = ["kg_events", "kg_event_ops", "kg_head"];
+
+/// The state of every history subscription of the replica: its table,
+/// status, cursor and whether its effective `kg_graph` scope holds `?1`.
+pub(crate) const SUBSCRIPTIONS: &str = "SELECT s.tbl AS tbl, \
+    json_extract(s.state_json, '$.status') AS status, \
+    json_extract(s.state_json, '$.cursor') AS cursor, \
+    EXISTS (SELECT 1 FROM json_each(json_extract(s.state_json, '$.effectiveScopes.kg_graph')) v \
+      WHERE v.value = ?1) AS holds \
+  FROM _syncular_subscriptions s WHERE s.tbl IN ('kg_events', 'kg_event_ops', 'kg_head')";
+
+/// The checkpoint of rows of [`SUBSCRIPTIONS`]: revoked when any history
+/// subscription is revoked (or no longer holds the domain once pulled),
+/// pending until each of the three is active with a cursor, granted with
+/// the lowest cursor otherwise.
+pub(crate) fn checkpoint_of(rows: &[Map<String, Value>]) -> Checkpoint {
+    let mut lowest: Option<i64> = None;
+    let mut pending = false;
+    for table in HISTORY_TABLES {
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get("tbl").and_then(Value::as_str) == Some(table))
+            .collect();
+        if mine.is_empty() {
+            pending = true;
+        }
+        for row in mine {
+            let status = row.get("status").and_then(Value::as_str);
+            let cursor = row.get("cursor").and_then(Value::as_i64);
+            let holds = matches!(row.get("holds"), Some(Value::Bool(true)))
+                || row.get("holds").and_then(Value::as_i64) == Some(1);
+            match (status, cursor) {
+                (Some("revoked"), _) => {
+                    return Checkpoint {
+                        scope: ScopeState::Revoked,
+                        cursor: None,
+                    }
+                }
+                (Some("active"), Some(c)) if c >= 0 => {
+                    if !holds {
+                        return Checkpoint {
+                            scope: ScopeState::Revoked,
+                            cursor: None,
+                        };
+                    }
+                    lowest = Some(lowest.map_or(c, |l| l.min(c)));
+                }
+                _ => pending = true,
+            }
+        }
+    }
+    if pending {
+        Checkpoint {
+            scope: ScopeState::Pending,
+            cursor: None,
+        }
+    } else {
+        Checkpoint {
+            scope: ScopeState::Granted,
+            cursor: lowest,
+        }
+    }
 }
 
 /// The most positions one [`Source`] batch reads, whatever is asked.
@@ -68,53 +157,137 @@ pub(crate) const BATCH: &str = "SELECT json_object(\
         WHERE graph = ?1 AND graph_seq IN (SELECT value FROM json_each(?2)))) o)\
   ) AS batch";
 
+/// One read of a replica's file: `sql` with `params`, its rows. keeper's is
+/// [`crate::hq::port::Replica::query`]; keeper-hq's is its own replica's
+/// fallible query channel. Both answer from the same Syncular tables.
+pub trait Query: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError> {}
+impl<F: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError>> Query for F {}
+
+/// [`GraphSource::checkpoint`] of `domain` over any replica `query`: the
+/// state of its history subscriptions ([`checkpoint_of`]).
+pub fn checkpoint_with(domain: &str, query: impl Query) -> Result<Checkpoint, SourceError> {
+    let rows = query(SUBSCRIPTIONS, &[Value::from(domain)])?;
+    Ok(checkpoint_of(&rows))
+}
+
+/// The status of every replica subscription on one of the tables `?1` (a
+/// JSON array of table names): its table and status.
+pub(crate) const TABLE_SUBSCRIPTIONS: &str = "SELECT s.tbl AS tbl, \
+    json_extract(s.state_json, '$.status') AS status \
+  FROM _syncular_subscriptions s WHERE s.tbl IN (SELECT value FROM json_each(?1))";
+
+/// How far a server scope revocation reached the replica's graph
+/// subscriptions (112.1 CC-7, CC-8): the Syncular client deletes a revoked
+/// subscription's scope rows in the transaction that records it revoked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Revocation {
+    /// No subscription of these tables is revoked.
+    None,
+    /// Some are revoked: a revocation signal, its purge not complete.
+    Partial,
+    /// Every one of these tables has a subscription, and every one is
+    /// revoked: their rows are purged.
+    Purged,
+}
+
+/// [`Revocation`] of the subscriptions of `tables` over any replica
+/// `query`. A table with no subscription is not purged (fail closed).
+pub fn revocation_with(tables: &[&str], query: impl Query) -> Result<Revocation, SourceError> {
+    let names =
+        serde_json::to_string(tables).map_err(|_| SourceError::Unreadable("tables".into()))?;
+    let rows = query(TABLE_SUBSCRIPTIONS, &[Value::from(names)])?;
+    Ok(revocation_of(tables, &rows))
+}
+
+/// [`Revocation`] of the rows of [`TABLE_SUBSCRIPTIONS`] for `tables`.
+pub(crate) fn revocation_of(tables: &[&str], rows: &[Map<String, Value>]) -> Revocation {
+    let revoked =
+        |row: &Map<String, Value>| row.get("status").and_then(Value::as_str) == Some("revoked");
+    if !rows.iter().any(revoked) {
+        return Revocation::None;
+    }
+    let purged = tables.iter().all(|table| {
+        let mine: Vec<_> = rows
+            .iter()
+            .filter(|row| row.get("tbl").and_then(Value::as_str) == Some(table))
+            .collect();
+        !mine.is_empty() && mine.into_iter().all(revoked)
+    });
+    if purged {
+        Revocation::Purged
+    } else {
+        Revocation::Partial
+    }
+}
+
+/// [`GraphSource::prefix_batch`] of `domain` over any replica `query`: one
+/// statement, so one snapshot, of the head and the events and operations
+/// at positions `after + 1 ..= after + limit` (at most
+/// [`MAX_BATCH_EVENTS`]).
+pub fn prefix_batch_with(
+    domain: &str,
+    after: u64,
+    limit: usize,
+    query: impl Query,
+) -> Result<PrefixBatch, SourceError> {
+    let limit = limit.min(MAX_BATCH_EVENTS);
+    let upto = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
+    let positions: Vec<String> = (after.saturating_add(1)..=upto)
+        .map(|n| n.to_string())
+        .collect();
+    let rows = query(
+        BATCH,
+        &[
+            Value::from(domain),
+            Value::from(serde_json::to_string(&positions).unwrap_or_default()),
+        ],
+    )?;
+    let unreadable = |what: &str| SourceError::Unreadable(what.to_owned());
+    let batch = rows
+        .into_iter()
+        .next()
+        .and_then(|mut row| row.remove("batch"))
+        .ok_or_else(|| unreadable("no batch"))?;
+    let batch: Value = match batch {
+        Value::String(text) => serde_json::from_str(&text).map_err(|_| unreadable("batch"))?,
+        other => other,
+    };
+    let head = match &batch["head"] {
+        Value::Null => None,
+        Value::String(seq) => Some(seq.parse().map_err(|_| unreadable("head"))?),
+        _ => return Err(unreadable("head")),
+    };
+    let rows = |key: &str| -> Result<Vec<Map<String, Value>>, SourceError> {
+        match &batch[key] {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_object().cloned().ok_or_else(|| unreadable(key)))
+                .collect(),
+            _ => Err(unreadable(key)),
+        }
+    };
+    Ok(PrefixBatch {
+        head,
+        events: rows("events")?,
+        ops: rows("ops")?,
+    })
+}
+
 impl GraphSource for Source {
     fn domain(&self) -> &str {
         &self.database
     }
 
+    fn checkpoint(&self) -> Result<Checkpoint, SourceError> {
+        checkpoint_with(&self.database, |sql, params| {
+            Ok(self.replica.query(sql, params)?)
+        })
+    }
+
     fn prefix_batch(&self, after: u64, limit: usize) -> Result<PrefixBatch, SourceError> {
-        let limit = limit.min(MAX_BATCH_EVENTS);
-        let upto = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
-        let positions: Vec<String> = (after.saturating_add(1)..=upto)
-            .map(|n| n.to_string())
-            .collect();
-        let rows = self.replica.query(
-            BATCH,
-            &[
-                Value::from(self.database.as_str()),
-                Value::from(serde_json::to_string(&positions).unwrap_or_default()),
-            ],
-        )?;
-        let unreadable = |what: &str| SourceError::Unreadable(what.to_owned());
-        let batch = rows
-            .into_iter()
-            .next()
-            .and_then(|mut row| row.remove("batch"))
-            .ok_or_else(|| unreadable("no batch"))?;
-        let batch: Value = match batch {
-            Value::String(text) => serde_json::from_str(&text).map_err(|_| unreadable("batch"))?,
-            other => other,
-        };
-        let head = match &batch["head"] {
-            Value::Null => None,
-            Value::String(seq) => Some(seq.parse().map_err(|_| unreadable("head"))?),
-            _ => return Err(unreadable("head")),
-        };
-        let rows = |key: &str| -> Result<Vec<Map<String, Value>>, SourceError> {
-            match &batch[key] {
-                Value::Null => Ok(Vec::new()),
-                Value::Array(items) => items
-                    .iter()
-                    .map(|item| item.as_object().cloned().ok_or_else(|| unreadable(key)))
-                    .collect(),
-                _ => Err(unreadable(key)),
-            }
-        };
-        Ok(PrefixBatch {
-            head,
-            events: rows("events")?,
-            ops: rows("ops")?,
+        prefix_batch_with(&self.database, after, limit, |sql, params| {
+            Ok(self.replica.query(sql, params)?)
         })
     }
 }

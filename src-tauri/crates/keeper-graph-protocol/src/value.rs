@@ -8,7 +8,9 @@
 //!
 //! A typed reference is the closed wrapper
 //! `{"$ref":{"entity_type":…,"id":…,"revision":…}}`; inside properties every
-//! other `$`-prefixed key is refused, so nothing can look like one.
+//! other `$`-prefixed key is refused, so nothing can look like one — except
+//! a node's reserved top-level members ([`RESERVED_MEMBERS`]), each checked
+//! under its own closed shape.
 
 use std::cell::Cell;
 use std::fmt;
@@ -245,15 +247,68 @@ pub fn typed_ref(value: &Value) -> Result<Option<TypedRef>, Refusal> {
     }))
 }
 
+/// The reserved top-level members of a **node's** `properties`, each with
+/// its own closed shape and kind rule ([`check_node_properties`]):
+/// `$definition` ([`crate::vocabulary::check_definition`]) is required on a
+/// `Vocabulary` node and refused on every other kind; `$assertion`
+/// ([`crate::assertion`]) may sit on any kind; `$locator`
+/// ([`crate::locator`]) on a `Resource` only. None is a query symbol.
+pub const RESERVED_MEMBERS: [&str; 3] = [
+    crate::vocabulary::DEFINITION_MEMBER,
+    crate::assertion::MEMBER,
+    crate::locator::MEMBER,
+];
+
 /// Check a node's or edge's `properties`: an object whose keys are custom
 /// property keys (never a structural field), nested at most
 /// [`MAX_PROPERTY_NESTING`], within [`MAX_PROPERTIES_BYTES`] canonical bytes,
 /// with numbers in range and every `$` key a well-formed typed reference.
+/// No reserved member is admitted: an edge never has one, and a node's are
+/// [`check_node_properties`]'.
 pub fn check_properties(properties: &Value) -> Result<(), Refusal> {
+    check_object(properties, false)
+}
+
+/// Check a node's `properties` as [`check_properties`] does, admitting the
+/// [`RESERVED_MEMBERS`] at the top level under their own shapes, and, when
+/// the node's `kind` is known, their kind rule.
+pub fn check_node_properties(kind: Option<&str>, properties: &Value) -> Result<(), Refusal> {
+    check_object(properties, true)?;
+    let Some(kind) = kind else {
+        return Ok(());
+    };
+    let has = |member: &str| properties.get(member).is_some();
+    let definition_ok = has(crate::vocabulary::DEFINITION_MEMBER) == (kind == "Vocabulary");
+    let locator_ok = !has(crate::locator::MEMBER) || kind == "Resource";
+    if definition_ok && locator_ok {
+        Ok(())
+    } else {
+        Err(Refusal::InvalidChange)
+    }
+}
+
+/// Whether `key` may be named by a node's `remove_properties`: a custom
+/// property key or a reserved member.
+#[must_use]
+pub fn node_property_key(key: &str) -> bool {
+    RESERVED_MEMBERS.contains(&key) || property_key(key)
+}
+
+/// Whether `key` is a custom property key: one [`check_properties`] admits.
+#[must_use]
+pub fn property_key(key: &str) -> bool {
+    !key.starts_with('$') && encode(SymbolKind::Property, key).is_ok()
+}
+
+fn check_object(properties: &Value, node: bool) -> Result<(), Refusal> {
     let Some(members) = properties.as_object() else {
         return Err(Refusal::InvalidChange);
     };
     for (key, member) in members {
+        if node && RESERVED_MEMBERS.contains(&key.as_str()) {
+            check_reserved(key, member)?;
+            continue;
+        }
         encode(SymbolKind::Property, key)?;
         if key.starts_with('$') {
             return Err(Refusal::InvalidChange);
@@ -262,6 +317,33 @@ pub fn check_properties(properties: &Value) -> Result<(), Refusal> {
     }
     if canonical(properties)?.len() > MAX_PROPERTIES_BYTES {
         return Err(Refusal::ChangeLimit);
+    }
+    Ok(())
+}
+
+/// One reserved member's shape. Its free-form parts (a definition's
+/// `schema`, `index_hints`, `extensions`; an envelope's `extensions`) are
+/// checked as property values, one level below the member.
+fn check_reserved(key: &str, member: &Value) -> Result<(), Refusal> {
+    let free: &[&str] = match key {
+        crate::vocabulary::DEFINITION_MEMBER => {
+            crate::vocabulary::check_definition(member)?;
+            &["schema", "index_hints", "extensions"]
+        }
+        crate::assertion::MEMBER => {
+            crate::assertion::check(member)?;
+            &[]
+        }
+        crate::locator::MEMBER => {
+            crate::locator::check(member)?;
+            &["extensions"]
+        }
+        _ => return Err(Refusal::InvalidChange),
+    };
+    for part in free {
+        if let Some(value) = member.get(*part) {
+            check_member(value, 3)?;
+        }
     }
     Ok(())
 }

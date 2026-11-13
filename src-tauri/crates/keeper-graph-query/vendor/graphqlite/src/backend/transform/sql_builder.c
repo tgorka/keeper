@@ -1,0 +1,1144 @@
+/*
+ * sql_builder.c
+ *    Dynamic buffer and SQL builder utilities for Cypher transformation
+ *
+ * This module provides a reusable growing string buffer (dynamic_buffer) that
+ * serves as the foundation for unified SQL generation.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
+#include "transform/sql_builder.h"
+#include "gql_thread_local.h"
+
+/*
+ * Ensure buffer has at least 'needed' bytes of additional capacity.
+ * Returns true on success, false on allocation failure.
+ */
+static bool dbuf_ensure_capacity(dynamic_buffer *buf, size_t needed)
+{
+    if (!buf) return false;
+
+    size_t required = buf->len + needed + 1; /* +1 for null terminator */
+
+    if (required <= buf->capacity) {
+        return true;
+    }
+
+    /* Calculate new capacity - double until sufficient */
+    size_t new_capacity = buf->capacity;
+    if (new_capacity == 0) {
+        new_capacity = DBUF_INITIAL_CAPACITY;
+    }
+    while (new_capacity < required) {
+        new_capacity *= 2;
+    }
+
+    char *new_data = realloc(buf->data, new_capacity);
+    if (!new_data) {
+        return false;
+    }
+
+    buf->data = new_data;
+    buf->capacity = new_capacity;
+    return true;
+}
+
+/*
+ * Initialize a dynamic buffer.
+ */
+void dbuf_init(dynamic_buffer *buf)
+{
+    if (!buf) return;
+
+    buf->data = NULL;
+    buf->len = 0;
+    buf->capacity = 0;
+}
+
+/*
+ * Free all memory associated with a dynamic buffer.
+ */
+void dbuf_free(dynamic_buffer *buf)
+{
+    if (!buf) return;
+
+    free(buf->data);
+    buf->data = NULL;
+    buf->len = 0;
+    buf->capacity = 0;
+}
+
+/*
+ * Clear buffer contents without freeing memory.
+ */
+void dbuf_clear(dynamic_buffer *buf)
+{
+    if (!buf) return;
+
+    buf->len = 0;
+    if (buf->data && buf->capacity > 0) {
+        buf->data[0] = '\0';
+    }
+}
+
+/*
+ * Append a string to the buffer.
+ */
+void dbuf_append(dynamic_buffer *buf, const char *str)
+{
+    if (!buf || !str) return;
+
+    size_t str_len = strlen(str);
+    if (str_len == 0) return;
+
+    if (!dbuf_ensure_capacity(buf, str_len)) {
+        return; /* Allocation failure - silently fail */
+    }
+
+    memcpy(buf->data + buf->len, str, str_len);
+    buf->len += str_len;
+    buf->data[buf->len] = '\0';
+}
+
+/*
+ * Append a single character to the buffer.
+ */
+void dbuf_append_char(dynamic_buffer *buf, char c)
+{
+    if (!buf) return;
+
+    if (!dbuf_ensure_capacity(buf, 1)) {
+        return; /* Allocation failure - silently fail */
+    }
+
+    buf->data[buf->len] = c;
+    buf->len++;
+    buf->data[buf->len] = '\0';
+}
+
+/*
+ * Escape a string for SQL by doubling single quotes.
+ * Returns a newly allocated string that must be freed by the caller.
+ * Returns NULL on allocation failure or if input is NULL.
+ */
+char *escape_sql_string(const char *str)
+{
+    if (!str) return NULL;
+
+    /* Count single quotes to determine output size */
+    size_t quote_count = 0;
+    size_t len = 0;
+    for (const char *p = str; *p; p++) {
+        if (*p == '\'') quote_count++;
+        len++;
+    }
+
+    /* Allocate output buffer: original length + extra quotes + null terminator */
+    char *result = malloc(len + quote_count + 1);
+    if (!result) return NULL;
+
+    /* Copy with escaping */
+    char *out = result;
+    for (const char *p = str; *p; p++) {
+        if (*p == '\'') {
+            *out++ = '\''; /* Double the quote */
+        }
+        *out++ = *p;
+    }
+    *out = '\0';
+
+    return result;
+}
+
+/* escape_sql_string into one of 16 per-thread buffers, for a key used inline
+ * in a printf-style SQL build (GQLITE-T-0414: some property keys reached SQL
+ * unescaped, so a key with an apostrophe broke the query). The result is
+ * valid until 16 later calls on the same thread. */
+const char *sql_esc_tmp(const char *s)
+{
+    static GQL_THREAD_LOCAL char *ring[16];
+    static GQL_THREAD_LOCAL int pos;
+    pos = (pos + 1) % 16;
+    free(ring[pos]);
+    ring[pos] = escape_sql_string(s ? s : "");
+    return ring[pos] ? ring[pos] : "";
+}
+
+/*
+ * Append formatted string using va_list.
+ */
+void dbuf_vappendf(dynamic_buffer *buf, const char *fmt, va_list args)
+{
+    if (!buf || !fmt) return;
+
+    /* First, determine the required size */
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = vsnprintf(NULL, 0, fmt, args_copy);
+    va_end(args_copy);
+
+    if (needed < 0) return; /* Format error */
+    if (needed == 0) return; /* Nothing to append */
+
+    if (!dbuf_ensure_capacity(buf, (size_t)needed)) {
+        return; /* Allocation failure - silently fail */
+    }
+
+    /* Now format into the buffer */
+    vsnprintf(buf->data + buf->len, (size_t)needed + 1, fmt, args);
+    buf->len += (size_t)needed;
+}
+
+/*
+ * Append formatted string to the buffer (printf-style).
+ */
+void dbuf_appendf(dynamic_buffer *buf, const char *fmt, ...)
+{
+    if (!buf || !fmt) return;
+
+    va_list args;
+    va_start(args, fmt);
+    dbuf_vappendf(buf, fmt, args);
+    va_end(args);
+}
+
+/*
+ * Finish building and return the owned string.
+ */
+char *dbuf_finish(dynamic_buffer *buf)
+{
+    if (!buf) return NULL;
+
+    if (buf->len == 0 || !buf->data) {
+        return NULL;
+    }
+
+    /* Take ownership of the buffer data */
+    char *result = buf->data;
+
+    /* Reset buffer without freeing the data */
+    buf->data = NULL;
+    buf->len = 0;
+    buf->capacity = 0;
+
+    return result;
+}
+
+/*
+ * Get current buffer contents without consuming.
+ */
+const char *dbuf_get(const dynamic_buffer *buf)
+{
+    if (!buf || buf->len == 0) return NULL;
+    return buf->data;
+}
+
+/*
+ * Get current buffer length.
+ */
+size_t dbuf_len(const dynamic_buffer *buf)
+{
+    if (!buf) return 0;
+    return buf->len;
+}
+
+/*
+ * Check if buffer is empty.
+ */
+bool dbuf_is_empty(const dynamic_buffer *buf)
+{
+    if (!buf) return true;
+    return buf->len == 0;
+}
+
+/*
+ * =============================================================================
+ * SQL Builder Implementation
+ * =============================================================================
+ */
+
+/*
+ * Create a new SQL builder.
+ */
+sql_builder *sql_builder_create(void)
+{
+    sql_builder *b = calloc(1, sizeof(sql_builder));
+    if (!b) return NULL;
+
+    dbuf_init(&b->pre_cte);
+    dbuf_init(&b->cte);
+    dbuf_init(&b->select);
+    dbuf_init(&b->from);
+    dbuf_init(&b->joins);
+    dbuf_init(&b->deferred_joins);
+    dbuf_init(&b->where);
+    dbuf_init(&b->group_by);
+    dbuf_init(&b->order_by);
+    dbuf_init(&b->raw_output);
+
+    b->limit = -1;
+    b->offset = -1;
+    b->select_count = 0;
+    b->cte_count = 0;
+    b->pre_cte_count = 0;
+    b->pre_cte_recursive = false;
+    b->where_count = 0;
+    b->group_count = 0;
+    b->order_count = 0;
+    b->finalized = false;
+
+    return b;
+}
+
+/*
+ * Free an SQL builder.
+ */
+void sql_builder_free(sql_builder *b)
+{
+    if (!b) return;
+
+    dbuf_free(&b->pre_cte);
+    dbuf_free(&b->cte);
+    dbuf_free(&b->select);
+    dbuf_free(&b->from);
+    dbuf_free(&b->joins);
+    dbuf_free(&b->deferred_joins);
+    dbuf_free(&b->where);
+    dbuf_free(&b->group_by);
+    dbuf_free(&b->order_by);
+    dbuf_free(&b->raw_output);
+    free(b->limit_expr);
+    free(b->offset_expr);
+
+    free(b);
+}
+
+/*
+ * Reset an SQL builder for reuse.
+ */
+void sql_builder_reset(sql_builder *b)
+{
+    if (!b) return;
+
+    dbuf_clear(&b->pre_cte);
+    dbuf_clear(&b->cte);
+    dbuf_clear(&b->select);
+    dbuf_clear(&b->from);
+    dbuf_clear(&b->joins);
+    dbuf_clear(&b->deferred_joins);
+    dbuf_clear(&b->where);
+    dbuf_clear(&b->group_by);
+    dbuf_clear(&b->order_by);
+    dbuf_clear(&b->raw_output);
+    free(b->limit_expr); b->limit_expr = NULL;
+    free(b->offset_expr); b->offset_expr = NULL;
+
+    b->limit = -1;
+    b->offset = -1;
+    b->select_count = 0;
+    b->cte_count = 0;
+    b->pre_cte_count = 0;
+    b->pre_cte_recursive = false;
+    b->where_count = 0;
+    b->group_count = 0;
+    b->order_count = 0;
+    b->finalized = false;
+    b->distinct = false;
+}
+
+/*
+ * Clear the finalized flag (I-0042 E1) so a subsequent call to
+ * sql_builder_to_string emits again. Use when state has been added
+ * after a previous finalize.
+ */
+void sql_builder_unfinalize(sql_builder *b)
+{
+    if (b) b->finalized = false;
+}
+
+/*
+ * Add a SELECT expression.
+ */
+void sql_select(sql_builder *b, const char *expr, const char *alias)
+{
+    if (!b || !expr) return;
+
+    if (b->select_count > 0) {
+        dbuf_append(&b->select, ", ");
+    }
+
+    dbuf_append(&b->select, expr);
+
+    if (alias && alias[0] != '\0') {
+        dbuf_appendf(&b->select, " AS %s", alias);
+    }
+
+    b->select_count++;
+}
+
+/*
+ * Set SELECT DISTINCT mode.
+ */
+void sql_distinct(sql_builder *b)
+{
+    if (!b) return;
+    b->distinct = true;
+}
+
+/*
+ * Set the FROM clause.
+ */
+void sql_from(sql_builder *b, const char *table, const char *alias)
+{
+    if (!b || !table) return;
+
+    dbuf_clear(&b->from);
+    dbuf_append(&b->from, table);
+
+    if (alias && alias[0] != '\0') {
+        dbuf_appendf(&b->from, " AS %s", alias);
+    }
+}
+
+
+/* Graph6 [6]: a leading OPTIONAL MATCH is one optional unit. It was built as
+ * `(SELECT 1) AS _gql_anchor LEFT JOIN nodes n ON .. LEFT JOIN edges e ON ..
+ * LEFT JOIN nodes m ON ..`, so a node with no matching edge made a row of its
+ * own. Regroup the joins as `LEFT JOIN (nodes n JOIN edges e ON .. JOIN nodes
+ * m ON ..) ON <first condition>`: a full match, or the one row of nulls.
+ * Only when the FROM is the anchor and there is more than one join. */
+static const char *scan_next_join(const char *p, const char *end, size_t *kwlen, bool *is_left)
+{
+    int depth = 0;
+    char quote = 0;
+    for (; p < end; p++) {
+        char c = *p;
+        if (quote) { if (c == quote) quote = 0; continue; }
+        if (c == '\'' || c == '"') { quote = c; continue; }
+        if (c == '(') { depth++; continue; }
+        if (c == ')') { depth--; continue; }
+        if (depth != 0 || c != ' ') continue;
+        if (strncmp(p, " LEFT JOIN ", 11) == 0) { *kwlen = 11; *is_left = true; return p; }
+        if (strncmp(p, " JOIN ", 6) == 0) { *kwlen = 6; *is_left = false; return p; }
+        if (strncmp(p, " CROSS JOIN ", 12) == 0) { *kwlen = 12; *is_left = false; return p; }
+    }
+    return NULL;
+}
+
+size_t sql_builder_joins_len(sql_builder *b)
+{
+    return b ? dbuf_len(&b->joins) : 0;
+}
+
+void sql_builder_group_anchor_joins(sql_builder *b)
+{
+    if (!b) return;
+    const char *from = dbuf_get(&b->from);
+    if (!from || strcmp(from, "(SELECT 1) AS _gql_anchor") != 0) return;
+    const char *j = dbuf_get(&b->joins);
+    if (!j || strncmp(j, " LEFT JOIN ", 11) != 0) return;
+    const char *end = j + strlen(j);
+    const char *tbl = j + 11;
+    const char *on = strstr(tbl, " ON ");
+    if (!on) return;
+    size_t kw = 0; bool left = false;
+    const char *next = scan_next_join(on + 4, end, &kw, &left);
+    if (!next) return;   /* one join: already a unit */
+
+    dynamic_buffer out;
+    dbuf_init(&out);
+    dbuf_append(&out, " LEFT JOIN (");
+    dbuf_appendf(&out, "%.*s", (int)(on - tbl), tbl);
+    const char *cur = next;
+    while (cur) {
+        const char *after = cur + kw;
+        size_t kw2 = 0; bool left2 = false;
+        const char *nxt = scan_next_join(after, end, &kw2, &left2);
+        const char *seg_end = nxt ? nxt : end;
+        /* inside the group every join is an inner join */
+        dbuf_append(&out, (kw == 12) ? " CROSS JOIN " : " JOIN ");
+        dbuf_appendf(&out, "%.*s", (int)(seg_end - after), after);
+        cur = nxt; kw = kw2;
+    }
+    dbuf_appendf(&out, ") ON %.*s", (int)(next - (on + 4)), on + 4);
+    dbuf_clear(&b->joins);
+    dbuf_append(&b->joins, dbuf_get(&out));
+    dbuf_free(&out);
+}
+
+/*
+ * Add raw JOIN SQL (appended verbatim to the JOIN section).
+ */
+void sql_join_raw(sql_builder *b, const char *raw_join_sql)
+{
+    if (!b || !raw_join_sql) return;
+    dbuf_append(&b->joins, raw_join_sql);
+}
+
+/*
+ * Deferred JOIN section (T-0268) — see sql_builder.h.
+ */
+void sql_join_deferred(sql_builder *b, const char *raw_join_sql)
+{
+    if (!b || !raw_join_sql) return;
+    dbuf_append(&b->deferred_joins, raw_join_sql);
+}
+
+const char *sql_builder_get_deferred_joins(sql_builder *b)
+{
+    if (!b || dbuf_is_empty(&b->deferred_joins)) {
+        return NULL;
+    }
+    return dbuf_get(&b->deferred_joins);
+}
+
+void sql_builder_clear_deferred_joins(sql_builder *b)
+{
+    if (!b) return;
+    dbuf_clear(&b->deferred_joins);
+}
+
+void sql_builder_flush_deferred_joins(sql_builder *b)
+{
+    if (!b || dbuf_is_empty(&b->deferred_joins)) return;
+    dbuf_append(&b->joins, dbuf_get(&b->deferred_joins));
+    dbuf_clear(&b->deferred_joins);
+}
+
+void sql_join_append_on(sql_builder *b, const char *condition)
+{
+    if (!b || !condition) return;
+    dbuf_appendf(&b->joins, " AND %s", condition);
+}
+
+/*
+ * Add a JOIN clause.
+ */
+void sql_join(sql_builder *b, sql_join_type type, const char *table,
+              const char *alias, const char *on_condition)
+{
+    if (!b || !table) return;
+
+    /* Add join keyword */
+    switch (type) {
+        case SQL_JOIN_INNER:
+            dbuf_append(&b->joins, " JOIN ");
+            break;
+        case SQL_JOIN_LEFT:
+            dbuf_append(&b->joins, " LEFT JOIN ");
+            break;
+        case SQL_JOIN_CROSS:
+            dbuf_append(&b->joins, " CROSS JOIN ");
+            break;
+    }
+
+    /* Add table */
+    dbuf_append(&b->joins, table);
+
+    /* Add alias */
+    if (alias && alias[0] != '\0') {
+        dbuf_appendf(&b->joins, " AS %s", alias);
+    }
+
+    /* Add ON condition (not for CROSS JOIN) */
+    if (type != SQL_JOIN_CROSS && on_condition && on_condition[0] != '\0') {
+        dbuf_appendf(&b->joins, " ON %s", on_condition);
+    }
+}
+
+/*
+ * Add a WHERE condition.
+ */
+void sql_where(sql_builder *b, const char *condition)
+{
+    if (!b || !condition) return;
+
+    if (b->where_count > 0) {
+        dbuf_append(&b->where, " AND ");
+    }
+
+    dbuf_append(&b->where, condition);
+    b->where_count++;
+}
+
+/*
+ * Add a GROUP BY expression.
+ */
+void sql_group_by(sql_builder *b, const char *expr)
+{
+    if (!b || !expr) return;
+
+    if (b->group_count > 0) {
+        dbuf_append(&b->group_by, ", ");
+    }
+
+    dbuf_append(&b->group_by, expr);
+    b->group_count++;
+}
+
+/*
+ * Add an ORDER BY expression.
+ */
+void sql_order_by(sql_builder *b, const char *expr, bool desc)
+{
+    if (!b || !expr) return;
+
+    if (b->order_count > 0) {
+        dbuf_append(&b->order_by, ", ");
+    }
+
+    /* Cypher orderability: sort first by type rank so mixed types order
+     * map<node<rel<list<path<string<bool<number<NaN<null (GQLITE-T-0340),
+     * then by the within-type key. `_gql_order_key` additionally makes
+     * time/datetime strings sort by UTC instant and lists sort by Cypher
+     * list semantics; pass-through for other types. */
+    const char *dir = desc ? " DESC" : "";
+    dbuf_append(&b->order_by, "_gql_order_rank(");
+    dbuf_append(&b->order_by, expr);
+    dbuf_append(&b->order_by, ")");
+    dbuf_append(&b->order_by, dir);
+    dbuf_append(&b->order_by, ", _gql_order_key(");
+    dbuf_append(&b->order_by, expr);
+    dbuf_append(&b->order_by, ")");
+    dbuf_append(&b->order_by, dir);
+
+    b->order_count++;
+}
+
+/*
+ * Set LIMIT and OFFSET.
+ */
+void sql_limit(sql_builder *b, int limit, int offset)
+{
+    if (!b) return;
+    b->limit = limit;
+    b->offset = offset;
+}
+
+void sql_limit_expr(sql_builder *b, const char *limit_expr, const char *offset_expr)
+{
+    if (!b) return;
+    if (limit_expr) {
+        free(b->limit_expr);
+        b->limit_expr = strdup(limit_expr);
+    }
+    if (offset_expr) {
+        free(b->offset_expr);
+        b->offset_expr = strdup(offset_expr);
+    }
+}
+
+/*
+ * Add a CTE (Common Table Expression).
+ */
+void sql_cte(sql_builder *b, const char *name, const char *query, bool recursive)
+{
+    if (!b || !name || !query) return;
+
+    if (b->cte_count == 0) {
+        /* First CTE - add WITH keyword */
+        if (recursive) {
+            dbuf_append(&b->cte, "WITH RECURSIVE ");
+        } else {
+            dbuf_append(&b->cte, "WITH ");
+        }
+    } else {
+        /* Additional CTE */
+        dbuf_append(&b->cte, ", ");
+    }
+
+    /* A CTE whose body calls a non-deterministic function (rand() ->
+     * RANDOM()) must be MATERIALIZED: SQLite otherwise treats a multiply-
+     * referenced CTE as a view and re-evaluates RANDOM() per reference, so a
+     * WITH-projected random list yields a DIFFERENT value at each use (e.g.
+     * none()/any() over it see different lists — Quantifier9/11/12). Gating on
+     * RANDOM() keeps recursive/UNWIND CTEs untouched. Non-recursive only
+     * (MATERIALIZED is invalid on a recursive CTE). */
+    bool materialize = !recursive && strstr(query, "RANDOM(") != NULL;
+    dbuf_appendf(&b->cte, "%s AS %s(%s)", name, materialize ? "MATERIALIZED " : "", query);
+    b->cte_count++;
+}
+
+/*
+ * Add a pre-CTE definition (T-0267). Pre-CTEs appear in the final SQL
+ * before any sql_cte() entries. Stored as raw "name AS (query)"
+ * fragments separated by ", " — sql_builder_to_string is responsible
+ * for emitting the WITH/WITH RECURSIVE keyword and merging with user
+ * CTEs into a single WITH clause.
+ */
+void sql_pre_cte(sql_builder *b, const char *name, const char *query, bool recursive)
+{
+    if (!b || !name || !query) return;
+
+    if (b->pre_cte_count > 0) {
+        dbuf_append(&b->pre_cte, ", ");
+    }
+    /* MATERIALIZED when the body is non-deterministic — see sql_cte(). */
+    bool materialize = !recursive && strstr(query, "RANDOM(") != NULL;
+    dbuf_appendf(&b->pre_cte, "%s AS %s(%s)", name, materialize ? "MATERIALIZED " : "", query);
+    b->pre_cte_count++;
+    if (recursive) b->pre_cte_recursive = true;
+}
+
+/*
+ * Append a printf-formatted fragment into raw_output. Emitted after
+ * the typed SELECT sections in sql_builder_to_string. (I-0039 Ext A.)
+ */
+void sql_raw(sql_builder *b, const char *fmt, ...)
+{
+    if (!b || !fmt) return;
+    va_list args;
+    va_start(args, fmt);
+    dbuf_vappendf(&b->raw_output, fmt, args);
+    va_end(args);
+}
+
+/*
+ * Build the final SQL string.
+ *
+ * NOTE: CTEs are NOT included here. They are handled separately by
+ * prepend_cte_to_sql() which runs at the end of transformation.
+ * This ensures CTEs are only added once and are preserved across
+ * multiple calls to sql_builder_to_string() during clause processing.
+ */
+char *sql_builder_to_string(sql_builder *b)
+{
+    if (!b) return NULL;
+
+    /* I-0042 E1: idempotent finalize. Once a builder has been
+     * serialized, subsequent calls return NULL until the builder is
+     * explicitly reset (sql_builder_reset). Callers that legitimately
+     * need to re-serialize after additional state changes must
+     * either:
+     *   1. call sql_builder_reset(b) and rebuild, or
+     *   2. call sql_builder_unfinalize(b) to clear the flag in place.
+     * This protects against accidental double-finalize that would
+     * append the same SQL twice into ctx->sql_buffer via
+     * finalize_sql_generation. */
+    if (b->finalized) {
+        return NULL;
+    }
+
+    /* T-0312 (E3): need at least SELECT items, FROM clause, OR raw_output
+     * content. Pure-DML queries (write-only: SET / DELETE / REMOVE /
+     * CREATE without RETURN) populate raw_output but never call
+     * sql_from / sql_select; previously their finalize would return
+     * NULL and fall back to the explicit drain shim in
+     * cypher_transform_query. Now sql_builder_to_string emits
+     * raw_output directly, removing the need for the shim. */
+    if (b->select_count == 0 && dbuf_is_empty(&b->from) &&
+        dbuf_is_empty(&b->raw_output)) {
+        return NULL;
+    }
+
+    /* T-0312 (E3): pure-DML path — no SELECT/FROM, only raw_output.
+     * Emit raw_output alone (no SELECT prefix) so prepare_v2 sees a
+     * valid DML statement. */
+    if (b->select_count == 0 && dbuf_is_empty(&b->from)) {
+        dynamic_buffer dml_only; dbuf_init(&dml_only);
+        const char *raw = dbuf_get(&b->raw_output);
+        /* Skip leading ws / stray ';' */
+        while (*raw == ' ' || *raw == '\t' || *raw == '\n' ||
+               *raw == '\r' || *raw == ';') raw++;
+        dbuf_append(&dml_only, raw);
+        b->finalized = true;
+        return dbuf_finish(&dml_only);
+    }
+
+    dynamic_buffer result;
+    dbuf_init(&result);
+
+    /* NOTE: CTEs (both pre_cte and cte) are intentionally NOT included
+     * here. They are emitted by prepend_cte_to_sql() at the end of
+     * transformation, which fuses pre_cte (T-0267) and the user CTE
+     * buffer into a single WITH clause. */
+
+    /* SELECT */
+    if (b->distinct) {
+        dbuf_append(&result, "SELECT DISTINCT ");
+    } else {
+        dbuf_append(&result, "SELECT ");
+    }
+    if (b->select_count > 0) {
+        dbuf_append(&result, dbuf_get(&b->select));
+    } else {
+        dbuf_append(&result, "*");
+    }
+
+    /* FROM (optional for standalone SELECT like "SELECT 1 + 2") */
+    if (!dbuf_is_empty(&b->from)) {
+        dbuf_append(&result, " FROM ");
+        dbuf_append(&result, dbuf_get(&b->from));
+
+        /* JOINs (only valid with FROM) */
+        if (!dbuf_is_empty(&b->joins)) {
+            dbuf_append(&result, dbuf_get(&b->joins));
+        }
+    }
+
+    /* WHERE */
+    if (!dbuf_is_empty(&b->where)) {
+        dbuf_append(&result, " WHERE ");
+        dbuf_append(&result, dbuf_get(&b->where));
+    }
+
+    /* GROUP BY */
+    if (!dbuf_is_empty(&b->group_by)) {
+        dbuf_append(&result, " GROUP BY ");
+        dbuf_append(&result, dbuf_get(&b->group_by));
+    }
+
+    /* ORDER BY */
+    if (!dbuf_is_empty(&b->order_by)) {
+        dbuf_append(&result, " ORDER BY ");
+        dbuf_append(&result, dbuf_get(&b->order_by));
+    }
+
+    /* LIMIT */
+    if (b->limit_expr) {
+        dbuf_appendf(&result, " LIMIT %s", b->limit_expr);
+    } else if (b->limit >= 0) {
+        dbuf_appendf(&result, " LIMIT %d", b->limit);
+    } else if (b->offset >= 0 || b->offset_expr) {
+        /* SQLite requires LIMIT before OFFSET - use -1 for unlimited */
+        dbuf_append(&result, " LIMIT -1");
+    }
+
+    /* OFFSET */
+    if (b->offset_expr) {
+        dbuf_appendf(&result, " OFFSET %s", b->offset_expr);
+    } else if (b->offset >= 0) {
+        dbuf_appendf(&result, " OFFSET %d", b->offset);
+    }
+
+    /* Raw-output appendage (I-0039 Extension A) — compound DML
+     * statements emitted by transform_set/delete/remove. Prefix with
+     * `; ` when both a SELECT body and raw DML are present so the two
+     * statements parse as separate sqlite3 statements (otherwise
+     * `... FROM tableINSERT INTO ...` is a syntax error). */
+    if (!dbuf_is_empty(&b->raw_output)) {
+        const char *raw = dbuf_get(&b->raw_output);
+        /* Skip leading whitespace to test the first meaningful char. */
+        const char *p = raw;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!dbuf_is_empty(&result) && *p != ';') {
+            dbuf_append(&result, "; ");
+        }
+        dbuf_append(&result, raw);
+    }
+
+    b->finalized = true;
+    return dbuf_finish(&result);
+}
+
+/*
+ * Build a subquery (SELECT/FROM/JOIN/WHERE) WITHOUT CTEs.
+ * Use this when the result will become the body of a new CTE.
+ * CTEs are NOT included - they should be preserved in the builder
+ * and merged with the parent query's CTEs later.
+ */
+char *sql_builder_to_subquery(sql_builder *b)
+{
+    if (!b) return NULL;
+
+    /* Need at least a FROM clause */
+    if (dbuf_is_empty(&b->from)) {
+        return NULL;
+    }
+
+    dynamic_buffer result;
+    dbuf_init(&result);
+
+    /* NOTE: CTEs are intentionally NOT included here.
+     * They will be handled separately by the caller. */
+
+    /* SELECT */
+    if (b->distinct) {
+        dbuf_append(&result, "SELECT DISTINCT ");
+    } else {
+        dbuf_append(&result, "SELECT ");
+    }
+    if (b->select_count > 0) {
+        dbuf_append(&result, dbuf_get(&b->select));
+    } else {
+        dbuf_append(&result, "*");
+    }
+
+    /* FROM */
+    dbuf_append(&result, " FROM ");
+    dbuf_append(&result, dbuf_get(&b->from));
+
+    /* JOINs */
+    if (!dbuf_is_empty(&b->joins)) {
+        dbuf_append(&result, dbuf_get(&b->joins));
+    }
+
+    /* WHERE */
+    if (!dbuf_is_empty(&b->where)) {
+        dbuf_append(&result, " WHERE ");
+        dbuf_append(&result, dbuf_get(&b->where));
+    }
+
+    /* GROUP BY */
+    if (!dbuf_is_empty(&b->group_by)) {
+        dbuf_append(&result, " GROUP BY ");
+        dbuf_append(&result, dbuf_get(&b->group_by));
+    }
+
+    /* ORDER BY */
+    if (!dbuf_is_empty(&b->order_by)) {
+        dbuf_append(&result, " ORDER BY ");
+        dbuf_append(&result, dbuf_get(&b->order_by));
+    }
+
+    /* LIMIT */
+    if (b->limit_expr) {
+        dbuf_appendf(&result, " LIMIT %s", b->limit_expr);
+    } else if (b->limit >= 0) {
+        dbuf_appendf(&result, " LIMIT %d", b->limit);
+    } else if (b->offset >= 0 || b->offset_expr) {
+        dbuf_append(&result, " LIMIT -1");
+    }
+
+    /* OFFSET */
+    if (b->offset_expr) {
+        dbuf_appendf(&result, " OFFSET %s", b->offset_expr);
+    } else if (b->offset >= 0) {
+        dbuf_appendf(&result, " OFFSET %d", b->offset);
+    }
+
+    return dbuf_finish(&result);
+}
+
+/*
+ * =============================================================================
+ * Builder State Extraction Functions
+ * =============================================================================
+ * These functions allow reading builder state without generating full SQL.
+ * Used by WITH/UNWIND to extract FROM/JOIN/WHERE for CTE construction.
+ */
+
+/*
+ * Get the FROM clause content (table and alias).
+ * Returns NULL if no FROM clause set.
+ */
+const char *sql_builder_get_from(sql_builder *b)
+{
+    if (!b || dbuf_is_empty(&b->from)) {
+        return NULL;
+    }
+    return dbuf_get(&b->from);
+}
+
+/*
+ * Get the JOIN clauses content.
+ * Returns NULL if no JOINs added.
+ */
+const char *sql_builder_get_joins(sql_builder *b)
+{
+    if (!b || dbuf_is_empty(&b->joins)) {
+        return NULL;
+    }
+    return dbuf_get(&b->joins);
+}
+
+/*
+ * Get the WHERE clause content (conditions only, no "WHERE" keyword).
+ * Returns NULL if no WHERE conditions.
+ */
+const char *sql_builder_get_where(sql_builder *b)
+{
+    if (!b || dbuf_is_empty(&b->where)) {
+        return NULL;
+    }
+    return dbuf_get(&b->where);
+}
+
+/*
+ * Get the GROUP BY clause content.
+ * Returns NULL if no GROUP BY.
+ */
+const char *sql_builder_get_group_by(sql_builder *b)
+{
+    if (!b || dbuf_is_empty(&b->group_by)) {
+        return NULL;
+    }
+    return dbuf_get(&b->group_by);
+}
+
+/*
+ * Check if the builder has any FROM clause content.
+ */
+bool sql_builder_has_from(sql_builder *b)
+{
+    return b && !dbuf_is_empty(&b->from);
+}
+
+/*
+ * =============================================================================
+ * Write Builder Implementation
+ * =============================================================================
+ * Builds INSERT, UPDATE, DELETE statements for WRITE clauses.
+ */
+
+/*
+ * Create a new write builder.
+ */
+write_builder *write_builder_create(void)
+{
+    write_builder *wb = calloc(1, sizeof(write_builder));
+    if (!wb) return NULL;
+
+    dbuf_init(&wb->statement);
+    wb->statement_count = 0;
+
+    return wb;
+}
+
+/*
+ * Free a write builder and all associated memory.
+ */
+void write_builder_free(write_builder *wb)
+{
+    if (!wb) return;
+
+    dbuf_free(&wb->statement);
+    free(wb);
+}
+
+/*
+ * Reset a write builder for reuse.
+ */
+void write_builder_reset(write_builder *wb)
+{
+    if (!wb) return;
+
+    dbuf_clear(&wb->statement);
+    wb->statement_count = 0;
+}
+
+/*
+ * Helper to add statement separator if needed.
+ */
+static void write_add_separator(write_builder *wb)
+{
+    if (!wb) return;
+
+    if (wb->statement_count > 0) {
+        dbuf_append(&wb->statement, "; ");
+    }
+}
+
+/*
+ * Helper to get INSERT keyword with mode.
+ */
+static const char *get_insert_keyword(sql_insert_mode mode)
+{
+    switch (mode) {
+        case SQL_INSERT_OR_REPLACE:
+            return "INSERT OR REPLACE INTO ";
+        case SQL_INSERT_OR_IGNORE:
+            return "INSERT OR IGNORE INTO ";
+        case SQL_INSERT_NORMAL:
+        default:
+            return "INSERT INTO ";
+    }
+}
+
+/*
+ * Add an INSERT statement with literal VALUES.
+ */
+void write_insert_values(write_builder *wb, sql_insert_mode mode,
+                         const char *table, const char *columns, const char *values)
+{
+    if (!wb || !table || !columns || !values) return;
+
+    write_add_separator(wb);
+
+    dbuf_append(&wb->statement, get_insert_keyword(mode));
+    dbuf_append(&wb->statement, table);
+    dbuf_appendf(&wb->statement, " (%s) VALUES (%s)", columns, values);
+
+    wb->statement_count++;
+}
+
+/*
+ * Add an INSERT ... SELECT statement.
+ */
+void write_insert_select(write_builder *wb, sql_insert_mode mode,
+                         const char *table, const char *columns, const char *select_sql)
+{
+    if (!wb || !table || !columns || !select_sql) return;
+
+    write_add_separator(wb);
+
+    dbuf_append(&wb->statement, get_insert_keyword(mode));
+    dbuf_append(&wb->statement, table);
+    dbuf_appendf(&wb->statement, " (%s) %s", columns, select_sql);
+
+    wb->statement_count++;
+}
+
+/*
+ * Add a DELETE statement.
+ */
+void write_delete(write_builder *wb, const char *table, const char *where_condition)
+{
+    if (!wb || !table) return;
+
+    write_add_separator(wb);
+
+    dbuf_appendf(&wb->statement, "DELETE FROM %s", table);
+
+    if (where_condition && where_condition[0] != '\0') {
+        dbuf_appendf(&wb->statement, " WHERE %s", where_condition);
+    }
+
+    wb->statement_count++;
+}
+
+/*
+ * Add a DELETE with subquery.
+ */
+void write_delete_where_in(write_builder *wb, const char *table,
+                           const char *id_column, const char *subquery)
+{
+    if (!wb || !table || !id_column || !subquery) return;
+
+    write_add_separator(wb);
+
+    dbuf_appendf(&wb->statement, "DELETE FROM %s WHERE %s IN (%s)",
+                 table, id_column, subquery);
+
+    wb->statement_count++;
+}
+
+/*
+ * Add a raw SQL statement.
+ */
+void write_raw(write_builder *wb, const char *sql)
+{
+    if (!wb || !sql) return;
+
+    write_add_separator(wb);
+    dbuf_append(&wb->statement, sql);
+    wb->statement_count++;
+}
+
+/*
+ * Build the final SQL string.
+ */
+char *write_builder_to_string(write_builder *wb)
+{
+    if (!wb) return NULL;
+
+    if (wb->statement_count == 0 || dbuf_is_empty(&wb->statement)) {
+        return NULL;
+    }
+
+    return dbuf_finish(&wb->statement);
+}

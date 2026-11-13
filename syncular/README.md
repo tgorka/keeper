@@ -61,6 +61,24 @@ through 5 beside it with the graph tables omitted from their projections (and sc
 graph rules below; only then may a schema-6 keeper ship. A server that has migrated to schema 6
 is never rolled back to a binary that predates it.
 
+### Schema 7 release prerequisite
+
+Schema 7 adds `kg_contents` and two indexes (`kg_contents_owner`, `kg_edges_from_active`) and
+nothing else; 0006 is unchanged. The server serves schemas 3 through 6 beside it with
+`kg_contents` omitted. A keeper whose graph worker reads projection version 2 ships with or
+before the server release that first accepts a content operation or a reserved `$` member: a
+version-1 worker answers `unsupported_version` (fails closed) on such an event until it is
+upgraded.
+
+### Schema 8 release prerequisite
+
+Schema 8 (`0008_knowledge_graph_review`) adds `kg_proposals`, `kg_reviews` and the bounded
+owner read index `kg_contents_owner_id`, and nothing else; 0006 and 0007 are unchanged. The
+server serves schemas 3 through 7 beside it with `kg_proposals` and `kg_reviews` omitted (and
+`kg_contents` below 7, as before). A keeper whose graph worker reads projection version 3 ships
+with or before the server release that first accepts a review or a reversal event: a version-2
+worker refuses a `review` operation (fails closed) until it is upgraded.
+
 
 ## Scopes
 
@@ -80,8 +98,9 @@ request a single variable alone, so a wildcard would be a public read of every t
 | `agent` | an agent's actor id | the agents of this database that serve the person | itself | `agent_memory` |
 | `family` | a family name | the families of this database that serve the person | its own family | `agent_memory` |
 | `person_agent` | a person-agent key (*Ids*) | the key of (itself, agent) for each agent of this database that serves the person | the key of (person, itself) for each person of this database it serves | `standing_grants` |
-| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags` |
+| `kg_graph` | the name of the database (its graph's domain) | only under an explicit graph-read policy for that database; membership alone grants none | only under an explicit graph-read policy for the instance; reaching a session's model takes an admitted context as well | `kg_events`, `kg_event_ops`, `kg_head`, `kg_nodes`, `kg_edges`, `kg_tags`, `kg_node_tags`, `kg_contents`, `kg_reviews` |
 | `kg_client` | a client scope (*Ids*) | its own (actor, client) | its own (actor, client) | `kg_receipts` |
+| `kg_proposal` | a proposer's actor id | itself | itself | `kg_proposals` |
 
 A member who is not a reader receives a session's messages and its streamed text, and never its
 reasoning, tool calls (with their arguments and results) or approvals: those live only under
@@ -497,17 +516,60 @@ structural field (below) and never start with `$`, except the typed reference
 `{"$ref": {"entity_type": "node" | "content", "id": <ULID>, "revision": <decimal> | null}}`
 (`resource_revision` and `blob` are reserved and refused until storage implements them).
 
-**Vocabulary.** The reserved node kinds are `Concept`, `Collection`, `Resource`, `Tag` and
-`Guidance`; the reserved relationship types `HAS_TAG`, `contains`, `guidance_scope` and `sources`.
+**Vocabulary.** The reserved node kinds are `Concept`, `Collection`, `Resource`, `Tag`,
+`Guidance` and `Vocabulary`; the reserved relationship types `HAS_TAG`, `contains`,
+`guidance_scope` and `sources`.
 A tag is a `kg_tags` row and a tag membership a `kg_node_tags` row, so `Tag` and `HAS_TAG` are
 never a node's kind or an edge's type; they are how a query sees tags. Any other kind or type is
 a custom name, `<namespace>:<name>`, which can therefore never spell a reserved one. A node's
 structural fields are `id`, `kind`, `title`, `description`, `description_source_id`,
 `lifecycle`, `lifecycle_revision`, `revision` and `merged_into_id`; an edge's `id`, `from_id`,
-`to_id`, `type`, `lifecycle` and `revision`; a tag's `id` and `text`. A tag's `text` is the
-canonical form keeper's tag policy gives (`tags` in the vectors). In the query profile
-`KG-Cypher/1` a reserved name is its own symbol, and a custom kind, relationship type or
-property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes.
+`to_id`, `type`, `lifecycle` and `revision`; a tag's `id` and `text`. The assertion names
+`generated_at`, `observed_at`, `verified_at`, `verified_by`, `stale_after` and `status` are
+reserved: no property may use them (`vocabulary.assertion_fields` in the vectors). A tag's
+`text` is the canonical form keeper's tag policy gives (`tags` in the vectors). In the query
+profile `KG-Cypher/1` a reserved name is its own symbol, and a custom kind, relationship type or
+property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes; a `$`-prefixed
+name never is.
+
+**Reserved members** (story 111.1). A node's `properties` may hold, at the top level only, three
+members each with its own closed shape (`node_properties[]` and `locators[]` in the vectors);
+an edge's never does, and no member is a query symbol:
+
+- `$definition` — required on a `Vocabulary` node and refused on every other kind:
+  `{defines: <namespace>:<name>, of: kind|relation|property, status: active|deprecated,
+  schema?, index_hints?, extensions?}`. A definition is versioned by its node's revision;
+  deprecation is metadata only (entities of a deprecated kind stay readable and writable); its
+  `schema` and `index_hints` are stored data, never executed; unknown `extensions` are kept
+  byte-exact. No uniqueness rule holds across definitions.
+- `$assertion` — exactly `{generated_at, observed_at, verified_at, verified_by, stale_after,
+  status}`: times are integer ms or null, `status` `unverified` or `verified`, and
+  `verified_at`/`verified_by` are set exactly when `verified`. A written one is always
+  `unverified`: only `verify_assertion` verifies (*Changes*). From projection version 2 the six
+  fields are structural keys of a node binding (null when absent).
+- `$locator` — a `Resource` only: `{kind: internal|git|s3|relational|https|ssh_fs|local_fs,
+  management: managed|external, locator, selector, version, format, capabilities?,
+  credential_ref?, extensions?}`. `locator`, `selector` and `credential_ref` are admitted only
+  when they match an allowlist grammar; everything else is refused before anything is stored.
+  A **URL** (the text holds `://` or starts with `//`) is printable ASCII, its scheme one of
+  `https`, `git`, `ssh`, `sftp`, `s3`, `postgres`, `postgresql`, `file` (any case), its
+  authority exactly `host[:port]` (no `@` at all, no `%`; a host of unreserved characters or a
+  bracketed IPv6 literal; empty only for `file`), its query and fragment free of `@`, and every
+  `&`/`;` query or fragment key, decoded once, of unreserved characters and, ASCII-folded, neither
+  a credential parameter (`token`, `access_token`, `password`, `secret`, `sig`, `signature`, the
+  four `x-amz-*`/`x-goog-*` signatures, `pwd`, `passwd`, `sslpassword`) nor named like a
+  credential. Otherwise a text holding `=` is a **libpq keyword DSN**, tokenised as libpq does
+  (spaces around `=`, quoted values, backslash escapes) but stricter: printable ASCII, keys only
+  `host`, `hostaddr`, `port`, `dbname`, `user`, `passfile`, `sslmode`, `application_name` (exact,
+  no repeats), a space or the end after every value (libpq also takes a key straight after a
+  closing quote), and unescaped values of unreserved characters, `/`, `:`, `+`, `,` and spaces.
+  Anything else is a **plain reference** (`/srv/a.md`, `host:/srv/notes`, `keeper:drive/notes`):
+  unreserved characters, `/`, `:`, `+`, `,`, and no `//`, so a path with a space or non-ASCII is
+  refused. Any object key named like a credential is refused too. `scripts/check-locator-parsers.py`
+  holds every `locators[]` vector to libpq's `PQconninfoParse` and Node's `URL`: an admitted vector
+  yields no credential in either, and each pinned bypass vector does. `credential_ref` is an
+  opaque handle that grants nothing, `capabilities` are observations, and no resolver is
+  implemented. An envelope is read through `graph.get_node`, never queried.
 
 **Tables.** Ids are ULIDs; revisions and graph sequences are decimal strings the server assigns.
 
@@ -520,7 +582,7 @@ property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes.
   `reverses_event_id`, `event_time_ms` (the source's time, or null), `recorded_at_ms`, `op_count`
   and `delta_digest`. Never changed or deleted.
 - **`kg_event_ops`** — its operations, `id` `<event_id>/<ordinal>`: `ordinal` (0 to
-  `op_count` − 1), `entity_type` (`node` | `edge` | `tag` | `node_tag`; `content` and `review` are
+  `op_count` − 1), `entity_type` (`node` | `edge` | `tag` | `node_tag` | `content`; `review` is
   reserved), `entity_id`, `operation` (`create` | `update` | `archive` | `unarchive` | `remove`,
   the last only of a `node_tag`), `before_revision`, `after_revision`, `before_value`,
   `after_value`. An event's `delta_digest` is the SHA-256 of the canonical bytes of the array of
@@ -537,6 +599,16 @@ property is `K_`, `R_` or `P_` followed by the lowercase hex of its UTF-8 bytes.
   `created_event_id`, `updated_event_id`.
 - **`kg_node_tags`** — `node_id`, `tag_id`, `created_event_id`; the one graph row ever deleted,
   by a `remove` operation.
+- **`kg_contents`** (schema 7) — `owner_node_id` (fixed for good), `revision`, `body`,
+  `created_event_id`, `updated_event_id`. A content has no lifecycle: its owner node's governs it.
+- **`kg_proposals`** (schema 8) — one immutable proposal revision, `id`
+  `<proposal_id>/<revision>`: `status` (`open` | `approved` | `rejected` | `expired` |
+  `superseded`), `reason`, `digest`, `change` (the `graph.apply` payload), `reviewers`,
+  `expires_at_ms`, the proposer's actor, client, context, origin and source labels, and the
+  decision's time, person and event. Private: synced to its proposer only; never replayed.
+- **`kg_reviews`** (schema 8) — one review of an accepted event, equal to its `review`
+  operation's after-image: `target_event_id`, `target_delta_digest`, `kind` (`acknowledgement` |
+  `reversal`), `reviewer_actor`, `revision` `1`, `created_event_id`. Never updated or deleted.
 - **`kg_receipts`** — the outcome of one request, `id` `<descriptor>/<request_id>/<client_scope>`:
   `descriptor`, `request_id`, `request_digest`, `outcome` (`accepted` | `proposed` | `conflict` |
   `rejected`; never `pending`), `reason` (a `rejected` receipt's stable code), `event_id` and
@@ -567,12 +639,16 @@ marked `?`:
 | `op` | members |
 | --- | --- |
 | `create_node` | `id`, `kind`, `title` (non-empty), `description` (string or null), `properties` |
-| `update_node` | `id`, `expected_revision`, `set`? (`{title?, description?}`), `set_properties`?, `remove_properties`? (at least one; none empty) |
+| `update_node` | `id`, `expected_revision`, `set`? (`{title?, description?, description_source?}`), `set_properties`?, `remove_properties`? (at least one; none empty) |
 | `archive_node`, `unarchive_node` | `id`, `expected_revision` |
 | `create_edge` | `id`, `from_id`, `to_id`, `type`, `properties`, `from_lifecycle_revision`, `to_lifecycle_revision` |
 | `update_edge` | `id`, `expected_revision`, `set_properties`?, `remove_properties`? (at least one), `from_lifecycle_revision`, `to_lifecycle_revision` |
 | `archive_edge`, `unarchive_edge` | `id`, `expected_revision`, `from_lifecycle_revision`, `to_lifecycle_revision` |
 | `add_tag`, `remove_tag` | `node_id`, `tag`, `expected_revision` |
+| `merge_nodes` | `target_id`, `target_revision`, `absorbed` `[{id, expected_revision}]` (at least one), `edges` `[{id, expected_revision, from_lifecycle_revision, to_lifecycle_revision}]` |
+| `create_content` | `id`, `owner_node_id`, `body` |
+| `update_content` | `id`, `owner_node_id`, `expected_revision`, `body` |
+| `verify_assertion` | `id`, `expected_revision`, `sources` `[{edge_id, edge_revision, ref_id, ref_revision}]` (at most 64), `contents` `[{id, revision}]` (at most 64) |
 
 The caller mints the ids of the nodes and edges it creates; a node's `kind` is fixed at creation.
 A tag is named by its text, made canonical by keeper's tag policy (`tags` in the vectors); the
@@ -583,6 +659,12 @@ memberships their ids. Every precondition is the accepted state before the chang
 means the node is created by an earlier operation of the same change. `approval_id` is the
 approval an agent acts under; the server derives every attribution. `event_time_ms` is the
 source's time.
+
+`description_source` names where a *generated* description comes from — a content of the same
+node or a node carrying `$assertion` — and is set only together with a non-null `description`;
+setting `description` without it makes the description authored and clears the provenance. A
+`merge_nodes` or `verify_assertion` is the only operation of its change naming anything it names,
+and a change holds at most one merge (`absorbed` and `edges` together at most 128).
 
 A change with more than one create or explicit field/lifecycle operation for one entity, the same
 canonical tag membership changed twice, a key both set and removed, a reference (an edge
@@ -598,8 +680,8 @@ it is then, the first failure deciding:
    archiving what is archived, unarchiving what is active (or merged), removing a property or
    membership that is absent and adding a membership that exists are `invalid_change`; a node's
    or edge's final `properties` must still obey *Values*;
-2. every typed reference written must name a node of the final graph at a revision it has had
-   (a `content` reference refuses until content exists);
+2. every typed reference written must name a node or content of the final graph at a revision
+   it has had;
 3. an edge this change creates, unarchives or updates and leaves active needs both endpoints
    active in the final graph, so an edge to an archived node is accepted only when the same
    change unarchives it; a `guidance_scope` edge must start at a `Guidance` node;
@@ -609,7 +691,50 @@ it is then, the first failure deciding:
    change's walks together, it is `change_limit`, and a level with an edge from `C` (or `P` =
    `C`) is `invalid_change`. A level is read with a limit of one edge more than the budget still
    allows, never whole. Other relationship types may form cycles;
-5. the event must fit its bounds (*Tables*), before-images included: `change_limit`.
+5. the final graph's own rules: every node written keeps its reserved members within its kind's
+   rules; a description source resolves as above; a content's owner exists and a reference body
+   names a `Resource`; and the verification rules below;
+6. the event must fit its bounds (*Tables*), before-images included: `change_limit`.
+
+**Merge.** `merge_nodes` absorbs nodes into an active, unmerged target: the target at
+`target_revision`, each absorbed node active at its revision, and `edges` exactly the active
+edges incident to any absorbed node, each under its `update_edge` preconditions taken from the
+pre-merge endpoints — any difference is a `conflict`, so a dependency added or changed since the
+read refuses with no effect. It expands, before the final checks, into one node `archive` per
+absorbed node (`merged_into_id` the target, revision and lifecycle revision +1) and then one edge
+`update` per listed edge (each absorbed endpoint rewritten to the target, same id, revision +1),
+each with whole before- and after-images. Parallel edges keep their ids; archived incident edges,
+tag memberships, contents and typed references stay with the absorbed node. `invalid_change`: a
+`Guidance` or `Vocabulary` node, or one carrying `$assertion`, as target or absorbed; a rewritten
+`guidance_scope` edge (a scope edge is retargeted only by archive and create); a rewrite that
+would make a self-loop; a redirect cycle. A redirect chain longer than 8 hops is `change_limit`,
+walked over `merged_into_id` with bounded reads. Rewritten `contains` edges are walked for
+cycles like created ones. No operation clears `merged_into_id`: an unarchive of a merged node is
+refused, and an `update_edge` never moves an endpoint.
+
+**Verification.** `verify_assertion` (a person's alone; the server refuses it to an agent) is
+accepted only against the exact state the person checked, read from the pre-change graph: the
+node at `expected_revision`, active and carrying `$assertion`; `sources` exactly its active
+outgoing `sources` edges (read through `kg_edges_from_active`), each at its revision, its one
+top-level typed-reference property naming `ref_id` — the edge's `to_id` node, or a content that
+node owns — at `ref_revision`, which is that entity's current revision; and `contents` exactly
+the contents it owns (through `kg_contents_owner`), each at its revision. A difference is a
+`conflict`. No active `sources` edge, a reference that is absent, null-revisioned or does not
+resolve, an archived node or source target is `invalid_change`; more than 64 of either is
+`change_limit`, read with a limit of 65. It writes one node `update` whose after-image differs
+only in `status: verified`, `verified_at` (the server's acceptance time) and `verified_by` (the
+authenticated person), never taken from the payload. A change may verify several assertions
+(disjoint, since each locks what it names); each ends `verified`. A change that verifies may not
+write any node or content one of its checked `sources` references — another assertion it
+verifies included — because that verification would be stale on acceptance: `invalid_change`.
+After it, every other write to a node
+verified before the change — an update of any kind, a tag, an archive or unarchive — leaves it
+`unverified` with null `verified_*` in that same operation, and a change to its `sources` edges
+or contents is refused unless the same change holds an `update_node` of it; the content keeps its
+own revision, and the node is never bumped on its behalf. Whether a verification is still
+current is read, never written: it is, while the node is active and verified, it has 1 to 64
+active `sources` edges, and every reference's revision is the referenced entity's current one
+(`assertion_currency[]` in the vectors).
 
 A refused or conflicting change writes only its receipt. An accepted one: a created node or edge
 starts at revision 1 (a node at lifecycle revision 1, active), a new tag at revision 1; a node
@@ -627,12 +752,14 @@ node_id, tag_id}`; an entity's row is its after-image. The accepted receipt's `d
 edge and new tag in order of the change's first touch of each (which may differ from the
 event's order). `algebra` in the vectors pins all of this.
 
-**Content.** Stable content (a later schema's `kg_contents`) has one revision rule, pinned now by
-`contents` in the vectors though no content is stored or changed yet: an update names the
-content's id and owner node, both fixed for good, and its expected revision; it replaces the
-body whole (`{"inline_text"}` of at most 32 KiB, or `{"reference": {resource_node_id,
-observed_revision}}`), moves the content's own revision by exactly one, and moves nothing else —
-not the owner node's revision.
+**Content.** A content (`kg_contents`, schema 7) is created by `create_content` (revision 1;
+its id new to the graph as a node, edge or content; its owner any node of the final graph) and
+changed only by `update_content`, which names the content's id and owner node, both fixed for
+good, and its expected revision; it replaces the body whole (`{"inline_text"}` of at most
+32 KiB, or `{"reference": {resource_node_id, observed_revision}}` naming a `Resource`), moves
+the content's own revision by exactly one, and moves nothing else — not the owner node's
+revision. `contents` in the vectors pins the update rule; its operation is a `content`
+`create` or `update` with the image `{id, owner_node_id, revision, body}`.
 
 An agent's event carries `context_id`, `origin_actor` (the person whose session the chain
 starts from), `origin_chain` `[{"session_id", "agent_actor"}, …]` from that root session down
@@ -647,10 +774,12 @@ person's device); a caller who may not read the graph is refused alike whatever 
 | `graph.outcome` | `request_id` | `[]` or the caller's own `kg_receipts` row for it |
 | `graph.get_node` | `id`, `include_archived` | `[]` or `[{<node image>, "tags": [<canonical text>…]}]` |
 | `graph.get_edge` | `id`, `include_archived` | `[]` or `[<edge image>]` |
+| `graph.get_content` | `id`, `include_archived` | `[]` or `[<content image>]` |
 | `graph.history` | `after` (decimal, `"0"` first), `limit` (1–100), `filter` `{entity_id?, actor_id?, origin_class?}` | `[{"events": [{"event": <header>, "ops": [<op>…]}], "scanned_through": <decimal>}]` |
 
 Without `include_archived` a node is answered only while active, an edge only while it and both
-its endpoints are. A history header is the event's row without `graph` and the author columns,
+its endpoints are, a content only while its owner node is. A history header is the event's row
+without `graph` and the author columns,
 JSON decoded. Every event in `(after, scanned_through]` that matches the filter is in `events`,
 whole and ascending; `scanned_through` is the last position examined, matching or not, so an
 empty or filtered page still moves the cursor and no later match is skipped. A page examines at
@@ -658,6 +787,100 @@ most 1,000 positions and holds at most `limit` events and 4 MiB of canonical eve
 its first event, and every event in it, the first included, is within the row bounds of
 *Tables* (its header at most 128 KiB, its operations as for the event); a client refuses a page
 outside these bounds, or an image outside its entity's shape. History is the retained events, never the pruned transport log.
+
+**Read authority.** A graph read is exposed only under an authority the server answered for now,
+through registered queries whose params carry `version` (1):
+
+| query | params | rows |
+| --- | --- | --- |
+| `graph.admit_read` | `context`, `domain` | `[{context, session, permitted, sources, expires_at_ms, authority}]` |
+| `graph.refresh_context` | `context` | the same row |
+| `graph.read_status` | `domain` | `[{domain, authority}]`, for a person's device |
+
+`authority` is `{"epoch": <decimal>, "digest": <lowercase SHA-256 hex>}`: the server's graph-read
+authority epoch and its `(domain, principal)` digest. An agent's reader calls `graph.admit_read`
+before it reads anything of a domain and `graph.refresh_context` again before it delivers a
+result; a person's reader calls `graph.read_status`. A refusal (`operation.forbidden`, collapsed
+for a caller who may not read), a domain missing from `sources`, or an authority other than the
+one the result was computed under suppresses the result.
+
+**Queries (`KG-Cypher/1`).** A native reader answers a bounded read-only Cypher subset from a
+local projection of a complete accepted prefix, never from the server and never from the current
+rows: one `MATCH` of one connected chain of at most 8 typed directed relationship segments; an
+optional `WHERE` of at most 32 `AND`-ed comparisons of a property with a named parameter (`=`,
+`<>`, `<`, `<=`, `>`, `>=`) or `IS [NOT] NULL`; `RETURN` of at most 16 aliased properties or one
+`count(*)`/`count(variable)`; an optional `ORDER BY` of returned aliases; a literal `LIMIT`
+1–1,000. Source at most 8 KiB; parameters a JSON object of at most 32 scalars and 64 KiB, numbers
+normalised as values are. Labels, relationship types and property keys are reserved names or
+their `K_`/`R_`/`P_` symbols; a node binding reads a node's structural fields, the six assertion
+fields (projection version 2) or a tag's `id` and `text`, an edge binding an edge's. Anything
+else is `query_unsupported`, any bound exceeded
+`query_limit`. The renderer adds every binding's `id` ascending as the final sort keys, so ties
+never depend on the engine. Only active nodes, tags, and active edges between active nodes are
+visible; a membership is a `HAS_TAG` relationship to a `Tag` node. Archived entities are read
+through the typed `get_node`/`get_edge`/`get_content` lookups, locally the same as the server's.
+A content is never a query symbol. A result names
+its domain, the prefix length N, the Syncular checkpoint, the schema, projection and engine
+versions and whether the prefix is still the replica's whole history (`current`) or behind it
+(`stale`). `queries[]` in the vectors pins the grammar and the renderer.
+
+**The worker frames.** The query projection is built and read by a separate single-use worker
+(`keeper-graph-query`). Its builder reads one manifest frame — domain, authority, N,
+`prefix_digest`, Syncular checkpoint, `contract_schema` 8, projection version (3) and engine —
+and
+then exactly N event frames: `{graph_seq, event_id, op_count, delta_digest, ops}`, each op its
+row without the before-image (the consumer has already verified every event's digest and
+before-images against its own replay). `prefix_digest` chains from 64 zeros: each event's is the
+SHA-256 hex of the previous digest, `graph_seq` and `delta_digest`, newline-separated. A frame is
+at most 2 MiB, a prefix at most 100,000 events. Every Linux worker runs with exactly
+`GQL_STMT_CACHE=0` and `GLIBC_TUNABLES` equal to `worker.linux_glibc_tunables` in the vectors.
+`prefix_chains[]`, `manifests[]` and `worker` pin these. A `review` operation is checked and
+skipped: no review is an entity of a generation (projection version 3).
+
+**Proposals and decisions** (story 111.2, `keeper-graph-protocol::proposal`). `graph.propose`'s
+payload is exactly `{proposal_id, base_revision, change, reviewers, expires_at_ms}`: a new
+proposal (`base_revision` null, revision 1) or the next revision of an open one, a `graph.apply`
+payload without `approval_id` validated as a write is, 1 to 16 ascending distinct reviewer actor
+ids, and an optional expiry. Its receipt is `proposed` with `{proposal_id, proposal_revision,
+proposal_digest}`; the digest is the SHA-256 of the JCS of `{version, graph, proposal_id,
+revision, change, reviewers, expires_at_ms}`. `graph.decide` (`{proposal_id, proposal_revision,
+proposal_digest, decision}`, `approve` | `reject`) is a person's who is enumerated on that
+revision: an approval is the proposal's accepted event (the decider's request, actor, client and
+origin class, context null, the proposer's origin, `approval_basis {basis: "proposal",
+proposal_id, proposal_revision, proposal_digest, proposer_actor, proposer_client,
+proposer_context}`) or terminally `rejected proposal_stale`; a rejection is `proposed` with the
+revision's new `status`. A reviewer reads a proposal through `graph.proposal`, authorised per
+call.
+
+**Reviews and reversals** (`review`, `inverse`). `graph.acknowledge` (`{target_event_id,
+target_delta_digest}`, a person with the reviewer role) adds one event of one `review` creation
+(kind `acknowledgement`) and its `kg_reviews` row; the acknowledged event never changes and stays
+reversible; a second acknowledgement is refused `invalid_change`. `graph.unreviewed` pages the
+agent-origin `graph.apply`/`graph.reverse` events no review targets, as `graph.history` pages.
+`graph.preview_reversal` answers one event's server-derived inverse (its planned operations, a
+restored membership's id null), the `expected` revisions and whether it applies now (`ready`,
+`approval_required` — ready, but an agent's reversal needs its per-call `approval_id`; a person
+never gets it —, `conflict` or `rejected`; any other outcome is unreadable and fails closed).
+`graph.reverse` (`{target_event_id, target_delta_digest, expected,
+approval_id?, event_time_ms?}`, never operations) re-derives the inverse, requires the current
+graph to be exactly the target's after-images and `expected` exactly the plan's, and adds one
+event: the inverse operations and one `review` creation of kind `reversal`, with
+`reverses_event_id` set. An update restores the before-image, a create is archived, a merge is
+restored (redirect cleared, endpoints put back) and its reversal re-merges; every revision moves
+forward, no id is reused, and verification is never restored (always `unverified`). A reversal
+is judged by forward's own per-operation refusals and whole-candidate validation (references,
+endpoints, containment, node members, description provenance, content owners, verification),
+differing only by the four inverse exceptions listed once at `candidate::Exception`:
+restore-merged (an `unarchive` clearing `merged_into_id`), re-merge (an `archive` setting it,
+judged by the merge rules: a survivor that is `Guidance`, `Vocabulary` or carries `$assertion`
+is refused `invalid_change`), endpoint moves (only along a redirect the same reversal restores
+or sets, never on a `guidance_scope` edge or into a self-loop), and the X29 normalisation. A
+later dependent of a node the reversal archives (an active edge, an owned content, a
+domain-visible reference written after the target) is a `conflict` whose precondition is
+`dependency`; a `graph.reverse` conflict is reported as `reversal_conflict`. `inverses[]`,
+`inverse_caps[]` (the 128-operation cap as generators: `creates` node creates, reversed, fit
+with their review at 127 and refuse `change_limit` at 128), `reversals[]`, `reviews[]`,
+`previews[]` (preview rows decoded or refused), `proposals[]` and `outcomes[]` pin these.
 
 ## The live check
 

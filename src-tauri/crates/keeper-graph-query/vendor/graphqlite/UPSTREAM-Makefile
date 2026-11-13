@@ -1,0 +1,637 @@
+# GraphQLite Makefile
+
+CC = gcc
+BISON ?= bison
+FLEX ?= flex
+SQLITE ?= sqlite3
+# Override with: make PYTHON=python3.12 test-python
+PYTHON ?= python3
+
+# Platform-specific paths for test builds (CUnit headers/libs)
+# Auto-detect MacPorts (/opt/local) or Homebrew paths
+# Can override with: make EXTRA_LIBS=-L/path/to/lib EXTRA_INCLUDES=-I/path/to/include
+
+# Auto-detect CUnit from MacPorts
+ifneq ($(wildcard /opt/local/include/CUnit/CUnit.h),)
+    MACPORTS_INCLUDES = -I/opt/local/include
+    MACPORTS_LIBS = -L/opt/local/lib
+else
+    MACPORTS_INCLUDES =
+    MACPORTS_LIBS =
+endif
+
+# Auto-detect CUnit from Homebrew (common paths)
+ifneq ($(wildcard /usr/local/include/CUnit/CUnit.h),)
+    HOMEBREW_INCLUDES = -I/usr/local/include
+    HOMEBREW_LIBS = -L/usr/local/lib
+else ifneq ($(wildcard /opt/homebrew/include/CUnit/CUnit.h),)
+    HOMEBREW_INCLUDES = -I/opt/homebrew/include
+    HOMEBREW_LIBS = -L/opt/homebrew/lib
+else
+    HOMEBREW_INCLUDES =
+    HOMEBREW_LIBS =
+endif
+
+# Combine detected paths (MacPorts takes priority, then Homebrew)
+EXTRA_LIBS ?= $(MACPORTS_LIBS) $(HOMEBREW_LIBS)
+EXTRA_INCLUDES ?= $(MACPORTS_INCLUDES) $(HOMEBREW_INCLUDES)
+
+# Vendored SQLite headers for consistent extension builds
+VENDOR_SQLITE_DIR = bindings/python/vendor/sqlite
+
+# Base flags for extension builds (vendor headers only, no system includes)
+EXTENSION_BASE_CFLAGS = -Wall -Wextra -I$(VENDOR_SQLITE_DIR) -I./src/include
+
+# Build mode: debug (default) or release
+# Use: make extension RELEASE=1
+ifdef RELEASE
+CFLAGS = -Wall -Wextra -O2 -I$(VENDOR_SQLITE_DIR) -I./src/include $(EXTRA_INCLUDES)
+EXTENSION_CFLAGS_BASE = -Wall -Wextra -O2 -I$(VENDOR_SQLITE_DIR) -I./src/include
+else
+# Opt into the noisy CYPHER_DEBUG printf trace by setting DEBUG_LOGS=1 at
+# build time. Without it, debug builds still have -g symbols but the
+# extension stays silent (a full TCK run otherwise produced hundreds of
+# GB of CYPHER_DEBUG output).
+ifdef DEBUG_LOGS
+DEBUG_DEFINES = -DGRAPHQLITE_DEBUG
+else
+DEBUG_DEFINES =
+endif
+# Add -DGRAPHQLITE_PERF_TIMING for detailed query timing instrumentation
+CFLAGS = -Wall -Wextra -g -I$(VENDOR_SQLITE_DIR) -I./src/include $(DEBUG_DEFINES) $(EXTRA_INCLUDES)
+EXTENSION_CFLAGS_BASE = -Wall -Wextra -g -I$(VENDOR_SQLITE_DIR) -I./src/include $(DEBUG_DEFINES)
+endif
+LDFLAGS = $(EXTRA_LIBS) -lcunit -lsqlite3 -lm
+
+# Extension-specific flags: enable sqlite3ext.h API pointer redirection
+EXTENSION_CFLAGS = -DGRAPHQLITE_EXTENSION
+
+# Coverage flags
+COVERAGE_FLAGS = -fprofile-arcs -ftest-coverage
+
+# Detect OS and set coverage libs accordingly
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    COVERAGE_LIBS = -lgcov
+endif
+ifeq ($(UNAME_S),Darwin)
+    # macOS with clang doesn't need -lgcov
+    COVERAGE_LIBS =
+endif
+
+# Source directories
+SRC_DIR = src
+BACKEND_DIR = $(SRC_DIR)/backend
+PARSER_DIR = $(BACKEND_DIR)/parser
+TEST_DIR = tests
+
+# Build directories
+BUILD_DIR = build
+BUILD_PARSER_DIR = $(BUILD_DIR)/parser
+BUILD_TRANSFORM_DIR = $(BUILD_DIR)/transform
+BUILD_EXECUTOR_DIR = $(BUILD_DIR)/executor
+BUILD_RUNTIME_DIR = $(BUILD_DIR)/runtime
+BUILD_TEST_DIR = $(BUILD_DIR)/tests
+COVERAGE_DIR = $(BUILD_DIR)/coverage
+
+# Parser sources (C files)
+PARSER_SRCS = \
+	$(PARSER_DIR)/cypher_keywords.c \
+	$(PARSER_DIR)/cypher_scanner_api.c \
+	$(PARSER_DIR)/cypher_ast.c \
+	$(PARSER_DIR)/cypher_parser.c
+
+# Generated sources
+SCANNER_SRC = $(BUILD_PARSER_DIR)/cypher_scanner.c
+SCANNER_HDR = $(BUILD_PARSER_DIR)/cypher_flex.h
+SCANNER_L = $(PARSER_DIR)/cypher_scanner.l
+GRAMMAR_SRC = $(BUILD_PARSER_DIR)/cypher_gram.tab.c
+GRAMMAR_HDR = $(BUILD_PARSER_DIR)/cypher_gram.tab.h
+GRAMMAR_Y = $(PARSER_DIR)/cypher_gram.y
+
+# All parser sources including generated
+ALL_PARSER_SRCS = $(PARSER_SRCS) $(SCANNER_SRC) $(GRAMMAR_SRC)
+
+PARSER_OBJS = $(PARSER_SRCS:$(PARSER_DIR)/%.c=$(BUILD_PARSER_DIR)/%.o) $(BUILD_PARSER_DIR)/cypher_scanner.o $(BUILD_PARSER_DIR)/cypher_gram.tab.o
+PARSER_OBJS_COV = $(PARSER_SRCS:$(PARSER_DIR)/%.c=$(BUILD_PARSER_DIR)/%.cov.o) $(BUILD_PARSER_DIR)/cypher_scanner.cov.o $(BUILD_PARSER_DIR)/cypher_gram.tab.cov.o
+PARSER_OBJS_PIC = $(PARSER_SRCS:$(PARSER_DIR)/%.c=$(BUILD_PARSER_DIR)/%.pic.o) $(BUILD_PARSER_DIR)/cypher_scanner.pic.o $(BUILD_PARSER_DIR)/cypher_gram.tab.pic.o
+
+# Transform sources
+TRANSFORM_DIR = $(SRC_DIR)/backend/transform
+TRANSFORM_SRCS = \
+	$(TRANSFORM_DIR)/cypher_transform.c \
+	$(TRANSFORM_DIR)/transform_match.c \
+	$(TRANSFORM_DIR)/transform_create.c \
+	$(TRANSFORM_DIR)/transform_set.c \
+	$(TRANSFORM_DIR)/transform_delete.c \
+	$(TRANSFORM_DIR)/transform_remove.c \
+	$(TRANSFORM_DIR)/transform_foreach.c \
+	$(TRANSFORM_DIR)/transform_load_csv.c \
+	$(TRANSFORM_DIR)/transform_return.c \
+	$(TRANSFORM_DIR)/transform_func_string.c \
+	$(TRANSFORM_DIR)/transform_func_math.c \
+	$(TRANSFORM_DIR)/transform_func_entity.c \
+	$(TRANSFORM_DIR)/transform_func_path.c \
+	$(TRANSFORM_DIR)/transform_func_list.c \
+	$(TRANSFORM_DIR)/transform_func_temporal.c \
+	$(TRANSFORM_DIR)/transform_func_geo.c \
+	$(TRANSFORM_DIR)/transform_func_json.c \
+	$(TRANSFORM_DIR)/transform_func_typeconv.c \
+	$(TRANSFORM_DIR)/transform_func_graph.c \
+	$(TRANSFORM_DIR)/transform_func_aggregate.c \
+	$(TRANSFORM_DIR)/transform_func_dispatch.c \
+	$(TRANSFORM_DIR)/transform_helpers.c \
+	$(TRANSFORM_DIR)/transform_variables.c \
+	$(TRANSFORM_DIR)/transform_expr_predicate.c \
+	$(TRANSFORM_DIR)/transform_with.c \
+	$(TRANSFORM_DIR)/transform_unwind.c \
+	$(TRANSFORM_DIR)/transform_expr_ops.c \
+	$(TRANSFORM_DIR)/transform_validate.c \
+	$(TRANSFORM_DIR)/sql_builder.c
+
+# Executor sources
+EXECUTOR_DIR = $(SRC_DIR)/backend/executor
+EXECUTOR_SRCS = \
+	$(EXECUTOR_DIR)/cypher_schema.c \
+	$(EXECUTOR_DIR)/cypher_executor.c \
+	$(EXECUTOR_DIR)/executor_variable_map.c \
+	$(EXECUTOR_DIR)/executor_foreach_ctx.c \
+	$(EXECUTOR_DIR)/executor_result.c \
+	$(EXECUTOR_DIR)/executor_helpers.c \
+	$(EXECUTOR_DIR)/executor_delete.c \
+	$(EXECUTOR_DIR)/executor_set.c \
+	$(EXECUTOR_DIR)/executor_remove.c \
+	$(EXECUTOR_DIR)/executor_create.c \
+	$(EXECUTOR_DIR)/executor_foreach.c \
+	$(EXECUTOR_DIR)/executor_merge.c \
+	$(EXECUTOR_DIR)/executor_match.c \
+	$(EXECUTOR_DIR)/query_dispatch.c \
+	$(EXECUTOR_DIR)/executor_call_subquery.c \
+	$(EXECUTOR_DIR)/executor_merge_pipeline.c \
+	$(EXECUTOR_DIR)/executor_schema_objects.c \
+	$(EXECUTOR_DIR)/executor_result_project.c \
+	$(EXECUTOR_DIR)/agtype.c \
+	$(EXECUTOR_DIR)/json_builder.c \
+	$(EXECUTOR_DIR)/graph_algorithms.c \
+	$(EXECUTOR_DIR)/graph_algo_pagerank.c \
+	$(EXECUTOR_DIR)/graph_algo_community.c \
+	$(EXECUTOR_DIR)/graph_algo_paths.c \
+	$(EXECUTOR_DIR)/graph_algo_centrality.c \
+	$(EXECUTOR_DIR)/graph_algo_components.c \
+	$(EXECUTOR_DIR)/graph_algo_betweenness.c \
+	$(EXECUTOR_DIR)/graph_algo_closeness.c \
+	$(EXECUTOR_DIR)/graph_algo_louvain.c \
+	$(EXECUTOR_DIR)/graph_algo_triangle.c \
+	$(EXECUTOR_DIR)/graph_algo_astar.c \
+	$(EXECUTOR_DIR)/graph_algo_traversal.c \
+	$(EXECUTOR_DIR)/graph_algo_similarity.c \
+	$(EXECUTOR_DIR)/graph_algo_knn.c \
+	$(EXECUTOR_DIR)/graph_algo_eigenvector.c \
+	$(EXECUTOR_DIR)/graph_algo_apsp.c
+
+TRANSFORM_OBJS = $(TRANSFORM_SRCS:$(TRANSFORM_DIR)/%.c=$(BUILD_TRANSFORM_DIR)/%.o)
+TRANSFORM_OBJS_COV = $(TRANSFORM_SRCS:$(TRANSFORM_DIR)/%.c=$(BUILD_TRANSFORM_DIR)/%.cov.o)
+TRANSFORM_OBJS_PIC = $(TRANSFORM_SRCS:$(TRANSFORM_DIR)/%.c=$(BUILD_TRANSFORM_DIR)/%.pic.o)
+
+EXECUTOR_OBJS = $(EXECUTOR_SRCS:$(EXECUTOR_DIR)/%.c=$(BUILD_EXECUTOR_DIR)/%.o)
+EXECUTOR_OBJS_COV = $(EXECUTOR_SRCS:$(EXECUTOR_DIR)/%.c=$(BUILD_EXECUTOR_DIR)/%.cov.o)
+EXECUTOR_OBJS_PIC = $(EXECUTOR_SRCS:$(EXECUTOR_DIR)/%.c=$(BUILD_EXECUTOR_DIR)/%.pic.o)
+
+# Runtime sources (helper UDFs moved from extension.c, I-0040 M4-M7)
+RUNTIME_DIR = $(SRC_DIR)/backend/runtime
+RUNTIME_SRCS = \
+	$(RUNTIME_DIR)/udf_helpers.c \
+	$(RUNTIME_DIR)/udf_register.c \
+	$(RUNTIME_DIR)/cypher_rows_vtab.c \
+	$(RUNTIME_DIR)/gql_tz.c \
+	$(RUNTIME_DIR)/gql_tzdata.c
+
+RUNTIME_OBJS = $(RUNTIME_SRCS:$(RUNTIME_DIR)/%.c=$(BUILD_RUNTIME_DIR)/%.o)
+RUNTIME_OBJS_COV = $(RUNTIME_SRCS:$(RUNTIME_DIR)/%.c=$(BUILD_RUNTIME_DIR)/%.cov.o)
+RUNTIME_OBJS_PIC = $(RUNTIME_SRCS:$(RUNTIME_DIR)/%.c=$(BUILD_RUNTIME_DIR)/%.pic.o)
+
+# Test sources
+TEST_SRCS = \
+	$(TEST_DIR)/test_runner.c \
+	$(TEST_DIR)/test_parser_keywords.c \
+	$(TEST_DIR)/test_scanner.c \
+	$(TEST_DIR)/test_parser.c \
+	$(TEST_DIR)/test_transform_create.c \
+	$(TEST_DIR)/test_transform_set.c \
+	$(TEST_DIR)/test_transform_delete.c \
+	$(TEST_DIR)/test_transform_functions.c \
+	$(TEST_DIR)/test_transform_match.c \
+	$(TEST_DIR)/test_transform_return.c \
+	$(TEST_DIR)/test_agtype.c \
+	$(TEST_DIR)/test_schema.c \
+	$(TEST_DIR)/test_executor_basic.c \
+	$(TEST_DIR)/test_executor_relationships.c \
+	$(TEST_DIR)/test_executor_set.c \
+	$(TEST_DIR)/test_executor_delete.c \
+	$(TEST_DIR)/test_executor_varlen.c \
+	$(TEST_DIR)/test_executor_with.c \
+	$(TEST_DIR)/test_executor_unwind.c \
+	$(TEST_DIR)/test_executor_merge.c \
+	$(TEST_DIR)/test_executor_pagerank.c \
+	$(TEST_DIR)/test_executor_label_propagation.c \
+	$(TEST_DIR)/test_executor_dijkstra.c \
+	$(TEST_DIR)/test_executor_degree_centrality.c \
+	$(TEST_DIR)/test_executor_components.c \
+	$(TEST_DIR)/test_executor_betweenness.c \
+	$(TEST_DIR)/test_executor_closeness.c \
+	$(TEST_DIR)/test_executor_louvain.c \
+	$(TEST_DIR)/test_executor_triangle.c \
+	$(TEST_DIR)/test_executor_astar.c \
+	$(TEST_DIR)/test_executor_traversal.c \
+	$(TEST_DIR)/test_executor_algo_regressions.c \
+	$(TEST_DIR)/test_executor_similarity.c \
+	$(TEST_DIR)/test_executor_knn.c \
+	$(TEST_DIR)/test_executor_eigenvector.c \
+	$(TEST_DIR)/test_executor_apsp.c \
+	$(TEST_DIR)/test_executor_remove.c \
+	$(TEST_DIR)/test_executor_params.c \
+	$(TEST_DIR)/test_output_format.c \
+	$(TEST_DIR)/test_executor_expressions.c \
+	$(TEST_DIR)/test_executor_clauses.c \
+	$(TEST_DIR)/test_executor_patterns.c \
+	$(TEST_DIR)/test_executor_functions.c \
+	$(TEST_DIR)/test_executor_predicates.c \
+	$(TEST_DIR)/test_executor_multigraph.c \
+	$(TEST_DIR)/test_sql_builder.c \
+	$(TEST_DIR)/test_query_dispatch.c \
+	$(TEST_DIR)/test_cache.c
+
+TEST_OBJS = $(TEST_SRCS:$(TEST_DIR)/%.c=$(BUILD_TEST_DIR)/%.o)
+
+# Test executable
+TEST_RUNNER = $(BUILD_DIR)/test_runner
+
+# Main application executable
+MAIN_APP = $(BUILD_DIR)/gqlite
+MAIN_OBJ = $(BUILD_DIR)/main.o
+
+# SQLite extension - use .dylib on macOS, .dll on Windows, .so on Linux
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+    EXTENSION_LIB = $(BUILD_DIR)/graphqlite.dylib
+else ifneq (,$(findstring MINGW,$(UNAME_S)))
+    EXTENSION_LIB = $(BUILD_DIR)/graphqlite.dll
+else ifneq (,$(findstring MSYS,$(UNAME_S)))
+    EXTENSION_LIB = $(BUILD_DIR)/graphqlite.dll
+else
+    EXTENSION_LIB = $(BUILD_DIR)/graphqlite.so
+endif
+EXTENSION_OBJ = $(BUILD_DIR)/extension.o
+
+# Default target
+all: dirs $(PARSER_OBJS)
+
+# Build main application
+graphqlite: $(MAIN_APP)
+
+# Build SQLite extension
+extension: $(EXTENSION_LIB)
+
+# Copy extension to Rust bindings libs/ directory for bundled builds
+# Note: macOS uses "arm64", Linux uses "aarch64" for ARM64
+install-bundled: $(EXTENSION_LIB)
+	@mkdir -p $(RUST_BINDINGS_DIR)/libs
+ifeq ($(UNAME_S),Darwin)
+ifneq (,$(filter arm64 aarch64,$(UNAME_M)))
+	cp $(EXTENSION_LIB) $(RUST_BINDINGS_DIR)/libs/graphqlite-macos-aarch64.dylib
+else
+	cp $(EXTENSION_LIB) $(RUST_BINDINGS_DIR)/libs/graphqlite-macos-x86_64.dylib
+endif
+else ifeq ($(UNAME_S),Linux)
+ifneq (,$(filter arm64 aarch64,$(UNAME_M)))
+	cp $(EXTENSION_LIB) $(RUST_BINDINGS_DIR)/libs/graphqlite-linux-aarch64.so
+else
+	cp $(EXTENSION_LIB) $(RUST_BINDINGS_DIR)/libs/graphqlite-linux-x86_64.so
+endif
+else
+	cp $(EXTENSION_LIB) $(RUST_BINDINGS_DIR)/libs/graphqlite-windows-x86_64.dll
+endif
+
+
+# Standard gqlite build (dynamic linking)
+$(MAIN_APP): $(MAIN_OBJ) $(PARSER_OBJS) $(TRANSFORM_OBJS) $(EXECUTOR_OBJS) $(RUNTIME_OBJS) | dirs
+	$(CC) $(CFLAGS) $^ -o $@ -lsqlite3
+
+# Portable gqlite build for releases (static linking where possible)
+gqlite-portable: $(MAIN_OBJ) $(PARSER_OBJS) $(TRANSFORM_OBJS) $(EXECUTOR_OBJS) $(RUNTIME_OBJS) | dirs
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) $^ -o $(BUILD_DIR)/gqlite -lsqlite3
+else ifneq (,$(findstring MINGW,$(UNAME_S)))
+	$(CC) $(CFLAGS) -static $^ -o $(BUILD_DIR)/gqlite.exe -lsqlite3 -lsystre -ltre -lintl -liconv
+else ifneq (,$(findstring MSYS,$(UNAME_S)))
+	$(CC) $(CFLAGS) -static $^ -o $(BUILD_DIR)/gqlite.exe -lsqlite3 -lsystre -ltre -lintl -liconv
+else
+	$(CC) $(CFLAGS) $^ -o $(BUILD_DIR)/gqlite -l:libsqlite3.a -lpthread -ldl -lm
+endif
+
+# SQLite extension shared library (with full parser, transform, and executor)
+$(EXTENSION_LIB): $(EXTENSION_OBJ) $(PARSER_OBJS_PIC) $(TRANSFORM_OBJS_PIC) $(EXECUTOR_OBJS_PIC) $(RUNTIME_OBJS_PIC) | dirs $(GRAMMAR_HDR)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) -g -fPIC -dynamiclib $(EXTENSION_OBJ) $(PARSER_OBJS_PIC) $(TRANSFORM_OBJS_PIC) $(EXECUTOR_OBJS_PIC) $(RUNTIME_OBJS_PIC) -o $@ -undefined dynamic_lookup
+else ifneq (,$(findstring MINGW,$(UNAME_S)))
+	$(CC) -shared -static $(EXTENSION_OBJ) $(PARSER_OBJS_PIC) $(TRANSFORM_OBJS_PIC) $(EXECUTOR_OBJS_PIC) $(RUNTIME_OBJS_PIC) -o $@ -lsqlite3 -lsystre -ltre -lintl -liconv
+else ifneq (,$(findstring MSYS,$(UNAME_S)))
+	$(CC) -shared -static $(EXTENSION_OBJ) $(PARSER_OBJS_PIC) $(TRANSFORM_OBJS_PIC) $(EXECUTOR_OBJS_PIC) $(RUNTIME_OBJS_PIC) -o $@ -lsqlite3 -lsystre -ltre -lintl -liconv
+else
+	$(CC) -shared -fPIC $(EXTENSION_OBJ) $(PARSER_OBJS_PIC) $(TRANSFORM_OBJS_PIC) $(EXECUTOR_OBJS_PIC) $(RUNTIME_OBJS_PIC) -o $@
+endif
+
+# Main application object
+$(BUILD_DIR)/main.o: $(SRC_DIR)/main.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Extension object (uses vendored SQLite headers for ABI consistency - no EXTRA_INCLUDES)
+$(BUILD_DIR)/extension.o: $(SRC_DIR)/extension.c | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -c $< -o $@
+
+# Extension object for the unit-test runner. Compiled with -DSQLITE_CORE so
+# SQLITE_EXTENSION_INIT macros become no-ops and sqlite3_create_function and
+# friends bind directly to the linked libsqlite3 (rather than going through
+# the loadable-extension API pointer, which isn't set up in tests).
+$(BUILD_DIR)/extension.test.o: $(SRC_DIR)/extension.c | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -DSQLITE_CORE -c $< -o $@
+
+# Help target
+help:
+	@echo "GraphQLite Makefile Commands:"
+	@echo "  make           - Build parser objects (default)"
+	@echo "  make all       - Same as 'make'"
+	@echo "  make graphqlite - Build main interactive application"
+	@echo "  make extension - Build SQLite extension (graphqlite.dylib on macOS, graphqlite.so on Linux)"
+	@echo "  make test      - Run all tests (unit + functional + bindings)"
+	@echo "  make test unit - Run only CUnit tests"
+	@echo "  make test rust - Run Rust binding tests"
+	@echo "  make test python - Run Python binding tests"
+	@echo "  make test bindings - Run all binding tests (Rust + Python)"
+	@echo "  make test functional - Run functional SQL tests"
+	@echo "  make test-constraints - Run constraint tests (expected to fail)"
+	@echo "  make performance - Run all performance tests with summary table"
+	@echo "  make coverage  - Run tests and generate gcov coverage report"
+	@echo "  make clean     - Remove all build artifacts"
+	@echo "  make help      - Show this help message"
+	@echo ""
+	@echo "Build Directories:"
+	@echo "  $(BUILD_DIR)/       - Main build directory"
+	@echo "  $(BUILD_PARSER_DIR)/ - Parser objects"
+	@echo "  $(BUILD_TEST_DIR)/   - Test objects"
+	@echo "  $(COVERAGE_DIR)/     - Coverage reports"
+
+# Create build directories
+dirs:
+	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(BUILD_PARSER_DIR)
+	@mkdir -p $(BUILD_TRANSFORM_DIR)
+	@mkdir -p $(BUILD_EXECUTOR_DIR)
+	@mkdir -p $(BUILD_RUNTIME_DIR)
+	@mkdir -p $(BUILD_TEST_DIR)
+	@mkdir -p $(COVERAGE_DIR)
+
+# Parser objects (regular build) - need build dir for generated headers
+$(BUILD_PARSER_DIR)/%.o: $(PARSER_DIR)/%.c $(GRAMMAR_HDR) | dirs
+	$(CC) $(CFLAGS) -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+# Scanner API needs Flex-generated header (reentrant API declarations)
+$(BUILD_PARSER_DIR)/cypher_scanner_api.o: $(SCANNER_HDR)
+
+# Parser objects (coverage build) - need build dir for generated headers
+$(BUILD_PARSER_DIR)/%.cov.o: $(PARSER_DIR)/%.c $(GRAMMAR_HDR) | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+$(BUILD_PARSER_DIR)/cypher_scanner_api.cov.o: $(SCANNER_HDR)
+
+# Generate scanner from Flex specification (reentrant, with header for API)
+$(SCANNER_SRC) $(SCANNER_HDR): $(SCANNER_L) | dirs
+	$(FLEX) -o $(SCANNER_SRC) --header=$(SCANNER_HDR) $<
+
+# Generate parser from Bison grammar
+$(GRAMMAR_SRC) $(GRAMMAR_HDR): $(GRAMMAR_Y) | dirs
+	$(BISON) -d -o $(GRAMMAR_SRC) $<
+
+# Scanner objects (regular build)
+$(BUILD_PARSER_DIR)/cypher_scanner.o: $(SCANNER_SRC) | dirs
+	$(CC) $(CFLAGS) -Wno-sign-compare -c $< -o $@
+
+# Scanner objects (coverage build)
+$(BUILD_PARSER_DIR)/cypher_scanner.cov.o: $(SCANNER_SRC) | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -Wno-sign-compare -c $< -o $@
+
+# Grammar objects (regular build)
+$(BUILD_PARSER_DIR)/cypher_gram.tab.o: $(GRAMMAR_SRC) $(GRAMMAR_HDR) | dirs
+	$(CC) $(CFLAGS) -Wno-unused-but-set-variable -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+# Grammar objects (coverage build)
+$(BUILD_PARSER_DIR)/cypher_gram.tab.cov.o: $(GRAMMAR_SRC) $(GRAMMAR_HDR) | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -Wno-unused-but-set-variable -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+# Transform objects
+$(BUILD_TRANSFORM_DIR)/%.o: $(TRANSFORM_DIR)/%.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Transform objects (coverage build)
+$(BUILD_TRANSFORM_DIR)/%.cov.o: $(TRANSFORM_DIR)/%.c | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
+
+# Executor objects
+$(BUILD_EXECUTOR_DIR)/%.o: $(EXECUTOR_DIR)/%.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Executor objects (coverage build)
+$(BUILD_EXECUTOR_DIR)/%.cov.o: $(EXECUTOR_DIR)/%.c | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
+
+# PIC object builds for shared library (uses vendored SQLite headers only - no EXTRA_INCLUDES)
+$(BUILD_PARSER_DIR)/%.pic.o: $(PARSER_DIR)/%.c $(GRAMMAR_HDR) | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+$(BUILD_PARSER_DIR)/cypher_scanner_api.pic.o: $(SCANNER_HDR)
+
+$(BUILD_PARSER_DIR)/cypher_scanner.pic.o: $(SCANNER_SRC) | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -Wno-sign-compare -c $< -o $@
+
+$(BUILD_PARSER_DIR)/cypher_gram.tab.pic.o: $(GRAMMAR_SRC) $(GRAMMAR_HDR) | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -Wno-unused-but-set-variable -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+$(BUILD_TRANSFORM_DIR)/%.pic.o: $(TRANSFORM_DIR)/%.c | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -c $< -o $@
+
+$(BUILD_EXECUTOR_DIR)/%.pic.o: $(EXECUTOR_DIR)/%.c | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -c $< -o $@
+
+# Runtime objects
+$(BUILD_RUNTIME_DIR)/%.o: $(RUNTIME_DIR)/%.c | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_RUNTIME_DIR)/%.cov.o: $(RUNTIME_DIR)/%.c | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) -c $< -o $@
+
+$(BUILD_RUNTIME_DIR)/%.pic.o: $(RUNTIME_DIR)/%.c | dirs
+	$(CC) $(EXTENSION_CFLAGS_BASE) $(EXTENSION_CFLAGS) -fPIC -c $< -o $@
+
+# Test objects
+$(BUILD_TEST_DIR)/%.o: $(TEST_DIR)/%.c $(GRAMMAR_HDR) | dirs
+	$(CC) $(CFLAGS) -I$(BUILD_PARSER_DIR) -c $< -o $@
+
+# Test runner executable
+$(TEST_RUNNER): $(TEST_OBJS) $(PARSER_OBJS_COV) $(TRANSFORM_OBJS_COV) $(EXECUTOR_OBJS_COV) $(RUNTIME_OBJS_COV) $(BUILD_DIR)/extension.test.o | dirs
+	$(CC) $(CFLAGS) $(COVERAGE_FLAGS) $^ -o $@ $(LDFLAGS) $(COVERAGE_LIBS)
+
+# Run constraint tests (expected to fail with specific errors)
+test-constraints: extension
+	@echo "Running constraint tests (expected to fail)..."
+	@for test_file in tests/functional/*constraint*.sql; do \
+		if [ -f "$$test_file" ]; then \
+			echo ""; \
+			echo "========================================"; \
+			echo "Running: $$(basename $$test_file)"; \
+			echo "========================================"; \
+			$(SQLITE) < "$$test_file" 2>&1 && echo "ERROR: Test should have failed!" || echo "Constraint correctly enforced"; \
+		fi; \
+	done
+	@echo ""
+	@echo "All functional tests completed successfully!"
+
+# Generate coverage report
+coverage: test-unit
+	@echo "Generating coverage report..."
+	@for obj in $(BUILD_PARSER_DIR)/*.cov.o; do \
+		gcov -o $(BUILD_PARSER_DIR) $$obj; \
+	done
+	@for obj in $(BUILD_TRANSFORM_DIR)/*.cov.o; do \
+		gcov -o $(BUILD_TRANSFORM_DIR) $$obj; \
+	done
+	@for obj in $(BUILD_EXECUTOR_DIR)/*.cov.o; do \
+		gcov -o $(BUILD_EXECUTOR_DIR) $$obj; \
+	done
+	@find . -name "*.gcov" -maxdepth 1 -exec mv {} $(COVERAGE_DIR)/ \;
+	@echo ""
+	@echo "========== CODE COVERAGE SUMMARY =========="
+	@for file in $(COVERAGE_DIR)/*.gcov; do \
+		if [ -f "$$file" ]; then \
+			filename=$$(basename $$file .gcov); \
+			coverage=$$(grep -E "^[[:space:]]*[0-9]+:" $$file | wc -l); \
+			total=$$(grep -E "^[[:space:]]*[0-9]+:|[[:space:]]*#####:" $$file | wc -l); \
+			if [ $$total -gt 0 ]; then \
+				percent=$$(echo "scale=2; $$coverage * 100 / $$total" | bc); \
+				printf "%-40s %6.2f%%\n" "$$filename:" "$$percent"; \
+			fi; \
+		fi; \
+	done
+	@echo "==========================================="
+	@echo ""
+	@echo "Detailed reports in: $(COVERAGE_DIR)/"
+
+# Performance tests - unified script with modes: quick, standard, full
+# Usage: make performance [MODE=quick|standard|full] [ITERATIONS=N]
+performance: extension
+	@tests/performance/run_all_perf.sh $(or $(MODE),standard) 2>&1 | grep -v "^\[CYPHER_DEBUG\]"
+
+# Quick performance check (~30s, 10K nodes only)
+performance-quick: extension
+	@tests/performance/run_all_perf.sh quick 2>&1 | grep -v "^\[CYPHER_DEBUG\]"
+
+# Full performance suite (~10min, up to 1M nodes)
+performance-full: extension
+	@tests/performance/run_all_perf.sh full 2>&1 | grep -v "^\[CYPHER_DEBUG\]"
+
+# Bindings directories
+RUST_BINDINGS_DIR = bindings/rust
+PYTHON_BINDINGS_DIR = bindings/python
+
+# Nested test commands: make test [unit|rust|python|bindings|functional]
+# Check what subcommand was passed
+ifneq ($(filter unit,$(MAKECMDGOALS)),)
+TEST_TARGET = unit
+else ifneq ($(filter rust,$(MAKECMDGOALS)),)
+TEST_TARGET = rust
+else ifneq ($(filter python,$(MAKECMDGOALS)),)
+TEST_TARGET = python
+else ifneq ($(filter bindings,$(MAKECMDGOALS)),)
+TEST_TARGET = bindings
+else ifneq ($(filter functional,$(MAKECMDGOALS)),)
+TEST_TARGET = functional
+else
+TEST_TARGET = all
+endif
+
+# Dummy targets for subcommands (prevents "No rule to make target" errors)
+unit rust python bindings functional:
+	@true
+
+# Individual test targets
+test-unit: $(TEST_RUNNER)
+	@echo "Running unit tests..."
+	./$(TEST_RUNNER)
+
+test-rust: extension install-bundled
+	@echo "Running Rust binding tests..."
+	cd $(RUST_BINDINGS_DIR) && cargo test -- --test-threads=1
+
+test-python: extension
+	@echo "Running Python binding tests..."
+	@# Install in dev mode if not already installed, then run tests
+	@# Use $(PYTHON) -m pip to ensure pip matches the Python interpreter
+	@cd $(PYTHON_BINDINGS_DIR) && $(PYTHON) -m pip install -q -e . 2>/dev/null || true
+	cd $(PYTHON_BINDINGS_DIR) && $(PYTHON) -m pytest tests/ -v
+
+test-bindings: test-rust test-python
+
+test-functional: extension
+	@echo "Running functional tests..."
+	@for test_file in tests/functional/*.sql; do \
+		if [ -f "$$test_file" ] && [[ "$$test_file" != *"constraint"* ]] && [[ "$$test_file" != *"expected_failures"* ]]; then \
+			echo "Running: $$(basename $$test_file)"; \
+			$(SQLITE) -bail < "$$test_file" || exit 1; \
+		fi; \
+	done
+
+test-cli:
+	@echo "Building gqlite in release mode for CLI tests..."
+	@$(MAKE) clean-app --no-print-directory 2>/dev/null || true
+	@$(MAKE) graphqlite RELEASE=1 --no-print-directory
+	@echo "Running CLI tests..."
+	@./tests/cli/run_cli_tests.sh $(BUILD_DIR)/gqlite
+
+# Clean only the app-related object files (for switching between debug/release)
+clean-app:
+	@rm -f $(BUILD_DIR)/main.o $(BUILD_DIR)/gqlite
+
+test-all: test-unit test-functional test-cli test-bindings
+
+# Main test target dispatches to appropriate sub-target
+test: test-$(TEST_TARGET)
+
+# Strict compilation check — catches C99/C11 compliance issues that CI will reject
+# Run before pushing to catch label-after-declaration, implicit declarations, etc.
+lint:
+	@echo "=== Strict C11 compilation check ==="
+	@echo "Catches: declarations after labels, implicit function declarations,"
+	@echo "         missing prototypes, and other C99/C11 violations that break CI."
+	@FAIL=0; \
+	for f in src/backend/parser/cypher_ast.c src/backend/parser/cypher_parser.c src/backend/parser/cypher_scanner_api.c src/backend/parser/cypher_keywords.c \
+		src/backend/transform/*.c src/backend/executor/*.c src/extension.c; do \
+		/usr/bin/clang -std=c11 -Wall -Wextra -Werror -Wc23-extensions \
+			-Wno-unused-parameter -Wno-sign-compare -Wno-unused-variable \
+			-Wno-unused-but-set-variable -Wno-unused-function \
+			-Wno-newline-eof -Wno-gnu-zero-variadic-macro-arguments \
+			-Wno-incompatible-pointer-types-discards-qualifiers -Wno-format \
+			-I$(VENDOR_SQLITE_DIR) -I./src/include -DGRAPHQLITE_DEBUG \
+			-DGRAPHQLITE_EXTENSION -fPIC -I$(BUILD_DIR)/parser \
+			-fsyntax-only $$f 2>&1 || { echo "  FAIL: $$f"; FAIL=1; }; \
+	done; \
+	if [ $$FAIL -eq 0 ]; then echo "=== All files pass strict C11 check ==="; \
+	else echo "=== STRICT CHECK FAILED — fix before pushing ==="; exit 1; fi
+
+# Clean
+clean:
+	rm -rf $(BUILD_DIR)
+	find . -name "*.gcda" -delete
+	find . -name "*.gcno" -delete
+	find . -name "*.gcov" -delete
+
+.PHONY: all help dirs test test-unit test-rust test-python test-bindings test-functional test-cli test-all test-constraints test-perf test-perf-quick test-perf-scaled test-perf-pagerank performance coverage clean unit rust python bindings functional cli gqlite-portable

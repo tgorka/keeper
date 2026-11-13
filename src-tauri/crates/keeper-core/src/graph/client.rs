@@ -1,41 +1,69 @@
-//! A person's device's graph client for one database: changes sent through
-//! `graph.apply` with their outcomes, and the typed reads.
+//! A person's device's graph client for one database: its commands —
+//! changes (`graph.apply`), proposals and decisions (`graph.propose`,
+//! `graph.decide`), acknowledgements (`graph.acknowledge`) and reversals
+//! (`graph.reverse`) — with their outcomes, and the typed reads, the
+//! unreviewed feed, a reversal's preview and a proposal as its reviewer
+//! reads it.
 //!
 //! Sending is split in two so nothing is lost across a crash: [`GraphClient::mint`]
-//! gives a change its request id once (the caller may persist
+//! (or [`GraphClient::mint_command`]) gives a command its request id once (the caller may persist
 //! [`Prepared::request`] before anything is sent), and [`GraphClient::send`]
 //! sends it, as often as needed, always under that id.
 //! [`GraphClient::prepared`] restores a persisted request. An outcome comes
 //! from the request's own receipt — on this replica, or from `graph.outcome`
 //! — never from the transport alone ([`super::outcome`]).
 //!
-//! The graph is online-only until a durable pending queue exists: a change
-//! is refused [`GraphClientError::Offline`] while the replica has no link,
-//! never accepted optimistically.
+//! A change may also be kept as a durable intent first ([`super::queue`]),
+//! minted here offline and sent later under its own id; it is never
+//! accepted optimistically. [`GraphClient::send`] and the reads refuse
+//! [`GraphClientError::Offline`] while the replica has no link.
+
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use super::outcome::{Attempt, GraphOutcome, GraphRequestError, GraphRequests, RequestKey};
+use super::outcome::{
+    Attempt, GraphOutcome, GraphRequestError, GraphRequests, PendingCause, RequestKey,
+};
+use super::protocol::candidate::MAX_REDIRECT_HOPS;
 use super::protocol::change::{self, Change, ChangeOp, DESCRIPTOR};
+use super::protocol::inverse::{self, Preview, Reverse, REVERSE};
+use super::protocol::proposal::{self, Decision, Proposal, DECIDE, PROPOSE};
 use super::protocol::request::Request;
+use super::protocol::review::{self, Target, ACKNOWLEDGE};
 use super::protocol::scope::{
-    client_scope, CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, RECEIPT_TABLE,
+    client_scope, CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE,
+    RECEIPT_TABLE,
 };
 use super::protocol::wire::{
-    self, decode_edge, decode_history, decode_node, HistoryFilter, HistoryPage, NodeView,
+    self, decode_content, decode_edge, decode_history, decode_node, decode_proposals,
+    HistoryFilter, HistoryPage, NodeView, ProposalRow,
 };
 use super::protocol::Refusal;
+use super::write::{Caller, GraphWrite, Writer};
 use crate::hq::port::{LinkState, ReplicaError, Subscription};
 use crate::hq::sessions::Source;
 use crate::notes::tags::normalise;
 
+/// The tables [`subscriptions`] subscribes: every graph table, the
+/// receipts and the proposals. A revocation of the domain purges all of
+/// them ([`super::source::revocation_with`]).
+#[must_use]
+pub fn subscribed_tables() -> Vec<&'static str> {
+    GRAPH_TABLES
+        .into_iter()
+        .chain([RECEIPT_TABLE, PROPOSAL_TABLE])
+        .collect()
+}
+
 /// The subscriptions a replica of `database` holds for the graph: every
-/// graph table under the database's `kg_graph` scope, and this device's own
-/// receipts under its `kg_client` scope. Ids are the contract's
-/// subscription names.
+/// graph table under the database's `kg_graph` scope, this device's own
+/// receipts under its `kg_client` scope, and this actor's own proposals
+/// under its `kg_proposal` scope (never another proposer's). Ids are the
+/// contract's subscription names.
 #[must_use]
 pub fn subscriptions(database: &str, actor: &str, client: &str) -> Vec<Subscription> {
-    const NAMES: [&str; 7] = [
+    const NAMES: [&str; 9] = [
         "kgEvents",
         "kgEventOps",
         "kgHead",
@@ -43,6 +71,8 @@ pub fn subscriptions(database: &str, actor: &str, client: &str) -> Vec<Subscript
         "kgEdges",
         "kgTags",
         "kgNodeTags",
+        "kgContents",
+        "kgReviews",
     ];
     NAMES
         .iter()
@@ -60,10 +90,15 @@ pub fn subscriptions(database: &str, actor: &str, client: &str) -> Vec<Subscript
                 vec![client_scope(actor, client)],
             )],
         }))
+        .chain(std::iter::once(Subscription {
+            id: "kgProposals".to_owned(),
+            table: PROPOSAL_TABLE.to_owned(),
+            scopes: vec![(PROPOSAL_VARIABLE.to_owned(), vec![actor.to_owned()])],
+        }))
         .collect()
 }
 
-/// A change with its request id, ready to send (and to persist first).
+/// A command with its request id, ready to send (and to persist first).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {
     request: Request,
@@ -71,8 +106,8 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    /// What to persist: the request id and the payload, which
-    /// [`GraphClient::prepared`] turns back into this.
+    /// What to persist: the request id and the payload (and the key's
+    /// descriptor), which [`GraphClient::prepared`] turns back into this.
     #[must_use]
     pub fn request(&self) -> &Request {
         &self.request
@@ -84,7 +119,7 @@ impl Prepared {
     }
 }
 
-/// A change [`GraphClient::apply`] gave a request id: the request, the
+/// A command [`GraphClient::apply`] (or another command) gave a request id: the request, the
 /// attempt when one was made, and what can be concluded so far (or why that
 /// could not be read). Ask again with [`GraphClient::outcome`] while it is
 /// pending or unreadable.
@@ -111,18 +146,36 @@ pub enum GraphClientError {
     /// The server answered with something this build does not read.
     #[error("unreadable answer: {0}")]
     Unreadable(Refusal),
+    /// A typed read names no context: an agent reads through its own
+    /// sealed handles, never through this client.
+    #[error("this read is a person's only")]
+    PersonOnly,
 }
 
-/// One database's graph, as this device's person uses it.
+/// One database's graph, as this device's person (or an agent instance,
+/// for its approved changes only) uses it.
 pub struct GraphClient {
     requests: GraphRequests,
+    caller: Caller,
 }
 
 impl GraphClient {
+    /// A person's client over keeper's own replica `source`.
     #[must_use]
     pub fn new(source: Source) -> Self {
         Self {
             requests: GraphRequests::new(source),
+            caller: Caller::Person,
+        }
+    }
+
+    /// `caller`'s client of `writer`'s database behind the narrow write
+    /// `port` (the agent runtime's way in, CC-1).
+    #[must_use]
+    pub fn over(port: Arc<dyn GraphWrite>, writer: &Writer, caller: Caller) -> Self {
+        Self {
+            requests: GraphRequests::over(port, writer),
+            caller,
         }
     }
 
@@ -131,8 +184,10 @@ impl GraphClient {
         self.requests.domain()
     }
 
-    fn source(&self) -> &Source {
-        self.requests.source()
+    /// On whose authority this client sends.
+    #[must_use]
+    pub fn caller(&self) -> &Caller {
+        &self.caller
     }
 
     /// A person's change of `ops` (tags under keeper's tag policy).
@@ -146,26 +201,65 @@ impl GraphClient {
 
     /// Give `change` a new request id: the one every send of it uses.
     pub fn mint(&self, change: &Change) -> Result<Prepared, Refusal> {
-        self.prepared(Request {
-            request_id: ulid::Ulid::new().to_string(),
-            context_id: None,
-            payload: change.payload(),
-        })
+        self.mint_command(DESCRIPTOR, change.payload())
     }
 
-    /// Restore a persisted request: its payload must still be a change and
-    /// it must be a person's (no context).
-    pub fn prepared(&self, request: Request) -> Result<Prepared, Refusal> {
-        if request.context_id.is_some() || !super::protocol::is_ulid(&request.request_id) {
+    /// Give the `descriptor` command `payload` a new request id, under this
+    /// caller's context.
+    pub fn mint_command(&self, descriptor: &str, payload: Value) -> Result<Prepared, Refusal> {
+        self.prepared(
+            descriptor,
+            Request {
+                request_id: ulid::Ulid::new().to_string(),
+                context_id: self.caller.context_id().map(str::to_owned),
+                payload,
+            },
+        )
+    }
+
+    /// Restore a persisted request to `descriptor`. It must name exactly
+    /// this caller's context (none for a person) and its payload must still
+    /// be that command's. A person sends a change, a proposal, a decision,
+    /// an acknowledgement or a reversal; an agent only a change naming the
+    /// approval a person gives it (`graph_apply`). No other descriptor is a
+    /// command this client sends.
+    pub fn prepared(&self, descriptor: &str, request: Request) -> Result<Prepared, Refusal> {
+        if request.context_id.as_deref() != self.caller.context_id()
+            || !super::protocol::is_ulid(&request.request_id)
+        {
             return Err(Refusal::InvalidChange);
         }
-        change::parse(&request.payload, normalise)?;
-        let key = self.requests.key(DESCRIPTOR, &request)?;
+        match (&self.caller, descriptor) {
+            (Caller::Agent { .. }, DESCRIPTOR) => {
+                if change::parse(&request.payload, normalise)?
+                    .approval_id()
+                    .is_none()
+                {
+                    return Err(Refusal::InvalidChange);
+                }
+            }
+            (Caller::Agent { .. }, _) => return Err(Refusal::InvalidChange),
+            (Caller::Person, DESCRIPTOR) => {
+                change::parse(&request.payload, normalise).map(|_| ())?;
+            }
+            (Caller::Person, PROPOSE) => {
+                proposal::parse(&request.payload, normalise).map(|_| ())?;
+            }
+            (Caller::Person, DECIDE) => proposal::parse_decide(&request.payload).map(|_| ())?,
+            (Caller::Person, ACKNOWLEDGE) => {
+                review::parse_acknowledge(&request.payload).map(|_| ())?;
+            }
+            (Caller::Person, REVERSE) => inverse::parse_reverse(&request.payload).map(|_| ())?,
+            (Caller::Person, _) => return Err(Refusal::InvalidChange),
+        }
+        let key = self.requests.key(descriptor, &request)?;
         Ok(Prepared { request, key })
     }
 
-    fn online(&self) -> Result<(), GraphClientError> {
-        match self.source().replica.state().link {
+    /// Whether a send may start now: the replica has a link. A queued
+    /// entry is never moved to `submitting` without one.
+    pub fn online(&self) -> Result<(), GraphClientError> {
+        match self.requests.port().link() {
             LinkState::Connected | LinkState::Connecting => Ok(()),
             _ => Err(GraphClientError::Offline),
         }
@@ -183,18 +277,57 @@ impl GraphClient {
 
     /// What may be concluded about `prepared` now: from its receipt on this
     /// replica, else (online) from `graph.outcome`, with `attempt` lending
-    /// its transport answer when there is one.
+    /// its transport answer when there is one. A `graph.outcome` the server
+    /// refused is that refusal ([`GraphOutcome::Pending`] with its
+    /// [`PendingCause`]: a revocation signal when [`PendingCause::Refused`]
+    /// or [`PendingCause::CredentialRefused`]),
+    /// never a quiet pending; one that could not be asked leaves the
+    /// attempt to speak.
+    ///
+    /// A person's receipt cached on this replica settles nothing on its
+    /// own (112.1 T2.3: authority first, receipt second, replay last). It
+    /// may settle only after the server's current `graph.read_status` for
+    /// this domain answered, or when `attempt` is this request's own fresh
+    /// acknowledgement (the server accepted the command just now, under the
+    /// authority it checks at acceptance; a `cached` replay is not one). A
+    /// refused status is that refusal, never the cached outcome. With no
+    /// current authority (no link, an unreachable server, an unreadable
+    /// answer) the cached receipt is not used: an attempt in hand speaks
+    /// alone (a refused one is its refusal, an unanswered one stays
+    /// pending), and without one the lookup fails
+    /// ([`GraphClientError::Offline`], [`GraphClientError::Replica`]), so
+    /// the entry stays where it is. `graph.outcome` authorises on the
+    /// server itself. An agent replicates no receipts.
     pub fn outcome(
         &self,
         prepared: &Prepared,
         attempt: Option<&Attempt>,
     ) -> Result<GraphOutcome, GraphClientError> {
         let mut receipt = self.requests.receipt(&prepared.key)?;
+        if receipt.is_some()
+            && self.caller == Caller::Person
+            && !attempt.is_some_and(|attempt| Self::acknowledged(attempt, &prepared.key))
+        {
+            match (self.current_authority(), attempt) {
+                (Ok(None), _) => {}
+                (Ok(Some(refused)), _) => return Ok(refused),
+                (Err(_), Some(attempt)) => {
+                    return Ok(self.requests.resolve(&prepared.key, attempt, None));
+                }
+                (Err(error), None) => return Err(error),
+            }
+        }
         if receipt.is_none() && self.online().is_ok() {
-            receipt = match self.requests.remote_receipt(&prepared.key, None) {
+            receipt = match self
+                .requests
+                .remote_receipt(&prepared.key, self.caller.context_id())
+            {
                 Ok(receipt) => receipt,
-                // Unreachable or refused now: the request stays pending.
-                Err(GraphRequestError::Replica(_)) => None,
+                Err(GraphRequestError::Replica(error)) => match PendingCause::of(&error) {
+                    // Unreachable now: the request stays as the attempt says.
+                    PendingCause::Transport => None,
+                    cause => return Ok(GraphOutcome::Pending { cause }),
+                },
                 Err(error) => return Err(error.into()),
             };
         }
@@ -206,14 +339,81 @@ impl GraphClient {
         })
     }
 
+    /// Ask the server for this person's current read authority over the
+    /// domain: `None` when it answered one, the refusal as a pending outcome
+    /// when it refused, an error when it could not be asked or read.
+    fn current_authority(&self) -> Result<Option<GraphOutcome>, GraphClientError> {
+        self.online()?;
+        let domain = self.requests.domain();
+        match self
+            .requests
+            .port()
+            .remote_query(wire::READ_STATUS, wire::read_status_params(domain))
+        {
+            Ok(rows) => wire::decode_read_status(domain, rows)
+                .map(|_| None)
+                .map_err(GraphClientError::Unreadable),
+            Err(error) => match PendingCause::of(&error) {
+                PendingCause::Transport => Err(error.into()),
+                cause => Ok(Some(GraphOutcome::Pending { cause })),
+            },
+        }
+    }
+
+    /// Whether `attempt` is `key`'s own fresh acknowledgement: sent under
+    /// the whole key, answered for its request id, and not a `cached`
+    /// replay.
+    fn acknowledged(attempt: &Attempt, key: &RequestKey) -> bool {
+        attempt.key() == key
+            && matches!(attempt.result(), Ok(result)
+                if result.request_id == key.request_id() && !result.cached)
+    }
+
     /// Mint, send and resolve `change` once. Refused (`Err`) only before a
     /// request id exists — no link, or a change outside the contract. From
     /// then on the answer is [`Applied`], which always carries the request
     /// (and the attempt, once one was made), whatever failed after: the
     /// command may have committed, so the same id must stay askable.
     pub fn apply(&self, change: &Change) -> Result<Applied, GraphClientError> {
+        self.run(DESCRIPTOR, change.payload())
+    }
+
+    /// Propose `proposal` (its change under keeper's tag policy) for the
+    /// reviewers it names: `proposed` with `{proposal_id,
+    /// proposal_revision, proposal_digest}`, never accepted.
+    pub fn propose(&self, proposal: &Proposal) -> Result<Applied, GraphClientError> {
+        self.run(PROPOSE, proposal.payload())
+    }
+
+    /// Decide one proposal revision as an enumerated reviewer: an approval
+    /// is accepted (the proposal's event) or `rejected proposal_stale`; a
+    /// rejection is `proposed` with the revision's new status.
+    pub fn decide(&self, decision: &Decision) -> Result<Applied, GraphClientError> {
+        self.run(DECIDE, decision.payload())
+    }
+
+    /// Acknowledge the accepted event `target` as a human reviewer: one new
+    /// review event; the acknowledged event never changes and stays
+    /// reversible.
+    pub fn acknowledge(&self, target: &Target) -> Result<Applied, GraphClientError> {
+        self.run(ACKNOWLEDGE, review::acknowledge_payload(target))
+    }
+
+    /// Reverse the event `reverse` names under the revisions it expects
+    /// ([`Reverse::of`] a preview's plan). A precondition, dependency or
+    /// race failure is a conflict ([`GraphOutcome::code`]:
+    /// `reversal_conflict`), never a partial or forced reversal.
+    pub fn reverse(&self, reverse: &Reverse) -> Result<Applied, GraphClientError> {
+        self.run(REVERSE, reverse.payload())
+    }
+
+    /// Mint, send and resolve one `descriptor` command (the rules of
+    /// [`Self::apply`]).
+    fn run(&self, descriptor: &str, payload: Value) -> Result<Applied, GraphClientError> {
         self.online()?;
-        let prepared = self.mint(change).map_err(GraphClientError::Refused)?;
+        let prepared = self
+            .mint_command(descriptor, payload)
+            .map_err(GraphClientError::Refused)?;
         let attempt = match self.send(&prepared) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -237,8 +437,12 @@ impl GraphClient {
         operation: &str,
         params: Value,
     ) -> Result<Vec<Map<String, Value>>, GraphClientError> {
+        // The typed reads name no context: a person's only.
+        if self.caller != Caller::Person {
+            return Err(GraphClientError::PersonOnly);
+        }
         self.online()?;
-        Ok(self.source().replica.remote_query(operation, params)?)
+        Ok(self.requests.port().remote_query(operation, params)?)
     }
 
     /// The node `id` (archived ones only with `include_archived`).
@@ -259,6 +463,71 @@ impl GraphClient {
     ) -> Result<Option<Map<String, Value>>, GraphClientError> {
         let rows = self.read(wire::GET_EDGE, wire::get_params(None, id, include_archived))?;
         decode_edge(id, rows).map_err(GraphClientError::Unreadable)
+    }
+
+    /// The content `id`: by default only while its owner node is active (a
+    /// content has no lifecycle of its own).
+    pub fn get_content(
+        &self,
+        id: &str,
+        include_archived: bool,
+    ) -> Result<Option<Map<String, Value>>, GraphClientError> {
+        let rows = self.read(
+            wire::GET_CONTENT,
+            wire::get_params(None, id, include_archived),
+        )?;
+        decode_content(id, rows).map_err(GraphClientError::Unreadable)
+    }
+
+    /// The redirect chain of node `id`: the ids its `merged_into_id` links
+    /// lead through, in order, ending at the first unmerged node (empty for
+    /// a node never merged; `None` when `id` does not exist). The absorbed
+    /// node itself stays what [`Self::get_node`] answers for `id`: the
+    /// survivor is reported, never substituted. A chain longer than the
+    /// contract's [`MAX_REDIRECT_HOPS`], or one that loops or breaks, is an
+    /// answer this build does not read.
+    pub fn redirects(&self, id: &str) -> Result<Option<Vec<String>>, GraphClientError> {
+        let Some(mut node) = self.get_node(id, true)? else {
+            return Ok(None);
+        };
+        let mut chain: Vec<String> = Vec::new();
+        while let Some(next) = node.image.get("merged_into_id").and_then(Value::as_str) {
+            if chain.len() == MAX_REDIRECT_HOPS || next == id || chain.iter().any(|c| c == next) {
+                return Err(GraphClientError::Unreadable(Refusal::UnsupportedVersion));
+            }
+            chain.push(next.to_owned());
+            node = self
+                .get_node(next, true)?
+                .ok_or(GraphClientError::Unreadable(Refusal::UnsupportedVersion))?;
+        }
+        Ok(Some(chain))
+    }
+
+    /// One page of the unreviewed feed after graph position `after`: the
+    /// agent-origin effect events no review targets (persons with the
+    /// reviewer role only); resume from its `scanned_through`.
+    pub fn unreviewed(&self, after: &str, limit: u32) -> Result<HistoryPage, GraphClientError> {
+        let params =
+            wire::unreviewed_params(None, after, limit).map_err(GraphClientError::Refused)?;
+        let rows = self.read(wire::UNREVIEWED, params)?;
+        decode_history(after, limit, rows).map_err(GraphClientError::Unreadable)
+    }
+
+    /// What reversing the accepted event `event_id` would do now: its plan,
+    /// the revisions it requires and whether it would apply. Inspection
+    /// only: neither an approval nor a reservation.
+    pub fn preview_reversal(&self, event_id: &str) -> Result<Preview, GraphClientError> {
+        let params = wire::preview_params(None, event_id).map_err(GraphClientError::Refused)?;
+        let rows = self.read(wire::PREVIEW_REVERSAL, params)?;
+        inverse::decode_preview(event_id, rows).map_err(GraphClientError::Unreadable)
+    }
+
+    /// The revisions of proposal `proposal_id` this person reviews (none
+    /// when not enumerated on any, or not authorised now).
+    pub fn proposal(&self, proposal_id: &str) -> Result<Vec<ProposalRow>, GraphClientError> {
+        let params = wire::proposal_params(None, proposal_id).map_err(GraphClientError::Refused)?;
+        let rows = self.read(wire::PROPOSAL, params)?;
+        decode_proposals(proposal_id, rows).map_err(GraphClientError::Unreadable)
     }
 
     /// One page of retained history after graph position `after`; resume

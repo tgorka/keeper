@@ -1,0 +1,454 @@
+/*
+ * transform_func_aggregate.c
+ *    Aggregate function transformations for Cypher queries
+ *
+ * This file contains transformations for aggregate functions:
+ * - count() - count rows or expressions
+ * - sum(), avg(), min(), max() - numeric aggregations
+ * - type() - get relationship type
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "transform/cypher_transform.h"
+#include "transform/transform_func_aggregate.h"
+#include "parser/cypher_ast.h"
+#include "parser/cypher_debug.h"
+
+/* Transform COUNT function */
+int transform_count_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming COUNT function");
+
+    /* COUNT() with no arguments - treat as COUNT(*) */
+    if (!func_call->args || func_call->args->count == 0) {
+        append_sql(ctx, "COUNT(*)");
+        return 0;
+    }
+
+    /* COUNT(*) case - represented as single NULL argument */
+    if (func_call->args->count == 1 && func_call->args->items[0] == NULL) {
+        append_sql(ctx, "COUNT(*)");
+        return 0;
+    }
+
+    /* COUNT(expression) case */
+    if (func_call->args->count == 1 && func_call->args->items[0] != NULL) {
+        ast_node *arg = func_call->args->items[0];
+
+        if (func_call->distinct) {
+            append_sql(ctx, "COUNT(DISTINCT ");
+        } else {
+            append_sql(ctx, "COUNT(");
+        }
+
+        /* For bare node/edge identifiers, use alias.id instead of the full
+         * json_object expression. json_object() never returns NULL even when
+         * the underlying row is NULL (from LEFT JOIN / OPTIONAL MATCH),
+         * which causes COUNT to include null rows.
+         *
+         * T-0252 follow-on: varlen-bound vars (e.g. `r` in `MATCH ()-[r*]->()`)
+         * resolve to a recursive-CTE alias whose schema is
+         * (start_id, end_id, depth, ...) — there is no `.id` column.
+         * For those, use `alias.start_id` (every CTE row has a start
+         * so it's never NULL when the row exists). Counts paths. */
+        if (arg->type == AST_NODE_IDENTIFIER) {
+            cypher_identifier *id = (cypher_identifier*)arg;
+            const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+            if (alias) {
+                bool skip = transform_var_is_projected(ctx->var_ctx, id->name) ||
+                            transform_var_alias_is_id(ctx->var_ctx, id->name);
+                transform_var *v = transform_var_lookup(ctx->var_ctx, id->name);
+                if (v && v->cte_name) {
+                    append_sql(ctx, "%s.start_id)", alias);
+                } else {
+                    append_sql(ctx, "%s%s)", alias, skip ? "" : ".id");
+                }
+                return 0;
+            }
+        }
+
+        if (transform_expression(ctx, arg) < 0) {
+            return -1;
+        }
+
+        append_sql(ctx, ")");
+        return 0;
+    }
+
+    /* Invalid COUNT usage */
+    ctx->has_error = true;
+    ctx->error_message = strdup("COUNT function accepts 0 or 1 argument");
+    return -1;
+}
+
+/* Transform other aggregate functions (MIN, MAX, AVG, SUM) */
+int transform_aggregate_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming aggregate function: %s", func_call->function_name);
+
+    /* These functions require exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), "%s function requires exactly one non-null argument", func_call->function_name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    /* Check if argument is a property access - optimize with JOINs instead of correlated subqueries */
+    ast_node *arg = func_call->args->items[0];
+    if (arg->type == AST_NODE_PROPERTY) {
+        cypher_property *prop = (cypher_property *)arg;
+        return transform_aggregate_with_property(ctx, func_call, prop);
+    }
+
+    /* min()/max() use Cypher orderability (object < list < text < bool <
+     * number < null), not SQLite's storage-class MIN/MAX — route to the
+     * custom aggregates _gql_min / _gql_max (Aggregation2 [9]/[11]/[12]). */
+    const char *fn = func_call->function_name;
+    bool is_min = (strcasecmp(fn, "min") == 0);
+    bool is_max = (strcasecmp(fn, "max") == 0);
+
+    char upper_func[64];
+    if (is_min || is_max) {
+        snprintf(upper_func, sizeof(upper_func), is_min ? "_gql_min" : "_gql_max");
+    } else {
+        /* Generate SQL function call - convert to uppercase for SQL compliance */
+        strncpy(upper_func, func_call->function_name, sizeof(upper_func) - 1);
+        upper_func[sizeof(upper_func) - 1] = '\0';
+        for (int i = 0; upper_func[i]; i++) {
+            upper_func[i] = toupper(upper_func[i]);
+        }
+    }
+
+    if (func_call->distinct) {
+        append_sql(ctx, "%s(DISTINCT ", upper_func);
+    } else {
+        append_sql(ctx, "%s(", upper_func);
+    }
+
+    if (transform_expression(ctx, func_call->args->items[0]) < 0) {
+        return -1;
+    }
+
+    append_sql(ctx, ")");
+    return 0;
+}
+
+/*
+ * Optimized aggregation on property access using JOINs instead of correlated subqueries.
+ * Instead of generating MIN((SELECT COALESCE(...))) which runs 4 subqueries per row,
+ * we add LEFT JOINs to property tables and aggregate the joined columns directly.
+ */
+int transform_aggregate_with_property(cypher_transform_context *ctx,
+                                      cypher_function_call *func_call,
+                                      cypher_property *prop)
+{
+    CYPHER_DEBUG("Optimizing aggregate %s on property access", func_call->function_name);
+
+    /* Get the base expression (should be an identifier) */
+    if (prop->expr->type != AST_NODE_IDENTIFIER) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("Complex property access not yet supported in aggregations");
+        return -1;
+    }
+
+    cypher_identifier *id = (cypher_identifier *)prop->expr;
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: aggregation: `%s` is a path" : "SyntaxError: UndefinedVariable: aggregation: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    /* Check if this is a projected variable from WITH */
+    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+    const char *node_id_ref = is_projected ? alias : NULL;
+    char node_id_buf[256];
+    if (!is_projected) {
+        snprintf(node_id_buf, sizeof(node_id_buf), "%s.id", alias);
+        node_id_ref = node_id_buf;
+    }
+
+    /* T-0314: detect edge variables and pick the matching prop tables.
+     * Pre-T-0314, aggregation against edge properties (e.g.
+     * sum(r.num) where r is `()-[r:R]->()`) joined node_props_*,
+     * which never found edge IDs → returned NULL. */
+    bool is_edge_agg = transform_var_is_edge(ctx->var_ctx, id->name);
+    const char *agg_int_table  = is_edge_agg ? "edge_props_int"  : "node_props_int";
+    const char *agg_real_table = is_edge_agg ? "edge_props_real" : "node_props_real";
+    const char *agg_text_table = is_edge_agg ? "edge_props_text" : "node_props_text";
+    const char *agg_id_col     = is_edge_agg ? "edge_id"         : "node_id";
+
+    /* Generate unique alias for property joins */
+    int join_id = ++ctx->prop_join_counter;
+
+    /* Generate SQL function call - convert to uppercase */
+    char upper_func[64];
+    strncpy(upper_func, func_call->function_name, sizeof(upper_func) - 1);
+    upper_func[sizeof(upper_func) - 1] = '\0';
+    for (int i = 0; upper_func[i]; i++) {
+        upper_func[i] = toupper(upper_func[i]);
+    }
+
+    /*
+     * For MIN/MAX/AVG/SUM, we want numeric comparison.
+     * Generate: AGG_FUNC(COALESCE(_prop_N_int.value, _prop_N_real.value, CAST(_prop_N_text.value AS REAL)))
+     * And add LEFT JOINs to the property tables.
+     */
+
+    /* Add LEFT JOINs to property tables via sql_builder if active, otherwise inline */
+    char join_alias_int[64], join_alias_real[64], join_alias_text[64];
+    snprintf(join_alias_int, sizeof(join_alias_int), "_prop_%d_int", join_id);
+    snprintf(join_alias_real, sizeof(join_alias_real), "_prop_%d_real", join_id);
+    snprintf(join_alias_text, sizeof(join_alias_text), "_prop_%d_text", join_id);
+
+    /* Build property key subquery once */
+    char pk_subquery[256];
+    snprintf(pk_subquery, sizeof(pk_subquery),
+             "(SELECT id FROM property_keys WHERE key = '%s')", sql_esc_tmp(prop->property_name));
+
+    /*
+     * When using unified_builder, park the property JOINs in the builder's
+     * deferred-join section (T-0268). The owning RETURN / WITH clause
+     * appends them after its other JOINs once the projection is built.
+     */
+    if (ctx->unified_builder) {
+        /* Build the JOIN clauses and defer them */
+        char *join_sql = sqlite3_mprintf(
+                 " LEFT JOIN %s AS %s ON %s.%s = %s AND %s.key_id = %s"
+                 " LEFT JOIN %s AS %s ON %s.%s = %s AND %s.key_id = %s"
+                 " LEFT JOIN %s AS %s ON %s.%s = %s AND %s.key_id = %s",
+                 agg_int_table,  join_alias_int,  join_alias_int,  agg_id_col, node_id_ref, join_alias_int,  pk_subquery,
+                 agg_real_table, join_alias_real, join_alias_real, agg_id_col, node_id_ref, join_alias_real, pk_subquery,
+                 agg_text_table, join_alias_text, join_alias_text, agg_id_col, node_id_ref, join_alias_text, pk_subquery);
+
+        if (join_sql) sql_join_deferred(ctx->unified_builder, join_sql);
+        sqlite3_free(join_sql);
+        CYPHER_DEBUG("Deferred property JOINs for %s aggregation", upper_func);
+
+        /* Generate the aggregation expression using joined columns */
+        if (func_call->distinct) {
+            append_sql(ctx, "%s(DISTINCT COALESCE(%s.value, %s.value, CAST(%s.value AS REAL)))",
+                       upper_func, join_alias_int, join_alias_real, join_alias_text);
+        } else {
+            append_sql(ctx, "%s(COALESCE(%s.value, %s.value, CAST(%s.value AS REAL)))",
+                       upper_func, join_alias_int, join_alias_real, join_alias_text);
+        }
+    } else {
+        /*
+         * sql_builder not active - need to use subquery approach but optimized.
+         * Generate a single subquery that does JOIN + aggregation instead of correlated subqueries per row.
+         * Pattern: (SELECT AGG_FUNC(COALESCE(...)) FROM matched_nodes LEFT JOIN props...)
+         *
+         * This is tricky because we need to replicate the FROM clause context.
+         * For now, fall back to the original correlated subquery approach but preserve numeric types.
+         */
+        CYPHER_DEBUG("sql_builder not active, using optimized correlated subquery");
+
+        if (func_call->distinct) {
+            append_sql(ctx, "%s(DISTINCT ", upper_func);
+        } else {
+            append_sql(ctx, "%s(", upper_func);
+        }
+
+        /* Generate COALESCE that preserves numeric types instead of casting to TEXT */
+        append_sql(ctx, "COALESCE(");
+
+        /* Integer properties (preferred for numeric ops) */
+        append_sql(ctx, "(SELECT npi.value FROM node_props_int npi JOIN property_keys pk ON npi.key_id = pk.id WHERE npi.node_id = %s AND pk.key = ",
+                   node_id_ref);
+        append_string_literal(ctx, prop->property_name);
+        append_sql(ctx, "), ");
+
+        /* Real properties */
+        append_sql(ctx, "(SELECT npr.value FROM node_props_real npr JOIN property_keys pk ON npr.key_id = pk.id WHERE npr.node_id = %s AND pk.key = ",
+                   node_id_ref);
+        append_string_literal(ctx, prop->property_name);
+        append_sql(ctx, "), ");
+
+        /* Text properties (cast to REAL for numeric aggregation) */
+        append_sql(ctx, "(SELECT CAST(npt.value AS REAL) FROM node_props_text npt JOIN property_keys pk ON npt.key_id = pk.id WHERE npt.node_id = %s AND pk.key = ",
+                   node_id_ref);
+        append_string_literal(ctx, prop->property_name);
+        append_sql(ctx, ")");
+
+        append_sql(ctx, "))");
+    }
+
+    return 0;
+}
+
+/* Transform TYPE function specifically */
+int transform_type_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming TYPE function");
+
+    /* TYPE function requires exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("type() function requires exactly one non-null argument");
+        return -1;
+    }
+
+    ast_node *arg = func_call->args->items[0];
+
+    /* type(null) → null. Same propagation rule as labels(). */
+    if (arg->type == AST_NODE_LITERAL) {
+        cypher_literal *lit = (cypher_literal*)arg;
+        if (lit->literal_type == LITERAL_NULL) {
+            append_sql(ctx, "NULL");
+            return 0;
+        }
+        ctx->has_error = true;
+        ctx->error_message = strdup("SyntaxError: InvalidArgumentType: type() takes a relationship");
+        return -1;
+    }
+
+    if (arg->type != AST_NODE_IDENTIFIER ||
+        (!transform_var_is_edge(ctx->var_ctx, ((cypher_identifier*)arg)->name) &&
+         transform_var_get_alias(ctx->var_ctx, ((cypher_identifier*)arg)->name) &&
+         transform_var_lookup(ctx->var_ctx, ((cypher_identifier*)arg)->name) &&
+         transform_var_lookup(ctx->var_ctx, ((cypher_identifier*)arg)->name)->kind == VAR_KIND_PROJECTED)) {
+        /* type() accepts type Any (Graph4 [5]): a non-identifier argument
+         * (e.g. `type(list[0])`) is resolved at runtime by the _gql_type UDF —
+         * a relationship value yields its type, null yields null, anything else
+         * raises a TypeError. */
+        append_sql(ctx, "_gql_type(");
+        if (transform_expression(ctx, arg) < 0) return -1;
+        append_sql(ctx, ")");
+        return 0;
+    }
+
+    cypher_identifier *id = (cypher_identifier*)arg;
+
+    /* Check if the variable is registered */
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: type() function: `%s` is a path" : "SyntaxError: UndefinedVariable: type() function: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    /* Check if the variable is a relationship/edge variable */
+    if (!transform_var_is_edge(ctx->var_ctx, id->name)) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("SyntaxError: InvalidArgumentType: type() takes a relationship");
+        return -1;
+    }
+
+    /* Generate SQL to extract the relationship type from the edges table.
+     * Wrap in a CASE so OPTIONAL MATCH miss (id IS NULL) propagates to NULL. */
+    bool skip_id = transform_var_is_projected(ctx->var_ctx, id->name) ||
+                   transform_var_alias_is_id(ctx->var_ctx, id->name);
+    append_sql(ctx,
+        "(CASE WHEN %s%s IS NULL THEN NULL ELSE "
+        "(SELECT type FROM edges WHERE id = %s%s) END)",
+        alias, skip_id ? "" : ".id",
+        alias, skip_id ? "" : ".id");
+
+    return 0;
+}
+
+/* Transform stDev/stDevP - standard deviation aggregate functions
+ * stDev = sample standard deviation (divides by N-1)
+ * stDevP = population standard deviation (divides by N)
+ *
+ * SQLite doesn't have built-in stdev, so we compute it as:
+ * sqrt(avg(x*x) - avg(x)*avg(x)) for population, adjusted for sample.
+ * Using the computational formula: sqrt((sum(x^2)/n - (sum(x)/n)^2) * n/(n-1)) for sample
+ * Simplified: sqrt((SUM(x*x) - SUM(x)*SUM(x)/COUNT(x)) / (COUNT(x) - 1)) for sample
+ */
+int transform_stdev_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming stDev/stDevP function: %s", func_call->function_name);
+
+    if (!func_call->args || func_call->args->count != 1) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("stDev()/stDevP() requires exactly one argument");
+        return -1;
+    }
+
+    bool is_population = (strcasecmp(func_call->function_name, "stDevP") == 0 ||
+                         strcasecmp(func_call->function_name, "stdevp") == 0);
+
+    /* For population: sqrt(avg(x*x) - avg(x)*avg(x))
+     * For sample: sqrt((sum(x*x) - sum(x)*sum(x)/count(x)) / (count(x) - 1))
+     * Simpler approach using SQLite: */
+    if (is_population) {
+        /* Population std dev: sqrt(AVG(x*x) - AVG(x)*AVG(x)) */
+        append_sql(ctx, "CASE WHEN COUNT(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") = 0 THEN 0.0 ELSE SQRT(AVG(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, " * ");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") - AVG(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") * AVG(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ")) END");
+    } else {
+        /* Sample std dev: sqrt(N/(N-1)) * population_stdev */
+        append_sql(ctx, "CASE WHEN COUNT(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") <= 1 THEN 0.0 ELSE SQRT(CAST(COUNT(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") AS REAL) / (COUNT(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") - 1) * (AVG(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, " * ");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") - AVG(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, ") * AVG(");
+        if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+        append_sql(ctx, "))) END");
+    }
+
+    return 0;
+}
+
+/* Transform percentileCont/percentileDisc - percentile aggregate functions
+ * percentileCont(expr, pct) - continuous (interpolated) percentile
+ * percentileDisc(expr, pct) - discrete (nearest value) percentile
+ *
+ * Uses SQLite window functions or subquery-based approach.
+ * percentileDisc: the smallest value where cumulative fraction >= pct
+ * percentileCont: linear interpolation between adjacent values
+ */
+int transform_percentile_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming percentile function: %s", func_call->function_name);
+
+    if (!func_call->args || func_call->args->count != 2) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), "%s() requires exactly two arguments (expression, percentile)",
+                 func_call->function_name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    bool is_continuous = (strcasecmp(func_call->function_name, "percentileCont") == 0 ||
+                         strcasecmp(func_call->function_name, "percentilecont") == 0);
+
+    /* Emit as a SQLite custom aggregate (registered in runtime/udf_register.c
+     * during I-0040 M15). The aggregate collects all numeric values during
+     * xStep and computes the percentile in xFinal. */
+    append_sql(ctx, is_continuous ? "percentileCont(" : "percentileDisc(");
+    if (transform_expression(ctx, func_call->args->items[0]) < 0) return -1;
+    append_sql(ctx, ", ");
+    if (transform_expression(ctx, func_call->args->items[1]) < 0) return -1;
+    append_sql(ctx, ")");
+    return 0;
+}

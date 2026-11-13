@@ -88,6 +88,21 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   publisher is a residual risk, not a claim that the dependency is fixed.
   Follow-up: upgrade `tauri-plugin-updater` when it supports `zip >=9`, then upgrade
   keeper's direct ZIP dependency and remove all three waivers.
+- **ZIP / RUSTSEC-2026-0429** (waived 2026-11-11, **expires 2026-12-31**, owner decision
+  2026-11-11): `keeper -> tauri-plugin-updater 2.10.1 -> zip ^4` (the newest published
+  updater, 3.0.0-alpha.3, still requires `zip ^4`); the fix is only in `zip >=9`. The
+  affected `ZipArchive::extract` symlink path is the same exposure as above: the document
+  reader never extracts, and the updater extracts on Windows only, minisign-verified
+  releases only. Follow-up: the same updater upgrade to `zip >=9`, then remove.
+- **SQLite / RUSTSEC-2026-0459** (waived 2026-11-11, **expires 2026-12-31**, owner decision
+  2026-11-11): `matrix-sdk-sqlite 0.19.1 -> rusqlite ^0.40.2 -> libsqlite3-sys ^0.38`.
+  `libsqlite3-sys` is `links = "sqlite3"`, so the whole graph (keeper-core, keeper-sync,
+  syncular-client, the graph worker) shares that one version; the fix needs
+  `libsqlite3-sys >=0.39`, i.e. `rusqlite >=0.41`. The exposure is a crafted database plus
+  `-wal` pair with mismatched page sizes opened locally. Bump trigger: matrix-rust-sdk main
+  `18757f7e08` (2026-11-09) moved to `rusqlite 0.41.1` but is not yet released. Follow-up:
+  bump `rusqlite`, `libsqlite3-sys` and keeper-graph-query's exact `=0.38.2` pin once a
+  released `matrix-sdk-sqlite` allows it, then remove the waiver.
 
 No unmaintained crate is replaced in this lane. Each follow-up upgrades or replaces
 the dependency that owns it, rather than substituting an incompatible transitive crate:
@@ -196,11 +211,300 @@ why (`docs/android.md` has the whole list):
   covers groups, not single artifacts: a new artifact in a listed group passes unread
   (DW-1290).
 
-## Audited `unsafe` FFI inventory (shell crate only)
+## Audited `unsafe` FFI inventory
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
 carry function-level, audited `#[allow(unsafe_code)]` exceptions for platform FFI with no
-safe binding. Current inventory:
+safe binding. The graph worker `keeper-graph-query` carries exactly the eleven below (OD-1),
+and `keeper-core` exactly one, K01 (owner amendment 2026-11-13). Current inventory:
+
+### Graph worker `keeper-graph-query` (OD-1; story 110.5)
+
+The separate, single-use graph worker executable may carry exactly eleven function-level
+allowances, never a crate/module allowance or a first-party unsafe impl. `allocation.rs`
+and `native.rs` are byte-identical to the independently reviewed 110.1 sources (accepted
+head `56196413`); `scripts/check-graph-boundary.py` pins their SHA-256, so any edit reopens
+the inventory review.
+
+| ID | `keeper-graph-query` function | Boundary |
+|---|---|---|
+| U01 | `native::register` | Guarded connection handle/statement inspection and pinned static registration |
+| U02 | `allocation::install_sqlite` | Pre-initialization SQLite allocator/mmap/journal-spill configuration |
+| U03 | `allocation::native_malloc` | Checked charged positive allocation, export `keeper_graph_malloc` |
+| U04 | `allocation::native_free` | Owned-header deallocation, also SQLite xFree, export `keeper_graph_free` |
+| U05 | `allocation::native_calloc` | Checked multiplication/zeroing, export `keeper_graph_calloc` |
+| U06 | `allocation::native_realloc` | Charged replacement/copy/free, export `keeper_graph_realloc` |
+| U07 | `allocation::native_strdup` | Valid C-string copy, export `keeper_graph_strdup` |
+| U08 | `allocation::native_strndup` | Bounded C-string copy, export `keeper_graph_strndup` |
+| U09 | `allocation::sqlite_malloc` | Exact xMalloc ABI adapter |
+| U10 | `allocation::sqlite_realloc` | Exact xRealloc ABI adapter |
+| U11 | `allocation::sqlite_size` | Exact xSize ABI and owned-header read |
+
+The six exports live inside U03–U08. `sqlite_roundup`, `sqlite_init` and `sqlite_shutdown`
+are safe, unexported C-ABI callbacks without allowances. The 110.1 proof's test-only row T12
+(`examples/allocation_probe.rs`, behind the removed `proof-executables` feature) does not
+ship; its evidence stands against the byte-identical `allocation.rs`. The measurement-only
+interposer M1 stays in the 110.1 evidence bundle and is never linked into, shipped with or
+loaded by the worker. `keeper-graph-protocol` and `keeper-graph-driver` carry no `unsafe`,
+`keeper-core` only K01 below, and Linux confinement (Landlock, seccomp, rlimits) and every
+launch check use safe bindings (`landlock`, `seccompiler`, `rustix`).
+
+Every callback checks a const-TLS main-thread flag before allocation or pointer access. The
+flag is granted only by the crate-private `allocation::enter`, a process-wide one-shot claim
+made by the worker's sole entry `engine::start`; a repeated or second-thread claim exits 73.
+Allocating callbacks never return NULL, including zero-size requests, and return
+16-byte-aligned pointers; exhaustion exits 72 without unwinding. Registration rejects live
+statements before entering upstream code, whose `create_function_v2` failure path otherwise
+double-frees its cache. The guard enforces the inventory lexically over every first-party
+Rust file of the graph crates: every `unsafe` token and export attribute lies inside one of
+the eleven functions, no other `unsafe_code` attribute form exists, the three safe callbacks
+stay safe and unexported, the redirect header holds no function body, and the worker has no
+cargo feature and no example.
+
+**`cap` 0.1.2.** Its `unsafe impl GlobalAlloc` (crate SHA-256
+`6f125eb85b84a24c36b02ed1d22c9dd8632f53b3cde6e4d23512f94021030003`) is an audited
+dependency row. Concurrent allocation failure can permanently defeat its counter, so the
+worker is single-threaded by construction: the const-TLS callback guard, exit 73 on a second
+thread's claim, and process-wide seccomp `KillProcess` on `clone`/`clone3`/`fork`/`vfork`.
+No `set_limit`. It is not a multithreaded allocator guarantee.
+
+**`rustix` 1.1.6.** The worker's safe syscall layer for its launch and confinement checks
+(features `process`, `fs`, `thread`, `stdio`; `keeper-graph-query` pins `=1.1.6`), crate
+SHA-256 `e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa` (Cargo.lock
+`checksum`), is an audited dependency row: its internal `unsafe` is the upstream syscall
+boundary, never first-party. 1.1.6 is the first release outside RUSTSEC-2026-0486 (the
+`xattr` buffer functions, which the worker does not call; bumped 2026-11-11 from 1.1.4). A
+version or checksum change reopens this row.
+
+**Accounted-cost conversion (Linux).** glibc's per-chunk overhead on charged allocations is
+not charged, so the charge is a conservative conversion of the unchanged 256 MiB
+real-allocation budget: **R = 28 MiB**, with `H0 + 4R + 64·N_max + 64 + 8 MiB stack =
+261,357,632 B` (H0 = 1 MiB, N_max = 2,101,248 live allocations under 32 bytes). Its premises
+are enforced, not assumed:
+
+- **P1′** — the supervisor sets exactly `GQL_STMT_CACHE=0` and
+  `GLIBC_TUNABLES=glibc.malloc.mmap_max=0:glibc.malloc.tcache_count=0:glibc.malloc.trim_threshold=536870912:glibc.malloc.arena_max=1`
+  (`keeper_graph_protocol::worker::LINUX_WORKER_GLIBC_TUNABLES`; OD-A appends one arena)
+  after `env_clear`, and the worker refuses any other environment;
+- **P6/B0** — the worker checks its own `VmData` against H0 at the input boundary (after
+  confinement, before any input) and exits 74 above it;
+- **P6b** — the schema check refuses a repeated object name;
+- **P6c** — before every Linux spawn the supervisor refuses (no child) unless its inherited
+  soft `RLIMIT_STACK` is finite and at most 8 MiB and `/etc/ld.so.preload` is absent;
+- **execution class** (OD-A r6 step 8) — before closing any descriptor the worker requires
+  exactly one each of `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`/`AT_SECURE`, `AT_SECURE` 0, equal
+  uid/euid and gid/egid and an inherited `no_new_privs`, then `AT_PAGESZ` 4096 and
+  `AT_MINSIGSTKSZ` in 1..=12288; otherwise it writes `execution class refused: <label>` or
+  `platform prerequisite refused` and exits 74, before B0.
+
+`RLIMIT_AS` 512 MiB stays an independent backstop.
+
+**Supported Linux runtime class (R1, OD-A/Q6).** Exactly one: `agent-image/linux-amd64/trixie/r1`,
+defined by keeper-hq's reviewed runtime DSO ledger (`agent/graph-runtime-ledger.json`, schema
+`keeper-graph-runtime-ledger/3`) embedded into the spawning binary at build time. A Linux
+worker is spawned only when the binary is `linux`/`x86_64`, a ledger is embedded, the
+worker's digest is the ledger's, and `keeper_core::graph::ledger` verifies the tree (every
+ledger object resolved in-root through exactly the ledger's symlinks, root-owned with no
+group/other write bit, no set-id or sticky bit, no `security.capability`, every parent
+root-owned, its SHA-256, each `ld.so.cache` entry reaching the same inode, the absent paths
+absent, the ELF facts — DT_NEEDED, PT_INTERP, PT_TLS, writable load pages, BIND_NOW, highest
+GLIBC version need, build-id, and no RPATH/RUNPATH/AUDIT) and the process (no mount at or
+above a ledger path, a genuine `/proc`, page size 4096, `AT_MINSIGSTKSZ` 1..=12288, Landlock
+ABI ≥ 6, seccomp filters). Before every spawn it re-resolves every path and requires the same
+identity, then, last, on the spawning thread with nothing awaited between it and the spawn:
+`no_new_privs`, equal real/effective/saved/filesystem ids, a non-root euid and no permitted,
+effective or ambient capability (ambient read from the thread's `CapAmb`; `capget` does not
+return it). Any other tuple — an arm64 image (no worker, OD-B), a host-native keeper-built
+worker, a dev host — is `projection_unavailable` before any child exists.
+
+**Abort profile and binding (§10).** The worker artifact is built only with
+`--profile graph-worker` (`panic = "abort"`) by `scripts/build-graph-worker.sh`, which
+checks that no unwinder entry is imported and writes the digest the driver embeds; a worker
+rebuilt with plain `--release` has another digest and is refused. There is no search path
+and no fallback: `VerifiedWorker::open` takes an absolute path and the expected digest.
+
+**macOS.** The worker runs only under the deprecated, undocumented `/usr/bin/sandbox-exec`
+SBPL profile (dyld's libignition needs `/` readable; worker/generation ancestors need
+metadata), and only through the explicit `Runtime::macos_evidence` path
+(`keeper-graph-driver --macos-evidence`). It is evidence only (OD-C): nothing shipped
+enables it; macOS has no accounted-cost mechanism of its own and its benchmark is deferred
+(DW-KG1-1101-MACBENCH). iOS and Android have no graph worker (`graph::available()` is false;
+CI's iOS check excludes the worker and driver; `check:android-graph` rejects them).
+
+GraphQLite is source-built MIT v0.12.0 commit `995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629`
+against the sole `libsqlite3-sys`. The builder runs the pinned upstream schema DDL itself
+inside its host transaction; both roles verify the complete `sqlite_schema`. The query
+authorizer allows exactly the 41 `(table, column)` reads and 9 functions of the reviewed
+corpus; a retained statement re-prepares under that exact policy, and a denial fails the
+query. Process-wide admission (`keeper_core::graph::admission`, one per process through
+`Admission::process`): 4 query workers per agentd (2 headless), 2 per agent, 1 per context
+whatever domain it reads, one builder, at most 16 waiting, 3 s to admit. A projection root
+keeps at most two published generations alive (`MAX_RETAINED_GENERATIONS`); a build is
+refused while two are referenced. A selected generation a worker refuses as unreadable is
+unselected and rebuilt from the accepted history on the next refresh. Query and inspection
+deadlines (3 s) and the build deadline (180 s) run from before spawn through exit and reap. A
+prefix longer than 100,000 events or an export over 1 GiB is an R1 limit:
+`projection_unavailable`.
+
+**Worker value admission (R6).** The builder admits every after-image with the reviewed 110.1
+rule, unchanged: nesting at most 16, finite numbers within ±2^53−1, strings at most 65,536
+bytes, arrays/objects at most 8,192 entries, keys at most 8,192 bytes, at most 128 KiB of
+canonical bytes per image; canonical bytes are serialized from the borrowed value (no
+normalized copy). A value the server accepted beyond these (e.g. a title over 64 KiB) makes
+the projection `projection_unavailable`: an R1 limit.
+
+### Worker spawn `keeper-core` K01 (owner amendment 2026-11-13)
+
+| ID | `keeper-core` function | Boundary |
+|---|---|---|
+| K01 | `graph::parent_death::die_with_parent` (Linux) | `CommandExt::pre_exec` closure in the forked worker before `exec`: `prctl(PR_SET_PDEATHSIG, SIGKILL)` and `getppid` through rustix, the spawn refused when the parent already died; no allocation, lock or logging |
+
+Without it, a driver or agentd ended by SIGKILL left its running worker as an orphan that ran
+to its own end (the worker has memory rlimits but no wall or CPU limit). The kernel's parent
+is the spawning *thread*, so every Linux worker is spawned, and its spawning-thread check
+(step 5) run, on one process-lifetime spawner thread (`runtime::spawner`): a retiring runtime
+or blocking thread never kills a healthy worker. **Invariant:** that thread's per-thread
+identity (credentials, `no_new_privs`, capabilities, Landlock, seccomp, signal mask) is fixed
+by the thread that makes the process's first spawn, and every worker inherits it; a
+restriction another thread takes on later never reaches a worker. agentd must make its first
+spawn only once its identity is final and never change a per-thread identity afterwards.
+Step 5 runs on that forking thread (`runtime::tests::step_five_runs_on_the_thread_that_forks`),
+so a worker never exceeds what step 5 saw. `exec` keeps the setting because the worker
+is neither set-id nor file-capable (the ledger's checks). `parent_death.rs` is the only file
+of `keeper-core/src` with `unsafe`, and `scripts/check-graph-boundary.py` pins its
+SHA-256, so any edit reopens this row. This changes the proven agentd spawn path: it needs
+its own R-A and R-C on delectra before any deploy.
+
+### Graph intents, revocation and offline reads (story 112.1)
+
+**Queued changes are local intent, never graph data.** A person's graph change can be
+persisted before it is sent (`keeper_core::graph::queue`, `keeper-graph-driver enqueue`) in
+`<actor>.graph-queue` beside the replica: one SQLite file per server, domain and actor,
+never synced. It holds the whole request identity, the request's canonical bytes and their
+digest, and the entry's state. Queries never see it: the default query answers the accepted
+graph only, and there is no provisional view. A restored entry is rebuilt from its own
+bytes. One whose bytes no longer match its digest is refused and kept as it was; one whose
+identity is not the opened one (another server, account, device or domain) is `suspended`
+and never sent. A terminal outcome is persisted first, and the payload is deleted after;
+terminal records stay until acknowledged or until the server is forgotten. `forget` deletes
+the queue files with the server's replicas and logs how many entries in each state it
+dropped. Agents keep no offline queue: an agent's `graph_apply` entry is bound to its approval
+(`awaiting_approval`), sent only after a person approves and the call's frozen arguments
+match the stored request, and after an agent runtime restart an entry never sent is
+`refused_locally` while one that may have been sent stays `unresolved` until `graph.outcome`
+answers.
+
+**Revocation locks first and cleans up after.** A revocation signal is a refused link, any
+revoked graph, receipt or proposal subscription, or the server refusing a read-level call: a
+read (`read_status`, `admit_read`, `refresh_context`, a query) or a `graph.outcome` lookup.
+A refusal of one request — a command refused at send, or any `forbidden` receipt, whatever
+its code — ends that request alone (`rejected forbidden`): no fence, and no other entry is
+touched (owner decision 2026-11-12, amending CC-7). Every remote answer is read by one
+classifier (`ReplicaError::class`), by the server's stable names: only a refused credential
+or scope (`401`/`403`, `sync.auth_required`, `sync.forbidden`, `sync.scope_revoked`) or a
+refusal of graph authority (`forbidden`, `context_revoked`, `source_audience`,
+`label_unknown`, or an `operation.forbidden` message keeper does not name) is a refusal. The
+graph switched off (`graph_unavailable`), an unknown operation, an ended or unbound agent
+context (`context_expired`/`closed`/`invalid`, `parent_unavailable`, `context_unbound`), an
+invalid request, a failed handler or query, a storage outage and any code keeper does not
+name are not: a read answers `sync_pending`, a request retries or ends locally, and nothing
+fences. On a signal the domain is fenced: the in-memory gate closes, a `graph_fence` row is
+committed in the queue file with the signal's cause, every open entry becomes `disabled`
+(identity and payload kept, never sent again), and in-flight workers are killed and the
+projection purged. Reads, results, receipts, history and the queue listing refuse from the
+first step; a crash at any step restarts locked. The replica's own graph rows are purged only
+by the server's scope revocation, which the Syncular client applies atomically. keeper never
+deletes them itself. The fence records `purged` only once every subscribed graph table
+(111.x's contents and reviews included), the receipts and the proposals read revoked.
+
+**What clears a fence follows from its cause** (owner decision 2026-11-12, H3). The cause is
+persisted in the queue file (`graph_fence.cause`, schema version 3), so a restart keeps it
+and its clearing rule; a fence written by an earlier build reads as `revocation`, the
+stricter. A `credential` fence is one learned from the server refusing this device's
+credential: a refused link, or `401`/`403` (`sync.credential_refused`) or
+`sync.auth_required` on a read-level call, as when a device stayed offline past its
+attestation window. No scope was revoked and no purge will come, so it clears from `revoked`
+on fresh authority alone: a working (re-attested) credential, a successful `read_status` (a
+person) or an unexpired `admit_read` answered after the fence (an agent), granted
+subscriptions and a new projection instance. Every other fence — a revoked subscription or
+scope, a refusal of graph authority — is a `revocation` fence: it unlocks only from
+`purged`, with the same fresh authority, so one learned before the server's revoke frame
+keeps the domain locked. The cause only escalates: a revocation signal while a credential
+fence stands makes it a `revocation` fence, `revoked` again and set anew (an admission from
+before it is not fresh), and a credential signal never downgrades a revocation fence. After
+any regrant a disabled entry stays disabled: it can be discarded or resolved by its own
+receipt, never resent.
+
+**The kill switch purges and fences** (owner ruling 2026-11-12, M4). An operator switching
+the graph off (`KEEPER_HQ_GRAPH=off`) makes the server resolve the graph scopes to nothing,
+so a client sees its graph subscriptions revoked: a `revocation` fence, the projection and
+the replica's graph rows purged, and every queued intent `disabled` for good. CC-5's retry on
+`graph_unavailable` does not outlive it. Once the graph is switched back on and the
+subscriptions are granted again, the purge observed, a normal regrant from fresh authority
+restores reads; the intents queued before the switch stay disabled.
+
+**What an answer does to a queued entry** (`keeper_core::graph::queue::next`, keyed on the
+outcome and its typed `PendingCause`, never on text): a receipt resolves it — but a person's
+receipt already on the replica settles nothing until the server's current `graph.read_status`
+answers, unless the same request's own fresh (not `cached`) acknowledgement is in hand: a
+refused status fences the domain and disables the entry instead; with no link or an
+unreachable server the cached receipt is not used (a replay refused at send ends that request,
+an unanswered one stays as it is); a transport
+failure, a transient server error or `graph_unavailable` keeps it and retries the identical
+request; `outcome_unresolved` makes it `unresolved` (only a same-id replay or `graph.outcome`,
+never a new id); an ended agent context refuses it locally only if it was never sent, otherwise
+it stays `unresolved`; a refused `graph.outcome` lookup fences the domain. A resume
+(`queue::resume_sends`, the driver's and the live
+harness's one rule) sends only an entry nothing is known of — no receipt, or a lookup the
+transport lost — that is queued, or a person's already submitting: never after
+`outcome_unresolved` or from `unresolved` (lookup only), never on `graph_unavailable` (its
+back-off), never an agent's request that may have been sent. A fenced queue discloses no
+frozen request (`GraphQueue::bound` refuses, also after a reopen). The queue file's schema
+migration is one transaction with its version bump, and a column an older build already added
+is not added again.
+
+**What keeper does not claim.** Revocation stops this device from serving graph data from the
+moment it learns of it. It does not erase anything remotely, and it cannot recall bytes
+already delivered to a reader. Until the device learns of a revocation, a person may read
+what was last authorised (below). The replica purge is the server's: if the server does not
+revoke a scope, its rows stay and a `revocation` fence stays `revoked` (locked).
+
+**Last-authorised offline reads (people only).** A person's query or inspect may be served
+while the server cannot be reached only when all of these hold:
+- the server's `read_status` failed because the request left the device and no status line
+  ever came back (`QueryError::Unreachable`). This is decided at the transport while the
+  HTTP details are there: once any status line has arrived the server answered, and that is
+  never it — a `401`/`403` is its refusal (which fences); any other status, a redirect, a
+  body over the limit, or a body that broke off or stalled past the timeout after the status
+  line is an unusable answer. Any other failure never serves: a local refusal, a closed
+  replica, an unreadable answer, a failed task, a storage error. A refusal fences;
+- no fence stands;
+- the graph subscriptions are granted and the link is not refused;
+- the caller asked for it (`Freshness::AllowStale`, the driver's `--allow-stale`);
+- the generation was built under the authority the last successful online `read_status`
+  answered;
+- that answer is not from the future and is at most `OFFLINE_READ_LIMIT` (24 h, inclusive)
+  old on the device's clock. A kept answer found to be from the future is distrusted in
+  memory and dropped from the queue file on sight. Within a process it never authorises
+  again, not even once the clock catches up: only the next successful online `read_status`
+  keeps one again. If the drop cannot commit (the file is busy), the row stays distrusted for
+  the process and the drop is retried on the next read. **Across a restart this holds only
+  if the drop committed.** If it did not, the restarted process trusts the row again once the
+  clock is past its `observed_at` and inside the 24 h window. So an offline stale read can lag
+  a revocation this device has not yet learned online by up to 24 h plus the clock error.
+  What it serves is the same actor's own, already-authorised projection, always `stale`, and
+  a persisted revocation fence still refuses. This bound is an explicit accepted exception
+  (owner decision 112.1 G3, 2026-11-11), not a durable distrust guarantee.
+
+Everything is checked again at delivery against a fresh clock, and a fence — in memory or
+persisted in the queue file by another holder — refuses at every delivery point (each
+authority answer and the result), whether or not its cleanup has run. The result is always
+`stale`. Offline, nothing builds or extends a projection. The first successful `read_status`
+after reconnecting replaces the kept authority. Agents read nothing offline: an agent's
+reader refuses whenever its context cannot be refreshed, so offline it is exposed to no
+graph domain.
+
+### Existing platform exceptions
 
 - iOS backup exclusion (`NSURL.setResourceValue(NSURLIsExcludedFromBackupKey)`) via
   objc2-foundation, behind `Platform::exclude_from_backup` — the single function-level

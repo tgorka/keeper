@@ -8,7 +8,9 @@ use serde_json::{Map, Value};
 use super::protocol::candidate::{self, State, Verdict};
 use super::protocol::change;
 use super::protocol::delta::Op;
-use super::protocol::scope::{CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, RECEIPT_TABLE};
+use super::protocol::scope::{
+    CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE,
+};
 use super::protocol::SCHEMA_VERSION;
 use crate::notes::tags::normalise;
 
@@ -51,19 +53,32 @@ fn entries(key: &str) -> Vec<Value> {
         .collect()
 }
 
-/// An accepted graph held as the vector's images.
+/// An accepted graph held as the vector's images (`contents` optional).
 struct Images(Value);
 
 impl Images {
     fn rows(&self, table: &str) -> impl Iterator<Item = &Map<String, Value>> {
-        self.0[table]
-            .as_array()
-            .expect(table)
+        self.0
+            .get(table)
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
             .iter()
             .map(|row| row.as_object().expect("image"))
     }
     fn find(&self, table: &str, key: &str, value: &str) -> Option<Map<String, Value>> {
         self.rows(table).find(|row| row[key] == value).cloned()
+    }
+    /// Rows of `table` matching `keep`, ascending by id, at most `limit`.
+    fn select(
+        &self,
+        table: &str,
+        limit: usize,
+        keep: impl Fn(&Map<String, Value>) -> bool,
+    ) -> Vec<Map<String, Value>> {
+        let mut rows: Vec<_> = self.rows(table).filter(|r| keep(r)).cloned().collect();
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        rows.truncate(limit);
+        rows
     }
 }
 
@@ -83,18 +98,37 @@ impl State for Images {
             .cloned()
     }
     fn contains_into(&self, to_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
-        let mut edges: Vec<_> = self
-            .rows("edges")
-            .filter(|row| {
-                row["type"] == "contains"
-                    && row["lifecycle"] == "active"
-                    && to_ids.iter().any(|id| row["to_id"] == id.as_str())
-            })
-            .cloned()
-            .collect();
-        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        edges.truncate(limit);
-        edges
+        self.select("edges", limit, |row| {
+            row["type"] == "contains"
+                && row["lifecycle"] == "active"
+                && to_ids.iter().any(|id| row["to_id"] == id.as_str())
+        })
+    }
+    fn content(&self, id: &str) -> Option<Map<String, Value>> {
+        self.find("contents", "id", id)
+    }
+    fn contents_of(&self, owner_id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.select("contents", limit, |row| row["owner_node_id"] == owner_id)
+    }
+    fn sources_from(&self, from_id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.select("edges", limit, |row| {
+            row["type"] == "sources" && row["lifecycle"] == "active" && row["from_id"] == from_id
+        })
+    }
+    fn incident_active(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.select("edges", limit, |row| {
+            row["lifecycle"] == "active"
+                && node_ids
+                    .iter()
+                    .any(|id| row["from_id"] == id.as_str() || row["to_id"] == id.as_str())
+        })
+    }
+    fn merged_into(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.select("nodes", limit, |row| {
+            node_ids
+                .iter()
+                .any(|id| row["merged_into_id"] == id.as_str())
+        })
     }
 }
 
@@ -163,7 +197,17 @@ fn algebra_vectors_reproduce() {
             .iter()
             .map(|m| m.as_str().expect("minted id").to_owned());
         let mut mint = || minted.next().expect("enough minted ids");
-        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &mut mint);
+        // A vector's `stamp` is the acceptance a verification is stamped
+        // with; without one, a fixed stamp no other vector names.
+        let stamp = entry.get("stamp");
+        let actor = stamp
+            .and_then(|s| s["actor_id"].as_str())
+            .unwrap_or("vector-actor");
+        let stamp = candidate::Stamp {
+            time_ms: stamp.and_then(|s| s["time_ms"].as_u64()).unwrap_or(1),
+            actor_id: actor,
+        };
+        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &stamp, &mut mint);
         if let Some(code) = entry.get("refusal").and_then(Value::as_str) {
             assert_eq!(
                 match verdict {
@@ -187,6 +231,79 @@ fn algebra_vectors_reproduce() {
     }
 }
 
+/// `images` after accepting `ops`: each row replaced by its after image, or
+/// removed when it has none.
+fn fold(images: &mut Value, ops: &[Op]) {
+    for op in ops {
+        let entity = serde_json::to_value(op.entity_type).expect("entity type");
+        let table = format!("{}s", entity.as_str().expect("entity type"));
+        let rows = images[table.as_str()].as_array_mut().expect("table");
+        rows.retain(|row| row["id"] != op.entity_id.as_str());
+        if let Some(after) = &op.after_value {
+            rows.push(after.clone());
+        }
+    }
+}
+
+/// The revision rule `graph_query_live`'s fixture relies on: a tag added in
+/// a node's creating change, and an edge created from it later, leave the
+/// node at revision 1. Its first update names "1"; naming "2" is a revision
+/// conflict whose current revision is "1", as keeper-hq answers it.
+#[test]
+fn a_tag_in_the_creating_change_leaves_the_node_at_revision_one() {
+    let id = |n: u32| format!("01JF{n:022}");
+    let mut images = serde_json::json!({"nodes": [], "edges": [], "tags": [], "node_tags": []});
+    let mut minted = 100;
+    let mut judge = |images: &Value, payload: Value| {
+        let change = change::parse(&payload, normalise).expect("payload");
+        let stamp = candidate::Stamp {
+            time_ms: 1,
+            actor_id: "vector-actor",
+        };
+        candidate::apply(&Images(images.clone()), &change, &stamp, &mut || {
+            minted += 1;
+            id(minted)
+        })
+    };
+    let accepted = |verdict: Verdict| match verdict {
+        Verdict::Accepted(effects) => effects.ops,
+        other => panic!("{other:?}"),
+    };
+    let node = |n: u32, title: &str| {
+        serde_json::json!({"op": "create_node", "id": id(n), "kind": "Concept", "title": title,
+            "description": null, "properties": {}})
+    };
+    let created = accepted(judge(
+        &images,
+        serde_json::json!({"ops": [node(1, "Alpha"), node(2, "Beta"),
+            {"op": "add_tag", "node_id": id(1), "tag": "#Project", "expected_revision": null}]}),
+    ));
+    fold(&mut images, &created);
+    let linked = accepted(judge(
+        &images,
+        serde_json::json!({"ops": [{"op": "create_edge", "id": id(10), "from_id": id(1), "to_id": id(2),
+            "type": "test:rel", "properties": {}, "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"}]}),
+    ));
+    fold(&mut images, &linked);
+    let update = |expected: &str| {
+        serde_json::json!({"ops": [{"op": "update_node", "id": id(1), "expected_revision": expected,
+            "set": {"title": "Alpha 2"}}]})
+    };
+    assert_eq!(
+        judge(&images, update("2")),
+        Verdict::Conflict(serde_json::json!({
+            "entity": {"entity_type": "node", "id": id(1)},
+            "precondition": "revision",
+            "current_revision": "1",
+        }))
+    );
+    let updated = accepted(judge(&images, update("1")));
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0].before_revision.as_deref(), Some("1"));
+    assert_eq!(updated[0].after_revision.as_deref(), Some("2"));
+}
+
 #[test]
 fn shared_tag_vectors_hold_under_the_notes_policy() {
     let corpus: Value = serde_json::from_str(CORPUS).expect("vectors");
@@ -203,8 +320,9 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
 }
 
 /// Every graph table carries exactly one scope variable, `kg_graph` on the
-/// graph's rows and `kg_client` on receipts; no other table carries either,
-/// and no subscription reaches a graph table through any other variable.
+/// graph's rows, `kg_client` on receipts and `kg_proposal` on proposals;
+/// no other table carries any of them, and no subscription reaches a graph
+/// table through any other variable.
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
     let ir = crate::hq::syncular::schema().expect("schema");
@@ -238,11 +356,15 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
         scopes(RECEIPT_TABLE),
         [(CLIENT_VARIABLE.to_owned(), "client_scope".to_owned())]
     );
+    assert_eq!(
+        scopes(PROPOSAL_TABLE),
+        [(PROPOSAL_VARIABLE.to_owned(), "proposer_actor".to_owned())]
+    );
     for table in tables {
         let name = table["name"].as_str().expect("name");
         if name.starts_with("kg_") {
             assert!(
-                GRAPH_TABLES.contains(&name) || name == RECEIPT_TABLE,
+                GRAPH_TABLES.contains(&name) || name == RECEIPT_TABLE || name == PROPOSAL_TABLE,
                 "{name}"
             );
             continue;
@@ -262,10 +384,10 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
             .iter()
             .map(|scope| scope["variable"].as_str().expect("variable"))
             .collect();
-        let expected = if table == RECEIPT_TABLE {
-            CLIENT_VARIABLE
-        } else {
-            GRAPH_VARIABLE
+        let expected = match table {
+            RECEIPT_TABLE => CLIENT_VARIABLE,
+            PROPOSAL_TABLE => PROPOSAL_VARIABLE,
+            _ => GRAPH_VARIABLE,
         };
         assert_eq!(requested, [expected], "{table}");
     }
