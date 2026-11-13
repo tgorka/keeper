@@ -18,9 +18,17 @@
 //! nothing awaited between ([`Runtime::spawn`]). A failed recheck
 //! invalidates the runtime for good: the consumer opens a new one, which
 //! verifies everything again.
+//!
+//! On Linux a worker dies with its parent (`PR_SET_PDEATHSIG`, SIGKILL;
+//! owner amendment 2026-11-13), so a driver or agentd killed outright never
+//! leaves one running. The kernel's parent is the spawning *thread*, so every
+//! Linux worker is spawned, and its spawning-thread check run, on one thread
+//! that lives as long as the process ([`spawner`]): a runtime or blocking
+//! thread that retires never takes a healthy worker with it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -227,14 +235,29 @@ impl Runtime {
         Ok(command)
     }
 
-    /// Step 5 on this thread, then the spawn, synchronously. `called` is
-    /// told of the real spawn call: after step 5 passed, immediately before
-    /// `spawn()`, whether the kernel then refuses it or not.
+    /// Step 5 on the spawning thread, then the spawn, synchronously. On
+    /// Linux the spawning thread is the process-lifetime [`spawner`] thread
+    /// and the child dies with its parent. `called` is told of the real
+    /// spawn call: after step 5 passed, immediately before `spawn()`,
+    /// whether the kernel then refuses it or not.
     pub(crate) fn spawn(
-        &self,
-        command: &mut tokio::process::Command,
-        called: impl FnOnce(),
+        self: &Arc<Self>,
+        mut command: tokio::process::Command,
+        called: impl FnOnce() + Send + 'static,
     ) -> Result<tokio::process::Child, QueryError> {
+        #[cfg(target_os = "linux")]
+        {
+            let runtime = Arc::clone(self);
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| QueryError::Unavailable("worker.spawner"))?;
+            spawner::run(move || {
+                let _entered = handle.enter();
+                super::parent_death::die_with_parent(&mut command);
+                guarded_spawn(|| runtime.step_five(), called, || command.spawn())
+            })
+            .ok_or(QueryError::Unavailable("worker.spawner"))?
+        }
+        #[cfg(not(target_os = "linux"))]
         guarded_spawn(|| self.step_five(), called, || command.spawn())
     }
 
@@ -263,6 +286,47 @@ fn guarded_spawn<T>(
     step_five().map_err(QueryError::Unavailable)?;
     called();
     spawn().map_err(|_| QueryError::Unavailable("worker.spawn"))
+}
+
+/// The one thread every Linux worker is spawned from. It lives as long as
+/// the process: a worker dies with its parent thread, so a spawn from a
+/// thread that may retire (a blocking-pool thread, a runtime's) would kill
+/// a healthy worker when that thread exits.
+#[cfg(target_os = "linux")]
+mod spawner {
+    use std::sync::{mpsc, LazyLock};
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// The spawner thread's queue, the thread started by the first spawn
+    /// (inheriting that thread's credentials and `no_new_privs`, as threads
+    /// do); `None` when the thread could not start.
+    static JOBS: LazyLock<Option<mpsc::Sender<Job>>> = LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("keeper-graph-spawner".to_owned())
+            .spawn(move || {
+                for job in receiver {
+                    // A panicking job must not end the thread: every worker
+                    // it spawned would die with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+
+    /// `job`'s answer, run on the spawner thread; `None` when the thread
+    /// could not be started.
+    pub(super) fn run<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (answer, answered) = mpsc::sync_channel(1);
+        JOBS.as_ref()?
+            .send(Box::new(move || {
+                let _ = answer.send(job());
+            }))
+            .ok()?;
+        answered.recv().ok()
+    }
 }
 
 /// The largest inherited soft `RLIMIT_STACK` the worker's startup

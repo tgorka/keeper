@@ -11,6 +11,7 @@
 //! are `query_limit`, 74 with an execution-class or platform label is
 //! `projection_unavailable` with that label, anything else unavailable.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -131,8 +132,8 @@ fn startup_label(out: &[u8]) -> &'static str {
 
 /// Run one worker `role` over `path` with `input` within `deadline`.
 pub(crate) async fn run<R: AsyncRead + Unpin>(
-    runtime: &Runtime,
-    admission: &Admission,
+    runtime: &Arc<Runtime>,
+    admission: &Arc<Admission>,
     role: &str,
     path: &std::path::Path,
     input: R,
@@ -144,9 +145,10 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
         return Err(stop);
     }
     runtime.before_spawn()?;
-    let mut command = runtime.command(role, path)?;
+    let command = runtime.command(role, path)?;
     admission.attempt();
-    let mut child = runtime.spawn(&mut command, || admission.call())?;
+    let counted = Arc::clone(admission);
+    let mut child = runtime.spawn(command, move || counted.call())?;
     let _live = admission.live();
     let Some(pid) = child.id() else {
         let _ = child.start_kill();

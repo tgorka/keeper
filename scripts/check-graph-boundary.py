@@ -3,7 +3,8 @@
 
 The graph worker `keeper-graph-query` carries exactly the eleven audited allowances U01-U11
 (docs/constraints-and-limitations.md) and six named exports; `allocation.rs` and `native.rs`
-stay byte-identical to the reviewed 110.1 sources. Core, protocol and driver carry no unsafe.
+stay byte-identical to the reviewed 110.1 sources. Protocol and driver carry no unsafe; core
+carries only K01, the worker's parent-death `pre_exec` alone in its byte-pinned file.
 """
 import hashlib
 import json
@@ -357,9 +358,24 @@ for crate in ['keeper-graph-query', 'keeper-graph-protocol', 'keeper-graph-drive
             head = re.search(r'((?:#\[[^\]]*\]\s*)*)((?:pub\s+)?(?:unsafe\s+)?extern\s+\S*\s*fn\s+' + name + r')\b', text)
             if not head or 'unsafe' in head.group(0) or 'export' in head.group(1):
                 raise SystemExit(f'safe callback {name} changed shape in {rel}')
-for path in (CRATES / 'keeper-core/src/graph').rglob('*.rs'):
-    if re.search(r'\bunsafe\b|unsafe_code', strip(path.read_text())):
-        raise SystemExit(f'unsafe in credential-bearing graph client: {path}')
+# K01 (owner amendment 2026-11-13): keeper-core's one unsafe item, the graph worker's
+# parent-death `pre_exec`, alone in `graph/parent_death.rs`, whose reviewed bytes are pinned.
+# No other keeper-core source names unsafe_code, and no other graph client file names unsafe.
+K01 = CRATES / 'keeper-core/src/graph/parent_death.rs'
+K01_SHA256 = 'a3687b5ccc0209643dbcf6a7d92aedba2b8cc98347a6cfe63d735d114993631a'
+if hashlib.sha256(K01.read_bytes()).hexdigest() != K01_SHA256:
+    raise SystemExit(f'K01 drifted from its reviewed bytes: {K01}')
+k01 = strip(K01.read_text())
+if (re.findall(r'#\s*!?\s*\[[^\]]*unsafe_code[^\]]*\]', k01) != ['#[allow(unsafe_code)]']
+        or len(re.findall(r'\bunsafe\b', k01)) != 1
+        or not re.search(r'#\[allow\(unsafe_code\)\]\s*pub\(crate\) fn die_with_parent\(', k01)):
+    raise SystemExit('K01 is not exactly one allowance on die_with_parent with one unsafe block')
+for path in (CRATES / 'keeper-core/src').rglob('*.rs'):
+    if path == K01:
+        continue
+    text = strip(path.read_text())
+    if 'unsafe_code' in text or ('/graph/' in str(path) and re.search(r'\bunsafe\b', text)):
+        raise SystemExit(f'unsafe outside K01 in keeper-core: {path}')
 if len(allowances) != 11 or sorted(allowances) != sorted(set().union(*INVENTORY.values())):
     raise SystemExit(f'unsafe inventory drift: {sorted(allowances)}')
 if sorted(exports) != EXPORTS:
@@ -409,4 +425,4 @@ for crate in ['keeper-graph-protocol', 'keeper-graph-driver']:
     for path in (CRATES / crate / 'src').rglob('*'):
         if path.is_file() and re.search(rb'examples/|rc_corpus|rc_spawner', path.read_bytes()):
             raise SystemExit(f'shipped source refers to measurement tooling: {path}')
-print('graph protocol/worker/core/mobile dependency boundaries and exact 11/6 unsafe inventory passed')
+print('graph protocol/worker/core/mobile dependency boundaries, exact 11/6 worker and K01 core unsafe inventory passed')

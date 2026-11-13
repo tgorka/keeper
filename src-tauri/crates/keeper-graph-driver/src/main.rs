@@ -56,8 +56,8 @@
 //! running worker is killed and reaped by the cancellation path before the
 //! driver answers `query_cancelled` and exits with 128 + the signal's
 //! number (130, 143). Later signals are taken and ignored. SIGKILL cannot be
-//! taken: it still ends the driver without its worker, which then runs to
-//! its own end (no safe parent-death signal for it; a known limitation).
+//! taken: it ends the driver at once, and on Linux its worker with it (the
+//! worker dies with its parent, keeper-core K01).
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod driver {

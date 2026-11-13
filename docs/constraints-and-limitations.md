@@ -215,8 +215,8 @@ why (`docs/android.md` has the whole list):
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
 carry function-level, audited `#[allow(unsafe_code)]` exceptions for platform FFI with no
-safe binding. The graph worker `keeper-graph-query` carries exactly the eleven below (OD-1).
-Current inventory:
+safe binding. The graph worker `keeper-graph-query` carries exactly the eleven below (OD-1),
+and `keeper-core` exactly one, K01 (owner amendment 2026-11-13). Current inventory:
 
 ### Graph worker `keeper-graph-query` (OD-1; story 110.5)
 
@@ -245,9 +245,9 @@ are safe, unexported C-ABI callbacks without allowances. The 110.1 proof's test-
 (`examples/allocation_probe.rs`, behind the removed `proof-executables` feature) does not
 ship; its evidence stands against the byte-identical `allocation.rs`. The measurement-only
 interposer M1 stays in the 110.1 evidence bundle and is never linked into, shipped with or
-loaded by the worker. `keeper-core`, `keeper-graph-protocol` and `keeper-graph-driver` carry
-no `unsafe`, and Linux confinement (Landlock, seccomp, rlimits) and every launch check use
-safe bindings (`landlock`, `seccompiler`, `rustix`).
+loaded by the worker. `keeper-graph-protocol` and `keeper-graph-driver` carry no `unsafe`,
+`keeper-core` only K01 below, and Linux confinement (Landlock, seccomp, rlimits) and every
+launch check use safe bindings (`landlock`, `seccompiler`, `rustix`).
 
 Every callback checks a const-TLS main-thread flag before allocation or pointer access. The
 flag is granted only by the crate-private `allocation::enter`, a process-wide one-shot claim
@@ -352,6 +352,22 @@ bytes, arrays/objects at most 8,192 entries, keys at most 8,192 bytes, at most 1
 canonical bytes per image; canonical bytes are serialized from the borrowed value (no
 normalized copy). A value the server accepted beyond these (e.g. a title over 64 KiB) makes
 the projection `projection_unavailable`: an R1 limit.
+
+### Worker spawn `keeper-core` K01 (owner amendment 2026-11-13)
+
+| ID | `keeper-core` function | Boundary |
+|---|---|---|
+| K01 | `graph::parent_death::die_with_parent` (Linux) | `CommandExt::pre_exec` closure in the forked worker before `exec`: `prctl(PR_SET_PDEATHSIG, SIGKILL)` and `getppid` through rustix, the spawn refused when the parent already died; no allocation, lock or logging |
+
+Without it, a driver or agentd ended by SIGKILL left its running worker as an orphan that ran
+to its own end (the worker has memory rlimits but no wall or CPU limit). The kernel's parent
+is the spawning *thread*, so every Linux worker is spawned, and its spawning-thread check
+(step 5) run, on one process-lifetime spawner thread (`runtime::spawner`): a retiring runtime
+or blocking thread never kills a healthy worker. `exec` keeps the setting because the worker
+is neither set-id nor file-capable (the ledger's checks). `parent_death.rs` is the only file
+of `keeper-core/src/graph` with `unsafe`, and `scripts/check-graph-boundary.py` pins its
+SHA-256, so any edit reopens this row. This changes the proven agentd spawn path: it needs
+its own R-A and R-C on delectra before any deploy.
 
 ### Graph intents, revocation and offline reads (story 112.1)
 

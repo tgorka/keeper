@@ -488,7 +488,12 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("dir");
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    /// A rig in a fresh directory under `parent`.
+    fn new_in(parent: &Path) -> Self {
+        let dir = tempfile::tempdir_in(parent).expect("dir");
         let world = World::new(dir.path());
         let source = Arc::new(Replicated {
             source: world.source.clone(),
@@ -1354,6 +1359,156 @@ async fn a_cancellation_mid_query_kills_and_reaps_the_worker() {
         )
         .await,
         vec![json!({"i": ulid(1)}).as_object().expect("row").clone()]
+    );
+}
+
+/// Owner amendment 2026-11-13 (thread hazard): a Linux worker dies with its
+/// parent *thread*, so it is spawned from the process-lifetime spawner
+/// thread, never from the thread that asked for it: that thread may retire
+/// while the worker runs, and the worker survives it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_worker_outlives_the_thread_that_asked_for_it() {
+    use std::time::Duration;
+    let mut rig = Rig::new();
+    rig.world
+        .accept(vec![node(&ulid(1), "Concept", "A", json!({}))]);
+    rig.world.replicate(1, 1, 1, None);
+    rig.reader()
+        .refresh(&Cancellation::default())
+        .await
+        .expect("built");
+    let generation = std::fs::read_dir(&rig.root)
+        .expect("projection")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.extension().is_some_and(|x| x == "db"))
+        .expect("the published generation");
+    let runtime = worker();
+    let admission = rig.admission.clone();
+    let handle = tokio::runtime::Handle::current();
+    let asking = std::thread::spawn(move || {
+        let _entered = handle.enter();
+        // A query worker waits on its stdin, held open here, for its request.
+        let command = runtime.command("query", &generation).expect("command");
+        runtime
+            .spawn(command, move || admission.call())
+            .expect("spawned")
+    });
+    let mut child = asking.join().expect("the asking thread retired");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        child.try_wait().expect("polled"),
+        None,
+        "the worker survived the thread that asked for it"
+    );
+    child.start_kill().expect("killed");
+    child.wait().await.expect("reaped");
+}
+
+/// The parent process of `a_killed_parent_takes_its_worker_with_it` (run
+/// only by it): a running four-hop query whose worker pid it prints.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "a parent process started by a_killed_parent_takes_its_worker_with_it"]
+async fn a_killed_parents_running_query() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let Ok(dir) = std::env::var("KG1_PARENT_DEATH_DIR") else {
+        return;
+    };
+    let mut rig = Rig::new_in(Path::new(&dir));
+    let reader = dense_sources(&mut rig).await;
+    let running = {
+        let reader = reader.clone();
+        tokio::spawn(async move {
+            reader
+                .query(
+                    FOUR_HOPS,
+                    b"{}",
+                    Freshness::Current,
+                    &Cancellation::default(),
+                )
+                .await
+        })
+    };
+    let started = Instant::now();
+    let pid = loop {
+        if let Some(pid) = query_worker_under(&rig.root) {
+            break pid;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "no worker");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    println!("KG1_PARENT_DEATH_WORKER {pid}");
+    std::io::stdout().flush().expect("flushed");
+    let _ = running.await;
+}
+
+/// Owner amendment 2026-11-13: a process holding a running worker that is
+/// SIGKILLed (no handler can run, no `kill_on_drop`) takes the worker with
+/// it (`PR_SET_PDEATHSIG`): the worker is killed by SIGKILL and reaped within
+/// a second, never left running as an orphan. The killed process runs the
+/// driver's own read and spawn path (a release driver admits a worker only
+/// in the ledgered image). This process is the orphan's subreaper, so it
+/// reaps the worker itself and reads how it ended.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_killed_parent_takes_its_worker_with_it() {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+
+    use rustix::io::Errno;
+    use rustix::process::{
+        getpid, kill_process, set_child_subreaper, waitpid, Pid, Signal, WaitOptions,
+    };
+    let dir = tempfile::tempdir().expect("dir");
+    set_child_subreaper(Some(getpid())).expect("subreaper");
+    let mut parent = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "graph::query::tests::a_killed_parents_running_query",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("KG1_PARENT_DEATH_DIR", dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("parent");
+    let worker = std::io::BufReader::new(parent.stdout.take().expect("stdout"))
+        .lines()
+        .find_map(|line| {
+            line.ok()?
+                .strip_prefix("KG1_PARENT_DEATH_WORKER ")?
+                .parse::<i32>()
+                .ok()
+        })
+        .and_then(Pid::from_raw)
+        .expect("the parent's running worker");
+    parent.kill().expect("SIGKILL");
+    let killed = Instant::now();
+    parent.wait().expect("the parent reaped");
+    let ended = loop {
+        match waitpid(Some(worker), WaitOptions::NOHANG) {
+            Ok(Some((_, status))) => break Some(status),
+            // Running, or not re-parented to this process yet.
+            Ok(None) | Err(Errno::CHILD) => {}
+            Err(error) => panic!("waitpid: {error}"),
+        }
+        if killed.elapsed() > Duration::from_secs(1) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let Some(status) = ended else {
+        let _ = kill_process(worker, Signal::KILL);
+        let _ = waitpid(Some(worker), WaitOptions::empty());
+        panic!("worker {worker:?} outlived its SIGKILLed parent");
+    };
+    assert_eq!(
+        status.terminating_signal(),
+        Some(Signal::KILL.as_raw()),
+        "{status:?}"
     );
 }
 
