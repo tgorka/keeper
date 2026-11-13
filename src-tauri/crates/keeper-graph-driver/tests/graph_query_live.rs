@@ -199,9 +199,11 @@ fn apply_fixture(client: &GraphClient) -> u64 {
             to_lifecycle_revision: Some("1".into()),
         },
     ]);
+    // A tag added in the creating change and the edges created since leave
+    // node 1 at revision 1 (contract algebra `create-nodes-parallel-edges-and-tag`).
     send(vec![ChangeOp::UpdateNode {
         id: ulid(1),
-        expected_revision: "2".into(),
+        expected_revision: "1".into(),
         set: NodeFields {
             title: Some("Alpha 2".into()),
             description: None,
