@@ -268,6 +268,14 @@ worker is single-threaded by construction: the const-TLS callback guard, exit 73
 thread's claim, and process-wide seccomp `KillProcess` on `clone`/`clone3`/`fork`/`vfork`.
 No `set_limit`. It is not a multithreaded allocator guarantee.
 
+**`rustix` 1.1.6.** The worker's safe syscall layer for its launch and confinement checks
+(features `process`, `fs`, `thread`, `stdio`; `keeper-graph-query` pins `=1.1.6`), crate
+SHA-256 `e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa` (Cargo.lock
+`checksum`), is an audited dependency row: its internal `unsafe` is the upstream syscall
+boundary, never first-party. 1.1.6 is the first release outside RUSTSEC-2026-0486 (the
+`xattr` buffer functions, which the worker does not call; bumped 2026-11-11 from 1.1.4). A
+version or checksum change reopens this row.
+
 **Accounted-cost conversion (Linux).** glibc's per-chunk overhead on charged allocations is
 not charged, so the charge is a conservative conversion of the unchanged 256 MiB
 real-allocation budget: **R = 28 MiB**, with `H0 + 4R + 64·N_max + 64 + 8 MiB stack =
