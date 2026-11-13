@@ -360,7 +360,9 @@ for crate in ['keeper-graph-query', 'keeper-graph-protocol', 'keeper-graph-drive
                 raise SystemExit(f'safe callback {name} changed shape in {rel}')
 # K01 (owner amendment 2026-11-13): keeper-core's one unsafe item, the graph worker's
 # parent-death `pre_exec`, alone in `graph/parent_death.rs`, whose reviewed bytes are pinned.
-# No other keeper-core source names unsafe_code, and no other graph client file names unsafe.
+# No other keeper-core source names unsafe or unsafe_code, whatever the lint settings say
+# (review 623 F3); the lints themselves must stay: keeper-core inherits the workspace's, and
+# the workspace denies unsafe_code.
 K01 = CRATES / 'keeper-core/src/graph/parent_death.rs'
 K01_SHA256 = 'a3687b5ccc0209643dbcf6a7d92aedba2b8cc98347a6cfe63d735d114993631a'
 if hashlib.sha256(K01.read_bytes()).hexdigest() != K01_SHA256:
@@ -373,9 +375,12 @@ if (re.findall(r'#\s*!?\s*\[[^\]]*unsafe_code[^\]]*\]', k01) != ['#[allow(unsafe
 for path in (CRATES / 'keeper-core/src').rglob('*.rs'):
     if path == K01:
         continue
-    text = strip(path.read_text())
-    if 'unsafe_code' in text or ('/graph/' in str(path) and re.search(r'\bunsafe\b', text)):
+    if re.search(r'\bunsafe\b|unsafe_code', strip(path.read_text())):
         raise SystemExit(f'unsafe outside K01 in keeper-core: {path}')
+core_lints = tomllib.loads((CRATES / 'keeper-core/Cargo.toml').read_text()).get('lints')
+root_lints = tomllib.loads((CRATES.parent / 'Cargo.toml').read_text()).get('workspace', {}).get('lints', {})
+if core_lints != {'workspace': True} or root_lints.get('rust', {}).get('unsafe_code') != 'deny':
+    raise SystemExit('keeper-core must inherit the workspace lints, which deny unsafe_code')
 if len(allowances) != 11 or sorted(allowances) != sorted(set().union(*INVENTORY.values())):
     raise SystemExit(f'unsafe inventory drift: {sorted(allowances)}')
 if sorted(exports) != EXPORTS:

@@ -363,9 +363,15 @@ Without it, a driver or agentd ended by SIGKILL left its running worker as an or
 to its own end (the worker has memory rlimits but no wall or CPU limit). The kernel's parent
 is the spawning *thread*, so every Linux worker is spawned, and its spawning-thread check
 (step 5) run, on one process-lifetime spawner thread (`runtime::spawner`): a retiring runtime
-or blocking thread never kills a healthy worker. `exec` keeps the setting because the worker
+or blocking thread never kills a healthy worker. **Invariant:** that thread's per-thread
+identity (credentials, `no_new_privs`, capabilities, Landlock, seccomp, signal mask) is fixed
+by the thread that makes the process's first spawn, and every worker inherits it; a
+restriction another thread takes on later never reaches a worker. agentd must make its first
+spawn only once its identity is final and never change a per-thread identity afterwards.
+Step 5 runs on that forking thread (`runtime::tests::step_five_runs_on_the_thread_that_forks`),
+so a worker never exceeds what step 5 saw. `exec` keeps the setting because the worker
 is neither set-id nor file-capable (the ledger's checks). `parent_death.rs` is the only file
-of `keeper-core/src/graph` with `unsafe`, and `scripts/check-graph-boundary.py` pins its
+of `keeper-core/src` with `unsafe`, and `scripts/check-graph-boundary.py` pins its
 SHA-256, so any edit reopens this row. This changes the proven agentd spawn path: it needs
 its own R-A and R-C on delectra before any deploy.
 
