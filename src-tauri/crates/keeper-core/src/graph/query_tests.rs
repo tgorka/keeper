@@ -2122,7 +2122,8 @@ mod offline {
     }
 
     /// A fence another holder of the queue file persisted refuses this
-    /// reader, though its own lifecycle never saw the lock.
+    /// reader, though its own lifecycle never saw the lock: `forbidden`,
+    /// never `sync_pending`, which would invite a retry loop (LOW-2r3).
     #[tokio::test(flavor = "current_thread")]
     async fn a_fence_persisted_by_another_holder_refuses() {
         let o = Offline::new().await;
@@ -2140,7 +2141,9 @@ mod offline {
             .persist_fence(T0 + 1, FenceCause::Revocation)
             .expect("fenced");
         assert!(!o.lifecycle.is_locked());
-        assert_eq!(o.query(Freshness::Current).await, Err(QueryError::Fenced));
+        let refused = o.query(Freshness::Current).await;
+        assert_eq!(refused, Err(QueryError::Fenced));
+        assert_eq!(refused.err().map(|e| e.code()), Some("forbidden"));
     }
 
     /// The authority-level fence check on its own (112.1 r2 R2-L4, M-auth):

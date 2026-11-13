@@ -78,11 +78,12 @@ pub struct AdmissionStats {
     /// Every worker spawn attempted, counted before the attempt whether or
     /// not it succeeds: zero means no worker was ever started.
     pub spawn_attempts: usize,
-    /// Every real `spawn()` call: counted after step 5 (the spawning
-    /// thread's last check) passed and immediately before the call, whether
-    /// the kernel then refuses it or not. Zero means no fork or clone was
-    /// ever asked of the kernel, which an attempt refused at step 5 never
-    /// does.
+    /// Every real worker-process `spawn()` call: counted after step 5 (the
+    /// spawning thread's last check) passed and immediately before the call,
+    /// whether the kernel then refuses it or not. Zero means no worker
+    /// process spawn was ever asked of the kernel, which an attempt refused
+    /// at step 5 never does. It counts nothing else: the process's own
+    /// threads are created with `clone` too and are not counted here.
     pub spawn_calls: usize,
 }
 
