@@ -1121,23 +1121,23 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
 }
 
 /// keeper's real filter: the `lfs-filter-harness` binary `cargo test` builds
-/// beside this test binary (`tests/lfs_filter_process.rs` uses the same one).
+/// into the target directory (`tests/lfs_filter_process.rs` uses the same one).
+/// The test binary sits below that directory: in `deps/` on the classic layout,
+/// in `build/<pkg>/<hash>/out/` on cargo's build-dir layout (cargo 1.100), so
+/// the nearest ancestor holding the harness is the target directory on both.
 fn filter_harness() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary");
-    let target = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("the target directory");
-    let harness = target.join(format!(
-        "lfs-filter-harness{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    assert!(
-        harness.is_file(),
-        "{} is built by `cargo test -p keeper-sync`",
-        harness.display()
-    );
-    harness
+    let name = format!("lfs-filter-harness{}", std::env::consts::EXE_SUFFIX);
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "no {name} above {}: it is built by `cargo test -p keeper-sync`",
+                exe.display()
+            )
+        })
 }
 
 /// R503 (review R102S1-02), Marta's merge as it happened: the folder routes
