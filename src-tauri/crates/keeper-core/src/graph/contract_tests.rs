@@ -8,7 +8,9 @@ use serde_json::{Map, Value};
 use super::protocol::candidate::{self, State, Verdict};
 use super::protocol::change;
 use super::protocol::delta::Op;
-use super::protocol::scope::{CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, RECEIPT_TABLE};
+use super::protocol::scope::{
+    CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE,
+};
 use super::protocol::SCHEMA_VERSION;
 use crate::notes::tags::normalise;
 
@@ -51,19 +53,32 @@ fn entries(key: &str) -> Vec<Value> {
         .collect()
 }
 
-/// An accepted graph held as the vector's images.
+/// An accepted graph held as the vector's images (`contents` optional).
 struct Images(Value);
 
 impl Images {
     fn rows(&self, table: &str) -> impl Iterator<Item = &Map<String, Value>> {
-        self.0[table]
-            .as_array()
-            .expect(table)
+        self.0
+            .get(table)
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
             .iter()
             .map(|row| row.as_object().expect("image"))
     }
     fn find(&self, table: &str, key: &str, value: &str) -> Option<Map<String, Value>> {
         self.rows(table).find(|row| row[key] == value).cloned()
+    }
+    /// Rows of `table` matching `keep`, ascending by id, at most `limit`.
+    fn select(
+        &self,
+        table: &str,
+        limit: usize,
+        keep: impl Fn(&Map<String, Value>) -> bool,
+    ) -> Vec<Map<String, Value>> {
+        let mut rows: Vec<_> = self.rows(table).filter(|r| keep(r)).cloned().collect();
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        rows.truncate(limit);
+        rows
     }
 }
 
@@ -83,18 +98,37 @@ impl State for Images {
             .cloned()
     }
     fn contains_into(&self, to_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
-        let mut edges: Vec<_> = self
-            .rows("edges")
-            .filter(|row| {
-                row["type"] == "contains"
-                    && row["lifecycle"] == "active"
-                    && to_ids.iter().any(|id| row["to_id"] == id.as_str())
-            })
-            .cloned()
-            .collect();
-        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        edges.truncate(limit);
-        edges
+        self.select("edges", limit, |row| {
+            row["type"] == "contains"
+                && row["lifecycle"] == "active"
+                && to_ids.iter().any(|id| row["to_id"] == id.as_str())
+        })
+    }
+    fn content(&self, id: &str) -> Option<Map<String, Value>> {
+        self.find("contents", "id", id)
+    }
+    fn contents_of(&self, owner_id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.select("contents", limit, |row| row["owner_node_id"] == owner_id)
+    }
+    fn sources_from(&self, from_id: &str, limit: usize) -> Vec<Map<String, Value>> {
+        self.select("edges", limit, |row| {
+            row["type"] == "sources" && row["lifecycle"] == "active" && row["from_id"] == from_id
+        })
+    }
+    fn incident_active(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.select("edges", limit, |row| {
+            row["lifecycle"] == "active"
+                && node_ids
+                    .iter()
+                    .any(|id| row["from_id"] == id.as_str() || row["to_id"] == id.as_str())
+        })
+    }
+    fn merged_into(&self, node_ids: &[String], limit: usize) -> Vec<Map<String, Value>> {
+        self.select("nodes", limit, |row| {
+            node_ids
+                .iter()
+                .any(|id| row["merged_into_id"] == id.as_str())
+        })
     }
 }
 
@@ -163,7 +197,17 @@ fn algebra_vectors_reproduce() {
             .iter()
             .map(|m| m.as_str().expect("minted id").to_owned());
         let mut mint = || minted.next().expect("enough minted ids");
-        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &mut mint);
+        // A vector's `stamp` is the acceptance a verification is stamped
+        // with; without one, a fixed stamp no other vector names.
+        let stamp = entry.get("stamp");
+        let actor = stamp
+            .and_then(|s| s["actor_id"].as_str())
+            .unwrap_or("vector-actor");
+        let stamp = candidate::Stamp {
+            time_ms: stamp.and_then(|s| s["time_ms"].as_u64()).unwrap_or(1),
+            actor_id: actor,
+        };
+        let verdict = candidate::apply(&Images(entry["state"].clone()), &change, &stamp, &mut mint);
         if let Some(code) = entry.get("refusal").and_then(Value::as_str) {
             assert_eq!(
                 match verdict {
@@ -203,8 +247,9 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
 }
 
 /// Every graph table carries exactly one scope variable, `kg_graph` on the
-/// graph's rows and `kg_client` on receipts; no other table carries either,
-/// and no subscription reaches a graph table through any other variable.
+/// graph's rows, `kg_client` on receipts and `kg_proposal` on proposals;
+/// no other table carries any of them, and no subscription reaches a graph
+/// table through any other variable.
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
     let ir = crate::hq::syncular::schema().expect("schema");
@@ -238,11 +283,15 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
         scopes(RECEIPT_TABLE),
         [(CLIENT_VARIABLE.to_owned(), "client_scope".to_owned())]
     );
+    assert_eq!(
+        scopes(PROPOSAL_TABLE),
+        [(PROPOSAL_VARIABLE.to_owned(), "proposer_actor".to_owned())]
+    );
     for table in tables {
         let name = table["name"].as_str().expect("name");
         if name.starts_with("kg_") {
             assert!(
-                GRAPH_TABLES.contains(&name) || name == RECEIPT_TABLE,
+                GRAPH_TABLES.contains(&name) || name == RECEIPT_TABLE || name == PROPOSAL_TABLE,
                 "{name}"
             );
             continue;
@@ -262,10 +311,10 @@ fn compiled_schema_scopes_graph_tables_by_one_variable() {
             .iter()
             .map(|scope| scope["variable"].as_str().expect("variable"))
             .collect();
-        let expected = if table == RECEIPT_TABLE {
-            CLIENT_VARIABLE
-        } else {
-            GRAPH_VARIABLE
+        let expected = match table {
+            RECEIPT_TABLE => CLIENT_VARIABLE,
+            PROPOSAL_TABLE => PROPOSAL_VARIABLE,
+            _ => GRAPH_VARIABLE,
         };
         assert_eq!(requested, [expected], "{table}");
     }

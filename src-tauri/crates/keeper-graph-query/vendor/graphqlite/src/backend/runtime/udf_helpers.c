@@ -1,0 +1,4501 @@
+/*
+ * runtime/udf_helpers.c
+ *    Cache-less helper UDFs emitted by the transform/executor layer into
+ *    generated SQL: equality / subscript / containment, type strictness,
+ *    bool coercion, order-key extraction, temporal normalization /
+ *    construction / arithmetic / diff, duration math, regex, and the
+ *    cypher_validate() reflection function.
+ *
+ *    Moved from src/extension.c (I-0040 M4-M6). The further split into
+ *    udf_core / udf_temporal / udf_misc is deferred — the gql_dyn_addsub
+ *    and gql_order_key call-graphs intertwine temporal and core helpers
+ *    enough that a single file is cleaner than three files with mutual
+ *    forward decls.
+ */
+
+#include "graphqlite_version.h"
+#include "graphqlite_sqlite.h"
+#include "runtime/gql_tz.h"
+#include "gql_thread_local.h"
+#include "transform/transform_helpers.h"
+#include <string.h>
+#include <strings.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <regex.h>
+#include <time.h>
+#include <stdbool.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
+#  define timegm(tm) _mkgmtime(tm)
+#endif
+
+#include "parser/cypher_parser.h"
+#include "parser/cypher_debug.h"
+#include "runtime/gql_error.h"
+#include "executor/executor_internal.h"
+#include "transform/sql_builder.h"
+#include "transform/transform_validate.h"
+
+/* SQLite's JSON subtype marker (added in 3.45). Matches the 'J' char =
+ * 0x4A used by json_array/json_object to flag JSON-typed text results
+ * so json_array(json_array(...)) embeds the inner array instead of
+ * quoting it. Define locally to avoid a hard dep on a specific SQLite
+ * version. */
+#ifndef GQL_SUBTYPE_JSON
+#define GQL_SUBTYPE_JSON 0x4A
+#endif
+
+/* Definitions of the structured-error helpers declared in gql_error.h. */
+char *gql_json_quote(const char *s) {
+    if (!s) s = "";
+    /* Worst case every byte becomes \uXXXX (6 bytes), plus quotes and NUL. */
+    size_t cap = strlen(s) * 6 + 3;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    char *d = out;
+    *d++ = '"';
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+            case '"':  *d++ = '\\'; *d++ = '"';  break;
+            case '\\': *d++ = '\\'; *d++ = '\\'; break;
+            case '\n': *d++ = '\\'; *d++ = 'n';  break;
+            case '\r': *d++ = '\\'; *d++ = 'r';  break;
+            case '\t': *d++ = '\\'; *d++ = 't';  break;
+            case '\b': *d++ = '\\'; *d++ = 'b';  break;
+            case '\f': *d++ = '\\'; *d++ = 'f';  break;
+            default:
+                if (*p < 0x20) {
+                    d += sprintf(d, "\\u%04x", (unsigned int)*p);
+                } else {
+                    *d++ = (char)*p;
+                }
+        }
+    }
+    *d++ = '"';
+    *d = '\0';
+    return out;
+}
+
+char *gql_error_json(const char *message, const char *code, int line, int column) {
+    char *msg = gql_json_quote(message ? message : "Unknown error");
+    if (!msg) return NULL;
+    char *out;
+    if (line > 0 && column > 0) {
+        out = sqlite3_mprintf("{\"error\":%s,\"code\":\"%s\",\"line\":%d,\"column\":%d}",
+                              msg, code ? code : GQL_ERR_EXECUTION, line, column);
+    } else if (line > 0) {
+        out = sqlite3_mprintf("{\"error\":%s,\"code\":\"%s\",\"line\":%d}",
+                              msg, code ? code : GQL_ERR_EXECUTION, line);
+    } else {
+        out = sqlite3_mprintf("{\"error\":%s,\"code\":\"%s\"}",
+                              msg, code ? code : GQL_ERR_EXECUTION);
+    }
+    free(msg);
+    return out;
+}
+
+void graphqlite_result_error_at(sqlite3_context *context,
+                                const char *message,
+                                const char *code,
+                                int line,
+                                int column) {
+    char *json = gql_error_json(message, code, line, column);
+    if (!json) {
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+    sqlite3_result_error(context, json, -1);
+    sqlite3_free(json);
+}
+
+void graphqlite_result_error(sqlite3_context *context,
+                             const char *message,
+                             const char *code) {
+    graphqlite_result_error_at(context, message, code, 0, 0);
+}
+
+/* Cypher's three-valued equality for any pair of values.
+ *   null = anything           -> null
+ *   list = list (element-wise, three-valued)
+ *   map  = map  (key-set + value-wise, three-valued)
+ *   scalar/scalar             -> standard equality
+ *
+ * Returns SQL integer 0 / 1 / NULL. */
+typedef enum { TVAL_FALSE = 0, TVAL_TRUE = 1, TVAL_NULL = 2 } tval;
+
+/* Parse helpers — walk a JSON text using sqlite's json_each is too slow
+ * for recursion; we use a thin manual scanner that returns (json_type,
+ * value text, value length, advance). We only need to distinguish
+ * arrays, objects, null, and scalar (which we'll compare via raw text). */
+
+static const char *skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+
+/* Compare two values represented as JSON-text fragments using Cypher
+ * three-valued equality semantics. Returns TVAL_TRUE / FALSE / NULL. */
+static tval gql_eq_json(const char *a, const char *b);
+
+/* Compute the end pointer of one JSON value starting at p (which is at
+ * the first non-whitespace char of a value). Returns pointer just past
+ * the value, or NULL on malformed input. */
+static const char *json_value_end(const char *p) {
+    p = skip_ws(p);
+    if (!*p) return NULL;
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') {
+            if (*p == '\\' && p[1]) p += 2;
+            else p++;
+        }
+        if (*p == '"') p++;
+        return p;
+    }
+    if (*p == '[' || *p == '{') {
+        char open = *p, close = (open == '[') ? ']' : '}';
+        int depth = 1;
+        p++;
+        bool in_str = false;
+        while (*p && depth > 0) {
+            if (in_str) {
+                if (*p == '\\' && p[1]) p += 2;
+                else { if (*p == '"') in_str = false; p++; }
+            } else {
+                if (*p == '"') { in_str = true; p++; }
+                else if (*p == open) { depth++; p++; }
+                else if (*p == close) { depth--; p++; }
+                else p++;
+            }
+        }
+        return p;
+    }
+    /* Number, true, false, null: scan until delim */
+    while (*p && *p != ',' && *p != ']' && *p != '}' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    return p;
+}
+
+static tval gql_eq_array(const char *a, const char *b) {
+    a = skip_ws(a); b = skip_ws(b);
+    if (*a != '[' || *b != '[') return TVAL_FALSE;
+    a++; b++;
+    tval found_null = TVAL_TRUE; /* will downgrade to NULL on element-null */
+    while (1) {
+        a = skip_ws(a); b = skip_ws(b);
+        bool a_end = (*a == ']'), b_end = (*b == ']');
+        if (a_end && b_end) return found_null;
+        if (a_end != b_end) return TVAL_FALSE; /* length mismatch */
+        const char *a_endp = json_value_end(a);
+        const char *b_endp = json_value_end(b);
+        if (!a_endp || !b_endp) return TVAL_NULL;
+        /* Extract substrings */
+        size_t alen = a_endp - a, blen = b_endp - b;
+        char *as = malloc(alen + 1), *bs = malloc(blen + 1);
+        if (!as || !bs) { free(as); free(bs); return TVAL_NULL; }
+        memcpy(as, a, alen); as[alen] = 0;
+        memcpy(bs, b, blen); bs[blen] = 0;
+        tval t = gql_eq_json(as, bs);
+        free(as); free(bs);
+        if (t == TVAL_FALSE) return TVAL_FALSE;
+        if (t == TVAL_NULL) found_null = TVAL_NULL;
+        a = a_endp; b = b_endp;
+        a = skip_ws(a); b = skip_ws(b);
+        if (*a == ',') a++;
+        if (*b == ',') b++;
+    }
+}
+
+static tval gql_eq_object(const char *a, const char *b) {
+    /* Compare two JSON objects. Sufficient to use SQLite's json_patch
+     * approach: serialize via json() canonicalization, compare keys/values.
+     * To keep this self-contained, do a simple sort-and-compare by parsing
+     * pairs into arrays of (key, value). */
+    /* For now defer to text compare unless contents include null —
+     * which we detect via substring. The TCK map cases use null values
+     * so we need handling for those. */
+    a = skip_ws(a); b = skip_ws(b);
+    if (*a != '{' || *b != '{') return TVAL_FALSE;
+    /* Count pairs and check structural equality: same key set, three-eq values. */
+    /* Helper: parse one (key, value) pair starting at p; *p must be at '"' */
+    /* For simplicity build a small list of keys and value endpoints from each side. */
+    struct kv { const char *k; size_t klen; const char *v; const char *vend; };
+    struct kv aa[64], bb[64];
+    int na = 0, nb = 0;
+    const char *p = a + 1;
+    while (1) {
+        p = skip_ws(p);
+        if (*p == '}') break;
+        if (*p != '"' || na >= 64) return TVAL_NULL;
+        const char *kstart = p + 1;
+        const char *kend = kstart;
+        while (*kend && *kend != '"') {
+            if (*kend == '\\' && kend[1]) kend += 2; else kend++;
+        }
+        if (*kend != '"') return TVAL_NULL;
+        aa[na].k = kstart; aa[na].klen = kend - kstart;
+        p = skip_ws(kend + 1);
+        if (*p != ':') return TVAL_NULL;
+        p = skip_ws(p + 1);
+        aa[na].v = p;
+        const char *vend = json_value_end(p);
+        if (!vend) return TVAL_NULL;
+        aa[na].vend = vend;
+        na++;
+        p = skip_ws(vend);
+        if (*p == ',') p++;
+        else if (*p == '}') break;
+        else return TVAL_NULL;
+    }
+    p = b + 1;
+    while (1) {
+        p = skip_ws(p);
+        if (*p == '}') break;
+        if (*p != '"' || nb >= 64) return TVAL_NULL;
+        const char *kstart = p + 1;
+        const char *kend = kstart;
+        while (*kend && *kend != '"') {
+            if (*kend == '\\' && kend[1]) kend += 2; else kend++;
+        }
+        if (*kend != '"') return TVAL_NULL;
+        bb[nb].k = kstart; bb[nb].klen = kend - kstart;
+        p = skip_ws(kend + 1);
+        if (*p != ':') return TVAL_NULL;
+        p = skip_ws(p + 1);
+        bb[nb].v = p;
+        const char *vend = json_value_end(p);
+        if (!vend) return TVAL_NULL;
+        bb[nb].vend = vend;
+        nb++;
+        p = skip_ws(vend);
+        if (*p == ',') p++;
+        else if (*p == '}') break;
+        else return TVAL_NULL;
+    }
+    if (na != nb) return TVAL_FALSE; /* different key counts */
+    /* Match each key in aa to a key in bb */
+    tval found_null = TVAL_TRUE;
+    for (int i = 0; i < na; i++) {
+        int j;
+        for (j = 0; j < nb; j++) {
+            if (bb[j].klen == aa[i].klen && memcmp(aa[i].k, bb[j].k, aa[i].klen) == 0) break;
+        }
+        if (j == nb) return TVAL_FALSE; /* key not present */
+        size_t alen = aa[i].vend - aa[i].v, blen = bb[j].vend - bb[j].v;
+        char *as = malloc(alen + 1), *bs = malloc(blen + 1);
+        if (!as || !bs) { free(as); free(bs); return TVAL_NULL; }
+        memcpy(as, aa[i].v, alen); as[alen] = 0;
+        memcpy(bs, bb[j].v, blen); bs[blen] = 0;
+        tval t = gql_eq_json(as, bs);
+        free(as); free(bs);
+        if (t == TVAL_FALSE) return TVAL_FALSE;
+        if (t == TVAL_NULL) found_null = TVAL_NULL;
+    }
+    return found_null;
+}
+
+static tval gql_eq_json(const char *a, const char *b) {
+    if (!a || !b) return TVAL_NULL;
+    a = skip_ws(a); b = skip_ws(b);
+    /* JSON null on either side => null */
+    if (strncmp(a, "null", 4) == 0 && (a[4] == 0 || a[4] == ',' || a[4] == ']' || a[4] == '}' || a[4] == ' ')) return TVAL_NULL;
+    if (strncmp(b, "null", 4) == 0 && (b[4] == 0 || b[4] == ',' || b[4] == ']' || b[4] == '}' || b[4] == ' ')) return TVAL_NULL;
+    if (*a == '[' && *b == '[') return gql_eq_array(a, b);
+    if (*a == '{' && *b == '{') return gql_eq_object(a, b);
+    /* Type mismatch between containers and scalars */
+    if ((*a == '[' || *a == '{') != (*b == '[' || *b == '{')) return TVAL_FALSE;
+    /* Scalars: compare strings */
+    const char *aend = json_value_end(a);
+    const char *bend = json_value_end(b);
+    size_t alen = aend - a, blen = bend - b;
+    if (alen == blen && memcmp(a, b, alen) == 0) return TVAL_TRUE;
+    return TVAL_FALSE;
+}
+
+void gql_eq_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 2) { sqlite3_result_null(context); return; }
+    int at = sqlite3_value_type(argv[0]);
+    int bt = sqlite3_value_type(argv[1]);
+    if (at == SQLITE_NULL || bt == SQLITE_NULL) {
+        sqlite3_result_null(context);
+        return;
+    }
+    const char *a = (const char*)sqlite3_value_text(argv[0]);
+    const char *b = (const char*)sqlite3_value_text(argv[1]);
+    if (!a || !b) { sqlite3_result_null(context); return; }
+    tval t = gql_eq_json(a, b);
+    if (t == TVAL_NULL) sqlite3_result_null(context);
+    else sqlite3_result_int(context, t == TVAL_TRUE ? 1 : 0);
+}
+
+/* Cypher ordered comparison of two values rendered as JSON-element text,
+ * with the element's json_type. Returns:
+ *   -1, 0, 1  ordinary comparison result
+ *   -2        undefined (null result — cross-type, null operand, or an
+ *             unorderable type such as a map/object reached during compare)
+ * Recurses into arrays element-wise per the Cypher list-ordering rules:
+ * compare pairwise; the first decisive element wins; if all compared
+ * elements are equal, the shorter list sorts first. A null/undefined
+ * element comparison propagates only once it is actually reached. */
+static int gql_cmp_json_vals(sqlite3 *db,
+                             const char *ja, const char *jta,
+                             const char *jb, const char *jtb);
+
+/* Compare two JSON array texts element-wise. */
+static int gql_cmp_json_arrays(sqlite3 *db, const char *aa, const char *ab) {
+    sqlite3_stmt *st = NULL;
+    int la = 0, lb = 0;
+    if (sqlite3_prepare_v2(db, "SELECT json_array_length(?1), json_array_length(?2)",
+                           -1, &st, NULL) != SQLITE_OK) return -2;
+    sqlite3_bind_text(st, 1, aa, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, ab, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        la = sqlite3_column_int(st, 0);
+        lb = sqlite3_column_int(st, 1);
+    }
+    sqlite3_finalize(st);
+
+    int n = la < lb ? la : lb;
+    for (int i = 0; i < n; i++) {
+        char qa[96], qb[96];
+        snprintf(qa, sizeof(qa), "$[%d]", i);
+        snprintf(qb, sizeof(qb), "$[%d]", i);
+        sqlite3_stmt *es = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT json_extract(?1, ?3), json_type(?1, ?3), "
+                "json_extract(?2, ?4), json_type(?2, ?4)",
+                -1, &es, NULL) != SQLITE_OK) return -2;
+        sqlite3_bind_text(es, 1, aa, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(es, 2, ab, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(es, 3, qa, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(es, 4, qb, -1, SQLITE_TRANSIENT);
+        int c = -2;
+        if (sqlite3_step(es) == SQLITE_ROW) {
+            const char *va  = (const char*)sqlite3_column_text(es, 0);
+            const char *ta  = (const char*)sqlite3_column_text(es, 1);
+            const char *vb  = (const char*)sqlite3_column_text(es, 2);
+            const char *tb  = (const char*)sqlite3_column_text(es, 3);
+            /* For nested arrays, json_extract returns the sub-array text. */
+            char *va_dup = va ? strdup(va) : NULL;
+            char *ta_dup = ta ? strdup(ta) : NULL;
+            char *vb_dup = vb ? strdup(vb) : NULL;
+            char *tb_dup = tb ? strdup(tb) : NULL;
+            sqlite3_finalize(es);
+            c = gql_cmp_json_vals(db, va_dup, ta_dup, vb_dup, tb_dup);
+            free(va_dup); free(ta_dup); free(vb_dup); free(tb_dup);
+        } else {
+            sqlite3_finalize(es);
+        }
+        if (c != 0) return c;  /* decisive (or -2 undefined) */
+    }
+    /* All compared elements equal — shorter list sorts first. */
+    if (la == lb) return 0;
+    return la < lb ? -1 : 1;
+}
+
+static int gql_cmp_json_vals(sqlite3 *db,
+                             const char *ja, const char *jta,
+                             const char *jb, const char *jtb) {
+    if (!jta || !jtb) return -2;                  /* missing */
+    if (strcmp(jta, "null") == 0 || strcmp(jtb, "null") == 0) return -2;
+
+    bool a_num = (strcmp(jta, "integer") == 0 || strcmp(jta, "real") == 0);
+    bool b_num = (strcmp(jtb, "integer") == 0 || strcmp(jtb, "real") == 0);
+    if (a_num && b_num) {
+        double da = ja ? atof(ja) : 0.0, dbv = jb ? atof(jb) : 0.0;
+        return (da < dbv) ? -1 : (da > dbv) ? 1 : 0;
+    }
+    bool a_bool = (strcmp(jta, "true") == 0 || strcmp(jta, "false") == 0);
+    bool b_bool = (strcmp(jtb, "true") == 0 || strcmp(jtb, "false") == 0);
+    if (a_bool && b_bool) {
+        int ia = (strcmp(jta, "true") == 0), ib = (strcmp(jtb, "true") == 0);
+        return (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
+    }
+    if (strcmp(jta, "text") == 0 && strcmp(jtb, "text") == 0) {
+        int c = strcmp(ja ? ja : "", jb ? jb : "");
+        return (c < 0) ? -1 : (c > 0) ? 1 : 0;
+    }
+    if (strcmp(jta, "array") == 0 && strcmp(jtb, "array") == 0) {
+        return gql_cmp_json_arrays(db, ja ? ja : "[]", jb ? jb : "[]");
+    }
+    /* Anything else (object/map/entity, or cross-type) is unorderable. */
+    return -2;
+}
+
+/* T-0308: Cypher ordering comparison with type-class check.
+ *   _gql_order_cmp(left, right, op_str)
+ *     op_str in {"<", ">", "<=", ">="}
+ *
+ *   Per the openCypher spec, ordering comparisons across incompatible
+ *   type classes return null. SQLite's native `<` / `>` silently coerce
+ *   types (e.g. `1 < 'a'` → true), so we route LT/GT/LTE/GTE through
+ *   this UDF instead.
+ *
+ *   Rules:
+ *     - null operand            -> null
+ *     - both numeric            -> compare as doubles
+ *     - both text (non-JSON)    -> compare as text
+ *     - text starts with '['/'{' (JSON container) -> null
+ *     - boolean (subtype 0x42)  -> null (booleans aren't orderable
+ *                                  with each other or with numerics
+ *                                  per the Cypher type lattice)
+ *     - any other mixed class   -> null
+ *
+ *   Called by transform_binary_operation's LT/GT/LTE/GTE path —
+ *   each operand is transformed exactly once. */
+static int64_t parse_temporal_ns(const char *s);  /* defined below */
+/* Overflow-safe temporal ordering: compares two ISO temporal strings by their
+ * UTC instant using (epoch_seconds, sub_second_ns) components, so far-future
+ * years whose epoch-nanoseconds exceed int64 don't wrap. Returns -1/0/1, or
+ * -2 if either operand fails to parse. (WithOrderBy1 [45].) */
+static int cmp_temporal_strings(const char *a, const char *b);  /* defined below */
+static bool parse_iso_date_head(const char *s, int *y, int *mo, int *d,
+                                const char **after);  /* defined below */
+
+/* Heuristic: does the text look like a Cypher temporal value (time 'HH:MM…' or
+ * date/datetime 'YYYY-MM-DD…', including the signed extended-year form
+ * '[+-]YYYYYYYYY-MM-DD…')? Used so ordered comparison of two temporals uses
+ * their UTC instant rather than a lexical compare (Temporal7 [3]). */
+static bool looks_temporal(const char *s) {
+    if (!s) return false;
+    size_t n = strlen(s);
+    if (n >= 5 && s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9' &&
+        s[2] == ':' && s[3] >= '0' && s[3] <= '9' && s[4] >= '0' && s[4] <= '9')
+        return true;  /* time HH:MM… */
+    if (n >= 10 && s[4] == '-' && s[7] == '-' &&
+        s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9')
+        return true;  /* date / datetime YYYY-MM-DD… */
+    if ((s[0] == '+' || s[0] == '-') && s[1] >= '0' && s[1] <= '9') {
+        int y, mo, d;
+        if (parse_iso_date_head(s, &y, &mo, &d, NULL)) return true;
+    }
+    return false;
+}
+
+void gql_order_cmp_func(
+    sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 3 && argc != 5) { sqlite3_result_null(context); return; }
+    int lt = sqlite3_value_type(argv[0]);
+    int rt = sqlite3_value_type(argv[1]);
+    if (lt == SQLITE_NULL || rt == SQLITE_NULL) {
+        sqlite3_result_null(context); return;
+    }
+    /* Note: we don't reject boolean-vs-boolean ordering here. The
+     * spec is fuzzy and graphqlite's existing tests (Precedence1
+     * [23]/[26]) rely on boolean values surviving the < / > paths
+     * with stable (if not strictly type-checked) results. The strict
+     * cross-type rule below is what T-0308 is really after. */
+
+    /* A boolean (by its type tag) orders only against a boolean, false <
+     * true; against anything else it is null (Comparison2 [3]). */
+    const char *ltag = argc == 5 ? (const char *)sqlite3_value_text(argv[3]) : NULL;
+    const char *rtag = argc == 5 ? (const char *)sqlite3_value_text(argv[4]) : NULL;
+    bool l_bool = ltag && strcmp(ltag, "bool") == 0;
+    bool r_bool = rtag && strcmp(rtag, "bool") == 0;
+    if (l_bool || r_bool) {
+        if (!(l_bool && r_bool)) { sqlite3_result_null(context); return; }
+        const char *a = (const char *)sqlite3_value_text(argv[0]);
+        const char *b = (const char *)sqlite3_value_text(argv[1]);
+        int av = a && (strcmp(a, "true") == 0 || strcmp(a, "1") == 0);
+        int bv = b && (strcmp(b, "true") == 0 || strcmp(b, "1") == 0);
+        const char *bop = (const char *)sqlite3_value_text(argv[2]);
+        if (!bop) { sqlite3_result_null(context); return; }
+        bool r;
+        if      (strcmp(bop, "<")  == 0) r = av < bv;
+        else if (strcmp(bop, ">")  == 0) r = av > bv;
+        else if (strcmp(bop, "<=") == 0) r = av <= bv;
+        else if (strcmp(bop, ">=") == 0) r = av >= bv;
+        else { sqlite3_result_null(context); return; }
+        sqlite3_result_int(context, r ? 1 : 0);
+        return;
+    }
+
+    bool l_num = (lt == SQLITE_INTEGER || lt == SQLITE_FLOAT);
+    bool r_num = (rt == SQLITE_INTEGER || rt == SQLITE_FLOAT);
+    bool l_text = (lt == SQLITE_TEXT);
+    bool r_text = (rt == SQLITE_TEXT);
+
+    /* JSON-container text (list/map encoded as text) compared with
+     * anything that's NOT also a container → null. This is the
+     * clearest cross-type case (list vs scalar, map vs scalar) and
+     * matches what TCK Comparison2 [3] enforces. */
+    bool l_json = false, r_json = false;
+    bool l_list = false, r_list = false, l_obj = false, r_obj = false;
+    if (l_text) {
+        const char *s = (const char *)sqlite3_value_text(argv[0]);
+        if (s && s[0] == '[') { l_json = true; l_list = true; }
+        else if (s && s[0] == '{') { l_json = true; l_obj = true; }
+    }
+    if (r_text) {
+        const char *s = (const char *)sqlite3_value_text(argv[1]);
+        if (s && s[0] == '[') { r_json = true; r_list = true; }
+        else if (s && s[0] == '{') { r_json = true; r_obj = true; }
+    }
+    if (l_json != r_json) {
+        /* container vs scalar — null per Cypher type lattice. */
+        sqlite3_result_null(context); return;
+    }
+    /* Maps / nodes / relationships / paths (JSON objects) have no ordering
+     * relation in Cypher — any ordered comparison involving one is null.
+     * (Comparison2 [3].) */
+    if (l_obj || r_obj) { sqlite3_result_null(context); return; }
+
+    const char *op = (const char *)sqlite3_value_text(argv[2]);
+    if (!op) { sqlite3_result_null(context); return; }
+
+    /* Two lists — element-wise comparison with null propagation and the
+     * shorter-prefix-sorts-first rule (Comparison2 [4]). */
+    if (l_list && r_list) {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        int c = gql_cmp_json_arrays(db,
+                    (const char *)sqlite3_value_text(argv[0]),
+                    (const char *)sqlite3_value_text(argv[1]));
+        if (c == -2) { sqlite3_result_null(context); return; }
+        bool result;
+        if      (strcmp(op, "<")  == 0) result = (c < 0);
+        else if (strcmp(op, ">")  == 0) result = (c > 0);
+        else if (strcmp(op, "<=") == 0) result = (c <= 0);
+        else if (strcmp(op, ">=") == 0) result = (c >= 0);
+        else { sqlite3_result_null(context); return; }
+        sqlite3_result_int(context, result ? 1 : 0);
+        return;
+    }
+
+    int cmp = 0;
+    if (l_num && r_num) {
+        double a = sqlite3_value_double(argv[0]);
+        double b = sqlite3_value_double(argv[1]);
+        cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
+    } else if (l_text && r_text) {
+        const char *a = (const char *)sqlite3_value_text(argv[0]);
+        const char *b = (const char *)sqlite3_value_text(argv[1]);
+        if (!a || !b) { sqlite3_result_null(context); return; }
+        if (looks_temporal(a) && looks_temporal(b)) {
+            /* Compare two temporal values by UTC instant, not lexically, so a
+             * tz offset is honored (Temporal7 [3]: 10:00+01:00 < 09:35+00:00).
+             * Use the overflow-safe (seconds, ns) comparison so far-future
+             * years (9999) don't wrap int64 epoch-ns (WithOrderBy1 [45]). */
+            cmp = cmp_temporal_strings(a, b);
+            if (cmp == -2) cmp = strcmp(a, b);  /* unparseable → lexical */
+        } else {
+            cmp = strcmp(a, b);
+        }
+        if (cmp < 0) cmp = -1;
+        else if (cmp > 0) cmp = 1;
+    } else {
+        /* T-0331: Cross-type ordered comparison returns null per the
+         * Cypher spec (Comparison2 [3], [6]).
+         *
+         * Exception: graphqlite sometimes flows boolean values as the
+         * text 'true'/'false' (no boolean subtype on this value path).
+         * Precedence1 [23]/[26] rely on those still ordering against
+         * numeric-encoded booleans. Treat stringified booleans as 1/0
+         * and let the comparison proceed numerically; otherwise null. */
+        double la = 0.0, lb = 0.0;
+        bool l_resolved = false, r_resolved = false;
+        if (l_num) { la = sqlite3_value_double(argv[0]); l_resolved = true; }
+        else if (l_text) {
+            const char *s = (const char *)sqlite3_value_text(argv[0]);
+            if (s && strcmp(s, "true") == 0)  { la = 1.0; l_resolved = true; }
+            else if (s && strcmp(s, "false") == 0) { la = 0.0; l_resolved = true; }
+        }
+        if (r_num) { lb = sqlite3_value_double(argv[1]); r_resolved = true; }
+        else if (r_text) {
+            const char *s = (const char *)sqlite3_value_text(argv[1]);
+            if (s && strcmp(s, "true") == 0)  { lb = 1.0; r_resolved = true; }
+            else if (s && strcmp(s, "false") == 0) { lb = 0.0; r_resolved = true; }
+        }
+        if (!l_resolved || !r_resolved) {
+            sqlite3_result_null(context); return;
+        }
+        cmp = (la < lb) ? -1 : (la > lb) ? 1 : 0;
+    }
+
+    bool result;
+    if (strcmp(op, "<")  == 0) result = (cmp < 0);
+    else if (strcmp(op, ">")  == 0) result = (cmp > 0);
+    else if (strcmp(op, "<=") == 0) result = (cmp <= 0);
+    else if (strcmp(op, ">=") == 0) result = (cmp >= 0);
+    else { sqlite3_result_null(context); return; }
+    sqlite3_result_int(context, result ? 1 : 0);
+}
+
+static void gql_map_get_result(sqlite3_context *context, sqlite3_value *obj,
+                               sqlite3_value *key, int mode);
+
+/* Cypher subscript with runtime type checks.
+ *   value[idx]:
+ *     value NULL                      -> NULL
+ *     value JSON-array, idx integer   -> json_extract by index (neg ok)
+ *     value JSON-array, idx other     -> TypeError InvalidArgumentType
+ *     value JSON-object, idx string   -> json_extract by key
+ *     value JSON-object, idx other    -> TypeError MapElementAccessByNonString
+ *     value scalar (int/float/bool)   -> TypeError InvalidArgumentType
+ *     value string                    -> TypeError (Cypher disallows string subscript)
+ *
+ * Use sqlite3_result_error to abort the query — the harness classifies
+ * "TypeError:" messages as TypeError. */
+void gql_subscript_func(
+    sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 2) { sqlite3_result_null(context); return; }
+    int vt = sqlite3_value_type(argv[0]);
+    int it = sqlite3_value_type(argv[1]);
+    if (vt == SQLITE_NULL || it == SQLITE_NULL) { sqlite3_result_null(context); return; }
+
+    const char *vstr = (vt == SQLITE_TEXT) ? (const char*)sqlite3_value_text(argv[0]) : NULL;
+    bool is_arr = vstr && vstr[0] == '[';
+    bool is_obj = vstr && vstr[0] == '{';
+
+    if (is_arr) {
+        if (it != SQLITE_INTEGER) {
+            sqlite3_result_error(context,
+                "TypeError: InvalidArgumentType: List index must be Integer", -1);
+            return;
+        }
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db,
+            "SELECT json_extract(?1, p), json_type(?1, p) FROM (SELECT '$[' || "
+            " CAST(CASE WHEN ?2 < 0 THEN json_array_length(?1) + ?2 ELSE ?2 END AS INTEGER) "
+            " || ']' AS p)", -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_value(stmt, 1, argv[0]);
+            sqlite3_bind_value(stmt, 2, argv[1]);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                /* GQLITE-T-0387: a JSON true/false element stays a boolean
+                 * (json_extract gives 1/0). Same form as _gql_bool_str. */
+                const char *jt = (const char*)sqlite3_column_text(stmt, 1);
+                if (jt && (strcmp(jt, "true") == 0 || strcmp(jt, "false") == 0)) {
+                    sqlite3_result_text(context, jt[0] == 't' ? "true" : "false", -1, SQLITE_STATIC);
+                    sqlite3_result_subtype(context, GQL_SUBTYPE_BOOLEAN);
+                } else {
+                    sqlite3_result_value(context, sqlite3_column_value(stmt, 0));
+                }
+            } else {
+                sqlite3_result_null(context);
+            }
+            sqlite3_finalize(stmt);
+        } else {
+            sqlite3_result_null(context);
+        }
+        return;
+    }
+
+    if (is_obj) {
+        if (it != SQLITE_TEXT) {
+            sqlite3_result_error(context,
+                "TypeError: MapElementAccessByNonString: Map index must be String", -1);
+            return;
+        }
+        const char *key = (const char*)sqlite3_value_text(argv[1]);
+        if (!key) { sqlite3_result_null(context); return; }
+        /* The key is looked up with json_each: any key text, also with a
+         * quote (GQLITE-T-0414); a list or boolean element keeps its type. */
+        gql_map_get_result(context, argv[0], argv[1], 2);
+        return;
+    }
+
+    /* Not a list or map — scalar / non-JSON text. */
+    sqlite3_result_error(context,
+        "TypeError: InvalidArgumentType: Cannot subscript value of non-list/non-map", -1);
+}
+
+/* labels()/type() over a statically-Any argument (Graph3 [6], Graph4 [5]).
+ * The runtime value decides: a node/relationship JSON object yields its
+ * labels/type; null yields null; anything else raises a TypeError so the
+ * "fail on invalid argument" scenarios (Graph3 [9]) still error. `path` is
+ * "$.labels" or "$.type"; `want_array` distinguishes the two shapes. */
+static void gql_entity_accessor(sqlite3_context *context, sqlite3_value *v,
+                                const char *path, bool want_array,
+                                const char *err) {
+    if (sqlite3_value_type(v) == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    const char *s = (sqlite3_value_type(v) == SQLITE_TEXT)
+                    ? (const char*)sqlite3_value_text(v) : NULL;
+    if (s && s[0] == '{') {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT json_type(?1, ?2), json_extract(?1, ?2)",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_value(st, 1, v);
+            sqlite3_bind_text(st, 2, path, -1, SQLITE_TRANSIENT);
+            int ok = 0;
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const char *jt = (const char*)sqlite3_column_text(st, 0);
+                if (jt && ((want_array && strcmp(jt, "array") == 0) ||
+                           (!want_array && strcmp(jt, "text") == 0))) {
+                    sqlite3_result_value(context, sqlite3_column_value(st, 1));
+                    ok = 1;
+                }
+            }
+            sqlite3_finalize(st);
+            if (ok) return;
+        }
+    }
+    sqlite3_result_error(context, err, -1);
+}
+
+void gql_labels_func(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    gql_entity_accessor(context, argv[0], "$.labels", true,
+        "TypeError: InvalidArgumentValue: labels() requires a Node");
+}
+
+void gql_type_func(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    gql_entity_accessor(context, argv[0], "$.type", false,
+        "TypeError: InvalidArgumentValue: type() requires a Relationship");
+}
+
+/* Cypher's three-valued IN operator.
+ *   null IN []          -> false
+ *   null IN <non-empty> -> null
+ *   x    IN coll        -> true if some element equals x, null if no match
+ *                          but coll contains null, else false.
+ * coll is provided as a JSON array text. */
+/* Dynamic property lookup on a node/edge by runtime key string, e.g.
+ * `n['nam' + 'e']` (Graph7 [1]-[3]). Static string keys are normalized to
+ * property access at transform time; a computed key needs this runtime
+ * EAV lookup. argv[0] = entity id, argv[1] = key text. */
+static void gql_entity_prop_lookup(sqlite3_context *context, int argc,
+                                   sqlite3_value **argv, bool is_edge) {
+    if (argc != 2) { sqlite3_result_null(context); return; }
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
+        sqlite3_value_type(argv[1]) == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    const char *col = is_edge ? "edge_id" : "node_id";
+    const char *pfx = is_edge ? "edge_props" : "node_props";
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+        "SELECT COALESCE("
+        "(SELECT value FROM %s_int t JOIN property_keys pk ON t.key_id=pk.id WHERE t.%s=?1 AND pk.key=?2),"
+        "(SELECT value FROM %s_real t JOIN property_keys pk ON t.key_id=pk.id WHERE t.%s=?1 AND pk.key=?2),"
+        "(SELECT value FROM %s_text t JOIN property_keys pk ON t.key_id=pk.id WHERE t.%s=?1 AND pk.key=?2),"
+        "(SELECT CASE WHEN value THEN 'true' ELSE 'false' END FROM %s_bool t JOIN property_keys pk ON t.key_id=pk.id WHERE t.%s=?1 AND pk.key=?2),"
+        "(SELECT json(value) FROM %s_json t JOIN property_keys pk ON t.key_id=pk.id WHERE t.%s=?1 AND pk.key=?2))",
+        pfx, col, pfx, col, pfx, col, pfx, col, pfx, col);
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_value(st, 1, argv[0]);
+        sqlite3_bind_value(st, 2, argv[1]);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            sqlite3_result_value(context, sqlite3_column_value(st, 0));
+        else
+            sqlite3_result_null(context);
+        sqlite3_finalize(st);
+    } else {
+        sqlite3_result_null(context);
+    }
+}
+
+void gql_node_prop_func(sqlite3_context *c, int argc, sqlite3_value **argv) {
+    gql_entity_prop_lookup(c, argc, argv, false);
+}
+
+/* Static property access on a JSON value of unknown shape: `(expr).key`
+ * where expr yields a node/rel JSON object ({id,labels,properties}) OR a
+ * plain map. For a node/rel shape, regular keys live under $.properties and
+ * the meta keys (id/labels/type/startNode/endNode) at top level; a plain map
+ * uses top-level keys. (Graph6 [4]/[6]/[8].) argv[0]=value, argv[1]=key. */
+void gql_dyn_prop_func(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 2) { sqlite3_result_null(context); return; }
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
+        sqlite3_value_type(argv[1]) == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    const char *v = (const char*)sqlite3_value_text(argv[0]);
+    if (!v) { sqlite3_result_null(context); return; }
+    const char *vw = skip_ws(v);
+    if (*vw != '{') { sqlite3_result_null(context); return; }  /* not a map/entity */
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_stmt *st = NULL;
+    /* An entity's properties live under $.properties (its meta keys at the
+     * top); a plain map uses its own keys. The key is looked up with
+     * json_each, so any key text works (GQLITE-T-0414). */
+    static const char *const meta[] = {"id", "labels", "type", "startNode", "endNode", "start", "end", NULL};
+    const char *k = (const char *)sqlite3_value_text(argv[1]);
+    bool is_meta = false;
+    for (int i = 0; k && meta[i]; i++) if (strcmp(k, meta[i]) == 0) is_meta = true;
+    sqlite3_value *obj = argv[0];
+    sqlite3_value *props = NULL;
+    if (!is_meta && sqlite3_prepare_v2(db, "SELECT json_extract(?1, '$.properties')", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_value(st, 1, argv[0]);
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
+            props = sqlite3_value_dup(sqlite3_column_value(st, 0));
+        sqlite3_finalize(st);
+        if (props) obj = props;
+    }
+    gql_map_get_result(context, obj, argv[1], sqlite3_user_data(context) ? 3 : 2);
+    if (props) sqlite3_value_free(props);
+}
+void gql_edge_prop_func(sqlite3_context *c, int argc, sqlite3_value **argv) {
+    gql_entity_prop_lookup(c, argc, argv, true);
+}
+
+void gql_in_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 2) { sqlite3_result_null(context); return; }
+    const char *coll = (const char*)sqlite3_value_text(argv[1]);
+    if (!coll) { sqlite3_result_null(context); return; }
+
+    /* Empty array case: null IN [] -> false */
+    /* Detect empty array textually after trimming whitespace */
+    const char *p = coll;
+    while (*p == ' ' || *p == '\t') p++;
+    bool is_empty = (p[0] == '[' && p[1] == ']');
+
+    int elt_type = sqlite3_value_type(argv[0]);
+
+    if (elt_type == SQLITE_NULL) {
+        sqlite3_result_int(context, is_empty ? 0 : -1);
+        /* Use -1 sentinel for null result? No, use NULL */
+        if (!is_empty) sqlite3_result_null(context);
+        else sqlite3_result_int(context, 0);
+        return;
+    }
+
+    /* Compare LHS against each collection element using Cypher 3VL equality
+     * (gql_eq_json), not raw SQL `=`. This gives correct results when an
+     * element is a list/map whose own elements include null (e.g.
+     * `[1,2] IN [[1,null]]` → null, `[1,null] IN [[1,null]]` → null). Aggregate
+     * per 3VL: any TRUE → true; else any NULL → null; else false.
+     * (List5 [21]/[29]/[31]/[34].) */
+    const char *lhs = (const char*)sqlite3_value_text(argv[0]);
+    if (!lhs) { sqlite3_result_null(context); return; }
+
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT je.value, je.type FROM json_each(?1) je", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) { sqlite3_result_null(context); return; }
+    sqlite3_bind_text(stmt, 1, coll, -1, SQLITE_TRANSIENT);
+
+    const char *lhs_s = skip_ws(lhs);
+    bool lhs_container = (*lhs_s == '[' || *lhs_s == '{');
+    /* #135: a boolean (JSON true/false, or a tagged boolean) on the left
+     * equals only a boolean; the number 1 is not true. */
+    unsigned int lhs_sub = sqlite3_value_subtype(argv[0]);
+    bool lhs_bool = (lhs_sub == GQL_SUBTYPE_BOOLEAN) ||
+        (lhs_sub == GQL_SUBTYPE_JSON && (strcmp(lhs_s, "true") == 0 || strcmp(lhs_s, "false") == 0));
+
+    /* For scalar-vs-scalar comparison, replicate SQLite's typed `=` (the
+     * historical behavior: `1 = '1'` is false by storage class, booleans
+     * compare correctly) rather than gql_eq_json's text compare. */
+    sqlite3_stmt *cmp = NULL;
+    sqlite3_prepare_v2(db, "SELECT ?1 = ?2", -1, &cmp, NULL);
+
+    bool any_true = false, any_null = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *etype = (const char*)sqlite3_column_text(stmt, 1);
+        const char *eval  = (const char*)sqlite3_column_text(stmt, 0);
+        if ((etype && strcmp(etype, "null") == 0) || !eval) {
+            any_null = true;   /* comparing against null is indeterminate */
+            continue;
+        }
+        bool elem_container = etype && (strcmp(etype, "array") == 0 ||
+                                        strcmp(etype, "object") == 0);
+        bool elem_bool = etype && (strcmp(etype, "true") == 0 || strcmp(etype, "false") == 0);
+        tval t = TVAL_FALSE;
+        /* A boolean equals only a boolean. The left side comes in value form
+         * (GQLITE-T-0422), so a stored boolean carries its tag; an untagged
+         * 1 / 0 on the left is a number. */
+        if (lhs_bool || elem_bool) {
+            if (lhs_bool && elem_bool) {
+                bool lv = (strcmp(lhs_s, "true") == 0 || strcmp(lhs_s, "1") == 0);
+                t = (lv == (etype[0] == 't')) ? TVAL_TRUE : TVAL_FALSE;
+            }
+        } else if (lhs_container || elem_container) {
+            /* Container on either side: gql_eq_json handles element-wise
+             * equality with null propagation and container-vs-scalar=false. */
+            t = gql_eq_json(lhs, eval);
+        } else if (cmp) {
+            /* Both scalars: typed SQLite equality on the original values. */
+            sqlite3_reset(cmp);
+            sqlite3_bind_value(cmp, 1, argv[0]);
+            sqlite3_bind_value(cmp, 2, sqlite3_column_value(stmt, 0));
+            if (sqlite3_step(cmp) == SQLITE_ROW)
+                t = sqlite3_column_int(cmp, 0) ? TVAL_TRUE : TVAL_FALSE;
+        }
+        if (t == TVAL_TRUE)  any_true = true;
+        else if (t == TVAL_NULL) any_null = true;
+    }
+    if (cmp) sqlite3_finalize(cmp);
+    sqlite3_finalize(stmt);
+
+    if (any_true)      sqlite3_result_int(context, 1);
+    else if (any_null) sqlite3_result_null(context);
+    else               sqlite3_result_int(context, 0);
+}
+
+/* Strict type-conversion UDFs. Each raises an SQL error (which the harness
+ * classifies as TypeError) when given an incompatible input type, matching
+ * openCypher's contract for toBoolean/toInteger/toFloat/toString. */
+
+static bool is_json_container(sqlite3_value *v) {
+    if (sqlite3_value_type(v) != SQLITE_TEXT) return false;
+    const char *s = (const char*)sqlite3_value_text(v);
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    return *s == '[' || *s == '{';
+}
+
+void gql_to_bool_strict_func(
+    sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    if (is_json_container(argv[0])) {
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toBoolean() does not accept lists or maps", -1);
+        return;
+    }
+    if (t == SQLITE_TEXT) {
+        const char *s = (const char*)sqlite3_value_text(argv[0]);
+        if (!s) { sqlite3_result_null(context); return; }
+        /* Case-insensitive, surrounding spaces ignored ('TRUE', ' false '). */
+        while (*s == ' ' || *s == '\t') s++;
+        size_t n = strlen(s);
+        while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+        if (n == 4 && strncasecmp(s, "true", 4) == 0)  { sqlite3_result_int(context, 1); return; }
+        if (n == 5 && strncasecmp(s, "false", 5) == 0) { sqlite3_result_int(context, 0); return; }
+        sqlite3_result_null(context);
+        return;
+    }
+    if (t == SQLITE_FLOAT) {
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toBoolean() does not accept Float", -1);
+        return;
+    }
+    /* Integer / pass-through */
+    sqlite3_result_int(context, sqlite3_value_int64(argv[0]) ? 1 : 0);
+}
+
+void gql_to_integer_strict_func(
+    sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    if (is_json_container(argv[0])) {
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toInteger() does not accept lists or maps", -1);
+        return;
+    }
+    if (t == SQLITE_INTEGER) {
+        sqlite3_result_value(context, argv[0]); return;
+    }
+    if (t == SQLITE_FLOAT) {
+        sqlite3_result_int64(context, (long long)sqlite3_value_double(argv[0]));
+        return;
+    }
+    /* Text: try parse */
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(context); return; }
+    /* 'true' / 'false' are not numeric */
+    if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0) {
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toInteger() does not accept Boolean", -1);
+        return;
+    }
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end != s && *end == 0) { sqlite3_result_int64(context, v); return; }
+    /* try float then truncate */
+    double d = strtod(s, &end);
+    if (end != s && *end == 0) { sqlite3_result_int64(context, (long long)d); return; }
+    sqlite3_result_null(context);
+}
+
+void gql_to_float_strict_func(
+    sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    if (is_json_container(argv[0])) {
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toFloat() does not accept lists or maps", -1);
+        return;
+    }
+    if (t == SQLITE_INTEGER) {
+        sqlite3_result_double(context, (double)sqlite3_value_int64(argv[0])); return;
+    }
+    if (t == SQLITE_FLOAT) {
+        sqlite3_result_value(context, argv[0]); return;
+    }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(context); return; }
+    if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0) {
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toFloat() does not accept Boolean", -1);
+        return;
+    }
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end != s && *end == 0) { sqlite3_result_double(context, v); return; }
+    sqlite3_result_null(context);
+}
+
+void gql_to_string_strict_func(
+    sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    if (is_json_container(argv[0])) {
+        /* Duration JSON has an _iso8601 field — render that. Vertex JSON
+         * has 'id'+'labels'; edge JSON has 'type'+'startNode'/'startNodeId';
+         * path JSON has 'nodes'+'rels'; reject those. */
+        const char *s = (const char*)sqlite3_value_text(argv[0]);
+        if (s && strstr(s, "\"_iso8601\"")) {
+            sqlite3 *db = sqlite3_context_db_handle(context);
+            sqlite3_stmt *stmt = NULL;
+            if (sqlite3_prepare_v2(db, "SELECT json_extract(?1, '$._iso8601')",
+                                   -1, &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, s, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const char *iso = (const char*)sqlite3_column_text(stmt, 0);
+                    if (iso) sqlite3_result_text(context, iso, -1, SQLITE_TRANSIENT);
+                    else sqlite3_result_null(context);
+                }
+                sqlite3_finalize(stmt);
+                return;
+            }
+        }
+        sqlite3_result_error(context,
+            "TypeError: InvalidArgumentValue: toString() does not accept lists, maps, nodes, relationships, or paths", -1);
+        return;
+    }
+    if (t == SQLITE_TEXT) {
+        /* Copy the text without preserving subtype — toString() always
+         * produces a plain string, even when fed a boolean-tagged value
+         * (e.g. toString(m.bool_prop)). (I-0040 M13.) */
+        const char *s = (const char*)sqlite3_value_text(argv[0]);
+        sqlite3_result_text(context, s ? s : "", -1, SQLITE_TRANSIENT);
+        return;
+    }
+    if (t == SQLITE_INTEGER) {
+        char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)sqlite3_value_int64(argv[0]));
+        sqlite3_result_text(context, buf, -1, SQLITE_TRANSIENT); return;
+    }
+    if (t == SQLITE_FLOAT) {
+        /* The shortest text that reads back as the same value, with ".0"
+         * on a whole number: toString(2.3) is '2.3', not
+         * '2.2999999999999998' (TypeConversion4 [5]). */
+        char buf[40];
+        gql_format_double(buf, sizeof(buf), sqlite3_value_double(argv[0]));
+        sqlite3_result_text(context, buf, -1, SQLITE_TRANSIENT); return;
+    }
+    sqlite3_result_null(context);
+}
+
+/* Map a boolean-ish value to the string 'true' or 'false' (NULL passes
+ * through). Used to make the result of NOT / AND / OR / XOR consistent
+ * with the rest of the system, where booleans flow as 'true'/'false'
+ * text — so downstream `= true` comparisons work. */
+/* _gql_typetag(x): the Cypher type of a value while its subtype is still
+ * attached: 'null', 'bool' (boolean subtype), 'json' (JSON subtype), 'int'
+ * or 'real'. Text without a subtype gives NULL (unknown): some functions
+ * return JSON text without the subtype, so only a source that knows it has
+ * a string (a literal, a text property, a parameter) tags 'text'. A SET
+ * stores the value in the table of this type (GQLITE-T-0406); a CTE carries
+ * it in a tag column (GQLITE-A-0007). */
+void gql_typetag_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    unsigned int sub = sqlite3_value_subtype(argv[0]);
+    const char *tag;
+    if (t == SQLITE_NULL) tag = "null";
+    else if (sub == GQL_SUBTYPE_BOOLEAN) tag = "bool";
+    else if (sub == GQL_SUBTYPE_JSON && t == SQLITE_TEXT) tag = "json";
+    else if (t == SQLITE_INTEGER) tag = "int";
+    else if (t == SQLITE_FLOAT) tag = "real";
+    else { sqlite3_result_null(context); return; }
+    sqlite3_result_text(context, tag, -1, SQLITE_STATIC);
+}
+
+/* _gql_json_elem(x): x as an element for json_group_array / json_object:
+ * a boolean (boolean subtype) becomes JSON true/false; anything else is
+ * returned with its subtype, so JSON stays JSON (GQLITE-T-0404). */
+void gql_json_elem_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    unsigned int sub = sqlite3_value_subtype(argv[0]);
+    if (sub == GQL_SUBTYPE_BOOLEAN && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
+        const char *s = (const char *)sqlite3_value_text(argv[0]);
+        bool b = s && (strcmp(s, "true") == 0 || strcmp(s, "1") == 0);
+        sqlite3_result_text(context, b ? "true" : "false", -1, SQLITE_STATIC);
+        sqlite3_result_subtype(context, GQL_SUBTYPE_JSON);
+        return;
+    }
+    sqlite3_result_value(context, argv[0]);
+    if (sub == GQL_SUBTYPE_JSON) sqlite3_result_subtype(context, GQL_SUBTYPE_JSON);
+}
+
+/* _gql_subscript_tag(list, index): the type tag of list[index] ('bool',
+ * 'json' or 'text' for a JSON list element; NULL otherwise), so a string
+ * element that looks like JSON stays a string (GQLITE-A-0007). */
+void gql_subscript_tag_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    sqlite3_result_null(context);
+    if (argc != 2 || sqlite3_value_type(argv[0]) != SQLITE_TEXT ||
+        (sqlite3_value_type(argv[1]) != SQLITE_INTEGER)) return;
+    const char *v = (const char *)sqlite3_value_text(argv[0]);
+    while (v && (*v == ' ' || *v == '\t' || *v == '\n')) v++;
+    if (!v || *v != '[') return;
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT json_type(?1, '$[' || CAST(CASE WHEN ?2 < 0 THEN json_array_length(?1) + ?2 "
+            "ELSE ?2 END AS INTEGER) || ']')", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_value(st, 1, argv[0]);
+    sqlite3_bind_value(st, 2, argv[1]);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *jt = (const char *)sqlite3_column_text(st, 0);
+        const char *tag = !jt ? NULL
+            : (strcmp(jt, "true") == 0 || strcmp(jt, "false") == 0) ? "bool"
+            : (strcmp(jt, "array") == 0 || strcmp(jt, "object") == 0) ? "json"
+            : strcmp(jt, "text") == 0 ? "text" : NULL;
+        if (tag) sqlite3_result_text(context, tag, -1, SQLITE_STATIC);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Look up `key` in the JSON object `obj` with json_each (any key text; a
+ * JSON path cannot carry a key with `"` on SQLite before 3.47) and set the
+ * result by `mode` (GQLITE-T-0414):
+ *   0: as json_extract: a boolean is 1/0, a list or map JSON text
+ *   2: typed: a boolean is 'true'/'false' with the boolean subtype, a list
+ *      or map JSON text with the JSON subtype
+ *   3: the type tag: 'bool', 'json', 'text' or NULL */
+static void gql_map_get_result(sqlite3_context *context, sqlite3_value *obj,
+                               sqlite3_value *key, int mode)
+{
+    if (sqlite3_value_type(obj) == SQLITE_NULL || sqlite3_value_type(key) == SQLITE_NULL) {
+        sqlite3_result_null(context);
+        return;
+    }
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT value, type FROM json_each(CASE WHEN json_valid(?1) THEN ?1 END) "
+            "WHERE key = ?2 LIMIT 1", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_result_null(context);
+        return;
+    }
+    sqlite3_bind_value(st, 1, obj);
+    sqlite3_bind_value(st, 2, key);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_result_null(context);
+        sqlite3_finalize(st);
+        return;
+    }
+    const char *jt = (const char *)sqlite3_column_text(st, 1);
+    bool is_bool = jt && (strcmp(jt, "true") == 0 || strcmp(jt, "false") == 0);
+    bool is_json = jt && (strcmp(jt, "array") == 0 || strcmp(jt, "object") == 0);
+    if (mode == 3) {
+        const char *tag = is_bool ? "bool" : is_json ? "json"
+                        : (jt && strcmp(jt, "text") == 0) ? "text" : NULL;
+        if (tag) sqlite3_result_text(context, tag, -1, SQLITE_STATIC);
+        else sqlite3_result_null(context);
+    } else if (is_bool) {
+        if (mode == 2) {
+            sqlite3_result_text(context, jt[0] == 't' ? "true" : "false", -1, SQLITE_STATIC);
+            sqlite3_result_subtype(context, GQL_SUBTYPE_BOOLEAN);
+        } else {
+            sqlite3_result_int(context, jt[0] == 't');
+        }
+    } else if (is_json) {
+        sqlite3_result_text(context, (const char *)sqlite3_column_text(st, 0), -1, SQLITE_TRANSIENT);
+        sqlite3_result_subtype(context, GQL_SUBTYPE_JSON);
+    } else {
+        sqlite3_result_value(context, sqlite3_column_value(st, 0));
+    }
+    sqlite3_finalize(st);
+}
+
+/* _gql_map_get(obj, key, mode): see gql_map_get_result. */
+void gql_map_get_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    if (argc != 3) { sqlite3_result_null(context); return; }
+    gql_map_get_result(context, argv[0], argv[1], sqlite3_value_int(argv[2]));
+}
+
+/* _gql_retag(x, tag): x with the subtype its tag names put back: 'bool'
+ * gives 'true'/'false' with the boolean subtype, 'json' gives the text with
+ * the JSON subtype; any other tag returns x unchanged (GQLITE-A-0007). */
+void gql_retag_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    if (argc != 2) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    const char *tag = (const char *)sqlite3_value_text(argv[1]);
+    if (t == SQLITE_NULL || !tag) { sqlite3_result_value(context, argv[0]); return; }
+    if (strcmp(tag, "bool") == 0) {
+        bool b;
+        if (t == SQLITE_INTEGER || t == SQLITE_FLOAT) {
+            b = sqlite3_value_int64(argv[0]) != 0;
+        } else {
+            const char *s = (const char *)sqlite3_value_text(argv[0]);
+            b = s && (strcmp(s, "true") == 0 || strcmp(s, "1") == 0);
+        }
+        sqlite3_result_text(context, b ? "true" : "false", -1, SQLITE_STATIC);
+        sqlite3_result_subtype(context, GQL_SUBTYPE_BOOLEAN);
+        return;
+    }
+    if (strcmp(tag, "json") == 0 && t == SQLITE_TEXT) {
+        sqlite3_result_value(context, argv[0]);
+        sqlite3_result_subtype(context, GQL_SUBTYPE_JSON);
+        return;
+    }
+    sqlite3_result_value(context, argv[0]);
+}
+
+void gql_bool_str_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    if (t == SQLITE_INTEGER || t == SQLITE_FLOAT) {
+        long long v = sqlite3_value_int64(argv[0]);
+        sqlite3_result_text(context, v ? "true" : "false", -1, SQLITE_STATIC);
+        sqlite3_result_subtype(context, GQL_SUBTYPE_BOOLEAN);
+        return;
+    }
+    /* Already text — pass through if it's 'true'/'false', else NULL.
+     * Preserve the boolean subtype if the source value carried it; also
+     * apply the subtype unconditionally for the canonical literals so a
+     * comparison whose result was already converted to text once still
+     * renders as a JSON boolean. */
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (s && (strcmp(s, "true") == 0 || strcmp(s, "false") == 0)) {
+        sqlite3_result_text(context, s, -1, SQLITE_TRANSIENT);
+        sqlite3_result_subtype(context, GQL_SUBTYPE_BOOLEAN);
+    } else {
+        sqlite3_result_null(context);
+    }
+}
+
+/* Coerce a possibly-string-encoded boolean ('true' / 'false') to a SQL
+ * integer (1 / 0). Pass-through for NULL and other types. Used to make
+ * Cypher boolean operators (NOT, AND, OR) work correctly on the
+ * 'true'/'false' strings returned by property access. */
+void gql_bool_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_null(context); return; }
+    if (t == SQLITE_TEXT) {
+        const char *s = (const char*)sqlite3_value_text(argv[0]);
+        if (s) {
+            if (strcmp(s, "true") == 0)  { sqlite3_result_int(context, 1); return; }
+            if (strcmp(s, "false") == 0) { sqlite3_result_int(context, 0); return; }
+        }
+    }
+    /* Numeric or unknown - pass through */
+    sqlite3_result_value(context, argv[0]);
+}
+
+/* Compute a sortable key for Cypher ORDER BY. For time/datetime/date strings
+ * with timezone offsets, return a UTC-normalized sortable string. For lists
+ * (JSON arrays), return a typed sortable representation. Otherwise, pass
+ * through.
+ *
+ * Inputs we recognize:
+ *   - 'YYYY-MM-DD[THH:MM[:SS[.NNN...]][TZ]]'  date or datetime
+ *   - 'HH:MM[:SS[.NNN...]][TZ]'                time
+ *   - TZ forms: 'Z', '+HH:MM', '-HH:MM'
+ *
+ * For datetimes/times with TZ, convert local components to UTC and reformat
+ * so lexicographic sort matches chronological order. We do NOT attempt to
+ * fully validate input; bad strings just pass through. */
+static int parse_int_n(const char *s, int n) {
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return -1;
+        v = v*10 + (s[i] - '0');
+    }
+    return v;
+}
+
+/* Days in month, treating Feb as 29 on leap years */
+static int days_in_month(int y, int m) {
+    static const int dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (m < 1 || m > 12) return 30;
+    if (m == 2) {
+        int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+        return leap ? 29 : 28;
+    }
+    return dim[m-1];
+}
+
+/* Apply a signed minute offset to a date+time tuple, with proper carry. */
+static void apply_offset(int *y, int *mo, int *d, int *h, int *mi, int delta_min) {
+    /* Convert offset: we want to ADD delta_min minutes to get UTC equivalent
+     * when delta_min = -tz_offset_minutes. */
+    *mi += delta_min;
+    while (*mi < 0)  { *mi += 60; (*h)--; }
+    while (*mi >= 60) { *mi -= 60; (*h)++; }
+    while (*h  < 0)  { *h  += 24; (*d)--; }
+    while (*h  >= 24) { *h  -= 24; (*d)++; }
+    while (*d < 1) {
+        (*mo)--;
+        if (*mo < 1) { *mo = 12; (*y)--; }
+        *d += days_in_month(*y, *mo);
+    }
+    while (1) {
+        int dim = days_in_month(*y, *mo);
+        if (*d <= dim) break;
+        *d -= dim;
+        (*mo)++;
+        if (*mo > 12) { *mo = 1; (*y)++; }
+    }
+}
+
+/* Parse a timezone suffix starting at p. Returns minutes offset (positive
+ * means east-of-UTC), and the number of characters consumed. Returns
+ * (0, 0) if no TZ recognized. */
+static int parse_tz(const char *p, int *consumed) {
+    *consumed = 0;
+    if (!*p) return 0;
+    if (*p == 'Z') { *consumed = 1; return 0; }
+    if (*p != '+' && *p != '-') return 0;
+    int sign = (*p == '-') ? -1 : 1;
+    if (!p[1] || !p[2]) return 0;
+    int hh = parse_int_n(p+1, 2);
+    if (hh < 0) return 0;
+    int mm = 0;
+    int n = 3;
+    if (p[3] == ':' && p[4] && p[5]) {
+        mm = parse_int_n(p+4, 2);
+        if (mm < 0) return 0;
+        n = 6;
+    } else if (p[3] >= '0' && p[3] <= '9' && p[4] >= '0' && p[4] <= '9') {
+        mm = parse_int_n(p+3, 2);
+        n = 5;
+    }
+    *consumed = n;
+    return sign * (hh*60 + mm);
+}
+
+/* --- Order-preserving sort-key encoding for JSON lists (WithOrderBy1
+ * [9]/[10]/[31]). Cypher orders lists element-wise, shorter-prefix first.
+ * SQLite ORDER BY needs a scalar key whose BINARY (byte) comparison matches
+ * that order, so we encode each list element into a token whose lexicographic
+ * byte order matches Cypher orderability. --- */
+static void okey_append(char **b, size_t *n, size_t *cap, const char *s, size_t slen) {
+    if (*n + slen + 1 > *cap) {
+        size_t nc = (*cap ? *cap : 64);
+        while (nc < *n + slen + 1) nc *= 2;
+        char *nb = realloc(*b, nc);
+        if (!nb) return;
+        *b = nb; *cap = nc;
+    }
+    memcpy(*b + *n, s, slen); *n += slen; (*b)[*n] = '\0';
+}
+
+/* IEEE-754 order-preserving transform: map a double to a uint64 whose
+ * unsigned order matches numeric order, then emit as fixed-width hex. */
+static void okey_num(char **b, size_t *n, size_t *cap, double d) {
+    uint64_t bits; memcpy(&bits, &d, sizeof(bits));
+    if (bits & 0x8000000000000000ULL) bits = ~bits;      /* negative */
+    else bits |= 0x8000000000000000ULL;                  /* positive */
+    char hex[20];
+    snprintf(hex, sizeof(hex), "%016llX", (unsigned long long)bits);
+    okey_append(b, n, cap, hex, 16);
+}
+
+static void okey_encode_list(sqlite3 *db, const char *json,
+                             char **b, size_t *n, size_t *cap) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT value, type FROM json_each(?1)",
+                           -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, json, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        okey_append(b, n, cap, "\x02", 1);   /* element marker (> terminator) */
+        const char *type = (const char*)sqlite3_column_text(st, 1);
+        if (!type) { okey_append(b, n, cap, "9", 1); continue; }
+        /* Leading digit = cross-type group order; constant within a type so
+         * same-typed elements compare by their payload. Per Cypher
+         * orderability (ascending): map/object < list < string < boolean
+         * < number < null (WithOrderBy1 [9]/[10]). */
+        if (strcmp(type, "object") == 0) {
+            okey_append(b, n, cap, "1", 1);
+            const char *sub = (const char*)sqlite3_column_text(st, 0);
+            okey_append(b, n, cap, sub ? sub : "{}", sub ? strlen(sub) : 2);
+        } else if (strcmp(type, "array") == 0) {
+            okey_append(b, n, cap, "2", 1);
+            const char *sub = (const char*)sqlite3_column_text(st, 0);
+            okey_encode_list(db, sub ? sub : "[]", b, n, cap);
+        } else if (strcmp(type, "text") == 0) {
+            okey_append(b, n, cap, "5", 1);
+            const char *tv = (const char*)sqlite3_column_text(st, 0);
+            okey_append(b, n, cap, tv ? tv : "", tv ? strlen(tv) : 0);
+        } else if (strcmp(type, "true") == 0 || strcmp(type, "false") == 0) {
+            okey_append(b, n, cap, strcmp(type, "true") == 0 ? "6T" : "6F", 2);
+        } else if (strcmp(type, "integer") == 0 || strcmp(type, "real") == 0) {
+            okey_append(b, n, cap, "7", 1);
+            okey_num(b, n, cap, sqlite3_column_double(st, 0));
+        } else { /* null sorts last */
+            okey_append(b, n, cap, "9", 1);
+        }
+    }
+    sqlite3_finalize(st);
+    okey_append(b, n, cap, "\x01", 1);   /* terminator (< element marker) */
+}
+
+void gql_order_key_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t != SQLITE_TEXT) {
+        sqlite3_result_value(context, argv[0]);
+        return;
+    }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(context); return; }
+
+    /* JSON list → order-preserving element-wise key. */
+    if (s[0] == '[') {
+        char *buf = NULL; size_t n = 0, cap = 0;
+        okey_encode_list(sqlite3_context_db_handle(context), s, &buf, &n, &cap);
+        if (buf) {
+            sqlite3_result_text(context, buf, (int)n, SQLITE_TRANSIENT);
+            free(buf);
+        } else {
+            sqlite3_result_value(context, argv[0]);
+        }
+        return;
+    }
+
+    size_t slen = strlen(s);
+
+    /* Detect datetime: 'YYYY-MM-DDTHH:MM...' (need at least 16 chars) */
+    if (slen >= 16 && s[4] == '-' && s[7] == '-' && s[10] == 'T'
+        && s[13] == ':') {
+        int y = parse_int_n(s, 4);
+        int mo = parse_int_n(s+5, 2);
+        int d = parse_int_n(s+8, 2);
+        int h = parse_int_n(s+11, 2);
+        int mi = parse_int_n(s+14, 2);
+        if (y >= 0 && mo > 0 && d > 0 && h >= 0 && mi >= 0) {
+            int p = 16;
+            int sec = 0;
+            char frac[16] = "";
+            if (s[p] == ':' && slen > (size_t)(p+2)) {
+                sec = parse_int_n(s+p+1, 2);
+                if (sec < 0) sec = 0;
+                p += 3;
+                if (s[p] == '.') {
+                    int fi = 0; p++;
+                    while (s[p] >= '0' && s[p] <= '9' && fi < 9) frac[fi++] = s[p++];
+                    while (fi < 9) frac[fi++] = '0';
+                    frac[9] = '\0';
+                }
+            }
+            int tz_consumed = 0;
+            int tz_min = parse_tz(s+p, &tz_consumed);
+            if (tz_consumed > 0) {
+                /* Convert to UTC by subtracting tz_min */
+                apply_offset(&y, &mo, &d, &h, &mi, -tz_min);
+            }
+            /* Emit UTC sortable key (padded for lexicographic order) */
+            char out[64];
+            if (frac[0])
+                snprintf(out, sizeof(out), "%05d-%02d-%02dT%02d:%02d:%02d.%s",
+                         y, mo, d, h, mi, sec, frac);
+            else
+                snprintf(out, sizeof(out), "%05d-%02d-%02dT%02d:%02d:%02d",
+                         y, mo, d, h, mi, sec);
+            sqlite3_result_text(context, out, -1, SQLITE_TRANSIENT);
+            return;
+        }
+    }
+
+    /* Detect time: 'HH:MM[:SS[.fff]][TZ]' (need at least 5 chars: HH:MM) */
+    if (slen >= 5 && s[2] == ':'
+        && s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9'
+        && s[3] >= '0' && s[3] <= '9' && s[4] >= '0' && s[4] <= '9') {
+        int h = parse_int_n(s, 2);
+        int mi = parse_int_n(s+3, 2);
+        if (h >= 0 && mi >= 0) {
+            int p = 5;
+            int sec = 0;
+            char frac[16] = "";
+            if (s[p] == ':' && slen > (size_t)(p+2)) {
+                sec = parse_int_n(s+p+1, 2);
+                if (sec < 0) sec = 0;
+                p += 3;
+                if (s[p] == '.') {
+                    int fi = 0; p++;
+                    while (s[p] >= '0' && s[p] <= '9' && fi < 9) frac[fi++] = s[p++];
+                    while (fi < 9) frac[fi++] = '0';
+                    frac[9] = '\0';
+                }
+            }
+            int tz_consumed = 0;
+            int tz_min = parse_tz(s+p, &tz_consumed);
+            if (tz_consumed > 0) {
+                /* Treat as time-of-day; rotate by -tz_min to get UTC time. */
+                int y = 2000, mo = 1, d = 1;
+                apply_offset(&y, &mo, &d, &h, &mi, -tz_min);
+            }
+            char out[32];
+            if (frac[0])
+                snprintf(out, sizeof(out), "%02d:%02d:%02d.%s", h, mi, sec, frac);
+            else
+                snprintf(out, sizeof(out), "%02d:%02d:%02d", h, mi, sec);
+            sqlite3_result_text(context, out, -1, SQLITE_TRANSIENT);
+            return;
+        }
+    }
+
+    /* Fallback: pass-through */
+    sqlite3_result_value(context, argv[0]);
+}
+
+/* Cypher orderability type-rank (0..9), the PRIMARY ORDER BY key so mixed-type
+ * sorts follow Cypher's total order:
+ *   map < node < rel < list < path < string < bool < number < NaN < null
+ * The secondary key (_gql_order_key) then orders within a homogeneous rank.
+ * Values arrive as untyped SQLite cells; JSON entity/map/path shapes are told
+ * apart by their distinctive keys (heuristic, sufficient for the value shapes
+ * this engine emits). GQLITE-T-0340. */
+/* Normalize a numeric tz offset string: drop a zero seconds suffix, keep
+ * non-zero seconds (Temporal1 [13]: '+02:05:00' -> '+02:05', '+02:05:59' kept).
+ * Non-offset inputs (e.g. 'Z', a named zone) pass through unchanged. */
+void gql_fmt_offset_func(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    const char *tz = (const char*)sqlite3_value_text(argv[0]);
+    if (!tz) { sqlite3_result_null(context); return; }
+    int oh = 0, om = 0, os = 0;
+    if ((tz[0] == '+' || tz[0] == '-') &&
+        sscanf(tz + 1, "%d:%d:%d", &oh, &om, &os) >= 2) {
+        char buf[16];
+        if (os != 0) snprintf(buf, sizeof(buf), "%c%02d:%02d:%02d", tz[0], oh, om, os);
+        else         snprintf(buf, sizeof(buf), "%c%02d:%02d", tz[0], oh, om);
+        sqlite3_result_text(context, buf, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_result_text(context, tz, -1, SQLITE_TRANSIENT);
+    }
+}
+
+void gql_order_rank_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_int(context, 9); return; }
+    int t = sqlite3_value_type(argv[0]);
+    if (t == SQLITE_NULL) { sqlite3_result_int(context, 9); return; }   /* null  */
+    if (t == SQLITE_INTEGER || t == SQLITE_FLOAT) {
+        sqlite3_result_int(context, 7); return;                          /* number */
+    }
+    if (t == SQLITE_TEXT) {
+        const char *s = (const char*)sqlite3_value_text(argv[0]);
+        if (!s) { sqlite3_result_int(context, 9); return; }
+        /* NaN sentinel — ranks just after numbers. */
+        if (strcmp(s, GQL_NAN_SENTINEL) == 0) { sqlite3_result_int(context, 8); return; }
+        /* Boolean: subtype-tagged or the canonical literals. */
+        if (sqlite3_value_subtype(argv[0]) == GQL_SUBTYPE_BOOLEAN ||
+            strcmp(s, "true") == 0 || strcmp(s, "false") == 0) {
+            sqlite3_result_int(context, 6); return;                      /* bool */
+        }
+        if (s[0] == '{') {
+            /* Entity/path/map JSON. Path carries both "nodes" and "rels"
+             * arrays; a node carries "labels"; a relationship carries
+             * "startNode"/"startNodeId"; otherwise it is a plain map. Order of
+             * checks matters because a path's text contains the inner keys. */
+            bool has_nodes = strstr(s, "\"nodes\"") != NULL;
+            bool has_rels  = strstr(s, "\"rels\"")  != NULL;
+            if (has_nodes && has_rels) { sqlite3_result_int(context, 4); return; }   /* path */
+            if (strstr(s, "\"labels\"")) { sqlite3_result_int(context, 1); return; } /* node */
+            if (strstr(s, "\"startNode")) { sqlite3_result_int(context, 2); return; }/* rel  */
+            sqlite3_result_int(context, 0); return;                      /* map */
+        }
+        if (s[0] == '[') { sqlite3_result_int(context, 3); return; }     /* list */
+        sqlite3_result_int(context, 5); return;                          /* string */
+    }
+    /* BLOB / unknown — treat as string-ish. */
+    sqlite3_result_int(context, 5);
+}
+
+/* --- Cypher-orderability min()/max() aggregates (Aggregation2 [9]/[11]/[12]).
+ * SQLite's native MIN/MAX use storage-class order, which mis-orders mixed-type
+ * and list values. These custom aggregates keep the element whose Cypher
+ * order-key (same total order as _gql_order_key: object < list < text < bool
+ * < number < null) is smallest/largest, ignoring nulls, and return the
+ * original typed value via sqlite3_value_dup so type is preserved. --- */
+
+/* Build a Cypher order-key for any single value into a malloc'd string. */
+static char *okey_for_value(sqlite3 *db, sqlite3_value *v) {
+    char *b = NULL; size_t n = 0, cap = 0;
+    int t = sqlite3_value_type(v);
+    if (t == SQLITE_INTEGER || t == SQLITE_FLOAT) {
+        okey_append(&b, &n, &cap, "7", 1);
+        okey_num(&b, &n, &cap, sqlite3_value_double(v));
+    } else if (t == SQLITE_TEXT) {
+        const char *s = (const char*)sqlite3_value_text(v);
+        const char *sw = s ? skip_ws(s) : "";
+        if (*sw == '[') { okey_append(&b, &n, &cap, "2", 1); okey_encode_list(db, s, &b, &n, &cap); }
+        else if (*sw == '{') { okey_append(&b, &n, &cap, "1", 1); okey_append(&b, &n, &cap, s, strlen(s)); }
+        else if (sqlite3_value_subtype(v) == GQL_SUBTYPE_BOOLEAN && s) {
+            okey_append(&b, &n, &cap, strcmp(s, "true") == 0 ? "61" : "60", 2);
+        } else { okey_append(&b, &n, &cap, "5", 1); if (s) okey_append(&b, &n, &cap, s, strlen(s)); }
+    } else {
+        okey_append(&b, &n, &cap, "9", 1);  /* unknown → sort last */
+    }
+    if (!b) { b = malloc(1); if (b) b[0] = '\0'; }
+    return b;
+}
+
+typedef struct { char *key; sqlite3_value *val; int have; } gql_minmax_acc;
+
+static void gql_minmax_step(sqlite3_context *context, int argc,
+                            sqlite3_value **argv, int is_max) {
+    if (argc != 1) return;
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;  /* ignore nulls */
+    gql_minmax_acc *a = (gql_minmax_acc*)sqlite3_aggregate_context(context, sizeof(*a));
+    if (!a) return;
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    char *k = okey_for_value(db, argv[0]);
+    if (!k) return;
+    if (!a->have) {
+        a->key = k; a->val = sqlite3_value_dup(argv[0]); a->have = 1;
+        return;
+    }
+    int cmp = strcmp(k, a->key);
+    bool better = is_max ? (cmp > 0) : (cmp < 0);
+    if (better) {
+        free(a->key); a->key = k;
+        sqlite3_value_free(a->val); a->val = sqlite3_value_dup(argv[0]);
+    } else {
+        free(k);
+    }
+}
+
+static void gql_minmax_final(sqlite3_context *context, int is_max) {
+    (void)is_max;
+    gql_minmax_acc *a = (gql_minmax_acc*)sqlite3_aggregate_context(context, 0);
+    if (!a || !a->have) { sqlite3_result_null(context); return; }
+    sqlite3_result_value(context, a->val);
+    free(a->key);
+    sqlite3_value_free(a->val);
+}
+
+void gql_min_step(sqlite3_context *c, int argc, sqlite3_value **argv) { gql_minmax_step(c, argc, argv, 0); }
+void gql_min_final(sqlite3_context *c) { gql_minmax_final(c, 0); }
+void gql_max_step(sqlite3_context *c, int argc, sqlite3_value **argv) { gql_minmax_step(c, argc, argv, 1); }
+void gql_max_final(sqlite3_context *c) { gql_minmax_final(c, 1); }
+
+/* Extract nanosecond portion from ISO datetime string.
+ * Input forms: 'YYYY-MM-DDTHH:MM:SS.<digits><tz>?', returns digits zero-padded
+ * to 9 places as integer. Returns 0 if no fractional second present. */
+void gql_extract_ns_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_int64(context, 0); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_int64(context, 0); return; }
+    const char *dot = strchr(s, '.');
+    if (!dot) { sqlite3_result_int64(context, 0); return; }
+    const char *p = dot + 1;
+    char buf[10]; int n = 0;
+    while (*p && n < 9 && *p >= '0' && *p <= '9') buf[n++] = *p++;
+    while (n < 9) buf[n++] = '0';
+    buf[9] = '\0';
+    sqlite3_result_int64(context, atoll(buf));
+}
+
+/* Return the ISO temporal string with any tz suffix stripped. Used by
+ * localdatetime(string) / localtime(string) when projecting from a
+ * tz-bearing value. */
+void gql_strip_tz_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_null(context); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(context); return; }
+    const char *start;
+    const char *t = strchr(s, 'T');
+    if (t) start = t + 1;
+    else if (strlen(s) >= 8 && s[2] == ':') start = s;
+    else { sqlite3_result_text(context, s, -1, SQLITE_TRANSIENT); return; }
+    const char *p = start;
+    while (*p && !(*p == '+' || (*p == '-' && p > start) || *p == 'Z' || *p == '[')) p++;
+    if (!*p) { sqlite3_result_text(context, s, -1, SQLITE_TRANSIENT); return; }
+    /* Truncate at p — preserve everything before. */
+    int len = (int)(p - s);
+    sqlite3_result_text(context, s, len, SQLITE_TRANSIENT);
+}
+
+/* Extract timezone suffix from ISO datetime string.
+ * Returns the substring from the first +/-/Z after the time portion, or ''. */
+void gql_extract_tz_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_text(context, "", 0, SQLITE_TRANSIENT); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_text(context, "", 0, SQLITE_TRANSIENT); return; }
+    /* For datetime strings ('YYYY-MM-DDT...'), scan after the 'T'.
+     * For time-only strings ('HH:MM:SS...'), scan from the start.
+     * Pure date strings ('YYYY-MM-DD') have no tz; return ''.
+     */
+    const char *t = strchr(s, 'T');
+    const char *start;
+    if (t) {
+        start = t + 1;
+    } else if (strlen(s) >= 5 && s[2] == ':') {
+        /* Time-only 'HH:MM[...]' — a 'Z' or offset can follow as early as
+         * position 5 (e.g. '21:40Z'), so require only HH:MM, not HH:MM:SS. */
+        start = s;
+    } else {
+        sqlite3_result_text(context, "", 0, SQLITE_TRANSIENT); return;
+    }
+    const char *p = start;
+    while (*p && !(*p == '+' || (*p == '-' && p > start) || *p == 'Z' || *p == '[')) p++;
+    sqlite3_result_text(context, p, -1, SQLITE_TRANSIENT);
+}
+
+/* Parse an ISO temporal string into UTC epoch nanoseconds (int64).
+ * Supports:
+ *   YYYY-MM-DDTHH:MM:SS[.frac][tz]
+ *   YYYY-MM-DD
+ *   HH:MM:SS[.frac][tz]            (treated as 1970-01-01 with the time)
+ * Where [tz] is one of:  Z | (+|-)HH:MM | (+|-)HH:MM[Region/Name]
+ * Returns 0 on parse failure.
+ */
+static long long days_from_civil(int y, int m, int d);  /* defined below */
+
+/* Parse the leading calendar-date portion of an ISO temporal string.
+ * Accepts the plain `YYYY-MM-DD` form and openCypher's extended-year form
+ * `[+-]YYYYYYYYY-MM-DD` (an explicit sign followed by 4..9 year digits, so
+ * years outside 0000..9999 such as `-999999999-01-01` are representable).
+ * Month and day take one or two digits. On success stores the fields, sets
+ * *after to the first character past the day and returns true. */
+static bool parse_iso_date_head(const char *s, int *y, int *mo, int *d,
+                                const char **after) {
+    if (!s) return false;
+    const char *p = s;
+    int sign = 1;
+    if (*p == '+' || *p == '-') { if (*p == '-') sign = -1; p++; }
+    const char *ys = p;
+    long long yv = 0;
+    while (*p >= '0' && *p <= '9') { yv = yv * 10 + (*p - '0'); p++; }
+    int ydigits = (int)(p - ys);
+    if (ydigits < 4 || ydigits > 9 || *p != '-') return false;
+    if (ydigits > 4 && ys == s) return false;   /* >4 digits need a sign */
+    p++;
+    int mv = 0, md = 0;
+    while (*p >= '0' && *p <= '9' && md < 2) { mv = mv * 10 + (*p - '0'); p++; md++; }
+    if (md == 0 || *p != '-') return false;
+    p++;
+    int dv = 0, dd = 0;
+    while (*p >= '0' && *p <= '9' && dd < 2) { dv = dv * 10 + (*p - '0'); p++; dd++; }
+    if (dd == 0) return false;
+    *y = (int)(sign * yv); *mo = mv; *d = dv;
+    if (after) *after = p;
+    return true;
+}
+
+/* Render a calendar date in ISO form. Years 0000..9999 print as four digits;
+ * years outside that range carry an explicit sign (`+10000-01-01`,
+ * `-999999999-01-01`), matching Java's SignStyle.EXCEEDS_PAD that Neo4j uses. */
+static int format_iso_date(char *buf, size_t cap, int y, int mo, int d) {
+    if (y < 0)        return snprintf(buf, cap, "-%04d-%02d-%02d", -y, mo, d);
+    if (y > 9999)     return snprintf(buf, cap, "+%d-%02d-%02d", y, mo, d);
+    return snprintf(buf, cap, "%04d-%02d-%02d", y, mo, d);
+}
+
+/* Forward-declare parse_temporal_parts (impl below). parse_temporal_ns
+ * delegates to it for the simple int64-epoch-ns return shape used by
+ * `_gql_temporal_diff_ns`. */
+typedef struct tparts tparts_fwd;
+static bool parse_temporal_parts_impl(const char *s, void *p);
+static int64_t parse_temporal_ns(const char *s) {
+    /* Inline minimal parse that mirrors parse_temporal_parts's epoch-ns
+     * computation without needing the full struct (impl is far below). */
+    if (!s) return 0;
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, sec = 0;
+    int64_t ns = 0;
+    int tz_offset_min = 0;
+    const char *time_start = NULL;
+    const char *after_date = NULL;
+    if (parse_iso_date_head(s, &y, &mo, &d, &after_date)) {
+        if (*after_date == 'T' || *after_date == ' ') time_start = after_date + 1;
+    } else if (strlen(s) >= 5 && s[2] == ':') {
+        time_start = s;
+    } else {
+        return 0;
+    }
+    if (time_start) {
+        sscanf(time_start, "%d:%d:%d", &h, &mi, &sec);
+        const char *dot = strchr(time_start, '.');
+        if (dot) {
+            char buf[10] = { '0','0','0','0','0','0','0','0','0', 0 };
+            int i;
+            for (i = 0; i < 9 && dot[i + 1] >= '0' && dot[i + 1] <= '9'; i++)
+                buf[i] = dot[i + 1];
+            ns = atoll(buf);
+        }
+        const char *tz_from = dot ? dot + 1 : time_start;
+        const char *tz = NULL;
+        for (const char *q = tz_from; *q; q++) {
+            if (*q == 'Z' || *q == '+' || (*q == '-' && q > time_start + 2)) { tz = q; break; }
+        }
+        if (tz) {
+            if (*tz == 'Z') tz_offset_min = 0;
+            else {
+                int sign = (*tz == '+') ? 1 : -1;
+                int oh = 0, om = 0;
+                if (sscanf(tz + 1, "%d:%d", &oh, &om) >= 1 ||
+                    sscanf(tz + 1, "%2d%2d", &oh, &om) >= 1)
+                    tz_offset_min = sign * (oh * 60 + om);
+            }
+        }
+    }
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d;
+    t.tm_hour = h; t.tm_min = mi; t.tm_sec = sec;
+    time_t epoch = timegm(&t);
+    epoch -= tz_offset_min * 60;
+    return (int64_t)epoch * 1000000000LL + ns;
+}
+
+/* Parse an ISO temporal string into UTC epoch SECONDS plus sub-second nanos,
+ * without the int64 overflow that (epoch * 1e9) suffers for far-future years.
+ * Mirrors parse_temporal_ns's field extraction. Returns false on parse error. */
+static bool parse_temporal_secs_ns(const char *s, int64_t *out_secs, int64_t *out_ns) {
+    if (!s) return false;
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, sec = 0;
+    int64_t ns = 0;
+    int tz_offset_min = 0;
+    const char *time_start = NULL;
+    const char *after_date = NULL;
+    if (parse_iso_date_head(s, &y, &mo, &d, &after_date)) {
+        if (*after_date == 'T' || *after_date == ' ') time_start = after_date + 1;
+    } else if (strlen(s) >= 5 && s[2] == ':') {
+        time_start = s;
+    } else {
+        return false;
+    }
+    if (time_start) {
+        sscanf(time_start, "%d:%d:%d", &h, &mi, &sec);
+        const char *dot = strchr(time_start, '.');
+        if (dot) {
+            char buf[10] = { '0','0','0','0','0','0','0','0','0', 0 };
+            int i;
+            for (i = 0; i < 9 && dot[i + 1] >= '0' && dot[i + 1] <= '9'; i++)
+                buf[i] = dot[i + 1];
+            ns = atoll(buf);
+        }
+        const char *tz_from = dot ? dot + 1 : time_start;
+        const char *tz = NULL;
+        for (const char *q = tz_from; *q; q++) {
+            if (*q == 'Z' || *q == '+' || (*q == '-' && q > time_start + 2)) { tz = q; break; }
+        }
+        if (tz) {
+            if (*tz == 'Z') tz_offset_min = 0;
+            else {
+                int sign = (*tz == '+') ? 1 : -1;
+                int oh = 0, om = 0;
+                if (sscanf(tz + 1, "%d:%d", &oh, &om) >= 1 ||
+                    sscanf(tz + 1, "%2d%2d", &oh, &om) >= 1)
+                    tz_offset_min = sign * (oh * 60 + om);
+            }
+        }
+    }
+    /* Proleptic-Gregorian day count * 86400: valid for any year the parser
+     * accepts (+-999999999), unlike timegm's platform-bounded range. */
+    int64_t epoch = (int64_t)days_from_civil(y, mo, d) * 86400LL
+                  + (int64_t)h * 3600LL + (int64_t)mi * 60LL + sec;
+    epoch -= (int64_t)tz_offset_min * 60;
+    *out_secs = epoch;
+    *out_ns = ns;
+    return true;
+}
+
+static int cmp_temporal_strings(const char *a, const char *b) {
+    int64_t sa, na, sb, nb;
+    if (!parse_temporal_secs_ns(a, &sa, &na) ||
+        !parse_temporal_secs_ns(b, &sb, &nb))
+        return -2;
+    if (sa != sb) return (sa < sb) ? -1 : 1;
+    if (na != nb) return (na < nb) ? -1 : 1;
+    return 0;
+}
+
+/* Build openCypher Duration JSON object from a signed total-nanoseconds value.
+ * Returns: {"_iso8601": "...", "months": 0, "days": D, "seconds": S, "nanosecondsOfSecond": N}
+ *
+ * Decomposition rules (matches openCypher TCK):
+ *   days        = total_ns / 86_400_000_000_000          (truncate toward zero)
+ *   residue_ns  = total_ns - days * 86_400_000_000_000
+ *   seconds     = floorDiv(residue_ns, 1_000_000_000)
+ *   nanos       = residue_ns - seconds * 1_000_000_000   (always in [0, 1e9))
+ *
+ * ISO format truncates each (H, M, S) toward zero so signs are per-component.
+ */
+void gql_duration_from_total_ns_func(
+    sqlite3_context *ctx, int argc, sqlite3_value **argv
+) {
+    if (argc != 1) { sqlite3_result_null(ctx); return; }
+    int64_t total_ns = sqlite3_value_int64(argv[0]);
+
+    int64_t DAY_NS = 86400LL * 1000000000LL;
+    int64_t days = total_ns / DAY_NS;
+    int64_t residue = total_ns - days * DAY_NS;
+    int64_t seconds, nanos;
+    if (residue >= 0) {
+        seconds = residue / 1000000000LL;
+        nanos = residue - seconds * 1000000000LL;
+    } else {
+        /* floor division: round toward -infinity */
+        seconds = -(((-residue) + 999999999LL) / 1000000000LL);
+        nanos = residue - seconds * 1000000000LL;
+    }
+
+    /* ISO 8601 PT-form. Build hours/minutes/seconds via trunc-toward-zero. */
+    int64_t rem = total_ns;
+    int64_t hours = rem / (3600LL * 1000000000LL);
+    rem -= hours * 3600LL * 1000000000LL;
+    int64_t mins = rem / (60LL * 1000000000LL);
+    rem -= mins * 60LL * 1000000000LL;
+    int64_t isec = rem / 1000000000LL;
+    int64_t subns = rem - isec * 1000000000LL;
+
+    char iso[160];
+    char *p = iso;
+    *p++ = 'P'; *p++ = 'T';
+    bool wrote = false;
+    if (hours != 0) { p += snprintf(p, 24, "%lldH", (long long)hours); wrote = true; }
+    if (mins != 0)  { p += snprintf(p, 24, "%lldM", (long long)mins); wrote = true; }
+    if (isec != 0 || subns != 0) {
+        if (subns != 0) {
+            char frac[12];
+            int64_t abs_subns = subns < 0 ? -subns : subns;
+            snprintf(frac, sizeof(frac), "%09lld", (long long)abs_subns);
+            int flen = 9;
+            while (flen > 0 && frac[flen - 1] == '0') flen--;
+            frac[flen] = 0;
+            bool neg = (isec < 0) || (isec == 0 && subns < 0);
+            int64_t abs_isec = isec < 0 ? -isec : isec;
+            p += snprintf(p, 40, "%s%lld.%sS", neg ? "-" : "", (long long)abs_isec, frac);
+        } else {
+            p += snprintf(p, 24, "%lldS", (long long)isec);
+        }
+        wrote = true;
+    }
+    if (!wrote) { *p++ = '0'; *p++ = 'S'; }
+    *p = 0;
+
+    char json[400];
+    snprintf(json, sizeof(json),
+        "{\"_iso8601\":\"%s\",\"months\":0,\"days\":%lld,\"seconds\":%lld,\"nanosecondsOfSecond\":%lld}",
+        iso, (long long)days, (long long)seconds, (long long)nanos);
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/* Decomposed parse of an ISO temporal string. */
+typedef struct {
+    bool has_date;
+    bool has_time;
+    bool has_tz;
+    int y, mo, d;
+    int h, mi, sec;
+    int64_t ns;
+    int tz_offset_min;
+} tparts;
+
+static bool parse_temporal_parts(const char *s, tparts *p) {
+    memset(p, 0, sizeof(*p));
+    if (!s) return false;
+    p->mo = 1; p->d = 1;
+    const char *time_start = NULL;
+    const char *after_date = NULL;
+    if (parse_iso_date_head(s, &p->y, &p->mo, &p->d, &after_date)) {
+        p->has_date = true;
+        if (*after_date == 'T' || *after_date == ' ') time_start = after_date + 1;
+    } else if (strlen(s) >= 5 && s[2] == ':') {
+        time_start = s;
+    } else {
+        return false;
+    }
+    if (time_start) {
+        int r = sscanf(time_start, "%d:%d:%d", &p->h, &p->mi, &p->sec);
+        if (r >= 2) p->has_time = true;
+        if (r < 3) p->sec = 0;
+        const char *dot = strchr(time_start, '.');
+        if (dot) {
+            char buf[10] = { '0','0','0','0','0','0','0','0','0', 0 };
+            int i;
+            for (i = 0; i < 9 && dot[i + 1] >= '0' && dot[i + 1] <= '9'; i++)
+                buf[i] = dot[i + 1];
+            p->ns = atoll(buf);
+        }
+        /* parse tz */
+        const char *tz = NULL;
+        for (const char *q = (dot ? dot + 1 : time_start); *q; q++) {
+            if (*q == 'Z' || *q == '+' || (*q == '-' && q > time_start + 2)) {
+                tz = q; break;
+            }
+        }
+        if (tz) {
+            p->has_tz = true;
+            if (*tz == 'Z') p->tz_offset_min = 0;
+            else {
+                int sign = (*tz == '+') ? 1 : -1;
+                int oh = 0, om = 0;
+                /* Two forms: '+HH:MM' (with colon) and '+HHMM' (compact). */
+                if (strchr(tz + 1, ':')) {
+                    sscanf(tz + 1, "%d:%d", &oh, &om);
+                } else {
+                    sscanf(tz + 1, "%2d%2d", &oh, &om);
+                }
+                p->tz_offset_min = sign * (oh * 60 + om);
+            }
+        }
+    }
+    return true;
+}
+
+static int days_in_month_c(int year, int month) {
+    static const int dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (month == 2) {
+        bool leap = (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
+        return leap ? 29 : 28;
+    }
+    if (month < 1 || month > 12) return 30;
+    return dim[month - 1];
+}
+
+/* Compute openCypher Duration components between two temporals.
+ * Date-bearing inputs use calendar arithmetic (years, months, days with
+ * borrowing). Time-bearing inputs contribute a time delta. When one side
+ * is missing a date or time component, the result borrows zero for that
+ * component. Components share sign per-section (date and time may have
+ * opposite signs to match TCK examples like 'P-27DT-21H-40M-32.142S'). */
+static long long days_from_civil(int y, int m, int d);  /* defined below */
+
+static int64_t time_ns_of(const tparts *p) {
+    if (!p->has_time) return 0;
+    int64_t NS = 1000000000LL;
+    int64_t t = (int64_t)p->h * 3600LL * NS + (int64_t)p->mi * 60LL * NS +
+                (int64_t)p->sec * NS + p->ns;
+    return t;
+}
+
+/* Time-of-day in nanoseconds, with timezone adjusted to UTC. Apply tz when
+ * the parsed input carries a tz indicator (Z, +, -, or named bracketed). */
+static int64_t time_ns_of_utc(const tparts *p) {
+    int64_t NS = 1000000000LL;
+    int64_t t = time_ns_of(p);
+    if (p->has_tz) t -= (int64_t)p->tz_offset_min * 60LL * NS;
+    return t;
+}
+
+/* Strict ordering of temporals — by date if both have one, else by
+ * time-of-day (date-less inputs sort as if at 1970-01-01). */
+static int compare_temporal(const tparts *a, const tparts *b) {
+    if (a->has_date && b->has_date) {
+        if (a->y != b->y) return (a->y < b->y) ? -1 : 1;
+        if (a->mo != b->mo) return a->mo - b->mo;
+        if (a->d != b->d) return a->d - b->d;
+    } else if (a->has_date != b->has_date) {
+        /* Mixed (date-only vs time-only): order by time-of-day only. */
+    }
+    int64_t ta = time_ns_of(a), tb = time_ns_of(b);
+    if (ta < tb) return -1;
+    if (ta > tb) return 1;
+    return 0;
+}
+
+static void compute_calendar_duration(const tparts *a, const tparts *b,
+                                      int64_t *out_months, int *out_days,
+                                      int64_t *out_time_ns) {
+    /* Pick (lo, hi) so the diff is non-negative; negate at the end if we
+     * swapped. This matches Java Period.between semantics where date and
+     * time components share sign per-section. */
+    int cmp = compare_temporal(a, b);
+    bool forward = (cmp <= 0);
+    const tparts *lo = forward ? a : b;
+    const tparts *hi = forward ? b : a;
+
+    int y = 0, m = 0, d = 0;
+    int64_t time_ns = 0;
+    int64_t NS = 1000000000LL;
+
+    if (lo->has_date && hi->has_date) {
+        y = hi->y - lo->y; m = hi->mo - lo->mo; d = hi->d - lo->d;
+        if (d < 0) {
+            int pm = hi->mo - 1, py = hi->y;
+            if (pm == 0) { pm = 12; py -= 1; }
+            d += days_in_month_c(py, pm);
+            m -= 1;
+        }
+        if (m < 0) { m += 12; y -= 1; }
+    }
+
+    /* Apply tz normalization when BOTH sides carry tz info (the datetime/time
+     * families). Mixed pairings involving localtime/localdatetime — which are
+     * tz-naive — use the local clock face directly. */
+    if (lo->has_tz && hi->has_tz) {
+        time_ns = time_ns_of_utc(hi) - time_ns_of_utc(lo);
+    } else {
+        time_ns = time_ns_of(hi) - time_ns_of(lo);
+    }
+    /* Borrow a day into the time portion when time is negative but the
+     * calendar diff has at least one day — keeps components same-signed
+     * within a (lo, hi) forward pair. */
+    if (time_ns < 0 && d > 0) {
+        d -= 1;
+        time_ns += 86400LL * NS;
+    }
+    /* Borrow a month → ~30 days; only triggers when m > 0 and d == 0 and
+     * time_ns < 0 (rare, mostly defensive). */
+    if (time_ns < 0 && d == 0 && m > 0) {
+        /* Borrow from month — use prev-month length of hi. */
+        int pm = hi->mo - 1, py = hi->y;
+        if (pm == 0) { pm = 12; py -= 1; }
+        int dim = days_in_month_c(py, pm);
+        m -= 1;
+        d = dim - 1;
+        time_ns += 86400LL * NS;
+    }
+
+    if (!forward) { y = -y; m = -m; d = -d; time_ns = -time_ns; }
+
+    /* Billion-year spans (Temporal10 [9]) exceed int32 months. */
+    *out_months = (int64_t)y * 12 + m;
+    *out_days = d;
+    *out_time_ns = time_ns;
+}
+
+/* Format ISO 8601 Duration `PnYnMnDTnHnMnS` with per-component signs.
+ * Each non-zero component appears; if every component is zero, output PT0S.
+ * The time part arrives as a (whole seconds, nanoseconds) pair so spans far
+ * beyond the int64 nanosecond range (Temporal10 [10]: 17.5 trillion hours)
+ * never pass through a total-ns value. `subns` may carry any sign or
+ * magnitude; it is carried into `secs` first. */
+static void format_iso_duration(int64_t total_months, int64_t days,
+                                 int64_t secs, int64_t subns,
+                                 char *out, size_t cap) {
+    const int64_t NS = 1000000000LL;
+    int64_t years = total_months / 12;
+    int64_t months = total_months - years * 12;
+    /* Normalise the pair so both halves share the sign of the total
+     * (truncate-toward-zero decomposition, so components print same-signed). */
+    secs += subns / NS;
+    subns %= NS;
+    if (secs > 0 && subns < 0) { secs -= 1; subns += NS; }
+    else if (secs < 0 && subns > 0) { secs += 1; subns -= NS; }
+    int64_t hours = secs / 3600;
+    int64_t rem_s = secs - hours * 3600;
+    int64_t mins = rem_s / 60;
+    int64_t isec = rem_s - mins * 60;
+
+    char *p = out;
+    char *end = out + cap;
+    *p++ = 'P';
+    bool any = false;
+    if (years)  { p += snprintf(p, end - p, "%lldY", (long long)years); any = true; }
+    if (months) { p += snprintf(p, end - p, "%lldM", (long long)months); any = true; }
+    if (days)   { p += snprintf(p, end - p, "%lldD", (long long)days); any = true; }
+    bool any_time = hours || mins || isec || subns;
+    if (any_time) {
+        *p++ = 'T';
+        if (hours) { p += snprintf(p, end - p, "%lldH", (long long)hours); }
+        if (mins)  { p += snprintf(p, end - p, "%lldM", (long long)mins); }
+        if (isec || subns) {
+            if (subns) {
+                char frac[12];
+                int64_t abs_sub = subns < 0 ? -subns : subns;
+                snprintf(frac, sizeof(frac), "%09lld", (long long)abs_sub);
+                int flen = 9;
+                while (flen > 0 && frac[flen - 1] == '0') flen--;
+                frac[flen] = 0;
+                bool neg = (isec < 0) || (isec == 0 && subns < 0);
+                int64_t abs_isec = isec < 0 ? -isec : isec;
+                p += snprintf(p, end - p, "%s%lld.%sS", neg ? "-" : "",
+                              (long long)abs_isec, frac);
+            } else {
+                p += snprintf(p, end - p, "%lldS", (long long)isec);
+            }
+        }
+        any = true;
+    }
+    if (!any) { *p++ = 'T'; *p++ = '0'; *p++ = 'S'; }
+    *p = 0;
+}
+
+/* duration.inDays — total whole days between two temporals.
+ * Returns 0 (i.e., PT0S Duration) when either side lacks a date. */
+void gql_duration_in_days_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    const char *sa = (const char*)sqlite3_value_text(argv[0]);
+    const char *sb = (const char*)sqlite3_value_text(argv[1]);
+    tparts a, b;
+    if (!parse_temporal_parts(sa, &a) || !parse_temporal_parts(sb, &b)) { sqlite3_result_null(ctx); return; }
+    int64_t days = 0;
+    if (a.has_date && b.has_date) {
+        /* Whole days in the elapsed period — the calendar day difference,
+         * reduced by one when the later instant's time-of-day falls short of
+         * the earlier one (so a partial trailing day isn't counted). Compare in
+         * UTC when both sides carry a tz offset (Temporal10 [4] example 17). */
+        int cmp = compare_temporal(&a, &b);
+        bool forward = (cmp <= 0);
+        const tparts *lo = forward ? &a : &b;
+        const tparts *hi = forward ? &b : &a;
+        int64_t dd = days_from_civil(hi->y, hi->mo, hi->d)
+                   - days_from_civil(lo->y, lo->mo, lo->d);
+        int64_t lo_t, hi_t;
+        if (lo->has_tz && hi->has_tz) { lo_t = time_ns_of_utc(lo); hi_t = time_ns_of_utc(hi); }
+        else { lo_t = time_ns_of(lo); hi_t = time_ns_of(hi); }
+        if (hi_t < lo_t) dd -= 1;
+        days = forward ? dd : -dd;
+    }
+    char iso[64];
+    if (days == 0) snprintf(iso, sizeof(iso), "PT0S");
+    else snprintf(iso, sizeof(iso), "P%lldD", (long long)days);
+    char json[200];
+    snprintf(json, sizeof(json),
+        "{\"_iso8601\":\"%s\",\"months\":0,\"days\":%lld,\"seconds\":0,\"nanosecondsOfSecond\":0}",
+        iso, (long long)days);
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/* duration.inMonths — calendar months between two date-bearing temporals.
+ * Returns PT0S when either side lacks a date. */
+void gql_duration_in_months_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    const char *sa = (const char*)sqlite3_value_text(argv[0]);
+    const char *sb = (const char*)sqlite3_value_text(argv[1]);
+    tparts a, b;
+    if (!parse_temporal_parts(sa, &a) || !parse_temporal_parts(sb, &b)) { sqlite3_result_null(ctx); return; }
+    long long total_months = 0;
+    if (a.has_date && b.has_date) {
+        int cmp = compare_temporal(&a, &b);
+        bool forward = (cmp <= 0);
+        const tparts *lo = forward ? &a : &b;
+        const tparts *hi = forward ? &b : &a;
+        int y = hi->y - lo->y, m = hi->mo - lo->mo, dd = hi->d - lo->d;
+        /* When days equal, also account for time-of-day: a full month is
+         * only reached when hi.time >= lo.time. Compare in UTC when both sides
+         * carry a tz offset so a tz difference doesn't spuriously drop a month
+         * (Temporal10 [3] example 19). */
+        int64_t lo_t, hi_t;
+        if (lo->has_tz && hi->has_tz) { lo_t = time_ns_of_utc(lo); hi_t = time_ns_of_utc(hi); }
+        else { lo_t = time_ns_of(lo); hi_t = time_ns_of(hi); }
+        if (dd < 0 || (dd == 0 && hi_t < lo_t)) m -= 1;
+        if (m < 0) { m += 12; y -= 1; }
+        total_months = (long long)y * 12 + m;
+        if (!forward) total_months = -total_months;
+    }
+    long long years = total_months / 12, months = total_months - years * 12;
+    char iso[64];
+    if (total_months == 0) snprintf(iso, sizeof(iso), "PT0S");
+    else {
+        char *p = iso; *p++ = 'P';
+        if (years) p += snprintf(p, sizeof(iso) - (p - iso), "%lldY", years);
+        if (months) p += snprintf(p, sizeof(iso) - (p - iso), "%lldM", months);
+        *p = 0;
+    }
+    char json[200];
+    snprintf(json, sizeof(json),
+        "{\"_iso8601\":\"%s\",\"months\":%lld,\"days\":0,\"seconds\":0,\"nanosecondsOfSecond\":0}",
+        iso, total_months);
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+static void emit_duration_json_split(sqlite3_context *ctx, long long total_months,
+                                     long long total_days, long long secs,
+                                     long long nanos);  /* defined below */
+static void emit_duration_json(sqlite3_context *ctx, long long total_months,
+                                long long total_days, long long total_ns);
+
+/* duration.inSeconds — total elapsed seconds, PT-form. */
+void gql_duration_in_seconds_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    const char *sa = (const char*)sqlite3_value_text(argv[0]);
+    const char *sb = (const char*)sqlite3_value_text(argv[1]);
+    tparts a, b;
+    if (!parse_temporal_parts(sa, &a) || !parse_temporal_parts(sb, &b)) { sqlite3_result_null(ctx); return; }
+
+    /* One side in a named zone, the other local: the local side is a wall
+     * clock in that zone (its date from the zoned side when it has none),
+     * and the elapsed time counts a daylight-saving change between them:
+     * 00:00 to 04:00 Stockholm on 2017-10-29 is PT5H (Temporal10 [8]). */
+    {
+        const char *ra = strchr(sa, '['), *rb = strchr(sb, '[');
+        const char *zs = (ra && !b.has_tz) ? ra : (rb && !a.has_tz) ? rb : NULL;
+        const gql_tz_zone *zone = NULL;
+        if (zs) {
+            char zname[64];
+            const char *ze = strchr(zs + 1, ']');
+            int zl = ze ? (int)(ze - zs - 1) : (int)strlen(zs + 1);
+            if (zl > 0 && zl < (int)sizeof(zname)) {
+                memcpy(zname, zs + 1, (size_t)zl); zname[zl] = 0;
+                zone = gql_tz_find(zname);
+            }
+        }
+        if (zone) {
+            tparts *zoned = (zs == ra) ? &a : &b, *local = (zs == ra) ? &b : &a;
+            if (zoned->has_date) {
+                if (!local->has_date) {
+                    local->y = zoned->y; local->mo = zoned->mo; local->d = zoned->d;
+                    local->has_date = true;
+                }
+                int64_t lz = (int64_t)days_from_civil(zoned->y, zoned->mo, zoned->d) * 86400
+                           + zoned->h * 3600 + zoned->mi * 60 + zoned->sec;
+                int64_t ll = (int64_t)days_from_civil(local->y, local->mo, local->d) * 86400
+                           + local->h * 3600 + local->mi * 60 + local->sec;
+                int64_t uz = lz - (int64_t)zoned->tz_offset_min * 60;
+                int64_t ul = ll - gql_tz_offset_at_local(zone, ll);
+                int64_t ua = (zs == ra) ? uz : ul, ub = (zs == ra) ? ul : uz;
+                emit_duration_json_split(ctx, 0, 0, ub - ua, b.ns - a.ns);
+                return;
+            }
+        }
+    }
+
+    /* Calendar day diff (when both have a date) + time-of-day diff.
+     * Time-of-day uses local clock unless BOTH inputs are full datetimes
+     * (date+time), in which case tz offsets are applied for true UTC diff.
+     * The day delta is carried in whole seconds and the time-of-day delta in
+     * nanoseconds (each side < 1e14 ns), so billion-year spans never form a
+     * total-nanosecond int64 (Temporal10 [10]). */
+    int64_t secs = 0, tod_ns = 0;
+    bool both_tz = (a.has_tz && b.has_tz);
+    if (a.has_date && b.has_date) {
+        int64_t dd = (int64_t)days_from_civil(b.y, b.mo, b.d)
+                   - (int64_t)days_from_civil(a.y, a.mo, a.d);
+        secs = dd * 86400LL;
+        if (both_tz) tod_ns = time_ns_of_utc(&b) - time_ns_of_utc(&a);
+        else         tod_ns = time_ns_of(&b) - time_ns_of(&a);
+    } else if (a.has_time || b.has_time) {
+        /* At least one side has time. Mixed (date + time-only) → use the
+         * time-bearing side's clock as the diff; e.g. date → localtime('16:30')
+         * = 'PT16H30M'. When both sides have tz, normalize to UTC. */
+        if (both_tz) tod_ns = time_ns_of_utc(&b) - time_ns_of_utc(&a);
+        else         tod_ns = time_ns_of(&b) - time_ns_of(&a);
+    }
+    emit_duration_json_split(ctx, 0, 0, secs, tod_ns);
+}
+
+void gql_duration_calendar_func(
+    sqlite3_context *ctx, int argc, sqlite3_value **argv
+) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    const char *sa = (const char*)sqlite3_value_text(argv[0]);
+    const char *sb = (const char*)sqlite3_value_text(argv[1]);
+    tparts a, b;
+    if (!parse_temporal_parts(sa, &a) || !parse_temporal_parts(sb, &b)) {
+        sqlite3_result_null(ctx); return;
+    }
+    int64_t total_months = 0;
+    int days = 0;
+    int64_t time_ns = 0;
+    compute_calendar_duration(&a, &b, &total_months, &days, &time_ns);
+    /* time_ns is a sub-day delta here (< 2 * 86400e9), so the ns form is
+     * safe; emit_duration_json floor-normalises seconds/nanos for the JSON
+     * fields (Java Duration-style, nanos in [0, 1e9)). */
+    emit_duration_json(ctx, total_months, days, time_ns);
+}
+
+static long long days_from_civil(int y, int m, int d);
+
+/* The offset of a named zone at a local wall-clock time, from the IANA time
+ * zone table (gql_tz.c): daylight saving and historical offsets, e.g.
+ * Europe/Stockholm +02:00 on 1984-03-28 and +00:53:28 in 1818. "+00:00"
+ * for an unknown name. The text is thread-local storage. */
+static const char *named_tz_offset_at(const char *tz, int y, int mo, int d, int h, int mi, int s) {
+    static GQL_THREAD_LOCAL char buf[16];
+    const gql_tz_zone *z = gql_tz_find(tz);
+    if (!z) return "+00:00";
+    int64_t local = (int64_t)days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+    gql_tz_format_offset(gql_tz_offset_at_local(z, local), buf, (int)sizeof(buf));
+    return buf;
+}
+
+/* The offset of a named zone on a calendar date (at noon). */
+static const char *named_tz_offset(const char *tz, int y, int mo, int d) {
+    return named_tz_offset_at(tz, y, mo, d, 12, 0, 0);
+}
+
+/* SQLite UDF: offset string for a named tz on a given date (handles DST). */
+void gql_tz_offset_for_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc < 1) { sqlite3_result_null(ctx); return; }
+    const char *tz = (const char*)sqlite3_value_text(argv[0]);
+    int y = 2000, m = 6, d = 15;
+    if (argc >= 2 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
+        const char *ds = (const char*)sqlite3_value_text(argv[1]);
+        if (ds && strlen(ds) >= 10) {
+            sscanf(ds, "%d-%d-%d", &y, &m, &d);
+        }
+    }
+    /* Optional hour, minute, second: the offset at that wall-clock time,
+     * which matters on a daylight-saving day (Temporal10 [8]). */
+    if (argc >= 3) {
+        int h = (sqlite3_value_type(argv[2]) != SQLITE_NULL) ? sqlite3_value_int(argv[2]) : 0;
+        int mi = (argc >= 4 && sqlite3_value_type(argv[3]) != SQLITE_NULL) ? sqlite3_value_int(argv[3]) : 0;
+        int sec = (argc >= 5 && sqlite3_value_type(argv[4]) != SQLITE_NULL) ? sqlite3_value_int(argv[4]) : 0;
+        sqlite3_result_text(ctx, named_tz_offset_at(tz, y, m, d, h, mi, sec), -1, SQLITE_TRANSIENT);
+        return;
+    }
+    sqlite3_result_text(ctx, named_tz_offset(tz, y, m, d), -1, SQLITE_TRANSIENT);
+}
+
+/* Days from 1970-01-01 to (y, m, d). Howard Hinnant's algorithm — works
+ * for any proleptic Gregorian year (positive or negative), unlike timegm
+ * which is bounded by the platform's epoch range. */
+static long long days_from_civil(int y, int m, int d) {
+    y -= (m <= 2) ? 1 : 0;
+    const long long era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (long long)doe - 719468;
+}
+
+/* Inverse of days_from_civil. */
+static void civil_from_days(long long z, int *outy, int *outm, int *outd) {
+    z += 719468;
+    const long long era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int y = (int)yoe + (int)(era * 400);
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    *outd = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *outm = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *outy = y + (*outm <= 2 ? 1 : 0);
+}
+
+/* Day-of-week (0=Sun..6=Sat) for any year via Sakamoto's algorithm. */
+static int weekday_of(int y, int m, int d) {
+    static const int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+    if (m < 3) y -= 1;
+    int dow = (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+    return (dow + 7) % 7;
+}
+
+/* Extract a numeric field from a Duration JSON string. */
+static long long dur_field_ll(const char *s, const char *key) {
+    if (!s || !key) return 0;
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char *p = strstr(s, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p == ' ') p++;
+    return strtoll(p, NULL, 10);
+}
+
+/* Build a Duration JSON object from months/days and a (seconds, nanos) pair.
+ * Does NOT normalize overflow between the months/days/seconds fields —
+ * duration arithmetic preserves the components as specified ('28D + 32H'
+ * stays as such instead of becoming '29DT8H'). Only the nanos are carried
+ * into seconds and floor-normalised to [0, 1e9) (Java Duration convention),
+ * so `seconds` may be any int64 without an intermediate total-ns value. */
+static void emit_duration_json_split(sqlite3_context *ctx, long long total_months,
+                                     long long total_days, long long secs,
+                                     long long nanos) {
+    const long long NS = 1000000000LL;
+    secs += nanos / NS;
+    nanos %= NS;
+    if (nanos < 0) { nanos += NS; secs -= 1; }
+
+    char iso[160];
+    format_iso_duration(total_months, total_days, secs, nanos, iso, sizeof(iso));
+
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"_iso8601\":\"%s\",\"months\":%lld,\"days\":%lld,\"seconds\":%lld,\"nanosecondsOfSecond\":%lld}",
+        iso, total_months, total_days, secs, nanos);
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/* Convenience form for callers whose time part is a sub-day residue that
+ * safely fits a total-nanosecond int64. */
+static void emit_duration_json(sqlite3_context *ctx, long long total_months,
+                                long long total_days, long long total_ns) {
+    emit_duration_json_split(ctx, total_months, total_days, 0, total_ns);
+}
+
+/* Detect Duration JSON value (object with _iso8601 field). */
+static bool is_duration_value(sqlite3_value *v, const char **out_text) {
+    if (sqlite3_value_type(v) != SQLITE_TEXT) return false;
+    const char *s = (const char*)sqlite3_value_text(v);
+    if (!s || s[0] != '{') return false;
+    if (!strstr(s, "\"_iso8601\"")) return false;
+    if (out_text) *out_text = s;
+    return true;
+}
+
+/* Apply a duration to a temporal string. `sign` is +1 (add) or -1 (sub). */
+static void apply_duration_to_temporal(sqlite3_context *ctx, const char *temporal,
+                                        const char *duration_json, int sign) {
+    tparts p;
+    if (!parse_temporal_parts(temporal, &p)) { sqlite3_result_text(ctx, temporal, -1, SQLITE_TRANSIENT); return; }
+    long long add_months = dur_field_ll(duration_json, "months") * sign;
+    long long add_days = dur_field_ll(duration_json, "days") * sign;
+    long long add_seconds = dur_field_ll(duration_json, "seconds") * sign;
+    long long add_ns_field = dur_field_ll(duration_json, "nanosecondsOfSecond") * sign;
+    long long add_total_ns = add_seconds * 1000000000LL + add_ns_field;
+
+    if (p.has_date) {
+        /* Add months / years first. */
+        long long total_months = (long long)(p.y) * 12 + (p.mo - 1) + add_months;
+        int new_year = (int)(total_months / 12);
+        int new_month = (int)(total_months - (long long)new_year * 12) + 1;
+        if (new_month < 1) { new_month += 12; new_year -= 1; }
+        int new_day = p.d;
+        /* Clamp day to last day of month. */
+        int dim = days_in_month_c(new_year, new_month);
+        if (new_day > dim) new_day = dim;
+        /* Add days. */
+        long long base_days = days_from_civil(new_year, new_month, new_day) + (long long)add_days;
+        /* Time-of-day contribution: only applies when the input itself has a
+         * time component (datetime/localdatetime). Pure date inputs ignore
+         * the duration's hours/minutes/seconds/ns (openCypher rule). */
+        long long time_ns = 0;
+        long long residue_ns = 0;
+        if (p.has_time) {
+            time_ns = (long long)p.h * 3600LL * 1000000000LL
+                    + (long long)p.mi * 60LL * 1000000000LL
+                    + (long long)p.sec * 1000000000LL + p.ns;
+            time_ns += add_total_ns;
+            long long DAY_NS = 86400LL * 1000000000LL;
+            long long extra_days = time_ns / DAY_NS;
+            residue_ns = time_ns - extra_days * DAY_NS;
+            if (residue_ns < 0) { residue_ns += DAY_NS; extra_days -= 1; }
+            base_days += extra_days;
+        } else {
+            /* Pure date + duration: the duration's sub-day time still
+             * contributes its WHOLE days (truncated toward zero); the sub-day
+             * remainder is dropped since a date has no time-of-day. The
+             * duration value itself is not normalized — only this date
+             * arithmetic rolls the hours into days. (Temporal8 [1] example 3.) */
+            long long DAY_NS = 86400LL * 1000000000LL;
+            base_days += add_total_ns / DAY_NS;
+        }
+        int oy, om, od;
+        civil_from_days(base_days, &oy, &om, &od);
+
+        if (p.has_time) {
+            /* datetime/localdatetime: emit full datetime. */
+            int new_h = (int)(residue_ns / (3600LL * 1000000000LL));
+            int new_mi = (int)((residue_ns / (60LL * 1000000000LL)) % 60);
+            int new_sec = (int)((residue_ns / 1000000000LL) % 60);
+            int64_t new_ns = residue_ns % 1000000000LL;
+            char buf[96];
+            size_t dl = (size_t)format_iso_date(buf, sizeof(buf), oy, om, od);
+            if (new_ns) {
+                int width = 9;
+                long long sub = new_ns;
+                while (width > 0 && sub % 10 == 0) { sub /= 10; width--; }
+                snprintf(buf + dl, sizeof(buf) - dl, "T%02d:%02d:%02d.%0*lld",
+                         new_h, new_mi, new_sec, width, sub);
+            } else if (new_sec) {
+                snprintf(buf + dl, sizeof(buf) - dl, "T%02d:%02d:%02d",
+                         new_h, new_mi, new_sec);
+            } else {
+                snprintf(buf + dl, sizeof(buf) - dl, "T%02d:%02d",
+                         new_h, new_mi);
+            }
+            /* Re-attach the tz suffix if the source had one. */
+            if (p.has_tz) {
+                char tz_buf[16];
+                int oh = p.tz_offset_min / 60;
+                int om2 = p.tz_offset_min - oh * 60;
+                if (om2 < 0) om2 = -om2;
+                snprintf(tz_buf, sizeof(tz_buf), "%+03d:%02d", oh, om2);
+                size_t l = strlen(buf);
+                snprintf(buf + l, sizeof(buf) - l, "%s", tz_buf);
+            }
+            sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+        } else {
+            /* date-only output. */
+            char buf[32];
+            format_iso_date(buf, sizeof(buf), oy, om, od);
+            sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+        }
+        return;
+    }
+    if (p.has_time) {
+        /* time / localtime: apply time-portion of duration, wrap modulo 24h. */
+        long long time_ns = (long long)p.h * 3600LL * 1000000000LL
+                          + (long long)p.mi * 60LL * 1000000000LL
+                          + (long long)p.sec * 1000000000LL + p.ns;
+        time_ns += add_total_ns;
+        long long DAY_NS = 86400LL * 1000000000LL;
+        time_ns = ((time_ns % DAY_NS) + DAY_NS) % DAY_NS;
+        int new_h = (int)(time_ns / (3600LL * 1000000000LL));
+        int new_mi = (int)((time_ns / (60LL * 1000000000LL)) % 60);
+        int new_sec = (int)((time_ns / 1000000000LL) % 60);
+        int64_t new_ns = time_ns % 1000000000LL;
+        char buf[80];
+        if (new_ns) {
+            int width = 9;
+            long long sub = new_ns;
+            while (width > 0 && sub % 10 == 0) { sub /= 10; width--; }
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%0*lld",
+                     new_h, new_mi, new_sec, width, sub);
+        } else if (new_sec) {
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d", new_h, new_mi, new_sec);
+        } else {
+            snprintf(buf, sizeof(buf), "%02d:%02d", new_h, new_mi);
+        }
+        if (p.has_tz) {
+            char tz_buf[16];
+            int oh = p.tz_offset_min / 60;
+            int om2 = p.tz_offset_min - oh * 60;
+            if (om2 < 0) om2 = -om2;
+            snprintf(tz_buf, sizeof(tz_buf), "%+03d:%02d", oh, om2);
+            size_t l = strlen(buf);
+            snprintf(buf + l, sizeof(buf) - l, "%s", tz_buf);
+        }
+        sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+        return;
+    }
+    sqlite3_result_text(ctx, temporal, -1, SQLITE_TRANSIENT);
+}
+
+/* Polymorphic `+` / `-` handling Duration JSON + numeric + string concat. */
+static void gql_dyn_addsub_func(sqlite3_context *ctx, int argc, sqlite3_value **argv,
+                                 int sign) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    const char *lhs_text = (sqlite3_value_type(argv[0]) == SQLITE_TEXT)
+                            ? (const char*)sqlite3_value_text(argv[0]) : NULL;
+    const char *rhs_text = (sqlite3_value_type(argv[1]) == SQLITE_TEXT)
+                            ? (const char*)sqlite3_value_text(argv[1]) : NULL;
+    bool lhs_dur = is_duration_value(argv[0], NULL);
+    bool rhs_dur = is_duration_value(argv[1], NULL);
+
+    if (lhs_dur && rhs_dur) {
+        long long m = dur_field_ll(lhs_text, "months") + sign * dur_field_ll(rhs_text, "months");
+        long long da = dur_field_ll(lhs_text, "days") + sign * dur_field_ll(rhs_text, "days");
+        long long s = dur_field_ll(lhs_text, "seconds") + sign * dur_field_ll(rhs_text, "seconds");
+        long long ns = dur_field_ll(lhs_text, "nanosecondsOfSecond") + sign * dur_field_ll(rhs_text, "nanosecondsOfSecond");
+        emit_duration_json_split(ctx, m, da, s, ns);
+        return;
+    }
+    if (lhs_dur || rhs_dur) {
+        const char *temp_v = lhs_dur ? (rhs_text ? rhs_text : (const char*)sqlite3_value_text(argv[1])) : lhs_text;
+        const char *dur_v = lhs_dur ? lhs_text : rhs_text;
+        /* duration + temporal = temporal + duration (commutes for + only). */
+        if (lhs_dur && sign > 0) {
+            apply_duration_to_temporal(ctx, (const char*)sqlite3_value_text(argv[1]), dur_v, +1);
+        } else if (lhs_dur && sign < 0) {
+            /* duration - temporal is not a defined operation; return NULL. */
+            sqlite3_result_null(ctx);
+        } else {
+            apply_duration_to_temporal(ctx, temp_v, dur_v, sign);
+        }
+        return;
+    }
+
+    /* Fall through to native arithmetic / string concat. */
+    int t0 = sqlite3_value_type(argv[0]);
+    int t1 = sqlite3_value_type(argv[1]);
+    if (t0 == SQLITE_NULL || t1 == SQLITE_NULL) { sqlite3_result_null(ctx); return; }
+    /* List append / concat for +. If either operand is a JSON array text,
+     * treat the + as Cypher list +. Use SQLite's json_insert/json_patch
+     * via a one-shot query. */
+    if (sign > 0) {
+        const char *l_text = (t0 == SQLITE_TEXT) ? (const char*)sqlite3_value_text(argv[0]) : NULL;
+        const char *r_text = (t1 == SQLITE_TEXT) ? (const char*)sqlite3_value_text(argv[1]) : NULL;
+        bool l_is_arr = l_text && l_text[0] == '[';
+        bool r_is_arr = r_text && r_text[0] == '[';
+        if (l_is_arr || r_is_arr) {
+            sqlite3 *db = sqlite3_context_db_handle(ctx);
+            sqlite3_stmt *stmt = NULL;
+            const char *sql;
+            /* Detect if the scalar side is itself a JSON container
+             * (list/map). json_insert defaults to quoting text values
+             * as strings, which corrupts `[1,2] + [3]` into
+             * `[1,2,"[3]"]`. Wrapping with `json(?)` embeds the value
+             * verbatim — but json() is malformed-JSON-strict on bare
+             * scalars, so only wrap when the value looks like a JSON
+             * container. T-0304 / I-0042-followup. */
+            bool l_is_json_container = l_text && (l_text[0] == '[' || l_text[0] == '{');
+            bool r_is_json_container = r_text && (r_text[0] == '[' || r_text[0] == '{');
+            /* A boolean ('true'/'false' with the boolean subtype) is JSON
+             * true/false in the list, not 1 or "true" (TCK List4 [2]). */
+            if (sqlite3_value_subtype(argv[0]) == GQL_SUBTYPE_BOOLEAN) l_is_json_container = true;
+            if (sqlite3_value_subtype(argv[1]) == GQL_SUBTYPE_BOOLEAN) r_is_json_container = true;
+            if (l_is_arr && r_is_arr) {
+                /* list + list: splice the two JSON arrays at the text
+                 * level. UNION ALL strips JSON subtype, which causes
+                 * json_group_array to re-quote nested arrays/maps as
+                 * strings. String-splicing preserves them.
+                 *   [1,2] + [[3,4]] → [1,2] minus trailing ']' (= "[1,2")
+                 *                     + "," + [[3,4]] minus leading '[' (= "[3,4]]")
+                 *                   → "[1,2,[3,4]]" */
+                sql = "SELECT CASE "
+                      "  WHEN ?1 = '[]' THEN ?2 "
+                      "  WHEN ?2 = '[]' THEN ?1 "
+                      "  ELSE substr(?1, 1, length(?1)-1) || ',' || substr(?2, 2) "
+                      "END";
+            } else if (l_is_arr) {
+                /* list + value: append. Embed the value verbatim when
+                 * it's a JSON container (map literal, nested list).
+                 * Otherwise json_insert string-quotes it. */
+                sql = r_is_json_container
+                    ? "SELECT json_insert(?1, '$[#]', json(?2))"
+                    : "SELECT json_insert(?1, '$[#]', ?2)";
+            } else {
+                /* value + list: prepend (Cypher allows this). Splice
+                 * via substr to preserve the leading scalar's JSON
+                 * subtype when it's a container. */
+                if (l_is_json_container) {
+                    sql = "SELECT CASE "
+                          "  WHEN ?2 = '[]' THEN '[' || ?1 || ']' "
+                          "  ELSE '[' || ?1 || ',' || substr(?2, 2) "
+                          "END";
+                } else {
+                    sql = "WITH b(v) AS (SELECT value FROM json_each(?2)) "
+                          "SELECT json_group_array(v) FROM (SELECT ?1 AS v UNION ALL SELECT v FROM b)";
+                }
+            }
+            if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_value(stmt, 1, argv[0]);
+                sqlite3_bind_value(stmt, 2, argv[1]);
+                if (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const char *out = (const char*)sqlite3_column_text(stmt, 0);
+                    if (out) {
+                        sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
+                        sqlite3_result_subtype(ctx, GQL_SUBTYPE_JSON);  /* a list */
+                    } else {
+                        sqlite3_result_null(ctx);
+                    }
+                } else {
+                    sqlite3_result_null(ctx);
+                }
+                sqlite3_finalize(stmt);
+                return;
+            }
+        }
+    }
+    /* String concat for + when either side is text (Cypher semantics). */
+    if (sign > 0 && (t0 == SQLITE_TEXT || t1 == SQLITE_TEXT)) {
+        const char *l = (const char*)sqlite3_value_text(argv[0]);
+        const char *r = (const char*)sqlite3_value_text(argv[1]);
+        if (!l) l = ""; if (!r) r = "";
+        size_t cap = strlen(l) + strlen(r) + 1;
+        char *buf = malloc(cap);
+        if (!buf) { sqlite3_result_error_nomem(ctx); return; }
+        snprintf(buf, cap, "%s%s", l, r);
+        sqlite3_result_text(ctx, buf, -1, free);
+        return;
+    }
+    /* Numeric. */
+    if (t0 == SQLITE_FLOAT || t1 == SQLITE_FLOAT) {
+        double a = sqlite3_value_double(argv[0]);
+        double b = sqlite3_value_double(argv[1]);
+        sqlite3_result_double(ctx, sign > 0 ? a + b : a - b);
+    } else {
+        long long a = sqlite3_value_int64(argv[0]);
+        long long b = sqlite3_value_int64(argv[1]);
+        sqlite3_result_int64(ctx, sign > 0 ? a + b : a - b);
+    }
+}
+
+void gql_dyn_add_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    gql_dyn_addsub_func(ctx, argc, argv, +1);
+}
+void gql_dyn_sub_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    gql_dyn_addsub_func(ctx, argc, argv, -1);
+}
+
+/* Scale a Duration by a numeric factor (Temporal8 [7]). Cypher multiplies each
+ * component (months, days, seconds, nanos) by the factor and cascades the
+ * fractional remainder of each larger unit down into the next smaller one, using
+ * the duration-arithmetic conversions 1 month = 30.436875 days and 1 day = 86400
+ * seconds. Components are NOT otherwise normalized across each other. */
+static void scale_duration(sqlite3_context *ctx, const char *dur, double factor) {
+    double months_f = (double)dur_field_ll(dur, "months") * factor;
+    double days_f   = (double)dur_field_ll(dur, "days") * factor;
+    double total_ns_base = ((double)dur_field_ll(dur, "seconds") * 1e9
+                            + (double)dur_field_ll(dur, "nanosecondsOfSecond")) * factor;
+
+    /* trunc toward zero keeps the signed fraction so negatives cascade too. */
+    double months_int = trunc(months_f);
+    double month_frac = months_f - months_int;
+    days_f += month_frac * 30.436875;        /* avg Gregorian month in days */
+
+    double days_int = trunc(days_f);
+    double day_frac = days_f - days_int;
+    double total_ns = total_ns_base + day_frac * 86400.0 * 1e9;
+
+    /* Cypher truncates the final nanosecond toward zero. But the carries above
+     * accumulate floating-point noise (~0.02 ULP at this magnitude), so an
+     * exact-integer result can read as x.9999. Snap to the nearest integer when
+     * within a small tolerance (absorbs the noise), otherwise truncate toward
+     * zero (so a genuine half like *0.5 of an odd nanosecond drops, not rounds). */
+    double rounded = round(total_ns);
+    long long ns_ll = (fabs(total_ns - rounded) < 0.05)
+                          ? (long long)rounded
+                          : (long long)trunc(total_ns);
+    emit_duration_json(ctx, (long long)months_int, (long long)days_int, ns_ll);
+}
+
+/* `_gql_dyn_mul` / `_gql_dyn_div`: numeric * / / that also scales a Duration
+ * operand (Temporal8 [7]). `op` is '*' or '/'. */
+static void gql_dyn_muldiv_func(sqlite3_context *ctx, int argc, sqlite3_value **argv, char op) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    int t0 = sqlite3_value_type(argv[0]);
+    int t1 = sqlite3_value_type(argv[1]);
+    if (t0 == SQLITE_NULL || t1 == SQLITE_NULL) { sqlite3_result_null(ctx); return; }
+
+    const char *l_dur = NULL, *r_dur = NULL;
+    bool l_is_dur = is_duration_value(argv[0], &l_dur);
+    bool r_is_dur = is_duration_value(argv[1], &r_dur);
+
+    if (l_is_dur && !r_is_dur) {
+        /* duration * num  or  duration / num */
+        double n = sqlite3_value_double(argv[1]);
+        if (op == '/') {
+            if (n == 0.0) { sqlite3_result_null(ctx); return; }
+            n = 1.0 / n;
+        }
+        scale_duration(ctx, l_dur, n);
+        return;
+    }
+    if (r_is_dur && !l_is_dur && op == '*') {
+        /* num * duration (commutes for * only) */
+        scale_duration(ctx, r_dur, sqlite3_value_double(argv[0]));
+        return;
+    }
+    if (l_is_dur || r_is_dur) {
+        /* num / duration, duration * duration, etc. — undefined. */
+        sqlite3_result_null(ctx);
+        return;
+    }
+
+    /* Plain numeric: preserve SQLite-native int/float semantics. */
+    if (op == '*') {
+        if (t0 == SQLITE_INTEGER && t1 == SQLITE_INTEGER) {
+            sqlite3_result_int64(ctx, sqlite3_value_int64(argv[0]) * sqlite3_value_int64(argv[1]));
+        } else {
+            sqlite3_result_double(ctx, sqlite3_value_double(argv[0]) * sqlite3_value_double(argv[1]));
+        }
+    } else { /* '/' — Cypher integer division truncates toward zero. */
+        if (t0 == SQLITE_INTEGER && t1 == SQLITE_INTEGER) {
+            long long b = sqlite3_value_int64(argv[1]);
+            if (b == 0) { sqlite3_result_null(ctx); return; }
+            sqlite3_result_int64(ctx, sqlite3_value_int64(argv[0]) / b);
+        } else {
+            sqlite3_result_double(ctx, sqlite3_value_double(argv[0]) / sqlite3_value_double(argv[1]));
+        }
+    }
+}
+
+void gql_dyn_mul_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    gql_dyn_muldiv_func(ctx, argc, argv, '*');
+}
+void gql_dyn_div_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    gql_dyn_muldiv_func(ctx, argc, argv, '/');
+}
+
+/* Compose a YYYY-MM-DD date string from a map's named components. Used by
+ * the date()/datetime()/localdatetime() constructors when the map has a
+ * `date` or `datetime` base value alongside scalar component overrides.
+ *
+ * argv layout (10 args, NULL-when-absent):
+ *   0  year         (int)
+ *   1  month        (int)
+ *   2  day          (int)
+ *   3  week         (int, ISO week 1..53)
+ *   4  dayOfWeek    (int, 1=Mon..7=Sun)
+ *   5  ordinalDay   (int, 1..366)
+ *   6  quarter      (int, 1..4)
+ *   7  dayOfQuarter (int, 1..92)
+ *   8  base_date    (text, 'YYYY-MM-DD'…)
+ *   9  base_datetime(text, 'YYYY-MM-DDT…')
+ *
+ * Precedence: week > ordinalDay > quarter > month/day. Components missing
+ * from the map but present in a base value are inherited.
+ */
+void gql_date_compose_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 10) { sqlite3_result_null(ctx); return; }
+    int y = 0, mo = 1, d = 1;
+    bool have_y = false;
+    bool year_from_base = false;
+    bool has_base = false;
+    /* Year/month/day defaults from base value. */
+    const char *base = NULL;
+    if (sqlite3_value_type(argv[8]) != SQLITE_NULL) base = (const char*)sqlite3_value_text(argv[8]);
+    else if (sqlite3_value_type(argv[9]) != SQLITE_NULL) base = (const char*)sqlite3_value_text(argv[9]);
+    int base_y = 0, base_mo = 1, base_d = 1;
+    if (base && strlen(base) >= 10) {
+        y = atoi(base); mo = atoi(base + 5); d = atoi(base + 8);
+        have_y = (y > 0);
+        year_from_base = have_y;
+        has_base = have_y;
+        /* Snapshot the base calendar BEFORE any scalar override of y, so
+         * the dayOfWeek-inheritance path below uses the actual base
+         * date's weekday. */
+        base_y = y; base_mo = mo; base_d = d;
+    }
+    /* Scalar overrides. */
+    if (sqlite3_value_type(argv[0]) != SQLITE_NULL) { y = sqlite3_value_int(argv[0]); have_y = true; year_from_base = false; }
+    if (!have_y) {
+        time_t now = time(NULL);
+        struct tm *t = gmtime(&now);
+        y = t->tm_year + 1900;
+    }
+
+    /* When computing a week date and the year was inherited from a base
+     * value (not explicitly set), the ISO standard requires using the
+     * week-year of the base, not its calendar year. (E.g., 1816-12-30 is
+     * Mon of ISO week 1 of 1817 even though calendar year is 1816.) */
+    if (year_from_base && sqlite3_value_type(argv[3]) != SQLITE_NULL) {
+        int base_dow = weekday_of(base_y, base_mo, base_d);
+        /* Thursday of week = base + (3 - ((base_dow-1+7)%7)). */
+        int wd_iso = (base_dow + 6) % 7;  /* 0=Mon..6=Sun */
+        int days_to_thu = 3 - wd_iso;
+        long long base_days = days_from_civil(base_y, base_mo, base_d);
+        int ty, tmo, td;
+        civil_from_days(base_days + days_to_thu, &ty, &tmo, &td);
+        y = ty;
+    }
+
+    char buf[16];
+    int oy, omm, odd;
+    if (sqlite3_value_type(argv[3]) != SQLITE_NULL) {
+        /* ISO week date — use pure-arithmetic day math so old years like
+         * 1817 work (timegm wraps before 1970). */
+        int week = sqlite3_value_int(argv[3]);
+        int dow;
+        if (sqlite3_value_type(argv[4]) != SQLITE_NULL) {
+            dow = sqlite3_value_int(argv[4]);
+        } else if (has_base) {
+            /* Inherit dayOfWeek from base — '{date: other, week: N}' or
+             * '{date: other, year: Y, week: N}' should resolve to the same
+             * dayOfWeek as the base date in the new week. Use the
+             * *original* base (base_y/mo/d), not the overwritten
+             * ISO-year y. (M14 bugfix.) */
+            int base_dow = weekday_of(base_y, base_mo, base_d);
+            dow = (base_dow + 6) % 7 + 1;  /* Mon=1..Sun=7 */
+        } else {
+            dow = 1;
+        }
+        int jan4_wd = weekday_of(y, 1, 4);
+        int monday_offset = (jan4_wd + 6) % 7;
+        long long jan4_days = days_from_civil(y, 1, 4);
+        long long target = jan4_days - monday_offset + (long long)(week - 1) * 7 + (dow - 1);
+        civil_from_days(target, &oy, &omm, &odd);
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", oy, omm, odd);
+    } else if (sqlite3_value_type(argv[5]) != SQLITE_NULL) {
+        int ord = sqlite3_value_int(argv[5]);
+        long long jan1_days = days_from_civil(y, 1, 1);
+        civil_from_days(jan1_days + (ord - 1), &oy, &omm, &odd);
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", oy, omm, odd);
+    } else if (sqlite3_value_type(argv[6]) != SQLITE_NULL) {
+        int q = sqlite3_value_int(argv[6]);
+        if (sqlite3_value_type(argv[7]) != SQLITE_NULL) {
+            /* dayOfQuarter is absolute within the quarter. */
+            int doq = sqlite3_value_int(argv[7]);
+            int month = (q - 1) * 3 + 1;
+            long long start_days = days_from_civil(y, month, 1);
+            civil_from_days(start_days + (doq - 1), &oy, &omm, &odd);
+            snprintf(buf, sizeof(buf), "%04d-%02d-%02d", oy, omm, odd);
+        } else {
+            /* Only `quarter` is selected — preserve the month-within-quarter and
+             * day from the base value (or month/day scalar overrides). E.g.
+             * quarter 3 over 1984-11-11 (Q4 month-2, day 11) -> 1984-08-11.
+             * (Temporal3 [1] quarter examples.) */
+            int src_mo = (sqlite3_value_type(argv[1]) != SQLITE_NULL)
+                             ? sqlite3_value_int(argv[1]) : mo;
+            int month_in_q = ((src_mo - 1) % 3 + 3) % 3 + 1;
+            int new_month = (q - 1) * 3 + month_in_q;
+            int day = (sqlite3_value_type(argv[2]) != SQLITE_NULL)
+                          ? sqlite3_value_int(argv[2]) : d;
+            int dim = days_in_month_c(y, new_month);
+            if (day > dim) day = dim;
+            snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, new_month, day);
+        }
+    } else {
+        if (sqlite3_value_type(argv[1]) != SQLITE_NULL) mo = sqlite3_value_int(argv[1]);
+        if (sqlite3_value_type(argv[2]) != SQLITE_NULL) d = sqlite3_value_int(argv[2]);
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, mo, d);
+    }
+    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+/* Compose a time string from map components (HH:MM[:SS[.frac]][tz]).
+ *
+ * argv:
+ *   0 hour, 1 minute, 2 second, 3 millisecond, 4 microsecond, 5 nanosecond,
+ *   6 timezone (text, '+HH:MM' or named), 7 emit_tz (int 1/0),
+ *   8 base_time, 9 base_datetime, 10 base_localdatetime, 11 base_localtime
+ */
+void gql_time_compose_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 13 && argc != 14) { sqlite3_result_null(ctx); return; }
+    /* argv[13] (datetime only): the composed date 'YYYY-MM-DD', so a named
+     * zone is resolved at that date, not a fixed summer date (Temporal3 [10]). */
+    int cy = 0, cmo = 0, cd = 0;
+    bool have_date = false;
+    if (argc == 14 && sqlite3_value_type(argv[13]) != SQLITE_NULL) {
+        const char *ds = (const char*)sqlite3_value_text(argv[13]);
+        if (ds && sscanf(ds, "%d-%d-%d", &cy, &cmo, &cd) == 3) have_date = true;
+    }
+    /* drop_region: a Cypher time/localtime value never carries a named zone —
+     * keep only the numeric offset. datetime() passes 0 to retain it. */
+    int drop_region = (sqlite3_value_type(argv[12]) != SQLITE_NULL)
+                          ? sqlite3_value_int(argv[12]) : 0;
+    int h = 0, mi = 0, sec = 0;
+    int64_t ns = 0;
+    bool inherit_subsec = false;
+    int64_t inherited_ns = 0;
+    const char *base_tz = NULL;
+    int base_tz_offset_min = 0;
+    const gql_tz_zone *base_region_zone = NULL;  /* base's zone, resolved at the date */
+    char base_region_name[64] = "";
+    bool base_has_tz = false;
+    /* Inherit from base time/datetime if present. */
+    for (int b = 8; b <= 11; b++) {
+        if (sqlite3_value_type(argv[b]) == SQLITE_NULL) continue;
+        const char *bs = (const char*)sqlite3_value_text(argv[b]);
+        if (!bs) continue;
+        const char *t = strchr(bs, 'T');
+        if (!t) t = (bs[2] == ':') ? bs : NULL;
+        else t += 1;
+        if (!t) continue;
+        if (sscanf(t, "%d:%d:%d", &h, &mi, &sec) >= 2) {
+            const char *dot = strchr(t, '.');
+            if (dot) {
+                char buf[10] = { '0','0','0','0','0','0','0','0','0', 0 };
+                int i; for (i = 0; i < 9 && dot[i+1] >= '0' && dot[i+1] <= '9'; i++) buf[i] = dot[i+1];
+                inherited_ns = atoll(buf);
+                inherit_subsec = true;
+            }
+            /* Inherit tz from base. */
+            for (const char *q = t; *q; q++) {
+                if (*q == 'Z' || *q == '+' || (*q == '-' && q > t + 2) || *q == '[') { base_tz = q; break; }
+            }
+            if (base_tz) {
+                base_has_tz = true;
+                const char *base_region = strchr(base_tz, '[');
+                if (have_date && base_region) {
+                    /* The base's named zone at the composed date: its own
+                     * offset was for its own date. */
+                    char zname[64];
+                    const char *zb = base_region + 1, *ze = strchr(zb, ']');
+                    int zl = ze ? (int)(ze - zb) : (int)strlen(zb);
+                    if (zl > 0 && zl < (int)sizeof(zname)) {
+                        memcpy(zname, zb, (size_t)zl); zname[zl] = 0;
+                        const gql_tz_zone *z = gql_tz_find(zname);
+                        if (z) {
+                            int64_t local = (int64_t)days_from_civil(cy, cmo, cd) * 86400 + h * 3600 + mi * 60 + sec;
+                            base_tz_offset_min = gql_tz_offset_at_local(z, local) / 60;
+                            base_region_zone = z;
+                            snprintf(base_region_name, sizeof(base_region_name), "%s", zname);
+                            goto base_tz_done;
+                        }
+                    }
+                }
+                if (*base_tz == 'Z') base_tz_offset_min = 0;
+                else if (*base_tz == '+' || *base_tz == '-') {
+                    int sign = (*base_tz == '+') ? 1 : -1;
+                    int oh = 0, om = 0;
+                    if (strchr(base_tz + 1, ':')) sscanf(base_tz + 1, "%d:%d", &oh, &om);
+                    else if (strlen(base_tz + 1) >= 4) sscanf(base_tz + 1, "%2d%2d", &oh, &om);
+                    else sscanf(base_tz + 1, "%d", &oh);
+                    base_tz_offset_min = sign * (oh * 60 + om);
+                }
+            }
+        base_tz_done:
+            break;
+        }
+    }
+    /* Scalar overrides. */
+    if (sqlite3_value_type(argv[0]) != SQLITE_NULL) h = sqlite3_value_int(argv[0]);
+    if (sqlite3_value_type(argv[1]) != SQLITE_NULL) mi = sqlite3_value_int(argv[1]);
+    if (sqlite3_value_type(argv[2]) != SQLITE_NULL) sec = sqlite3_value_int(argv[2]);
+
+    /* If both the base has a tz and the map specifies a new `timezone`,
+     * convert the clock time to the new offset (preserving the absolute
+     * instant). This matches openCypher OffsetTime.withOffsetSameInstant /
+     * ZonedDateTime semantics — '12:31+01:00' viewed in '+05:00' becomes
+     * '16:31+05:00'. */
+    if (base_has_tz && sqlite3_value_type(argv[6]) != SQLITE_NULL) {
+        const char *new_tz = (const char*)sqlite3_value_text(argv[6]);
+        int new_offset_min = 0;
+        if (new_tz) {
+            if (*new_tz == 'Z') new_offset_min = 0;
+            else if (*new_tz == '+' || *new_tz == '-') {
+                int sign = (*new_tz == '+') ? 1 : -1;
+                int oh = 0, om = 0;
+                if (strchr(new_tz + 1, ':')) sscanf(new_tz + 1, "%d:%d", &oh, &om);
+                else if (strlen(new_tz + 1) >= 4) sscanf(new_tz + 1, "%2d%2d", &oh, &om);
+                else sscanf(new_tz + 1, "%d", &oh);
+                new_offset_min = sign * (oh * 60 + om);
+            } else if (strchr(new_tz, '/')) {
+                /* Named tz: its offset at the same instant (the composed date
+                 * and the base clock), else a summer date. */
+                const gql_tz_zone *nz = gql_tz_find(new_tz);
+                if (nz && have_date) {
+                    int64_t utc = (int64_t)days_from_civil(cy, cmo, cd) * 86400 + h * 3600 + mi * 60 + sec
+                                - (int64_t)base_tz_offset_min * 60;
+                    new_offset_min = gql_tz_offset_at_utc(nz, utc) / 60;
+                } else {
+                    const char *off = named_tz_offset(new_tz, 2000, 7, 15);
+                    if (*off == '+' || *off == '-') {
+                        int sign = (*off == '+') ? 1 : -1;
+                        int oh, om;
+                        sscanf(off + 1, "%d:%d", &oh, &om);
+                        new_offset_min = sign * (oh * 60 + om);
+                    }
+                }
+            }
+            int shift_min = new_offset_min - base_tz_offset_min;
+            int total_min = h * 60 + mi + shift_min;
+            /* Wrap to a single day. */
+            total_min = ((total_min % 1440) + 1440) % 1440;
+            h = total_min / 60; mi = total_min - h * 60;
+        }
+    }
+    /* Sub-second: explicit override of ns/us/ms wins; else inherited if base. */
+    int subsec_digits = 0; /* 0 = none, 3 = ms, 6 = us, 9 = ns */
+    if (sqlite3_value_type(argv[5]) != SQLITE_NULL) { ns = sqlite3_value_int64(argv[5]); subsec_digits = 9; }
+    else if (sqlite3_value_type(argv[4]) != SQLITE_NULL) { ns = sqlite3_value_int64(argv[4]) * 1000; subsec_digits = 6; }
+    else if (sqlite3_value_type(argv[3]) != SQLITE_NULL) { ns = sqlite3_value_int64(argv[3]) * 1000000; subsec_digits = 3; }
+    else if (inherit_subsec) {
+        ns = inherited_ns;
+        /* Match base's precision exactly so output formatting is preserved. */
+        if (ns % 1000000 == 0) subsec_digits = 3;
+        else if (ns % 1000 == 0) subsec_digits = 6;
+        else subsec_digits = 9;
+    }
+
+    char buf[64];
+    char *p = buf;
+    if (subsec_digits == 0 && sec == 0 && sqlite3_value_type(argv[2]) == SQLITE_NULL && !inherit_subsec) {
+        /* No explicit second and no sub-second → 'HH:MM' (matches TCK style). */
+        p += snprintf(p, sizeof(buf), "%02d:%02d", h, mi);
+    } else if (subsec_digits == 0) {
+        p += snprintf(p, sizeof(buf), "%02d:%02d:%02d", h, mi, sec);
+    } else {
+        int width = subsec_digits;
+        int divisor = (subsec_digits == 3) ? 1000000 : (subsec_digits == 6) ? 1000 : 1;
+        p += snprintf(p, sizeof(buf), "%02d:%02d:%02d.%0*lld", h, mi, sec, width, (long long)(ns / divisor));
+    }
+    /* Timezone */
+    int emit_tz = (sqlite3_value_type(argv[7]) != SQLITE_NULL) ? sqlite3_value_int(argv[7]) : 0;
+    if (emit_tz) {
+        if (sqlite3_value_type(argv[6]) != SQLITE_NULL) {
+            const char *tz = (const char*)sqlite3_value_text(argv[6]);
+            if (tz && strchr(tz, '/')) {
+                /* Named tz — DST-aware offset via shared lookup. The time
+                 * composer lacks the date directly, so we approximate with
+                 * a summer date (most TCK tests with named zones use one).
+                 * For datetime() the outer SQL replaces this when needed. */
+                const char *off = have_date ? named_tz_offset_at(tz, cy, cmo, cd, h, mi, sec)
+                                            : named_tz_offset(tz, 2000, 7, 15);
+                if (drop_region)
+                    p += snprintf(p, sizeof(buf) - (p - buf), "%s", off);
+                else
+                    p += snprintf(p, sizeof(buf) - (p - buf), "%s[%s]", off, tz);
+            } else if (tz) {
+                p += snprintf(p, sizeof(buf) - (p - buf), "%s", tz);
+            }
+        } else if (base_tz) {
+            /* Inherited from a base value. A time value drops any [Region]
+             * suffix, keeping only the offset (Temporal3 [3]). */
+            if (base_region_zone && !drop_region) {
+                /* The base's zone at the composed date (Temporal3 [10]). */
+                char ob[16];
+                gql_tz_format_offset(base_tz_offset_min * 60, ob, (int)sizeof(ob));
+                p += snprintf(p, sizeof(buf) - (p - buf), "%s[%s]", ob, base_region_name);
+            } else if (drop_region) {
+                const char *br = strchr(base_tz, '[');
+                if (br) p += snprintf(p, sizeof(buf) - (p - buf), "%.*s", (int)(br - base_tz), base_tz);
+                else    p += snprintf(p, sizeof(buf) - (p - buf), "%s", base_tz);
+            } else {
+                p += snprintf(p, sizeof(buf) - (p - buf), "%s", base_tz);
+            }
+        } else {
+            *p++ = 'Z'; *p = 0;
+        }
+    }
+    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+/* Construct an openCypher Duration JSON from individual map components.
+ * argv: 0=years, 1=months, 2=weeks, 3=days, 4=hours, 5=minutes, 6=seconds,
+ *       7=milliseconds, 8=microseconds, 9=nanoseconds.
+ *
+ * Fractional values cascade into smaller units (e.g., years=12.5 contributes
+ * 6 months). The result is the same Duration JSON used elsewhere with
+ * `_iso8601` plus months/days/seconds/nanosecondsOfSecond accessor fields. */
+void gql_duration_compose_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 10) { sqlite3_result_null(ctx); return; }
+    /* Check whether each input is fractional to choose integer vs double
+     * math (integer math avoids floating-point drift in the common case). */
+    bool has_frac = false;
+    for (int i = 0; i < 10; i++) {
+        if (sqlite3_value_type(argv[i]) == SQLITE_FLOAT) { has_frac = true; break; }
+    }
+
+    long long total_months;
+    long long total_days;
+    long long total_secs; /* whole seconds of the time part (signed) */
+    long long total_ns;   /* nanoseconds beyond total_secs (signed) */
+
+    if (!has_frac) {
+        /* Pure-integer path — exact arithmetic. */
+        long long years = sqlite3_value_int64(argv[0]);
+        long long months = sqlite3_value_int64(argv[1]);
+        long long weeks = sqlite3_value_int64(argv[2]);
+        long long days = sqlite3_value_int64(argv[3]);
+        long long hours = sqlite3_value_int64(argv[4]);
+        long long minutes = sqlite3_value_int64(argv[5]);
+        long long seconds = sqlite3_value_int64(argv[6]);
+        long long ms = sqlite3_value_int64(argv[7]);
+        long long us = sqlite3_value_int64(argv[8]);
+        long long ns = sqlite3_value_int64(argv[9]);
+        total_months = years * 12 + months;
+        total_days = weeks * 7 + days;
+        total_secs = hours * 3600LL + minutes * 60LL + seconds;
+        total_ns = ms * 1000000LL + us * 1000LL + ns;
+    } else {
+        /* Fractional path — cascade via double, watching for tiny drift.
+         * Fractional months convert to days at 30 days/month (openCypher
+         * convention). */
+        double years = sqlite3_value_double(argv[0]);
+        double months = sqlite3_value_double(argv[1]);
+        double weeks = sqlite3_value_double(argv[2]);
+        double days = sqlite3_value_double(argv[3]);
+        double hours = sqlite3_value_double(argv[4]);
+        double minutes = sqlite3_value_double(argv[5]);
+        double seconds = sqlite3_value_double(argv[6]);
+        double ms = sqlite3_value_double(argv[7]);
+        double us = sqlite3_value_double(argv[8]);
+        double ns = sqlite3_value_double(argv[9]);
+        double total_months_d = years * 12.0 + months;
+        total_months = (long long)total_months_d;
+        double frac_months = total_months_d - total_months;
+        /* Fractional months convert to days at the average Gregorian month
+         * (365.2425/12 = 30.436875 days), matching Cypher duration arithmetic
+         * (Temporal8 [6]). */
+        double total_days_d = weeks * 7.0 + days + frac_months * 30.436875;
+        total_days = (long long)total_days_d;
+        double frac_days = total_days_d - total_days;
+        double total_seconds_d = frac_days * 86400.0 + hours * 3600.0
+                               + minutes * 60.0 + seconds;
+        total_secs = (long long)total_seconds_d;
+        double frac_secs = total_seconds_d - total_secs;
+        long long total_ns_from_secs = (long long)(frac_secs * 1e9 + 0.5);
+        long long extra_ns = (long long)(ms * 1e6 + us * 1e3 + ns + 0.5);
+        total_ns = total_ns_from_secs + extra_ns;
+    }
+
+    /* Cypher durations do NOT normalize sub-day time into the days field — the
+     * seconds component keeps hours even past 24 (e.g. `PT67H`, Temporal8 [6]).
+     * Only weeks→days and the fractional month/day carries above feed `days`;
+     * the time residue stays in (`total_secs`, `total_ns`). The accessor
+     * fields .days/.seconds/.nanos are NOT calendar-decomposed — they reflect
+     * the stored components; emit_duration_json_split (also used by duration
+     * addition) only floor-normalises nanos into [0, 1e9). */
+    emit_duration_json_split(ctx, total_months, total_days, total_secs, total_ns);
+}
+
+/* Parse an ISO 8601 duration string 'P[nY][nM][nW][nD][T[nH][nM][n[.f]S]]'.
+ * Returns Duration JSON (same shape as compose). */
+void gql_duration_parse_iso_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(ctx); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s || *s != 'P') { sqlite3_result_null(ctx); return; }
+    double years = 0, months = 0, weeks = 0, days = 0;
+    double hours = 0, minutes = 0, seconds = 0;
+    bool in_time = false;
+    const char *p = s + 1;
+    /* Alternate ISO form P[YYYY]-[MM]-[DD]T[hh]:[mm]:[ss] (Temporal2 [7] ex8).
+     * Detected by date-style dashes after 'P'; the unit-letter form below has
+     * none. */
+    {
+        int Y = 0, Mo = 0, D = 0, H = 0, Mi = 0; double S = 0;
+        int n = sscanf(p, "%d-%d-%dT%d:%d:%lf", &Y, &Mo, &D, &H, &Mi, &S);
+        if (n >= 3 && strchr(p, '-')) {
+            years = Y; months = Mo; days = D;
+            if (n >= 4) hours = H;
+            if (n >= 5) minutes = Mi;
+            if (n >= 6) seconds = S;
+            p = ""; /* skip the unit-letter loop below */
+        }
+    }
+    while (*p) {
+        if (*p == 'T') { in_time = true; p++; continue; }
+        /* Parse a numeric value (with optional sign + fractional). */
+        char *end;
+        double v = strtod(p, &end);
+        if (end == p) break;
+        char unit = *end;
+        if (!unit) break;
+        if (!in_time) {
+            switch (unit) {
+                case 'Y': years = v; break;
+                case 'M': months = v; break;
+                case 'W': weeks = v; break;
+                case 'D': days = v; break;
+                default: break;
+            }
+        } else {
+            switch (unit) {
+                case 'H': hours = v; break;
+                case 'M': minutes = v; break;
+                case 'S': seconds = v; break;
+                default: break;
+            }
+        }
+        p = end + 1;
+    }
+    /* Reuse the compose path via a synthetic argv. */
+    sqlite3_value *vals[10];
+    for (int i = 0; i < 10; i++) vals[i] = NULL;
+    double inputs[10] = { years, months, weeks, days, hours, minutes, seconds, 0, 0, 0 };
+    /* We need sqlite3_value objects to pass; simpler: inline the compose logic. */
+    double total_months_d = years * 12.0 + months;
+    long long total_months = (long long)total_months_d;
+    double frac_months = total_months_d - total_months;
+    /* Fractional months cascade to days at the average Gregorian month
+     * (30.436875), matching Cypher (Temporal2 [7] 'P0.75M'). */
+    double total_days_d = weeks * 7.0 + days + frac_months * 30.436875;
+    long long total_days = (long long)total_days_d;
+    double frac_days = total_days_d - total_days;
+    double total_seconds_d = frac_days * 86400.0 + hours * 3600.0 + minutes * 60.0 + seconds;
+    long long total_secs = (long long)total_seconds_d;
+    double frac_secs = total_seconds_d - total_secs;
+    /* Round half away from zero — the constant +0.5 truncated negative
+     * fractional seconds the wrong way (PT-1.999S → -1.998999999S). */
+    long long total_ns_from_secs = (long long)(frac_secs * 1e9 + (frac_secs >= 0 ? 0.5 : -0.5));
+    long long total_ns = total_secs * 1000000000LL + total_ns_from_secs;
+    /* Durations keep days and the sub-day time part as independent signed
+     * components — do NOT carry sub-day seconds into days (a day is not always
+     * 86400s, and PT-1.999S must stay a time duration, not -1 day + 23:59:58).
+     * emit_duration_json applies the same floor-normalization as the
+     * duration(map) path, so ISO round-trips equal the original. (Temporal6 [6].) */
+    emit_duration_json(ctx, total_months, total_days, total_ns);
+    (void)inputs; (void)vals;
+}
+
+/* Property accessor for a temporal/Duration string.
+ * Handles all openCypher accessors:
+ *   date/datetime/localdatetime: year, quarter, month, week, weekYear,
+ *                                 day, ordinalDay, weekDay, dayOfQuarter
+ *   time/datetime: hour, minute, second, millisecond, microsecond,
+ *                  nanosecond, timezone, offset, offsetMinutes, epochSeconds,
+ *                  epochMillis
+ *   duration (Duration JSON): pass through to json_extract on the JSON.
+ *
+ * Returns NULL on parse failure or unknown field.
+ */
+/* Duration component accessors (Temporal5 [7]). All derive from the normalized
+ * {months, days, seconds, nanosecondsOfSecond}. argv[0]=duration JSON,
+ * argv[1]=field. */
+void gql_duration_field_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 2 || sqlite3_value_type(argv[0]) == SQLITE_NULL ||
+        sqlite3_value_type(argv[1]) == SQLITE_NULL) { sqlite3_result_null(ctx); return; }
+    const char *j = (const char*)sqlite3_value_text(argv[0]);
+    const char *f = (const char*)sqlite3_value_text(argv[1]);
+    if (!j || !f) { sqlite3_result_null(ctx); return; }
+    long long m  = dur_field_ll(j, "months");
+    long long da = dur_field_ll(j, "days");
+    long long s  = dur_field_ll(j, "seconds");
+    long long ns = dur_field_ll(j, "nanosecondsOfSecond");
+    long long r;
+    if      (!strcmp(f, "years"))                r = m / 12;
+    else if (!strcmp(f, "quarters"))             r = m / 3;
+    else if (!strcmp(f, "months"))               r = m;
+    else if (!strcmp(f, "monthsOfYear"))         r = m % 12;
+    else if (!strcmp(f, "monthsOfQuarter"))      r = m % 3;
+    else if (!strcmp(f, "quartersOfYear"))       r = (m / 3) % 4;
+    else if (!strcmp(f, "weeks"))                r = da / 7;
+    else if (!strcmp(f, "days"))                 r = da;
+    else if (!strcmp(f, "daysOfWeek"))           r = da % 7;
+    else if (!strcmp(f, "hours"))                r = s / 3600;
+    else if (!strcmp(f, "minutes"))              r = s / 60;
+    else if (!strcmp(f, "minutesOfHour"))        r = (s / 60) % 60;
+    else if (!strcmp(f, "seconds"))              r = s;
+    else if (!strcmp(f, "secondsOfMinute"))      r = s % 60;
+    else if (!strcmp(f, "milliseconds"))         r = s * 1000LL + ns / 1000000LL;
+    else if (!strcmp(f, "millisecondsOfSecond")) r = ns / 1000000LL;
+    else if (!strcmp(f, "microseconds"))         r = s * 1000000LL + ns / 1000LL;
+    else if (!strcmp(f, "microsecondsOfSecond")) r = ns / 1000LL;
+    else if (!strcmp(f, "nanoseconds"))          r = s * 1000000000LL + ns;
+    else if (!strcmp(f, "nanosecondsOfSecond"))  r = ns;
+    else { sqlite3_result_null(ctx); return; }
+    sqlite3_result_int64(ctx, r);
+}
+
+void gql_temporal_field_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 2) { sqlite3_result_null(ctx); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    const char *field = (const char*)sqlite3_value_text(argv[1]);
+    if (!s || !field) { sqlite3_result_null(ctx); return; }
+
+    /* Duration object: pass through via simple JSON extraction. */
+    if (s[0] == '{') {
+        /* The caller already wraps with COALESCE(json_extract(...), ...) — so
+         * fall through to null on this path; the JSON extract handles it. */
+        sqlite3_result_null(ctx);
+        return;
+    }
+
+    tparts p;
+    if (!parse_temporal_parts(s, &p)) { sqlite3_result_null(ctx); return; }
+
+    /* Date/datetime accessors. */
+    if (p.has_date) {
+        if (strcmp(field, "year") == 0) { sqlite3_result_int(ctx, p.y); return; }
+        if (strcmp(field, "month") == 0) { sqlite3_result_int(ctx, p.mo); return; }
+        if (strcmp(field, "day") == 0) { sqlite3_result_int(ctx, p.d); return; }
+        if (strcmp(field, "quarter") == 0) { sqlite3_result_int(ctx, (p.mo - 1) / 3 + 1); return; }
+        if (strcmp(field, "dayOfQuarter") == 0) {
+            int qstart_mo = ((p.mo - 1) / 3) * 3 + 1;
+            struct tm a, b; memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+            a.tm_year = p.y - 1900; a.tm_mon = qstart_mo - 1; a.tm_mday = 1;
+            b.tm_year = p.y - 1900; b.tm_mon = p.mo - 1; b.tm_mday = p.d;
+            int days = (int)((timegm(&b) - timegm(&a)) / 86400) + 1;
+            sqlite3_result_int(ctx, days);
+            return;
+        }
+        if (strcmp(field, "ordinalDay") == 0) {
+            struct tm a, b; memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+            a.tm_year = p.y - 1900; a.tm_mon = 0; a.tm_mday = 1;
+            b.tm_year = p.y - 1900; b.tm_mon = p.mo - 1; b.tm_mday = p.d;
+            int days = (int)((timegm(&b) - timegm(&a)) / 86400) + 1;
+            sqlite3_result_int(ctx, days);
+            return;
+        }
+        if (strcmp(field, "weekDay") == 0 || strcmp(field, "dayOfWeek") == 0) {
+            struct tm t; memset(&t, 0, sizeof(t));
+            t.tm_year = p.y - 1900; t.tm_mon = p.mo - 1; t.tm_mday = p.d;
+            time_t ts = timegm(&t);
+            struct tm *gt = gmtime(&ts);
+            int wd = (gt->tm_wday + 6) % 7 + 1;  /* Mon=1..Sun=7 */
+            sqlite3_result_int(ctx, wd);
+            return;
+        }
+        if (strcmp(field, "week") == 0 || strcmp(field, "weekYear") == 0) {
+            /* ISO week + week-year: find Thursday of week containing the date. */
+            struct tm t; memset(&t, 0, sizeof(t));
+            t.tm_year = p.y - 1900; t.tm_mon = p.mo - 1; t.tm_mday = p.d;
+            time_t ts = timegm(&t);
+            struct tm *gt = gmtime(&ts);
+            int weekday = gt->tm_wday;  /* 0=Sun..6=Sat */
+            int days_to_thu = 3 - ((weekday + 6) % 7);
+            time_t thu = ts + (time_t)days_to_thu * 86400;
+            struct tm *tt = gmtime(&thu);
+            int wy = tt->tm_year + 1900;
+            if (strcmp(field, "weekYear") == 0) { sqlite3_result_int(ctx, wy); return; }
+            /* Week number = (ordinal_day of Thursday + 6) / 7 with day-of-year. */
+            struct tm jan1; memset(&jan1, 0, sizeof(jan1));
+            jan1.tm_year = tt->tm_year; jan1.tm_mon = 0; jan1.tm_mday = 1;
+            int doy = (int)((thu - timegm(&jan1)) / 86400) + 1;
+            int week = (doy + 6) / 7;
+            sqlite3_result_int(ctx, week);
+            return;
+        }
+    }
+    /* Time accessors. */
+    if (p.has_time) {
+        if (strcmp(field, "hour") == 0) { sqlite3_result_int(ctx, p.h); return; }
+        if (strcmp(field, "minute") == 0) { sqlite3_result_int(ctx, p.mi); return; }
+        if (strcmp(field, "second") == 0) { sqlite3_result_int(ctx, p.sec); return; }
+        if (strcmp(field, "millisecond") == 0) { sqlite3_result_int(ctx, (int)(p.ns / 1000000)); return; }
+        if (strcmp(field, "microsecond") == 0) { sqlite3_result_int(ctx, (int)(p.ns / 1000)); return; }
+        if (strcmp(field, "nanosecond") == 0) { sqlite3_result_int64(ctx, p.ns); return; }
+    }
+    if (p.has_tz) {
+        if (strcmp(field, "offsetMinutes") == 0) { sqlite3_result_int(ctx, p.tz_offset_min); return; }
+        if (strcmp(field, "offsetSeconds") == 0) { sqlite3_result_int(ctx, p.tz_offset_min * 60); return; }
+        if (strcmp(field, "timezone") == 0) {
+            /* `.timezone` returns the named zone when present (e.g.
+             * 'Europe/Stockholm'), otherwise the numeric offset (Temporal5 [6]). */
+            const char *lb = s ? strchr(s, '[') : NULL;
+            if (lb) {
+                const char *rb = strchr(lb, ']');
+                int zlen = rb ? (int)(rb - lb - 1) : (int)strlen(lb + 1);
+                sqlite3_result_text(ctx, lb + 1, zlen, SQLITE_TRANSIENT);
+                return;
+            }
+            /* fall through to offset form below */
+        }
+        if (strcmp(field, "offset") == 0 || strcmp(field, "timezone") == 0) {
+            char buf[16];
+            int oh = p.tz_offset_min / 60;
+            int om = p.tz_offset_min - oh * 60;
+            if (om < 0) om = -om;
+            snprintf(buf, sizeof(buf), "%+03d:%02d", oh, om);
+            sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+            return;
+        }
+    }
+    /* epochSeconds / epochMillis. */
+    if (p.has_date && p.has_time) {
+        if (strcmp(field, "epochSeconds") == 0 || strcmp(field, "epochMillis") == 0) {
+            struct tm t; memset(&t, 0, sizeof(t));
+            t.tm_year = p.y - 1900; t.tm_mon = p.mo - 1; t.tm_mday = p.d;
+            t.tm_hour = p.h; t.tm_min = p.mi; t.tm_sec = p.sec;
+            time_t ts = timegm(&t) - (time_t)p.tz_offset_min * 60;
+            if (strcmp(field, "epochSeconds") == 0) { sqlite3_result_int64(ctx, (int64_t)ts); return; }
+            sqlite3_result_int64(ctx, (int64_t)ts * 1000 + p.ns / 1000000);
+            return;
+        }
+    }
+    sqlite3_result_null(ctx);
+}
+
+/* Normalize a date string to canonical YYYY-MM-DD. Accepts:
+ *   YYYY-MM-DD / YYYYMMDD
+ *   YYYY-MM   / YYYYMM            (day defaults to 1)
+ *   YYYY                          (month, day default to 1)
+ *   YYYY-Www-D / YYYYWwwD         (ISO week date, full)
+ *   YYYY-Www   / YYYYWww          (ISO week, dayOfWeek defaults to 1)
+ *   YYYY-DDD  / YYYYDDD           (ordinal day)
+ * Returns NULL on parse failure. */
+void gql_normalize_date_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(ctx); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(ctx); return; }
+    /* date(datetime/localdatetime): keep only the date portion before the 'T'
+     * so '1984-11-11T12:31:14' yields '1984-11-11' rather than failing the
+     * length checks below (Temporal3 [1] ex8/15). */
+    char datebuf[32];
+    const char *Tpos = strchr(s, 'T');
+    if (Tpos) {
+        size_t dlen = (size_t)(Tpos - s);
+        if (dlen >= sizeof(datebuf)) dlen = sizeof(datebuf) - 1;
+        memcpy(datebuf, s, dlen);
+        datebuf[dlen] = 0;
+        s = datebuf;
+    }
+    int len = (int)strlen(s);
+    bool has_W = strchr(s, 'W') != NULL;
+    bool has_dash = strchr(s, '-') != NULL;
+    /* Extended year: explicit sign + 4..9 digits ('-999999999-01-01'). */
+    bool ext_year = (s[0] == '+' || s[0] == '-') && s[1] >= '0' && s[1] <= '9';
+    int y = 0, mo = 1, d = 1;
+    int week = 0, dow = 1, ord = 0;
+    bool from_week = false, from_ord = false;
+
+    if (ext_year) {
+        const char *after = NULL;
+        if (!parse_iso_date_head(s, &y, &mo, &d, &after) || *after) {
+            sqlite3_result_null(ctx); return;
+        }
+    } else if (has_W) {
+        from_week = true;
+        if (has_dash) {
+            int n = sscanf(s, "%d-W%d-%d", &y, &week, &dow);
+            if (n < 2) { sqlite3_result_null(ctx); return; }
+        } else {
+            if (len < 7) { sqlite3_result_null(ctx); return; }
+            char yb[5] = {0}; memcpy(yb, s, 4); y = atoi(yb);
+            char wb[3] = {0}; memcpy(wb, s + 5, 2); week = atoi(wb);
+            if (len >= 8) dow = s[7] - '0';
+        }
+    } else if (has_dash) {
+        if (len == 10 && sscanf(s, "%d-%d-%d", &y, &mo, &d) == 3) { /* ok */ }
+        else if (len == 8) {
+            /* YYYY-DDD ordinal */
+            from_ord = true;
+            if (sscanf(s, "%d-%d", &y, &ord) < 2) { sqlite3_result_null(ctx); return; }
+        } else if (len == 7) {
+            if (sscanf(s, "%d-%d", &y, &mo) < 2) { sqlite3_result_null(ctx); return; }
+            d = 1;
+        } else { sqlite3_result_null(ctx); return; }
+    } else {
+        if (len == 8) {
+            char yb[5]={0}, mob[3]={0}, db[3]={0};
+            memcpy(yb, s, 4); memcpy(mob, s + 4, 2); memcpy(db, s + 6, 2);
+            y = atoi(yb); mo = atoi(mob); d = atoi(db);
+        } else if (len == 7) {
+            /* YYYYDDD ordinal */
+            from_ord = true;
+            char yb[5]={0}, ob[4]={0};
+            memcpy(yb, s, 4); memcpy(ob, s + 4, 3);
+            y = atoi(yb); ord = atoi(ob);
+        } else if (len == 6) {
+            char yb[5]={0}, mob[3]={0};
+            memcpy(yb, s, 4); memcpy(mob, s + 4, 2);
+            y = atoi(yb); mo = atoi(mob); d = 1;
+        } else if (len == 4) {
+            y = atoi(s);
+        } else { sqlite3_result_null(ctx); return; }
+    }
+
+    char buf[32];
+    int oy, omm, odd;
+    if (from_week) {
+        int monday_offset = (weekday_of(y, 1, 4) + 6) % 7;
+        long long jan4_days = days_from_civil(y, 1, 4);
+        long long target = jan4_days - monday_offset + (long long)(week - 1) * 7 + (dow - 1);
+        civil_from_days(target, &oy, &omm, &odd);
+        format_iso_date(buf, sizeof(buf), oy, omm, odd);
+    } else if (from_ord) {
+        long long target = days_from_civil(y, 1, 1) + (ord - 1);
+        civil_from_days(target, &oy, &omm, &odd);
+        format_iso_date(buf, sizeof(buf), oy, omm, odd);
+    } else {
+        format_iso_date(buf, sizeof(buf), y, mo, d);
+    }
+    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+/* Normalize a time string to canonical 'HH:MM[:SS[.fff]][tz]'.
+ * Accepts an optional leading 'YYYY-MM-DDT' (datetime input — we extract
+ * just the time portion). */
+void gql_normalize_time_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(ctx); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(ctx); return; }
+    const char *T = strchr(s, 'T');
+    if (T) s = T + 1;
+
+    /* Split tz suffix off. */
+    const char *p = s;
+    const char *tz = NULL;
+    while (*p && !(*p == 'Z' || (*p == '+' && p > s) || (*p == '-' && p > s + 2) || *p == '[')) p++;
+    if (*p) tz = p;
+    int main_len = (int)(p - s);
+
+    /* Parse time portion. */
+    int h = 0, mi = 0, sec = 0;
+    int64_t ns = 0;
+    int subsec_digits = 0;
+    char timepart[32];
+    int copy_len = main_len < 31 ? main_len : 31;
+    memcpy(timepart, s, copy_len);
+    timepart[copy_len] = 0;
+
+    char *dot = strchr(timepart, '.');
+    if (dot) {
+        *dot = 0;
+        const char *frac = dot + 1;
+        int i; char buf[10] = "000000000";
+        for (i = 0; i < 9 && frac[i] >= '0' && frac[i] <= '9'; i++) buf[i] = frac[i];
+        ns = atoll(buf);
+        subsec_digits = i;
+        main_len = (int)(dot - timepart);
+    }
+
+    bool has_colon = strchr(timepart, ':') != NULL;
+    if (has_colon) {
+        int n = sscanf(timepart, "%d:%d:%d", &h, &mi, &sec);
+        if (n < 2) { sqlite3_result_null(ctx); return; }
+    } else {
+        /* Basic form HH, HHMM, HHMMSS. */
+        if (main_len == 2) sscanf(timepart, "%2d", &h);
+        else if (main_len == 4) sscanf(timepart, "%2d%2d", &h, &mi);
+        else if (main_len == 6) sscanf(timepart, "%2d%2d%2d", &h, &mi, &sec);
+        else { sqlite3_result_null(ctx); return; }
+    }
+
+    /* Normalize tz. */
+    char tz_out[64] = "";
+    if (tz) {
+        if (*tz == 'Z') {
+            strcpy(tz_out, "Z");
+        } else if (*tz == '+' || *tz == '-') {
+            /* Possible '+HHMM', '+HH:MM', '+HH', followed by optional '[Name]'. */
+            const char *bracket = strchr(tz, '[');
+            int tz_main_len = bracket ? (int)(bracket - tz) : (int)strlen(tz);
+            char tz_main[16] = {0};
+            int cl = tz_main_len < 15 ? tz_main_len : 15;
+            memcpy(tz_main, tz, cl);
+            tz_main[cl] = 0;
+
+            int oh = 0, om = 0;
+            if (strchr(tz_main + 1, ':')) {
+                sscanf(tz_main + 1, "%d:%d", &oh, &om);
+            } else {
+                if (strlen(tz_main + 1) >= 4) sscanf(tz_main + 1, "%2d%2d", &oh, &om);
+                else sscanf(tz_main + 1, "%d", &oh);
+            }
+            /* A `time` value carries only the numeric offset — the named-zone
+             * bracket (e.g. [Europe/Stockholm], already resolved to the offset)
+             * is dropped (only datetime keeps the zone name). Temporal3 [3].
+             * A zero offset renders as `Z`, not `±00:00` (Temporal2 [3]). */
+            if (oh == 0 && om == 0)
+                snprintf(tz_out, sizeof(tz_out), "Z");
+            else
+                snprintf(tz_out, sizeof(tz_out), "%c%02d:%02d", tz_main[0], oh, om);
+        }
+    }
+
+    /* Compose output. Drop seconds + sub-second when zero & not in source. */
+    char out[80];
+    char *o = out;
+    if (subsec_digits > 0) {
+        int width = subsec_digits;
+        int64_t shown = ns;
+        /* ns is already padded to 9 digits in the parser; reduce to width. */
+        int divisor = 1;
+        for (int i = width; i < 9; i++) divisor *= 10;
+        shown = ns / divisor;
+        o += snprintf(o, sizeof(out), "%02d:%02d:%02d.%0*lld", h, mi, sec, width, (long long)shown);
+    } else if (has_colon ? (sscanf(s, "%*d:%*d:%d", &sec) == 1) : (main_len == 6)) {
+        o += snprintf(o, sizeof(out), "%02d:%02d:%02d", h, mi, sec);
+    } else {
+        o += snprintf(o, sizeof(out), "%02d:%02d", h, mi);
+    }
+    o += snprintf(o, sizeof(out) - (o - out), "%s", tz_out);
+    sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
+}
+
+/* Normalize a datetime string: date portion + 'T' + time portion. */
+void gql_normalize_datetime_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != 1) { sqlite3_result_null(ctx); return; }
+    const char *s = (const char*)sqlite3_value_text(argv[0]);
+    if (!s) { sqlite3_result_null(ctx); return; }
+    const char *t = strchr(s, 'T');
+    if (!t) {
+        /* No time portion — defer to date normalize and append T00:00. */
+        sqlite3_value *one[1] = { (sqlite3_value*)argv[0] };
+        gql_normalize_date_func(ctx, 1, one);
+        return;
+    }
+    int date_len = (int)(t - s);
+    char date_part[32] = {0};
+    int cl = date_len < 31 ? date_len : 31;
+    memcpy(date_part, s, cl);
+    date_part[cl] = 0;
+    /* Normalize date portion via the date helper (one-arg). */
+    sqlite3_value *one[1];
+    one[0] = sqlite3_value_dup(argv[0]);
+    /* Manually invoke the date normalizer with the substring. */
+    char normalized_date[32] = {0};
+    {
+        /* Re-implement the date normalize logic inline for the substring. */
+        const char *ds = date_part;
+        int len = (int)strlen(ds);
+        bool has_W = strchr(ds, 'W') != NULL;
+        bool has_dash = strchr(ds, '-') != NULL;
+        /* Extended year: explicit sign + 4..9 digits ('+999999999-12-31'). */
+        bool ext_year = (ds[0] == '+' || ds[0] == '-') && ds[1] >= '0' && ds[1] <= '9';
+        int y = 0, mo = 1, d = 1, week = 0, dow = 1, ord = 0;
+        bool from_week = false, from_ord = false;
+        if (ext_year) {
+            const char *after = NULL;
+            if (!parse_iso_date_head(ds, &y, &mo, &d, &after) || *after) goto bad;
+        } else if (has_W) {
+            from_week = true;
+            if (has_dash) {
+                int n = sscanf(ds, "%d-W%d-%d", &y, &week, &dow);
+                if (n < 2) goto bad;
+            } else {
+                if (len < 7) goto bad;
+                char yb[5] = {0}; memcpy(yb, ds, 4); y = atoi(yb);
+                char wb[3] = {0}; memcpy(wb, ds + 5, 2); week = atoi(wb);
+                if (len >= 8) dow = ds[7] - '0';
+            }
+        } else if (has_dash) {
+            if (len == 10 && sscanf(ds, "%d-%d-%d", &y, &mo, &d) == 3) { /* ok */ }
+            else if (len == 8) { from_ord = true; sscanf(ds, "%d-%d", &y, &ord); }
+            else if (len == 7) sscanf(ds, "%d-%d", &y, &mo);
+            else goto bad;
+        } else {
+            if (len == 8) {
+                char yb[5]={0}, mob[3]={0}, db[3]={0};
+                memcpy(yb, ds, 4); memcpy(mob, ds + 4, 2); memcpy(db, ds + 6, 2);
+                y = atoi(yb); mo = atoi(mob); d = atoi(db);
+            } else if (len == 7) {
+                from_ord = true;
+                char yb[5]={0}, ob[4]={0};
+                memcpy(yb, ds, 4); memcpy(ob, ds + 4, 3);
+                y = atoi(yb); ord = atoi(ob);
+            } else if (len == 6) {
+                char yb[5]={0}, mob[3]={0};
+                memcpy(yb, ds, 4); memcpy(mob, ds + 4, 2);
+                y = atoi(yb); mo = atoi(mob);
+            } else if (len == 4) {
+                y = atoi(ds);
+            } else goto bad;
+        }
+        /* Week and ordinal dates go through the same proleptic-Gregorian
+         * integer arithmetic as gql_normalize_date_func (days_from_civil /
+         * civil_from_days / weekday_of) rather than timegm()/gmtime(), so
+         * the rendering does not depend on the platform's libc time range or
+         * behaviour (GQLITE-T-0301: byte-identical output on macOS and Linux). */
+        int oy, omm, odd;
+        if (from_week) {
+            int monday_off = (weekday_of(y, 1, 4) + 6) % 7;
+            long long jan4_days = days_from_civil(y, 1, 4);
+            long long target = jan4_days - monday_off + (long long)(week - 1) * 7 + (dow - 1);
+            civil_from_days(target, &oy, &omm, &odd);
+            format_iso_date(normalized_date, sizeof(normalized_date), oy, omm, odd);
+        } else if (from_ord) {
+            long long target = days_from_civil(y, 1, 1) + (ord - 1);
+            civil_from_days(target, &oy, &omm, &odd);
+            format_iso_date(normalized_date, sizeof(normalized_date), oy, omm, odd);
+        } else {
+            format_iso_date(normalized_date, sizeof(normalized_date), y, mo, d);
+        }
+        goto ok;
+    bad:
+        sqlite3_value_free(one[0]);
+        sqlite3_result_null(ctx);
+        return;
+    ok: ;
+    }
+    sqlite3_value_free(one[0]);
+
+    /* Normalize time portion: rebuild argv with just the time portion. */
+    sqlite3_value *tv = sqlite3_value_dup(argv[0]);
+    sqlite3_value_free(tv);
+    /* Just call our time normalizer inline by allocating a value. */
+    /* Simpler: manually do the time normalize here. */
+    const char *time_str = t + 1;
+    /* Re-use same logic: find tz, parse h/mi/sec/ns, compose. */
+    {
+        const char *p = time_str;
+        const char *tz_start = NULL;
+        while (*p && !(*p == 'Z' || (*p == '+' && p > time_str) || (*p == '-' && p > time_str + 2) || *p == '[')) p++;
+        if (*p) tz_start = p;
+        int main_len = (int)(p - time_str);
+
+        int h = 0, mi = 0, sec = 0;
+        int64_t ns = 0;
+        int subsec_digits = 0;
+        bool has_seconds = false;
+        char timepart[32] = {0};
+        int cl2 = main_len < 31 ? main_len : 31;
+        memcpy(timepart, time_str, cl2);
+
+        char *dot2 = strchr(timepart, '.');
+        if (dot2) {
+            *dot2 = 0;
+            const char *frac = dot2 + 1;
+            int i; char buf[10] = "000000000";
+            for (i = 0; i < 9 && frac[i] >= '0' && frac[i] <= '9'; i++) buf[i] = frac[i];
+            ns = atoll(buf);
+            subsec_digits = i;
+            main_len = (int)(dot2 - timepart);
+        }
+
+        bool has_colon = strchr(timepart, ':') != NULL;
+        if (has_colon) {
+            int n = sscanf(timepart, "%d:%d:%d", &h, &mi, &sec);
+            has_seconds = (n >= 3);
+        } else {
+            if (main_len == 2) sscanf(timepart, "%2d", &h);
+            else if (main_len == 4) sscanf(timepart, "%2d%2d", &h, &mi);
+            else if (main_len == 6) { sscanf(timepart, "%2d%2d%2d", &h, &mi, &sec); has_seconds = true; }
+            else { sqlite3_result_null(ctx); return; }
+        }
+
+        char tz_out[64] = "";
+        if (tz_start) {
+            if (*tz_start == 'Z') strcpy(tz_out, "Z");
+            else if (*tz_start == '+' || *tz_start == '-') {
+                const char *bracket = strchr(tz_start, '[');
+                int tz_main_len = bracket ? (int)(bracket - tz_start) : (int)strlen(tz_start);
+                char tz_main[16] = {0};
+                int xl = tz_main_len < 15 ? tz_main_len : 15;
+                memcpy(tz_main, tz_start, xl);
+                int oh = 0, om = 0;
+                if (strchr(tz_main + 1, ':')) sscanf(tz_main + 1, "%d:%d", &oh, &om);
+                else if (strlen(tz_main + 1) >= 4) sscanf(tz_main + 1, "%2d%2d", &oh, &om);
+                else sscanf(tz_main + 1, "%d", &oh);
+                /* A zero numeric offset with no named zone renders as `Z`
+                 * (Temporal2 [5]); a named zone keeps the explicit offset. */
+                if (oh == 0 && om == 0 && !bracket)
+                    snprintf(tz_out, sizeof(tz_out), "Z");
+                else
+                    snprintf(tz_out, sizeof(tz_out), "%c%02d:%02d%s", tz_main[0], oh, om, bracket ? bracket : "");
+            } else if (*tz_start == '[') {
+                /* A named zone with no offset: insert the zone's offset at
+                 * this local time, e.g. +01:00 for London in July, +00:53:28
+                 * (local mean time) for Stockholm in 1818 (Temporal2 [6]). */
+                char zname[64] = "";
+                const char *ze = strchr(tz_start + 1, ']');
+                int zl = ze ? (int)(ze - tz_start - 1) : (int)strlen(tz_start + 1);
+                int zy = 0, zmo = 0, zd = 0;
+                const gql_tz_zone *z = NULL;
+                if (zl > 0 && zl < (int)sizeof(zname)) {
+                    memcpy(zname, tz_start + 1, (size_t)zl);
+                    z = gql_tz_find(zname);
+                }
+                if (z && sscanf(normalized_date, "%d-%d-%d", &zy, &zmo, &zd) == 3) {
+                    int64_t local = (int64_t)days_from_civil(zy, zmo, zd) * 86400 + h * 3600 + mi * 60 + sec;
+                    char ob[16];
+                    gql_tz_format_offset(gql_tz_offset_at_local(z, local), ob, (int)sizeof(ob));
+                    snprintf(tz_out, sizeof(tz_out), "%s%s", ob, tz_start);
+                } else {
+                    snprintf(tz_out, sizeof(tz_out), "%s", tz_start);
+                }
+            }
+        }
+
+        char out[96];
+        char *o = out;
+        o += snprintf(o, sizeof(out), "%sT", normalized_date);
+        if (subsec_digits > 0) {
+            int width = subsec_digits;
+            int divisor = 1;
+            for (int i = width; i < 9; i++) divisor *= 10;
+            o += snprintf(o, sizeof(out) - (o - out), "%02d:%02d:%02d.%0*lld",
+                          h, mi, sec, width, (long long)(ns / divisor));
+        } else if (has_seconds) {
+            o += snprintf(o, sizeof(out) - (o - out), "%02d:%02d:%02d", h, mi, sec);
+        } else {
+            o += snprintf(o, sizeof(out) - (o - out), "%02d:%02d", h, mi);
+        }
+        o += snprintf(o, sizeof(out) - (o - out), "%s", tz_out);
+        sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
+    }
+}
+
+/* Diff (b - a) in nanoseconds between two ISO temporal strings. */
+void gql_temporal_diff_ns_func(
+    sqlite3_context *ctx, int argc, sqlite3_value **argv
+) {
+    if (argc != 2) { sqlite3_result_int64(ctx, 0); return; }
+    const char *a = (const char*)sqlite3_value_text(argv[0]);
+    const char *b = (const char*)sqlite3_value_text(argv[1]);
+    int64_t ta = parse_temporal_ns(a);
+    int64_t tb = parse_temporal_ns(b);
+    sqlite3_result_int64(ctx, tb - ta);
+}
+
+/*
+ * REGEXP function for SQLite
+ * Implements the =~ operator from Cypher
+ * Usage: regexp(pattern, string) returns 1 if string matches pattern, 0 otherwise
+ */
+void regexp_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    const char *pattern;
+    const char *string;
+    regex_t regex;
+    int ret;
+    int cflags = REG_EXTENDED | REG_NOSUB;
+
+    if (argc != 2) {
+        graphqlite_result_error(context, "regexp() requires 2 arguments", GQL_ERR_VALIDATION);
+        return;
+    }
+
+    /* Get pattern and string */
+    pattern = (const char*)sqlite3_value_text(argv[0]);
+    string = (const char*)sqlite3_value_text(argv[1]);
+
+    /* Handle NULL arguments */
+    if (!pattern || !string) {
+        sqlite3_result_null(context);
+        return;
+    }
+
+    /* Check for (?i) flag at start of pattern for case-insensitive matching */
+    if (strncmp(pattern, "(?i)", 4) == 0) {
+        cflags |= REG_ICASE;
+        pattern += 4;  /* Skip the flag */
+    }
+
+    /* Compile the regex */
+    ret = regcomp(&regex, pattern, cflags);
+    if (ret != 0) {
+        char errbuf[256];
+        regerror(ret, &regex, errbuf, sizeof(errbuf));
+        /* Sanitize double quotes in dynamic error message */
+        for (char *p = errbuf; *p; p++) { if (*p == '"') *p = '\''; }
+        graphqlite_result_error(context, errbuf, GQL_ERR_EXECUTION);
+        return;
+    }
+
+    /* Execute the regex */
+    ret = regexec(&regex, string, 0, NULL, 0);
+    regfree(&regex);
+
+    /* Return result: 1 for match, 0 for no match */
+    sqlite3_result_int(context, ret == 0 ? 1 : 0);
+}
+
+/* Validate the AST the way the executor does before transform: the static
+ * argument-type pass for single queries and the column-agreement pass for
+ * UNION trees. Returns 0 when valid, -1 with *error_message set otherwise. */
+static int validate_parsed_ast(ast_node *ast, char **error_message) {
+    if (!ast) return 0;
+    if (ast->type == AST_NODE_QUERY || ast->type == AST_NODE_SINGLE_QUERY) {
+        return transform_validate_query((cypher_query *)ast, error_message);
+    }
+    if (ast->type == AST_NODE_UNION) {
+        return transform_validate_union((cypher_union *)ast, error_message);
+    }
+    return 0;
+}
+
+/* Emit {"valid":false,"error":...,"code":...[,"line":N][,"column":M]} by
+ * reusing the cypher() error renderer so both surfaces agree. */
+static void validate_result_error(sqlite3_context *context, const char *message,
+                                  const char *code, int line, int column) {
+    char *err = gql_error_json(message, code, line, column);
+    if (!err) {
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+    /* err starts with '{'; splice the valid flag in front of its keys. */
+    char *out = sqlite3_mprintf("{\"valid\":false,%s", err + 1);
+    sqlite3_free(err);
+    if (!out) {
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+    sqlite3_result_text(context, out, -1, sqlite3_free);
+}
+
+/* cypher_validate() - Parse and statically validate a Cypher query without
+ * executing it (issue #16). Runs the scanner, the grammar and the same
+ * compile-time semantic pass the executor runs before transform; it never
+ * touches the graph. Returns a JSON object:
+ *   {"valid": true}
+ *   {"valid":false,"error":"...","code":"PARSE_ERROR","line":N,"column":M}
+ *   {"valid":false,"error":"...","code":"VALIDATION_ERROR"}
+ * "line" and "column" (1-based) are present only when known. */
+void cypher_validate_func(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc < 1) {
+        graphqlite_result_error(context, "cypher_validate requires a query argument", GQL_ERR_VALIDATION);
+        return;
+    }
+
+    const char *query = (const char*)sqlite3_value_text(argv[0]);
+    if (!query) {
+        validate_result_error(context, "Query is NULL", GQL_ERR_VALIDATION, 0, 0);
+        return;
+    }
+
+    /* CREATE / DROP / SHOW INDEX and CONSTRAINT (GQLITE-T-0008) */
+    {
+        char msg[400];
+        int sc = schema_command_check(query, msg, sizeof(msg));
+        if (sc > 0) { sqlite3_result_text(context, "{\"valid\": true}", -1, SQLITE_STATIC); return; }
+        if (sc < 0) { validate_result_error(context, msg, GQL_ERR_PARSE, 0, 0); return; }
+    }
+
+    cypher_parse_result *parse_result = parse_cypher_query_ext(query);
+    if (!parse_result) {
+        sqlite3_result_error_nomem(context);
+        return;
+    }
+
+    if (parse_result->ast == NULL || parse_result->error_message != NULL) {
+        validate_result_error(context,
+                              parse_result->error_message ? parse_result->error_message : "Unknown parse error",
+                              GQL_ERR_PARSE,
+                              parse_result->error_line,
+                              parse_result->error_column);
+        cypher_parse_result_free(parse_result);
+        return;
+    }
+
+    char *validation_error = NULL;
+    if (validate_parsed_ast(parse_result->ast, &validation_error) < 0) {
+        validate_result_error(context,
+                              validation_error ? validation_error : "Validation failed",
+                              GQL_ERR_VALIDATION, 0, 0);
+        free(validation_error);
+        cypher_parse_result_free(parse_result);
+        return;
+    }
+
+    sqlite3_result_text(context, "{\"valid\": true}", -1, SQLITE_STATIC);
+    cypher_parse_result_free(parse_result);
+}
+
+/* ============================================================================
+ * Percentile aggregates — percentileCont / percentileDisc
+ *
+ * Cypher signatures:
+ *   percentileCont(expr, p)  -- linear interpolation between adjacent values
+ *   percentileDisc(expr, p)  -- discrete: smallest value where cum frac >= p
+ *
+ * Implementation: collect every non-null numeric value into a dynamically
+ * grown double[] in the aggregate context. xFinal sorts the array and
+ * computes the result. Percentile (second arg) must be the same constant
+ * for every row in a group — we read it from each xStep call but only
+ * keep the last; openCypher requires it constant.
+ *
+ * Memory: sqlite3_aggregate_context() allocates a small header that
+ * survives the lifetime of the aggregate group. The values array is
+ * allocated separately with sqlite3_malloc and freed in xFinal.
+ * ========================================================================= */
+
+typedef struct {
+    double *values;
+    int count;
+    int capacity;
+    double percentile;
+    int have_percentile;
+    int out_of_range;
+} percentile_agg;
+
+static int percentile_cmp(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return  1;
+    return 0;
+}
+
+static void percentile_step_common(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc < 2) return;
+    percentile_agg *agg = (percentile_agg*)sqlite3_aggregate_context(ctx, sizeof(*agg));
+    if (!agg) return;
+
+    /* Record percentile (constant per group; last write wins, openCypher
+     * requires the parameter be a literal/constant). */
+    int p_type = sqlite3_value_type(argv[1]);
+    if (p_type == SQLITE_INTEGER || p_type == SQLITE_FLOAT) {
+        agg->percentile = sqlite3_value_double(argv[1]);
+        agg->have_percentile = 1;
+        if (agg->percentile < 0.0 || agg->percentile > 1.0) {
+            agg->out_of_range = 1;
+        }
+    }
+
+    /* Skip null input values per openCypher aggregate semantics. */
+    int v_type = sqlite3_value_type(argv[0]);
+    if (v_type == SQLITE_NULL) return;
+    if (v_type != SQLITE_INTEGER && v_type != SQLITE_FLOAT) {
+        /* Type error — openCypher requires numeric input for percentile aggregates.
+         * Defer error to xFinal so the row count is still meaningful in tests. */
+        return;
+    }
+
+    /* Grow buffer geometrically. */
+    if (agg->count == agg->capacity) {
+        int new_cap = agg->capacity ? agg->capacity * 2 : 16;
+        double *new_buf = (double*)sqlite3_realloc(agg->values, new_cap * sizeof(double));
+        if (!new_buf) return; /* out of memory; result will be partial */
+        agg->values = new_buf;
+        agg->capacity = new_cap;
+    }
+    agg->values[agg->count++] = sqlite3_value_double(argv[0]);
+}
+
+static void percentile_cont_final(sqlite3_context *ctx) {
+    percentile_agg *agg = (percentile_agg*)sqlite3_aggregate_context(ctx, 0);
+    if (agg && agg->out_of_range) {
+        sqlite3_result_error(ctx,
+            "ArgumentError: NumberOutOfRange: percentileCont: percentile must be in [0,1]", -1);
+        if (agg->values) sqlite3_free(agg->values);
+        return;
+    }
+    if (!agg || agg->count == 0 || !agg->have_percentile) {
+        sqlite3_result_null(ctx);
+        if (agg && agg->values) sqlite3_free(agg->values);
+        return;
+    }
+    double p = agg->percentile;
+    qsort(agg->values, agg->count, sizeof(double), percentile_cmp);
+    int n = agg->count;
+    double idx = p * (n - 1);
+    int lo = (int)idx;
+    int hi = lo + 1;
+    double frac = idx - lo;
+    double result;
+    if (hi >= n) {
+        result = agg->values[n - 1];
+    } else {
+        result = agg->values[lo] + frac * (agg->values[hi] - agg->values[lo]);
+    }
+    sqlite3_result_double(ctx, result);
+    sqlite3_free(agg->values);
+}
+
+static void percentile_disc_final(sqlite3_context *ctx) {
+    percentile_agg *agg = (percentile_agg*)sqlite3_aggregate_context(ctx, 0);
+    if (agg && agg->out_of_range) {
+        sqlite3_result_error(ctx,
+            "ArgumentError: NumberOutOfRange: percentileDisc: percentile must be in [0,1]", -1);
+        if (agg->values) sqlite3_free(agg->values);
+        return;
+    }
+    if (!agg || agg->count == 0 || !agg->have_percentile) {
+        sqlite3_result_null(ctx);
+        if (agg && agg->values) sqlite3_free(agg->values);
+        return;
+    }
+    double p = agg->percentile;
+    qsort(agg->values, agg->count, sizeof(double), percentile_cmp);
+    int n = agg->count;
+    /* Nearest-rank: smallest index i in [0,n-1] such that (i+1)/n >= p.
+     * Equivalent to ceil(p*n) - 1, clamped to [0, n-1]. p==0 -> 0. */
+    int i;
+    if (p == 0.0) {
+        i = 0;
+    } else {
+        double k = p * (double)n;
+        i = (int)k;
+        if ((double)i < k) i++;       /* ceil */
+        i -= 1;
+        if (i < 0) i = 0;
+        if (i >= n) i = n - 1;
+    }
+    /* Return INTEGER if the original value is integral and exact, else REAL.
+     * SQLite already preserves int-ness via storage class, but we coerced to
+     * double in xStep. Just return as double; the JSON renderer will
+     * format trailing zeros — that's fine for openCypher. */
+    sqlite3_result_double(ctx, agg->values[i]);
+    sqlite3_free(agg->values);
+}
+
+void gql_percentile_cont_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    percentile_step_common(ctx, argc, argv);
+}
+void gql_percentile_cont_final(sqlite3_context *ctx) {
+    percentile_cont_final(ctx);
+}
+void gql_percentile_disc_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    percentile_step_common(ctx, argc, argv);
+}
+void gql_percentile_disc_final(sqlite3_context *ctx) {
+    percentile_disc_final(ctx);
+}
+
+/* =============================================================================
+ * _gql_list / _gql_map — JSON array/object constructors that honor the
+ * boolean subtype.
+ *
+ * SQLite's native json_array / json_object preserve nested-JSON values
+ * (via the JSON subtype tag) but cannot distinguish a Cypher Boolean
+ * stored as int 0/1 from the integer 0/1. The result is `[true]` being
+ * rendered as `[1]`. These UDFs intercept boolean-subtype arguments and
+ * emit the JSON tokens `true`/`false`, deferring to standard formatting
+ * for everything else. They also tag their result with the JSON subtype
+ * so nested `_gql_list(_gql_list(...))` embeds correctly.
+ * =============================================================================
+ */
+
+static bool gql_value_looks_like_json(const char *s, int subtype) {
+    if (!s) return false;
+    /* Strict: only embed raw when the value is explicitly JSON-tagged
+     * (subtype 0x4A). Heuristic sniffing on the first character would
+     * mis-classify user string literals like ' [ a ' as JSON and
+     * corrupt the output (Literals7 [17] / Literals8 [17]). Anything
+     * that legitimately needs embedding flows through json_array /
+     * json_object / _gql_list / _gql_map, which all set
+     * GQL_SUBTYPE_JSON on their results. */
+    return subtype == GQL_SUBTYPE_JSON;
+}
+
+static void gql_json_append_value(dynamic_buffer *out,
+                                  sqlite3_value *v) {
+    int t = sqlite3_value_type(v);
+    int st = sqlite3_value_subtype(v);
+    if (st == GQL_SUBTYPE_BOOLEAN) {
+        if (t == SQLITE_INTEGER || t == SQLITE_FLOAT) {
+            dbuf_append(out, sqlite3_value_int64(v) ? "true" : "false");
+        } else if (t == SQLITE_TEXT) {
+            const char *s = (const char*)sqlite3_value_text(v);
+            dbuf_append(out, (s && strcmp(s, "true") == 0) ? "true" : "false");
+        } else {
+            dbuf_append(out, "null");
+        }
+        return;
+    }
+    if (t == SQLITE_NULL) { dbuf_append(out, "null"); return; }
+    if (t == SQLITE_INTEGER) {
+        dbuf_appendf(out, "%lld", (long long)sqlite3_value_int64(v));
+        return;
+    }
+    if (t == SQLITE_FLOAT) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%.17g", sqlite3_value_double(v));
+        dbuf_append(out, buf);
+        bool has_frac = false;
+        for (const char *p = buf; *p; p++) {
+            if (*p == '.' || *p == 'e' || *p == 'E') { has_frac = true; break; }
+        }
+        if (!has_frac) dbuf_append(out, ".0");
+        return;
+    }
+    /* TEXT or BLOB */
+    const char *s = (const char*)sqlite3_value_text(v);
+    if (!s) { dbuf_append(out, "null"); return; }
+    if (gql_value_looks_like_json(s, st)) {
+        dbuf_append(out, s);
+        return;
+    }
+    /* JSON-encode as string. */
+    dbuf_append_char(out, '"');
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+            case '"':  dbuf_append(out, "\\\""); break;
+            case '\\': dbuf_append(out, "\\\\"); break;
+            case '\b': dbuf_append(out, "\\b"); break;
+            case '\f': dbuf_append(out, "\\f"); break;
+            case '\n': dbuf_append(out, "\\n"); break;
+            case '\r': dbuf_append(out, "\\r"); break;
+            case '\t': dbuf_append(out, "\\t"); break;
+            default:
+                if (c < 0x20) {
+                    dbuf_appendf(out, "\\u%04x", c);
+                } else {
+                    dbuf_append_char(out, (char)c);
+                }
+        }
+    }
+    dbuf_append_char(out, '"');
+}
+
+void gql_list_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    dynamic_buffer out; dbuf_init(&out);
+    dbuf_append_char(&out, '[');
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) dbuf_append_char(&out, ',');
+        gql_json_append_value(&out, argv[i]);
+    }
+    dbuf_append_char(&out, ']');
+    sqlite3_result_text(ctx, dbuf_get(&out), (int)dbuf_len(&out), SQLITE_TRANSIENT);
+    sqlite3_result_subtype(ctx, GQL_SUBTYPE_JSON);
+    dbuf_free(&out);
+}
+
+void gql_map_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc & 1) {
+        sqlite3_result_error(ctx, "_gql_map: requires an even number of arguments (key, value, ...)", -1);
+        return;
+    }
+    dynamic_buffer out; dbuf_init(&out);
+    dbuf_append_char(&out, '{');
+    for (int i = 0; i < argc; i += 2) {
+        if (i > 0) dbuf_append_char(&out, ',');
+        /* Key — always emit as JSON string. */
+        const char *k = (const char*)sqlite3_value_text(argv[i]);
+        dbuf_append_char(&out, '"');
+        if (k) {
+            for (const char *p = k; *p; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') dbuf_append_char(&out, '\\');
+                dbuf_append_char(&out, (char)c);
+            }
+        }
+        dbuf_append_char(&out, '"');
+        dbuf_append_char(&out, ':');
+        gql_json_append_value(&out, argv[i + 1]);
+    }
+    dbuf_append_char(&out, '}');
+    sqlite3_result_text(ctx, dbuf_get(&out), (int)dbuf_len(&out), SQLITE_TRANSIENT);
+    sqlite3_result_subtype(ctx, GQL_SUBTYPE_JSON);
+    dbuf_free(&out);
+}
+
+
+/* ------------------------------------------------------------------------
+ * GQLITE-T-0100: cypher_capabilities()
+ *
+ * Returns a JSON object clients use to detect features at run time instead
+ * of guessing from the version string:
+ *
+ *   {"schema_version": 1,
+ *    "graphqlite_version": "0.9.1",
+ *    "cypher_dialect": "openCypher 9",
+ *    "sqlite": {"version": "3.47.2", "json1": true},
+ *    "neo4j_compat": false,
+ *    "features": {"<flag>": true|false, ...}}
+ *
+ * `schema_version` changes only when a key is added, renamed or removed;
+ * new feature flags may appear at any release and unknown flags must be
+ * read as false. The flag list is static per build: it documents what this
+ * version of the engine implements, not what the current graph contains.
+ * ---------------------------------------------------------------------- */
+typedef struct { const char *name; int on; } gql_capability_flag;
+
+static const gql_capability_flag gql_capability_flags[] = {
+    /* Syntax asked about in GitHub #17 */
+    {"bracket_property_access",       1},  /* n['prop'], list[0], map['k'] */
+    {"list_literals",                 1},
+    {"map_literals",                  1},
+    {"list_properties",               1},  /* list-valued node/edge properties (JSON) */
+    {"map_properties",                1},  /* map-valued node/edge properties (JSON) */
+    {"backtick_identifiers",          1},
+    {"json_path_access",              1},  /* json_extract-style nested access */
+    {"parameters",                    1},  /* $param with a JSON params argument */
+    /* Clauses and constructs */
+    {"optional_match",                1},
+    {"with_where",                    1},
+    {"unwind",                        1},
+    {"foreach",                       1},
+    {"merge_on_create_on_match",      1},
+    {"union",                         1},
+    {"call_subquery",                 1},  /* CALL { ... } */
+    {"call_procedures",               1},  /* CALL algorithm(...) YIELD ...; other names: ProcedureNotFound */
+    {"existential_subquery_pattern",  1},  /* EXISTS((p)), EXISTS { (p) WHERE ... } */
+    {"existential_subquery_full",     1},  /* EXISTS { MATCH ... RETURN ... } */
+    {"pattern_comprehension",         1},
+    {"list_comprehension",            1},
+    {"quantifiers",                   1},  /* all/any/none/single */
+    {"reduce",                        1},
+    {"case_expressions",              1},
+    {"shortest_path",                 1},
+    {"variable_length_paths",         1},
+    {"named_paths",                   1},
+    {"temporal_types",                1},  /* date/time/datetime/duration */
+    {"named_timezones",               1},  /* IANA tzdata for 13 zones (gql_tzdata.c) */
+    {"timezone_historical_dst",       1},  /* DST and local mean time, 1800-2100 */
+    {"graph_algorithms",              1},  /* pagerank, louvain, ... */
+    {"multi_graph",                   1},  /* gql_load_graph / graph-scoped tables */
+    {"cypher_rows_vtab",              1},  /* cypher_rows() table-valued function */
+    {"validate",                      1},  /* cypher_validate() */
+    {"write_stats",                   1},  /* JSON stats object on writes */
+    {"load_csv",                      1},  /* local files */
+    {"profile",                       1},
+    {"explain",                       1},
+    {"create_index",                  1},  /* a record only: each property is indexed */
+    {"create_constraint",             1},  /* node UNIQUE and NOT NULL */
+    {"label_disjunction",             1},  /* (n:A|B) in MATCH */
+    {"map_projection_all_properties", 1},  /* n{.*} */
+};
+
+void cypher_capabilities_func(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    (void)argc; (void)argv;
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_str *s = sqlite3_str_new(db);
+    int json1 = sqlite3_libversion_number() >= 3038000 ||
+                sqlite3_compileoption_used("ENABLE_JSON1");
+    sqlite3_str_appendf(s, "{\"schema_version\":%d,", GRAPHQLITE_CAPABILITIES_SCHEMA);
+    sqlite3_str_appendf(s, "\"graphqlite_version\":\"%s\",", GRAPHQLITE_VERSION);
+    sqlite3_str_appendf(s, "\"cypher_dialect\":\"%s\",", GRAPHQLITE_CYPHER_DIALECT);
+    sqlite3_str_appendf(s, "\"sqlite\":{\"version\":\"%s\",\"json1\":%s},",
+                        sqlite3_libversion(), json1 ? "true" : "false");
+    sqlite3_str_appendall(s, "\"neo4j_compat\":false,");
+    sqlite3_str_appendall(s, "\"features\":{");
+    size_t n = sizeof(gql_capability_flags) / sizeof(gql_capability_flags[0]);
+    for (size_t i = 0; i < n; i++) {
+        sqlite3_str_appendf(s, "%s\"%s\":%s", i ? "," : "",
+                            gql_capability_flags[i].name,
+                            gql_capability_flags[i].on ? "true" : "false");
+    }
+    sqlite3_str_appendall(s, "}}");
+    char *out = sqlite3_str_finish(s);
+    if (!out) { sqlite3_result_error_nomem(context); return; }
+    sqlite3_result_text(context, out, -1, sqlite3_free);
+}

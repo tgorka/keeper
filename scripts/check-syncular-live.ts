@@ -21,7 +21,10 @@
 //     receive one graph's rows only under that graph's `kg_graph` value and
 //     a client's receipts only under its own `kg_client` value, and a
 //     caller holding every conversation scope but no graph scope receives
-//     no graph row at all.
+//     no graph row at all;
+//   - a proposal (`kg_proposals`, schema 8) reaches its proposer under its
+//     own `kg_proposal` value only: another actor's value, and a graph
+//     reader without it, receive none.
 //
 // Point it at a fresh, throwaway database: a schema that already holds
 // tables is refused.
@@ -50,13 +53,16 @@ import {
   agentMemoryFamilySubscription,
   agentMemoryOwnSubscription,
   schema as generatedSchema,
+  kgContentsSubscription,
   kgEdgesSubscription,
   kgEventOpsSubscription,
   kgEventsSubscription,
   kgHeadSubscription,
   kgNodesSubscription,
   kgNodeTagsSubscription,
+  kgProposalsSubscription,
   kgReceiptsSubscription,
+  kgReviewsSubscription,
   kgTagsSubscription,
 } from "../syncular/syncular.generated.ts";
 import { sessionPageQuery } from "../syncular/syncular.queries.ts";
@@ -91,6 +97,7 @@ const clientScope = (actor: string, client: string) =>
   `${Buffer.byteLength(actor)}:${actor}${Buffer.byteLength(client)}:${client}`;
 const OWN_RECEIPTS = clientScope(ACTOR, CLIENT);
 const OTHER_RECEIPTS = clientScope(ACTOR, `${CLIENT}-2`);
+const OTHER_PROPOSER = `other-person-${RUN}`;
 const CONVERSATION_SCOPES = {
   dir: [PARTITION],
   session: [SESSION],
@@ -135,6 +142,7 @@ function config(sql: SQL): SyncServerConfig {
             family: [FAMILY, OTHER_FAMILY],
             kg_graph: [GRAPH, OTHER_GRAPH],
             kg_client: [OWN_RECEIPTS, OTHER_RECEIPTS],
+            kg_proposal: [ACTOR, OTHER_PROPOSER],
           }
         : { session: [SESSION], member: [ACTOR], page: [PAGE], trace: [PAGE], actor: [ACTOR] },
   };
@@ -255,6 +263,20 @@ function graphRows(graph: string, now: number, originChain?: unknown) {
     },
     kg_tags: { text: "live-check", revision: "1", ...made },
     kg_node_tags: { node_id: id("node"), tag_id: id("tag"), created_event_id: event },
+    kg_contents: {
+      owner_node_id: id("node"),
+      revision: "1",
+      body: JSON.stringify({ inline_text: "live check" }),
+      ...made,
+    },
+    kg_reviews: {
+      target_event_id: event,
+      target_delta_digest: "0".repeat(64),
+      kind: "acknowledgement",
+      reviewer_actor: ACTOR,
+      revision: "1",
+      created_event_id: event,
+    },
   };
   const ids: Record<string, string> = {
     kg_events: event,
@@ -264,12 +286,38 @@ function graphRows(graph: string, now: number, originChain?: unknown) {
     kg_edges: id("edge"),
     kg_tags: id("tag"),
     kg_node_tags: id("node_tag"),
+    kg_contents: id("content"),
+    kg_reviews: id("review"),
   };
   return Object.entries(rows).map(([table, values]) => ({
     table,
     op: "upsert" as const,
     values: { id: ids[table], ...values, ...stamp },
   }));
+}
+
+/** One proposal revision of `proposer`'s, private to them. */
+function proposalRow(proposer: string, now: number) {
+  return {
+    table: "kg_proposals",
+    op: "upsert" as const,
+    values: {
+      id: `proposal-${proposer}/1`,
+      graph: GRAPH,
+      proposal_id: `proposal-${proposer}`,
+      revision: "1",
+      status: "open",
+      digest: "0".repeat(64),
+      change: JSON.stringify({ ops: [] }),
+      reviewers: JSON.stringify([OTHER_PROPOSER]),
+      proposer_actor: proposer,
+      proposer_client: CLIENT,
+      source_labels: "[]",
+      created_at_ms: now,
+      author_actor: SERVICE,
+      author_client: SERVICE,
+    },
+  };
 }
 
 function receipt(scope: string, now: number) {
@@ -472,6 +520,11 @@ async function checkOne(url: string): Promise<void> {
     { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `receipts-${RUN}` },
     [receipt(OWN_RECEIPTS, now), receipt(OTHER_RECEIPTS, now)],
   );
+  await seedMutations(
+    first,
+    { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `proposals-${RUN}` },
+    [proposalRow(ACTOR, now), proposalRow(OTHER_PROPOSER, now)],
+  );
   const graphSubscriptions = [
     kgEventsSubscription,
     kgEventOpsSubscription,
@@ -480,6 +533,8 @@ async function checkOne(url: string): Promise<void> {
     kgEdgesSubscription,
     kgTagsSubscription,
     kgNodeTagsSubscription,
+    kgContentsSubscription,
+    kgReviewsSubscription,
   ];
   for (const subscription of graphSubscriptions) {
     const { table } = subscription;
@@ -525,6 +580,33 @@ async function checkOne(url: string): Promise<void> {
   if (otherClients.length !== 0) {
     fail(`${role}: another client's receipt reached this one: ${JSON.stringify(otherClients)}`);
   }
+  const ownProposals = await rowsFor(
+    first,
+    "kg_proposals",
+    kgProposalsSubscription.scopes({ actorId: ACTOR }),
+    { kg_proposal: [ACTOR], kg_graph: [GRAPH] },
+  );
+  const otherProposals = await rowsFor(
+    first,
+    "kg_proposals",
+    kgProposalsSubscription.scopes({ actorId: OTHER_PROPOSER }),
+    { kg_proposal: [ACTOR], kg_graph: [GRAPH] },
+  );
+  const readerProposals = await rowsFor(
+    first,
+    "kg_proposals",
+    kgProposalsSubscription.scopes({ actorId: ACTOR }),
+    { kg_graph: [GRAPH, OTHER_GRAPH], kg_client: [OWN_RECEIPTS] },
+  );
+  if (JSON.stringify(ownProposals) !== JSON.stringify([`proposal-${ACTOR}/1`])) {
+    fail(`${role}: own proposals received ${JSON.stringify(ownProposals)}`);
+  }
+  if (otherProposals.length !== 0 || readerProposals.length !== 0) {
+    fail(
+      `${role}: a proposal reached another actor or a graph reader: ` +
+        `${JSON.stringify({ otherProposals, readerProposals })}`,
+    );
+  }
   // `kg_events.origin_chain` (schema 6): a nullable JSON column that keeps a
   // delegation chain as written and stays null on an event without one.
   const [chainColumn] = await sql`
@@ -555,6 +637,8 @@ async function checkOne(url: string): Promise<void> {
       `family ${family.length} (with the peer), other family ${foreign.length}, graph: ` +
       `${graphSubscriptions.length} tables one graph each, none without kg_graph, ` +
       `receipts own ${ownReceipts.length} other client ${otherClients.length}, ` +
+      `proposals own ${ownProposals.length} other actor ${otherProposals.length} ` +
+      `graph reader ${readerProposals.length}, ` +
       `origin_chain ${chainColumn.data_type} nullable, written chain kept, absent chain null`,
   );
 }

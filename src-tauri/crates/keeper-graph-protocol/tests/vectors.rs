@@ -12,7 +12,9 @@ use keeper_graph_protocol::vocabulary::{
     self, stored_edge_type, stored_node_kind, EntityType, Lifecycle, Operation, OriginClass,
     Outcome,
 };
-use keeper_graph_protocol::{request, Refusal, CONTRACT_VERSION, PROFILE, SCHEMA_VERSION};
+use keeper_graph_protocol::{
+    assertion, locator, request, Refusal, CONTRACT_VERSION, PROFILE, SCHEMA_VERSION,
+};
 use serde_json::Value;
 
 const CORPUS: &str = include_str!("../../../../syncular/knowledge-graph.vectors.json");
@@ -63,6 +65,7 @@ fn versions_and_vocabulary_agree() {
     assert_eq!(w["node_fields"], names(&vocabulary::NODE_FIELDS));
     assert_eq!(w["edge_fields"], names(&vocabulary::EDGE_FIELDS));
     assert_eq!(w["tag_fields"], names(&vocabulary::TAG_FIELDS));
+    assert_eq!(w["assertion_fields"], names(&vocabulary::ASSERTION_FIELDS));
     assert_eq!(
         w["lifecycles"],
         names(&[Lifecycle::Active, Lifecycle::Archived])
@@ -114,6 +117,8 @@ fn versions_and_vocabulary_agree() {
     assert_eq!(s["client_variable"], scope::CLIENT_VARIABLE);
     assert_eq!(s["graph_tables"], names(&scope::GRAPH_TABLES));
     assert_eq!(s["receipt_table"], scope::RECEIPT_TABLE);
+    assert_eq!(s["proposal_variable"], scope::PROPOSAL_VARIABLE);
+    assert_eq!(s["proposal_table"], scope::PROPOSAL_TABLE);
 }
 
 #[test]
@@ -143,6 +148,77 @@ fn values_canonicalise_or_refuse() {
     }
 }
 
+#[test]
+fn node_properties_are_admitted_or_refused_by_kind() {
+    let v = corpus();
+    for entry in entries(&v, "node_properties") {
+        let id = text(entry, "id");
+        let checked = value::parse(text(entry, "json").as_bytes())
+            .and_then(|p| value::check_node_properties(Some(text(entry, "kind")), &p));
+        assert_eq!(checked.err().map(Refusal::code), refusal(entry), "{id}");
+    }
+}
+
+#[test]
+fn locator_envelopes_are_admitted_or_refused() {
+    let v = corpus();
+    for entry in entries(&v, "locators") {
+        let id = text(entry, "id");
+        let checked = value::parse(text(entry, "json").as_bytes()).and_then(|envelope| {
+            // As stored: a Resource's member, its free-form parts included.
+            let properties = serde_json::json!({ (locator::MEMBER): envelope });
+            value::check_node_properties(Some("Resource"), &properties)
+        });
+        assert_eq!(checked.err().map(Refusal::code), refusal(entry), "{id}");
+    }
+    assert!(locator::SUPPORTED_RESOLVERS.is_empty());
+}
+
+/// The graph as it is now, held as a vector's images.
+struct Now<'a>(&'a Value);
+
+impl Now<'_> {
+    fn rows(&self, table: &str) -> impl Iterator<Item = &serde_json::Map<String, Value>> {
+        self.0[table]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|r| r.as_object().expect("image"))
+    }
+}
+
+impl assertion::Current for Now<'_> {
+    fn node(&self, id: &str) -> Option<serde_json::Map<String, Value>> {
+        self.rows("nodes").find(|r| r["id"] == id).cloned()
+    }
+    fn content(&self, id: &str) -> Option<serde_json::Map<String, Value>> {
+        self.rows("contents").find(|r| r["id"] == id).cloned()
+    }
+    fn sources_from(&self, id: &str, limit: usize) -> Vec<serde_json::Map<String, Value>> {
+        let mut edges: Vec<_> = self
+            .rows("edges")
+            .filter(|r| r["type"] == "sources" && r["lifecycle"] == "active" && r["from_id"] == id)
+            .cloned()
+            .collect();
+        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        edges.truncate(limit);
+        edges
+    }
+}
+
+#[test]
+fn assertion_currency_is_read_not_written() {
+    let v = corpus();
+    for entry in entries(&v, "assertion_currency") {
+        let id = text(entry, "id");
+        let now = Now(&entry["state"]);
+        assert_eq!(
+            assertion::is_current(&now, text(entry, "node")),
+            entry["current"].as_bool().expect("current"),
+            "{id}"
+        );
+    }
+}
 #[test]
 fn properties_are_admitted_or_refused() {
     let v = corpus();

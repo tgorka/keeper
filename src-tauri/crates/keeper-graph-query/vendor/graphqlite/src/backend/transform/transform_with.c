@@ -1,0 +1,1403 @@
+/*
+ * WITH Clause Transformation
+ * Converts WITH clauses into SQL subqueries with variable projection
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "transform/cypher_transform.h"
+#include "gql_thread_local.h"
+#include "transform/transform_helpers.h"
+#include "transform/sql_builder.h"
+#include "parser/cypher_debug.h"
+
+/*
+ * Walk an expression AST and validate every identifier reference resolves
+ * to a variable currently in scope. Returns 0 if all OK, -1 if any
+ * identifier is undefined (and sets ctx->error_message accordingly).
+ * Used to enforce Cypher's UndefinedVariable semantics for ORDER BY in
+ * WITH where variables drop out of scope at the projection boundary.
+ */
+/* Returns true if `name` is a Cypher aggregating function. */
+static bool is_aggregating_function(const char *name)
+{
+    if (!name) return false;
+    static const char *fns[] = {
+        "count", "sum", "avg", "max", "min", "collect",
+        "percentiledisc", "percentilecont", "stdev", "stdevp",
+        NULL
+    };
+    for (int i = 0; fns[i]; i++) {
+        size_t klen = strlen(fns[i]);
+        if (strlen(name) == klen) {
+            bool match = true;
+            for (size_t j = 0; j < klen; j++) {
+                char a = name[j];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (a != fns[i][j]) { match = false; break; }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
+/* Walk expr looking for an aggregating function call. Returns the name
+ * of the first one found (or NULL). */
+static const char *find_aggregating_call(ast_node *expr)
+{
+    if (!expr) return NULL;
+    if (expr->type == AST_NODE_FUNCTION_CALL) {
+        cypher_function_call *fc = (cypher_function_call*)expr;
+        if (is_aggregating_function(fc->function_name)) return fc->function_name;
+        if (fc->args) {
+            for (int i = 0; i < fc->args->count; i++) {
+                const char *r = find_aggregating_call(fc->args->items[i]);
+                if (r) return r;
+            }
+        }
+    } else if (expr->type == AST_NODE_BINARY_OP) {
+        cypher_binary_op *b = (cypher_binary_op*)expr;
+        const char *r = find_aggregating_call(b->left);
+        if (r) return r;
+        return find_aggregating_call(b->right);
+    } else if (expr->type == AST_NODE_NOT_EXPR) {
+        return find_aggregating_call(((cypher_not_expr*)expr)->expr);
+    } else if (expr->type == AST_NODE_PROPERTY) {
+        return find_aggregating_call(((cypher_property*)expr)->expr);
+    } else if (expr->type == AST_NODE_NULL_CHECK) {
+        return find_aggregating_call(((cypher_null_check*)expr)->expr);
+    } else if (expr->type == AST_NODE_LIST) {
+        cypher_list *l = (cypher_list*)expr;
+        if (l->items) {
+            for (int i = 0; i < l->items->count; i++) {
+                const char *r = find_aggregating_call(l->items->items[i]);
+                if (r) return r;
+            }
+        }
+    } else if (expr->type == AST_NODE_MAP) {
+        cypher_map *m = (cypher_map*)expr;
+        if (m->pairs) {
+            for (int i = 0; i < m->pairs->count; i++) {
+                cypher_map_pair *mp = (cypher_map_pair*)m->pairs->items[i];
+                if (mp) {
+                    const char *r = find_aggregating_call(mp->value);
+                    if (r) return r;
+                }
+            }
+        }
+    } else if (expr->type == AST_NODE_SUBSCRIPT) {
+        cypher_subscript *s = (cypher_subscript*)expr;
+        const char *r = find_aggregating_call(s->expr);
+        if (r) return r;
+        return find_aggregating_call(s->index);
+    } else if (expr->type == AST_NODE_LIST_COMPREHENSION) {
+        /* T-0370: `[x IN collect(p) | ...]` aggregates over its source
+         * list (List12 [5]); the element/WHERE expressions run per
+         * element and are not grouping keys. */
+        return find_aggregating_call(((cypher_list_comprehension*)expr)->list_expr);
+    }
+    return NULL;
+}
+
+static int validate_identifiers_in_scope_ex(cypher_transform_context *ctx, ast_node *expr,
+                                             char **extra, int extra_count)
+{
+    if (!expr) return 0;
+    switch (expr->type) {
+        case AST_NODE_IDENTIFIER: {
+            cypher_identifier *id = (cypher_identifier*)expr;
+            if (!id->name) return 0;
+            if (transform_var_lookup(ctx->var_ctx, id->name)) return 0;
+            for (int i = 0; i < extra_count; i++) {
+                if (extra[i] && strcmp(extra[i], id->name) == 0) return 0;
+            }
+            ctx->has_error = true;
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "SyntaxError: UndefinedVariable: Variable `%s` not defined",
+                     id->name);
+            ctx->error_message = strdup(msg);
+            return -1;
+        }
+        case AST_NODE_PROPERTY: {
+            cypher_property *p = (cypher_property*)expr;
+            return validate_identifiers_in_scope_ex(ctx, p->expr, extra, extra_count);
+        }
+        case AST_NODE_BINARY_OP: {
+            cypher_binary_op *b = (cypher_binary_op*)expr;
+            if (validate_identifiers_in_scope_ex(ctx, b->left, extra, extra_count) < 0) return -1;
+            return validate_identifiers_in_scope_ex(ctx, b->right, extra, extra_count);
+        }
+        case AST_NODE_NOT_EXPR: {
+            cypher_not_expr *n = (cypher_not_expr*)expr;
+            return validate_identifiers_in_scope_ex(ctx, n->expr, extra, extra_count);
+        }
+        case AST_NODE_NULL_CHECK: {
+            cypher_null_check *nc = (cypher_null_check*)expr;
+            return validate_identifiers_in_scope_ex(ctx, nc->expr, extra, extra_count);
+        }
+        case AST_NODE_FUNCTION_CALL: {
+            cypher_function_call *fc = (cypher_function_call*)expr;
+            if (fc->args) {
+                for (int i = 0; i < fc->args->count; i++) {
+                    if (validate_identifiers_in_scope_ex(ctx, fc->args->items[i], extra, extra_count) < 0) return -1;
+                }
+            }
+            return 0;
+        }
+        case AST_NODE_LIST: {
+            cypher_list *l = (cypher_list*)expr;
+            if (l->items) {
+                for (int i = 0; i < l->items->count; i++) {
+                    if (validate_identifiers_in_scope_ex(ctx, l->items->items[i], extra, extra_count) < 0) return -1;
+                }
+            }
+            return 0;
+        }
+        case AST_NODE_SUBSCRIPT: {
+            cypher_subscript *s = (cypher_subscript*)expr;
+            if (validate_identifiers_in_scope_ex(ctx, s->expr, extra, extra_count) < 0) return -1;
+            if (validate_identifiers_in_scope_ex(ctx, s->index, extra, extra_count) < 0) return -1;
+            if (validate_identifiers_in_scope_ex(ctx, s->slice_start, extra, extra_count) < 0) return -1;
+            if (validate_identifiers_in_scope_ex(ctx, s->slice_end, extra, extra_count) < 0) return -1;
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int validate_identifiers_in_scope(cypher_transform_context *ctx, ast_node *expr)
+{
+    return validate_identifiers_in_scope_ex(ctx, expr, NULL, 0);
+}
+
+/* True if `expr` references a variable that is live in the CURRENT (input)
+ * scope but is NOT among `proj` (the WITH's projected output names) — i.e. a
+ * variable the WITH discards. Such an ORDER BY can only be evaluated inside
+ * the WITH CTE (where the input tables are still in FROM), not on the outer
+ * SELECT over the CTE. (WithOrderBy2 [21]-[24].) Mirrors the walk of
+ * validate_identifiers_in_scope_ex. */
+static bool expr_refs_dropped_input_var(cypher_transform_context *ctx, ast_node *expr,
+                                        char **proj, int proj_count)
+{
+    if (!expr) return false;
+    switch (expr->type) {
+        case AST_NODE_IDENTIFIER: {
+            cypher_identifier *id = (cypher_identifier*)expr;
+            if (!id->name) return false;
+            if (!transform_var_lookup(ctx->var_ctx, id->name)) return false; /* not input-scope */
+            for (int i = 0; i < proj_count; i++)
+                if (proj[i] && strcmp(proj[i], id->name) == 0) return false;  /* survives WITH */
+            return true;
+        }
+        case AST_NODE_PROPERTY:
+            return expr_refs_dropped_input_var(ctx, ((cypher_property*)expr)->expr, proj, proj_count);
+        case AST_NODE_BINARY_OP: {
+            cypher_binary_op *b = (cypher_binary_op*)expr;
+            return expr_refs_dropped_input_var(ctx, b->left, proj, proj_count) ||
+                   expr_refs_dropped_input_var(ctx, b->right, proj, proj_count);
+        }
+        case AST_NODE_NOT_EXPR:
+            return expr_refs_dropped_input_var(ctx, ((cypher_not_expr*)expr)->expr, proj, proj_count);
+        case AST_NODE_NULL_CHECK:
+            return expr_refs_dropped_input_var(ctx, ((cypher_null_check*)expr)->expr, proj, proj_count);
+        case AST_NODE_FUNCTION_CALL: {
+            cypher_function_call *fc = (cypher_function_call*)expr;
+            if (fc->args)
+                for (int i = 0; i < fc->args->count; i++)
+                    if (expr_refs_dropped_input_var(ctx, fc->args->items[i], proj, proj_count)) return true;
+            return false;
+        }
+        case AST_NODE_LIST: {
+            cypher_list *l = (cypher_list*)expr;
+            if (l->items)
+                for (int i = 0; i < l->items->count; i++)
+                    if (expr_refs_dropped_input_var(ctx, l->items->items[i], proj, proj_count)) return true;
+            return false;
+        }
+        case AST_NODE_SUBSCRIPT: {
+            cypher_subscript *s = (cypher_subscript*)expr;
+            return expr_refs_dropped_input_var(ctx, s->expr, proj, proj_count) ||
+                   expr_refs_dropped_input_var(ctx, s->index, proj, proj_count);
+        }
+        default:
+            return false;
+    }
+}
+
+/* True if every identifier referenced by `expr` is live in the CURRENT
+ * (input) scope — i.e. the expression can be evaluated inside the WITH's CTE
+ * body (where the input tables are in FROM). Used to decide whether a
+ * non-aggregating WITH's ORDER BY can be pushed into the CTE body so a
+ * DOWNSTREAM aggregating WITH (e.g. `... ORDER BY value WITH collect(x)`)
+ * sees rows in sorted order. Mirrors validate_identifiers_in_scope_ex's walk;
+ * projected-only aliases (not yet input vars) make this return false, so they
+ * stay on the outer path. (WithOrderBy1 [45].) */
+static bool order_expr_all_live_input(cypher_transform_context *ctx, ast_node *expr)
+{
+    if (!expr) return true;
+    switch (expr->type) {
+        case AST_NODE_IDENTIFIER: {
+            cypher_identifier *id = (cypher_identifier*)expr;
+            if (!id->name) return true;
+            return transform_var_lookup(ctx->var_ctx, id->name) != NULL;
+        }
+        case AST_NODE_PROPERTY:
+            return order_expr_all_live_input(ctx, ((cypher_property*)expr)->expr);
+        case AST_NODE_BINARY_OP: {
+            cypher_binary_op *b = (cypher_binary_op*)expr;
+            return order_expr_all_live_input(ctx, b->left) &&
+                   order_expr_all_live_input(ctx, b->right);
+        }
+        case AST_NODE_NOT_EXPR:
+            return order_expr_all_live_input(ctx, ((cypher_not_expr*)expr)->expr);
+        case AST_NODE_NULL_CHECK:
+            return order_expr_all_live_input(ctx, ((cypher_null_check*)expr)->expr);
+        case AST_NODE_FUNCTION_CALL: {
+            cypher_function_call *fc = (cypher_function_call*)expr;
+            if (fc->args)
+                for (int i = 0; i < fc->args->count; i++)
+                    if (!order_expr_all_live_input(ctx, fc->args->items[i])) return false;
+            return true;
+        }
+        case AST_NODE_LIST: {
+            cypher_list *l = (cypher_list*)expr;
+            if (l->items)
+                for (int i = 0; i < l->items->count; i++)
+                    if (!order_expr_all_live_input(ctx, l->items->items[i])) return false;
+            return true;
+        }
+        case AST_NODE_SUBSCRIPT: {
+            cypher_subscript *s = (cypher_subscript*)expr;
+            return order_expr_all_live_input(ctx, s->expr) &&
+                   order_expr_all_live_input(ctx, s->index) &&
+                   order_expr_all_live_input(ctx, s->slice_start) &&
+                   order_expr_all_live_input(ctx, s->slice_end);
+        }
+        default:
+            return true;  /* literals, parameters, etc. */
+    }
+}
+
+/*
+ * Transform an expression to a dynamically allocated string.
+ * Uses a temporary buffer to capture output, then returns the result.
+ * Caller must free the returned string.
+ * Returns NULL on error.
+ */
+static char *transform_expression_to_string(cypher_transform_context *ctx, ast_node *expr)
+{
+    if (!ctx || !expr) return NULL;
+
+    /* Save current buffer state */
+    char *saved_buffer = ctx->sql_buffer;
+    size_t saved_size = ctx->sql_size;
+    size_t saved_capacity = ctx->sql_capacity;
+
+    /* Allocate temporary buffer */
+    size_t temp_capacity = 4096;
+    char *temp_buffer = malloc(temp_capacity);
+    if (!temp_buffer) return NULL;
+    temp_buffer[0] = '\0';
+
+    /* Switch to temporary buffer */
+    ctx->sql_buffer = temp_buffer;
+    ctx->sql_size = 0;
+    ctx->sql_capacity = temp_capacity;
+
+    /* Transform the expression */
+    int result = transform_expression(ctx, expr);
+
+    /* Capture the result */
+    char *output = NULL;
+    if (result == 0 && ctx->sql_size > 0) {
+        output = strdup(ctx->sql_buffer);
+    }
+
+    /* Restore original buffer */
+    free(temp_buffer);
+    ctx->sql_buffer = saved_buffer;
+    ctx->sql_size = saved_size;
+    ctx->sql_capacity = saved_capacity;
+
+    return output;
+}
+
+/*
+ * Transform a WITH clause
+ * WITH acts like an intermediate RETURN, projecting columns and optionally filtering
+ * with a WHERE clause. The result becomes a CTE that subsequent clauses query from.
+ */
+/* GQLITE-A-0007: the SQL of the type tag column of a WITH item, or NULL. */
+static char *with_item_tag_sql(cypher_transform_context *ctx, ast_node *expr,
+                               const char *value_sql)
+{
+    return cypher_expr_tag_sql(ctx, expr, value_sql);
+}
+
+/* The tag column name of projected column `col` ("x" -> x__gqlt), as SQL. */
+static const char *with_tag_col(char *buf, size_t buflen, const char *col)
+{
+    char nm[256];
+    snprintf(nm, sizeof(nm), "%s__gqlt", col);
+    return sql_ident(buf, buflen, nm);
+}
+
+/* Append ", <tag> AS <col__gqlt>" when there is a tag; returns whether. */
+static bool with_append_tag(dynamic_buffer *col_buf, char *tag_sql, const char *col)
+{
+    if (!tag_sql) return false;
+    char tb[320];
+    dbuf_appendf(col_buf, ", %s AS %s", tag_sql, with_tag_col(tb, sizeof(tb), col));
+    free(tag_sql);
+    return true;
+}
+
+int transform_with_clause(cypher_transform_context *ctx, cypher_with *with)
+{
+    CYPHER_DEBUG("Transforming WITH clause");
+
+    if (!ctx || !with) {
+        return -1;
+    }
+
+    /* Discard any deferred property JOINs left over from an earlier
+     * clause; this WITH starts with an empty deferred section. */
+    sql_builder_clear_deferred_joins(ctx->unified_builder);
+
+    /* GQLITE-T-0220: translate `with->where` in the PRE-WITH variable scope so
+     * it can reference variables bound by prior MATCH/OPTIONAL MATCH that are
+     * NOT in the projection (e.g. `WITH other WHERE r IS NULL` after an
+     * `OPTIONAL MATCH (a)-[r]->(other)`). We embed the translated predicate in
+     * the CTE body's WHERE below; the post-projection `with->where` path is
+     * still used as a fallback for predicates that reference projected
+     * aliases only. */
+    char *with_where_pre = NULL;
+    if (with->where) {
+        ctx->where_conjunct = true;   /* perf review F7 */
+        with_where_pre = transform_expression_to_string(ctx, with->where);
+        ctx->where_conjunct = false;
+        if (!with_where_pre && ctx->has_error) {
+            /* Couldn't translate in pre-WITH scope (e.g. only projected
+             * variables exist). Clear the error and try again post-projection
+             * (the legacy path at the bottom of this function). */
+            ctx->has_error = false;
+            if (ctx->error_message) {
+                free(ctx->error_message);
+                ctx->error_message = NULL;
+            }
+        }
+    }
+
+    /* GQLITE-T-0324: a WITH's WHERE sees BOTH the pre-WITH variables AND the
+     * projected aliases (Cypher scope carve-out for the WITH filter only).
+     * When the plain pre-WITH translation failed because the predicate also
+     * names a projected alias (`WITH a.name AS name WHERE name = 'B' OR
+     * a.name2 = 'C'`), retry in the pre-WITH scope with each non-aggregate
+     * projection alias temporarily registered as a projected variable whose
+     * source expression is the item's own translated SQL. The temporary
+     * registrations are truncated away afterwards so downstream clauses keep
+     * the strict post-WITH scope (WithWhere7 [3]). Aggregate items are not
+     * registered: a filter on them belongs after grouping (the post path). */
+    if (with->where && !with_where_pre && with->items && !with->pass_all) {
+        int saved_var_count = transform_var_count(ctx->var_ctx);
+        bool registered_any = false;
+        for (int i = 0; i < with->items->count; i++) {
+            cypher_return_item *item = (cypher_return_item*)with->items->items[i];
+            if (!item || !item->alias || !item->expr) continue;
+            if (item->expr->type == AST_NODE_IDENTIFIER &&
+                strcmp(((cypher_identifier*)item->expr)->name, item->alias) == 0) continue;
+            if (find_aggregating_call(item->expr) != NULL) continue;
+            if (transform_var_lookup(ctx->var_ctx, item->alias) != NULL) continue;
+            char *src = transform_expression_to_string(ctx, item->expr);
+            if (!src || ctx->has_error) {
+                ctx->has_error = false;
+                if (ctx->error_message) { free(ctx->error_message); ctx->error_message = NULL; }
+                free(src);
+                continue;
+            }
+            if (transform_var_register_projected(ctx->var_ctx, item->alias, src) == 0) {
+                registered_any = true;
+            }
+            free(src);
+        }
+        if (registered_any) {
+            ctx->where_conjunct = true;
+            with_where_pre = transform_expression_to_string(ctx, with->where);
+            ctx->where_conjunct = false;
+            if (!with_where_pre && ctx->has_error) {
+                ctx->has_error = false;
+                if (ctx->error_message) { free(ctx->error_message); ctx->error_message = NULL; }
+            }
+        }
+        transform_var_truncate_to(ctx->var_ctx, saved_var_count);
+    }
+
+    /* Generate a unique CTE name */
+    char cte_name[32];
+    snprintf(cte_name, sizeof(cte_name), "_with_%d", ctx->with_cte_counter++);
+
+    /*
+     * Extract builder state directly instead of generating SQL and doing string manipulation.
+     * This avoids the fragile "SELECT *" replacement pattern.
+     */
+    if (!ctx->unified_builder) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("WITH clause requires a query builder context");
+        return -1;
+    }
+
+    /* GQLITE-T-0219: WITH does NOT require a preceding MATCH in openCypher.
+     * `WITH 1 AS x RETURN x`, `WITH 'hi' AS msg RETURN msg`, etc. are legal
+     * (FROM-less projection). When no FROM has been built yet, emit a CTE of
+     * the form `_with_N AS (SELECT <cols>)` with no FROM/JOIN/WHERE/GROUP BY. */
+    bool no_from = !sql_builder_has_from(ctx->unified_builder);
+
+    /* Extract FROM, JOINs, WHERE from builder (NULL/empty in no-FROM mode) */
+    const char *from_clause = no_from ? NULL : sql_builder_get_from(ctx->unified_builder);
+    const char *joins_clause = no_from ? NULL : sql_builder_get_joins(ctx->unified_builder);
+    const char *where_clause = no_from ? NULL : sql_builder_get_where(ctx->unified_builder);
+    const char *group_by_clause = no_from ? NULL : sql_builder_get_group_by(ctx->unified_builder);
+
+    /* Save CTE buffer before reset */
+    char *saved_cte = NULL;
+    int saved_cte_count = 0;
+    if (!dbuf_is_empty(&ctx->unified_builder->cte)) {
+        saved_cte = strdup(dbuf_get(&ctx->unified_builder->cte));
+        saved_cte_count = ctx->unified_builder->cte_count;
+    }
+
+    /* T-0310: preserve raw_output (DML from a prior SET/DELETE/REMOVE)
+     * across the builder reset so MATCH+SET+WITH+... keeps the SET. */
+    char *saved_raw = NULL;
+    if (!dbuf_is_empty(&ctx->unified_builder->raw_output)) {
+        saved_raw = strdup(dbuf_get(&ctx->unified_builder->raw_output));
+    }
+
+    /* Build SELECT columns from WITH items */
+    dynamic_buffer col_buf;
+    dbuf_init(&col_buf);
+
+    /* GQLITE-A-0007: which items (or, for WITH *, which variables) carry a
+     * type tag column, for the registration after the CTE. */
+    bool item_tagged[256] = {0};
+    char *star_tagged[256];
+    int star_tagged_n = 0;
+
+    /* Track GROUP BY columns for aggregate handling */
+    dynamic_buffer group_buf;
+    dbuf_init(&group_buf);
+    dynamic_buffer cte_body;
+    bool has_aggregate = false;
+    int group_count = 0;
+    bool dropped_outer_key = false;
+
+    /* Handle WITH * - pass all visible variables through */
+    if (with->pass_all) {
+        CYPHER_DEBUG("Expanding WITH * with all bound variables");
+        int var_count = transform_var_count(ctx->var_ctx);
+        int added = 0;
+        for (int vi = 0; vi < var_count; vi++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, vi);
+            if (!var || !var->is_visible || !var->name) continue;
+
+            if (added > 0) {
+                dbuf_append(&col_buf, ", ");
+                dbuf_append(&group_buf, ", ");
+            }
+
+            bool is_projected = (var->kind == VAR_KIND_PROJECTED);
+            bool skip_id = var->alias_is_id || is_projected;
+            const char *id_suffix = skip_id ? "" : ".id";
+            /* A projected value (an UNWIND variable) keeps its SQL in
+             * source_expr: `UNWIND [1] AS x WITH * RETURN x` gave null. */
+            const char *src = transform_var_get_alias(ctx->var_ctx, var->name);
+            if (!src) src = var->table_alias ? var->table_alias : "NULL";
+
+            { char idbuf[128];
+              dbuf_appendf(&col_buf, "%s%s AS %s", src, id_suffix,
+                           sql_ident(idbuf, sizeof(idbuf), var->name)); }
+            if (is_projected && var->tag_expr && star_tagged_n < 256) {
+                char tb[320];
+                dbuf_appendf(&col_buf, ", %s AS %s", var->tag_expr,
+                             with_tag_col(tb, sizeof(tb), var->name));
+                star_tagged[star_tagged_n++] = strdup(var->name);
+            }
+            dbuf_appendf(&group_buf, "%s%s", src, id_suffix);
+            group_count++;
+            added++;
+        }
+        goto with_star_columns_done;
+    }
+
+    for (int i = 0; i < with->items->count; i++) {
+        cypher_return_item *item = (cypher_return_item*)with->items->items[i];
+
+        if (i > 0) {
+            dbuf_append(&col_buf, ", ");
+        }
+
+        /* Get the expression as SQL */
+        if (item->expr->type == AST_NODE_IDENTIFIER) {
+            cypher_identifier *id = (cypher_identifier*)item->expr;
+            /* I-0047 P4: a path variable has no table alias; emit its
+             * hydration SQL (transform_expression handles path vars, building
+             * `'[' || …ids… ']'`) AS the column so the path survives the WITH
+             * boundary. Without this it fell through to a bare `p` column →
+             * "no such column: p" (With1 [4]). The post-CTE registration maps
+             * the path var to a projected `_with_N.p` for the outer scope. */
+            if (transform_var_is_path(ctx->var_ctx, id->name)) {
+                const char *col_name = item->alias ? item->alias : id->name;
+                char *psql = transform_expression_to_string(ctx, item->expr);
+                char idbuf[128];
+                if (psql && psql[0]) {
+                    dbuf_appendf(&col_buf, "%s AS %s", psql,
+                                 sql_ident(idbuf, sizeof(idbuf), col_name));
+                    if (group_count > 0) dbuf_append(&group_buf, ", ");
+                    dbuf_append(&group_buf, psql);
+                    group_count++;
+                } else {
+                    dbuf_appendf(&col_buf, "'[]' AS %s",
+                                 sql_ident(idbuf, sizeof(idbuf), col_name));
+                }
+                free(psql);
+                continue;
+            }
+            const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+            if (alias) {
+                /* Determine column name */
+                const char *col_name = item->alias ? item->alias : id->name;
+                /* Check if alias IS already the id (projected or post-WITH node/edge) */
+                bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+                bool alias_is_id = transform_var_alias_is_id(ctx->var_ctx, id->name);
+                const char *id_suffix = (is_projected || alias_is_id) ? "" : ".id";
+                { char idbuf[128];
+                  dbuf_appendf(&col_buf, "%s%s AS %s", alias, id_suffix,
+                               sql_ident(idbuf, sizeof(idbuf), col_name)); }
+                if (is_projected && i < 256) {
+                    item_tagged[i] = with_append_tag(&col_buf,
+                        with_item_tag_sql(ctx, item->expr, NULL), col_name);
+                }
+                /* Add to GROUP BY. Inside EXISTS { ... }, a variable of the
+                 * outer query is one value per outer row, so it is not a
+                 * key: SQLite 3.45 rejects GROUP BY on an outer column
+                 * ("no such column"). */
+                bool outer_key = false;
+                for (int oi = 0; oi < ctx->correlated_outer_count; oi++) {
+                    const char *tok = ctx->correlated_outer_aliases[oi];
+                    size_t tl = tok ? strlen(tok) : 0;
+                    /* the alias is the outer token or <token>.id */
+                    if (tok && strncmp(alias, tok, tl) == 0 &&
+                        (alias[tl] == '\0' || alias[tl] == '.')) {
+                        outer_key = true;
+                        break;
+                    }
+                }
+                if (outer_key) {
+                    dropped_outer_key = true;
+                } else {
+                    if (group_count > 0) {
+                        dbuf_append(&group_buf, ", ");
+                    }
+                    dbuf_appendf(&group_buf, "%s%s", alias, id_suffix);
+                    group_count++;
+                }
+            } else {
+                dbuf_append(&col_buf, id->name);
+            }
+        } else if (item->expr->type == AST_NODE_PROPERTY) {
+            cypher_property *prop = (cypher_property*)item->expr;
+            if (prop->expr->type == AST_NODE_IDENTIFIER) {
+                cypher_identifier *id = (cypher_identifier*)prop->expr;
+                const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+                const char *col_name = item->alias ? item->alias : prop->property_name;
+                if (alias) {
+                    /* Check if alias IS already the id (projected or post-WITH node/edge) */
+                    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+                    bool alias_is_id = transform_var_alias_is_id(ctx->var_ctx, id->name);
+                    const char *id_suffix = (is_projected || alias_is_id) ? "" : ".id";
+                    /* T-0313: edge-aware, typed property read: the same SQL
+                     * as anywhere else (transform_property_access), so a
+                     * boolean or list keeps its subtype for the tag column
+                     * (GQLITE-A-0007) and the key is escaped. */
+                    (void)id_suffix;
+                    char *psql = transform_expression_to_string(ctx, item->expr);
+                    if (!psql) {
+                        dbuf_free(&col_buf);
+                        dbuf_free(&group_buf);
+                        free(saved_cte);
+                        return -1;
+                    }
+                    { char _idbuf[128];
+                      dbuf_appendf(&col_buf, "%s AS %s", psql,
+                                   sql_ident(_idbuf, sizeof(_idbuf), col_name)); }
+                    if (i < 256) {
+                        item_tagged[i] = with_append_tag(&col_buf,
+                            with_item_tag_sql(ctx, item->expr, psql), col_name);
+                    }
+                    /* Group by the property value (not the node id) */
+                    if (group_count > 0) {
+                        dbuf_append(&group_buf, ", ");
+                    }
+                    dbuf_append(&group_buf, psql);
+                    free(psql);
+                    group_count++;
+                }
+            }
+        } else if (item->expr->type == AST_NODE_FUNCTION_CALL) {
+            /* Handle function calls including aggregates */
+            cypher_function_call *func = (cypher_function_call*)item->expr;
+            const char *col_name = item->alias ? item->alias : func->function_name;
+
+            /* Save current sql_buffer state */
+            size_t saved_size = ctx->sql_size;
+            char *saved_buffer = strdup(ctx->sql_buffer);
+            if (!saved_buffer) {
+                ctx->has_error = true;
+                ctx->error_message = strdup("Memory allocation failed");
+                dbuf_free(&col_buf);
+                dbuf_free(&group_buf);
+                free(saved_cte);
+                return -1;
+            }
+            ctx->sql_size = 0;
+            ctx->sql_buffer[0] = '\0';
+
+            /* Transform the function call */
+            if (transform_function_call(ctx, func) < 0) {
+                free(saved_buffer);
+                dbuf_free(&col_buf);
+                dbuf_free(&group_buf);
+                free(saved_cte);
+                return -1;
+            }
+
+            /* Append to column buffer */
+            { char _idbuf[128];
+              dbuf_appendf(&col_buf, "%s AS %s", ctx->sql_buffer,
+                           sql_ident(_idbuf, sizeof(_idbuf), col_name)); }
+            if (i < 256) {
+                item_tagged[i] = with_append_tag(&col_buf,
+                    with_item_tag_sql(ctx, item->expr, ctx->sql_buffer), col_name);
+            }
+            char *fn_sql = strdup(ctx->sql_buffer);
+
+            /* Restore sql_buffer */
+            ctx->sql_size = saved_size;
+            strcpy(ctx->sql_buffer, saved_buffer);
+            free(saved_buffer);
+
+            /* An aggregate (also nested: `size(collect(x))`) makes the WITH
+             * aggregate. Any other call is a grouping key: `WITH
+             * tail(relationships(p)) AS r, count(*)` grouped nothing and
+             * gave one row (Quantifier1-4 [9]). */
+            if (find_aggregating_call(item->expr) != NULL) {
+                has_aggregate = true;
+            } else if (fn_sql && fn_sql[0]) {
+                if (group_count > 0) dbuf_append(&group_buf, ", ");
+                dbuf_append(&group_buf, fn_sql);
+                group_count++;
+            }
+            free(fn_sql);
+        } else {
+            /* GQLITE-T-0225: any other expression type — let
+             * transform_expression try. Common cases: list/map literals,
+             * comparisons, unary ops, IS NULL, list comprehensions, etc.
+             * If transform_expression doesn't know the type, it sets
+             * ctx->error and we surface that to the user. */
+            const char *col_name = item->alias;
+            if (!col_name) {
+                /* Generate a column name for expressions without alias */
+                static GQL_THREAD_LOCAL char auto_col[32];
+                snprintf(auto_col, sizeof(auto_col), "expr_%d", i);
+                col_name = auto_col;
+            }
+
+            /* Save current sql_buffer state */
+            size_t saved_size = ctx->sql_size;
+            char *saved_buffer = strdup(ctx->sql_buffer);
+            if (!saved_buffer) {
+                ctx->has_error = true;
+                ctx->error_message = strdup("Memory allocation failed");
+                dbuf_free(&col_buf);
+                dbuf_free(&group_buf);
+                free(saved_cte);
+                return -1;
+            }
+            ctx->sql_size = 0;
+            ctx->sql_buffer[0] = '\0';
+
+            /* Transform the expression */
+            if (transform_expression(ctx, item->expr) < 0) {
+                free(saved_buffer);
+                dbuf_free(&col_buf);
+                dbuf_free(&group_buf);
+                free(saved_cte);
+                return -1;
+            }
+
+            /* Capture the raw transformed expression so it can serve as both
+             * the projected column and (when it's a non-aggregate key) a
+             * GROUP BY term. */
+            char *grp_expr = strdup(ctx->sql_buffer);
+
+            /* Boolean-valued projections (comparisons, AND/OR/NOT, quantifiers,
+             * IS NULL, ...) must carry the boolean subtype so a downstream
+             * RETURN of this column renders as a JSON boolean, not 1/0. Wrap the
+             * already-transformed SQL in _gql_bool_str(CASE ...), reusing the
+             * captured text (no second transform — that would double its
+             * side effects). Otherwise `WITH (a = b) AS r RETURN r` returned 1
+             * instead of true (Quantifier9/11 [3]/[4]/[5] family). */
+            { char _idbuf[128];
+              const char *expr_sql = ctx->sql_buffer;
+              if (ast_yields_boolean(item->expr)) {
+                  dbuf_appendf(&col_buf,
+                      "(_gql_bool_str(CASE WHEN (%s) IS NULL THEN NULL WHEN (%s) THEN 1 ELSE 0 END)) AS %s",
+                      expr_sql, expr_sql,
+                      sql_ident(_idbuf, sizeof(_idbuf), col_name));
+              } else {
+                  dbuf_appendf(&col_buf, "(%s) AS %s", expr_sql,
+                               sql_ident(_idbuf, sizeof(_idbuf), col_name));
+              }
+              if (i < 256) {
+                  item_tagged[i] = with_append_tag(&col_buf,
+                      ast_yields_boolean(item->expr) ? strdup("'bool'")
+                                                     : with_item_tag_sql(ctx, item->expr, expr_sql),
+                      col_name);
+              }
+            }
+
+            /* Restore sql_buffer */
+            ctx->sql_size = saved_size;
+            strcpy(ctx->sql_buffer, saved_buffer);
+            free(saved_buffer);
+
+            /* Check for nested aggregates (e.g. `age + count(x)` or
+             * `{kids: collect(x)}`). Without this, the implicit GROUP BY
+             * isn't emitted and a grouped-aggregate-on-empty produces 1
+             * all-null row instead of 0 rows. (With6 [6]/[7].) */
+            if (find_aggregating_call(item->expr) != NULL) {
+                has_aggregate = true;
+            } else if (grp_expr && grp_expr[0]) {
+                /* A non-aggregate COMPUTED key (e.g. `a.num2 % 3 AS mod`) is a
+                 * grouping key — emit it into GROUP BY just like simple
+                 * identifier/property keys. Without this the key was projected
+                 * but never grouped, so an aggregating WITH collapsed all rows
+                 * into one group (WithOrderBy4 [11]/[12]). */
+                if (group_count > 0) dbuf_append(&group_buf, ", ");
+                dbuf_append(&group_buf, grp_expr);
+                group_count++;
+            }
+            free(grp_expr);
+        }
+    }
+
+with_star_columns_done:
+    /* Build CTE body: SELECT <cols> FROM <from><joins> WHERE <where> GROUP BY <group> */
+    dbuf_init(&cte_body);
+
+    /* DISTINCT applies to the WITH's rows, inside the CTE. On the outer
+     * query it deduplicated the final rows instead (`WITH DISTINCT x RETURN
+     * count(*)` counted the duplicates; With5 [2]). */
+    dbuf_append(&cte_body, with->distinct ? "SELECT DISTINCT " : "SELECT ");
+    dbuf_append(&cte_body, dbuf_get(&col_buf));
+    if (from_clause) {
+        dbuf_append(&cte_body, " FROM ");
+        dbuf_append(&cte_body, from_clause);
+    }
+
+    if (joins_clause) {
+        dbuf_append(&cte_body, joins_clause);
+    }
+
+    /* Append the property JOINs deferred by aggregate functions (T-0268).
+     * joins_clause was borrowed before the items were transformed, so the
+     * deferred text goes after it here, exactly where sql_builder would
+     * put it. */
+    const char *deferred_joins = sql_builder_get_deferred_joins(ctx->unified_builder);
+    if (deferred_joins) {
+        dbuf_append(&cte_body, deferred_joins);
+        CYPHER_DEBUG("WITH: Added property JOINs: %s", deferred_joins);
+        sql_builder_clear_deferred_joins(ctx->unified_builder);
+    }
+
+    if (where_clause || with_where_pre) {
+        dbuf_append(&cte_body, " WHERE ");
+        if (where_clause && with_where_pre) {
+            dbuf_appendf(&cte_body, "(%s) AND (%s)", where_clause, with_where_pre);
+        } else if (where_clause) {
+            dbuf_append(&cte_body, where_clause);
+        } else {
+            dbuf_append(&cte_body, with_where_pre);
+        }
+    }
+
+    /* Add GROUP BY if we have aggregates and non-aggregate columns */
+    if (has_aggregate && group_count > 0) {
+        dbuf_append(&cte_body, " GROUP BY ");
+        dbuf_append(&cte_body, dbuf_get(&group_buf));
+    } else if (has_aggregate && dropped_outer_key && !group_by_clause) {
+        /* Every key was an outer variable: aggregate over all rows, but no
+         * input rows must still give no row, as with a grouping key. */
+        dbuf_append(&cte_body, " HAVING COUNT(*) > 0");
+    } else if (group_by_clause) {
+        /* Preserve existing GROUP BY from builder */
+        dbuf_append(&cte_body, " GROUP BY ");
+        dbuf_append(&cte_body, group_by_clause);
+    }
+
+    /* WithOrderBy2 [21]-[24]: when the WITH's ORDER BY references an input
+     * variable that the WITH drops (e.g. `WITH a.name AS name ORDER BY
+     * a.name + 'C' DESC`), the outer SELECT over the CTE cannot resolve it,
+     * so the ORDER BY was silently dropped. Emit it INSIDE the CTE body —
+     * transformed in the still-live input scope, where the input tables are
+     * in FROM (projected aliases also resolve there). Only triggers for that
+     * specific case; ORDER BY over projected columns keeps the outer path. */
+    bool order_pushed_to_cte = false;
+    if (with->order_by && with->order_by->count > 0 && !with->pass_all && with->items) {
+        char *proj_names[128]; int proj_n = 0;
+        for (int i = 0; i < with->items->count && proj_n < 128; i++) {
+            cypher_return_item *it = (cypher_return_item*)with->items->items[i];
+            const char *nm = it->alias;
+            if (!nm && it->expr && it->expr->type == AST_NODE_IDENTIFIER)
+                nm = ((cypher_identifier*)it->expr)->name;
+            else if (!nm && it->expr && it->expr->type == AST_NODE_PROPERTY)
+                nm = ((cypher_property*)it->expr)->property_name;
+            if (nm) proj_names[proj_n++] = (char*)nm;
+        }
+        bool needs = false, has_agg_order = false, all_live_input = true;
+        for (int i = 0; i < with->order_by->count; i++) {
+            cypher_order_by_item *oi = (cypher_order_by_item*)with->order_by->items[i];
+            if (find_aggregating_call(oi->expr)) has_agg_order = true;
+            if (expr_refs_dropped_input_var(ctx, oi->expr, proj_names, proj_n)) needs = true;
+            if (!order_expr_all_live_input(ctx, oi->expr)) all_live_input = false;
+        }
+        /* Aggregating ORDER BY exprs (e.g. ORDER BY count(x) + 1) interact with
+         * the WITH's GROUP BY and must stay on the outer path. (WithOrderBy4 [16].) */
+        if (has_agg_order) needs = false;
+
+        /* Push the ORDER BY into the CTE body when either:
+         *  (a) `needs` — it references an input variable the WITH drops, which
+         *      the outer SELECT over the CTE cannot resolve (WithOrderBy2
+         *      [21]-[24]); this REPLACES the outer ORDER BY; or
+         *  (b) every ORDER BY identifier is a live input variable and the WITH
+         *      has no LIMIT/SKIP — ordering the CTE rows so a DOWNSTREAM
+         *      aggregating WITH (`... ORDER BY value WITH collect(x)`) sees
+         *      sorted input. SQLite preserves an ordered subquery's row order
+         *      through json_group_array. The outer ORDER BY is still emitted
+         *      for final-output ordering. (WithOrderBy1 [45].) */
+        bool no_limit = !with->limit && !with->skip;
+        bool dup_for_downstream = !needs && !has_agg_order && all_live_input && no_limit;
+        if (needs || dup_for_downstream) {
+            dbuf_append(&cte_body, " ORDER BY ");
+            for (int i = 0; i < with->order_by->count; i++) {
+                cypher_order_by_item *oi = (cypher_order_by_item*)with->order_by->items[i];
+                if (i > 0) dbuf_append(&cte_body, ", ");
+                char *oe = transform_expression_to_string(ctx, oi->expr);
+                const char *oexpr = oe ? oe : "NULL";
+                const char *odir = oi->descending ? " DESC" : "";
+                /* Type-rank primary key for Cypher orderability, then the
+                 * within-type key (GQLITE-T-0340). */
+                dbuf_appendf(&cte_body, "_gql_order_rank(%s)%s, _gql_order_key(%s)%s",
+                             oexpr, odir, oexpr, odir);
+                free(oe);
+            }
+            /* Only the dropped-var case suppresses the outer ORDER BY; the
+             * downstream-ordering duplicate keeps it for final output. */
+            if (needs) order_pushed_to_cte = true;
+        }
+    }
+
+    /* T-0323: emit LIMIT / OFFSET inside the CTE body when WITH
+     * has them AND no ORDER BY is present (or the ORDER BY was just pushed
+     * into the CTE above). The outer-LIMIT positioning previously applied
+     * the limit to the final projection instead of the WITH's row set.
+     * `MATCH (n) WITH n LIMIT 2 RETURN count(*)` should limit
+     * WITH's rows to 2 then count → 2.
+     *
+     * When ORDER BY is present on the OUTER path (not pushed into the CTE),
+     * pushing LIMIT into the CTE without ORDER BY would yield wrong rows —
+     * leave that combined case on the outer-builder path. */
+    if ((with->limit || with->skip) &&
+        ((!with->order_by || with->order_by->count == 0) || order_pushed_to_cte)) {
+        char *cte_limit_str = with->limit ? transform_expression_to_string(ctx, with->limit) : NULL;
+        char *cte_skip_str = with->skip ? transform_expression_to_string(ctx, with->skip) : NULL;
+        if (cte_limit_str) {
+            dbuf_appendf(&cte_body, " LIMIT %s", cte_limit_str);
+        } else if (cte_skip_str) {
+            dbuf_append(&cte_body, " LIMIT -1");
+        }
+        if (cte_skip_str) {
+            dbuf_appendf(&cte_body, " OFFSET %s", cte_skip_str);
+        }
+        free(cte_limit_str);
+        free(cte_skip_str);
+    }
+
+    char *inner_sql = dbuf_finish(&cte_body);
+    dbuf_free(&col_buf);
+    dbuf_free(&group_buf);
+
+    /* Reset builder and restore CTEs */
+    sql_builder_reset(ctx->unified_builder);
+    if (saved_cte) {
+        dbuf_append(&ctx->unified_builder->cte, saved_cte);
+        ctx->unified_builder->cte_count = saved_cte_count;
+        free(saved_cte);
+    }
+    /* T-0310: restore raw_output so subsequent clauses keep the DML. */
+    if (saved_raw) {
+        dbuf_append(&ctx->unified_builder->raw_output, saved_raw);
+        free(saved_raw);
+    }
+
+    /* Add CTE to unified builder */
+    sql_cte(ctx->unified_builder, cte_name, inner_sql, false);
+    ctx->cte_count++;
+    free(inner_sql);
+
+    /* Before reset - save source variable kinds for simple identifiers
+     * This preserves node/edge status so property lookups work after WITH */
+    var_kind *source_kinds = NULL;
+    /* T-0333 (Unwind1 [12]): for `collect(<node|edge var>) AS x` items, capture
+     * the collected element's kind BEFORE the var-ctx reset (the source var is
+     * wiped by the reset below), so the projection loop can tag list_inner_kind
+     * on x for a downstream UNWIND to rebind elements as nodes/edges. */
+    var_kind *inner_kinds = NULL;
+    int saved_var_count = 0;
+    char **saved_var_names = NULL;
+    var_kind *saved_var_kinds = NULL;
+    /* I-0047 P4: preserve path-variable metadata (elements + type) across the
+     * var-ctx reset so a forwarded path var (`MATCH p=… WITH p …`) can be
+     * re-registered as a path pointing at the CTE column, and the executor
+     * still hydrates the stored text into a path object (With1 [4]). */
+    ast_list **saved_path_elems = NULL;
+    var_path_type *saved_path_types = NULL;
+
+    if (with->pass_all) {
+        /* WITH * - save all visible variable names and kinds */
+        int total_vars = transform_var_count(ctx->var_ctx);
+        saved_var_names = calloc(total_vars, sizeof(char*));
+        saved_var_kinds = calloc(total_vars, sizeof(var_kind));
+        if (saved_var_names && saved_var_kinds) {
+            for (int vi = 0; vi < total_vars; vi++) {
+                transform_var *var = transform_var_at(ctx->var_ctx, vi);
+                if (var && var->is_visible && var->name) {
+                    saved_var_names[saved_var_count] = strdup(var->name);
+                    saved_var_kinds[saved_var_count] = var->kind;
+                    saved_var_count++;
+                }
+            }
+        }
+    } else if (with->items && with->items->count > 0) {
+        source_kinds = calloc(with->items->count, sizeof(var_kind));
+        inner_kinds = calloc(with->items->count, sizeof(var_kind));
+        saved_path_elems = calloc(with->items->count, sizeof(ast_list*));
+        saved_path_types = calloc(with->items->count, sizeof(var_path_type));
+        if (source_kinds) {
+            for (int i = 0; i < with->items->count; i++) {
+                cypher_return_item *item = (cypher_return_item*)with->items->items[i];
+                if (inner_kinds) inner_kinds[i] = VAR_KIND_PROJECTED;
+                if (item->expr->type == AST_NODE_IDENTIFIER) {
+                    cypher_identifier *id = (cypher_identifier*)item->expr;
+                    transform_var *var = transform_var_lookup(ctx->var_ctx, id->name);
+                    if (var) {
+                        source_kinds[i] = var->kind;
+                        /* T-0370: `WITH nodes, ...` re-projects a collected
+                         * entity list — keep its inner kind so a later
+                         * UNWIND still rebinds elements as nodes/edges
+                         * (List12 [1]/[2]). */
+                        if (inner_kinds && var->kind == VAR_KIND_PROJECTED)
+                            inner_kinds[i] = var->list_inner_kind;
+                        if (var->kind == VAR_KIND_PATH && saved_path_elems) {
+                            saved_path_elems[i] = var->path_elements;
+                            saved_path_types[i] = var->path_type;
+                        }
+                    } else {
+                        source_kinds[i] = VAR_KIND_PROJECTED;
+                    }
+                } else {
+                    source_kinds[i] = VAR_KIND_PROJECTED;
+                    /* collect(<identifier>) — record the element's kind now,
+                     * while the source var is still in scope. */
+                    if (inner_kinds && item->expr->type == AST_NODE_FUNCTION_CALL) {
+                        cypher_function_call *fc = (cypher_function_call*)item->expr;
+                        if (fc->function_name &&
+                            strcasecmp(fc->function_name, "collect") == 0 &&
+                            fc->args && fc->args->count == 1 &&
+                            fc->args->items[0] &&
+                            fc->args->items[0]->type == AST_NODE_IDENTIFIER) {
+                            cypher_identifier *aid = (cypher_identifier*)fc->args->items[0];
+                            transform_var *src = transform_var_lookup(ctx->var_ctx, aid->name);
+                            if (src && (src->kind == VAR_KIND_NODE ||
+                                        src->kind == VAR_KIND_EDGE)) {
+                                inner_kinds[i] = src->kind;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Snapshot the immediate pre-WITH variable names so the ORDER BY
+     * validator below can accept references to them (Cypher allows ORDER
+     * BY to see both the projection scope and the input scope of the
+     * containing WITH). */
+    int pre_var_count = 0;
+    char **pre_var_names = NULL;
+    {
+        int total = transform_var_count(ctx->var_ctx);
+        if (total > 0) {
+            pre_var_names = calloc(total, sizeof(char*));
+            if (pre_var_names) {
+                for (int vi = 0; vi < total; vi++) {
+                    transform_var *v = transform_var_at(ctx->var_ctx, vi);
+                    if (v && v->name && v->is_visible) {
+                        pre_var_names[pre_var_count++] = strdup(v->name);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Clear old variables - WITH creates a new scope */
+    transform_var_ctx_reset(ctx->var_ctx);
+
+
+    /* Set FROM to the CTE */
+    sql_from(ctx->unified_builder, cte_name, NULL);
+
+    if (with->pass_all) {
+        /* WITH * - re-register all saved variables pointing at the CTE */
+        for (int i = 0; i < saved_var_count; i++) {
+            char select_expr[256];
+            { char _idbuf[128];
+              snprintf(select_expr, sizeof(select_expr), "%s.%s", cte_name,
+                       sql_ident(_idbuf, sizeof(_idbuf), saved_var_names[i])); }
+
+            var_kind kind = saved_var_kinds[i];
+            if (kind == VAR_KIND_NODE) {
+                transform_var_register_node(ctx->var_ctx, saved_var_names[i], select_expr, NULL);
+                transform_var_set_alias_is_id(ctx->var_ctx, saved_var_names[i], true);
+            } else if (kind == VAR_KIND_EDGE) {
+                transform_var_register_edge(ctx->var_ctx, saved_var_names[i], select_expr, NULL);
+                transform_var_set_alias_is_id(ctx->var_ctx, saved_var_names[i], true);
+            } else {
+                transform_var_register_projected(ctx->var_ctx, saved_var_names[i], select_expr);
+                for (int t = 0; t < star_tagged_n; t++) {
+                    if (strcmp(star_tagged[t], saved_var_names[i]) != 0) continue;
+                    char tag_ref[400], tb[320];
+                    snprintf(tag_ref, sizeof(tag_ref), "%s.%s", cte_name,
+                             with_tag_col(tb, sizeof(tb), saved_var_names[i]));
+                    transform_var_set_tag(ctx->var_ctx, saved_var_names[i], tag_ref);
+                }
+            }
+            free(saved_var_names[i]);
+        }
+        free(saved_var_names);
+        free(saved_var_kinds);
+        for (int t = 0; t < star_tagged_n; t++) free(star_tagged[t]);
+    } else {
+        /* Register new variables from WITH projections and build SELECT list */
+        for (int i = 0; i < with->items->count; i++) {
+            cypher_return_item *item = (cypher_return_item*)with->items->items[i];
+
+            /* Determine the column name (alias or expression name) */
+            const char *col_name = NULL;
+            if (item->alias) {
+                col_name = item->alias;
+            } else if (item->expr->type == AST_NODE_IDENTIFIER) {
+                col_name = ((cypher_identifier*)item->expr)->name;
+            } else if (item->expr->type == AST_NODE_PROPERTY) {
+                col_name = ((cypher_property*)item->expr)->property_name;
+            } else if (item->expr->type == AST_NODE_FUNCTION_CALL) {
+                col_name = ((cypher_function_call*)item->expr)->function_name;
+            }
+
+            if (col_name) {
+                char select_expr[256];
+                { char _idbuf[128];
+                  snprintf(select_expr, sizeof(select_expr), "%s.%s", cte_name,
+                           sql_ident(_idbuf, sizeof(_idbuf), col_name)); }
+
+                var_kind kind = source_kinds ? source_kinds[i] : VAR_KIND_PROJECTED;
+                if (kind == VAR_KIND_PATH) {
+                    /* I-0047 P4: re-register the forwarded path as a path var
+                     * whose table_alias is the CTE column holding the already-
+                     * hydrated path text. transform_expression's path branch
+                     * emits that column directly (it has a '.') and the
+                     * executor hydrates it via the preserved path_elements. */
+                    transform_var_register_path(ctx->var_ctx, col_name, select_expr,
+                                                saved_path_elems ? saved_path_elems[i] : NULL,
+                                                saved_path_types ? saved_path_types[i] : VAR_PATH_NORMAL);
+                    CYPHER_DEBUG("WITH: Registered path variable '%s' -> %s", col_name, select_expr);
+                } else if (kind == VAR_KIND_NODE) {
+                    transform_var_register_node(ctx->var_ctx, col_name, select_expr, NULL);
+                    transform_var_set_alias_is_id(ctx->var_ctx, col_name, true);
+                    CYPHER_DEBUG("WITH: Registered node variable '%s' -> %s (alias_is_id)", col_name, select_expr);
+                } else if (kind == VAR_KIND_EDGE) {
+                    transform_var_register_edge(ctx->var_ctx, col_name, select_expr, NULL);
+                    transform_var_set_alias_is_id(ctx->var_ctx, col_name, true);
+                    CYPHER_DEBUG("WITH: Registered edge variable '%s' -> %s (alias_is_id)", col_name, select_expr);
+                } else {
+                    transform_var_register_projected(ctx->var_ctx, col_name, select_expr);
+                    if (i < 256 && item_tagged[i]) {
+                        char tag_ref[400], tb[320];
+                        snprintf(tag_ref, sizeof(tag_ref), "%s.%s", cte_name,
+                                 with_tag_col(tb, sizeof(tb), col_name));
+                        transform_var_set_tag(ctx->var_ctx, col_name, tag_ref);
+                    }
+                    /* T-0333 (Unwind1 [12]): when this WITH item is
+                     * `collect(<node|edge_var>)`, tag the projected var so a
+                     * downstream UNWIND can rebind elements as nodes/edges.
+                     * inner_kinds[i] was captured pre-reset (the source var is
+                     * no longer in scope here). */
+                    if (inner_kinds &&
+                        (inner_kinds[i] == VAR_KIND_NODE ||
+                         inner_kinds[i] == VAR_KIND_EDGE)) {
+                        transform_var *dst = transform_var_lookup(ctx->var_ctx, col_name);
+                        if (dst) dst->list_inner_kind = inner_kinds[i];
+                    }
+                    /* Mark vars whose projection is a scalar literal /
+                     * scalar expression so MATCH can later reject
+                     * `WITH 123 AS n MATCH (n)`. */
+                    if (item->expr) {
+                        bool is_scalar = false;
+                        if (item->expr->type == AST_NODE_LITERAL) {
+                            cypher_literal *lit = (cypher_literal*)item->expr;
+                            if (lit->literal_type == LITERAL_INTEGER ||
+                                lit->literal_type == LITERAL_DECIMAL ||
+                                lit->literal_type == LITERAL_STRING  ||
+                                lit->literal_type == LITERAL_BOOLEAN) {
+                                is_scalar = true;
+                            }
+                        } else if (item->expr->type == AST_NODE_LIST ||
+                                   item->expr->type == AST_NODE_MAP) {
+                            is_scalar = true;
+                        }
+                        if (is_scalar) {
+                            transform_var_set_scalar_value(ctx->var_ctx, col_name, true);
+                        }
+                    }
+                    CYPHER_DEBUG("WITH: Registered projected variable '%s' -> %s", col_name, select_expr);
+                }
+            }
+        }
+    }
+
+    /* Free saved kinds array */
+    free(source_kinds);
+    free(inner_kinds);
+    free(saved_path_elems);
+    free(saved_path_types);
+
+    /* Handle WHERE clause (applied after projection) — only if the pre-WITH
+     * translation didn't succeed (i.e., the WHERE references projected
+     * aliases only, which weren't in scope earlier). */
+    if (with->where && !with_where_pre) {
+        ctx->where_conjunct = true;   /* perf review F7 */
+        char *where_str = transform_expression_to_string(ctx, with->where);
+        ctx->where_conjunct = false;
+        if (where_str) {
+            sql_where(ctx->unified_builder, where_str);
+            free(where_str);
+        } else {
+            return -1;
+        }
+    }
+    if (with_where_pre) {
+        free(with_where_pre);
+    }
+
+    /* Handle ORDER BY */
+    bool order_limit_in_from = false;
+    if (with->order_by && with->order_by->count > 0) {
+        /* Validate: every identifier referenced in an ORDER BY expression
+         * must be a projected variable. Cypher requires this — references
+         * to variables that fall out of scope at WITH must raise
+         * SyntaxError(UndefinedVariable). */
+        /* Aggregating functions are not allowed in ORDER BY when the
+         * containing WITH is not itself an aggregation. (Cypher TCK
+         * scenarios in WithOrderBy2 [25] enforce this.) Reject before
+         * the scope validation so we get an InvalidAggregation diagnostic
+         * rather than an UndefinedVariable one. */
+        {
+            bool with_has_agg = false;
+            if (with->items) {
+                for (int i = 0; i < with->items->count; i++) {
+                    cypher_return_item *it = (cypher_return_item*)with->items->items[i];
+                    if (it && find_aggregating_call(it->expr)) {
+                        with_has_agg = true;
+                        break;
+                    }
+                }
+            }
+            if (!with_has_agg) {
+                for (int i = 0; i < with->order_by->count; i++) {
+                    cypher_order_by_item *order_item = (cypher_order_by_item*)with->order_by->items[i];
+                    const char *agg = find_aggregating_call(order_item->expr);
+                    if (agg) {
+                        ctx->has_error = true;
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                                 "SyntaxError: InvalidAggregation: aggregating function `%s` is not allowed in ORDER BY of a non-aggregating WITH",
+                                 agg);
+                        ctx->error_message = strdup(msg);
+                        return -1;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < with->order_by->count; i++) {
+            cypher_order_by_item *order_item = (cypher_order_by_item*)with->order_by->items[i];
+            if (validate_identifiers_in_scope_ex(ctx, order_item->expr,
+                                                 pre_var_names, pre_var_count) < 0) {
+                return -1;
+            }
+        }
+        /* ORDER BY normally stays on the outer builder (over the CTE).
+         * If it referenced a dropped input variable it was already emitted
+         * inside the CTE body above (order_pushed_to_cte) — skip here. */
+        if (!order_pushed_to_cte) {
+            /* With SKIP / LIMIT, the ordered and limited rows are the WITH's
+             * rows, not the final ones: read the CTE through a subquery that
+             * orders and limits it, under the CTE's own name, so every
+             * reference stays valid. On the outer query the SKIP removed rows
+             * after a later aggregate or MATCH (`WITH x ORDER BY x SKIP 1
+             * RETURN count(*)` gave no row; WithSkipLimit1 [1]). */
+            dynamic_buffer ord;
+            dbuf_init(&ord);
+            for (int i = 0; i < with->order_by->count; i++) {
+                cypher_order_by_item *order_item = (cypher_order_by_item*)with->order_by->items[i];
+                /* An ORDER BY written as a projected expression is that
+                 * projection: `WITH sum(x) AS s ORDER BY sum(x)` sorts by s
+                 * (its inputs are out of scope here; WithOrderBy4 [11]). */
+                ast_node *oexpr_node = order_item->expr;
+                cypher_identifier *alias_id = NULL;
+                for (int wi = 0; with->items && wi < with->items->count; wi++) {
+                    cypher_return_item *it = (cypher_return_item*)with->items->items[wi];
+                    if (it && it->alias && ast_expr_equal(it->expr, order_item->expr)) {
+                        alias_id = make_identifier(it->alias, 0);
+                        oexpr_node = (ast_node *)alias_id;
+                        break;
+                    }
+                }
+                char *order_expr = transform_expression_to_string(ctx, oexpr_node);
+                if (alias_id) ast_node_free((ast_node *)alias_id);
+                if (order_expr) {
+                    sql_order_by(ctx->unified_builder, order_expr, order_item->descending);
+                    const char *dir = order_item->descending ? " DESC" : "";
+                    dbuf_appendf(&ord, "%s_gql_order_rank(%s)%s, _gql_order_key(%s)%s",
+                                 dbuf_len(&ord) ? ", " : "", order_expr, dir, order_expr, dir);
+                    free(order_expr);
+                }
+            }
+            if ((with->limit || with->skip) && dbuf_len(&ord) > 0) {
+                char *l = with->limit ? transform_expression_to_string(ctx, with->limit) : NULL;
+                char *o = with->skip ? transform_expression_to_string(ctx, with->skip) : NULL;
+                dynamic_buffer sub;
+                dbuf_init(&sub);
+                dbuf_appendf(&sub, "(SELECT * FROM %s ORDER BY %s LIMIT %s", cte_name,
+                             dbuf_get(&ord), l ? l : "-1");
+                if (o) dbuf_appendf(&sub, " OFFSET %s", o);
+                dbuf_append(&sub, ")");
+                sql_from(ctx->unified_builder, dbuf_get(&sub), cte_name);
+                dbuf_free(&sub);
+                free(l);
+                free(o);
+                order_limit_in_from = true;
+            }
+            dbuf_free(&ord);
+        }
+    }
+
+    /* Handle LIMIT and SKIP. T-0252 follow-on: when the LIMIT/SKIP
+     * expression isn't a bare integer literal (e.g. `toInteger(
+     * ceil(1.7))`), atoi() returns 0 and we emit `LIMIT 0` which
+     * drops all rows. Detect non-numeric exprs and use the
+     * builder's expr path (sql_limit_expr) which inlines the SQL
+     * verbatim. */
+    char *limit_str = NULL;
+    char *skip_str = NULL;
+    int limit_val = -1;
+    int offset_val = -1;
+    bool limit_is_expr = false;
+    bool skip_is_expr = false;
+
+    /* T-0323: when ORDER BY is present in WITH, LIMIT/SKIP is
+     * NOT inlined into the CTE (would lose ordering correctness).
+     * Use the outer-builder path for those cases. Otherwise the
+     * CTE-inline above already handled it; skip here. */
+    bool inline_limit_done = order_limit_in_from ||
+                             ((with->limit || with->skip) &&
+                              ((!with->order_by || with->order_by->count == 0) ||
+                               order_pushed_to_cte));
+    if (!inline_limit_done && with->limit) {
+        limit_str = transform_expression_to_string(ctx, with->limit);
+        if (limit_str) {
+            const char *p = limit_str;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '-') p++;
+            bool all_digits = (*p != '\0');
+            for (; *p; p++) {
+                if (*p < '0' || *p > '9') { all_digits = false; break; }
+            }
+            if (all_digits) {
+                limit_val = atoi(limit_str);
+            } else {
+                limit_is_expr = true;
+            }
+        }
+    }
+
+    if (!inline_limit_done && with->skip) {
+        skip_str = transform_expression_to_string(ctx, with->skip);
+        if (skip_str) {
+            const char *p = skip_str;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '-') p++;
+            bool all_digits = (*p != '\0');
+            for (; *p; p++) {
+                if (*p < '0' || *p > '9') { all_digits = false; break; }
+            }
+            if (all_digits) {
+                offset_val = atoi(skip_str);
+            } else {
+                skip_is_expr = true;
+            }
+        }
+    }
+
+    if (limit_is_expr || skip_is_expr) {
+        sql_limit_expr(ctx->unified_builder,
+                       limit_is_expr ? limit_str : NULL,
+                       skip_is_expr ? skip_str : NULL);
+        /* Also set numeric for the non-expr side if both present. */
+        if (!limit_is_expr && limit_val >= 0) {
+            sql_limit(ctx->unified_builder, limit_val, -1);
+        }
+        if (!skip_is_expr && offset_val >= 0) {
+            sql_limit(ctx->unified_builder, -1, offset_val);
+        }
+    } else if (limit_val >= 0 || offset_val >= 0) {
+        sql_limit(ctx->unified_builder, limit_val, offset_val);
+    }
+
+    free(limit_str);
+    free(skip_str);
+
+    if (pre_var_names) {
+        for (int i = 0; i < pre_var_count; i++) free(pre_var_names[i]);
+        free(pre_var_names);
+    }
+
+    CYPHER_DEBUG("WITH clause generated CTE via unified builder: %s", cte_name);
+    return 0;
+}
+

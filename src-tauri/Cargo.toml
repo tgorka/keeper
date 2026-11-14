@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-graph-driver"]
 
 [workspace.package]
 version = "0.10.6"
@@ -550,6 +550,16 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
 # (`num-complex`, `num-integer`, `num-traits`, `primal-check`, `strength_reduce`,
 # `transpose`) are MIT OR Apache-2.0 — on deny.toml's allow-list.
 rustfft = "6.4"
+
+# The graph worker (`keeper-graph-query`) is built with this profile only:
+# `cargo build --profile graph-worker -p keeper-graph-query --bins`, output in
+# `target/graph-worker/` (`scripts/build-graph-worker.sh` builds it, checks its
+# abort path and writes its digest). `panic = "abort"` links `panic_abort`, so
+# no panic in the process unwinds, std's runtime init before `main` included.
+# Every other profile and test build is unchanged.
+[profile.graph-worker]
+inherits = "release"
+panic = "abort"
 
 # tao, the window layer under Tauri, from `tools/tao`: 0.35.3 as crates.io serves
 # it plus one hunk in `ios/app_state.rs`'s `connect_scene`, so a URL that LAUNCHED

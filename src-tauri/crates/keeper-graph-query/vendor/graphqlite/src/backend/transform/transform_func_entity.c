@@ -1,0 +1,427 @@
+/*
+ * transform_func_entity.c
+ *    Entity introspection function transformations for Cypher queries
+ *
+ * This file contains transformations for entity introspection functions:
+ * - id() - returns internal ID of node or relationship
+ * - labels() - returns list of labels for a node
+ * - properties() - returns property map for node or relationship
+ * - keys() - returns list of property keys
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "transform/cypher_transform.h"
+#include "entity_json_sql.h"
+#include "transform/transform_func_entity.h"
+#include "parser/cypher_ast.h"
+#include "parser/cypher_debug.h"
+#include "transform/transform_func_path.h"
+
+/* Transform id() function - returns internal ID of node or relationship */
+int transform_id_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming id() function");
+
+    /* id() requires exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("id() function requires exactly one argument");
+        return -1;
+    }
+
+    ast_node *arg = func_call->args->items[0];
+
+    /* GQLITE-T-0181: id(startNode(r)) / id(endNode(r)) — take the endpoint id
+     * directly instead of building and re-parsing the node object. */
+    if (arg->type == AST_NODE_FUNCTION_CALL) {
+        cypher_function_call *inner = (cypher_function_call *)arg;
+        if (inner->function_name &&
+            (strcasecmp(inner->function_name, "startNode") == 0 ||
+             strcasecmp(inner->function_name, "endNode") == 0)) {
+            return transform_endpoint_node_id(ctx, inner);
+        }
+    }
+
+    /* Any other non-identifier argument is resolved at runtime: an entity
+     * JSON object yields its "id" member, anything else (including null)
+     * yields null. */
+    if (arg->type != AST_NODE_IDENTIFIER) {
+        char *inner_sql = cypher_transform_capture_expression(ctx, arg);
+        if (!inner_sql) {
+            if (!ctx->has_error) {
+                ctx->has_error = true;
+                ctx->error_message = strdup("id() function argument must be a node or relationship");
+            }
+            return -1;
+        }
+        append_sql(ctx,
+            "(CASE WHEN json_valid(%s) AND json_type(%s) = 'object' "
+            "THEN json_extract(%s, '$.id') ELSE NULL END)",
+            inner_sql, inner_sql, inner_sql);
+        free(inner_sql);
+        return 0;
+    }
+
+    cypher_identifier *id = (cypher_identifier*)arg;
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: id() function: `%s` is a path" : "SyntaxError: UndefinedVariable: id() function: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    /* Check if it's a projected variable (from WITH), or a node/edge carried
+     * through WITH / UNWIND whose alias IS the id column (alias_is_id):
+     * GQLITE-T-0375 — `WITH n ... RETURN id(n)` used to emit `_with_0.n.id`. */
+    if (transform_var_is_projected(ctx->var_ctx, id->name) ||
+        transform_var_alias_is_id(ctx->var_ctx, id->name)) {
+        /* The alias already is the ID value */
+        append_sql(ctx, "%s", alias);
+    } else {
+        /* Node or edge variable - access .id field */
+        append_sql(ctx, "%s.id", alias);
+    }
+
+    return 0;
+}
+
+/* Transform labels() function - returns list of labels for a node */
+int transform_labels_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming labels() function");
+
+    /* labels() requires exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("labels() function requires exactly one argument");
+        return -1;
+    }
+
+    ast_node *arg = func_call->args->items[0];
+
+    /* labels(null) → null (openCypher: propagate NULL). */
+    if (arg->type == AST_NODE_LITERAL) {
+        cypher_literal *lit = (cypher_literal*)arg;
+        if (lit->literal_type == LITERAL_NULL) {
+            append_sql(ctx, "NULL");
+            return 0;
+        }
+        ctx->has_error = true;
+        ctx->error_message = strdup("labels() function argument must be a node variable");
+        return -1;
+    }
+
+    if (arg->type != AST_NODE_IDENTIFIER) {
+        /* labels() accepts type Any (Graph3 [6]): a non-identifier argument
+         * (e.g. `labels(list[0])`) is statically typed Any and resolved at
+         * runtime by the _gql_labels UDF — a node value yields its labels, null
+         * yields null, anything else raises a TypeError (Graph3 [9]). */
+        append_sql(ctx, "_gql_labels(");
+        if (transform_expression(ctx, arg) < 0) return -1;
+        append_sql(ctx, ")");
+        return 0;
+    }
+
+    cypher_identifier *id = (cypher_identifier*)arg;
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: labels() function: `%s` is a path" : "SyntaxError: UndefinedVariable: labels() function: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    /* labels() only works on nodes, not relationships */
+    if (transform_var_is_edge(ctx->var_ctx, id->name)) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("labels() function argument must be a node variable, not a relationship");
+        return -1;
+    }
+
+    /* Multi-graph support: get graph prefix for table references */
+    const char *graph = transform_var_get_graph(ctx->var_ctx, id->name);
+    const char *gprefix = "";
+    char gprefix_buf[64] = "";
+    if (graph && graph[0] != '\0') {
+        snprintf(gprefix_buf, sizeof(gprefix_buf), "%s.", graph);
+        gprefix = gprefix_buf;
+    }
+
+    /* Wrap the subquery so a NULL node id (e.g. OPTIONAL MATCH miss)
+     * propagates to NULL rather than an empty list. For a non-NULL
+     * node with zero labels, COALESCE the inner aggregate to
+     * `json('[]')` — `json_group_array` over an empty result set
+     * yields NULL in SQLite, but Cypher spec says labels() on a
+     * label-less node returns []. T-0325. */
+    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+    append_sql(ctx,
+        "(CASE WHEN %s%s IS NULL THEN NULL ELSE "
+        "COALESCE((SELECT json_group_array(label) FROM %snode_labels WHERE node_id = %s%s), json('[]')) END)",
+        alias, is_projected ? "" : ".id",
+        gprefix, alias, is_projected ? "" : ".id");
+
+    return 0;
+}
+
+/* Transform properties() function - returns property map for node or relationship */
+int transform_properties_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming properties() function");
+
+    /* properties() requires exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("properties() function requires exactly one argument");
+        return -1;
+    }
+
+    ast_node *arg = func_call->args->items[0];
+
+    /* properties() on a map literal returns the map itself. */
+    if (arg->type == AST_NODE_MAP) {
+        append_sql(ctx, "json(");
+        if (transform_expression(ctx, arg) < 0) return -1;
+        append_sql(ctx, ")");
+        return 0;
+    }
+
+    /* properties(null) → null. */
+    if (arg->type == AST_NODE_LITERAL) {
+        cypher_literal *lit = (cypher_literal*)arg;
+        if (lit->literal_type == LITERAL_NULL) {
+            append_sql(ctx, "NULL");
+            return 0;
+        }
+        ctx->has_error = true;
+        ctx->error_message = strdup("properties() function argument must be a node, relationship, or map");
+        return -1;
+    }
+
+    if (arg->type != AST_NODE_IDENTIFIER) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("properties() function argument must be a node, relationship, or map");
+        return -1;
+    }
+
+    cypher_identifier *id = (cypher_identifier*)arg;
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: properties() function: `%s` is a path" : "SyntaxError: UndefinedVariable: properties() function: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+    bool alias_is_id_check = transform_var_alias_is_id(ctx->var_ctx, id->name);
+    if (is_projected && !transform_var_is_edge(ctx->var_ctx, id->name) && !alias_is_id_check) {
+        /* Projected scalar map value: pass through. */
+        append_sql(ctx, "json(%s)", alias);
+        return 0;
+    }
+    bool is_edge = transform_var_is_edge(ctx->var_ctx, id->name);
+    const char *id_suffix = is_projected ? "" : ".id";
+
+    /* Multi-graph support: get graph prefix for table references */
+    const char *graph = transform_var_get_graph(ctx->var_ctx, id->name);
+    const char *gprefix = "";
+    char gprefix_buf[64] = "";
+    if (graph && graph[0] != '\0') {
+        snprintf(gprefix_buf, sizeof(gprefix_buf), "%s.", graph);
+        gprefix = gprefix_buf;
+    }
+
+    /* Wrap in NULL guard so properties() of an unmatched (OPTIONAL
+     * MATCH) node/edge returns NULL rather than an empty object. */
+    append_sql(ctx, "(CASE WHEN %s%s IS NULL THEN NULL ELSE ",
+               alias, id_suffix);
+
+    if (is_edge) {
+        /* For edges, query edge property tables */
+        /* Use separate EXISTS checks with OR - SQLite doesn't handle EXISTS with UNION ALL correctly */
+        char id_e[300];
+        snprintf(id_e, sizeof(id_e), "%s%s", alias, id_suffix);
+        char *pe = gql_sql_props_expr("edge", "edge_id", gprefix, id_e);
+        if (!pe) return -1;
+        append_sql(ctx, "%s", pe);
+        free(pe);
+    } else {
+        /* For nodes, query node property tables */
+        /* Use separate EXISTS checks with OR - SQLite doesn't handle EXISTS with UNION ALL correctly */
+        char id_e[300];
+        snprintf(id_e, sizeof(id_e), "%s%s", alias, id_suffix);
+        char *pe = gql_sql_props_expr("node", "node_id", gprefix, id_e);
+        if (!pe) return -1;
+        append_sql(ctx, "%s", pe);
+        free(pe);
+    }
+
+    /* Close the NULL guard CASE opened above. */
+    append_sql(ctx, " END)");
+
+    return 0;
+}
+
+/* Transform graph() function - returns source graph name for a variable */
+int transform_graph_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming graph() function");
+
+    /* graph() requires exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("graph() function requires exactly one argument");
+        return -1;
+    }
+
+    /* The argument must be an identifier (variable) */
+    ast_node *arg = func_call->args->items[0];
+    if (arg->type != AST_NODE_IDENTIFIER) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("graph() function argument must be a node or relationship variable");
+        return -1;
+    }
+
+    cypher_identifier *id = (cypher_identifier*)arg;
+
+    /* Check that the variable exists */
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: graph() function: `%s` is a path" : "SyntaxError: UndefinedVariable: graph() function: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    /* Get the graph name for this variable */
+    const char *graph = transform_var_get_graph(ctx->var_ctx, id->name);
+
+    /* Return the graph name as a string literal, or 'main' for the default graph */
+    if (graph && graph[0] != '\0') {
+        append_sql(ctx, "'%s'", graph);
+    } else {
+        append_sql(ctx, "'main'");
+    }
+
+    return 0;
+}
+
+/* Transform keys() function - returns list of property keys for node or relationship */
+int transform_keys_function(cypher_transform_context *ctx, cypher_function_call *func_call)
+{
+    CYPHER_DEBUG("Transforming keys() function");
+
+    /* keys() requires exactly one argument */
+    if (!func_call->args || func_call->args->count != 1 || func_call->args->items[0] == NULL) {
+        ctx->has_error = true;
+        ctx->error_message = strdup("keys() function requires exactly one argument");
+        return -1;
+    }
+
+    ast_node *arg = func_call->args->items[0];
+
+    /* keys() also works on maps. For map literals or projected map values,
+     * use SQLite's json functions to extract keys directly. */
+    if (arg->type == AST_NODE_MAP) {
+        append_sql(ctx, "(SELECT json_group_array(key) FROM json_each(");
+        if (transform_expression(ctx, arg) < 0) return -1;
+        append_sql(ctx, "))");
+        return 0;
+    }
+
+    /* keys(null) → null. */
+    if (arg->type == AST_NODE_LITERAL) {
+        cypher_literal *lit = (cypher_literal *)arg;
+        if (lit->literal_type == LITERAL_NULL) {
+            append_sql(ctx, "NULL");
+            return 0;
+        }
+        ctx->has_error = true;
+        ctx->error_message = strdup("keys() function argument must be a node, relationship, or map");
+        return -1;
+    }
+
+    if (arg->type != AST_NODE_IDENTIFIER) {
+        /* keys() accepts type Any (Map3 [2] `keys($param)`): a parameter or
+         * other expression that resolves to a map at runtime. Compute the value
+         * once in a subquery, then json_each its keys; if it is a node/rel JSON
+         * object (carries a `properties` object) use that object's keys instead
+         * of the wrapper keys. NULL-guarded. */
+        append_sql(ctx,
+            "(SELECT CASE WHEN _kv.v IS NULL THEN NULL ELSE "
+            "(SELECT json_group_array(key) FROM json_each("
+            "CASE WHEN json_type(_kv.v, '$.properties') = 'object' "
+            "THEN json_extract(_kv.v, '$.properties') ELSE _kv.v END)) END "
+            "FROM (SELECT ");
+        if (transform_expression(ctx, arg) < 0) return -1;
+        append_sql(ctx, " AS v) _kv)");
+        return 0;
+    }
+
+    cypher_identifier *id = (cypher_identifier*)arg;
+    const char *alias = transform_var_get_alias(ctx->var_ctx, id->name);
+    if (!alias) {
+        ctx->has_error = true;
+        char error[256];
+        snprintf(error, sizeof(error), transform_var_is_path(ctx->var_ctx, id->name) ? "SyntaxError: InvalidArgumentType: keys() function: `%s` is a path" : "SyntaxError: UndefinedVariable: keys() function: `%s` is not defined", id->name);
+        ctx->error_message = strdup(error);
+        return -1;
+    }
+
+    bool is_projected = transform_var_is_projected(ctx->var_ctx, id->name);
+    bool is_edge = transform_var_is_edge(ctx->var_ctx, id->name);
+    bool alias_is_id = transform_var_alias_is_id(ctx->var_ctx, id->name);
+
+    /* Projected non-node/non-edge value (e.g., WITH-projected map literal):
+     * use json_each on the value itself. NULL-guard so keys(null) → null
+     * instead of an empty list. */
+    if (is_projected && !is_edge && !alias_is_id) {
+        append_sql(ctx,
+            "(CASE WHEN %s IS NULL THEN NULL ELSE "
+            "(SELECT json_group_array(key) FROM json_each(%s)) END)",
+            alias, alias);
+        return 0;
+    }
+    const char *id_suffix = is_projected ? "" : ".id";
+
+    /* Multi-graph support: get graph prefix for table references */
+    const char *graph = transform_var_get_graph(ctx->var_ctx, id->name);
+    const char *gprefix = "";
+    char gprefix_buf[64] = "";
+    if (graph && graph[0] != '\0') {
+        snprintf(gprefix_buf, sizeof(gprefix_buf), "%s.", graph);
+        gprefix = gprefix_buf;
+    }
+
+    if (is_edge) {
+        /* For edges, query edge property tables */
+        /* Use separate EXISTS checks with OR - SQLite doesn't handle EXISTS with UNION ALL correctly */
+        append_sql(ctx, "(SELECT json_group_array(pk.key) FROM %sproperty_keys pk WHERE "
+            "EXISTS (SELECT 1 FROM %sedge_props_text WHERE edge_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %sedge_props_int WHERE edge_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %sedge_props_real WHERE edge_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %sedge_props_bool WHERE edge_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %sedge_props_json WHERE edge_id = %s%s AND key_id = pk.id))",
+            gprefix, gprefix, alias, id_suffix, gprefix, alias, id_suffix, gprefix, alias, id_suffix, gprefix, alias, id_suffix, gprefix, alias, id_suffix);
+    } else {
+        /* For nodes, query node property tables */
+        /* Use separate EXISTS checks with OR - SQLite doesn't handle EXISTS with UNION ALL correctly */
+        append_sql(ctx, "(SELECT json_group_array(pk.key) FROM %sproperty_keys pk WHERE "
+            "EXISTS (SELECT 1 FROM %snode_props_text WHERE node_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %snode_props_int WHERE node_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %snode_props_real WHERE node_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %snode_props_bool WHERE node_id = %s%s AND key_id = pk.id) OR "
+            "EXISTS (SELECT 1 FROM %snode_props_json WHERE node_id = %s%s AND key_id = pk.id))",
+            gprefix, gprefix, alias, id_suffix, gprefix, alias, id_suffix, gprefix, alias, id_suffix, gprefix, alias, id_suffix, gprefix, alias, id_suffix);
+    }
+
+    return 0;
+}

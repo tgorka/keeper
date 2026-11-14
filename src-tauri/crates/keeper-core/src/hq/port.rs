@@ -296,10 +296,15 @@ pub enum ReplicaError {
     /// before it runs, this is always the command's own definite outcome.
     #[error("{code}: {message}")]
     Rejected { code: String, message: String },
-    /// A command was sent and no answer keeper can trust came back — the
-    /// connection failed, or the answer could not be read — so whether the
-    /// server made it is not known. Asking again under the same request id
-    /// answers it (the server replays a request it applied). `retryable` is
+    /// A command or query was sent and no answer keeper can trust came back
+    /// — the connection failed, or (a command's) answer said nothing about
+    /// the command (unreadable, another HTTP status, a redirect) — so
+    /// whether the server made a command is not known. Asking again under
+    /// the same request id answers it (the server replays a request it
+    /// applied). For a query it is the only failure that means the server
+    /// could not be reached, and only when nothing came back: whatever the
+    /// server answered (`401`/`403` is [`ReplicaError::Remote`]; anything
+    /// else unusable is [`ReplicaError::Client`]) is never it. `retryable` is
     /// only the client's word on asking again now: `false` (an answer keeper
     /// could not read) means something must change first, never that the
     /// command was refused.
@@ -316,6 +321,121 @@ pub enum ReplicaError {
     /// The owner thread is gone (the replica was closed).
     #[error("this database's replica is closed")]
     Closed,
+}
+
+/// The code a remote operation the server refused with HTTP `401`/`403`
+/// carries (the server refused this credential before the operation ran);
+/// the transport's own code (`transport.failed`) would hide that.
+pub const CREDENTIAL_REFUSED: &str = "sync.credential_refused";
+
+/// What a failed remote call says, read by the server's stable names: the
+/// one classifier every reader of a remote answer uses (the read path's
+/// [`crate::graph::query`] errors and, from 112.1, a request's pending
+/// cause). keeper-hq names a graph refusal by its code or, under
+/// `operation.forbidden`, by its message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The server refused this device's credential: `401`/`403`
+    /// ([`CREDENTIAL_REFUSED`]) or the client's own `sync.auth_required`.
+    /// No scope was revoked: fresh authority (a re-attested credential)
+    /// restores it.
+    Credential,
+    /// The server revoked the caller's scope: `sync.forbidden`,
+    /// `sync.scope_revoked`.
+    Revoked,
+    /// The server refused the caller's graph authority for this call:
+    /// `forbidden`, `context_revoked`, `source_audience`, `label_unknown`,
+    /// or an `operation.forbidden` whose message it does not name (fail
+    /// closed).
+    Forbidden,
+    /// The graph is switched off (`graph_unavailable`), or the server lacks
+    /// the operation (`operation.unknown`, a deploy's version skew).
+    Unavailable,
+    /// The server cannot say what became of a command (`outcome_unresolved`).
+    Unresolved,
+    /// The agent context the call names ended or was unbound
+    /// (`context_expired`, `context_closed`, `context_invalid`,
+    /// `parent_unavailable`, `context_unbound`): re-admit, never a refusal.
+    ContextEnded,
+    /// The server refused this request as it is, saying nothing of the
+    /// caller: an invalid request or client id, an answer or change over
+    /// its limit, an unsupported contract version.
+    Invalid,
+    /// The server answered with a failure that says nothing of the caller:
+    /// a failed handler or query, an internal or storage error, anything
+    /// it calls retryable, any code keeper does not name.
+    Transient,
+    /// Not the server's answer: unheard, local, closed, unreadable.
+    Unanswered,
+}
+
+/// The codes that refuse this device's credential.
+const CREDENTIAL: [&str; 2] = [CREDENTIAL_REFUSED, "sync.auth_required"];
+
+/// The codes that revoke the caller's scope.
+const REVOKING: [&str; 2] = ["sync.forbidden", "sync.scope_revoked"];
+
+/// The names that refuse the caller's graph authority.
+const AUTHORITY_REFUSALS: [&str; 4] = [
+    "forbidden",
+    "context_revoked",
+    "source_audience",
+    "label_unknown",
+];
+
+/// The names of an agent context that ended or was unbound.
+pub const CONTEXT_ENDED: [&str; 5] = [
+    "context_expired",
+    "context_closed",
+    "context_invalid",
+    "parent_unavailable",
+    "context_unbound",
+];
+
+/// The names that refuse one request as it is.
+const INVALID: [&str; 7] = [
+    "operation.invalid_request",
+    "operation.result_too_large",
+    "result_too_large",
+    "change_limit",
+    "unsupported_version",
+    "sync.invalid_client_id",
+    "invalid_request",
+];
+
+impl ReplicaError {
+    /// This failure's [`ErrorClass`]. Names are matched exactly, as the
+    /// code or the message; precedence runs from the credential down, so a
+    /// named ending or limit under `operation.forbidden` is never read as a
+    /// refusal, while an `operation.forbidden` message keeper does not name
+    /// is one (fail closed). An unknown code is transient.
+    #[must_use]
+    pub fn class(&self) -> ErrorClass {
+        let (code, message) = match self {
+            Self::Remote { code, message, .. } | Self::Rejected { code, message } => {
+                (code.as_str(), message.as_str())
+            }
+            _ => return ErrorClass::Unanswered,
+        };
+        let named = |name: &&str| code == *name || message == *name;
+        if CREDENTIAL.contains(&code) {
+            ErrorClass::Credential
+        } else if REVOKING.contains(&code) {
+            ErrorClass::Revoked
+        } else if named(&"graph_unavailable") || code == "operation.unknown" {
+            ErrorClass::Unavailable
+        } else if named(&"outcome_unresolved") {
+            ErrorClass::Unresolved
+        } else if CONTEXT_ENDED.iter().any(named) {
+            ErrorClass::ContextEnded
+        } else if INVALID.iter().any(named) {
+            ErrorClass::Invalid
+        } else if code == "operation.forbidden" || AUTHORITY_REFUSALS.iter().any(named) {
+            ErrorClass::Forbidden
+        } else {
+            ErrorClass::Transient
+        }
+    }
 }
 
 /// One database's local replica.

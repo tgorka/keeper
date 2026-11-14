@@ -146,6 +146,21 @@ tracing-subscriber = { workspace = true }
 # gix-free; its SQLite is the workspace's rusqlite.
 syncular-client = { workspace = true }
 
+# Graph worker launch checks (110.5, OD-A delta §4.4): P6c's soft stack
+# limit, the spawning thread's `no_new_privs`, the page and signal-frame
+# sizes, `security.capability`, and the Landlock ABI probe. Safe bindings;
+# both are already agentd dependencies (D-33).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["thread", "param"] }
+landlock = "=0.4.7"
+
+[features]
+# A person's graph reader (`graph::query::HumanReader`). Only keeper's
+# headless driver (`keeper-graph-driver`) enables it; no other crate and no
+# default does (`scripts/check-graph-boundary.py`), so no agent tool can
+# obtain one.
+human-reads = []
+
 [dev-dependencies]
 # The privacy lifecycle tests observe real localhost connection/cancellation;
 # the display-name bound is measured on tokio's paused clock.

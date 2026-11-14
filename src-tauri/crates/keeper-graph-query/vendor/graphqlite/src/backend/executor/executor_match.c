@@ -1,0 +1,1451 @@
+/*
+ * MATCH Clause Execution
+ * Handles MATCH clause and MATCH+... query combinations
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <math.h>
+#include <limits.h>
+
+#include "executor/executor_internal.h"
+#include "executor/cypher_executor.h"
+#include "parser/cypher_debug.h"
+#include "transform/transform_variables.h"
+#include "runtime/gql_error.h"
+
+/* Functions will be migrated here one by one */
+
+/* Execute MATCH clause by running generated SQL */
+int execute_match_clause(cypher_executor *executor, cypher_match *match, cypher_result *result)
+{
+    if (!executor || !match || !result) {
+        return -1;
+    }
+    
+    /* Transform MATCH to SQL */
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) {
+        set_result_error(result, "Failed to create transform context");
+        return -1;
+    }
+    
+    if (transform_match_clause(ctx, match) < 0) {
+        set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform MATCH clause");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+    
+    /* For now, just return success - full SQL execution would be implemented here */
+    CYPHER_DEBUG("Generated SQL for MATCH: %s", ctx->sql_buffer);
+    
+    /* Simulate finding some results */
+    result->row_count = 1;
+    result->column_count = 1;
+    result->column_names = malloc(sizeof(char*));
+    result->column_names[0] = strdup("n");
+    
+    result->data = malloc(sizeof(char**));
+    result->data[0] = malloc(sizeof(char*));
+    result->data[0][0] = strdup("Node(1)");
+    
+    cypher_transform_free_context(ctx);
+    return 0;
+}
+
+/* Execute MATCH+RETURN query combination */
+int execute_match_return_query(cypher_executor *executor, cypher_match *match, cypher_return *return_clause, cypher_result *result)
+{
+    if (!executor || !match || !return_clause || !result) {
+        return -1;
+    }
+
+#ifdef GRAPHQLITE_PERF_TIMING
+    struct timespec t_start, t_transform, t_prepare, t_execute;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+#endif
+
+    CYPHER_DEBUG("Executing MATCH+RETURN query");
+
+    /* Build SQL query from MATCH and RETURN clauses */
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) {
+        set_result_error(result, "Failed to create transform context");
+        return -1;
+    }
+
+    /* Transform MATCH clause to generate FROM/WHERE */
+    if (transform_match_clause(ctx, match) < 0) {
+        set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform MATCH clause");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Finalize SQL generation before RETURN (assembles FROM + JOINs + WHERE) */
+    /* Always call - function checks internally if there's anything to finalize */
+    if (finalize_sql_generation(ctx) < 0) {
+        set_result_error(result, "Failed to finalize SQL generation");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Expand RETURN * into explicit return items for all bound variables */
+    if (return_clause->return_all && !return_clause->items) {
+        CYPHER_DEBUG("Expanding RETURN * into explicit items");
+        ast_list *star_items = ast_list_create();
+        int var_count = transform_var_count(ctx->var_ctx);
+        for (int vi = 0; vi < var_count; vi++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, vi);
+            if (!var || !var->is_visible || !var->name) continue;
+            /* RETURN * exposes only user-named variables, not synthetic
+             * aliases for anonymous nodes/rels (With1 [1]/[2]).
+             * Named paths additionally synthesize `_pv_n<base>_<j>` /
+             * `_pv_e<base>_<j>` for their anonymous path elements (Return7 [1]). */
+            if (strncmp(var->name, "_gql_default_alias_", 19) == 0 ||
+                strncmp(var->name, "__unnamed_rel_", 14) == 0 ||
+                strncmp(var->name, "_pv_n", 5) == 0 ||
+                strncmp(var->name, "_pv_e", 5) == 0) continue;
+            /* Create an identifier node referencing this variable */
+            ast_node *id_node = (ast_node*)make_identifier(strdup(var->name), -1);
+            if (id_node) {
+                cypher_return_item *ri = make_return_item(id_node, NULL);
+                if (ri) {
+                    ast_list_append(star_items, (ast_node*)ri);
+                }
+            }
+        }
+        return_clause->items = star_items;
+        return_clause->return_all = false;
+    }
+
+    /* Transform RETURN clause to generate SELECT projections */
+    if (transform_return_clause(ctx, return_clause) < 0) {
+        set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform RETURN clause");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* T-0311 (E2): finalize was previously done inside transform_return_clause;
+     * now it's the caller's responsibility. */
+    if (finalize_sql_generation(ctx) < 0) {
+        set_result_error(result, "Failed to finalize SQL generation");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Prepend any CTE (Common Table Expression) for variable-length relationships */
+    prepend_cte_to_sql(ctx);
+
+#ifdef GRAPHQLITE_PERF_TIMING
+    clock_gettime(CLOCK_MONOTONIC, &t_transform);
+#endif
+
+    CYPHER_DEBUG("Generated SQL: %s", ctx->sql_buffer);
+
+    /* Execute the SQL query */
+    sqlite3_stmt *stmt = NULL;
+    /* Outside the read cache's capture, reuse a prepared statement for the
+     * same SQL: the row pipeline runs one MATCH per row (GQLITE-T-0431). */
+    bool cached = !executor->stmt_capture;
+    int rc = SQLITE_OK;
+    if (cached) {
+        stmt = cypher_executor_helper_stmt(executor, ctx->sql_buffer);
+        if (!stmt) rc = SQLITE_ERROR;
+    } else {
+        rc = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
+    }
+    if (rc != SQLITE_OK) {
+        char error[512];
+        snprintf(error, sizeof(error), "SQL prepare failed: %s", sqlite3_errmsg(executor->db));
+        set_result_error(result, error);
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Bind parameters if provided */
+    if (executor->params_json) {
+        if (bind_params_from_json(stmt, executor->params_json) < 0) {
+            set_result_error(result, "Failed to bind query parameters");
+            if (cached) sqlite3_reset(stmt); else sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            return -1;
+        }
+    }
+
+#ifdef GRAPHQLITE_PERF_TIMING
+    clock_gettime(CLOCK_MONOTONIC, &t_prepare);
+#endif
+
+    /* Build result from SQL execution */
+    if (build_query_results(executor, stmt, return_clause, result, ctx) < 0) {
+        if (cached) sqlite3_reset(stmt); else sqlite3_finalize(stmt);
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+#ifdef GRAPHQLITE_PERF_TIMING
+    clock_gettime(CLOCK_MONOTONIC, &t_execute);
+    double transform_ms = (t_transform.tv_sec - t_start.tv_sec) * 1000.0 + (t_transform.tv_nsec - t_start.tv_nsec) / 1000000.0;
+    double prepare_ms = (t_prepare.tv_sec - t_transform.tv_sec) * 1000.0 + (t_prepare.tv_nsec - t_transform.tv_nsec) / 1000000.0;
+    double execute_ms = (t_execute.tv_sec - t_prepare.tv_sec) * 1000.0 + (t_execute.tv_nsec - t_prepare.tv_nsec) / 1000000.0;
+    CYPHER_DEBUG("MATCH+RETURN TIMING: transform=%.2fms, prepare=%.2fms, build_results=%.2fms", transform_ms, prepare_ms, execute_ms);
+#endif
+
+    /* Perf review F8: park the statement + transform context for the
+     * statement cache when the entry point asked for it. */
+    if (executor->stmt_capture && !executor->captured_stmt) {
+        sqlite3_reset(stmt);
+        executor->captured_stmt = stmt;
+        executor->captured_ctx = ctx;
+        executor->captured_ret = return_clause;
+        return 0;
+    }
+    if (cached) sqlite3_reset(stmt); else sqlite3_finalize(stmt);
+    cypher_transform_free_context(ctx);
+    return 0;
+}
+
+/* Build query results from executed SQL statement */
+int build_query_results(cypher_executor *executor, sqlite3_stmt *stmt, cypher_return *return_clause, cypher_result *result, cypher_transform_context *ctx)
+{
+#ifdef GRAPHQLITE_PERF_TIMING
+    struct timespec t_start, t_read;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+#endif
+
+    if (!stmt || !return_clause || !result) {
+        return -1;
+    }
+
+    /* GQLITE-T-0218: callers from the generic-transform dispatch path (e.g.
+     * MATCH ... WITH ... MATCH ... RETURN *) may arrive here with the AST's
+     * items list never populated — the SQL has been generated and the column
+     * list lives only in the prepared statement. Synthesize identifier items
+     * from sqlite3_column_count/name so the rest of this function works
+     * uniformly. Previously this dereferenced NULL and SIGSEGV'd. */
+    if (!return_clause->items) {
+        int n_cols = sqlite3_column_count(stmt);
+        ast_list *synth = ast_list_create();
+        for (int c = 0; c < n_cols; c++) {
+            const char *col_name = sqlite3_column_name(stmt, c);
+            if (!col_name) col_name = "";
+            ast_node *id_node = (ast_node *)make_identifier(strdup(col_name), -1);
+            if (!id_node) continue;
+            cypher_return_item *ri = make_return_item(id_node, NULL);
+            if (!ri) continue;
+            ast_list_append(synth, (ast_node *)ri);
+        }
+        return_clause->items = synth;
+        return_clause->return_all = false;
+    }
+
+    /* Get column count from return clause */
+    int column_count = return_clause->items->count;
+
+    /* Allocate column names array */
+    result->column_names = malloc(column_count * sizeof(char*));
+    if (!result->column_names) {
+        set_result_error(result, "Memory allocation failed for column names");
+        return -1;
+    }
+
+    /* Determine if we're returning vertices/edges/properties by analyzing return items */
+    bool has_agtype_values = false;
+    for (int i = 0; i < column_count; i++) {
+        cypher_return_item *item = (cypher_return_item*)return_clause->items->items[i];
+        if (item->expr && (item->expr->type == AST_NODE_IDENTIFIER || item->expr->type == AST_NODE_PROPERTY)) {
+            /* This looks like a node/relationship variable (e.g., RETURN n, r) or property access (e.g., RETURN n.name) */
+            has_agtype_values = true;
+        }
+    }
+
+    /* Set column names from return items */
+    for (int i = 0; i < column_count; i++) {
+        cypher_return_item *item = (cypher_return_item*)return_clause->items->items[i];
+        if (item->alias) {
+            /* Use explicit alias if provided */
+            result->column_names[i] = strdup(item->alias);
+        } else if (item->source_text && item->expr && item->expr->type != AST_NODE_IDENTIFIER) {
+            /* An unaliased expression is named as written (GQLITE-T-0429). */
+            result->column_names[i] = strdup(item->source_text);
+        } else if (item->expr && item->expr->type == AST_NODE_PROPERTY) {
+            /* Build full property path from property access (n.age -> "n.age") */
+            cypher_property *prop = (cypher_property*)item->expr;
+            if (prop->expr && prop->expr->type == AST_NODE_IDENTIFIER) {
+                cypher_identifier *id = (cypher_identifier*)prop->expr;
+                char full_name[256];
+                snprintf(full_name, sizeof(full_name), "%s.%s", id->name, prop->property_name);
+                result->column_names[i] = strdup(full_name);
+            } else if (prop->expr && prop->expr->type == AST_NODE_FUNCTION_CALL) {
+                /* Property on function call: startNode(r).name → "startNode(r).name" */
+                cypher_function_call *func = (cypher_function_call*)prop->expr;
+                if (func->function_name) {
+                    char full_name[256];
+                    size_t pos = 0;
+                    pos += snprintf(full_name + pos, sizeof(full_name) - pos, "%s(", func->function_name);
+                    if (func->args) {
+                        for (int j = 0; j < func->args->count && pos < sizeof(full_name) - 20; j++) {
+                            if (j > 0) pos += snprintf(full_name + pos, sizeof(full_name) - pos, ", ");
+                            ast_node *arg = func->args->items[j];
+                            if (arg && arg->type == AST_NODE_IDENTIFIER) {
+                                pos += snprintf(full_name + pos, sizeof(full_name) - pos, "%s",
+                                                ((cypher_identifier*)arg)->name);
+                            }
+                        }
+                    }
+                    snprintf(full_name + pos, sizeof(full_name) - pos, ").%s", prop->property_name);
+                    result->column_names[i] = strdup(full_name);
+                } else {
+                    result->column_names[i] = strdup(prop->property_name);
+                }
+            } else {
+                result->column_names[i] = strdup(prop->property_name);
+            }
+        } else if (item->expr && item->expr->type == AST_NODE_IDENTIFIER) {
+            /* Use identifier name as column name (n -> "n") */
+            cypher_identifier *ident = (cypher_identifier*)item->expr;
+            result->column_names[i] = strdup(ident->name);
+        } else if (item->expr && item->expr->type == AST_NODE_FUNCTION_CALL) {
+            /* Generate function name as column name: funcname(arg1, arg2, ...) */
+            cypher_function_call *func = (cypher_function_call*)item->expr;
+            if (func->function_name) {
+                char func_name[256];
+                size_t pos = 0;
+                pos += snprintf(func_name + pos, sizeof(func_name) - pos, "%s(", func->function_name);
+                /* count(*) carries one NULL argument (or none). */
+                if (strcasecmp(func->function_name, "count") == 0 &&
+                    (!func->args || func->args->count == 0 ||
+                     (func->args->count == 1 && !func->args->items[0]))) {
+                    pos += snprintf(func_name + pos, sizeof(func_name) - pos, "*");
+                } else if (func->args) {
+                    for (int j = 0; j < func->args->count && pos < sizeof(func_name) - 10; j++) {
+                        if (j > 0) {
+                            pos += snprintf(func_name + pos, sizeof(func_name) - pos, ", ");
+                        }
+                        ast_node *arg = func->args->items[j];
+                        if (arg && arg->type == AST_NODE_IDENTIFIER) {
+                            cypher_identifier *arg_id = (cypher_identifier*)arg;
+                            pos += snprintf(func_name + pos, sizeof(func_name) - pos, "%s", arg_id->name);
+                        } else if (arg && arg->type == AST_NODE_PROPERTY) {
+                            cypher_property *arg_prop = (cypher_property*)arg;
+                            if (arg_prop->expr && arg_prop->expr->type == AST_NODE_IDENTIFIER) {
+                                cypher_identifier *prop_id = (cypher_identifier*)arg_prop->expr;
+                                pos += snprintf(func_name + pos, sizeof(func_name) - pos, "%s.%s", prop_id->name, arg_prop->property_name);
+                            }
+                        } else {
+                            pos += snprintf(func_name + pos, sizeof(func_name) - pos, "...");
+                        }
+                    }
+                }
+                snprintf(func_name + pos, sizeof(func_name) - pos, ")");
+                result->column_names[i] = strdup(func_name);
+            } else {
+                char default_name[32];
+                snprintf(default_name, sizeof(default_name), "column_%d", i);
+                result->column_names[i] = strdup(default_name);
+            }
+        } else {
+            /* Generate default column name for complex expressions */
+            char default_name[32];
+            snprintf(default_name, sizeof(default_name), "column_%d", i);
+            result->column_names[i] = strdup(default_name);
+        }
+    }
+    result->column_count = column_count;
+
+    /* Single-pass result reading with incremental realloc.
+     * Eliminates the double SQLite execution pass (count then read). */
+    int allocated = 64;
+    result->data = malloc(allocated * sizeof(char**));
+    result->data_types = malloc(allocated * sizeof(int*));
+    if (!result->data || !result->data_types) {
+        set_result_error(result, "Memory allocation failed for result data");
+        return -1;
+    }
+
+    if (has_agtype_values) {
+        result->agtype_data = malloc(allocated * sizeof(agtype_value**));
+        if (!result->agtype_data) {
+            set_result_error(result, "Memory allocation failed for agtype data");
+            return -1;
+        }
+        result->use_agtype = true;
+    }
+
+#ifdef GRAPHQLITE_PERF_TIMING
+    struct timespec t_first_step;
+#endif
+    int current_row = 0;
+    int first_step_rc = sqlite3_step(stmt);
+#ifdef GRAPHQLITE_PERF_TIMING
+    clock_gettime(CLOCK_MONOTONIC, &t_first_step);
+#endif
+
+    while (first_step_rc == SQLITE_ROW) {
+        /* Grow arrays if needed */
+        if (current_row >= allocated) {
+            allocated *= 2;
+            char ***new_data = realloc(result->data, allocated * sizeof(char**));
+            int **new_types = realloc(result->data_types, allocated * sizeof(int*));
+            if (!new_data || !new_types) {
+                set_result_error(result, "Memory allocation failed growing result data");
+                return -1;
+            }
+            result->data = new_data;
+            result->data_types = new_types;
+            if (has_agtype_values) {
+                agtype_value ***new_ag = realloc(result->agtype_data, allocated * sizeof(agtype_value**));
+                if (!new_ag) {
+                    set_result_error(result, "Memory allocation failed growing agtype data");
+                    return -1;
+                }
+                result->agtype_data = new_ag;
+            }
+        }
+
+        result->data[current_row] = malloc(column_count * sizeof(char*));
+        if (!result->data[current_row]) {
+            set_result_error(result, "Memory allocation failed for row data");
+            return -1;
+        }
+        
+        if (has_agtype_values) {
+            /* calloc: a NULL cell means "render result->data verbatim"
+             * (entity JSON pass-through, perf review F5). */
+            result->agtype_data[current_row] = calloc(column_count, sizeof(agtype_value*));
+            if (!result->agtype_data[current_row]) {
+                set_result_error(result, "Memory allocation failed for agtype row data");
+                return -1;
+            }
+        }
+
+        /* Allocate and populate data_types for this row */
+        result->data_types[current_row] = malloc(column_count * sizeof(int));
+        if (!result->data_types[current_row]) {
+            set_result_error(result, "Memory allocation failed for row data types");
+            return -1;
+        }
+
+        for (int col = 0; col < column_count; col++) {
+            /* Store SQLite column type for proper JSON formatting.
+             * If the UDF that produced this cell tagged it with the
+             * boolean subtype, override with GQL_COL_TYPE_BOOLEAN so
+             * the renderer emits unquoted JSON booleans (I-0040 M13). */
+            /* SQLite type, subtype, and the hidden RETURN tag column
+             * (GQLITE-A-0007). */
+            int ct = gql_result_cell_type(stmt, col, column_count);
+            /* A property read with no tag column: its TEXT is a string (the
+             * bool / JSON subtypes are still attached). */
+            if (ct == SQLITE_TEXT) {
+                cypher_return_item *ri = (cypher_return_item*)return_clause->items->items[col];
+                if (ri && ri->expr && ri->expr->type == AST_NODE_PROPERTY)
+                    ct = GQL_COL_TYPE_STRING;
+            }
+            result->data_types[current_row][col] = ct;
+            const char *value = (const char*)sqlite3_column_text(stmt, col);
+            char float_buf[40];
+            if (ct == SQLITE_FLOAT && value) {
+                /* Full double precision (TCK), and a whole float keeps
+                 * ".0" (GQLITE-T-0403). */
+                gql_format_double(float_buf, sizeof(float_buf),
+                                  sqlite3_column_double(stmt, col));
+                value = float_buf;
+            }
+            if (value) {
+                result->data[current_row][col] = strdup(value);
+                
+                /* Create agtype value for graph entities */
+                if (has_agtype_values) {
+                    cypher_return_item *item = (cypher_return_item*)return_clause->items->items[col];
+                    if (item->expr && item->expr->type == AST_NODE_IDENTIFIER) {
+                        cypher_identifier *ident = (cypher_identifier*)item->expr;
+                        
+                        /* Check if this is a path variable */
+                        if (ctx && transform_var_is_path(ctx->var_ctx, ident->name) && value[0] == '{') {
+                            /* Already the hydrated {nodes, rels} object (a path
+                             * with inner variable-length entities): kept as
+                             * JSON, as for a pattern comprehension's path. */
+                        } else if (ctx && transform_var_is_path(ctx->var_ctx, ident->name)) {
+                            CYPHER_DEBUG("Executor: Processing path variable '%s' with value: %s", ident->name, value);
+                            /* Parse the JSON array of element IDs and build path object */
+                            result->agtype_data[current_row][col] = build_path_from_ids(executor, ctx, ident->name, value);
+                        } else if (ctx && transform_var_is_edge(ctx->var_ctx, ident->name)) {
+                            /* T-0309: varlen-bound edge vars hold a JSON array
+                             * of edge objects (the RETURN projector emitted
+                             * json_group_array). Skip the single-edge
+                             * interpretation; leave the value as the text
+                             * column so the renderer outputs it verbatim. */
+                            transform_var *_evar = transform_var_lookup_edge(ctx->var_ctx, ident->name);
+                            if (_evar && _evar->cte_name && value[0] == '[') {
+                                /* No agtype conversion — text result will be
+                                 * rendered as the JSON array. */
+                                result->agtype_data[current_row][col] = NULL;
+                            } else
+                            /* Perf review F5: the SQL already emitted the final
+                             * edge JSON; leave the agtype cell NULL so the
+                             * renderer passes the text through verbatim instead
+                             * of parsing it into an agtype tree and serialising
+                             * it again (~300 mallocs per row). */
+                            if (value[0] == '{') {
+                                /* verbatim pass-through */
+                                result->agtype_data[current_row][col] = NULL;
+                            } else {
+                                /* Legacy path: value is just an edge ID */
+                                int64_t edge_id = atoll(value);
+
+                                /* Query the schema to get edge details */
+                                char *type = NULL;
+                                int64_t source_id = 0, target_id = 0;
+
+                                if (executor && executor->schema_mgr) {
+                                    /* Get edge details from edges table */
+                                    sqlite3_stmt *edge_stmt;
+                                    const char *edge_sql = "SELECT source_id, target_id, type FROM edges WHERE id = ?";
+                                    if (sqlite3_prepare_v2(executor->db, edge_sql, -1, &edge_stmt, NULL) == SQLITE_OK) {
+                                        sqlite3_bind_int64(edge_stmt, 1, edge_id);
+                                        if (sqlite3_step(edge_stmt) == SQLITE_ROW) {
+                                            source_id = sqlite3_column_int64(edge_stmt, 0);
+                                            target_id = sqlite3_column_int64(edge_stmt, 1);
+                                            const char *type_text = (const char*)sqlite3_column_text(edge_stmt, 2);
+                                            if (type_text) {
+                                                type = strdup(type_text);
+                                            }
+                                        }
+                                        sqlite3_finalize(edge_stmt);
+                                    }
+                                }
+
+                                /* Create edge agtype value with properties */
+                                result->agtype_data[current_row][col] = agtype_value_create_edge_with_properties(executor->db, edge_id, type, source_id, target_id);
+                                free(type);
+                            }
+                        } else if (ctx && transform_var_lookup_node(ctx->var_ctx, ident->name)) {
+                            /* This is a node variable */
+                            /* Perf review F5: pass the SQL-built node JSON
+                             * through verbatim (see the edge case above). */
+                            if (value[0] == '{') {
+                                /* verbatim pass-through */
+                                result->agtype_data[current_row][col] = NULL;
+                            } else {
+                                /* Legacy path: value is just a node ID */
+                                int64_t node_id = atoll(value);
+
+                                /* Query the schema to get node details */
+                                char *label = NULL;
+                                if (executor && executor->schema_mgr) {
+                                    /* Get node label from node_labels table */
+                                    sqlite3_stmt *label_stmt;
+                                    const char *label_sql = "SELECT label FROM node_labels WHERE node_id = ? LIMIT 1";
+                                    if (sqlite3_prepare_v2(executor->db, label_sql, -1, &label_stmt, NULL) == SQLITE_OK) {
+                                        sqlite3_bind_int64(label_stmt, 1, node_id);
+                                        if (sqlite3_step(label_stmt) == SQLITE_ROW) {
+                                            const char *label_text = (const char*)sqlite3_column_text(label_stmt, 0);
+                                            if (label_text) {
+                                                label = strdup(label_text);
+                                            }
+                                        }
+                                        sqlite3_finalize(label_stmt);
+                                    }
+                                }
+
+                                /* Create vertex agtype value with properties */
+                                result->agtype_data[current_row][col] = agtype_value_create_vertex_with_properties(executor->db, node_id, label);
+                                free(label);
+                            }
+                        } else {
+                            /* Not a graph entity - treat as scalar value. A
+                             * projected value that crossed a CTE has its
+                             * boolean / JSON subtype put back from its tag
+                             * column (GQLITE-A-0007): text is a string. */
+                            result->agtype_data[current_row][col] =
+                                create_property_agtype_value(value, ct);
+                        }
+                    } else if (item->expr && item->expr->type == AST_NODE_PROPERTY) {
+                        /* Property access reads the typed property tables
+                         * directly: the SQL type and subtype are the
+                         * property's type (GQLITE-T-0394). */
+                        result->agtype_data[current_row][col] = create_property_agtype_value(value, ct);
+                    } else {
+                        /* For other non-entity columns (binary ops, NOT,
+                         * function calls, etc.) detect the type from the
+                         * value so booleans, integers, and floats get the
+                         * right agtype rather than being stringified. */
+                        result->agtype_data[current_row][col] =
+                            create_property_agtype_value(value, ct);
+                    }
+                }
+            } else {
+                /* Store NULL pointer - extension.c will format as JSON null */
+                result->data[current_row][col] = NULL;
+                if (has_agtype_values) {
+                    result->agtype_data[current_row][col] = agtype_value_create_null();
+                }
+            }
+        }
+        current_row++;
+        first_step_rc = sqlite3_step(stmt);
+    }
+
+    if (first_step_rc != SQLITE_DONE && first_step_rc != SQLITE_ROW) {
+        char err[1024];
+        snprintf(err, sizeof(err), "%s", sqlite3_errmsg(executor->db));
+        set_result_error(result, err);
+        return -1;
+    }
+
+    if (current_row == 0) {
+        /* No rows — free allocated arrays and return empty */
+        free(result->data); result->data = NULL;
+        free(result->data_types); result->data_types = NULL;
+        if (has_agtype_values) { free(result->agtype_data); result->agtype_data = NULL; }
+        result->row_count = 0;
+        result->success = true;
+        return 0;
+    }
+
+    result->row_count = current_row;
+    result->success = true;
+
+#ifdef GRAPHQLITE_PERF_TIMING
+    clock_gettime(CLOCK_MONOTONIC, &t_read);
+    double first_step_ms = (t_first_step.tv_sec - t_start.tv_sec) * 1000.0 + (t_first_step.tv_nsec - t_start.tv_nsec) / 1000000.0;
+    double total_ms = (t_read.tv_sec - t_start.tv_sec) * 1000.0 + (t_read.tv_nsec - t_start.tv_nsec) / 1000000.0;
+    CYPHER_DEBUG("BUILD_RESULTS TIMING: first_step=%.2fms, total=%.2fms (%d rows, agtype: %s)",
+                first_step_ms, total_ms, current_row, has_agtype_values ? "yes" : "no");
+#endif
+
+    return 0;
+}
+
+/* Create agtype value for a scalar cell. `col_type` is the SQLite type of the
+ * cell, or GQL_COL_TYPE_BOOLEAN / _JSON / _STRING from its subtype or its
+ * RETURN tag column (GQLITE-A-0007): those keep their type, so the string
+ * '123' stays a string (GQLITE-T-0394). Plain TEXT (type unknown: some
+ * functions return JSON text without the subtype) and col_type < 0 are
+ * typed from the text as before. */
+agtype_value* create_property_agtype_value(const char* value, int col_type)
+{
+    if (!value) {
+        return agtype_value_create_null();
+    }
+
+    if (col_type >= 0 && strcmp(value, GQL_NAN_SENTINEL) != 0) {
+        switch (col_type) {
+            case SQLITE_INTEGER:
+                return agtype_value_create_integer((int64_t)strtoll(value, NULL, 10));
+            case SQLITE_FLOAT:
+                return agtype_value_create_float(strtod(value, NULL));
+            case GQL_COL_TYPE_BOOLEAN:
+                return agtype_value_create_bool(strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+            case GQL_COL_TYPE_JSON:
+                return agtype_value_create_json(value);
+            case GQL_COL_TYPE_STRING:
+                return agtype_value_create_string(value);
+            default:
+                break;
+        }
+    }
+
+    /* NaN sentinel (GQLITE-T-0340): carried as the private string
+     * GQL_NAN_SENTINEL. Materialize as a float NaN so the serializer renders
+     * the bare token `NaN` instead of a quoted control-char string. */
+    if (strcmp(value, GQL_NAN_SENTINEL) == 0) {
+        return agtype_value_create_float(NAN);
+    }
+
+    /* Try to detect the data type from the string value */
+
+    /* Check for boolean values */
+    if (strcmp(value, "true") == 0) {
+        return agtype_value_create_bool(true);
+    }
+    if (strcmp(value, "false") == 0) {
+        return agtype_value_create_bool(false);
+    }
+    
+    /* Check for integer values.
+     * Skip if value has a leading zero followed by more digits (e.g., "02134")
+     * since that indicates a text value like a zip code or padded ID. */
+    const char *digits = value;
+    if (*digits == '-') digits++;
+    bool has_leading_zero = (digits[0] == '0' && digits[1] >= '0' && digits[1] <= '9');
+
+    if (!has_leading_zero) {
+        char *endptr;
+        errno = 0;
+        /* int64_t, not long: long is 32 bits on Windows, and a millisecond
+         * timestamp (about 1.7e12) was cut (GQLITE-T-0391) */
+        int64_t long_val = strtoll(value, &endptr, 10);
+        if (errno == 0 && *endptr == '\0' && endptr != value) {
+            /* Successfully parsed as integer */
+            return agtype_value_create_integer((int64_t)long_val);
+        }
+
+        /* Check for float values */
+        errno = 0;
+        double double_val = strtod(value, &endptr);
+        if (errno == 0 && *endptr == '\0' && endptr != value) {
+            /* Successfully parsed as float */
+            return agtype_value_create_float(double_val);
+        }
+    }
+    
+    /* JSON list/map values get parsed so RETURN of a list-typed property
+     * emits as a JSON array, not as a quoted string. */
+    if (value[0] == '[' || value[0] == '{') {
+        return agtype_value_create_json(value);
+    }
+
+    /* Default to string */
+    return agtype_value_create_string(value);
+}
+
+/* Create one path element (vertex or edge) by id, hydrating from the DB. */
+static agtype_value *make_path_element(cypher_executor *executor, int64_t element_id,
+                                       bool make_node, const char *first_label)
+{
+    if (make_node) {
+        return agtype_value_create_vertex_with_properties(executor->db, element_id, first_label);
+    }
+    agtype_value *out = NULL;
+    sqlite3_stmt *edge_stmt;
+    const char *edge_sql = "SELECT source_id, target_id, type FROM edges WHERE id = ?";
+    if (sqlite3_prepare_v2(executor->db, edge_sql, -1, &edge_stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(edge_stmt, 1, element_id);
+        if (sqlite3_step(edge_stmt) == SQLITE_ROW) {
+            int64_t source_id = sqlite3_column_int64(edge_stmt, 0);
+            int64_t target_id = sqlite3_column_int64(edge_stmt, 1);
+            const char *type = (const char*)sqlite3_column_text(edge_stmt, 2);
+            out = agtype_value_create_edge_with_properties(executor->db, element_id, type, source_id, target_id);
+        }
+        sqlite3_finalize(edge_stmt);
+    }
+    return out ? out : agtype_value_create_null();
+}
+
+/* Decide whether path element `elem_index` is a node, and its label hint.
+ * For variable-length paths the element kind alternates by position
+ * (even=node, odd=edge); otherwise it follows the AST element. */
+static bool path_elem_is_node(transform_var *path_var, bool is_varlen,
+                              int elem_index, const char **first_label_out)
+{
+    *first_label_out = NULL;
+    if (is_varlen) return (elem_index % 2) == 0;
+    ast_node *element = path_var->path_elements->items[elem_index];
+    if (element->type == AST_NODE_NODE_PATTERN) {
+        cypher_node_pattern *node = (cypher_node_pattern*)element;
+        *first_label_out = has_labels(node) ? get_label_string(node->labels->items[0]) : NULL;
+        return true;
+    }
+    return false;  /* rel (or unknown — treated as edge) */
+}
+
+/* Build a path agtype value from JSON array of element IDs */
+agtype_value* build_path_from_ids(cypher_executor *executor, cypher_transform_context *ctx, const char *path_name, const char *json_ids)
+{
+    CYPHER_DEBUG("build_path_from_ids called: path_name='%s', json_ids='%s'", 
+                 path_name ? path_name : "NULL", json_ids ? json_ids : "NULL");
+    
+    if (!executor || !ctx || !path_name || !json_ids) {
+        CYPHER_DEBUG("build_path_from_ids: Missing required parameters");
+        return agtype_value_create_null();
+    }
+    
+    /* Get path variable metadata */
+    transform_var *path_var = transform_var_lookup_path(ctx->var_ctx, path_name);
+    if (!path_var || !path_var->path_elements) {
+        CYPHER_DEBUG("build_path_from_ids: Failed to get path variable metadata for '%s'", path_name);
+        return agtype_value_create_null();
+    }
+    CYPHER_DEBUG("build_path_from_ids: Found path metadata with %d elements", path_var->path_elements->count);
+    
+    /* Parse the JSON array of IDs (simple parsing for "[id1,id2,id3]" format) */
+    if (json_ids[0] != '[') {
+        CYPHER_DEBUG("build_path_from_ids: JSON doesn't start with '[': %s", json_ids);
+        return agtype_value_create_null();
+    }
+    CYPHER_DEBUG("build_path_from_ids: Starting JSON parsing");
+    
+    /* Count elements in the JSON array */
+    int id_count = 0;
+    for (const char *p = json_ids + 1; *p && *p != ']'; p++) {
+        if (*p == ',' || (*p >= '0' && *p <= '9')) {
+            if (*p != ',' && (p == json_ids + 1 || *(p-1) == ',' || *(p-1) == '[')) {
+                id_count++;
+            }
+        }
+    }
+    
+    CYPHER_DEBUG("build_path_from_ids: Counted %d IDs in JSON", id_count);
+
+    /* A variable-length path emits an interleaved id array of unbounded
+     * length (node,edge,node,...). Its AST has a fixed element count
+     * (e.g. 3 for (n)-[*]->(x)), so the fixed-count check below does not
+     * apply — instead the element kind alternates by position (even=node,
+     * odd=edge). Detect varlen by a rel element carrying ->varlen. */
+    bool is_varlen = false;
+    int rel_count = 0;
+    for (int e = 0; e < path_var->path_elements->count; e++) {
+        if (path_var->path_elements->items[e]->type == AST_NODE_REL_PATTERN) rel_count++;
+    }
+    /* Only a single-varlen-segment path uses the interleaved elem_ids array
+     * (and thus position-parity hydration). Mixed fixed+varlen paths keep the
+     * legacy AST-indexed behavior. Must match the transform_return projection. */
+    if (rel_count == 1) {
+        for (int e = 0; e < path_var->path_elements->count; e++) {
+            ast_node *el = path_var->path_elements->items[e];
+            if (el->type == AST_NODE_REL_PATTERN && ((cypher_rel_pattern*)el)->varlen) {
+                is_varlen = true;
+                break;
+            }
+        }
+    }
+
+    if (!is_varlen && id_count != path_var->path_elements->count) {
+        /* Mismatch between expected elements and actual IDs */
+        CYPHER_DEBUG("build_path_from_ids: Mismatch - expected %d elements, got %d IDs",
+                     path_var->path_elements->count, id_count);
+        return agtype_value_create_null();
+    }
+    if (is_varlen && (id_count % 2) == 0) {
+        /* Interleaved path must have an odd count (n,e,n,...,n). */
+        CYPHER_DEBUG("build_path_from_ids: varlen id_count %d not odd", id_count);
+        return agtype_value_create_null();
+    }
+    
+    /* Extract IDs and create agtype values for each element */
+    agtype_value **path_elements = malloc(id_count * sizeof(agtype_value*));
+    if (!path_elements) {
+        return agtype_value_create_null();
+    }
+    
+    /* Parse IDs from JSON array */
+    const char *p = json_ids + 1; /* Skip opening bracket */
+    int elem_index = 0;
+    char id_buffer[32];
+    int id_pos = 0;
+    
+    CYPHER_DEBUG("build_path_from_ids: Parsing JSON array: %s", json_ids);
+    while (*p && *p != ']' && elem_index < id_count) {
+        if (*p >= '0' && *p <= '9') {
+            if (id_pos < sizeof(id_buffer) - 1) {
+                id_buffer[id_pos++] = *p;
+            }
+        } else if (*p == ',') {
+            if (id_pos > 0) {
+                id_buffer[id_pos] = '\0';
+                int64_t element_id = atoll(id_buffer);
+
+                const char *first_label = NULL;
+                bool make_node = path_elem_is_node(path_var, is_varlen, elem_index, &first_label);
+                path_elements[elem_index] = make_path_element(executor, element_id, make_node, first_label);
+
+                elem_index++;
+                id_pos = 0;
+                CYPHER_DEBUG("build_path_from_ids: Finished element %d, moving to next", elem_index - 1);
+            }
+        }
+        p++;
+    }
+    
+    /* Handle the last element if there's still data in the buffer */
+    if (id_pos > 0 && elem_index < id_count) {
+        id_buffer[id_pos] = '\0';
+        int64_t element_id = atoll(id_buffer);
+        
+        CYPHER_DEBUG("build_path_from_ids: Processing final element %d with ID %lld", elem_index, (long long)element_id);
+
+        const char *first_label = NULL;
+        bool make_node = path_elem_is_node(path_var, is_varlen, elem_index, &first_label);
+        path_elements[elem_index] = make_path_element(executor, element_id, make_node, first_label);
+        elem_index++;
+    }
+    
+    CYPHER_DEBUG("build_path_from_ids: Parsed all elements, elem_index = %d, expected = %d", elem_index, id_count);
+    
+    /* Check if we parsed all elements */
+    if (elem_index != id_count) {
+        CYPHER_DEBUG("build_path_from_ids: ERROR - only parsed %d elements but expected %d", elem_index, id_count);
+        for (int i = 0; i < elem_index; i++) {
+            /* Free already allocated elements */
+            agtype_value_free(path_elements[i]);
+        }
+        free(path_elements);
+        return agtype_value_create_null();
+    }
+    
+    CYPHER_DEBUG("build_path_from_ids: About to create path agtype value with %d elements", id_count);
+    
+    /* Create path agtype value */
+    agtype_value *path_value = agtype_build_path(path_elements, id_count);
+    
+    CYPHER_DEBUG("build_path_from_ids: Created path agtype value: %p", (void*)path_value);
+    
+    /* Cleanup */
+    free(path_elements);
+    
+    CYPHER_DEBUG("build_path_from_ids: Returning path value");
+    return path_value ? path_value : agtype_value_create_null();
+}
+
+
+/* Execute MATCH+CREATE query combination */
+
+/*
+ * T-0319 (E10) — bind_match_clause_into_varmap audit:
+ *
+ * The canonical helper for "transform a MATCH clause, prepare the
+ * ID-only SELECT, step it ONCE, populate var_map with the FIRST
+ * matched row's bindings". Used wherever a handler needs to capture
+ * variable bindings without consuming a full agtype-projecting
+ * result.
+ *
+ * Captures BOTH VAR_KIND_NODE and VAR_KIND_EDGE bindings (extended
+ * 2026-05-21 during T-0313 light landing — was nodes-only before).
+ *
+ * Current callers:
+ *   - executor_match.c::execute_match_create_query_with_varmap (multi-MATCH CREATE).
+ *   - query_dispatch.c::handle_match_set (multi-MATCH branch).
+ *   - query_dispatch.c::handle_match_merge (T-0317 MATCH+WITH+MERGE).
+ *
+ * Latent duplicates (functions that build their OWN inline copy
+ * instead of reusing this helper):
+ *   - execute_match_create_query (executor_match.c:949)
+ *   - execute_match_set_query    (executor_set.c:~390)
+ *   - execute_match_remove_query (executor_remove.c:~16)
+ *   - execute_match_merge_query_with_varmap (executor_merge.c:~975)
+ *
+ * Each duplicates the same six-step pattern with subtle variations
+ * (single-row vs all-rows iteration, what to do per row). A clean
+ * consolidation would replace the inline MATCH-transform-then-step
+ * blocks with a callback-based helper, but the variants iterate
+ * differently per-row so the callback signature would be wide.
+ * Marked as low-priority structural cleanup — TCK-neutral work,
+ * better tackled when sql_builder fully replaces the append_sql
+ * scratchpad (post-I-0043).
+ */
+/* Helper: run a single MATCH clause and accumulate its node bindings into var_map.
+ * Used by the multi-MATCH path (GQLITE-T-0197) so that
+ * MATCH (a) MATCH (b) CREATE|MERGE|SET ... sees bindings from every MATCH,
+ * not just the first. Returns 0 on success, -1 on error (result carries msg). */
+int bind_match_clause_into_varmap(cypher_executor *executor, cypher_match *match,
+                                  variable_map *var_map, cypher_result *result)
+{
+    if (!executor || !match || !var_map || !result) return -1;
+
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) {
+        set_result_error(result, "Failed to create transform context");
+        return -1;
+    }
+
+    if (transform_match_clause(ctx, match) < 0) {
+        set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform MATCH clause");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    if (finalize_sql_generation(ctx) < 0) {
+        set_result_error(result, "Failed to finalize SQL generation");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Replace SELECT * with explicit node-id selection for each MATCH variable. */
+    char *select_pos = strstr(ctx->sql_buffer, "SELECT *");
+    if (select_pos) {
+        char *after_star = select_pos + strlen("SELECT *");
+        char *temp = strdup(after_star);
+        ctx->sql_size = select_pos + strlen("SELECT ") - ctx->sql_buffer;
+        ctx->sql_buffer[ctx->sql_size] = '\0';
+        bool first = true;
+        int var_count = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < var_count; i++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, i);
+            /* I-0042 E4 prep: also bind edge variables. DELETE/SET
+             * may target edges; without this they'd be missing from
+             * var_map. */
+            if (var && (var->kind == VAR_KIND_NODE || var->kind == VAR_KIND_EDGE)) {
+                if (!first) append_sql(ctx, ", ");
+                append_sql(ctx, "%s.id AS \"%s_id\"", var->table_alias, var->name);
+                first = false;
+            }
+        }
+        if (first) append_sql(ctx, "1");   /* no named variable: `MATCH () CREATE ()` */
+        append_sql(ctx, " %s", temp);
+        free(temp);
+    }
+
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        char error[512];
+        snprintf(error, sizeof(error), "MATCH SQL prepare failed: %s", sqlite3_errmsg(executor->db));
+        set_result_error(result, error);
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+    if (executor->params_json) {
+        if (bind_params_from_json(stmt, executor->params_json) < 0) {
+            set_result_error(result, "Failed to bind query parameters");
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            return -1;
+        }
+    }
+
+    /* Take the first matched row. Last-wins for same-name variable rebinds. */
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int col = 0;
+        int var_count2 = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < var_count2; i++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, i);
+            if (var && var->kind == VAR_KIND_NODE) {
+                int64_t node_id = sqlite3_column_int64(stmt, col);
+                /* an OPTIONAL MATCH miss stays unbound, not id 0 */
+                if (sqlite3_column_type(stmt, col) != SQLITE_NULL)
+                    set_variable_node_id(var_map, var->name, (int)node_id);
+                CYPHER_DEBUG("multi-MATCH bound '%s' -> node %lld", var->name, (long long)node_id);
+                col++;
+            } else if (var && var->kind == VAR_KIND_EDGE) {
+                int64_t edge_id = sqlite3_column_int64(stmt, col);
+                /* an OPTIONAL MATCH miss stays unbound, not id 0 */
+                if (sqlite3_column_type(stmt, col) != SQLITE_NULL)
+                    set_variable_edge_id(var_map, var->name, (int)edge_id);
+                CYPHER_DEBUG("multi-MATCH bound '%s' -> edge %lld", var->name, (long long)edge_id);
+                col++;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    cypher_transform_free_context(ctx);
+    return 0;
+}
+
+/* Multi-MATCH variant: iterate every AST_NODE_MATCH clause in the query,
+ * accumulate bindings, then run CREATE. Resolves GQLITE-T-0190 for the
+ * MATCH ... MATCH ... CREATE shape (single MATCH routed through the legacy
+ * execute_match_create_query still works since it takes the first MATCH). */
+/* Canonical entry point — pass NULL for out_var_map if the caller
+ * doesn't need the accumulated MATCH+CREATE bindings (the previous
+ * no-arg wrapper just did this). I-0041 C11. */
+int execute_multi_match_create_query(cypher_executor *executor, cypher_query *query,
+                                     cypher_create *create, cypher_result *result,
+                                     variable_map **out_var_map,
+                                     variable_map ***out_row_maps, int *out_row_count)
+{
+    if (out_row_maps) *out_row_maps = NULL;
+    if (out_row_count) *out_row_count = 0;
+    if (!executor || !query || !create || !result) {
+        if (out_var_map) *out_var_map = NULL;
+        return -1;
+    }
+    if (out_var_map) *out_var_map = NULL;
+
+    /* GitHub #95: when out_row_maps is non-NULL, hand back one variable_map
+     * per processed MATCH row (matched + CREATE-introduced bindings) so the
+     * caller can project a RETURN that references CREATE-only variables.
+     * Caller owns the array and each map. */
+    variable_map **row_maps = NULL;
+    int row_maps_n = 0, row_maps_cap = 0;
+    const bool collect_rows = (out_row_maps != NULL);
+
+    variable_map *var_map = create_variable_map();
+    if (!var_map) {
+        set_result_error(result, "Failed to create variable map");
+        return -1;
+    }
+    if (!create->pattern) {
+        set_result_error(result, "No pattern in CREATE clause");
+        free_variable_map(var_map);
+        return -1;
+    }
+
+    /* Count MATCH clauses to detect the single-MATCH case (the common shape). */
+    int match_count = 0;
+    cypher_match *single_match = NULL;
+    for (int i = 0; i < query->clauses->count; i++) {
+        ast_node *c = query->clauses->items[i];
+        if (c && c->type == AST_NODE_MATCH) {
+            match_count++;
+            if (!single_match) single_match = (cypher_match*)c;
+        }
+    }
+
+    /* GQLITE-T-0339: legacy code took only the first matched row (a hard-coded
+     * `break` in bind_match_clause_into_varmap), so MATCH (d:D) CREATE (e:E)
+     * created exactly one `e` regardless of how many D nodes existed. For the
+     * single-MATCH case run the MATCH inline, materialize ALL matched rows
+     * into memory (executing CREATE during sqlite3_step invalidates the
+     * iterating SELECT — observed: only the first row processed), then
+     * iterate the captured rows running EVERY CREATE clause's patterns per
+     * row. A fresh row_vm per row keeps CREATE-introduced bindings (e, g, …)
+     * from bleeding across rows. Multi-MATCH keeps the legacy first-row
+     * behavior (a separate, larger fix). */
+    if (match_count == 1 && single_match) {
+        cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+        if (!ctx) {
+            set_result_error(result, "Failed to create transform context");
+            free_variable_map(var_map);
+            return -1;
+        }
+        if (transform_match_clause(ctx, single_match) < 0) {
+            set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform MATCH");
+            cypher_transform_free_context(ctx);
+            free_variable_map(var_map);
+            return -1;
+        }
+        if (finalize_sql_generation(ctx) < 0) {
+            set_result_error(result, "Failed to finalize SQL generation");
+            cypher_transform_free_context(ctx);
+            free_variable_map(var_map);
+            return -1;
+        }
+        /* Replace SELECT * with explicit node/edge id selection. */
+        char *select_pos = strstr(ctx->sql_buffer, "SELECT *");
+        if (select_pos) {
+            char *after_star = select_pos + strlen("SELECT *");
+            char *temp = strdup(after_star);
+            ctx->sql_size = select_pos + strlen("SELECT ") - ctx->sql_buffer;
+            ctx->sql_buffer[ctx->sql_size] = '\0';
+            bool first_col = true;
+            int vcount = transform_var_count(ctx->var_ctx);
+            for (int i = 0; i < vcount; i++) {
+                transform_var *var = transform_var_at(ctx->var_ctx, i);
+                if (var && (var->kind == VAR_KIND_NODE || var->kind == VAR_KIND_EDGE)) {
+                    if (!first_col) append_sql(ctx, ", ");
+                    append_sql(ctx, "%s.id AS \"%s_id\"", var->table_alias, var->name);
+                    first_col = false;
+                }
+            }
+            if (first_col) append_sql(ctx, "1");   /* no named variable: `MATCH () CREATE ()` */
+            append_sql(ctx, " %s", temp);
+            free(temp);
+        }
+        sqlite3_stmt *stmt = NULL;
+        int rc_prep = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
+        if (rc_prep != SQLITE_OK) {
+            char err[512];
+            snprintf(err, sizeof(err), "MATCH SQL prepare failed: %s", sqlite3_errmsg(executor->db));
+            set_result_error(result, err);
+            cypher_transform_free_context(ctx);
+            free_variable_map(var_map);
+            return -1;
+        }
+        if (executor->params_json && bind_params_from_json(stmt, executor->params_json) < 0) {
+            set_result_error(result, "Failed to bind query parameters");
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            free_variable_map(var_map);
+            return -1;
+        }
+        /* Materialize all matched rows BEFORE any CREATE. */
+        int vcount2 = transform_var_count(ctx->var_ctx);
+        int rows_cap = 16, rows_n = 0;
+        int64_t **row_ids = malloc(rows_cap * sizeof(int64_t*));
+        if (!row_ids) {
+            set_result_error(result, "OOM (row id buffer)");
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            free_variable_map(var_map);
+            return -1;
+        }
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            if (rows_n == rows_cap) {
+                rows_cap *= 2;
+                int64_t **g = realloc(row_ids, rows_cap * sizeof(int64_t*));
+                if (!g) {
+                    set_result_error(result, "OOM (row grow)");
+                    for (int k = 0; k < rows_n; k++) free(row_ids[k]);
+                    free(row_ids);
+                    sqlite3_finalize(stmt);
+                    cypher_transform_free_context(ctx);
+                    free_variable_map(var_map);
+                    return -1;
+                }
+                row_ids = g;
+            }
+            row_ids[rows_n] = malloc(vcount2 * sizeof(int64_t));
+            int col = 0;
+            for (int i = 0; i < vcount2; i++) {
+                transform_var *var = transform_var_at(ctx->var_ctx, i);
+                if (var && (var->kind == VAR_KIND_NODE || var->kind == VAR_KIND_EDGE)) {
+                    row_ids[rows_n][i] = sqlite3_column_int64(stmt, col++);
+                } else {
+                    row_ids[rows_n][i] = -1;
+                }
+            }
+            rows_n++;
+        }
+        sqlite3_finalize(stmt);
+
+        /* Now run CREATEs per row with a fresh var_map (the placeholder is
+         * discarded since the loop builds replacements). */
+        free_variable_map(var_map);
+        var_map = NULL;
+        for (int r = 0; r < rows_n; r++) {
+            variable_map *row_vm = create_variable_map();
+            if (!row_vm) {
+                set_result_error(result, "Failed to create row var_map");
+                for (int k = 0; k < rows_n; k++) free(row_ids[k]);
+                free(row_ids);
+                cypher_transform_free_context(ctx);
+                if (var_map) free_variable_map(var_map);
+                for (int k = 0; k < row_maps_n; k++) free_variable_map(row_maps[k]);
+                free(row_maps);
+                return -1;
+            }
+            for (int i = 0; i < vcount2; i++) {
+                transform_var *var = transform_var_at(ctx->var_ctx, i);
+                if (!var) continue;
+                if (var->kind == VAR_KIND_NODE) {
+                    set_variable_node_id(row_vm, var->name, (int)row_ids[r][i]);
+                } else if (var->kind == VAR_KIND_EDGE) {
+                    set_variable_edge_id(row_vm, var->name, (int)row_ids[r][i]);
+                }
+            }
+            /* Every CREATE clause's patterns for this row. */
+            for (int ci = 0; ci < query->clauses->count; ci++) {
+                ast_node *cclause = query->clauses->items[ci];
+                if (!cclause || cclause->type != AST_NODE_CREATE) continue;
+                cypher_create *cc = (cypher_create*)cclause;
+                if (!cc->pattern) continue;
+                for (int i = 0; i < cc->pattern->count; i++) {
+                    ast_node *pattern = cc->pattern->items[i];
+                    if (pattern->type == AST_NODE_PATH) {
+                        if (execute_path_pattern_with_variables(executor, (cypher_path*)pattern, result, row_vm) < 0) {
+                            free_variable_map(row_vm);
+                            for (int k = 0; k < rows_n; k++) free(row_ids[k]);
+                            free(row_ids);
+                            cypher_transform_free_context(ctx);
+                            if (var_map) free_variable_map(var_map);
+                            for (int k = 0; k < row_maps_n; k++) free_variable_map(row_maps[k]);
+                            free(row_maps);
+                            return -1;
+                        }
+                    }
+                }
+            }
+            if (collect_rows) {
+                /* Hand row ownership to the collected array; var_map stays
+                 * NULL and is recreated empty below. */
+                if (row_maps_n == row_maps_cap) {
+                    row_maps_cap = row_maps_cap ? row_maps_cap * 2 : 8;
+                    variable_map **grown = realloc(row_maps, row_maps_cap * sizeof(variable_map*));
+                    if (!grown) {
+                        set_result_error(result, "OOM (row map array)");
+                        free_variable_map(row_vm);
+                        for (int k = 0; k < rows_n; k++) free(row_ids[k]);
+                        free(row_ids);
+                        cypher_transform_free_context(ctx);
+                        for (int k = 0; k < row_maps_n; k++) free_variable_map(row_maps[k]);
+                        free(row_maps);
+                        return -1;
+                    }
+                    row_maps = grown;
+                }
+                row_maps[row_maps_n++] = row_vm;
+            } else {
+                if (var_map) free_variable_map(var_map);
+                var_map = row_vm;
+            }
+        }
+        for (int k = 0; k < rows_n; k++) free(row_ids[k]);
+        free(row_ids);
+        cypher_transform_free_context(ctx);
+        if (!var_map) var_map = create_variable_map(); /* no matched rows */
+    } else {
+        /* Multi-MATCH (or zero-MATCH) legacy path: first-row-only binding. */
+        for (int i = 0; i < query->clauses->count; i++) {
+            ast_node *clause = query->clauses->items[i];
+            if (!clause || clause->type != AST_NODE_MATCH) continue;
+            if (bind_match_clause_into_varmap(executor, (cypher_match*)clause, var_map, result) < 0) {
+                free_variable_map(var_map);
+                return -1;
+            }
+        }
+        for (int i = 0; i < create->pattern->count; i++) {
+            ast_node *pattern = create->pattern->items[i];
+            if (pattern->type == AST_NODE_PATH) {
+                if (execute_path_pattern_with_variables(executor, (cypher_path*)pattern, result, var_map) < 0) {
+                    free_variable_map(var_map);
+                    return -1;
+                }
+            }
+        }
+        if (collect_rows) {
+            /* Legacy path binds/creates a single row; expose it as one map. */
+            row_maps = malloc(sizeof(variable_map*));
+            if (row_maps) {
+                row_maps[0] = var_map;
+                row_maps_n = 1;
+                var_map = NULL;
+            }
+        }
+    }
+
+    if (out_row_maps) {
+        *out_row_maps = row_maps;
+        if (out_row_count) *out_row_count = row_maps_n;
+    }
+    if (out_var_map) {
+        *out_var_map = var_map ? var_map : create_variable_map();
+    } else if (var_map) {
+        free_variable_map(var_map);
+    }
+    return 0;
+}
+
+int execute_match_create_query(cypher_executor *executor, cypher_match *match, cypher_create *create, cypher_result *result)
+{
+    if (!executor || !match || !create || !result) {
+        return -1;
+    }
+
+    CYPHER_DEBUG("Executing MATCH+CREATE query");
+    
+    /* First, execute the MATCH to bind variables to existing nodes */
+    cypher_transform_context *ctx = cypher_transform_create_context_ex(executor->db, false);
+    if (!ctx) {
+        set_result_error(result, "Failed to create transform context");
+        return -1;
+    }
+    
+    /* Transform MATCH clause to generate SQL */
+    if (transform_match_clause(ctx, match) < 0) {
+        set_result_error(result, ctx && ctx->error_message ? ctx->error_message : "Failed to transform MATCH clause");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Finalize SQL generation to assemble unified builder content into sql_buffer */
+    if (finalize_sql_generation(ctx) < 0) {
+        set_result_error(result, "Failed to finalize SQL generation");
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Add a simple SELECT to get the matched node IDs */
+    char *select_pos = strstr(ctx->sql_buffer, "SELECT *");
+    if (select_pos) {
+        /* Replace SELECT * with specific node ID selection */
+        char *after_star = select_pos + strlen("SELECT *");
+        char *temp = strdup(after_star);
+        
+        ctx->sql_size = select_pos + strlen("SELECT ") - ctx->sql_buffer;
+        ctx->sql_buffer[ctx->sql_size] = '\0';
+        
+        /* Select all node variables found in the MATCH */
+        bool first = true;
+        int var_count = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < var_count; i++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, i);
+            if (var && var->kind == VAR_KIND_NODE) {
+                if (!first) append_sql(ctx, ", ");
+                append_sql(ctx, "%s.id AS \"%s_id\"", var->table_alias, var->name);
+                first = false;
+            }
+        }
+        
+        if (first) append_sql(ctx, "1");   /* no named variable: `MATCH () CREATE ()` */
+        append_sql(ctx, " %s", temp);
+        free(temp);
+    }
+    
+    CYPHER_DEBUG("Generated MATCH SQL: %s", ctx->sql_buffer);
+
+    /* Execute the MATCH query to get existing node IDs */
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(executor->db, ctx->sql_buffer, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        char error[512];
+        snprintf(error, sizeof(error), "MATCH SQL prepare failed: %s", sqlite3_errmsg(executor->db));
+        set_result_error(result, error);
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+
+    /* Bind parameters if provided */
+    if (executor->params_json) {
+        if (bind_params_from_json(stmt, executor->params_json) < 0) {
+            set_result_error(result, "Failed to bind query parameters");
+            sqlite3_finalize(stmt);
+            cypher_transform_free_context(ctx);
+            return -1;
+        }
+    }
+
+    /* Create variable map to store matched node IDs */
+    variable_map *var_map = create_variable_map();
+    if (!var_map) {
+        set_result_error(result, "Failed to create variable map");
+        sqlite3_finalize(stmt);
+        cypher_transform_free_context(ctx);
+        return -1;
+    }
+    
+    /* Read matched node IDs */
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int col = 0;
+        int var_count2 = transform_var_count(ctx->var_ctx);
+        for (int i = 0; i < var_count2; i++) {
+            transform_var *var = transform_var_at(ctx->var_ctx, i);
+            if (var && var->kind == VAR_KIND_NODE) {
+                int64_t node_id = sqlite3_column_int64(stmt, col);
+                /* an OPTIONAL MATCH miss stays unbound, not id 0 */
+                if (sqlite3_column_type(stmt, col) != SQLITE_NULL)
+                    set_variable_node_id(var_map, var->name, (int)node_id);
+                CYPHER_DEBUG("Bound variable '%s' to existing node %lld", var->name, (long long)node_id);
+                col++;
+            }
+        }
+        break; /* For now, just take the first match */
+    }
+    
+    sqlite3_finalize(stmt);
+    cypher_transform_free_context(ctx);
+    
+    /* Now execute the CREATE clause with the bound variables */
+    if (!create->pattern) {
+        set_result_error(result, "No pattern in CREATE clause");
+        free_variable_map(var_map);
+        return -1;
+    }
+    
+    /* Process each path pattern in the CREATE clause */
+    for (int i = 0; i < create->pattern->count; i++) {
+        ast_node *pattern = create->pattern->items[i];
+        
+        if (pattern->type == AST_NODE_PATH) {
+            if (execute_path_pattern_with_variables(executor, (cypher_path*)pattern, result, var_map) < 0) {
+                free_variable_map(var_map);
+                return -1;
+            }
+        }
+    }
+    
+    free_variable_map(var_map);
+    return 0;
+}
+
+
+/* Execute MATCH+CREATE+RETURN query combination */
+int execute_match_create_return_query(cypher_executor *executor, cypher_match *match, cypher_create *create, cypher_return *return_clause, cypher_result *result)
+{
+    if (!executor || !match || !create || !return_clause || !result) {
+        return -1;
+    }
+    
+    CYPHER_DEBUG("Executing MATCH+CREATE+RETURN query");
+    
+    /* First execute MATCH+CREATE */
+    if (execute_match_create_query(executor, match, create, result) < 0) {
+        return -1;
+    }
+    
+    /* Then execute the RETURN clause as a separate MATCH query */
+    /* This is a simplified approach - in a full implementation, we'd track created objects */
+    return execute_match_return_query(executor, match, return_clause, result);
+}

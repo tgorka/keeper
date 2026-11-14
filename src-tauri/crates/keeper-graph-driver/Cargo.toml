@@ -1,0 +1,22 @@
+[package]
+name = "keeper-graph-driver"
+description = "The headless app-human consumer of keeper's graph: apply, sync, query, inspect, history and status against a real keeper-hq"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+keeper-core = { path = "../keeper-core", features = ["human-reads"] }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+# Only the P1 measurement example `rc_spawner` (never shipped) uses these.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["resource"] }
+sha2 = { workspace = true }
