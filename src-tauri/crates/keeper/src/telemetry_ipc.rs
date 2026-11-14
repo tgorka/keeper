@@ -13,9 +13,13 @@ use tauri::{Emitter, Manager, State};
 
 pub fn init(app: &tauri::App) {
     // Build-time public values only. No process-env lookup or secret provider.
-    let config = option_env!("KEEPER_POSTHOG_HOST")
-        .zip(option_env!("KEEPER_POSTHOG_PROJECT_TOKEN"))
-        .and_then(|(host, token)| PublicConfig::parse(host, token));
+    let config = match (
+        option_env!("KEEPER_POSTHOG_HOST"),
+        option_env!("KEEPER_POSTHOG_PROJECT_TOKEN"),
+    ) {
+        (Some(host), Some(token)) => PublicConfig::parse(host, token),
+        _ => None,
+    };
     let data_dir = app.state::<crate::ipc::AppState>().platform.data_dir().ok();
     let telemetry = Telemetry::open(data_dir.as_deref(), config);
     app.manage(Arc::clone(&telemetry));
