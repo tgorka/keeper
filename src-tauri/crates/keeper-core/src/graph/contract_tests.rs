@@ -231,6 +231,79 @@ fn algebra_vectors_reproduce() {
     }
 }
 
+/// `images` after accepting `ops`: each row replaced by its after image, or
+/// removed when it has none.
+fn fold(images: &mut Value, ops: &[Op]) {
+    for op in ops {
+        let entity = serde_json::to_value(op.entity_type).expect("entity type");
+        let table = format!("{}s", entity.as_str().expect("entity type"));
+        let rows = images[table.as_str()].as_array_mut().expect("table");
+        rows.retain(|row| row["id"] != op.entity_id.as_str());
+        if let Some(after) = &op.after_value {
+            rows.push(after.clone());
+        }
+    }
+}
+
+/// The revision rule `graph_query_live`'s fixture relies on: a tag added in
+/// a node's creating change, and an edge created from it later, leave the
+/// node at revision 1. Its first update names "1"; naming "2" is a revision
+/// conflict whose current revision is "1", as keeper-hq answers it.
+#[test]
+fn a_tag_in_the_creating_change_leaves_the_node_at_revision_one() {
+    let id = |n: u32| format!("01JF{n:022}");
+    let mut images = serde_json::json!({"nodes": [], "edges": [], "tags": [], "node_tags": []});
+    let mut minted = 100;
+    let mut judge = |images: &Value, payload: Value| {
+        let change = change::parse(&payload, normalise).expect("payload");
+        let stamp = candidate::Stamp {
+            time_ms: 1,
+            actor_id: "vector-actor",
+        };
+        candidate::apply(&Images(images.clone()), &change, &stamp, &mut || {
+            minted += 1;
+            id(minted)
+        })
+    };
+    let accepted = |verdict: Verdict| match verdict {
+        Verdict::Accepted(effects) => effects.ops,
+        other => panic!("{other:?}"),
+    };
+    let node = |n: u32, title: &str| {
+        serde_json::json!({"op": "create_node", "id": id(n), "kind": "Concept", "title": title,
+            "description": null, "properties": {}})
+    };
+    let created = accepted(judge(
+        &images,
+        serde_json::json!({"ops": [node(1, "Alpha"), node(2, "Beta"),
+            {"op": "add_tag", "node_id": id(1), "tag": "#Project", "expected_revision": null}]}),
+    ));
+    fold(&mut images, &created);
+    let linked = accepted(judge(
+        &images,
+        serde_json::json!({"ops": [{"op": "create_edge", "id": id(10), "from_id": id(1), "to_id": id(2),
+            "type": "test:rel", "properties": {}, "from_lifecycle_revision": "1",
+            "to_lifecycle_revision": "1"}]}),
+    ));
+    fold(&mut images, &linked);
+    let update = |expected: &str| {
+        serde_json::json!({"ops": [{"op": "update_node", "id": id(1), "expected_revision": expected,
+            "set": {"title": "Alpha 2"}}]})
+    };
+    assert_eq!(
+        judge(&images, update("2")),
+        Verdict::Conflict(serde_json::json!({
+            "entity": {"entity_type": "node", "id": id(1)},
+            "precondition": "revision",
+            "current_revision": "1",
+        }))
+    );
+    let updated = accepted(judge(&images, update("1")));
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0].before_revision.as_deref(), Some("1"));
+    assert_eq!(updated[0].after_revision.as_deref(), Some("2"));
+}
+
 #[test]
 fn shared_tag_vectors_hold_under_the_notes_policy() {
     let corpus: Value = serde_json::from_str(CORPUS).expect("vectors");

@@ -8,8 +8,17 @@
 //!
 //! ```sh
 //! rc_spawner --worker <abs path> --worker-sha256 <hex> [--ledger <file>] \
-//!            [--macos-evidence] --root <projection dir> --mode admit|run
+//!            [--macos-evidence] [--saved-uid0] --root <projection dir> --mode admit|run
 //! ```
+//!
+//! `--saved-uid0` (Linux, test-only, for R-C's NC-13a saved-uid-0 control): launched as uid 0
+//! with `CAP_SETUID`, the spawner calls `setresuid(1000, 1000, 0)` in-process before it builds
+//! its runtime or starts any thread, so every later thread, the spawning thread included, runs
+//! with real and effective uid 1000 and saved uid 0 (an exec cannot produce that state: it
+//! resets the saved uid to the effective one). It refuses to continue (exit 2) unless the drop
+//! succeeded and `/proc/thread-self/status` then reads `Uid: 1000 1000 0 1000`, and the report
+//! carries those four ids as `saved_uid0.uid`. The expected NC-13a row is then step 5's
+//! `process.credentials`, with `spawn_attempts == 1` and `spawn_calls == 0`.
 //!
 //! It prints one JSON line:
 //! - `admitted`, and the refusal `label` when not;
@@ -19,11 +28,12 @@
 //!   and tag) — only a worker that reached B0 and answered produces them;
 //! - `children.spawn_attempts`: the admission's cumulative count, incremented immediately
 //!   before every `runtime.spawn()` whether or not the spawn succeeds;
-//! - `children.spawn_calls`: the cumulative count of real spawn calls, incremented inside
-//!   `Runtime::spawn` after step 5 (`ledger::spawning_thread()`) returned Ok and immediately
-//!   before `command.spawn()`, whether or not the kernel then refuses it. Zero means no fork
-//!   or clone was ever asked of the kernel: unlike a pids count, it cannot read zero because
-//!   an idle blocking thread was retired;
+//! - `children.spawn_calls`: the cumulative count of real worker-process spawn calls,
+//!   incremented inside `Runtime::spawn` after step 5 (`ledger::spawning_thread()`) returned Ok
+//!   and immediately before `command.spawn()`, whether or not the kernel then refuses it. Zero
+//!   means no worker-process spawn was ever asked of the kernel; it counts nothing else (this
+//!   process's own threads are created with `clone` too and are not counted). Unlike a pids
+//!   count, it cannot read zero because an idle blocking thread was retired;
 //! - `telemetry` (peak/live workers, `RUSAGE_CHILDREN` max RSS): observations only, never a
 //!   creation count (a live or unwaited child leaves max RSS 0).
 //!
@@ -258,7 +268,7 @@ mod spawner {
     }
 
     /// The report and whether the invocation succeeded (mode `run`: NC-9 passed).
-    async fn run(args: Vec<String>) -> Result<(Value, bool)> {
+    async fn run(args: Vec<String>, saved_uid0: Option<[u32; 4]>) -> Result<(Value, bool)> {
         let mode = arg(&args, "--mode").ok_or("--mode admit|run is required")?;
         if mode != "run" && mode != "admit" {
             return Err(format!("unknown --mode {mode}: admit or run").into());
@@ -276,6 +286,9 @@ mod spawner {
             "tool": "rc_spawner", "mode": mode, "worker": worker, "worker_sha256": file_sha256(&worker),
             "ledger_sha256": ledger_path.as_deref().and_then(file_sha256),
         });
+        if let Some(uid) = saved_uid0 {
+            report["saved_uid0"] = json!({"uid": uid});
+        }
         let runtime = VerifiedWorker::open(&worker, expected.as_deref()).and_then(|w| {
             #[cfg(target_os = "macos")]
             if args.iter().any(|a| a == "--macos-evidence") {
@@ -363,15 +376,51 @@ mod spawner {
         Ok((report, ok))
     }
 
+    /// `--saved-uid0`: real and effective uid 1000, saved uid 0, taken while this process
+    /// has one thread (glibc's `setresuid` would apply it to every thread regardless), and
+    /// the four `Uid:` ids `/proc/thread-self/status` reads afterwards. Anything else is an
+    /// error: a control whose premise did not hold must not run.
+    #[cfg(target_os = "linux")]
+    fn saved_uid0() -> Result<[u32; 4]> {
+        use nix::unistd::{setresuid, Uid};
+        setresuid(Uid::from_raw(1000), Uid::from_raw(1000), Uid::from_raw(0))
+            .map_err(|e| format!("saved-uid0: setresuid(1000, 1000, 0): {e}"))?;
+        let status = std::fs::read_to_string("/proc/thread-self/status")?;
+        let ids: Vec<u32> = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .ok_or("saved-uid0: no Uid line")?
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()?;
+        match <[u32; 4]>::try_from(ids) {
+            Ok(ids) if ids == [1000, 1000, 0, 1000] => Ok(ids),
+            Ok(ids) => Err(format!("saved-uid0: Uid reads {ids:?}").into()),
+            Err(ids) => Err(format!("saved-uid0: Uid reads {ids:?}").into()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn saved_uid0() -> Result<[u32; 4]> {
+        Err("--saved-uid0 is Linux only".into())
+    }
+
     pub fn main() -> std::process::ExitCode {
         use std::process::ExitCode;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let outcome = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(run(args)),
-            Err(error) => Err(error.into()),
+        let saved = if args.iter().any(|a| a == "--saved-uid0") {
+            saved_uid0().map(Some)
+        } else {
+            Ok(None)
+        };
+        let outcome = match saved {
+            Err(error) => Err(error),
+            Ok(saved) => match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(run(args, saved)),
+                Err(error) => Err(error.into()),
+            },
         };
         match outcome {
             Ok((report, ok)) => {

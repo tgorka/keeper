@@ -70,20 +70,24 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
 ### Rust Rules (src-tauri/)
 
 - `unsafe_code = "deny"` (workspace lint). In `keeper-core` and all business logic: no
-  `unsafe`, ever. In the `keeper` shell crate ONLY, a narrowly-scoped, function-level
+  `unsafe`, ever, save the one K01 item below. In the `keeper` shell crate ONLY, a narrowly-scoped, function-level
   `#[allow(unsafe_code)]` is permitted for platform FFI that has no safe binding (e.g.
   iOS `NSURLIsExcludedFromBackupKey` via objc2), under these conditions: one function per
   concern, behind the `Platform` port, with a `// SAFETY:` comment citing the API contract,
   and listed in the audit inventory in docs/constraints-and-limitations.md. (Coordinator
   policy amendment, 2026-07-11, story 14.7.) The iPhone notification extension's crate
   `keeper-nse` may carry the same for its two C-ABI exports and nothing else (Epic 98,
-  rung `agents-98-nse`).
+  rung `agents-98-nse`). `keeper-core` carries exactly one: `die_with_parent` in
+  `crates/keeper-core/src/graph/parent_death.rs` (Linux), the graph worker's
+  `pre_exec` parent-death signal (owner amendment 2026-11-13; inventory row K01 in
+  docs/constraints-and-limitations.md; the file's bytes pinned by
+  `scripts/check-graph-boundary.py`). Nothing else in keeper-core, ever.
 - `keeper-graph-query` (the separate graph worker executable) may carry exactly the eleven
   function-scoped allowances U01–U11 in docs/constraints-and-limitations.md: six named
   exports and three safe callbacks without allowances (`scripts/check-graph-boundary.py`
-  pins them and the reviewed bytes of `allocation.rs`/`native.rs`). Core, protocol and
-  driver stay unsafe-free, and Linux confinement uses safe bindings. Any additional item
-  needs an independent inventory review and an owner decision (OD-1).
+  pins them and the reviewed bytes of `allocation.rs`/`native.rs`). Protocol and driver
+  stay unsafe-free, core carries only K01, and Linux confinement uses safe bindings. Any
+  additional item needs an independent inventory review and an owner decision (OD-1).
 - `clippy::unwrap_used = "warn"` and clippy runs with `-D warnings`: **never use `.unwrap()` (or bare `.expect()`) in production paths.** Use `?` with `thiserror` error types; `expect` is tolerated only in tests and startup code that cannot proceed (e.g. `tauri::Builder::run`).
 - `clippy --all-targets -- -D warnings` must pass — treat every clippy lint as an error.
 - Use `tracing` for logging (not `println!`/`eprintln!`).

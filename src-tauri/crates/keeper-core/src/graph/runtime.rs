@@ -18,9 +18,17 @@
 //! nothing awaited between ([`Runtime::spawn`]). A failed recheck
 //! invalidates the runtime for good: the consumer opens a new one, which
 //! verifies everything again.
+//!
+//! On Linux a worker dies with its parent (`PR_SET_PDEATHSIG`, SIGKILL;
+//! owner amendment 2026-11-13), so a driver or agentd killed outright never
+//! leaves one running. The kernel's parent is the spawning *thread*, so every
+//! Linux worker is spawned, and its spawning-thread check run, on one thread
+//! that lives as long as the process ([`spawner`]): a runtime or blocking
+//! thread that retires never takes a healthy worker with it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -86,13 +94,18 @@ enum Class {
     #[cfg(target_os = "macos")]
     MacosEvidence,
     /// Unit tests of the supervisor run the real worker without the ledger
-    /// (a dev host is never the measured class).
+    /// (a dev host is never the measured class); a test may stand in a
+    /// step 5 of its own, run where step 5 runs.
     #[cfg(test)]
-    Test,
+    Test(Option<StepFive>),
     /// Keeps the enum inhabited-checkable on targets with no class.
     #[allow(dead_code)]
     Never(std::convert::Infallible),
 }
+
+/// A test's step 5, run where the ledger class runs the real one.
+#[cfg(test)]
+type StepFive = std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>;
 
 /// A worker and the runtime class it was admitted in.
 pub struct Runtime {
@@ -163,9 +176,18 @@ impl Runtime {
 
     #[cfg(test)]
     pub(crate) fn for_tests(worker: VerifiedWorker) -> Self {
+        Self::for_tests_with_step_five(worker, None)
+    }
+
+    /// The test class, with `step_five` run in step 5's place.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_step_five(
+        worker: VerifiedWorker,
+        step_five: Option<StepFive>,
+    ) -> Self {
         Self {
             worker,
-            class: Class::Test,
+            class: Class::Test(step_five),
             invalidated: AtomicBool::new(false),
         }
     }
@@ -196,7 +218,7 @@ impl Runtime {
             #[cfg(target_os = "macos")]
             Class::MacosEvidence => Ok(()),
             #[cfg(test)]
-            Class::Test => Ok(()),
+            Class::Test(_) => Ok(()),
             Class::Never(never) => match *never {},
         };
         if result.is_err() {
@@ -227,14 +249,29 @@ impl Runtime {
         Ok(command)
     }
 
-    /// Step 5 on this thread, then the spawn, synchronously. `called` is
-    /// told of the real spawn call: after step 5 passed, immediately before
-    /// `spawn()`, whether the kernel then refuses it or not.
+    /// Step 5 on the spawning thread, then the spawn, synchronously. On
+    /// Linux the spawning thread is the process-lifetime [`spawner`] thread
+    /// and the child dies with its parent. `called` is told of the real
+    /// spawn call: after step 5 passed, immediately before `spawn()`,
+    /// whether the kernel then refuses it or not.
     pub(crate) fn spawn(
-        &self,
-        command: &mut tokio::process::Command,
-        called: impl FnOnce(),
+        self: &Arc<Self>,
+        mut command: tokio::process::Command,
+        called: impl FnOnce() + Send + 'static,
     ) -> Result<tokio::process::Child, QueryError> {
+        #[cfg(target_os = "linux")]
+        {
+            let runtime = Arc::clone(self);
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| QueryError::Unavailable("worker.spawner"))?;
+            spawner::run(move || {
+                let _entered = handle.enter();
+                super::parent_death::die_with_parent(&mut command);
+                guarded_spawn(|| runtime.step_five(), called, || command.spawn())
+            })
+            .ok_or(QueryError::Unavailable("worker.spawner"))?
+        }
+        #[cfg(not(target_os = "linux"))]
         guarded_spawn(|| self.step_five(), called, || command.spawn())
     }
 
@@ -247,6 +284,10 @@ impl Runtime {
                 self.invalidated.store(true, Ordering::SeqCst);
                 return Err(label);
             }
+        }
+        #[cfg(test)]
+        if let Class::Test(Some(step_five)) = &self.class {
+            return step_five();
         }
         Ok(())
     }
@@ -263,6 +304,56 @@ fn guarded_spawn<T>(
     step_five().map_err(QueryError::Unavailable)?;
     called();
     spawn().map_err(|_| QueryError::Unavailable("worker.spawn"))
+}
+
+/// The one thread every Linux worker is spawned from. It lives as long as
+/// the process: a worker dies with its parent thread, so a spawn from a
+/// thread that may retire (a blocking-pool thread, a runtime's) would kill
+/// a healthy worker when that thread exits.
+///
+/// Invariant (review 623 F2): this thread's per-thread identity
+/// (credentials, `no_new_privs`, capabilities, Landlock, seccomp, signal
+/// mask) is fixed by the thread that makes the process's FIRST spawn, which
+/// starts it, and every worker inherits it. A restriction any other thread
+/// takes on later never reaches a worker. So agentd must make its first
+/// spawn only once its identity is final, and must never change a
+/// per-thread identity afterwards. Step 5 runs here, on the forking thread,
+/// so a worker never exceeds what step 5 saw.
+#[cfg(target_os = "linux")]
+mod spawner {
+    use std::sync::{mpsc, LazyLock};
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// The spawner thread's queue, the thread started by the first spawn
+    /// (inheriting that thread's credentials and `no_new_privs`, as threads
+    /// do); `None` when the thread could not start.
+    static JOBS: LazyLock<Option<mpsc::Sender<Job>>> = LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("keeper-graph-spawner".to_owned())
+            .spawn(move || {
+                for job in receiver {
+                    // A panicking job must not end the thread: every worker
+                    // it spawned would die with it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+
+    /// `job`'s answer, run on the spawner thread; `None` when the thread
+    /// could not be started.
+    pub(super) fn run<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (answer, answered) = mpsc::sync_channel(1);
+        JOBS.as_ref()?
+            .send(Box::new(move || {
+                let _ = answer.send(job());
+            }))
+            .ok()?;
+        answered.recv().ok()
+    }
 }
 
 /// The largest inherited soft `RLIMIT_STACK` the worker's startup
@@ -374,6 +465,46 @@ mod tests {
                 (Ok(()), Ok(())) => assert_eq!(result, Ok(())),
             }
         }
+    }
+
+    /// Review 623 F1: step 5 runs on the thread that forks, the spawner
+    /// thread, never on the thread that asked for the spawn: the worker
+    /// inherits the forking thread's identity, so that is the identity step
+    /// 5 must see. (Their identities can differ: a per-thread restriction
+    /// the asking thread took on never reaches the spawner.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn step_five_runs_on_the_thread_that_forks() {
+        use sha2::{Digest, Sha256};
+        use std::sync::Mutex;
+        // Any regular executable serves: only where step 5 runs is observed.
+        let program = std::fs::canonicalize("/bin/true").expect("an executable");
+        let digest: String = Sha256::digest(std::fs::read(&program).expect("its bytes"))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let runtime = Arc::new(Runtime::for_tests_with_step_five(
+            VerifiedWorker::open(&program, Some(&digest)).expect("verified"),
+            Some(Arc::new(move || {
+                record.lock().expect("seen").push(rustix::thread::gettid());
+                Ok(())
+            })),
+        ));
+        let handle = tokio::runtime::Handle::current();
+        let (asker, mut child) = std::thread::spawn(move || {
+            let _entered = handle.enter();
+            let command = runtime.command("query", Path::new("/")).expect("command");
+            let child = runtime.spawn(command, || {}).expect("spawned");
+            (rustix::thread::gettid(), child)
+        })
+        .join()
+        .expect("asked");
+        child.wait().await.expect("reaped");
+        let forker = spawner::run(rustix::thread::gettid).expect("the spawner thread");
+        assert_ne!(asker, forker);
+        assert_eq!(*seen.lock().expect("seen"), vec![forker]);
     }
 
     /// Q6 / OD-B / OD-C guard: only linux/x86_64 with an embedded ledger
