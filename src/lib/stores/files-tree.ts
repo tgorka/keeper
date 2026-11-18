@@ -136,7 +136,7 @@ function nodeDepth(key: string): number {
  * remembered path stops being trusted, exactly as `isRestorableTarget` is for
  * the panel list. AD-65 says no frontend joins a root and a subpath; the
  * corollary is that a path arriving from outside the app has to be a relative
- * one before it is handed to a call that will join it. `keeper_sync::browse`
+ * one before it is handed to a call that will join it. `keeper_paths::resolve`
  * refuses `..` lexically and refuses a symlink out of the tree after
  * canonicalisation, so this is the outer of two gates rather than the only one.
  */

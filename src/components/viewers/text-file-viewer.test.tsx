@@ -1169,7 +1169,7 @@ describe("a file that is not prose keeps the editor it had (Story 50.3)", () => 
  * menu, emoji completion and a Save button over a buffer every write refuses,
  * and was not marked read-only either.
  *
- * The refusal is Rust's own: `keeper_sync::files_write::WriteRefusal::
+ * The refusal is Rust's own: `keeper_paths::WriteRefusal::
  * SessionWorkspace`'s Display, which `sync_browse` puts on the listing row this
  * panel opened the file from.
  */

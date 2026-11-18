@@ -713,7 +713,7 @@ export function TextFileFrame({
   // the reader gets a sentence instead of an editor that silently refuses.
   //
   // The LOCATION's answer is `writeRefusal`, and it is Rust's — composed by
-  // `keeper_sync::files_write::WriteRefusal` and carried on the listing row
+  // `keeper_paths::WriteRefusal` and carried on the listing row
   // the panel opened, so consulting it is not the frontend deciding which
   // volumes are writable; re-deriving it here would be. Story 50.3 shipped
   // without it and the hole was exact: a session's `workspace/` file (AD-113)

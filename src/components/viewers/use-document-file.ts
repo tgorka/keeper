@@ -13,7 +13,7 @@
  * # It reads no path and joins nothing
  *
  * `profileId` and `subpath` go to Rust as they arrived; Rust re-resolves them
- * through `keeper_sync::browse`'s containment on every call (AD-65). Nothing
+ * through `keeper_paths::resolve` on every call (AD-65). Nothing
  * here composes a path, and `absolutePath` is never touched (FR-145).
  *
  * # There is nothing to save

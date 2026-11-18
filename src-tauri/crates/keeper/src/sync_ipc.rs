@@ -30,7 +30,7 @@ use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, ReleaseSchedule, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::export::{self, ExportRefusal};
-use keeper_sync::files_write::{self};
+use keeper_sync::files_write;
 use keeper_sync::lfs::hydrate::ContentRefusal;
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_AGENTS_SUBFOLDER,
@@ -3468,11 +3468,12 @@ pub async fn sync_unsubscribe_progress(
 ///
 /// **Listing is the shell's job, and this is the only place it is done.** The
 /// frontend hands back a `subpath` this command previously produced and never
-/// composes one; `keeper_sync::browse` resolves it against the profile's own
-/// root, refuses anything that is not a plain descendant of it — lexically and
-/// again after symlinks are followed — and applies the profile's tier-0
-/// exclusions. A webview that asked for `../../.ssh` would have to have
-/// persuaded the engine to store a profile pointing there first.
+/// composes one; `keeper_sync::browse` resolves it through `keeper_paths::resolve`
+/// against the profile's own root, refuses anything that is not a plain
+/// descendant of it — lexically and again after symlinks are followed — and
+/// applies the profile's tier-0 exclusions. A webview that asked for
+/// `../../.ssh` would have to have persuaded the engine to store a profile
+/// pointing there first.
 ///
 /// **Lazy, one directory per call.** These trees hold a hundred thousand files.
 /// Nothing here descends, and the cap is reported rather than hidden.

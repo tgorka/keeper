@@ -237,7 +237,7 @@ export interface ViewerFile extends ViewerSubject {
    *
    * Every read and write command Story 45.3 exposes is scoped to a profile id
    * plus a profile-relative subpath, so that Rust re-resolves the path through
-   * `keeper_sync::browse`'s containment rule on every call and the frontend
+   * `keeper_paths::resolve` on every call and the frontend
    * never names a location the engine has not agreed to. A viewer therefore
    * cannot load its own bytes without this, and it must not substitute
    * {@link ViewerFile.absolutePath}: reading through an absolute path would go
@@ -330,7 +330,7 @@ export interface ViewerFile extends ViewerSubject {
    * 50.3's fix).
    *
    * The sibling of {@link ViewerFile.writeCaveat} and read the same way: a
-   * whole sentence composed by `keeper_sync::files_write::WriteRefusal`,
+   * whole sentence composed by `keeper_paths::WriteRefusal`,
    * rendered verbatim, never paraphrased and never re-derived. The two are
    * mutually exclusive by construction — a location keeper refuses has no
    * caveat, because a caveat is what it says about a file it WILL write.

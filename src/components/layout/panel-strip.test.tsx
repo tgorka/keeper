@@ -287,7 +287,7 @@ describe("the panel strip", () => {
     // still pass if THIS function put `entry.name` where `relativePath`
     // belongs — measured, not supposed: that mutation survived the whole
     // sweep. The consequence is not cosmetic. A file in a subfolder would be
-    // addressed as if it sat at the profile root, `browse::resolve` would find
+    // addressed as if it sat at the profile root, `keeper_paths::resolve` would find
     // nothing there, and every video, image and audio inside a folder would
     // 404. So the assertion is over the composed URL, which is the only place
     // the two spellings differ.

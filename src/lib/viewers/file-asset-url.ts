@@ -11,7 +11,7 @@
  * `local_path/subfolder` and therefore narrower than the tree the pane browses.
  * So Story 45.7 added a fourth scheme with a fourth fixed root — the sync
  * profile's own — served by `keeper/src/file_protocol.rs` and contained by
- * `keeper_sync::browse::resolve`, the same function the listing uses.
+ * `keeper_paths::resolve`, the same function the listing uses.
  *
  * **Both halves arrive from Rust and neither is joined onto anything here.**
  * The profile id and the relative path both come from `sync_browse`. This
