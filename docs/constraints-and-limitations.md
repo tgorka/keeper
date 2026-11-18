@@ -77,8 +77,22 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   dependency and `CoreRsaPrivateSigningKey` generate/sign fixtures under `cfg(test)`.
   Follow-up: upgrade `openidconnect` when it adopts a fixed RSA implementation;
   reassess before introducing private-key signing/decryption in production.
-- **ZIP / RUSTSEC-2026-0367, -0368, -0369:** `keeper-core` and
-  `keeper -> tauri-plugin-updater 2.10.1` require `zip 4.6.1`; fixes require 9.0.0.
+- **ZIP / RUSTSEC-2026-0367, -0368, -0369:** `keeper-core` reads OOXML through
+  `zip 9.7.0` (moved from 4.6.1 on 2026-11-18). The waivers remain for
+  `keeper -> tauri-plugin-updater 2.10.1 -> zip 4.6.1`, a `cfg(target_os = "windows")`
+  dependency; fixes require 9.0.0.
+  **RUSTSEC-2026-0545 and -0548 are cleared for `keeper-core` and every crate that links
+  it, keeper-hq included — not for keeper's own lockfile.** RUSTSEC-2026-0545 is fixed in
+  `zip >= 9.0.0` and -0548 in `zip >= 9.0.5`; the same Windows-only updater still pulls
+  `zip 4.6.1`, so `cargo deny check advisories` from `src-tauri/` reports both IDs. They
+  are deliberately not waived, and CI runs only `cargo deny check licenses bans sources`
+  (`.github/workflows/ci.yml`), so no gate fails on them either. They remain until the
+  updater is bumped to a release requiring `zip ^9`. The exposure meanwhile:
+  RUSTSEC-2026-0545 is in the WinZip AES reader behind zip's `aes-crypto` feature, and the
+  updater declares its `zip 4` with `default-features = false` and enables no features, so
+  that reader is not compiled in; RUSTSEC-2026-0548 is in `ZipStreamReader`, and the updater
+  reads through `ZipArchive::new(..)?.extract(..)` (`tauri-plugin-updater` 2.10.1,
+  `src/updater.rs:903`), never the stream reader.
   The document reader only reads named, size-bounded OOXML parts, never extracts
   entries or applies archive permissions. The updater's ZIP extraction is Windows-only:
   the Unix SUID/SGID and permission-setting paths are not used. Its download path
@@ -86,14 +100,35 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   archive bytes cannot reach it through keeper's update flow. The extraction API
   remains reachable for signed Windows releases; compromise of the trusted release
   publisher is a residual risk, not a claim that the dependency is fixed.
-  Follow-up: upgrade `tauri-plugin-updater` when it supports `zip >=9`, then upgrade
-  keeper's direct ZIP dependency and remove all three waivers.
+  The updater declares its `zip 4` with no compression feature; it used to inflate
+  Deflate only because keeper-core's `deflate-flate2` unified onto the same `zip 4`.
+  With `createUpdaterArtifacts: true` (not `"v1Compatible"`) Windows updates are bare
+  installers rather than ZIPs, so that path does not run today.
+  Follow-up: upgrade `tauri-plugin-updater` to a release on `zip >=9` (2.14.1 requires
+  `zip ^9` on Windows), then remove all three waivers; the same bump clears
+  RUSTSEC-2026-0545 and -0548 from keeper's lockfile.
+  What zip 9 changes for documents, all of it a named refusal rather than a panic:
+  - It looks for the end-of-central-directory record only in an archive's last 64 KiB, so
+    a DOCX, PPTX or XLSX with more than 64 KiB of data after that record is now
+    unrecognised.
+  - It builds a part's decompressor only when the part is read. A part compressed with a
+    method keeper does not build (Deflate64, BZIP2, LZMA, Zstandard, …) is therefore
+    FOUND by name and refused as "*part* could not be decompressed (…)", where zip 4
+    failed the lookup and treated it as absent. For an optional workbook part
+    (`xl/_rels/workbook.xml.rels`, `xl/sharedStrings.xml`) that means the whole workbook
+    is refused instead of rendering without it; a required part was refused either way.
+  - A part that lies low about its uncompressed size is still refused while inflating and
+    nothing renders, but zip's own declared-size check now fires before keeper's
+    produced-bytes guard, so the reader sees "*part* could not be decompressed (File is
+    larger than its declared uncompressed size)" rather than the old "decompression
+    bomb" wording. keeper's guard stays: it bounds what is read to the per-part cap plus
+    one byte whatever the library does.
 - **ZIP / RUSTSEC-2026-0429** (waived 2026-11-11, **expires 2026-12-31**, owner decision
-  2026-11-11): `keeper -> tauri-plugin-updater 2.10.1 -> zip ^4` (the newest published
-  updater, 3.0.0-alpha.3, still requires `zip ^4`); the fix is only in `zip >=9`. The
-  affected `ZipArchive::extract` symlink path is the same exposure as above: the document
-  reader never extracts, and the updater extracts on Windows only, minisign-verified
-  releases only. Follow-up: the same updater upgrade to `zip >=9`, then remove.
+  2026-11-11): `keeper -> tauri-plugin-updater 2.10.1 -> zip ^4`; the fix is only in
+  `zip >=9`. The affected `ZipArchive::extract` symlink path is the same exposure as
+  above: the document reader never extracts, and the updater extracts on Windows only,
+  minisign-verified releases only. Follow-up: the same updater upgrade to `zip >=9`,
+  then remove.
 - **SQLite / RUSTSEC-2026-0459** (waived 2026-11-11, **expires 2026-12-31**, owner decision
   2026-11-11): `matrix-sdk-sqlite 0.19.1 -> rusqlite ^0.40.2 -> libsqlite3-sys ^0.38`.
   `libsqlite3-sys` is `links = "sqlite3"`, so the whole graph (keeper-core, keeper-sync,

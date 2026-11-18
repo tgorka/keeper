@@ -49,7 +49,7 @@ fn zip_of(parts: &[(&str, &[u8])]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, contents) in parts {
             writer.start_file(*name, options).expect("start part");
@@ -58,6 +58,33 @@ fn zip_of(parts: &[(&str, &[u8])]) -> Vec<u8> {
         writer.finish().expect("finish zip");
     }
     buffer.into_inner()
+}
+
+/// Grow a container to exactly `size` bytes with one STORED part nothing asks for.
+///
+/// Padding has to go INSIDE the archive: zip 9, like the ZIP specification,
+/// looks for the end-of-central-directory record only in the last 64 KiB, so
+/// megabytes appended after it make the container unreadable rather than large.
+fn padded_to(container: &[u8], size: usize) -> Vec<u8> {
+    let with_padding = |padding: usize| {
+        let mut writer = zip::ZipWriter::new_append(std::io::Cursor::new(container.to_vec()))
+            .expect("reopen container");
+        let options: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("padding.bin", options)
+            .expect("start padding");
+        writer.write_all(&vec![0; padding]).expect("write padding");
+        writer.finish().expect("finish padded zip").into_inner()
+    };
+    let overhead = with_padding(0).len();
+    let padded = with_padding(size - overhead);
+    assert_eq!(
+        padded.len(),
+        size,
+        "the padding must land exactly on the size"
+    );
+    padded
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +134,36 @@ fn a_plain_zip_is_not_a_document() {
     let vm = open_document(&path).expect("open");
 
     assert_eq!(vm.format, None);
+}
+
+/// zip 9 looks for the end-of-central-directory record only in the last 64 KiB
+/// (the record plus its longest possible comment), so a document with more
+/// trailing bytes than that is unrecognised — named, not a panic. The same
+/// bytes without the trailer are read, so the trailer is the only cause.
+#[test]
+fn a_document_with_over_64_kib_after_its_directory_is_unrecognised() {
+    let scratch = Scratch::new("trailer");
+    let docx = docx_of(&[("Normal", "hi")]);
+    let control = scratch.file("control.docx", &docx);
+    assert_eq!(
+        open_document(&control).expect("open").format,
+        Some(DocumentFormat::Docx),
+        "the container without the trailer must be a document"
+    );
+
+    let mut trailed = docx;
+    trailed.extend(std::iter::repeat_n(0_u8, 64 * 1024 + 1024));
+    let path = scratch.file("trailed.docx", &trailed);
+
+    let vm = open_document(&path).expect("open, not throw");
+
+    assert_eq!(vm.format, None);
+    let detail = vm.detail.expect("a sentence");
+    assert!(
+        detail.contains("could not recognise"),
+        "the reason must name what happened, got {detail:?}"
+    );
+    assert!(vm.words.is_none());
 }
 
 /// Every document carries the size formatted by the ONE Rust formatter, so this
@@ -372,6 +429,13 @@ fn a_decompression_bomb_is_refused_before_it_is_inflated() {
 /// Without this test the previous one would pass against a `read_part` that had
 /// no real cap at all, which is precisely the false confidence a bomb test is
 /// supposed to eliminate.
+///
+/// zip 9 enforces the declared size itself: reading past it fails inside
+/// `zip` (zip-rs/zip2#1022, zip 9.0.1), earlier than keeper's own
+/// produced-bytes guard can fire. The property held is the same — the lie does
+/// not get past the cheap check, the part is refused WHILE inflating, and
+/// nothing renders — so this asserts the refusal is not the declared-size one
+/// and that it names the lie.
 #[test]
 fn a_bomb_that_lies_about_its_size_is_refused_while_inflating() {
     let scratch = Scratch::new("liar");
@@ -382,10 +446,83 @@ fn a_bomb_that_lies_about_its_size_is_refused_while_inflating() {
 
     let detail = vm.detail.expect("a sentence");
     assert!(
-        detail.contains("inflates past"),
-        "the refusal must come from the guard that counts produced bytes, got {detail:?}"
+        !detail.contains("declares"),
+        "the forged size must have fooled the cheap check, got {detail:?}"
+    );
+    assert!(
+        detail.contains("larger than its declared uncompressed size"),
+        "the refusal must come from counting produced bytes, got {detail:?}"
     );
     assert!(vm.words.is_none());
+}
+
+/// keeper's own produced-bytes guard, without zip in front of it.
+///
+/// zip 9 refuses a part that outgrows its declared size before this guard can
+/// fire, so no container reaches it — and deleting it would otherwise fail no
+/// test. A plain reader that produces more than the cap stands in for a
+/// decompressor whose output nothing upstream bounds.
+#[test]
+fn a_part_that_produces_more_than_the_cap_is_refused_by_keepers_own_guard() {
+    use std::io::Read as _;
+
+    let over = std::io::repeat(b'A').take(OOXML_MAX_PART_BYTES + 1_000);
+    match inflate_part(over, "word/document.xml") {
+        Err(Refusal::Bomb(detail)) => assert!(
+            detail.contains("inflates past"),
+            "the refusal must be the produced-bytes guard, got {detail:?}"
+        ),
+        Err(_) => panic!("refused, but not as a decompression bomb"),
+        Ok(bytes) => panic!("{} bytes were held past the cap", bytes.len()),
+    }
+
+    let at_cap = std::io::repeat(b'A').take(OOXML_MAX_PART_BYTES);
+    let bytes = inflate_part(at_cap, "word/document.xml")
+        .unwrap_or_else(|_| panic!("a part exactly at the cap is inside it"));
+    assert_eq!(bytes.len() as u64, OOXML_MAX_PART_BYTES);
+}
+
+/// The memory bound itself: however much a part could produce, keeper pulls
+/// at most [`OOXML_MAX_PART_BYTES`] plus one byte from it.
+///
+/// The reader here produces four times the cap and counts what is pulled. A
+/// guard that read everything and only then compared the length would still
+/// refuse the part, so the refusal alone does not prove the bound — the count
+/// does.
+#[test]
+fn a_part_is_never_read_past_the_cap_plus_one_byte() {
+    struct Counting {
+        left: u64,
+        pulled: u64,
+    }
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf
+                .len()
+                .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+            buf[..n].fill(b'A');
+            self.left -= n as u64;
+            self.pulled += n as u64;
+            Ok(n)
+        }
+    }
+
+    let mut part = Counting {
+        left: OOXML_MAX_PART_BYTES * 4,
+        pulled: 0,
+    };
+    let outcome = inflate_part(&mut part, "word/document.xml");
+
+    assert!(
+        matches!(outcome, Err(Refusal::Bomb(_))),
+        "a part past the cap must be refused as a bomb"
+    );
+    assert!(
+        part.pulled <= OOXML_MAX_PART_BYTES + 1,
+        "{} bytes were pulled; the bound is {}",
+        part.pulled,
+        OOXML_MAX_PART_BYTES + 1
+    );
 }
 
 /// A part that inflates past [`OOXML_MAX_PART_BYTES`], stored compressed.
@@ -503,11 +640,12 @@ fn entity_expansion_is_refused() {
 #[test]
 fn a_container_over_the_cap_is_refused_with_its_size() {
     let scratch = Scratch::new("toobig");
-    // A valid container, then padded past the cap. The padding lands after the
-    // central directory, which `zip` tolerates — so this genuinely exercises
-    // the size gate rather than a parse failure.
-    let mut container = docx_of(&[("Normal", "small")]);
-    container.resize((OOXML_MAX_BYTES + 1) as usize, 0);
+    // A valid container, padded past the cap with a part no reader opens — so
+    // this genuinely exercises the size gate rather than a parse failure.
+    let container = padded_to(
+        &docx_of(&[("Normal", "small")]),
+        (OOXML_MAX_BYTES + 1) as usize,
+    );
     let path = scratch.file("huge.docx", &container);
 
     let vm = open_document(&path).expect("open");
@@ -529,8 +667,10 @@ fn a_container_over_the_cap_is_refused_with_its_size() {
 #[test]
 fn a_container_at_the_cap_is_read() {
     let scratch = Scratch::new("atcap");
-    let mut container = docx_of(&[("Normal", "just inside")]);
-    container.resize(OOXML_MAX_BYTES as usize, 0);
+    let container = padded_to(
+        &docx_of(&[("Normal", "just inside")]),
+        OOXML_MAX_BYTES as usize,
+    );
     let path = scratch.file("big.docx", &container);
 
     let vm = open_document(&path).expect("open");
@@ -938,6 +1078,60 @@ fn an_out_of_range_shared_string_does_not_panic() {
     let sheets = vm.sheets.expect("a workbook body");
 
     assert_eq!(sheets.sheets[0].rows[0][0], "");
+}
+
+/// An optional workbook part compressed with a method keeper does not build
+/// (Deflate64, method 9) refuses the whole workbook, naming the part.
+///
+/// zip 9 builds a part's decompressor only when the part is read, so `by_name`
+/// FINDS such a part and the read fails; under zip 4 the lookup itself failed
+/// and the part was treated as absent. `has_part` therefore says yes, and
+/// `read_part` refuses rather than falling back to "no shared strings". This
+/// pins that behaviour, which docs/constraints-and-limitations.md records.
+#[test]
+fn an_optional_part_in_an_unsupported_method_refuses_the_workbook() {
+    let scratch = Scratch::new("deflate64");
+    let container = forge_method(
+        xlsx_of(&[("Revenue", vec![vec!["Region"]])]),
+        "xl/sharedStrings.xml",
+        9,
+    );
+    let path = scratch.file("deflate64.xlsx", &container);
+
+    let vm = open_document(&path).expect("open, not throw");
+
+    assert_eq!(vm.format, Some(DocumentFormat::Xlsx));
+    assert!(vm.sheets.is_none(), "nothing may render from the workbook");
+    let detail = vm.detail.expect("a sentence");
+    assert!(
+        detail.contains("xl/sharedStrings.xml could not be decompressed"),
+        "the refusal must name the part that could not be read, got {detail:?}"
+    );
+}
+
+/// Rewrite the compression method of the part called `name` to `method`.
+///
+/// Patches offset 8 of its local file header and offset 10 of its central
+/// directory header, found by the name each header carries (at offsets 30 and
+/// 46). Every other part is left as written.
+fn forge_method(mut container: Vec<u8>, name: &str, method: u16) -> Vec<u8> {
+    let bytes = method.to_le_bytes();
+    let mut patched = 0;
+    for index in 0..container.len() {
+        let (method_at, name_at) = if container[index..].starts_with(b"PK\x03\x04") {
+            (index + 8, index + 30)
+        } else if container[index..].starts_with(b"PK\x01\x02") {
+            (index + 10, index + 46)
+        } else {
+            continue;
+        };
+        if container[name_at..].starts_with(name.as_bytes()) {
+            container[method_at..method_at + 2].copy_from_slice(&bytes);
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 2, "both headers of {name} must be patched");
+    container
 }
 
 /// Column references are base-26 with no zero digit.

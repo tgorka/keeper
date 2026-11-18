@@ -76,9 +76,9 @@ semver = "1"
 globset = { workspace = true }
 # Reading DOCX, PPTX and XLSX (Story 45.8, FR-181, FR-182). Those three formats
 # are a ZIP of XML, so the whole of `document.rs` is these two crates plus a
-# pile of caps. Both are already compiled in every keeper build — `zip` via
-# tauri-plugin-updater, `quick-xml` via plist <- tauri-utils — so this adds no
-# new package to Cargo.lock, and the alternative was ~1.2 MB of JavaScript
+# pile of caps. `quick-xml` is already compiled in every keeper build (plist <-
+# tauri-utils); `zip` 9 is this crate's own (see the workspace manifest for why
+# 9 and not the updater's 4). The alternative was ~1.2 MB of JavaScript
 # parsers in the bundle. Neither drags in tauri or gix, so
 # `check:core-tauri-free` and `check:core-sync-free` stay green. See the
 # workspace manifest for the feature choices and the decompression caveat.
