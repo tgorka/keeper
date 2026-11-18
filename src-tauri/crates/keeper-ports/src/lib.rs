@@ -1,5 +1,5 @@
-//! The replica port: what the rest of keeper-core calls to read and write one
-//! database's local replica. Its one adapter is `keeper-replica`; a
+//! The replica port: what keeper-core and its callers use to read and write
+//! one database's local replica. Its one adapter is `keeper-replica`; a
 //! replacement client would be a second adapter, and nothing above this file
 //! names `syncular_client`.
 //!
