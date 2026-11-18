@@ -79,11 +79,11 @@ mod driver {
     use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
     use keeper_core::graph::source::{revocation_with, GraphSource, Revocation, ScopeState};
     use keeper_core::graph::supervisor::Cancellation;
-    use keeper_core::hq::port::{Link, LinkState, ReplicaSpec};
     use keeper_core::hq::server::ServerUrl;
     use keeper_core::hq::sessions::Source;
-    use keeper_core::hq::syncular::SyncularReplica;
     use keeper_core::notes::tags::normalise;
+    use keeper_ports::{Link, LinkState, ReplicaSpec};
+    use keeper_replica::SyncularReplica;
     use serde_json::{json, Value};
 
     mod embedded {
@@ -919,7 +919,7 @@ mod driver {
     /// Wait until the replica's link has made its first round and `ready`
     /// holds, at most `limit`.
     async fn wait(source: &Source, limit: Duration, ready: impl Fn(&Source) -> bool) -> bool {
-        use keeper_core::hq::port::LinkState;
+        use keeper_ports::LinkState;
         let started = Instant::now();
         loop {
             let link = source.replica.state().link;
@@ -956,7 +956,7 @@ mod driver {
     mod tests {
         use super::*;
         use keeper_core::graph::write::{Caller, GraphWrite, Writer};
-        use keeper_core::hq::port::{CommandResult, ReplicaError};
+        use keeper_ports::{CommandResult, ReplicaError};
         use std::sync::atomic::{AtomicU32, Ordering};
 
         /// A connected server whose every answer about the request is

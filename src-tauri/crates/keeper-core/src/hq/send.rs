@@ -31,10 +31,10 @@ use serde_json::{Map, Value};
 use ts_rs::TS;
 
 use crate::hq::approvals::{self, Decisions, ShownApprovalVm};
-use crate::hq::port::{ReplicaError, RowOp};
 use crate::hq::sessions::{authored, now_ms, object, person_message, Source};
 use crate::hq::timeline::session_row;
 use crate::notes::outline::heading_in;
+use keeper_ports::{ReplicaError, RowOp};
 
 /// The longest `focus.path` the runtime reads, in bytes (contract §9.1).
 pub const FOCUS_PATH_MAX_BYTES: usize = 1024;

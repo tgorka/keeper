@@ -860,7 +860,7 @@ impl Hq {
 
     /// Set this device's drive writer (109.27): the shell's, over its synced
     /// folders. Until it is, a drive write is never offered *Allow* here.
-    pub fn set_drive_writes(&self, port: Arc<dyn crate::hq::port::DriveWrites>) {
+    pub fn set_drive_writes(&self, port: Arc<dyn crate::hq::drive_writes::DriveWrites>) {
         self.writes.set_port(port);
         self.touch();
     }

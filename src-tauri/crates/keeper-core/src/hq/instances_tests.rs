@@ -13,9 +13,9 @@ use super::{
     Instance, Online, Prefs, Shared,
 };
 use crate::hq::live::{Claim, Live, LEASE};
-use crate::hq::port::{Refusal, Rejection, ReplicaSpec, RowOp, RowWrites};
 use crate::hq::sessions::{names, object, Source};
-use crate::hq::syncular::SyncularReplica;
+use keeper_ports::{Refusal, Rejection, ReplicaSpec, RowOp, RowWrites};
+use keeper_replica::SyncularReplica;
 
 const ANA: &str = "ana";
 const NIXIE: &str = "nixie";
@@ -894,14 +894,15 @@ fn what_waits_and_what_was_refused_survives_a_restart_and_belongs_to_its_person(
 
 #[test]
 fn a_connected_socket_is_not_a_complete_view_of_who_is_online() {
-    use crate::hq::port::{fake::FakeOpener, LinkState, Opener};
+    use keeper_ports::{LinkState, Opener};
+    use keeper_testkit::FakeOpener;
     let opener = FakeOpener::default();
     opener
         .open(ReplicaSpec {
             database: "alpha".to_owned(),
             path: std::path::PathBuf::from("alpha.sqlite"),
             client_id: Some("ana.dev".to_owned()),
-            link: Some(crate::hq::port::Link {
+            link: Some(keeper_ports::Link {
                 base_url: "https://hq.example.org/alpha".to_owned(),
                 token: "t".to_owned(),
             }),

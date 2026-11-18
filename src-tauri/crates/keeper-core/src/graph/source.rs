@@ -2,12 +2,12 @@
 //! narrow [`GraphSource`] port. The prefix reader ([`super::prefix`]) and,
 //! later, the query projection read only through it, so the trusted agent
 //! runtime can implement it over its own replica without implementing the
-//! whole [`Replica`](crate::hq::port::Replica) trait.
+//! whole [`Replica`](keeper_ports::Replica) trait.
 
 use serde_json::{Map, Value};
 
-use crate::hq::port::ReplicaError;
 use crate::hq::sessions::Source;
+use keeper_ports::ReplicaError;
 
 /// One read snapshot of a domain's history: its head and the events (with
 /// their operation rows) at graph positions `after + 1 ..= after + limit`.
@@ -158,7 +158,7 @@ pub(crate) const BATCH: &str = "SELECT json_object(\
   ) AS batch";
 
 /// One read of a replica's file: `sql` with `params`, its rows. keeper's is
-/// [`crate::hq::port::Replica::query`]; keeper-hq's is its own replica's
+/// [`keeper_ports::Replica::query`]; keeper-hq's is its own replica's
 /// fallible query channel. Both answer from the same Syncular tables.
 pub trait Query: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError> {}
 impl<F: Fn(&str, &[Value]) -> Result<Vec<Map<String, Value>>, SourceError>> Query for F {}

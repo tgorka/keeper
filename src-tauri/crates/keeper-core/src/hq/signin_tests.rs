@@ -8,9 +8,9 @@ use std::sync::mpsc;
 
 use super::*;
 use crate::forges::testing::{serve, Fake, FakePlatform, Reply, Seen};
-use crate::hq::port::fake::FakeOpener;
 use crate::hq::signin::{AccountSignIn, AccountState, Bound, SignIn, TokenAnswer, TokenError};
 use crate::hq::vm::HqSignInState;
+use keeper_testkit::FakeOpener;
 
 const ISSUER: &str = "https://id.example.org";
 const OTHER_ISSUER: &str = "https://id.elsewhere.org";

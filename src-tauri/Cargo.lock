@@ -4556,6 +4556,7 @@ dependencies = [
  "fs4",
  "keeper-agent",
  "keeper-core",
+ "keeper-replica",
  "keeper-sync",
  "keyring",
  "objc2",
@@ -4633,6 +4634,9 @@ dependencies = [
  "keeper-graph-protocol",
  "keeper-llm",
  "keeper-ported",
+ "keeper-ports",
+ "keeper-replica",
+ "keeper-testkit",
  "landlock",
  "matrix-sdk",
  "matrix-sdk-base",
@@ -4668,7 +4672,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-rs",
- "tungstenite",
  "ulid 1.2.1",
  "unicode-normalization",
  "url",
@@ -4681,6 +4684,8 @@ version = "0.11.0"
 dependencies = [
  "clap",
  "keeper-core",
+ "keeper-ports",
+ "keeper-replica",
  "nix",
  "serde_json",
  "sha2 0.10.9",
@@ -4760,6 +4765,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-ports"
+version = "0.11.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "keeper-replica"
+version = "0.11.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "keeper-ports",
+ "keeper-testkit",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.10.9",
+ "syncular-client",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tungstenite",
+ "url",
+]
+
+[[package]]
 name = "keeper-sync"
 version = "0.11.0"
 dependencies = [
@@ -4812,6 +4845,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid 1.2.1",
+]
+
+[[package]]
+name = "keeper-testkit"
+version = "0.11.0"
+dependencies = [
+ "keeper-ports",
+ "rusqlite",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

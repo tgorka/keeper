@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::*;
-use crate::hq::port::{Peer, ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, object, Source};
-use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, Opened};
+use keeper_ports::{Peer, ReplicaSpec, RowOp};
+use keeper_replica::SyncularReplica;
 
 const TURN: &str = "t1";
 const INSTANCE: &str = "alpha.box";

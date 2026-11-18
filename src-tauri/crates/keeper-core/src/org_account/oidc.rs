@@ -3510,7 +3510,7 @@ mod tests {
     fn agents_hq(p: &Arc<FakePlatform>, d: &AccountDescriptor) -> Arc<crate::hq::Hq> {
         crate::hq::Hq::new(
             Arc::clone(p) as Arc<dyn Platform>,
-            Arc::new(crate::hq::port::fake::FakeOpener::default()),
+            Arc::new(keeper_testkit::FakeOpener::default()),
             Arc::new(crate::hq::routes::HttpRoutes::new()),
             Arc::new(org(p, d)),
             "keeper".to_owned(),

@@ -1477,7 +1477,7 @@ Closing returns focus to the chip. Installed WebKit/custom-scheme preview and do
 behavior still needs the hesperia/kalypso device check; Chrome's mock blob URL is not that proof.
 
 **The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
-outbox pins (`keeper_core::hq::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
+outbox pins (`keeper_replica::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
 `blob_cache_max_bytes`): ten of the largest files a message may carry, so a session's recent files
 open again without a download, while a phone holding both databases spends at most half a
 gigabyte on them. Past the cap, the least recently opened body the outbox does not pin is evicted
@@ -1575,8 +1575,9 @@ message pins kept), a failed Send whose clean-up failed too uploading nothing of
 while storage stays faulted, the same owner putting it back on its next wake once storage
 recovers, the waiting message's file uploaded — without a reopen or another commit, a refused
 upload resolved and explained across a relaunch while the next
-rounds go past it, a moot refusal pruned after a round without a reopen (`hq/syncular.rs`,
-`hq/blob_cache.rs`, against a local server that answers the blob requests and cuts the push); an
+rounds go past it, a moot refusal pruned after a round without a reopen
+(`keeper-replica/src/lib.rs`, `keeper-replica/src/blob_cache.rs`, against a local server that
+answers the blob requests and cuts the push); an
 opened archived session's attachments window (`hq/sessions.rs`); the relay's HTTP framing, a
 `100`/`103` before the final answer included (`tests/hq_live.rs`). **Inspection only:**
 `hq_ipc.rs`'s four commands — `agent_attach_path`/`agent_attach_bytes` stage and return handles,

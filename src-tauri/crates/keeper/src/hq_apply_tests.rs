@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use keeper_core::agents::drive_write::Refusal;
-use keeper_core::hq::port::{DriveCommit, DriveCommitted, DriveTarget, DriveWrites};
+use keeper_core::hq::drive_writes::{DriveCommit, DriveCommitted, DriveTarget, DriveWrites};
 use keeper_sync::engine::{blob_id, Engine};
 use keeper_sync::platform::TestPlatform;
 use keeper_sync::{SyncPlatform, SyncProfile};
@@ -309,7 +309,7 @@ fn machinery_lfs_and_folders_are_refused() {
     ));
     assert_eq!(
         d.writes.keeps("neuradrive"),
-        Err(keeper_core::hq::port::DriveAbsent::NotKept)
+        Err(keeper_core::hq::drive_writes::DriveAbsent::NotKept)
     );
 }
 

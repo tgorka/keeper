@@ -29,10 +29,10 @@ use serde_json::{Map, Value};
 use ts_rs::TS;
 
 use crate::hq::grants::{self, AgentGrantOfferVm, SessionFacts};
-use crate::hq::port::{Delivery, LinkState, Rejection, RowOp};
 use crate::hq::sessions::{
     authored, int, names, object, opt_text, read, reads_trace, text, Source,
 };
+use keeper_ports::{Delivery, LinkState, Rejection, RowOp};
 
 pub mod write;
 

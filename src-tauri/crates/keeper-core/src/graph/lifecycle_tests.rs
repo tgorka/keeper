@@ -19,9 +19,9 @@ use crate::graph::queue::{Binding, Restored, State};
 use crate::graph::runtime::{Runtime, VerifiedWorker};
 use crate::graph::source::{GraphSource, PrefixBatch, Revocation, SourceError};
 use crate::graph::write::{Caller, GraphWrite, Writer};
-use crate::hq::port::fake::FakeOpener;
-use crate::hq::port::{CommandResult, LinkState, Opener, ReplicaError, ReplicaSpec};
 use crate::hq::sessions::Source;
+use keeper_ports::{CommandResult, LinkState, Opener, ReplicaError, ReplicaSpec};
+use keeper_testkit::FakeOpener;
 
 const DB: &str = "work";
 

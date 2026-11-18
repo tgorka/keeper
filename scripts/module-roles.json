@@ -2,12 +2,15 @@
   "keeper": "composition-root",
   "keeper-agent": "legacy",
   "keeper-core": "legacy",
-  "keeper-graph-driver": "legacy",
+  "keeper-graph-driver": "composition-root",
   "keeper-graph-protocol": "contract",
   "keeper-graph-query": "legacy",
   "keeper-llm": "legacy",
   "keeper-nse": "legacy",
   "keeper-ported": "legacy",
+  "keeper-ports": "port",
+  "keeper-replica": "provider",
+  "keeper-testkit": "provider",
   "keeper-sync": "legacy",
   "keeper-syncd": "legacy"
 }

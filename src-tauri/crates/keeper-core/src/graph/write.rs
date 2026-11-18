@@ -8,13 +8,13 @@
 //! typed reads) and the link's state. keeper's [`Source`] implements it over
 //! its replica; the trusted agent runtime implements it over its own remote
 //! and replica channels without implementing the whole
-//! [`Replica`](crate::hq::port::Replica) trait. There is one command path
+//! [`Replica`](keeper_ports::Replica) trait. There is one command path
 //! and one decoder ([`super::outcome`]) whichever side implements it.
 
 use serde_json::{Map, Value};
 
-use crate::hq::port::{CommandResult, LinkState, ReplicaError};
 use crate::hq::sessions::Source;
+use keeper_ports::{CommandResult, LinkState, ReplicaError};
 
 /// One database's graph write boundary.
 pub trait GraphWrite: Send + Sync {

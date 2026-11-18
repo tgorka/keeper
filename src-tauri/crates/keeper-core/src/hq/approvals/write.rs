@@ -40,14 +40,14 @@ use super::{
     DECISION_WAIT,
 };
 use crate::agents::drive_write::{self, Change, LineKind, Op, Preview, Request};
-use crate::hq::port::{
-    Delivery, DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
-    LinkState, RowOp,
+use crate::hq::drive_writes::{
+    DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
 };
 use crate::hq::sessions::{
     authored, int, json as json_column, month, names, object, opt_text, page_key, read, text,
     Source,
 };
+use keeper_ports::{Delivery, LinkState, RowOp};
 
 /// `metadata.kind` of the message that says what became of a write (V18).
 pub const KIND: &str = "applied";

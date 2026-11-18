@@ -25,7 +25,7 @@
 //!   ticked again.
 //! - **A refusal reaches the row.** What became of the selections written
 //!   here is the replica's per-row outcome record
-//!   ([`crate::hq::port::Replica::row_writes`]), the same record a refused
+//!   ([`keeper_ports::Replica::row_writes`]), the same record a refused
 //!   rename and the instance choice read — never inferred from the write
 //!   returning, which only says the outbox took it.
 //! - **The risk is said where a drive is ticked** ([`WARNING`]; D-34's
@@ -44,13 +44,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use crate::hq::port::{Rejection, ReplicaError, RowOp, CONFLICT};
 use crate::hq::sessions::{
     self, authored, int, json, names, object, opt_text, read, text, AgentNoteSessionVm,
     AgentSessionRef, Source,
 };
 use crate::hq::timeline::{self, SessionRow};
 use crate::hq::{lock, Hq, HqError};
+use keeper_ports::{Rejection, ReplicaError, RowOp, CONFLICT};
 
 const TABLE: &str = "session_drives";
 

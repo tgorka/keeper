@@ -3,7 +3,7 @@
 /**
  * What became of the renames written on this device, read from the
  * replica's outbox and outcome journal — the same per-row delivery the
- * instance choice reads ([`crate::hq::port::Replica::row_writes`]) — never
+ * instance choice reads ([`keeper_ports::Replica::row_writes`]) — never
  * inferred from the rename call returning: that only says the outbox took
  * it. The session's own creation is not a rename.
  */

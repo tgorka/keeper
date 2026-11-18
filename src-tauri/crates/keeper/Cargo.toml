@@ -23,6 +23,7 @@ url = { workspace = true }
 
 [dependencies]
 keeper-core = { path = "../keeper-core" }
+keeper-replica = { path = "../keeper-replica" }
 # Folder sync (Epic 29, AD-40) — on every target since Epic 66 (AD-198).
 # It sat in the desktop-only table below for eight epics on the belief that
 # gitoxide had no place in an iOS bundle; `cargo check -p keeper-sync --target

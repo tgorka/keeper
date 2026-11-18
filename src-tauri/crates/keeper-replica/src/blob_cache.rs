@@ -14,7 +14,7 @@
 //! for upload, or referenced by a commit the server has not taken) is never
 //! evicted, even when the pinned bodies alone pass the cap: it is the only
 //! copy of something the person wrote. [`evictions`] is that rule; the
-//! adapter (`hq::syncular`) reads the facts from the replica file and drops
+//! adapter (`keeper-replica`) reads the facts from the replica file and drops
 //! what it names. When each body was last used is keeper's own record, in a
 //! small SQLite file beside the replica ([`AccessLog`]) — and so is every
 //! refusal of a blob's upload the server sent, tied to the commits that
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
-use crate::hq::port::{Rejection, UploadRefusal};
+use keeper_ports::{Rejection, UploadRefusal};
 
 /// The most bytes of blob bodies one database's replica keeps beyond what its
 /// outbox pins: ten of the largest attachments a message may carry

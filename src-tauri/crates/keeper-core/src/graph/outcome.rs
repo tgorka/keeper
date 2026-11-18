@@ -36,8 +36,8 @@ use super::protocol::scope::{client_scope, receipt_id};
 use super::protocol::{is_decimal, is_ulid, value, Refusal, CONTRACT_VERSION};
 use super::queue::FenceCause;
 use super::write::{GraphWrite, Writer};
-use crate::hq::port::{CommandResult, ErrorClass, ReplicaError};
 use crate::hq::sessions::Source;
+use keeper_ports::{CommandResult, ErrorClass, ReplicaError};
 
 /// Which request this is: its database, descriptor, request id and client
 /// scope, compared only as a whole. Two requests with equal identities are
@@ -364,7 +364,7 @@ pub enum PendingCause {
     /// only a same-id replay or `graph.outcome`, never a new id.
     Unresolved,
     /// The agent context the request names ended or was unbound
-    /// ([`crate::hq::port::CONTEXT_ENDED`]).
+    /// ([`keeper_ports::CONTEXT_ENDED`]).
     ContextEnded,
     /// The server refused a lookup as it is (an invalid request, an answer
     /// over its limit): the entry stays as it is, nothing is resent.

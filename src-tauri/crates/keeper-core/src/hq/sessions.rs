@@ -24,9 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use crate::hq::port::{
-    RefusedCommit, Rejection, Replica, ReplicaError, RowOp, WindowBase, CONFLICT,
-};
+use keeper_ports::{RefusedCommit, Rejection, Replica, ReplicaError, RowOp, WindowBase, CONFLICT};
 
 /// A session's state in the Agents list; a session in none of them carries
 /// none.
@@ -69,7 +67,7 @@ pub struct AgentSessionRef {
 
 /// What became of the renames written on this device, read from the
 /// replica's outbox and outcome journal — the same per-row delivery the
-/// instance choice reads ([`crate::hq::port::Replica::row_writes`]) — never
+/// instance choice reads ([`keeper_ports::Replica::row_writes`]) — never
 /// inferred from the rename call returning: that only says the outbox took
 /// it. The session's own creation is not a rename.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

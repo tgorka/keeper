@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::forges::testing::FakePlatform;
-use crate::hq::port::fake::{FakeOpener, FakeReplica};
-use crate::hq::port::RowOp;
 use crate::hq::routes::{Answer, Discovery, Issued, Redeemed};
 use crate::hq::vm::HqDatabaseState;
+use keeper_ports::RowOp;
+use keeper_testkit::{FakeOpener, FakeReplica};
 
 /// Root routes that answer what the test says, counting what was asked.
 #[derive(Default)]
@@ -767,14 +767,14 @@ struct Staged {
     /// caller can persist the seen record (R605-18).
     after_sync: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// What every thread the staging does not name reads.
-    others: Mutex<Vec<crate::hq::port::Peer>>,
+    others: Mutex<Vec<keeper_ports::Peer>>,
 }
 
 /// One side says it got there; the other lets it go on.
 type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
-fn tail(from_seq: i64, text: &str) -> Vec<crate::hq::port::Peer> {
-    vec![crate::hq::port::Peer {
+fn tail(from_seq: i64, text: &str) -> Vec<keeper_ports::Peer> {
+    vec![keeper_ports::Peer {
         actor_id: "nixie".to_owned(),
         client_id: "nixie.box".to_owned(),
         doc: serde_json::json!({"turn": "t1", "from_seq": from_seq, "text": text}),
@@ -782,14 +782,14 @@ fn tail(from_seq: i64, text: &str) -> Vec<crate::hq::port::Peer> {
 }
 
 impl Replica for Staged {
-    fn mutate(&self, ops: Vec<RowOp>) -> Result<String, crate::hq::port::ReplicaError> {
+    fn mutate(&self, ops: Vec<RowOp>) -> Result<String, keeper_ports::ReplicaError> {
         self.inner.mutate(ops)
     }
     fn query(
         &self,
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<serde_json::Map<String, Value>>, keeper_ports::ReplicaError> {
         let rows = self.inner.query(sql, params)?;
         if std::thread::current().name() == Some("people")
             && sql.contains("reads_trace FROM session_members WHERE session_id")
@@ -805,9 +805,9 @@ impl Replica for Staged {
         &self,
         sql: &str,
         params: &[Value],
-        base: &crate::hq::port::WindowBase,
+        base: &keeper_ports::WindowBase,
         units: &[String],
-    ) -> Result<crate::hq::port::Covered, crate::hq::port::ReplicaError> {
+    ) -> Result<keeper_ports::Covered, keeper_ports::ReplicaError> {
         if std::thread::current().name() == Some("older") {
             if let Some((entered, release)) = lock(&self.projecting).take() {
                 let _ = entered.send(());
@@ -816,33 +816,30 @@ impl Replica for Staged {
         }
         self.inner.query_covered(sql, params, base, units)
     }
-    fn subscribe(&self, s: Subscription) -> Result<(), crate::hq::port::ReplicaError> {
+    fn subscribe(&self, s: Subscription) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.subscribe(s)
     }
     fn set_window(
         &self,
-        base: &crate::hq::port::WindowBase,
+        base: &keeper_ports::WindowBase,
         units: &[String],
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    ) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.set_window(base, units)
     }
     fn window_state(
         &self,
-        base: &crate::hq::port::WindowBase,
-    ) -> Result<crate::hq::port::WindowState, crate::hq::port::ReplicaError> {
+        base: &keeper_ports::WindowBase,
+    ) -> Result<keeper_ports::WindowState, keeper_ports::ReplicaError> {
         self.inner.window_state(base)
     }
     fn set_presence(
         &self,
         key: &str,
         doc: Option<Value>,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    ) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.set_presence(key, doc)
     }
-    fn presence(
-        &self,
-        key: &str,
-    ) -> Result<Vec<crate::hq::port::Peer>, crate::hq::port::ReplicaError> {
+    fn presence(&self, key: &str) -> Result<Vec<keeper_ports::Peer>, keeper_ports::ReplicaError> {
         if !key.starts_with("session:") {
             return Ok(Vec::new());
         }
@@ -867,21 +864,18 @@ impl Replica for Staged {
     }
     fn commit_with_blobs(
         &self,
-        b: Vec<crate::hq::port::BlobBody>,
+        b: Vec<keeper_ports::BlobBody>,
         ops: Vec<RowOp>,
-    ) -> Result<String, crate::hq::port::ReplicaError> {
+    ) -> Result<String, keeper_ports::ReplicaError> {
         self.inner.commit_with_blobs(b, ops)
     }
-    fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
+    fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, keeper_ports::ReplicaError> {
         self.inner.fetch_blob(b)
     }
-    fn cached_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
+    fn cached_blob(&self, b: &str) -> Result<Vec<u8>, keeper_ports::ReplicaError> {
         self.inner.cached_blob(b)
     }
-    fn delivery(
-        &self,
-        commit: &str,
-    ) -> Result<crate::hq::port::Delivery, crate::hq::port::ReplicaError> {
+    fn delivery(&self, commit: &str) -> Result<keeper_ports::Delivery, keeper_ports::ReplicaError> {
         self.inner.delivery(commit)
     }
     fn row_writes(
@@ -889,43 +883,43 @@ impl Replica for Staged {
         table: &str,
         row_id: &str,
         field: Option<&str>,
-    ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
+    ) -> Result<keeper_ports::RowWrites, keeper_ports::ReplicaError> {
         self.inner.row_writes(table, row_id, field)
     }
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, keeper_ports::ReplicaError> {
         self.inner.revoked_units(table)
     }
     fn granted(
         &self,
         table: &str,
         variable: &str,
-    ) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<String>, keeper_ports::ReplicaError> {
         self.inner.granted(table, variable)
     }
     fn refused_commits(
         &self,
         table: &str,
-    ) -> Result<Vec<crate::hq::port::RefusedCommit>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<keeper_ports::RefusedCommit>, keeper_ports::ReplicaError> {
         self.inner.refused_commits(table)
     }
-    fn upload_refusals(&self) -> Vec<crate::hq::port::UploadRefusal> {
+    fn upload_refusals(&self) -> Vec<keeper_ports::UploadRefusal> {
         self.inner.upload_refusals()
     }
-    fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
+    fn blob_cache_bytes(&self) -> Result<u64, keeper_ports::ReplicaError> {
         self.inner.blob_cache_bytes()
     }
     fn mutate_superseding(
         &self,
         ops: Vec<RowOp>,
         earlier: Vec<String>,
-    ) -> Result<String, crate::hq::port::ReplicaError> {
+    ) -> Result<String, keeper_ports::ReplicaError> {
         self.inner.mutate_superseding(ops, earlier)
     }
     fn remote_query(
         &self,
         id: &str,
         params: Value,
-    ) -> Result<Vec<serde_json::Map<String, Value>>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<serde_json::Map<String, Value>>, keeper_ports::ReplicaError> {
         self.inner.remote_query(id, params)
     }
     fn remote_command(
@@ -933,7 +927,7 @@ impl Replica for Staged {
         id: &str,
         request: &str,
         params: Value,
-    ) -> Result<crate::hq::port::CommandResult, crate::hq::port::ReplicaError> {
+    ) -> Result<keeper_ports::CommandResult, keeper_ports::ReplicaError> {
         self.inner.remote_command(id, request, params)
     }
     fn sync_now(&self) {
@@ -961,8 +955,8 @@ impl Replica for Staged {
 struct StagedOpener(Mutex<Option<Arc<Staged>>>);
 
 impl Opener for StagedOpener {
-    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
-        let inner = crate::hq::syncular::SyncularReplica::open(ReplicaSpec { link: None, ..spec })?;
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, keeper_ports::ReplicaError> {
+        let inner = keeper_replica::SyncularReplica::open(ReplicaSpec { link: None, ..spec })?;
         let (entered, _) = std::sync::mpsc::channel();
         let (_, early_done) = std::sync::mpsc::channel();
         let staged = Arc::new(Staged {
@@ -1380,7 +1374,7 @@ fn paired_holding_alpha(world: &World) {
         "ana",
     );
     std::fs::create_dir_all(alpha.parent().expect("parent")).expect("mkdir");
-    let seed = syncular::SyncularReplica::open(ReplicaSpec {
+    let seed = keeper_replica::SyncularReplica::open(ReplicaSpec {
         database: "alpha".to_owned(),
         path: alpha,
         client_id: Some("ana.1".to_owned()),
@@ -1423,7 +1417,7 @@ fn real_hq(world: &World, opener: Arc<dyn Opener>) -> Arc<Hq> {
 async fn with_the_address_cleared_the_composer_writes_into_the_held_database_and_it_waits() {
     let world = World::new();
     paired_holding_alpha(&world);
-    let service = || real_hq(&world, Arc::new(syncular::SyncularOpener));
+    let service = || real_hq(&world, Arc::new(keeper_replica::SyncularOpener));
     let hq = service();
     hq.start().await.expect("starts");
 
@@ -1573,7 +1567,7 @@ struct HeldOpener {
 }
 
 impl Opener for HeldOpener {
-    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, keeper_ports::ReplicaError> {
         if spec.database == self.database {
             let release = lock(&self.release).take();
             if let Some(release) = release {
@@ -1581,7 +1575,7 @@ impl Opener for HeldOpener {
                 let _ = release.recv();
             }
         }
-        syncular::SyncularOpener.open(spec)
+        keeper_replica::SyncularOpener.open(spec)
     }
 }
 
@@ -1594,7 +1588,7 @@ impl Opener for HeldOpener {
 async fn a_held_session_opened_while_its_replica_reopens_is_arriving_then_opens() {
     let world = World::new();
     paired_holding_alpha(&world);
-    let first = real_hq(&world, Arc::new(syncular::SyncularOpener));
+    let first = real_hq(&world, Arc::new(keeper_replica::SyncularOpener));
     first.start().await.expect("starts");
     first.set_server("").await.expect("clears");
     status_until(&first, "alpha held with no server", |s| {
@@ -1650,11 +1644,11 @@ struct LocalOpener(
 );
 
 impl Opener for LocalOpener {
-    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, keeper_ports::ReplicaError> {
         let database = spec.database.clone();
         lock(&self.1).insert(database.clone(), spec.path.clone());
         let replica: Arc<dyn Replica> =
-            Arc::new(crate::hq::syncular::SyncularReplica::open(ReplicaSpec {
+            Arc::new(keeper_replica::SyncularReplica::open(ReplicaSpec {
                 link: None,
                 ..spec
             })?);
@@ -2174,7 +2168,7 @@ async fn a_lost_or_foreign_seen_record_fails_toward_the_warning() {
 struct Shared(Arc<LocalOpener>);
 
 impl Opener for Shared {
-    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, crate::hq::port::ReplicaError> {
+    fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, keeper_ports::ReplicaError> {
         Ok(self.0.replica(&spec.database))
     }
 }

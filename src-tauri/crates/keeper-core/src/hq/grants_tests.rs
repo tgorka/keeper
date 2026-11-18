@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::hq::approvals::{AgentApprovalActionVm as Action, AgentApprovalStateVm, Decisions};
-use crate::hq::port::ReplicaSpec;
 use crate::hq::sessions::{self, object, Source};
-use crate::hq::syncular::SyncularReplica;
+use keeper_ports::ReplicaSpec;
+use keeper_replica::SyncularReplica;
 
 const NIXI: &str = "nixi";
 

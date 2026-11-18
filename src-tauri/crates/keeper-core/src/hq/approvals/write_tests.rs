@@ -11,13 +11,15 @@ use serde_json::{json, Map, Value};
 
 use super::*;
 use crate::hq::approvals::{self, AgentApprovalActionVm, AgentApprovalStateVm, Decisions};
-use crate::hq::port::{
-    Covered, Delivery, DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget,
-    DriveWrites, Peer, RefusedCommit, Rejection, Replica, ReplicaError, ReplicaSpec, ReplicaState,
-    RowOp, RowWrites, Subscription, UploadRefusal, WindowBase, WindowState,
+use crate::hq::drive_writes::{
+    DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
 };
 use crate::hq::sessions::{self, object, Source};
-use crate::hq::syncular::SyncularReplica;
+use keeper_ports::{
+    Covered, Delivery, Peer, RefusedCommit, Rejection, Replica, ReplicaError, ReplicaSpec,
+    ReplicaState, RowOp, RowWrites, Subscription, UploadRefusal, WindowBase, WindowState,
+};
+use keeper_replica::SyncularReplica;
 
 const ANA: &str = "ana";
 const NIXI: &str = "nixi";
@@ -173,7 +175,7 @@ impl Replica for Server {
     }
     fn commit_with_blobs(
         &self,
-        b: Vec<crate::hq::port::BlobBody>,
+        b: Vec<keeper_ports::BlobBody>,
         ops: Vec<RowOp>,
     ) -> Result<String, ReplicaError> {
         self.inner.commit_with_blobs(b, ops)
@@ -247,13 +249,13 @@ impl Replica for Server {
         id: &str,
         request: &str,
         params: Value,
-    ) -> Result<crate::hq::port::CommandResult, ReplicaError> {
+    ) -> Result<keeper_ports::CommandResult, ReplicaError> {
         self.inner.remote_command(id, request, params)
     }
     fn sync_now(&self) {}
     fn state(&self) -> ReplicaState {
         ReplicaState {
-            link: crate::hq::port::LinkState::Connected,
+            link: keeper_ports::LinkState::Connected,
             ..self.inner.state()
         }
     }
@@ -1492,7 +1494,7 @@ fn hq_over(w: &World, port: Arc<dyn DriveWrites>) -> Arc<crate::hq::Hq> {
     use crate::hq::{Db, DeviceHosts, Hq, Pairing};
     let hq = Hq::new(
         Arc::new(crate::forges::testing::FakePlatform::default()),
-        Arc::new(crate::hq::port::fake::FakeOpener::default()),
+        Arc::new(keeper_testkit::FakeOpener::default()),
         Arc::new(crate::hq::routes::HttpRoutes::new()),
         Arc::new(crate::hq::signin::NoAccount),
         "hesperia".to_owned(),

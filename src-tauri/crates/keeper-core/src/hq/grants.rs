@@ -23,7 +23,7 @@
 //!   V15 refuses a grant about any other agent (`hq.v15.agent`), and keeper
 //!   knows which agents serve the person only from the server itself: the
 //!   `person_agent` keys it grants this device's grants window
-//!   ([`crate::hq::port::Replica::granted`]). A key not granted, or not yet
+//!   ([`keeper_ports::Replica::granted`]). A key not granted, or not yet
 //!   pulled, offers nothing.
 //!
 //! Elsewhere the menu leaves *Always allow …* out rather than disabling it.
@@ -32,8 +32,8 @@
 //! person; it is never deleted. Revoking stops new uses, not the approvals
 //! the grant already issued ([`REVOKE_NOTE`]), and a session-bound grant
 //! ends with its session. A refused write is read back from the replica's
-//! per-row outcome record ([`crate::hq::port::Replica::row_writes`],
-//! [`crate::hq::port::Replica::refused_commits`]), as a refused rename is.
+//! per-row outcome record ([`keeper_ports::Replica::row_writes`],
+//! [`keeper_ports::Replica::refused_commits`]), as a refused rename is.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,13 +42,13 @@ use serde_json::{json, Map, Value};
 use ts_rs::TS;
 
 use crate::hq::approvals::{self, AgentDecisionOutcomeVm, Decisions, Refusal};
-use crate::hq::port::{Rejection, ReplicaError, RowOp, RowWrites};
 use crate::hq::sessions::{
     authored, directory, int, json as json_column, object, opt_text, read, text, truthy,
     SessionNames, Source,
 };
 use crate::hq::vocabulary;
 use crate::hq::{sentence, Hq, HqError};
+use keeper_ports::{Rejection, ReplicaError, RowOp, RowWrites};
 
 /// The table.
 pub const TABLE: &str = "standing_grants";
@@ -573,7 +573,7 @@ pub fn always_allow(
 
 /// Revoke this person's grant `grant_id`: its one change (V15). An earlier
 /// refused revocation of it is set aside, in the revocation's own step
-/// ([`crate::hq::port::Replica::mutate_superseding`]).
+/// ([`keeper_ports::Replica::mutate_superseding`]).
 pub fn revoke(source: &Source, grant_id: &str, now_ms: i64) -> Result<(), String> {
     let rows = read(
         source,

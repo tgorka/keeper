@@ -1,0 +1,28 @@
+[package]
+name = "keeper-replica"
+description = "Syncular adapter of the keeper replica port"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+keeper-ports = { path = "../keeper-ports" }
+syncular-client = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+keeper-testkit = { path = "../keeper-testkit" }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tungstenite = "0.30"

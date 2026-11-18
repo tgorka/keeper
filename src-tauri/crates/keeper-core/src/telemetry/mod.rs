@@ -499,14 +499,15 @@ pub struct LogSite<'a> {
 pub const SHELL_AGENTS_TARGET: &str = "keeper_lib::hq";
 
 /// Agent content stays home (R461): a line under `keeper_agent…`,
-/// `keeper_core::agents…`, `keeper_core::hq…` (the agents' database, whose
-/// errors can quote a server's refusal of a row) or the shell's
+/// `keeper_core::agents…`, `keeper_core::hq…`, `keeper_replica…` (the agents'
+/// database, whose errors can quote a server's refusal of a row) or the shell's
 /// [`SHELL_AGENTS_TARGET`] leaves with its level, target, callsite and
 /// fingerprint, never its message.
 pub fn is_agent_target(target: &str) -> bool {
     target.starts_with("keeper_agent")
         || target.starts_with("keeper_core::agents")
         || target.starts_with("keeper_core::hq")
+        || target.starts_with("keeper_replica")
         || target.starts_with(SHELL_AGENTS_TARGET)
 }
 

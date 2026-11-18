@@ -16,10 +16,10 @@ use super::protocol::candidate::{self, State, Verdict};
 use super::protocol::change::{Change, ChangeOp, DESCRIPTOR};
 use super::protocol::delta::Op;
 use super::protocol::scope::{client_scope, event_op_id, receipt_id};
-use crate::hq::port::{ReplicaSpec, RowOp};
 use crate::hq::sessions::Source;
-use crate::hq::syncular::SyncularReplica;
 use crate::notes::tags::normalise;
+use keeper_ports::{ReplicaSpec, RowOp};
+use keeper_replica::SyncularReplica;
 
 const DB: &str = "tgdrive";
 
@@ -460,12 +460,12 @@ fn a_prefix_batch_seeks_exact_positions() {
 /// A replica that accepts every command and cannot read its own rows: what
 /// a send followed by a failing receipt read looks like.
 struct Answering {
-    inner: Arc<dyn crate::hq::port::Replica>,
+    inner: Arc<dyn keeper_ports::Replica>,
 }
 
 mod answering {
     use super::Answering;
-    use crate::hq::port::{
+    use keeper_ports::{
         BlobBody, CommandResult, Covered, Delivery, LinkState, Peer, RefusedCommit, Replica,
         ReplicaError, ReplicaState, RowOp, RowWrites, Subscription, UploadRefusal, WindowBase,
         WindowState,
@@ -683,7 +683,7 @@ fn the_source_helpers_answer_over_any_query_channel() {
 #[test]
 fn every_graph_subscription_has_a_purgeable_scope_column() {
     let schema = syncular_client::parse_schema_json(
-        crate::hq::syncular::schema().expect("the contract's schema"),
+        keeper_replica::schema().expect("the contract's schema"),
     )
     .expect("compiles");
     let taken = super::client::subscriptions(DB, "ana", "dev1");
