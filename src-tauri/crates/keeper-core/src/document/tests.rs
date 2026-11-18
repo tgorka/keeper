@@ -426,6 +426,32 @@ fn a_bomb_that_lies_about_its_size_is_refused_while_inflating() {
     assert!(vm.words.is_none());
 }
 
+/// keeper's own produced-bytes guard, without zip in front of it.
+///
+/// zip 9 refuses a part that outgrows its declared size before this guard can
+/// fire, so no container reaches it — and deleting it would otherwise fail no
+/// test. A plain reader that produces more than the cap stands in for a
+/// decompressor whose output nothing upstream bounds.
+#[test]
+fn a_part_that_produces_more_than_the_cap_is_refused_by_keepers_own_guard() {
+    use std::io::Read as _;
+
+    let over = std::io::repeat(b'A').take(OOXML_MAX_PART_BYTES + 1_000);
+    match inflate_part(over, "word/document.xml") {
+        Err(Refusal::Bomb(detail)) => assert!(
+            detail.contains("inflates past"),
+            "the refusal must be the produced-bytes guard, got {detail:?}"
+        ),
+        Err(_) => panic!("refused, but not as a decompression bomb"),
+        Ok(bytes) => panic!("{} bytes were held past the cap", bytes.len()),
+    }
+
+    let at_cap = std::io::repeat(b'A').take(OOXML_MAX_PART_BYTES);
+    let bytes = inflate_part(at_cap, "word/document.xml")
+        .unwrap_or_else(|_| panic!("a part exactly at the cap is inside it"));
+    assert_eq!(bytes.len() as u64, OOXML_MAX_PART_BYTES);
+}
+
 /// A part that inflates past [`OOXML_MAX_PART_BYTES`], stored compressed.
 fn bomb_container() -> Vec<u8> {
     let huge = vec![b'A'; (OOXML_MAX_PART_BYTES + 1_000) as usize];

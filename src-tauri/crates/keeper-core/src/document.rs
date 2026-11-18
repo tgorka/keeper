@@ -650,9 +650,21 @@ fn read_part<R: io::Read + io::Seek>(
         )));
     }
 
+    let bytes = inflate_part(&mut part, name)?;
+    budget.charge(bytes.len() as u64)?;
+
+    String::from_utf8(bytes)
+        .map_err(|_| Refusal::Malformed(format!("{name} is not valid UTF-8 text")))
+}
+
+/// Guard 2 of [`read_part`]: read at most [`OOXML_MAX_PART_BYTES`] plus one
+/// byte, and refuse the part if it got there.
+///
+/// Separate from `read_part` only so the guard can be tested on a plain
+/// `Read`: zip 9's own declared-size check fires first on any real container.
+fn inflate_part(part: impl io::Read, name: &str) -> Result<Vec<u8>, Refusal> {
     let mut bytes = Vec::new();
-    part.by_ref()
-        .take(OOXML_MAX_PART_BYTES + 1)
+    part.take(OOXML_MAX_PART_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
             Refusal::Malformed(format!("{name} could not be decompressed ({error})"))
@@ -664,10 +676,7 @@ fn read_part<R: io::Read + io::Seek>(
             format_file_size(OOXML_MAX_PART_BYTES)
         )));
     }
-    budget.charge(bytes.len() as u64)?;
-
-    String::from_utf8(bytes)
-        .map_err(|_| Refusal::Malformed(format!("{name} is not valid UTF-8 text")))
+    Ok(bytes)
 }
 
 /// The local element name, with any namespace prefix removed.

@@ -80,7 +80,9 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
 - **ZIP / RUSTSEC-2026-0367, -0368, -0369:** `keeper-core` reads OOXML through
   `zip 9.7.0` (moved from 4.6.1 on 2026-11-18, which also cleared RUSTSEC-2026-0545
   and -0548). The waivers remain for `keeper -> tauri-plugin-updater 2.10.1 -> zip 4.6.1`,
-  a `cfg(target_os = "windows")` dependency; fixes require 9.0.0.
+  a `cfg(target_os = "windows")` dependency; fixes require 9.0.0. zip 9 looks for the
+  end-of-central-directory record only in an archive's last 64 KiB, so a DOCX, PPTX or
+  XLSX with more than 64 KiB of data after that record is now unrecognised.
   The document reader only reads named, size-bounded OOXML parts, never extracts
   entries or applies archive permissions. The updater's ZIP extraction is Windows-only:
   the Unix SUID/SGID and permission-setting paths are not used. Its download path
