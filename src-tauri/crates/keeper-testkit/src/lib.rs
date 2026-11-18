@@ -23,9 +23,14 @@ pub fn blob_id(bytes: &[u8]) -> String {
 
 /// The [`Replica`] methods whose offline semantics [`FakeReplica`] models,
 /// as the real replica answers them with no server: keeper-replica's
-/// parity suite runs each against both. Every other method is a stub that
-/// answers empty (or [`ReplicaError::NotSyncing`] for a remote call) and
-/// stands in only for a collaborator outside the claim a test proves.
+/// parity suite runs each against both. The other methods are stubs that
+/// stand in only for a collaborator outside the claim a test proves:
+/// `query` and `query_covered` answer the rows a test set
+/// ([`FakeReplica::replicate`]), with nothing covered; `mutate_superseding`
+/// commits as `mutate` does and sets no refusal aside; a remote call
+/// answers [`ReplicaError::NotSyncing`]; `delivery` answers
+/// [`Delivery::Unknown`]; `close` and `join` set their flag; every other
+/// one answers empty (or `Ok`).
 pub const MODELLED: [&str; 8] = [
     "mutate",
     "commit_with_blobs",
@@ -64,7 +69,11 @@ fn row_id(op: &RowOp) -> Option<String> {
 }
 
 /// Whether `op` writes a column holding a blob reference to `blob`, read as
-/// the adapter reads one: a JSON text column whose `blobId` it is.
+/// the adapter reads one for an upload refusal: a JSON text column whose
+/// `blobId` it is. The port gives the fake no schema, so its pins
+/// ([`FakeReplica::pins`]) read references the same way; syncular pins only
+/// columns its schema types as blob references, so the fake over-approximates
+/// a pin for a JSON text column that only looks like one.
 fn references(op: &RowOp, blob: &str) -> bool {
     let (RowOp::Upsert { values, .. } | RowOp::Patch { values, .. }) = op else {
         return false;
@@ -161,9 +170,9 @@ impl FakeReplica {
 
     /// The server refused `blob`'s upload, as a later round would report:
     /// the refusal is tied to every waiting commit that references the
-    /// blob, and the blob leaves the upload queue and those commits' pins
-    /// ([`UploadRefusal`]). A blob no waiting commit references is left
-    /// alone, as the adapter leaves it.
+    /// blob ([`UploadRefusal`]), and the blob leaves the upload queue and
+    /// every commit's pins. A blob no waiting commit references surfaces no
+    /// refusal and leaves the queue all the same, as the adapter releases it.
     pub fn refuse_upload(&self, blob: &str, rejection: Rejection) {
         let mut store = self.store();
         let refusals: Vec<UploadRefusal> = store
@@ -184,9 +193,6 @@ impl FakeReplica {
                 })
             })
             .collect();
-        if refusals.is_empty() {
-            return;
-        }
         store.queued.remove(blob);
         for refusal in &refusals {
             store
@@ -454,9 +460,10 @@ pub fn bootstrapped(path: &std::path::Path) {
     .expect("bootstraps");
 }
 
-/// What a blob server saw: each request's method and path, and the
-/// status it answered.
-pub type Seen = Arc<Mutex<Vec<(String, String, u16)>>>;
+/// What a blob server saw: each request's method and path, the status it
+/// answered, and — for a push (`POST …/sync`) — its body, so a test can tell
+/// which commits it carried (empty for every other request).
+pub type Seen = Arc<Mutex<Vec<(String, String, u16, String)>>>;
 
 /// A server for the blob half of a round: an upload grant is answered
 /// `{}` (no signed URL: `PUT` it here) and a `PUT` `200`, unless
@@ -511,7 +518,14 @@ pub fn blob_server(refused: Vec<(String, u16)>) -> (u16, Seen) {
                 ("PUT", None) if path.contains("/blobs/") => (200, "{}"),
                 _ => (503, r#"{"error":"unavailable"}"#),
             };
-            log.lock().expect("seen").push((method, path, status));
+            let pushed = if method == "POST" && path.ends_with("/sync") {
+                String::from_utf8_lossy(&request[head_end..]).into_owned()
+            } else {
+                String::new()
+            };
+            log.lock()
+                .expect("seen")
+                .push((method, path, status, pushed));
             let _ = write!(
                 stream,
                 "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -527,7 +541,7 @@ pub fn puts(seen: &Seen, blob: &str, status: u16) -> usize {
     seen.lock()
         .expect("seen")
         .iter()
-        .filter(|(method, path, answered)| {
+        .filter(|(method, path, answered, _)| {
             method == "PUT" && path.ends_with(blob) && *answered == status
         })
         .count()
@@ -539,5 +553,18 @@ pub fn pushed_after(seen: &Seen, after: usize) -> bool {
         .expect("seen")
         .iter()
         .skip(after)
-        .any(|(method, path, _)| method == "POST" && path.ends_with("/sync"))
+        .any(|(method, path, _, _)| method == "POST" && path.ends_with("/sync"))
+}
+
+/// Where in the record a push (`/sync`) carried `commit`, in order.
+pub fn pushes_of(seen: &Seen, commit: &str) -> Vec<usize> {
+    seen.lock()
+        .expect("seen")
+        .iter()
+        .enumerate()
+        .filter(|(_, (method, path, _, body))| {
+            method == "POST" && path.ends_with("/sync") && body.contains(commit)
+        })
+        .map(|(at, _)| at)
+        .collect()
 }

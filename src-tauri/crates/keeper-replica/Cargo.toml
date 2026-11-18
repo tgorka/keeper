@@ -19,6 +19,8 @@ tracing = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [features]
 # The outcome journal's test writer (`journal`). Only keeper-core's
@@ -28,6 +30,4 @@ outcome-journal = []
 [dev-dependencies]
 keeper-testkit = { path = "../keeper-testkit" }
 tempfile = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 tungstenite = "0.30"

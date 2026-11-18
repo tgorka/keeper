@@ -847,6 +847,20 @@ fn interrupt_after(uploads: usize) {
 #[inline(always)]
 fn interrupt_after(_uploads: usize) {}
 
+/// `bytes`' content address, `sha256:<hex>`, as syncular names a staged
+/// body ([`BlobBody::id`]).
+fn content_address(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// The refusal of a body `id` names but its bytes are not at.
+fn misaddressed(id: &str) -> ReplicaError {
+    ReplicaError::Client(format!(
+        "the replica staged {id} under another content address"
+    ))
+}
+
 /// Whether `values` (one operation's columns) reference `blob_id`: a column
 /// holding a blob reference whose `blobId` it is.
 fn references(values: &Value, blob_id: &str) -> bool {
@@ -1282,7 +1296,10 @@ impl Owner {
 
     /// Stage `blobs`, then commit `ops`, in this one command: no round and
     /// no eviction between, so every blob stays pinned — by its upload row,
-    /// then by the commit's reference. What the blobs were before is kept
+    /// then by the commit's reference. A body whose bytes are not at the
+    /// address it names is refused before anything is staged: staging files
+    /// bytes under their real address, which the claimed id cannot put back.
+    /// What the blobs were before is kept
     /// beside the replica first ([`AccessLog::begin_commit`]): on a failure
     /// they go back as they were ([`BlobCache::unstage`]), and if the process
     /// dies before the message is in the outbox the next open puts them back
@@ -1300,6 +1317,12 @@ impl Owner {
         };
         self.cache.recover().map_err(storage)?;
         self.settle = None;
+        if let Some(blob) = blobs
+            .iter()
+            .find(|blob| content_address(&blob.bytes) != blob.id)
+        {
+            return Err(misaddressed(&blob.id));
+        }
         let before = blobs
             .iter()
             .map(|blob| self.cache.held(&blob.id))
@@ -1340,10 +1363,7 @@ impl Owner {
                 .map_err(ReplicaError::Client)?;
             interrupt_after(staged);
             if reference["blobId"].as_str() != Some(blob.id.as_str()) {
-                return Err(ReplicaError::Client(format!(
-                    "the replica staged {} under another content address",
-                    blob.id
-                )));
+                return Err(misaddressed(&blob.id));
             }
         }
         self.client
@@ -3449,8 +3469,7 @@ pub(crate) mod tests {
     }
 
     fn sha(bytes: &[u8]) -> String {
-        use sha2::Digest;
-        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+        super::content_address(bytes)
     }
 
     /// Put `bytes` in the client's cache as a download would, cached at `at`.
@@ -3809,7 +3828,7 @@ pub(crate) mod tests {
                     seen.lock()
                         .expect("seen")
                         .iter()
-                        .filter(|(_, path, _)| path.contains(&sha(orphan)))
+                        .filter(|(_, path, _, _)| path.contains(&sha(orphan)))
                         .count(),
                     0,
                     "cut {cut}: nothing is uploaded without its message"
@@ -3910,7 +3929,7 @@ pub(crate) mod tests {
             seen.lock()
                 .expect("seen")
                 .iter()
-                .filter(|(_, path, _)| path.contains(&sha(&fresh)))
+                .filter(|(_, path, _, _)| path.contains(&sha(&fresh)))
                 .count(),
             0,
             "the failed Send's file is never uploaded"

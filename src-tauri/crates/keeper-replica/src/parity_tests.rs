@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use keeper_ports::{BlobBody, RefusedCommit, Rejection, RowOp, UploadRefusal};
-use keeper_testkit::{blob_id, harness, pushed_after, puts, Harness, Over, MODELLED};
+use keeper_testkit::{blob_id, harness, pushes_of, puts, Harness, Over, Seen, MODELLED};
 use serde_json::{json, Map, Value};
 
 use crate::journal::journal_refused;
@@ -207,13 +207,9 @@ fn a_failed_commit_unstages_what_it_staged() {
 
 /// AC2, the port's own words ("when a blob or the commit fails, what this
 /// call staged and nothing else holds is unstaged again"), for a body whose
-/// bytes are not at the address it names. The fake passes; the adapter
-/// refuses the commit but leaves the bytes queued for upload under their
-/// real address, with no message naming them — a finding of 113.4 against
-/// the adapter, which this story may not change. Run it with
-/// `--run-ignored only`.
+/// bytes are not at the address it names: refused, with nothing of it left
+/// queued under either address.
 #[test]
-#[ignore = "113.4 finding: the adapter leaves a forged body's bytes queued"]
 fn a_failed_commit_unstages_a_body_not_at_its_address() {
     for (name, world) in local_subjects() {
         let kept = vec![5u8; 32];
@@ -271,40 +267,55 @@ fn with_no_server_commits_wait_and_nothing_is_refused() {
     }
 }
 
-/// AC3: a linked replica uploads a body before the round's push reaches
-/// the stand-in, and keeps it pinned while the push is cut.
+/// AC3: a linked replica uploads a body before any push carries its
+/// commit to the stand-in, and keeps it pinned while the push is cut.
 #[test]
 fn a_linked_replica_puts_the_body_before_the_rounds_push() {
     let world = harness(Over::Linked(&SyncularOpener, Vec::new()));
     let seen = world.seen.clone().expect("the stand-in's record");
     let bytes = vec![9u8; 100];
     let id = blob_id(&bytes);
-    let commit = send(&world, "m-1", "a-1", &bytes);
-    world.source.replica.sync_now();
-    eventually("the body's PUT, then a push", || {
-        let at = seen
-            .lock()
+    let grant_of = |seen: &Seen| {
+        seen.lock()
             .expect("seen")
             .iter()
-            .position(|(method, path, _)| method == "PUT" && path.ends_with(&id));
-        at.is_some_and(|at| pushed_after(&seen, at + 1))
+            .position(|(method, path, _, _)| {
+                method == "POST" && path.contains(&id) && path.ends_with("/upload-grant")
+            })
+    };
+    let commit = send(&world, "m-1", "a-1", &bytes);
+    world.source.replica.sync_now();
+    eventually("the body's grant, then a push of its commit", || {
+        grant_of(&seen).is_some_and(|grant| {
+            pushes_of(&seen, &commit)
+                .last()
+                .is_some_and(|&push| push > grant)
+        })
     });
     let record = seen.lock().expect("seen").clone();
     // The stand-in's record, for the run's evidence (`--no-capture`).
-    println!("stand-in record: {record:?}");
-    let put = record
+    let shown: Vec<_> = record
         .iter()
-        .position(|(method, path, _)| method == "PUT" && path.ends_with(&id))
-        .expect("the PUT");
-    assert_eq!(puts(&seen, &id, 200), 1, "{record:?}");
-    // The round that uploads opens with the body's grant: no push of that
-    // round reached the stand-in before its PUT.
-    let (method, path, _) = &record[put - 1];
-    assert!(
-        method == "POST" && path.contains(&id) && path.ends_with("/upload-grant"),
-        "{record:?}"
+        .map(|(method, path, status, _)| (method, path, status))
+        .collect();
+    println!(
+        "stand-in record: {shown:?}; pushes of {commit}: {:?}",
+        pushes_of(&seen, &commit)
     );
-    assert!(pushed_after(&seen, put + 1), "{record:?}");
+    let grant = grant_of(&seen).expect("the grant");
+    assert_eq!(puts(&seen, &id, 200), 1, "{shown:?}");
+    // The grant is answered by the body's PUT, and every push that carried
+    // the commit — not only some later round's — came after both.
+    let (method, path, status, _) = &record[grant + 1];
+    assert!(
+        method == "PUT" && path.ends_with(&id) && *status == 200,
+        "{shown:?}"
+    );
+    let pushes = pushes_of(&seen, &commit);
+    assert!(
+        !pushes.is_empty() && pushes.iter().all(|&push| push > grant + 1),
+        "{shown:?}; pushes of the commit at {pushes:?}"
+    );
     eventually("the server has the body", || world.queued().is_empty());
     assert_eq!(
         world.pins(),
@@ -358,6 +369,56 @@ fn a_refused_upload_surfaces_with_its_commit_and_blob() {
         );
         assert!(world.queued().is_empty(), "{name}: out of the queue");
         assert!(world.pins().is_empty(), "{name}: and its commit's pins");
+    }
+}
+
+/// AC3: a body staged with a commit that does not reference it — so no
+/// waiting commit does — leaves the upload queue when the server refuses
+/// it, and no refusal surfaces: on the linked replica from the stand-in's
+/// `413`, on the fake as a test sets it.
+#[test]
+fn a_refused_upload_no_waiting_commit_references_leaves_the_queue() {
+    let bytes = vec![11u8; 100];
+    let id = blob_id(&bytes);
+    let subjects = [
+        ("fake", harness(Over::Fake)),
+        (
+            "linked",
+            harness(Over::Linked(&SyncularOpener, vec![(id.clone(), 413)])),
+        ),
+    ];
+    for (name, world) in subjects {
+        let replica = &world.source.replica;
+        replica
+            .commit_with_blobs(vec![body(&bytes)], vec![upsert("messages", message("m-1"))])
+            .expect("commits");
+        match (&world.fake, &world.seen) {
+            (Some(fake), _) => {
+                assert_eq!(world.queued(), vec![id.clone()], "{name}: staged");
+                fake.refuse_upload(&id, too_large());
+            }
+            (None, Some(seen)) => {
+                replica.sync_now();
+                eventually(&format!("{name}: the server refused it"), || {
+                    seen.lock()
+                        .expect("seen")
+                        .iter()
+                        .any(|(_, path, status, _)| path.contains(&id) && *status == 413)
+                });
+            }
+            (None, None) => unreachable!("a linked harness keeps the stand-in's record"),
+        }
+        eventually(&format!("{name}: out of the queue"), || {
+            world.queued().is_empty()
+        });
+        assert!(world.pins().is_empty(), "{name}: pinned by nothing");
+        assert!(
+            replica.upload_refusals().is_empty(),
+            "{name}: no waiting commit to refuse"
+        );
+        eventually(&format!("{name}: its commit still waits"), || {
+            replica.state().outbox == 1
+        });
     }
 }
 

@@ -1032,7 +1032,7 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
         seen.lock()
             .expect("seen")
             .iter()
-            .position(|(_, path, status)| *status == 413 && path.contains(&sha256(&huge)))
+            .position(|(_, path, status, _)| *status == 413 && path.contains(&sha256(&huge)))
     };
     eventually(
         "the server refuses huge.zip, then a round goes past it",
@@ -1089,7 +1089,7 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
         .lock()
         .expect("seen")
         .iter()
-        .filter(|(_, path, status)| *status == 413 && path.contains(&sha256(&huge)))
+        .filter(|(_, path, status, _)| *status == 413 && path.contains(&sha256(&huge)))
         .count();
     assert_eq!(refusals, 1, "never tried again");
 }
