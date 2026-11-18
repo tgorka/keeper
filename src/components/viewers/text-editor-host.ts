@@ -27,7 +27,7 @@
  * `format` verdict decides what markdown is (AD-87 — never a second extension
  * sniff), and whether a save can follow is `TextFileFrame`'s `savable`, which
  * reads the FORMAT's verdict, the size guard, and — since the fix to this
- * story — the LOCATION's verdict that `keeper_sync::files_write` composed and
+ * story — the LOCATION's verdict that `keeper_paths::WriteRefusal` composed and
  * the listing row carried. That last one is what actually keeps the tools off
  * a session's `workspace/` file (AD-113): it is ordinary markdown of an
  * ordinary writable format, so nothing about the file itself withholds

@@ -4856,8 +4856,9 @@ pub async fn sync_export_entry(
 //     reconciler already understands, so a deletion is announced rather than
 //     discovered on the next scan;
 //   * every decision — is this inside a vault, is it a folder, is the name a
-//     name, is it already taken — is made in `keeper_sync::files_write`, which
-//     compiles and is tested on any machine. This crate does not build on Linux
+//     name — is made by `keeper_paths::WriteScope`, and whether the name is
+//     already taken by `keeper_sync::files_write::collides`; both compile and
+//     are tested on any machine. This crate does not build on Linux
 //     (AD-55, AD-56), so a rule written here would be a rule guarding a write
 //     that nobody could exercise until macOS.
 

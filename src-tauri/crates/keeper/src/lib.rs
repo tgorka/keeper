@@ -1472,7 +1472,8 @@ pub fn run() {
                 // And the write half (Story 45.3, AD-89, which retired AD-75). Every
                 // one of these goes through `notes_vault`'s single writer and refuses
                 // anything outside a notes vault; the decisions are in
-                // `keeper_sync::files_write`, and these are the call sites.
+                // `keeper_paths::WriteScope` (and `keeper_sync::files_write::collides`
+                // for a taken name), and these are the call sites.
                 sync_ipc::sync_write_entry,
                 sync_ipc::sync_delete_plan,
                 sync_ipc::sync_delete_entries,

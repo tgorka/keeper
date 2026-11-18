@@ -45,8 +45,9 @@
  *   attach by reference at all.
  * - **`notes_gallery` already IS the vault's directory reader.** It goes through
  *   `keeper_sync::browse`, the repo's one directory reader, so the containment
- *   test, the built-in noise filter, the entry cap and the folders-then-files
- *   order are the same ones the Files pane shows. It answers with the
+ *   test (`keeper_paths::resolve`, which browse calls), the built-in noise
+ *   filter, the entry cap and the folders-then-files order are the same ones
+ *   the Files pane shows. It answers with the
  *   vault-relative `relPath` a note embeds and with the one classifier's `kind`
  *   (AD-73). Nothing new was needed in Rust for the browsing at all.
  *
