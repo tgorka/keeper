@@ -2112,3 +2112,53 @@ take a client's word for which device wrote a row.
   rulings (AD-417…AD-433). Owner is the architect. Epics 103–108 implement it: keeper-hq's `server/`,
   `agent/` and `agents/`; keeper's `syncular/` contract, `keeper-llm` and syncular client;
   makistack's six agent containers and the `keeper_hq` database with its two schemas.
+
+## D-38 — A domain is an audience; one role model; the operator alone changes who is in each
+
+The owner asked that the configuration hard-coded in the server's file move into data: "konfiguracja
+przejdzie do grafu … generalny graph dla generalnych konfigow i mapy innych graphow itp (zamiast
+static w kodzie)". D-37 left two databases, `tgdrive` and `neuradrive`, and a file of the operator's
+naming who reads each. He then named the general domain — "zmien na makidrive" — and said who may
+use it: "moga wszyscy miec dostep read - tgorka write admin". Asked what a member sees of a domain
+they are not in, he answered "nic"; asked what guards the path that changes membership besides the
+operator's token, "sam token"; asked whether a person may see the list of drives that exist, "nie -
+tylko te dyski ktore ma dostep". This entry records what a domain is, the roles in it, and who changes
+them.
+
+keeper will treat every database of its `syncular/` contract as a **domain** — one audience, with its
+own schema, drive and graph, named alike — of one of three kinds: `general` (the organisation's one,
+`makidrive`, which every person is in as `reader` and the owner as `owner`), `personal` or `group`. A
+person's membership of a domain carries one of four roles — `reader`, `editor`, `reviewer`, `owner` —
+or none, and the same four name their standing in every module of that domain. Which domains exist,
+who is in each and with which role is the server's own **map**, changed only on the operator's admin
+path. keeper will **not** hold the map, replicate it, show a person anything of a domain they are not
+in, list the domains that exist, or let any device — an owner's included — change who is in a domain.
+
+- **What changes:** `syncular/vocabulary.json` gains `roles`, the one list of the four; the new
+  contract crate `keeper-accounts-api` defines the domain kinds, the roles, the entry `GET /databases`
+  gives for each domain a credential opens (its kind, its display name, and when they exist the git
+  repository it replaced, its graph's root and its file-write record), the operator's admin requests
+  and answers, and the refusal codes, pinned by `syncular/accounts.vectors.json`. `syncular/README.md`
+  § *Domains and the map* states the rules a server enforces: the map is server-only; a domain the
+  credential does not open and a name that is no domain get one answer; an agent profile and a
+  session's ticked drives name only drives everyone who reads the database may read, narrowed by the
+  server when that audience changes. (Story 114.2)
+- **Why the map is not data a device holds:** every person reads the general domain, and anything
+  in it — a row, a graph node — reaches every person, which would show each one every domain. So the
+  map is tables the server keeps beside the general domain, and a person learns only their own
+  domains, from discovery and each domain's own directory.
+- **Why only the operator's path:** a stolen or compromised device, an owner's included, cannot widen
+  a grant. The path's one guard is the operator's token; every accepted change is a history event
+  attributed to the operator, written in the change's own transaction.
+- **What it costs, stated so it is chosen:** whoever holds the operator's token and reaches the server
+  can change the map, including which sign-in subject is which person, and so act as any person; the
+  owner accepts this ("sam token"), kept small by reading the token at use and never storing it, and by
+  the history that shows every change. A second factor can be added later without changing the
+  contract.
+- **What it amends:** D-37 — the databases are no longer two fixed names but the domains the map
+  lists, each deployed on its own; who reads each moves from the operator's file into the map.
+- **Revisit triggers:** a person needing to manage their own group's members from the app; the token
+  alone judged not enough.
+- **Status / owner:** decided by the owner (the answers quoted above), 2026-11; the contract lands in
+  keeper with story 114.2's contract rung, and the server enforces it from keeper-hq's side of the
+  same story. Owner is the architect.
