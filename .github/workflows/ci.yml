@@ -10,6 +10,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  crate-graph:
+    name: Crate dependency guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Crate-graph guards and on-disk acceptance tests
+        run: |
+          bash scripts/check-crate-graph.sh
+          python3 scripts/check-module-guards-test.py
+
   frontend:
     name: Frontend (lint, typecheck, test)
     runs-on: macos-latest
