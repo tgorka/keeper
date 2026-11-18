@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the graph worker exactly as it ships and the headless driver bound to it
+# Build the graph worker exactly as it ships and the headless command line bound to it
 # (story 110.5; design v7 §10). Fails closed at every step.
 #
 #   1. `cargo build --locked --profile graph-worker -p keeper-graph-query --bins`
@@ -8,11 +8,11 @@
 #      `_Unwind_ForcedUnwind`, `_Unwind_Resume_or_Rethrow`, `_Unwind_DeleteException`,
 #      and panic_abort's `__rust_start_panic`/`__rust_abort` are linked;
 #   3. `target/graph-worker/keeper-graph-query.sha256`;
-#   4. the driver, with that digest embedded (`KEEPER_GRAPH_WORKER_SHA256`) and, when
+#   4. `keeper-cli`, with that digest embedded (`KEEPER_GRAPH_WORKER_SHA256`) and, when
 #      `KEEPER_GRAPH_RUNTIME_LEDGER` names one, the runtime ledger.
 #
 # The output names the artifact by path and digest. A worker built any other way
-# (plain `--release`, another profile) has another digest and the driver refuses it.
+# (plain `--release`, another profile) has another digest and `keeper-cli graph` refuses it.
 set -euo pipefail
 cd "$(dirname "$0")/../src-tauri"
 
@@ -49,6 +49,6 @@ else
 fi
 printf '%s\n' "$digest" > "$worker.sha256"
 
-KEEPER_GRAPH_WORKER_SHA256="$digest" cargo build --locked --profile graph-worker -p keeper-graph-driver --bins
+KEEPER_GRAPH_WORKER_SHA256="$digest" cargo build --locked --profile graph-worker -p keeper-cli --bins
 echo "worker $(pwd)/$worker sha256 $digest"
-echo "driver $(pwd)/target/graph-worker/keeper-graph-driver"
+echo "cli $(pwd)/target/graph-worker/keeper-cli"

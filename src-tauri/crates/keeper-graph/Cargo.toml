@@ -33,7 +33,7 @@ landlock = "=0.4.7"
 
 [features]
 # A person's graph reader (`query::HumanReader`). Only keeper's headless
-# driver (`keeper-graph-driver`) enables it; no other crate and no default
+# command line (`keeper-cli`) enables it; no other crate and no default
 # does (`scripts/check-graph-boundary.py`), so no agent tool can obtain one.
 human-reads = []
 

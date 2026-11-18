@@ -1,4 +1,4 @@
-//! Embeds the build-time worker digest and runtime ledger: the driver
+//! Embeds the build-time worker digest and runtime ledger: `keeper-cli graph`
 //! refuses to spawn a worker without them (no search path, no fallback).
 //! `KEEPER_GRAPH_WORKER_SHA256` is read by `option_env!`; the ledger is the
 //! file `KEEPER_GRAPH_RUNTIME_LEDGER` names, copied into `OUT_DIR`.

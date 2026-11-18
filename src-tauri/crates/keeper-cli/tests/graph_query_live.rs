@@ -7,7 +7,7 @@
 //!
 //! - `KEEPER_HQ_LIVE_URL`, `KEEPER_HQ_LIVE_DATABASE`, `KEEPER_HQ_LIVE_ACTOR`,
 //!   `KEEPER_HQ_LIVE_CLIENT_{1,2}`, `KEEPER_HQ_LIVE_TOKEN_{1,2}`,
-//!   `KEEPER_HQ_LIVE_STATE_DIR` (as `keeper-core/tests/graph_live.rs`);
+//!   `KEEPER_HQ_LIVE_STATE_DIR` (as `keeper-graph/tests/graph_live.rs`);
 //! - `KEEPER_GRAPH_LIVE_WORKER` (absolute path of the shipped worker) and
 //!   `KEEPER_GRAPH_LIVE_WORKER_SHA256`;
 //! - `KEEPER_GRAPH_LIVE_LEDGER` (the runtime ledger file; Linux);

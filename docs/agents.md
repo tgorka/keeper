@@ -115,7 +115,7 @@ Story 106.1 (AD-418, AD-422; D-4). **Settings › Agents & voice › Agents serv
 setting, `agents.server_url`: the base URL of the server you run. Blank means no server. Anything
 else must be an `http://` or `https://` address with a host, and no user name, password, query or
 fragment; a path is kept, for a server behind a reverse proxy
-(`src-tauri/crates/keeper-core/src/hq/server.rs:1-50`). keeper ships no address, and the
+(`src-tauri/crates/keeper-ports/src/server.rs:1-50`). keeper ships no address, and the
 databases are discovered from the server, never typed.
 
 **Pairing.** A device that is already paired offers **Add a device**. It asks the server for a

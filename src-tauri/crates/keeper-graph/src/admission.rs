@@ -1,8 +1,8 @@
 //! Process-wide admission of graph workers (contract §5 *Initial limits*;
 //! R15). One [`Admission`] per process is shared by every domain's
 //! [`super::query::GraphReads`], so the bounds hold per process, not per
-//! projection root: at most 4 query workers in an agentd (2 in a headless
-//! driver), 2 per agent, 1 per context, and at most one builder. Waiting is
+//! projection root: at most 4 query workers in an agentd (2 in the headless
+//! command line, `keeper-cli graph`), 2 per agent, 1 per context, and at most one builder. Waiting is
 //! fair (FIFO) and bounded: at most [`MAX_QUEUED`] queries wait, and a
 //! query that is not admitted within its deadline is `query_limit`, never
 //! queued without end.
@@ -18,7 +18,7 @@ use super::query::QueryError;
 
 /// Query workers per agentd process.
 pub const AGENTD_WORKERS: usize = 4;
-/// Query workers per headless driver process.
+/// Query workers per headless command-line process (`keeper-cli graph`).
 pub const HEADLESS_WORKERS: usize = 2;
 /// Query workers per agent.
 pub const PER_AGENT: usize = 2;
@@ -38,7 +38,7 @@ pub const ADMISSION_DEADLINE: Duration = Duration::from_secs(3);
 pub enum Process {
     /// The agent runtime: [`AGENTD_WORKERS`].
     Agentd,
-    /// A headless driver: [`HEADLESS_WORKERS`].
+    /// The headless command line (`keeper-cli graph`): [`HEADLESS_WORKERS`].
     Headless,
 }
 

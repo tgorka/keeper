@@ -524,7 +524,7 @@ impl GraphWrite for Reconnected {
 }
 
 /// One sent change whose answer was lost and whose accepted receipt
-/// replicates, resumed as the driver's `resume` does it (restore, then
+/// replicates, resumed as `keeper-cli graph resume` does it (restore, then
 /// `outcome` and `settle`) against a server answering `read_status` with
 /// `status`. With no `replay` the receipt is already held and the lookup
 /// has no attempt; with one, the same id is sent again, the server answers

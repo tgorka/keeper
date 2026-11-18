@@ -245,8 +245,9 @@ are safe, unexported C-ABI callbacks without allowances. The 110.1 proof's test-
 (`examples/allocation_probe.rs`, behind the removed `proof-executables` feature) does not
 ship; its evidence stands against the byte-identical `allocation.rs`. The measurement-only
 interposer M1 stays in the 110.1 evidence bundle and is never linked into, shipped with or
-loaded by the worker. `keeper-core`, `keeper-graph-protocol` and `keeper-graph-driver` carry
-no `unsafe`, and Linux confinement (Landlock, seccomp, rlimits) and every launch check use
+loaded by the worker. `keeper-core`, the graph client `keeper-graph`, `keeper-graph-protocol`
+and the headless command line `keeper-cli` carry no `unsafe`, and Linux confinement
+(Landlock, seccomp, rlimits) and every launch check use
 safe bindings (`landlock`, `seccompiler`, `rustix`).
 
 Every callback checks a const-TLS main-thread flag before allocation or pointer access. The
@@ -311,17 +312,17 @@ worker, a dev host — is `projection_unavailable` before any child exists.
 
 **Abort profile and binding (§10).** The worker artifact is built only with
 `--profile graph-worker` (`panic = "abort"`) by `scripts/build-graph-worker.sh`, which
-checks that no unwinder entry is imported and writes the digest the driver embeds; a worker
+checks that no unwinder entry is imported and writes the digest `keeper-cli` embeds; a worker
 rebuilt with plain `--release` has another digest and is refused. There is no search path
 and no fallback: `VerifiedWorker::open` takes an absolute path and the expected digest.
 
 **macOS.** The worker runs only under the deprecated, undocumented `/usr/bin/sandbox-exec`
 SBPL profile (dyld's libignition needs `/` readable; worker/generation ancestors need
 metadata), and only through the explicit `Runtime::macos_evidence` path
-(`keeper-graph-driver --macos-evidence`). It is evidence only (OD-C): nothing shipped
+(`keeper-cli graph --macos-evidence`). It is evidence only (OD-C): nothing shipped
 enables it; macOS has no accounted-cost mechanism of its own and its benchmark is deferred
 (DW-KG1-1101-MACBENCH). iOS and Android have no graph worker (`graph::available()` is false;
-CI's iOS check excludes the worker and driver; `check:android-graph` rejects them).
+CI's iOS check excludes the worker and `keeper-cli`; `check:android-graph` rejects them).
 
 GraphQLite is source-built MIT v0.12.0 commit `995a8b9bc25cdd86d4c2b50ff7ff87f0eb236629`
 against the sole `libsqlite3-sys`. The builder runs the pinned upstream schema DDL itself
@@ -348,7 +349,7 @@ the projection `projection_unavailable`: an R1 limit.
 ### Graph intents, revocation and offline reads (story 112.1)
 
 **Queued changes are local intent, never graph data.** A person's graph change can be
-persisted before it is sent (`keeper_graph::queue`, `keeper-graph-driver enqueue`) in
+persisted before it is sent (`keeper_graph::queue`, `keeper-cli graph enqueue`) in
 `<actor>.graph-queue` beside the replica: one SQLite file per server, domain and actor,
 never synced. It holds the whole request identity, the request's canonical bytes and their
 digest, and the entry's state. Queries never see it: the default query answers the accepted
@@ -424,7 +425,7 @@ failure, a transient server error or `graph_unavailable` keeps it and retries th
 request; `outcome_unresolved` makes it `unresolved` (only a same-id replay or `graph.outcome`,
 never a new id); an ended agent context refuses it locally only if it was never sent, otherwise
 it stays `unresolved`; a refused `graph.outcome` lookup fences the domain. A resume
-(`queue::resume_sends`, the driver's and the live
+(`queue::resume_sends`, `keeper-cli graph resume`'s and the live
 harness's one rule) sends only an entry nothing is known of — no receipt, or a lookup the
 transport lost — that is queued, or a person's already submitting: never after
 `outcome_unresolved` or from `unresolved` (lookup only), never on `graph_unavailable` (its
@@ -450,7 +451,7 @@ while the server cannot be reached only when all of these hold:
   replica, an unreadable answer, a failed task, a storage error. A refusal fences;
 - no fence stands;
 - the graph subscriptions are granted and the link is not refused;
-- the caller asked for it (`Freshness::AllowStale`, the driver's `--allow-stale`);
+- the caller asked for it (`Freshness::AllowStale`, `keeper-cli graph`'s `--allow-stale`);
 - the generation was built under the authority the last successful online `read_status`
   answered;
 - that answer is not from the future and is at most `OFFLINE_READ_LIMIT` (24 h, inclusive)

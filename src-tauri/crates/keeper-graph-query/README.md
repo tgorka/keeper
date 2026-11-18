@@ -2,7 +2,7 @@
 
 The separate, single-use, confined graph worker. Linux and macOS only; on every other target
 the crate is empty and its build script returns before any native compilation.
-Credential-bearing code (`keeper-core`, `keeper-graph`, the driver, keeper-hq's agentd) never
+Credential-bearing code (`keeper-core`, `keeper-graph`, `keeper-cli`, keeper-hq's agentd) never
 links this crate: `keeper_graph` launches its executable through the supervisor.
 
 ## Native source

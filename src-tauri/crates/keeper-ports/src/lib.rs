@@ -336,7 +336,7 @@ pub const CREDENTIAL_REFUSED: &str = "sync.credential_refused";
 
 /// What a failed remote call says, read by the server's stable names: the
 /// one classifier every reader of a remote answer uses (the read path's
-/// keeper-core graph query errors and, from 112.1, a request's pending
+/// keeper-graph query errors and, from 112.1, a request's pending
 /// cause). keeper-hq names a graph refusal by its code or, under
 /// `operation.forbidden`, by its message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
