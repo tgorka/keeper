@@ -89,4 +89,5 @@ Artifacts live in `_bmad-output/`.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Contributions are accepted under the same license, with a
+[DCO](DCO) sign-off on every commit; see [CONTRIBUTING.md](CONTRIBUTING.md).

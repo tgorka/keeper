@@ -1,0 +1,36 @@
+name: DCO
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: DCO sign-off
+    # The repository owner's commits need no certificate to themselves, and bots
+    # (dependabot, renovate) cannot sign one. The skip is keyed on the
+    # authenticated pull request author, never on a commit's author email,
+    # which anyone can set to anything. A skipped job satisfies a required check.
+    if: >-
+      github.event.pull_request.user.login != github.repository_owner &&
+      !endsWith(github.event.pull_request.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Every commit is signed off by its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: bun run scripts/check-dco.ts "$BASE" "$HEAD"
