@@ -73,7 +73,8 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
     roles = root / "roles.json"
     roles.write_text(json.dumps(names))
     env = dict(os.environ, KEEPER_MODULE_MANIFEST=str(root / "Cargo.toml"),
-               KEEPER_MODULE_ROLES=str(roles), CARGO_NET_OFFLINE="true")
+               KEEPER_MODULE_ROLES=str(roles), CARGO_NET_OFFLINE="true",
+               CARGO_TERM_COLOR="never")
 
     def crate(name, dependency=None, kind="dependencies", feature=False):
         path = root / name
@@ -132,6 +133,6 @@ with tempfile.TemporaryDirectory(prefix="keeper-module-guards-") as temporary:
     run("transitive legacy reverted GREEN", "check-module-edges.py", env=env)
     # A real cargo parse error must remain an error, including its diagnostic.
     (root / "Cargo.toml").write_text("[invalid\n")
-    run("cargo failure RED", "check-module-edges.py", "error:", env)
+    run("cargo failure RED", "check-module-edges.py", "error: unclosed table, expected `]`", env)
 
 print("module guard on-disk acceptance tests passed")
