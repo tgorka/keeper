@@ -21,8 +21,9 @@
 //!    unaffected: the frontend still never joins a root and a subpath).
 //! 2. **One writer.** Every byte goes through `notes_vault::write_vault_file` +
 //!    `mark_dirty`, the same path notes and Story 44.16's CSV editor use. This
-//!    module writes nothing itself; it decides *whether* and *where*, and hands
-//!    a vault-relative path to the one writer.
+//!    module writes nothing itself; it asks [`keeper_paths::WriteScope`]
+//!    *whether* and *where*, and hands the vault-relative path that answer
+//!    carries to the one writer.
 //! 3. **A removal is announced, not discovered.** Deleting uses
 //!    `notes_vault::trash_note`, which moves the bytes into the vault's own
 //!    trash (NFR-30, never an `unlink`), tells the reconciler the path changed
@@ -73,22 +74,31 @@
 //!   [`keeper_paths::resolve_existing`] refuses anything whose canonical form leaves the
 //!   profile root — a symlink inside the profile pointing out of it included.
 //!
-//! # Why the decision lives in this crate and not in the shell
+//! # What lives in this crate, and what does not
 //!
-//! The same reason [`crate::browse`] does. The shell does not build on Linux,
-//! so a containment rule written there is a security rule proved on no machine
-//! any of this is developed on — and this one guards a *write*, which is the
-//! half where being wrong costs a file rather than a listing. Everything here
-//! is pure over strings plus one `read_dir`, so `..`, an escape out of the
-//! vault, a colliding name and a name that is not a name are all asserted over
-//! a real temp directory on any machine.
+//! The decision does not. Whether a path may be written, and by which of the
+//! two writers, is [`keeper_paths::WriteScope`]'s answer ([`WriteScope::route`]),
+//! and the refusal is [`keeper_paths::WriteRefusal`]'s sentence. What stays
+//! here is what acts on that answer or needs this crate to give its own: the
+//! effects and the unmanaged writers ([`write_unmanaged`], [`replace_unmanaged`],
+//! [`trash_unmanaged`]), the agent's checks ([`agent_write_check`],
+//! [`agent_apply_check`]), which read the drive's index, ignore rules and
+//! attributes this crate owns, and [`collides`].
 //!
-//! This module has no opinion about whether a vault is *live*: the caller passes
-//! the subfolder of the vault it can actually reach, or `None`. That is what
-//! keeps the flag the surface renders and the answer the command gives from
-//! being two different questions — a pane told "writable" by config while the
-//! command answers from a registry that has no slot for that vault is a pane
-//! offering an action that will fail.
+//! None of it lives in the shell, for the same reason [`crate::browse`] does
+//! not. The shell does not build on Linux, so a containment rule written there
+//! is a security rule proved on no machine any of this is developed on — and
+//! this one guards a *write*, which is the half where being wrong costs a file
+//! rather than a listing. The rule in `keeper-paths` and what stays here are
+//! both asserted over a real temp directory on any machine: `..`, an escape
+//! out of the vault, a colliding name and a name that is not a name.
+//!
+//! Neither this module nor `WriteScope` has an opinion about whether a vault is
+//! *live*: the caller passes the subfolder of the vault it can actually reach,
+//! or `None`. That is what keeps the flag the surface renders and the answer
+//! the command gives from being two different questions — a pane told
+//! "writable" by config while the command answers from a registry that has no
+//! slot for that vault is a pane offering an action that will fail.
 
 use std::path::{Path, PathBuf};
 

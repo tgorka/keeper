@@ -1,7 +1,7 @@
 //! [`ShellDriveWrites`] over a real checkout and keeper-sync's own engine
 //! (109.27, contract § 5.2): each op is one authored commit carrying its
 //! approval's trailer, found again by the trailer search; git's, keeper's
-//! and LFS-routed paths are refused by keeper-sync's path rule.
+//! and LFS-routed paths are refused by keeper-sync's agent write checks.
 
 use std::path::Path;
 use std::sync::Arc;

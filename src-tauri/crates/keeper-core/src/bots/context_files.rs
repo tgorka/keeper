@@ -8,7 +8,8 @@
 //! here (AD-55/AD-56) and it is pure: [`candidates`] answers "which paths would
 //! you read" without reading any, and [`merge`] turns what somebody else read
 //! into the block that enters the request. The reading is
-//! `keeper_sync::bots_fs`' job, because the containment rule lives there.
+//! `keeper_sync::bots_fs`' job, which reaches the disk only through
+//! `keeper-paths`' containment rule.
 //!
 //! That split is also what makes the surface honest. FR-391 asks that these
 //! files be **shown to the user as what the model was told**, and a

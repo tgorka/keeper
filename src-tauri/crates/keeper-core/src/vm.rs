@@ -6187,7 +6187,7 @@ pub struct ModelProviderSaveReq {
 /// differently.
 ///
 /// `refusal` is the refusing layer's sentence carried verbatim —
-/// `keeper-sync`'s containment wording, the write router's, or one of
+/// `keeper-paths`' containment wording, the write router's, or one of
 /// `keeper_core::bots::grant`'s `DENY_*` constants — because a paraphrase of a
 /// security refusal is a second, unproved wording of the rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

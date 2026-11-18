@@ -12,9 +12,10 @@
 //! actually sent.
 //!
 //! The **drive is fake**, deliberately. `keeper-core` never touches a file —
-//! the containment rule lives in `keeper-sync` and is proved there, over real
-//! temp directories, real symlinks and a real pointer file
-//! (`keeper-sync/tests/bots_fs.rs`). What is proved *here* is everything a
+//! the containment rule lives in `keeper-paths`, and it and the tool host over
+//! it are proved there and in `keeper-sync`, over real temp directories, real
+//! symlinks and a real pointer file (`keeper-sync/tests/bots_fs.rs`). What is
+//! proved *here* is everything a
 //! filesystem cannot tell you: that a refusal reaches the model as a sentence
 //! it can act on, that a truncation is disclosed in the bytes the model reads,
 //! that a grant denial reaches the user as well, and that the loop terminates.

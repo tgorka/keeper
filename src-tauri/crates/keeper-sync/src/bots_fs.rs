@@ -17,14 +17,17 @@
 //!
 //! # Why it lives here rather than in `keeper-core` or in the shell
 //!
-//! The containment functions are here and cannot move: `keeper-core` may not
-//! depend on this crate (AD-40, `check:core-sync-free`), and the shell crate
-//! does not build on a Linux developer machine, so a containment rule written
-//! there is a security rule proved on no machine any of this is developed on
-//! (`files_write.rs:76-84`). Everything below is `std::fs` plus those
-//! functions, so it is asserted over a real temp directory — with a real
-//! symlink, a real pointer file, a real binary file and a real `rename` — on
-//! any machine.
+//! The containment rule is not here: it is `keeper-paths`' ([`keeper_paths::resolve`],
+//! [`keeper_paths::plain_segments`], [`keeper_paths::WriteScope::route`]), and this
+//! module only calls it. What is here is the tool host's half — the reads,
+//! listings, searches and writes a tool call makes — and it cannot move:
+//! `keeper-core` may not depend on this crate (AD-40, `check:core-sync-free`),
+//! and the shell crate does not build on a Linux developer machine, so a
+//! security boundary written there is one proved on no machine any of this is
+//! developed on (`files_write`'s module doc, § What lives in this crate, and
+//! what does not). Everything below is `std::fs` plus those functions, so it
+//! is asserted over a real temp directory — with a real symlink, a real
+//! pointer file, a real binary file and a real `rename` — on any machine.
 //!
 //! # Who chooses the caps
 //!

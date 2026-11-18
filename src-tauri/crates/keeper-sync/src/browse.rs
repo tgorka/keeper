@@ -16,9 +16,11 @@
 //! *what is in this folder right now, minus the noise sync already knows to
 //! skip, and is the drive even attached?* Both halves of that already exist
 //! here — [`crate::exclude::ExcludeSet`] and [`crate::volume::scan`] — and
-//! putting the listing beside them means the containment rule, the exclusion
-//! rule and the absent-media answer are all asserted over a temp directory on
-//! any machine, which is the only way a security rule is ever actually tested.
+//! putting the listing beside them — calling the containment rule,
+//! [`keeper_paths::resolve`], rather than restating it — means the containment
+//! rule, the exclusion rule and the absent-media answer are all asserted over
+//! a temp directory on any machine, which is the only way a security rule is
+//! ever actually tested.
 //! A copy of the rule in the Tauri shell would be a copy that compiles on one
 //! platform and is proved on none.
 //!
