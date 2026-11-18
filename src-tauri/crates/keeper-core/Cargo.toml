@@ -144,11 +144,14 @@ prost = "0.14"
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-keeper-replica = { path = "../keeper-replica" }
+# `outcome-journal`: the outcome journal's test writer (`journal_refused`).
+keeper-replica = { path = "../keeper-replica", features = ["outcome-journal"] }
 keeper-testkit = { path = "../keeper-testkit" }
 # The queue rule's place beside the replica layout (`hq::databases` tests).
 keeper-graph = { path = "../keeper-graph" }
-# Outcome-journal fixtures only; production code depends on keeper-ports.
+# Outcome-journal fixtures only (eight helpers write the journal through
+# `syncular_client::api`; `journal_refused` lives in keeper-replica);
+# production code depends on keeper-ports.
 syncular-client = { workspace = true }
 # The privacy lifecycle tests observe real localhost connection/cancellation;
 # the display-name bound is measured on tokio's paused clock.

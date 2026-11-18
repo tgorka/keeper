@@ -20,6 +20,11 @@ rusqlite = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
 
+[features]
+# The outcome journal's test writer (`journal`). Only keeper-core's
+# `[dev-dependencies]` enable it; nothing shipped does.
+outcome-journal = []
+
 [dev-dependencies]
 keeper-testkit = { path = "../keeper-testkit" }
 tempfile = { workspace = true }

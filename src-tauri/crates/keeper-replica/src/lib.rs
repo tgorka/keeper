@@ -78,6 +78,12 @@ pub fn schema() -> Result<&'static Value, ReplicaError> {
 pub mod blob_cache;
 mod limits;
 
+#[cfg(any(test, feature = "outcome-journal"))]
+pub mod journal;
+
+#[cfg(test)]
+mod parity_tests;
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
