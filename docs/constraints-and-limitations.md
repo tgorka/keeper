@@ -82,10 +82,10 @@ from `src-tauri/` after changing the dependency graph. New advisory IDs still fa
   `keeper -> tauri-plugin-updater 2.10.1 -> zip 4.6.1`, a `cfg(target_os = "windows")`
   dependency; fixes require 9.0.0.
   **RUSTSEC-2026-0545 and -0548 are cleared for `keeper-core` and every crate that links
-  it, keeper-hq included — not for keeper's own lockfile.** They are fixed only in
-  `zip >= 9.0.5`, and the same Windows-only updater still pulls `zip 4.6.1`, so
-  `cargo deny check advisories` from `src-tauri/` reports both IDs. They are deliberately
-  not waived, and CI runs only `cargo deny check licenses bans sources`
+  it, keeper-hq included — not for keeper's own lockfile.** RUSTSEC-2026-0545 is fixed in
+  `zip >= 9.0.0` and -0548 in `zip >= 9.0.5`; the same Windows-only updater still pulls
+  `zip 4.6.1`, so `cargo deny check advisories` from `src-tauri/` reports both IDs. They
+  are deliberately not waived, and CI runs only `cargo deny check licenses bans sources`
   (`.github/workflows/ci.yml`), so no gate fails on them either. They remain until the
   updater is bumped to a release requiring `zip ^9`. The exposure meanwhile:
   RUSTSEC-2026-0545 is in the WinZip AES reader behind zip's `aes-crypto` feature, and the
