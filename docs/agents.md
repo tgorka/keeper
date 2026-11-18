@@ -1477,7 +1477,7 @@ Closing returns focus to the chip. Installed WebKit/custom-scheme preview and do
 behavior still needs the hesperia/kalypso device check; Chrome's mock blob URL is not that proof.
 
 **The cache.** Each database's replica keeps at most **256 MiB** of blob bodies beyond what its
-outbox pins (`keeper_core::hq::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
+outbox pins (`keeper_replica::blob_cache::BLOB_CACHE_MAX_BYTES`, also the client's
 `blob_cache_max_bytes`): ten of the largest files a message may carry, so a session's recent files
 open again without a download, while a phone holding both databases spends at most half a
 gigabyte on them. Past the cap, the least recently opened body the outbox does not pin is evicted
