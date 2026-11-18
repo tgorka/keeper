@@ -1,13 +1,90 @@
-//! Replica test doubles and on-disk adapter fixtures. Dev-dependency only.
+//! Replica test doubles, on-disk adapter fixtures and the harness that gives
+//! a module a [`Source`] over the replica its test chooses ([`harness`]).
+//! Dev-dependency only: no shipped crate depends on it.
 
 use keeper_ports::*;
 use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+pub mod harness;
+
+pub use harness::{harness, Harness, Over};
+
+/// A body's content address, `sha256:<hex>` ([`BlobBody::id`]).
+pub fn blob_id(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// The [`Replica`] methods whose offline semantics [`FakeReplica`] models,
+/// as the real replica answers them with no server: keeper-replica's
+/// parity suite runs each against both. Every other method is a stub that
+/// answers empty (or [`ReplicaError::NotSyncing`] for a remote call) and
+/// stands in only for a collaborator outside the claim a test proves.
+pub const MODELLED: [&str; 8] = [
+    "mutate",
+    "commit_with_blobs",
+    "cached_blob",
+    "fetch_blob",
+    "upload_refusals",
+    "refused_commits",
+    "sync_now",
+    "state",
+];
+
+/// The fake's blob bodies and outbox: what the port keeps on this device.
+#[derive(Default)]
+struct Store {
+    /// Cached bodies, by content address.
+    bodies: BTreeMap<String, Vec<u8>>,
+    /// Bodies staged for upload.
+    queued: BTreeSet<String>,
+    /// Commits waiting for the server, oldest first, with what they write.
+    outbox: Vec<(String, Vec<RowOp>)>,
+    /// `(commit, blob)` pins the server's refusal of the blob's upload
+    /// released, as the adapter releases them.
+    released: BTreeSet<(String, String)>,
+    /// Standing refusals of commits written here, newest first.
+    refused: Vec<RefusedCommit>,
+}
+
+/// The row an operation writes.
+fn row_id(op: &RowOp) -> Option<String> {
+    match op {
+        RowOp::Upsert { values, .. } | RowOp::Patch { values, .. } => {
+            values.get("id").and_then(Value::as_str).map(str::to_owned)
+        }
+        RowOp::Delete { row_id, .. } => Some(row_id.clone()),
+    }
+}
+
+/// Whether `op` writes a column holding a blob reference to `blob`, read as
+/// the adapter reads one: a JSON text column whose `blobId` it is.
+fn references(op: &RowOp, blob: &str) -> bool {
+    let (RowOp::Upsert { values, .. } | RowOp::Patch { values, .. }) = op else {
+        return false;
+    };
+    values.values().any(|value| {
+        value
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|reference| reference.get("blobId").and_then(Value::as_str) == Some(blob))
+    })
+}
+
+/// A [`Replica`] held in memory. It models the port's offline semantics for
+/// the methods [`MODELLED`] names, never a server's: a commit waits in its
+/// outbox, a body committed with it is cached, staged and pinned, and a
+/// failed commit leaves nothing staged. A server's answer is what a test
+/// sets ([`FakeReplica::refuse_upload`], [`FakeReplica::refuse_commit`]),
+/// and it surfaces as the adapter reports a later round's: through
+/// [`Replica::upload_refusals`] and [`Replica::refused_commits`], never as
+/// an error from a call.
 pub struct FakeReplica {
     pub spec: ReplicaSpec,
     pub rows: Mutex<Vec<Map<String, Value>>>,
@@ -17,6 +94,9 @@ pub struct FakeReplica {
     pub upload_refusals: Mutex<Vec<UploadRefusal>>,
     /// Downloads attempted through the network-capable blob port.
     pub fetched_blobs: Mutex<Vec<String>>,
+    store: Mutex<Store>,
+    /// Commits written so far: the next commit's id.
+    commits: AtomicUsize,
     state: watch::Sender<ReplicaState>,
 }
 
@@ -38,15 +118,106 @@ impl FakeReplica {
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
+    fn store(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Cache `bytes`, as a download from the server would: neither staged
+    /// nor pinned. Their content address.
+    pub fn cache_blob(&self, bytes: &[u8]) -> String {
+        let id = blob_id(bytes);
+        self.store().bodies.insert(id.clone(), bytes.to_vec());
+        id
+    }
+
+    /// The bodies staged for upload, sorted ([`queued`] of a replica file).
+    pub fn queued(&self) -> Vec<String> {
+        self.store().queued.iter().cloned().collect()
+    }
+
+    /// The commits that pin each blob, `(commit, blob)`, sorted ([`pins`]
+    /// of a replica file): every waiting commit's reference to a body the
+    /// fake holds, unless a refused upload released it.
+    pub fn pins(&self) -> Vec<(String, String)> {
+        let store = self.store();
+        let mut pins: Vec<(String, String)> = store
+            .outbox
+            .iter()
+            .flat_map(|(commit, ops)| {
+                store
+                    .bodies
+                    .keys()
+                    .filter(|blob| ops.iter().any(|op| references(op, blob)))
+                    .map(|blob| (commit.clone(), blob.clone()))
+            })
+            .filter(|pin| !store.released.contains(pin))
+            .collect();
+        pins.sort();
+        pins
+    }
+
+    /// The server refused `blob`'s upload, as a later round would report:
+    /// the refusal is tied to every waiting commit that references the
+    /// blob, and the blob leaves the upload queue and those commits' pins
+    /// ([`UploadRefusal`]). A blob no waiting commit references is left
+    /// alone, as the adapter leaves it.
+    pub fn refuse_upload(&self, blob: &str, rejection: Rejection) {
+        let mut store = self.store();
+        let refusals: Vec<UploadRefusal> = store
+            .outbox
+            .iter()
+            .filter_map(|(commit, ops)| {
+                let refused_rows: Vec<String> = ops
+                    .iter()
+                    .filter(|op| references(op, blob))
+                    .filter_map(row_id)
+                    .collect();
+                (!refused_rows.is_empty()).then(|| UploadRefusal {
+                    commit_id: commit.clone(),
+                    blob_id: blob.to_owned(),
+                    rejection: rejection.clone(),
+                    refused_rows,
+                    commit_rows: ops.iter().filter_map(row_id).collect(),
+                })
+            })
+            .collect();
+        if refusals.is_empty() {
+            return;
+        }
+        store.queued.remove(blob);
+        for refusal in &refusals {
+            store
+                .released
+                .insert((refusal.commit_id.clone(), blob.to_owned()));
+        }
+        drop(store);
+        let mut held = self
+            .upload_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for refusal in refusals {
+            held.retain(|standing| {
+                standing.commit_id != refusal.commit_id || standing.blob_id != refusal.blob_id
+            });
+            held.push(refusal);
+        }
+    }
+
+    /// The server refused `refused.commit_id`, as the outcome journal would
+    /// record it: it stands in [`Replica::refused_commits`] once the commit
+    /// no longer waits in the outbox (a waiting commit's delivery is still
+    /// pending, as the replica file answers it).
+    pub fn refuse_commit(&self, refused: RefusedCommit) {
+        self.store().refused.insert(0, refused);
+    }
 }
 
 impl Replica for FakeReplica {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
-        if ops.is_empty() {
-            return Err(ReplicaError::Client("no operations".to_owned()));
-        }
-        self.state.send_modify(|state| state.outbox += 1);
-        Ok(format!("commit-{}", self.state.borrow().outbox))
+        self.commit_with_blobs(Vec::new(), ops)
     }
     fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError> {
         Ok(self.rows.lock().map_err(|_| ReplicaError::Closed)?.clone())
@@ -75,18 +246,50 @@ impl Replica for FakeReplica {
     fn presence(&self, _: &str) -> Result<Vec<Peer>, ReplicaError> {
         Ok(Vec::new())
     }
-    fn commit_with_blobs(&self, _: Vec<BlobBody>, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
-        self.mutate(ops)
+    /// Stages and commits as one step, as the adapter does: a body whose
+    /// bytes are not at its address, or a commit with no operation, fails
+    /// with nothing staged; otherwise every body is cached and staged, and
+    /// the commit waits in the outbox, pinning those it references.
+    fn commit_with_blobs(
+        &self,
+        blobs: Vec<BlobBody>,
+        ops: Vec<RowOp>,
+    ) -> Result<String, ReplicaError> {
+        if let Some(blob) = blobs.iter().find(|blob| blob_id(&blob.bytes) != blob.id) {
+            return Err(ReplicaError::Client(format!(
+                "the replica staged {} under another content address",
+                blob.id
+            )));
+        }
+        if ops.is_empty() {
+            return Err(ReplicaError::Client("no operations".to_owned()));
+        }
+        let commit = format!("commit-{}", self.commits.fetch_add(1, Ordering::SeqCst) + 1);
+        let mut store = self.store();
+        for blob in blobs {
+            store.queued.insert(blob.id.clone());
+            store.bodies.insert(blob.id, blob.bytes);
+        }
+        store.outbox.push((commit.clone(), ops));
+        drop(store);
+        self.state.send_modify(|state| state.outbox += 1);
+        Ok(commit)
     }
+    /// The cached body; a miss is refused, never fetched (the fake has no
+    /// server). The attempt is recorded in [`FakeReplica::fetched_blobs`].
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
         self.fetched_blobs
             .lock()
             .expect("fetched blobs")
             .push(blob.to_owned());
-        Ok(Vec::new())
+        self.cached_blob(blob)
     }
-    fn cached_blob(&self, _: &str) -> Result<Vec<u8>, ReplicaError> {
-        Err(ReplicaError::Closed)
+    fn cached_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
+        self.store()
+            .bodies
+            .get(blob)
+            .cloned()
+            .ok_or_else(|| ReplicaError::Client(format!("{blob} is not cached here")))
     }
     fn delivery(&self, _: &str) -> Result<Delivery, ReplicaError> {
         Ok(Delivery::Unknown)
@@ -100,8 +303,20 @@ impl Replica for FakeReplica {
     fn revoked_units(&self, _: &str) -> Result<Vec<String>, ReplicaError> {
         Ok(Vec::new())
     }
-    fn refused_commits(&self, _: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
-        Ok(Vec::new())
+    fn refused_commits(&self, table: &str) -> Result<Vec<RefusedCommit>, ReplicaError> {
+        let store = self.store();
+        Ok(store
+            .refused
+            .iter()
+            .filter(|refused| {
+                !store
+                    .outbox
+                    .iter()
+                    .any(|(commit, _)| *commit == refused.commit_id)
+            })
+            .filter(|refused| refused.rows.iter().any(|(written, _)| written == table))
+            .cloned()
+            .collect())
     }
     fn upload_refusals(&self) -> Vec<UploadRefusal> {
         self.upload_refusals
@@ -184,6 +399,8 @@ impl Opener for FakeOpener {
             joined: AtomicBool::new(false),
             upload_refusals: Mutex::new(Vec::new()),
             fetched_blobs: Mutex::new(Vec::new()),
+            store: Mutex::new(Store::default()),
+            commits: AtomicUsize::new(0),
             state,
         });
         self.opened
