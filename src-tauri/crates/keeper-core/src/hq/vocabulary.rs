@@ -7,6 +7,9 @@
 //! - [`grant_tiers`]: the tiers a standing grant may cover (`standing_grants
 //!   .max_tier`, V8, V15) — never `T4`, which another device decides every
 //!   time;
+//! - [`roles`]: the four roles a membership of a domain may carry (story
+//!   114.2); keeper's role type is `keeper_accounts_api::Role`, which a test
+//!   there holds to this list;
 //! - [`handle`]: a session's handle, two words drawn from the file's lists
 //!   by the SHA-256 of the session id (the contract's *Session handles*).
 //!   A handle is display only: never a key, a scope value or a lookup path;
@@ -27,6 +30,7 @@ const VOCABULARY: &str = include_str!("../../../../../syncular/vocabulary.json")
 struct Vocabulary {
     efforts: Vec<String>,
     grant_tiers: Vec<String>,
+    roles: Vec<String>,
     handle: HandleWords,
     person_agent_key: PersonAgentWords,
 }
@@ -81,6 +85,11 @@ pub fn is_effort(effort: &str) -> bool {
 /// The tiers a standing grant may cover, in the contract's order.
 pub fn grant_tiers() -> &'static [String] {
     PARSED.as_ref().map_or(&[], |v| v.grant_tiers.as_slice())
+}
+
+/// The roles a membership of a domain may carry, in the contract's order.
+pub fn roles() -> &'static [String] {
+    PARSED.as_ref().map_or(&[], |v| v.roles.as_slice())
 }
 
 /// The contract's examples: each session id with the handle it must have.

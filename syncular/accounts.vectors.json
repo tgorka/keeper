@@ -1,0 +1,468 @@
+{
+  "about": "Keeper's accounts contract vectors (syncular/README.md, Domains and the map; story 114.2). Every implementation reproduces each entry: roles is vocabulary.json's roles; discovery[] bodies of GET /databases parse, and serialise back to want (an entry field a parser does not know is dropped, an absent optional stays absent); discovery_refusals[] do not parse; admin_requests[] parse and serialise back to json exactly; admin_request_refusals[] do not parse and the server answers them with refusal; admin_answers[] and map_views[] parse and serialise back to json exactly; refusals[] is every code the contract adds, with its HTTP status (null: a commit refusal).",
+  "roles": ["reader", "editor", "reviewer", "owner"],
+  "kinds": ["general", "personal", "group"],
+  "files_writes": ["shadow", "open"],
+  "barriers": ["open", "starting", "reconciling", "failed", "stale_restore"],
+  "discovery": [
+    {
+      "name": "the general domain alone, no optional field",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          { "name": "makidrive", "mount": "/makidrive", "kind": "general", "display_name": "Makidrive" }
+        ]
+      },
+      "want": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          { "name": "makidrive", "mount": "/makidrive", "kind": "general", "display_name": "Makidrive" }
+        ]
+      }
+    },
+    {
+      "name": "a personal domain that replaced a repository, still shadow",
+      "json": {
+        "actorId": "tgorka",
+        "clientId": "tgorka.01",
+        "databases": [
+          {
+            "name": "tgdrive",
+            "mount": "/tgdrive",
+            "kind": "personal",
+            "display_name": "tgdrive",
+            "replaced_repository": "https://forge.example/git/tgorka/tgdrive.git",
+            "files_writes": "shadow"
+          }
+        ]
+      },
+      "want": {
+        "actorId": "tgorka",
+        "clientId": "tgorka.01",
+        "databases": [
+          {
+            "name": "tgdrive",
+            "mount": "/tgdrive",
+            "kind": "personal",
+            "display_name": "tgdrive",
+            "replaced_repository": "https://forge.example/git/tgorka/tgdrive.git",
+            "files_writes": "shadow"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a group domain with its graph root, open, and no replaced repository",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "neuradrive",
+            "mount": "/neuradrive",
+            "kind": "group",
+            "display_name": "Neuradrive",
+            "graph_root": "01JD0000000000000000000000",
+            "files_writes": "open"
+          }
+        ]
+      },
+      "want": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "neuradrive",
+            "mount": "/neuradrive",
+            "kind": "group",
+            "display_name": "Neuradrive",
+            "graph_root": "01JD0000000000000000000000",
+            "files_writes": "open"
+          }
+        ]
+      }
+    },
+    {
+      "name": "an entry field and a body field a parser does not know are ignored",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive",
+            "added_later": { "any": ["shape"] }
+          }
+        ],
+        "server_note": "ignored"
+      },
+      "want": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          { "name": "makidrive", "mount": "/makidrive", "kind": "general", "display_name": "Makidrive" }
+        ]
+      }
+    }
+  ],
+  "discovery_refusals": [
+    {
+      "name": "an entry without a kind",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [{ "name": "makidrive", "mount": "/makidrive", "display_name": "Makidrive" }]
+      }
+    },
+    {
+      "name": "a kind the contract does not have",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          { "name": "makidrive", "mount": "/makidrive", "kind": "team", "display_name": "Makidrive" }
+        ]
+      }
+    },
+    {
+      "name": "an entry without a display name",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [{ "name": "makidrive", "mount": "/makidrive", "kind": "general" }]
+      }
+    },
+    {
+      "name": "a files_writes value the contract does not have",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive",
+            "files_writes": "closed"
+          }
+        ]
+      }
+    }
+  ],
+  "admin_requests": [
+    {
+      "name": "add a person",
+      "json": {
+        "request_id": "req-01",
+        "expected_revision": 0,
+        "command": {
+          "op": "add_person",
+          "actor_id": "ola",
+          "display_name": "Ola",
+          "personal_domain": "oladrive",
+          "serving_agents": ["nixi"]
+        }
+      }
+    },
+    {
+      "name": "add a person with no personal domain and no agent",
+      "json": {
+        "request_id": "req-02",
+        "expected_revision": 1,
+        "command": { "op": "add_person", "actor_id": "ola", "display_name": "Ola", "serving_agents": [] }
+      }
+    },
+    {
+      "name": "list a deployed group domain",
+      "json": {
+        "request_id": "req-03",
+        "expected_revision": 2,
+        "command": { "op": "list_domain", "name": "scratch-group", "kind": "group", "display_name": "Scratch group" }
+      }
+    },
+    {
+      "name": "list a deployed personal domain",
+      "json": {
+        "request_id": "req-04",
+        "expected_revision": 3,
+        "command": {
+          "op": "list_domain",
+          "name": "mdrive",
+          "kind": "personal",
+          "display_name": "mdrive",
+          "personal_of": "marta"
+        }
+      }
+    },
+    {
+      "name": "a membership with a role",
+      "json": {
+        "request_id": "req-05",
+        "expected_revision": 4,
+        "command": { "op": "set_membership", "domain": "makidrive", "actor_id": "marta", "role": "reader" }
+      }
+    },
+    {
+      "name": "a membership with no role",
+      "json": {
+        "request_id": "req-06",
+        "expected_revision": 5,
+        "command": { "op": "set_membership", "domain": "neuradrive", "actor_id": "marta" }
+      }
+    },
+    {
+      "name": "a membership removed",
+      "json": {
+        "request_id": "req-07",
+        "expected_revision": 6,
+        "command": { "op": "remove_membership", "domain": "scratch-group", "actor_id": "marta" }
+      }
+    },
+    {
+      "name": "a sign-in subject bound",
+      "json": {
+        "request_id": "req-08",
+        "expected_revision": 7,
+        "command": { "op": "bind_subject", "actor_id": "ola", "oidc_subject": "312345678901234567" }
+      }
+    },
+    {
+      "name": "a sign-in subject unbound",
+      "json": {
+        "request_id": "req-09",
+        "expected_revision": 8,
+        "command": { "op": "unbind_subject", "actor_id": "ola" }
+      }
+    },
+    {
+      "name": "a replaced repository set",
+      "json": {
+        "request_id": "req-10",
+        "expected_revision": 9,
+        "command": {
+          "op": "set_replaced_repository",
+          "domain": "tgdrive",
+          "repository": "https://forge.example/git/tgorka/tgdrive.git"
+        }
+      }
+    },
+    {
+      "name": "a replaced repository cleared",
+      "json": {
+        "request_id": "req-11",
+        "expected_revision": 10,
+        "command": { "op": "clear_replaced_repository", "domain": "tgdrive" }
+      }
+    },
+    {
+      "name": "a reconcile accepting one difference",
+      "json": {
+        "request_id": "req-12",
+        "expected_revision": 11,
+        "command": { "op": "reconcile", "accept": [{ "actor_id": "marta", "domain": "neuradrive" }] }
+      }
+    },
+    {
+      "name": "a reconcile accepting nothing",
+      "json": {
+        "request_id": "req-13",
+        "expected_revision": 11,
+        "command": { "op": "reconcile", "accept": [] }
+      }
+    },
+    {
+      "name": "a membership change sent again with the operator's confirmation",
+      "json": {
+        "request_id": "req-14",
+        "expected_revision": 12,
+        "command": { "op": "set_membership", "domain": "scratch-s", "actor_id": "marta", "role": "editor" },
+        "confirm": [
+          {
+            "domain": "scratch-s",
+            "entry_id": "01JD0000000000000000000001",
+            "source_domain": "scratch-d",
+            "readers": ["marta"]
+          }
+        ]
+      }
+    }
+  ],
+  "admin_request_refusals": [
+    {
+      "name": "a request field the contract does not have",
+      "json": {
+        "request_id": "req-20",
+        "expected_revision": 0,
+        "command": { "op": "unbind_subject", "actor_id": "ola" },
+        "force": true
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a command field the contract does not have",
+      "json": {
+        "request_id": "req-21",
+        "expected_revision": 0,
+        "command": { "op": "remove_membership", "domain": "tgdrive", "actor_id": "marta", "also": "neuradrive" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "an op the contract does not have",
+      "json": {
+        "request_id": "req-22",
+        "expected_revision": 0,
+        "command": { "op": "grant_everything", "actor_id": "marta" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a role that is not one of the four",
+      "json": {
+        "request_id": "req-23",
+        "expected_revision": 0,
+        "command": { "op": "set_membership", "domain": "makidrive", "actor_id": "marta", "role": "admin" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a request without an id",
+      "json": {
+        "expected_revision": 0,
+        "command": { "op": "unbind_subject", "actor_id": "ola" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a request without an expected revision",
+      "json": {
+        "request_id": "req-25",
+        "command": { "op": "unbind_subject", "actor_id": "ola" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a negative expected revision",
+      "json": {
+        "request_id": "req-26",
+        "expected_revision": -1,
+        "command": { "op": "unbind_subject", "actor_id": "ola" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a domain kind the contract does not have",
+      "json": {
+        "request_id": "req-27",
+        "expected_revision": 0,
+        "command": { "op": "list_domain", "name": "scratch-team", "kind": "team", "display_name": "Team" }
+      },
+      "refusal": "hq.admin.malformed"
+    }
+  ],
+  "admin_answers": [
+    { "name": "applied", "json": { "outcome": "applied", "event_id": "01JD0000000000000000000010", "revision": 13 } },
+    {
+      "name": "committed but not applied",
+      "json": {
+        "outcome": "committed_not_applied",
+        "event_id": "01JD0000000000000000000011",
+        "revision": 14,
+        "failure": "directory projection of scratch-s failed"
+      }
+    },
+    {
+      "name": "confirmation required",
+      "json": {
+        "outcome": "confirmation_required",
+        "entries": [
+          {
+            "domain": "scratch-s",
+            "entry_id": "01JD0000000000000000000001",
+            "source_domain": "scratch-d",
+            "readers": ["marta"]
+          }
+        ]
+      }
+    },
+    {
+      "name": "unreconciled",
+      "json": {
+        "outcome": "unreconciled",
+        "differences": [{ "actor_id": "marta", "domain": "neuradrive" }]
+      }
+    }
+  ],
+  "map_views": [
+    {
+      "name": "an empty map before the seed",
+      "json": { "revision": 0, "barrier": "starting", "domains": [], "people": [], "memberships": [] }
+    },
+    {
+      "name": "a seeded map with one operator change",
+      "json": {
+        "revision": 2,
+        "barrier": "open",
+        "domains": [
+          { "name": "makidrive", "kind": "general", "display_name": "Makidrive", "provisioned": true },
+          {
+            "name": "tgdrive",
+            "kind": "personal",
+            "display_name": "tgdrive",
+            "personal_of": "tgorka",
+            "provisioned": true,
+            "replaced_repository": "https://forge.example/git/tgorka/tgdrive.git",
+            "files_writes": "shadow"
+          }
+        ],
+        "people": [
+          {
+            "actor_id": "tgorka",
+            "display_name": "Tomasz",
+            "personal_domain": "tgdrive",
+            "serving_agents": ["nixi"],
+            "oidc_subject": "312345678901234560"
+          },
+          { "actor_id": "marta", "display_name": "Marta", "serving_agents": [] }
+        ],
+        "memberships": [
+          {
+            "domain": "tgdrive",
+            "actor_id": "tgorka",
+            "role": "owner",
+            "issuer": "seed",
+            "revision": 1,
+            "granted_at_ms": 1763424000000
+          },
+          {
+            "domain": "makidrive",
+            "actor_id": "marta",
+            "role": "reader",
+            "issuer": "operator",
+            "revision": 2,
+            "granted_at_ms": 1763427600000,
+            "expires_at_ms": 1795000000000
+          }
+        ]
+      }
+    }
+  ],
+  "refusals": [
+    { "code": "hq.admin.malformed", "status": 400 },
+    { "code": "hq.admin.request_reused", "status": 409 },
+    { "code": "hq.admin.stale_revision", "status": 409 },
+    { "code": "hq.admin.unknown_domain", "status": 404 },
+    { "code": "hq.admin.not_deployed", "status": 409 },
+    { "code": "hq.admin.domain_exists", "status": 409 },
+    { "code": "hq.admin.unknown_person", "status": 404 },
+    { "code": "hq.admin.person_exists", "status": 409 },
+    { "code": "hq.admin.subject_taken", "status": 409 },
+    { "code": "hq.admin.map_unreadable", "status": 503 },
+    { "code": "hq.map_closed", "status": 503 },
+    { "code": "hq.profile.drive_audience", "status": null }
+  ]
+}

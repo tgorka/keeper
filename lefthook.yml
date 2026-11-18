@@ -42,9 +42,9 @@ pre-push:
           cargo clippy --workspace --all-targets -- -D warnings
         else
           echo "note: glib-2.0 is absent, so the tauri shell cannot be built here."
-          echo "note: linting keeper-core, keeper-ports, keeper-replica, keeper-testkit, keeper-graph, keeper-llm, keeper-paths, keeper-sync, keeper-syncd, keeper-ported and keeper-agent only."
+          echo "note: linting keeper-core, keeper-ports, keeper-replica, keeper-testkit, keeper-graph, keeper-accounts-api, keeper-llm, keeper-paths, keeper-sync, keeper-syncd, keeper-ported and keeper-agent only."
           echo "note: run 'bun run check:rust:macos' to gate the shell before merging."
-          cargo clippy -p keeper-core -p keeper-ports -p keeper-replica -p keeper-testkit -p keeper-graph -p keeper-llm -p keeper-paths -p keeper-sync -p keeper-syncd -p keeper-ported -p keeper-agent \
+          cargo clippy -p keeper-core -p keeper-ports -p keeper-replica -p keeper-testkit -p keeper-graph -p keeper-accounts-api -p keeper-llm -p keeper-paths -p keeper-sync -p keeper-syncd -p keeper-ported -p keeper-agent \
             --all-targets -- -D warnings
         fi
     - name: frontend-tests

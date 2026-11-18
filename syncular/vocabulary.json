@@ -1,6 +1,7 @@
 {
   "efforts": ["low", "medium", "high", "xhigh"],
   "grantTiers": ["T2", "T3"],
+  "roles": ["reader", "editor", "reviewer", "owner"],
   "handle": {
     "hash": "sha256",
     "adjectives": [

@@ -7,6 +7,13 @@ fn the_compiled_vocabulary_parses() {
     assert!(PARSED.is_some(), "syncular/vocabulary.json does not parse");
 }
 
+/// The four roles of story 114.2, in the contract's order; a fifth on one
+/// side only fails here or in `keeper-accounts-api`'s vectors.
+#[test]
+fn the_roles_are_the_four() {
+    assert_eq!(roles(), ["reader", "editor", "reviewer", "owner"]);
+}
+
 /// The contract's examples were computed outside keeper; a derivation that
 /// reads the digest another way, or another byte, gives other words.
 #[test]
