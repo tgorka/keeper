@@ -12,9 +12,10 @@
 //! actually sent.
 //!
 //! The **drive is fake**, deliberately. `keeper-core` never touches a file —
-//! the containment rule lives in `keeper-sync` and is proved there, over real
-//! temp directories, real symlinks and a real pointer file
-//! (`keeper-sync/tests/bots_fs.rs`). What is proved *here* is everything a
+//! the containment rule lives in `keeper-paths`, and it and the tool host over
+//! it are proved there and in `keeper-sync`, over real temp directories, real
+//! symlinks and a real pointer file (`keeper-sync/tests/bots_fs.rs`). What is
+//! proved *here* is everything a
 //! filesystem cannot tell you: that a refusal reaches the model as a sentence
 //! it can act on, that a truncation is disclosed in the bytes the model reads,
 //! that a grant denial reaches the user as well, and that the loop terminates.
@@ -603,7 +604,7 @@ fn arguments_that_are_not_json_are_a_sentence_and_not_a_panic() {
 }
 
 /// A path that escapes never becomes a target. The grammar refuses it in
-/// `keeper-core` before any host is reached, and `browse::resolve` would refuse
+/// `keeper-core` before any host is reached, and `keeper_paths::resolve` would refuse
 /// it again in `keeper-sync` — two layers, and the model is told what a path
 /// may look like either way.
 #[test]

@@ -2292,9 +2292,10 @@ fn vault_relative(vault: &Vault, root: &Path, listed_rel: &str) -> Option<String
 /// reads the index, and the index holds notes — a folder of four hundred
 /// photographs is invisible to it. This reads the disk, once, through
 /// [`keeper_sync::browse`], which is the repo's one directory reader: the
-/// lexical containment test, the canonicalizing one behind it, the built-in
-/// noise filter, the cap and the stable order all come from there rather than
-/// from a second `read_dir` written next to it.
+/// lexical containment test and the canonicalizing one behind it are
+/// [`keeper_paths::resolve`]'s, which browse calls, and the built-in noise
+/// filter, the cap and the stable order are browse's own — none of them from
+/// a second `read_dir` written next to it.
 ///
 /// **`scope` says which root, and it is explicit because a default that
 /// changed would be invisible.** [`NoteGalleryScope::Vault`] — which is what

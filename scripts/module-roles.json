@@ -8,6 +8,7 @@
   "keeper-graph-query": "legacy",
   "keeper-llm": "legacy",
   "keeper-nse": "legacy",
+  "keeper-paths": "path-leaf",
   "keeper-ported": "legacy",
   "keeper-ports": "port",
   "keeper-replica": "provider",

@@ -4596,7 +4596,7 @@ pub struct FilesEntryFacts<'a> {
     pub release: Option<FilesReleaseVm>,
     /// The profile's configuration, not the folder's name (Story 45.5).
     pub roles: FilesFolderRoles<'a>,
-    /// The location verdict `keeper_sync::files_write` already reached.
+    /// The location verdict `keeper_paths::WriteScope` already reached.
     pub write: FilesWriteVm,
     /// How many entries beneath a **directory** are virtual, from the marks
     /// walk's own inventory. A file's caller passes `0`; the constructor
@@ -4656,7 +4656,7 @@ impl FilesEntryVm {
     ///
     /// `roles` is the profile's configuration, not the folder's name.
     ///
-    /// `write` is the location verdict `keeper_sync::files_write` already
+    /// `write` is the location verdict `keeper_paths::WriteScope` already
     /// reached for this path. Passed in rather than derived: this crate is
     /// deliberately `keeper-sync`-free (AD-40), so it cannot see a profile's
     /// vault configuration, and a second opinion about where keeper may write
@@ -4807,7 +4807,7 @@ pub struct FilesListingVm {
 /// the control, so the verdict rides with the data.
 ///
 /// `reason` is a whole sentence composed by
-/// `keeper_sync::files_write::WriteRefusal`, rendered verbatim and never
+/// `keeper_paths::WriteRefusal`, rendered verbatim and never
 /// paraphrased in TypeScript — the same rule [`FilesEntrySyncVm::detail`]
 /// follows, for the same reason: a second copy of these words is a second copy
 /// that will be edited once.
@@ -4862,7 +4862,7 @@ impl FilesWriteVm {
     /// say what that costs — the whole of it, and the one line a folded surface
     /// shows in its place (Story 53.3).
     ///
-    /// Composed by `keeper_sync::files_write::WriteScope::unmanaged_caveat` and
+    /// Composed by `keeper_paths::WriteScope::unmanaged_caveat` and
     /// `unmanaged_caveat_short`, rendered verbatim, exactly as `reason` is. Both
     /// at once and from one call, so a row cannot carry the standing fact in a
     /// form the surface it reaches has folded away.
@@ -4890,7 +4890,7 @@ impl FilesWriteVm {
     ///
     /// Deliberately has no unmanaged arm: a `Result` carries two states and
     /// the third one is a different question. The entry path answers it with
-    /// `keeper_sync::files_write::WriteOwner` and picks the constructor
+    /// `keeper_paths::WriteOwner` and picks the constructor
     /// itself, so a caller cannot reach [`Self::allowed`] for a file AD-102
     /// says needs a caveat by routing through this.
     pub fn from_verdict<T, E: std::fmt::Display>(verdict: &Result<T, E>) -> Self {
@@ -4932,7 +4932,7 @@ pub enum FilesDeleteDestinationVm {
 pub struct FilesDeleteRefusalVm {
     /// The entry's profile-relative path — what the surface already shows.
     pub relative_path: String,
-    /// The whole sentence, composed by `keeper_sync::files_write`.
+    /// The whole sentence, composed by `keeper_paths::WriteScope`.
     pub reason: String,
 }
 
@@ -6187,7 +6187,7 @@ pub struct ModelProviderSaveReq {
 /// differently.
 ///
 /// `refusal` is the refusing layer's sentence carried verbatim —
-/// `keeper-sync`'s containment wording, the write router's, or one of
+/// `keeper-paths`' containment wording, the write router's, or one of
 /// `keeper_core::bots::grant`'s `DENY_*` constants — because a paraphrase of a
 /// security refusal is a second, unproved wording of the rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

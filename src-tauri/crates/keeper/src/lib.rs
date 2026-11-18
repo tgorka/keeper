@@ -415,7 +415,7 @@ pub fn run() {
     // AD-74 forbids the Files surface from reaching, and rather than a wider
     // `keeper-note://`, whose root is the notes SUBFOLDER and therefore narrower
     // than the tree the Files pane browses. This one is contained to the sync
-    // profile's own root, through the same `browse::resolve` the listing uses.
+    // profile's own root, through the same `keeper_paths::resolve` the listing uses.
     let builder = builder.register_asynchronous_uri_scheme_protocol(
         file_protocol::SCHEME,
         |ctx, request, responder| {
@@ -1472,7 +1472,8 @@ pub fn run() {
                 // And the write half (Story 45.3, AD-89, which retired AD-75). Every
                 // one of these goes through `notes_vault`'s single writer and refuses
                 // anything outside a notes vault; the decisions are in
-                // `keeper_sync::files_write`, and these are the call sites.
+                // `keeper_paths::WriteScope` (and `keeper_sync::files_write::collides`
+                // for a taken name), and these are the call sites.
                 sync_ipc::sync_write_entry,
                 sync_ipc::sync_delete_plan,
                 sync_ipc::sync_delete_entries,

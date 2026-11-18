@@ -8,7 +8,7 @@
 //! wrong for any of them fails here. Asked both ways round, because the
 //! comparison must not depend on which side the index or the agent spelled.
 
-use keeper_sync::names::same_entry_folded;
+use keeper_paths::names::same_entry_folded;
 
 const MEASURED: &str = include_str!("data/apfs-caseless-sweep.txt");
 

@@ -11,7 +11,7 @@
  * the control, so the verdict rides with the data.
  *
  * `reason` is a whole sentence composed by
- * `keeper_sync::files_write::WriteRefusal`, rendered verbatim and never
+ * `keeper_paths::WriteRefusal`, rendered verbatim and never
  * paraphrased in TypeScript — the same rule [`FilesEntrySyncVm::detail`]
  * follows, for the same reason: a second copy of these words is a second copy
  * that will be edited once.

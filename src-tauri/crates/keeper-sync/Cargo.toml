@@ -14,6 +14,7 @@ description = "Git-protocol folder synchronization engine for keeper (AD-40 … 
 # `bun run check:core-sync-free` asserts the reverse edge (keeper-core must
 # never name gix or keeper-sync).
 [dependencies]
+keeper-paths = { path = "../keeper-paths" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -31,11 +32,6 @@ notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }
-# Folding names as the Mac's volume folds them (`names::same_entry_folded`):
-# canonical decomposition and Unicode full case folding. Both already resolved
-# in Cargo.lock, so the tree gains no package.
-unicode-normalization = { workspace = true }
-unicase = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 # Exact-Content-Length streaming bodies for LFS uploads — see the workspace

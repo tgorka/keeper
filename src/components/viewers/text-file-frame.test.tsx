@@ -1157,11 +1157,12 @@ describe("the properties fold", () => {
  * Story 53.3: AD-102's caveat folds to ONE Rust-composed line, and never to
  * nothing (FR-318).
  *
- * The decision being narrowed is `files_write.rs:675-679` — the standing fact has
- * to be on screen BEFORE the first keystroke, because a person who finds out
- * after saving that this file has no history has already lost what history would
- * have given them. The fold keeps that: what is on screen by default names what
- * is missing, and the full four sentences are one press away.
+ * The decision being narrowed is `keeper_paths::WriteScope::unmanaged_caveat`
+ * (`keeper-paths/src/write.rs`) — the standing fact has to be on screen BEFORE
+ * the first keystroke, because a person who finds out after saving that this
+ * file has no history has already lost what history would have given them. The
+ * fold keeps that: what is on screen by default names what is missing, and the
+ * full four sentences are one press away.
  */
 describe("the caveat fold", () => {
   /** The frame over a file keeper will write and does not manage. */

@@ -13,6 +13,7 @@ workspace = true
 # AD-367: tauri-free, so it stays a library the app links on every target.
 # `bun run check:agent-tauri-free` asserts it over `cargo tree`.
 [dependencies]
+keeper-paths = { path = "../keeper-paths" }
 keeper-core = { path = "../keeper-core" }
 keeper-sync = { path = "../keeper-sync" }
 tracing = { workspace = true }

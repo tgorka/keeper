@@ -66,7 +66,7 @@ the render refusals' sentences.
   segment, no backslash, no drive letter, `{project-root}` only at the start — or the value is
   refused with "`config.<path>` must resolve inside this session: <value>". That is a grammar
   check; the caller still resolves each location through the drive's containment
-  (`browse::resolve`) before reading or writing. Format-B skills therefore read their inputs only
+  (`keeper_paths::resolve`) before reading or writing. Format-B skills therefore read their inputs only
   through the inputs a workflow declares.
 - **Overlays (R97).** Upstream reads `_bmad/custom/` wherever the filesystem leads, symlinks
   included. keeper reads only what the drive holds: the caller builds each `Layer` through its

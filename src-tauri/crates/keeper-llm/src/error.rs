@@ -181,7 +181,7 @@ pub enum BotsError {
     /// and carries on, because a model that asked for a file that is not there
     /// should get to ask for a different one — a stream failure would end the
     /// turn over a mistake the model could have fixed itself. `detail` is
-    /// whichever layer refused, rendered verbatim: `keeper-sync`'s containment
+    /// whichever layer refused, rendered verbatim: `keeper-paths`' containment
     /// sentence, the write router's, or the OS's own words.
     #[error("{detail}")]
     Tool {

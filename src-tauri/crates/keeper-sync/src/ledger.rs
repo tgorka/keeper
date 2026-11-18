@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::browse;
 use crate::error::{Result, SyncError};
 
 /// Every run file starts with this word, so one glob finds the ledger's own
@@ -315,14 +314,14 @@ impl RunCounts {
 /// because a lexicographic sort of the directory listing has to be a
 /// chronological sort, which a variable-width field would break.
 ///
-/// The decomposition is the crate's own [`crate::platform::civil_from_unix_ms`]
+/// The decomposition is the crate's own [`keeper_paths::civil_from_unix_ms`]
 /// — `keeper-sync` deliberately has no `chrono`, and that port's doc says why
 /// one copy of a leap-year calculation is the only acceptable number. It says
 /// nothing about zones, so the UTC guarantee is this function's: the `ms` it is
 /// handed is an epoch instant, which is what `SyncPlatform::now_ms` and a
 /// file's mtime both are.
 pub fn stamp(ms: i64) -> String {
-    let (year, month, day, hour, minute, second) = crate::platform::civil_from_unix_ms(ms);
+    let (year, month, day, hour, minute, second) = keeper_paths::civil_from_unix_ms(ms);
     format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
 }
 
@@ -363,7 +362,7 @@ pub fn parse_stamp(text: &str) -> Option<i64> {
 }
 
 /// Days since 1970-01-01 for a civil date — the inverse of
-/// [`crate::platform::civil_from_unix_ms`]'s decomposition, and Howard
+/// [`keeper_paths::civil_from_unix_ms`]'s decomposition, and Howard
 /// Hinnant's `days_from_civil` itself.
 ///
 /// Written here rather than beside its inverse because the port is where time
@@ -389,7 +388,7 @@ fn unix_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// local-time year would file two machines' runs under different folders and
 /// the reader would miss one.
 pub fn year_folder(ms: i64) -> String {
-    let (year, ..) = crate::platform::civil_from_unix_ms(ms);
+    let (year, ..) = keeper_paths::civil_from_unix_ms(ms);
     format!("{year:04}")
 }
 
@@ -474,19 +473,19 @@ impl TaskLedger {
     /// `<profile root>/<ledger subfolder>/<task id>`.
     ///
     /// Every segment of both the subfolder and the task id goes through
-    /// [`browse::plain_segments`], so a `..`, a separator, a control character
+    /// [`keeper_paths::plain_segments`], so a `..`, a separator, a control character
     /// or an unspellable name is refused here rather than escaping the profile
     /// at write time. A task id is minted by keeper and is a ULID today, but
     /// it arrives here as a `&str` from a database column — which is exactly
     /// the kind of value that must not be trusted to be well-formed.
     pub fn resolve(profile_root: &Path, subfolder: &str, task_id: &str) -> Result<Self> {
         let mut root = profile_root.to_path_buf();
-        for segment in browse::plain_segments(subfolder).map_err(|refusal| {
+        for segment in keeper_paths::plain_segments(subfolder).map_err(|refusal| {
             SyncError::Config(format!("task ledger subfolder is unusable: {refusal}"))
         })? {
             root.push(segment);
         }
-        for segment in browse::plain_segments(task_id).map_err(|refusal| {
+        for segment in keeper_paths::plain_segments(task_id).map_err(|refusal| {
             SyncError::Config(format!("task id is unusable as a folder name: {refusal}"))
         })? {
             root.push(segment);
@@ -1036,7 +1035,7 @@ mod tests {
 
     #[test]
     fn a_name_is_one_path_segment_no_filesystem_refuses() {
-        // The writer composes this through `keeper_sync::browse::plain_segments`
+        // The writer composes this through `keeper_paths::plain_segments`
         // (AD-65), which refuses separators, `..`, control characters and the
         // characters Windows forbids. A grammar that could produce one would
         // fail at the write, in the field, on somebody's drive.

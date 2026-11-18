@@ -19,7 +19,7 @@
  * What AD-65 forbids is a frontend joining a **root** and a subpath. Nothing
  * here has a root. Both inputs and both outputs are relative paths, no absolute
  * path is formed or read (FR-145), and every real read still goes through
- * `keeper_sync::browse`, which re-resolves and re-contains whatever this
+ * `keeper_paths::resolve`, which re-resolves and re-contains whatever this
  * produced (AD-59). The refusals below are the outer of two gates.
  *
  * It resolves no note **id**: turning a vault-relative path into a note is a

@@ -1,0 +1,19 @@
+[package]
+name = "keeper-paths"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+description = "Shared containment, filename and write-routing rules for keeper"
+
+[dependencies]
+serde = { workspace = true }
+unicase = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

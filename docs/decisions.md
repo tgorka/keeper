@@ -1565,7 +1565,7 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
   this (`registerMarkdownCodeBlockProcessor`), the form of its own ` ```base ` block and of
   Dataview. The callout rule stands for widgets; this entry scopes it. (AD-351)
 - **What stays true: the note is the person's.** Rust resolves every name — a `session` through
-  the recordings index, so a retitle does not break it; a path through `browse::resolve` under
+  the recordings index, so a retitle does not break it; a path through `keeper_paths::resolve` under
   the drive's root (AD-65). keeper changes a block's bytes only on the person's action — adding,
   renaming or removing a marker, when only that marker's table changes and every comment is
   kept; *Edit block source*; *Remove widget* — and never by itself. Markers live in the note,

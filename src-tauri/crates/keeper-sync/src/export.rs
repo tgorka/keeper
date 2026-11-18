@@ -36,14 +36,15 @@
 //!    returned. Half an export in somebody's Documents folder, with no sign of
 //!    which half, is worse than no export.
 //!
-//! Every source path is re-resolved through [`crate::browse::resolve`], the one
+//! Every source path is re-resolved through [`keeper_paths::resolve`], the one
 //! containment rule the listing already used, so the webview hands over ids and
 //! relative paths and never a location on disk (AD-65).
 
 use std::path::{Path, PathBuf};
 
-use crate::browse::{self, BrowseRefusal};
-use crate::files_write::{self, WriteRefusal};
+use crate::files_write;
+use keeper_paths::BrowseRefusal;
+use keeper_paths::WriteRefusal;
 
 /// Why keeper will not export, or did not finish exporting.
 ///
@@ -148,7 +149,7 @@ impl std::fmt::Display for ExportRefusal {
 impl From<BrowseRefusal> for ExportRefusal {
     /// Carry a containment refusal across without re-deriving it.
     ///
-    /// The verdict is `browse`'s lexical rule, as it is for every other
+    /// The verdict is `keeper_paths`' lexical rule, as it is for every other
     /// consumer; only the sentence changes, because the reader is about to lose
     /// an export rather than a listing.
     fn from(refusal: BrowseRefusal) -> Self {
@@ -250,7 +251,7 @@ fn checked_destination(source_root: &Path, destination: &Path) -> Result<PathBuf
 
 /// Resolve one source file through the listing's own containment rule.
 fn source_file(root: &Path, subpath: &str) -> Result<PathBuf, ExportRefusal> {
-    let resolved = browse::resolve(root, subpath)?.ok_or_else(|| ExportRefusal::Missing {
+    let resolved = keeper_paths::resolve(root, subpath)?.ok_or_else(|| ExportRefusal::Missing {
         subpath: subpath.to_owned(),
     })?;
     if resolved.is_dir() {
@@ -421,7 +422,7 @@ mod tests {
         fs::write(vault.join("data/rows.csv"), b"a,b\r\n1,2").expect("csv");
         // Canonicalised, and this is a macOS fact rather than tidiness: the
         // system temp dir is `/var/...`, which is a symlink to `/private/var/...`.
-        // Containment is decided by `browse::resolve`, which resolves symlinks,
+        // Containment is decided by `keeper_paths::resolve`, which resolves symlinks,
         // so every path this module HANDS BACK is the real one. A fixture holding
         // the symlinked spelling makes `done.path` compare unequal to the folder
         // it actually wrote — a green suite on Linux and two reds on the only
@@ -470,7 +471,7 @@ mod tests {
     }
 
     /// The module doc says every source is re-resolved through
-    /// [`browse::resolve`]. The note's own path is asserted elsewhere; this is
+    /// [`keeper_paths::resolve`]. The note's own path is asserted elsewhere; this is
     /// the same promise for a CARRIED path, which arrives from a different
     /// producer and is the one a malformed embed could reach.
     #[test]

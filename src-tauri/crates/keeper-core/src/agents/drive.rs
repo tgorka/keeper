@@ -3,7 +3,7 @@
 //! The file is a contract: an unknown key is refused with its name (the D-30
 //! precedent), a newer `version` is refused rather than half-read, and every
 //! refusal is one sentence a person can act on. Parsing is pure — the host
-//! reads the file through `browse::resolve` and hands the text here.
+//! reads the file through `keeper_paths::resolve` and hands the text here.
 
 use std::collections::BTreeSet;
 

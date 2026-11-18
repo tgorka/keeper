@@ -132,7 +132,7 @@ const SESSION_TREE_DIR_UNDELETABLE: &str =
 /// in those words, because it is one fact asked from two places.
 ///
 /// **The lock is the write fence, asked** (AD-113). `workspace/` entries carry
-/// [`keeper_sync::files_write::WriteRefusal::SessionWorkspace`]'s own sentence
+/// [`keeper_paths::WriteRefusal::SessionWorkspace`]'s own sentence
 /// rather than a UI convention that could drift from what a write would
 /// actually do. `undeletable` is the same trick for the Delete verb: the row
 /// carries [`keeper_core::sessions::files::check_deletable`]'s refusal, so the
@@ -246,7 +246,7 @@ pub async fn sessions_tree(
                 locked: scope
                     .session_workspace_lock(&subpath, entry.is_dir)
                     .then(|| {
-                        keeper_sync::files_write::WriteRefusal::SessionWorkspace {
+                        keeper_paths::WriteRefusal::SessionWorkspace {
                             subpath: subpath.clone(),
                         }
                         .to_string()
@@ -3272,7 +3272,7 @@ fn session_of_subpath(
 ///
 /// The fence is `WriteScope`'s, not a copy: `files::check_rel` refuses a
 /// `workspace/` path on shape grounds with no knowledge of zones, and this asks
-/// [`keeper_sync::files_write::WriteScope::in_session_workspace`] — the same
+/// [`keeper_paths::WriteScope::in_session_workspace`] — the same
 /// predicate `sessions_tree` renders its lock from (AD-113). Two predicates that
 /// must agree both run; a second "third segment is workspace" test written here
 /// would be the one that gets edited alone and drifts.
@@ -3302,8 +3302,7 @@ fn resolve_session_file(
     if scope.in_session_workspace(&subpath) {
         return Err(IpcError {
             code: IpcErrorCode::Internal,
-            message: keeper_sync::files_write::WriteRefusal::SessionWorkspace { subpath }
-                .to_string(),
+            message: keeper_paths::WriteRefusal::SessionWorkspace { subpath }.to_string(),
             account_id: None,
             retriable: false,
         });
@@ -3433,7 +3432,7 @@ pub async fn sessions_file_new(
 /// **Two fences, both asked, and neither defeated by the shift key.**
 /// `files::dir_rel` refuses `workspace/`, traversal, an absolute path and any
 /// dotted segment on shape grounds with no knowledge of zones; then this asks
-/// [`keeper_sync::files_write::WriteScope::in_session_workspace`] about the
+/// [`keeper_paths::WriteScope::in_session_workspace`] about the
 /// profile-relative subpath, which is the fence the product is measured against
 /// (AD-113). Both compare the scratch segment folded — `keeper_core`'s in
 /// `files::check_dir`, sync's in `WriteScope`'s own segment walk — because they
@@ -3477,8 +3476,7 @@ pub async fn sessions_dir_new(
     if scope.in_session_workspace(&subpath) {
         return Err(IpcError {
             code: IpcErrorCode::Internal,
-            message: keeper_sync::files_write::WriteRefusal::SessionWorkspace { subpath }
-                .to_string(),
+            message: keeper_paths::WriteRefusal::SessionWorkspace { subpath }.to_string(),
             account_id: None,
             retriable: false,
         });
@@ -3908,7 +3906,7 @@ pub async fn sessions_file_rename(
 /// [`sessions_tree`], which would pay for a whole tree walk and a sync-engine
 /// pending query per right-click.
 ///
-/// **Resolved rather than joined**, through the same `browse::resolve` every read
+/// **Resolved rather than joined**, through the same `keeper_paths::resolve` every read
 /// on this side of the app goes through: it refuses a subpath that leaves the
 /// profile and answers `None` for a file that is not there, so *Reveal* cannot be
 /// handed a location that does not exist. A `local_path.join(subpath)` would have
@@ -3937,7 +3935,7 @@ pub fn sessions_file_path(
         account_id: None,
         retriable: false,
     };
-    let resolved = keeper_sync::browse::resolve(&profile.local_path, &subpath)
+    let resolved = keeper_paths::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| IpcError {
             code: IpcErrorCode::Internal,
             message: refusal.to_string(),
@@ -4371,7 +4369,7 @@ const CANDIDATE_BUDGET: usize = 500;
 /// belongs beside the index that answers it (AD-7, AD-65).
 ///
 /// **The workspace fence is asked, not guessed.** Whether a candidate is
-/// promotable comes from the same [`keeper_sync::files_write::WriteScope`] the
+/// promotable comes from the same [`keeper_paths::WriteScope`] the
 /// write path enforces, so the offer cannot appear on a file keeper would then
 /// refuse to copy.
 ///

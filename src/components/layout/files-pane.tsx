@@ -40,7 +40,7 @@
  *
  * **The frontend never composes a path** (AD-65). Every call carries a profile
  * id and a `subpath` that Rust itself produced; the join onto the folder root
- * happens once, in `keeper_sync::browse`, which also refuses `..` lexically and
+ * happens once, in `keeper_paths::resolve`, which also refuses `..` lexically and
  * refuses a symlink out of the tree after canonicalisation. What arrives here
  * is a relative path to render and an absolute path that is only ever an
  * action's argument.

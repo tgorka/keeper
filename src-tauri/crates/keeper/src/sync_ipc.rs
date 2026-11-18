@@ -25,11 +25,12 @@ use keeper_core::vm::{
     FilesDeleteRefusalVm, FilesEntryFacts, FilesEntrySyncVm, FilesEntryVm, FilesListingState,
     FilesListingVm, FilesReleaseVm, FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
 };
+use keeper_paths::{WriteRefusal, WriteRoute, WriteScope};
 use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, ReleaseSchedule, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::export::{self, ExportRefusal};
-use keeper_sync::files_write::{self, WriteRefusal, WriteRoute, WriteScope};
+use keeper_sync::files_write;
 use keeper_sync::lfs::hydrate::ContentRefusal;
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_AGENTS_SUBFOLDER,
@@ -685,7 +686,7 @@ pub struct SyncParkedVm {
 /// A file whose name is not text, as the Problems pane shows it (Story 47.2,
 /// DW-200).
 ///
-/// The shell-side shape of `keeper_sync::UnspellableName`, for the same reason
+/// The shell-side shape of `keeper_paths::UnspellableName`, for the same reason
 /// [`SyncParkedVm`] is the shell-side shape of a parked unit: the engine type
 /// is not a view model and does not derive [`TS`].
 ///
@@ -723,7 +724,7 @@ pub struct SyncProblemsVm {
     /// Reported rather than silent. Before this, keeper rendered such a name
     /// lossily and said nothing, and the rendering could be joined back to a
     /// *different real file* — so a delete confirmed against one row removed
-    /// another. `browse::plain_segments` now refuses the rendering; this list is
+    /// another. `keeper_paths::plain_segments` now refuses the rendering; this list is
     /// how the person finds out the file exists at all.
     pub unspellable: Vec<SyncUnspellableVm>,
 }
@@ -3467,11 +3468,12 @@ pub async fn sync_unsubscribe_progress(
 ///
 /// **Listing is the shell's job, and this is the only place it is done.** The
 /// frontend hands back a `subpath` this command previously produced and never
-/// composes one; `keeper_sync::browse` resolves it against the profile's own
-/// root, refuses anything that is not a plain descendant of it — lexically and
-/// again after symlinks are followed — and applies the profile's tier-0
-/// exclusions. A webview that asked for `../../.ssh` would have to have
-/// persuaded the engine to store a profile pointing there first.
+/// composes one; `keeper_sync::browse` resolves it through `keeper_paths::resolve`
+/// against the profile's own root, refuses anything that is not a plain
+/// descendant of it — lexically and again after symlinks are followed — and
+/// applies the profile's tier-0 exclusions. A webview that asked for
+/// `../../.ssh` would have to have persuaded the engine to store a profile
+/// pointing there first.
 ///
 /// **Lazy, one directory per call.** These trees hold a hundred thousand files.
 /// Nothing here descends, and the cap is reported rather than hidden.
@@ -3856,7 +3858,7 @@ fn files_listing_vm(
     listing: browse::BrowseListing,
     engine_failure: Option<&str>,
     stale: bool,
-    scope: &files_write::WriteScope<'_>,
+    scope: &keeper_paths::WriteScope<'_>,
     schedules: &HashMap<String, ReleaseSchedule>,
 ) -> FilesListingVm {
     let roles = keeper_core::vm::FilesFolderRoles {
@@ -3890,8 +3892,8 @@ fn files_listing_vm(
                     // `canonicalize` calls to re-learn the `is_dir` the dirent
                     // just supplied.
                     let write = match scope.owner(&entry.relative_path, entry.is_dir) {
-                        Ok(files_write::WriteOwner::Vault) => FilesWriteVm::allowed(),
-                        Ok(files_write::WriteOwner::Unmanaged) => FilesWriteVm::unmanaged(
+                        Ok(keeper_paths::WriteOwner::Vault) => FilesWriteVm::allowed(),
+                        Ok(keeper_paths::WriteOwner::Unmanaged) => FilesWriteVm::unmanaged(
                             scope.unmanaged_caveat(&entry.name),
                             // Story 53.3: the same fact in one line, for the
                             // surface that folds the caveat away. Composed here
@@ -4191,7 +4193,7 @@ pub(crate) fn missing_sentence(profile: &SyncProfile, subpath: &str) -> String {
 /// debug mode.
 ///
 /// `resolved` is the path the caller has already put through
-/// [`browse::resolve`]; nothing is composed here (AD-65).
+/// [`keeper_paths::resolve`]; nothing is composed here (AD-65).
 pub(crate) async fn fetch_before_serving(
     engine: &keeper_sync::engine::Engine,
     id: &str,
@@ -4231,7 +4233,7 @@ pub(crate) async fn fetch_before_serving(
 /// for one folder in five is worse than one with no Open at all.
 ///
 /// So the root here is the profile's own, and the containment rule is not a
-/// second one: it is [`browse::resolve`], the same function the listing uses,
+/// second one: it is [`keeper_paths::resolve`], the same function the listing uses,
 /// which refuses `..` lexically and refuses a symlink out of the tree after
 /// canonicalisation.
 ///
@@ -4262,7 +4264,7 @@ pub async fn sync_open_entry(
         let engine = engine_of(&state)?;
         let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
         let profile = find_profile(&profiles, &id)?;
-        let resolved = browse::resolve(&profile.local_path, &subpath)
+        let resolved = keeper_paths::resolve(&profile.local_path, &subpath)
             .map_err(|refusal| open_failure(refusal.to_string()))?
             .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
         // A virtual entry is fetched before the opener sees it (Story 69.1,
@@ -4514,7 +4516,7 @@ pub async fn sync_pin_entry(
 /// half of itself.
 ///
 /// **Containment is not restated here.** The subpath is one the listing already
-/// produced, and [`browse::resolve`] is the same function `sync_browse` and
+/// produced, and [`keeper_paths::resolve`] is the same function `sync_browse` and
 /// `sync_open_entry` use: it refuses `..` lexically and refuses a symlink out
 /// of the tree after canonicalisation. This command composes no path of its
 /// own, so there is no second rule to keep in step with the first.
@@ -4541,7 +4543,7 @@ pub async fn sync_read_text(
     let engine = engine_of(&state)?;
     let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
     let profile = find_profile(&profiles, &id)?;
-    let resolved = browse::resolve(&profile.local_path, &subpath)
+    let resolved = keeper_paths::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
     // A pointer is fetched before it is read, so the editor opens the content
@@ -4591,7 +4593,7 @@ pub async fn sync_export_pdf(
         let engine = engine_of(&state)?;
         let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
         let profile = find_profile(&profiles, &id)?;
-        let source = browse::resolve(&profile.local_path, &subpath)
+        let source = keeper_paths::resolve(&profile.local_path, &subpath)
             .map_err(|refusal| open_failure(refusal.to_string()))?
             .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
         let out = crate::pdf_export::pdf_beside(&source);
@@ -4709,7 +4711,7 @@ fn uuid_like(subpath: &str) -> String {
 /// of one command's answer it was looking at.
 ///
 /// **Containment is not restated here.** The subpath is one the listing already
-/// produced, and [`browse::resolve`] is the same function `sync_browse`,
+/// produced, and [`keeper_paths::resolve`] is the same function `sync_browse`,
 /// `sync_open_entry` and `sync_read_text` use. This command composes no path of
 /// its own (AD-65).
 ///
@@ -4742,7 +4744,7 @@ pub async fn sync_read_document(
     let engine = engine_of(&state)?;
     let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
     let profile = find_profile(&profiles, &id)?;
-    let resolved = browse::resolve(&profile.local_path, &subpath)
+    let resolved = keeper_paths::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
     // A pointer is fetched before it is parsed, so the viewer gets the document
@@ -4793,7 +4795,7 @@ pub(crate) fn export_refused(refusal: &ExportRefusal) -> IpcError {
 /// path AD-65 permits it to: the user picked it from the OS folder chooser, it
 /// is not composed from anything keeper holds, and nothing under it is read.
 /// The source is still an id plus a relative path, re-resolved through
-/// `browse::resolve` like every other reader on this surface.
+/// `keeper_paths::resolve` like every other reader on this surface.
 ///
 /// Every decision — is the destination there, is the name taken, does a partial
 /// copy get cleaned up — is [`keeper_sync::export`], which compiles and is
@@ -4854,8 +4856,9 @@ pub async fn sync_export_entry(
 //     reconciler already understands, so a deletion is announced rather than
 //     discovered on the next scan;
 //   * every decision — is this inside a vault, is it a folder, is the name a
-//     name, is it already taken — is made in `keeper_sync::files_write`, which
-//     compiles and is tested on any machine. This crate does not build on Linux
+//     name — is made by `keeper_paths::WriteScope`, and whether the name is
+//     already taken by `keeper_sync::files_write::collides`; both compile and
+//     are tested on any machine. This crate does not build on Linux
 //     (AD-55, AD-56), so a rule written here would be a rule guarding a write
 //     that nobody could exercise until macOS.
 
@@ -4937,7 +4940,7 @@ fn writable_profile(
 /// holding no reachable vault before `WriteScope` was ever consulted, which is
 /// what made the owner's `AGENTS.md` unreachable: it is inside a sync profile,
 /// outside the vault. Editing and deleting now start here and let
-/// [`WriteScope::route`] decide the fork, in `keeper-sync`, where it is
+/// [`WriteScope::route`] decide the fork, in `keeper-paths`, where it is
 /// asserted on every machine.
 ///
 /// Deliberately does NOT return a vault. The vault a command writes through
@@ -5014,7 +5017,7 @@ pub(crate) fn sessions_sync_mark(
 /// Story 46.14, AD-102).
 ///
 /// **Two writers, and `WriteScope::route` picks.** Which one is not decided
-/// here — it is decided in `keeper-sync`, where it is asserted on Linux, and it
+/// here — it is decided in `keeper-paths`, where it is asserted on Linux, and it
 /// arrives as a `WriteRoute` whose vault arm already carries the vault. This
 /// command's job is to spend the verdict, not to reach it.
 ///
@@ -5156,18 +5159,18 @@ fn editable_source(
 ///
 /// **Routed, not merely resolved, and with the same call the write makes.**
 /// `WriteScope::route` is what refuses a `workspace/` path (AD-113), a
-/// directory, and a subpath that leaves the profile — in `keeper-sync`, where
+/// directory, and a subpath that leaves the profile — in `keeper-paths`, where
 /// it is asserted on Linux. Asking it here as well is what makes matrix row 8
 /// true: a file whose properties keeper would refuse to write gets no panel at
 /// all, rather than a panel that refuses on the first keystroke. Story 45.3's
 /// rule, applied to a second pair of commands.
 ///
 /// It routes AND resolves because those are two questions: `route` answers
-/// "may keeper write here", and `browse::resolve` — the same call
-/// `sync_read_text` makes — answers "where is it". The route's own path is
-/// deliberately opaque (`UnmanagedPath` keeps its absolute form private so a
-/// `PathBuf` cannot reach a writer from anywhere else), so the second `stat` is
-/// the price of that, and it is one `stat` per panel open.
+/// "may keeper write here", and `keeper_paths::resolve` — the same call
+/// `sync_read_text` makes — answers "where is it". The route's path types have
+/// no public constructor, so a `PathBuf` cannot reach a writer from elsewhere.
+/// This reader resolves again after checking the route; the borrowed absolute
+/// accessor on `UnmanagedPath` is for the unmanaged writer's filesystem effects.
 ///
 /// Returns the block **verbatim**, `""` for a file that has none — the same
 /// shape `NoteBodyBatch.frontmatter` and `NoteWriteVm.frontmatter` carry, so
@@ -5192,7 +5195,7 @@ pub async fn sync_read_frontmatter(
     scope
         .route(vault, &profile.local_path, &subpath)
         .map_err(|refusal| write_refused(&refusal))?;
-    let resolved = browse::resolve(&profile.local_path, &subpath)
+    let resolved = keeper_paths::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(&profile, &subpath)))?;
 
@@ -5257,7 +5260,7 @@ pub async fn sync_write_frontmatter(
     let route = scope
         .route(vault, &profile.local_path, &subpath)
         .map_err(|refusal| write_refused(&refusal))?;
-    let resolved = browse::resolve(&profile.local_path, &subpath)
+    let resolved = keeper_paths::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(&profile, &subpath)))?;
 
@@ -5590,7 +5593,7 @@ pub async fn sync_create_entry(
         let target = target.clone();
         let wanted = name.clone();
         tokio::task::spawn_blocking(move || {
-            let directory = files_write::resolve_existing(&root, &subpath)?;
+            let directory = keeper_paths::resolve_existing(&root, &subpath)?;
             if files_write::collides(&directory, &wanted)? {
                 return Err(WriteRefusal::NameTaken { name: wanted });
             }

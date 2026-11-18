@@ -974,8 +974,8 @@ fn drive_of(zone: &Path, inside: &str) -> Option<PathBuf> {
 /// hash to that; anything else, it is that target fact
 /// ([`keeper_core::sessions::offer::target_fact`]) as the panel reads it.
 fn still_says(base: &Path, rel: &str, said: &str) -> bool {
-    let found = keeper_sync::browse::resolve_known(base, rel)
-        .map(|known| known.landed().map(keeper_sync::browse::Landing::into_path));
+    let found = keeper_paths::resolve_known(base, rel)
+        .map(|known| known.landed().map(keeper_paths::Landing::into_path));
     if let Some(sha256) = said.strip_prefix("sha256:") {
         return matches!(found, Ok(Some(path)) if hash_file(&path).is_ok_and(|held| held == sha256));
     }

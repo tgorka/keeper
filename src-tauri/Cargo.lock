@@ -4565,6 +4565,7 @@ dependencies = [
  "fs4",
  "keeper-agent",
  "keeper-core",
+ "keeper-paths",
  "keeper-replica",
  "keeper-sync",
  "keyring",
@@ -4613,6 +4614,7 @@ dependencies = [
  "chrono",
  "fs4",
  "keeper-core",
+ "keeper-paths",
  "keeper-sync",
  "matrix-sdk",
  "rustix",
@@ -4780,6 +4782,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-paths"
+version = "0.11.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "unicase",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "keeper-ported"
 version = "0.11.0"
 dependencies = [
@@ -4839,6 +4851,7 @@ dependencies = [
  "globset",
  "hex",
  "http-body",
+ "keeper-paths",
  "notify",
  "notify-debouncer-full",
  "objc2-foundation",
@@ -4856,8 +4869,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid 1.2.1",
- "unicase",
- "unicode-normalization",
  "url",
 ]
 

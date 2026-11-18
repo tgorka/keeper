@@ -44,7 +44,7 @@
  * `write_vault_file` + `mark_dirty`, the same path notes use, never a second
  * writer. {@link useTextFile} calls {@link syncWriteEntry} and composes no path
  * of its own: the `subpath` it saves to is the one the listing handed it, and
- * Rust re-resolves it through `keeper_sync::browse`'s containment on every call
+ * Rust re-resolves it through `keeper_paths::resolve` on every call
  * (AD-65). A note embed's `notes_embed_write` lands on that same
  * `write_vault_file`, after the vault's own containment check.
  *
@@ -335,7 +335,7 @@ export function useTextBuffer(source: TextFileSource): UseTextFileResult {
  * (Story 45.6, FR-179, AD-89).
  *
  * Nothing is composed here. The subpath is the one the listing produced, and
- * Rust re-resolves it through `keeper_sync::browse`'s containment on every call
+ * Rust re-resolves it through `keeper_paths::resolve` on every call
  * (AD-65) — which is also why a file outside every profile is `unreachable`
  * rather than read through its `absolutePath`: that route would go around the
  * containment check the profile commands exist to enforce.

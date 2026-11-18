@@ -27,11 +27,11 @@
  * `format` verdict decides what markdown is (AD-87 — never a second extension
  * sniff), and whether a save can follow is `TextFileFrame`'s `savable`, which
  * reads the FORMAT's verdict, the size guard, and — since the fix to this
- * story — the LOCATION's verdict that `keeper_sync::files_write` composed and
- * the listing row carried. That last one is what actually keeps the tools off
- * a session's `workspace/` file (AD-113): it is ordinary markdown of an
- * ordinary writable format, so nothing about the file itself withholds
- * anything, and only the fence does.
+ * story — the LOCATION's verdict that `keeper_paths::WriteScope::owner` decided,
+ * in `WriteRefusal`'s sentence, and the listing row carried. That last one is
+ * what actually keeps the tools off a session's `workspace/` file (AD-113): it
+ * is ordinary markdown of an ordinary writable format, so nothing about the
+ * file itself withholds anything, and only the fence does.
  *
  * What did NOT move is live preview, the notes store, wikilink and tag
  * completion. The first two need a note id, a subscription and an autosave that

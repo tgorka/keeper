@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-cli", "crates/keeper-ports", "crates/keeper-replica", "crates/keeper-testkit", "crates/keeper-graph"]
+members = ["crates/keeper-core", "crates/keeper-paths", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-cli", "crates/keeper-ports", "crates/keeper-replica", "crates/keeper-testkit", "crates/keeper-graph"]
 
 [workspace.package]
 version = "0.11.0"
@@ -467,7 +467,7 @@ flate2 = "1"
 # tauri nor gix. MIT OR Apache-2.0 — passes `cargo deny check`.
 unicode-normalization = "0.1"
 # Unicode full case folding (`CaseFolding.txt` C+F: `ß` → `ss`, `ſ` → `s`,
-# final sigma → σ) for `keeper_sync::names::same_entry_folded`, which must
+# final sigma → σ) for `keeper_paths::names::same_entry_folded`, which must
 # answer as the Mac's APFS does (R603-08). Already resolved in Cargo.lock as
 # `mime_guess`'s dependency of `keeper-core`, so the direct edge adds no
 # package. MIT OR Apache-2.0 — passes `cargo deny check`.

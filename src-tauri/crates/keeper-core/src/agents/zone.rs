@@ -1,7 +1,7 @@
 //! The agents zone as a listing: which entries are homes and why a zone hosts nothing (AD-361, story 89.2).
 //!
 //! The host lists the zone's top level and reads `_drive.toml` through
-//! `browse::resolve`; this module decides. A zone hosts an agent only when its
+//! `keeper_paths::resolve`; this module decides. A zone hosts an agent only when its
 //! declaration parses, because the declaration names the audience every agent
 //! homed there speaks to — an undeclared audience is never guessed.
 

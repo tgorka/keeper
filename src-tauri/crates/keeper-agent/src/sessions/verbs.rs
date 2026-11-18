@@ -555,7 +555,7 @@ pub fn archive_with(
             "only an active session can be archived".to_owned(),
         ));
     }
-    let dir = keeper_sync::browse::lexical_join(held.zone(), &row.path)
+    let dir = keeper_paths::lexical_join(held.zone(), &row.path)
         .map_err(|_| VerbError::NoSuchSession(session_id.to_owned()))?;
     let mut workspace = Workspace {
         root: exec::identity(&dir.join(WORKSPACE_DIR)),

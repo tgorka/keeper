@@ -1,0 +1,461 @@
+//! Names the filesystem holds that keeper cannot spell (Story 47.2).
+//!
+//! # The bug this module exists to make impossible
+//!
+//! POSIX filenames are byte strings. Every rule about them is "no `/`, no
+//! `NUL`"; nothing requires them to be UTF-8, and a repository that has been
+//! through a `zip` written on a Windows box, a `tar` from a CP-1250 era, or a
+//! restore from a filesystem with a different locale will contain names that
+//! are not. git carries such a name without complaint — it stores path *bytes*
+//! — so the file syncs, pushes and clones perfectly well.
+//!
+//! Rust's `String` is UTF-8 by construction, so every surface that renders a
+//! name has to decide what to do at that boundary, and the convenient answer is
+//! [`std::path::Path::to_string_lossy`], which substitutes `U+FFFD` for each
+//! byte it cannot decode. That is the right answer *for display* and a
+//! catastrophic one for anything else, because the substitution is **not
+//! injective and not reversible**:
+//!
+//! * Two files, `a\xFF.txt` and `a\xFE.txt`, render to the same string. A
+//!   listing keyed on that string has one row for two files.
+//! * A file *legitimately* named `a\u{FFFD}.txt` — three ordinary UTF-8 bytes,
+//!   a name a user can type — renders to that same string too. Joining the
+//!   rendering back onto the root does not fail; it **succeeds, at the wrong
+//!   file**. That was measured, not theorised: before this module existed,
+//!   browsing a folder holding both files and clicking the mangled row resolved
+//!   to the ordinary one, and [`crate::write`] shares the same join, so a
+//!   delete confirmed against one row removed the other.
+//!
+//! So a lossy rendering is fine to *show* and must never be used to *reach*.
+//! That distinction is not something a comment can enforce — the old code had
+//! the comment and the bug — so it is enforced by the type system here.
+//!
+//! # How the type enforces it
+//!
+//! [`UnspellableName`] holds two renderings and hands out neither as anything a
+//! path can be built from:
+//!
+//! * [`UnspellableName::for_display`] returns [`ForDisplay`], which implements
+//!   [`std::fmt::Display`] and **nothing else**. `Path::new(…)`,
+//!   `PathBuf::push(…)` and `Path::join(…)` all require `AsRef<Path>`, and
+//!   `ForDisplay` is not, so `root.join(name.for_display())` does not compile.
+//!   Getting a `String` out of it takes an explicit `.to_string()`, which is a
+//!   decision a reviewer can see rather than a coercion nobody notices.
+//! * [`UnspellableName::escaped`] is the *lossless* rendering — byte-exact,
+//!   pure ASCII, `\xNN` for anything outside printable ASCII. It is what makes
+//!   the report actionable: `doc-\xffepuap.txt` tells a human exactly which
+//!   bytes to look for, where `doc-<?>epuap.txt` tells them only that something
+//!   is wrong. It is also, deliberately, not the name — pasting it into a shell
+//!   as a literal reaches nothing, and `printf` is required to turn it back
+//!   into one. A rendering that needs a decoding step is a rendering nobody
+//!   joins onto a root by accident.
+//!
+//! There is no constructor from a valid name. [`UnspellableName::of`] and its
+//! siblings return `None` when the name decodes cleanly, so **the existence of
+//! one of these values is itself the finding** — a surface cannot hold one and
+//! have nothing to report, and a caller cannot forget to check a boolean it was
+//! never given.
+//!
+//! # What this module deliberately does not do
+//!
+//! It does not make such a file syncable, because it already is. git stages,
+//! commits and pushes the raw bytes; `gix::path::try_into_bstr` is infallible
+//! on unix and the tree entry that comes back out holds the original name. The
+//! owner who reported this guessed the file "probably would not make it to the
+//! remote anyway" and that guess was wrong: the only thing that could not
+//! handle the name was keeper's own rendering of it.
+
+use std::ffi::OsStr;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+/// A name on disk that is not valid UTF-8, in the two renderings a human needs
+/// and in no rendering a path can be built from.
+///
+/// Construct with [`Self::of`], [`Self::of_path`] or [`Self::of_bytes`], each of
+/// which answers `None` for a name that decodes cleanly. See the module docs
+/// for why this is a type rather than a `bool` beside a `String`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnspellableName {
+    /// `U+FFFD`-substituted rendering: what a person reads in a row.
+    ///
+    /// Lossy, non-injective, and **not** the name. Public because it is what
+    /// crosses to the frontend, where it lands in a text node; every consumer
+    /// inside this crate goes through [`Self::for_display`] instead.
+    pub display: String,
+    /// Byte-exact ASCII rendering, `\xNN` for every byte outside printable
+    /// ASCII and `\\` for a literal backslash.
+    ///
+    /// Lossless: two names that share a `display` never share this. It is what
+    /// a report quotes so the reader can go and find the file.
+    pub escaped: String,
+}
+
+impl UnspellableName {
+    /// The name of one directory entry, or `None` if it is ordinary text.
+    pub fn of(name: &OsStr) -> Option<Self> {
+        if name.to_str().is_some() {
+            return None;
+        }
+        Some(Self {
+            display: name.to_string_lossy().into_owned(),
+            escaped: escape(name.as_encoded_bytes()),
+        })
+    }
+
+    /// A whole path — relative or absolute — or `None` if it is ordinary text.
+    ///
+    /// Separators are left as the platform wrote them. This renders paths that
+    /// have already been refused, so a shape a user can compare against `ls`
+    /// output beats one normalized for matching.
+    pub fn of_path(path: &Path) -> Option<Self> {
+        Self::of(path.as_os_str())
+    }
+
+    /// A path git handed us as raw bytes — an index entry or a status walk.
+    ///
+    /// git stores path bytes and never decodes them, so this is the shape the
+    /// only complete inventory of a repository arrives in.
+    pub fn of_bytes(bytes: &[u8]) -> Option<Self> {
+        if std::str::from_utf8(bytes).is_ok() {
+            return None;
+        }
+        Some(Self {
+            display: String::from_utf8_lossy(bytes).into_owned(),
+            escaped: escape(bytes),
+        })
+    }
+
+    /// The lossy rendering, in a wrapper that is not `AsRef<Path>`.
+    ///
+    /// This is the whole point of the type: `format!("{}", n.for_display())`
+    /// compiles and `root.join(n.for_display())` does not.
+    pub fn for_display(&self) -> ForDisplay<'_> {
+        ForDisplay(&self.display)
+    }
+}
+
+/// A borrowed lossy name that can be printed and cannot be walked.
+///
+/// Implements [`std::fmt::Display`] and deliberately no other trait — in
+/// particular not `AsRef<Path>`, `AsRef<OsStr>`, `AsRef<str>` or `Deref`, each
+/// of which would silently re-open the hole this type closes. See the module
+/// docs.
+#[derive(Debug, Clone, Copy)]
+pub struct ForDisplay<'a>(&'a str);
+
+impl std::fmt::Display for ForDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// The character a lossy decode leaves behind.
+///
+/// Named because two places test for it and a bare `'\u{FFFD}'` in a condition
+/// reads like a typo.
+pub const REPLACEMENT: char = '\u{FFFD}';
+
+/// Whether a string carries the mark of a lossy decode.
+///
+/// Used by [`crate::plain_segments`] to refuse a subpath that may be a
+/// rendering rather than a name. It cannot distinguish a rendering from a file
+/// genuinely named with `U+FFFD` — nothing can, which is exactly the ambiguity
+/// that makes the join unsafe — so it refuses both. See
+/// [`crate::BrowseRefusal::Unspellable`] for why that trade is the
+/// right way round.
+pub fn is_lossy_rendering(text: &str) -> bool {
+    text.contains(REPLACEMENT)
+}
+
+/// Whether two names are one directory entry on a volume that folds case and
+/// Unicode normalization, as the Mac's default APFS does: `README.md` and
+/// `readme.md` are one file there, and so are an `é` composed and the same
+/// `é` decomposed. A fence that compares names it must keep keeper's own
+/// compares them this way on every platform, so it refuses on Linux what the
+/// Mac would let through.
+///
+/// The comparison is Unicode's canonical caseless match (D145):
+/// `NFD(fold(NFD(name)))`, where `fold` is **full** case folding
+/// (`CaseFolding.txt` C+F, never the Turkic T rows). Lowercasing is not it:
+/// APFS takes `.obſidian` (U+017F long s) for `.obsidian`, `ß` for `ss`, and
+/// `ς` for `Σ`, and lowercasing keeps every one of those apart. Measured on
+/// hesperia (macOS 27, APFS) over every code point whose canonical caseless
+/// key differs from itself, 14,369 of them, and 114 pairs picked by hand, and
+/// in agreement on every one — including where both say *different*:
+/// `ı`/`i`, `İ`/`i`, a fullwidth `Ａ` and `A`, a zero-width joiner, `①` and
+/// `1`, `ﬃ` and `iff`. The tables are `tests/apfs_caseless_sweep.rs` and
+/// `the_comparison_answers_as_apfs_did_on_every_measured_pair` below. The
+/// whole name is folded; nothing is stripped or skipped.
+///
+/// The one comparison every name fence in this crate reads (109.27, AD-65):
+/// the agents' home, the sessions zone and its workspace, git's and keeper's
+/// own names, a create's collision. Two ASCII names fold as ASCII, with no
+/// allocation, because the index scans that ask it ask once per tracked file
+/// — full folding of ASCII is ASCII lowercasing, and only a non-ASCII name
+/// (`ſ`, the Kelvin sign) can fold *into* ASCII.
+pub fn same_entry_folded(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    caseless(a) == caseless(b)
+}
+
+/// `NFD(full_case_fold(NFD(name)))`: the key two names APFS takes for one
+/// entry share. The second decomposition is not redundant — folding can
+/// leave a sequence that is not in NFD (`ΐ` folds to three characters).
+///
+/// The fold is `unicase`'s, but for [`UNICASE_OUT_OF_ORDER`], which is
+/// spelled out before it folds.
+fn caseless(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let mut decomposed = String::with_capacity(name.len());
+    for c in name.nfd() {
+        match UNICASE_OUT_OF_ORDER.iter().find(|(from, _)| *from == c) {
+            Some((_, fold)) => decomposed.push_str(fold),
+            None => decomposed.push(c),
+        }
+    }
+    unicase::UniCase::unicode(decomposed.as_str())
+        .to_folded_case()
+        .nfd()
+        .collect()
+}
+
+/// The code points whose full case fold `unicase` 2.9.0 emits in the wrong
+/// order, with the fold `CaseFolding.txt` gives them (R603-09).
+///
+/// Its three-character fold (`Fold::Three`) yields its third character
+/// first, so `ﬃ` folds to `iff` and `ﬄ` to `lff`: APFS takes `oﬃce` for
+/// `Office` and keeps `ﬃ` and `iff` apart, and the plain fold said the
+/// opposite of both. After the first NFD these two are the only code points
+/// that reach a three-character fold — every Greek one decomposes first —
+/// and what replaces each is ASCII, which folds to itself. Exactly these two:
+/// `tests/apfs_caseless_sweep.rs` holds every code point whose fold differs,
+/// with the answer APFS gave on hesperia, and fails on any other.
+const UNICASE_OUT_OF_ORDER: [(char, &str); 2] = [('\u{fb03}', "ffi"), ('\u{fb04}', "ffl")];
+
+/// Byte-exact ASCII rendering: printable ASCII verbatim, `\xNN` for the rest.
+///
+/// `\\` for a literal backslash, so the escaping is unambiguous and two
+/// distinct names can never produce one string.
+fn escape(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7E => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    /// R603-08: every pair `/home/dev/wt/reviews/evidence/fix603r3/apfs-probe.py`
+    /// measured on hesperia (macOS 27, APFS, case-insensitive): it created `a`
+    /// in an empty folder and asked the filesystem whether `b` was there. Where
+    /// APFS said one entry, so must this; where it said two, so must this —
+    /// a fence that over-folds refuses a name the Mac keeps apart. Asked both
+    /// ways round, because the comparison must not depend on which side the
+    /// index or the agent spelled.
+    #[test]
+    fn the_comparison_answers_as_apfs_did_on_every_measured_pair() {
+        let measured: [(&str, &str, bool); 51] = [
+            (".obsidian", ".ob\u{17f}idian", true),
+            ("sessions", "\u{17f}essions", true),
+            ("\u{3a3}", "\u{3c2}", true),
+            ("\u{df}", "ss", true),
+            ("README.md", "readme.md", true),
+            ("caf\u{e9}", "cafe\u{301}", true),
+            ("Caf\u{e9}", "cafe\u{301}", true),
+            ("log", "logs", false),
+            ("\u{1e9e}", "ss", true),
+            ("\u{1e9e}", "\u{df}", true),
+            ("agents", "agent\u{17f}", true),
+            ("stra\u{df}e", "STRASSE", true),
+            ("\u{3c3}", "\u{3c2}", true),
+            ("\u{3a3}\u{3a3}", "\u{3c3}\u{3c2}", true),
+            ("\u{131}", "i", false),
+            ("\u{131}", "I", false),
+            ("\u{130}", "i", false),
+            ("\u{130}", "I", false),
+            ("\u{130}", "i\u{307}", true),
+            ("\u{130}", "I\u{307}", true),
+            ("\u{131}", "\u{130}", false),
+            ("\u{fb01}", "fi", true),
+            ("\u{fb01}", "FI", true),
+            ("\u{fb00}", "ff", true),
+            ("\u{fb06}", "st", true),
+            ("\u{212a}", "K", true),
+            ("\u{212a}", "k", true),
+            ("\u{212b}", "\u{c5}", true),
+            ("\u{212b}", "\u{e5}", true),
+            ("\u{212b}", "a\u{30a}", true),
+            ("\u{386}", "\u{3ac}", true),
+            ("\u{386}", "\u{3b1}\u{301}", true),
+            ("\u{390}", "\u{3b9}\u{308}\u{301}", true),
+            ("\u{1f88}", "\u{1f00}\u{3b9}", true),
+            ("\u{3b9}\u{345}", "\u{3b9}\u{3b9}", true),
+            ("\u{345}", "\u{3b9}", true),
+            ("\u{ff21}", "\u{ff41}", true),
+            ("\u{ff21}", "A", false),
+            ("\u{ff41}", "a", false),
+            ("ab", "a\u{200d}b", false),
+            ("ab", "a\u{200c}b", false),
+            ("ab", "a\u{feff}b", false),
+            ("a\u{200d}b", "A\u{200d}B", true),
+            ("\u{2460}", "1", false),
+            ("\u{b5}", "\u{3bc}", true),
+            ("\u{b5}", "\u{39c}", true),
+            ("\u{1c90}", "\u{10d0}", true),
+            ("\u{13a0}", "\u{ab70}", true),
+            ("\u{a7c0}", "\u{a7c1}", true),
+            ("\u{2c2f}", "\u{2c5f}", true),
+            ("\u{d55c}", "\u{1112}\u{1161}\u{11ab}", true),
+        ];
+        let wrong: Vec<String> = measured
+            .iter()
+            .flat_map(|&(a, b, apfs)| [(a, b, apfs), (b, a, apfs)])
+            .filter(|&(a, b, apfs)| super::same_entry_folded(a, b) != apfs)
+            .map(|(a, b, apfs)| format!("{a:?} vs {b:?}: APFS said same={apfs}"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    use super::*;
+
+    #[cfg(unix)]
+    fn osname(bytes: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn an_ordinary_name_is_not_a_finding() {
+        // The type's existence IS the report, so a clean name must not produce
+        // one — otherwise every listing would report every file.
+        assert_eq!(UnspellableName::of(OsStr::new("notes.md")), None);
+        assert_eq!(UnspellableName::of_bytes(b"notes.md"), None);
+        // Non-ASCII is not the same as non-UTF-8. A Polish filename is text.
+        assert_eq!(UnspellableName::of(OsStr::new("zaświadczenie.pdf")), None);
+        assert_eq!(
+            UnspellableName::of_bytes("zaświadczenie.pdf".as_bytes()),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_name_is_reported_in_both_renderings() {
+        let name = osname(b"doc-\xffepuap.txt");
+        let found = UnspellableName::of(&name).expect("not valid UTF-8");
+        assert_eq!(found.display, "doc-\u{FFFD}epuap.txt");
+        assert_eq!(found.escaped, "doc-\\xffepuap.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_escaped_rendering_separates_names_the_lossy_one_merges() {
+        // This is the property that makes `escaped` worth carrying: two files
+        // a user must be able to tell apart collapse into one `display`.
+        let one = UnspellableName::of(&osname(b"a\xff.txt")).expect("invalid");
+        let two = UnspellableName::of(&osname(b"a\xfe.txt")).expect("invalid");
+        assert_eq!(one.display, two.display, "the lossy renderings do collide");
+        assert_ne!(one.escaped, two.escaped);
+        assert_eq!(one.escaped, "a\\xff.txt");
+        assert_eq!(two.escaped, "a\\xfe.txt");
+    }
+
+    #[test]
+    fn escaping_a_backslash_keeps_the_rendering_injective() {
+        // Without `\\`, a file literally named `a\xff.txt` (five ASCII
+        // characters) and one holding the byte 0xFF would render identically,
+        // and `escaped` would be as ambiguous as `display`.
+        assert_eq!(escape(b"a\\xff.txt"), "a\\\\xff.txt");
+        assert_ne!(escape(b"a\\xff.txt"), escape(b"a\xff.txt"));
+    }
+
+    #[test]
+    fn control_bytes_are_escaped_so_a_report_cannot_be_forged() {
+        // A newline in a filename would otherwise let one entry write what
+        // looks like two lines of a report.
+        assert_eq!(escape(b"a\nb\tc"), "a\\x0ab\\x09c");
+        assert!(!escape(b"a\nb").contains('\n'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_display_rendering_cannot_be_joined_onto_a_root() {
+        // The compile-time guarantee, asserted the only way a runtime test can:
+        // `ForDisplay` is not `AsRef<Path>`, so the sentence below is the ONLY
+        // way to get a path-shaped value out, and it is explicit.
+        let name = UnspellableName::of(&osname(b"a\xff.txt")).expect("invalid");
+        let shown = format!("{}", name.for_display());
+        assert_eq!(shown, "a\u{FFFD}.txt");
+        // And the rendering, if someone does force it back to a string, is
+        // recognisable as a rendering — which is what lets `plain_segments`
+        // refuse it.
+        assert!(is_lossy_rendering(&shown));
+    }
+
+    #[test]
+    fn a_source_scan_proves_no_path_conversion_was_ever_added() {
+        // `ForDisplay` closes the hole only for as long as nobody adds a
+        // conversion to it. A future `impl AsRef<Path> for ForDisplay`, or a
+        // `Deref<Target = str>`, would re-open it silently and every other test
+        // in this file would still pass. This is the one that would not.
+        //
+        // **An allowlist, not a blocklist, and that distinction was found by a
+        // mutation.** The first version of this test listed the spellings to
+        // forbid — `impl AsRef<Path> for ForDisplay` and four others — and a
+        // mutation adding `impl AsRef<std::path::Path> for ForDisplay<'_>`
+        // walked straight past it. There is no finite list of ways to write a
+        // trait path, so the rule is inverted: exactly one trait may be
+        // implemented for each of these types, and every other `impl` is a
+        // failure whatever it is called.
+        let source = include_str!("names.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the non-test half");
+
+        let allowed = [
+            "impl std::fmt::Display for ForDisplay<'_> {",
+            "impl UnspellableName {",
+        ];
+        let offenders: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("impl "))
+            .filter(|line| line.contains("ForDisplay") || line.contains("UnspellableName"))
+            .filter(|line| !allowed.contains(line))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these could hand a lossy name back as something path-shaped: {offenders:?}. \
+             Only {allowed:?} may exist; anything else needs a new argument, not a new arm here."
+        );
+        // And the allowlist is not vacuous — if the impls were renamed away,
+        // the loop above would pass over an empty file and prove nothing.
+        for expected in allowed {
+            assert!(
+                body.contains(expected),
+                "{expected} is gone; this test is now blind"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_two_constructors_agree_about_one_name() {
+        // `of_bytes` reads git's path bytes and `of` reads a dirent; a report
+        // that joined the two must not word one file two ways.
+        let from_os = UnspellableName::of(&osname(b"doc-\xffepuap.txt")).expect("invalid");
+        let from_git = UnspellableName::of_bytes(b"doc-\xffepuap.txt").expect("invalid");
+        assert_eq!(from_os, from_git);
+    }
+}

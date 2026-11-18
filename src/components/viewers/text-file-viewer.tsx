@@ -12,7 +12,7 @@
  *
  * **It reads no path and joins nothing.** `file.profileId` and
  * `file.relativePath` go to Rust as they arrived; Rust re-resolves them through
- * `keeper_sync::browse`'s containment on every call (AD-65). `absolutePath` is
+ * `keeper_paths::resolve` on every call (AD-65). `absolutePath` is
  * never touched here, and never rendered anywhere (FR-145). The vault question
  * is answered by `@/lib/vault-link`, whose rule is authored in
  * `keeper_core::vault_link` and pinned to it by a shared vector table — so the

@@ -356,7 +356,7 @@ describe("the states a real vault produces", () => {
     await settle();
 
     // The hook never calls a command it cannot scope — reading through
-    // `absolutePath` would go around browse.rs's containment (AD-65).
+    // `absolutePath` would go around `keeper_paths::resolve`'s containment (AD-65).
     expect(syncReadText).not.toHaveBeenCalled();
     expect(screen.getByRole("alert")).toHaveTextContent("not inside a synced folder");
   });
@@ -1169,7 +1169,7 @@ describe("a file that is not prose keeps the editor it had (Story 50.3)", () => 
  * menu, emoji completion and a Save button over a buffer every write refuses,
  * and was not marked read-only either.
  *
- * The refusal is Rust's own: `keeper_sync::files_write::WriteRefusal::
+ * The refusal is Rust's own: `keeper_paths::WriteRefusal::
  * SessionWorkspace`'s Display, which `sync_browse` puts on the listing row this
  * panel opened the file from.
  */

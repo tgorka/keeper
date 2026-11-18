@@ -4,7 +4,7 @@
  * A file whose name is not text, as the Problems pane shows it (Story 47.2,
  * DW-200).
  *
- * The shell-side shape of `keeper_sync::UnspellableName`, for the same reason
+ * The shell-side shape of `keeper_paths::UnspellableName`, for the same reason
  * [`SyncParkedVm`] is the shell-side shape of a parked unit: the engine type
  * is not a view model and does not derive [`TS`].
  *

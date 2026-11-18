@@ -1005,8 +1005,8 @@ unreachable:
   `sync_release_entry` (`sync_ipc.rs:3663-3680`) and the TTL sweep refuse — by design
   (AD-125); a phone that cannot ask "is this file open" does not release.
 - **Trash outside a vault.** `files_write::trash_unmanaged`
-  (`src-tauri/crates/keeper-sync/src/files_write.rs:968-981`) falls to the freedesktop.org
-  home trash off `$HOME` (`:926-930`) everywhere but macOS, which on a phone is a
+  (in `src-tauri/crates/keeper-sync/src/files_write.rs`) falls to the freedesktop.org
+  home trash off `$HOME` (`files_write::os_trash`) everywhere but macOS, which on a phone is a
   directory under the app container — reachable through `sync_delete_entries` for a
   non-vault path. DW-242.
 - **Export and copy.** `sync_export_entry` and the `copy_*` commands compile and run,

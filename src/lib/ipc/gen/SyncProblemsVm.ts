@@ -17,7 +17,7 @@ conflicts: Array<string>,
  * Reported rather than silent. Before this, keeper rendered such a name
  * lossily and said nothing, and the rendering could be joined back to a
  * *different real file* — so a delete confirmed against one row removed
- * another. `browse::plain_segments` now refuses the rendering; this list is
+ * another. `keeper_paths::plain_segments` now refuses the rendering; this list is
  * how the person finds out the file exists at all.
  */
 unspellable: Array<SyncUnspellableVm>, };

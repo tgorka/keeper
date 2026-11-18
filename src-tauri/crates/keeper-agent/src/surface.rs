@@ -5,14 +5,14 @@
 //! whose agents zone declares it in `_drive.toml`. The docked notes view
 //! names a note by its vault and its vault-relative path, and the agent by
 //! its drive id and drive-relative path. The two are joined here, both ways
-//! ([`drive_of`], [`locate`]), by `keeper_sync::browse`'s segment rules
+//! ([`drive_of`], [`locate`]), by `keeper_paths`'s segment rules
 //! (AD-65), never by string arithmetic in a caller.
 //!
 //! The surface tools — a request into the person's focused device over the
 //! agent's Matrix room — left keeper in 108.2 (DW-E106-1).
 
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_sync::browse;
+
 use keeper_sync::SyncProfile;
 
 use crate::zone::read_text;
@@ -42,14 +42,14 @@ pub fn declared(profile: &SyncProfile) -> Result<DriveDecl, String> {
 /// does not name a file inside it.
 pub fn drive_of(profile: &SyncProfile, subfolder: &str, note_path: &str) -> Option<DriveRef> {
     let decl = declared(profile).ok()?;
-    let mut segments = browse::plain_segments(subfolder.trim_matches('/')).ok()?;
-    segments.extend(browse::plain_segments(note_path).ok()?);
+    let mut segments = keeper_paths::plain_segments(subfolder.trim_matches('/')).ok()?;
+    segments.extend(keeper_paths::plain_segments(note_path).ok()?);
     if segments.is_empty() {
         return None;
     }
     let parts: Option<Vec<&str>> = segments.iter().map(|segment| segment.to_str()).collect();
     let path = parts?.join("/");
-    match browse::resolve(&profile.local_path, &path) {
+    match keeper_paths::resolve(&profile.local_path, &path) {
         Ok(Some(found)) if found.is_file() => Some(DriveRef {
             drive: decl.id,
             path,
@@ -75,7 +75,7 @@ pub enum Located {
 /// The file `path` of the drive `drive` among this device's synced folders,
 /// each with its notes vault's subfolder when it keeps one. A path the
 /// segment rules refuse, or one that resolves outside its folder, is
-/// refused with `browse`'s own sentence (AD-65).
+/// refused with `keeper_paths::BrowseRefusal`'s own sentence (AD-65).
 pub fn locate(
     folders: &[(SyncProfile, Option<String>)],
     drive: &str,
@@ -85,8 +85,8 @@ pub fn locate(
         .iter()
         .find(|(profile, _)| declared(profile).is_ok_and(|decl| decl.id == drive))
         .ok_or_else(|| format!("This device does not keep the drive {drive}."))?;
-    let segments = browse::plain_segments(path).map_err(|refusal| refusal.to_string())?;
-    match browse::resolve(&profile.local_path, path) {
+    let segments = keeper_paths::plain_segments(path).map_err(|refusal| refusal.to_string())?;
+    match keeper_paths::resolve(&profile.local_path, path) {
         Ok(Some(found)) if found.is_file() => {}
         Ok(_) => return Err(format!("{path} is not a file on {drive}.")),
         Err(refusal) => return Err(refusal.to_string()),
@@ -94,7 +94,7 @@ pub fn locate(
     let parts: Option<Vec<&str>> = segments.iter().map(|segment| segment.to_str()).collect();
     let parts = parts.ok_or_else(|| format!("{path} is not a file on {drive}."))?;
     if let Some(subfolder) = vault {
-        let folder = browse::plain_segments(subfolder.trim_matches('/'))
+        let folder = keeper_paths::plain_segments(subfolder.trim_matches('/'))
             .map_err(|refusal| refusal.to_string())?;
         let folder: Option<Vec<&str>> = folder.iter().map(|segment| segment.to_str()).collect();
         if let Some(folder) = folder {
@@ -178,9 +178,9 @@ mod tests {
                 relative_path: "media/talk.txt".to_owned(),
             })
         );
-        // A path escaping the drive is refused with browse's own sentence.
+        // A path escaping the drive is refused with BrowseRefusal's own sentence.
         let escape = locate(&folders, "tgdrive", "../outside.md").expect_err("refused");
-        let browse_says = browse::plain_segments("../outside.md")
+        let browse_says = keeper_paths::plain_segments("../outside.md")
             .expect_err("browse refuses it")
             .to_string();
         assert_eq!(escape, browse_says);

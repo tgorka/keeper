@@ -3270,20 +3270,20 @@ pub fn pointer_sized_tracked_paths(repo: &gix::Repository, max_bytes: u32) -> Re
 /// status walk cannot answer this: a tracked, unmodified file is exactly the
 /// case that reports nothing, and it was the case the owner hit.
 ///
-/// Allocates only for the offenders. [`crate::names::UnspellableName::of_bytes`]
+/// Allocates only for the offenders. [`keeper_paths::names::UnspellableName::of_bytes`]
 /// answers `None` after a UTF-8 validation and nothing else, so a repository
 /// with a hundred thousand ordinary paths pays one scan of the index's own
 /// bytes and builds no strings at all.
 pub fn unspellable_tracked_paths(
     repo: &gix::Repository,
-) -> Result<Vec<crate::names::UnspellableName>> {
+) -> Result<Vec<keeper_paths::names::UnspellableName>> {
     let index = repo
         .index_or_empty()
         .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
-    let mut out: Vec<crate::names::UnspellableName> = index
+    let mut out: Vec<keeper_paths::names::UnspellableName> = index
         .entries()
         .iter()
-        .filter_map(|entry| crate::names::UnspellableName::of_bytes(entry.path(&index)))
+        .filter_map(|entry| keeper_paths::names::UnspellableName::of_bytes(entry.path(&index)))
         .collect();
     // The index is sorted by raw path bytes, which is not the order the
     // escaped renderings sort in; a report that reshuffles between polls reads

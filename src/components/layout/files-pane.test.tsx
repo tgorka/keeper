@@ -137,9 +137,11 @@ import { type ListGeometry, withListGeometry, withTextLayout } from "@/test/layo
 
 /** The exact sentence Rust composes for an unplugged profile. Verbatim, because
  * the whole point of the state is that this reaches the screen unaltered. */
-/** The exact sentence `keeper_sync::files_write` composes for a path outside a
- * vault. Verbatim, because the whole point of carrying it on the listing is
- * that it reaches the screen unaltered. */
+/** A refusal for a path outside a vault, in its pre-AD-102 wording. No Rust
+ * code composes this text today: since AD-102, `keeper_paths::WriteRefusal::
+ * OutsideVault` refuses only a create, in different words. Here it stands for
+ * any reason Rust puts on a listing row, kept verbatim because the whole point
+ * of carrying it on the listing is that it reaches the screen unaltered. */
 const OUTSIDE_VAULT =
   "outside.txt is outside Vault's notes vault (10-notes), and keeper only writes inside the vault it manages. You can open and reveal this file here; changing it is your file manager's job.";
 

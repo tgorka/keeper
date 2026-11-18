@@ -5,8 +5,8 @@
 //!
 //! Every function here takes `(root, subpath)` where `subpath` is
 //! profile-relative and `/`-joined, and every one of them reaches the disk
-//! through [`crate::browse::resolve`], [`crate::browse::plain_segments`] or
-//! [`crate::files_write::WriteScope::route`]. There is **no path arithmetic in
+//! through [`keeper_paths::resolve`], [`keeper_paths::plain_segments`] or
+//! [`keeper_paths::WriteScope::route`]. There is **no path arithmetic in
 //! this file and there must never be any**: `..`, an absolute path, a platform
 //! separator, an empty segment, a `U+FFFD` rendering and a symlink whose
 //! canonical form leaves the profile root are all refused by those functions,
@@ -17,14 +17,17 @@
 //!
 //! # Why it lives here rather than in `keeper-core` or in the shell
 //!
-//! The containment functions are here and cannot move: `keeper-core` may not
-//! depend on this crate (AD-40, `check:core-sync-free`), and the shell crate
-//! does not build on a Linux developer machine, so a containment rule written
-//! there is a security rule proved on no machine any of this is developed on
-//! (`files_write.rs:76-84`). Everything below is `std::fs` plus those
-//! functions, so it is asserted over a real temp directory — with a real
-//! symlink, a real pointer file, a real binary file and a real `rename` — on
-//! any machine.
+//! The containment rule is not here: it is `keeper-paths`' ([`keeper_paths::resolve`],
+//! [`keeper_paths::plain_segments`], [`keeper_paths::WriteScope::route`]), and this
+//! module only calls it. What is here is the tool host's half — the reads,
+//! listings, searches and writes a tool call makes — and it cannot move:
+//! `keeper-core` may not depend on this crate (AD-40, `check:core-sync-free`),
+//! and the shell crate does not build on a Linux developer machine, so a
+//! security boundary written there is one proved on no machine any of this is
+//! developed on (`files_write`'s module doc, § What lives in this crate, and
+//! what does not). Everything below is `std::fs` plus those functions, so it
+//! is asserted over a real temp directory — with a real symlink, a real
+//! pointer file, a real binary file and a real `rename` — on any machine.
 //!
 //! # Who chooses the caps
 //!
@@ -57,9 +60,10 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::browse::{self, BrowseRefusal};
-use crate::files_write::{self, UnmanagedPath, WriteRefusal, WriteRoute, WriteScope};
+use crate::files_write;
 use crate::lfs::stage;
+use keeper_paths::BrowseRefusal;
+use keeper_paths::{UnmanagedPath, WriteRefusal, WriteRoute, WriteScope};
 
 /// Every bound one tool call must respect.
 ///
@@ -93,7 +97,7 @@ pub struct Limits {
 /// rule's own and this module paraphrases neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsRefusal {
-    /// [`browse::resolve`] or [`browse::plain_segments`] refused the subpath:
+    /// [`keeper_paths::resolve`] or [`keeper_paths::plain_segments`] refused the subpath:
     /// `..`, absolute, a platform separator, an empty segment, a `U+FFFD`
     /// rendering, or a symlink resolving outside the profile root.
     Contained(BrowseRefusal),
@@ -739,7 +743,7 @@ struct WalkReport {
 /// symlink.
 ///
 /// **Symlinked directories are never descended and symlinked files are never
-/// offered.** `browse::resolve` would refuse one pointing out of the root, but
+/// offered.** `keeper_paths::resolve` would refuse one pointing out of the root, but
 /// one pointing *inside* it is a second name for a file the walk already has,
 /// and a cycle of two of them is a walk that never ends. The entry-count bound
 /// alone would turn that cycle into a truncated answer rather than a hang,
@@ -951,7 +955,7 @@ impl ScanBudget {
         got
     }
 
-    /// Read `landed` ([`browse::Landing::relative`]) of `root` as a search reads
+    /// Read `landed` ([`keeper_paths::Landing::relative`]) of `root` as a search reads
     /// anything — a candidate, a drive's config, a listing, a ranked or
     /// listed document: admitted as a walked candidate is, then opened from
     /// the root a name at a time, no link followed, so what is read is the
@@ -989,7 +993,7 @@ impl ScanBudget {
 #[cfg(unix)]
 fn read_landed(root: &Path, landed: &str, max: u64, cap: u64) -> (Result<Scanned, Unread>, u64) {
     let skipped = (Err(Unread::Skipped), 0);
-    let Ok(segments) = browse::plain_segments(landed) else {
+    let Ok(segments) = keeper_paths::plain_segments(landed) else {
         return skipped;
     };
     let Some((name, folders)) = segments.split_last() else {
@@ -1007,7 +1011,7 @@ fn read_landed(_: &Path, _: &str, _: u64, _: u64) -> (Result<Scanned, Unread>, u
     (Err(Unread::Skipped), 0)
 }
 
-/// The absolute path of `landed` ([`browse::Landing::relative`]) of `root`, for a
+/// The absolute path of `landed` ([`keeper_paths::Landing::relative`]) of `root`, for a
 /// search's reader that opens it by path — the vault's SQLite index — where
 /// it is a file [`ScanBudget::read`] would open: reached from the root a
 /// name at a time with no link followed, a regular file, its content on
@@ -1015,7 +1019,7 @@ fn read_landed(_: &Path, _: &str, _: u64, _: u64) -> (Result<Scanned, Unread>, u
 /// materialize it).
 #[cfg(unix)]
 pub fn search_file(root: &Path, landed: &str) -> Result<PathBuf, Unread> {
-    let segments = browse::plain_segments(landed).map_err(|_| Unread::Skipped)?;
+    let segments = keeper_paths::plain_segments(landed).map_err(|_| Unread::Skipped)?;
     let (name, folders) = segments.split_last().ok_or(Unread::Skipped)?;
     let dir = nofollow::descend(root, folders).map_err(|_| Unread::Skipped)?;
     if !nofollow::file_at(std::os::fd::AsFd::as_fd(&dir), name, nofollow::dataless) {
@@ -1054,7 +1058,7 @@ pub struct SearchWalk {
     pub unreadable: usize,
 }
 
-/// Walk `start`'s subtree (a landing, [`browse::Landing::relative`]) for a search: in
+/// Walk `start`'s subtree (a landing, [`keeper_paths::Landing::relative`]) for a search: in
 /// name order, depth first, each entry — `start` first — offered to
 /// `visit` before anything of it is opened: a folder it skips is never
 /// opened, a file it skips never read. Every folder is opened by its name
@@ -1071,7 +1075,7 @@ pub fn search_walk(
     visit: &mut dyn FnMut(&SearchEntry) -> Step,
     found: &mut dyn FnMut(&str, Scanned),
 ) -> Result<SearchWalk, FsRefusal> {
-    let segments = browse::plain_segments(start)?;
+    let segments = keeper_paths::plain_segments(start)?;
     let mut report = SearchWalk::default();
     let entry = SearchEntry {
         subpath: start.to_owned(),
@@ -1510,9 +1514,9 @@ pub fn edited_text(
 // The shared plumbing — every one of these is three lines around a borrowed rule
 // ---------------------------------------------------------------------------
 
-/// [`browse::resolve`], with its `Ok(None)` given the name a tool call needs.
+/// [`keeper_paths::resolve`], with its `Ok(None)` given the name a tool call needs.
 fn resolve_existing(root: &Path, subpath: &str) -> Result<PathBuf, FsRefusal> {
-    browse::resolve(root, subpath)?.ok_or_else(|| FsRefusal::Missing {
+    keeper_paths::resolve(root, subpath)?.ok_or_else(|| FsRefusal::Missing {
         subpath: subpath.to_owned(),
     })
 }
@@ -1533,7 +1537,7 @@ fn read_dir(absolute: &Path, subpath: &str) -> Result<std::fs::ReadDir, FsRefusa
 
 /// Join a parent subpath and one plain name in the `/`-joined frame every
 /// caller speaks. Never a `Path::join`: this is the listing's own frame, and
-/// the result is re-validated by [`browse::plain_segments`] on the next call.
+/// the result is re-validated by [`keeper_paths::plain_segments`] on the next call.
 fn join(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_owned()

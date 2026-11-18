@@ -9,8 +9,9 @@
 //! every bound is, how a result is worded for the model, and how many rounds a
 //! tool loop may run. **Nothing here touches a file.** The impure half is
 //! [`ToolHost`], which the shell implements over `keeper_sync::bots_fs` — the
-//! containment rule lives in `keeper-sync` because `keeper-core` may not depend
-//! on it (AD-40) and because the shell does not build on Linux. Tests implement
+//! tool host lives in `keeper-sync`, over `keeper-paths`' containment rule,
+//! because `keeper-core` may not depend on it (AD-40) and because the shell
+//! does not build on Linux. Tests implement
 //! [`ToolHost`] over a fake, which is what lets the loop, the bounds and every
 //! sentence below be asserted on any machine.
 //!
@@ -39,7 +40,7 @@
 //! mitigations and neither is a control: "permission rules are enforced by
 //! Claude Code, not by the model" (R6 §6.2) is the load-bearing caveat, and the
 //! thing that actually enforces anything here is `decide()` plus
-//! `browse::resolve`.
+//! `keeper_paths::resolve`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -469,7 +470,7 @@ pub enum ToolOutcome {
 /// The impure half.
 ///
 /// `keeper-core` never touches a file: the shell implements this over
-/// `keeper_sync::bots_fs`' containment functions plus
+/// `keeper_sync::bots_fs`' functions (over `keeper-paths`' containment rule) plus
 /// [`check`](super::grant::check) and the audit pair, and tests implement it
 /// over a fake. The per-call grant re-read belongs *inside* [`Self::run`],
 /// which is what makes revocation mid-conversation take effect at the next call
