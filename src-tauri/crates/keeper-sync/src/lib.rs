@@ -83,7 +83,6 @@ pub use engine::{
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
-
 pub use platform::{OpenFileState, SyncPlatform};
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};

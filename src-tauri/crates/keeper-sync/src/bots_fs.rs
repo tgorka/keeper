@@ -57,7 +57,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::files_write::{self};
+use crate::files_write;
 use crate::lfs::stage;
 use keeper_paths::BrowseRefusal;
 use keeper_paths::{UnmanagedPath, WriteRefusal, WriteRoute, WriteScope};

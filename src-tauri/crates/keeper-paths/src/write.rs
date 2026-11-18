@@ -1002,6 +1002,17 @@ pub struct UnmanagedPath {
 
 impl UnmanagedPath {
     /// Canonical destination for the unmanaged writer, never a display label.
+    ///
+    /// **Only keeper-sync's effect writers may call this** —
+    /// `keeper_sync::files_write::write_unmanaged` and the operating-system
+    /// trash path in the same module. It is public only because those effects
+    /// stayed in keeper-sync while the routing that proves the path moved here,
+    /// and Rust has no visibility narrower than `pub` that crosses a crate.
+    /// Construction stays crate-private, so the accessor cannot launder an
+    /// unproven path; but a reader that takes this `&Path` anywhere else — a
+    /// view model, a log line, a second writer — puts the absolute path on a
+    /// surface FR-145 keeps it off and opens a write path AD-102 does not name.
+    /// Show [`Self::profile_relative`] instead.
     pub fn absolute(&self) -> &Path {
         &self.absolute
     }
