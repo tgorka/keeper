@@ -75,7 +75,7 @@ pub enum Located {
 /// The file `path` of the drive `drive` among this device's synced folders,
 /// each with its notes vault's subfolder when it keeps one. A path the
 /// segment rules refuse, or one that resolves outside its folder, is
-/// refused with `browse`'s own sentence (AD-65).
+/// refused with `keeper_paths::BrowseRefusal`'s own sentence (AD-65).
 pub fn locate(
     folders: &[(SyncProfile, Option<String>)],
     drive: &str,
@@ -178,7 +178,7 @@ mod tests {
                 relative_path: "media/talk.txt".to_owned(),
             })
         );
-        // A path escaping the drive is refused with browse's own sentence.
+        // A path escaping the drive is refused with BrowseRefusal's own sentence.
         let escape = locate(&folders, "tgdrive", "../outside.md").expect_err("refused");
         let browse_says = keeper_paths::plain_segments("../outside.md")
             .expect_err("browse refuses it")

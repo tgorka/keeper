@@ -1117,9 +1117,9 @@ held as before.
 The notes view's dock is the default agent's chat **on the open note's drive** (R-HQ-86):
 
 - **Which chat.** keeper maps the note to its drive (`keeper_agent::surface::drive_of`: the vault's
-  synced folder's `_drive.toml` and the note's path, through `browse`'s segment rules) and opens the
-  default agent's newest unarchived session in the database named after that drive (AD-433), or
-  starts one there with this device's last model and effort for the agent
+  synced folder's `_drive.toml` and the note's path, through `keeper_paths`' segment rules) and
+  opens the default agent's newest unarchived session in the database named after that drive
+  (AD-433), or starts one there with this device's last model and effort for the agent
   (`Hq::session_for_note`, IPC `agent_session_for_note`). A note on no drive, or a drive with no
   database here that names the agent, opens the agent's main conversation and says why.
 - **The tick, and its warning.** In that chat keeper ticks the drive as the person, by the menu's

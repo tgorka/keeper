@@ -209,7 +209,7 @@ impl GrantMode {
 ///
 /// **`subpath` is profile-relative and always was.** There is no variant that
 /// can hold an absolute path, so a grant cannot name a location outside the
-/// drive even by accident — the same reason `files_write.rs`'s `VaultPath` has
+/// drive even by accident — the same reason `keeper_paths::VaultPath` has
 /// exactly one constructor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(

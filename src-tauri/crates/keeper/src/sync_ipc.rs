@@ -4940,7 +4940,7 @@ fn writable_profile(
 /// holding no reachable vault before `WriteScope` was ever consulted, which is
 /// what made the owner's `AGENTS.md` unreachable: it is inside a sync profile,
 /// outside the vault. Editing and deleting now start here and let
-/// [`WriteScope::route`] decide the fork, in `keeper-sync`, where it is
+/// [`WriteScope::route`] decide the fork, in `keeper-paths`, where it is
 /// asserted on every machine.
 ///
 /// Deliberately does NOT return a vault. The vault a command writes through
@@ -5017,7 +5017,7 @@ pub(crate) fn sessions_sync_mark(
 /// Story 46.14, AD-102).
 ///
 /// **Two writers, and `WriteScope::route` picks.** Which one is not decided
-/// here — it is decided in `keeper-sync`, where it is asserted on Linux, and it
+/// here — it is decided in `keeper-paths`, where it is asserted on Linux, and it
 /// arrives as a `WriteRoute` whose vault arm already carries the vault. This
 /// command's job is to spend the verdict, not to reach it.
 ///

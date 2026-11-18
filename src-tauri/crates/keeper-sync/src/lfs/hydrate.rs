@@ -30,7 +30,7 @@
 //! growing the vocabulary costs no churn in the two exhaustive matches that
 //! have to classify it.
 //!
-//! # Containment is `browse`'s rule, and only `browse`'s
+//! # Containment is `keeper_paths`' rule, and only `keeper_paths`'
 //!
 //! [`keeper_paths::plain_segments`] is the single lexical containment test in
 //! this crate (AD-65). Its verdict is carried into
@@ -380,7 +380,7 @@ impl std::fmt::Display for ContentRefusal {
 impl From<BrowseRefusal> for ContentRefusal {
     /// Carry a containment refusal across without re-deriving it.
     ///
-    /// The verdict is `browse`'s lexical rule and it already says what was
+    /// The verdict is `keeper_paths`' lexical rule and it already says what was
     /// wrong with the subpath; restating it here would be a second rule to keep
     /// in step with the first.
     fn from(refusal: BrowseRefusal) -> Self {

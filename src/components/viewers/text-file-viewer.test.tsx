@@ -356,7 +356,7 @@ describe("the states a real vault produces", () => {
     await settle();
 
     // The hook never calls a command it cannot scope — reading through
-    // `absolutePath` would go around browse.rs's containment (AD-65).
+    // `absolutePath` would go around `keeper_paths::resolve`'s containment (AD-65).
     expect(syncReadText).not.toHaveBeenCalled();
     expect(screen.getByRole("alert")).toHaveTextContent("not inside a synced folder");
   });

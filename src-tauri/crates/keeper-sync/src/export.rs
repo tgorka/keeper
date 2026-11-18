@@ -149,7 +149,7 @@ impl std::fmt::Display for ExportRefusal {
 impl From<BrowseRefusal> for ExportRefusal {
     /// Carry a containment refusal across without re-deriving it.
     ///
-    /// The verdict is `browse`'s lexical rule, as it is for every other
+    /// The verdict is `keeper_paths`' lexical rule, as it is for every other
     /// consumer; only the sentence changes, because the reader is about to lose
     /// an export rather than a listing.
     fn from(refusal: BrowseRefusal) -> Self {
