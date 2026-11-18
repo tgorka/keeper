@@ -11,14 +11,24 @@
         "actorId": "marta",
         "clientId": "marta.01",
         "databases": [
-          { "name": "makidrive", "mount": "/makidrive", "kind": "general", "display_name": "Makidrive" }
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          }
         ]
       },
       "want": {
         "actorId": "marta",
         "clientId": "marta.01",
         "databases": [
-          { "name": "makidrive", "mount": "/makidrive", "kind": "general", "display_name": "Makidrive" }
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          }
         ]
       }
     },
@@ -104,7 +114,12 @@
         "actorId": "marta",
         "clientId": "marta.01",
         "databases": [
-          { "name": "makidrive", "mount": "/makidrive", "kind": "general", "display_name": "Makidrive" }
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          }
         ]
       }
     }
@@ -124,7 +139,12 @@
         "actorId": "marta",
         "clientId": "marta.01",
         "databases": [
-          { "name": "makidrive", "mount": "/makidrive", "kind": "team", "display_name": "Makidrive" }
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "team",
+            "display_name": "Makidrive"
+          }
         ]
       }
     },
@@ -173,7 +193,12 @@
       "json": {
         "request_id": "req-02",
         "expected_revision": 1,
-        "command": { "op": "add_person", "actor_id": "ola", "display_name": "Ola", "serving_agents": [] }
+        "command": {
+          "op": "add_person",
+          "actor_id": "ola",
+          "display_name": "Ola",
+          "serving_agents": []
+        }
       }
     },
     {
@@ -181,7 +206,12 @@
       "json": {
         "request_id": "req-03",
         "expected_revision": 2,
-        "command": { "op": "list_domain", "name": "scratch-group", "kind": "group", "display_name": "Scratch group" }
+        "command": {
+          "op": "list_domain",
+          "name": "scratch-group",
+          "kind": "group",
+          "display_name": "Scratch group"
+        }
       }
     },
     {
@@ -203,7 +233,12 @@
       "json": {
         "request_id": "req-05",
         "expected_revision": 4,
-        "command": { "op": "set_membership", "domain": "makidrive", "actor_id": "marta", "role": "reader" }
+        "command": {
+          "op": "set_membership",
+          "domain": "makidrive",
+          "actor_id": "marta",
+          "role": "reader"
+        }
       }
     },
     {
@@ -263,7 +298,10 @@
       "json": {
         "request_id": "req-12",
         "expected_revision": 11,
-        "command": { "op": "reconcile", "accept": [{ "actor_id": "marta", "domain": "neuradrive" }] }
+        "command": {
+          "op": "reconcile",
+          "accept": [{ "actor_id": "marta", "domain": "neuradrive" }]
+        }
       }
     },
     {
@@ -279,7 +317,12 @@
       "json": {
         "request_id": "req-14",
         "expected_revision": 12,
-        "command": { "op": "set_membership", "domain": "scratch-s", "actor_id": "marta", "role": "editor" },
+        "command": {
+          "op": "set_membership",
+          "domain": "scratch-s",
+          "actor_id": "marta",
+          "role": "editor"
+        },
         "confirm": [
           {
             "domain": "scratch-s",
@@ -307,7 +350,12 @@
       "json": {
         "request_id": "req-21",
         "expected_revision": 0,
-        "command": { "op": "remove_membership", "domain": "tgdrive", "actor_id": "marta", "also": "neuradrive" }
+        "command": {
+          "op": "remove_membership",
+          "domain": "tgdrive",
+          "actor_id": "marta",
+          "also": "neuradrive"
+        }
       },
       "refusal": "hq.admin.malformed"
     },
@@ -325,7 +373,12 @@
       "json": {
         "request_id": "req-23",
         "expected_revision": 0,
-        "command": { "op": "set_membership", "domain": "makidrive", "actor_id": "marta", "role": "admin" }
+        "command": {
+          "op": "set_membership",
+          "domain": "makidrive",
+          "actor_id": "marta",
+          "role": "admin"
+        }
       },
       "refusal": "hq.admin.malformed"
     },
@@ -359,13 +412,21 @@
       "json": {
         "request_id": "req-27",
         "expected_revision": 0,
-        "command": { "op": "list_domain", "name": "scratch-team", "kind": "team", "display_name": "Team" }
+        "command": {
+          "op": "list_domain",
+          "name": "scratch-team",
+          "kind": "team",
+          "display_name": "Team"
+        }
       },
       "refusal": "hq.admin.malformed"
     }
   ],
   "admin_answers": [
-    { "name": "applied", "json": { "outcome": "applied", "event_id": "01JD0000000000000000000010", "revision": 13 } },
+    {
+      "name": "applied",
+      "json": { "outcome": "applied", "event_id": "01JD0000000000000000000010", "revision": 13 }
+    },
     {
       "name": "committed but not applied",
       "json": {
@@ -400,7 +461,13 @@
   "map_views": [
     {
       "name": "an empty map before the seed",
-      "json": { "revision": 0, "barrier": "starting", "domains": [], "people": [], "memberships": [] }
+      "json": {
+        "revision": 0,
+        "barrier": "starting",
+        "domains": [],
+        "people": [],
+        "memberships": []
+      }
     },
     {
       "name": "a seeded map with one operator change",
@@ -408,7 +475,12 @@
         "revision": 2,
         "barrier": "open",
         "domains": [
-          { "name": "makidrive", "kind": "general", "display_name": "Makidrive", "provisioned": true },
+          {
+            "name": "makidrive",
+            "kind": "general",
+            "display_name": "Makidrive",
+            "provisioned": true
+          },
           {
             "name": "tgdrive",
             "kind": "personal",
