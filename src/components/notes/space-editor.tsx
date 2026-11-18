@@ -884,7 +884,7 @@ export function SpaceEditor({
                     making it one was that a free-text box would become a second
                     definition of what a tag is. It would not: the typed text
                     goes into the query DSL verbatim and `notes::query` runs
-                    every `tag:` through `tags::normalise` on the way back in
+                    every `tag:` through `keeper_graph_protocol::tag::normalise` on the way back in
                     (query.rs), which is the same road a hand-written space
                     travels. So creating is allowed HERE and refused on the
                     filter bar — a space is a document being authored, and
