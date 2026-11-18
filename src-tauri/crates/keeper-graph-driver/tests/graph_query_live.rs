@@ -201,7 +201,7 @@ fn apply_fixture(client: &GraphClient) -> u64 {
     ]);
     send(vec![ChangeOp::UpdateNode {
         id: ulid(1),
-        expected_revision: "2".into(),
+        expected_revision: "1".into(),
         set: NodeFields {
             title: Some("Alpha 2".into()),
             description: None,
