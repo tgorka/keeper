@@ -31,9 +31,9 @@ use keeper_core::graph::query::{Freshness, GraphReads, HumanReader, Inspected, Q
 use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
 use keeper_core::graph::source::{GraphSource, ScopeState};
 use keeper_core::graph::supervisor::Cancellation;
-use keeper_core::hq::port::{Link, ReplicaSpec};
 use keeper_core::hq::sessions::Source;
-use keeper_core::hq::syncular::SyncularReplica;
+use keeper_ports::{Link, ReplicaSpec};
+use keeper_replica::SyncularReplica;
 use serde_json::{json, Map, Value};
 
 fn env(key: &str) -> String {

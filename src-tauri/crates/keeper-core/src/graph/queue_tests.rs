@@ -7,9 +7,9 @@ use serde_json::Map;
 
 use super::*;
 use crate::graph::protocol::change::ChangeOp;
-use crate::hq::port::fake::FakeOpener;
-use crate::hq::port::{Opener, ReplicaSpec};
 use crate::hq::sessions::Source;
+use keeper_ports::{Opener, ReplicaSpec};
+use keeper_testkit::FakeOpener;
 
 const SERVER: &str = "https://hq.example";
 const DB: &str = "work";

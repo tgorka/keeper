@@ -541,7 +541,7 @@ fn agent_target_lines_leave_without_their_message() {
         tracing::error!(target: "keeper_agent::served", path = "60-sessions/active/plan", "agentd: PRIVATE_SENTINEL turn");
         tracing::warn!(target: "keeper_core::hq::spoken", error = "PRIVATE_SENTINEL", "a provider error");
         tracing::warn!(target: "keeper::sync", "push held for PUBLIC_VISIBLE");
-        tracing::warn!(target: "keeper_core::hq::syncular", why = "PRIVATE_SENTINEL", "agents server not reached");
+        tracing::warn!(target: "keeper_replica", why = "PRIVATE_SENTINEL", "agents server not reached");
     });
     telemetry.capture_log(
         LogSite {
@@ -563,7 +563,7 @@ fn agent_target_lines_leave_without_their_message() {
     }
     assert!(payloads[0].contains("\"keeper_agent::served\""));
     assert!(payloads[1].contains("\"keeper_core::hq::spoken\""));
-    assert!(payloads[3].contains("\"keeper_core::hq::syncular\""));
+    assert!(payloads[3].contains("\"keeper_replica\""));
     assert!(payloads[4].contains("\"keeper_agent::tools\""));
     assert!(payloads[2].contains("push held for PUBLIC_VISIBLE"));
 }

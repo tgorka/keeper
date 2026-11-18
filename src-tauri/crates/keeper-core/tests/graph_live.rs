@@ -48,10 +48,10 @@ use keeper_core::graph::queue::{
     resume_sends, Binding, FenceCause, FenceState, GraphQueue, Restored, State,
 };
 use keeper_core::graph::source::{revocation_with, Revocation};
-use keeper_core::hq::port::{Link, ReplicaError, ReplicaSpec};
 use keeper_core::hq::server::ServerUrl;
 use keeper_core::hq::sessions::Source;
-use keeper_core::hq::syncular::SyncularReplica;
+use keeper_ports::{Link, ReplicaError, ReplicaSpec};
+use keeper_replica::SyncularReplica;
 use serde_json::{json, Map, Value};
 
 fn env(key: &str) -> String {
@@ -1638,8 +1638,7 @@ fn graph_live_1121_an_offline_intent_survives_a_restart_and_lands_once() {
             let client = GraphClient::new(source.clone());
             let request = saved_request(&saved);
             until(&source, "the first round", || {
-                (source.replica.state().link == keeper_core::hq::port::LinkState::Connected)
-                    .then_some(())
+                (source.replica.state().link == keeper_ports::LinkState::Connected).then_some(())
             });
             let states = resume_all(&lifecycle, &client);
             assert_eq!(states, vec![(request.request_id.clone(), State::Accepted)]);

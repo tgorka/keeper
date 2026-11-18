@@ -71,7 +71,7 @@ pub enum QueryError {
     #[error("sync_pending")]
     SyncPending,
     /// The server could not be reached: the request left this device and
-    /// its transport failed ([`crate::hq::port::ReplicaError::Unheard`] of a
+    /// its transport failed ([`keeper_ports::ReplicaError::Unheard`] of a
     /// remote query). Made only by a native remote's authority read, never
     /// from any other failure; its stable code is `sync_pending`, so callers
     /// that do not need the cause read it as one.
@@ -152,7 +152,7 @@ pub trait GraphRemote: Send + Sync {
 }
 
 /// A read-level authority answer, through the one classifier
-/// ([`crate::hq::port::ReplicaError::class`]): only the server refusing the
+/// ([`keeper_ports::ReplicaError::class`]): only the server refusing the
 /// caller (a refused credential or scope, or a refusal of its graph
 /// authority — an `operation.forbidden` message keeper does not name
 /// included) is `forbidden` ([`QueryError::CredentialRefused`] for the
@@ -164,8 +164,8 @@ pub trait GraphRemote: Send + Sync {
 /// an unreadable answer, a closed or non-syncing replica — is
 /// `sync_pending`, never a refusal and never unreachable. Nothing is
 /// delivered without a fresh answer.
-fn remote_error(error: crate::hq::port::ReplicaError) -> QueryError {
-    use crate::hq::port::{ErrorClass, ReplicaError};
+fn remote_error(error: keeper_ports::ReplicaError) -> QueryError {
+    use keeper_ports::{ErrorClass, ReplicaError};
     match (&error, error.class()) {
         (_, ErrorClass::Credential) => QueryError::CredentialRefused,
         (_, ErrorClass::Revoked | ErrorClass::Forbidden) => QueryError::Forbidden,
@@ -1057,7 +1057,7 @@ fn wall_clock_ms() -> i64 {
 pub struct HumanReader {
     reads: GraphReads,
     remote: Arc<dyn GraphRemote>,
-    replica: Arc<dyn crate::hq::port::Replica>,
+    replica: Arc<dyn keeper_ports::Replica>,
     actor: String,
     invalidated: Cancellation,
     lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
@@ -1114,7 +1114,7 @@ impl HumanReader {
     }
 
     fn link_refused(&self) -> bool {
-        self.replica.state().link == crate::hq::port::LinkState::Refused
+        self.replica.state().link == keeper_ports::LinkState::Refused
     }
 
     /// The server's read authority now; kept for offline reads when it

@@ -11,8 +11,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::hq::port::ReplicaSpec;
-use crate::hq::syncular::SyncularReplica;
+use keeper_ports::ReplicaSpec;
+use keeper_replica::SyncularReplica;
 
 const SESSION: &str = "dev1.1";
 const AGENT: &str = "nixie";

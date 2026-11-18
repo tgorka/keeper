@@ -10,11 +10,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::hq::port::fake::{FakeOpener, FakeReplica};
-use crate::hq::port::{LinkState, Opener, Rejection, ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, object, Source};
-use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, AgentMessageStateVm, Opened};
+use keeper_ports::{LinkState, Opener, Rejection, ReplicaSpec, RowOp};
+use keeper_replica::SyncularReplica;
+use keeper_testkit::{FakeOpener, FakeReplica};
 
 const ANA: &str = "ana";
 
@@ -37,7 +37,7 @@ fn spec(dir: &Path) -> ReplicaSpec {
     }
 }
 
-fn source(replica: Arc<dyn crate::hq::port::Replica>) -> Source {
+fn source(replica: Arc<dyn keeper_ports::Replica>) -> Source {
     Source {
         database: "alpha".to_owned(),
         replica,
@@ -692,8 +692,8 @@ fn a_chip_is_uploading_while_the_server_is_reachable_waiting_while_not_and_sent_
 
 /// The server's refusal of `blob.too_large` for the commit writing
 /// `commit_rows`, of the blob `refused` carry.
-fn upload_refusal(refused: &str, commit_rows: &[&str]) -> crate::hq::port::UploadRefusal {
-    crate::hq::port::UploadRefusal {
+fn upload_refusal(refused: &str, commit_rows: &[&str]) -> keeper_ports::UploadRefusal {
+    keeper_ports::UploadRefusal {
         commit_id: "c-1".to_owned(),
         blob_id: sha256(b"huge"),
         rejection: Rejection::new("blob.too_large", "too large"),
@@ -913,12 +913,12 @@ fn a_message_refused_for_one_files_upload_shows_that_file_refused_and_its_other_
         "blob.not_found",
     );
     // …after its upload was refused, which the replica kept beside itself.
-    crate::hq::blob_cache::AccessLog::open(&crate::hq::blob_cache::AccessLog::beside(
+    keeper_replica::blob_cache::AccessLog::open(&keeper_replica::blob_cache::AccessLog::beside(
         &dir.path().join("alpha.sqlite"),
     ))
     .expect("opens")
     .refuse(
-        &[crate::hq::port::UploadRefusal {
+        &[keeper_ports::UploadRefusal {
             commit_id: "c-1".to_owned(),
             blob_id: huge.clone(),
             rejection: Rejection::new("blob.too_large", "too large"),
@@ -979,7 +979,7 @@ fn eventually(what: &str, ready: impl Fn() -> bool) {
 #[test]
 fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explained_after_a_relaunch(
 ) {
-    use crate::hq::syncular::tests::{blob_server, bootstrapped, pins, puts, queued};
+    use keeper_testkit::{blob_server, bootstrapped, pins, puts, queued};
     use AgentAttachmentStateVm::*;
     let (huge, tiny, note) = (
         b"pretend these are 26 MB".to_vec(),
@@ -995,7 +995,7 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
     bootstrapped(&dir.path().join("alpha.sqlite"));
     let linked = || {
         let mut spec = spec(dir.path());
-        spec.link = Some(crate::hq::port::Link {
+        spec.link = Some(keeper_ports::Link {
             base_url: format!("http://127.0.0.1:{port}/alpha"),
             token: "0123456789abcdef".to_owned(),
         });
@@ -1037,7 +1037,7 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
         "the server refuses huge.zip, then a round goes past it",
         || {
             refused_at().is_some_and(|at| {
-                crate::hq::syncular::tests::pushed_after(&seen, at + 1)
+                keeper_testkit::pushed_after(&seen, at + 1)
                     && puts(&seen, &sha256(&note), 200) >= 1
                     && puts(&seen, &sha256(&tiny), 200) >= 1
             })
@@ -1082,7 +1082,7 @@ fn a_refused_upload_is_resolved_so_every_other_write_goes_on_and_it_stays_explai
     let alpha = linked();
     explained(&alpha);
     eventually("a round after the relaunch reaches its push", || {
-        crate::hq::syncular::tests::pushed_after(&seen, pushes)
+        keeper_testkit::pushed_after(&seen, pushes)
     });
     let refusals = seen
         .lock()
@@ -1108,7 +1108,7 @@ fn every_refusal_code_the_server_sends_reads_as_a_sentence_naming_the_file() {
         "hq.attachment_blob_size",
         "hq.v1.author_actor",
         "hq.v1.author_client",
-        crate::hq::port::CONFLICT,
+        keeper_ports::CONFLICT,
     ];
     for code in codes {
         let sentence = say(code);

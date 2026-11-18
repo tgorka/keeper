@@ -24,12 +24,12 @@ use keeper_core::hq::sessions::{
 };
 use keeper_core::hq::signin::OrgAccount;
 use keeper_core::hq::spoken::{FollowSlot, SpokenStep};
-use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::timeline::AgentSessionViewVm;
 use keeper_core::hq::vm::{HqEnrolmentVm, HqPairCodeVm, HqStatusVm};
 use keeper_core::hq::{Hq, HqError};
 use keeper_core::platform::Platform;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceAgentTargetVm};
+use keeper_replica::SyncularOpener;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};

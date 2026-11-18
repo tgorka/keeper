@@ -13,8 +13,8 @@ use super::protocol::request::Request;
 use super::protocol::Refusal;
 use super::queue::{next, FenceCause, Next, State};
 use super::write::{Caller, GraphWrite, Writer};
-use crate::hq::port::{CommandResult, LinkState, ReplicaError};
 use crate::notes::tags::normalise;
+use keeper_ports::{CommandResult, LinkState, ReplicaError};
 
 /// A port whose every remote answer is scripted; it records what it sent.
 struct Scripted {
@@ -136,7 +136,7 @@ fn applied() -> Result<CommandResult, ReplicaError> {
 /// failure that is not the server's answer is `Transport`.
 #[test]
 fn every_failure_has_its_typed_cause() {
-    use crate::hq::port::CREDENTIAL_REFUSED;
+    use keeper_ports::CREDENTIAL_REFUSED;
     let refusal = |message: &str| remote("operation.forbidden", message, false);
     let cases = [
         (refusal("graph_unavailable"), PendingCause::Unavailable),

@@ -10,7 +10,7 @@
 //! file, a view model or a log line. `GET /databases` says which databases
 //! the token opens, and the device holds one replica of each ([`databases`]),
 //! each with its own socket at `<base>/<database>/…` and its own owner thread
-//! ([`syncular`]). With no address, or no credential, everything written
+//! (the `keeper-replica` adapter). With no address, or no credential, everything written
 //! waits in a local replica's outbox and keeper makes no request to any
 //! agents server.
 //!
@@ -43,11 +43,11 @@
 
 pub mod approvals;
 pub mod attachments;
-pub mod blob_cache;
 pub mod commands;
 pub mod context;
 pub mod databases;
 pub mod default_agent;
+pub mod drive_writes;
 pub mod drives;
 pub mod grants;
 pub mod identity;
@@ -56,7 +56,6 @@ pub mod live;
 pub mod members;
 pub mod mention;
 pub mod pairing;
-pub mod port;
 pub mod push;
 pub mod routes;
 pub mod send;
@@ -65,7 +64,6 @@ pub mod sessions;
 pub mod settings;
 pub mod signin;
 pub mod spoken;
-pub mod syncular;
 pub mod thumbnails;
 pub mod timeline;
 pub mod vm;
@@ -87,7 +85,6 @@ use tokio::time::Instant;
 use crate::error::CoreError;
 use crate::hq::databases::Authorization;
 use crate::hq::pairing::PairingCode;
-use crate::hq::port::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Subscription};
 use crate::hq::routes::{RouteError, Routes};
 use crate::hq::server::ServerUrl;
 use crate::hq::vm::{
@@ -95,6 +92,7 @@ use crate::hq::vm::{
     HqSignInState, HqSignInVm, HqStatusVm, HqThisDeviceVm,
 };
 use crate::platform::{exclude_from_backup_best_effort, Platform};
+use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Subscription};
 
 /// The keychain item of a server's pairing: this prefix and the base URL.
 const KEYCHAIN_PREFIX: &str = "agents-server/";
@@ -932,7 +930,8 @@ impl Hq {
                 match answer {
                     Err(RouteError::Unreachable(why)) | Err(RouteError::Unexpected(why)) => {
                         failures = failures.saturating_add(1);
-                        let wait = syncular::backoff(failures);
+                        let exponent = failures.saturating_sub(1).min(6);
+                        let wait = Duration::from_secs((1u64 << exponent).min(60));
                         tracing::info!(%why, retry_in_ms = wait.as_millis() as u64, "agents server discovery failed");
                         tokio::time::sleep(wait).await;
                     }

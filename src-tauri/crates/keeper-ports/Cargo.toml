@@ -1,0 +1,16 @@
+[package]
+name = "keeper-ports"
+description = "Replica port shared by keeper clients"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }

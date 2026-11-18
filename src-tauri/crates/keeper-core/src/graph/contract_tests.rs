@@ -252,7 +252,7 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
 /// table through any other variable.
 #[test]
 fn compiled_schema_scopes_graph_tables_by_one_variable() {
-    let ir = crate::hq::syncular::schema().expect("schema");
+    let ir = keeper_replica::schema().expect("schema");
     assert_eq!(ir["schemaVersion"], SCHEMA_VERSION);
     let tables = ir["tables"].as_array().expect("tables");
     let scopes = |name: &str| -> Vec<(String, String)> {

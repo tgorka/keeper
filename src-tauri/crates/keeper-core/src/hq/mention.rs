@@ -36,7 +36,6 @@ use ts_rs::TS;
 
 use crate::hq::approvals::{self, Decisions, ShownApprovalVm};
 use crate::hq::live::{AgentLiveTurnVm, AgentViewPrefsVm};
-use crate::hq::port::{Rejection, ReplicaError, CONFLICT};
 use crate::hq::send::{self, SendError};
 use crate::hq::sessions::{
     self, int, mark, month, opt_text, read, text, title_from, truthy, AgentSessionRef, Source,
@@ -47,6 +46,7 @@ use crate::hq::timeline::{
 };
 use crate::hq::{Hq, HqError};
 use crate::vm::{ChatInlineKindVm, ChatInlinePreviewVm, ChatInlineRowVm};
+use keeper_ports::{Rejection, ReplicaError, CONFLICT};
 
 /// The longest handle query worth asking about (the composer's bound too).
 pub const MAX_QUERY: usize = 64;

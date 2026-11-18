@@ -10,10 +10,10 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::{parse, preview, refusal_sentence, start, MentionError};
-use crate::hq::port::{Rejection, ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, object, Source};
-use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, AgentMessageStateVm, AgentTimelineItemVm as Item, Opened};
+use keeper_ports::{Rejection, ReplicaSpec, RowOp};
+use keeper_replica::SyncularReplica;
 
 const ANA: &str = "ana";
 const NIXIE: &str = "nixie";
@@ -756,19 +756,19 @@ fn a_thread_older_than_the_parents_months_is_not_drawn() {
 /// Counts the rows every read of the replica returns: what a view costs,
 /// independent of the host's speed.
 struct Counting {
-    inner: Arc<dyn crate::hq::port::Replica>,
+    inner: Arc<dyn keeper_ports::Replica>,
     rows: std::sync::atomic::AtomicUsize,
 }
 
-impl crate::hq::port::Replica for Counting {
-    fn mutate(&self, ops: Vec<RowOp>) -> Result<String, crate::hq::port::ReplicaError> {
+impl keeper_ports::Replica for Counting {
+    fn mutate(&self, ops: Vec<RowOp>) -> Result<String, keeper_ports::ReplicaError> {
         self.inner.mutate(ops)
     }
     fn query(
         &self,
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<Map<String, Value>>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<Map<String, Value>>, keeper_ports::ReplicaError> {
         let rows = self.inner.query(sql, params)?;
         self.rows
             .fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst);
@@ -778,63 +778,54 @@ impl crate::hq::port::Replica for Counting {
         &self,
         sql: &str,
         params: &[Value],
-        base: &crate::hq::port::WindowBase,
+        base: &keeper_ports::WindowBase,
         units: &[String],
-    ) -> Result<crate::hq::port::Covered, crate::hq::port::ReplicaError> {
+    ) -> Result<keeper_ports::Covered, keeper_ports::ReplicaError> {
         let covered = self.inner.query_covered(sql, params, base, units)?;
         self.rows
             .fetch_add(covered.0.len(), std::sync::atomic::Ordering::SeqCst);
         Ok(covered)
     }
-    fn subscribe(
-        &self,
-        s: crate::hq::port::Subscription,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    fn subscribe(&self, s: keeper_ports::Subscription) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.subscribe(s)
     }
     fn set_window(
         &self,
-        base: &crate::hq::port::WindowBase,
+        base: &keeper_ports::WindowBase,
         units: &[String],
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    ) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.set_window(base, units)
     }
     fn window_state(
         &self,
-        base: &crate::hq::port::WindowBase,
-    ) -> Result<crate::hq::port::WindowState, crate::hq::port::ReplicaError> {
+        base: &keeper_ports::WindowBase,
+    ) -> Result<keeper_ports::WindowState, keeper_ports::ReplicaError> {
         self.inner.window_state(base)
     }
     fn set_presence(
         &self,
         key: &str,
         doc: Option<Value>,
-    ) -> Result<(), crate::hq::port::ReplicaError> {
+    ) -> Result<(), keeper_ports::ReplicaError> {
         self.inner.set_presence(key, doc)
     }
-    fn presence(
-        &self,
-        key: &str,
-    ) -> Result<Vec<crate::hq::port::Peer>, crate::hq::port::ReplicaError> {
+    fn presence(&self, key: &str) -> Result<Vec<keeper_ports::Peer>, keeper_ports::ReplicaError> {
         self.inner.presence(key)
     }
     fn commit_with_blobs(
         &self,
-        b: Vec<crate::hq::port::BlobBody>,
+        b: Vec<keeper_ports::BlobBody>,
         ops: Vec<RowOp>,
-    ) -> Result<String, crate::hq::port::ReplicaError> {
+    ) -> Result<String, keeper_ports::ReplicaError> {
         self.inner.commit_with_blobs(b, ops)
     }
-    fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
+    fn fetch_blob(&self, b: &str) -> Result<Vec<u8>, keeper_ports::ReplicaError> {
         self.inner.fetch_blob(b)
     }
-    fn cached_blob(&self, b: &str) -> Result<Vec<u8>, crate::hq::port::ReplicaError> {
+    fn cached_blob(&self, b: &str) -> Result<Vec<u8>, keeper_ports::ReplicaError> {
         self.inner.cached_blob(b)
     }
-    fn delivery(
-        &self,
-        commit: &str,
-    ) -> Result<crate::hq::port::Delivery, crate::hq::port::ReplicaError> {
+    fn delivery(&self, commit: &str) -> Result<keeper_ports::Delivery, keeper_ports::ReplicaError> {
         self.inner.delivery(commit)
     }
     fn row_writes(
@@ -842,43 +833,43 @@ impl crate::hq::port::Replica for Counting {
         table: &str,
         row_id: &str,
         field: Option<&str>,
-    ) -> Result<crate::hq::port::RowWrites, crate::hq::port::ReplicaError> {
+    ) -> Result<keeper_ports::RowWrites, keeper_ports::ReplicaError> {
         self.inner.row_writes(table, row_id, field)
     }
     fn refused_commits(
         &self,
         table: &str,
-    ) -> Result<Vec<crate::hq::port::RefusedCommit>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<keeper_ports::RefusedCommit>, keeper_ports::ReplicaError> {
         self.inner.refused_commits(table)
     }
     fn granted(
         &self,
         table: &str,
         variable: &str,
-    ) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<String>, keeper_ports::ReplicaError> {
         self.inner.granted(table, variable)
     }
-    fn revoked_units(&self, table: &str) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+    fn revoked_units(&self, table: &str) -> Result<Vec<String>, keeper_ports::ReplicaError> {
         self.inner.revoked_units(table)
     }
-    fn upload_refusals(&self) -> Vec<crate::hq::port::UploadRefusal> {
+    fn upload_refusals(&self) -> Vec<keeper_ports::UploadRefusal> {
         self.inner.upload_refusals()
     }
-    fn blob_cache_bytes(&self) -> Result<u64, crate::hq::port::ReplicaError> {
+    fn blob_cache_bytes(&self) -> Result<u64, keeper_ports::ReplicaError> {
         self.inner.blob_cache_bytes()
     }
     fn mutate_superseding(
         &self,
         ops: Vec<RowOp>,
         earlier: Vec<String>,
-    ) -> Result<String, crate::hq::port::ReplicaError> {
+    ) -> Result<String, keeper_ports::ReplicaError> {
         self.inner.mutate_superseding(ops, earlier)
     }
     fn remote_query(
         &self,
         id: &str,
         params: Value,
-    ) -> Result<Vec<Map<String, Value>>, crate::hq::port::ReplicaError> {
+    ) -> Result<Vec<Map<String, Value>>, keeper_ports::ReplicaError> {
         self.inner.remote_query(id, params)
     }
     fn remote_command(
@@ -886,16 +877,16 @@ impl crate::hq::port::Replica for Counting {
         id: &str,
         request: &str,
         params: Value,
-    ) -> Result<crate::hq::port::CommandResult, crate::hq::port::ReplicaError> {
+    ) -> Result<keeper_ports::CommandResult, keeper_ports::ReplicaError> {
         self.inner.remote_command(id, request, params)
     }
     fn sync_now(&self) {
         self.inner.sync_now();
     }
-    fn state(&self) -> crate::hq::port::ReplicaState {
+    fn state(&self) -> keeper_ports::ReplicaState {
         self.inner.state()
     }
-    fn watch(&self) -> tokio::sync::watch::Receiver<crate::hq::port::ReplicaState> {
+    fn watch(&self) -> tokio::sync::watch::Receiver<keeper_ports::ReplicaState> {
         self.inner.watch()
     }
     fn close(&self) {
@@ -974,7 +965,7 @@ fn a_threads_history_is_not_read_by_its_parent() {
         rows: std::sync::atomic::AtomicUsize::new(0),
     });
     let source = Source {
-        replica: Arc::clone(&counting) as Arc<dyn crate::hq::port::Replica>,
+        replica: Arc::clone(&counting) as Arc<dyn keeper_ports::Replica>,
         ..w.alpha.clone()
     };
     let read = || {

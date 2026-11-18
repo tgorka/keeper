@@ -12,11 +12,11 @@ use serde_json::{json, Value};
 
 use super::{add, leave, remove, set_reader, view, AgentMemberRoleVm};
 use crate::hq::approvals::{self, Decisions};
-use crate::hq::port::{Rejection, ReplicaError, ReplicaSpec, RowOp};
 use crate::hq::sessions::{self, names, object, Source};
-use crate::hq::syncular::SyncularReplica;
 use crate::hq::timeline::{self, Opened};
 use crate::hq::window_tests::Staged;
+use keeper_ports::{Rejection, ReplicaError, ReplicaSpec, RowOp};
+use keeper_replica::SyncularReplica;
 
 const ANA: &str = "ana";
 const BEN: &str = "ben";
@@ -943,7 +943,7 @@ fn an_unreadable_answer_keeps_its_request_and_a_retry_replays_it() {
         database: "alpha".to_owned(),
         path: dir.path().join("alpha-linked.sqlite"),
         client_id: Some("ana.dev".to_owned()),
-        link: Some(crate::hq::port::Link {
+        link: Some(keeper_ports::Link {
             base_url: format!("http://127.0.0.1:{port}/alpha"),
             token: "0123456789abcdef".to_owned(),
         }),

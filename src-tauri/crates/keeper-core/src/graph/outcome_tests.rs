@@ -14,9 +14,9 @@ use super::outcome::{
 use super::protocol::request::{self, Request};
 use super::protocol::scope::receipt_id;
 use super::protocol::Refusal;
-use crate::hq::port::fake::{FakeOpener, FakeReplica};
-use crate::hq::port::{CommandResult, Opener, ReplicaError, ReplicaSpec};
 use crate::hq::sessions::Source;
+use keeper_ports::{CommandResult, Opener, ReplicaError, ReplicaSpec};
+use keeper_testkit::{FakeOpener, FakeReplica};
 
 const REQUEST: &str = "01JD0000000000000000000009";
 const OTHER_REQUEST: &str = "01JD000000000000000000000A";

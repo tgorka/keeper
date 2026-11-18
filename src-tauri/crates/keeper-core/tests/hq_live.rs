@@ -41,12 +41,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keeper_core::error::CoreError;
-use keeper_core::hq::port::{Replica, RowOp, Subscription};
 use keeper_core::hq::routes::HttpRoutes;
-use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::vm::{HqDatabaseState, HqPhase, HqStatusVm};
 use keeper_core::hq::Hq;
 use keeper_core::platform::Platform;
+use keeper_ports::{Replica, RowOp, Subscription};
+use keeper_replica::SyncularOpener;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -2064,8 +2064,8 @@ async fn until<T>(
 }
 
 /// What became of `commit` once the server answered it.
-async fn delivered(replica: &Arc<dyn Replica>, commit: &str) -> keeper_core::hq::port::Delivery {
-    use keeper_core::hq::port::Delivery;
+async fn delivered(replica: &Arc<dyn Replica>, commit: &str) -> keeper_ports::Delivery {
+    use keeper_ports::Delivery;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let delivery = replica.delivery(commit).expect("reads");
@@ -2106,7 +2106,7 @@ async fn count(replica: &Arc<dyn Replica>, table: &str, session: &str) -> u64 {
 #[ignore = "needs a running agents server and an agent instance in each database; see the module docs"]
 async fn many_people_in_one_session_by_the_owner_and_the_server() {
     use keeper_core::hq::live::{AgentViewModeVm, AgentViewPrefsPatch};
-    use keeper_core::hq::port::Delivery;
+    use keeper_ports::Delivery;
 
     let server = env("KEEPER_HQ_LIVE_URL");
     let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
@@ -3034,8 +3034,8 @@ async fn off<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> T 
 #[ignore = "needs a running agents server; see the module docs"]
 async fn attachments_upload_before_reference_open_on_demand_and_are_refused_where_they_must_be() {
     use keeper_core::hq::attachments::{AgentAttachmentStateVm as Chip, ATTACHMENT_MAX_BYTES};
-    use keeper_core::hq::port::{BlobBody, Delivery};
     use keeper_core::hq::timeline::AgentMessageStateVm;
+    use keeper_ports::{BlobBody, Delivery};
 
     let server = env("KEEPER_HQ_LIVE_URL");
     let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
@@ -3548,7 +3548,7 @@ async fn attachments_upload_before_reference_open_on_demand_and_are_refused_wher
     assert_eq!(refusal.rejection.code, "blob.too_large");
     assert_eq!(refusal.commit_id, refused_commit);
     let too_large_sentence = keeper_core::hq::attachments::refusal_sentence(
-        &keeper_core::hq::port::Rejection::new("blob.too_large", ""),
+        &keeper_ports::Rejection::new("blob.too_large", ""),
         "huge.zip",
     );
     // Resolved: the commit goes without the body and the server refuses

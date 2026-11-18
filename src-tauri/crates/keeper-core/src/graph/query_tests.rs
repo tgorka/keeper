@@ -21,10 +21,10 @@ use crate::graph::protocol::scope::event_op_id;
 use crate::graph::protocol::worker::InspectEntity;
 use crate::graph::runtime::VerifiedWorker;
 use crate::graph::source::{Checkpoint, PrefixBatch, SourceError};
-use crate::hq::port::{ReplicaSpec, RowOp};
 use crate::hq::sessions::Source;
-use crate::hq::syncular::SyncularReplica;
 use crate::notes::tags::normalise;
+use keeper_ports::{ReplicaSpec, RowOp};
+use keeper_replica::SyncularReplica;
 
 const DB: &str = "work";
 
@@ -1315,7 +1315,7 @@ fn checkpoint_rows_decide_the_scope() {
 /// `SyncPending`, never `Unreachable`.
 #[test]
 fn a_native_authority_failure_is_typed_by_its_cause() {
-    use crate::hq::port::{ReplicaError, CREDENTIAL_REFUSED};
+    use keeper_ports::{ReplicaError, CREDENTIAL_REFUSED};
     let remote = |code: &str, message: &str, retryable: bool| ReplicaError::Remote {
         code: code.to_owned(),
         message: message.to_owned(),
@@ -1978,7 +1978,7 @@ mod offline {
     /// domain unlocked, and the next healthy answer reads current.
     #[tokio::test(flavor = "current_thread")]
     async fn a_transient_server_error_never_fences() {
-        use crate::hq::port::ReplicaError;
+        use keeper_ports::ReplicaError;
         let answered = |code: &str, message: &str, retryable: bool| {
             Step::Fail(remote_error(ReplicaError::Remote {
                 code: code.to_owned(),

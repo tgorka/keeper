@@ -39,12 +39,12 @@ use serde_json::{Map, Value};
 use ts_rs::TS;
 
 use crate::asset_url::{self, UrlForm};
-use crate::hq::port::{BlobBody, LinkState, Rejection, ReplicaError, RowOp, UploadRefusal};
 use crate::hq::send::activity;
 use crate::hq::sessions::{
     authored, int, now_ms, object, person_message, read, text, AgentSessionRef, Source,
 };
 use crate::hq::timeline::session_row;
+use keeper_ports::{BlobBody, LinkState, Rejection, ReplicaError, RowOp, UploadRefusal};
 
 /// The contract's bounds, `syncular/limits.json`, compiled into keeper.
 const LIMITS: &str = include_str!("../../../../../syncular/limits.json");
@@ -488,7 +488,7 @@ pub fn refusal_sentence(rejection: &Rejection, name: &str) -> String {
         "hq.v1.author_actor" | "hq.v1.author_client" => format!(
             "The agents server refused {name}: the message was written in another person's or device's name."
         ),
-        crate::hq::port::CONFLICT => {
+        keeper_ports::CONFLICT => {
             format!("Another device changed this conversation first, so {name} was not sent.")
         }
         _ => format!("The agents server refused {name}: {rejection}."),

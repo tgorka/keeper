@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::hq::port::{Peer, RowOp};
 use crate::hq::sessions::{
     authored, int, json, names, object, opt_text, read, text, truthy, Source,
 };
+use keeper_ports::{Peer, RowOp};
 
 /// How long a claim's row may stay unchanged, as this device has watched
 /// it, before its holder is taken for gone: the runtime's lease (104.5),
@@ -800,7 +800,7 @@ pub fn tools(source: &Source, session_id: &str, agent_actor: &str) -> Vec<AgentS
 pub fn running_turns(
     source: &Source,
     session_id: &str,
-) -> Result<Vec<String>, crate::hq::port::ReplicaError> {
+) -> Result<Vec<String>, keeper_ports::ReplicaError> {
     Ok(source
         .replica
         .query(

@@ -1,4 +1,4 @@
-//! The one adapter of [`crate::hq::port`]: a `syncular_client::SyncClient` on
+//! The one adapter of `keeper-ports`: a `syncular_client::SyncClient` on
 //! a replica file, driven as a blocking host (SPEC §8.4) on its own owner
 //! thread, with realtime over the `native-transport` WebSocket.
 //!
@@ -18,7 +18,7 @@
 //! same file (`FileQuerySnapshotReader`, WAL), so a read never queues behind a
 //! round.
 //!
-//! The blob cache (`hq::blob_cache`): the client's own cap is set from
+//! The blob cache (`blob_cache`): the client's own cap is set from
 //! [`BLOB_CACHE_MAX_BYTES`], and the owner keeps the cached bodies under it
 //! by keeper's rule — least recently used first, never a body the outbox
 //! pins — through a third connection on the same file, used only on the
@@ -45,8 +45,8 @@ use syncular_client::{
 };
 use tokio::sync::watch;
 
-use crate::hq::blob_cache::{evictions, AccessLog, CachedBlob, StagedBlob, BLOB_CACHE_MAX_BYTES};
-use crate::hq::port::{
+use crate::blob_cache::{evictions, AccessLog, CachedBlob, StagedBlob, BLOB_CACHE_MAX_BYTES};
+use keeper_ports::{
     BlobBody, Covered, Delivery, LinkState, Opener, Peer, Refusal, RefusedCommit, Rejection,
     Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, RowWrites, Subscription,
     UploadRefusal, WindowBase, WindowState, CONFLICT, CREDENTIAL_REFUSED,
@@ -62,7 +62,7 @@ const ROUND_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// The contract's schema IR, compiled into keeper (`syncular/`).
-const SCHEMA_IR: &str = include_str!("../../../../../syncular/syncular.ir.json");
+const SCHEMA_IR: &str = include_str!("../../../../syncular/syncular.ir.json");
 
 /// The contract's schema, parsed once.
 static SCHEMA: LazyLock<Result<Value, String>> =
@@ -73,6 +73,13 @@ pub fn schema() -> Result<&'static Value, ReplicaError> {
     SCHEMA
         .as_ref()
         .map_err(|error| ReplicaError::Client(format!("the contract's schema: {error}")))
+}
+
+pub mod blob_cache;
+mod limits;
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// The code a request refused by a closed gate fails with.
@@ -658,7 +665,7 @@ impl BlobCache {
 
     /// `blob_id` was opened or written now.
     fn touch(&self, database: &str, blob_id: &str) {
-        if let Err(error) = self.log.touch(blob_id, crate::hq::sessions::now_ms()) {
+        if let Err(error) = self.log.touch(blob_id, now_ms()) {
             tracing::debug!(%database, %error, "a blob's last use was not recorded");
         }
     }
@@ -1237,7 +1244,7 @@ impl Owner {
             Command::CachedBlob(blob, reply) => {
                 let bytes = self.cache.bodies.query_row(
                     "SELECT bytes FROM _syncular_blobs WHERE blob_id = ?1 AND byte_length <= ?2 AND length(bytes) <= ?2",
-                    rusqlite::params![blob, super::attachments::ATTACHMENT_MAX_BYTES],
+                    rusqlite::params![blob, crate::limits::ATTACHMENT_MAX_BYTES],
                     |row| row.get::<_, Vec<u8>>(0),
                 ).map_err(|error| ReplicaError::Client(error.to_string()));
                 let _ = reply.send(bytes);
@@ -1362,7 +1369,7 @@ impl Owner {
         let kept = self
             .cache
             .log
-            .refuse(&refusals, crate::hq::sessions::now_ms())
+            .refuse(&refusals, now_ms())
             .and_then(|()| self.cache.release(blob_id));
         if let Err(error) = kept {
             tracing::warn!(database = %self.database, %error, "a refused upload could not be resolved");
@@ -1774,7 +1781,7 @@ impl Owner {
 }
 
 /// The transport configuration of a link, and its server's origin.
-fn link_config(link: &crate::hq::port::Link) -> Result<(Value, url::Origin), ReplicaError> {
+fn link_config(link: &keeper_ports::Link) -> Result<(Value, url::Origin), ReplicaError> {
     let origin = url::Url::parse(&link.base_url)
         .map_err(|error| ReplicaError::Client(format!("the server's address: {error}")))?
         .origin();
@@ -2232,7 +2239,7 @@ impl Replica for SyncularReplica {
         operation_id: &str,
         request_id: &str,
         params: Value,
-    ) -> Result<super::port::CommandResult, ReplicaError> {
+    ) -> Result<keeper_ports::CommandResult, ReplicaError> {
         let Some(remote) = &self.remote else {
             return Err(ReplicaError::NotSyncing);
         };
@@ -2268,7 +2275,7 @@ impl Replica for SyncularReplica {
                 })
             }
         };
-        Ok(super::port::CommandResult {
+        Ok(keeper_ports::CommandResult {
             request_id: answer.request_id,
             commit_seq: answer.commit_seq,
             cached,
@@ -2320,6 +2327,7 @@ impl Opener for SyncularOpener {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use keeper_testkit::{blob_server, bootstrapped, pins, pushed_after, puts, queued};
     use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
     use syncular_client::SyncReport;
@@ -3316,7 +3324,7 @@ pub(crate) mod tests {
             database: "alpha".to_owned(),
             path: dir.join("alpha.sqlite"),
             client_id: Some("ana.1".to_owned()),
-            link: Some(crate::hq::port::Link {
+            link: Some(keeper_ports::Link {
                 base_url: format!("http://127.0.0.1:{port}/alpha"),
                 token: "0123456789abcdef".to_owned(),
             }),
@@ -3532,7 +3540,7 @@ pub(crate) mod tests {
             "id": id,
             "session_id": "local.1",
             "message_id": message,
-            "blob_ref": crate::hq::attachments::blob_ref(&sha(bytes), bytes.len() as u64, None, None),
+            "blob_ref": format!("{{\"blobId\":\"{}\",\"byteLength\":{}}}", sha(bytes), bytes.len()),
             "name": format!("{id}.bin"),
             "mime": "application/octet-stream",
             "size": bytes.len(),
@@ -3547,134 +3555,6 @@ pub(crate) mod tests {
             values,
             base_version: None,
         }
-    }
-
-    /// The blobs the replica file still queues for upload.
-    pub(crate) fn queued(path: &std::path::Path) -> Vec<String> {
-        let conn = rusqlite::Connection::open(path).expect("opens");
-        let mut ids: Vec<String> = conn
-            .prepare("SELECT blob_id FROM _syncular_blob_uploads")
-            .expect("prepares")
-            .query_map([], |row| row.get(0))
-            .expect("reads")
-            .collect::<Result<_, _>>()
-            .expect("reads");
-        ids.sort();
-        ids
-    }
-
-    /// The commits that pin each blob in the replica file, `(commit, blob)`.
-    pub(crate) fn pins(path: &std::path::Path) -> Vec<(String, String)> {
-        let conn = rusqlite::Connection::open(path).expect("opens");
-        let mut pins: Vec<(String, String)> = conn
-            .prepare("SELECT commit_id, blob_id FROM _syncular_blob_commit_refs")
-            .expect("prepares")
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("reads")
-            .collect::<Result<_, _>>()
-            .expect("reads");
-        pins.sort();
-        pins
-    }
-
-    /// Mark the replica at `path` as bootstrapped against its server, as its
-    /// first round would: from then on a round uploads what is staged.
-    pub(crate) fn bootstrapped(path: &std::path::Path) {
-        let conn = rusqlite::Connection::open(path).expect("opens");
-        conn.busy_timeout(Duration::from_secs(5)).expect("timeout");
-        conn.execute(
-            "INSERT OR REPLACE INTO _syncular_meta (key, value) VALUES ('logEpoch', 'epoch-1')",
-            [],
-        )
-        .expect("bootstraps");
-    }
-
-    /// What a blob server saw: each request's method and path, and the
-    /// status it answered.
-    pub(crate) type Seen = Arc<Mutex<Vec<(String, String, u16)>>>;
-
-    /// A server for the blob half of a round: an upload grant is answered
-    /// `{}` (no signed URL: `PUT` it here) and a `PUT` `200`, unless
-    /// `refused` names the blob (then that status, on both); anything else
-    /// — the round's push, the socket — `503`: the network cut after the
-    /// upload and before the metadata exchange.
-    pub(crate) fn blob_server(refused: Vec<(String, u16)>) -> (u16, Seen) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
-        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut request = Vec::new();
-                let mut buf = [0u8; 8192];
-                let head_end = loop {
-                    if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break Some(at + 4);
-                    }
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break None,
-                        Ok(n) => request.extend_from_slice(&buf[..n]),
-                    }
-                };
-                let Some(head_end) = head_end else { continue };
-                let head = String::from_utf8_lossy(&request[..head_end]).to_string();
-                let length: usize = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().ok())?
-                    })
-                    .unwrap_or(0);
-                while request.len() < head_end + length {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => request.extend_from_slice(&buf[..n]),
-                    }
-                }
-                let mut words = head.split_whitespace();
-                let method = words.next().unwrap_or_default().to_owned();
-                let path = words.next().unwrap_or_default().to_owned();
-                let refusal = refused
-                    .iter()
-                    .find(|(blob, _)| path.contains(blob.as_str()))
-                    .map(|(_, status)| *status);
-                let (status, body) = match (method.as_str(), refusal) {
-                    (_, Some(status)) if path.contains("/blobs/") => (status, "{}"),
-                    ("POST", None) if path.ends_with("/upload-grant") => (200, "{}"),
-                    ("PUT", None) if path.contains("/blobs/") => (200, "{}"),
-                    _ => (503, r#"{"error":"unavailable"}"#),
-                };
-                log.lock().expect("seen").push((method, path, status));
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        (port, seen)
-    }
-
-    /// How many `PUT`s of `blob` the server answered with `status`.
-    pub(crate) fn puts(seen: &Seen, blob: &str, status: u16) -> usize {
-        seen.lock()
-            .expect("seen")
-            .iter()
-            .filter(|(method, path, answered)| {
-                method == "PUT" && path.ends_with(blob) && *answered == status
-            })
-            .count()
-    }
-
-    /// Whether a round reached its push (`/sync`) after `after` requests.
-    pub(crate) fn pushed_after(seen: &Seen, after: usize) -> bool {
-        seen.lock()
-            .expect("seen")
-            .iter()
-            .skip(after)
-            .any(|(method, path, _)| method == "POST" && path.ends_with("/sync"))
     }
 
     #[test]

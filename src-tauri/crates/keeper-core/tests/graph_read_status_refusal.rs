@@ -21,9 +21,9 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use keeper_core::graph::query::{GraphRemote, QueryError};
-use keeper_core::hq::port::{Link, ReplicaSpec};
 use keeper_core::hq::sessions::Source;
-use keeper_core::hq::syncular::SyncularReplica;
+use keeper_ports::{Link, ReplicaSpec};
+use keeper_replica::SyncularReplica;
 use serde_json::{json, Value};
 
 /// syncular's tagged operation value encoding.

@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use keeper_core::agents::drive_write::{Refusal, MAX_FILE_BYTES};
-use keeper_core::hq::port::{
+use keeper_core::hq::drive_writes::{
     DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
 };
 use keeper_sync::engine::{blob_id, CommitFence, CommitPaths, CommitRequest, Engine};

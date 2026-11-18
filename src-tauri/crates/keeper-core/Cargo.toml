@@ -11,6 +11,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+keeper-ports = { path = "../keeper-ports" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -140,11 +141,6 @@ prost = "0.14"
 # back from a real `fmt` subscriber (Epic 100). Already in the workspace
 # catalog and linked by every host, so no new crate is resolved.
 tracing-subscriber = { workspace = true }
-# The agents' database (AD-418, AD-421): one replica per database the device's
-# token opens, each driven on its own owner thread (`hq`). The port is
-# `hq::port`; this crate is its one adapter (`hq::syncular`). tauri- and
-# gix-free; its SQLite is the workspace's rusqlite.
-syncular-client = { workspace = true }
 
 # Graph worker launch checks (110.5, OD-A delta §4.4): P6c's soft stack
 # limit, the spawning thread's `no_new_privs`, the page and signal-frame
@@ -162,6 +158,10 @@ landlock = "=0.4.7"
 human-reads = []
 
 [dev-dependencies]
+keeper-replica = { path = "../keeper-replica" }
+keeper-testkit = { path = "../keeper-testkit" }
+# Outcome-journal fixtures only; production code depends on keeper-ports.
+syncular-client = { workspace = true }
 # The privacy lifecycle tests observe real localhost connection/cancellation;
 # the display-name bound is measured on tokio's paused clock.
 tokio = { workspace = true, features = ["net", "test-util"] }
@@ -181,7 +181,3 @@ matrix-sdk-base = "0.19"
 # The container move's tests (Epic 98) move real directories; already in the
 # graph through keeper-sync.
 tempfile = { workspace = true }
-# The agents adapter's socket-generation test (106.5, R1065-06) plays the
-# server's end of a realtime socket; already in the graph through
-# syncular-client's native transport.
-tungstenite = "0.30"

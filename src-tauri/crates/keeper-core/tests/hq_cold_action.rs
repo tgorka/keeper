@@ -15,9 +15,9 @@ use std::time::Duration;
 use keeper_core::error::CoreError;
 use keeper_core::hq::routes::HttpRoutes;
 use keeper_core::hq::server::ServerUrl;
-use keeper_core::hq::syncular::SyncularOpener;
 use keeper_core::hq::Hq;
 use keeper_core::platform::Platform;
+use keeper_replica::SyncularOpener;
 
 const HOST: &str = "kalypso";
 const LAYERED: &str = "https://agents.layer.example.org";
