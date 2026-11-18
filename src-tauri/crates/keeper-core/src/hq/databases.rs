@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::hq::routes::is_database_name;
-use crate::hq::server::ServerUrl;
+use keeper_ports::server::ServerUrl;
 
 /// The directory under the data dir every replica lives in.
 pub fn root(data_dir: &Path) -> PathBuf {
@@ -102,20 +102,6 @@ pub fn projection(data_dir: &Path, server: &ServerUrl, database: &str, actor: &s
         .join(database)
         .join(format!("{actor}.projection"))
 }
-
-/// The graph intent queue of one database's replica of `actor` (112.1): the
-/// device-local changes not yet resolved, the revocation fence and the last
-/// read authority, beside the replica under the same trusted
-/// server/database/actor identity. Never synced and never inside
-/// Syncular's own file; forgetting the server removes it with the replicas.
-pub fn graph_queue(data_dir: &Path, server: &ServerUrl, database: &str, actor: &str) -> PathBuf {
-    server_dir(data_dir, server)
-        .join(database)
-        .join(format!("{actor}.{GRAPH_QUEUE_EXTENSION}"))
-}
-
-/// The extension of every [`graph_queue`] file.
-pub const GRAPH_QUEUE_EXTENSION: &str = "graph-queue";
 
 /// The databases of `server` this device already holds a replica of for
 /// `actor`, by name.
@@ -208,6 +194,20 @@ mod tests {
         );
         // A server named `local` is not the local store.
         assert!(!server_dir(data, &server("http://local")).starts_with(root(data).join("local")));
+    }
+
+    /// The graph client's queue rule (`keeper_graph::queue::beside`) puts a
+    /// replica's intent queue beside it, under this layout's
+    /// server/database/actor directory, so forgetting the server removes it.
+    #[test]
+    fn the_graph_queue_lies_beside_its_replica() {
+        let data = Path::new("/data");
+        let a = server("http://100.64.0.7:8790");
+        let at = replica(data, &a, "alpha", "ana");
+        let queue = keeper_graph::queue::beside(&at, "ana");
+        assert_eq!(queue.parent(), at.parent());
+        assert_eq!(queue.file_name(), Some("ana.graph-queue".as_ref()));
+        assert!(queue.starts_with(server_dir(data, &a)));
     }
 
     #[test]

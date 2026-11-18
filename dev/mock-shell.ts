@@ -5902,7 +5902,7 @@ function mockCancelHeld(payload: Record<string, unknown>): HeldRestoreVm | Promi
 
 /**
  * The agents server (Epic 106, `keeper_core::hq`). Every sentence is copied from `hq::vm`;
- * the address grammar is Rust's (`hq::server::ServerUrl::parse`) and this answers its common
+ * the address grammar is Rust's (`keeper_ports::server::ServerUrl::parse`) and this answers its common
  * shapes. Names are invented: databases `alpha` and `beta`, the person's devices "keeper on
  * laptop" and "keeper on phone". `?hq=` picks the state Settings › Agents › Agents server
  * opens on: absent — no server; `connected` — paired, both databases connected; `notopen` —

@@ -1,0 +1,47 @@
+[package]
+name = "keeper-graph"
+description = "keeper's knowledge graph client: requests, outcomes, the intent queue, typed reads and the confined query worker's supervisor"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# First-party normal edges are the contract and the port only (G3, DF/AD-3).
+[dependencies]
+keeper-graph-protocol = { path = "../keeper-graph-protocol" }
+keeper-ports = { path = "../keeper-ports" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
+ulid = { workspace = true }
+
+# Graph worker launch checks (110.5, OD-A delta §4.4): P6c's soft stack
+# limit, the spawning thread's `no_new_privs`, the page and signal-frame
+# sizes, `security.capability`, and the Landlock ABI probe. Safe bindings;
+# both are already agentd dependencies (D-33).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["thread", "param"] }
+landlock = "=0.4.7"
+
+[features]
+# A person's graph reader (`query::HumanReader`). Only keeper's headless
+# driver (`keeper-graph-driver`) enables it; no other crate and no default
+# does (`scripts/check-graph-boundary.py`), so no agent tool can obtain one.
+human-reads = []
+
+[dev-dependencies]
+keeper-replica = { path = "../keeper-replica" }
+keeper-testkit = { path = "../keeper-testkit" }
+# The tests open real replicas and read the adapter's schema.
+syncular-client = { workspace = true }
+# The privacy lifecycle tests observe real localhost connection/cancellation.
+tokio = { workspace = true, features = ["net", "test-util"] }
+tempfile = { workspace = true }

@@ -46,10 +46,11 @@ use ts_rs::TS;
 
 use crate::hq::sessions::{
     self, authored, int, json, names, object, opt_text, read, text, AgentNoteSessionVm,
-    AgentSessionRef, Source,
+    AgentSessionRef,
 };
 use crate::hq::timeline::{self, SessionRow};
 use crate::hq::{lock, Hq, HqError};
+use keeper_ports::Source;
 use keeper_ports::{Rejection, ReplicaError, RowOp, CONFLICT};
 
 const TABLE: &str = "session_drives";

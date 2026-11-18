@@ -14,7 +14,7 @@ use super::outcome::{
 use super::protocol::request::{self, Request};
 use super::protocol::scope::receipt_id;
 use super::protocol::Refusal;
-use crate::hq::sessions::Source;
+use keeper_ports::Source;
 use keeper_ports::{CommandResult, Opener, ReplicaError, ReplicaSpec};
 use keeper_testkit::{FakeOpener, FakeReplica};
 
@@ -779,7 +779,7 @@ fn every_key_dimension_separates_requests() {
 /// `reversal_conflict`), never on a receipt field a conflict lacks.
 #[test]
 fn outcome_codes_follow_the_shared_vectors() {
-    const CORPUS: &str = include_str!("../../../../../syncular/knowledge-graph.vectors.json");
+    const CORPUS: &str = include_str!("../../../../syncular/knowledge-graph.vectors.json");
     let corpus: Value = serde_json::from_str(CORPUS).expect("vectors");
     let (_, owner) = owner("work");
     for entry in corpus["outcomes"].as_array().expect("outcomes") {

@@ -11,7 +11,7 @@ edition.workspace = true
 workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-keeper-core = { path = "../keeper-core", features = ["human-reads"] }
+keeper-graph = { path = "../keeper-graph", features = ["human-reads"] }
 keeper-ports = { path = "../keeper-ports" }
 keeper-replica = { path = "../keeper-replica" }
 clap = { workspace = true }

@@ -22,9 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::hq::sessions::{
-    authored, int, json, names, object, opt_text, read, text, truthy, Source,
-};
+use crate::hq::sessions::{authored, int, json, names, object, opt_text, read, text, truthy};
+use keeper_ports::Source;
 use keeper_ports::{Peer, RowOp};
 
 /// How long a claim's row may stay unchanged, as this device has watched

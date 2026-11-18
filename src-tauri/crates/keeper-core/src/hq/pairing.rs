@@ -8,7 +8,7 @@
 //! one sentence. The QR keeper draws is a [`pairing_link`], which carries the
 //! server's address too, so a scanned code needs no address typed first.
 
-use crate::hq::server::ServerUrl;
+use keeper_ports::server::ServerUrl;
 
 /// How many characters a code has.
 pub const CODE_LEN: usize = 24;

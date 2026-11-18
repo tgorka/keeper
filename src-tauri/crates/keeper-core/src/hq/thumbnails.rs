@@ -6,7 +6,8 @@ use std::sync::{LazyLock, Mutex};
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 
 use super::attachments::{self, OpenError, Staging, ATTACHMENT_MAX_BYTES};
-use super::sessions::{read, text, Source};
+use super::sessions::{read, text};
+use keeper_ports::Source;
 use serde_json::Value;
 
 pub const LONG_EDGE: u32 = 256;

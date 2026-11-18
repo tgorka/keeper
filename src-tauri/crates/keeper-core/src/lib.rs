@@ -35,7 +35,6 @@ pub mod failure;
 pub mod file_asset;
 pub mod file_properties;
 pub mod forges;
-pub mod graph;
 pub mod hq;
 pub mod inbox;
 pub mod media;

@@ -32,24 +32,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keeper_core::graph::client::{
+use keeper_graph::client::{
     subscribed_tables, subscriptions, GraphClient, GraphClientError, Prepared,
 };
-use keeper_core::graph::lifecycle::Lifecycle;
-use keeper_core::graph::outcome::{GraphOutcome, PendingCause};
-use keeper_core::graph::prefix::{self, Prefix};
-use keeper_core::graph::protocol::change::{Change, ChangeOp, NodeFields, DESCRIPTOR};
-use keeper_core::graph::protocol::inverse::{Preview, PreviewOutcome, Reverse};
-use keeper_core::graph::protocol::proposal::{self, Decision, Proposal, Verdict};
-use keeper_core::graph::protocol::request::Request;
-use keeper_core::graph::protocol::review::Target;
-use keeper_core::graph::protocol::wire::{self, HistoryFilter};
-use keeper_core::graph::queue::{
+use keeper_graph::lifecycle::Lifecycle;
+use keeper_graph::outcome::{GraphOutcome, PendingCause};
+use keeper_graph::prefix::{self, Prefix};
+use keeper_graph::protocol::change::{Change, ChangeOp, NodeFields, DESCRIPTOR};
+use keeper_graph::protocol::inverse::{Preview, PreviewOutcome, Reverse};
+use keeper_graph::protocol::proposal::{self, Decision, Proposal, Verdict};
+use keeper_graph::protocol::request::Request;
+use keeper_graph::protocol::review::Target;
+use keeper_graph::protocol::wire::{self, HistoryFilter};
+use keeper_graph::queue::{
     resume_sends, Binding, FenceCause, FenceState, GraphQueue, Restored, State,
 };
-use keeper_core::graph::source::{revocation_with, Revocation};
-use keeper_core::hq::server::ServerUrl;
-use keeper_core::hq::sessions::Source;
+use keeper_graph::source::{revocation_with, Revocation};
+use keeper_ports::server::ServerUrl;
+use keeper_ports::Source;
 use keeper_ports::{Link, ReplicaError, ReplicaSpec};
 use keeper_replica::SyncularReplica;
 use serde_json::{json, Map, Value};
@@ -906,7 +906,7 @@ fn graph_live_111_collections_content_merge_and_verification() {
             vec![ChangeOp::MergeNodes {
                 target_id: t.clone(),
                 target_revision: "1".into(),
-                absorbed: vec![keeper_core::graph::protocol::change::Absorbed {
+                absorbed: vec![keeper_graph::protocol::change::Absorbed {
                     id: x.clone(),
                     expected_revision: revision(&after.image, "revision"),
                 }],
@@ -939,7 +939,7 @@ fn graph_live_111_collections_content_merge_and_verification() {
                 vec![ChangeOp::VerifyAssertion {
                     id: claim.clone(),
                     expected_revision: expected.to_owned(),
-                    sources: vec![keeper_core::graph::protocol::change::CheckedSource {
+                    sources: vec![keeper_graph::protocol::change::CheckedSource {
                         edge_id: src.clone(),
                         edge_revision: "1".into(),
                         ref_id: res.clone(),
@@ -1051,7 +1051,7 @@ fn reviewer() -> Source {
 fn commanded(
     client: &GraphClient,
     source: &Source,
-    applied: Result<keeper_core::graph::client::Applied, GraphClientError>,
+    applied: Result<keeper_graph::client::Applied, GraphClientError>,
 ) -> (Prepared, GraphOutcome) {
     let applied = applied.expect("a request id");
     let outcome = settled(client, source, &applied.prepared);
@@ -1141,7 +1141,7 @@ fn graph_live_112_reversal_of_merge_to_depth_3_and_verification() {
     accepted(&applied(&first, &one, &setup).1);
 
     // Merge B into T, rewriting both parallel edges.
-    let merge_edge = |id: &str| keeper_core::graph::protocol::change::MergeEdge {
+    let merge_edge = |id: &str| keeper_graph::protocol::change::MergeEdge {
         id: id.to_owned(),
         expected_revision: "1".into(),
         from_lifecycle_revision: "1".into(),
@@ -1152,7 +1152,7 @@ fn graph_live_112_reversal_of_merge_to_depth_3_and_verification() {
             vec![ChangeOp::MergeNodes {
                 target_id: t.clone(),
                 target_revision: "1".into(),
-                absorbed: vec![keeper_core::graph::protocol::change::Absorbed {
+                absorbed: vec![keeper_graph::protocol::change::Absorbed {
                     id: b.clone(),
                     expected_revision: "1".into(),
                 }],
@@ -1217,7 +1217,7 @@ fn graph_live_112_reversal_of_merge_to_depth_3_and_verification() {
             vec![ChangeOp::VerifyAssertion {
                 id: claim.clone(),
                 expected_revision: "1".into(),
-                sources: vec![keeper_core::graph::protocol::change::CheckedSource {
+                sources: vec![keeper_graph::protocol::change::CheckedSource {
                     edge_id: src.clone(),
                     edge_revision: "1".into(),
                     ref_id: res.clone(),
@@ -1460,17 +1460,29 @@ fn graph_live_112_proposal_acknowledgement_and_unreviewed() {
 // - `KEEPER_HQ_LIVE_PHASE` per case, as each case names.
 // ---------------------------------------------------------------------------
 
+/// Where keeper keeps `source`'s replica of `server`, as keeper-core's
+/// replica layout names it (`hq/servers/<server>/<database>/<actor>.sqlite`
+/// under the state directory): the directory the queue rule writes beside.
+fn replica_at(server: &ServerUrl, source: &Source) -> PathBuf {
+    state_dir()
+        .join("hq")
+        .join("servers")
+        .join(server.dir_name())
+        .join(&source.database)
+        .join(format!("{}.sqlite", source.actor))
+}
+
+/// The person's queue file for `source`'s database on `server`.
+fn queue_file(server: &ServerUrl, source: &Source) -> PathBuf {
+    keeper_graph::queue::beside(&replica_at(server, source), &source.actor)
+}
+
 /// The person's queue file and fence for `source`'s database on `url`.
 fn lifecycle_at(url: &str, source: &Source) -> Lifecycle {
     let server = ServerUrl::parse(url)
         .expect("a server address")
         .expect("not local");
-    let file = keeper_core::hq::databases::graph_queue(
-        &state_dir(),
-        &server,
-        &source.database,
-        &source.actor,
-    );
+    let file = queue_file(&server, source);
     Lifecycle::open(GraphQueue::open(&file, Binding::of(&server, source)).expect("queue"))
         .expect("lifecycle")
 }
@@ -1546,7 +1558,7 @@ fn saved_request(path: &std::path::Path) -> Request {
     }
 }
 
-fn entry_of(lifecycle: &Lifecycle, id: &str) -> Option<keeper_core::graph::queue::Entry> {
+fn entry_of(lifecycle: &Lifecycle, id: &str) -> Option<keeper_graph::queue::Entry> {
     lifecycle
         .with_queue(|q| q.entries())
         .expect("listing")
@@ -1830,12 +1842,7 @@ fn graph_live_1121_an_identity_change_suspends_and_servers_never_cross() {
         ..two.clone()
     };
     let server = ServerUrl::parse(&url).expect("url").expect("server");
-    let file = keeper_core::hq::databases::graph_queue(
-        &state_dir(),
-        &server,
-        &switched.database,
-        &switched.actor,
-    );
+    let file = queue_file(&server, &switched);
     let lifecycle = Lifecycle::open(
         GraphQueue::open(&file, Binding::of(&server, &switched)).expect("same person's file"),
     )
@@ -1848,14 +1855,9 @@ fn graph_live_1121_an_identity_change_suspends_and_servers_never_cross() {
         .expect("server");
     assert!(matches!(
         GraphQueue::open(&file, Binding::of(&second, &switched)),
-        Err(keeper_core::graph::queue::QueueError::ForeignFile)
+        Err(keeper_graph::queue::QueueError::ForeignFile)
     ));
-    let elsewhere = keeper_core::hq::databases::graph_queue(
-        &state_dir(),
-        &second,
-        &switched.database,
-        &switched.actor,
-    );
+    let elsewhere = queue_file(&second, &switched);
     let queue = GraphQueue::open(&elsewhere, Binding::of(&second, &switched)).expect("its own");
     assert!(queue.entries().expect("listing").is_empty());
     report(
@@ -2054,8 +2056,8 @@ fn graph_live_1121_a_revocation_locks_first_and_purges_every_graph_table() {
             // The revocation, learned from the server.
             let probe = open_at(2, &database, &url, &format!("{database}-1121-probe.sqlite"));
             until(&probe, "the server's refusal", || {
-                match keeper_core::graph::query::GraphRemote::read_status(&probe, &database) {
-                    Err(keeper_core::graph::query::QueryError::Forbidden) => Some(()),
+                match keeper_graph::query::GraphRemote::read_status(&probe, &database) {
+                    Err(keeper_graph::query::QueryError::Forbidden) => Some(()),
                     _ => None,
                 }
             });

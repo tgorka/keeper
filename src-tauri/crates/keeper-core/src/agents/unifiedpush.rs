@@ -137,7 +137,7 @@ impl Endpoint {
         let raw = raw.trim();
         let url = url::Url::parse(raw).map_err(|_| EndpointRefusal::NotAnAddress)?;
         let host =
-            crate::agents::mcp::url_host(url.as_str()).ok_or(EndpointRefusal::NotAnAddress)?;
+            keeper_ports::server::url_host(url.as_str()).ok_or(EndpointRefusal::NotAnAddress)?;
         if url.scheme() != "https" {
             return Err(EndpointRefusal::NotHttps {
                 host,
@@ -161,7 +161,7 @@ impl Endpoint {
     /// The endpoint's host, and its port when it names one: what the egress
     /// list and Settings show.
     pub fn host(&self) -> String {
-        crate::agents::mcp::url_host(self.url.as_str()).unwrap_or_default()
+        keeper_ports::server::url_host(self.url.as_str()).unwrap_or_default()
     }
 
     /// The address keeper asks whether the endpoint's server is a Matrix

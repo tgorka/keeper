@@ -3,8 +3,8 @@
 //! state so that they survive a restart without ever being read as graph
 //! data.
 //!
-//! One file per server, domain and actor ([`crate::hq::databases::graph_queue`]),
-//! beside the replica and never synced: no Syncular table, outbox or
+//! One file per server, domain and actor ([`beside`]): `<actor>.graph-queue`
+//! beside the replica, and never synced: no Syncular table, outbox or
 //! migration touches it. It is SQLite on the workspace's one `rusqlite`, in
 //! WAL mode with `synchronous=FULL`, and every transition is one
 //! transaction, so an interruption leaves each entry in its last persisted
@@ -35,7 +35,7 @@
 //! allowed transitions refuses everything else.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -57,6 +57,19 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// version 3 the fence's cause (`graph_fence.cause`; a fence written before
 /// it reads as `revocation`, the stricter).
 const SCHEMA_VERSION: i64 = 3;
+
+/// The extension of every queue file ([`beside`]).
+pub const GRAPH_QUEUE_EXTENSION: &str = "graph-queue";
+
+/// The graph intent queue of the replica at `replica`, opened for `actor`:
+/// `<actor>.graph-queue` beside it, under the same trusted
+/// server/database/actor identity as the replica's own directory. Never
+/// synced and never inside Syncular's own file; forgetting the server
+/// removes it with the replicas.
+#[must_use]
+pub fn beside(replica: &Path, actor: &str) -> PathBuf {
+    replica.with_file_name(format!("{actor}.{GRAPH_QUEUE_EXTENSION}"))
+}
 
 /// Where an entry stands. The open states are the ones a send may come
 /// from or lead to; the outcome states and the three local terminal states
@@ -219,7 +232,7 @@ pub struct Binding {
 impl Binding {
     /// The identity a replica `source` of `server` was opened under.
     #[must_use]
-    pub fn of(server: &crate::hq::server::ServerUrl, source: &crate::hq::sessions::Source) -> Self {
+    pub fn of(server: &keeper_ports::server::ServerUrl, source: &keeper_ports::Source) -> Self {
         Self {
             server: server.as_str().to_owned(),
             domain: source.database.clone(),
@@ -1585,9 +1598,7 @@ pub fn counts_under(dir: &Path) -> (BTreeMap<State, usize>, usize) {
         };
         for file in files.flatten() {
             let path = file.path();
-            if path.extension().and_then(|e| e.to_str())
-                != Some(crate::hq::databases::GRAPH_QUEUE_EXTENSION)
-            {
+            if path.extension().and_then(|e| e.to_str()) != Some(GRAPH_QUEUE_EXTENSION) {
                 continue;
             }
             let counts = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)

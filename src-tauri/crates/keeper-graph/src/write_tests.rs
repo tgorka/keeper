@@ -13,7 +13,7 @@ use super::protocol::request::Request;
 use super::protocol::Refusal;
 use super::queue::{next, FenceCause, Next, State};
 use super::write::{Caller, GraphWrite, Writer};
-use crate::notes::tags::normalise;
+use keeper_graph_protocol::tag::normalise;
 use keeper_ports::{CommandResult, LinkState, ReplicaError};
 
 /// A port whose every remote answer is scripted; it records what it sent.

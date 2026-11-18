@@ -311,17 +311,6 @@ fn without_userinfo(raw: &str) -> String {
     }
 }
 
-/// The host and port a URL server is reached at — what an egress row and an
-/// approval name, never its path or a credential.
-pub fn url_host(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    Some(match parsed.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    })
-}
-
 /// A server's or a tool's name as the wire carries it: `[A-Za-z0-9_-]`,
 /// never `__` and never `_` at either end, so the one `__` between them
 /// splits a wire name exactly once.

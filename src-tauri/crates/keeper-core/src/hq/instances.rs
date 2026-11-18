@@ -37,8 +37,9 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::hq::live::{self, Claim, Live};
-use crate::hq::sessions::{authored, int, names, object, opt_text, read, text, Source};
+use crate::hq::sessions::{authored, int, names, object, opt_text, read, text};
 use crate::hq::{Hq, HqError};
+use keeper_ports::Source;
 use keeper_ports::{LinkState, RowOp, RowWrites};
 
 /// The table the person's choice is a row of.

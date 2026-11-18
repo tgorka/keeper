@@ -720,7 +720,7 @@ mod item_tests {
     //! The agents server branch over a real HTTP listener standing in for
     //! keeper-hq's item route, answering recorded item JSON.
     use super::*;
-    use keeper_core::hq::server::ServerUrl;
+    use keeper_ports::server::ServerUrl;
     use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader, Write};

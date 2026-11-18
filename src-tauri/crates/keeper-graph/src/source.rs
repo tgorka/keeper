@@ -6,8 +6,8 @@
 
 use serde_json::{Map, Value};
 
-use crate::hq::sessions::Source;
 use keeper_ports::ReplicaError;
+use keeper_ports::Source;
 
 /// One read snapshot of a domain's history: its head and the events (with
 /// their operation rows) at graph positions `after + 1 ..= after + limit`.
