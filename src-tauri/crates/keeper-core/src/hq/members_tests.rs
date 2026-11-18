@@ -12,9 +12,10 @@ use serde_json::{json, Value};
 
 use super::{add, leave, remove, set_reader, view, AgentMemberRoleVm};
 use crate::hq::approvals::{self, Decisions};
-use crate::hq::sessions::{self, names, object, Source};
+use crate::hq::sessions::{self, names, object};
 use crate::hq::timeline::{self, Opened};
 use crate::hq::window_tests::Staged;
+use keeper_ports::Source;
 use keeper_ports::{Rejection, ReplicaError, ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 

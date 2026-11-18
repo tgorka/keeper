@@ -6,8 +6,8 @@ use std::path::Path;
 use serde_json::Map;
 
 use super::*;
-use crate::graph::protocol::change::ChangeOp;
-use crate::hq::sessions::Source;
+use crate::protocol::change::ChangeOp;
+use keeper_ports::Source;
 use keeper_ports::{Opener, ReplicaSpec};
 use keeper_testkit::FakeOpener;
 
@@ -430,20 +430,27 @@ fn invalidating_drops_only_the_row_found_in_the_future() {
     assert_eq!(reopen(dir.path()).authority().expect("row"), None);
 }
 
-/// `forget`'s log: counts by state across a server's queue files.
+/// Counts by state across a server's queue files, read before the server's
+/// directory is deleted.
 #[test]
 fn counts_cover_every_queue_file_of_a_server() {
     let dir = tempfile::tempdir().expect("dir");
-    let server = crate::hq::server::ServerUrl::parse(SERVER)
+    let server = keeper_ports::server::ServerUrl::parse(SERVER)
         .expect("url")
         .expect("server");
+    let server_dir = dir
+        .path()
+        .join("hq")
+        .join("servers")
+        .join(server.dir_name());
     for actor in ["ana", "bo"] {
-        let file = crate::hq::databases::graph_queue(dir.path(), &server, DB, actor);
+        let replica = server_dir.join(DB).join(format!("{actor}.sqlite"));
+        let file = crate::queue::beside(&replica, actor);
         let graph = GraphClient::new(source(dir.path(), actor, "dev1"));
         let mut queue = GraphQueue::open(&file, binding(SERVER, actor, "dev1")).expect("opens");
         queue.enqueue(&minted(&graph), 1).expect("queued");
     }
-    let (counts, unreadable) = counts_under(&crate::hq::databases::server_dir(dir.path(), &server));
+    let (counts, unreadable) = counts_under(&server_dir);
     assert_eq!(counts, BTreeMap::from([(State::Queued, 2)]));
     assert_eq!(unreadable, 0);
 }
@@ -454,18 +461,18 @@ const CONTEXT: &str = "01JF00000000000000000000C1";
 /// An agent instance's client over `source`'s port, under its context.
 fn agent_client(dir: &Path) -> GraphClient {
     let source = source(dir, "agent-1", "inst-1");
-    let writer = crate::graph::write::Writer::of(&source);
+    let writer = crate::write::Writer::of(&source);
     GraphClient::over(
         std::sync::Arc::new(source),
         &writer,
-        crate::graph::write::Caller::Agent {
+        crate::write::Caller::Agent {
             context_id: CONTEXT.to_owned(),
         },
     )
 }
 
 fn agent_minted(client: &GraphClient, approval: &str) -> Prepared {
-    let change = crate::graph::protocol::change::Change::new(
+    let change = crate::protocol::change::Change::new(
         vec![ChangeOp::CreateNode {
             id: "01JF0000000000000000000002".to_owned(),
             kind: "Concept".into(),
@@ -475,7 +482,7 @@ fn agent_minted(client: &GraphClient, approval: &str) -> Prepared {
         }],
         Some(approval.to_owned()),
         None,
-        crate::notes::tags::normalise,
+        keeper_graph_protocol::tag::normalise,
     )
     .expect("change");
     client.mint(&change).expect("minted")

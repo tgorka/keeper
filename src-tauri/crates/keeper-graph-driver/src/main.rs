@@ -58,31 +58,28 @@ mod driver {
     use std::time::{Duration, Instant};
 
     use clap::{Parser, Subcommand};
-    use keeper_core::graph::admission::{Admission, Process};
-    use keeper_core::graph::client::{
+    use keeper_graph::admission::{Admission, Process};
+    use keeper_graph::client::{
         subscribed_tables, subscriptions, Applied, GraphClient, GraphClientError, Prepared,
     };
-    use keeper_core::graph::lifecycle::{Lifecycle, LifecycleError};
-    use keeper_core::graph::outcome::{GraphOutcome, PendingCause};
-    use keeper_core::graph::protocol::change::Change;
-    use keeper_core::graph::protocol::inverse::{PreviewOutcome, Reverse};
-    use keeper_core::graph::protocol::review::Target;
-    use keeper_core::graph::protocol::wire::HistoryFilter;
-    use keeper_core::graph::protocol::worker::InspectEntity;
-    use keeper_core::graph::protocol::{change, proposal};
-    use keeper_core::graph::query::{
+    use keeper_graph::lifecycle::{Lifecycle, LifecycleError};
+    use keeper_graph::outcome::{GraphOutcome, PendingCause};
+    use keeper_graph::protocol::change::Change;
+    use keeper_graph::protocol::inverse::{PreviewOutcome, Reverse};
+    use keeper_graph::protocol::review::Target;
+    use keeper_graph::protocol::tag::normalise;
+    use keeper_graph::protocol::wire::HistoryFilter;
+    use keeper_graph::protocol::worker::InspectEntity;
+    use keeper_graph::protocol::{change, proposal};
+    use keeper_graph::query::{
         Freshness, GraphReads, GraphRemote, HumanReader, Inspected, QueryError, QueryResult,
     };
-    use keeper_core::graph::queue::{
-        resume_sends, Binding, FenceCause, GraphQueue, Restored, State,
-    };
-    use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
-    use keeper_core::graph::source::{revocation_with, GraphSource, Revocation, ScopeState};
-    use keeper_core::graph::supervisor::Cancellation;
-    use keeper_core::hq::server::ServerUrl;
-    use keeper_core::hq::sessions::Source;
-    use keeper_core::notes::tags::normalise;
-    use keeper_ports::{Link, LinkState, ReplicaSpec};
+    use keeper_graph::queue::{resume_sends, Binding, FenceCause, GraphQueue, Restored, State};
+    use keeper_graph::runtime::{Runtime, VerifiedWorker};
+    use keeper_graph::source::{revocation_with, GraphSource, Revocation, ScopeState};
+    use keeper_graph::supervisor::Cancellation;
+    use keeper_ports::server::ServerUrl;
+    use keeper_ports::{Link, LinkState, ReplicaSpec, Source};
     use keeper_replica::SyncularReplica;
     use serde_json::{json, Value};
 
@@ -273,7 +270,7 @@ mod driver {
 
     fn payload(path: &PathBuf) -> Result<Value, Value> {
         let text = std::fs::read(path).map_err(|e| fail("invalid_change", &e.to_string()))?;
-        keeper_core::graph::protocol::value::parse(&text).map_err(|r| fail(r.code(), "payload"))
+        keeper_graph::protocol::value::parse(&text).map_err(|r| fail(r.code(), "payload"))
     }
 
     /// Run `call` on a blocking thread once the replica's first round is
@@ -445,7 +442,7 @@ mod driver {
 
     fn parse_change(payload: &PathBuf) -> Result<Change, Value> {
         let text = std::fs::read(payload).map_err(|e| fail("invalid_change", &e.to_string()))?;
-        keeper_core::graph::protocol::value::parse(&text)
+        keeper_graph::protocol::value::parse(&text)
             .and_then(|v| change::parse(&v, normalise))
             .map_err(|refusal| fail(refusal.code(), "payload"))
     }
@@ -955,7 +952,7 @@ mod driver {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use keeper_core::graph::write::{Caller, GraphWrite, Writer};
+        use keeper_graph::write::{Caller, GraphWrite, Writer};
         use keeper_ports::{CommandResult, ReplicaError};
         use std::sync::atomic::{AtomicU32, Ordering};
 

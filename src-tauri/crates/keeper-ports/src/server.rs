@@ -42,7 +42,7 @@ impl ServerUrl {
         if url.query().is_some() || url.fragment().is_some() {
             return Err(ServerRefusal::QueryOrFragment);
         }
-        let Some(host) = crate::agents::mcp::url_host(url.as_str()) else {
+        let Some(host) = url_host(url.as_str()) else {
             return Err(ServerRefusal::NotAnAddress);
         };
         let base = url.as_str().trim_end_matches('/').to_owned();
@@ -89,6 +89,17 @@ impl ServerUrl {
         let digest = sha2::Sha256::digest(self.base.as_bytes());
         format!("{host}-{}", hex::encode(&digest[..16]))
     }
+}
+
+/// The host and port a URL server is reached at — what an egress row and an
+/// approval name, never its path or a credential.
+pub fn url_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
 }
 
 /// Why a typed address is not one keeper will contact. The `Display` text is

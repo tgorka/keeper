@@ -13,7 +13,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::hq::sessions::Source;
+use keeper_ports::Source;
 use keeper_ports::{CommandResult, LinkState, ReplicaError};
 
 /// One database's graph write boundary.

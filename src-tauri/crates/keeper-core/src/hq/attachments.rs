@@ -41,9 +41,10 @@ use ts_rs::TS;
 use crate::asset_url::{self, UrlForm};
 use crate::hq::send::activity;
 use crate::hq::sessions::{
-    authored, int, now_ms, object, person_message, read, text, AgentSessionRef, Source,
+    authored, int, now_ms, object, person_message, read, text, AgentSessionRef,
 };
 use crate::hq::timeline::session_row;
+use keeper_ports::Source;
 use keeper_ports::{BlobBody, LinkState, Rejection, ReplicaError, RowOp, UploadRefusal};
 
 /// The contract's bounds, `syncular/limits.json`, compiled into keeper.

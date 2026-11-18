@@ -12,9 +12,9 @@ use super::protocol::scope::{
     CLIENT_VARIABLE, GRAPH_TABLES, GRAPH_VARIABLE, PROPOSAL_TABLE, PROPOSAL_VARIABLE, RECEIPT_TABLE,
 };
 use super::protocol::SCHEMA_VERSION;
-use crate::notes::tags::normalise;
+use keeper_graph_protocol::tag::normalise;
 
-const CORPUS: &str = include_str!("../../../../../syncular/knowledge-graph.vectors.json");
+const CORPUS: &str = include_str!("../../../../syncular/knowledge-graph.vectors.json");
 
 /// `value` with every `{NAME}` of the entry's `fills` expanded.
 fn expand(value: &Value, fills: &Map<String, Value>) -> Value {
@@ -239,7 +239,7 @@ fn shared_tag_vectors_hold_under_the_notes_policy() {
     for tag in tags {
         let input = tag["input"].as_str().expect("input");
         assert_eq!(
-            crate::notes::tags::normalise(input).as_deref(),
+            keeper_graph_protocol::tag::normalise(input).as_deref(),
             tag["canonical"].as_str(),
             "{input:?}"
         );

@@ -13,7 +13,8 @@ use super::{
     Instance, Online, Prefs, Shared,
 };
 use crate::hq::live::{Claim, Live, LEASE};
-use crate::hq::sessions::{names, object, Source};
+use crate::hq::sessions::{names, object};
+use keeper_ports::Source;
 use keeper_ports::{Refusal, Rejection, ReplicaSpec, RowOp, RowWrites};
 use keeper_replica::SyncularReplica;
 

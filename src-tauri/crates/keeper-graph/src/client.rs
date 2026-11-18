@@ -41,8 +41,8 @@ use super::protocol::wire::{
 };
 use super::protocol::Refusal;
 use super::write::{Caller, GraphWrite, Writer};
-use crate::hq::sessions::Source;
-use crate::notes::tags::normalise;
+use keeper_graph_protocol::tag::normalise;
+use keeper_ports::Source;
 use keeper_ports::{LinkState, ReplicaError, Subscription};
 
 /// The tables [`subscriptions`] subscribes: every graph table, the

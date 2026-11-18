@@ -10,8 +10,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::hq::sessions::{self, object, Source};
+use crate::hq::sessions::{self, object};
 use crate::hq::timeline::{self, AgentMessageStateVm, Opened};
+use keeper_ports::Source;
 use keeper_ports::{LinkState, Opener, Rejection, ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 use keeper_testkit::{FakeOpener, FakeReplica};

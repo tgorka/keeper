@@ -34,7 +34,6 @@ use crate::notes::index::IndexEntry;
 use crate::notes::naming;
 use crate::notes::order::NoteOrder;
 use crate::notes::query::{self, Term};
-use crate::notes::tags;
 use crate::notes::templates;
 
 /// The folder whose prefix makes the index flag a note `journal`.
@@ -164,7 +163,7 @@ fn seed_term(seed: &mut Seed, term: &Term) {
         // A value that is not a tag normalises away and seeds nothing, which
         // leaves `tag:---` matching nothing rather than tagging a note `---`.
         Some("tag") if !term.value.ends_with("/*") => {
-            if let Some(tag) = tags::normalise(&term.value) {
+            if let Some(tag) = keeper_graph_protocol::tag::normalise(&term.value) {
                 add_tag(seed, tag);
             }
         }
@@ -353,7 +352,7 @@ fn join_terms(terms: &[String]) -> String {
 ///
 /// Two refusals, both of which produce "no tag" rather than a bad one:
 ///
-/// - **A tag that is not a tag.** `tags::normalise` already rejects `"   "`, a
+/// - **A tag that is not a tag.** `tag::normalise` already rejects `"   "`, a
 ///   bare `#` and `---`. Cleared and unusable are one state; inventing a
 ///   literal `---` tag out of the second is how a vault acquires a tag nobody
 ///   can type again.
@@ -365,7 +364,7 @@ fn join_terms(terms: &[String]) -> String {
 ///   keeper reserves at the root and is left alone, which is 44.7's ruling for
 ///   the copy path spelled the same way here.
 pub fn capture_tag(configured: &str) -> Option<String> {
-    let tag = tags::normalise(configured)?;
+    let tag = keeper_graph_protocol::tag::normalise(configured)?;
     (tag != templates::TEMPLATE_TAG).then_some(tag)
 }
 

@@ -692,7 +692,7 @@ fn tag_pred(value: &str) -> Pred {
         Some(base) => (base, true),
         None => (value, false),
     };
-    let path = crate::notes::tags::normalise(base).unwrap_or_default();
+    let path = keeper_graph_protocol::tag::normalise(base).unwrap_or_default();
     Pred::Tag { path, strict }
 }
 
@@ -951,7 +951,7 @@ fn chip_tag(value: &str) -> Option<String> {
     if value.ends_with("/*") {
         return None;
     }
-    crate::notes::tags::normalise(value)
+    keeper_graph_protocol::tag::normalise(value)
 }
 
 /// Whether two `is:` values name the same flag. The parser folds case before it

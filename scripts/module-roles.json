@@ -2,6 +2,7 @@
   "keeper": "composition-root",
   "keeper-agent": "legacy",
   "keeper-core": "legacy",
+  "keeper-graph": "implementation",
   "keeper-graph-driver": "composition-root",
   "keeper-graph-protocol": "contract",
   "keeper-graph-query": "legacy",

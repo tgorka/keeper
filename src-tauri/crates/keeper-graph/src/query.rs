@@ -174,7 +174,7 @@ fn remote_error(error: keeper_ports::ReplicaError) -> QueryError {
     }
 }
 
-impl GraphRemote for crate::hq::sessions::Source {
+impl GraphRemote for keeper_ports::Source {
     fn admit_read(&self, context: &str, domain: &str) -> Result<ContextRow, QueryError> {
         let rows = self
             .replica
@@ -330,7 +330,7 @@ impl GraphReads {
     /// A person's reader over this device's own replica.
     #[cfg(feature = "human-reads")]
     #[must_use]
-    pub fn human(&self, source: &crate::hq::sessions::Source) -> Option<HumanReader> {
+    pub fn human(&self, source: &keeper_ports::Source) -> Option<HumanReader> {
         (source.database == self.domain())
             .then(|| HumanReader::new(self.clone(), Arc::new(source.clone()), source))
     }
@@ -339,7 +339,7 @@ impl GraphReads {
     #[cfg(all(test, feature = "human-reads"))]
     pub(crate) fn human_with(
         &self,
-        source: &crate::hq::sessions::Source,
+        source: &keeper_ports::Source,
         remote: Arc<dyn GraphRemote>,
     ) -> HumanReader {
         HumanReader::new(self.clone(), remote, source)
@@ -1066,11 +1066,7 @@ pub struct HumanReader {
 
 #[cfg(feature = "human-reads")]
 impl HumanReader {
-    fn new(
-        reads: GraphReads,
-        remote: Arc<dyn GraphRemote>,
-        source: &crate::hq::sessions::Source,
-    ) -> Self {
+    fn new(reads: GraphReads, remote: Arc<dyn GraphRemote>, source: &keeper_ports::Source) -> Self {
         Self {
             reads,
             remote,

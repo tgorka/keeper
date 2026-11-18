@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-graph-driver", "crates/keeper-ports", "crates/keeper-replica", "crates/keeper-testkit"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-llm", "crates/keeper-agent", "crates/keeper-nse", "crates/keeper-graph-protocol", "crates/keeper-graph-query", "crates/keeper-graph-driver", "crates/keeper-ports", "crates/keeper-replica", "crates/keeper-testkit", "crates/keeper-graph"]
 
 [workspace.package]
 version = "0.11.0"
@@ -219,7 +219,7 @@ ulid = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # The agents' database (AD-418, AD-421): the person's own syncular server, one
 # local replica per database the device's token opens. Consumed by keeper-replica
-# and keeper-core's tests only, behind keeper-ports. Apache-2.0; its `native-transport`
+# and by keeper-core's and keeper-graph's tests only, behind keeper-ports. Apache-2.0; its `native-transport`
 # is ureq 3, tungstenite 0.30 (rustls, webpki roots), url 2 and polling 3 —
 # all already in Cargo.lock — and it links the rusqlite above, so the graph
 # still holds one libsqlite3-sys (`bun run check:one-sqlite`).

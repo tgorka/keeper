@@ -18,11 +18,12 @@ use crate::hq::drives;
 use crate::hq::live::{self, AgentViewPrefsPatch, AgentViewPrefsVm};
 use crate::hq::send;
 use crate::hq::sessions::{
-    self, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionRowVm, Source,
+    self, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionRowVm,
 };
 use crate::hq::timeline::{self, AgentSessionViewVm, Opened};
 use crate::hq::vm::{phase_sentence, HqPhase};
 use crate::hq::{lock, sentence, Hq, HqError, LocalOpen};
+use keeper_ports::Source;
 
 /// How often the grants units the server revoked are asked for again.
 pub const GRANTS_REASK_EVERY: Duration = Duration::from_secs(3600);

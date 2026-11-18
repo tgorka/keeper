@@ -16,7 +16,6 @@ use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::index::IndexEntry;
 use crate::notes::media_block::{self, BlockRefusal, Source};
 use crate::notes::recording_note;
-use crate::notes::tags;
 
 /// The tag every note that is recording carries.
 pub const RECORDING_TAG: &str = "recording";
@@ -38,7 +37,7 @@ fn recording_tags(device: &str) -> [String; 2] {
 /// Whether `written` is `wanted`, as tags compare: normalised, so `Recording`
 /// written by hand is the same tag.
 fn same_tag(written: &str, wanted: &str) -> bool {
-    tags::normalise(written).is_some_and(|written| written == wanted)
+    keeper_graph_protocol::tag::normalise(written).is_some_and(|written| written == wanted)
 }
 
 /// The note's `tags` as a list, `Some(empty)` when there is no such key, and
@@ -89,7 +88,7 @@ pub fn without_recording_tags(note: &str, device: &str) -> String {
     let mine = device_tag(device);
     let others = format!("{RECORDING_TAG}/");
     let elsewhere = items.iter().any(|item| {
-        tags::normalise(&item.index_string())
+        keeper_graph_protocol::tag::normalise(&item.index_string())
             .is_some_and(|tag| tag.starts_with(&others) && tag != mine)
     });
     let kept: Vec<FieldValue> = items
@@ -163,7 +162,7 @@ pub fn tagged_on<'a>(
     entries: &'a [IndexEntry],
     device: &str,
 ) -> impl Iterator<Item = &'a IndexEntry> + 'a {
-    let wanted = tags::normalise(&device_tag(device));
+    let wanted = keeper_graph_protocol::tag::normalise(&device_tag(device));
     entries.iter().filter(move |entry| {
         wanted
             .as_deref()
@@ -192,6 +191,7 @@ pub fn without_session_keys(note: &str, session_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notes::tags;
 
     const ID: &str = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM0000000000000000000A";
 

@@ -3572,7 +3572,7 @@ mod tests {
         let d = account(&fake, "attest-no-auth-time", None);
         seed_session(&p, &d, Vec::new(), now_ms() + 3_600_000);
         let agents = agents_server(&d);
-        let server = crate::hq::server::ServerUrl::parse(&agents.base)
+        let server = keeper_ports::server::ServerUrl::parse(&agents.base)
             .expect("parses")
             .expect("an address");
         crate::registry::set_agents_server_url(&p.data_dir().expect("dir"), Some(&server))

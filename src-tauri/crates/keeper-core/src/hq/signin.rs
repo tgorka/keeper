@@ -35,7 +35,6 @@ use tokio::task::JoinHandle;
 
 use crate::hq::databases::Authorization;
 use crate::hq::routes::{AuthConfig, Enrolled, EnrolmentKind, RouteError};
-use crate::hq::server::ServerUrl;
 use crate::hq::sessions::now_ms;
 use crate::hq::vm::{HqEnrolmentVm, HqSignInState, HqSignInVm};
 use crate::hq::{
@@ -44,6 +43,7 @@ use crate::hq::{
 use crate::org_account::descriptor::AccountDescriptor;
 use crate::org_account::{oidc, session, AccountError};
 use crate::platform::Platform;
+use keeper_ports::server::ServerUrl;
 
 /// The server's attestation window unless it says otherwise (Q109-03 a).
 pub const ATTEST_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;

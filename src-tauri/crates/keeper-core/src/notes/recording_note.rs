@@ -77,7 +77,6 @@ use crate::archive::recordings_fts::kind_for_file_name;
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::media_block;
 use crate::notes::naming;
-use crate::notes::tags;
 use crate::notes::templates::Stamp;
 use crate::vm::RecordingNoteTargetKind;
 
@@ -110,7 +109,7 @@ pub fn is_recording_note(fm: &Frontmatter) -> bool {
 /// of note it is, so the notes keeper writes are the only ones a person cannot
 /// reach without already knowing they exist.
 ///
-/// Spelled here in the canonical form [`tags::normalise`] produces, and put
+/// Spelled here in the canonical form [`keeper_graph_protocol::tag::normalise`] produces, and put
 /// through that function anyway before it is emitted: the vocabulary is the
 /// authority on what this tag is, not this constant. The test
 /// `the_kind_tag_is_already_what_the_vocabulary_makes_of_it` pins the two
@@ -341,7 +340,7 @@ fn title_of(facts: &SessionFacts<'_>, date: &str) -> String {
 /// [`RECORDINGS_TAG`] in canonical form, or `None` when the session already
 /// carries it under some spelling of its own.
 ///
-/// **The question is asked of [`tags::normalise`], never of the strings.**
+/// **The question is asked of [`keeper_graph_protocol::tag::normalise`], never of the strings.**
 /// `Recordings`, `recordings ` and `#recordings` are all already this tag, and
 /// emitting a second spelling beside one of them is precisely the twin node
 /// Story 42.5 exists to prevent — the tree would show `recordings` counted
@@ -354,10 +353,10 @@ fn title_of(facts: &SessionFacts<'_>, date: &str) -> String {
 /// session for which the one minute in which a note would have been written is
 /// lost to a composer that refused.
 fn kind_tag(own: &[String]) -> Option<String> {
-    let kind = tags::normalise(RECORDINGS_TAG)?;
+    let kind = keeper_graph_protocol::tag::normalise(RECORDINGS_TAG)?;
     let already = own
         .iter()
-        .any(|tag| tags::normalise(tag).as_deref() == Some(kind.as_str()));
+        .any(|tag| keeper_graph_protocol::tag::normalise(tag).as_deref() == Some(kind.as_str()));
     (!already).then_some(kind)
 }
 
@@ -440,6 +439,7 @@ fn duration_text(started_ms: Option<i64>, ended_ms: Option<i64>) -> Option<Strin
 mod tests {
     use super::*;
     use crate::notes::links;
+    use crate::notes::tags;
 
     const ID: &str = "01K0DEVICE0000000000000000-01K0SESSION00000000000000";
 
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn the_kind_tag_is_already_what_the_vocabulary_makes_of_it() {
         assert_eq!(
-            tags::normalise(RECORDINGS_TAG).as_deref(),
+            keeper_graph_protocol::tag::normalise(RECORDINGS_TAG).as_deref(),
             Some(RECORDINGS_TAG)
         );
     }

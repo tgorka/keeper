@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::hq::pairing::PairingCode;
 use crate::hq::push::{PushTarget, PushedItem};
-use crate::hq::server::ServerUrl;
+use keeper_ports::server::ServerUrl;
 
 /// How long one root request may take. Discovery runs at every start, so a
 /// firewalled server must not hold the status on *connecting* for minutes.

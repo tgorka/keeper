@@ -6,7 +6,7 @@
 //! reads the outcome of its own requests under `kg_client`. The shared rules —
 //! vocabulary, canonical values, digests, scope values — are
 //! [`protocol`] (`keeper-graph-protocol`). A tag's canonical text is
-//! [`crate::notes::tags::normalise`]'s answer, the one tag policy keeper has.
+//! [`protocol::tag::normalise`]'s answer, the one tag policy keeper has.
 //!
 //! [`outcome::GraphRequests`] is one database's owner of this device's
 //! graph requests: it mints their keys, sends them, reads their receipts

@@ -17,14 +17,14 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ts_rs::TS;
 
-use keeper_ports::{RefusedCommit, Rejection, Replica, ReplicaError, RowOp, WindowBase, CONFLICT};
+use keeper_ports::{RefusedCommit, Rejection, ReplicaError, RowOp, Source, WindowBase, CONFLICT};
 
 /// A session's state in the Agents list; a session in none of them carries
 /// none.
@@ -43,17 +43,6 @@ pub enum AgentAttentionVm {
     Working,
     /// The session finished after the person last read it.
     DoneUnread,
-}
-
-/// One database this device holds, and who this device is in it.
-#[derive(Clone)]
-pub struct Source {
-    pub database: String,
-    pub replica: Arc<dyn Replica>,
-    /// The person's actor id.
-    pub actor: String,
-    /// This device's client id.
-    pub client: String,
 }
 
 /// A session, named as it must be wherever the two databases meet.
@@ -1343,7 +1332,7 @@ fn create_in(
 /// newest title write decides the row's rename state: every earlier title
 /// write of this row — refused, or still waiting and so not refused yet — is
 /// set aside by this one, in the same step of the replica's owner that
-/// writes it ([`Replica::mutate_superseding`]). The chat's own creation is
+/// writes it ([`keeper_ports::Replica::mutate_superseding`]). The chat's own creation is
 /// not a rename and is never set aside by one. The one title writer: the
 /// menu and `/rename` both come here.
 pub fn rename(source: &Source, session_id: &str, title: &str) -> Result<(), ReplicaError> {

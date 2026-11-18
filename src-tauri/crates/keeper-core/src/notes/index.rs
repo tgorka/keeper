@@ -37,7 +37,8 @@ use ts_rs::TS;
 use crate::notes::links::{predicate_name, RawLink};
 use crate::notes::order::NoteOrder;
 use crate::notes::search;
-use crate::notes::tags::{normalise, TagNode};
+use crate::notes::tags::TagNode;
+use keeper_graph_protocol::tag::normalise;
 
 /// Schema version of the on-disk [`IndexCache`]. Bump it whenever the meaning or
 /// the shape of an [`IndexEntry`] field changes; the loader's only response to a

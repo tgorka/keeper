@@ -13,16 +13,16 @@ use std::sync::{Arc, LazyLock, Mutex};
 use serde_json::{json, Map, Value};
 
 use super::*;
-use crate::graph::admission::Process;
-use crate::graph::protocol::candidate::{self, State, Verdict};
-use crate::graph::protocol::change::{Change, ChangeOp, NodeFields};
-use crate::graph::protocol::delta::Op;
-use crate::graph::protocol::scope::event_op_id;
-use crate::graph::protocol::worker::InspectEntity;
-use crate::graph::runtime::VerifiedWorker;
-use crate::graph::source::{Checkpoint, PrefixBatch, SourceError};
-use crate::hq::sessions::Source;
-use crate::notes::tags::normalise;
+use crate::admission::Process;
+use crate::protocol::candidate::{self, State, Verdict};
+use crate::protocol::change::{Change, ChangeOp, NodeFields};
+use crate::protocol::delta::Op;
+use crate::protocol::scope::event_op_id;
+use crate::protocol::worker::InspectEntity;
+use crate::runtime::VerifiedWorker;
+use crate::source::{Checkpoint, PrefixBatch, SourceError};
+use keeper_graph_protocol::tag::normalise;
+use keeper_ports::Source;
 use keeper_ports::{ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 
@@ -229,10 +229,10 @@ impl World {
         };
         for op in &effects.ops {
             let map = match op.entity_type {
-                crate::graph::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
-                crate::graph::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
-                crate::graph::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
-                crate::graph::protocol::vocabulary::EntityType::Content => &mut self.graph.contents,
+                crate::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
+                crate::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
+                crate::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
+                crate::protocol::vocabulary::EntityType::Content => &mut self.graph.contents,
                 _ => &mut self.graph.memberships,
             };
             match &op.after_value {
@@ -253,14 +253,12 @@ impl World {
     fn push(&mut self, ops: Vec<Op>) {
         for op in &ops {
             let map = match op.entity_type {
-                crate::graph::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
-                crate::graph::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
-                crate::graph::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
-                crate::graph::protocol::vocabulary::EntityType::Content => &mut self.graph.contents,
-                crate::graph::protocol::vocabulary::EntityType::Review => continue,
-                crate::graph::protocol::vocabulary::EntityType::NodeTag => {
-                    &mut self.graph.memberships
-                }
+                crate::protocol::vocabulary::EntityType::Node => &mut self.graph.nodes,
+                crate::protocol::vocabulary::EntityType::Edge => &mut self.graph.edges,
+                crate::protocol::vocabulary::EntityType::Tag => &mut self.graph.tags,
+                crate::protocol::vocabulary::EntityType::Content => &mut self.graph.contents,
+                crate::protocol::vocabulary::EntityType::Review => continue,
+                crate::protocol::vocabulary::EntityType::NodeTag => &mut self.graph.memberships,
             };
             match &op.after_value {
                 Some(Value::Object(after)) => {
@@ -275,7 +273,7 @@ impl World {
     }
 
     /// Event `seq` as the server retains it (its header as [`Self::replicate`] writes it).
-    fn retained(&self, seq: u64) -> crate::graph::protocol::wire::Event {
+    fn retained(&self, seq: u64) -> crate::protocol::wire::Event {
         let ops = self.events[usize::try_from(seq - 1).expect("seq")].clone();
         serde_json::from_value(json!({
             "event": {"id": Self::event_id(seq), "graph_seq": seq.to_string(), "descriptor": "graph.apply",
@@ -283,7 +281,7 @@ impl World {
                 "actor_id": "ana", "client_id": "dev1", "origin_class": "human", "origin_actor": null,
                 "origin_chain": null, "context_id": null, "approval_basis": {"basis": "direct"},
                 "reverses_event_id": null, "event_time_ms": null, "recorded_at_ms": 1,
-                "op_count": ops.len(), "delta_digest": crate::graph::protocol::delta::digest(&ops).expect("digest")},
+                "op_count": ops.len(), "delta_digest": crate::protocol::delta::digest(&ops).expect("digest")},
             "ops": ops,
         }))
         .expect("event")
@@ -309,7 +307,7 @@ impl World {
                     "actor_id": "ana", "client_id": "dev1", "origin_class": "human", "origin_actor": null,
                     "origin_chain": null, "context_id": null, "approval_basis": "{\"basis\":\"direct\"}",
                     "reverses_event_id": null, "event_time_ms": null, "recorded_at_ms": 1,
-                    "op_count": ops.len(), "delta_digest": crate::graph::protocol::delta::digest(ops).expect("digest"),
+                    "op_count": ops.len(), "delta_digest": crate::protocol::delta::digest(ops).expect("digest"),
                     "author_actor": "server", "author_client": "server",
                 }),
             ));
@@ -535,7 +533,7 @@ impl Rig {
 }
 
 fn is_ulid_text(v: &Value) -> bool {
-    v.as_str().is_some_and(crate::graph::protocol::is_ulid)
+    v.as_str().is_some_and(crate::protocol::is_ulid)
 }
 
 /// AC1/AC3: an accepted graph with custom kinds, properties, tags and
@@ -592,21 +590,17 @@ async fn a_replayed_prefix_answers_the_profile_exactly() {
         (2, true, Completeness::Current)
     );
 
-    let task = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Node,
-        "work:Task",
-    )
-    .expect("sym");
-    let dep = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Edge,
+    let task =
+        crate::protocol::symbol::encode(crate::protocol::symbol::SymbolKind::Node, "work:Task")
+            .expect("sym");
+    let dep = crate::protocol::symbol::encode(
+        crate::protocol::symbol::SymbolKind::Edge,
         "work:depends_on",
     )
     .expect("sym");
-    let weight = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Property,
-        "weight",
-    )
-    .expect("sym");
+    let weight =
+        crate::protocol::symbol::encode(crate::protocol::symbol::SymbolKind::Property, "weight")
+            .expect("sym");
     let result = reader
         .query(
             &format!("MATCH (a:Concept)-[d:{dep}]->(b:{task}) RETURN a.title AS from, d.{weight} AS w, d.id AS id ORDER BY w DESC LIMIT 10"),
@@ -701,16 +695,12 @@ async fn a_new_generation_leaves_no_stale_value() {
     rig.world.replicate(1, 2, 2, None);
     let reader = rig.reader();
     reader.refresh(&Cancellation::default()).await.expect("g1");
-    let gone = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Property,
-        "gone",
-    )
-    .expect("sym");
-    let kind_of = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Property,
-        "kind_of",
-    )
-    .expect("sym");
+    let gone =
+        crate::protocol::symbol::encode(crate::protocol::symbol::SymbolKind::Property, "gone")
+            .expect("sym");
+    let kind_of =
+        crate::protocol::symbol::encode(crate::protocol::symbol::SymbolKind::Property, "kind_of")
+            .expect("sym");
     let probe =
         format!("MATCH (n) WHERE n.id = $id RETURN n.{gone} AS gone, n.{kind_of} AS k LIMIT 1");
     let params = format!(r#"{{"id":"{a}"}}"#);
@@ -1269,7 +1259,7 @@ async fn a_revoked_scope_or_a_cancellation_stops_reads() {
 
 #[test]
 fn checkpoint_rows_decide_the_scope() {
-    use crate::graph::source::checkpoint_of;
+    use crate::source::checkpoint_of;
     let row = |tbl: &str, status: &str, cursor: i64, holds: bool| {
         json!({"tbl": tbl, "status": status, "cursor": cursor, "holds": holds})
             .as_object()
@@ -1523,8 +1513,8 @@ async fn projection_two_exposes_assertions_contents_and_merges() {
             );
         }
     }
-    let member = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Property,
+    let member = crate::protocol::symbol::encode(
+        crate::protocol::symbol::SymbolKind::Property,
         "$assertion",
     );
     assert!(member.is_err(), "a reserved member is never a symbol");
@@ -1559,11 +1549,11 @@ async fn projection_two_exposes_assertions_contents_and_merges() {
     rig.world.accept(vec![ChangeOp::MergeNodes {
         target_id: target.clone(),
         target_revision: t_rev,
-        absorbed: vec![crate::graph::protocol::change::Absorbed {
+        absorbed: vec![crate::protocol::change::Absorbed {
             id: x.clone(),
             expected_revision: x_rev,
         }],
-        edges: vec![crate::graph::protocol::change::MergeEdge {
+        edges: vec![crate::protocol::change::MergeEdge {
             id: ulid(10),
             expected_revision: "1".into(),
             from_lifecycle_revision: "1".into(),
@@ -1578,11 +1568,8 @@ async fn projection_two_exposes_assertions_contents_and_merges() {
             .expect("g2")
             .built
     );
-    let rel = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Edge,
-        "ex:rel",
-    )
-    .expect("sym");
+    let rel = crate::protocol::symbol::encode(crate::protocol::symbol::SymbolKind::Edge, "ex:rel")
+        .expect("sym");
     let hop =
         format!("MATCH (a)-[e:{rel}]->(b) WHERE e.id = $e RETURN a.id AS from, b.id AS to LIMIT 1");
     let rows = rig
@@ -1627,7 +1614,7 @@ async fn projection_two_exposes_assertions_contents_and_merges() {
 /// re-projects the cleared redirect and the restored endpoint.
 #[tokio::test]
 async fn projection_three_skips_reviews_and_reprojects_a_reversed_merge() {
-    use crate::graph::protocol::{inverse, review};
+    use crate::protocol::{inverse, review};
     let mut rig = Rig::new();
     let (target, x, y) = (ulid(1), ulid(2), ulid(3));
     rig.world.accept(vec![
@@ -1641,11 +1628,11 @@ async fn projection_three_skips_reviews_and_reprojects_a_reversed_merge() {
     rig.world.accept(vec![ChangeOp::MergeNodes {
         target_id: target.clone(),
         target_revision: t_rev,
-        absorbed: vec![crate::graph::protocol::change::Absorbed {
+        absorbed: vec![crate::protocol::change::Absorbed {
             id: x.clone(),
             expected_revision: x_rev,
         }],
-        edges: vec![crate::graph::protocol::change::MergeEdge {
+        edges: vec![crate::protocol::change::MergeEdge {
             id: ulid(10),
             expected_revision: "1".into(),
             from_lifecycle_revision: "1".into(),
@@ -1675,11 +1662,8 @@ async fn projection_three_skips_reviews_and_reprojects_a_reversed_merge() {
         .await
         .expect("generation");
     assert_eq!(built.graph_seq, 5);
-    let rel = crate::graph::protocol::symbol::encode(
-        crate::graph::protocol::symbol::SymbolKind::Edge,
-        "ex:rel",
-    )
-    .expect("sym");
+    let rel = crate::protocol::symbol::encode(crate::protocol::symbol::SymbolKind::Edge, "ex:rel")
+        .expect("sym");
     let hop =
         format!("MATCH (a)-[e:{rel}]->(b) WHERE e.id = $e RETURN a.id AS from, b.id AS to LIMIT 1");
     let rows = rig
@@ -1713,10 +1697,10 @@ mod offline {
     use std::sync::atomic::AtomicI64;
 
     use super::*;
-    use crate::graph::client::GraphClient;
-    use crate::graph::lifecycle::{Lifecycle, LifecycleError};
-    use crate::graph::queue::{Binding, FenceCause, FenceState, GraphQueue, State as QueueState};
-    use crate::graph::source::Revocation;
+    use crate::client::GraphClient;
+    use crate::lifecycle::{Lifecycle, LifecycleError};
+    use crate::queue::{Binding, FenceCause, FenceState, GraphQueue, State as QueueState};
+    use crate::source::Revocation;
 
     const T0: i64 = 1_000_000_000_000;
     const DAY: i64 = 24 * 60 * 60 * 1000;

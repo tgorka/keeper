@@ -59,7 +59,6 @@ pub mod pairing;
 pub mod push;
 pub mod routes;
 pub mod send;
-pub mod server;
 pub mod sessions;
 pub mod settings;
 pub mod signin;
@@ -86,12 +85,12 @@ use crate::error::CoreError;
 use crate::hq::databases::Authorization;
 use crate::hq::pairing::PairingCode;
 use crate::hq::routes::{RouteError, Routes};
-use crate::hq::server::ServerUrl;
 use crate::hq::vm::{
     database_vm, not_connected_sentence, phase_sentence, HqDeviceVm, HqPairCodeVm, HqPhase,
     HqSignInState, HqSignInVm, HqStatusVm, HqThisDeviceVm,
 };
 use crate::platform::{exclude_from_backup_best_effort, Platform};
+use keeper_ports::server::ServerUrl;
 use keeper_ports::{Link, LinkState, Opener, Replica, ReplicaSpec, ReplicaState, Subscription};
 
 /// The keychain item of a server's pairing: this prefix and the base URL.
@@ -1386,17 +1385,9 @@ impl Hq {
             return Ok(self.status.borrow().clone());
         };
         let dir = databases::server_dir(&data_dir, &server);
-        // The graph intents this deletes, by state (112.1): the person's
-        // explicit erase takes them too, and the log says how many.
-        let (intents, unreadable) = crate::graph::queue::counts_under(&dir);
-        if !intents.is_empty() || unreadable > 0 {
-            let counts = intents
-                .iter()
-                .map(|(state, count)| format!("{state}={count}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            tracing::info!(%counts, unreadable, "forgetting the server drops its graph intents");
-        }
+        // The graph intent queues beside the replicas (112.1) go with them:
+        // the person's explicit erase takes them too. keeper-core does not
+        // read them; counting them by state is `keeper_graph::queue::counts_under`.
         let removed = match std::fs::remove_dir_all(&dir) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),

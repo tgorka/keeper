@@ -19,8 +19,9 @@ ts-rs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-# The knowledge graph's shared contract (`keeper_core::graph`): vocabulary,
-# canonical values and digests. Safe and lean; nothing native.
+# The knowledge graph's shared contract, for its one tag policy
+# (`keeper_graph_protocol::tag`, which `notes` folds every tag through).
+# Safe and lean; nothing native.
 keeper-graph-protocol = { path = "../keeper-graph-protocol" }
 # Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
 matrix-sdk = { workspace = true }
@@ -142,24 +143,11 @@ prost = "0.14"
 # catalog and linked by every host, so no new crate is resolved.
 tracing-subscriber = { workspace = true }
 
-# Graph worker launch checks (110.5, OD-A delta §4.4): P6c's soft stack
-# limit, the spawning thread's `no_new_privs`, the page and signal-frame
-# sizes, `security.capability`, and the Landlock ABI probe. Safe bindings;
-# both are already agentd dependencies (D-33).
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true, features = ["thread", "param"] }
-landlock = "=0.4.7"
-
-[features]
-# A person's graph reader (`graph::query::HumanReader`). Only keeper's
-# headless driver (`keeper-graph-driver`) enables it; no other crate and no
-# default does (`scripts/check-graph-boundary.py`), so no agent tool can
-# obtain one.
-human-reads = []
-
 [dev-dependencies]
 keeper-replica = { path = "../keeper-replica" }
 keeper-testkit = { path = "../keeper-testkit" }
+# The queue rule's place beside the replica layout (`hq::databases` tests).
+keeper-graph = { path = "../keeper-graph" }
 # Outcome-journal fixtures only; production code depends on keeper-ports.
 syncular-client = { workspace = true }
 # The privacy lifecycle tests observe real localhost connection/cancellation;

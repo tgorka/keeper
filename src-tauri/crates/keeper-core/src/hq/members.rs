@@ -24,9 +24,10 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::hq::sessions::{
-    authored, mark, names, object, opt_text, read, text, truthy, AgentSessionRef, Source,
+    authored, mark, names, object, opt_text, read, text, truthy, AgentSessionRef,
 };
 use crate::hq::{lock, Hq, HqError};
+use keeper_ports::Source;
 use keeper_ports::{Delivery, Rejection, ReplicaError, RowOp};
 
 /// A member's part in a session.

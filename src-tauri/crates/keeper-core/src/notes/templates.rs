@@ -209,7 +209,7 @@ fn date_token(token: &str, stamp: &Stamp) -> Option<String> {
 /// The tag that marks a note as a template (AD-82).
 ///
 /// Normalised form, because that is the only form a tag exists in once
-/// [`crate::notes::tags::normalise`] has seen it: `#Template`, `template` and
+/// [`keeper_graph_protocol::tag::normalise`] has seen it: `#Template`, `template` and
 /// ` TEMPLATE ` are one tag, and comparing against anything else here would
 /// make the marker case-sensitive in exactly one place.
 pub const TEMPLATE_TAG: &str = "template";
