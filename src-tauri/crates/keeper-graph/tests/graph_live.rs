@@ -1487,7 +1487,7 @@ fn lifecycle_at(url: &str, source: &Source) -> Lifecycle {
         .expect("lifecycle")
 }
 
-/// What the driver's `resume` does: restore every entry, look its receipt
+/// What `keeper-cli graph resume` does: restore every entry, look its receipt
 /// up first, and send the identical request under its own id only when the
 /// one policy says nothing is known of it ([`resume_sends`]) and the domain
 /// is not locked; every answer goes through the one policy. The states each

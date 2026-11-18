@@ -4618,6 +4618,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-cli"
+version = "0.11.0"
+dependencies = [
+ "clap",
+ "keeper-graph",
+ "keeper-ports",
+ "keeper-replica",
+ "nix",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "keeper-core"
 version = "0.11.0"
 dependencies = [
@@ -4697,20 +4711,6 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid 1.2.1",
-]
-
-[[package]]
-name = "keeper-graph-driver"
-version = "0.11.0"
-dependencies = [
- "clap",
- "keeper-graph",
- "keeper-ports",
- "keeper-replica",
- "nix",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
 ]
 
 [[package]]

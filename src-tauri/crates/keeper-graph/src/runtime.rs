@@ -151,7 +151,7 @@ impl Runtime {
 
     /// macOS only, evidence only (OD-C): run `worker` under the constant
     /// `sandbox-exec` profile. Nothing shipped calls this; the headless
-    /// driver does when asked explicitly.
+    /// command line does when asked explicitly (`keeper-cli graph --macos-evidence`).
     #[cfg(target_os = "macos")]
     pub fn macos_evidence(worker: VerifiedWorker) -> Result<Self, QueryError> {
         Ok(Self {

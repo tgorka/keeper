@@ -2400,8 +2400,8 @@ mod offline {
         assert_eq!(o.lifecycle.regrant(&status, granted(), &fresh), Ok(()));
     }
 
-    /// Review r2 HIGH-1 (P2): another holder of the queue file (the
-    /// driver's `signals()` on a refused link) persists a credential fence
+    /// Review r2 HIGH-1 (P2): another holder of the queue file
+    /// (`keeper-cli graph`'s `signals()` on a refused link) persists a credential fence
     /// while this read runs: the cause stays `Credential` and fresh
     /// authority regrants it.
     #[tokio::test(flavor = "current_thread")]

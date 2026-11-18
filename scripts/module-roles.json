@@ -1,9 +1,9 @@
 {
   "keeper": "composition-root",
   "keeper-agent": "legacy",
+  "keeper-cli": "composition-root",
   "keeper-core": "legacy",
   "keeper-graph": "implementation",
-  "keeper-graph-driver": "composition-root",
   "keeper-graph-protocol": "contract",
   "keeper-graph-query": "legacy",
   "keeper-llm": "legacy",
