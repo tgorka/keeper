@@ -985,10 +985,16 @@ fn missing_prerequisite(reason: &str) -> bool {
 }
 
 /// The exit code an answer earns (keeper-syncd's five; the table is the
-/// module doc's).
-fn exit_code(answer: &Value) -> u8 {
+/// module doc's). `address_valid`: whether `--url` is an agents server
+/// address at all. The replica refuses an invalid one first, as
+/// `storage_unavailable`, and that answer stays the driver's byte for byte;
+/// it is still a configuration error.
+fn exit_code(answer: &Value, address_valid: bool) -> u8 {
     if answer["ok"] == true {
         return EXIT_OK;
+    }
+    if !address_valid {
+        return EXIT_CONFIG;
     }
     let detail = answer["detail"].as_str().unwrap_or_default();
     match answer["error"].as_str().unwrap_or_default() {
@@ -1012,6 +1018,7 @@ fn exit_code(answer: &Value) -> u8 {
 /// code.
 pub fn main(args: Args, printer: &Printer) -> u8 {
     let verb = args.command.name();
+    let address_valid = ServerUrl::parse(&args.url).ok().flatten().is_some();
     let answer = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1020,7 +1027,7 @@ pub fn main(args: Args, printer: &Printer) -> u8 {
         Err(e) => fail("storage_unavailable", &e.to_string()),
     };
     printer.answer(&answer, |answer| human::sentence(verb, answer));
-    exit_code(&answer)
+    exit_code(&answer, address_valid)
 }
 
 #[cfg(test)]
@@ -1266,7 +1273,14 @@ mod tests {
             ),
         ];
         for (answer, code) in cases {
-            assert_eq!(exit_code(&answer), code, "{answer}");
+            assert_eq!(exit_code(&answer, true), code, "{answer}");
         }
+        // An address that is none: the replica's refusal, a configuration error.
+        let unaddressed = refused(
+            "storage_unavailable",
+            "the server's address: relative URL without a base",
+        );
+        assert_eq!(exit_code(&unaddressed, false), EXIT_CONFIG);
+        assert_eq!(exit_code(&unaddressed, true), EXIT_FAILURE);
     }
 }
