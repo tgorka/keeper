@@ -1040,7 +1040,7 @@ fn a_locally_modified_file_is_refused_and_nothing_is_written_or_queued() {
 /// The lexical half of containment cannot see this: every segment of
 /// `vault/clip.mp4` is a plain `Component::Normal`, and the `symlink_metadata`
 /// in `hydrate::plan` does not follow the FINAL component but does follow every
-/// parent. Only the canonicalizing half — `browse::resolve`, which every read
+/// parent. Only the canonicalizing half — `keeper_paths::resolve`, which every read
 /// verb in the crate already runs (AD-59) — catches it, which is why a write
 /// verb must run it too. Without it `stage::materialize` writes its staging
 /// file and renames a real object into a directory the profile does not own.

@@ -5,7 +5,7 @@
 //! "bot" stays the provider's word (`crate::bots`), and an agent *runs on* one.
 //! Everything in this module is a decision over text the host read — no
 //! function here opens a file inside a zone (the host walks the drive through
-//! `keeper_sync::browse::resolve`, AD-65) — except the session log's writer and
+//! `keeper_paths::resolve`, AD-65) — except the session log's writer and
 //! reader and the `.keeper/` index, which own their own files (AD-366).
 pub mod agentd;
 pub mod approval;

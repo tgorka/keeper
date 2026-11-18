@@ -21,7 +21,7 @@
 //!   outside it anyway.
 //!
 //! So: a fourth scheme with a fourth fixed root — the sync profile's own
-//! `local_path` — resolved by [`keeper_sync::browse::resolve`], the same
+//! `local_path` — resolved by [`keeper_paths::resolve`], the same
 //! function `sync_browse`, `sync_open_entry` and `sync_read_text` already use.
 //! Not a second containment rule; the first one, called again. Everything below
 //! resolution — `Range`, the slice cap, 200/206/416/404, `Content-Type` from an
@@ -40,7 +40,7 @@
 //! # What this module does NOT do
 //!
 //! It composes no path and touches no disk. It turns a URL into two strings and
-//! says whether a kind is served. Containment is the caller's `browse::resolve`
+//! says whether a kind is served. Containment is the caller's `keeper_paths::resolve`
 //! and it is not restated here, because a second copy of a containment rule is
 //! a rule that will disagree with the first.
 
@@ -134,7 +134,7 @@ pub fn is_servable_path(rel: &str) -> bool {
 /// used — and a `?v=2` cache-buster appended by a reload must name the same
 /// file rather than a missing one.
 ///
-/// The component refusals are belt and braces. `browse::resolve` refuses `..`
+/// The component refusals are belt and braces. `keeper_paths::resolve` refuses `..`
 /// lexically and refuses a symlink out of the tree after canonicalisation, so a
 /// dot segment could not escape anything. Refusing here keeps the reason
 /// legible in the log and keeps a NUL out of a `Path` on a platform that would

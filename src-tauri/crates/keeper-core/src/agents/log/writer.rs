@@ -9,7 +9,7 @@
 //! so a chunk never becomes an LFS object, and it stores a body over 16 KiB as
 //! an immutable blob written and `fsync`ed before its line. It refuses a
 //! symlinked `log/` (or `blobs/`, or chunk): the caller resolved the session
-//! folder through `browse::resolve`, and a link inside it could point anywhere.
+//! folder through `keeper_paths::resolve`, and a link inside it could point anywhere.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

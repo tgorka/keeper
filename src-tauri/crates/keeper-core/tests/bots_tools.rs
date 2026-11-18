@@ -603,7 +603,7 @@ fn arguments_that_are_not_json_are_a_sentence_and_not_a_panic() {
 }
 
 /// A path that escapes never becomes a target. The grammar refuses it in
-/// `keeper-core` before any host is reached, and `browse::resolve` would refuse
+/// `keeper-core` before any host is reached, and `keeper_paths::resolve` would refuse
 /// it again in `keeper-sync` — two layers, and the model is told what a path
 /// may look like either way.
 #[test]

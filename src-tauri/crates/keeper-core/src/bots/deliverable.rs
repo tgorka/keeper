@@ -304,7 +304,7 @@ pub fn stage_image(data_dir: &Path, mime: &str, bytes: &[u8]) -> Result<StagedIm
 /// Read a staged image back, by id and MIME (FR-392).
 ///
 /// The id is matched against the folder's own listing rather than joined into a
-/// path: an id that arrived over IPC is input, and `browse::resolve` is not
+/// path: an id that arrived over IPC is input, and `keeper_paths::resolve` is not
 /// reachable from `keeper-core`, so the containment here is "the name must be
 /// one this folder already holds" — which no traversal string can satisfy.
 pub fn read_staged(data_dir: &Path, id: &str) -> Result<Vec<u8>, CoreError> {

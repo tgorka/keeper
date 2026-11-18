@@ -15,7 +15,7 @@
 //! frontend only ever echoes one Rust composed. Share is held to the stricter
 //! rule every other reader on the Files surface follows (AD-65): the webview
 //! names a profile and a profile-relative subpath, and [`share_target`] resolves
-//! it through [`keeper_sync::browse::resolve`] — the same function `sync_browse`,
+//! it through [`keeper_paths::resolve`] — the same function `sync_browse`,
 //! `sync_open_entry` and `sync_read_document` use, which refuses `..` lexically
 //! and refuses a symlink out of the tree after canonicalisation. A webview that
 //! wanted to share `/etc/passwd` would first have to persuade the engine to
@@ -42,7 +42,6 @@
 use std::path::{Path, PathBuf};
 
 use keeper_core::vm::IpcError;
-use keeper_sync::browse;
 
 use crate::ipc::AppState;
 use crate::sync_ipc::{engine_of, find_profile, missing_sentence, open_failure, sync_ipc_error};
@@ -65,7 +64,7 @@ pub fn folder_refusal(subpath: &str) -> String {
 /// the profile's name, which this function does not have. `Err` carries the
 /// refusal's own sentence: the escape, or the folder.
 pub fn share_target(root: &Path, subpath: &str) -> Result<Option<PathBuf>, String> {
-    let resolved = browse::resolve(root, subpath).map_err(|refusal| refusal.to_string())?;
+    let resolved = keeper_paths::resolve(root, subpath).map_err(|refusal| refusal.to_string())?;
     match resolved {
         Some(path) if path.is_dir() => Err(folder_refusal(subpath)),
         other => Ok(other),
@@ -215,7 +214,7 @@ mod tests {
         let refused = share_target(&root, "../outside.txt").expect_err("escapes");
         assert_eq!(
             refused,
-            browse::resolve(&root, "../outside.txt")
+            keeper_paths::resolve(&root, "../outside.txt")
                 .expect_err("the listing refuses it too")
                 .to_string(),
             "share and the listing must word the same escape the same way"

@@ -39,7 +39,7 @@ pub const MAX_TEXT_BYTES: usize = 262_144;
 pub const MAX_FILE_BYTES: usize = 1_000_000;
 
 /// The most bytes `path` or `to` may hold. Each of its names is held to
-/// `keeper_sync::files_write::MAX_NAME_BYTES` where the path is checked.
+/// `keeper_paths::MAX_NAME_BYTES` where the path is checked.
 pub const MAX_PATH_BYTES: usize = 1_024;
 
 /// How many lines of context a preview hunk keeps around a change.

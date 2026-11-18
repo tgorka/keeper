@@ -22,13 +22,14 @@ use gix::index::entry::Mode;
 use serde::{Deserialize, Serialize};
 
 use super::{blob_id, CommitFence, CommitPaths, CommitRequest, Engine, HashMap};
-use crate::browse::{landing, Contained, Displaced, Root, Staging};
+use crate::browse::{Contained, Displaced, Root, Staging};
 use crate::db::{self, WorkKind};
 use crate::error::{Result, SyncError};
 use crate::git;
 use crate::lfs;
 use crate::profile::SyncProfile;
 use crate::provenance::{Provenance, SyncSource};
+use keeper_paths::landing;
 
 /// How long [`Engine::commit_paths`] waits for the profile's lane before it
 /// says the folder is busy, and how often it looks.

@@ -21,7 +21,7 @@
 //!   fare. It is a local ref: nothing pushes it.
 //! * Every file the phone's own commits changed, and that the remote holds
 //!   differently, is copied **beside** the remote's version under a conflict
-//!   name ([`super::conflict::conflict_name`]) before the worktree moves —
+//!   name ([`keeper_paths::conflict::conflict_name`]) before the worktree moves —
 //!   AD-43's shape, the one a Mac's merge leaves, so a person meets the same
 //!   pair whichever device resolved it. A file only the phone holds stays at
 //!   its own path. The next pass commits both as ordinary new files and pushes
@@ -302,9 +302,9 @@ fn copy_beside(root: &Path, rela: &Path, stamp: &str, device: &str) -> Result<Op
     let parent = rela.parent().unwrap_or_else(|| Path::new(""));
     for ordinal in 1..=99u32 {
         let name = if ordinal == 1 {
-            super::conflict::conflict_name(rela, stamp, device)
+            keeper_paths::conflict::conflict_name(rela, stamp, device)
         } else {
-            super::conflict::conflict_name_numbered(rela, stamp, device, ordinal)
+            keeper_paths::conflict::conflict_name_numbered(rela, stamp, device, ordinal)
         };
         let copy = parent.join(name);
         let path = root.join(&copy);

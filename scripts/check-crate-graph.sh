@@ -7,6 +7,7 @@ bun run check:module-edges
 bun run check:core-tauri-free
 bun run check:core-sync-free
 bun run check:syncd-lean
+bun run check:paths-pure
 bun run check:ported-pure
 bun run check:llm-lean
 bun run check:agent-tauri-free

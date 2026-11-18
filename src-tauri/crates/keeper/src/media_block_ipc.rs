@@ -5,7 +5,7 @@
 //! The editor hands every command a block's body verbatim, or a note's text,
 //! and gets back a view model or text to splice. Nothing here reads a key:
 //! this module answers the world's questions the core asks — which drive a
-//! note is in and how a path joins under it (`browse::resolve`, AD-65), where
+//! note is in and how a path joins under it (`keeper_paths::resolve`, AD-65), where
 //! the recordings index says a recording is now — and does the reads and the
 //! writes (AD-55/AD-56).
 
@@ -65,7 +65,7 @@ struct ShellLookup {
 
 impl ShellLookup {
     fn new(platform: &Arc<dyn Platform>, profile_id: Option<&str>) -> Self {
-        // Canonical, as `browse::resolve` answers, so a drive reached through
+        // Canonical, as `keeper_paths::resolve` answers, so a drive reached through
         // a symlink still recognises its own files.
         let folders: Vec<(String, PathBuf)> = synced_folders(platform)
             .into_iter()
@@ -107,7 +107,7 @@ impl MediaLookup for ShellLookup {
             .drive_root
             .as_ref()
             .ok_or_else(|| NO_DRIVE_SENTENCE.to_owned())?;
-        match keeper_sync::browse::resolve(root, path) {
+        match keeper_paths::resolve(root, path) {
             Ok(Some(joined)) => Ok(joined),
             Ok(None) => Err(format!("{path} is not in this drive.")),
             Err(refusal) => Err(format!("{refusal}.")),

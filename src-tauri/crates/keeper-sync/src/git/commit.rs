@@ -726,7 +726,7 @@ impl Base {
 
     /// The entry it holds where a folder of `path` would be, as it spells
     /// it, its names compared as the Mac's volume compares them
-    /// ([`crate::names::same_entry_folded`]): on APFS `BLOCKED/child.txt` is
+    /// ([`keeper_paths::names::same_entry_folded`]): on APFS `BLOCKED/child.txt` is
     /// under the file `blocked`, and a tree holding both is one no Mac can
     /// check out. `None` when every folder of `path` is free.
     pub fn file_over(&self, path: &str) -> Option<String> {
@@ -740,7 +740,7 @@ impl Base {
                 && key
                     .split('/')
                     .zip(folders)
-                    .all(|(name, folder)| crate::names::same_entry_folded(name, folder));
+                    .all(|(name, folder)| keeper_paths::names::same_entry_folded(name, folder));
             over.then(|| key.into_owned())
         })
     }

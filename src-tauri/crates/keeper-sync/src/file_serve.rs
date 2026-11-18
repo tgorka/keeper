@@ -13,8 +13,8 @@
 //!
 //! A protocol handler is a hole in the sandbox unless its root is fixed and
 //! every request is checked against it (AD-59). That check is not written here.
-//! It is [`crate::browse::resolve`] — the same function `sync_browse`,
-//! `sync_open_entry`, `sync_read_text` and `files_write::resolve_existing`
+//! It is [`keeper_paths::resolve`] — the same function `sync_browse`,
+//! `sync_open_entry`, `sync_read_text` and `keeper_paths::resolve_existing`
 //! already call. This module is the second caller of a rule, not a second copy
 //! of one.
 //!
@@ -45,8 +45,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::browse::{self, BrowseRefusal};
 use crate::profile::SyncProfile;
+use keeper_paths::BrowseRefusal;
 
 /// Why one `keeper-file://` request will not be served.
 ///
@@ -61,7 +61,7 @@ pub enum ServeRefusal {
     /// No profile carries this id. The first gate, and the cheapest.
     UnknownProfile,
     /// The subpath is not a path inside the profile root — lexically, or after
-    /// resolution. Carries [`browse::resolve`]'s own refusal so the reason a log
+    /// resolution. Carries [`keeper_paths::resolve`]'s own refusal so the reason a log
     /// records is the reason the containment rule gave.
     Escapes(BrowseRefusal),
     /// The lexical test passed and nothing is at that path: deleted, renamed, or
@@ -91,7 +91,7 @@ impl std::fmt::Display for ServeRefusal {
 /// `PathBuf` in hand. A handler that could be handed a root would eventually be
 /// handed one from the URL.
 ///
-/// Returns a canonical path: [`browse::resolve`] canonicalizes both sides, so
+/// Returns a canonical path: [`keeper_paths::resolve`] canonicalizes both sides, so
 /// what comes back is the file that will actually be read rather than a name
 /// that resolves to it.
 pub fn resolve_served_path(
@@ -105,7 +105,8 @@ pub fn resolve_served_path(
         .find(|profile| profile.id == profile_id)
         .ok_or(ServeRefusal::UnknownProfile)?;
 
-    let resolved = browse::resolve(&profile.local_path, subpath).map_err(ServeRefusal::Escapes)?;
+    let resolved =
+        keeper_paths::resolve(&profile.local_path, subpath).map_err(ServeRefusal::Escapes)?;
     let resolved = resolved.ok_or(ServeRefusal::Missing)?;
 
     // `resolve` has already followed every link, so this describes the file that
@@ -130,10 +131,10 @@ pub fn served_file_name(subpath: &str) -> &str {
 
 /// Whether `path` is inside `root` after both are canonicalized.
 ///
-/// Not used by [`resolve_served_path`] — `browse::resolve` already does this —
+/// Not used by [`resolve_served_path`] — `keeper_paths::resolve` already does this —
 /// and exported for the test that proves the second caller inherits it. Keeping
 /// the assertion honest requires an independent way to state the property, and
-/// re-calling `browse::resolve` to check `browse::resolve` would prove nothing.
+/// re-calling `keeper_paths::resolve` to check `keeper_paths::resolve` would prove nothing.
 pub fn is_inside(root: &Path, path: &Path) -> bool {
     match (root.canonicalize(), path.canonicalize()) {
         (Ok(root), Ok(path)) => path.starts_with(&root),
@@ -265,7 +266,7 @@ mod tests {
 
         // Every string test this passes: one component, a normal name, no dots.
         // Only canonicalisation catches it, which is the half a lexical rule
-        // cannot have and the reason `browse::resolve` does both.
+        // cannot have and the reason `keeper_paths::resolve` does both.
         assert_eq!(
             resolve_served_path(&profiles, "01PROFILE", "escape.mov"),
             Err(ServeRefusal::Escapes(

@@ -16,11 +16,10 @@ use keeper_core::agents::drive_write::{Refusal, MAX_FILE_BYTES};
 use keeper_core::hq::drive_writes::{
     DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
 };
+use keeper_paths::{WriteRefusal, WriteRoute, WriteScope};
 use keeper_sync::engine::{blob_id, CommitFence, CommitPaths, CommitRequest, Engine};
 use keeper_sync::exclude::ExcludeSet;
-use keeper_sync::files_write::{
-    agent_apply_check, agent_write_check, AgentTarget, WriteRefusal, WriteRoute, WriteScope,
-};
+use keeper_sync::files_write::{agent_apply_check, agent_write_check, AgentTarget};
 use keeper_sync::lfs::stage::LfsPolicy;
 use keeper_sync::volume::{self, VolumeStatus};
 use keeper_sync::{MemoryTrailer, SyncProfile};
@@ -109,7 +108,7 @@ impl ShellDriveWrites {
             // No op changes a file over 1 MB (R606-10), checked again on the
             // disk right before the commit.
             if target == AgentTarget::Existing {
-                let size = keeper_sync::browse::resolve(&profile.local_path, key)
+                let size = keeper_paths::resolve(&profile.local_path, key)
                     .ok()
                     .flatten()
                     .and_then(|file| std::fs::metadata(file).ok())
@@ -222,7 +221,7 @@ impl DriveWrites for ShellDriveWrites {
         let head = keeper_sync::git::history::blob_at(&profile.local_path, "HEAD", &key)
             .map_err(|error| unreadable(error.to_string()))?
             .map(|bytes| blob_id(&bytes));
-        let file = keeper_sync::browse::resolve(&profile.local_path, &key)
+        let file = keeper_paths::resolve(&profile.local_path, &key)
             .map_err(|refused| Refusal::Path {
                 sentence: refused.to_string(),
             })?

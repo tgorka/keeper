@@ -42,7 +42,7 @@ pub use keeper_ported::bmad::memlog::MEMLOG;
 
 /// The `workspace/` fence, spelled session-relative.
 ///
-/// The real fence is `keeper_sync::files_write::WriteScope` and it works on
+/// The real fence is `keeper_paths::WriteScope` and it works on
 /// profile-relative subpaths; this is the same refusal asked one scope in, so a
 /// plan that would write into scratch is never compiled in the first place. The
 /// shell still asks the real one — see [`compile_new`]'s note — because two

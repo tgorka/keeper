@@ -10,8 +10,8 @@
 //! leaves a row whose state says so and which promoting again completes; a
 //! promotion out also keeps the version it admitted until both have landed
 //! ([`Pending`]). Nothing here composes a path: session files are where
-//! [`landing`] says, drive files where `keeper-sync`'s `browse::resolve_known`,
-//! `browse::landing` and [`WriteScope`] say (AD-65).
+//! [`landing`] says, drive files where `keeper_paths::resolve_known`,
+//! `keeper_paths::landing` and [`WriteScope`] say (AD-65).
 //!
 //! Who a promotion out reaches is decided here, never by the shell
 //! ([`audience`]): the session's label from its whole log, the drive's
@@ -35,8 +35,9 @@ use keeper_core::sessions::model::{ARTIFACTS_DIR, README, WORKSPACE_DIR};
 use keeper_core::sessions::offer as offers;
 use keeper_core::sessions::plan::{sha256_hex, Plan, PlanStep};
 use keeper_core::sessions::promote::{self, KnowledgeFile, PanelFacts, SessionPromoteVm};
-use keeper_sync::browse;
-use keeper_sync::files_write::{collides, WriteRefusal, WriteRoute, WriteScope};
+
+use keeper_paths::{WriteRefusal, WriteRoute, WriteScope};
+use keeper_sync::files_write::collides;
 use keeper_sync::git::history;
 use keeper_sync::stability::{read_verified, verify_while_reading, FileSample};
 use keeper_sync::SyncProfile;
@@ -164,7 +165,8 @@ impl Audience {
 ///   epoch, and the label is not established.
 pub fn audience(zone: &Path, session: &str, out: &OutOf) -> Result<Audience, String> {
     let refused = |why: String| format!("{why}, so nothing is promoted out of {session}.");
-    let dir = browse::lexical_join(zone, session).map_err(|error| refused(error.to_string()))?;
+    let dir =
+        keeper_paths::lexical_join(zone, session).map_err(|error| refused(error.to_string()))?;
     let agent_file = dir.join(agent_session::FILE_NAME);
     let agent = match std::fs::symlink_metadata(&agent_file) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -283,7 +285,7 @@ pub fn audience(zone: &Path, session: &str, out: &OutOf) -> Result<Audience, Str
 /// does not list, an entry or a size that does not read, an entry under a
 /// chunk's name that is not a file. No `log/` at all is no chunks.
 fn frontier(zone: &Path, session: &str) -> Result<Vec<(String, u64)>, String> {
-    let dir = browse::lexical_join(zone, session).map_err(|error| error.to_string())?;
+    let dir = keeper_paths::lexical_join(zone, session).map_err(|error| error.to_string())?;
     let entries = match std::fs::read_dir(dir.join(LOG_DIR)) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -333,7 +335,7 @@ pub fn panel(
     me: Option<&str>,
 ) -> Result<SessionPromoteVm, VerbError> {
     let readme = read_readme(zone, session)?;
-    let dir = browse::lexical_join(zone, session)
+    let dir = keeper_paths::lexical_join(zone, session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
     let root = out.profile.local_path.as_path();
     let mut facts = PanelFacts::default();
@@ -463,10 +465,10 @@ fn zone_in_drive(zone: &Path, root: &Path) -> Option<String> {
 /// The file `rel` under `root`, resolved inside it: `None` only when the
 /// disk says it is not there, the sentence when it leads out or cannot be
 /// looked at — a folder on the way that may not be searched is not an
-/// absence ([`browse::resolve_known`]).
+/// absence ([`keeper_paths::resolve_known`]).
 fn locate(root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
-    browse::resolve_known(root, rel)
-        .map(|known| known.landed().map(browse::Landing::into_path))
+    keeper_paths::resolve_known(root, rel)
+        .map(|known| known.landed().map(keeper_paths::Landing::into_path))
         .map_err(|refusal| format!("{rel}: {refusal}"))
 }
 
@@ -619,7 +621,7 @@ fn walk(dir: &Path, top: &str, problems: &mut Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     let mut todo = vec![top.to_owned()];
     while let Some(rel) = todo.pop() {
-        let Ok(path) = browse::lexical_join(dir, &rel) else {
+        let Ok(path) = keeper_paths::lexical_join(dir, &rel) else {
             continue;
         };
         let entries = match std::fs::read_dir(path) {
@@ -671,7 +673,7 @@ fn walk(dir: &Path, top: &str, problems: &mut Vec<String>) -> Vec<String> {
 
 /// The file `rel` of the session, when it is there inside the zone.
 fn session_file(zone: &Path, session: &str, rel: &str) -> Option<PathBuf> {
-    browse::resolve(zone, &format!("{session}/{rel}"))
+    keeper_paths::resolve(zone, &format!("{session}/{rel}"))
         .ok()
         .flatten()
 }
@@ -866,7 +868,7 @@ fn scope<'p>(profile: &'p SyncProfile, subfolder: Option<&str>) -> WriteScope<'p
 /// home, into the sessions zone — would carry the write past the fences
 /// [`WriteScope`] checked on the path (R95K-04).
 fn lands_as_named(root: &Path, target: &str) -> Result<(), VerbError> {
-    let landed = browse::landing(root, target)
+    let landed = keeper_paths::landing(root, target)
         .map_err(|refusal| VerbError::Refused(format!("{target}: {refusal}")))?;
     if landed.iter().map(String::as_str).ne(target.split('/')) {
         return Err(VerbError::Refused(format!(
@@ -1021,8 +1023,8 @@ fn finish_pending(held: &ZoneLock, out: &OutOf) -> Result<(), VerbError> {
     if pending.profile != out.profile.id {
         return refuse("it was for another drive.".to_owned());
     }
-    match browse::resolve_known(held.zone(), &format!("{}/{README}", pending.session))
-        .map(browse::Known::landed)
+    match keeper_paths::resolve_known(held.zone(), &format!("{}/{README}", pending.session))
+        .map(keeper_paths::Known::landed)
     {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1038,7 +1040,7 @@ fn finish_pending(held: &ZoneLock, out: &OutOf) -> Result<(), VerbError> {
             ))
         }
     }
-    let dir = browse::lexical_join(held.zone(), &pending.session)
+    let dir = keeper_paths::lexical_join(held.zone(), &pending.session)
         .map_err(|error| VerbError::Refused(error.to_string()))?;
     match scan::recorded_id(&dir) {
         Ok(Some(id)) if id == pending.session_id => {}
@@ -1135,7 +1137,7 @@ fn publish(
     if let Err(VerbError::Refused(why)) = lands_as_named(root, &pending.target) {
         return refuse(why);
     }
-    let at = browse::lexical_join(root, &pending.target)
+    let at = keeper_paths::lexical_join(root, &pending.target)
         .map_err(|error| VerbError::Refused(error.to_string()))?;
     let recorded = recorded_copy(
         &read_readme(held.zone(), &pending.session)?,
@@ -1295,10 +1297,10 @@ pub fn promote_out(
     scope.fenced(target).map_err(refused)?;
     let root = out.profile.local_path.as_path();
     lands_as_named(root, target)?;
-    let directory =
-        browse::lexical_join(root, dir).map_err(|error| VerbError::Refused(error.to_string()))?;
+    let directory = keeper_paths::lexical_join(root, dir)
+        .map_err(|error| VerbError::Refused(error.to_string()))?;
     let session_id = scan::session_id(
-        &browse::lexical_join(held.zone(), session)
+        &keeper_paths::lexical_join(held.zone(), session)
             .map_err(|error| VerbError::Refused(error.to_string()))?,
         session,
     );
@@ -1308,7 +1310,7 @@ pub fn promote_out(
                 .filter(|(_, named, _)| *named == target)
                 .map(|(_, _, published)| published.map(str::to_owned))
         });
-        let there = browse::lexical_join(root, target)
+        let there = keeper_paths::lexical_join(root, target)
             .ok()
             .and_then(|at| std::fs::read(at).ok());
         let (Some(recorded), Some(there)) = (row, there) else {
@@ -1417,7 +1419,7 @@ pub fn review(
     else {
         return Err(VerbError::Refused(NOT_PROMOTED.to_owned()));
     };
-    if browse::resolve_known(root, &target)
+    if keeper_paths::resolve_known(root, &target)
         .map_err(|refusal| VerbError::Refused(refusal.to_string()))?
         .landed()
         .is_none()

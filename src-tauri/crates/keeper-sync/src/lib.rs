@@ -55,7 +55,8 @@ pub mod http;
 pub mod ledger;
 pub mod lfs;
 pub mod logfile;
-pub mod names;
+#[cfg(test)]
+mod names;
 pub mod openfiles;
 pub mod platform;
 pub mod profile;
@@ -82,7 +83,7 @@ pub use engine::{
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
-pub use names::{ForDisplay, UnspellableName};
+
 pub use platform::{OpenFileState, SyncPlatform};
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};

@@ -39,7 +39,7 @@
 //! mitigations and neither is a control: "permission rules are enforced by
 //! Claude Code, not by the model" (R6 §6.2) is the load-bearing caveat, and the
 //! thing that actually enforces anything here is `decide()` plus
-//! `browse::resolve`.
+//! `keeper_paths::resolve`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

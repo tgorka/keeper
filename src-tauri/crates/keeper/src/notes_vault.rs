@@ -2886,10 +2886,10 @@ pub fn conflicts(vault: &Vault) -> Vec<(String, String)> {
 pub fn write_conflict_copy(vault: &Vault, rel: &str, theirs: &str) -> Option<String> {
     let device = crate::sync::engine_if_open()
         .map_or_else(|| "device".to_owned(), |engine| engine.device().label);
-    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let stamp = keeper_paths::conflict_stamp(chrono::Utc::now().timestamp_millis());
     // `rel` is UTF-8, so the name built from its bytes is too; the lossy
     // rendering here is exact.
-    let name = keeper_sync::git::conflict::conflict_name(Path::new(rel), &stamp, &device)
+    let name = keeper_paths::conflict::conflict_name(Path::new(rel), &stamp, &device)
         .to_string_lossy()
         .into_owned();
     let copy_rel = match rel.rfind('/') {
@@ -4898,7 +4898,7 @@ mod tests {
         );
         // The shape the engine actually writes, built by the engine's own
         // function so this cannot drift from AD-43.
-        let name = keeper_sync::git::conflict::conflict_name(
+        let name = keeper_paths::conflict::conflict_name(
             Path::new("note.md"),
             "20260802-120000",
             "laptop",

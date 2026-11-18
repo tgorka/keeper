@@ -442,7 +442,7 @@ pub struct ProblemReport {
     /// Read from the index, so it covers files committed long ago that no
     /// status walk would mention. Untracked ones are on the pending list
     /// instead, and once the first sync carries them they appear here.
-    pub unspellable: Vec<crate::names::UnspellableName>,
+    pub unspellable: Vec<keeper_paths::names::UnspellableName>,
 }
 
 /// Units claimed from the journal per profile per tick.
@@ -9751,7 +9751,7 @@ impl Engine {
         }
 
         let device = self.device();
-        let stamp = conflict_stamp(self.platform.now_ms());
+        let stamp = keeper_paths::conflict_stamp(self.platform.now_ms());
         let profile_for_task = profile.clone();
         // A merge is a sync action like any other, and until now it was the one
         // commit in the history that said nothing about who made it. "Which
@@ -10101,7 +10101,7 @@ impl Engine {
                 stages.entry(entry.path).or_default()[usize::from(entry.stage) - 1] =
                     Some(entry.oid);
             }
-            let their_label = git::conflict::rescue_label(tracking);
+            let their_label = keeper_paths::conflict::rescue_label(tracking);
             let mut take_ours: Vec<PathBuf> = Vec::new();
             let mut take_theirs: Vec<PathBuf> = Vec::new();
             for (path, [in_base, ours, theirs]) in &stages {
@@ -10112,12 +10112,10 @@ impl Engine {
                 // conflict copy of the canonical path — the one shape a user
                 // has been taught to look for — and the rescue litter goes.
                 let rescue = match (ours, theirs) {
-                    (Some(oid), None) => {
-                        git::conflict::rescue_origin(path, "HEAD").map(|origin| (origin, oid))
-                    }
-                    (None, Some(oid)) => {
-                        git::conflict::rescue_origin(path, &their_label).map(|origin| (origin, oid))
-                    }
+                    (Some(oid), None) => keeper_paths::conflict::rescue_origin(path, "HEAD")
+                        .map(|origin| (origin, oid)),
+                    (None, Some(oid)) => keeper_paths::conflict::rescue_origin(path, &their_label)
+                        .map(|origin| (origin, oid)),
                     _ => None,
                 };
                 if let Some((origin, oid)) = rescue {
@@ -10273,9 +10271,9 @@ impl Engine {
             .filter(|parent| !parent.as_os_str().is_empty());
         for ordinal in 1..=CONFLICT_COPY_ORDINALS {
             let name = if ordinal == 1 {
-                git::conflict::conflict_name(rela, stamp, device)
+                keeper_paths::conflict::conflict_name(rela, stamp, device)
             } else {
-                git::conflict::conflict_name_numbered(rela, stamp, device, ordinal)
+                keeper_paths::conflict::conflict_name_numbered(rela, stamp, device, ordinal)
             };
             let copy = parent.map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name));
             let destination = repo_path.join(&copy);
@@ -12367,7 +12365,7 @@ impl Engine {
         cursor: Option<i64>,
     ) -> Result<git::history::HistorySearch> {
         let mut paths = vec![path.to_owned()];
-        paths.extend(git::conflict::originals_of(path));
+        paths.extend(keeper_paths::conflict::originals_of(path));
         let at_paths = Self::blocking(|| {
             git::history::plain_blob_with_oid(&profile.local_path, &paths, oid, size)
         })?;
@@ -13368,7 +13366,7 @@ impl Engine {
         let root = self
             .task_ledger_path(&run.task_id)?
             .ok_or_else(|| SyncError::Config("This task has no available ledger folder.".into()))?;
-        let path = crate::browse::resolve(Path::new(&root), entry)
+        let path = keeper_paths::resolve(Path::new(&root), entry)
             .map_err(|err| SyncError::Config(format!("The run log path is unusable: {err}")))?
             .ok_or_else(|| SyncError::Config("The run log file is no longer available.".into()))?;
         let mut file =
@@ -13903,7 +13901,7 @@ impl Engine {
                 .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
             self.settle_commit_paths(&profile)?;
             Self::blocking(|| self.commit_local(&profile, SyncSource::Manual, None))?;
-            let stamp = conflict_stamp(self.platform.now_ms());
+            let stamp = keeper_paths::conflict_stamp(self.platform.now_ms());
             let device = self.device().label;
             let path = profile.local_path.clone();
             let removable = profile.removable;
@@ -15451,7 +15449,7 @@ impl Engine {
     /// [`WorkKind::LfsDownload`] the only transfer and
     /// [`Self::materialize_landed`] the only completion arm. The per-path
     /// decision is [`lfs::hydrate::plan`]'s, the containment rule is
-    /// [`crate::browse::plain_segments`]'s, and the queue is the journal's.
+    /// [`keeper_paths::plain_segments`]'s, and the queue is the journal's.
     ///
     /// Deliberately **not** [`Self::materialize_pending`], the whole-tree
     /// sweep: its own doc records the 40 hours lost to calling it per object,
@@ -15577,7 +15575,7 @@ impl Engine {
         // verbatim rather than restated. Ahead of the reservation, so a subpath
         // that may not be asked for is refused whatever the folder is doing —
         // and it costs no disk, so there is nothing to serialize yet.
-        let segments = crate::browse::plain_segments(subpath)
+        let segments = keeper_paths::plain_segments(subpath)
             .map_err(ContentRefusal::from)
             .map_err(SyncError::Refused)?;
         if segments.is_empty() {
@@ -15587,7 +15585,7 @@ impl Engine {
             // asking for the root as a file is — browse's own sentence names the
             // subpath that was asked for.
             return Err(SyncError::Refused(ContentRefusal::Escapes(
-                crate::browse::BrowseRefusal::Escapes {
+                keeper_paths::BrowseRefusal::Escapes {
                     subpath: subpath.to_owned(),
                 },
             )));
@@ -15595,11 +15593,11 @@ impl Engine {
         // The other half of the same rule, and this verb needs it more than the
         // read verbs that already run it: `plain_segments` is lexical, so it
         // cannot see a *parent* component replaced by a symlink pointing out of
-        // the folder — and this is a write. `browse::resolve` canonicalizes
+        // the folder — and this is a write. `keeper_paths::resolve` canonicalizes
         // both ends and refuses after resolution (AD-59). `Ok(None)` is a path
         // that is simply not on disk, which is [`ContentRefusal::Missing`]'s
         // business a few lines down, not an escape.
-        crate::browse::resolve(&profile.local_path, subpath)
+        keeper_paths::resolve(&profile.local_path, subpath)
             .map_err(ContentRefusal::from)
             .map_err(SyncError::Refused)?;
         let rela = lfs::hydrate::joined(&segments);
@@ -16113,7 +16111,7 @@ impl Engine {
     /// nothing (AD-55, AD-56).
     ///
     /// `resolved` is the absolute path the caller has ALREADY put through
-    /// [`crate::browse::resolve`]; this function composes no path of its own
+    /// [`keeper_paths::resolve`]; this function composes no path of its own
     /// (AD-65). It is used for one `stat` and a read of at most
     /// `MAX_POINTER_BYTES` — [`lfs::stage::worktree_pointer`], the probe the
     /// listing's own mark uses — so an ordinary file costs a stat and nothing
@@ -18301,7 +18299,7 @@ impl Drop for Reservation<'_> {
 fn release_target(profile: &SyncProfile, subpath: &str) -> Result<(PathBuf, String)> {
     use lfs::hydrate::ContentRefusal;
 
-    let segments = crate::browse::plain_segments(subpath)
+    let segments = keeper_paths::plain_segments(subpath)
         .map_err(ContentRefusal::from)
         .map_err(SyncError::Refused)?;
     if segments.is_empty() {
@@ -18309,7 +18307,7 @@ fn release_target(profile: &SyncProfile, subpath: &str) -> Result<(PathBuf, Stri
         // folder holds no content to release, and asking for one as a file
         // is an escape — browse's own sentence names the subpath.
         return Err(SyncError::Refused(ContentRefusal::Escapes(
-            crate::browse::BrowseRefusal::Escapes {
+            keeper_paths::BrowseRefusal::Escapes {
                 subpath: subpath.to_owned(),
             },
         )));
@@ -18345,7 +18343,7 @@ fn release_target(profile: &SyncProfile, subpath: &str) -> Result<(PathBuf, Stri
     // half cannot do: a *parent* component replaced by a symlink pointing
     // out of the folder is every-segment-normal and still outside. This is
     // a write, so it runs it.
-    crate::browse::resolve(&profile.local_path, subpath)
+    keeper_paths::resolve(&profile.local_path, subpath)
         .map_err(ContentRefusal::from)
         .map_err(SyncError::Refused)?;
     // git's spelling, from the very function that keys the index lookup —
@@ -19125,7 +19123,7 @@ impl crate::copy::ContentSource for Engine {
 
         let profiles = self.with_db(db::list_profiles)?;
         // Canonicalized before comparing, both sides, for the reason
-        // `browse::resolve` canonicalizes both sides (AD-59): a lexical
+        // `keeper_paths::resolve` canonicalizes both sides (AD-59): a lexical
         // `strip_prefix` over raw paths answers `NotTracked` for a synced
         // folder reached through a symlinked ancestor — `/tmp` and `/var` are
         // symlinks on macOS, and a relocated home directory is one everywhere
@@ -19163,10 +19161,10 @@ impl crate::copy::ContentSource for Engine {
         };
         // `/`-joined, the frame every subpath in this crate is already in;
         // rebuilt from components rather than string-replaced so a Windows `\`
-        // never reaches `browse::plain_segments`.
+        // never reaches `keeper_paths::plain_segments`.
         //
         // A component that is not valid UTF-8 is REFUSED rather than rendered,
-        // and `browse::BrowseRefusal::Unspellable` is the sentence for exactly
+        // and `keeper_paths::BrowseRefusal::Unspellable` is the sentence for exactly
         // this: `to_string_lossy` maps every invalid byte onto `U+FFFD`, so two
         // distinct names collapse onto one key and the index lookup can succeed
         // at the wrong entry — hydrating a different file than the one being
@@ -19176,7 +19174,7 @@ impl crate::copy::ContentSource for Engine {
         for part in rest.components() {
             let Some(name) = part.as_os_str().to_str() else {
                 return Err(SyncError::Refused(ContentRefusal::Escapes(
-                    crate::browse::BrowseRefusal::Unspellable {
+                    keeper_paths::BrowseRefusal::Unspellable {
                         subpath: absolute.to_string_lossy().into_owned(),
                     },
                 )));
@@ -19220,21 +19218,6 @@ impl crate::copy::ContentSource for Engine {
             })),
         }
     }
-}
-
-/// UTC `yyyymmdd-hhmmss` for a conflict filename.
-///
-/// UTC deliberately, unlike the `.trashinfo` `DeletionDate`
-/// [`crate::files_write`] writes: this name has to sort and compare the same
-/// on both machines that produced the conflict, and a local stamp would put
-/// two names an hour apart on one event.
-///
-/// The civil-date arithmetic itself is
-/// [`crate::platform::civil_from_unix_ms`], which is where it lives now that
-/// two modules format an instant into words.
-fn conflict_stamp(now_ms: i64) -> String {
-    let (year, month, day, hh, mm, ss) = crate::platform::civil_from_unix_ms(now_ms);
-    format!("{year:04}{month:02}{day:02}-{hh:02}{mm:02}{ss:02}")
 }
 
 fn read_head(path: &Path, cap: usize) -> Result<Vec<u8>> {
@@ -26695,20 +26678,6 @@ mod tests {
     }
 
     #[test]
-    fn conflict_stamps_are_correct_utc_civil_dates() {
-        // Hand-rolled civil-date arithmetic is exactly the kind of code that is
-        // silently wrong for years, so pin real epochs including a leap day and
-        // the pre-epoch direction.
-        assert_eq!(conflict_stamp(0), "19700101-000000");
-        assert_eq!(conflict_stamp(1_000), "19700101-000001");
-        assert_eq!(conflict_stamp(951_782_400_000), "20000229-000000");
-        assert_eq!(conflict_stamp(1_709_164_800_000), "20240229-000000");
-        assert_eq!(conflict_stamp(1_753_444_800_000), "20250725-120000");
-        // A clock before the epoch must not produce a negative-looking name.
-        assert_eq!(conflict_stamp(-1_000), "19691231-235959");
-    }
-
-    #[test]
     fn a_machine_without_git_cannot_open_the_engine() {
         // AD-41: git is a declared prerequisite, and discovering it missing
         // mid-push would leave a profile half-applied.
@@ -31717,7 +31686,7 @@ mod tests {
             }],
             conflicts: vec!["a.sync-conflict-x.md".to_owned()],
             unspellable: vec![
-                crate::names::UnspellableName::of_bytes(b"doc-\xffepuap.txt")
+                keeper_paths::names::UnspellableName::of_bytes(b"doc-\xffepuap.txt")
                     .expect("not valid UTF-8"),
             ],
         };

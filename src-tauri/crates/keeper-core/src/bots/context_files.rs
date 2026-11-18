@@ -45,7 +45,7 @@
 //! came from" (R6 §6.1), and Anthropic's own caveat is that permission rules
 //! are enforced by the tool layer and not by the model. What actually stops a
 //! file-borne directive from touching a byte is
-//! [`decide`](super::grant::decide) and `browse::resolve`. This sentence makes
+//! [`decide`](super::grant::decide) and `keeper_paths::resolve`. This sentence makes
 //! the common case less likely; those two make the bad case impossible.
 
 use super::grant::{decide, Effect, Grant, GrantMode, GrantScope, GrantVerdict, ToolTarget};
@@ -228,7 +228,7 @@ impl ContextBundle {
 /// **Pure, and returns paths rather than reading them**, which is what lets the
 /// walk be asserted on any machine and what keeps the containment rule the only
 /// thing that turns a path into a file. Every path returned is profile-relative
-/// and `/`-joined, so it goes through `browse::resolve` like every other.
+/// and `/`-joined, so it goes through `keeper_paths::resolve` like every other.
 ///
 /// A `subpath` naming a file and one naming that file's directory produce the
 /// same list, because "the rules that apply to this file" and "the rules that

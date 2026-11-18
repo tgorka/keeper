@@ -13,6 +13,6 @@ export type FilesDeleteRefusalVm = {
  */
 relativePath: string, 
 /**
- * The whole sentence, composed by `keeper_sync::files_write`.
+ * The whole sentence, composed by `keeper_paths::WriteScope`.
  */
 reason: string, };

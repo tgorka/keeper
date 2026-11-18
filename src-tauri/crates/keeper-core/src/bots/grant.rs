@@ -606,7 +606,7 @@ pub enum SubpathError {
 /// against the wrong path, and "sanitize then use" is precisely the pattern R6
 /// §5.2 records failing in production.
 ///
-/// **This is not the containment rule.** `keeper-sync`'s `browse::resolve` /
+/// **This is not the containment rule.** `keeper_paths::resolve` /
 /// `plain_segments` / `WriteScope::route` remain the only functions that turn a
 /// path into a location on disk, symlinks included (AD-65). This grammar is
 /// what makes the *grant* checkable at all: a `..` reaching [`decide`] would

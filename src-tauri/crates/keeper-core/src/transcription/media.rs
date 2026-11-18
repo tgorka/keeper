@@ -273,7 +273,7 @@ pub fn clip_source(json: &Path, folders: &[(String, PathBuf)]) -> Result<ClipSou
 /// What resolving a block needs from the world, answered by the shell.
 pub trait MediaLookup {
     /// `path`, relative to the drive holding the note, joined under that
-    /// drive by `browse::resolve` (AD-65) — or its refusal, as a sentence.
+    /// drive by `keeper_paths::resolve` (AD-65) — or its refusal, as a sentence.
     fn join(&self, path: &str) -> Result<PathBuf, String>;
     /// Where the recordings index says a recording is now.
     fn recording(&self, session_id: &str) -> Option<RecordingPlace>;
@@ -679,7 +679,7 @@ mod tests {
     }
 
     /// A lookup over a scratch drive: joins refuse what escapes it, the way
-    /// `browse::resolve` does, and one recording is indexed.
+    /// `keeper_paths::resolve` does, and one recording is indexed.
     struct Drive {
         root: PathBuf,
         folders: Vec<(String, PathBuf)>,

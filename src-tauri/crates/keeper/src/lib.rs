@@ -415,7 +415,7 @@ pub fn run() {
     // AD-74 forbids the Files surface from reaching, and rather than a wider
     // `keeper-note://`, whose root is the notes SUBFOLDER and therefore narrower
     // than the tree the Files pane browses. This one is contained to the sync
-    // profile's own root, through the same `browse::resolve` the listing uses.
+    // profile's own root, through the same `keeper_paths::resolve` the listing uses.
     let builder = builder.register_asynchronous_uri_scheme_protocol(
         file_protocol::SCHEME,
         |ctx, request, responder| {

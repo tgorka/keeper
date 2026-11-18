@@ -22,9 +22,9 @@
 
 use std::path::Path;
 
+use keeper_paths::BrowseRefusal;
+use keeper_paths::{WriteRoute, WriteScope};
 use keeper_sync::bots_fs::{self, FileRead, FsRefusal, Limits, LineRange};
-use keeper_sync::browse::{self, BrowseRefusal};
-use keeper_sync::files_write::{WriteRoute, WriteScope};
 use keeper_sync::lfs::pointer::Pointer;
 
 /// Small enough that every bound is reachable in a test that runs in
@@ -796,8 +796,8 @@ fn a_link_put_in_an_offered_entrys_place_is_never_followed() {
     assert_eq!(walked.skipped, 1, "the replaced file");
 
     let landed = |rel: &str| {
-        browse::resolve_known(root, rel)
-            .and_then(browse::Known::under_root)
+        keeper_paths::resolve_known(root, rel)
+            .and_then(keeper_paths::Known::under_root)
             .expect("contained")
             .map(|landing| landing.relative())
     };

@@ -42,7 +42,7 @@
 //! webview (AD-65, FR-145). Turning a vault path into a note id is a lookup in
 //! the note index, which is `notes_tree`'s job, and it stays there.
 //!
-//! Containment is still Rust's on every real read: `keeper_sync::browse`
+//! Containment is still Rust's on every real read: `keeper_paths::resolve`
 //! re-resolves and re-contains whatever path this produced (AD-59). The
 //! refusals below are the outer of two gates, kept here so a `..` reaches a log
 //! as a refusal with a name rather than as a path that already collapsed.

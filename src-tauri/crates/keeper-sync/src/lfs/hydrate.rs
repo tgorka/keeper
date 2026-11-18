@@ -23,8 +23,8 @@
 //! [`ContentRefusal::AlwaysMaterializes`]) extended this enum rather than
 //! forking a `ReleaseRefusal` beside it. It is a standalone enum with a
 //! hand-written
-//! `Display`, the idiom [`crate::browse::BrowseRefusal`],
-//! [`crate::files_write::WriteRefusal`], [`crate::export::ExportRefusal`] and
+//! `Display`, the idiom [`keeper_paths::BrowseRefusal`],
+//! [`keeper_paths::WriteRefusal`], [`crate::export::ExportRefusal`] and
 //! [`crate::file_serve::ServeRefusal`] already establish, and it is carried
 //! across the transport by one [`crate::error::SyncError::Refused`] so that
 //! growing the vocabulary costs no churn in the two exhaustive matches that
@@ -32,7 +32,7 @@
 //!
 //! # Containment is `browse`'s rule, and only `browse`'s
 //!
-//! [`crate::browse::plain_segments`] is the single lexical containment test in
+//! [`keeper_paths::plain_segments`] is the single lexical containment test in
 //! this crate (AD-65). Its verdict is carried into
 //! [`ContentRefusal::Escapes`] unchanged, exactly as
 //! [`crate::file_serve::ServeRefusal::Escapes`] carries it, so there is no
@@ -51,10 +51,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::browse::BrowseRefusal;
 use crate::lfs::pointer::Pointer;
 use crate::lfs::stage::{self, PendingSmudge};
 use crate::SyncError;
+use keeper_paths::BrowseRefusal;
 
 /// Why keeper will not change the bytes at one path.
 ///
@@ -72,7 +72,7 @@ use crate::SyncError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentRefusal {
     /// The subpath is not a plain descendant of the profile root. Carries
-    /// [`crate::browse::plain_segments`]'s own refusal, so the reason a log
+    /// [`keeper_paths::plain_segments`]'s own refusal, so the reason a log
     /// records is the reason the one containment rule gave.
     Escapes(BrowseRefusal),
     /// The profile's `lfs_mode` is [`crate::profile::LfsMode::Disabled`].
@@ -683,7 +683,7 @@ pub fn plan(root: &Path, rela: &Path, indexed: &Pointer) -> Result<Plan, SyncErr
 ///
 /// Here rather than at the call site so both doors join the segments the same
 /// way, and so nothing composes a path out of the raw subpath string after
-/// [`crate::browse::plain_segments`] has vetted it — the join and the check
+/// [`keeper_paths::plain_segments`] has vetted it — the join and the check
 /// stay one step.
 pub fn joined(segments: &[&std::ffi::OsStr]) -> PathBuf {
     segments.iter().collect()

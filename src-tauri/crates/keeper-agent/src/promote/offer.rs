@@ -28,7 +28,6 @@ use keeper_core::sessions::plan::{sha256_hex, Emptying, PlanStep};
 use keeper_core::sessions::promote::{
     self, PanelFacts, PromoteRow, PromoteState, SessionPromoteVm,
 };
-use keeper_sync::browse;
 
 use super::{OutOf, Request, Reviewer};
 use crate::sessions::verbs::{self, VerbError};
@@ -144,7 +143,7 @@ pub fn complete(vm: &mut SessionPromoteVm, readme: &str, zone: &Path, session: &
             (Some(_), _) => None,
         };
     }
-    let Ok(dir) = browse::lexical_join(zone, session) else {
+    let Ok(dir) = keeper_paths::lexical_join(zone, session) else {
         return;
     };
     let artifacts = super::walk(&dir, ARTIFACTS_DIR, &mut vm.problems);

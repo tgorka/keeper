@@ -19,7 +19,7 @@ use std::path::Path;
 use keeper_core::sessions::files;
 use keeper_core::sessions::model::{classify, ARTIFACTS_DIR, ATTACHMENTS_DIR, WORKSPACE_DIR};
 use keeper_core::sessions::plan::{Plan, PlanStep};
-use keeper_sync::{browse, names};
+use keeper_paths::names;
 
 use super::exec;
 use super::verbs::VerbError;
@@ -64,7 +64,7 @@ enum Place {
 
 /// Where `rel` lands in the session at `session`, session-relative, or why
 /// an agent may not write there (R119). The landing is the disk's, through
-/// keeper-sync's [`browse::landing`], never the requested string: the
+/// [`keeper_paths::landing`], never the requested string: the
 /// session must be a real folder of the zone reached through no link, the
 /// landing must stay inside it — a folder link to another session or out of
 /// the zone is refused — and no name of it may be dotted or one of keeper's
@@ -95,7 +95,7 @@ fn land(
             name.starts_with('.') && !(at + 1 == names.len() && leaf == Some(*name))
         })
     };
-    let segments = browse::plain_segments(rel).map_err(|_| plain())?;
+    let segments = keeper_paths::plain_segments(rel).map_err(|_| plain())?;
     let requested: Vec<&str> = segments
         .iter()
         .map(|part| part.to_str().unwrap_or("."))
@@ -105,14 +105,14 @@ fn land(
     }
     // The scan's own rule for what is a session: a real folder, not a link.
     let missing = || VerbError::NoSuchSession(session.to_owned());
-    let dir = browse::lexical_join(zone, session).map_err(|_| missing())?;
+    let dir = keeper_paths::lexical_join(zone, session).map_err(|_| missing())?;
     let real = std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir())
-        && browse::landing(zone, session)
+        && keeper_paths::landing(zone, session)
             .is_ok_and(|landed| landed.iter().map(String::as_str).eq(session.split('/')));
     if !real {
         return Err(missing());
     }
-    let landed = browse::landing(&dir, rel).map_err(|refusal| {
+    let landed = keeper_paths::landing(&dir, rel).map_err(|refusal| {
         VerbError::Refused(format!(
             "{rel} does not stay inside this session: {refusal}"
         ))
@@ -168,9 +168,9 @@ pub fn session_write_with(
         files::check_rel(&landed).map_err(refused)?;
         Place::Pool
     };
-    let dir = browse::lexical_join(held.zone(), session)
+    let dir = keeper_paths::lexical_join(held.zone(), session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
-    let file = browse::lexical_join(&dir, &landed)
+    let file = keeper_paths::lexical_join(&dir, &landed)
         .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
     let old = std::fs::read_to_string(file).ok();
     let content = compose(&landed, old.as_deref()).map_err(VerbError::Refused)?;
@@ -232,7 +232,7 @@ pub fn attachment_write(
     may_write: &dyn Fn() -> bool,
 ) -> Result<String, VerbError> {
     let held = exec::hold(zone)?;
-    let dir = browse::lexical_join(held.zone(), session)
+    let dir = keeper_paths::lexical_join(held.zone(), session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
     for n in 1..=ATTACHMENT_NAMES {
         let wanted = format!("{ATTACHMENTS_DIR}/{}", numbered(name, n));
@@ -242,7 +242,7 @@ pub fn attachment_write(
                 "{wanted} does not land in this session's {ATTACHMENTS_DIR}/ folder, so nothing was written."
             )));
         }
-        let file = browse::lexical_join(&dir, &landed)
+        let file = keeper_paths::lexical_join(&dir, &landed)
             .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
         match std::fs::read(&file) {
             // The create below finds these bytes its own and makes them
@@ -320,9 +320,9 @@ pub fn memlog_write(
     let held = exec::hold(zone)?;
     let landed = land(held.zone(), session, rel, Some(files::MEMLOG), None)?;
     files::check_memlog(&landed).map_err(refused)?;
-    let dir = browse::lexical_join(held.zone(), session)
+    let dir = keeper_paths::lexical_join(held.zone(), session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
-    let file = browse::lexical_join(&dir, &landed)
+    let file = keeper_paths::lexical_join(&dir, &landed)
         .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
     // Only a memlog that is not there is absent: one that is there but
     // cannot be read is evidence, never started over.
@@ -383,9 +383,9 @@ pub fn publish_generation(
             "{dir} is not a folder of this session's workspace/"
         )));
     };
-    let session_dir = browse::lexical_join(held.zone(), session)
+    let session_dir = keeper_paths::lexical_join(held.zone(), session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
-    let target = browse::lexical_join(&session_dir, &landed)
+    let target = keeper_paths::lexical_join(&session_dir, &landed)
         .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
     if target.symlink_metadata().is_ok() {
         let found = exec::regular_files(&target);

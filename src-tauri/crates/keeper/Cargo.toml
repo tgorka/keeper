@@ -22,6 +22,7 @@ tauri-build = { workspace = true }
 url = { workspace = true }
 
 [dependencies]
+keeper-paths = { path = "../keeper-paths" }
 keeper-core = { path = "../keeper-core" }
 keeper-replica = { path = "../keeper-replica" }
 # Folder sync (Epic 29, AD-40) — on every target since Epic 66 (AD-198).
@@ -94,7 +95,7 @@ url = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 # `file_protocol`'s Range tests build a real vault tree on disk: the protocol
-# handler answers with bytes read through `browse::resolve`, so a fixture that
+# handler answers with bytes read through `keeper_paths::resolve`, so a fixture that
 # is not a real directory would test the wrong half (Story 45.7).
 tempfile = { workspace = true }
 

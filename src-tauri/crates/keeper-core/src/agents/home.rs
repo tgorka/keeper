@@ -6,7 +6,7 @@
 //! drives is two agents with two audiences (AD-360). `kind` chooses the
 //! default tools and whether `human` is required; it is never a power.
 //!
-//! Parsing is pure: the host reads `agent.toml` through `browse::resolve` and
+//! Parsing is pure: the host reads `agent.toml` through `keeper_paths::resolve` and
 //! hands the text here with the folder name and the drive's declaration.
 
 use std::collections::BTreeSet;
