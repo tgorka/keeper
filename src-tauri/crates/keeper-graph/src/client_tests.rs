@@ -222,6 +222,27 @@ fn a_prefix_replays_whole_events_from_the_replica() {
     );
 }
 
+/// The module alone (113.4): its prefix over a real local-only replica the
+/// test kit's harness opens, with only keeper-graph, its contract, the port,
+/// the adapter and the test kit in this binary.
+#[test]
+fn the_harness_gives_the_graph_a_replica_its_prefix_replays_from() {
+    let world = keeper_testkit::harness::harness_of(
+        DB,
+        keeper_testkit::Over::Local(&keeper_replica::SyncularOpener),
+    );
+    let (first, second) = two_events();
+    let mut rows = event_rows(1, &first, None);
+    rows.extend(event_rows(2, &second, None));
+    rows.push(head(2));
+    world.source.replica.mutate(rows).expect("seeded");
+
+    let prefix = prefix::complete(&world.source).expect("prefix");
+    assert_eq!((prefix.head, prefix.n), (2, 2));
+    assert!(prefix.is_complete());
+    assert_eq!(prefix.events[1].ops, second);
+}
+
 #[test]
 fn a_missing_or_partial_event_ends_the_prefix_stale() {
     let (first, second) = two_events();
