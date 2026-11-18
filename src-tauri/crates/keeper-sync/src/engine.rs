@@ -33537,6 +33537,43 @@ mod tests {
         );
     }
 
+    /// Arm a live native watcher whose own reports go nowhere, and return the
+    /// sender of the channel the engine drains, for the test to drive by hand.
+    ///
+    /// These fixtures need the watcher *live* — that is what makes the paced
+    /// walk the [`LIVE_WATCH_BACKSTOP_MS`] backstop — but not *speaking*.
+    /// FSEvents delivers changes made just before its stream was created: the
+    /// fixture's own `create_dir_all` of the root arrives tens of milliseconds
+    /// after `watch()`, spelled as the root's canonical path (`/private/var/…`
+    /// for a `/var/…` tempdir), and an event on the root is a wake by design
+    /// (`fold_watch_events`). The wake is right, and in the field it costs one
+    /// walk right after arming a folder that was created a moment before; here
+    /// it landed between hand-sent events, as a third walk in 276 of 300 runs
+    /// on a Mac. inotify reports nothing from before `watch()`, which is why
+    /// Linux never saw it. Same answer as [`arm_poll_watcher`]: what a
+    /// filesystem event does is other tests' subject.
+    fn arm_silent_watcher(
+        engine: &Engine,
+        p: &SyncProfile,
+    ) -> tokio::sync::mpsc::UnboundedSender<WatchEvent> {
+        let (reports, _discarded) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                // No sweep: these tests own no timers, and a rescan event would
+                // be a wake they did not ask for.
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            reports,
+        )
+        .expect("a watcher arms over a real directory");
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+        tx
+    }
+
     /// Story 34.9 / AD-45: tier 0 decides the **wake**, not only the walk.
     ///
     /// The watcher is armed `RecursiveMode::Recursive` over the profile root,
@@ -33561,20 +33598,7 @@ mod tests {
         let p = adoptable(dir.path());
         engine.upsert_profile(&p).expect("upsert");
 
-        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-        let watcher = FolderWatcher::start(
-            &p.local_path,
-            WatchConfig {
-                debounce_ms: 50,
-                // No sweep: this test owns no timers, and a rescan event would
-                // be a wake this test did not ask for.
-                rescan_interval_ms: 0,
-                force_poll: false,
-            },
-            tx.clone(),
-        )
-        .expect("a watcher arms over a real directory");
-        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+        let tx = arm_silent_watcher(&engine, &p);
 
         // One row per tier-0 directory Story 34.9 added, at the depths a real
         // build writes them, plus `.git/**` — which is in the same corpus, so
@@ -33661,18 +33685,7 @@ mod tests {
         let p = adoptable(dir.path());
         engine.upsert_profile(&p).expect("upsert");
 
-        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-        let watcher = FolderWatcher::start(
-            &p.local_path,
-            WatchConfig {
-                debounce_ms: 50,
-                rescan_interval_ms: 0,
-                force_poll: false,
-            },
-            tx.clone(),
-        )
-        .expect("a watcher arms over a real directory");
-        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+        let tx = arm_silent_watcher(&engine, &p);
 
         tx.send(WatchEvent {
             path: p.local_path.join(".git/objects/pack/pack-abc.idx"),
@@ -33737,18 +33750,7 @@ mod tests {
         p.poll_interval_ms = 15_000;
         engine.upsert_profile(&p).expect("upsert");
 
-        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-        let watcher = FolderWatcher::start(
-            &p.local_path,
-            WatchConfig {
-                debounce_ms: 50,
-                rescan_interval_ms: 0,
-                force_poll: false,
-            },
-            tx.clone(),
-        )
-        .expect("a watcher arms over a real directory");
-        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+        let tx = arm_silent_watcher(&engine, &p);
 
         // Two hours of one-second ticks: the first-sight walk and one hourly
         // backstop, and not one for the build.
