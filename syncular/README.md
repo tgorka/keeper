@@ -105,7 +105,11 @@ widzi z domeny, do której nie należy: nic" — not its name, not that it exist
   `kind`, `display_name`, and, when they exist, `replaced_repository` (the git repository the
   domain replaced, told only to its members), `graph_root` (the id of the domain's root
   `Collection`, the node carrying `okf:profile_version`) and `files_writes` (`shadow` | `open`, the
-  domain's file-write record). A client ignores an entry field it does not know.
+  domain's file-write record). A client ignores an entry field it does not know, and skips an
+  entry whose `kind` or `files_writes` is a value it does not know, reading the others: a kind
+  added later hides that one domain from an older client, never the whole body. `kind` and
+  `display_name` are required, so a body from a server older than story 114.2 does not parse; a
+  client of story 114.5 or later does not support that server.
 - No row, scope value, refusal, agent profile or ticked drive names a domain to someone who is not
   in it, and nothing lists the domains that exist.
 - A domain the credential does not open and a name that is no domain get one answer, byte for byte
@@ -116,9 +120,27 @@ widzi z domeny, do której nie należy: nic" — not its name, not that it exist
   `clients` would show each the others' devices.
 
 A map-dependent admission — a graph command or scope, a first enrolment, a pairing redemption —
-waits while the map is being applied, failed to apply or was restored older than the last applied
-one, and is refused meanwhile with `hq.map_closed`; conversations and their attachments do not
-wait. `accounts.vectors.json` lists every code the accounts contract adds.
+waits while no map has been applied since the server started (`starting`), while the map is being
+applied (`reconciling`), after it failed to apply (`failed`) or when it was restored older than the
+last applied one (`stale_restore`), and is refused meanwhile with `hq.map_closed`; conversations
+and their attachments do not wait. Only `open` admits: a reader takes a barrier state it does not
+know as closed. `hq.map_closed` is answered with 503 on the admin route; for a graph command it is
+a commit refusal with no HTTP status. `accounts.vectors.json` lists every code the accounts
+contract adds.
+
+**The operator's admin path.** Every change is one request `{request_id, expected_revision,
+command, confirm?}`; its fields are closed, and `hq.admin.malformed` answers one that does not
+parse. The server checks the request id first: the first request it applies binds the id to the
+request's digest, the SHA-256 of the RFC 8785 (JCS) bytes of the request as the contract
+serialises it after parsing — every required field present, `serving_agents` and `accept` among
+them (`[]` for none), an optional field without a value absent and never `null`. The same id and
+digest again gets the recorded answer with no second effect, and the same id with another digest
+is refused `hq.admin.request_reused`. Only then does it check the revision, so a retry after a lost
+answer gets the recorded answer, not a stale revision: a request whose `expected_revision` is not
+the map's revision is refused `hq.admin.stale_revision`. The revision is the `seq` of the map's
+last history event, 0 before the first, and `seq` is one sequence for the whole map, not one per
+domain. An answer of `confirmation_required`, `unreconciled` or a refusal applies nothing and binds
+nothing.
 
 ## Scopes
 
@@ -255,7 +277,8 @@ last wrote it. Times are UTC milliseconds since the epoch.
   is no drive: none is ticked until a person ticks it. It can only name drives the agent offers
   (`agent_profiles.drives`), and it grants reading, never writing. When who reads the database,
   or a ticked drive, changes, the server's own client unticks every drive that no longer passes
-  V17's audience rule — the name and its tick id leave the row — before a new reader's first pull.
+  V17's audience rule — the name and its tick id leave the row, the other ticks keep theirs —
+  before a new reader's first pull.
   From schema 5, `tick_ids` (nullable JSON) names the identity of each tick:
   `{"at": <this row's updated_at_ms>, "drives": {<drive>: <ULID>}}`. A schema-5 client writes it in
   every write of the row: a fresh ULID for each drive it ticks anew, the same id for each drive it
@@ -381,8 +404,9 @@ rule broken refuses the whole commit.
    absent or a JSON array of distinct non-empty strings, every effort one of `vocabulary.json`'s
    `efforts`; `default_model` is absent or one of `models`, and `default_effort` absent or one of
    `efforts`. Every drive in `drives` is one everyone who reads this database may read; a row that
-   names another is refused (`hq.profile.drive_audience`). The service client may rewrite a stored
-   row's `drives` to remove names, and change nothing else.
+   names another is refused (`hq.profile.drive_audience`). The one exception: the service client
+   may rewrite a stored row's `drives` to remove a name that no longer passes this rule, and
+   change nothing else.
 3. **V3 — sessions.** A new session's id starts with the commit's client id followed by `.`.
    `agent_actor`, `created_by_actor`, `created_by_client` and `parent_session` never change. A
    session is inserted only by a person, or by an instance of an agent the registry lets start work;
@@ -474,7 +498,9 @@ rule broken refuses the whole commit.
     `agent_profiles` row of the session's agent offers, and each readable by every person of this
     database: a drive is ticked in a database only when everyone who reads that database may read
     the drive. The one exception: the service client removes a drive that no longer passes this
-    rule, and its tick id, and changes nothing else.
+    rule. In the same write it removes that drive's id from `tick_ids.drives`, keeps every
+    remaining drive's id, and sets `updated_at_ms` and `tick_ids.at` to one new value, so the
+    remaining ticks keep their identity; it changes nothing else.
 18. **V18 — a write carried out.** A person message whose `metadata.kind` is `applied` reports what
     became of a `drive_write` approval: its id is `applied.` followed by the approval's id, it is
     written once and never changed, by the device that decided the approval, and it says

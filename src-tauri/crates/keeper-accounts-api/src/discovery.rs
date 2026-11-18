@@ -1,11 +1,18 @@
 //! `GET /databases`: the domains a credential opens, and nothing about any
-//! other (DF/OQ-16). The body keeps its camelCase envelope; each entry's
+//! other (story 114.2). The body keeps its camelCase envelope; each entry's
 //! keys are snake_case, the names of the map's columns.
 //!
 //! A parser ignores an entry field it does not know, so the server can add
 //! one without breaking a shipped client; the vectors hold such an entry.
+//! It skips an entry whose `kind` or `files_writes` is a value it does not
+//! know, and reads the rest of the body: a server that adds a fourth kind
+//! hides that domain from an older client and nothing else. `kind` and
+//! `display_name` stay required, so a body from a server older than story
+//! 114.2 does not parse; that pairing is not supported.
 
-use serde::{Deserialize, Serialize};
+use serde::de::value::Error as ValueError;
+use serde::de::IntoDeserializer;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{DomainKind, FilesWrites};
 
@@ -15,7 +22,9 @@ use crate::{DomainKind, FilesWrites};
 pub struct Discovery {
     pub actor_id: String,
     pub client_id: String,
-    /// Every domain this credential opens, and only those.
+    /// Every domain this credential opens, and only those, less any entry
+    /// whose `kind` or `files_writes` this client does not know.
+    #[serde(deserialize_with = "known_entries")]
     pub databases: Vec<DomainEntry>,
 }
 
@@ -46,4 +55,61 @@ pub struct DomainEntry {
     /// manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_writes: Option<FilesWrites>,
+}
+
+/// A `databases[]` entry as the server sends it, before an entry with a
+/// value this client does not know is skipped.
+#[derive(Deserialize)]
+struct WireEntry {
+    name: String,
+    mount: String,
+    kind: Lenient<DomainKind>,
+    display_name: String,
+    #[serde(default)]
+    replaced_repository: Option<String>,
+    #[serde(default)]
+    graph_root: Option<String>,
+    #[serde(default)]
+    files_writes: Option<Lenient<FilesWrites>>,
+}
+
+impl WireEntry {
+    fn known(self) -> Option<DomainEntry> {
+        let Lenient::Known(kind) = self.kind else {
+            return None;
+        };
+        let files_writes = match self.files_writes {
+            None => None,
+            Some(Lenient::Known(value)) => Some(value),
+            Some(Lenient::Unknown) => return None,
+        };
+        Some(DomainEntry {
+            name: self.name,
+            mount: self.mount,
+            kind,
+            display_name: self.display_name,
+            replaced_repository: self.replaced_repository,
+            graph_root: self.graph_root,
+            files_writes,
+        })
+    }
+}
+
+/// A string from a closed set, or a value of it this client does not know.
+enum Lenient<T> {
+    Known(T),
+    Unknown,
+}
+
+impl<'de, T: for<'a> Deserialize<'a>> Deserialize<'de> for Lenient<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        let known: Result<T, ValueError> = T::deserialize(word.into_deserializer());
+        Ok(known.map_or(Self::Unknown, Self::Known))
+    }
+}
+
+fn known_entries<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<DomainEntry>, D::Error> {
+    let wire = Vec::<WireEntry>::deserialize(deserializer)?;
+    Ok(wire.into_iter().filter_map(WireEntry::known).collect())
 }

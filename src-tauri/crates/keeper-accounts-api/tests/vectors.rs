@@ -65,6 +65,26 @@ fn closed_sets_agree() {
 }
 
 #[test]
+fn a_barrier_state_admits_only_when_open_and_an_unknown_one_is_closed() {
+    let v = corpus();
+    for entry in entries(&v, "barrier_reads") {
+        let state: Barrier = serde_json::from_value(entry["state"].clone()).expect("state");
+        assert_eq!(state.is_open(), entry["open"], "{}", entry["state"]);
+        assert_eq!(serde_json::to_value(&state).expect("state"), entry["state"]);
+        let known = v["barriers"]
+            .as_array()
+            .expect("barriers")
+            .contains(&entry["state"]);
+        assert_eq!(
+            !known,
+            matches!(state, Barrier::Other(_)),
+            "{}",
+            entry["state"]
+        );
+    }
+}
+
+#[test]
 fn discovery_bodies_parse_to_what_they_want() {
     let v = corpus();
     for entry in entries(&v, "discovery") {

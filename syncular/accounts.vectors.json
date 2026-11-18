@@ -1,9 +1,17 @@
 {
-  "about": "Keeper's accounts contract vectors (syncular/README.md, Domains and the map; story 114.2). Every implementation reproduces each entry: roles is vocabulary.json's roles; discovery[] bodies of GET /databases parse, and serialise back to want (an entry field a parser does not know is dropped, an absent optional stays absent); discovery_refusals[] do not parse; admin_requests[] parse and serialise back to json exactly; admin_request_refusals[] do not parse and the server answers them with refusal; admin_answers[] and map_views[] parse and serialise back to json exactly; refusals[] is every code the contract adds, with its HTTP status (null: a commit refusal).",
+  "about": "Keeper's accounts contract vectors (syncular/README.md, Domains and the map; story 114.2). Every implementation reproduces each entry: roles is vocabulary.json's roles; barrier_reads[] is whether each barrier state admits, a state the contract does not have reading as closed; discovery[] bodies of GET /databases parse, and serialise back to want (an entry field a parser does not know is dropped, an absent optional stays absent, an entry whose kind or files_writes the parser does not know is skipped); discovery_refusals[] do not parse; admin_requests[] parse and serialise back to json exactly; admin_request_refusals[] do not parse and the server answers them with refusal; admin_answers[] and map_views[] parse and serialise back to json exactly; refusals[] is every code the contract adds, with its HTTP status (null: a commit refusal).",
   "roles": ["reader", "editor", "reviewer", "owner"],
   "kinds": ["general", "personal", "group"],
   "files_writes": ["shadow", "open"],
   "barriers": ["open", "starting", "reconciling", "failed", "stale_restore"],
+  "barrier_reads": [
+    { "state": "open", "open": true },
+    { "state": "starting", "open": false },
+    { "state": "reconciling", "open": false },
+    { "state": "failed", "open": false },
+    { "state": "stale_restore", "open": false },
+    { "state": "repairing", "open": false }
+  ],
   "discovery": [
     {
       "name": "the general domain alone, no optional field",
@@ -122,6 +130,73 @@
           }
         ]
       }
+    },
+    {
+      "name": "an entry whose kind the client does not know is skipped, the rest read",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          },
+          {
+            "name": "scratch-team",
+            "mount": "/scratch-team",
+            "kind": "team",
+            "display_name": "Team"
+          }
+        ]
+      },
+      "want": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          }
+        ]
+      }
+    },
+    {
+      "name": "an entry whose files_writes the client does not know is skipped, the rest read",
+      "json": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "neuradrive",
+            "mount": "/neuradrive",
+            "kind": "group",
+            "display_name": "Neuradrive",
+            "files_writes": "closed"
+          },
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          }
+        ]
+      },
+      "want": {
+        "actorId": "marta",
+        "clientId": "marta.01",
+        "databases": [
+          {
+            "name": "makidrive",
+            "mount": "/makidrive",
+            "kind": "general",
+            "display_name": "Makidrive"
+          }
+        ]
+      }
     }
   ],
   "discovery_refusals": [
@@ -134,42 +209,11 @@
       }
     },
     {
-      "name": "a kind the contract does not have",
-      "json": {
-        "actorId": "marta",
-        "clientId": "marta.01",
-        "databases": [
-          {
-            "name": "makidrive",
-            "mount": "/makidrive",
-            "kind": "team",
-            "display_name": "Makidrive"
-          }
-        ]
-      }
-    },
-    {
       "name": "an entry without a display name",
       "json": {
         "actorId": "marta",
         "clientId": "marta.01",
         "databases": [{ "name": "makidrive", "mount": "/makidrive", "kind": "general" }]
-      }
-    },
-    {
-      "name": "a files_writes value the contract does not have",
-      "json": {
-        "actorId": "marta",
-        "clientId": "marta.01",
-        "databases": [
-          {
-            "name": "makidrive",
-            "mount": "/makidrive",
-            "kind": "general",
-            "display_name": "Makidrive",
-            "files_writes": "closed"
-          }
-        ]
       }
     }
   ],
@@ -247,6 +291,20 @@
         "request_id": "req-06",
         "expected_revision": 5,
         "command": { "op": "set_membership", "domain": "neuradrive", "actor_id": "marta" }
+      }
+    },
+    {
+      "name": "a membership with a role and an expiry",
+      "json": {
+        "request_id": "req-15",
+        "expected_revision": 5,
+        "command": {
+          "op": "set_membership",
+          "domain": "makidrive",
+          "actor_id": "marta",
+          "role": "reader",
+          "expires_at_ms": 1795000000000
+        }
       }
     },
     {
@@ -420,6 +478,24 @@
         }
       },
       "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a person added without serving_agents",
+      "json": {
+        "request_id": "req-28",
+        "expected_revision": 0,
+        "command": { "op": "add_person", "actor_id": "ola", "display_name": "Ola" }
+      },
+      "refusal": "hq.admin.malformed"
+    },
+    {
+      "name": "a reconcile without accept",
+      "json": {
+        "request_id": "req-29",
+        "expected_revision": 0,
+        "command": { "op": "reconcile" }
+      },
+      "refusal": "hq.admin.malformed"
     }
   ],
   "admin_answers": [
@@ -489,6 +565,13 @@
             "provisioned": true,
             "replaced_repository": "https://forge.example/git/tgorka/tgdrive.git",
             "files_writes": "shadow"
+          },
+          {
+            "name": "neuradrive",
+            "kind": "group",
+            "display_name": "Neuradrive",
+            "provisioned": true,
+            "files_writes": "open"
           }
         ],
         "people": [
@@ -506,6 +589,13 @@
             "domain": "tgdrive",
             "actor_id": "tgorka",
             "role": "owner",
+            "issuer": "seed",
+            "revision": 1,
+            "granted_at_ms": 1763424000000
+          },
+          {
+            "domain": "neuradrive",
+            "actor_id": "marta",
             "issuer": "seed",
             "revision": 1,
             "granted_at_ms": 1763424000000

@@ -1,27 +1,41 @@
-//! The operator's admin path: the only way the map changes (DF/AD-6). Its
-//! one client is the operator's own tool, and its one guard is the
-//! operator's token (DF/OQ-14); no device credential, agent instance,
-//! service client or import token changes the map, an owner's device
-//! included.
+//! The operator's admin path: the only way the map changes (story 114.2).
+//! Its one client is the operator's own tool, and its one guard is the
+//! operator's token; no device credential, agent instance, service client or
+//! import token changes the map, an owner's device included.
 //!
 //! A change is one [`AdminRequest`]: a [`AdminCommand`], the request's id and
-//! the map revision the operator last saw. The server binds the id to the
-//! digest of the whole request the first time it applies it, answers the same
-//! id and payload again from that record with no second effect, and refuses
-//! the same id with another payload ([`Refusal::RequestReused`]) and a request
-//! whose `expected_revision` a later change moved past
-//! ([`Refusal::StaleRevision`]), so a replay cannot roll a revocation back.
+//! the map revision the operator last saw. The server checks, in this order:
+//!
+//! 1. **The request id.** The first time it applies a request it binds the
+//!    id to the request's digest — the SHA-256 of the RFC 8785 (JCS) bytes of
+//!    the request as this contract serialises it after parsing (an optional
+//!    field without a value absent, never `null`; `serving_agents` and
+//!    `accept` always present). The same id and digest again is answered
+//!    from that record with no second effect; the same id with another
+//!    digest is refused ([`Refusal::RequestReused`]). This lookup comes
+//!    before the revision check, so a retry after a lost answer gets the
+//!    recorded answer, not a stale revision.
+//! 2. **The revision.** A request whose `expected_revision` is not the map's
+//!    revision is refused ([`Refusal::StaleRevision`]), so a replay cannot
+//!    roll a revocation back. The revision is the `seq` of the map's last
+//!    event, and `seq` is one sequence for the whole map, not one per domain.
+//!
 //! A request answered [`AdminAnswer::ConfirmationRequired`] or refused applied
 //! nothing and binds nothing. Every applied request is one event of the map's
 //! history, attributed to the operator, in the request's own transaction.
 //!
+//! [`Refusal::MapClosed`] is answered with 503 on the admin route only; for a
+//! graph command it is a commit refusal with no HTTP status.
+//!
 //! A request's fields are closed: a parser refuses one it does not know. An
-//! answer's are open: a reader ignores one it does not know.
+//! answer's are open: a reader ignores one it does not know, and reads a
+//! [`Barrier`] state it does not know as closed.
 //!
 //! [`Refusal::RequestReused`]: crate::refusal::Refusal::RequestReused
 //! [`Refusal::StaleRevision`]: crate::refusal::Refusal::StaleRevision
+//! [`Refusal::MapClosed`]: crate::refusal::Refusal::MapClosed
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{DomainKind, FilesWrites, Role};
 
@@ -54,8 +68,7 @@ pub enum AdminCommand {
         /// The person's own domain, once it is deployed and listed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         personal_domain: Option<String>,
-        /// The agents that serve this person.
-        #[serde(default)]
+        /// The agents that serve this person; always present, `[]` for none.
         serving_agents: Vec<String>,
     },
     /// A domain a deployment created is listed in the map, and served from
@@ -77,6 +90,10 @@ pub enum AdminCommand {
         actor_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<Role>,
+        /// When the membership ends, UTC milliseconds; absent for one that
+        /// does not. The same value as [`MembershipRecord::expires_at_ms`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<i64>,
     },
     /// A person leaves a domain: their credentials there are revoked and their
     /// sockets on it closed.
@@ -107,7 +124,7 @@ pub enum AdminCommand {
     /// again or listed here as accepted; until each is, the answer is
     /// [`AdminAnswer::Unreconciled`] and the barrier stays closed.
     Reconcile {
-        #[serde(default)]
+        /// Always present, `[]` for none.
         accept: Vec<PersonDomain>,
     },
 }
@@ -152,9 +169,10 @@ pub enum AdminAnswer {
     Unreconciled { differences: Vec<PersonDomain> },
 }
 
-/// Whether map-dependent admissions are open, and why not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Whether map-dependent admissions are open, and why not. A state this
+/// client does not know is kept as [`Barrier::Other`] and reads as closed,
+/// so a server that adds one never opens anything on an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Barrier {
     Open,
     /// No map has been applied since the server started.
@@ -166,6 +184,53 @@ pub enum Barrier {
     /// The general domain was restored from a copy older than the last
     /// applied map.
     StaleRestore,
+    /// A state this contract does not have, as the server named it.
+    Other(String),
+}
+
+impl Barrier {
+    /// The state's name on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Open => "open",
+            Self::Starting => "starting",
+            Self::Reconciling => "reconciling",
+            Self::Failed => "failed",
+            Self::StaleRestore => "stale_restore",
+            Self::Other(name) => name,
+        }
+    }
+
+    /// Whether map-dependent admissions are open: only [`Barrier::Open`];
+    /// every other state, an unknown one included, is closed.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    fn from_wire(name: String) -> Self {
+        match name.as_str() {
+            "open" => Self::Open,
+            "starting" => Self::Starting,
+            "reconciling" => Self::Reconciling,
+            "failed" => Self::Failed,
+            "stale_restore" => Self::StaleRestore,
+            _ => Self::Other(name),
+        }
+    }
+}
+
+impl Serialize for Barrier {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Barrier {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::from_wire)
+    }
 }
 
 /// Who wrote a membership.

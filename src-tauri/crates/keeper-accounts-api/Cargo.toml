@@ -10,7 +10,7 @@ edition.workspace = true
 [lints]
 workspace = true
 
-# Types only (DF/AD-2): no storage, transport, Syncular, SQLite, Tauri or
+# Types only (story 114.2): no storage, transport, Syncular, SQLite, Tauri or
 # keeper-core. `bun run check:module-edges` holds it to the contract role.
 [dependencies]
 serde = { workspace = true }
