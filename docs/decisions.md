@@ -2127,12 +2127,12 @@ them.
 
 keeper will treat every database of its `syncular/` contract as a **domain** — one audience, with its
 own schema, drive and graph, named alike — of one of three kinds: `general` (the organisation's one,
-`makidrive`, which every person is in as `reader` and the owner as `owner`), `personal` or `group`. A
-person's membership of a domain carries one of four roles — `reader`, `editor`, `reviewer`, `owner` —
-or none, and the same four name their standing in every module of that domain. Which domains exist,
-who is in each and with which role is the server's own **map**, changed only on the operator's admin
-path. keeper will **not** hold the map, replicate it, show a person anything of a domain they are not
-in, list the domains that exist, or let any device — an owner's included — change who is in a domain.
+`makidrive`), `personal` or `group`. A person's membership of a domain carries one of four roles —
+`reader`, `editor`, `reviewer`, `owner` — or none, and the same four name their standing in every
+module of that domain. Which domains exist, who is in each and with which role is the server's own
+**map**, changed only on the operator's admin path. keeper will **not** hold the map, replicate it,
+show a person anything of a domain they are not in, list the domains that exist, or let any device —
+an owner's included — change who is in a domain.
 
 - **What changes:** `syncular/vocabulary.json` gains `roles`, the one list of the four; the new
   contract crate `keeper-accounts-api` defines the domain kinds, the roles, the entry `GET /databases`
@@ -2152,13 +2152,12 @@ in, list the domains that exist, or let any device — an owner's included — c
   attributed to the operator, written in the change's own transaction.
 - **What it costs, stated so it is chosen:** whoever holds the operator's token and reaches the server
   can change the map, including which sign-in subject is which person, and so act as any person; the
-  owner accepts this ("sam token"), kept small by reading the token at use and never storing it, and by
-  the history that shows every change. A second factor can be added later without changing the
-  contract.
+  owner accepts this ("sam token"), kept small by the history that shows every change. A second
+  factor can be added later without changing the contract.
 - **What it amends:** D-37 — the databases are no longer two fixed names but the domains the map
   lists, each deployed on its own; who reads each moves from the operator's file into the map.
 - **Revisit triggers:** a person needing to manage their own group's members from the app; the token
   alone judged not enough.
-- **Status / owner:** decided by the owner (the answers quoted above), 2026-11; the contract lands in
-  keeper with story 114.2's contract rung, and the server enforces it from keeper-hq's side of the
-  same story. Owner is the architect.
+- **Status / owner:** decided by the owner (the answers quoted above), 2026-11. What keeper ships now,
+  with story 114.2's contract rung, is the contract and its vectors; enforcement is keeper-hq's
+  server side of story 114.2. Owner is the architect.
