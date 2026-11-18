@@ -22,16 +22,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keeper_core::graph::admission::{Admission, Process};
-use keeper_core::graph::client::{subscriptions, GraphClient};
-use keeper_core::graph::outcome::GraphOutcome;
-use keeper_core::graph::protocol::change::{ChangeOp, NodeFields};
-use keeper_core::graph::protocol::worker::InspectEntity;
-use keeper_core::graph::query::{Freshness, GraphReads, HumanReader, Inspected, QueryError};
-use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
-use keeper_core::graph::source::{GraphSource, ScopeState};
-use keeper_core::graph::supervisor::Cancellation;
-use keeper_core::hq::sessions::Source;
+use keeper_graph::admission::{Admission, Process};
+use keeper_graph::client::{subscriptions, GraphClient};
+use keeper_graph::outcome::GraphOutcome;
+use keeper_graph::protocol::change::{ChangeOp, NodeFields};
+use keeper_graph::protocol::worker::InspectEntity;
+use keeper_graph::query::{Freshness, GraphReads, HumanReader, Inspected, QueryError};
+use keeper_graph::runtime::{Runtime, VerifiedWorker};
+use keeper_graph::source::{GraphSource, ScopeState};
+use keeper_graph::supervisor::Cancellation;
+use keeper_ports::Source;
 use keeper_ports::{Link, ReplicaSpec};
 use keeper_replica::SyncularReplica;
 use serde_json::{json, Map, Value};
@@ -108,7 +108,7 @@ async fn caught_up(source: &Source, head: u64) {
     let started = Instant::now();
     loop {
         let scope = source.checkpoint().expect("checkpoint").scope;
-        let prefix = keeper_core::graph::prefix::complete(source).expect("prefix");
+        let prefix = keeper_graph::prefix::complete(source).expect("prefix");
         if scope == ScopeState::Granted && prefix.is_complete() && prefix.n >= head {
             return;
         }
@@ -266,8 +266,8 @@ const UNTYPED_EDGE: &str = "MATCH (a)-[e]->(b) RETURN e.id AS id LIMIT 100";
 /// case refused, before any server is provisioned.
 #[test]
 fn the_live_corpus_is_in_the_profile() {
-    use keeper_core::graph::protocol::profile::admit;
-    use keeper_core::graph::protocol::PROFILE;
+    use keeper_graph::protocol::profile::admit;
+    use keeper_graph::protocol::PROFILE;
     for (source, params, _) in corpus() {
         admit(PROFILE, &source, params.as_bytes()).unwrap_or_else(|r| panic!("{source}: {r}"));
     }

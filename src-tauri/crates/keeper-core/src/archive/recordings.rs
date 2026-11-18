@@ -83,7 +83,7 @@ pub struct RecordingRow {
     /// The user's free-text note about the session.
     pub note: Option<String>,
     /// The session's tags as a JSON array of strings, **normalised** — the
-    /// canonical form [`crate::notes::tags::normalise`] defines, deduplicated
+    /// canonical form [`keeper_graph_protocol::tag::normalise`] defines, deduplicated
     /// (Story 42.5). The manifest still holds what the user typed; this column
     /// holds what it means.
     pub tags_json: Option<String>,

@@ -44,7 +44,6 @@ use crate::notes::index::IndexEntry;
 use crate::notes::naming;
 use crate::notes::query;
 use crate::notes::sort;
-use crate::notes::tags;
 use crate::sessions::plan::{Plan, PlanStep};
 use crate::sessions::pool::{as_index_entry, PoolEntry};
 use crate::sessions::shape::{kind_dir, KindHasNoHome, KindTag, Shape};
@@ -928,7 +927,7 @@ fn read_create(query: &str) -> CreateVerdict {
         if term.negated || term.key.as_deref() != Some("tag") {
             return None;
         }
-        KindTag::of(&[tags::normalise(&term.value)?])
+        KindTag::of(&[keeper_graph_protocol::tag::normalise(&term.value)?])
     };
     // Asked of every term, and `all` over an empty slice is why the emptiness
     // is checked first: a query with no terms at all is the space that has not
@@ -1140,7 +1139,7 @@ fn one_tag(query: &str) -> Option<query::Term> {
 }
 
 /// Whether two positive `tag:` terms ask for the same tag, folded the way the
-/// engine folds them ([`tags::normalise`]) so `tag:About` and `tag:about` are
+/// engine folds them ([`keeper_graph_protocol::tag::normalise`]) so `tag:About` and `tag:about` are
 /// the one term they select as. A `/*` subtree term is its own request and not
 /// the bare tag: narrowing `tag:about/* tag:log` to `tag:about` would select
 /// what neither term did.
@@ -1162,7 +1161,7 @@ fn tag_path(value: &str) -> Option<(String, bool)> {
         Some(base) => (base, true),
         None => (trimmed, false),
     };
-    tags::normalise(base).map(|path| (path, subtree))
+    keeper_graph_protocol::tag::normalise(base).map(|path| (path, subtree))
 }
 
 /// Why this space offers no create under this session's contract, and whether

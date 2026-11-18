@@ -7,10 +7,11 @@ use ts_rs::TS;
 use crate::bots::chat::Effort;
 use crate::chat::commands::{self, ArgMode, CommandSpec, Context, Place, Resolution, RoomKind};
 use crate::hq::approvals::{self, Decisions, ShownApprovalVm};
-use crate::hq::sessions::{self, AgentSessionRef, Source};
+use crate::hq::sessions::{self, AgentSessionRef};
 use crate::hq::settings::{self, AgentSettingsChange, AgentSettingsPick};
 use crate::hq::{drives, live, timeline, Hq, HqError};
 use crate::vm::{ChatCommandPreviewVm, ChatCommandRowVm, ChatCommandVerdictVm};
+use keeper_ports::Source;
 
 const fn spec(
     name: &'static str,

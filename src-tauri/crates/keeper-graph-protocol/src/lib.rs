@@ -10,7 +10,7 @@
 //! ([`delta`]), the scope and key values of the graph tables ([`scope`]),
 //! the reads' shapes ([`wire`]), the closed query profile `KG-Cypher/1`
 //! ([`profile`]) and the frames a native consumer exchanges with its
-//! separate graph worker ([`worker`]).
+//! separate graph worker ([`worker`]), and a tag's canonical text ([`tag`]).
 //! `syncular/knowledge-graph.vectors.json` pins every rule here; keeper-hq's
 //! TypeScript validator reproduces the same vectors.
 //!
@@ -30,6 +30,7 @@ pub mod request;
 pub mod review;
 pub mod scope;
 pub mod symbol;
+pub mod tag;
 pub mod value;
 pub mod vocabulary;
 pub mod wire;

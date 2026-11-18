@@ -14,7 +14,8 @@ use crate::hq::approvals::{self, AgentApprovalActionVm, AgentApprovalStateVm, De
 use crate::hq::drive_writes::{
     DriveAbsent, DriveCommit, DriveCommitted, DriveFile, DriveTarget, DriveWrites,
 };
-use crate::hq::sessions::{self, object, Source};
+use crate::hq::sessions::{self, object};
+use keeper_ports::Source;
 use keeper_ports::{
     Covered, Delivery, Peer, RefusedCommit, Rejection, Replica, ReplicaError, ReplicaSpec,
     ReplicaState, RowOp, RowWrites, Subscription, UploadRefusal, WindowBase, WindowState,

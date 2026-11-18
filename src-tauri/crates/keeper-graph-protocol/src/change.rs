@@ -215,7 +215,7 @@ pub struct Change {
 
 impl Change {
     /// Check `ops` as a change set, `canonical_tag` being the tag policy
-    /// (keeper's `notes::tags::normalise`). The same rules as [`parse`].
+    /// ([`crate::tag::normalise`]). The same rules as [`parse`].
     pub fn new(
         ops: Vec<ChangeOp>,
         approval_id: Option<String>,

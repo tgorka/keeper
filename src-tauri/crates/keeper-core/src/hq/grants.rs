@@ -44,10 +44,11 @@ use ts_rs::TS;
 use crate::hq::approvals::{self, AgentDecisionOutcomeVm, Decisions, Refusal};
 use crate::hq::sessions::{
     authored, directory, int, json as json_column, object, opt_text, read, text, truthy,
-    SessionNames, Source,
+    SessionNames,
 };
 use crate::hq::vocabulary;
 use crate::hq::{sentence, Hq, HqError};
+use keeper_ports::Source;
 use keeper_ports::{Rejection, ReplicaError, RowOp, RowWrites};
 
 /// The table.

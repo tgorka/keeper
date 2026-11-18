@@ -36,7 +36,7 @@ use super::protocol::scope::{client_scope, receipt_id};
 use super::protocol::{is_decimal, is_ulid, value, Refusal, CONTRACT_VERSION};
 use super::queue::FenceCause;
 use super::write::{GraphWrite, Writer};
-use crate::hq::sessions::Source;
+use keeper_ports::Source;
 use keeper_ports::{CommandResult, ErrorClass, ReplicaError};
 
 /// Which request this is: its database, descriptor, request id and client

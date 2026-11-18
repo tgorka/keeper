@@ -1539,13 +1539,13 @@ pub fn get_agents_server_url(data_dir: &Path) -> Result<Option<String>, CoreErro
 /// keeper never writes an address it would not contact.
 pub fn set_agents_server_url(
     data_dir: &Path,
-    server: Option<&crate::hq::server::ServerUrl>,
+    server: Option<&keeper_ports::server::ServerUrl>,
 ) -> Result<(), CoreError> {
     set_setting(
         data_dir,
         AGENTS_SERVER_URL_KEY,
         server
-            .map(crate::hq::server::ServerUrl::as_str)
+            .map(keeper_ports::server::ServerUrl::as_str)
             .unwrap_or_default(),
     )
 }

@@ -10,8 +10,9 @@ use serde_json::{json, Value};
 
 use crate::hq::approvals::{self, AgentApprovalStateVm, AgentDecisionStateVm};
 use crate::hq::sessions::AgentAttentionVm;
-use crate::hq::sessions::{self, object, Source};
+use crate::hq::sessions::{self, object};
 use crate::hq::timeline::{self, AgentMessageStateVm, Opened};
+use keeper_ports::Source;
 use keeper_ports::{ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 

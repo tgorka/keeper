@@ -295,7 +295,7 @@ are enforced, not assumed:
 defined by keeper-hq's reviewed runtime DSO ledger (`agent/graph-runtime-ledger.json`, schema
 `keeper-graph-runtime-ledger/3`) embedded into the spawning binary at build time. A Linux
 worker is spawned only when the binary is `linux`/`x86_64`, a ledger is embedded, the
-worker's digest is the ledger's, and `keeper_core::graph::ledger` verifies the tree (every
+worker's digest is the ledger's, and `keeper_graph::ledger` verifies the tree (every
 ledger object resolved in-root through exactly the ledger's symlinks, root-owned with no
 group/other write bit, no set-id or sticky bit, no `security.capability`, every parent
 root-owned, its SHA-256, each `ld.so.cache` entry reaching the same inode, the absent paths
@@ -328,7 +328,7 @@ against the sole `libsqlite3-sys`. The builder runs the pinned upstream schema D
 inside its host transaction; both roles verify the complete `sqlite_schema`. The query
 authorizer allows exactly the 41 `(table, column)` reads and 9 functions of the reviewed
 corpus; a retained statement re-prepares under that exact policy, and a denial fails the
-query. Process-wide admission (`keeper_core::graph::admission`, one per process through
+query. Process-wide admission (`keeper_graph::admission`, one per process through
 `Admission::process`): 4 query workers per agentd (2 headless), 2 per agent, 1 per context
 whatever domain it reads, one builder, at most 16 waiting, 3 s to admit. A projection root
 keeps at most two published generations alive (`MAX_RETAINED_GENERATIONS`); a build is
@@ -348,7 +348,7 @@ the projection `projection_unavailable`: an R1 limit.
 ### Graph intents, revocation and offline reads (story 112.1)
 
 **Queued changes are local intent, never graph data.** A person's graph change can be
-persisted before it is sent (`keeper_core::graph::queue`, `keeper-graph-driver enqueue`) in
+persisted before it is sent (`keeper_graph::queue`, `keeper-graph-driver enqueue`) in
 `<actor>.graph-queue` beside the replica: one SQLite file per server, domain and actor,
 never synced. It holds the whole request identity, the request's canonical bytes and their
 digest, and the entry's state. Queries never see it: the default query answers the accepted
@@ -413,7 +413,7 @@ the replica's graph rows purged, and every queued intent `disabled` for good. CC
 subscriptions are granted again, the purge observed, a normal regrant from fresh authority
 restores reads; the intents queued before the switch stay disabled.
 
-**What an answer does to a queued entry** (`keeper_core::graph::queue::next`, keyed on the
+**What an answer does to a queued entry** (`keeper_graph::queue::next`, keyed on the
 outcome and its typed `PendingCause`, never on text): a receipt resolves it — but a person's
 receipt already on the replica settles nothing until the server's current `graph.read_status`
 answers, unless the same request's own fresh (not `cached`) acknowledgement is in hand: a

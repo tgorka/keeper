@@ -20,8 +20,8 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use keeper_core::graph::query::{GraphRemote, QueryError};
-use keeper_core::hq::sessions::Source;
+use keeper_graph::query::{GraphRemote, QueryError};
+use keeper_ports::Source;
 use keeper_ports::{Link, ReplicaSpec};
 use keeper_replica::SyncularReplica;
 use serde_json::{json, Value};

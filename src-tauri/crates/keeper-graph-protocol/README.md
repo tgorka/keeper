@@ -14,8 +14,8 @@ native code (`bun run check:graph-protocol-lean`).
 | `scope` | the `kg_graph`/`kg_client` scope values and graph row keys |
 
 Every rule is pinned by `syncular/knowledge-graph.vectors.json`, which keeper-hq's TypeScript
-validator also reproduces; the tags in it are checked in keeper-core against
-`notes::tags::normalise`. The contract itself is described in `syncular/README.md`
+validator also reproduces; the tags in it are checked in keeper-graph against `tag::normalise`,
+the one tag policy keeper has. The contract itself is described in `syncular/README.md`
 (*The knowledge graph*). This crate accepts nothing: acceptance is the server's graph command.
 
 ```sh

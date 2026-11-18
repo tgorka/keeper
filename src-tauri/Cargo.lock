@@ -4631,13 +4631,13 @@ dependencies = [
  "globset",
  "hex",
  "image",
+ "keeper-graph",
  "keeper-graph-protocol",
  "keeper-llm",
  "keeper-ported",
  "keeper-ports",
  "keeper-replica",
  "keeper-testkit",
- "landlock",
  "matrix-sdk",
  "matrix-sdk-base",
  "matrix-sdk-crypto",
@@ -4656,7 +4656,6 @@ dependencies = [
  "reqwest",
  "rsa",
  "rusqlite",
- "rustix",
  "rustls",
  "semver",
  "serde",
@@ -4679,11 +4678,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-graph"
+version = "0.11.0"
+dependencies = [
+ "keeper-graph-protocol",
+ "keeper-ports",
+ "keeper-replica",
+ "keeper-testkit",
+ "landlock",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "syncular-client",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "ulid 1.2.1",
+]
+
+[[package]]
 name = "keeper-graph-driver"
 version = "0.11.0"
 dependencies = [
  "clap",
- "keeper-core",
+ "keeper-graph",
  "keeper-ports",
  "keeper-replica",
  "nix",
@@ -4741,6 +4762,7 @@ name = "keeper-nse"
 version = "0.11.0"
 dependencies = [
  "keeper-core",
+ "keeper-ports",
  "serde",
  "serde_json",
  "tempfile",
@@ -4768,9 +4790,12 @@ dependencies = [
 name = "keeper-ports"
 version = "0.11.0"
 dependencies = [
+ "hex",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
+ "url",
 ]
 
 [[package]]

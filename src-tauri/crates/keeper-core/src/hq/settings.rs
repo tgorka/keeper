@@ -10,8 +10,9 @@ use ts_rs::TS;
 use super::sessions::AgentSessionRef;
 use crate::bots::chat::Effort;
 use crate::hq::live;
-use crate::hq::sessions::{authored, int, json, names, object, opt_text, read, Source};
+use crate::hq::sessions::{authored, int, json, names, object, opt_text, read};
 use crate::hq::{Hq, HqError};
+use keeper_ports::Source;
 use keeper_ports::{Rejection, ReplicaError, RowOp, WindowBase, CONFLICT};
 
 const TABLE: &str = "session_settings";

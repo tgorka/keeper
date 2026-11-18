@@ -16,8 +16,8 @@ use super::protocol::candidate::{self, State, Verdict};
 use super::protocol::change::{Change, ChangeOp, DESCRIPTOR};
 use super::protocol::delta::Op;
 use super::protocol::scope::{client_scope, event_op_id, receipt_id};
-use crate::hq::sessions::Source;
-use crate::notes::tags::normalise;
+use keeper_graph_protocol::tag::normalise;
+use keeper_ports::Source;
 use keeper_ports::{ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 

@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::*;
-use crate::hq::sessions::{self, object, Source};
+use crate::hq::sessions::{self, object};
 use crate::hq::timeline::{self, Opened};
+use keeper_ports::Source;
 use keeper_ports::{Peer, ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 

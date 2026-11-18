@@ -10,8 +10,9 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use super::{parse, preview, refusal_sentence, start, MentionError};
-use crate::hq::sessions::{self, object, Source};
+use crate::hq::sessions::{self, object};
 use crate::hq::timeline::{self, AgentMessageStateVm, AgentTimelineItemVm as Item, Opened};
+use keeper_ports::Source;
 use keeper_ports::{Rejection, ReplicaSpec, RowOp};
 use keeper_replica::SyncularReplica;
 

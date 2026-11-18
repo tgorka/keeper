@@ -1,6 +1,6 @@
 [package]
 name = "keeper-ports"
-description = "Replica port shared by keeper clients"
+description = "Replica port, server address and database source shared by keeper clients"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -14,3 +14,7 @@ workspace = true
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# The server address grammar (`server`): parsing, and its replica directory name.
+url = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

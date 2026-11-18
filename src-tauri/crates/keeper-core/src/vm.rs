@@ -3854,7 +3854,7 @@ pub struct RecordingHitVm {
     /// row's durability glyph.
     pub durability: String,
     /// The session's tags, canonical (Story 42.5): what
-    /// [`crate::notes::tags::normalise`] made of what the user typed, which is
+    /// [`keeper_graph_protocol::tag::normalise`] made of what the user typed, which is
     /// also exactly what the sidebar's tag node is called. Empty when the
     /// session has none, or when the column holds something that is not a JSON
     /// array of strings. The session's `manifest.json` still holds the user's

@@ -41,19 +41,17 @@ mod spawner {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use keeper_core::graph::admission::{Admission, Process};
-    use keeper_core::graph::protocol::delta::{self, Op};
-    use keeper_core::graph::protocol::vocabulary::{EntityType, Operation};
-    use keeper_core::graph::protocol::wire::{Authority, ContextRow, ReadStatus};
-    use keeper_core::graph::protocol::worker::InspectEntity;
-    use keeper_core::graph::query::{
+    use keeper_graph::admission::{Admission, Process};
+    use keeper_graph::protocol::delta::{self, Op};
+    use keeper_graph::protocol::vocabulary::{EntityType, Operation};
+    use keeper_graph::protocol::wire::{Authority, ContextRow, ReadStatus};
+    use keeper_graph::protocol::worker::InspectEntity;
+    use keeper_graph::query::{
         AdmittedRead, Freshness, GraphReads, GraphRemote, Inspected, QueryError,
     };
-    use keeper_core::graph::runtime::{Runtime, VerifiedWorker};
-    use keeper_core::graph::source::{
-        Checkpoint, GraphSource, PrefixBatch, ScopeState, SourceError,
-    };
-    use keeper_core::graph::supervisor::Cancellation;
+    use keeper_graph::runtime::{Runtime, VerifiedWorker};
+    use keeper_graph::source::{Checkpoint, GraphSource, PrefixBatch, ScopeState, SourceError};
+    use keeper_graph::supervisor::Cancellation;
     use serde_json::{json, Map, Value};
 
     type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;

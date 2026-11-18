@@ -3,7 +3,8 @@
 
 The graph worker `keeper-graph-query` carries exactly the eleven audited allowances U01-U11
 (docs/constraints-and-limitations.md) and six named exports; `allocation.rs` and `native.rs`
-stay byte-identical to the reviewed 110.1 sources. Core, protocol and driver carry no unsafe.
+stay byte-identical to the reviewed 110.1 sources. Core, the graph client, protocol and driver
+carry no unsafe.
 """
 import hashlib
 import json
@@ -26,20 +27,24 @@ def reject(text, pattern):
     if bad:
         raise SystemExit('forbidden graph dependency: ' + ', '.join(bad))
 
-reject(tree('keeper-graph-protocol'), r'(keeper-(core|graph-query|graph-driver)|matrix-sdk.*|syncular.*|rusqlite|libsqlite3-sys|tauri.*|reqwest|hyper|tokio|cap|nix|landlock|seccompiler)')
-reject(tree('keeper-graph-query'), r'(keeper-core|matrix-sdk.*|syncular.*|tauri.*|tokio|rayon.*)')
-for package in ['keeper-core', 'keeper-graph-driver']:
+reject(tree('keeper-graph-protocol'), r'(keeper-(core|graph|graph-query|graph-driver)|matrix-sdk.*|syncular.*|rusqlite|libsqlite3-sys|tauri.*|reqwest|hyper|tokio|cap|nix|landlock|seccompiler)')
+reject(tree('keeper-graph-query'), r'(keeper-core|keeper-graph|matrix-sdk.*|syncular.*|tauri.*|tokio|rayon.*)')
+for package in ['keeper-core', 'keeper-graph', 'keeper-graph-driver']:
     reject(tree(package), r'(keeper-graph-query|graphqlite.*)')
 for target in ['aarch64-apple-ios', 'aarch64-linux-android']:
-    for package in ['keeper', 'keeper-core', 'keeper-agent', 'keeper-graph-protocol']:
+    for package in ['keeper', 'keeper-core', 'keeper-agent', 'keeper-graph', 'keeper-graph-protocol']:
         reject(tree(package, target), r'(keeper-graph-query|keeper-graph-driver|graphqlite.*|cap|landlock|seccompiler)')
+    # The graph client is its own crate: no mobile closure of the shell gains it.
+    for package in ['keeper', 'keeper-core', 'keeper-agent']:
+        reject(tree(package, target), r'keeper-graph')
     reject(tree('keeper-graph-query', target), r'(rusqlite|libsqlite3-sys|cap|nix|rustix|landlock|seccompiler)')
 
 CRATES = ROOT / 'src-tauri/crates'
 # A person's graph reader (`human-reads`) is compiled only for keeper's own headless driver:
-# not in keeper-core's default closure, not enabled through `[workspace.dependencies]`, and
+# not in keeper-graph's default closure, not enabled through `[workspace.dependencies]`, and
 # enabled by no workspace member but keeper-graph-driver (the agent runtime must never obtain
 # a HumanReader). Checked on the parsed manifests, then on cargo's resolved feature graph.
+GRAPH_CLIENT = 'keeper-graph'
 HUMAN = 'human-reads'
 
 
@@ -63,27 +68,27 @@ def dependency_tables(doc):
 
 
 def enables_human_reads(doc, inherited):
-    """Whether a member manifest enables keeper-core's human-reads."""
+    """Whether a member manifest enables keeper-graph's human-reads."""
     for table in dependency_tables(doc):
-        dep = table.get('keeper-core')
+        dep = table.get(GRAPH_CLIENT)
         if isinstance(dep, dict):
             if HUMAN in dep.get('features', []) or (dep.get('workspace') is True and inherited):
                 return True
-    return any(v in ('keeper-core/' + HUMAN, 'keeper-core?/' + HUMAN)
+    return any(v in (GRAPH_CLIENT + '/' + HUMAN, GRAPH_CLIENT + '?/' + HUMAN)
                for values in doc.get('features', {}).values() for v in values)
 
 
 def human_reads_violations(root_doc, members):
     """`members`: {crate name: parsed manifest}. Every way human-reads reaches a non-driver."""
     found = []
-    if HUMAN in default_closure(members['keeper-core'].get('features', {})):
-        found.append('keeper-core enables human-reads by default')
-    root_core = root_doc.get('workspace', {}).get('dependencies', {}).get('keeper-core')
-    inherited = isinstance(root_core, dict) and HUMAN in root_core.get('features', [])
+    if HUMAN in default_closure(members[GRAPH_CLIENT].get('features', {})):
+        found.append('keeper-graph enables human-reads by default')
+    root_graph = root_doc.get('workspace', {}).get('dependencies', {}).get(GRAPH_CLIENT)
+    inherited = isinstance(root_graph, dict) and HUMAN in root_graph.get('features', [])
     if inherited:
-        found.append('[workspace.dependencies] keeper-core enables human-reads')
+        found.append('[workspace.dependencies] keeper-graph enables human-reads')
     enablers = sorted(name for name, doc in members.items()
-                      if name != 'keeper-core' and enables_human_reads(doc, inherited))
+                      if name != GRAPH_CLIENT and enables_human_reads(doc, inherited))
     if enablers != ['keeper-graph-driver']:
         found.append(f'human-reads enabled outside the headless driver: {enablers}')
     return found
@@ -113,17 +118,17 @@ if violations:
     raise SystemExit('; '.join(violations))
 # Self-tests: each mutation of the (passing) real manifests must fail the guard (r2 review
 # M1, M3, M5).
-CORE = MEMBER_TEXT['keeper-core']
-if 'human-reads = []\n' not in CORE or '[workspace.dependencies]\n' not in ROOT_TEXT:
+GRAPH = MEMBER_TEXT[GRAPH_CLIENT]
+if 'human-reads = []\n' not in GRAPH or '[workspace.dependencies]\n' not in ROOT_TEXT:
     raise SystemExit('guard self-test anchors missing')
 MUTANTS = {
-    'M1 default after the feature': (ROOT_TEXT, {**MEMBER_TEXT, 'keeper-core': CORE.replace(
+    'M1 default after the feature': (ROOT_TEXT, {**MEMBER_TEXT, GRAPH_CLIENT: GRAPH.replace(
         'human-reads = []\n', 'human-reads = []\ndefault = ["human-reads"]\n')}),
-    'M3 transitive default': (ROOT_TEXT, {**MEMBER_TEXT, 'keeper-core': CORE.replace(
+    'M3 transitive default': (ROOT_TEXT, {**MEMBER_TEXT, GRAPH_CLIENT: GRAPH.replace(
         'human-reads = []\n', 'human-reads = []\ndefault = ["people"]\npeople = ["human-reads"]\n')}),
     'M5 workspace dependency': (ROOT_TEXT.replace(
         '[workspace.dependencies]\n',
-        '[workspace.dependencies]\nkeeper-core = { path = "crates/keeper-core", features = ["human-reads"] }\n'),
+        '[workspace.dependencies]\nkeeper-graph = { path = "crates/keeper-graph", features = ["human-reads"] }\n'),
         MEMBER_TEXT),
 }
 for label, (root_text, member_text) in MUTANTS.items():
@@ -132,23 +137,23 @@ for label, (root_text, member_text) in MUTANTS.items():
 
 
 # The resolved graph, over every target, every feature and every edge kind (normal, build,
-# dev): no member but the driver can compile keeper-core with human-reads. keeper-core
+# dev): no member but the driver can compile keeper-graph with human-reads. keeper-graph
 # itself is the default-closure check above (`--all-features` would trivially enable it).
 def resolves_human_reads(member):
     run = subprocess.run(
         ['cargo', 'tree', '--manifest-path', str(MANIFEST), '-p', member,
          '-e', 'normal,build,dev,features', '--all-features', '--target', 'all',
-         '-i', 'keeper-core', '--prefix', 'none'], text=True, capture_output=True)
+         '-i', GRAPH_CLIENT, '--prefix', 'none'], text=True, capture_output=True)
     if run.returncode != 0:
         if 'did not match any packages' in run.stderr:
-            return False  # the member does not depend on keeper-core
+            return False  # the member does not depend on keeper-graph
         raise SystemExit(f'cargo tree failed for {member}: {run.stderr.strip()}')
-    return f'keeper-core feature "{HUMAN}"' in run.stdout
+    return f'{GRAPH_CLIENT} feature "{HUMAN}"' in run.stdout
 
 
 def resolved_violations(names):
-    return [f'{member} resolves keeper-core human-reads: {enabled}'
-            for member in sorted(names) if member != 'keeper-core'
+    return [f'{member} resolves keeper-graph human-reads: {enabled}'
+            for member in sorted(names) if member != GRAPH_CLIENT
             for enabled in [resolves_human_reads(member)]
             if enabled != (member == 'keeper-graph-driver')]
 
@@ -218,7 +223,7 @@ class Mutation:
 
 
 # Self-tests on disk, each of which must fail the guard:
-# - N8 / N11 (r3 review): an indirect keeper-core feature implying human-reads, enabled from a
+# - N8 / N11 (r3 review): an indirect keeper-graph feature implying human-reads, enabled from a
 #   macOS-only table or from a non-default member feature; invisible to the manifest scan,
 #   caught by the resolved check;
 # - X3 (r4 review): a new workspace member outside `crates/` enabling human-reads, which pins
@@ -228,22 +233,24 @@ FULL = 'human-reads = []\nfull = ["human-reads"]\n'
 OUTSIDE = MANIFEST.parent / 'kg1-guard-selftest/people'
 SELF_TESTS = {
     'N8 indirect feature from a macOS table': lambda m: (
-        m.write(MEMBER_PATH['keeper-core'], CORE.replace('human-reads = []\n', FULL)),
+        m.write(MEMBER_PATH[GRAPH_CLIENT], GRAPH.replace('human-reads = []\n', FULL)),
         m.write(MEMBER_PATH['keeper'], MEMBER_TEXT['keeper'].replace(
-            MACOS, MACOS + 'keeper-core = { path = "../keeper-core", features = ["full"] }\n'))),
+            MACOS, MACOS + 'keeper-graph = { path = "../keeper-graph", features = ["full"] }\n'))),
     'N11 indirect feature from a non-default member feature': lambda m: (
-        m.write(MEMBER_PATH['keeper-core'], CORE.replace('human-reads = []\n', FULL)),
+        m.write(MEMBER_PATH[GRAPH_CLIENT], GRAPH.replace('human-reads = []\n', FULL)),
         m.write(MEMBER_PATH['keeper-agent'],
-                MEMBER_TEXT['keeper-agent'] + '\n[features]\npeople = ["keeper-core/full"]\n')),
+                MEMBER_TEXT['keeper-agent']
+                + '\n[dependencies.keeper-graph]\npath = "../keeper-graph"\noptional = true\n'
+                + '\n[features]\npeople = ["keeper-graph/full"]\n')),
     'X3 a member outside crates/': lambda m: (
         m.write(MANIFEST, ROOT_TEXT.replace(
             'members = [', 'members = ["kg1-guard-selftest/people", ', 1)),
         m.write(OUTSIDE / 'Cargo.toml',
                 '[package]\nname = "people"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n'
-                '[dependencies]\nkeeper-core = { path = "../../crates/keeper-core", features = ["human-reads"] }\n'),
+                '[dependencies]\nkeeper-graph = { path = "../../crates/keeper-graph", features = ["human-reads"] }\n'),
         m.write(OUTSIDE / 'src/lib.rs', '')),
 }
-if FULL in CORE or 'members = [' not in ROOT_TEXT or MACOS not in MEMBER_TEXT['keeper'] or OUTSIDE.exists():
+if FULL in GRAPH or 'members = [' not in ROOT_TEXT or MACOS not in MEMBER_TEXT['keeper'] or OUTSIDE.exists():
     raise SystemExit('guard self-test anchors missing')
 for label, apply in SELF_TESTS.items():
     with Mutation() as mutation:
@@ -357,7 +364,7 @@ for crate in ['keeper-graph-query', 'keeper-graph-protocol', 'keeper-graph-drive
             head = re.search(r'((?:#\[[^\]]*\]\s*)*)((?:pub\s+)?(?:unsafe\s+)?extern\s+\S*\s*fn\s+' + name + r')\b', text)
             if not head or 'unsafe' in head.group(0) or 'export' in head.group(1):
                 raise SystemExit(f'safe callback {name} changed shape in {rel}')
-for path in (CRATES / 'keeper-core/src/graph').rglob('*.rs'):
+for path in (CRATES / 'keeper-graph').rglob('*.rs'):
     if re.search(r'\bunsafe\b|unsafe_code', strip(path.read_text())):
         raise SystemExit(f'unsafe in credential-bearing graph client: {path}')
 if len(allowances) != 11 or sorted(allowances) != sorted(set().union(*INVENTORY.values())):

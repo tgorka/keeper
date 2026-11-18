@@ -52,7 +52,6 @@ use crate::agents::log::HeardReason;
 use crate::hq::live::AgentLiveTurnVm;
 use crate::hq::sessions::{
     self, authored, json as json_column, now_ms, object, page_key, read, text, AgentSessionRef,
-    Source,
 };
 use crate::hq::{Hq, HqError};
 use crate::vm::VoiceAgentTargetVm;
@@ -60,6 +59,7 @@ use crate::voice::backchannel::Utterance;
 use crate::voice::speech::{AnswerFollower, Sentence};
 use crate::voice::{Effect, TurnEvent, TurnState};
 use keeper_ports::RowOp;
+use keeper_ports::Source;
 
 /// The `kind` of a person's heard row's metadata (R-HQ-68).
 pub const HEARD_KIND: &str = "heard";

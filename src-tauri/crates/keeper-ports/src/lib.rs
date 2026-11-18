@@ -7,12 +7,18 @@
 //! on the network. Everything else is handed to the replica's owner thread
 //! and waits for it, which can be behind a round bounded by the transport's
 //! request timeout; an async caller runs those on `spawn_blocking`.
+//!
+//! Beside the port: [`Source`], one database a device holds and who it is
+//! in it, and [`server`], the agents server's address grammar every
+//! replica path and request reads the same way.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tokio::sync::watch;
+
+pub mod server;
 
 /// Rows a query read, and the window units not complete when it read them.
 pub type Covered = (Vec<Map<String, Value>>, Vec<String>);
@@ -564,4 +570,15 @@ pub trait Replica: Send + Sync {
 /// Opens a replica. Never touches the network.
 pub trait Opener: Send + Sync {
     fn open(&self, spec: ReplicaSpec) -> Result<Arc<dyn Replica>, ReplicaError>;
+}
+
+/// One database this device holds, and who this device is in it.
+#[derive(Clone)]
+pub struct Source {
+    pub database: String,
+    pub replica: Arc<dyn Replica>,
+    /// The person's actor id.
+    pub actor: String,
+    /// This device's client id.
+    pub client: String,
 }

@@ -178,7 +178,7 @@ fn remote_host(remote_url: &str) -> Option<String> {
 /// may still reach) once per host and port — one row however many of its
 /// databases this device holds, since they share it, and none for a blank
 /// value or an address
-/// [`ServerUrl::parse`](crate::hq::server::ServerUrl::parse) refuses, which
+/// [`ServerUrl::parse`](keeper_ports::server::ServerUrl::parse) refuses, which
 /// keeper never contacts — then the update endpoint
 /// last. Never panics and never uses `.unwrap()` — a malformed
 /// homeserver URL is surfaced verbatim as a homeserver entry and is *not* treated
@@ -281,7 +281,7 @@ pub fn compute_egress(
     // host, and nothing for what keeper would not contact.
     let mut seen_agents_hosts: Vec<String> = Vec::new();
     for stored in agents_servers {
-        let Ok(Some(server)) = crate::hq::server::ServerUrl::parse(stored) else {
+        let Ok(Some(server)) = keeper_ports::server::ServerUrl::parse(stored) else {
             continue;
         };
         if seen_agents_hosts.iter().any(|host| host == server.host()) {
@@ -448,7 +448,7 @@ pub const PUSH_GATEWAY_LABEL: &str =
 /// The push gateway the person named (98.1 #8, Q6; NFR-121), as one
 /// [`EgressKind::PushGateway`] row: its host, and its port when the address
 /// names one — the way an MCP server's row is composed
-/// ([`url_host`](crate::agents::mcp::url_host)), so `:8443` and `:443` are
+/// ([`url_host`](keeper_ports::server::url_host)), so `:8443` and `:443` are
 /// two destinations — never its path. `stored` is `push.gateway_url` as the
 /// settings table holds it; blank, absent, or an address
 /// [`Gateway::parse`](crate::agents::push::Gateway::parse) refuses (keeper
@@ -459,7 +459,7 @@ pub fn push_egress(stored: Option<&str>) -> Vec<EgressEndpointVm> {
     let Some(Ok(Some(gateway))) = stored.map(crate::agents::push::Gateway::parse) else {
         return Vec::new();
     };
-    crate::agents::mcp::url_host(gateway.as_str())
+    keeper_ports::server::url_host(gateway.as_str())
         .map(|host| EgressEndpointVm {
             url: host,
             kind: EgressKind::PushGateway,
